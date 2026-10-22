@@ -1,0 +1,18 @@
+# Build output
+/target/
+/dist/
+
+# Local scratch: screenshots, helper scripts, generated reports and patches
+/out/
+
+# Portable-mode settings written next to the executable
+oxidemerge.json
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

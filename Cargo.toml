@@ -1,0 +1,45 @@
+[package]
+name = "oxidemerge"
+version = "0.9.0"
+edition = "2021"
+description = "OxideMerge - a cross-platform differencing and merging tool for Windows, macOS and Linux, modeled on WinMerge"
+license = "MIT"
+
+[[bin]]
+name = "oxidemerge"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }
+egui = "0.31"
+egui_extras = { version = "0.31", default-features = false }
+rfd = "0.15"
+similar = "2.6"
+encoding_rs = "0.8"
+chardetng = "0.1"
+walkdir = "2"
+regex = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp", "tga", "pnm"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+anyhow = "1"
+tempfile = "3"
+
+trash = "5"
+sys-locale = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.dev.package."*"]
+opt-level = 2

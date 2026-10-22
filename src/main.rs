@@ -1,0 +1,436 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod config;
+mod core;
+mod i18n;
+mod shell;
+mod ui;
+
+use clap::{Parser, ValueEnum};
+use config::Config;
+use core::diff::WhitespaceMode;
+use core::filter::FileFilter;
+use core::folder::{CmpStatus, CompareMethod, Progress, Scanner};
+use core::patch::PatchStyle;
+use core::report::ReportFormat;
+use core::text::FileKind;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use ui::app::{OpenRequest, OxideMergeApp};
+
+#[derive(Clone, Copy, ValueEnum)]
+enum MethodArg {
+    Full,
+    Quick,
+    Binary,
+    Date,
+    Datesize,
+    Size,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum KindArg {
+    Text,
+    Binary,
+    Image,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum WsArg {
+    Compare,
+    Change,
+    All,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PatchArg {
+    Normal,
+    Context,
+    Unified,
+}
+
+/// OxideMerge - compare and merge files and folders on Windows, macOS and Linux.
+///
+/// WinMerge style switches (/r, /f, /dl, /wl, /o, /or ...) are accepted on Windows as well.
+#[derive(Parser)]
+#[command(name = "oxidemerge", version, about, long_about = None)]
+struct Cli {
+    /// Files or folders to compare (2 or 3; a single conflict file is opened for resolution)
+    paths: Vec<PathBuf>,
+    /// Compare folders recursively
+    #[arg(short = 'r', long)]
+    recursive: bool,
+    /// File filter: wildcard mask (e.g. "*.c;*.h;!*.bak") or "[F] <filter name>"
+    #[arg(short = 'f', long)]
+    filter: Option<String>,
+    /// Folder compare method
+    #[arg(short = 'm', long, value_enum)]
+    method: Option<MethodArg>,
+    /// Force the file compare type
+    #[arg(short = 't', long = "compare-as", value_enum)]
+    kind: Option<KindArg>,
+    /// Merge output file (middle pane in 3-way, right pane in 2-way)
+    #[arg(short = 'o', long)]
+    output: Option<PathBuf>,
+    /// Description of the left side
+    #[arg(long)]
+    dl: Option<String>,
+    /// Description of the middle side
+    #[arg(long)]
+    dm: Option<String>,
+    /// Description of the right side
+    #[arg(long)]
+    dr: Option<String>,
+    /// Open the left side read-only
+    #[arg(long)]
+    wl: bool,
+    /// Open the middle side read-only
+    #[arg(long)]
+    wm: bool,
+    /// Open the right side read-only
+    #[arg(long)]
+    wr: bool,
+    /// Whitespace handling
+    #[arg(long, value_enum)]
+    ignore_ws: Option<WsArg>,
+    #[arg(long)]
+    ignore_case: bool,
+    #[arg(long)]
+    ignore_blank: bool,
+    #[arg(long)]
+    ignore_eol: bool,
+    #[arg(long)]
+    ignore_numbers: bool,
+    /// Write a folder compare report (.html, .csv or .txt) without opening the GUI
+    #[arg(long)]
+    report: Option<PathBuf>,
+    /// Write a patch file without opening the GUI
+    #[arg(long)]
+    patch: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "unified")]
+    patch_style: PatchArg,
+    /// Context lines for context/unified patches
+    #[arg(long, default_value_t = 3)]
+    context: usize,
+    /// Compare in the console only: print differences, exit code 0 = identical, 1 = different, 2 = error
+    #[arg(long)]
+    cli: bool,
+    /// User interface language code (en, zh-TW, zh-CN, ja, ko, de, fr, es, ru, pt-BR, ...)
+    #[arg(long)]
+    lang: Option<String>,
+    /// List available languages
+    #[arg(long)]
+    list_languages: bool,
+    /// Add "OxideMerge" entries to the Windows Explorer context menu
+    #[arg(long)]
+    register_shell: bool,
+    /// Remove the Windows Explorer context menu entries
+    #[arg(long)]
+    unregister_shell: bool,
+    /// Remember a path as the left side for a later --compare-to (Explorer integration)
+    #[arg(long)]
+    select_left: Option<PathBuf>,
+    /// Compare a path with the one stored by --select-left
+    #[arg(long)]
+    compare_to: Option<PathBuf>,
+}
+
+/// Translates WinMerge style "/switch" arguments into the equivalent long options.
+fn winmerge_args() -> Vec<String> {
+    let mut out = Vec::new();
+    for a in std::env::args() {
+        if cfg!(windows) && a.starts_with('/') && a.len() > 1 && !a[1..].contains(['/', '\\', ':']) {
+            let sw = a[1..].to_ascii_lowercase();
+            let mapped = match sw.as_str() {
+                "r" => Some("--recursive"),
+                "f" => Some("--filter"),
+                "o" => Some("--output"),
+                "or" => Some("--report"),
+                "dl" => Some("--dl"),
+                "dm" => Some("--dm"),
+                "dr" => Some("--dr"),
+                "wl" => Some("--wl"),
+                "wm" => Some("--wm"),
+                "wr" => Some("--wr"),
+                "t" => Some("--compare-as"),
+                "m" => Some("--method"),
+                "e" | "u" | "x" | "s" | "minimize" | "maximize" | "noninteractive" | "noprefs" | "ub" | "fl" | "fm" | "fr" => None,
+                _ => {
+                    out.push(a);
+                    continue;
+                }
+            };
+            if let Some(m) = mapped {
+                out.push(m.to_string());
+            }
+            continue;
+        }
+        out.push(a);
+    }
+    out
+}
+
+fn attach_console() {
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
+    }
+}
+
+fn apply_cli_options(cli: &Cli, cfg: &mut Config) {
+    if let Some(ws) = cli.ignore_ws {
+        cfg.diff.whitespace = match ws {
+            WsArg::Compare => WhitespaceMode::Compare,
+            WsArg::Change => WhitespaceMode::IgnoreChange,
+            WsArg::All => WhitespaceMode::IgnoreAll,
+        };
+    }
+    cfg.diff.ignore_case |= cli.ignore_case;
+    cfg.diff.ignore_blank_lines |= cli.ignore_blank;
+    cfg.diff.ignore_eol |= cli.ignore_eol;
+    cfg.diff.ignore_numbers |= cli.ignore_numbers;
+    if let Some(m) = cli.method {
+        cfg.folder.method = method(m);
+    }
+    if cli.recursive {
+        cfg.folder.recursive = true;
+    }
+}
+
+fn method(m: MethodArg) -> CompareMethod {
+    match m {
+        MethodArg::Full => CompareMethod::FullContents,
+        MethodArg::Quick => CompareMethod::QuickContents,
+        MethodArg::Binary => CompareMethod::BinaryContents,
+        MethodArg::Date => CompareMethod::Date,
+        MethodArg::Datesize => CompareMethod::DateSize,
+        MethodArg::Size => CompareMethod::Size,
+    }
+}
+
+fn patch_style(p: PatchArg) -> PatchStyle {
+    match p {
+        PatchArg::Normal => PatchStyle::Normal,
+        PatchArg::Context => PatchStyle::Context,
+        PatchArg::Unified => PatchStyle::Unified,
+    }
+}
+
+/// Non-interactive operations (console compare, report, patch). Returns the process exit code.
+fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
+    let paths = &cli.paths;
+    if paths.len() < 2 {
+        anyhow::bail!("two or three paths are required");
+    }
+    if paths.iter().all(|p| p.is_dir()) {
+        let filter_spec = cli.filter.clone().unwrap_or_else(|| cfg.filter.clone());
+        let filter = FileFilter::resolve(&filter_spec, &core::filter::load_all_filters());
+        let progress = Progress::default();
+        let mut fopts = cfg.folder.clone();
+        fopts.recursive = cli.recursive || fopts.recursive;
+        let items = Scanner { roots: paths, filter: &filter, fopts: &fopts, dopts: &cfg.diff, progress: &progress }.run();
+        let display: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        let files: Vec<&core::folder::DirItem> = items.iter().filter(|i| !i.is_dir || i.children.is_empty()).collect();
+        let different = files.iter().any(|i| i.status != CmpStatus::Identical);
+        if let Some(r) = &cli.report {
+            std::fs::write(r, core::report::generate(&files, paths, ReportFormat::from_path(r)))?;
+        }
+        if let Some(p) = &cli.patch {
+            let text = core::patch::folder_patch(paths, &display, &items, &cfg.diff, patch_style(cli.patch_style), cli.context);
+            std::fs::write(p, text)?;
+        }
+        if cli.cli {
+            let changed: Vec<&core::folder::DirItem> =
+                files.iter().copied().filter(|i| i.status != CmpStatus::Identical).collect();
+            print!("{}", core::report::generate(&changed, paths, ReportFormat::Text));
+        }
+        return Ok(u8::from(different));
+    }
+    let kind = match cli.kind {
+        Some(KindArg::Binary) => FileKind::Binary,
+        Some(KindArg::Image) => FileKind::Image,
+        Some(KindArg::Text) => FileKind::Text,
+        None => {
+            if paths.iter().any(|p| core::text::detect_kind(p) == FileKind::Binary) {
+                FileKind::Binary
+            } else {
+                FileKind::Text
+            }
+        }
+    };
+    if kind != FileKind::Text {
+        let a = std::fs::read(&paths[0])?;
+        let b = std::fs::read(&paths[1])?;
+        let ranges = core::binary::diff_ranges(&[&a, &b]);
+        if cli.cli {
+            for r in ranges.iter().take(100) {
+                println!("0x{:08X}-0x{:08X} differ", r.start, r.end);
+            }
+            if ranges.is_empty() {
+                println!("{}", i18n::tr("msg.binary_identical"));
+            }
+        }
+        return Ok(u8::from(!ranges.is_empty()));
+    }
+    let docs: Vec<core::text::TextDoc> = paths.iter().map(|p| core::text::load_doc(p, None)).collect::<Result<_, _>>()?;
+    let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
+    let result = core::diff::compute(&refs, &cfg.diff);
+    if docs.len() == 2 {
+        let name = |i: usize| cli_desc(cli, i).unwrap_or_else(|| paths[i].display().to_string());
+        let (na, nb) = (name(0), name(1));
+        let date = |i: usize| {
+            std::fs::metadata(&paths[i]).and_then(|m| m.modified()).map(|t| core::report::fmt_time(Some(t))).unwrap_or_default()
+        };
+        let (da, db) = (date(0), date(1));
+        let input = core::patch::PatchInput { name_a: &na, name_b: &nb, date_a: &da, date_b: &db, a: &docs[0].lines, b: &docs[1].lines };
+        let text = core::patch::make_patch(&input, &result, patch_style(cli.patch_style), cli.context);
+        if let Some(p) = &cli.patch {
+            std::fs::write(p, &text)?;
+        }
+        if cli.cli {
+            print!("{text}");
+        }
+    } else if cli.cli {
+        for b in result.blocks.iter().filter(|b| !b.ignored) {
+            println!(
+                "{:?}: left {}-{}, middle {}-{}, right {}-{}",
+                b.kind,
+                b.ranges[0].start + 1,
+                b.ranges[0].end,
+                b.ranges[1].start + 1,
+                b.ranges[1].end,
+                b.ranges[2].start + 1,
+                b.ranges[2].end
+            );
+        }
+    }
+    Ok(u8::from(!result.is_identical()))
+}
+
+fn cli_desc(cli: &Cli, i: usize) -> Option<String> {
+    match (cli.paths.len(), i) {
+        (_, 0) => cli.dl.clone(),
+        (2, 1) => cli.dr.clone(),
+        (3, 1) => cli.dm.clone(),
+        _ => cli.dr.clone(),
+    }
+}
+
+fn app_icon() -> egui::IconData {
+    match ui::widgets::logo_image() {
+        Some(img) => egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() },
+        None => egui::IconData::default(),
+    }
+}
+
+fn main() -> ExitCode {
+    attach_console();
+    let cli = Cli::parse_from(winmerge_args());
+    let mut cfg = Config::load();
+    if let Some(l) = &cli.lang {
+        cfg.language = l.clone();
+    }
+    i18n::set_language(&cfg.language);
+
+    if cli.list_languages {
+        for l in i18n::languages() {
+            println!("{:8} {}", l.code, l.name);
+        }
+        return ExitCode::SUCCESS;
+    }
+    if cli.register_shell {
+        return match shell::register() {
+            Ok(()) => {
+                println!("{}", i18n::tr("msg.shell_registered"));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if cli.unregister_shell {
+        let _ = shell::unregister();
+        println!("{}", i18n::tr("msg.shell_unregistered"));
+        return ExitCode::SUCCESS;
+    }
+    if let Some(p) = &cli.select_left {
+        cfg.shell_selected_left = Some(p.display().to_string());
+        cfg.save();
+        return ExitCode::SUCCESS;
+    }
+
+    apply_cli_options(&cli, &mut cfg);
+
+    if cli.cli || cli.report.is_some() || cli.patch.is_some() {
+        return match run_batch(&cli, &cfg) {
+            Ok(code) => ExitCode::from(code),
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    let mut paths = cli.paths.clone();
+    if let Some(p) = &cli.compare_to {
+        if let Some(left) = cfg.shell_selected_left.take() {
+            paths = vec![PathBuf::from(left), p.clone()];
+            cfg.save();
+        } else {
+            paths = vec![p.clone()];
+        }
+    }
+    let initial = if paths.is_empty() {
+        None
+    } else {
+        let n = paths.len();
+        let descriptions = (0..n).map(|i| cli_desc(&cli, i)).collect();
+        let read_only = (0..n)
+            .map(|i| match (n, i) {
+                (_, 0) => cli.wl,
+                (2, 1) => cli.wr,
+                (3, 1) => cli.wm,
+                _ => cli.wr,
+            })
+            .collect();
+        Some(OpenRequest {
+            paths,
+            descriptions,
+            read_only,
+            kind: cli.kind.map(|k| match k {
+                KindArg::Text => FileKind::Text,
+                KindArg::Binary => FileKind::Binary,
+                KindArg::Image => FileKind::Image,
+            }),
+            recursive: if cli.recursive { Some(true) } else { None },
+            filter: cli.filter.clone(),
+            method: cli.method.map(method),
+            output: cli.output.clone(),
+            ..Default::default()
+        })
+    };
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("OxideMerge")
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([640.0, 400.0])
+            .with_drag_and_drop(true)
+            .with_icon(std::sync::Arc::new(app_icon())),
+        ..Default::default()
+    };
+    let result = eframe::run_native(
+        "OxideMerge",
+        options,
+        Box::new(move |cc| Ok(Box::new(OxideMergeApp::new(cc, cfg, initial)))),
+    );
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(2)
+        }
+    }
+}

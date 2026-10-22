@@ -1,0 +1,7 @@
+header
+<<<<<<< HEAD
+my change
+=======
+their change
+>>>>>>> feature
+footer
