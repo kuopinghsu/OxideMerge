@@ -60,8 +60,13 @@ The name comes from the language it is written in: rust is iron oxide.
 | Linux (X11 and Wayland) | GTK file dialogs, freedesktop Trash |
 
 The same code base builds on all three. Fonts come from the system: Segoe UI and Cascadia Mono on
-Windows, SF and Menlo on macOS, and Noto, Inter or DejaVu on Linux. Install Noto Sans CJK or
-WenQuanYi on Linux for Chinese, Japanese and Korean text.
+Windows, SF and Menlo on macOS, and Noto, Inter or DejaVu on Linux. For Chinese, Japanese and
+Korean text on Linux, any CJK font that fontconfig knows about is used (Noto Sans CJK or WenQuanYi
+recommended); under WSL the Windows fonts are used when no Linux CJK font is installed.
+
+Under WSL2 the app selects Mesa's `d3d12` driver (GPU acceleration through WSLg) when it is
+installed and silences Mesa's EGL driver-probing warnings. Set `GALLIUM_DRIVER` or `EGL_LOG_LEVEL`
+yourself to override either.
 
 ## Building
 

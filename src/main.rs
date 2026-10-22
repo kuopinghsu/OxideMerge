@@ -323,7 +323,31 @@ fn app_icon() -> egui::IconData {
     }
 }
 
+/// WSLg accelerates OpenGL only through Mesa's d3d12 driver. Left to itself, Mesa probes the
+/// DRM device and Vulkan (zink) first, prints errors for each, then settles on llvmpipe.
+/// An unknown `GALLIUM_DRIVER` makes Mesa fail outright, so d3d12 is only selected when installed.
+#[cfg(target_os = "linux")]
+fn wsl_gl_defaults() {
+    use std::path::Path;
+    if !Path::new("/dev/dxg").exists() {
+        return;
+    }
+    if std::env::var_os("GALLIUM_DRIVER").is_none() {
+        let arch_dir = format!("/usr/lib/{}-linux-gnu/dri", std::env::consts::ARCH);
+        let mut dirs: Vec<String> = std::env::var("LIBGL_DRIVERS_PATH").unwrap_or_default().split(':').map(String::from).collect();
+        dirs.extend([arch_dir, "/usr/lib64/dri".into(), "/usr/lib/dri".into()]);
+        if dirs.iter().any(|d| !d.is_empty() && Path::new(d).join("d3d12_dri.so").exists()) {
+            std::env::set_var("GALLIUM_DRIVER", "d3d12");
+        }
+    }
+    if std::env::var_os("EGL_LOG_LEVEL").is_none() {
+        std::env::set_var("EGL_LOG_LEVEL", "fatal");
+    }
+}
+
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    wsl_gl_defaults();
     attach_console();
     let cli = Cli::parse_from(winmerge_args());
     let mut cfg = Config::load();
