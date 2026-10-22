@@ -1372,6 +1372,7 @@ impl OxideMergeApp {
         }
         let mut open = true;
         let mut reload = false;
+        let mut apply = false;
         egui::Window::new(tr("menu.filters")).open(&mut open).default_width(560.0).show(ctx, |ui| {
             ui.label(tr("filters.hint"));
             ui.separator();
@@ -1390,6 +1391,7 @@ impl OxideMergeApp {
                         if let Some(d) = &mut self.open_dlg {
                             d.filter = self.cfg.filter.clone();
                         }
+                        apply = true;
                     }
                     ui.end_row();
                 }
@@ -1428,6 +1430,12 @@ impl OxideMergeApp {
         });
         if reload {
             self.named_filters = filter::load_all_filters();
+        }
+        if apply {
+            if let Some(Content::Folder(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.content) {
+                v.filter_spec = self.cfg.filter.clone();
+                v.refresh(&self.cfg, &self.named_filters);
+            }
         }
         self.filters_dlg = open;
     }

@@ -179,11 +179,13 @@ const BUILTIN: &[&str] = &[
 desc: Ignores files and folders of version control systems
 def: include
 d: \\\.git$
+d: \\\.github$
 d: \\\.svn$
 d: \\\.hg$
 d: \\\.bzr$
 d: \\CVS$
 d: \\_darcs$
+f: ^\.git$
 f: ^\.gitignore$
 f: ^\.gitattributes$
 f: ^\.gitmodules$
@@ -282,7 +284,11 @@ mod tests {
         let f = &builtin_filters()[0];
         let ff = FileFilter::Flt(f.clone());
         assert!(!ff.include_dir(".git", ".git"));
+        assert!(!ff.include_dir(".github", ".github"));
+        assert!(!ff.include_dir("sub/.git", ".git"));
+        assert!(!ff.include_file("sub/.git", ".git"));
         assert!(ff.include_dir("src", "src"));
+        assert!(ff.include_dir(".gitx", ".gitx"));
         assert!(!ff.include_file(".gitignore", ".gitignore"));
         let src = FileFilter::Flt(builtin_filters()[2].clone());
         assert!(src.include_file("a.rs", "a.rs"));
