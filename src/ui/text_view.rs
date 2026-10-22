@@ -1692,6 +1692,7 @@ impl TextView {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut open)
+                .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
                 .show(ui.ctx(), |ui| {
                     ui.horizontal(|ui| {
                         ui.label(tr("label.line"));

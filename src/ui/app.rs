@@ -1866,6 +1866,7 @@ impl OxideMergeApp {
         egui::Window::new(tr("menu.filters"))
             .open(&mut open)
             .default_width(560.0)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.label(tr("filters.hint"));
                 ui.separator();
@@ -2153,6 +2154,7 @@ impl OxideMergeApp {
             .open(&mut self.about)
             .collapsible(false)
             .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     widgets::logo(ui, 44.0);
@@ -2175,6 +2177,7 @@ impl OxideMergeApp {
             });
         egui::Window::new(tr("menu.shortcuts"))
             .open(&mut self.shortcuts)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 egui::Grid::new("sc").striped(true).show(ui, |ui| {
                     for (k, v) in [
