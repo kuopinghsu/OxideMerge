@@ -222,8 +222,14 @@ pub fn decode(bytes: &[u8], forced: Option<TextEncoding>) -> (String, TextEncodi
     let body = if has_bom { &bytes[bom_len..] } else { bytes };
     let text = match enc {
         TextEncoding::Utf8 => String::from_utf8_lossy(body).into_owned(),
-        TextEncoding::Utf16Le => encoding_rs::UTF_16LE.decode_without_bom_handling(body).0.into_owned(),
-        TextEncoding::Utf16Be => encoding_rs::UTF_16BE.decode_without_bom_handling(body).0.into_owned(),
+        TextEncoding::Utf16Le => encoding_rs::UTF_16LE
+            .decode_without_bom_handling(body)
+            .0
+            .into_owned(),
+        TextEncoding::Utf16Be => encoding_rs::UTF_16BE
+            .decode_without_bom_handling(body)
+            .0
+            .into_owned(),
         TextEncoding::Other(e) => e.decode_without_bom_handling(body).0.into_owned(),
     };
     (text, enc, has_bom)
@@ -313,7 +319,11 @@ pub fn load_doc(path: &Path, forced: Option<TextEncoding>) -> Result<TextDoc> {
     Ok(doc_from_bytes(Some(path.to_path_buf()), &bytes, forced))
 }
 
-pub fn doc_from_bytes(path: Option<PathBuf>, bytes: &[u8], forced: Option<TextEncoding>) -> TextDoc {
+pub fn doc_from_bytes(
+    path: Option<PathBuf>,
+    bytes: &[u8],
+    forced: Option<TextEncoding>,
+) -> TextDoc {
     let (text, enc, bom) = decode(bytes, forced);
     let mut doc = TextDoc::from_text(path, &text);
     doc.encoding = enc;
@@ -329,7 +339,8 @@ pub enum FileKind {
 }
 
 pub const IMAGE_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "bmp", "ico", "tif", "tiff", "webp", "tga", "pnm", "ppm", "pgm", "pbm",
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "tif", "tiff", "webp", "tga", "pnm", "ppm", "pgm",
+    "pbm",
 ];
 
 pub fn extension(path: &Path) -> String {

@@ -139,7 +139,8 @@ struct Cli {
 fn winmerge_args() -> Vec<String> {
     let mut out = Vec::new();
     for a in std::env::args() {
-        if cfg!(windows) && a.starts_with('/') && a.len() > 1 && !a[1..].contains(['/', '\\', ':']) {
+        if cfg!(windows) && a.starts_with('/') && a.len() > 1 && !a[1..].contains(['/', '\\', ':'])
+        {
             let sw = a[1..].to_ascii_lowercase();
             let mapped = match sw.as_str() {
                 "r" => Some("--recursive"),
@@ -154,7 +155,8 @@ fn winmerge_args() -> Vec<String> {
                 "wr" => Some("--wr"),
                 "t" => Some("--compare-as"),
                 "m" => Some("--method"),
-                "e" | "u" | "x" | "s" | "minimize" | "maximize" | "noninteractive" | "noprefs" | "ub" | "fl" | "fm" | "fr" => None,
+                "e" | "u" | "x" | "s" | "minimize" | "maximize" | "noninteractive" | "noprefs"
+                | "ub" | "fl" | "fm" | "fr" => None,
                 _ => {
                     out.push(a);
                     continue;
@@ -173,7 +175,9 @@ fn winmerge_args() -> Vec<String> {
 fn attach_console() {
     #[cfg(windows)]
     unsafe {
-        windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
+        windows_sys::Win32::System::Console::AttachConsole(
+            windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        );
     }
 }
 
@@ -228,21 +232,47 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         let progress = Progress::default();
         let mut fopts = cfg.folder.clone();
         fopts.recursive = cli.recursive || fopts.recursive;
-        let items = Scanner { roots: paths, filter: &filter, fopts: &fopts, dopts: &cfg.diff, progress: &progress }.run();
+        let items = Scanner {
+            roots: paths,
+            filter: &filter,
+            fopts: &fopts,
+            dopts: &cfg.diff,
+            progress: &progress,
+        }
+        .run();
         let display: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-        let files: Vec<&core::folder::DirItem> = items.iter().filter(|i| !i.is_dir || i.children.is_empty()).collect();
+        let files: Vec<&core::folder::DirItem> = items
+            .iter()
+            .filter(|i| !i.is_dir || i.children.is_empty())
+            .collect();
         let different = files.iter().any(|i| i.status != CmpStatus::Identical);
         if let Some(r) = &cli.report {
-            std::fs::write(r, core::report::generate(&files, paths, ReportFormat::from_path(r)))?;
+            std::fs::write(
+                r,
+                core::report::generate(&files, paths, ReportFormat::from_path(r)),
+            )?;
         }
         if let Some(p) = &cli.patch {
-            let text = core::patch::folder_patch(paths, &display, &items, &cfg.diff, patch_style(cli.patch_style), cli.context);
+            let text = core::patch::folder_patch(
+                paths,
+                &display,
+                &items,
+                &cfg.diff,
+                patch_style(cli.patch_style),
+                cli.context,
+            );
             std::fs::write(p, text)?;
         }
         if cli.cli {
-            let changed: Vec<&core::folder::DirItem> =
-                files.iter().copied().filter(|i| i.status != CmpStatus::Identical).collect();
-            print!("{}", core::report::generate(&changed, paths, ReportFormat::Text));
+            let changed: Vec<&core::folder::DirItem> = files
+                .iter()
+                .copied()
+                .filter(|i| i.status != CmpStatus::Identical)
+                .collect();
+            print!(
+                "{}",
+                core::report::generate(&changed, paths, ReportFormat::Text)
+            );
         }
         return Ok(u8::from(different));
     }
@@ -251,7 +281,10 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         Some(KindArg::Image) => FileKind::Image,
         Some(KindArg::Text) => FileKind::Text,
         None => {
-            if paths.iter().any(|p| core::text::detect_kind(p) == FileKind::Binary) {
+            if paths
+                .iter()
+                .any(|p| core::text::detect_kind(p) == FileKind::Binary)
+            {
                 FileKind::Binary
             } else {
                 FileKind::Text
@@ -272,18 +305,32 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         }
         return Ok(u8::from(!ranges.is_empty()));
     }
-    let docs: Vec<core::text::TextDoc> = paths.iter().map(|p| core::text::load_doc(p, None)).collect::<Result<_, _>>()?;
+    let docs: Vec<core::text::TextDoc> = paths
+        .iter()
+        .map(|p| core::text::load_doc(p, None))
+        .collect::<Result<_, _>>()?;
     let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
     let result = core::diff::compute(&refs, &cfg.diff);
     if docs.len() == 2 {
         let name = |i: usize| cli_desc(cli, i).unwrap_or_else(|| paths[i].display().to_string());
         let (na, nb) = (name(0), name(1));
         let date = |i: usize| {
-            std::fs::metadata(&paths[i]).and_then(|m| m.modified()).map(|t| core::report::fmt_time(Some(t))).unwrap_or_default()
+            std::fs::metadata(&paths[i])
+                .and_then(|m| m.modified())
+                .map(|t| core::report::fmt_time(Some(t)))
+                .unwrap_or_default()
         };
         let (da, db) = (date(0), date(1));
-        let input = core::patch::PatchInput { name_a: &na, name_b: &nb, date_a: &da, date_b: &db, a: &docs[0].lines, b: &docs[1].lines };
-        let text = core::patch::make_patch(&input, &result, patch_style(cli.patch_style), cli.context);
+        let input = core::patch::PatchInput {
+            name_a: &na,
+            name_b: &nb,
+            date_a: &da,
+            date_b: &db,
+            a: &docs[0].lines,
+            b: &docs[1].lines,
+        };
+        let text =
+            core::patch::make_patch(&input, &result, patch_style(cli.patch_style), cli.context);
         if let Some(p) = &cli.patch {
             std::fs::write(p, &text)?;
         }
@@ -318,7 +365,11 @@ fn cli_desc(cli: &Cli, i: usize) -> Option<String> {
 
 fn app_icon() -> egui::IconData {
     match ui::widgets::logo_image() {
-        Some(img) => egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() },
+        Some(img) => egui::IconData {
+            width: img.width(),
+            height: img.height(),
+            rgba: img.into_raw(),
+        },
         None => egui::IconData::default(),
     }
 }
@@ -334,9 +385,16 @@ fn wsl_gl_defaults() {
     }
     if std::env::var_os("GALLIUM_DRIVER").is_none() {
         let arch_dir = format!("/usr/lib/{}-linux-gnu/dri", std::env::consts::ARCH);
-        let mut dirs: Vec<String> = std::env::var("LIBGL_DRIVERS_PATH").unwrap_or_default().split(':').map(String::from).collect();
+        let mut dirs: Vec<String> = std::env::var("LIBGL_DRIVERS_PATH")
+            .unwrap_or_default()
+            .split(':')
+            .map(String::from)
+            .collect();
         dirs.extend([arch_dir, "/usr/lib64/dri".into(), "/usr/lib/dri".into()]);
-        if dirs.iter().any(|d| !d.is_empty() && Path::new(d).join("d3d12_dri.so").exists()) {
+        if dirs
+            .iter()
+            .any(|d| !d.is_empty() && Path::new(d).join("d3d12_dri.so").exists())
+        {
             std::env::set_var("GALLIUM_DRIVER", "d3d12");
         }
     }

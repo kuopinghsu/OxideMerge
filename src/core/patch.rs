@@ -21,7 +21,12 @@ pub struct PatchInput<'a> {
     pub b: &'a [String],
 }
 
-pub fn make_patch(input: &PatchInput, result: &DiffResult, style: PatchStyle, context: usize) -> String {
+pub fn make_patch(
+    input: &PatchInput,
+    result: &DiffResult,
+    style: PatchStyle,
+    context: usize,
+) -> String {
     let blocks: Vec<&Block> = result.blocks.iter().collect();
     if blocks.is_empty() {
         return String::new();
@@ -44,7 +49,10 @@ pub fn folder_patch(
 ) -> String {
     use super::folder::CmpStatus;
     let mut out = String::new();
-    for it in items.iter().filter(|i| !i.is_dir && matches!(i.status, CmpStatus::Different | CmpStatus::Unique)) {
+    for it in items
+        .iter()
+        .filter(|i| !i.is_dir && matches!(i.status, CmpStatus::Different | CmpStatus::Unique))
+    {
         if it.binary {
             continue;
         }
@@ -60,12 +68,21 @@ pub fn folder_patch(
             let doc = super::text::doc_from_bytes(None, &bytes, None);
             Some((doc.lines, name, super::report::fmt_time(it.mtime[s])))
         };
-        let (Some(a), Some(b)) = (load(0), load(1)) else { continue };
+        let (Some(a), Some(b)) = (load(0), load(1)) else {
+            continue;
+        };
         let r = super::diff::compute(&[&a.0, &b.0], opts);
         if r.blocks.is_empty() {
             continue;
         }
-        let input = PatchInput { name_a: &a.1, name_b: &b.1, date_a: &a.2, date_b: &b.2, a: &a.0, b: &b.0 };
+        let input = PatchInput {
+            name_a: &a.1,
+            name_b: &b.1,
+            date_a: &a.2,
+            date_b: &b.2,
+            a: &a.0,
+            b: &b.0,
+        };
         out.push_str(&make_patch(&input, &r, style, context));
     }
     out
@@ -230,7 +247,14 @@ mod tests {
         let a: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
         let b: Vec<String> = ["a", "x", "c"].iter().map(|s| s.to_string()).collect();
         let r = compute(&[&a, &b], &DiffOptions::default());
-        let input = PatchInput { name_a: "a.txt", name_b: "b.txt", date_a: "", date_b: "", a: &a, b: &b };
+        let input = PatchInput {
+            name_a: "a.txt",
+            name_b: "b.txt",
+            date_a: "",
+            date_b: "",
+            a: &a,
+            b: &b,
+        };
         let p = make_patch(&input, &r, PatchStyle::Unified, 3);
         assert!(p.contains("@@ -1,3 +1,3 @@"));
         assert!(p.contains("-b\n+x\n"));

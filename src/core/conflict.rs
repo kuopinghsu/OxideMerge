@@ -20,7 +20,13 @@ enum State {
 /// When the file has no base sections (diff2 style), the base contains only the common lines,
 /// which makes every conflict show up as a conflicting change in a 3-way compare.
 pub fn parse(lines: &[String]) -> Option<ConflictParts> {
-    let mut p = ConflictParts { mine: vec![], base: vec![], theirs: vec![], has_base: false, conflicts: 0 };
+    let mut p = ConflictParts {
+        mine: vec![],
+        base: vec![],
+        theirs: vec![],
+        has_base: false,
+        conflicts: 0,
+    };
     let mut state = State::Common;
     for l in lines {
         if l.starts_with("<<<<<<<") && state == State::Common {

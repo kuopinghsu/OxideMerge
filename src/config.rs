@@ -50,7 +50,12 @@ impl Default for Config {
             folder: FolderOptions::default(),
             filter: "*.*".into(),
             recent_paths: Vec::new(),
-            recent_filters: vec!["*.*".into(), "*.c;*.cpp;*.h".into(), "*.rs;*.toml".into(), "!.git\\;!target\\".into()],
+            recent_filters: vec![
+                "*.*".into(),
+                "*.c;*.cpp;*.h".into(),
+                "*.rs;*.toml".into(),
+                "!.git\\;!target\\".into(),
+            ],
             syntax_highlight: true,
             show_location_pane: true,
             show_line_numbers: true,

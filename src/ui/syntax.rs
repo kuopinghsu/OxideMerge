@@ -35,10 +35,9 @@ pub fn highlight(lines: &[String], ext: &str, dark: bool) -> Option<Vec<LineSpan
     }
     let h = highlighter();
     let first = lines.first().map(|s| s.as_str()).unwrap_or("");
-    let syntax = h
-        .ss
-        .find_syntax_by_extension(ext)
-        .or_else(|| h.ss.find_syntax_by_first_line(first))?;
+    let syntax =
+        h.ss.find_syntax_by_extension(ext)
+            .or_else(|| h.ss.find_syntax_by_first_line(first))?;
     if syntax.name == "Plain Text" {
         return None;
     }

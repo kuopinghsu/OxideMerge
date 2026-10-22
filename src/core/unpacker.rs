@@ -18,7 +18,10 @@ pub struct Unpacker {
 
 impl Unpacker {
     pub fn matches(&self, path: &Path) -> bool {
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         self.enabled
             && self
                 .pattern

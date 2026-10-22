@@ -2466,6 +2466,7 @@ dependencies = [
  "sys-locale",
  "tempfile",
  "trash",
+ "ttf-parser",
  "walkdir",
  "windows-sys 0.59.0",
  "winreg",

@@ -63,13 +63,23 @@ pub fn status_text(it: &DirItem, panes: usize) -> String {
         CmpStatus::Unique => {
             let present: Vec<usize> = (0..panes).filter(|&s| it.exists[s]).collect();
             if present.len() == 1 {
-                trf("status.only", &[("side", side_name(present[0], panes).to_string())])
+                trf(
+                    "status.only",
+                    &[("side", side_name(present[0], panes).to_string())],
+                )
             } else {
-                let missing: Vec<&str> = (0..panes).filter(|&s| !it.exists[s]).map(|s| side_name(s, panes)).collect();
+                let missing: Vec<&str> = (0..panes)
+                    .filter(|&s| !it.exists[s])
+                    .map(|s| side_name(s, panes))
+                    .collect();
                 trf("status.missing", &[("side", missing.join(", "))])
             }
         }
-        CmpStatus::Error => format!("{}: {}", tr("status.error"), it.error.clone().unwrap_or_default()),
+        CmpStatus::Error => format!(
+            "{}: {}",
+            tr("status.error"),
+            it.error.clone().unwrap_or_default()
+        ),
         CmpStatus::NotCompared => tr("status.not_compared").into(),
     }
 }
@@ -102,7 +112,10 @@ pub fn fmt_size(s: Option<u64>) -> String {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn csv_field(s: &str) -> String {
@@ -115,7 +128,11 @@ fn csv_field(s: &str) -> String {
 
 pub fn generate(items: &[&DirItem], roots: &[PathBuf], format: ReportFormat) -> String {
     let panes = roots.len();
-    let mut header: Vec<String> = vec![tr("col.name").into(), tr("col.folder").into(), tr("col.result").into()];
+    let mut header: Vec<String> = vec![
+        tr("col.name").into(),
+        tr("col.folder").into(),
+        tr("col.result").into(),
+    ];
     for s in 0..panes {
         header.push(format!("{} {}", side_name(s, panes), tr("col.date")));
     }
@@ -142,12 +159,29 @@ pub fn generate(items: &[&DirItem], roots: &[PathBuf], format: ReportFormat) -> 
     match format {
         ReportFormat::Csv => {
             for (s, r) in roots.iter().enumerate() {
-                let _ = writeln!(out, "{},{}", csv_field(side_name(s, panes)), csv_field(&r.display().to_string()));
+                let _ = writeln!(
+                    out,
+                    "{},{}",
+                    csv_field(side_name(s, panes)),
+                    csv_field(&r.display().to_string())
+                );
             }
             out.push('\n');
-            let _ = writeln!(out, "{}", header.iter().map(|h| csv_field(h)).collect::<Vec<_>>().join(","));
+            let _ = writeln!(
+                out,
+                "{}",
+                header
+                    .iter()
+                    .map(|h| csv_field(h))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
             for (_, r) in &rows {
-                let _ = writeln!(out, "{}", r.iter().map(|h| csv_field(h)).collect::<Vec<_>>().join(","));
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    r.iter().map(|h| csv_field(h)).collect::<Vec<_>>().join(",")
+                );
             }
         }
         ReportFormat::Text => {
@@ -173,7 +207,11 @@ pub fn generate(items: &[&DirItem], roots: &[PathBuf], format: ReportFormat) -> 
                     .to_string()
             };
             let _ = writeln!(out, "{}", line(&header));
-            let _ = writeln!(out, "{}", "-".repeat(widths.iter().sum::<usize>() + 2 * widths.len()));
+            let _ = writeln!(
+                out,
+                "{}",
+                "-".repeat(widths.iter().sum::<usize>() + 2 * widths.len())
+            );
             for (_, r) in &rows {
                 let _ = writeln!(out, "{}", line(r));
             }
@@ -187,9 +225,19 @@ pub fn generate(items: &[&DirItem], roots: &[PathBuf], format: ReportFormat) -> 
                  .identical{background:#fff}.different{background:#efcbd0}.unique{background:#c0c0c0}\
                  .error{background:#ffa0a0}</style></head><body>\n",
             );
-            let _ = writeln!(out, "<h2>{}</h2><p>{}</p><ul>", esc(tr("report.title")), now);
+            let _ = writeln!(
+                out,
+                "<h2>{}</h2><p>{}</p><ul>",
+                esc(tr("report.title")),
+                now
+            );
             for (s, r) in roots.iter().enumerate() {
-                let _ = writeln!(out, "<li><b>{}</b>: {}</li>", esc(side_name(s, panes)), esc(&r.display().to_string()));
+                let _ = writeln!(
+                    out,
+                    "<li><b>{}</b>: {}</li>",
+                    esc(side_name(s, panes)),
+                    esc(&r.display().to_string())
+                );
             }
             out.push_str("</ul><table><tr>");
             for h in &header {

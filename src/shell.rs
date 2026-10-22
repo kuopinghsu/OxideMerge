@@ -6,9 +6,16 @@ mod imp {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
 
-    const ROOTS: &[&str] = &["Software\\Classes\\*\\shell", "Software\\Classes\\Directory\\shell"];
+    const ROOTS: &[&str] = &[
+        "Software\\Classes\\*\\shell",
+        "Software\\Classes\\Directory\\shell",
+    ];
     const ENTRIES: &[(&str, &str, &str)] = &[
-        ("OxideMerge.SelectLeft", "shell.select_left", "--select-left"),
+        (
+            "OxideMerge.SelectLeft",
+            "shell.select_left",
+            "--select-left",
+        ),
         ("OxideMerge.CompareTo", "shell.compare_to", "--compare-to"),
         ("OxideMerge.Open", "shell.compare", ""),
     ];

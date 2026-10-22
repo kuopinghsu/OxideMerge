@@ -209,15 +209,29 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     style.interaction.tooltip_delay = 0.35;
 
     let v = &mut style.visuals;
-    *v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    *v = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
     v.override_text_color = None;
     v.panel_fill = p.surface;
     v.window_fill = p.surface;
     v.window_stroke = Stroke::new(1.0_f32, p.border);
     v.window_corner_radius = CornerRadius::same(12);
     v.menu_corner_radius = CornerRadius::same(10);
-    v.window_shadow = Shadow { offset: [0, 10], blur: 32, spread: 0, color: Color32::from_black_alpha(if dark { 120 } else { 38 }) };
-    v.popup_shadow = Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(if dark { 100 } else { 30 }) };
+    v.window_shadow = Shadow {
+        offset: [0, 10],
+        blur: 32,
+        spread: 0,
+        color: Color32::from_black_alpha(if dark { 120 } else { 38 }),
+    };
+    v.popup_shadow = Shadow {
+        offset: [0, 6],
+        blur: 18,
+        spread: 0,
+        color: Color32::from_black_alpha(if dark { 100 } else { 30 }),
+    };
     v.window_highlight_topmost = false;
     v.faint_bg_color = p.surface_alt;
     v.extreme_bg_color = p.input;

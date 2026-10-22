@@ -20,8 +20,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub enum FolderAction {
-    OpenFiles { paths: Vec<PathBuf>, missing: Vec<bool>, kind: Option<FileKind> },
-    OpenFolders { paths: Vec<PathBuf> },
+    OpenFiles {
+        paths: Vec<PathBuf>,
+        missing: Vec<bool>,
+        kind: Option<FileKind>,
+    },
+    OpenFolders {
+        paths: Vec<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,7 +90,10 @@ pub struct FolderView {
 
 fn system_open(path: &std::path::Path) {
     #[cfg(windows)]
-    let _ = std::process::Command::new("cmd").args(["/C", "start", ""]).arg(path).spawn();
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", ""])
+        .arg(path)
+        .spawn();
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(path).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -94,11 +103,16 @@ fn system_open(path: &std::path::Path) {
 fn reveal(path: &std::path::Path) {
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+        let _ = std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn();
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -173,12 +187,28 @@ impl FolderView {
             r.progress.abort.store(true, Ordering::Relaxed);
         }
         let progress = Arc::new(Progress::default());
-        let (roots, filter, fopts, dopts, pr) =
-            (self.roots.clone(), self.filter.clone(), self.fopts.clone(), self.dopts.clone(), progress.clone());
+        let (roots, filter, fopts, dopts, pr) = (
+            self.roots.clone(),
+            self.filter.clone(),
+            self.fopts.clone(),
+            self.dopts.clone(),
+            progress.clone(),
+        );
         let handle = std::thread::spawn(move || {
-            Scanner { roots: &roots, filter: &filter, fopts: &fopts, dopts: &dopts, progress: &pr }.run()
+            Scanner {
+                roots: &roots,
+                filter: &filter,
+                fopts: &fopts,
+                dopts: &dopts,
+                progress: &pr,
+            }
+            .run()
         });
-        self.running = Some(Running { progress, handle, started: Instant::now() });
+        self.running = Some(Running {
+            progress,
+            handle,
+            started: Instant::now(),
+        });
         self.status.clear();
     }
 
@@ -201,7 +231,10 @@ impl FolderView {
     }
 
     fn poll(&mut self) {
-        let finished = self.running.as_ref().is_some_and(|r| r.handle.is_finished());
+        let finished = self
+            .running
+            .as_ref()
+            .is_some_and(|r| r.handle.is_finished());
         if finished {
             let r = self.running.take().unwrap();
             let aborted = r.progress.abort.load(Ordering::Relaxed);
@@ -226,7 +259,13 @@ impl FolderView {
             CmpStatus::Identical => cfg.show_identical,
             CmpStatus::Different | CmpStatus::Error | CmpStatus::NotCompared => cfg.show_different,
             CmpStatus::Unique => {
-                let unique_flag = |s: usize| if n == 2 && s == 1 { cfg.show_unique[2] } else { cfg.show_unique[s] };
+                let unique_flag = |s: usize| {
+                    if n == 2 && s == 1 {
+                        cfg.show_unique[2]
+                    } else {
+                        cfg.show_unique[s]
+                    }
+                };
                 (0..n).any(|s| it.exists[s] && unique_flag(s))
             }
         }
@@ -238,11 +277,21 @@ impl FolderView {
         let name = || ia.name.to_lowercase().cmp(&ib.name.to_lowercase());
         let o = match col {
             Col::Name => ib.is_dir.cmp(&ia.is_dir).then_with(name),
-            Col::Folder => ia.rel_dir.to_lowercase().cmp(&ib.rel_dir.to_lowercase()).then_with(name),
-            Col::Result => status_text(ia, self.n()).cmp(&status_text(ib, self.n())).then_with(name),
+            Col::Folder => ia
+                .rel_dir
+                .to_lowercase()
+                .cmp(&ib.rel_dir.to_lowercase())
+                .then_with(name),
+            Col::Result => status_text(ia, self.n())
+                .cmp(&status_text(ib, self.n()))
+                .then_with(name),
             Col::Date(s) => ia.mtime[s].cmp(&ib.mtime[s]).then_with(name),
             Col::Size(s) => ia.size[s].cmp(&ib.size[s]).then_with(name),
-            Col::Ext => ia.ext().to_lowercase().cmp(&ib.ext().to_lowercase()).then_with(name),
+            Col::Ext => ia
+                .ext()
+                .to_lowercase()
+                .cmp(&ib.ext().to_lowercase())
+                .then_with(name),
         };
         if asc {
             o
@@ -256,7 +305,8 @@ impl FolderView {
         for i in (0..self.items.len()).rev() {
             let it = &self.items[i];
             vis[i] = if it.is_dir && !it.children.is_empty() {
-                it.children.iter().any(|&c| vis[c]) || self.shown(it, cfg) && it.status != CmpStatus::Identical
+                it.children.iter().any(|&c| vis[c])
+                    || self.shown(it, cfg) && it.status != CmpStatus::Identical
             } else {
                 self.shown(it, cfg)
             };
@@ -290,7 +340,9 @@ impl FolderView {
         }
         let vis = self.visibility(cfg);
         let mut out = Vec::new();
-        let mut roots: Vec<usize> = (0..self.items.len()).filter(|&i| self.items[i].parent.is_none() && vis[i]).collect();
+        let mut roots: Vec<usize> = (0..self.items.len())
+            .filter(|&i| self.items[i].parent.is_none() && vis[i])
+            .collect();
         roots.sort_by(|&a, &b| self.cmp_items(a, b));
         let mut stack: Vec<usize> = roots.into_iter().rev().collect();
         while let Some(i) = stack.pop() {
@@ -326,11 +378,18 @@ impl FolderView {
     }
 
     pub fn request_op_copy(&mut self, from: usize, to: usize, cfg: &Config) {
-        let targets: Vec<usize> = self.selected_targets().into_iter().filter(|&i| self.items[i].exists[from]).collect();
+        let targets: Vec<usize> = self
+            .selected_targets()
+            .into_iter()
+            .filter(|&i| self.items[i].exists[from])
+            .collect();
         if targets.is_empty() {
             return;
         }
-        let op = PendingOp { kind: OpKind::Copy { from, to }, targets };
+        let op = PendingOp {
+            kind: OpKind::Copy { from, to },
+            targets,
+        };
         if cfg.confirm_operations {
             self.confirm = Some(op);
         } else {
@@ -359,7 +418,9 @@ impl FolderView {
             let it = &self.items[i];
             any_dir |= it.is_dir;
             let r = match op.kind {
-                OpKind::Copy { from, to } => folder::copy_recursive(&it.path(&self.roots[from]), &it.path(&self.roots[to])),
+                OpKind::Copy { from, to } => {
+                    folder::copy_recursive(&it.path(&self.roots[from]), &it.path(&self.roots[to]))
+                }
                 OpKind::Delete { side } => {
                     let sides: Vec<usize> = match side {
                         Some(s) => vec![s],
@@ -368,7 +429,9 @@ impl FolderView {
                     sides
                         .into_iter()
                         .filter(|&s| it.exists[s])
-                        .try_for_each(|s| folder::delete_path(&it.path(&self.roots[s]), cfg.use_recycle_bin))
+                        .try_for_each(|s| {
+                            folder::delete_path(&it.path(&self.roots[s]), cfg.use_recycle_bin)
+                        })
                 }
             };
             match r {
@@ -378,7 +441,8 @@ impl FolderView {
         }
         self.status = trf("msg.op_done", &[("n", done.to_string())]);
         if !errors.is_empty() {
-            self.status.push_str(&format!(" — {}: {}", tr("status.error"), errors.join("; ")));
+            self.status
+                .push_str(&format!(" — {}: {}", tr("status.error"), errors.join("; ")));
         }
         if any_dir {
             self.start_compare();
@@ -411,7 +475,11 @@ impl FolderView {
             return None;
         }
         let missing: Vec<bool> = (0..n).map(|s| !it.exists[s]).collect();
-        Some(FolderAction::OpenFiles { paths, missing, kind })
+        Some(FolderAction::OpenFiles {
+            paths,
+            missing,
+            kind,
+        })
     }
 
     pub fn copy_selected(&mut self, to_right: bool, cfg: &Config) {
@@ -425,7 +493,14 @@ impl FolderView {
         if self.n() != 2 {
             return String::new();
         }
-        patch::folder_patch(&self.roots, &self.display_roots, &self.items, &self.dopts, style, context)
+        patch::folder_patch(
+            &self.roots,
+            &self.display_roots,
+            &self.items,
+            &self.dopts,
+            style,
+            context,
+        )
     }
 
     pub fn report(&self, format: ReportFormat, cfg: &Config) -> String {
@@ -447,13 +522,22 @@ impl FolderView {
         let (same, diff, uniq, err) = folder::status_counts(&self.items);
         let mut s = trf(
             "msg.folder_summary",
-            &[("same", same.to_string()), ("diff", diff.to_string()), ("unique", uniq.to_string()), ("err", err.to_string())],
+            &[
+                ("same", same.to_string()),
+                ("diff", diff.to_string()),
+                ("unique", uniq.to_string()),
+                ("err", err.to_string()),
+            ],
         );
         if let Some(e) = self.elapsed {
             s.push_str(&format!("  |  {:.2}s", e.as_secs_f32()));
         }
         if self.selected.len() > 1 {
-            s.push_str(&format!("  |  {} {}", self.selected.len(), tr("label.selected")));
+            s.push_str(&format!(
+                "  |  {} {}",
+                self.selected.len(),
+                tr("label.selected")
+            ));
         }
         if !self.status.is_empty() {
             s.push_str("  |  ");
@@ -464,7 +548,12 @@ impl FolderView {
 
     pub fn expand_all(&mut self, expand: bool) {
         if expand {
-            self.expanded = self.items.iter().filter(|i| i.is_dir).map(|i| i.rel_path()).collect();
+            self.expanded = self
+                .items
+                .iter()
+                .filter(|i| i.is_dir)
+                .map(|i| i.rel_path())
+                .collect();
         } else {
             self.expanded.clear();
         }
@@ -479,7 +568,10 @@ impl FolderView {
         let sel = !self.selected.is_empty();
         widgets::toolbar(ui, |ui| {
             let pal = widgets::pal(ui);
-            if widgets::ghost_button(ui, &format!("⟳  {}", tr("cmd.refresh"))).on_hover_text("F5").clicked() {
+            if widgets::ghost_button(ui, &format!("⟳  {}", tr("cmd.refresh")))
+                .on_hover_text("F5")
+                .clicked()
+            {
                 refresh = true;
             }
             if cfg.tree_mode {
@@ -499,60 +591,98 @@ impl FolderView {
                     self.request_op_copy(1, 0, cfg);
                 }
             } else {
-                if widgets::icon_button_enabled(ui, sel, "L→M", tr("cmd.copy_from_left")).clicked() {
+                if widgets::icon_button_enabled(ui, sel, "L→M", tr("cmd.copy_from_left")).clicked()
+                {
                     self.request_op_copy(0, 1, cfg);
                 }
-                if widgets::icon_button_enabled(ui, sel, "M←R", tr("cmd.copy_from_right")).clicked() {
+                if widgets::icon_button_enabled(ui, sel, "M←R", tr("cmd.copy_from_right")).clicked()
+                {
                     self.request_op_copy(2, 1, cfg);
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                widgets::chip(ui, &format!("{}  {}", tr("label.method"), tr(self.fopts.method.key())), pal.text_dim, pal.control);
-                widgets::chip(ui, &format!("{}  {}", tr("label.filter"), self.filter_spec), pal.text_dim, pal.control);
+                widgets::chip(
+                    ui,
+                    &format!("{}  {}", tr("label.method"), tr(self.fopts.method.key())),
+                    pal.text_dim,
+                    pal.control,
+                );
+                widgets::chip(
+                    ui,
+                    &format!("{}  {}", tr("label.filter"), self.filter_spec),
+                    pal.text_dim,
+                    pal.control,
+                );
             });
         });
         let pal = widgets::pal(ui);
-        let paths = egui::Frame::new().fill(pal.surface).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.columns(n, |cols| {
-                for (s, col) in cols.iter_mut().enumerate() {
-                    col.horizontal(|ui| {
-                        widgets::side_chip(ui, s, n);
-                        ui.add(egui::Label::new(egui::RichText::new(&self.display_roots[s]).size(13.0)).truncate())
+        let paths = egui::Frame::new()
+            .fill(pal.surface)
+            .inner_margin(Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.columns(n, |cols| {
+                    for (s, col) in cols.iter_mut().enumerate() {
+                        col.horizontal(|ui| {
+                            widgets::side_chip(ui, s, n);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&self.display_roots[s]).size(13.0),
+                                )
+                                .truncate(),
+                            )
                             .on_hover_text(&self.display_roots[s]);
-                    });
-                }
+                        });
+                    }
+                });
             });
-        });
         let rect = paths.response.rect;
-        ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0_f32, pal.border));
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            Stroke::new(1.0_f32, pal.border),
+        );
         if let Some(r) = &self.running {
             let done = r.progress.done.load(Ordering::Relaxed);
             let total = r.progress.total.load(Ordering::Relaxed);
             let mut stop = false;
-            egui::Frame::new().inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                    let text = if total > 0 {
-                        format!("{done} / {total}")
-                    } else {
-                        format!("{} {}", tr("msg.scanning"), r.progress.current.lock().map(|c| c.clone()).unwrap_or_default())
-                    };
-                    ui.label(egui::RichText::new(text).size(12.5).color(pal.text_dim));
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .fill(pal.accent)
-                            .desired_height(6.0)
-                            .corner_radius(3)
-                            .desired_width(ui.available_width() - 90.0)
-                            .animate(total == 0),
-                    );
-                    if widgets::secondary_button(ui, tr("btn.stop")).clicked() {
-                        stop = true;
-                    }
+            egui::Frame::new()
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let frac = if total > 0 {
+                            done as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        let text = if total > 0 {
+                            format!("{done} / {total}")
+                        } else {
+                            format!(
+                                "{} {}",
+                                tr("msg.scanning"),
+                                r.progress
+                                    .current
+                                    .lock()
+                                    .map(|c| c.clone())
+                                    .unwrap_or_default()
+                            )
+                        };
+                        ui.label(egui::RichText::new(text).size(12.5).color(pal.text_dim));
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .fill(pal.accent)
+                                .desired_height(6.0)
+                                .corner_radius(3)
+                                .desired_width(ui.available_width() - 90.0)
+                                .animate(total == 0),
+                        );
+                        if widgets::secondary_button(ui, tr("btn.stop")).clicked() {
+                            stop = true;
+                        }
+                    });
                 });
-            });
             if stop {
                 self.stop();
             }
@@ -560,7 +690,13 @@ impl FolderView {
         refresh
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors, named: &[FltFilter]) -> Option<FolderAction> {
+    pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        cfg: &Config,
+        c: &Colors,
+        named: &[FltFilter],
+    ) -> Option<FolderAction> {
         self.poll();
         if self.running.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -568,7 +704,12 @@ impl FolderView {
         if self.header_bar(ui, cfg) {
             self.refresh(cfg, named);
         }
-        let key = (cfg.tree_mode, cfg.show_identical, cfg.show_different, cfg.show_unique);
+        let key = (
+            cfg.tree_mode,
+            cfg.show_identical,
+            cfg.show_different,
+            cfg.show_unique,
+        );
         if self.view_key != Some(key) {
             self.view_key = Some(key);
             self.rebuild_visible(cfg);
@@ -661,12 +802,22 @@ impl FolderView {
         if let Some(r) = self.scroll_to.take() {
             table = table.scroll_to_row(r, None);
         }
-        let mut cols = vec![(Col::Name, tr("col.name").to_string()), (Col::Folder, tr("col.folder").into()), (Col::Result, tr("col.result").into())];
+        let mut cols = vec![
+            (Col::Name, tr("col.name").to_string()),
+            (Col::Folder, tr("col.folder").into()),
+            (Col::Result, tr("col.result").into()),
+        ];
         for s in 0..n {
-            cols.push((Col::Date(s), format!("{} {}", side_name(s, n), tr("col.date"))));
+            cols.push((
+                Col::Date(s),
+                format!("{} {}", side_name(s, n), tr("col.date")),
+            ));
         }
         for s in 0..n {
-            cols.push((Col::Size(s), format!("{} {}", side_name(s, n), tr("col.size"))));
+            cols.push((
+                Col::Size(s),
+                format!("{} {}", side_name(s, n), tr("col.size")),
+            ));
         }
         cols.push((Col::Ext, tr("col.ext").into()));
 
@@ -680,13 +831,31 @@ impl FolderView {
             .header(row_h, |mut header| {
                 for (col, label) in &cols {
                     header.col(|ui| {
-                        ui.painter().rect_filled(ui.max_rect().expand2(vec2(4.0, 3.0)), 0.0, pal.surface_alt);
+                        ui.painter().rect_filled(
+                            ui.max_rect().expand2(vec2(4.0, 3.0)),
+                            0.0,
+                            pal.surface_alt,
+                        );
                         let r = ui.max_rect().expand2(vec2(4.0, 3.0));
-                        ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0_f32, pal.border));
+                        ui.painter().hline(
+                            r.x_range(),
+                            r.bottom() - 0.5,
+                            Stroke::new(1.0_f32, pal.border),
+                        );
                         let sorted = sort.0 == *col;
-                        let arrow = if sorted { if sort.1 { "  ▲" } else { "  ▼" } } else { "" };
+                        let arrow = if sorted {
+                            if sort.1 {
+                                "  ▲"
+                            } else {
+                                "  ▼"
+                            }
+                        } else {
+                            ""
+                        };
                         let color = if sorted { pal.text } else { pal.text_dim };
-                        let text = egui::RichText::new(format!("{label}{arrow}")).font(theme::semibold(12.5)).color(color);
+                        let text = egui::RichText::new(format!("{label}{arrow}"))
+                            .font(theme::semibold(12.5))
+                            .color(color);
                         if ui.add(egui::Button::new(text).frame(false)).clicked() {
                             new_sort = Some(*col);
                         }
@@ -720,28 +889,53 @@ impl FolderView {
                             ui.add_space(it.depth as f32 * 16.0);
                             if it.is_dir && !it.children.is_empty() {
                                 let open = expanded.contains(&it.rel_path());
-                                let arrow = egui::RichText::new(if open { "⏷" } else { "⏵" }).color(pal.text_dim);
-                                if ui.add(egui::Button::new(arrow).frame(false).small()).clicked() {
+                                let arrow = egui::RichText::new(if open { "⏷" } else { "⏵" })
+                                    .color(pal.text_dim);
+                                if ui
+                                    .add(egui::Button::new(arrow).frame(false).small())
+                                    .clicked()
+                                {
                                     toggle = Some(idx);
                                 }
                             } else {
                                 ui.add_space(16.0);
                             }
                         }
-                        let (icon, icon_color) = if it.is_dir { ("📁", Color32::from_rgb(0xE0, 0xA4, 0x2E)) } else { ("📄", pal.text_dim) };
-                        ui.add(egui::Label::new(txt(icon.to_string()).color(icon_color)).selectable(false));
-                        ui.add(egui::Label::new(txt(it.name.clone())).selectable(false).truncate());
+                        let (icon, icon_color) = if it.is_dir {
+                            ("📁", Color32::from_rgb(0xE0, 0xA4, 0x2E))
+                        } else {
+                            ("📄", pal.text_dim)
+                        };
+                        ui.add(
+                            egui::Label::new(txt(icon.to_string()).color(icon_color))
+                                .selectable(false),
+                        );
+                        ui.add(
+                            egui::Label::new(txt(it.name.clone()))
+                                .selectable(false)
+                                .truncate(),
+                        );
                     });
                     row.col(|ui| {
                         paint_bg(ui);
-                        ui.add(egui::Label::new(txt(it.rel_dir.clone()).color(pal.text_dim)).selectable(false).truncate());
+                        ui.add(
+                            egui::Label::new(txt(it.rel_dir.clone()).color(pal.text_dim))
+                                .selectable(false)
+                                .truncate(),
+                        );
                     });
                     row.col(|ui| {
                         paint_bg(ui);
                         let sc = status_color(it);
                         let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
                         ui.painter().circle_filled(dot.center(), 4.0, sc);
-                        ui.add(egui::Label::new(txt(status_text(it, n)).font(FontId::proportional(13.5))).selectable(false).truncate());
+                        ui.add(
+                            egui::Label::new(
+                                txt(status_text(it, n)).font(FontId::proportional(13.5)),
+                            )
+                            .selectable(false)
+                            .truncate(),
+                        );
                     });
                     for s in 0..n {
                         row.col(|ui| {
@@ -753,7 +947,9 @@ impl FolderView {
                         row.col(|ui| {
                             paint_bg(ui);
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.add(egui::Label::new(txt(fmt_size(it.size[s]))).selectable(false));
+                                ui.add(
+                                    egui::Label::new(txt(fmt_size(it.size[s]))).selectable(false),
+                                );
                             });
                         });
                     }
@@ -791,8 +987,17 @@ impl FolderView {
                         for from in 0..n {
                             for to in 0..n {
                                 if from != to && (n == 2 || from == 1 || to == 1) {
-                                    let label = trf("cmd.copy_from_to", &[("from", side_name(from, n).into()), ("to", side_name(to, n).into())]);
-                                    if ui.add_enabled(it.exists[from], egui::Button::new(label)).clicked() {
+                                    let label = trf(
+                                        "cmd.copy_from_to",
+                                        &[
+                                            ("from", side_name(from, n).into()),
+                                            ("to", side_name(to, n).into()),
+                                        ],
+                                    );
+                                    if ui
+                                        .add_enabled(it.exists[from], egui::Button::new(label))
+                                        .clicked()
+                                    {
                                         menu = Some(MenuCmd::Op(OpKind::Copy { from, to }));
                                     }
                                 }
@@ -800,7 +1005,10 @@ impl FolderView {
                         }
                         ui.menu_button(tr("cmd.delete"), |ui| {
                             for s in 0..n {
-                                if ui.add_enabled(it.exists[s], egui::Button::new(side_name(s, n))).clicked() {
+                                if ui
+                                    .add_enabled(it.exists[s], egui::Button::new(side_name(s, n)))
+                                    .clicked()
+                                {
                                     menu = Some(MenuCmd::Op(OpKind::Delete { side: Some(s) }));
                                 }
                             }
@@ -811,14 +1019,20 @@ impl FolderView {
                         ui.separator();
                         ui.menu_button(tr("cmd.open_with_app"), |ui| {
                             for s in 0..n {
-                                if ui.add_enabled(it.exists[s], egui::Button::new(side_name(s, n))).clicked() {
+                                if ui
+                                    .add_enabled(it.exists[s], egui::Button::new(side_name(s, n)))
+                                    .clicked()
+                                {
                                     menu = Some(MenuCmd::SystemOpen(idx, s));
                                 }
                             }
                         });
                         ui.menu_button(tr("cmd.reveal"), |ui| {
                             for s in 0..n {
-                                if ui.add_enabled(it.exists[s], egui::Button::new(side_name(s, n))).clicked() {
+                                if ui
+                                    .add_enabled(it.exists[s], egui::Button::new(side_name(s, n)))
+                                    .clicked()
+                                {
                                     menu = Some(MenuCmd::Reveal(idx, s));
                                 }
                             }
@@ -838,7 +1052,11 @@ impl FolderView {
             });
 
         if let Some(col) = new_sort {
-            self.sort = if self.sort.0 == col { (col, !self.sort.1) } else { (col, true) };
+            self.sort = if self.sort.0 == col {
+                (col, !self.sort.1)
+            } else {
+                (col, true)
+            };
             self.view_key = None;
         }
         if let Some((vi, mods)) = click {
@@ -883,7 +1101,9 @@ impl FolderView {
                 MenuCmd::Op(kind) => self.request_op(kind, cfg),
                 MenuCmd::SystemOpen(i, s) => system_open(&self.items[i].path(&self.roots[s])),
                 MenuCmd::Reveal(i, s) => reveal(&self.items[i].path(&self.roots[s])),
-                MenuCmd::CopyPath(i, s) => ui.ctx().copy_text(self.items[i].path(&self.roots[s]).display().to_string()),
+                MenuCmd::CopyPath(i, s) => ui
+                    .ctx()
+                    .copy_text(self.items[i].path(&self.roots[s]).display().to_string()),
             }
         }
 
@@ -894,11 +1114,23 @@ impl FolderView {
             let msg = match op.kind {
                 OpKind::Copy { from, to } => trf(
                     "msg.confirm_copy",
-                    &[("n", op.targets.len().to_string()), ("from", side_name(from, n).into()), ("to", side_name(to, n).into())],
+                    &[
+                        ("n", op.targets.len().to_string()),
+                        ("from", side_name(from, n).into()),
+                        ("to", side_name(to, n).into()),
+                    ],
                 ),
                 OpKind::Delete { side } => trf(
                     "msg.confirm_delete",
-                    &[("n", op.targets.len().to_string()), ("side", side.map(|s| side_name(s, n)).unwrap_or(tr("side.all")).into())],
+                    &[
+                        ("n", op.targets.len().to_string()),
+                        (
+                            "side",
+                            side.map(|s| side_name(s, n))
+                                .unwrap_or(tr("side.all"))
+                                .into(),
+                        ),
+                    ],
                 ),
             };
             egui::Modal::new(self.id.with("confirm")).show(ui.ctx(), |ui| {
@@ -908,21 +1140,31 @@ impl FolderView {
                 ui.heading(tr("dlg.confirm"));
                 ui.label(msg);
                 ui.add_space(4.0);
-                egui::Frame::new().fill(pal.surface_alt).corner_radius(8).inner_margin(Margin::same(10)).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    for &i in op.targets.iter().take(10) {
-                        ui.label(egui::RichText::new(self.items[i].rel_path()).monospace().color(pal.text_dim));
-                    }
-                    if op.targets.len() > 10 {
-                        ui.label("…");
-                    }
-                });
+                egui::Frame::new()
+                    .fill(pal.surface_alt)
+                    .corner_radius(8)
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for &i in op.targets.iter().take(10) {
+                            ui.label(
+                                egui::RichText::new(self.items[i].rel_path())
+                                    .monospace()
+                                    .color(pal.text_dim),
+                            );
+                        }
+                        if op.targets.len() > 10 {
+                            ui.label("…");
+                        }
+                    });
                 widgets::dialog_footer(ui, |ui| {
                     if widgets::primary_button(ui, tr("btn.ok")).clicked() {
                         run = true;
                         keep = false;
                     }
-                    if widgets::secondary_button(ui, tr("btn.cancel")).clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
+                        || ui.input(|i| i.key_pressed(Key::Escape))
+                    {
                         keep = false;
                     }
                 });

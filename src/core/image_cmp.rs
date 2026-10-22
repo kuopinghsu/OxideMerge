@@ -27,7 +27,10 @@ fn pixel(img: &RgbaImage, x: u32, y: u32) -> Option<[u8; 4]> {
 
 fn differs(a: Option<[u8; 4]>, b: Option<[u8; 4]>, threshold: u8) -> bool {
     match (a, b) {
-        (Some(a), Some(b)) => a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > threshold),
+        (Some(a), Some(b)) => a
+            .iter()
+            .zip(b.iter())
+            .any(|(x, y)| x.abs_diff(*y) > threshold),
         (None, None) => false,
         _ => true,
     }
@@ -47,7 +50,9 @@ pub fn compare(images: &[&RgbaImage], threshold: u8, block_size: u32) -> ImageDi
     for y in 0..height {
         for x in 0..width {
             let p0 = pixel(first, x, y);
-            let d = images[1..].iter().any(|img| differs(p0, pixel(img, x, y), threshold));
+            let d = images[1..]
+                .iter()
+                .any(|img| differs(p0, pixel(img, x, y), threshold));
             let pl = pixel(last, x, y);
             let out = match (p0, pl) {
                 (Some(a), Some(b)) => {
@@ -71,7 +76,17 @@ pub fn compare(images: &[&RgbaImage], threshold: u8, block_size: u32) -> ImageDi
         }
     }
     let regions = regions(&blocks, bx, by, bs, width, height);
-    ImageDiff { width, height, block_size: bs, blocks_x: bx, blocks_y: by, blocks, diff_pixels, regions, diff_image }
+    ImageDiff {
+        width,
+        height,
+        block_size: bs,
+        blocks_x: bx,
+        blocks_y: by,
+        blocks,
+        diff_pixels,
+        regions,
+        diff_image,
+    }
 }
 
 fn regions(blocks: &[bool], bx: u32, by: u32, bs: u32, w: u32, h: u32) -> Vec<[u32; 4]> {

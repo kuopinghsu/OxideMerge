@@ -92,7 +92,11 @@ impl Normalizer {
         } else {
             Vec::new()
         };
-        Normalizer { opts: opts.clone(), line_res, subs }
+        Normalizer {
+            opts: opts.clone(),
+            line_res,
+            subs,
+        }
     }
 
     pub fn key(&self, line: &str) -> String {
@@ -231,7 +235,11 @@ impl Interner {
     }
 }
 
-fn line_ops(a: &[u32], b: &[u32], alg: DiffAlgorithm) -> Vec<(DiffTag, Range<usize>, Range<usize>)> {
+fn line_ops(
+    a: &[u32],
+    b: &[u32],
+    alg: DiffAlgorithm,
+) -> Vec<(DiffTag, Range<usize>, Range<usize>)> {
     let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
     similar::capture_diff_slices_deadline(algorithm(alg), a, b, deadline)
         .iter()
@@ -242,7 +250,9 @@ fn line_ops(a: &[u32], b: &[u32], alg: DiffAlgorithm) -> Vec<(DiffTag, Range<usi
 /// Compute a diff between 2 or 3 documents. For three panes the middle one is the base.
 pub fn compute(panes: &[&[String]], opts: &DiffOptions) -> DiffResult {
     let norm = Normalizer::new(opts);
-    let mut interner = Interner { map: HashMap::new() };
+    let mut interner = Interner {
+        map: HashMap::new(),
+    };
     let ids: Vec<Vec<u32>> = panes.iter().map(|p| interner.ids(&norm, p)).collect();
     let mut result = if panes.len() == 3 {
         diff3(&ids, panes, &norm, opts)
@@ -276,13 +286,31 @@ fn push_block(result: &mut DiffResult, ranges: [Range<usize>; 3], kind: BlockKin
                 line[p] = Some(ranges[p].start + i);
             }
         }
-        result.rows.push(Row { line, block: Some(idx) });
+        result.rows.push(Row {
+            line,
+            block: Some(idx),
+        });
     }
-    result.blocks.push(Block { ranges, kind, ignored, first_row, rows: n });
+    result.blocks.push(Block {
+        ranges,
+        kind,
+        ignored,
+        first_row,
+        rows: n,
+    });
 }
 
-fn diff2(a: &[u32], b: &[u32], panes: &[&[String]], norm: &Normalizer, opts: &DiffOptions) -> DiffResult {
-    let mut result = DiffResult { panes: 2, ..Default::default() };
+fn diff2(
+    a: &[u32],
+    b: &[u32],
+    panes: &[&[String]],
+    norm: &Normalizer,
+    opts: &DiffOptions,
+) -> DiffResult {
+    let mut result = DiffResult {
+        panes: 2,
+        ..Default::default()
+    };
     let mut pending: Option<(Range<usize>, Range<usize>)> = None;
     let flush = |result: &mut DiffResult, pending: &mut Option<(Range<usize>, Range<usize>)>| {
         if let Some((ra, rb)) = pending.take() {
@@ -294,7 +322,10 @@ fn diff2(a: &[u32], b: &[u32], panes: &[&[String]], norm: &Normalizer, opts: &Di
         if tag == DiffTag::Equal {
             flush(&mut result, &mut pending);
             for k in 0..o.len() {
-                result.rows.push(Row { line: [Some(o.start + k), Some(n.start + k), None], block: None });
+                result.rows.push(Row {
+                    line: [Some(o.start + k), Some(n.start + k), None],
+                    block: None,
+                });
             }
         } else {
             pending = Some(match pending {
@@ -319,16 +350,27 @@ fn matches(a: &[u32], b: &[u32], alg: DiffAlgorithm) -> Vec<Option<usize>> {
     m
 }
 
-fn diff3(ids: &[Vec<u32>], panes: &[&[String]], norm: &Normalizer, opts: &DiffOptions) -> DiffResult {
+fn diff3(
+    ids: &[Vec<u32>],
+    panes: &[&[String]],
+    norm: &Normalizer,
+    opts: &DiffOptions,
+) -> DiffResult {
     let (left, base, right) = (&ids[0], &ids[1], &ids[2]);
     let ml = matches(base, left, opts.algorithm);
     let mr = matches(base, right, opts.algorithm);
-    let mut result = DiffResult { panes: 3, ..Default::default() };
+    let mut result = DiffResult {
+        panes: 3,
+        ..Default::default()
+    };
     let (mut i, mut l, mut r) = (0usize, 0usize, 0usize);
     let (nb, nl, nr) = (base.len(), left.len(), right.len());
     while i < nb || l < nl || r < nr {
         if i < nb && ml[i] == Some(l) && mr[i] == Some(r) {
-            result.rows.push(Row { line: [Some(l), Some(i), Some(r)], block: None });
+            result.rows.push(Row {
+                line: [Some(l), Some(i), Some(r)],
+                block: None,
+            });
             i += 1;
             l += 1;
             r += 1;
@@ -338,7 +380,11 @@ fn diff3(ids: &[Vec<u32>], panes: &[&[String]], norm: &Normalizer, opts: &DiffOp
         while j < nb && !(ml[j].is_some() && mr[j].is_some()) {
             j += 1;
         }
-        let (le, re) = if j < nb { (ml[j].unwrap(), mr[j].unwrap()) } else { (nl, nr) };
+        let (le, re) = if j < nb {
+            (ml[j].unwrap(), mr[j].unwrap())
+        } else {
+            (nl, nr)
+        };
         let (rl, rb, rr) = (l..le, i..j, r..re);
         let lc = left[rl.clone()] != base[rb.clone()];
         let rc = right[rr.clone()] != base[rb.clone()];
@@ -362,7 +408,10 @@ fn diff3(ids: &[Vec<u32>], panes: &[&[String]], norm: &Normalizer, opts: &DiffOp
             }
             None => {
                 for k in 0..rb.len() {
-                    result.rows.push(Row { line: [Some(l + k), Some(i + k), Some(r + k)], block: None });
+                    result.rows.push(Row {
+                        line: [Some(l + k), Some(i + k), Some(r + k)],
+                        block: None,
+                    });
                 }
             }
         }
@@ -396,7 +445,9 @@ fn detect_moved(result: &mut DiffResult, ids: &[Vec<u32>]) {
                 let mut found = false;
                 for q in others {
                     if let Some(blocks) = per_pane[q].get(&id) {
-                        if blocks.iter().any(|&ob| ob != bi) && !b.ranges[q].clone().any(|ql| ids[q][ql] == id) {
+                        if blocks.iter().any(|&ob| ob != bi)
+                            && !b.ranges[q].clone().any(|ql| ids[q][ql] == id)
+                        {
                             found = true;
                         }
                     }
@@ -416,7 +467,10 @@ pub fn inline_diff(a: &str, b: &str, opts: &DiffOptions) -> (Vec<Range<usize>>, 
         return (Vec::new(), Vec::new());
     }
     if a.len() > 4000 || b.len() > 4000 {
-        return (std::iter::once(0..a.len()).collect(), std::iter::once(0..b.len()).collect());
+        return (
+            std::iter::once(0..a.len()).collect(),
+            std::iter::once(0..b.len()).collect(),
+        );
     }
     let ta = tokenize(a, opts);
     let tb = tokenize(b, opts);
@@ -529,7 +583,10 @@ mod tests {
     fn blank_lines_ignored() {
         let a = v(&["a", "", "b"]);
         let b = v(&["a", "b"]);
-        let o = DiffOptions { ignore_blank_lines: true, ..Default::default() };
+        let o = DiffOptions {
+            ignore_blank_lines: true,
+            ..Default::default()
+        };
         let r = compute(&[&a, &b], &o);
         assert_eq!(r.blocks.len(), 1);
         assert!(r.is_identical());

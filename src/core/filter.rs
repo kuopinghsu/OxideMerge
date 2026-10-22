@@ -77,7 +77,11 @@ impl FileFilter {
             let is_dir = pat.ends_with('\\') || pat.ends_with('/');
             let pat = pat.trim_end_matches(['\\', '/']);
             // "*.*" should also match files without extension.
-            let re = if pat == "*.*" { wildcard_to_regex("*") } else { wildcard_to_regex(pat) };
+            let re = if pat == "*.*" {
+                wildcard_to_regex("*")
+            } else {
+                wildcard_to_regex(pat)
+            };
             let Some(re) = re else { continue };
             match (neg, is_dir) {
                 (true, true) => dir_excludes.push(re),
@@ -86,13 +90,19 @@ impl FileFilter {
                 (false, false) => includes.push(re),
             }
         }
-        FileFilter::Mask { includes, excludes, dir_excludes }
+        FileFilter::Mask {
+            includes,
+            excludes,
+            dir_excludes,
+        }
     }
 
     /// `rel_path` uses '/' separators and is relative to the compared root.
     pub fn include_file(&self, rel_path: &str, name: &str) -> bool {
         match self {
-            FileFilter::Mask { includes, excludes, .. } => {
+            FileFilter::Mask {
+                includes, excludes, ..
+            } => {
                 (includes.is_empty() || includes.iter().any(|r| r.is_match(name)))
                     && !excludes.iter().any(|r| r.is_match(name))
             }
@@ -115,8 +125,14 @@ impl FileFilter {
             FileFilter::Mask { dir_excludes, .. } => !dir_excludes.iter().any(|r| r.is_match(name)),
             FileFilter::Flt(f) => {
                 let win_path = format!("\\{}", rel_path.replace('/', "\\"));
-                let hit = f.dirs.iter().any(|r| r.is_match(&win_path) || r.is_match(name));
-                let exc = f.dir_except.iter().any(|r| r.is_match(&win_path) || r.is_match(name));
+                let hit = f
+                    .dirs
+                    .iter()
+                    .any(|r| r.is_match(&win_path) || r.is_match(name));
+                let exc = f
+                    .dir_except
+                    .iter()
+                    .any(|r| r.is_match(&win_path) || r.is_match(name));
                 let matched = hit && !exc;
                 if f.default_include {
                     !matched
@@ -146,7 +162,9 @@ pub fn parse_flt(text: &str, source: Option<PathBuf>) -> Option<FltFilter> {
         if line.is_empty() || line.starts_with("##") {
             continue;
         }
-        let Some((key, value)) = line.split_once(':') else { continue };
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
         // strip trailing comments ("  ## comment")
         let value = match value.find(" ##") {
             Some(i) => &value[..i],
@@ -230,10 +248,15 @@ pub fn filter_dirs() -> Vec<PathBuf> {
 pub fn load_all_filters() -> Vec<FltFilter> {
     let mut all = builtin_filters();
     for dir in filter_dirs() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
-            if p.extension().map(|x| x.eq_ignore_ascii_case("flt")).unwrap_or(false) {
+            if p.extension()
+                .map(|x| x.eq_ignore_ascii_case("flt"))
+                .unwrap_or(false)
+            {
                 if let Some(f) = load_flt(&p) {
                     all.retain(|x| x.name != f.name);
                     all.push(f);

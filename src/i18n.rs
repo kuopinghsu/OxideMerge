@@ -78,14 +78,26 @@ pub fn languages() -> &'static [LanguageInfo] {
             })
             .collect();
         for dir in lang_dirs() {
-            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for e in rd.flatten() {
                 let p = e.path();
-                if p.extension().map(|x| x.eq_ignore_ascii_case("json")).unwrap_or(false) {
+                if p.extension()
+                    .map(|x| x.eq_ignore_ascii_case("json"))
+                    .unwrap_or(false)
+                {
                     let code = p.file_stem().unwrap().to_string_lossy().into_owned();
-                    let name = std::fs::read_to_string(&p).ok().and_then(|t| name_of(&t)).unwrap_or(code.clone());
+                    let name = std::fs::read_to_string(&p)
+                        .ok()
+                        .and_then(|t| name_of(&t))
+                        .unwrap_or(code.clone());
                     v.retain(|l| l.code != code);
-                    v.push(LanguageInfo { code, name, source: Source::File(p) });
+                    v.push(LanguageInfo {
+                        code,
+                        name,
+                        source: Source::File(p),
+                    });
                 }
             }
         }
@@ -103,8 +115,15 @@ pub fn system_language() -> String {
     }
     let lower = loc.to_ascii_lowercase();
     if lower.starts_with("zh") {
-        let traditional = lower.contains("tw") || lower.contains("hk") || lower.contains("mo") || lower.contains("hant");
-        return if traditional { "zh-TW".into() } else { "zh-CN".into() };
+        let traditional = lower.contains("tw")
+            || lower.contains("hk")
+            || lower.contains("mo")
+            || lower.contains("hant");
+        return if traditional {
+            "zh-TW".into()
+        } else {
+            "zh-CN".into()
+        };
     }
     let primary = lower.split('-').next().unwrap_or("en");
     langs
@@ -115,11 +134,17 @@ pub fn system_language() -> String {
 }
 
 pub fn set_language(code: &str) {
-    let code = if code.is_empty() { system_language() } else { code.to_string() };
+    let code = if code.is_empty() {
+        system_language()
+    } else {
+        code.to_string()
+    };
     let info = languages().iter().find(|l| l.code == code).cloned();
     let table: &'static Table = match info.map(|i| i.source) {
         Some(Source::Embedded(text)) => Box::leak(Box::new(parse(text))),
-        Some(Source::File(p)) => Box::leak(Box::new(parse(&std::fs::read_to_string(p).unwrap_or_default()))),
+        Some(Source::File(p)) => Box::leak(Box::new(parse(
+            &std::fs::read_to_string(p).unwrap_or_default(),
+        ))),
         None => english(),
     };
     let code: &'static str = Box::leak(code.into_boxed_str());

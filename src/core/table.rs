@@ -46,6 +46,9 @@ mod tests {
 
     #[test]
     fn split() {
-        assert_eq!(split_row("a,\"b,c\",\"d\"\"e\"", ','), vec!["a", "b,c", "d\"e"]);
+        assert_eq!(
+            split_row("a,\"b,c\",\"d\"\"e\"", ','),
+            vec!["a", "b,c", "d\"e"]
+        );
     }
 }

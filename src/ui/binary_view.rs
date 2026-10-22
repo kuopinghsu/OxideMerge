@@ -70,7 +70,10 @@ impl BinaryView {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let name = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                let name = p
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 if self.modified[i] {
                     format!("{name}*")
                 } else {
@@ -137,14 +140,20 @@ impl BinaryView {
 
     pub fn undo(&mut self) {
         if let Some((d, m)) = self.undo.pop() {
-            self.redo.push((std::mem::replace(&mut self.data, d), std::mem::replace(&mut self.modified, m)));
+            self.redo.push((
+                std::mem::replace(&mut self.data, d),
+                std::mem::replace(&mut self.modified, m),
+            ));
             self.recompute();
         }
     }
 
     pub fn redo(&mut self) {
         if let Some((d, m)) = self.redo.pop() {
-            self.undo.push((std::mem::replace(&mut self.data, d), std::mem::replace(&mut self.modified, m)));
+            self.undo.push((
+                std::mem::replace(&mut self.data, d),
+                std::mem::replace(&mut self.modified, m),
+            ));
             self.recompute();
         }
     }
@@ -184,7 +193,11 @@ impl BinaryView {
     }
 
     pub fn copy_all(&mut self, to_right: bool) {
-        let (from, to) = if to_right { (0, 1) } else { (self.n() - 1, self.n() - 2) };
+        let (from, to) = if to_right {
+            (0, 1)
+        } else {
+            (self.n() - 1, self.n() - 2)
+        };
         if self.read_only[to] {
             return;
         }
@@ -199,7 +212,10 @@ impl BinaryView {
             if self.modified[i] {
                 std::fs::write(&self.paths[i], &self.data[i])?;
                 self.modified[i] = false;
-                self.status = trf("msg.saved", &[("file", self.paths[i].display().to_string())]);
+                self.status = trf(
+                    "msg.saved",
+                    &[("file", self.paths[i].display().to_string())],
+                );
             }
         }
         Ok(())
@@ -210,11 +226,21 @@ impl BinaryView {
             tr("msg.binary_identical").to_string()
         } else {
             match self.cur {
-                Some(c) => trf("msg.diff_of", &[("n", (c + 1).to_string()), ("total", self.diffs.len().to_string())]),
+                Some(c) => trf(
+                    "msg.diff_of",
+                    &[
+                        ("n", (c + 1).to_string()),
+                        ("total", self.diffs.len().to_string()),
+                    ],
+                ),
                 None => trf("msg.diff_count", &[("total", self.diffs.len().to_string())]),
             }
         };
-        let sizes: Vec<String> = self.data.iter().map(|d| crate::core::report::fmt_size(Some(d.len() as u64))).collect();
+        let sizes: Vec<String> = self
+            .data
+            .iter()
+            .map(|d| crate::core::report::fmt_size(Some(d.len() as u64)))
+            .collect();
         s.push_str(&format!("  |  {}: {}", tr("col.size"), sizes.join(" / ")));
         if let Some(c) = self.cursor {
             s.push_str(&format!("  |  {} 0x{c:08X} ({c})", tr("label.offset")));
@@ -258,17 +284,25 @@ impl BinaryView {
                 self.copy_current(false);
             }
             widgets::toolbar_sep(ui);
-            if widgets::icon_button_enabled(ui, !self.undo.is_empty(), "↶", tr("cmd.undo")).clicked() {
+            if widgets::icon_button_enabled(ui, !self.undo.is_empty(), "↶", tr("cmd.undo"))
+                .clicked()
+            {
                 self.undo();
             }
-            if widgets::icon_button_enabled(ui, !self.redo.is_empty(), "↷", tr("cmd.redo")).clicked() {
+            if widgets::icon_button_enabled(ui, !self.redo.is_empty(), "↷", tr("cmd.redo"))
+                .clicked()
+            {
                 self.redo();
             }
         });
         let n = self.n();
         let avail = ui.available_rect_before_wrap();
         let header_h = 36.0;
-        let loc_w = if cfg.show_location_pane { 14.0 + 8.0 * n as f32 } else { 0.0 };
+        let loc_w = if cfg.show_location_pane {
+            14.0 + 8.0 * n as f32
+        } else {
+            0.0
+        };
         let vbar_w = 12.0;
         let left = avail.left() + loc_w;
         let right = avail.right() - vbar_w;
@@ -283,13 +317,24 @@ impl BinaryView {
         let total = max_len.div_ceil(bpl).max(1);
 
         let pal = widgets::pal(ui);
-        let header_rect = Rect::from_min_max(avail.min, pos2(avail.right(), avail.top() + header_h));
+        let header_rect =
+            Rect::from_min_max(avail.min, pos2(avail.right(), avail.top() + header_h));
         ui.painter().rect_filled(header_rect, 0.0, pal.surface_alt);
-        ui.painter().hline(header_rect.x_range(), header_rect.bottom() - 0.5, Stroke::new(1.0_f32, pal.border));
+        ui.painter().hline(
+            header_rect.x_range(),
+            header_rect.bottom() - 0.5,
+            Stroke::new(1.0_f32, pal.border),
+        );
         for p in 0..n {
-            let r = Rect::from_min_size(pos2(left + p as f32 * pane_w + 8.0, avail.top()), vec2(pane_w - 16.0, header_h));
+            let r = Rect::from_min_size(
+                pos2(left + p as f32 * pane_w + 8.0, avail.top()),
+                vec2(pane_w - 16.0, header_h),
+            );
             let path = self.paths[p].display().to_string();
-            let mut title = self.paths[p].file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+            let mut title = self.paths[p]
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
             if self.modified[p] {
                 title.push_str("  ●");
             }
@@ -299,10 +344,22 @@ impl BinaryView {
                     widgets::side_chip(ui, p, n);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let lock = if self.read_only[p] { "🔒" } else { "🔓" };
-                        widgets::toggle_button(ui, &mut self.read_only[p], lock, tr("label.read_only"));
+                        widgets::toggle_button(
+                            ui,
+                            &mut self.read_only[p],
+                            lock,
+                            tr("label.read_only"),
+                        );
                         widgets::chip(ui, &size, pal.text_dim, pal.control);
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.add(egui::Label::new(egui::RichText::new(title).font(crate::ui::theme::semibold(13.5))).truncate()).on_hover_text(path);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(title)
+                                        .font(crate::ui::theme::semibold(13.5)),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(path);
                         });
                     });
                 });
@@ -352,8 +409,17 @@ impl BinaryView {
             for line in first..last {
                 let y = top + (line as f32 - self.scroll) * row_h;
                 let mut job = LayoutJob::default();
-                let fmt = |color: Color32, bg: Color32| TextFormat { font_id: font.clone(), color, background: bg, ..Default::default() };
-                job.append(&format!("{:08X}  ", line * bpl), 0.0, fmt(c.gutter_text, Color32::TRANSPARENT));
+                let fmt = |color: Color32, bg: Color32| TextFormat {
+                    font_id: font.clone(),
+                    color,
+                    background: bg,
+                    ..Default::default()
+                };
+                job.append(
+                    &format!("{:08X}  ", line * bpl),
+                    0.0,
+                    fmt(c.gutter_text, Color32::TRANSPARENT),
+                );
                 let mut ascii = LayoutJob::default();
                 for k in 0..bpl {
                     let off = line * bpl + k;
@@ -366,8 +432,14 @@ impl BinaryView {
                         (_, true, false) => c.inline,
                         _ => Color32::TRANSPARENT,
                     };
-                    let bg = if self.cursor == Some(off) { c.find_hit } else { bg };
-                    let hex = byte.map(|b| format!("{b:02X}")).unwrap_or_else(|| "  ".into());
+                    let bg = if self.cursor == Some(off) {
+                        c.find_hit
+                    } else {
+                        bg
+                    };
+                    let hex = byte
+                        .map(|b| format!("{b:02X}"))
+                        .unwrap_or_else(|| "  ".into());
                     job.append(&hex, 0.0, fmt(c.text, bg));
                     job.append(" ", 0.0, fmt(c.text, Color32::TRANSPARENT));
                     let ch = match byte {
@@ -386,13 +458,19 @@ impl BinaryView {
                 painter.galley(pos2(x0 + 4.0, y + 1.0), galley, c.text);
             }
             ui.painter().line_segment(
-                [pos2(x0 + pane_w - 1.0, avail.top()), pos2(x0 + pane_w - 1.0, bottom)],
+                [
+                    pos2(x0 + pane_w - 1.0, avail.top()),
+                    pos2(x0 + pane_w - 1.0, bottom),
+                ],
                 Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
             );
         }
 
         if cfg.show_location_pane {
-            let loc = Rect::from_min_max(pos2(avail.left(), top), pos2(avail.left() + loc_w - 2.0, bottom));
+            let loc = Rect::from_min_max(
+                pos2(avail.left(), top),
+                pos2(avail.left() + loc_w - 2.0, bottom),
+            );
             let marks: Vec<Mark> = self
                 .diffs
                 .iter()
@@ -400,16 +478,41 @@ impl BinaryView {
                 .map(|(i, r)| {
                     let start = r.start / bpl;
                     let end = (r.end.saturating_sub(1)) / bpl;
-                    let color = if self.cur == Some(i) { c.ui.accent } else { c.change_bar };
-                    Mark { start, len: end - start + 1, columns: vec![Some(color); n] }
+                    let color = if self.cur == Some(i) {
+                        c.ui.accent
+                    } else {
+                        c.change_bar
+                    };
+                    Mark {
+                        start,
+                        len: end - start + 1,
+                        columns: vec![Some(color); n],
+                    }
                 })
                 .collect();
-            if let Some(t) = widgets::location_pane(ui, self.id.with("loc"), loc, total, &marks, self.scroll, visible, c.location_bg, c.viewport) {
+            if let Some(t) = widgets::location_pane(
+                ui,
+                self.id.with("loc"),
+                loc,
+                total,
+                &marks,
+                self.scroll,
+                visible,
+                c.location_bg,
+                c.viewport,
+            ) {
                 self.scroll = (t - visible / 2.0).clamp(0.0, max_scroll);
             }
         }
         let vbar = Rect::from_min_max(pos2(right, top), pos2(avail.right(), bottom));
-        widgets::vscrollbar(ui, self.id.with("vbar"), vbar, &mut self.scroll, total + 1, visible);
+        widgets::vscrollbar(
+            ui,
+            self.id.with("vbar"),
+            vbar,
+            &mut self.scroll,
+            total + 1,
+            visible,
+        );
         ui.allocate_rect(avail, Sense::hover());
     }
 }

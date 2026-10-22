@@ -10,7 +10,10 @@ use crate::ui::syntax::{self, LineSpans};
 use crate::ui::theme::{self, Colors};
 use crate::ui::widgets::{self, Mark};
 use egui::text::LayoutJob;
-use egui::{pos2, vec2, Align2, Color32, FontId, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, TextFormat, Ui};
+use egui::{
+    pos2, vec2, Align2, Color32, FontId, Key, Modifiers, Rect, Sense, Stroke, StrokeKind,
+    TextFormat, Ui,
+};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::mpsc::Receiver;
@@ -25,7 +28,13 @@ pub struct Pane {
 
 impl Pane {
     fn new(doc: TextDoc) -> Self {
-        Pane { doc, hl: None, hl_rx: None, hl_dirty: true, hl_dark: false }
+        Pane {
+            doc,
+            hl: None,
+            hl_rx: None,
+            hl_dirty: true,
+            hl_dark: false,
+        }
     }
 }
 
@@ -86,7 +95,10 @@ pub struct TextView {
 
 impl TextView {
     pub fn new(docs: Vec<TextDoc>, cfg: &Config) -> Self {
-        let table_delim = docs.iter().filter_map(|d| d.path.as_deref()).find_map(table::delimiter_for);
+        let table_delim = docs
+            .iter()
+            .filter_map(|d| d.path.as_deref())
+            .find_map(table::delimiter_for);
         let mut v = TextView {
             panes: docs.into_iter().map(Pane::new).collect(),
             diff: DiffResult::default(),
@@ -128,7 +140,10 @@ impl TextView {
             .map(|p| {
                 let name = match (&p.doc.description, &p.doc.path) {
                     (Some(d), _) => d.clone(),
-                    (None, Some(path)) => path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                    (None, Some(path)) => path
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
                     (None, None) => tr("untitled").to_string(),
                 };
                 if p.doc.modified {
@@ -195,7 +210,12 @@ impl TextView {
     // ---------- navigation ----------
 
     fn significant(&self) -> impl Iterator<Item = usize> + '_ {
-        self.diff.blocks.iter().enumerate().filter(|(_, b)| !b.ignored).map(|(i, _)| i)
+        self.diff
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| !b.ignored)
+            .map(|(i, _)| i)
     }
 
     pub fn select_block(&mut self, b: usize) {
@@ -245,7 +265,9 @@ impl TextView {
 
     pub fn diff_position(&self) -> (Option<usize>, usize) {
         let sig: Vec<usize> = self.significant().collect();
-        let pos = self.cur_block.and_then(|c| sig.iter().position(|&b| b == c));
+        let pos = self
+            .cur_block
+            .and_then(|c| sig.iter().position(|&b| b == c));
         (pos, sig.len())
     }
 
@@ -318,7 +340,12 @@ impl TextView {
     }
 
     pub fn copy_block(&mut self, b: usize, from: usize, to: usize) {
-        if from == to || from >= self.n() || to >= self.n() || b >= self.diff.blocks.len() || !self.writable(to) {
+        if from == to
+            || from >= self.n()
+            || to >= self.n()
+            || b >= self.diff.blocks.len()
+            || !self.writable(to)
+        {
             return;
         }
         self.push_undo();
@@ -328,7 +355,9 @@ impl TextView {
         // stay near the merged position
         self.cur_block = None;
         self.cursor_row = Some(row);
-        let next = self.significant().find(|&nb| self.diff.blocks[nb].first_row >= row);
+        let next = self
+            .significant()
+            .find(|&nb| self.diff.blocks[nb].first_row >= row);
         if let Some(nb) = next {
             self.select_block(nb);
         }
@@ -373,7 +402,10 @@ impl TextView {
             return;
         }
         self.push_undo();
-        let blocks: Vec<(usize, BlockKind)> = self.significant().map(|b| (b, self.diff.blocks[b].kind)).collect();
+        let blocks: Vec<(usize, BlockKind)> = self
+            .significant()
+            .map(|b| (b, self.diff.blocks[b].kind))
+            .collect();
         let mut merged = 0;
         for &(b, kind) in blocks.iter().rev() {
             let from = match kind {
@@ -388,7 +420,10 @@ impl TextView {
         self.cur_block = None;
         self.status = trf(
             "msg.auto_merged",
-            &[("n", merged.to_string()), ("c", self.diff.conflicts().to_string())],
+            &[
+                ("n", merged.to_string()),
+                ("c", self.diff.conflicts().to_string()),
+            ],
         );
         if self.diff.conflicts() > 0 {
             self.cursor_row = Some(0);
@@ -419,11 +454,20 @@ impl TextView {
             .and_then(|r| r.line[pane])
             .map(|l| self.panes[pane].doc.lines[l].clone())
             .unwrap_or_default();
-        self.edit = Some(EditState { row, pane, text, focus: true });
+        self.edit = Some(EditState {
+            row,
+            pane,
+            text,
+            focus: true,
+        });
     }
 
     fn commit_edit(&mut self, e: EditState) {
-        let new_lines: Vec<String> = e.text.split('\n').map(|s| s.trim_end_matches('\r').to_string()).collect();
+        let new_lines: Vec<String> = e
+            .text
+            .split('\n')
+            .map(|s| s.trim_end_matches('\r').to_string())
+            .collect();
         let existing = self.diff.rows.get(e.row).and_then(|r| r.line[e.pane]);
         if let Some(l) = existing {
             if new_lines.len() == 1 && self.panes[e.pane].doc.lines[l] == new_lines[0] {
@@ -479,7 +523,10 @@ impl TextView {
             anyhow::bail!("{}", tr("msg.readonly"));
         }
         if doc.path.is_none() {
-            let Some(path) = rfd::FileDialog::new().set_title(tr("dlg.save_as")).save_file() else {
+            let Some(path) = rfd::FileDialog::new()
+                .set_title(tr("dlg.save_as"))
+                .save_file()
+            else {
                 return Ok(false);
             };
             doc.path = Some(path);
@@ -499,7 +546,9 @@ impl TextView {
                 dlg = dlg.set_file_name(name.to_string_lossy());
             }
         }
-        let Some(path) = dlg.save_file() else { return Ok(false) };
+        let Some(path) = dlg.save_file() else {
+            return Ok(false);
+        };
         let doc = &mut self.panes[p].doc;
         doc.save_as(&path)?;
         doc.read_only = false;
@@ -518,7 +567,9 @@ impl TextView {
     }
 
     pub fn reload_encoding(&mut self, p: usize, enc: TextEncoding) {
-        let Some(path) = self.panes[p].doc.path.clone() else { return };
+        let Some(path) = self.panes[p].doc.path.clone() else {
+            return;
+        };
         match text::load_doc(&path, Some(enc)) {
             Ok(mut d) => {
                 let old = &self.panes[p].doc;
@@ -587,7 +638,11 @@ impl TextView {
         if self.find.query.is_empty() {
             return;
         }
-        let q = if self.find.match_case { self.find.query.clone() } else { self.find.query.to_lowercase() };
+        let q = if self.find.match_case {
+            self.find.query.clone()
+        } else {
+            self.find.query.to_lowercase()
+        };
         let pane = self.active_pane;
         let total = self.diff.rows.len();
         if total == 0 {
@@ -595,10 +650,18 @@ impl TextView {
         }
         let start = self.cursor_row.unwrap_or(0);
         for k in 1..=total {
-            let r = if forward { (start + k) % total } else { (start + total * 2 - k) % total };
+            let r = if forward {
+                (start + k) % total
+            } else {
+                (start + total * 2 - k) % total
+            };
             if let Some(l) = self.diff.rows[r].line[pane] {
                 let line = &self.panes[pane].doc.lines[l];
-                let hit = if self.find.match_case { line.contains(&q) } else { line.to_lowercase().contains(&q) };
+                let hit = if self.find.match_case {
+                    line.contains(&q)
+                } else {
+                    line.to_lowercase().contains(&q)
+                };
                 if hit {
                     self.cursor_row = Some(r);
                     self.scroll_to = Some(r);
@@ -612,7 +675,9 @@ impl TextView {
     }
 
     pub fn goto_line(&mut self, line: usize) {
-        let r = self.diff.row_of_line(self.active_pane, line.saturating_sub(1));
+        let r = self
+            .diff
+            .row_of_line(self.active_pane, line.saturating_sub(1));
         self.cursor_row = Some(r);
         self.scroll_to = Some(r);
     }
@@ -623,15 +688,27 @@ impl TextView {
             tr("msg.identical").to_string()
         } else {
             match pos {
-                Some(p) => trf("msg.diff_of", &[("n", (p + 1).to_string()), ("total", total.to_string())]),
+                Some(p) => trf(
+                    "msg.diff_of",
+                    &[("n", (p + 1).to_string()), ("total", total.to_string())],
+                ),
                 None => trf("msg.diff_count", &[("total", total.to_string())]),
             }
         };
         if self.n() == 3 {
-            s.push_str(&format!("  |  {}: {}", tr("label.conflicts"), self.diff.conflicts()));
+            s.push_str(&format!(
+                "  |  {}: {}",
+                tr("label.conflicts"),
+                self.diff.conflicts()
+            ));
         }
         if let Some(r) = self.cursor_row {
-            if let Some(l) = self.diff.rows.get(r).and_then(|row| row.line[self.active_pane]) {
+            if let Some(l) = self
+                .diff
+                .rows
+                .get(r)
+                .and_then(|row| row.line[self.active_pane])
+            {
                 s.push_str(&format!("  |  {} {}", tr("label.line"), l + 1));
             }
         }
@@ -659,7 +736,12 @@ impl TextView {
             if (p.hl_dirty || p.hl_dark != cfg.dark_mode) && p.hl_rx.is_none() {
                 p.hl_dirty = false;
                 p.hl_dark = cfg.dark_mode;
-                let ext = p.doc.path.as_deref().map(text::extension).unwrap_or_default();
+                let ext = p
+                    .doc
+                    .path
+                    .as_deref()
+                    .map(text::extension)
+                    .unwrap_or_default();
                 p.hl_rx = Some(syntax::spawn(p.doc.lines.clone(), ext, cfg.dark_mode));
             }
         }
@@ -714,7 +796,10 @@ impl TextView {
         }
         if self.n() == 3 {
             // the side that equals the base is drawn lighter
-            let unchanged = matches!((blk.kind, p), (BlockKind::LeftOnly, 2) | (BlockKind::RightOnly, 0));
+            let unchanged = matches!(
+                (blk.kind, p),
+                (BlockKind::LeftOnly, 2) | (BlockKind::RightOnly, 0)
+            );
             if unchanged && !sel {
                 return None;
             }
@@ -733,7 +818,11 @@ impl TextView {
         if blk.ignored || row.line[p].is_none() {
             return None;
         }
-        Some(if blk.kind == BlockKind::Conflict { c.conflict_bar } else { c.change_bar })
+        Some(if blk.kind == BlockKind::Conflict {
+            c.conflict_bar
+        } else {
+            c.change_bar
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -779,7 +868,11 @@ impl TextView {
                 continue;
             }
             let fg = spans
-                .and_then(|sp| sp.iter().find(|(r, _)| r.start <= a && a < r.end).map(|(_, c)| *c))
+                .and_then(|sp| {
+                    sp.iter()
+                        .find(|(r, _)| r.start <= a && a < r.end)
+                        .map(|(_, c)| *c)
+                })
                 .unwrap_or(color);
             let bg = if hits.iter().any(|r| r.start <= a && a < r.end) {
                 hit_bg
@@ -811,7 +904,16 @@ impl TextView {
                     }
                 }
             }
-            job.append(&seg, 0.0, TextFormat { font_id: font.clone(), color: fg, background: bg, ..Default::default() });
+            job.append(
+                &seg,
+                0.0,
+                TextFormat {
+                    font_id: font.clone(),
+                    color: fg,
+                    background: bg,
+                    ..Default::default()
+                },
+            );
         }
         job
     }
@@ -911,7 +1013,12 @@ impl TextView {
                 }
             }
             if self.table_delim.is_some() {
-                widgets::toggle_button(ui, &mut self.table_mode, &format!("▦ {}", tr("cmd.table_mode")), tr("cmd.table_mode"));
+                widgets::toggle_button(
+                    ui,
+                    &mut self.table_mode,
+                    &format!("▦ {}", tr("cmd.table_mode")),
+                    tr("cmd.table_mode"),
+                );
             }
         });
     }
@@ -919,7 +1026,12 @@ impl TextView {
     fn find_bar(&mut self, ui: &mut Ui) {
         widgets::toolbar(ui, |ui| {
             let hint = tr("label.find").trim_end_matches([':', '：']);
-            let r = ui.add(egui::TextEdit::singleline(&mut self.find.query).hint_text(format!("🔍 {hint}")).margin(vec2(8.0, 4.0)).desired_width(280.0));
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.find.query)
+                    .hint_text(format!("🔍 {hint}"))
+                    .margin(vec2(8.0, 4.0))
+                    .desired_width(280.0),
+            );
             if self.find.focus {
                 r.request_focus();
                 self.find.focus = false;
@@ -950,87 +1062,140 @@ impl TextView {
         let active = self.active_pane == p;
         let pal = widgets::pal(ui);
         ui.painter().rect_filled(rect, 0.0, pal.surface_alt);
-        ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0_f32, pal.border));
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            Stroke::new(1.0_f32, pal.border),
+        );
         if active {
-            ui.painter().hline(rect.left() + 1.0..=rect.right() - 2.0, rect.bottom() - 1.0, Stroke::new(2.0_f32, widgets::side_color(ui, p, n)));
+            ui.painter().hline(
+                rect.left() + 1.0..=rect.right() - 2.0,
+                rect.bottom() - 1.0,
+                Stroke::new(2.0_f32, widgets::side_color(ui, p, n)),
+            );
         }
-        ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(8.0, 3.0))), |ui| {
-            ui.horizontal_centered(|ui| {
-                let doc = &self.panes[p].doc;
-                let title = doc.title();
-                let (name, dir) = match (&doc.description, &doc.path) {
-                    (Some(d), _) => (d.clone(), String::new()),
-                    (None, Some(path)) => (
-                        path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
-                        path.parent().map(|d| d.display().to_string()).unwrap_or_default(),
-                    ),
-                    _ => (tr("untitled").to_string(), String::new()),
-                };
-                let modified = doc.modified;
-                let mut enc_choice: Option<TextEncoding> = None;
-                let mut eol_choice: Option<Eol> = None;
-                let enc_name = doc.encoding.name();
-                let bom = if doc.bom { " BOM" } else { "" };
-                let eol = doc.eol;
-                let mixed = doc.mixed_eol;
-                let mut ro = doc.read_only;
-                widgets::side_chip(ui, p, n);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    let lock = if ro { "🔒" } else { "🔓" };
-                    if widgets::toggle_button(ui, &mut ro, lock, tr("label.read_only")).clicked() {
-                        self.panes[p].doc.read_only = ro;
-                    }
-                    let eol_label = if mixed { format!("{}*", eol.label()) } else { eol.label().to_string() };
-                    egui::ComboBox::from_id_salt((self.id, "eol", p))
-                        .selected_text(eol_label)
-                        .width(58.0)
-                        .show_ui(ui, |ui| {
-                            for e in [Eol::CrLf, Eol::Lf, Eol::Cr] {
-                                if ui.selectable_label(e == eol, e.label()).clicked() {
-                                    eol_choice = Some(e);
-                                }
-                            }
-                        })
-                        .response
-                        .on_hover_text(tr("tip.eol"));
-                    egui::ComboBox::from_id_salt((self.id, "enc", p))
-                        .selected_text(format!("{enc_name}{bom}"))
-                        .width(96.0)
-                        .show_ui(ui, |ui| {
-                            for e in COMMON_ENCODINGS {
-                                if ui.selectable_label(enc_name.eq_ignore_ascii_case(e), *e).clicked() {
-                                    enc_choice = TextEncoding::from_label(e);
-                                }
-                            }
-                        })
-                        .response
-                        .on_hover_text(tr("tip.encoding"));
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        let mut job = LayoutJob::default();
-                        let name_font = if active { theme::semibold(13.5) } else { FontId::proportional(13.5) };
-                        job.append(&name, 0.0, TextFormat { font_id: name_font, color: pal.text, ..Default::default() });
-                        if modified {
-                            job.append("  ●", 0.0, TextFormat { font_id: FontId::proportional(11.0), color: pal.warning, ..Default::default() });
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(rect.shrink2(vec2(8.0, 3.0))),
+            |ui| {
+                ui.horizontal_centered(|ui| {
+                    let doc = &self.panes[p].doc;
+                    let title = doc.title();
+                    let (name, dir) = match (&doc.description, &doc.path) {
+                        (Some(d), _) => (d.clone(), String::new()),
+                        (None, Some(path)) => (
+                            path.file_name()
+                                .map(|f| f.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            path.parent()
+                                .map(|d| d.display().to_string())
+                                .unwrap_or_default(),
+                        ),
+                        _ => (tr("untitled").to_string(), String::new()),
+                    };
+                    let modified = doc.modified;
+                    let mut enc_choice: Option<TextEncoding> = None;
+                    let mut eol_choice: Option<Eol> = None;
+                    let enc_name = doc.encoding.name();
+                    let bom = if doc.bom { " BOM" } else { "" };
+                    let eol = doc.eol;
+                    let mixed = doc.mixed_eol;
+                    let mut ro = doc.read_only;
+                    widgets::side_chip(ui, p, n);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let lock = if ro { "🔒" } else { "🔓" };
+                        if widgets::toggle_button(ui, &mut ro, lock, tr("label.read_only"))
+                            .clicked()
+                        {
+                            self.panes[p].doc.read_only = ro;
                         }
-                        if !dir.is_empty() {
-                            job.append(&format!("   {dir}"), 0.0, TextFormat { font_id: FontId::proportional(12.5), color: pal.text_dim, ..Default::default() });
-                        }
-                        ui.add(egui::Label::new(job).truncate().selectable(false)).on_hover_text(title);
+                        let eol_label = if mixed {
+                            format!("{}*", eol.label())
+                        } else {
+                            eol.label().to_string()
+                        };
+                        egui::ComboBox::from_id_salt((self.id, "eol", p))
+                            .selected_text(eol_label)
+                            .width(58.0)
+                            .show_ui(ui, |ui| {
+                                for e in [Eol::CrLf, Eol::Lf, Eol::Cr] {
+                                    if ui.selectable_label(e == eol, e.label()).clicked() {
+                                        eol_choice = Some(e);
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(tr("tip.eol"));
+                        egui::ComboBox::from_id_salt((self.id, "enc", p))
+                            .selected_text(format!("{enc_name}{bom}"))
+                            .width(96.0)
+                            .show_ui(ui, |ui| {
+                                for e in COMMON_ENCODINGS {
+                                    if ui
+                                        .selectable_label(enc_name.eq_ignore_ascii_case(e), *e)
+                                        .clicked()
+                                    {
+                                        enc_choice = TextEncoding::from_label(e);
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(tr("tip.encoding"));
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let mut job = LayoutJob::default();
+                            let name_font = if active {
+                                theme::semibold(13.5)
+                            } else {
+                                FontId::proportional(13.5)
+                            };
+                            job.append(
+                                &name,
+                                0.0,
+                                TextFormat {
+                                    font_id: name_font,
+                                    color: pal.text,
+                                    ..Default::default()
+                                },
+                            );
+                            if modified {
+                                job.append(
+                                    "  ●",
+                                    0.0,
+                                    TextFormat {
+                                        font_id: FontId::proportional(11.0),
+                                        color: pal.warning,
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                            if !dir.is_empty() {
+                                job.append(
+                                    &format!("   {dir}"),
+                                    0.0,
+                                    TextFormat {
+                                        font_id: FontId::proportional(12.5),
+                                        color: pal.text_dim,
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                            ui.add(egui::Label::new(job).truncate().selectable(false))
+                                .on_hover_text(title);
+                        });
                     });
-                });
-                if let Some(e) = enc_choice {
-                    self.reload_encoding(p, e);
-                }
-                if let Some(e) = eol_choice {
-                    if e != self.panes[p].doc.eol || self.panes[p].doc.mixed_eol {
-                        self.panes[p].doc.eol = e;
-                        self.panes[p].doc.mixed_eol = false;
-                        self.panes[p].doc.modified = true;
+                    if let Some(e) = enc_choice {
+                        self.reload_encoding(p, e);
                     }
-                }
-            });
-        });
+                    if let Some(e) = eol_choice {
+                        if e != self.panes[p].doc.eol || self.panes[p].doc.mixed_eol {
+                            self.panes[p].doc.eol = e;
+                            self.panes[p].doc.mixed_eol = false;
+                            self.panes[p].doc.modified = true;
+                        }
+                    }
+                });
+            },
+        );
     }
 
     fn handle_keys(&mut self, ui: &Ui) {
@@ -1072,14 +1237,18 @@ impl TextView {
             if i.consume_key(Modifiers::NONE, Key::ArrowLeft) && self.active_pane > 0 {
                 self.active_pane -= 1;
             }
-            if i.consume_key(Modifiers::NONE, Key::ArrowRight) && self.active_pane + 1 < self.panes.len() {
+            if i.consume_key(Modifiers::NONE, Key::ArrowRight)
+                && self.active_pane + 1 < self.panes.len()
+            {
                 self.active_pane += 1;
             }
         });
         if moved {
             self.cursor_row = Some(row);
             self.scroll_to = Some(row);
-            self.cur_block = self.diff.rows[row].block.filter(|&b| !self.diff.blocks[b].ignored);
+            self.cur_block = self.diff.rows[row]
+                .block
+                .filter(|&b| !self.diff.blocks[b].ignored);
         }
         if ui.input(|i| i.key_pressed(Key::F2) || i.key_pressed(Key::Enter)) {
             if let Some(r) = self.cursor_row {
@@ -1091,7 +1260,8 @@ impl TextView {
     pub fn ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
         self.poll_highlight(cfg);
         if self.panes.iter().any(|p| p.hl_rx.is_some()) {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.toolbar(ui);
         if self.find.open {
@@ -1103,7 +1273,11 @@ impl TextView {
         let avail = ui.available_rect_before_wrap();
         let header_h = 36.0;
         let hbar_h = 12.0;
-        let loc_w = if cfg.show_location_pane { 14.0 + 8.0 * n as f32 } else { 0.0 };
+        let loc_w = if cfg.show_location_pane {
+            14.0 + 8.0 * n as f32
+        } else {
+            0.0
+        };
         let vbar_w = 12.0;
         let content_left = avail.left() + loc_w;
         let content_right = avail.right() - vbar_w;
@@ -1120,11 +1294,17 @@ impl TextView {
 
         // headers
         for p in 0..n {
-            let r = Rect::from_min_size(pos2(content_left + p as f32 * pane_w, avail.top()), vec2(pane_w, header_h));
+            let r = Rect::from_min_size(
+                pos2(content_left + p as f32 * pane_w, avail.top()),
+                vec2(pane_w, header_h),
+            );
             self.pane_header(ui, p, r);
         }
 
-        let body_rect = Rect::from_min_max(pos2(content_left, body_top), pos2(content_right, body_bottom));
+        let body_rect = Rect::from_min_max(
+            pos2(content_left, body_top),
+            pos2(content_right, body_bottom),
+        );
         let resp = ui.interact(body_rect, self.id.with("body"), Sense::click());
 
         // scrolling
@@ -1142,11 +1322,27 @@ impl TextView {
         let max_scroll = (total as f32 - visible + 1.0).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max_scroll);
 
-        let digits = self.panes.iter().map(|p| p.doc.lines.len()).max().unwrap_or(1).to_string().len().max(3);
-        let gutter_w = if cfg.show_line_numbers { (digits as f32 + 1.0) * char_w + 6.0 } else { 6.0 };
+        let digits = self
+            .panes
+            .iter()
+            .map(|p| p.doc.lines.len())
+            .max()
+            .unwrap_or(1)
+            .to_string()
+            .len()
+            .max(3);
+        let gutter_w = if cfg.show_line_numbers {
+            (digits as f32 + 1.0) * char_w + 6.0
+        } else {
+            6.0
+        };
         let text_w = pane_w - gutter_w - 2.0;
         let content_w = if self.table_mode {
-            self.col_widths.iter().map(|w| (*w as f32 + 1.0) * char_w + 8.0).sum::<f32>() + 20.0
+            self.col_widths
+                .iter()
+                .map(|w| (*w as f32 + 1.0) * char_w + 8.0)
+                .sum::<f32>()
+                + 20.0
         } else {
             self.max_cols as f32 * char_w + 40.0
         };
@@ -1186,8 +1382,12 @@ impl TextView {
         let tab = cfg.tab_size;
         for p in 0..n {
             let x0 = content_left + p as f32 * pane_w;
-            let gutter_rect = Rect::from_min_max(pos2(x0, body_top), pos2(x0 + gutter_w, body_bottom));
-            let text_rect = Rect::from_min_max(pos2(x0 + gutter_w, body_top), pos2(x0 + pane_w - 2.0, body_bottom));
+            let gutter_rect =
+                Rect::from_min_max(pos2(x0, body_top), pos2(x0 + gutter_w, body_bottom));
+            let text_rect = Rect::from_min_max(
+                pos2(x0 + gutter_w, body_top),
+                pos2(x0 + pane_w - 2.0, body_bottom),
+            );
             painter.rect_filled(gutter_rect, 0.0, c.gutter_bg);
             painter.rect_filled(text_rect, 0.0, c.text_bg);
             let gp = ui.painter_at(gutter_rect);
@@ -1195,11 +1395,19 @@ impl TextView {
             let pane = &self.panes[p];
             for r in first..last {
                 let y = body_top + (r as f32 - self.scroll) * row_h;
-                let row_rect = Rect::from_min_size(pos2(text_rect.left(), y), vec2(text_rect.width(), row_h));
+                let row_rect =
+                    Rect::from_min_size(pos2(text_rect.left(), y), vec2(text_rect.width(), row_h));
                 if let Some(bg) = self.row_bg(r, p, c) {
                     tp.rect_filled(row_rect, 0.0, bg);
                     if let Some(bar) = self.row_bar(r, p, c) {
-                        gp.rect_filled(Rect::from_min_size(pos2(gutter_rect.right() - 3.0, y), vec2(3.0, row_h)), 0.0, bar);
+                        gp.rect_filled(
+                            Rect::from_min_size(
+                                pos2(gutter_rect.right() - 3.0, y),
+                                vec2(3.0, row_h),
+                            ),
+                            0.0,
+                            bar,
+                        );
                     }
                 }
                 let row = self.diff.rows[r];
@@ -1214,7 +1422,10 @@ impl TextView {
                     );
                 }
                 let line = &pane.doc.lines[l];
-                let ignored = row.block.map(|b| self.diff.blocks[b].ignored).unwrap_or(false);
+                let ignored = row
+                    .block
+                    .map(|b| self.diff.blocks[b].ignored)
+                    .unwrap_or(false);
                 let fg = if ignored { c.gutter_text } else { c.text };
                 let sel = row.block.is_some() && row.block == self.cur_block;
                 let inline_bg = if sel { c.inline_sel } else { c.inline };
@@ -1222,40 +1433,89 @@ impl TextView {
                     let cells = table::split_row(line, delim);
                     let others: Vec<Vec<String>> = (0..n)
                         .filter(|&q| q != p)
-                        .filter_map(|q| row.line[q].map(|ol| table::split_row(&self.panes[q].doc.lines[ol], delim)))
+                        .filter_map(|q| {
+                            row.line[q]
+                                .map(|ol| table::split_row(&self.panes[q].doc.lines[ol], delim))
+                        })
                         .collect();
                     let mut x = text_rect.left() + 4.0 - self.hscroll;
                     for (ci, cell) in cells.iter().enumerate() {
-                        let w = (self.col_widths.get(ci).copied().unwrap_or(3) as f32 + 1.0) * char_w + 8.0;
+                        let w = (self.col_widths.get(ci).copied().unwrap_or(3) as f32 + 1.0)
+                            * char_w
+                            + 8.0;
                         let cell_rect = Rect::from_min_size(pos2(x, y), vec2(w, row_h));
-                        let differs = row.block.is_some() && !ignored && others.iter().any(|o| o.get(ci) != Some(cell));
+                        let differs = row.block.is_some()
+                            && !ignored
+                            && others.iter().any(|o| o.get(ci) != Some(cell));
                         if differs {
                             tp.rect_filled(cell_rect.shrink(1.0), 0.0, inline_bg);
                         }
                         let cp = tp.with_clip_rect(cell_rect.intersect(text_rect));
-                        cp.text(pos2(x + 4.0, y + row_h / 2.0), Align2::LEFT_CENTER, cell, font.clone(), fg);
-                        tp.line_segment([pos2(x + w, y), pos2(x + w, y + row_h)], Stroke::new(1.0_f32, c.table_grid));
+                        cp.text(
+                            pos2(x + 4.0, y + row_h / 2.0),
+                            Align2::LEFT_CENTER,
+                            cell,
+                            font.clone(),
+                            fg,
+                        );
+                        tp.line_segment(
+                            [pos2(x + w, y), pos2(x + w, y + row_h)],
+                            Stroke::new(1.0_f32, c.table_grid),
+                        );
                         x += w;
                     }
                     continue;
                 }
-                let spans = if ignored { None } else { pane.hl.as_ref().and_then(|h| h.get(l)) };
-                let inline = self.inline_cache.get(&r).map(|v| v[p].as_slice()).unwrap_or(&[]);
+                let spans = if ignored {
+                    None
+                } else {
+                    pane.hl.as_ref().and_then(|h| h.get(l))
+                };
+                let inline = self
+                    .inline_cache
+                    .get(&r)
+                    .map(|v| v[p].as_slice())
+                    .unwrap_or(&[]);
                 let hits = self.find_hits(line);
-                let job = Self::line_job(line, spans, inline, &hits, inline_bg, c.find_hit, fg, &font, tab, cfg.show_whitespace);
+                let job = Self::line_job(
+                    line,
+                    spans,
+                    inline,
+                    &hits,
+                    inline_bg,
+                    c.find_hit,
+                    fg,
+                    &font,
+                    tab,
+                    cfg.show_whitespace,
+                );
                 let galley = ui.fonts(|f| f.layout_job(job));
-                tp.galley(pos2(text_rect.left() + 4.0 - self.hscroll, y + 1.0), galley, fg);
+                tp.galley(
+                    pos2(text_rect.left() + 4.0 - self.hscroll, y + 1.0),
+                    galley,
+                    fg,
+                );
             }
             if let Some(cr) = self.cursor_row {
                 if cr >= first && cr < last {
                     let y = body_top + (cr as f32 - self.scroll) * row_h;
-                    let rr = Rect::from_min_size(pos2(text_rect.left() + 1.0, y), vec2(text_rect.width() - 2.0, row_h));
-                    let color = if p == self.active_pane { c.cursor_row } else { c.cursor_row.gamma_multiply(0.35) };
+                    let rr = Rect::from_min_size(
+                        pos2(text_rect.left() + 1.0, y),
+                        vec2(text_rect.width() - 2.0, row_h),
+                    );
+                    let color = if p == self.active_pane {
+                        c.cursor_row
+                    } else {
+                        c.cursor_row.gamma_multiply(0.35)
+                    };
                     tp.rect_stroke(rr, 3.0, Stroke::new(1.5_f32, color), StrokeKind::Inside);
                 }
             }
             painter.line_segment(
-                [pos2(x0 + pane_w - 1.0, avail.top()), pos2(x0 + pane_w - 1.0, body_bottom)],
+                [
+                    pos2(x0 + pane_w - 1.0, avail.top()),
+                    pos2(x0 + pane_w - 1.0, body_bottom),
+                ],
                 Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
             );
         }
@@ -1268,7 +1528,9 @@ impl TextView {
                 let x0 = content_left + e.pane as f32 * pane_w + gutter_w;
                 let y = body_top + (e.row as f32 - self.scroll) * row_h;
                 let rect = Rect::from_min_size(pos2(x0, y - 1.0), vec2(text_w, row_h + 2.0));
-                let te = egui::TextEdit::singleline(&mut e.text).font(font.clone()).desired_width(text_w);
+                let te = egui::TextEdit::singleline(&mut e.text)
+                    .font(font.clone())
+                    .desired_width(text_w);
                 let r = ui.put(rect, te);
                 if e.focus {
                     r.request_focus();
@@ -1350,7 +1612,10 @@ impl TextView {
 
         // location pane
         if cfg.show_location_pane {
-            let loc_rect = Rect::from_min_max(pos2(avail.left(), body_top), pos2(avail.left() + loc_w - 2.0, body_bottom));
+            let loc_rect = Rect::from_min_max(
+                pos2(avail.left(), body_top),
+                pos2(avail.left() + loc_w - 2.0, body_bottom),
+            );
             let marks: Vec<Mark> = self
                 .diff
                 .blocks
@@ -1372,19 +1637,51 @@ impl TextView {
                             })
                         })
                         .collect();
-                    Mark { start: b.first_row, len: b.rows, columns }
+                    Mark {
+                        start: b.first_row,
+                        len: b.rows,
+                        columns,
+                    }
                 })
                 .collect();
-            if let Some(target) =
-                widgets::location_pane(ui, self.id.with("loc"), loc_rect, total, &marks, self.scroll, visible, c.location_bg, c.viewport)
-            {
+            if let Some(target) = widgets::location_pane(
+                ui,
+                self.id.with("loc"),
+                loc_rect,
+                total,
+                &marks,
+                self.scroll,
+                visible,
+                c.location_bg,
+                c.viewport,
+            ) {
                 self.scroll = (target - visible / 2.0).clamp(0.0, max_scroll);
             }
         }
-        let vbar = Rect::from_min_max(pos2(content_right, body_top), pos2(avail.right(), body_bottom));
-        widgets::vscrollbar(ui, self.id.with("vbar"), vbar, &mut self.scroll, total + 1, visible);
-        let hbar = Rect::from_min_max(pos2(content_left, body_bottom), pos2(content_right, avail.bottom()));
-        widgets::hscrollbar(ui, self.id.with("hbar"), hbar, &mut self.hscroll, content_w, text_w);
+        let vbar = Rect::from_min_max(
+            pos2(content_right, body_top),
+            pos2(avail.right(), body_bottom),
+        );
+        widgets::vscrollbar(
+            ui,
+            self.id.with("vbar"),
+            vbar,
+            &mut self.scroll,
+            total + 1,
+            visible,
+        );
+        let hbar = Rect::from_min_max(
+            pos2(content_left, body_bottom),
+            pos2(content_right, avail.bottom()),
+        );
+        widgets::hscrollbar(
+            ui,
+            self.id.with("hbar"),
+            hbar,
+            &mut self.hscroll,
+            content_w,
+            text_w,
+        );
         ui.allocate_rect(avail, Sense::hover());
 
         // go to line dialog
