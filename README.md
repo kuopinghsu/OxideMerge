@@ -76,7 +76,7 @@ On Linux, also install the development packages for GTK 3 (file dialogs), X11, W
 OpenGL. On Debian or Ubuntu:
 
 ```sh
-sudo apt install libgtk-3-dev libxkbcommon-dev libwayland-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+sudo apt install libgtk-3-dev libxkbcommon-dev libwayland-dev libxcursor-dev libxrandr-dev libxi-dev libgl-dev
 ```
 
 Then build:
