@@ -122,11 +122,11 @@ languages: build
 
 dist: release
 ifeq ($(OS),Windows_NT)
-	powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path '$(DIST_DIR)' | Out-Null; Copy-Item -Force '$(RELEASE_BIN)', 'README.md' '$(DIST_DIR)'; Compress-Archive -Force -Path '$(DIST_DIR)/*' -DestinationPath '$(DIST_DIR).zip'"
+	powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path '$(DIST_DIR)' | Out-Null; Copy-Item -Force '$(RELEASE_BIN)', 'README.md', 'LICENSE' '$(DIST_DIR)'; Remove-Item -Force -ErrorAction SilentlyContinue '$(DIST_DIR).zip'; Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::CreateFromDirectory('$(DIST_DIR)', '$(DIST_DIR).zip')"
 	@echo Created $(DIST_DIR).zip
 else
 	mkdir -p $(DIST_DIR)
-	cp $(RELEASE_BIN) README.md $(DIST_DIR)/
+	cp $(RELEASE_BIN) README.md LICENSE $(DIST_DIR)/
 	tar -C dist -czf $(DIST_DIR).tar.gz $(DIST_NAME)
 	@echo Created $(DIST_DIR).tar.gz
 endif
