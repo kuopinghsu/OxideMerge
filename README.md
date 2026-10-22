@@ -109,9 +109,10 @@ A `Makefile` for GNU Make wraps the common tasks. It works on Windows and Unix.
 ### Continuous integration
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main` and on every
-pull request. It builds OxideMerge on Windows and Linux, runs clippy with warnings treated as
+pull request. It builds OxideMerge on Windows, macOS and Linux, runs clippy with warnings treated as
 errors, runs the unit tests, and smoke-tests the command line (`--version`, `--list-languages` and
-the `--cli` exit codes).
+the `--cli` exit codes). The macOS job also builds a universal binary (Apple silicon and Intel),
+ad-hoc signs it, and uploads `oxidemerge-<version>-macos.dmg` as a workflow artifact.
 
 ## Usage
 

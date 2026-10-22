@@ -27,6 +27,8 @@ jobs:
             os: windows-latest
           - name: Linux
             os: ubuntu-latest
+          - name: macOS
+            os: macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -65,3 +67,35 @@ jobs:
           code=$?
           set -e
           test "$code" -eq 1 || { echo "expected exit code 1 for differing folders, got $code"; exit 1; }
+
+      - name: Package macOS disk image
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
+          root="dist/macos-root"
+          mkdir -p "$root"
+          lipo -create \
+            target/aarch64-apple-darwin/release/oxidemerge \
+            target/x86_64-apple-darwin/release/oxidemerge \
+            -output "$root/oxidemerge"
+          codesign --force --sign - "$root/oxidemerge"
+          cp README.md LICENSE "$root/"
+          hdiutil create \
+            -volname "OxideMerge ${version}" \
+            -srcfolder "$root" \
+            -ov \
+            -format UDZO \
+            "dist/oxidemerge-${version}-macos.dmg"
+          rm -rf "$root"
+
+      - name: Upload macOS package
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxidemerge-macos
+          path: dist/*.dmg
+          if-no-files-found: error
