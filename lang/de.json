@@ -72,6 +72,7 @@
   "dlg.save_as": "Speichern unter",
   "dlg.unsaved": "Ungespeicherte Änderungen",
   "filters.builtin": "(integriert)",
+  "filters.clear": "Filter entfernen",
   "filters.current": "Aktueller Filter",
   "filters.desc": "Beschreibung",
   "filters.hint": "Filter legen fest, welche Dateien und Ordner verglichen werden. WinMerge-kompatible .flt-Dateien werden aus den Filters-Ordnern geladen.",

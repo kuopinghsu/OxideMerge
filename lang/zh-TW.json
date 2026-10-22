@@ -72,6 +72,7 @@
   "dlg.save_as": "另存新檔",
   "dlg.unsaved": "尚未儲存的變更",
   "filters.builtin": "（內建）",
+  "filters.clear": "清除篩選器",
   "filters.current": "目前的篩選器",
   "filters.desc": "說明",
   "filters.hint": "篩選器決定要比較哪些檔案與資料夾。會從 Filters 資料夾載入與 WinMerge 相容的 .flt 檔案。",

@@ -72,6 +72,7 @@
   "dlg.save_as": "名前を付けて保存",
   "dlg.unsaved": "未保存の変更",
   "filters.builtin": "(組み込み)",
+  "filters.clear": "フィルターを解除",
   "filters.current": "現在のフィルター",
   "filters.desc": "説明",
   "filters.hint": "フィルターは比較するファイルとフォルダーを決めます。WinMerge 互換の .flt ファイルを Filters フォルダーから読み込みます。",

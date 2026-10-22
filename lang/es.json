@@ -72,6 +72,7 @@
   "dlg.save_as": "Guardar como",
   "dlg.unsaved": "Cambios sin guardar",
   "filters.builtin": "(integrado)",
+  "filters.clear": "Quitar filtro",
   "filters.current": "Filtro actual",
   "filters.desc": "Descripción",
   "filters.hint": "Los filtros deciden qué archivos y carpetas se comparan. Los archivos .flt compatibles con WinMerge se cargan desde las carpetas Filters.",

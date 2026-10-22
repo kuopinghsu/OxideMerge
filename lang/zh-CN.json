@@ -72,6 +72,7 @@
   "dlg.save_as": "另存为",
   "dlg.unsaved": "未保存的更改",
   "filters.builtin": "（内置）",
+  "filters.clear": "清除过滤器",
   "filters.current": "当前过滤器",
   "filters.desc": "描述",
   "filters.hint": "过滤器决定比较哪些文件和文件夹。会从 Filters 文件夹加载与 WinMerge 兼容的 .flt 文件。",

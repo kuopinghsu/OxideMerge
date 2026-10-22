@@ -1372,7 +1372,10 @@ impl OxideMergeApp {
         }
         let mut open = true;
         let mut reload = false;
-        let mut apply = false;
+        let mut apply: Option<String> = None;
+        let default_filter = Config::default().filter;
+        let can_clear = self.cfg.filter != default_filter
+            || matches!(self.tabs.get(self.active).map(|t| &t.content), Some(Content::Folder(v)) if v.filter_spec != default_filter);
         egui::Window::new(tr("menu.filters")).open(&mut open).default_width(560.0).show(ctx, |ui| {
             ui.label(tr("filters.hint"));
             ui.separator();
@@ -1387,11 +1390,7 @@ impl OxideMergeApp {
                     ui.label(&f.desc);
                     ui.label(f.source.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| tr("filters.builtin").into()));
                     if ui.button(tr("filters.use")).clicked() {
-                        self.cfg.filter = format!("{FLT_PREFIX}{}", f.name);
-                        if let Some(d) = &mut self.open_dlg {
-                            d.filter = self.cfg.filter.clone();
-                        }
-                        apply = true;
+                        apply = Some(format!("{FLT_PREFIX}{}", f.name));
                     }
                     ui.end_row();
                 }
@@ -1426,12 +1425,21 @@ impl OxideMergeApp {
                     reload = true;
                 }
             });
-            ui.label(format!("{}: {}", tr("filters.current"), self.cfg.filter));
+            ui.horizontal(|ui| {
+                ui.label(format!("{}: {}", tr("filters.current"), self.cfg.filter));
+                if ui.add_enabled(can_clear, egui::Button::new(tr("filters.clear"))).clicked() {
+                    apply = Some(default_filter.clone());
+                }
+            });
         });
         if reload {
             self.named_filters = filter::load_all_filters();
         }
-        if apply {
+        if let Some(spec) = apply {
+            self.cfg.filter = spec;
+            if let Some(d) = &mut self.open_dlg {
+                d.filter = self.cfg.filter.clone();
+            }
             if let Some(Content::Folder(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.content) {
                 v.filter_spec = self.cfg.filter.clone();
                 v.refresh(&self.cfg, &self.named_filters);

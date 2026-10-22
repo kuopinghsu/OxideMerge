@@ -72,6 +72,7 @@
   "dlg.save_as": "다른 이름으로 저장",
   "dlg.unsaved": "저장되지 않은 변경 내용",
   "filters.builtin": "(기본 제공)",
+  "filters.clear": "필터 해제",
   "filters.current": "현재 필터",
   "filters.desc": "설명",
   "filters.hint": "필터는 비교할 파일과 폴더를 결정합니다. WinMerge 호환 .flt 파일을 Filters 폴더에서 불러옵니다.",
