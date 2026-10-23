@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Package target/release/oxidemerge as dist/oxidemerge-$VERSION-linux-x64.AppImage.
+# Package the release binary as dist/oxidemerge-$VERSION-linux-x64.AppImage.
 #
 # OxideMerge links only to glibc and opens its display and keyboard libraries
 # at runtime. This bundles those libraries, and everything they need. glibc,
@@ -25,14 +25,15 @@ if [ -z "${VERSION:-}" ]; then
     VERSION=${VERSION##*@}
 fi
 
-bin=target/release/oxidemerge
+target_dir=${CARGO_TARGET_DIR:-target}
+bin=$target_dir/release/oxidemerge
 if [ ! -x "$bin" ]; then
     echo "Missing $bin; run 'make release' first" >&2
     exit 1
 fi
 
 name="oxidemerge-$VERSION-linux-x64"
-work=target/appimage
+work=$target_dir/appimage
 app=$work/OxideMerge.AppDir
 rm -rf "$app"
 mkdir -p dist "$work"
@@ -56,9 +57,11 @@ system='^(ld-linux-x86-64|libc|libm|libdl|libpthread|librt|libresolv|libutil|lib
 {
     ldd "$bin"
     for lib in $wanted; do
-        file=$( { /sbin/ldconfig -p || ldconfig -p; } 2>/dev/null | awk -v name="$lib" '$1 == name && /x86-64/ { print $NF; exit }')
+        # awk exits at the first match, so ldconfig gets SIGPIPE. `|| true` keeps
+        # pipefail from aborting the script; a missing library is reported below.
+        file=$( { /sbin/ldconfig -p || ldconfig -p; } 2>/dev/null | awk -v name="$lib" '$1 == name && /x86-64/ { print $NF; exit }' || true)
         if [ -z "$file" ]; then
-            echo "$lib is not installed" >&2
+            echo "${GITHUB_ACTIONS:+::error::}$lib is not installed" >&2
             exit 1
         fi
         echo "$lib $file"

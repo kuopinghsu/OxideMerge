@@ -136,6 +136,7 @@ A `Makefile` for GNU Make wraps the common tasks. It works on Windows and Unix.
 | `make install` / `uninstall` | `cargo install` into `~/.cargo/bin` |
 | `make shell-register` | Install, then add the Explorer context menu (Windows) |
 | `make dist` | Package the release binary into `dist/` (`.zip` on Windows, `.tar.gz` elsewhere) |
+| `make appimage` | Linux x86_64 AppImage in `dist/` (same layout as CI; needs the X11, Wayland and keyboard libraries installed, and downloads `appimagetool`) |
 | `make clean` | Remove build output |
 | `make help` | List all targets |
 
@@ -308,6 +309,7 @@ src/
   ui/               egui application, views, theme and widgets
 build.rs            embeds the icon and version details in the Windows executable
 assets/             application icon (.png, .ico), Linux desktop entry and AppImage launcher
+scripts/            Linux AppImage packaging used by `make appimage` and CI
 lang/               built-in translations
 samples/            files used by the make demo targets
 ```

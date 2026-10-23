@@ -27,32 +27,33 @@ DIST_DIR    := dist/$(DIST_NAME)
 
 .PHONY: all help build release run run-release demo demo-text demo-3way demo-conflict \
         test check check-platforms lint fmt fmt-check ci install uninstall shell-register shell-unregister \
-        languages dist clean
+        languages dist appimage clean
 
 help:
-	@echo OxideMerge $(VERSION) - make targets
-	@echo   all               Release build (default, same as release)
-	@echo   release           Optimized build in $(RELEASE_BIN)
-	@echo   build             Debug build
-	@echo   run               Run the debug build, pass arguments with ARGS="left right"
-	@echo   run-release       Run the release build with ARGS
-	@echo   demo              Folder compare of samples/left and samples/right
-	@echo   demo-text         2-way text compare of the sample main.rs files
-	@echo   demo-3way         3-way text compare of samples/three
-	@echo   demo-conflict     Resolve the sample Git conflict file
-	@echo   test              Run the unit tests
-	@echo   check             Type-check all targets
-	@echo   check-platforms   Type-check for Windows, macOS and Linux
-	@echo   lint              Clippy with warnings treated as errors
-	@echo   fmt / fmt-check   Format the code / verify formatting
-	@echo   ci                check + lint + test
-	@echo   install           cargo install into ~/.cargo/bin
-	@echo   uninstall         Remove the installed binary
-	@echo   shell-register    Install, then add the Explorer context menu (Windows)
-	@echo   shell-unregister  Remove the Explorer context menu (Windows)
-	@echo   languages         List the available UI languages
-	@echo   dist              Release build packaged into dist/$(DIST_NAME)
-	@echo   clean             Remove build output and dist/
+	@echo 'OxideMerge $(VERSION) - make targets'
+	@echo '  all               Release build (default, same as release)'
+	@echo '  release           Optimized build in $(RELEASE_BIN)'
+	@echo '  build             Debug build'
+	@echo '  run               Run the debug build, pass arguments with ARGS="left right"'
+	@echo '  run-release       Run the release build with ARGS'
+	@echo '  demo              Folder compare of samples/left and samples/right'
+	@echo '  demo-text         2-way text compare of the sample main.rs files'
+	@echo '  demo-3way         3-way text compare of samples/three'
+	@echo '  demo-conflict     Resolve the sample Git conflict file'
+	@echo '  test              Run the unit tests'
+	@echo '  check             Type-check all targets'
+	@echo '  check-platforms   Type-check for Windows, macOS and Linux'
+	@echo '  lint              Clippy with warnings treated as errors'
+	@echo '  fmt / fmt-check   Format the code / verify formatting'
+	@echo '  ci                check + lint + test'
+	@echo '  install           cargo install into ~/.cargo/bin'
+	@echo '  uninstall         Remove the installed binary'
+	@echo '  shell-register    Install, then add the Explorer context menu (Windows)'
+	@echo '  shell-unregister  Remove the Explorer context menu (Windows)'
+	@echo '  languages         List the available UI languages'
+	@echo '  dist              Release build packaged into dist/$(DIST_NAME)'
+	@echo '  appimage          Linux x86_64 AppImage in dist/'
+	@echo '  clean             Remove build output and dist/'
 
 all: release
 
@@ -129,6 +130,15 @@ else
 	cp $(RELEASE_BIN) README.md LICENSE $(DIST_DIR)/
 	tar -C dist -czf $(DIST_DIR).tar.gz $(DIST_NAME)
 	@echo Created $(DIST_DIR).tar.gz
+endif
+
+# Same AppDir as the CI AppImage job. Linux x86_64 only.
+appimage: release
+ifeq ($(PLATFORM),linux)
+	VERSION='$(VERSION)' bash scripts/package-appimage.sh
+else
+	@echo AppImage packages are built on Linux x86_64 >&2
+	@exit 1
 endif
 
 clean:
