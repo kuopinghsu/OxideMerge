@@ -74,6 +74,7 @@ impl Selection {
     }
 
     /// Label of the Compare entry, naming the remembered sides.
+    #[cfg(windows)]
     pub fn compare_label(&self) -> String {
         use crate::i18n::{tr, trf};
         let name = |p: &PathBuf| {
