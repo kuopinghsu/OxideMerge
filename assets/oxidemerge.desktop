@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=OxideMerge
+GenericName=Diff and Merge Tool
+Comment=Compare and merge folders, text files, binary files, images and web pages
+Exec=oxidemerge %F
+Icon=oxidemerge
+Terminal=false
+StartupWMClass=oxidemerge
+Categories=Development;Utility;TextTools;
+Keywords=diff;merge;compare;folder;text;binary;image;conflict;winmerge;
+MimeType=inode/directory;text/plain;

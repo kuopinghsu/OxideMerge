@@ -1,0 +1,29 @@
+#!/bin/sh
+# Starts OxideMerge inside its AppImage.
+#
+# The AppImage carries every library OxideMerge loads at runtime, apart from
+# glibc and the OpenGL driver, each in a folder of its own under
+# usr/lib/oxidemerge. Only the folders of libraries the system lacks go on the
+# library path, so the system's own copies, which match its display setup,
+# come first, and programs OxideMerge starts, such as a browser for web page
+# screenshots or an unpacker, are not handed libraries that differ from the
+# system's.
+
+here=$(dirname "$(readlink -f "$0")")
+
+tab=$(printf '\t')
+installed=$({ /sbin/ldconfig -p || ldconfig -p; } 2>/dev/null)
+bundled=
+for dir in "$here"/usr/lib/oxidemerge/*/; do
+    dir=${dir%/}
+    name=${dir##*/}
+    case $installed in
+        *"$tab$name (libc6,x86-64"*) ;;
+        *) bundled=$bundled${bundled:+:}$dir ;;
+    esac
+done
+if [ -n "$bundled" ]; then
+    export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$bundled"
+fi
+
+exec "$here/usr/bin/oxidemerge" "$@"
