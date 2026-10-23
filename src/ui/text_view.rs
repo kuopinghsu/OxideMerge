@@ -17,6 +17,7 @@ use egui::{
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::mpsc::Receiver;
+use std::time::SystemTime;
 
 pub struct Pane {
     pub doc: TextDoc,
@@ -24,16 +25,32 @@ pub struct Pane {
     hl_rx: Option<Receiver<Option<Vec<LineSpans>>>>,
     hl_dirty: bool,
     hl_dark: bool,
+    /// Number of times this pane was saved; undo snapshots from before a save are unsaved changes.
+    saves: u64,
+    /// Modification time of the file when it was loaded or saved.
+    disk_time: Option<SystemTime>,
+}
+
+/// Modification time of a document's file. Documents with a description (unpacked or
+/// generated text) do not mirror their file, so they are not watched.
+fn disk_time(doc: &TextDoc) -> Option<SystemTime> {
+    if doc.description.is_some() {
+        return None;
+    }
+    std::fs::metadata(doc.path.as_ref()?).ok()?.modified().ok()
 }
 
 impl Pane {
     fn new(doc: TextDoc) -> Self {
+        let disk_time = disk_time(&doc);
         Pane {
             doc,
             hl: None,
             hl_rx: None,
             hl_dirty: true,
             hl_dark: false,
+            saves: 0,
+            disk_time,
         }
     }
 }
@@ -56,6 +73,7 @@ pub struct FindState {
 struct Snapshot {
     lines: Vec<Vec<String>>,
     modified: Vec<bool>,
+    saves: Vec<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -90,6 +108,8 @@ pub struct TextView {
     max_cols: usize,
     ctx_target: Option<(usize, usize)>,
     page_rows: usize,
+    /// Modified panes whose file was changed by another program.
+    disk_changed: Vec<usize>,
     id: egui::Id,
 }
 
@@ -122,6 +142,7 @@ impl TextView {
             max_cols: 0,
             ctx_target: None,
             page_rows: 30,
+            disk_changed: Vec::new(),
             id: egui::Id::new(("textview", std::time::Instant::now())),
         };
         v.rediff();
@@ -277,25 +298,29 @@ impl TextView {
         Snapshot {
             lines: self.panes.iter().map(|p| p.doc.lines.clone()).collect(),
             modified: self.panes.iter().map(|p| p.doc.modified).collect(),
+            saves: self.panes.iter().map(|p| p.saves).collect(),
         }
     }
 
     fn push_undo(&mut self) {
         let s = self.snapshot();
+        // Each snapshot copies every pane, so keep fewer levels for large files.
+        let lines: usize = s.lines.iter().map(Vec::len).sum();
+        let max = (5_000_000 / lines.max(1)).clamp(10, 200);
         self.undo.push(s);
-        if self.undo.len() > 200 {
-            self.undo.remove(0);
+        if self.undo.len() > max {
+            self.undo.drain(..self.undo.len() - max);
         }
         self.redo.clear();
     }
 
     fn restore(&mut self, s: Snapshot) {
-        for (i, p) in self.panes.iter_mut().enumerate() {
-            if p.doc.lines != s.lines[i] {
+        for (i, (p, lines)) in self.panes.iter_mut().zip(s.lines).enumerate() {
+            if p.doc.lines != lines {
                 p.hl_dirty = true;
             }
-            p.doc.lines = s.lines[i].clone();
-            p.doc.modified = s.modified[i];
+            p.doc.lines = lines;
+            p.doc.modified = s.modified[i] || s.saves[i] != p.saves;
         }
         self.rediff();
     }
@@ -533,7 +558,63 @@ impl TextView {
         }
         doc.save()?;
         self.status = trf("msg.saved", &[("file", doc.title())]);
+        self.saved(p);
         Ok(true)
+    }
+
+    fn saved(&mut self, p: usize) {
+        let pane = &mut self.panes[p];
+        pane.saves += 1;
+        pane.disk_time = disk_time(&pane.doc);
+        self.disk_changed.retain(|&c| c != p);
+    }
+
+    /// Reacts to files changed by another program: unmodified panes are reloaded, and panes with
+    /// unsaved edits are listed in a warning bar.
+    pub fn check_disk(&mut self) {
+        let mut reload = Vec::new();
+        for (i, p) in self.panes.iter_mut().enumerate() {
+            let now = disk_time(&p.doc);
+            if now.is_none() || now == p.disk_time {
+                continue;
+            }
+            p.disk_time = now;
+            if p.doc.modified {
+                if !self.disk_changed.contains(&i) {
+                    self.disk_changed.push(i);
+                }
+            } else {
+                reload.push(i);
+            }
+        }
+        if !reload.is_empty() {
+            self.refresh();
+            let names: Vec<String> = reload.iter().map(|&i| self.panes[i].doc.title()).collect();
+            self.status = trf("msg.reloaded", &[("file", names.join(", "))]);
+        }
+    }
+
+    /// Replaces the listed panes with the file contents on disk, discarding their edits (undoable).
+    fn reload_changed(&mut self) {
+        let panes = std::mem::take(&mut self.disk_changed);
+        self.push_undo();
+        for p in panes {
+            let pane = &mut self.panes[p];
+            let Some(path) = pane.doc.path.clone() else {
+                continue;
+            };
+            match text::load_doc(&path, Some(pane.doc.encoding)) {
+                Ok(mut d) => {
+                    d.read_only = pane.doc.read_only;
+                    pane.doc = d;
+                    pane.hl_dirty = true;
+                    pane.saves += 1;
+                    pane.disk_time = disk_time(&pane.doc);
+                }
+                Err(e) => self.status = e.to_string(),
+            }
+        }
+        self.rediff();
     }
 
     pub fn save_pane_as(&mut self, p: usize) -> anyhow::Result<bool> {
@@ -554,6 +635,7 @@ impl TextView {
         doc.read_only = false;
         doc.description = None;
         self.status = trf("msg.saved", &[("file", doc.title())]);
+        self.saved(p);
         Ok(true)
     }
 
@@ -577,6 +659,7 @@ impl TextView {
                 d.description = old.description.clone();
                 self.panes[p].doc = d;
                 self.panes[p].hl_dirty = true;
+                self.panes[p].disk_time = disk_time(&self.panes[p].doc);
                 self.rediff();
             }
             Err(e) => self.status = e.to_string(),
@@ -596,6 +679,7 @@ impl TextView {
                         p.hl_dirty = true;
                     }
                     p.doc = d;
+                    p.disk_time = disk_time(&p.doc);
                 }
             }
         }
@@ -741,6 +825,7 @@ impl TextView {
                     .path
                     .as_deref()
                     .map(text::extension)
+                    .or_else(|| p.doc.syntax.clone())
                     .unwrap_or_default();
                 p.hl_rx = Some(syntax::spawn(p.doc.lines.clone(), ext, cfg.dark_mode));
             }
@@ -1023,6 +1108,35 @@ impl TextView {
         });
     }
 
+    fn disk_changed_bar(&mut self, ui: &mut Ui) {
+        let names: Vec<String> = self
+            .disk_changed
+            .iter()
+            .map(|&p| self.panes[p].doc.title())
+            .collect();
+        let mut reload = false;
+        let mut ignore = false;
+        widgets::toolbar(ui, |ui| {
+            let pal = widgets::pal(ui);
+            ui.label(
+                egui::RichText::new(format!(
+                    "⚠ {}",
+                    trf("msg.changed_on_disk", &[("file", names.join(", "))])
+                ))
+                .color(pal.warning),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ignore = widgets::ghost_button(ui, tr("btn.ignore")).clicked();
+                reload = widgets::ghost_button(ui, tr("btn.reload")).clicked();
+            });
+        });
+        if reload {
+            self.reload_changed();
+        } else if ignore {
+            self.disk_changed.clear();
+        }
+    }
+
     fn find_bar(&mut self, ui: &mut Ui) {
         widgets::toolbar(ui, |ui| {
             let hint = tr("label.find").trim_end_matches([':', '：']);
@@ -1040,6 +1154,13 @@ impl TextView {
                 let back = ui.input(|i| i.modifiers.shift);
                 self.find_next(!back);
                 r.request_focus();
+            }
+            if ui.input(|i| i.key_pressed(Key::Escape))
+                && self.edit.is_none()
+                && self.goto.is_none()
+                && !widgets::modal_open(ui.ctx())
+            {
+                self.find.open = false;
             }
             ui.add_space(4.0);
             widgets::toggle_button(ui, &mut self.find.match_case, "Aa", tr("label.match_case"));
@@ -1199,7 +1320,11 @@ impl TextView {
     }
 
     fn handle_keys(&mut self, ui: &Ui) {
-        if ui.ctx().wants_keyboard_input() || self.edit.is_some() {
+        if ui.ctx().wants_keyboard_input()
+            || self.edit.is_some()
+            || self.goto.is_some()
+            || widgets::modal_open(ui.ctx())
+        {
             return;
         }
         let total = self.diff.rows.len();
@@ -1264,6 +1389,9 @@ impl TextView {
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.toolbar(ui);
+        if !self.disk_changed.is_empty() {
+            self.disk_changed_bar(ui);
+        }
         if self.find.open {
             self.find_bar(ui);
         }
@@ -1624,19 +1752,17 @@ impl TextView {
                 .filter(|(_, b)| !b.ignored)
                 .map(|(i, b)| {
                     let sel = self.cur_block == Some(i);
-                    let columns = (0..n)
-                        .map(|p| {
-                            Some(if b.ranges[p].is_empty() {
-                                c.ui.border_strong
-                            } else if sel {
-                                c.ui.accent
-                            } else if b.kind == BlockKind::Conflict {
-                                c.conflict_bar
-                            } else {
-                                c.change_bar
-                            })
+                    let columns = std::array::from_fn(|p| {
+                        Some(if b.ranges[p].is_empty() {
+                            c.ui.border_strong
+                        } else if sel {
+                            c.ui.accent
+                        } else if b.kind == BlockKind::Conflict {
+                            c.conflict_bar
+                        } else {
+                            c.change_bar
                         })
-                        .collect();
+                    });
                     Mark {
                         start: b.first_row,
                         len: b.rows,
@@ -1649,6 +1775,7 @@ impl TextView {
                 self.id.with("loc"),
                 loc_rect,
                 total,
+                n,
                 &marks,
                 self.scroll,
                 visible,
@@ -1686,8 +1813,9 @@ impl TextView {
 
         // go to line dialog
         if let Some(mut g) = self.goto.take() {
-            let mut open = true;
+            let mut open = !ui.input(|i| i.key_pressed(Key::Escape));
             let mut go = false;
+            let max = self.panes[self.active_pane].doc.lines.len().max(1);
             egui::Window::new(tr("dlg.goto"))
                 .collapsible(false)
                 .resizable(false)
@@ -1696,7 +1824,9 @@ impl TextView {
                 .show(ui.ctx(), |ui| {
                     ui.horizontal(|ui| {
                         ui.label(tr("label.line"));
-                        let r = ui.text_edit_singleline(&mut g);
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut g).hint_text(format!("1 – {max}")),
+                        );
                         r.request_focus();
                         if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                             go = true;
@@ -1714,5 +1844,75 @@ impl TextView {
                 self.goto = Some(g);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn touch(path: &std::path::Path, text: &str, age: u64) {
+        std::fs::write(path, text).unwrap();
+        let t = SystemTime::now() - Duration::from_secs(age);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    #[test]
+    fn handles_files_changed_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        touch(&a, "one\ntwo\n", 100);
+        touch(&b, "one\nTWO\n", 100);
+        let docs = [&a, &b].map(|p| text::load_doc(p, None).unwrap()).to_vec();
+        let mut v = TextView::new(docs, &Config::default());
+
+        // Unmodified pane: reloaded silently.
+        touch(&a, "one\nthree\n", 50);
+        v.check_disk();
+        assert_eq!(v.panes[0].doc.lines, ["one", "three"]);
+        assert!(v.disk_changed.is_empty());
+
+        // Pane with edits: reported, then reloaded on request; undo brings the edits back.
+        v.push_undo();
+        v.panes[0].doc.lines[1] = "edited".into();
+        v.mark_changed(&[0]);
+        touch(&a, "one\nfour\n", 10);
+        v.check_disk();
+        assert_eq!(v.disk_changed, [0]);
+        assert_eq!(v.panes[0].doc.lines[1], "edited");
+        v.reload_changed();
+        assert_eq!(v.panes[0].doc.lines, ["one", "four"]);
+        assert!(!v.panes[0].doc.modified);
+        v.undo();
+        assert_eq!(v.panes[0].doc.lines[1], "edited");
+        assert!(v.panes[0].doc.modified);
+    }
+
+    #[test]
+    fn undo_after_save_marks_pane_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        touch(&a, "one\n", 100);
+        touch(&b, "two\n", 100);
+        let docs = [&a, &b].map(|p| text::load_doc(p, None).unwrap()).to_vec();
+        let mut v = TextView::new(docs, &Config::default());
+        v.push_undo();
+        v.panes[0].doc.lines[0] = "edited".into();
+        v.mark_changed(&[0]);
+        v.save_pane(0).unwrap();
+        assert!(!v.panes[0].doc.modified);
+        v.undo();
+        assert!(
+            v.panes[0].doc.modified,
+            "disk has the edit, the pane does not"
+        );
+        v.redo();
+        assert!(!v.panes[0].doc.modified, "back to the saved text");
     }
 }

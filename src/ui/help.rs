@@ -1,7 +1,7 @@
 //! Help & Shortcuts dialog, opened with F1, `?`, the Help menu, or the help button in the header.
 
 use crate::i18n::{tr, trf};
-use crate::ui::{theme, widgets};
+use crate::ui::{about, theme, widgets};
 use egui::{FontId, Key, Margin, Modifiers, RichText, Stroke, Vec2};
 use std::path::Path;
 
@@ -117,6 +117,8 @@ const KEYS: f32 = 196.0;
 const ACTION: f32 = 196.0;
 const GAP: f32 = 12.0;
 const PANEL_MARGIN: i8 = 14;
+/// Space between the dialog edge and the panels.
+const MARGIN: i8 = 16;
 /// Outer width of one panel, including its margin and outline.
 const PANEL: f32 = KEYS + GAP + ACTION + 2.0 * PANEL_MARGIN as f32 + 2.0;
 
@@ -135,41 +137,48 @@ pub fn show(ctx: &egui::Context, settings: Option<&Path>) -> bool {
         PANEL
     };
     let max_height = (screen.height() - 160.0).max(200.0);
-    let response = egui::Modal::new(egui::Id::new("help_dialog")).show(ctx, |ui| {
-        ui.set_width(content + 16.0);
-        if widgets::dialog_title(ui, tr("help.title")) {
-            close = true;
-        }
-        egui::ScrollArea::vertical()
-            .max_height(max_height)
-            .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::splat(GAP);
-                    if side_by_side {
-                        panel(ui, tr("help.keyboard"), KEYBOARD, false);
-                        panel(ui, tr("help.mouse"), MOUSE, true);
-                    } else {
-                        ui.vertical(|ui| {
-                            panel(ui, tr("help.keyboard"), KEYBOARD, false);
-                            panel(ui, tr("help.mouse"), MOUSE, true);
+    let response = egui::Modal::new(egui::Id::new("help_dialog"))
+        .frame(about::dialog_frame(ctx))
+        .show(ctx, |ui| {
+            ui.set_width(content + 2.0 * MARGIN as f32 + 4.0);
+            about::title_bar(ui, tr("help.title"), &mut close);
+            egui::Frame::new()
+                .inner_margin(Margin::same(MARGIN))
+                .show(ui, |ui| {
+                    // A modal is laid out in the size it had the frame before, so without a
+                    // minimum it would grow a little each frame instead of opening at full size.
+                    egui::ScrollArea::vertical()
+                        .max_height(max_height)
+                        .min_scrolled_height(max_height)
+                        .show(ui, |ui| {
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing = Vec2::splat(GAP);
+                                if side_by_side {
+                                    panel(ui, tr("help.keyboard"), KEYBOARD, false);
+                                    panel(ui, tr("help.mouse"), MOUSE, true);
+                                } else {
+                                    ui.vertical(|ui| {
+                                        panel(ui, tr("help.keyboard"), KEYBOARD, false);
+                                        panel(ui, tr("help.mouse"), MOUSE, true);
+                                    });
+                                }
+                                // Room for the scroll bar.
+                                ui.add_space(4.0);
+                            });
                         });
+                    if let Some(path) = settings {
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(trf(
+                                "help.settings_file",
+                                &[("path", path.display().to_string())],
+                            ))
+                            .size(11.5)
+                            .color(widgets::pal(ui).text_dim),
+                        );
                     }
-                    // Room for the scroll bar.
-                    ui.add_space(4.0);
                 });
-            });
-        if let Some(path) = settings {
-            ui.add_space(10.0);
-            ui.label(
-                RichText::new(trf(
-                    "help.settings_file",
-                    &[("path", path.display().to_string())],
-                ))
-                .size(11.5)
-                .color(widgets::pal(ui).text_dim),
-            );
-        }
-    });
+        });
     close || response.should_close()
 }
 

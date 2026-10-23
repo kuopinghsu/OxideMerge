@@ -21,10 +21,13 @@ pub enum ImgMode {
 
 pub struct ImageView {
     pub paths: Vec<PathBuf>,
+    /// Shown instead of the file names in the pane headers.
+    pub descriptions: Vec<Option<String>>,
     images: Vec<RgbaImage>,
     textures: Vec<Option<TextureHandle>>,
     diff_tex: Option<TextureHandle>,
     textures_dirty: bool,
+    diff_dirty: bool,
     diff: ImageDiff,
     mode: ImgMode,
     zoom: f32,
@@ -54,10 +57,12 @@ impl ImageView {
         let n = paths.len();
         Ok(ImageView {
             paths,
+            descriptions: vec![None; n],
             images,
             textures: vec![None; n],
             diff_tex: None,
             textures_dirty: true,
+            diff_dirty: true,
             diff,
             mode: ImgMode::SideBySide,
             zoom: 1.0,
@@ -106,7 +111,7 @@ impl ImageView {
     fn recompute(&mut self) {
         let refs: Vec<&RgbaImage> = self.images.iter().collect();
         self.diff = image_cmp::compare(&refs, self.threshold, self.block);
-        self.textures_dirty = true;
+        self.diff_dirty = true;
         if self.cur.is_some_and(|c| c >= self.diff.regions.len()) {
             self.cur = None;
         }
@@ -178,6 +183,7 @@ impl ImageView {
             }
         }
         self.modified[to] = true;
+        self.textures_dirty = true;
         self.recompute();
     }
 
@@ -185,6 +191,7 @@ impl ImageView {
         if let Some((imgs, m)) = self.undo.pop() {
             self.images = imgs;
             self.modified = m;
+            self.textures_dirty = true;
             self.recompute();
         }
     }
@@ -245,18 +252,24 @@ impl ImageView {
     }
 
     fn ensure_textures(&mut self, ctx: &egui::Context) {
-        if !self.textures_dirty {
+        if self.textures_dirty {
+            self.textures_dirty = false;
+            for (i, img) in self.images.iter().enumerate() {
+                let ci = ColorImage::from_rgba_unmultiplied(
+                    [img.width() as usize, img.height() as usize],
+                    img.as_raw(),
+                );
+                self.textures[i] = Some(ctx.load_texture(
+                    format!("{:?}img{i}", self.id),
+                    ci,
+                    TextureOptions::NEAREST,
+                ));
+            }
+        }
+        if !self.diff_dirty {
             return;
         }
-        self.textures_dirty = false;
-        for (i, img) in self.images.iter().enumerate() {
-            let ci = ColorImage::from_rgba_unmultiplied(
-                [img.width() as usize, img.height() as usize],
-                img.as_raw(),
-            );
-            self.textures[i] =
-                Some(ctx.load_texture(format!("{:?}img{i}", self.id), ci, TextureOptions::NEAREST));
-        }
+        self.diff_dirty = false;
         let d = &self.diff.diff_image;
         let ci = ColorImage::from_rgba_unmultiplied(
             [d.width() as usize, d.height() as usize],
@@ -309,14 +322,12 @@ impl ImageView {
             );
             ui.add_space(6.0);
             ui.label(egui::RichText::new(tr("img.threshold")).color(pal.text_dim));
-            recompute |= ui
-                .add(egui::DragValue::new(&mut self.threshold).range(0..=255))
-                .changed();
+            // Comparing every pixel is too slow to repeat on each frame of a drag.
+            let settled = |r: egui::Response| (r.changed() && !r.dragged()) || r.drag_stopped();
+            recompute |= settled(ui.add(egui::DragValue::new(&mut self.threshold).range(0..=255)));
             ui.add_space(6.0);
             ui.label(egui::RichText::new(tr("img.block_size")).color(pal.text_dim));
-            recompute |= ui
-                .add(egui::DragValue::new(&mut self.block).range(1..=256))
-                .changed();
+            recompute |= settled(ui.add(egui::DragValue::new(&mut self.block).range(1..=256)));
             if self.mode == ImgMode::Overlay {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(tr("img.alpha")).color(pal.text_dim));
@@ -425,11 +436,17 @@ impl ImageView {
                 ui.horizontal_centered(|ui| match self.mode {
                     ImgMode::SideBySide => {
                         widgets::side_chip(ui, p, n);
-                        let path = self.paths[p].display().to_string();
-                        let mut name = self.paths[p]
-                            .file_name()
-                            .map(|f| f.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| path.clone());
+                        let path = match self.descriptions.get(p) {
+                            Some(Some(d)) => d.clone(),
+                            _ => self.paths[p].display().to_string(),
+                        };
+                        let mut name = match self.descriptions.get(p) {
+                            Some(Some(d)) => d.clone(),
+                            _ => self.paths[p]
+                                .file_name()
+                                .map(|f| f.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.clone()),
+                        };
                         if self.modified[p] {
                             name.push_str("  ●");
                         }
@@ -532,16 +549,29 @@ impl ImageView {
             }
             if self.show_blocks {
                 let bs = self.diff.block_size as f32 * self.zoom;
-                for by in 0..self.diff.blocks_y {
-                    for bx in 0..self.diff.blocks_x {
-                        if self.diff.blocks[(by * self.diff.blocks_x + bx) as usize] {
-                            let r = Rect::from_min_size(
-                                origin + vec2(bx as f32 * bs, by as f32 * bs),
-                                vec2(bs, bs),
-                            );
-                            if r.intersects(view) {
-                                painter.rect_filled(r, 0.0, c.conflict_bar.gamma_multiply(0.22));
+                let (bw, bh) = (self.diff.blocks_x, self.diff.blocks_y);
+                let span = |lo: f32, hi: f32, n: u32| {
+                    let first = (lo / bs).floor().clamp(0.0, n as f32) as u32;
+                    let last = (hi / bs).ceil().clamp(0.0, n as f32) as u32;
+                    first..last
+                };
+                let fill = c.conflict_bar.gamma_multiply(0.22);
+                for by in span(view.top() - origin.y, view.bottom() - origin.y, bh) {
+                    let cols = span(view.left() - origin.x, view.right() - origin.x, bw);
+                    let mut run: Option<u32> = None;
+                    for bx in cols.start..=cols.end {
+                        let set = bx < cols.end && self.diff.blocks[(by * bw + bx) as usize];
+                        match (set, run) {
+                            (true, None) => run = Some(bx),
+                            (false, Some(start)) => {
+                                let r = Rect::from_min_size(
+                                    origin + vec2(start as f32 * bs, by as f32 * bs),
+                                    vec2((bx - start) as f32 * bs, bs),
+                                );
+                                painter.rect_filled(r, 0.0, fill);
+                                run = None;
                             }
+                            _ => {}
                         }
                     }
                 }

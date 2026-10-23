@@ -5,7 +5,7 @@ CARGO ?= cargo
 BIN   := oxidemerge
 ARGS  ?=
 
-# `cargo pkgid` prints ".../OxideMerge#oxidemerge@0.9.0" (or "...#0.9.0").
+# `cargo pkgid` prints ".../OxideMerge#oxidemerge@0.9.1" (or "...#0.9.1").
 # Make before 4.3 (macOS ships 3.81) treats a bare `#` inside a function call as a comment.
 HASH    := \#
 VERSION := $(lastword $(subst @, ,$(subst $(HASH), ,$(shell $(CARGO) pkgid))))

@@ -10,6 +10,19 @@ pub fn pal(ui: &Ui) -> Palette {
     theme::palette(ui.visuals().dark_mode)
 }
 
+fn modal_id() -> egui::Id {
+    egui::Id::new("oxidemerge_modal_open")
+}
+
+/// Marks whether an application dialog is open, so views ignore keys meant for the dialog.
+pub fn set_modal_open(ctx: &egui::Context, open: bool) {
+    ctx.data_mut(|d| d.insert_temp(modal_id(), open));
+}
+
+pub fn modal_open(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp(modal_id()).unwrap_or(false))
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Look {
     Ghost,
@@ -362,18 +375,19 @@ pub fn hscrollbar(
 pub struct Mark {
     pub start: usize,
     pub len: usize,
-    /// Which columns of the location bar to paint (one per pane).
-    pub columns: Vec<Option<Color32>>,
+    /// Color of each column of the location bar (one per pane); `None` leaves it empty.
+    pub columns: [Option<Color32>; 3],
 }
 
 /// Location pane: overview of all differences with the visible region outlined.
-/// Returns the row the user clicked/dragged to (to be centered).
+/// `marks` must be sorted by `start`. Returns the row the user clicked/dragged to (to be centered).
 #[allow(clippy::too_many_arguments)]
 pub fn location_pane(
     ui: &mut Ui,
     id: egui::Id,
     rect: Rect,
     total: usize,
+    columns: usize,
     marks: &[Mark],
     first_visible: f32,
     visible: f32,
@@ -386,19 +400,35 @@ pub fn location_pane(
     let inner = rect.shrink2(egui::vec2(3.0, 2.0));
     let h = inner.height();
     let scale = h / total_f;
+    let n = columns.clamp(1, 3);
+    let col_w = inner.width() / n as f32;
+    let paint = |c: usize, (y0, y1, color): (f32, f32, Color32)| {
+        let r = Rect::from_min_max(
+            egui::pos2(inner.left() + c as f32 * col_w, y0),
+            egui::pos2(inner.left() + (c + 1) as f32 * col_w - 1.5, y1),
+        );
+        painter.rect_filled(r, 1.5, color);
+    };
+    // Marks closer than a pixel are merged, so large diffs paint at most one rect per pixel row.
+    let mut pending: [Option<(f32, f32, Color32)>; 3] = [None; 3];
     for m in marks {
-        let n = m.columns.len().max(1);
-        let col_w = inner.width() / n as f32;
         let y0 = inner.top() + m.start as f32 * scale;
-        let hh = (m.len as f32 * scale).max(3.0);
-        for (c, color) in m.columns.iter().enumerate() {
-            if let Some(color) = color {
-                let r = Rect::from_min_size(
-                    egui::pos2(inner.left() + c as f32 * col_w, y0),
-                    egui::vec2(col_w - 1.5, hh),
-                );
-                painter.rect_filled(r, 1.5, *color);
+        let y1 = y0 + (m.len as f32 * scale).max(3.0);
+        for (c, color) in m.columns.iter().take(n).enumerate() {
+            let Some(color) = *color else { continue };
+            match &mut pending[c] {
+                Some(p) if p.2 == color && y0 <= p.1 + 1.0 => p.1 = p.1.max(y1),
+                slot => {
+                    if let Some(p) = slot.replace((y0, y1, color)) {
+                        paint(c, p);
+                    }
+                }
             }
+        }
+    }
+    for (c, p) in pending.into_iter().enumerate() {
+        if let Some(p) = p {
+            paint(c, p);
         }
     }
     let vr = Rect::from_min_max(

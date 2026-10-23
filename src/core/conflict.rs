@@ -1,5 +1,20 @@
 //! Parsing of version-control conflict files (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`).
 
+use std::path::Path;
+
+/// Cheap test before decoding a whole file: whether some line starts with `<<<<<<<`.
+/// Files over 64 MB are never treated as conflict files.
+pub fn has_markers(path: &Path) -> bool {
+    const LIMIT: u64 = 64 << 20;
+    if std::fs::metadata(path).map_or(true, |m| m.len() > LIMIT) {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    bytes.starts_with(b"<<<<<<<") || bytes.windows(8).any(|w| w == b"\n<<<<<<<")
+}
+
 pub struct ConflictParts {
     pub mine: Vec<String>,
     pub base: Vec<String>,
@@ -71,5 +86,16 @@ mod tests {
         assert_eq!(p.theirs, vec!["a", "theirs", "z"]);
         assert_eq!(p.base, vec!["a", "z"]);
         assert_eq!(p.conflicts, 1);
+    }
+
+    #[test]
+    fn finds_markers_in_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let yes = dir.path().join("c.txt");
+        let no = dir.path().join("n.txt");
+        std::fs::write(&yes, "a\n<<<<<<< HEAD\nb\n=======\nc\n>>>>>>> x\n").unwrap();
+        std::fs::write(&no, "a <<<<<<< not at line start\n").unwrap();
+        assert!(has_markers(&yes));
+        assert!(!has_markers(&no));
     }
 }

@@ -5,7 +5,8 @@
 OxideMerge is an open source, cross-platform differencing and merging tool written in Rust. It
 brings the feature set of [WinMerge](https://winmerge.org/)
 ([source](https://github.com/WinMerge/winmerge)) to **Windows, macOS and Linux**. It compares and
-merges folders, text files, binary files and images, with a modern multilingual UI.
+merges folders, text files, binary files and images, and compares web pages, with a modern
+multilingual UI.
 
 The name comes from the language it is written in: rust is iron oxide.
 
@@ -20,8 +21,9 @@ The name comes from the language it is written in: rust is iron oxide.
 **Folder compare and merge**
 - 2-way and 3-way folder comparison, recursive or flat, shown as a tree or a flat list.
 - Compare methods: full contents, quick contents, binary contents, modified date, date and size, size only.
-- Show or hide identical, different and unique items. Copy, move or delete items between sides,
+- Show or hide identical, different and unique items. Copy items between sides or delete them,
   with optional Recycle Bin support and confirmation prompts.
+- Keyboard selection: arrow keys, Page Up/Down, Home/End, Shift to extend, Ctrl+A to select all.
 - File filters: wildcard masks such as `*.c;*.h;!*.bak;!.git\` and WinMerge `.flt` filter files.
 - Zip-based archives (`.zip`, `.jar`, `.apk`, `.docx`, `.xlsx`, `.odt`, `.epub`, `.nupkg`, ...) are extracted and compared as folders.
 - Reports in HTML, CSV and plain text.
@@ -35,6 +37,8 @@ The name comes from the language it is written in: rust is iron oxide.
 - Resolve version-control conflict files containing `<<<<<<<`, `|||||||`, `=======` and `>>>>>>>` markers.
 - Encoding and end-of-line detection, syntax highlighting, find, go to line, and CSV/TSV table mode.
 - Patch generation in normal, context and unified formats.
+- Files changed by another program are detected when the window regains focus: unmodified files
+  reload automatically, and files with unsaved edits show a bar offering to reload them.
 - Unpacker plugins: run an external command (for example `pandoc -t plain ${file}`) to convert files to text before comparing.
 
 **Binary compare**
@@ -43,6 +47,16 @@ The name comes from the language it is written in: rust is iron oxide.
 **Image compare**
 - Side-by-side, overlay and difference modes, with zoom, fit and 1:1 views.
 - Difference blocks highlighted with an adjustable color threshold and block size.
+
+**Web page compare**
+- Compare two or three `http://`, `https://` URLs or local HTML files, in four modes:
+  - **Screenshot**: renders each page with a headless Chromium-based browser (Edge, Chrome,
+    Chromium or Brave, found automatically) and opens the images in the image compare.
+  - **HTML source**: the page source, with long minified lines split between tags, in the text compare.
+  - **Text**: the visible text of each page (scripts, styles and markup removed), in the text compare.
+  - **Resource tree**: downloads each page with its stylesheets, scripts, images, frames and media,
+    and compares the downloaded files in the folder compare.
+- Pages are decoded using the HTTP or `<meta>` charset. Non-2xx HTTP status codes are shown in the pane header.
 
 **Interface**
 - Tabbed documents, a start page with recent comparisons, and drag and drop of files and folders.
@@ -57,7 +71,7 @@ The name comes from the language it is written in: rust is iron oxide.
 | --- | --- |
 | Windows 10/11 | Explorer context menu, WinMerge-style `/switch` arguments, Recycle Bin |
 | macOS 11+ | Native file dialogs, Trash, "Reveal in Finder" |
-| Linux (X11 and Wayland) | GTK file dialogs, freedesktop Trash |
+| Linux (X11 and Wayland) | File dialogs through the XDG desktop portal, freedesktop Trash |
 
 The same code base builds on all three. Fonts come from the system: Segoe UI and Cascadia Mono on
 Windows, SF and Menlo on macOS, and Noto, Inter or DejaVu on Linux. For Chinese, Japanese and
@@ -68,16 +82,30 @@ Under WSL2 the app selects Mesa's `d3d12` driver (GPU acceleration through WSLg)
 installed and silences Mesa's EGL driver-probing warnings. Set `GALLIUM_DRIVER` or `EGL_LOG_LEVEL`
 yourself to override either.
 
+## Installing
+
+Every [GitHub release](https://github.com/kuopinghsu/OxideMerge/releases) has these packages, and
+`SHA256SUMS.txt` to check them against:
+
+| Platform | Package |
+| --- | --- |
+| Windows x64 | `oxidemerge-<version>-windows-x64.exe` (runs as is) or `.zip` |
+| Linux x64 | `.AppImage` (Ubuntu 20.04, RHEL 8, Debian 10 and newer; no install needed), `.deb` (Ubuntu 22.04 and newer), or `.tar.gz` |
+| macOS 11+ (Apple silicon and Intel) | `oxidemerge-<version>-macos-universal.dmg`, or the same app in a `.zip` |
+
+- **Linux:** run `chmod +x oxidemerge-*.AppImage` before starting the AppImage. Without FUSE, start
+  it with `--appimage-extract-and-run`. To install the Debian package, run
+  `sudo apt install ./oxidemerge-*.deb`. File dialogs need `xdg-desktop-portal`, which desktop
+  environments normally include.
+- **macOS:** the app is ad-hoc signed but not notarized. The first time, Control-click it and choose
+  **Open**, or allow it in **System Settings → Privacy & Security**. To use it from the terminal, run
+  `sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin/oxidemerge`.
+
 ## Building
 
-You need a Rust toolchain ([rustup](https://rustup.rs/)).
-
-On Linux, also install the development packages for GTK 3 (file dialogs), X11, Wayland and
-OpenGL. On Debian or Ubuntu:
-
-```sh
-sudo apt install libgtk-3-dev libxkbcommon-dev libwayland-dev libxcursor-dev libxrandr-dev libxi-dev libgl-dev
-```
+You need a Rust toolchain ([rustup](https://rustup.rs/)). On Linux, a C compiler is also needed.
+OxideMerge loads the X11, Wayland, keyboard and OpenGL libraries at runtime, so it needs no
+development packages to build.
 
 Then build:
 
@@ -109,10 +137,22 @@ A `Makefile` for GNU Make wraps the common tasks. It works on Windows and Unix.
 ### Continuous integration
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main` and on every
-pull request. It builds OxideMerge on Windows, macOS and Linux, runs clippy with warnings treated as
-errors, runs the unit tests, and smoke-tests the command line (`--version`, `--list-languages` and
-the `--cli` exit codes). The macOS job also builds a universal binary (Apple silicon and Intel),
-ad-hoc signs it, and uploads `oxidemerge-<version>-macos.dmg` as a workflow artifact.
+pull request. On Windows, Linux and macOS it runs clippy with warnings treated as errors, runs the
+unit tests, builds a release, and smoke-tests the command line (`--version`, `--list-languages` and
+the `--cli` exit codes). It then uploads these packages as workflow artifacts:
+
+- **Windows:** the `.exe` and a `.zip`.
+- **Linux:** a `.tar.gz` and a `.deb`, built on Ubuntu 22.04.
+- **Linux AppImage:** built on AlmaLinux 8 (glibc 2.28). It bundles the X11, Wayland and keyboard
+  libraries, and [`assets/AppRun`](assets/AppRun) uses them only when the system lacks them. The
+  AppImage is then checked on Ubuntu 22.04 and 24.04 and on AlmaLinux 8 and 9: every bundled
+  library must resolve, the command line must work, and the window must stay open under Xvfb.
+- **macOS:** a universal (Apple silicon and Intel) `OxideMerge.app`, ad-hoc signed, in a `.dmg` and
+  a `.zip`.
+
+Pushing a tag such as `v0.9.1` publishes all packages and `SHA256SUMS.txt` on a GitHub release. The
+tag must match the version in `Cargo.toml`, and tags containing `-` (for example `v1.0.0-rc1`) are
+marked as pre-releases.
 
 ## Usage
 
@@ -126,18 +166,24 @@ oxidemerge -r C:\project\v1 C:\project\v2       # recursive folder compare
 oxidemerge -r -f "*.rs;!target/" old new        # folder compare with a filter
 oxidemerge conflict.txt                         # resolve a file with conflict markers
 oxidemerge -t image a.png b.png                 # force the compare type
+oxidemerge https://example.com https://example.org   # web page compare
+oxidemerge -t web old.html new.html             # compare local HTML files as web pages
 oxidemerge left.txt right.txt -o merged.txt     # save the merge result to another file
 ```
+
+A web page compare tab has a mode bar (Screenshot, HTML source, Text, Resource tree) and a reload
+button. The last mode used is remembered. Screenshot size and the browser path are set under
+**Options → Image / Binary / Web**. Leave the browser path empty to detect it automatically.
 
 ### Command line options
 
 | Option | Description |
 | --- | --- |
-| `PATHS...` | 2 or 3 files or folders, or a single conflict file |
+| `PATHS...` | 2 or 3 files, folders or URLs, or a single conflict file |
 | `-r, --recursive` | Include subfolders in folder compares |
 | `-f, --filter <MASK>` | File filter, for example `*.c;*.h` or `!*.bak` |
 | `-m, --method <M>` | Folder compare method: `full`, `quick`, `binary`, `date`, `datesize`, `size` |
-| `-t, --compare-as <T>` | Force `text`, `binary` or `image` |
+| `-t, --compare-as <T>` | Force `text`, `binary`, `image` or `web` |
 | `-o, --output <PATH>` | Output path for the merge result |
 | `--dl/--dm/--dr <TEXT>` | Descriptions shown instead of the left, middle and right paths |
 | `--wl/--wm/--wr` | Open the left, middle or right side read-only |
@@ -166,17 +212,26 @@ oxidemerge -r dirA dirB --report report.html
 
 # Unified diff with 5 lines of context
 oxidemerge old.c new.c --patch changes.patch --context 5
+
+# Compare the visible text of two web pages (the HTML source when the last mode was HTML source)
+oxidemerge --cli https://staging.example.com/ https://www.example.com/
 ```
 
 ### Keyboard shortcuts
 
+Press `F1` or `?`, or click the `?` button at the top right, to open the Help & Shortcuts
+dialog. It lists every keyboard shortcut and mouse action by view, and shows where the settings
+file is stored.
+
 | Keys | Action |
 | --- | --- |
+| `F1`, `?` | Show or hide Help & Shortcuts |
 | `Ctrl+O` | Open |
 | `Ctrl+S` | Save |
-| `Ctrl+W`, `Ctrl+F4` | Close tab |
+| `Ctrl+Shift+S` | Save all |
+| `Ctrl+W`, `Ctrl+F4` | Close tab (right-click a tab to close others, to the right, or all) |
 | `Ctrl+Tab`, `Ctrl+Shift+Tab` | Next or previous tab |
-| `Ctrl+F`, `F3`, `Shift+F3` | Find, find next, find previous |
+| `Ctrl+F`, `F3`, `Shift+F3`, `Esc` | Find, find next, find previous, close the find bar |
 | `Ctrl+G` | Go to line |
 | `F5` | Refresh |
 | `Alt+Down`, `Alt+Up` | Next or previous difference |
@@ -184,7 +239,7 @@ oxidemerge old.c new.c --patch changes.patch --context 5
 | `Alt+PgDn`, `Alt+PgUp` | Next or previous conflict |
 | `Alt+Right`, `Alt+Left` | Copy the current difference right or left |
 | `Ctrl+Alt+Right`, `Ctrl+Alt+Left` | Copy all differences right or left |
-| `Ctrl+Z`, `Ctrl+Y` | Undo, redo |
+| `Ctrl+Z`, `Ctrl+Y` / `Ctrl+Shift+Z` | Undo, redo |
 | `F2`, `Enter` | Edit the current line |
 | `Ctrl++`, `Ctrl+-`, `Ctrl+0` | Zoom in, zoom out, reset zoom |
 
@@ -228,8 +283,11 @@ src/
   i18n.rs           language packs
   shell.rs          Explorer context menu
   core/             diff engine, folder scanning, binary/image/table compare,
-                    conflict parsing, filters, archives, patches, reports
+                    conflict parsing, filters, archives, patches, reports,
+                    web page download, text extraction and screenshots
   ui/               egui application, views, theme and widgets
+build.rs            embeds the icon and version details in the Windows executable
+assets/             application icon (.png, .ico), Linux desktop entry and AppImage launcher
 lang/               built-in translations
 samples/            files used by the make demo targets
 ```
@@ -237,7 +295,9 @@ samples/            files used by the make demo targets
 ## Limitations
 
 - Archive support covers zip-based formats only; 7z, rar and tar are not supported.
-- WinMerge's web page compare is not implemented.
+- Web page compare fetches pages without running their scripts, except in Screenshot mode. Text,
+  HTML source and resource tree modes therefore see the HTML as served, not as rendered by
+  JavaScript. Screenshots need a Chromium-based browser. There is no cookie or login support.
 - Text editing is line-based, so it is not a full code editor.
 - Unpacker plugins are external commands rather than WinMerge plugin DLLs or scripts.
 - Machine-assisted translations have not been reviewed by native speakers.

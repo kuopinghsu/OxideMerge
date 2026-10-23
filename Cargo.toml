@@ -1,9 +1,10 @@
 [package]
 name = "oxidemerge"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 description = "OxideMerge - a cross-platform differencing and merging tool for Windows, macOS and Linux, modeled on WinMerge"
 license = "MIT"
+repository = "https://github.com/kuopinghsu/OxideMerge"
 
 [[bin]]
 name = "oxidemerge"
@@ -33,10 +34,15 @@ tempfile = "3"
 trash = "5"
 sys-locale = "0.3"
 ttf-parser = "0.25"
+ureq = "3"
+url = "2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
+[build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 opt-level = 3

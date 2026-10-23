@@ -114,6 +114,8 @@ pub struct TextDoc {
     pub modified: bool,
     pub read_only: bool,
     pub description: Option<String>,
+    /// File extension used to pick syntax highlighting when there is no path.
+    pub syntax: Option<String>,
 }
 
 impl TextDoc {
@@ -129,6 +131,7 @@ impl TextDoc {
             modified: false,
             read_only: false,
             description: None,
+            syntax: None,
         }
     }
 
@@ -336,6 +339,7 @@ pub enum FileKind {
     Text,
     Binary,
     Image,
+    Web,
 }
 
 pub const IMAGE_EXTS: &[&str] = &[

@@ -486,7 +486,7 @@ impl BinaryView {
                     Mark {
                         start,
                         len: end - start + 1,
-                        columns: vec![Some(color); n],
+                        columns: [Some(color); 3],
                     }
                 })
                 .collect();
@@ -495,6 +495,7 @@ impl BinaryView {
                 self.id.with("loc"),
                 loc,
                 total,
+                n,
                 &marks,
                 self.scroll,
                 visible,

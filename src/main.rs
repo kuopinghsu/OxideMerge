@@ -33,6 +33,8 @@ enum KindArg {
     Text,
     Binary,
     Image,
+    /// Web pages (URLs or HTML files); the console compare uses the visible text
+    Web,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -53,9 +55,14 @@ enum PatchArg {
 ///
 /// WinMerge style switches (/r, /f, /dl, /wl, /o, /or ...) are accepted on Windows as well.
 #[derive(Parser)]
-#[command(name = "oxidemerge", version, about, long_about = None)]
+#[command(
+    name = "oxidemerge",
+    version = concat!(env!("CARGO_PKG_VERSION"), " (build ", env!("OXIDEMERGE_BUILD_DATE"), ")"),
+    about,
+    long_about = None
+)]
 struct Cli {
-    /// Files or folders to compare (2 or 3; a single conflict file is opened for resolution)
+    /// Files, folders or http(s) URLs to compare (2 or 3; a single conflict file is opened for resolution)
     paths: Vec<PathBuf>,
     /// Compare folders recursively
     #[arg(short = 'r', long)]
@@ -212,6 +219,15 @@ fn method(m: MethodArg) -> CompareMethod {
     }
 }
 
+fn file_kind(k: KindArg) -> FileKind {
+    match k {
+        KindArg::Text => FileKind::Text,
+        KindArg::Binary => FileKind::Binary,
+        KindArg::Image => FileKind::Image,
+        KindArg::Web => FileKind::Web,
+    }
+}
+
 fn patch_style(p: PatchArg) -> PatchStyle {
     match p {
         PatchArg::Normal => PatchStyle::Normal,
@@ -277,9 +293,13 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         return Ok(u8::from(different));
     }
     let kind = match cli.kind {
-        Some(KindArg::Binary) => FileKind::Binary,
-        Some(KindArg::Image) => FileKind::Image,
-        Some(KindArg::Text) => FileKind::Text,
+        Some(k) => file_kind(k),
+        None if paths
+            .iter()
+            .any(|p| core::web::is_url(&p.to_string_lossy())) =>
+        {
+            FileKind::Web
+        }
         None => {
             if paths
                 .iter()
@@ -291,7 +311,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             }
         }
     };
-    if kind != FileKind::Text {
+    if matches!(kind, FileKind::Binary | FileKind::Image) {
         let a = std::fs::read(&paths[0])?;
         let b = std::fs::read(&paths[1])?;
         let ranges = core::binary::diff_ranges(&[&a, &b]);
@@ -305,10 +325,27 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         }
         return Ok(u8::from(!ranges.is_empty()));
     }
-    let docs: Vec<core::text::TextDoc> = paths
-        .iter()
-        .map(|p| core::text::load_doc(p, None))
-        .collect::<Result<_, _>>()?;
+    let docs: Vec<core::text::TextDoc> = if kind == FileKind::Web {
+        let urls = paths
+            .iter()
+            .map(|p| core::web::location(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        core::web::fetch_pages(&urls)?
+            .iter()
+            .map(|p| {
+                let text = match cfg.web_mode {
+                    core::web::WebMode::Html => core::web::format_html(&p.html),
+                    _ => core::web::html_to_text(&p.html),
+                };
+                core::text::TextDoc::from_text(None, &text)
+            })
+            .collect()
+    } else {
+        paths
+            .iter()
+            .map(|p| core::text::load_doc(p, None))
+            .collect::<Result<_, _>>()?
+    };
     let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
     let result = core::diff::compute(&refs, &cfg.diff);
     if docs.len() == 2 {
@@ -449,7 +486,7 @@ fn main() -> ExitCode {
         return match run_batch(&cli, &cfg) {
             Ok(code) => ExitCode::from(code),
             Err(e) => {
-                eprintln!("error: {e}");
+                eprintln!("error: {e:#}");
                 ExitCode::from(2)
             }
         };
@@ -481,11 +518,7 @@ fn main() -> ExitCode {
             paths,
             descriptions,
             read_only,
-            kind: cli.kind.map(|k| match k {
-                KindArg::Text => FileKind::Text,
-                KindArg::Binary => FileKind::Binary,
-                KindArg::Image => FileKind::Image,
-            }),
+            kind: cli.kind.map(file_kind),
             recursive: if cli.recursive { Some(true) } else { None },
             filter: cli.filter.clone(),
             method: cli.method.map(method),
@@ -497,6 +530,7 @@ fn main() -> ExitCode {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("OxideMerge")
+            .with_app_id("oxidemerge")
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([640.0, 400.0])
             .with_drag_and_drop(true)

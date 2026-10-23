@@ -10,3 +10,4 @@ pub mod report;
 pub mod table;
 pub mod text;
 pub mod unpacker;
+pub mod web;

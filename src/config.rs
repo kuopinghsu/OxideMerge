@@ -4,6 +4,7 @@ use crate::core::diff::DiffOptions;
 use crate::core::folder::FolderOptions;
 use crate::core::patch::PatchStyle;
 use crate::core::unpacker::Unpacker;
+use crate::core::web::WebMode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -37,6 +38,11 @@ pub struct Config {
     pub binary_bytes_per_line: usize,
     pub unpackers: Vec<Unpacker>,
     pub shell_selected_left: Option<String>,
+    /// Browser used for web page screenshots ("" = detect Edge, Chrome or Chromium).
+    pub web_browser: String,
+    pub web_width: u32,
+    pub web_height: u32,
+    pub web_mode: WebMode,
 }
 
 impl Default for Config {
@@ -77,6 +83,10 @@ impl Default for Config {
                 command: "pandoc -t plain ${file}".into(),
             }],
             shell_selected_left: None,
+            web_browser: String::new(),
+            web_width: 1280,
+            web_height: 1600,
+            web_mode: WebMode::Screenshot,
         }
     }
 }
@@ -86,7 +96,7 @@ pub fn config_dir() -> Option<PathBuf> {
 }
 
 /// A `oxidemerge.json` next to the executable enables portable mode.
-fn config_path() -> Option<PathBuf> {
+pub fn config_path() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let p = dir.join("oxidemerge.json");

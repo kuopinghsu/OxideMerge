@@ -1,48 +1,36 @@
+# Builds, lints, and tests OxideMerge on Windows, Linux, and macOS for every
+# push and pull request, then packages it: oxidemerge.exe plus a .zip for
+# Windows, a .tar.gz, a .deb, and an AppImage for Linux, and OxideMerge.app in
+# a .dmg and a .zip for macOS. The AppImage is started on Ubuntu and
+# RHEL-compatible systems before it is published. Pushing a tag like `v0.9.1`
+# also publishes every package on a GitHub release. The tag must match the
+# version in Cargo.toml.
 name: CI
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ["v*"]
   pull_request:
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
-  build-and-test:
-    name: Build and test (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows
-            os: windows-latest
-            platform: windows-x86_64
-          - name: Linux
-            os: ubuntu-26.04
-            platform: linux-x86_64
-          - name: macOS
-            os: macos-latest
-
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-3-dev libxkbcommon-dev libwayland-dev \
-            libxcursor-dev libxrandr-dev libxi-dev libgl-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -50,105 +38,501 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --release --locked
+
       - name: Build
-        run: cargo build --locked --all-targets
+        run: cargo build --release --locked
+
+      - name: Command line smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=target/release/oxidemerge
+          "$bin" --version
+          "$bin" --list-languages
+          "$bin" --cli samples/left/same.txt samples/right/same.txt
+          code=0
+          "$bin" --cli -r samples/left samples/right >/dev/null || code=$?
+          test "$code" -eq 1 || { echo "::error::Expected exit code 1 for differing folders, got $code"; exit 1; }
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            if ($env:GITHUB_REF_NAME -ne "v$version") {
+              Write-Error "Tag $env:GITHUB_REF_NAME does not match version $version in Cargo.toml"
+              exit 1
+            }
+            $label = $version
+          } else {
+            $label = "$version-$($env:GITHUB_SHA.Substring(0, 7))"
+          }
+          $name = "oxidemerge-$label-windows-x64"
+
+          New-Item -ItemType Directory -Force -Path dist, "staging/$name" | Out-Null
+          Copy-Item target/release/oxidemerge.exe "dist/$name.exe"
+          Copy-Item target/release/oxidemerge.exe, README.md, LICENSE "staging/$name/"
+          Compress-Archive -Path "staging/$name" -DestinationPath "dist/$name.zip"
+
+          Get-ChildItem dist | Format-Table Name, Length
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux x64
+    # The oldest supported runner, so the binary runs on older glibc too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
 
       - name: Command line smoke test
-        shell: bash
         run: |
-          cargo run --locked -- --version
-          cargo run --locked -- --list-languages
-          cargo run --locked -- --cli samples/left/same.txt samples/right/same.txt
-          set +e
-          cargo run --locked -- --cli -r samples/left samples/right > /dev/null
-          code=$?
-          set -e
-          test "$code" -eq 1 || { echo "expected exit code 1 for differing folders, got $code"; exit 1; }
+          set -euo pipefail
+          bin=target/release/oxidemerge
+          "$bin" --version
+          "$bin" --list-languages
+          "$bin" --cli samples/left/same.txt samples/right/same.txt
+          code=0
+          "$bin" --cli -r samples/left samples/right >/dev/null || code=$?
+          test "$code" -eq 1 || { echo "::error::Expected exit code 1 for differing folders, got $code"; exit 1; }
 
-      - name: Package Windows and Linux archive
+      - name: Package
         id: package
-        if: runner.os != 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          cargo build --locked --release
-          name="oxidemerge-${version}-${{ matrix.platform }}"
-          mkdir -p "dist/$name"
-          exe=""
-          [ "$RUNNER_OS" = Windows ] && exe=".exe"
-          cp "target/release/oxidemerge$exe" README.md LICENSE "dist/$name/"
-          cd dist
-          if [ "$RUNNER_OS" = Windows ]; then
-            7z a -tzip "$name.zip" "$name" > /dev/null
-            file="dist/$name.zip"
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+              exit 1
+            fi
+            label=$version
           else
-            tar -czf "$name.tar.gz" "$name"
-            file="dist/$name.tar.gz"
+            label="$version-${GITHUB_SHA::7}"
           fi
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "file=$file" >> "$GITHUB_OUTPUT"
+          name="oxidemerge-$label-linux-x64"
+          strip target/release/oxidemerge
+          mkdir -p dist "staging/$name"
 
-      - name: Upload Windows and Linux package
-        if: runner.os != 'macOS'
-        uses: actions/upload-artifact@v7
+          install -m 755 target/release/oxidemerge "staging/$name/"
+          install -m 644 README.md LICENSE assets/oxidemerge.desktop assets/oxidemerge.png "staging/$name/"
+          tar -C staging -czf "dist/$name.tar.gz" "$name"
+
+          # Debian versions can't contain "-" without a revision; "~" also
+          # sorts a build or pre-release before the release it leads to.
+          deb_version=$(echo "$label" | tr '-' '~')
+          root=staging/deb
+          install -Dm 755 target/release/oxidemerge "$root/usr/bin/oxidemerge"
+          install -Dm 644 assets/oxidemerge.desktop "$root/usr/share/applications/oxidemerge.desktop"
+          install -Dm 644 assets/oxidemerge.png "$root/usr/share/icons/hicolor/256x256/apps/oxidemerge.png"
+          install -Dm 644 LICENSE "$root/usr/share/doc/oxidemerge/copyright"
+          install -Dm 644 README.md "$root/usr/share/doc/oxidemerge/README.md"
+          mkdir -p "$root/DEBIAN"
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: oxidemerge
+          Version: $deb_version
+          Architecture: amd64
+          Maintainer: ${GITHUB_REPOSITORY_OWNER} <${GITHUB_REPOSITORY_OWNER}@users.noreply.github.com>
+          Installed-Size: $(du -sk "$root/usr" | cut -f1)
+          Depends: libc6 (>= 2.35), libgl1, libegl1, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libx11-xcb1, libxcursor1, libxi6
+          Recommends: xdg-desktop-portal, xdg-utils, fontconfig
+          Suggests: chromium | google-chrome-stable | microsoft-edge-stable
+          Section: devel
+          Priority: optional
+          Homepage: https://github.com/${GITHUB_REPOSITORY}
+          Description: Cross-platform diff and merge tool in the style of WinMerge
+           OxideMerge compares and merges folders, text files, binary files and
+           images, resolves version-control conflict files, and compares web
+           pages.
+          EOF
+          dpkg-deb --build --root-owner-group "$root" "dist/$name.deb"
+          dpkg-deb --info "dist/$name.deb"
+
+          ls -l dist
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.name }}
-          path: ${{ steps.package.outputs.file }}
+          path: dist/*
           if-no-files-found: error
 
-      - name: Package macOS disk image
-        if: runner.os == 'macOS'
+  appimage:
+    name: Linux AppImage
+    # AlmaLinux 8 has glibc 2.28, so the AppImage runs on RHEL 8, Ubuntu 20.04,
+    # Debian 10, and newer.
+    runs-on: ubuntu-24.04
+    container: almalinux:8
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      artifact: ${{ steps.package.outputs.artifact }}
+    steps:
+      # OxideMerge links only to glibc and opens its display and keyboard
+      # libraries at runtime. They are installed without their -devel
+      # packages, so the build does not record AlmaLinux's library folders and
+      # OxideMerge looks them up by name, as AppRun arranges.
+      - name: Install build dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            gcc make pkgconf-pkg-config git curl tar gzip jq file desktop-file-utils \
+            libX11 libX11-xcb libxcb libXcursor libXi libxkbcommon libxkbcommon-x11 \
+            libwayland-client libwayland-cursor libwayland-egl
+
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        id: package
         run: |
           set -euo pipefail
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          rustup target add aarch64-apple-darwin x86_64-apple-darwin
-          cargo build --locked --release --target aarch64-apple-darwin
-          cargo build --locked --release --target x86_64-apple-darwin
-          root="dist/macos-root"
-          mkdir -p "$root"
-          lipo -create \
-            target/aarch64-apple-darwin/release/oxidemerge \
-            target/x86_64-apple-darwin/release/oxidemerge \
-            -output "$root/oxidemerge"
-          codesign --force --sign - "$root/oxidemerge"
-          cp README.md LICENSE "$root/"
-          hdiutil create \
-            -volname "OxideMerge ${version}" \
-            -srcfolder "$root" \
-            -ov \
-            -format UDZO \
-            "dist/oxidemerge-${version}-macos.dmg"
-          rm -rf "$root"
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+              exit 1
+            fi
+            label=$version
+          else
+            label="$version-${GITHUB_SHA::7}"
+          fi
+          name="oxidemerge-$label-linux-x64"
+          app=staging/OxideMerge.AppDir
+          strip target/release/oxidemerge
+          mkdir -p dist
 
-      - name: Upload macOS package
-        if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v7
+          install -Dm 755 target/release/oxidemerge "$app/usr/bin/oxidemerge"
+          install -Dm 755 assets/AppRun "$app/AppRun"
+          install -Dm 644 assets/oxidemerge.desktop "$app/oxidemerge.desktop"
+          install -Dm 644 assets/oxidemerge.png "$app/oxidemerge.png"
+          install -Dm 644 assets/oxidemerge.png "$app/usr/share/icons/hicolor/256x256/apps/oxidemerge.png"
+          install -Dm 644 LICENSE "$app/usr/share/doc/oxidemerge/LICENSE"
+          install -Dm 644 README.md "$app/usr/share/doc/oxidemerge/README.md"
+          ln -s oxidemerge.png "$app/.DirIcon"
+
+          # Libraries OxideMerge links to or opens at runtime (X11, Wayland,
+          # and keyboard maps through winit), with everything they need.
+          # glibc, libgcc, and the OpenGL and Vulkan drivers have to match the
+          # system, so they stay out.
+          wanted="libxcb.so.1 libX11.so.6 libX11-xcb.so.1 libXcursor.so.1 libXi.so.6
+            libxkbcommon.so.0 libxkbcommon-x11.so.0 libwayland-client.so.0 libwayland-cursor.so.0 libwayland-egl.so.1"
+          system='^(ld-linux-x86-64|libc|libm|libdl|libpthread|librt|libresolv|libutil|libgcc_s|libGL|libEGL|libGLX|libGLdispatch|libOpenGL|libvulkan)\.so'
+          {
+            ldd target/release/oxidemerge
+            for lib in $wanted; do
+              file=$(/sbin/ldconfig -p | awk -v name="$lib" '$1 == name && /x86-64/ { print $NF; exit }')
+              if [ -z "$file" ]; then
+                echo "::error::$lib is not installed" >&2
+                exit 1
+              fi
+              echo "$lib $file"
+              ldd "$file"
+            done
+          } | awk '$2 ~ /^\// { print $1, $2 } $2 == "=>" && $3 ~ /^\// { print $1, $3 }' | sort -u |
+          while read -r lib file; do
+            if [[ ! $lib =~ $system ]]; then
+              install -Dm 644 "$(readlink -f "$file")" "$app/usr/lib/oxidemerge/$lib/$lib"
+            fi
+          done
+          echo "Bundled libraries:"
+          ls "$app/usr/lib/oxidemerge"
+
+          curl -fsSL -o staging/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x staging/appimagetool
+          # Containers have no FUSE to mount an AppImage, so the tool runs unpacked.
+          (cd staging && ./appimagetool --appimage-extract >/dev/null)
+          ARCH=x86_64 VERSION=$label staging/squashfs-root/AppRun --no-appstream "$app" "dist/$name.AppImage"
+
+          ls -l dist
+          echo "artifact=$name-appimage" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
         with:
-          name: oxidemerge-macos
-          path: dist/*.dmg
+          name: ${{ steps.package.outputs.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  appimage-test:
+    name: AppImage on ${{ matrix.system }}
+    needs: appimage
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: Ubuntu 22.04
+            image: ubuntu:22.04
+          - system: Ubuntu 24.04
+            image: ubuntu:24.04
+          - system: RHEL 8 (AlmaLinux 8)
+            image: almalinux:8
+          - system: RHEL 9 (AlmaLinux 9)
+            image: almalinux:9
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.appimage.outputs.artifact }}
+
+      - name: Unpack
+        run: |
+          chmod +x oxidemerge-*.AppImage
+          ./oxidemerge-*.AppImage --appimage-extract >/dev/null
+          ls squashfs-root/usr/lib/oxidemerge
+
+      # The bare image has no display libraries, so AppRun would use every
+      # bundled one: together with glibc they must cover everything
+      # OxideMerge and each of them needs.
+      - name: Check bundled libraries
+        working-directory: squashfs-root
+        run: |
+          bundled=$(printf '%s:' "$PWD"/usr/lib/oxidemerge/*)
+          failed=0
+          for file in usr/bin/oxidemerge usr/lib/oxidemerge/*/*; do
+            if LD_LIBRARY_PATH=${bundled%:} ldd "$file" 2>&1 | grep 'not found'; then
+              echo "::error::$file needs the libraries above"
+              failed=1
+            fi
+          done
+          exit $failed
+
+      - name: Command line smoke test
+        run: |
+          set -euo pipefail
+          app=squashfs-root/AppRun
+          "$app" --version
+          mkdir -p left right
+          printf 'one\ntwo\n' > left/a.txt
+          printf 'one\ntwo\n' > right/a.txt
+          "$app" --cli left/a.txt right/a.txt
+          printf 'one\nthree\n' > right/a.txt
+          code=0
+          "$app" --cli left/a.txt right/a.txt >/dev/null || code=$?
+          test "$code" -eq 1 || { echo "::error::Expected exit code 1 for differing files, got $code"; exit 1; }
+
+      - name: Install a virtual display
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              xvfb libgl1 libglx-mesa0 libegl1 libegl-mesa0 libgl1-mesa-dri
+          else
+            dnf install -y --setopt=install_weak_deps=False \
+              xorg-x11-server-Xvfb mesa-libGL mesa-libEGL mesa-dri-drivers
+          fi
+
+      # OxideMerge should open its window and keep running until timeout stops it.
+      - name: Start OxideMerge
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 >xvfb.log 2>&1 &
+          xvfb=$!
+          sleep 3
+          status=0
+          DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 timeout 20 squashfs-root/AppRun || status=$?
+          kill "$xvfb"
+          if [ "$status" != 124 ]; then
+            echo "::error::OxideMerge quit with status $status within 20 seconds"
+            exit 1
+          fi
+          echo "OxideMerge was still running after 20 seconds"
+
+  macos:
+    name: macOS universal
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+              exit 1
+            fi
+            label=$version
+          else
+            label="$version-${GITHUB_SHA::7}"
+          fi
+          name="oxidemerge-$label-macos-universal"
+          app=staging/dmg/OxideMerge.app
+          mkdir -p dist "$app/Contents/MacOS" "$app/Contents/Resources"
+
+          # One binary for Apple silicon and Intel Macs.
+          lipo -create -output "$app/Contents/MacOS/oxidemerge" \
+            target/aarch64-apple-darwin/release/oxidemerge \
+            target/x86_64-apple-darwin/release/oxidemerge
+          strip -x "$app/Contents/MacOS/oxidemerge"
+          lipo -info "$app/Contents/MacOS/oxidemerge"
+
+          iconset=staging/oxidemerge.iconset
+          mkdir -p "$iconset"
+          for size in 16 32 128 256; do
+            sips -z "$size" "$size" assets/oxidemerge.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
+          done
+          for size in 16 32 128; do
+            double=$((size * 2))
+            sips -z "$double" "$double" assets/oxidemerge.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$iconset" -o "$app/Contents/Resources/oxidemerge.icns"
+
+          cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>OxideMerge</string>
+            <key>CFBundleDisplayName</key><string>OxideMerge</string>
+            <key>CFBundleIdentifier</key><string>io.github.kuopinghsu.oxidemerge</string>
+            <key>CFBundleExecutable</key><string>oxidemerge</string>
+            <key>CFBundleIconFile</key><string>oxidemerge</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$version</string>
+            <key>CFBundleVersion</key><string>$version</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>LSMinimumSystemVersion</key><string>$MACOSX_DEPLOYMENT_TARGET</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSHumanReadableCopyright</key><string>MIT License</string>
+            <key>NSDesktopFolderUsageDescription</key><string>OxideMerge compares the files and folders you open.</string>
+            <key>NSDocumentsFolderUsageDescription</key><string>OxideMerge compares the files and folders you open.</string>
+            <key>NSDownloadsFolderUsageDescription</key><string>OxideMerge compares the files and folders you open.</string>
+            <key>NSRemovableVolumesUsageDescription</key><string>OxideMerge compares the files and folders you open.</string>
+            <key>NSNetworkVolumesUsageDescription</key><string>OxideMerge compares the files and folders you open.</string>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$app/Contents/Info.plist"
+          cp README.md LICENSE staging/dmg/
+
+          # Ad-hoc signature: Apple silicon refuses to run unsigned code. The
+          # app is not notarized, so the first launch needs Open from the
+          # context menu, or System Settings > Privacy & Security > Open Anyway.
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+
+          # The packaged binary must still work from the command line.
+          bin="$app/Contents/MacOS/oxidemerge"
+          "$bin" --version
+          "$bin" --cli samples/left/same.txt samples/right/same.txt
+          code=0
+          "$bin" --cli -r samples/left samples/right >/dev/null || code=$?
+          test "$code" -eq 1 || { echo "::error::Expected exit code 1 for differing folders, got $code"; exit 1; }
+
+          ditto -c -k --keepParent "$app" "dist/$name.zip"
+          ln -s /Applications staging/dmg/Applications
+          # hdiutil now and then fails with "Resource busy" on hosted runners.
+          for attempt in 1 2 3; do
+            hdiutil create -volname OxideMerge -srcfolder staging/dmg -fs HFS+ -format UDZO -ov "dist/$name.dmg" && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 10
+          done
+
+          ls -l dist
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*
           if-no-files-found: error
 
   release:
-    name: Publish release
+    name: GitHub release
+    needs: [windows, linux, appimage, appimage-test, macos]
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build-and-test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
+          pattern: oxidemerge-*
           path: dist
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            **Windows x64:** download `oxidemerge-*-windows-x64.exe` and run it, or unzip `oxidemerge-*-windows-x64.zip`. Run `oxidemerge --register-shell` once to add the Explorer context menu.
+
+            **Linux x64:** `oxidemerge-*-linux-x64.AppImage` runs without installing anything on Ubuntu 20.04, RHEL 8, Debian 10, and newer: `chmod +x oxidemerge-*-linux-x64.AppImage`, then run it. It carries the libraries OxideMerge needs besides glibc and the graphics driver. Without FUSE, start it with `--appimage-extract-and-run`. On Ubuntu 22.04 or newer, `sudo apt install ./oxidemerge-*-linux-x64.deb` installs OxideMerge instead, and `oxidemerge-*-linux-x64.tar.gz` holds the bare program. File dialogs use the XDG desktop portal (`xdg-desktop-portal`).
+
+            **macOS 11 or later (Apple silicon and Intel):** open `oxidemerge-*-macos-universal.dmg` and drag OxideMerge to Applications. The app is not notarized, so the first time, Control-click it and choose **Open**, or allow it in **System Settings → Privacy & Security**. `oxidemerge-*-macos-universal.zip` holds the same app. To use it from the terminal, run `sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin/oxidemerge`.
+
+            Check downloads against `SHA256SUMS.txt`. Web page screenshots need a Chromium-based browser (Edge, Chrome, Chromium or Brave); every other compare works without one.

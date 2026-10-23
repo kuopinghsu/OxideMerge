@@ -10,13 +10,15 @@ use crate::core::patch::PatchStyle;
 use crate::core::report::ReportFormat;
 use crate::core::text::{self, FileKind, TextDoc};
 use crate::core::unpacker::{self, Unpacker};
+use crate::core::web;
 use crate::i18n::{self, tr, trf};
 use crate::ui::binary_view::BinaryView;
 use crate::ui::folder_view::{FolderAction, FolderView};
 use crate::ui::image_view::ImageView;
 use crate::ui::text_view::TextView;
+use crate::ui::web_view::WebView;
 use crate::ui::widgets::{self, pal};
-use crate::ui::{fonts, theme};
+use crate::ui::{about, fonts, help, theme};
 use egui::{
     vec2, Align, Align2, CornerRadius, FontId, Key, KeyboardShortcut, Layout, Margin, Modifiers,
     Sense, Stroke,
@@ -41,6 +43,38 @@ pub enum Content {
     Text(TextView),
     Binary(BinaryView),
     Image(ImageView),
+    Web(WebView),
+}
+
+impl Content {
+    /// The view that receives commands: what a web page tab currently shows, otherwise itself.
+    fn view(&self) -> &Content {
+        match self {
+            Content::Web(WebView {
+                inner: Some(inner), ..
+            }) => inner,
+            other => other,
+        }
+    }
+
+    fn view_mut(&mut self) -> &mut Content {
+        match self {
+            Content::Web(WebView {
+                inner: Some(inner), ..
+            }) => inner,
+            other => other,
+        }
+    }
+
+    fn status_line(&self) -> String {
+        match self {
+            Content::Folder(v) => v.status_line(),
+            Content::Text(v) => v.status_line(),
+            Content::Binary(v) => v.status_line(),
+            Content::Image(v) => v.status_line(),
+            Content::Web(v) => v.status_line(v.inner.as_deref().map(Content::status_line)),
+        }
+    }
 }
 
 pub struct Tab {
@@ -56,6 +90,7 @@ impl Tab {
             Content::Text(v) => v.title(),
             Content::Binary(v) => v.title(),
             Content::Image(v) => v.title(),
+            Content::Web(v) => v.title(),
         }
     }
 
@@ -65,12 +100,13 @@ impl Tab {
             Content::Text(_) => "📝",
             Content::Binary(_) => "🔢",
             Content::Image(_) => "🖼",
+            Content::Web(_) => "🌐",
         }
     }
 
     fn is_modified(&self) -> bool {
         match &self.content {
-            Content::Folder(_) => false,
+            Content::Folder(_) | Content::Web(_) => false,
             Content::Text(v) => v.is_modified(),
             Content::Binary(v) => v.is_modified(),
             Content::Image(v) => v.is_modified(),
@@ -78,20 +114,46 @@ impl Tab {
     }
 
     fn status_line(&self) -> String {
-        match &self.content {
-            Content::Folder(v) => v.status_line(),
-            Content::Text(v) => v.status_line(),
-            Content::Binary(v) => v.status_line(),
-            Content::Image(v) => v.status_line(),
-        }
+        self.content.status_line()
     }
 
     fn save(&mut self) -> anyhow::Result<()> {
         match &mut self.content {
-            Content::Folder(_) => Ok(()),
+            Content::Folder(_) | Content::Web(_) => Ok(()),
             Content::Text(v) => v.save_modified(),
             Content::Binary(v) => v.save(),
             Content::Image(v) => v.save(),
+        }
+    }
+}
+
+fn content_ui(
+    content: &mut Content,
+    ui: &mut egui::Ui,
+    cfg: &Config,
+    colors: &theme::Colors,
+    named: &[FltFilter],
+) -> Option<FolderAction> {
+    match content {
+        Content::Text(v) => {
+            v.set_options(&cfg.diff);
+            v.ui(ui, cfg, colors);
+            None
+        }
+        Content::Binary(v) => {
+            v.ui(ui, cfg, colors);
+            None
+        }
+        Content::Image(v) => {
+            v.ui(ui, cfg, colors);
+            None
+        }
+        Content::Folder(v) => v.ui(ui, cfg, colors, named),
+        Content::Web(v) => {
+            v.header(ui, cfg, named);
+            v.inner
+                .as_deref_mut()
+                .and_then(|c| content_ui(c, ui, cfg, colors, named))
         }
     }
 }
@@ -101,8 +163,13 @@ pub enum Cmd {
     Open,
     OpenConflict,
     Save,
+    SaveAll,
     SaveAs(usize),
     CloseTab,
+    CloseTabAt(usize),
+    CloseOtherTabs(usize),
+    CloseTabsToRight(usize),
+    CloseAllTabs,
     Exit,
     Undo,
     Redo,
@@ -111,6 +178,7 @@ pub enum Cmd {
     FindPrev,
     GotoLine,
     Options,
+    Help,
     NextDiff,
     PrevDiff,
     FirstDiff,
@@ -182,13 +250,18 @@ pub struct OxideMergeApp {
     patch_dlg: Option<PatchDialog>,
     filters_dlg: bool,
     about: bool,
-    shortcuts: bool,
+    help: bool,
     named_filters: Vec<FltFilter>,
     prompt: Option<Prompt>,
     font_lang: String,
     applied_lang: String,
     visuals_dark: Option<bool>,
     allow_close: bool,
+    /// Tab last scrolled into view in the tab strip.
+    shown_active: Option<usize>,
+    /// Whether the window had focus on the previous frame; files are checked for outside changes
+    /// when it comes back.
+    was_focused: bool,
 }
 
 fn kind_label(k: Option<FileKind>) -> &'static str {
@@ -197,6 +270,7 @@ fn kind_label(k: Option<FileKind>) -> &'static str {
         Some(FileKind::Text) => tr("kind.text"),
         Some(FileKind::Binary) => tr("kind.binary"),
         Some(FileKind::Image) => tr("kind.image"),
+        Some(FileKind::Web) => tr("kind.web"),
     }
 }
 
@@ -279,13 +353,15 @@ impl OxideMergeApp {
             patch_dlg: None,
             filters_dlg: false,
             about: false,
-            shortcuts: false,
+            help: false,
             named_filters: filter::load_all_filters(),
             prompt: None,
             font_lang: lang,
             applied_lang,
             visuals_dark: None,
             allow_close: false,
+            shown_active: None,
+            was_focused: true,
         };
         if let Some(req) = initial {
             app.open(req);
@@ -340,7 +416,7 @@ impl OxideMergeApp {
         }
         if paths.len() == 1 {
             let p = &paths[0];
-            if p.is_file() {
+            if p.is_file() && conflict::has_markers(p) {
                 if let Ok(doc) = text::load_doc(p, None) {
                     if conflict::parse(&doc.lines).is_some() {
                         return self.open_conflict(p);
@@ -352,6 +428,16 @@ impl OxideMergeApp {
         }
         for p in &paths {
             self.cfg.add_recent_path(&p.display().to_string());
+        }
+        if req.kind == Some(FileKind::Web)
+            || paths.iter().any(|p| web::is_url(&p.to_string_lossy()))
+        {
+            let urls = paths
+                .iter()
+                .map(|p| web::location(p))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            self.push_tab(Content::Web(WebView::new(urls, &self.cfg)), paths);
+            return Ok(());
         }
         // a folder compared with a file: use the same file name inside the folder
         if let Some(file) = paths.iter().find(|p| p.is_file()).cloned() {
@@ -486,6 +572,7 @@ impl OxideMergeApp {
                 }
                 Content::Image(ImageView::load(paths, &self.cfg)?)
             }
+            FileKind::Web => unreachable!("web pages are opened above"),
         };
         self.push_tab(content, source);
         Ok(())
@@ -555,6 +642,32 @@ impl OxideMergeApp {
         }
     }
 
+    /// Closes the tabs selected by `close`. Tabs with unsaved changes stay open and the first of
+    /// them asks whether to save.
+    fn close_tabs(&mut self, close: impl Fn(usize) -> bool) {
+        let mut kept = Vec::new();
+        let mut active = 0;
+        let mut ask = None;
+        for (i, t) in std::mem::take(&mut self.tabs).into_iter().enumerate() {
+            if close(i) {
+                if !t.is_modified() {
+                    continue;
+                }
+                ask.get_or_insert(kept.len());
+            }
+            if i <= self.active {
+                active = kept.len();
+            }
+            kept.push(t);
+        }
+        self.tabs = kept;
+        self.active = active;
+        if let Some(i) = ask {
+            self.active = i;
+            self.prompt = Some(Prompt::CloseTab(i));
+        }
+    }
+
     // ---------- commands ----------
 
     fn run(&mut self, cmd: Cmd, ctx: &egui::Context) {
@@ -572,6 +685,7 @@ impl OxideMergeApp {
                 }
             }
             Cmd::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Cmd::Help => self.help = true,
             Cmd::Options => {
                 self.options_dlg = Some(OptionsDialog {
                     line_filters: self.cfg.diff.line_filters.join("\n"),
@@ -602,6 +716,21 @@ impl OxideMergeApp {
                 }
             }
             Cmd::CloseTab => self.close_tab(self.active, false),
+            Cmd::CloseTabAt(i) => self.close_tab(i, false),
+            Cmd::CloseOtherTabs(keep) => self.close_tabs(|i| i != keep),
+            Cmd::CloseTabsToRight(keep) => self.close_tabs(|i| i > keep),
+            Cmd::CloseAllTabs => self.close_tabs(|_| true),
+            Cmd::SaveAll => {
+                let errors: Vec<String> = self
+                    .tabs
+                    .iter_mut()
+                    .filter(|t| t.is_modified())
+                    .filter_map(|t| t.save().err().map(|e| e.to_string()))
+                    .collect();
+                if !errors.is_empty() {
+                    self.error(errors.join("\n"));
+                }
+            }
             Cmd::Patch => {
                 self.patch_dlg = Some(PatchDialog {
                     style: self.cfg.patch_style,
@@ -627,8 +756,14 @@ impl OxideMergeApp {
                 let Some(tab) = self.tabs.get_mut(self.active) else {
                     return;
                 };
+                if let Content::Web(w) = &mut tab.content {
+                    if cmd == Cmd::Refresh {
+                        w.reload(&cfg);
+                        return;
+                    }
+                }
                 let mut err: Option<String> = None;
-                match &mut tab.content {
+                match tab.content.view_mut() {
                     Content::Text(v) => match cmd {
                         Cmd::Save => {
                             if let Err(e) = v.save_modified() {
@@ -702,6 +837,7 @@ impl OxideMergeApp {
                         Cmd::CopyLeft => v.copy_selected(false, &cfg),
                         _ => {}
                     },
+                    Content::Web(_) => {}
                 }
                 if let Some(e) = err {
                     self.error(e);
@@ -711,11 +847,7 @@ impl OxideMergeApp {
     }
 
     fn save_report(&mut self) {
-        let Some(Tab {
-            content: Content::Folder(v),
-            ..
-        }) = self.tabs.get(self.active)
-        else {
+        let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
             self.error(tr("msg.report_folder_only"));
             return;
         };
@@ -751,17 +883,19 @@ impl OxideMergeApp {
                 }
             };
             sc(Modifiers::COMMAND, Key::O, Cmd::Open);
+            sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::S, Cmd::SaveAll);
             sc(Modifiers::COMMAND, Key::S, Cmd::Save);
             sc(Modifiers::COMMAND, Key::W, Cmd::CloseTab);
             sc(Modifiers::COMMAND, Key::F4, Cmd::CloseTab);
             sc(Modifiers::COMMAND, Key::F, Cmd::Find);
             sc(Modifiers::COMMAND, Key::G, Cmd::GotoLine);
-            sc(Modifiers::COMMAND, Key::Tab, Cmd::NextTab);
+            // A pattern without Shift also matches with Shift held, so Shift variants go first.
             sc(
                 Modifiers::COMMAND | Modifiers::SHIFT,
                 Key::Tab,
                 Cmd::PrevTab,
             );
+            sc(Modifiers::COMMAND, Key::Tab, Cmd::NextTab);
             sc(Modifiers::COMMAND, Key::Plus, Cmd::ZoomIn);
             sc(Modifiers::COMMAND, Key::Equals, Cmd::ZoomIn);
             sc(Modifiers::COMMAND, Key::Minus, Cmd::ZoomOut);
@@ -769,10 +903,12 @@ impl OxideMergeApp {
             sc(Modifiers::SHIFT, Key::F3, Cmd::FindPrev);
             sc(Modifiers::NONE, Key::F3, Cmd::FindNext);
             sc(Modifiers::NONE, Key::F5, Cmd::Refresh);
+            sc(Modifiers::NONE, Key::F1, Cmd::Help);
             if !typing {
+                sc(Modifiers::NONE, Key::Questionmark, Cmd::Help);
+                sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z, Cmd::Redo);
                 sc(Modifiers::COMMAND, Key::Z, Cmd::Undo);
                 sc(Modifiers::COMMAND, Key::Y, Cmd::Redo);
-                sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z, Cmd::Redo);
                 sc(
                     Modifiers::COMMAND | Modifiers::ALT,
                     Key::ArrowRight,
@@ -802,12 +938,12 @@ impl OxideMergeApp {
 
     fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut cmd: Option<Cmd> = None;
-        let n_panes = match self.tabs.get(self.active).map(|t| &t.content) {
+        let n_panes = match self.tabs.get(self.active).map(|t| t.content.view()) {
             Some(Content::Text(v)) => v.n(),
             _ => 0,
         };
         let is_folder = matches!(
-            self.tabs.get(self.active).map(|t| &t.content),
+            self.tabs.get(self.active).map(|t| t.content.view()),
             Some(Content::Folder(_))
         );
         let item =
@@ -822,7 +958,15 @@ impl OxideMergeApp {
             };
         egui::menu::bar(ui, |ui| {
             ui.spacing_mut().button_padding = vec2(9.0, 4.0);
-            widgets::logo(ui, 22.0);
+            let logo = widgets::logo(ui, 22.0);
+            if ui
+                .interact(logo.rect, logo.id.with("about"), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(tr("menu.about"))
+                .clicked()
+            {
+                self.about = true;
+            }
             ui.label(egui::RichText::new("OxideMerge").font(theme::semibold(14.5)));
             ui.add_space(12.0);
             ui.menu_button(tr("menu.file"), |ui| {
@@ -836,6 +980,13 @@ impl OxideMergeApp {
                 );
                 ui.separator();
                 item(ui, tr("menu.save"), "Ctrl+S", Cmd::Save, &mut cmd);
+                item(
+                    ui,
+                    tr("btn.save_all"),
+                    "Ctrl+Shift+S",
+                    Cmd::SaveAll,
+                    &mut cmd,
+                );
                 for p in 0..n_panes {
                     let label = trf(
                         "menu.save_side_as",
@@ -1003,6 +1154,13 @@ impl OxideMergeApp {
                         Cmd::CompareAs(FileKind::Image),
                         &mut cmd,
                     );
+                    item(
+                        ui,
+                        tr("kind.web"),
+                        "",
+                        Cmd::CompareAs(FileKind::Web),
+                        &mut cmd,
+                    );
                 });
                 if cfg!(windows) {
                     ui.separator();
@@ -1048,16 +1206,16 @@ impl OxideMergeApp {
                 }
             });
             ui.menu_button(tr("menu.help"), |ui| {
-                if ui.button(tr("menu.shortcuts")).clicked() {
-                    self.shortcuts = true;
-                    ui.close_menu();
-                }
+                item(ui, tr("help.title"), "F1", Cmd::Help, &mut cmd);
                 if ui.button(tr("menu.about")).clicked() {
                     self.about = true;
                     ui.close_menu();
                 }
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if widgets::icon_button(ui, "?", &format!("{} (F1)", tr("help.title"))).clicked() {
+                    cmd = Some(Cmd::Help);
+                }
                 if widgets::icon_button(ui, "⚙", tr("menu.options")).clicked() {
                     cmd = Some(Cmd::Options);
                 }
@@ -1080,6 +1238,8 @@ impl OxideMergeApp {
         let mut close: Option<usize> = None;
         let mut activate: Option<usize> = None;
         let mut new_tab = false;
+        let mut tab_cmd: Option<Cmd> = None;
+        let n_tabs = self.tabs.len();
         egui::ScrollArea::horizontal()
             .id_salt("tabs")
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -1167,7 +1327,43 @@ impl OxideMergeApp {
                         } else if resp.clicked() {
                             activate = Some(i);
                         }
-                        resp.on_hover_text(full);
+                        if active && self.shown_active != Some(i) {
+                            resp.scroll_to_me(None);
+                            self.shown_active = Some(i);
+                        }
+                        let paths: Vec<String> =
+                            t.source.iter().map(|s| s.display().to_string()).collect();
+                        let resp = resp.on_hover_text(if paths.is_empty() {
+                            full
+                        } else {
+                            paths.join("\n")
+                        });
+                        let last = i + 1 == n_tabs;
+                        resp.context_menu(|ui| {
+                            let mut item =
+                                |ui: &mut egui::Ui, label: &str, enabled: bool, c: Cmd| {
+                                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                                        tab_cmd = Some(c);
+                                        ui.close_menu();
+                                    }
+                                };
+                            item(ui, tr("menu.close_tab"), true, Cmd::CloseTabAt(i));
+                            item(
+                                ui,
+                                tr("tab.close_others"),
+                                n_tabs > 1,
+                                Cmd::CloseOtherTabs(i),
+                            );
+                            item(ui, tr("tab.close_right"), !last, Cmd::CloseTabsToRight(i));
+                            item(ui, tr("tab.close_all"), true, Cmd::CloseAllTabs);
+                            if !paths.is_empty() {
+                                ui.separator();
+                                if ui.button(tr("cmd.copy_path")).clicked() {
+                                    ui.ctx().copy_text(paths.join("\n"));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
                     }
                     ui.add_space(4.0);
                     if widgets::icon_button(ui, "➕", tr("menu.open")).clicked() {
@@ -1183,6 +1379,10 @@ impl OxideMergeApp {
         }
         if let Some(i) = close {
             self.close_tab(i, false);
+        }
+        if let Some(c) = tab_cmd {
+            let ctx = ui.ctx().clone();
+            self.run(c, &ctx);
         }
     }
 
@@ -1300,7 +1500,9 @@ impl OxideMergeApp {
                                     if resp.hovered() {
                                         ui.painter().rect_filled(rect, 7.0, p.control_hover);
                                     }
-                                    let icon = if Path::new(path).is_dir() {
+                                    let icon = if web::is_url(path) {
+                                        "🌐"
+                                    } else if Path::new(path).is_dir() {
                                         "📁"
                                     } else {
                                         "📄"
@@ -1387,8 +1589,7 @@ impl OxideMergeApp {
                             let field = ui.add(
                                 egui::TextEdit::singleline(&mut d.paths[s])
                                     .hint_text(
-                                        egui::RichText::new(tr("btn.browse_file"))
-                                            .color(p.text_dim),
+                                        egui::RichText::new(tr("dlg.path_hint")).color(p.text_dim),
                                     )
                                     .margin(vec2(8.0, 5.0))
                                     .desired_width(w),
@@ -1478,6 +1679,7 @@ impl OxideMergeApp {
                                     (Some(FileKind::Text), kind_label(Some(FileKind::Text))),
                                     (Some(FileKind::Binary), kind_label(Some(FileKind::Binary))),
                                     (Some(FileKind::Image), kind_label(Some(FileKind::Image))),
+                                    (Some(FileKind::Web), kind_label(Some(FileKind::Web))),
                                 ],
                             );
                             d.kind = kind;
@@ -1753,6 +1955,40 @@ impl OxideMergeApp {
                                         egui::Slider::new(&mut c.binary_bytes_per_line, 4..=64)
                                             .text(tr("opt.bytes_per_line")),
                                     );
+                                    ui.separator();
+                                    ui.label(egui::RichText::new(tr("opt.web")).strong());
+                                    ui.label(tr("opt.web_browser"));
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut c.web_browser)
+                                                .hint_text(tr("opt.web_browser_hint"))
+                                                .desired_width(420.0),
+                                        );
+                                        if widgets::icon_button(ui, "📄", tr("btn.browse_file"))
+                                            .clicked()
+                                        {
+                                            if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                                c.web_browser = p.display().to_string();
+                                            }
+                                        }
+                                    });
+                                    let found = web::find_browser(&c.web_browser);
+                                    ui.label(
+                                        egui::RichText::new(match &found {
+                                            Some(p) => p.display().to_string(),
+                                            None => tr("web.no_browser").to_string(),
+                                        })
+                                        .small()
+                                        .color(pal(ui).text_dim),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(&mut c.web_width, 320..=3840)
+                                            .text(tr("opt.web_width")),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(&mut c.web_height, 240..=8000)
+                                            .text(tr("opt.web_height")),
+                                    );
                                 }
                                 OptTab::Plugins => {
                                     ui.label(tr("opt.unpackers_hint"));
@@ -1862,7 +2098,7 @@ impl OxideMergeApp {
         let mut apply: Option<String> = None;
         let default_filter = Config::default().filter;
         let can_clear = self.cfg.filter != default_filter
-            || matches!(self.tabs.get(self.active).map(|t| &t.content), Some(Content::Folder(v)) if v.filter_spec != default_filter);
+            || matches!(self.tabs.get(self.active).map(|t| t.content.view()), Some(Content::Folder(v)) if v.filter_spec != default_filter);
         egui::Window::new(tr("menu.filters"))
             .open(&mut open)
             .default_width(560.0)
@@ -1946,7 +2182,8 @@ impl OxideMergeApp {
             if let Some(d) = &mut self.open_dlg {
                 d.filter = self.cfg.filter.clone();
             }
-            if let Some(Content::Folder(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.content)
+            if let Some(Content::Folder(v)) =
+                self.tabs.get_mut(self.active).map(|t| t.content.view_mut())
             {
                 v.filter_spec = self.cfg.filter.clone();
                 v.refresh(&self.cfg, &self.named_filters);
@@ -2018,7 +2255,7 @@ impl OxideMergeApp {
         if go {
             self.cfg.patch_style = d.style;
             self.cfg.patch_context = d.context;
-            let text = match self.tabs.get(self.active).map(|t| &t.content) {
+            let text = match self.tabs.get(self.active).map(|t| t.content.view()) {
                 Some(Content::Text(v)) => v.make_patch(d.style, d.context),
                 Some(Content::Folder(v)) if v.n() == 2 => Some(v.make_patch(d.style, d.context)),
                 _ => None,
@@ -2150,60 +2387,12 @@ impl OxideMergeApp {
     }
 
     fn about_window(&mut self, ctx: &egui::Context) {
-        egui::Window::new(tr("menu.about"))
-            .open(&mut self.about)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    widgets::logo(ui, 44.0);
-                    ui.vertical(|ui| {
-                        ui.label(egui::RichText::new("OxideMerge").font(theme::semibold(22.0)));
-                        let p = pal(ui);
-                        widgets::chip(
-                            ui,
-                            &format!("v{}", env!("CARGO_PKG_VERSION")),
-                            p.accent,
-                            p.accent_soft,
-                        );
-                    });
-                });
-                ui.add_space(6.0);
-                ui.label(tr("app.tagline"));
-                ui.label(tr("app.about"));
-                ui.hyperlink_to("WinMerge", "https://winmerge.org/");
-                ui.label(concat!("License: ", env!("CARGO_PKG_LICENSE")));
-            });
-        egui::Window::new(tr("menu.shortcuts"))
-            .open(&mut self.shortcuts)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                egui::Grid::new("sc").striped(true).show(ui, |ui| {
-                    for (k, v) in [
-                        ("Ctrl+O", "menu.open"),
-                        ("Ctrl+S", "menu.save"),
-                        ("Ctrl+W", "menu.close_tab"),
-                        ("Ctrl+Z / Ctrl+Y", "cmd.undo"),
-                        ("Ctrl+F / F3 / Shift+F3", "cmd.find"),
-                        ("Ctrl+G", "dlg.goto"),
-                        ("F5", "cmd.refresh"),
-                        ("Alt+Down / Alt+Up", "cmd.next_diff"),
-                        ("Alt+Home / Alt+End", "cmd.first_diff"),
-                        ("Alt+PgDn / Alt+PgUp", "cmd.next_conflict"),
-                        ("Alt+Right", "cmd.copy_right"),
-                        ("Alt+Left", "cmd.copy_left"),
-                        ("Ctrl+Alt+Right / Left", "cmd.copy_all_right"),
-                        ("F2 / Enter / Double-click", "cmd.edit_line"),
-                        ("Ctrl+Tab", "menu.next_tab"),
-                        ("Ctrl + / Ctrl -", "cmd.zoom_in"),
-                    ] {
-                        ui.monospace(k);
-                        ui.label(tr(v));
-                        ui.end_row();
-                    }
-                });
-            });
+        if self.about && about::show(ctx) {
+            self.about = false;
+        }
+        if self.help && help::show(ctx, crate::config::config_path().as_deref()) {
+            self.help = false;
+        }
     }
 
     fn handle_drops(&mut self, ctx: &egui::Context) {
@@ -2270,8 +2459,26 @@ impl eframe::App for OxideMergeApp {
             self.prompt = Some(Prompt::Exit);
         }
 
+        let focused = ctx.input(|i| i.focused);
+        if focused && !self.was_focused {
+            for t in &mut self.tabs {
+                if let Content::Text(v) = &mut t.content {
+                    v.check_disk();
+                }
+            }
+        }
+        self.was_focused = focused;
+
         self.handle_drops(ctx);
-        if self.prompt.is_none() && self.open_dlg.is_none() {
+        let modal = self.prompt.is_some()
+            || self.open_dlg.is_some()
+            || self.options_dlg.is_some()
+            || self.patch_dlg.is_some()
+            || self.filters_dlg
+            || self.help
+            || self.about;
+        widgets::set_modal_open(ctx, modal);
+        if !modal {
             self.handle_shortcuts(ctx);
         }
 
@@ -2318,15 +2525,12 @@ impl eframe::App for OxideMergeApp {
                 }
                 match self.tabs.get_mut(self.active).map(|t| &mut t.content) {
                     None => self.start_page(ui),
-                    Some(Content::Text(v)) => {
-                        v.set_options(&cfg.diff);
-                        v.ui(ui, &cfg, &colors);
-                    }
-                    Some(Content::Binary(v)) => v.ui(ui, &cfg, &colors),
-                    Some(Content::Image(v)) => v.ui(ui, &cfg, &colors),
-                    Some(Content::Folder(v)) => folder_action = v.ui(ui, &cfg, &colors, &named),
+                    Some(c) => folder_action = content_ui(c, ui, &cfg, &colors, &named),
                 }
             });
+        if let Some(Content::Web(w)) = self.tabs.get(self.active).map(|t| &t.content) {
+            self.cfg.web_mode = w.mode;
+        }
         if let Some(a) = folder_action {
             match a {
                 FolderAction::OpenFiles {

@@ -78,7 +78,10 @@ pub struct FolderView {
     elapsed: Option<Duration>,
     expanded: HashSet<String>,
     selected: BTreeSet<usize>,
+    /// Start of a Shift range selection, as an index into `visible`.
     anchor: Option<usize>,
+    /// Keyboard focus row, as an index into `visible`.
+    cursor: Option<usize>,
     sort: (Col, bool),
     visible: Vec<usize>,
     view_key: Option<(bool, bool, bool, [bool; 3])>,
@@ -145,6 +148,7 @@ impl FolderView {
             expanded: HashSet::new(),
             selected: BTreeSet::new(),
             anchor: None,
+            cursor: None,
             sort: (Col::Name, true),
             visible: Vec::new(),
             view_key: None,
@@ -697,8 +701,10 @@ impl FolderView {
         c: &Colors,
         named: &[FltFilter],
     ) -> Option<FolderAction> {
+        let was_running = self.running.is_some();
         self.poll();
-        if self.running.is_some() {
+        if was_running {
+            // Also repaints once after finishing, as the status bar was drawn before this poll.
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         if self.header_bar(ui, cfg) {
@@ -723,21 +729,37 @@ impl FolderView {
         let mut new_sort: Option<Col> = None;
 
         // keyboard navigation
-        if !ui.ctx().wants_keyboard_input() && self.confirm.is_none() && !self.visible.is_empty() {
-            let cur = self.anchor.unwrap_or(0).min(self.visible.len() - 1);
+        let row_h = ui.text_style_height(&egui::TextStyle::Body) + 12.0;
+        if !ui.ctx().wants_keyboard_input()
+            && !widgets::modal_open(ui.ctx())
+            && self.confirm.is_none()
+            && !self.visible.is_empty()
+        {
+            let last = self.visible.len() - 1;
+            let cur = self.cursor.or(self.anchor).unwrap_or(0).min(last);
+            let page = ((ui.available_height() / row_h) as usize)
+                .saturating_sub(2)
+                .max(1);
             let mut target = None;
+            let mut extend = false;
+            let mut select_all = false;
             ui.input_mut(|i| {
-                if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
-                    target = Some((cur + 1).min(self.visible.len() - 1));
+                extend = i.modifiers.shift;
+                for (key, to) in [
+                    (Key::ArrowDown, (cur + 1).min(last)),
+                    (Key::ArrowUp, cur.saturating_sub(1)),
+                    (Key::PageDown, (cur + page).min(last)),
+                    (Key::PageUp, cur.saturating_sub(page)),
+                    (Key::Home, 0),
+                    (Key::End, last),
+                ] {
+                    // Matches with or without Shift; Shift extends the selection.
+                    if i.consume_key(Modifiers::NONE, key) {
+                        target = Some(to);
+                    }
                 }
-                if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
-                    target = Some(cur.saturating_sub(1));
-                }
-                if i.consume_key(Modifiers::NONE, Key::Home) {
-                    target = Some(0);
-                }
-                if i.consume_key(Modifiers::NONE, Key::End) {
-                    target = Some(self.visible.len() - 1);
+                if i.consume_key(Modifiers::COMMAND, Key::A) {
+                    select_all = true;
                 }
                 if i.consume_key(Modifiers::NONE, Key::Enter) && self.anchor.is_some() {
                     double = Some(self.visible[cur]);
@@ -756,15 +778,27 @@ impl FolderView {
                 }
             });
             if let Some(t) = target {
-                self.selected.clear();
-                self.selected.insert(self.visible[t]);
-                self.anchor = Some(t);
+                match self.anchor.filter(|_| extend) {
+                    Some(a) => {
+                        let a = a.min(last);
+                        let (lo, hi) = if a < t { (a, t) } else { (t, a) };
+                        self.selected = self.visible[lo..=hi].iter().copied().collect();
+                    }
+                    None => {
+                        self.selected.clear();
+                        self.selected.insert(self.visible[t]);
+                        self.anchor = Some(t);
+                    }
+                }
+                self.cursor = Some(t);
                 self.scroll_to = Some(t);
+            }
+            if select_all {
+                self.selected = self.visible.iter().copied().collect();
             }
         }
 
         let n = self.n();
-        let row_h = ui.text_style_height(&egui::TextStyle::Body) + 12.0;
         let pal = widgets::pal(ui);
         let side_cols: Vec<Color32> = (0..n).map(|s| widgets::side_color(ui, s, n)).collect();
         let status_color = |it: &DirItem| -> Color32 {
@@ -1075,6 +1109,7 @@ impl FolderView {
                 self.selected.insert(idx);
                 self.anchor = Some(vi);
             }
+            self.cursor = Some(vi);
         }
         if let Some(i) = toggle {
             let key = self.items[i].rel_path();

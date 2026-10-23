@@ -241,6 +241,12 @@ fn line_ops(
     alg: DiffAlgorithm,
 ) -> Vec<(DiffTag, Range<usize>, Range<usize>)> {
     let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+    // LCS needs a table of a.len() * b.len() entries, which the deadline does not bound.
+    let alg = if alg == DiffAlgorithm::Lcs && (a.len() as u64) * (b.len() as u64) > 25_000_000 {
+        DiffAlgorithm::Myers
+    } else {
+        alg
+    };
     similar::capture_diff_slices_deadline(algorithm(alg), a, b, deadline)
         .iter()
         .map(|op| op.as_tag_tuple())
@@ -424,12 +430,15 @@ fn diff3(
 
 fn detect_moved(result: &mut DiffResult, ids: &[Vec<u32>]) {
     let n = result.panes;
-    // For each pane, the set of line ids appearing inside difference blocks.
+    // For each pane, the sorted, deduplicated blocks each line id appears in.
     let mut per_pane: Vec<HashMap<u32, Vec<usize>>> = vec![HashMap::new(); n];
     for (bi, b) in result.blocks.iter().enumerate() {
         for p in 0..n {
             for line in b.ranges[p].clone() {
-                per_pane[p].entry(ids[p][line]).or_default().push(bi);
+                let blocks = per_pane[p].entry(ids[p][line]).or_default();
+                if blocks.last() != Some(&bi) {
+                    blocks.push(bi);
+                }
             }
         }
     }
@@ -441,17 +450,12 @@ fn detect_moved(result: &mut DiffResult, ids: &[Vec<u32>]) {
         for p in 0..n {
             for line in b.ranges[p].clone() {
                 let id = ids[p][line];
-                let others = (0..n).filter(|&q| q != p);
-                let mut found = false;
-                for q in others {
-                    if let Some(blocks) = per_pane[q].get(&id) {
-                        if blocks.iter().any(|&ob| ob != bi)
-                            && !b.ranges[q].clone().any(|ql| ids[q][ql] == id)
-                        {
-                            found = true;
-                        }
-                    }
-                }
+                // Moved: the line is in another block of another pane, but not in this block there.
+                let found = (0..n).filter(|&q| q != p).any(|q| {
+                    per_pane[q]
+                        .get(&id)
+                        .is_some_and(|blocks| blocks.binary_search(&bi).is_err())
+                });
                 if found {
                     moved[p].insert(line);
                 }
@@ -611,5 +615,38 @@ mod tests {
         let (a, b) = inline_diff("let x = 1;", "let y = 1;", &o);
         assert_eq!(a, vec![4..5]);
         assert_eq!(b, vec![4..5]);
+    }
+
+    #[test]
+    fn detects_moved_lines() {
+        let a = v(&["moved", "a", "b", "c", "x"]);
+        let b = v(&["y", "a", "b", "c", "moved"]);
+        let r = compute(&[&a, &b], &DiffOptions::default());
+        assert!(r.moved[0].contains(&0));
+        assert!(r.moved[1].contains(&4));
+        assert!(!r.moved[0].contains(&4));
+        assert!(!r.moved[1].contains(&0));
+    }
+
+    #[test]
+    fn moved_detection_handles_large_repetitive_blocks() {
+        // One huge block full of identical lines used to take quadratic time.
+        let n = 40_000;
+        let ids: Vec<Vec<u32>> = (0..2u32)
+            .map(|p| {
+                (0..n as u32)
+                    .map(|i| if i % 2 == 0 { 0 } else { 1 + p * n as u32 + i })
+                    .collect()
+            })
+            .collect();
+        let mut r = DiffResult {
+            panes: 2,
+            ..Default::default()
+        };
+        push_block(&mut r, [0..n, 0..n, 0..0], BlockKind::Diff, false);
+        let start = std::time::Instant::now();
+        detect_moved(&mut r, &ids);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(r.moved[0].is_empty() && r.moved[1].is_empty());
     }
 }
