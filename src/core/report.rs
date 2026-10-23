@@ -80,7 +80,9 @@ pub fn status_text(it: &DirItem, panes: usize) -> String {
             tr("status.error"),
             it.error.clone().unwrap_or_default()
         ),
-        CmpStatus::NotCompared => tr("status.not_compared").into(),
+        CmpStatus::NotCompared if it.is_dir => tr("status.not_compared").into(),
+        CmpStatus::NotCompared => tr("status.file_not_compared").into(),
+        CmpStatus::Pending => tr("status.pending").into(),
     }
 }
 
@@ -246,7 +248,9 @@ pub fn generate(items: &[&DirItem], roots: &[PathBuf], format: ReportFormat) -> 
             out.push_str("</tr>\n");
             for (st, r) in &rows {
                 let class = match st {
-                    CmpStatus::Identical | CmpStatus::NotCompared => "identical",
+                    CmpStatus::Identical | CmpStatus::NotCompared | CmpStatus::Pending => {
+                        "identical"
+                    }
                     CmpStatus::Different => "different",
                     CmpStatus::Unique => "unique",
                     CmpStatus::Error => "error",

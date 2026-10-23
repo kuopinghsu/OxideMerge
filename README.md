@@ -20,6 +20,10 @@ The name comes from the language it is written in: rust is iron oxide.
 
 **Folder compare and merge**
 - 2-way and 3-way folder comparison, recursive or flat, shown as a tree or a flat list.
+- Results appear while the comparison runs: files are compared during the folder scan, and
+  differences and unique items are listed as soon as they are found.
+- Large files are compared in chunks, so identical and binary files are never loaded whole;
+  files of different sizes are told apart without reading them in the quick and binary methods.
 - Compare methods: full contents, quick contents, binary contents, modified date, date and size, size only.
 - Show or hide identical, different and unique items. Copy items between sides or delete them,
   with optional Recycle Bin support and confirmation prompts.
@@ -63,7 +67,8 @@ The name comes from the language it is written in: rust is iron oxide.
 - Light and dark themes.
 - 10 built-in languages: English, 繁體中文, 简体中文, 日本語, 한국어, Deutsch, Français, Español,
   Русский and Português (Brasil). You can add more as JSON files (see [Languages](#languages)).
-- Windows Explorer context menu integration (Windows only).
+- Windows Explorer context menu in the style of WinMerge: compare the selected files or folders,
+  or select a left (and middle) side first and compare to it later.
 
 ## Platforms
 
@@ -197,6 +202,8 @@ button. The last mode used is remembered. Screenshot size and the browser path a
 | `--lang <CODE>` | UI language, for example `ja` or `zh-TW` |
 | `--list-languages` | Print the available languages |
 | `--register-shell` / `--unregister-shell` | Add or remove the Explorer context menu (Windows) |
+| `--select-left <PATH>` / `--select-middle <PATH>` | Remember a side for a later `--compare-to` |
+| `--compare-to <PATH>` | Compare a path with the remembered left (and middle) side |
 
 On Windows, WinMerge-style switches are also accepted, so existing scripts keep working:
 `/r`, `/f`, `/o`, `/dl`, `/dr`, `/wl`, `/wr` and so on.
@@ -270,9 +277,22 @@ all placeholders.
 
 ### Explorer integration (Windows)
 
-`oxidemerge --register-shell` adds **Select Left**, **Compare To** and **Compare** entries to the
-Explorer context menu for the current user. These entries point at the executable you run the
-command from, so run it from the installed copy (`make shell-register` does this for you).
+`oxidemerge --register-shell` (or **Tools → Add to Explorer context menu**) adds an **OxideMerge**
+submenu to the Explorer context menu of files, folders, drives and folder backgrounds, for the
+current user. It works like WinMerge's shell extension:
+
+- **Compare**: select two or three files or folders and compare them in one window (3-way for
+  three). With a single item, it compares the item with the side chosen earlier with Select Left
+  (and Select Middle), or opens the Open dialog with the item filled in.
+- **Select Left** / **Select Middle**: remember an item, for example in another folder. The Compare
+  entry then reads **Compare to "name"**.
+- **Compare As** (files): compare as text, binary, image or web page.
+
+Explorer starts one OxideMerge process per selected item; they find each other through a small
+spool folder in the temp directory, and only the first one opens a window. The entries point at
+the executable you run the command from, so run it from the installed copy (`make shell-register`
+does this for you), and run it again after moving the program. On Windows 11 the entries are under
+**Show more options**.
 
 ## Project layout
 

@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use encoding_rs::Encoding;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -198,6 +199,15 @@ pub fn looks_binary(bytes: &[u8]) -> bool {
 }
 
 pub fn decode(bytes: &[u8], forced: Option<TextEncoding>) -> (String, TextEncoding, bool) {
+    let (text, enc, bom) = decode_cow(bytes, forced);
+    (text.into_owned(), enc, bom)
+}
+
+/// Like `decode`, but borrows `bytes` when they are already valid UTF-8.
+pub fn decode_cow(
+    bytes: &[u8],
+    forced: Option<TextEncoding>,
+) -> (Cow<'_, str>, TextEncoding, bool) {
     let (bom_enc, bom_len) = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         (Some(TextEncoding::Utf8), 3)
     } else if bytes.starts_with(&[0xFF, 0xFE]) {
@@ -224,16 +234,10 @@ pub fn decode(bytes: &[u8], forced: Option<TextEncoding>) -> (String, TextEncodi
     let has_bom = bom_enc == Some(enc);
     let body = if has_bom { &bytes[bom_len..] } else { bytes };
     let text = match enc {
-        TextEncoding::Utf8 => String::from_utf8_lossy(body).into_owned(),
-        TextEncoding::Utf16Le => encoding_rs::UTF_16LE
-            .decode_without_bom_handling(body)
-            .0
-            .into_owned(),
-        TextEncoding::Utf16Be => encoding_rs::UTF_16BE
-            .decode_without_bom_handling(body)
-            .0
-            .into_owned(),
-        TextEncoding::Other(e) => e.decode_without_bom_handling(body).0.into_owned(),
+        TextEncoding::Utf8 => String::from_utf8_lossy(body),
+        TextEncoding::Utf16Le => encoding_rs::UTF_16LE.decode_without_bom_handling(body).0,
+        TextEncoding::Utf16Be => encoding_rs::UTF_16BE.decode_without_bom_handling(body).0,
+        TextEncoding::Other(e) => e.decode_without_bom_handling(body).0,
     };
     (text, enc, has_bom)
 }
@@ -270,51 +274,99 @@ pub fn encode(text: &str, enc: TextEncoding, bom: bool) -> Vec<u8> {
     out
 }
 
+/// Iterates the lines of `s` (without terminators) together with their terminator. A final
+/// terminator does not start another, empty line.
+pub fn lines(s: &str) -> Lines<'_> {
+    Lines { rest: s }
+}
+
+pub struct Lines<'a> {
+    rest: &'a str,
+}
+
+impl<'a> Iterator for Lines<'a> {
+    type Item = (&'a str, Option<Eol>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        let bytes = self.rest.as_bytes();
+        let Some(i) = memchr::memchr2(b'\n', b'\r', bytes) else {
+            return Some((std::mem::take(&mut self.rest), None));
+        };
+        let (eol, len) = match (bytes[i], bytes.get(i + 1)) {
+            (b'\n', _) => (Eol::Lf, 1),
+            (_, Some(b'\n')) => (Eol::CrLf, 2),
+            _ => (Eol::Cr, 1),
+        };
+        let line = &self.rest[..i];
+        self.rest = &self.rest[i + len..];
+        Some((line, Some(eol)))
+    }
+}
+
+/// Counts the line terminators of a text.
+#[derive(Default)]
+pub struct EolCounts {
+    crlf: usize,
+    lf: usize,
+    cr: usize,
+}
+
+impl EolCounts {
+    pub fn of(s: &str) -> EolCounts {
+        let mut counts = EolCounts::default();
+        for (_, eol) in lines(s) {
+            counts.add(eol);
+        }
+        counts
+    }
+
+    pub fn add(&mut self, eol: Option<Eol>) {
+        match eol {
+            Some(Eol::CrLf) => self.crlf += 1,
+            Some(Eol::Lf) => self.lf += 1,
+            Some(Eol::Cr) => self.cr += 1,
+            None => {}
+        }
+    }
+
+    pub fn dominant(&self) -> Option<Eol> {
+        let (crlf, lf, cr) = (self.crlf, self.lf, self.cr);
+        if crlf == 0 && lf == 0 && cr == 0 {
+            None
+        } else if crlf >= lf && crlf >= cr {
+            Some(Eol::CrLf)
+        } else if lf >= cr {
+            Some(Eol::Lf)
+        } else {
+            Some(Eol::Cr)
+        }
+    }
+
+    pub fn mixed(&self) -> bool {
+        [self.crlf, self.lf, self.cr]
+            .iter()
+            .filter(|&&c| c > 0)
+            .count()
+            > 1
+    }
+}
+
 /// Splits text into lines (without terminators).
 /// Returns (lines, dominant eol, mixed eols, ends with newline).
 pub fn split_lines(s: &str) -> (Vec<String>, Option<Eol>, bool, bool) {
-    let bytes = s.as_bytes();
-    let mut lines = Vec::new();
-    let (mut crlf, mut lf, mut cr) = (0usize, 0usize, 0usize);
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\r' => {
-                lines.push(s[start..i].to_string());
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                    crlf += 1;
-                    i += 2;
-                } else {
-                    cr += 1;
-                    i += 1;
-                }
-                start = i;
-            }
-            b'\n' => {
-                lines.push(s[start..i].to_string());
-                lf += 1;
-                i += 1;
-                start = i;
-            }
-            _ => i += 1,
-        }
-    }
-    let final_newline = !bytes.is_empty() && start == bytes.len();
-    if start < bytes.len() {
-        lines.push(s[start..].to_string());
-    }
-    let eol = if crlf == 0 && lf == 0 && cr == 0 {
-        None
-    } else if crlf >= lf && crlf >= cr {
-        Some(Eol::CrLf)
-    } else if lf >= cr {
-        Some(Eol::Lf)
-    } else {
-        Some(Eol::Cr)
-    };
-    let mixed = [crlf, lf, cr].iter().filter(|&&c| c > 0).count() > 1;
-    (lines, eol, mixed, final_newline)
+    let mut counts = EolCounts::default();
+    let mut final_newline = false;
+    let lines = lines(s)
+        .map(|(line, eol)| {
+            counts.add(eol);
+            final_newline = eol.is_some();
+            line.to_string()
+        })
+        .collect();
+    (lines, counts.dominant(), counts.mixed(), final_newline)
 }
 
 pub fn load_doc(path: &Path, forced: Option<TextEncoding>) -> Result<TextDoc> {
@@ -389,6 +441,27 @@ mod tests {
         assert!(!mixed);
         assert!(!nl);
         assert_eq!(join_lines(&lines, Eol::CrLf, nl), s);
+    }
+
+    #[test]
+    fn lines_keep_their_terminators() {
+        let v: Vec<_> = lines("a\r\nb\rc\n\nd").collect();
+        assert_eq!(
+            v,
+            vec![
+                ("a", Some(Eol::CrLf)),
+                ("b", Some(Eol::Cr)),
+                ("c", Some(Eol::Lf)),
+                ("", Some(Eol::Lf)),
+                ("d", None),
+            ]
+        );
+        assert_eq!(lines("x\r").collect::<Vec<_>>(), vec![("x", Some(Eol::Cr))]);
+        let (l, eol, mixed, nl) = split_lines("a\nb\n");
+        assert_eq!(
+            (l, eol, mixed, nl),
+            (vec!["a".into(), "b".into()], Some(Eol::Lf), false, true)
+        );
     }
 
     #[test]

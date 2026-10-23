@@ -5,11 +5,12 @@ use super::filter::FileFilter;
 use super::text;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::SystemTime;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
@@ -75,8 +76,11 @@ pub enum CmpStatus {
     Different,
     Unique,
     Error,
-    /// Folder whose contents were not compared (non-recursive mode).
+    /// Folder whose contents were not compared (non-recursive mode), or a file left over when
+    /// the comparison was stopped.
     NotCompared,
+    /// File on every side whose comparison has not finished yet.
+    Pending,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +135,92 @@ pub struct Progress {
     pub total: AtomicUsize,
     pub abort: AtomicBool,
     pub current: Mutex<String>,
+    /// Collects every item and result for `take_updates`, so a view can show them while the
+    /// comparison runs.
+    pub live: bool,
+    updates: Mutex<Updates>,
+}
+
+impl Progress {
+    pub fn live() -> Progress {
+        Progress {
+            live: true,
+            ..Default::default()
+        }
+    }
+
+    /// Items found and files compared since the last call.
+    pub fn take_updates(&self) -> Updates {
+        std::mem::take(&mut *self.updates.lock().unwrap())
+    }
+}
+
+#[derive(Default)]
+pub struct Updates {
+    /// New items in index order. Their `children` are empty: each item is a child of its
+    /// `parent`, which came earlier.
+    pub items: Vec<DirItem>,
+    pub results: Vec<Outcome>,
+}
+
+impl Updates {
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty() && self.results.is_empty()
+    }
+}
+
+/// Result of one file comparison.
+#[derive(Clone, Debug)]
+pub struct Outcome {
+    pub index: usize,
+    pub status: CmpStatus,
+    /// Three-way: the pane that differs from the other two.
+    pub diff_side: Option<usize>,
+    pub binary: bool,
+    pub error: Option<String>,
+}
+
+impl Outcome {
+    pub fn apply(self, items: &mut [DirItem]) {
+        let it = &mut items[self.index];
+        it.status = self.status;
+        it.diff_side = self.diff_side;
+        it.binary = self.binary;
+        it.error = self.error;
+    }
+}
+
+/// Files waiting for a compare worker, filled while the folders are still being scanned.
+#[derive(Default)]
+struct Queue {
+    state: Mutex<(VecDeque<(usize, DirItem)>, bool)>,
+    ready: Condvar,
+}
+
+impl Queue {
+    fn push(&self, job: (usize, DirItem)) {
+        self.state.lock().unwrap().0.push_back(job);
+        self.ready.notify_one();
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.ready.notify_all();
+    }
+
+    /// Next file, or `None` once the queue is closed and empty.
+    fn pop(&self) -> Option<(usize, DirItem)> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(job) = state.0.pop_front() {
+                return Some(job);
+            }
+            if state.1 {
+                return None;
+            }
+            state = self.ready.wait(state).unwrap();
+        }
+    }
 }
 
 struct Entry {
@@ -181,9 +271,6 @@ fn name_key(name: &str, is_dir: bool) -> (bool, String) {
     (!is_dir, n)
 }
 
-/// Item index, status, differing side, binary flag and error message of one file comparison.
-type CompareOutcome = (usize, CmpStatus, Option<usize>, bool, Option<String>);
-
 pub struct Scanner<'a> {
     pub roots: &'a [PathBuf],
     pub filter: &'a FileFilter,
@@ -193,22 +280,73 @@ pub struct Scanner<'a> {
 }
 
 impl<'a> Scanner<'a> {
+    /// Scans the folders and compares the files found on every side. Workers compare files
+    /// while the scan is still running, so results arrive early on large trees.
     pub fn run(&self) -> Vec<DirItem> {
+        let threads = if self.fopts.threads > 0 {
+            self.fopts.threads
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(8)
+        };
+        let queue = Queue::default();
+        let results = Mutex::new(Vec::new());
+        let norm = Normalizer::new(self.dopts);
         let mut items = Vec::new();
-        self.scan("", None, 0, [true; 3], &mut items);
-        if self.progress.abort.load(Ordering::Relaxed) {
-            return items;
+        std::thread::scope(|s| {
+            for _ in 0..threads.max(1) {
+                s.spawn(|| self.compare_worker(&queue, &results, &norm));
+            }
+            self.scan("", None, 0, [true; 3], &mut items, &queue);
+            queue.close();
+        });
+        for o in results.into_inner().unwrap() {
+            o.apply(&mut items);
         }
-        let todo: Vec<usize> = items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| !it.is_dir && it.exists[..self.roots.len()].iter().all(|&e| e))
-            .map(|(i, _)| i)
-            .collect();
-        self.progress.total.store(todo.len(), Ordering::Relaxed);
-        self.compare_all(&mut items, &todo);
+        for it in &mut items {
+            if it.status == CmpStatus::Pending {
+                it.status = CmpStatus::NotCompared;
+            }
+        }
         aggregate(&mut items, self.roots.len());
         items
+    }
+
+    fn compare_worker(&self, queue: &Queue, results: &Mutex<Vec<Outcome>>, norm: &Normalizer) {
+        while let Some((index, it)) = queue.pop() {
+            if self.progress.abort.load(Ordering::Relaxed) {
+                break;
+            }
+            let paths: Vec<PathBuf> = self.roots.iter().map(|r| it.path(r)).collect();
+            let o = match compare_files(&paths, &it, self.fopts, self.dopts, norm) {
+                Ok((status, diff_side, binary)) => Outcome {
+                    index,
+                    status,
+                    diff_side,
+                    binary,
+                    error: None,
+                },
+                Err(e) => Outcome {
+                    index,
+                    status: CmpStatus::Error,
+                    diff_side: None,
+                    binary: false,
+                    error: Some(e.to_string()),
+                },
+            };
+            if self.progress.live {
+                self.progress
+                    .updates
+                    .lock()
+                    .unwrap()
+                    .results
+                    .push(o.clone());
+            }
+            results.lock().unwrap().push(o);
+            self.progress.done.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn scan(
@@ -218,6 +356,7 @@ impl<'a> Scanner<'a> {
         depth: usize,
         present: [bool; 3],
         items: &mut Vec<DirItem>,
+        queue: &Queue,
     ) {
         if self.progress.abort.load(Ordering::Relaxed) {
             return;
@@ -277,64 +416,51 @@ impl<'a> Scanner<'a> {
             if let Some(p) = parent {
                 items[p].children.push(idx);
             }
-            let is_dir = item.is_dir;
-            let exists = item.exists;
+            let mut item = item;
+            let all = item.exists[..n].iter().all(|&e| e);
+            if item.is_dir && all {
+                // Until scanned, a folder must not look like an empty, identical one.
+                item.status = if self.fopts.recursive {
+                    CmpStatus::Pending
+                } else {
+                    CmpStatus::NotCompared
+                };
+            } else if !item.is_dir && all {
+                item.status = CmpStatus::Pending;
+                self.progress.total.fetch_add(1, Ordering::Relaxed);
+                queue.push((idx, item.clone()));
+            }
+            if self.progress.live {
+                self.progress
+                    .updates
+                    .lock()
+                    .unwrap()
+                    .items
+                    .push(item.clone());
+            }
+            let (is_dir, exists) = (item.is_dir, item.exists);
             items.push(item);
-            if is_dir {
-                let all = exists[..n].iter().all(|&e| e);
-                if !self.fopts.recursive {
-                    items[idx].status = if all {
-                        CmpStatus::NotCompared
-                    } else {
-                        CmpStatus::Unique
-                    };
-                } else if all || self.fopts.include_unique_subfolders {
-                    self.scan(&rel_path, Some(idx), depth + 1, exists, items);
+            if is_dir && self.fopts.recursive && (all || self.fopts.include_unique_subfolders) {
+                self.scan(&rel_path, Some(idx), depth + 1, exists, items, queue);
+                if all && !self.progress.abort.load(Ordering::Relaxed) {
+                    self.scanned(idx, items);
                 }
             }
         }
     }
 
-    fn compare_all(&self, items: &mut [DirItem], todo: &[usize]) {
-        let threads = if self.fopts.threads > 0 {
-            self.fopts.threads
-        } else {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .min(8)
-        };
-        let next = AtomicUsize::new(0);
-        let results: Mutex<Vec<CompareOutcome>> = Mutex::new(Vec::new());
-        let items_ref: &[DirItem] = items;
-        std::thread::scope(|s| {
-            for _ in 0..threads.max(1) {
-                s.spawn(|| loop {
-                    if self.progress.abort.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let k = next.fetch_add(1, Ordering::Relaxed);
-                    if k >= todo.len() {
-                        break;
-                    }
-                    let idx = todo[k];
-                    let it = &items_ref[idx];
-                    let paths: Vec<PathBuf> = self.roots.iter().map(|r| it.path(r)).collect();
-                    let r = compare_files(&paths, it, self.fopts, self.dopts);
-                    let entry = match r {
-                        Ok((st, side, bin)) => (idx, st, side, bin, None),
-                        Err(e) => (idx, CmpStatus::Error, None, false, Some(e.to_string())),
-                    };
-                    results.lock().unwrap().push(entry);
-                    self.progress.done.fetch_add(1, Ordering::Relaxed);
-                });
-            }
-        });
-        for (idx, st, side, bin, err) in results.into_inner().unwrap() {
-            items[idx].status = st;
-            items[idx].diff_side = side;
-            items[idx].binary = bin;
-            items[idx].error = err;
+    /// Marks a folder as fully scanned; `aggregate` derives its status from the children.
+    fn scanned(&self, index: usize, items: &mut [DirItem]) {
+        items[index].status = CmpStatus::Identical;
+        if self.progress.live {
+            let o = Outcome {
+                index,
+                status: CmpStatus::Identical,
+                diff_side: None,
+                binary: false,
+                error: None,
+            };
+            self.progress.updates.lock().unwrap().results.push(o);
         }
     }
 }
@@ -350,9 +476,12 @@ pub fn aggregate(items: &mut [DirItem], panes: usize) {
             items[i].status = CmpStatus::Unique;
             continue;
         }
-        if items[i].status == CmpStatus::NotCompared && items[i].children.is_empty() {
+        if matches!(items[i].status, CmpStatus::NotCompared | CmpStatus::Pending)
+            && items[i].children.is_empty()
+        {
             continue;
         }
+        let (mut pending, mut error, mut skipped) = (false, false, false);
         let mut st = CmpStatus::Identical;
         for &c in &items[i].children {
             match items[c].status {
@@ -360,38 +489,68 @@ pub fn aggregate(items: &mut [DirItem], panes: usize) {
                     st = CmpStatus::Different;
                     break;
                 }
-                CmpStatus::Error => st = CmpStatus::Error,
-                _ => {}
+                CmpStatus::Pending => pending = true,
+                CmpStatus::Error => error = true,
+                CmpStatus::NotCompared => skipped = true,
+                CmpStatus::Identical => {}
             }
+        }
+        if st != CmpStatus::Different {
+            st = if pending {
+                CmpStatus::Pending
+            } else if error {
+                CmpStatus::Error
+            } else if skipped {
+                CmpStatus::NotCompared
+            } else {
+                CmpStatus::Identical
+            };
         }
         items[i].status = st;
     }
 }
 
-fn read_file(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))
+/// Reads a whole file; `size` from the scan saves asking the file system for it again.
+fn read_file(path: &Path, size: Option<u64>) -> Result<Vec<u8>> {
+    let read = || -> std::io::Result<Vec<u8>> {
+        let mut f = std::fs::File::open(path)?;
+        let mut bytes = Vec::with_capacity(size.map_or(0, |s| s as usize + 1));
+        f.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    read().with_context(|| format!("cannot read {}", path.display()))
 }
 
-fn same_bytes(a: &Path, b: &Path) -> Result<bool> {
-    let ma = std::fs::metadata(a)?;
-    let mb = std::fs::metadata(b)?;
-    if ma.len() != mb.len() {
+/// Byte comparison of two files with the sizes found by the scan.
+fn same_bytes(a: &Path, b: &Path, size_a: Option<u64>, size_b: Option<u64>) -> Result<bool> {
+    if size_a != size_b {
         return Ok(false);
     }
-    let mut fa = std::io::BufReader::new(std::fs::File::open(a)?);
-    let mut fb = std::io::BufReader::new(std::fs::File::open(b)?);
-    let mut ba = vec![0u8; 64 * 1024];
-    let mut bb = vec![0u8; 64 * 1024];
+    let open =
+        |p: &Path| std::fs::File::open(p).with_context(|| format!("cannot read {}", p.display()));
+    let (mut fa, mut fb) = (open(a)?, open(b)?);
+    // One spare byte, so a small file is done after a single read.
+    let chunk = size_a.map_or(CHUNK, |s| (s as usize).saturating_add(1).min(CHUNK));
+    let (mut ba, mut bb) = (vec![0u8; chunk], vec![0u8; chunk]);
     loop {
         let na = read_full(&mut fa, &mut ba)?;
         let nb = read_full(&mut fb, &mut bb)?;
         if na != nb || ba[..na] != bb[..nb] {
             return Ok(false);
         }
-        if na == 0 {
+        if na < chunk {
             return Ok(true);
         }
     }
+}
+
+/// Binary detection from the start of a file, without reading all of it.
+fn head_is_binary(path: &Path) -> Result<bool> {
+    let mut f =
+        std::fs::File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut head = vec![0u8; 8192];
+    let n = read_full(&mut f, &mut head)?;
+    Ok(text::looks_binary(&head[..n]))
 }
 
 fn read_full(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -419,9 +578,25 @@ fn time_eq(a: Option<SystemTime>, b: Option<SystemTime>, tol: u64) -> bool {
     }
 }
 
+/// Read size for comparing files in chunks.
+const CHUNK: usize = 1 << 20;
+
+/// Full-contents compares read files up to this size in one go. Larger files are compared in
+/// chunks first, so identical and binary files never have to fit in memory; only large text
+/// files whose bytes differ are loaded to apply the ignore options.
+const LOAD_LIMIT: u64 = 16 << 20;
+
 struct Loaded {
     bytes: Vec<u8>,
     binary: bool,
+}
+
+impl Loaded {
+    fn read(path: &Path, size: Option<u64>) -> Result<Loaded> {
+        let bytes = read_file(path, size)?;
+        let binary = text::looks_binary(&bytes);
+        Ok(Loaded { bytes, binary })
+    }
 }
 
 /// Text aware equality honoring the ignore options.
@@ -432,75 +607,112 @@ fn text_equal(a: &Loaded, b: &Loaded, norm: &Normalizer, dopts: &DiffOptions) ->
     if a.binary || b.binary {
         return false;
     }
-    let da = text::doc_from_bytes(None, &a.bytes, None);
-    let db = text::doc_from_bytes(None, &b.bytes, None);
-    if !dopts.ignore_eol && (da.eol != db.eol || da.mixed_eol || db.mixed_eol) {
+    let (ta, enc_a, bom_a) = text::decode_cow(&a.bytes, None);
+    let (tb, enc_b, bom_b) = text::decode_cow(&b.bytes, None);
+    if !dopts.ignore_codepage && (enc_a != enc_b || bom_a != bom_b) {
         return false;
     }
-    if !dopts.ignore_codepage && (da.encoding != db.encoding || da.bom != db.bom) {
-        return false;
+    if !dopts.ignore_eol {
+        let (ea, eb) = (text::EolCounts::of(&ta), text::EolCounts::of(&tb));
+        let eol = |c: &text::EolCounts| c.dominant().unwrap_or_else(text::Eol::platform);
+        if eol(&ea) != eol(&eb) || ea.mixed() || eb.mixed() {
+            return false;
+        }
     }
-    let ka = da
-        .lines
-        .iter()
-        .filter(|l| !norm.is_ignorable(l))
-        .map(|l| norm.key(l));
-    let kb = db
-        .lines
-        .iter()
-        .filter(|l| !norm.is_ignorable(l))
-        .map(|l| norm.key(l));
-    ka.eq(kb)
+    line_keys(&ta, norm).eq(line_keys(&tb, norm))
 }
 
-/// Returns (status, differing side for 3-way, is binary).
+fn line_keys<'a>(text: &'a str, norm: &'a Normalizer) -> impl Iterator<Item = Cow<'a, str>> {
+    text::lines(text)
+        .map(|(l, _)| l)
+        .filter(|l| !norm.is_ignorable(l))
+        .map(|l| norm.key(l))
+}
+
+/// Compares the sides pairwise; left and right are equal when both equal the middle.
+fn pairwise(
+    n: usize,
+    binary: bool,
+    mut eq: impl FnMut(usize, usize) -> Result<bool>,
+) -> Result<(CmpStatus, Option<usize>, bool)> {
+    let e01 = eq(0, 1)?;
+    if n == 2 {
+        return Ok(three_way_status(2, e01, false, false, binary));
+    }
+    let e12 = eq(1, 2)?;
+    let e02 = if e01 && e12 { true } else { eq(0, 2)? };
+    Ok(three_way_status(3, e01, e12, e02, binary))
+}
+
+fn full_contents(
+    paths: &[PathBuf],
+    item: &DirItem,
+    norm: &Normalizer,
+    dopts: &DiffOptions,
+    load_limit: u64,
+) -> Result<(CmpStatus, Option<usize>, bool)> {
+    let n = paths.len();
+    if item.size[..n]
+        .iter()
+        .all(|s| s.is_some_and(|s| s <= load_limit))
+    {
+        let loaded: Vec<Loaded> = paths
+            .iter()
+            .zip(item.size)
+            .map(|(p, size)| Loaded::read(p, size))
+            .collect::<Result<_>>()?;
+        let any_bin = loaded.iter().any(|l| l.binary);
+        return pairwise(n, any_bin, |a, b| {
+            Ok(text_equal(&loaded[a], &loaded[b], norm, dopts))
+        });
+    }
+    let binary: Vec<bool> = paths
+        .iter()
+        .map(|p| head_is_binary(p))
+        .collect::<Result<_>>()?;
+    let mut loaded: Vec<Option<Loaded>> = paths.iter().map(|_| None).collect();
+    pairwise(n, binary.contains(&true), |a, b| {
+        if same_bytes(&paths[a], &paths[b], item.size[a], item.size[b])? {
+            return Ok(true);
+        }
+        if binary[a] || binary[b] {
+            return Ok(false);
+        }
+        for s in [a, b] {
+            if loaded[s].is_none() {
+                loaded[s] = Some(Loaded::read(&paths[s], item.size[s])?);
+            }
+        }
+        let (la, lb) = (loaded[a].as_ref().unwrap(), loaded[b].as_ref().unwrap());
+        Ok(text_equal(la, lb, norm, dopts))
+    })
+}
+
+/// Returns (status, differing side for 3-way, is binary). `norm` must be built from `dopts`.
 pub fn compare_files(
     paths: &[PathBuf],
     item: &DirItem,
     fopts: &FolderOptions,
     dopts: &DiffOptions,
+    norm: &Normalizer,
 ) -> Result<(CmpStatus, Option<usize>, bool)> {
     let n = paths.len();
-    let pair_eq: Box<dyn Fn(usize, usize) -> Result<bool>> = match fopts.method {
-        CompareMethod::Size => Box::new(|a, b| Ok(item.size[a] == item.size[b])),
-        CompareMethod::Date => Box::new(|a, b| {
-            Ok(time_eq(
-                item.mtime[a],
-                item.mtime[b],
-                fopts.time_tolerance_secs,
-            ))
-        }),
-        CompareMethod::DateSize => Box::new(|a, b| {
-            Ok(item.size[a] == item.size[b]
-                && time_eq(item.mtime[a], item.mtime[b], fopts.time_tolerance_secs))
+    let tol = fopts.time_tolerance_secs;
+    let (size, mtime) = (&item.size, &item.mtime);
+    match fopts.method {
+        CompareMethod::Size => pairwise(n, false, |a, b| Ok(size[a] == size[b])),
+        CompareMethod::Date => pairwise(n, false, |a, b| Ok(time_eq(mtime[a], mtime[b], tol))),
+        CompareMethod::DateSize => pairwise(n, false, |a, b| {
+            Ok(size[a] == size[b] && time_eq(mtime[a], mtime[b], tol))
         }),
         CompareMethod::QuickContents | CompareMethod::BinaryContents => {
-            Box::new(|a, b| same_bytes(&paths[a], &paths[b]))
+            let binary = fopts.method == CompareMethod::BinaryContents;
+            pairwise(n, binary, |a, b| {
+                same_bytes(&paths[a], &paths[b], size[a], size[b])
+            })
         }
-        CompareMethod::FullContents => {
-            let mut loaded = Vec::new();
-            for p in paths {
-                let bytes = read_file(p)?;
-                let binary = text::looks_binary(&bytes);
-                loaded.push(Loaded { bytes, binary });
-            }
-            let norm = Normalizer::new(dopts);
-            let any_bin = loaded.iter().any(|l| l.binary);
-            let eqs: Vec<bool> = [(0, 1), (1, 2), (0, 2)]
-                .iter()
-                .map(|&(a, b)| b < n && text_equal(&loaded[a], &loaded[b], &norm, dopts))
-                .collect();
-            return Ok(three_way_status(n, eqs[0], eqs[1], eqs[2], any_bin));
-        }
-    };
-    let binary = matches!(fopts.method, CompareMethod::BinaryContents);
-    let e01 = pair_eq(0, 1)?;
-    if n == 2 {
-        return Ok(three_way_status(2, e01, false, false, binary));
+        CompareMethod::FullContents => full_contents(paths, item, norm, dopts, LOAD_LIMIT),
     }
-    let e12 = pair_eq(1, 2)?;
-    let e02 = if e01 && e12 { true } else { pair_eq(0, 2)? };
-    Ok(three_way_status(3, e01, e12, e02, binary))
 }
 
 fn three_way_status(
@@ -563,7 +775,8 @@ pub fn refresh_file_item(
             if it.exists[..n].iter().all(|&e| e) {
                 let paths: Vec<PathBuf> = roots.iter().map(|r| it.path(r)).collect();
                 let snapshot = it.clone();
-                match compare_files(&paths, &snapshot, fopts, dopts) {
+                let norm = Normalizer::new(dopts);
+                match compare_files(&paths, &snapshot, fopts, dopts, &norm) {
                     Ok((st, side, bin)) => {
                         it.status = st;
                         it.diff_side = side;
@@ -633,7 +846,7 @@ pub fn status_counts(items: &[DirItem]) -> (usize, usize, usize, usize) {
             CmpStatus::Different => diff += 1,
             CmpStatus::Unique => uniq += 1,
             CmpStatus::Error => err += 1,
-            CmpStatus::NotCompared => {}
+            CmpStatus::NotCompared | CmpStatus::Pending => {}
         }
     }
     (same, diff, uniq, err)
@@ -671,5 +884,153 @@ mod tests {
         assert_eq!(find("diff.txt").status, CmpStatus::Different);
         assert_eq!(find("sub").status, CmpStatus::Unique);
         assert_eq!(find("only.txt").status, CmpStatus::Unique);
+    }
+
+    #[test]
+    fn streamed_updates_rebuild_the_result() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        for root in [a.path(), b.path()] {
+            std::fs::create_dir_all(root.join("deep").join("er")).unwrap();
+            std::fs::create_dir(root.join("empty")).unwrap();
+            std::fs::create_dir(root.join("same")).unwrap();
+            std::fs::write(root.join("same").join("s.txt"), "s").unwrap();
+        }
+        std::fs::write(a.path().join("deep").join("er").join("d.txt"), "1").unwrap();
+        std::fs::write(b.path().join("deep").join("er").join("d.txt"), "2").unwrap();
+        std::fs::write(a.path().join("deep").join("u.txt"), "u").unwrap();
+        let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        let progress = Progress::live();
+        let filter = FileFilter::default();
+        let fopts = FolderOptions::default();
+        let dopts = DiffOptions::default();
+        let items = Scanner {
+            roots: &roots,
+            filter: &filter,
+            fopts: &fopts,
+            dopts: &dopts,
+            progress: &progress,
+        }
+        .run();
+
+        let updates = progress.take_updates();
+        let mut streamed: Vec<DirItem> = Vec::new();
+        for it in updates.items {
+            if let Some(p) = it.parent {
+                let idx = streamed.len();
+                streamed[p].children.push(idx);
+            }
+            streamed.push(it);
+        }
+        for o in updates.results {
+            o.apply(&mut streamed);
+        }
+        aggregate(&mut streamed, 2);
+
+        let summary = |v: &[DirItem]| -> Vec<(String, CmpStatus, Vec<usize>)> {
+            v.iter()
+                .map(|i| (i.rel_path(), i.status, i.children.clone()))
+                .collect()
+        };
+        assert_eq!(summary(&streamed), summary(&items));
+        let find = |n: &str| items.iter().find(|i| i.rel_path() == n).unwrap();
+        assert_eq!(find("deep").status, CmpStatus::Different);
+        assert_eq!(find("deep/er").status, CmpStatus::Different);
+        assert_eq!(find("empty").status, CmpStatus::Identical);
+        assert_eq!(find("same").status, CmpStatus::Identical);
+        assert_eq!(progress.total.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn large_and_small_files_compare_alike() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        let text: String = (0..60_000).map(|i| format!("line {i}\n")).collect();
+        let mut binary = vec![0u8; 2 * CHUNK];
+        binary[5] = 1;
+        let mut binary2 = binary.clone();
+        *binary2.last_mut().unwrap() = 9;
+        let cases = [
+            (
+                "same",
+                text.as_bytes().to_vec(),
+                text.as_bytes().to_vec(),
+                true,
+            ),
+            (
+                "eol",
+                text.as_bytes().to_vec(),
+                text.replace('\n', "\r\n").into_bytes(),
+                true,
+            ),
+            (
+                "text",
+                text.as_bytes().to_vec(),
+                text.replace("line 7\n", "x\n").into_bytes(),
+                false,
+            ),
+            ("bin", binary.clone(), binary.clone(), true),
+            ("bin2", binary, binary2, false),
+        ];
+        let dopts = DiffOptions::default();
+        let norm = Normalizer::new(&dopts);
+        for (name, a, b, equal) in cases {
+            let paths = vec![
+                write(&format!("{name}.a"), &a),
+                write(&format!("{name}.b"), &b),
+            ];
+            let mut item = DirItem {
+                rel_dir: String::new(),
+                name: name.into(),
+                is_dir: false,
+                exists: [true, true, false],
+                size: [Some(a.len() as u64), Some(b.len() as u64), None],
+                mtime: [None; 3],
+                status: CmpStatus::Pending,
+                diff_side: None,
+                binary: false,
+                error: None,
+                depth: 0,
+                parent: None,
+                children: Vec::new(),
+            };
+            let expected = if equal {
+                CmpStatus::Identical
+            } else {
+                CmpStatus::Different
+            };
+            for limit in [0, LOAD_LIMIT] {
+                let (status, _, _) = full_contents(&paths, &item, &norm, &dopts, limit).unwrap();
+                assert_eq!(status, expected, "{name} with load limit {limit}");
+            }
+            item.size[1] = item.size[0];
+            let quick = same_bytes(&paths[0], &paths[1], item.size[0], item.size[1]).unwrap();
+            assert_eq!(quick, a == b, "{name} byte compare");
+        }
+    }
+
+    #[test]
+    fn unscanned_folders_stay_pending() {
+        let mut items = vec![DirItem {
+            rel_dir: String::new(),
+            name: "dir".into(),
+            is_dir: true,
+            exists: [true, true, false],
+            size: [None; 3],
+            mtime: [None; 3],
+            status: CmpStatus::Pending,
+            diff_side: None,
+            binary: false,
+            error: None,
+            depth: 0,
+            parent: None,
+            children: Vec::new(),
+        }];
+        aggregate(&mut items, 2);
+        assert_eq!(items[0].status, CmpStatus::Pending);
     }
 }

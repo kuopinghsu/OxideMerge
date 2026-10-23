@@ -59,10 +59,14 @@ enum MenuCmd {
     CopyPath(usize, usize),
 }
 
+/// How often a running comparison refreshes the list with what it has found so far, at most.
+const UPDATE_INTERVAL: Duration = Duration::from_millis(250);
+
 struct Running {
     progress: Arc<Progress>,
     handle: JoinHandle<Vec<DirItem>>,
     started: Instant,
+    updated: Instant,
 }
 
 pub struct FolderView {
@@ -85,10 +89,37 @@ pub struct FolderView {
     sort: (Col, bool),
     visible: Vec<usize>,
     view_key: Option<(bool, bool, bool, [bool; 3])>,
+    /// Time spent on the last list refresh; a running comparison refreshes less often when the
+    /// list is expensive to rebuild.
+    view_cost: Duration,
     pub status: String,
     confirm: Option<PendingOp>,
     scroll_to: Option<usize>,
     id: egui::Id,
+}
+
+/// Case-insensitive ordering without allocating lowercase copies.
+fn cmp_ci(a: &str, b: &str) -> std::cmp::Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        let (a, b) = (a.bytes(), b.bytes());
+        return a
+            .map(|c| c.to_ascii_lowercase())
+            .cmp(b.map(|c| c.to_ascii_lowercase()));
+    }
+    let (a, b) = (a.chars(), b.chars());
+    a.flat_map(char::to_lowercase)
+        .cmp(b.flat_map(char::to_lowercase))
+}
+
+/// File extension for sorting; folders have none.
+fn sort_ext(it: &DirItem) -> &str {
+    if it.is_dir {
+        return "";
+    }
+    std::path::Path::new(&it.name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
 }
 
 fn system_open(path: &std::path::Path) {
@@ -152,6 +183,7 @@ impl FolderView {
             sort: (Col::Name, true),
             visible: Vec::new(),
             view_key: None,
+            view_cost: Duration::ZERO,
             status: String::new(),
             confirm: None,
             scroll_to: None,
@@ -190,7 +222,7 @@ impl FolderView {
         if let Some(r) = &self.running {
             r.progress.abort.store(true, Ordering::Relaxed);
         }
-        let progress = Arc::new(Progress::default());
+        let progress = Arc::new(Progress::live());
         let (roots, filter, fopts, dopts, pr) = (
             self.roots.clone(),
             self.filter.clone(),
@@ -212,7 +244,14 @@ impl FolderView {
             progress,
             handle,
             started: Instant::now(),
+            updated: Instant::now(),
         });
+        self.items.clear();
+        self.visible.clear();
+        self.selected.clear();
+        self.anchor = None;
+        self.cursor = None;
+        self.view_key = None;
         self.status.clear();
     }
 
@@ -235,21 +274,45 @@ impl FolderView {
     }
 
     fn poll(&mut self) {
-        let finished = self
-            .running
-            .as_ref()
-            .is_some_and(|r| r.handle.is_finished());
-        if finished {
+        let Some(r) = &mut self.running else { return };
+        if r.handle.is_finished() {
             let r = self.running.take().unwrap();
             let aborted = r.progress.abort.load(Ordering::Relaxed);
+            // Same items in the same order as the streamed ones, so the selection stays valid.
             self.items = r.handle.join().unwrap_or_default();
             self.elapsed = Some(r.started.elapsed());
-            self.selected.clear();
+            self.selected.retain(|&i| i < self.items.len());
             self.view_key = None;
             if aborted {
                 self.status = tr("msg.aborted").into();
             }
+        } else if r.updated.elapsed() >= UPDATE_INTERVAL.max(self.view_cost * 4) {
+            r.updated = Instant::now();
+            let updates = r.progress.take_updates();
+            if !updates.is_empty() {
+                let t = Instant::now();
+                self.apply_updates(updates);
+                self.view_cost = t.elapsed();
+            }
         }
+    }
+
+    /// Shows what the running comparison has found so far: new items, and the results of
+    /// the files compared since the last update.
+    fn apply_updates(&mut self, updates: folder::Updates) {
+        for it in updates.items {
+            if let Some(p) = it.parent {
+                let idx = self.items.len();
+                self.items[p].children.push(idx);
+            }
+            self.items.push(it);
+        }
+        for o in updates.results {
+            o.apply(&mut self.items);
+        }
+        let panes = self.n();
+        folder::aggregate(&mut self.items, panes);
+        self.view_key = None;
     }
 
     // ---------- visibility & sorting ----------
@@ -262,6 +325,7 @@ impl FolderView {
         match it.status {
             CmpStatus::Identical => cfg.show_identical,
             CmpStatus::Different | CmpStatus::Error | CmpStatus::NotCompared => cfg.show_different,
+            CmpStatus::Pending => false,
             CmpStatus::Unique => {
                 let unique_flag = |s: usize| {
                     if n == 2 && s == 1 {
@@ -278,24 +342,16 @@ impl FolderView {
     fn cmp_items(&self, a: usize, b: usize) -> std::cmp::Ordering {
         let (ia, ib) = (&self.items[a], &self.items[b]);
         let (col, asc) = self.sort;
-        let name = || ia.name.to_lowercase().cmp(&ib.name.to_lowercase());
+        let name = || cmp_ci(&ia.name, &ib.name);
         let o = match col {
             Col::Name => ib.is_dir.cmp(&ia.is_dir).then_with(name),
-            Col::Folder => ia
-                .rel_dir
-                .to_lowercase()
-                .cmp(&ib.rel_dir.to_lowercase())
-                .then_with(name),
+            Col::Folder => cmp_ci(&ia.rel_dir, &ib.rel_dir).then_with(name),
             Col::Result => status_text(ia, self.n())
                 .cmp(&status_text(ib, self.n()))
                 .then_with(name),
             Col::Date(s) => ia.mtime[s].cmp(&ib.mtime[s]).then_with(name),
             Col::Size(s) => ia.size[s].cmp(&ib.size[s]).then_with(name),
-            Col::Ext => ia
-                .ext()
-                .to_lowercase()
-                .cmp(&ib.ext().to_lowercase())
-                .then_with(name),
+            Col::Ext => cmp_ci(sort_ext(ia), sort_ext(ib)).then_with(name),
         };
         if asc {
             o
@@ -325,10 +381,7 @@ impl FolderView {
             .collect();
         v.sort_by(|&a, &b| {
             if self.sort.0 == Col::Name {
-                self.items[a]
-                    .rel_dir
-                    .to_lowercase()
-                    .cmp(&self.items[b].rel_dir.to_lowercase())
+                cmp_ci(&self.items[a].rel_dir, &self.items[b].rel_dir)
                     .then_with(|| self.cmp_items(a, b))
             } else {
                 self.cmp_items(a, b)
@@ -718,7 +771,9 @@ impl FolderView {
         );
         if self.view_key != Some(key) {
             self.view_key = Some(key);
+            let t = Instant::now();
             self.rebuild_visible(cfg);
+            self.view_cost += t.elapsed();
         }
 
         let mut result: Option<FolderAction> = None;
@@ -806,7 +861,7 @@ impl FolderView {
                 CmpStatus::Identical => pal.success,
                 CmpStatus::Different => pal.warning,
                 CmpStatus::Error => pal.danger,
-                CmpStatus::NotCompared => pal.text_dim,
+                CmpStatus::NotCompared | CmpStatus::Pending => pal.text_dim,
                 CmpStatus::Unique => {
                     let present: Vec<usize> = (0..n).filter(|&s| it.exists[s]).collect();
                     if present.len() == 1 {

@@ -37,7 +37,6 @@ pub struct Config {
     pub image_block: u32,
     pub binary_bytes_per_line: usize,
     pub unpackers: Vec<Unpacker>,
-    pub shell_selected_left: Option<String>,
     /// Browser used for web page screenshots ("" = detect Edge, Chrome or Chromium).
     pub web_browser: String,
     pub web_width: u32,
@@ -82,7 +81,6 @@ impl Default for Config {
                 pattern: "*.docx;*.odt;*.rtf".into(),
                 command: "pandoc -t plain ${file}".into(),
             }],
-            shell_selected_left: None,
             web_browser: String::new(),
             web_width: 1280,
             web_height: 1600,

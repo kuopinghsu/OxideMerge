@@ -3,6 +3,7 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use similar::{Algorithm, DiffTag};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -99,7 +100,15 @@ impl Normalizer {
         }
     }
 
-    pub fn key(&self, line: &str) -> String {
+    pub fn key<'a>(&self, line: &'a str) -> Cow<'a, str> {
+        let o = &self.opts;
+        if self.subs.is_empty()
+            && !o.ignore_numbers
+            && o.whitespace == WhitespaceMode::Compare
+            && !o.ignore_case
+        {
+            return Cow::Borrowed(line);
+        }
         let mut s: String = line.to_string();
         for (re, rep) in &self.subs {
             s = re.replace_all(&s, rep.as_str()).into_owned();
@@ -130,7 +139,7 @@ impl Normalizer {
         if self.opts.ignore_case {
             s = s.to_lowercase();
         }
-        s
+        Cow::Owned(s)
     }
 
     /// Lines that do not count as differences on their own (blank lines / line filters).
@@ -228,8 +237,12 @@ impl Interner {
             .iter()
             .map(|l| {
                 let k = norm.key(l);
-                let n = self.map.len() as u32;
-                *self.map.entry(k).or_insert(n)
+                if let Some(&id) = self.map.get(k.as_ref()) {
+                    return id;
+                }
+                let id = self.map.len() as u32;
+                self.map.insert(k.into_owned(), id);
+                id
             })
             .collect()
     }

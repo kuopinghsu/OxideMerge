@@ -134,12 +134,18 @@ struct Cli {
     /// Remove the Windows Explorer context menu entries
     #[arg(long)]
     unregister_shell: bool,
-    /// Remember a path as the left side for a later --compare-to (Explorer integration)
+    /// Remember a path as the left side for a later compare (Explorer integration)
     #[arg(long)]
     select_left: Option<PathBuf>,
-    /// Compare a path with the one stored by --select-left
+    /// Remember a path as the middle side for a later 3-way compare (Explorer integration)
+    #[arg(long)]
+    select_middle: Option<PathBuf>,
+    /// Compare a path with the side(s) remembered by --select-left and --select-middle
     #[arg(long)]
     compare_to: Option<PathBuf>,
+    /// Explorer's Compare entry: compares all items selected together, or one item like --compare-to
+    #[arg(long, hide = true)]
+    shell_compare: Option<PathBuf>,
 }
 
 /// Translates WinMerge style "/switch" arguments into the equivalent long options.
@@ -474,10 +480,21 @@ fn main() -> ExitCode {
         println!("{}", i18n::tr("msg.shell_unregistered"));
         return ExitCode::SUCCESS;
     }
-    if let Some(p) = &cli.select_left {
-        cfg.shell_selected_left = Some(p.display().to_string());
-        cfg.save();
+    let selected = [(&cli.select_left, false), (&cli.select_middle, true)];
+    if let Some((Some(p), middle)) = selected.into_iter().find(|(p, _)| p.is_some()) {
+        let mut selection = shell::Selection::load();
+        selection.select(shell::clean_arg(p), middle);
+        selection.save();
         return ExitCode::SUCCESS;
+    }
+    let mut paths = cli.paths.clone();
+    if let Some(p) = &cli.shell_compare {
+        match shell::gather(&shell::clean_arg(p)) {
+            Some(items) => paths = shell::compare_paths(items),
+            None => return ExitCode::SUCCESS,
+        }
+    } else if let Some(p) = &cli.compare_to {
+        paths = shell::compare_paths(vec![shell::clean_arg(p)]);
     }
 
     apply_cli_options(&cli, &mut cfg);
@@ -492,15 +509,6 @@ fn main() -> ExitCode {
         };
     }
 
-    let mut paths = cli.paths.clone();
-    if let Some(p) = &cli.compare_to {
-        if let Some(left) = cfg.shell_selected_left.take() {
-            paths = vec![PathBuf::from(left), p.clone()];
-            cfg.save();
-        } else {
-            paths = vec![p.clone()];
-        }
-    }
     let initial = if paths.is_empty() {
         None
     } else {
