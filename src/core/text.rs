@@ -174,7 +174,7 @@ impl TextDoc {
                 std::fs::create_dir_all(parent).ok();
             }
         }
-        std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+        super::fsutil::write_atomic(path, &bytes)?;
         self.path = Some(path.to_path_buf());
         self.modified = false;
         Ok(())

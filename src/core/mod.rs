@@ -1,11 +1,15 @@
 pub mod archive;
 pub mod binary;
+pub mod comments;
 pub mod conflict;
 pub mod diff;
 pub mod filter;
 pub mod folder;
+pub mod fsutil;
 pub mod image_cmp;
 pub mod patch;
+pub mod prettify;
+pub mod project;
 pub mod report;
 pub mod table;
 pub mod text;

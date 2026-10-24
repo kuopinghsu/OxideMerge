@@ -2,7 +2,7 @@
 
 use super::diff::{DiffOptions, Normalizer};
 use super::filter::FileFilter;
-use super::text;
+use super::{comments, prettify, text};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -599,27 +599,48 @@ impl Loaded {
     }
 }
 
-/// Text aware equality honoring the ignore options.
-fn text_equal(a: &Loaded, b: &Loaded, norm: &Normalizer, dopts: &DiffOptions) -> bool {
+/// Text aware equality honoring the ignore options. `path` (of either side) tells the
+/// language for ignoring comments and the format for reformatting JSON and XML.
+fn text_equal(a: &Loaded, b: &Loaded, norm: &Normalizer, dopts: &DiffOptions, path: &Path) -> bool {
     if a.bytes == b.bytes {
         return true;
     }
     if a.binary || b.binary {
         return false;
     }
-    let (ta, enc_a, bom_a) = text::decode_cow(&a.bytes, None);
-    let (tb, enc_b, bom_b) = text::decode_cow(&b.bytes, None);
+    let (mut ta, enc_a, bom_a) = text::decode_cow(&a.bytes, None);
+    let (mut tb, enc_b, bom_b) = text::decode_cow(&b.bytes, None);
     if !dopts.ignore_codepage && (enc_a != enc_b || bom_a != bom_b) {
         return false;
     }
-    if !dopts.ignore_eol {
+    let formatted = dopts
+        .prettify
+        .then(|| prettify::detect(Some(path), &ta))
+        .flatten()
+        .and_then(|f| Some((prettify::format(&ta, f)?, prettify::format(&tb, f)?)));
+    if let Some((fa, fb)) = formatted {
+        (ta, tb) = (Cow::Owned(fa), Cow::Owned(fb));
+    } else if !dopts.ignore_eol {
         let (ea, eb) = (text::EolCounts::of(&ta), text::EolCounts::of(&tb));
         let eol = |c: &text::EolCounts| c.dominant().unwrap_or_else(text::Eol::platform);
         if eol(&ea) != eol(&eb) || ea.mixed() || eb.mixed() {
             return false;
         }
     }
-    line_keys(&ta, norm).eq(line_keys(&tb, norm))
+    match comments::for_path(path).filter(|_| dopts.ignore_comments) {
+        Some(syn) => {
+            let code = |t: &str| -> Vec<String> {
+                let lines: Vec<&str> = text::lines(t).map(|(l, _)| l).collect();
+                comments::strip(&lines, syn)
+                    .into_iter()
+                    .filter(|s| !s.comment_only && !norm.is_ignorable(&s.code))
+                    .map(|s| norm.key(&s.code).into_owned())
+                    .collect()
+            };
+            code(&ta) == code(&tb)
+        }
+        None => line_keys(&ta, norm).eq(line_keys(&tb, norm)),
+    }
 }
 
 fn line_keys<'a>(text: &'a str, norm: &'a Normalizer) -> impl Iterator<Item = Cow<'a, str>> {
@@ -663,7 +684,7 @@ fn full_contents(
             .collect::<Result<_>>()?;
         let any_bin = loaded.iter().any(|l| l.binary);
         return pairwise(n, any_bin, |a, b| {
-            Ok(text_equal(&loaded[a], &loaded[b], norm, dopts))
+            Ok(text_equal(&loaded[a], &loaded[b], norm, dopts, &paths[a]))
         });
     }
     let binary: Vec<bool> = paths
@@ -684,7 +705,7 @@ fn full_contents(
             }
         }
         let (la, lb) = (loaded[a].as_ref().unwrap(), loaded[b].as_ref().unwrap());
-        Ok(text_equal(la, lb, norm, dopts))
+        Ok(text_equal(la, lb, norm, dopts, &paths[a]))
     })
 }
 

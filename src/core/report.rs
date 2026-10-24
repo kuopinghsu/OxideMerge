@@ -1,5 +1,7 @@
-//! Folder compare reports (HTML, CSV, plain text) and status descriptions.
+//! Folder compare reports (HTML, CSV, plain text), text compare HTML reports and status
+//! descriptions.
 
+use super::diff::{inline_diff, BlockKind, DiffOptions, DiffResult};
 use super::folder::{CmpStatus, DirItem};
 use crate::i18n::{tr, trf};
 use std::fmt::Write;
@@ -126,6 +128,108 @@ fn csv_field(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Escapes `line`, marking the byte ranges in `marks` (which must be sorted and on char boundaries).
+fn esc_marked(line: &str, marks: &[std::ops::Range<usize>]) -> String {
+    let mut out = String::new();
+    let mut pos = 0;
+    for r in marks {
+        let (start, end) = (r.start.max(pos).min(line.len()), r.end.min(line.len()));
+        if start >= end {
+            continue;
+        }
+        out.push_str(&esc(&line[pos..start]));
+        let _ = write!(out, "<span class=\"w\">{}</span>", esc(&line[start..end]));
+        pos = end;
+    }
+    out.push_str(&esc(&line[pos..]));
+    out
+}
+
+/// Side-by-side HTML report of a 2-way or 3-way text compare.
+pub fn text_html(
+    titles: &[String],
+    panes: &[&[String]],
+    result: &DiffResult,
+    opts: &DiffOptions,
+) -> String {
+    let n = panes.len();
+    let mut out = String::new();
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    out.push_str("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n");
+    let _ = writeln!(out, "<title>{}</title>", esc(tr("report.text_title")));
+    out.push_str(
+        "<style>body{font-family:Segoe UI,Arial,sans-serif;font-size:13px}\
+         table{border-collapse:collapse;width:100%;table-layout:fixed}\
+         td,th{padding:0 4px;vertical-align:top}th{background:#ddd;text-align:left;border:1px solid #bbb}\
+         td.n{width:4em;color:#888;text-align:right;user-select:none;background:#f4f4f4}\
+         td.t{font-family:Consolas,Menlo,monospace;white-space:pre-wrap;word-break:break-all}\
+         .chg{background:#efcbd0}.conf{background:#ffb3b3}.same{background:#fff3b0}\
+         .gap{background:#e4e4e4}.ign{background:#ececf8}.w{background:#e48a96}</style></head><body>\n",
+    );
+    let _ = writeln!(
+        out,
+        "<h2>{}</h2><p>{}<br>{}</p>",
+        esc(tr("report.text_title")),
+        now,
+        esc(&trf(
+            "report.text_summary",
+            &[("n", result.significant_blocks().to_string())]
+        ))
+    );
+    out.push_str("<table><tr>");
+    for (p, t) in titles.iter().enumerate().take(n) {
+        let _ = write!(
+            out,
+            "<th class=\"n\"></th><th>{}: {}</th>",
+            esc(side_name(p, n)),
+            esc(t)
+        );
+    }
+    out.push_str("</tr>\n");
+    for row in &result.rows {
+        let block = row.block.map(|b| &result.blocks[b]);
+        let class = match block {
+            None => "",
+            Some(b) if b.ignored => "ign",
+            Some(b) => match b.kind {
+                BlockKind::Conflict => "conf",
+                BlockKind::BothSame => "same",
+                _ => "chg",
+            },
+        };
+        let inline = |p: usize| -> Vec<std::ops::Range<usize>> {
+            let other = if n == 3 { 1 } else { 1 - p };
+            if class.is_empty() || class == "ign" || (n == 3 && p == 1) {
+                return Vec::new();
+            }
+            match (row.line[p], row.line[other]) {
+                (Some(a), Some(b)) => inline_diff(&panes[p][a], &panes[other][b], opts).0,
+                _ => Vec::new(),
+            }
+        };
+        out.push_str("<tr>");
+        for (p, lines) in panes.iter().enumerate() {
+            match row.line[p] {
+                Some(l) => {
+                    let _ = write!(
+                        out,
+                        "<td class=\"n\">{}</td><td class=\"t {class}\">{}</td>",
+                        l + 1,
+                        esc_marked(&lines[l], &inline(p))
+                    );
+                }
+                None => {
+                    let gap = if class.is_empty() { "" } else { "gap" };
+                    let _ = write!(out, "<td class=\"n\"></td><td class=\"t {gap}\"></td>");
+                }
+            }
+        }
+        out.push_str("</tr>\n");
+    }
+    out.push_str("</table></body></html>\n");
+    out
 }
 
 pub fn generate(items: &[&DirItem], roots: &[PathBuf], format: ReportFormat) -> String {
@@ -265,4 +369,30 @@ pub fn generate(items: &[&DirItem], roots: &[PathBuf], format: ReportFormat) -> 
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::diff::compute;
+
+    #[test]
+    fn text_report_marks_changed_rows_and_words() {
+        let a: Vec<String> = ["same", "old <word>", "gone"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let b: Vec<String> = ["same", "new <word>"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let opts = DiffOptions::default();
+        let r = compute(&[&a, &b], &opts);
+        let html = text_html(&["a.txt".into(), "b.txt".into()], &[&a, &b], &r, &opts);
+        assert!(html.contains("<td class=\"t \">same</td>"));
+        assert!(html.contains("<span class=\"w\">old</span> &lt;word&gt;"));
+        assert!(html.contains(
+            "<td class=\"t chg\">gone</td><td class=\"n\"></td><td class=\"t gap\"></td>"
+        ));
+    }
 }
