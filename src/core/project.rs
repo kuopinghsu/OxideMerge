@@ -162,8 +162,9 @@ mod tests {
     fn saves_loads_and_reads_winmerge_projects() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("p.oxmproj");
+        let abs = std::env::temp_dir().join("abs").join("right");
         let p = Project {
-            paths: vec!["left".into(), "/abs/right".into()],
+            paths: vec!["left".into(), abs.to_string_lossy().into_owned()],
             descriptions: vec![Some("Old".into()), None],
             read_only: vec![true, false],
             filter: Some("*.rs".into()),
@@ -176,7 +177,7 @@ mod tests {
         assert_eq!(back, p);
         let paths = back.resolved_paths(&file);
         assert_eq!(paths[0], dir.path().join("left"));
-        assert_eq!(paths[1], PathBuf::from("/abs/right"));
+        assert_eq!(paths[1], abs);
 
         let wm = dir.path().join("x.WinMerge");
         std::fs::write(
