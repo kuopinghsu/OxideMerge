@@ -50,6 +50,9 @@ pub enum Icon {
     Filter,
     Method,
     Check,
+    Fold,
+    Wrap,
+    Palette,
 }
 
 /// Maps 16×16 design-grid coordinates into `rect`.
@@ -359,6 +362,26 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Check => {
             pen.circle(8.0, 8.0, 6.5);
             pen.line(&[(5.0, 8.2), (7.2, 10.4), (11.2, 6.0)]);
+        }
+        Icon::Fold => {
+            pen.line(&[(4.5, 2.5), (8.0, 6.0), (11.5, 2.5)]);
+            pen.line(&[(4.5, 13.5), (8.0, 10.0), (11.5, 13.5)]);
+            pen.line(&[(2.5, 8.0), (5.5, 8.0)]);
+            pen.line(&[(10.5, 8.0), (13.5, 8.0)]);
+        }
+        Icon::Wrap => {
+            pen.line(&[(2.5, 3.5), (13.5, 3.5)]);
+            let mut path = vec![(2.5, 8.0), (11.0, 8.0)];
+            path.extend(pen.arc(11.0, 10.25, 2.25, -90.0, 90.0));
+            path.push((8.0, 12.5));
+            pen.line(&path);
+            pen.line(&[(9.5, 11.0), (8.0, 12.5), (9.5, 14.0)]);
+            pen.line(&[(2.5, 12.5), (5.0, 12.5)]);
+        }
+        Icon::Palette => {
+            pen.closed(&[(2.0, 3.0), (14.0, 3.0), (14.0, 13.0), (2.0, 13.0)]);
+            pen.line(&[(4.5, 6.0), (7.0, 8.0), (4.5, 10.0)]);
+            pen.line(&[(8.5, 10.5), (11.5, 10.5)]);
         }
     }
 }

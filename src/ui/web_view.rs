@@ -10,7 +10,7 @@ use crate::ui::app::Content;
 use crate::ui::folder_view::FolderView;
 use crate::ui::image_view::ImageView;
 use crate::ui::text_view::TextView;
-use crate::ui::widgets;
+use crate::ui::widgets::{self, Icon, Outcome};
 use egui::Ui;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -260,6 +260,17 @@ impl WebView {
         format!("{msg}  ({secs} s)")
     }
 
+    /// `inner` is the outcome of the view showing the result, when there is one.
+    pub fn outcome(&self, inner: Option<Outcome>) -> Option<Outcome> {
+        if self.job.is_some() {
+            Some(Outcome::Busy)
+        } else if self.error.is_some() {
+            Some(Outcome::Error)
+        } else {
+            inner
+        }
+    }
+
     pub fn status_line(&self, inner: Option<String>) -> String {
         if self.job.is_some() {
             return self.loading_text();
@@ -283,16 +294,23 @@ impl WebView {
         let mut stop = false;
         widgets::toolbar(ui, |ui| {
             let pal = widgets::pal(ui);
-            ui.label(egui::RichText::new("🌐").color(pal.text_dim));
+            widgets::inline_icon(ui, Icon::Globe, pal.text_dim);
+            ui.add_space(4.0);
             let options: Vec<(WebMode, &str)> =
                 WebMode::ALL.iter().map(|&m| (m, tr(m.key()))).collect();
             widgets::segmented(ui, &mut mode, &options);
             widgets::toolbar_sep(ui);
             if self.job.is_some() {
-                if widgets::icon_button(ui, "⏹", tr("btn.stop")).clicked() {
+                if widgets::icon_button(ui, Icon::Stop, tr("btn.stop")).clicked() {
                     stop = true;
                 }
-            } else if widgets::icon_button(ui, "⟳", tr("web.reload")).clicked() {
+            } else if widgets::icon_button(
+                ui,
+                Icon::Refresh,
+                &widgets::with_key(tr("web.reload"), "F5"),
+            )
+            .clicked()
+            {
                 reload = true;
             }
         });

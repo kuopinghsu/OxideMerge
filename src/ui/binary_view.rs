@@ -4,9 +4,9 @@ use crate::config::Config;
 use crate::core::binary;
 use crate::i18n::{tr, trf};
 use crate::ui::theme::Colors;
-use crate::ui::widgets::{self, Mark};
+use crate::ui::widgets::{self, Icon, Mark, Outcome};
 use egui::text::LayoutJob;
-use egui::{pos2, vec2, Color32, FontId, Rect, Sense, Stroke, TextFormat, Ui};
+use egui::{pos2, vec2, Align2, Color32, FontId, Key, Rect, Sense, Stroke, TextFormat, Ui};
 use std::ops::Range;
 use std::path::PathBuf;
 
@@ -23,6 +23,16 @@ pub struct BinaryView {
     undo: Vec<(Vec<Vec<u8>>, Vec<bool>)>,
     redo: Vec<(Vec<Vec<u8>>, Vec<bool>)>,
     pub status: String,
+    /// Message about an edit that changed many differences at once, for an undo toast.
+    pub bulk_edit: Option<String>,
+    /// Set when difference navigation ran past the last (true) or first (false) difference,
+    /// so the app can move on to the next or previous file of the folder compare.
+    pub step_file: Option<bool>,
+    pub find: crate::ui::text_view::FindState,
+    /// The bytes found last, highlighted.
+    hit: Option<Range<usize>>,
+    /// Text of the open "Go to offset" dialog.
+    pub goto: Option<String>,
     id: egui::Id,
     bpl: usize,
 }
@@ -51,7 +61,12 @@ impl BinaryView {
             undo: Vec::new(),
             redo: Vec::new(),
             status: String::new(),
+            bulk_edit: None,
             id: egui::Id::new(("binview", std::time::Instant::now())),
+            step_file: None,
+            find: Default::default(),
+            hit: None,
+            goto: None,
             bpl: 16,
         };
         v.recompute();
@@ -104,18 +119,24 @@ impl BinaryView {
         self.scroll_to = Some(self.diffs[i].start / self.bpl);
     }
 
-    pub fn next_diff(&mut self) {
+    /// Selects the next difference; false when there is none after the cursor.
+    pub fn next_diff(&mut self) -> bool {
         let off = self.cursor.map(|c| c as i64).unwrap_or(-1);
-        if let Some(i) = self.diffs.iter().position(|r| r.start as i64 > off) {
+        let found = self.diffs.iter().position(|r| r.start as i64 > off);
+        if let Some(i) = found {
             self.select(i);
         }
+        found.is_some()
     }
 
-    pub fn prev_diff(&mut self) {
+    /// Selects the previous difference; false when there is none before the cursor.
+    pub fn prev_diff(&mut self) -> bool {
         let off = self.cursor.unwrap_or(usize::MAX);
-        if let Some(i) = self.diffs.iter().rposition(|r| r.end <= off) {
+        let found = self.diffs.iter().rposition(|r| r.end <= off);
+        if let Some(i) = found {
             self.select(i);
         }
+        found.is_some()
     }
 
     pub fn first_diff(&mut self) {
@@ -128,6 +149,47 @@ impl BinaryView {
         if !self.diffs.is_empty() {
             self.select(self.diffs.len() - 1);
         }
+    }
+
+    pub fn open_find(&mut self) {
+        self.find.open = true;
+        self.find.focus = true;
+    }
+
+    /// Finds the hex bytes or text of the find bar in any pane, after or before the cursor,
+    /// wrapping around at the end.
+    pub fn find_next(&mut self, forward: bool) {
+        let Some(needle) = binary::parse_pattern(&self.find.query) else {
+            return;
+        };
+        let search = |from: Option<usize>| {
+            let hits = self
+                .data
+                .iter()
+                .filter_map(|d| binary::find(d, &needle, from, forward));
+            if forward {
+                hits.min()
+            } else {
+                hits.max()
+            }
+        };
+        match search(self.cursor).or_else(|| search(None)) {
+            Some(off) => {
+                self.go_to(off);
+                self.hit = Some(off..off + needle.len());
+                self.status.clear();
+            }
+            None => self.status = trf("msg.not_found", &[("text", self.find.query.clone())]),
+        }
+    }
+
+    pub fn go_to(&mut self, off: usize) {
+        let max = self.data.iter().map(|d| d.len()).max().unwrap_or(0);
+        let off = off.min(max.saturating_sub(1));
+        self.cursor = Some(off);
+        self.cur = self.diffs.iter().position(|r| r.contains(&off));
+        self.scroll_to = Some(off / self.bpl);
+        self.hit = None;
     }
 
     fn push_undo(&mut self) {
@@ -198,19 +260,21 @@ impl BinaryView {
         } else {
             (self.n() - 1, self.n() - 2)
         };
-        if self.read_only[to] {
+        if self.read_only[to] || self.diffs.is_empty() {
             return;
         }
+        let n = self.diffs.len();
         self.push_undo();
         self.data[to] = self.data[from].clone();
         self.modified[to] = true;
         self.recompute();
+        self.bulk_edit = Some(trf("msg.copied_blocks", &[("n", n.to_string())]));
     }
 
     pub fn save(&mut self) -> anyhow::Result<()> {
         for i in 0..self.n() {
             if self.modified[i] {
-                std::fs::write(&self.paths[i], &self.data[i])?;
+                crate::core::fsutil::write_atomic(&self.paths[i], &self.data[i])?;
                 self.modified[i] = false;
                 self.status = trf(
                     "msg.saved",
@@ -219,6 +283,14 @@ impl BinaryView {
             }
         }
         Ok(())
+    }
+
+    pub fn outcome(&self) -> Outcome {
+        if self.diffs.is_empty() {
+            Outcome::Identical
+        } else {
+            Outcome::Different
+        }
     }
 
     pub fn status_line(&self) -> String {
@@ -259,42 +331,80 @@ impl BinaryView {
         let bpl = self.bpl;
         widgets::toolbar(ui, |ui| {
             let pal = widgets::pal(ui);
-            if widgets::icon_button(ui, "⇈", tr("cmd.first_diff")).clicked() {
+            let key = widgets::with_key;
+            if widgets::icon_button(ui, Icon::First, &key(tr("cmd.first_diff"), "Alt+Home"))
+                .clicked()
+            {
                 self.first_diff();
             }
-            if widgets::icon_button(ui, "↑", tr("cmd.prev_diff")).clicked() {
-                self.prev_diff();
+            if widgets::icon_button(ui, Icon::Prev, &key(tr("cmd.prev_diff"), "Alt+↑")).clicked()
+                && !self.prev_diff()
+            {
+                self.step_file = Some(false);
             }
             let counter = match self.cur {
                 Some(c) => format!("{} / {}", c + 1, self.diffs.len()),
                 None => format!("– / {}", self.diffs.len()),
             };
             widgets::chip(ui, &counter, pal.text, pal.control);
-            if widgets::icon_button(ui, "↓", tr("cmd.next_diff")).clicked() {
-                self.next_diff();
+            if widgets::icon_button(ui, Icon::Next, &key(tr("cmd.next_diff"), "Alt+↓")).clicked()
+                && !self.next_diff()
+            {
+                self.step_file = Some(true);
             }
-            if widgets::icon_button(ui, "⇊", tr("cmd.last_diff")).clicked() {
+            if widgets::icon_button(ui, Icon::Last, &key(tr("cmd.last_diff"), "Alt+End")).clicked()
+            {
                 self.last_diff();
             }
             widgets::toolbar_sep(ui);
-            if widgets::icon_button(ui, "→", tr("cmd.copy_right")).clicked() {
+            if widgets::icon_button(ui, Icon::CopyRight, &key(tr("cmd.copy_right"), "Alt+→"))
+                .clicked()
+            {
                 self.copy_current(true);
             }
-            if widgets::icon_button(ui, "←", tr("cmd.copy_left")).clicked() {
+            if widgets::icon_button(ui, Icon::CopyLeft, &key(tr("cmd.copy_left"), "Alt+←"))
+                .clicked()
+            {
                 self.copy_current(false);
             }
             widgets::toolbar_sep(ui);
-            if widgets::icon_button_enabled(ui, !self.undo.is_empty(), "↶", tr("cmd.undo"))
-                .clicked()
+            if widgets::icon_button_enabled(
+                ui,
+                !self.undo.is_empty(),
+                Icon::Undo,
+                &key(tr("cmd.undo"), "Ctrl+Z"),
+            )
+            .clicked()
             {
                 self.undo();
             }
-            if widgets::icon_button_enabled(ui, !self.redo.is_empty(), "↷", tr("cmd.redo"))
-                .clicked()
+            if widgets::icon_button_enabled(
+                ui,
+                !self.redo.is_empty(),
+                Icon::Redo,
+                &key(tr("cmd.redo"), "Ctrl+Y"),
+            )
+            .clicked()
             {
                 self.redo();
             }
+            widgets::toolbar_sep(ui);
+            if widgets::icon_button(ui, Icon::Search, &key(tr("cmd.find"), "Ctrl+F")).clicked() {
+                self.open_find();
+            }
+            if widgets::icon_button(ui, Icon::Method, &key(tr("cmd.goto_offset"), "Ctrl+G"))
+                .clicked()
+            {
+                self.goto = Some(String::new());
+            }
         });
+        if self.find.open {
+            self.find_bar(ui);
+        }
+        if self.outcome() == Outcome::Identical {
+            let color = widgets::pal(ui).success;
+            widgets::info_bar(ui, Icon::Check, tr("msg.binary_identical"), color);
+        }
         let n = self.n();
         let avail = ui.available_rect_before_wrap();
         let header_h = 36.0;
@@ -343,11 +453,16 @@ impl BinaryView {
                 ui.horizontal_centered(|ui| {
                     widgets::side_chip(ui, p, n);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let lock = if self.read_only[p] { "🔒" } else { "🔓" };
-                        widgets::toggle_button(
+                        let lock = if self.read_only[p] {
+                            Icon::Lock
+                        } else {
+                            Icon::Unlock
+                        };
+                        widgets::toggle_icon_button(
                             ui,
                             &mut self.read_only[p],
-                            lock,
+                            Some(lock),
+                            "",
                             tr("label.read_only"),
                         );
                         widgets::chip(ui, &size, pal.text_dim, pal.control);
@@ -394,6 +509,7 @@ impl BinaryView {
                         let off = line * bpl + col;
                         self.cursor = Some(off);
                         self.cur = self.diffs.iter().position(|r| r.contains(&off));
+                        self.hit = None;
                     }
                 }
             }
@@ -432,7 +548,8 @@ impl BinaryView {
                         (_, true, false) => c.inline,
                         _ => Color32::TRANSPARENT,
                     };
-                    let bg = if self.cursor == Some(off) {
+                    let found = self.hit.as_ref().is_some_and(|h| h.contains(&off));
+                    let bg = if self.cursor == Some(off) || found {
                         c.find_hit
                     } else {
                         bg
@@ -515,5 +632,86 @@ impl BinaryView {
             visible,
         );
         ui.allocate_rect(avail, Sense::hover());
+        self.goto_dialog(ui, max_len);
+    }
+
+    fn find_bar(&mut self, ui: &mut Ui) {
+        widgets::toolbar(ui, |ui| {
+            let dim = widgets::pal(ui).text_dim;
+            ui.add_space(4.0);
+            widgets::inline_icon(ui, Icon::Search, dim);
+            ui.add_space(4.0);
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.find.query)
+                    .hint_text(tr("label.find_bytes"))
+                    .margin(vec2(8.0, 4.0))
+                    .desired_width(280.0),
+            );
+            if self.find.focus {
+                r.request_focus();
+                self.find.focus = false;
+            }
+            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                let back = ui.input(|i| i.modifiers.shift);
+                self.find_next(!back);
+                r.request_focus();
+            }
+            if ui.input(|i| i.key_pressed(Key::Escape))
+                && self.goto.is_none()
+                && !widgets::modal_open(ui.ctx())
+            {
+                self.find.open = false;
+                self.hit = None;
+            }
+            let key = widgets::with_key;
+            if widgets::icon_button(ui, Icon::Prev, &key(tr("cmd.find_prev"), "Shift+F3")).clicked()
+            {
+                self.find_next(false);
+            }
+            if widgets::icon_button(ui, Icon::Next, &key(tr("cmd.find_next"), "F3")).clicked() {
+                self.find_next(true);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::icon_button(ui, Icon::Close, &key(tr("btn.close"), "Esc")).clicked() {
+                    self.find.open = false;
+                    self.hit = None;
+                }
+            });
+        });
+    }
+
+    fn goto_dialog(&mut self, ui: &mut Ui, max_len: usize) {
+        let Some(mut g) = self.goto.take() else {
+            return;
+        };
+        let mut open = !ui.input(|i| i.key_pressed(Key::Escape));
+        let mut go = false;
+        egui::Window::new(tr("cmd.goto_offset"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(tr("label.offset"));
+                    let hint = format!("0 – 0x{:X}", max_len.saturating_sub(1));
+                    let r = ui.add(egui::TextEdit::singleline(&mut g).hint_text(hint));
+                    r.request_focus();
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        go = true;
+                    }
+                    if ui.button(tr("btn.ok")).clicked() {
+                        go = true;
+                    }
+                });
+            });
+        if go {
+            match binary::parse_offset(&g) {
+                Some(off) => self.go_to(off),
+                None => self.status = trf("msg.not_found", &[("text", g)]),
+            }
+        } else if open {
+            self.goto = Some(g);
+        }
     }
 }

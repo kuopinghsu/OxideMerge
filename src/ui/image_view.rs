@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::core::image_cmp::{self, ImageDiff};
 use crate::i18n::{tr, trf};
 use crate::ui::theme::Colors;
-use crate::ui::widgets;
+use crate::ui::widgets::{self, Icon, Outcome};
 use egui::{
     pos2, vec2, Color32, ColorImage, Rect, Sense, Stroke, StrokeKind, TextureHandle,
     TextureOptions, Ui, Vec2,
@@ -16,8 +16,14 @@ use std::path::PathBuf;
 pub enum ImgMode {
     SideBySide,
     Overlay,
+    /// The first image left of a draggable divider, the last one right of it.
+    Swipe,
+    /// The first and last images in turn.
+    Blink,
     Difference,
 }
+
+const BLINK_SECS: f64 = 0.6;
 
 pub struct ImageView {
     pub paths: Vec<PathBuf>,
@@ -36,12 +42,17 @@ pub struct ImageView {
     center: bool,
     show_blocks: bool,
     overlay_alpha: f32,
+    /// Divider position of the swipe mode, as a fraction of the view width.
+    swipe: f32,
     threshold: u8,
     block: u32,
     cur: Option<usize>,
     pub modified: Vec<bool>,
     undo: Vec<(Vec<RgbaImage>, Vec<bool>)>,
     pub status: String,
+    /// Set when difference navigation ran past the last (true) or first (false) difference,
+    /// so the app can move on to the next or previous file of the folder compare.
+    pub step_file: Option<bool>,
     id: egui::Id,
 }
 
@@ -65,6 +76,7 @@ impl ImageView {
             diff_dirty: true,
             diff,
             mode: ImgMode::SideBySide,
+            swipe: 0.5,
             zoom: 1.0,
             offset: Vec2::ZERO,
             fit: true,
@@ -78,6 +90,7 @@ impl ImageView {
             undo: Vec::new(),
             status: String::new(),
             id: egui::Id::new(("imgview", std::time::Instant::now())),
+            step_file: None,
         })
     }
 
@@ -117,25 +130,30 @@ impl ImageView {
         }
     }
 
-    pub fn next_diff(&mut self) {
-        if self.diff.regions.is_empty() {
-            return;
+    /// Selects the next difference; false when the last one is already selected.
+    pub fn next_diff(&mut self) -> bool {
+        let i = self.cur.map_or(0, |c| c + 1);
+        if i >= self.diff.regions.len() {
+            return false;
         }
-        let i = self
-            .cur
-            .map(|c| (c + 1).min(self.diff.regions.len() - 1))
-            .unwrap_or(0);
         self.cur = Some(i);
         self.center_on_current();
+        true
     }
 
-    pub fn prev_diff(&mut self) {
-        if self.diff.regions.is_empty() {
-            return;
-        }
-        let i = self.cur.map(|c| c.saturating_sub(1)).unwrap_or(0);
+    /// Selects the previous difference; false when the first one is already selected.
+    pub fn prev_diff(&mut self) -> bool {
+        let i = match self.cur {
+            Some(0) => return false,
+            Some(c) => c - 1,
+            None => match self.diff.regions.len() {
+                0 => return false,
+                n => n - 1,
+            },
+        };
         self.cur = Some(i);
         self.center_on_current();
+        true
     }
 
     pub fn first_diff(&mut self) {
@@ -199,9 +217,10 @@ impl ImageView {
     pub fn save(&mut self) -> anyhow::Result<()> {
         for i in 0..self.n() {
             if self.modified[i] {
-                self.images[i]
-                    .save(&self.paths[i])
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let format = image::ImageFormat::from_path(&self.paths[i])?;
+                let mut bytes = std::io::Cursor::new(Vec::new());
+                self.images[i].write_to(&mut bytes, format)?;
+                crate::core::fsutil::write_atomic(&self.paths[i], bytes.get_ref())?;
                 self.modified[i] = false;
                 self.status = trf(
                     "msg.saved",
@@ -210,6 +229,14 @@ impl ImageView {
             }
         }
         Ok(())
+    }
+
+    pub fn outcome(&self) -> Outcome {
+        if self.diff.diff_pixels == 0 {
+            Outcome::Identical
+        } else {
+            Outcome::Different
+        }
     }
 
     pub fn status_line(&self) -> String {
@@ -290,11 +317,13 @@ impl ImageView {
                 &[
                     (ImgMode::SideBySide, tr("img.side_by_side")),
                     (ImgMode::Overlay, tr("img.overlay")),
+                    (ImgMode::Swipe, tr("img.swipe")),
+                    (ImgMode::Blink, tr("img.blink")),
                     (ImgMode::Difference, tr("img.difference")),
                 ],
             );
             widgets::toolbar_sep(ui);
-            if widgets::icon_button(ui, "−", tr("cmd.zoom_out")).clicked() {
+            if widgets::icon_button(ui, Icon::ZoomOut, tr("cmd.zoom_out")).clicked() {
                 self.zoom = (self.zoom / 1.25).max(0.02);
             }
             widgets::chip(
@@ -303,10 +332,10 @@ impl ImageView {
                 pal.text,
                 pal.control,
             );
-            if widgets::icon_button(ui, "+", tr("cmd.zoom_in")).clicked() {
+            if widgets::icon_button(ui, Icon::ZoomIn, tr("cmd.zoom_in")).clicked() {
                 self.zoom = (self.zoom * 1.25).min(64.0);
             }
-            if widgets::ghost_button(ui, &format!("⛶ {}", tr("img.fit"))).clicked() {
+            if widgets::ghost_icon_button(ui, Icon::Fit, tr("img.fit")).clicked() {
                 self.fit = true;
             }
             if widgets::ghost_button(ui, "1:1").clicked() {
@@ -314,10 +343,11 @@ impl ImageView {
                 self.offset = Vec2::ZERO;
             }
             widgets::toolbar_sep(ui);
-            widgets::toggle_button(
+            widgets::toggle_icon_button(
                 ui,
                 &mut self.show_blocks,
-                &format!("▦ {}", tr("img.show_blocks")),
+                Some(Icon::Table),
+                tr("img.show_blocks"),
                 tr("img.show_blocks"),
             );
             ui.add_space(6.0);
@@ -334,24 +364,42 @@ impl ImageView {
                 ui.add(egui::Slider::new(&mut self.overlay_alpha, 0.0..=1.0).show_value(false));
             }
             widgets::toolbar_sep(ui);
-            if widgets::icon_button(ui, "↑", tr("cmd.prev_diff")).clicked() {
-                self.prev_diff();
+            let key = widgets::with_key;
+            if widgets::icon_button(ui, Icon::Prev, &key(tr("cmd.prev_diff"), "Alt+↑")).clicked()
+                && !self.prev_diff()
+            {
+                self.step_file = Some(false);
             }
-            if widgets::icon_button(ui, "↓", tr("cmd.next_diff")).clicked() {
-                self.next_diff();
+            if widgets::icon_button(ui, Icon::Next, &key(tr("cmd.next_diff"), "Alt+↓")).clicked()
+                && !self.next_diff()
+            {
+                self.step_file = Some(true);
             }
-            if widgets::icon_button(ui, "→", tr("cmd.copy_right")).clicked() {
+            if widgets::icon_button(ui, Icon::CopyRight, &key(tr("cmd.copy_right"), "Alt+→"))
+                .clicked()
+            {
                 self.copy_current(true);
             }
-            if widgets::icon_button(ui, "←", tr("cmd.copy_left")).clicked() {
+            if widgets::icon_button(ui, Icon::CopyLeft, &key(tr("cmd.copy_left"), "Alt+←"))
+                .clicked()
+            {
                 self.copy_current(false);
             }
-            if widgets::icon_button_enabled(ui, !self.undo.is_empty(), "↶", tr("cmd.undo"))
-                .clicked()
+            if widgets::icon_button_enabled(
+                ui,
+                !self.undo.is_empty(),
+                Icon::Undo,
+                &key(tr("cmd.undo"), "Ctrl+Z"),
+            )
+            .clicked()
             {
                 self.undo();
             }
         });
+        if self.outcome() == Outcome::Identical {
+            let color = widgets::pal(ui).success;
+            widgets::info_bar(ui, Icon::Check, tr("msg.images_identical"), color);
+        }
         if recompute {
             self.recompute();
         }
@@ -388,16 +436,42 @@ impl ImageView {
             self.offset += resp.drag_delta();
         }
         if let Some(hover) = resp.hover_pos() {
-            let dy = ui.input(|i| i.smooth_scroll_delta.y);
-            if dy != 0.0 {
+            // Trackpads scroll in points and pan; mouse wheels scroll in lines and zoom.
+            // Pinching and Ctrl/Cmd+scroll arrive as zoom_delta.
+            let (mut factor, pan) = ui.input(|i| {
+                let mut factor = i.zoom_delta();
+                let mut pan = Vec2::ZERO;
+                for e in &i.events {
+                    let egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                    } = e
+                    else {
+                        continue;
+                    };
+                    if modifiers.command || modifiers.ctrl {
+                        continue;
+                    }
+                    match unit {
+                        egui::MouseWheelUnit::Point => pan += *delta,
+                        _ if modifiers.shift => pan.x += delta.y * 40.0,
+                        _ => factor *= 1.1_f32.powf(delta.y),
+                    }
+                }
+                (factor, pan)
+            });
+            self.offset += pan;
+            if factor != 1.0 {
                 let local = hover
                     - pos2(
                         avail.left() + ((hover.x - avail.left()) / pane_w).floor() * pane_w,
                         avail.top() + header_h,
                     );
                 let old = self.zoom;
-                let new = (old * (1.0 + dy * 0.0015)).clamp(0.02, 64.0);
-                self.offset = local - (local - self.offset) * (new / old);
+                let new = (old * factor).clamp(0.02, 64.0);
+                factor = new / old;
+                self.offset = local - (local - self.offset) * factor;
                 self.zoom = new;
             }
         }
@@ -467,14 +541,18 @@ impl ImageView {
                             );
                         });
                     }
-                    ImgMode::Overlay | ImgMode::Difference => {
-                        let title = if self.mode == ImgMode::Overlay {
-                            tr("img.overlay")
-                        } else {
-                            tr("img.difference")
+                    mode => {
+                        let title = match mode {
+                            ImgMode::Overlay => tr("img.overlay"),
+                            ImgMode::Swipe => tr("img.swipe"),
+                            ImgMode::Blink => tr("img.blink"),
+                            _ => tr("img.difference"),
                         };
                         ui.label(egui::RichText::new(title).font(crate::ui::theme::semibold(13.5)));
                         widgets::chip(ui, &dims.join(" / "), pal.text_dim, pal.control);
+                        if mode == ImgMode::Blink {
+                            widgets::side_chip(ui, self.blink_side(ui), n);
+                        }
                     }
                 });
             });
@@ -540,6 +618,66 @@ impl ImageView {
                         Color32::from_white_alpha(a),
                     );
                 }
+                ImgMode::Swipe => {
+                    let last = self.n() - 1;
+                    let split = view.left() + view.width() * self.swipe;
+                    let handle = Rect::from_center_size(
+                        pos2(split, view.center().y),
+                        vec2(16.0, view.height()),
+                    );
+                    let h = ui
+                        .interact(handle, self.id.with("swipe"), Sense::drag())
+                        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                    if let Some(pos) = h.interact_pointer_pos().filter(|_| h.dragged()) {
+                        self.swipe = ((pos.x - view.left()) / view.width()).clamp(0.0, 1.0);
+                    }
+                    let split = view.left() + view.width() * self.swipe;
+                    for (i, clip) in [
+                        (0, Rect::from_min_max(view.min, pos2(split, view.bottom()))),
+                        (last, Rect::from_min_max(pos2(split, view.top()), view.max)),
+                    ] {
+                        if let Some(t) = &self.textures[i] {
+                            let size = vec2(
+                                self.images[i].width() as f32,
+                                self.images[i].height() as f32,
+                            );
+                            let r = Rect::from_min_size(origin, size * self.zoom);
+                            painter
+                                .with_clip_rect(clip)
+                                .image(t.id(), r, uv, Color32::WHITE);
+                        }
+                    }
+                    let stroke = if h.hovered() || h.dragged() {
+                        Stroke::new(3.0_f32, c.ui.accent)
+                    } else {
+                        Stroke::new(2.0_f32, Color32::WHITE)
+                    };
+                    painter.vline(
+                        split,
+                        view.y_range(),
+                        Stroke::new(4.0_f32, Color32::BLACK.gamma_multiply(0.35)),
+                    );
+                    painter.vline(split, view.y_range(), stroke);
+                    painter.circle(
+                        pos2(split, view.center().y),
+                        9.0,
+                        c.ui.accent,
+                        Stroke::new(2.0_f32, Color32::WHITE),
+                    );
+                }
+                ImgMode::Blink => {
+                    let i = self.blink_side(ui);
+                    draw(
+                        &self.textures[i],
+                        self.images[i].width(),
+                        self.images[i].height(),
+                        Color32::WHITE,
+                    );
+                    let t = ui.input(|i| i.time);
+                    let left = BLINK_SECS - t % BLINK_SECS;
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_secs_f64(left));
+                }
                 ImgMode::Difference => draw(
                     &self.diff_tex,
                     self.diff.diff_image.width(),
@@ -604,5 +742,14 @@ impl ImageView {
             }
         }
         ui.allocate_rect(avail, Sense::hover());
+    }
+
+    /// The image shown by the blink mode now: the first one or the last one.
+    fn blink_side(&self, ui: &Ui) -> usize {
+        if ((ui.input(|i| i.time) / BLINK_SECS) as u64).is_multiple_of(2) {
+            0
+        } else {
+            self.n() - 1
+        }
     }
 }

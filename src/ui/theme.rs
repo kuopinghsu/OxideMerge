@@ -180,6 +180,12 @@ pub fn colors(dark: bool) -> Colors {
 
 /// Installs the visual style (colors, spacing, rounding, typography) for the given mode.
 pub fn apply(ctx: &egui::Context, dark: bool) {
+    // Pin egui's own theme so it never swaps in its stock style behind ours.
+    ctx.set_theme(if dark {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    });
     let p = palette(dark);
     let mut style = (*ctx.style()).clone();
 

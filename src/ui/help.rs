@@ -1,6 +1,7 @@
 //! Help & Shortcuts dialog, opened with F1, `?`, the Help menu, or the help button in the header.
 
 use crate::i18n::{tr, trf};
+use crate::ui::text_view::REPLACE_KEY;
 use crate::ui::{about, theme, widgets};
 use egui::{FontId, Key, Margin, Modifiers, RichText, Stroke, Vec2};
 use std::path::Path;
@@ -15,6 +16,8 @@ const KEYBOARD: &[Section] = &[
         "help.general",
         &[
             (&["F1", "?"], "help.toggle"),
+            (&["Ctrl+K", "Ctrl+Shift+P"], "palette.title"),
+            (&["Ctrl+N"], "menu.new"),
             (&["Ctrl+O"], "help.open"),
             (&["Ctrl+S"], "menu.save"),
             (&["Ctrl+Shift+S"], "btn.save_all"),
@@ -44,10 +47,18 @@ const KEYBOARD: &[Section] = &[
             (&["↑ ↓", "PgUp PgDn"], "help.move_line"),
             (&["Ctrl+Home", "Ctrl+End"], "help.first_last_line"),
             (&["← →"], "help.switch_pane"),
+            (&["Shift+↑ ↓", "Shift+PgUp PgDn"], "help.select_lines"),
+            (&["Ctrl+C"], "help.copy_lines"),
+            (&["Ctrl+V"], "help.paste"),
             (&["F2", "Enter"], "cmd.edit_line"),
+            (&["Ctrl+F2"], "cmd.toggle_bookmark"),
+            (&["F4", "Shift+F4"], "help.next_prev_bookmark"),
             (&["Ctrl+F"], "cmd.find"),
+            (&[REPLACE_KEY], "cmd.replace"),
             (&["F3", "Shift+F3"], "help.find_next_prev"),
             (&["Ctrl+G"], "dlg.goto"),
+            (&["Alt+C"], "cmd.collapse_unchanged"),
+            (&["Alt+Z"], "cmd.word_wrap"),
             (&["Esc"], "help.close_find"),
         ],
     ),
@@ -58,8 +69,17 @@ const KEYBOARD: &[Section] = &[
             (&["Shift+↑ ↓"], "help.extend_selection"),
             (&["Ctrl+A"], "help.select_all"),
             (&["Enter"], "help.open_item"),
+            (&["Space"], "help.quick_preview"),
             (&["→", "←"], "help.expand_collapse"),
             (&["Alt+→", "Alt+←"], "help.copy_selection"),
+        ],
+    ),
+    (
+        "help.binary_compare",
+        &[
+            (&["Ctrl+F"], "cmd.find"),
+            (&["F3", "Shift+F3"], "help.find_next_prev"),
+            (&["Ctrl+G"], "cmd.goto_offset"),
         ],
     ),
 ];
@@ -78,8 +98,13 @@ const MOUSE: &[Section] = &[
         "help.text_compare",
         &[
             (&["gesture.click"], "help.select_line"),
+            (
+                &["gesture.drag", "Shift+gesture.click"],
+                "help.select_lines",
+            ),
             (&["gesture.double_click"], "cmd.edit_line"),
             (&["gesture.right_click"], "help.line_menu"),
+            (&["gesture.click"], "help.expand_fold"),
             (&["gesture.wheel"], "help.scroll"),
             (&["gesture.click", "gesture.drag"], "help.location_pane"),
         ],
@@ -98,9 +123,10 @@ const MOUSE: &[Section] = &[
     (
         "help.image_compare",
         &[
-            (&["gesture.wheel"], "help.zoom_pointer"),
-            (&["gesture.drag"], "help.pan"),
+            (&["gesture.wheel", "gesture.pinch"], "help.zoom_pointer"),
+            (&["gesture.drag", "gesture.two_finger"], "help.pan"),
             (&["gesture.click"], "help.select_region"),
+            (&["gesture.drag"], "help.swipe"),
         ],
     ),
     (

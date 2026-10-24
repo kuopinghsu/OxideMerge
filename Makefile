@@ -5,7 +5,7 @@ CARGO ?= cargo
 BIN   := oxidemerge
 ARGS  ?=
 
-# `cargo pkgid` prints ".../OxideMerge#oxidemerge@0.9.1" (or "...#0.9.1").
+# `cargo pkgid` prints ".../OxideMerge#oxidemerge@0.9.2" (or "...#0.9.2").
 # Make before 4.3 (macOS ships 3.81) treats a bare `#` inside a function call as a comment.
 HASH    := \#
 VERSION := $(lastword $(subst @, ,$(subst $(HASH), ,$(shell $(CARGO) pkgid))))
@@ -48,8 +48,8 @@ help:
 	@echo '  ci                check + lint + test'
 	@echo '  install           cargo install into ~/.cargo/bin'
 	@echo '  uninstall         Remove the installed binary'
-	@echo '  shell-register    Install, then add the Explorer context menu (Windows)'
-	@echo '  shell-unregister  Remove the Explorer context menu (Windows)'
+	@echo '  shell-register    Install, then add the file manager entries (Explorer, Finder, Linux)'
+	@echo '  shell-unregister  Remove the file manager entries'
 	@echo '  languages         List the available UI languages'
 	@echo '  dist              Release build packaged into dist/$(DIST_NAME)'
 	@echo '  appimage          Linux x86_64 AppImage in dist/'

@@ -10,6 +10,10 @@
 //! - **Compare As** (files only) compares with the file type forced.
 //!
 //! Explorer starts one process per selected item; `gather` lets them find each other.
+//!
+//! On macOS `register` writes Finder Quick Actions to `~/Library/Services`, and on Linux it adds
+//! entries for Nautilus, Nemo and Dolphin. Those file managers pass all selected items to one
+//! process, which runs with `--compare-selected`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -350,21 +354,437 @@ mod imp {
     }
 }
 
+/// The entries offered by file managers other than Explorer: name, label key, option, and
+/// whether the option takes all selected items (else only the first).
 #[cfg(not(windows))]
+const ENTRIES: &[(&str, &str, &str, bool)] = &[
+    ("Compare", "shell.compare", "--compare-selected", true),
+    ("Select Left", "shell.select_left", "--select-left", false),
+    (
+        "Select Middle",
+        "shell.select_middle",
+        "--select-middle",
+        false,
+    ),
+];
+
+/// Quotes `s` for a POSIX shell.
+#[cfg(not(windows))]
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn write_executable(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    std::fs::write(path, text)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+}
+
+/// Finder Quick Actions: one Automator workflow per entry in `~/Library/Services`.
+#[cfg(target_os = "macos")]
 mod imp {
-    use super::Selection;
-    use anyhow::{bail, Result};
+    use super::{sh_quote, Selection, ENTRIES};
+    use crate::i18n::tr;
+    use anyhow::{Context, Result};
+    use std::path::{Path, PathBuf};
+
+    fn services_dir() -> Option<PathBuf> {
+        Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Services"))
+    }
+
+    fn bundle(dir: &Path, name: &str) -> PathBuf {
+        dir.join(format!("OxideMerge - {name}.workflow"))
+    }
+
+    fn xml(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
 
     pub fn register() -> Result<()> {
-        bail!("shell integration is only available on Windows")
+        let dir = services_dir().context("HOME is not set")?;
+        register_in(&dir, &std::env::current_exe()?)?;
+        // Makes the new entries show up without logging out.
+        let _ = std::process::Command::new("/System/Library/CoreServices/pbs")
+            .arg("-update")
+            .status();
+        Ok(())
+    }
+
+    pub(super) fn register_in(dir: &Path, exe: &Path) -> Result<()> {
+        unregister_in(dir);
+        for (i, (name, label, option, all)) in ENTRIES.iter().enumerate() {
+            let contents = bundle(dir, name).join("Contents");
+            std::fs::create_dir_all(&contents)?;
+            let label = format!("OxideMerge: {}", tr(label));
+            std::fs::write(contents.join("Info.plist"), info_plist(&label))?;
+            let items = if *all { "\"$@\"" } else { "\"$1\"" };
+            let command = format!(
+                "nohup {} {option} {items} >/dev/null 2>&1 &",
+                sh_quote(&exe.display().to_string())
+            );
+            std::fs::write(contents.join("document.wflow"), workflow(&command, i))?;
+        }
+        Ok(())
+    }
+
+    fn unregister_in(dir: &Path) {
+        for (name, ..) in ENTRIES {
+            let _ = std::fs::remove_dir_all(bundle(dir, name));
+        }
     }
 
     pub fn unregister() -> Result<()> {
+        if let Some(dir) = services_dir() {
+            unregister_in(&dir);
+        }
         Ok(())
     }
 
     pub fn is_registered() -> bool {
-        false
+        services_dir().is_some_and(|d| bundle(&d, ENTRIES[0].0).exists())
+    }
+
+    pub fn update_labels(_: &Selection) {}
+
+    fn info_plist(label: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSIconName</key>
+			<string>NSActionTemplate</string>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>{}</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>runWorkflowAsService</string>
+			<key>NSRequiredContext</key>
+			<dict>
+				<key>NSApplicationIdentifier</key>
+				<string>com.apple.finder</string>
+			</dict>
+			<key>NSSendFileTypes</key>
+			<array>
+				<string>public.item</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
+"#,
+            xml(label)
+        )
+    }
+
+    /// A workflow with one "Run Shell Script" action that gets the selected items as arguments.
+    fn workflow(command: &str, n: usize) -> String {
+        let uuid = |k: usize| format!("7F3C9A10-0D2B-4E5A-9C1D-{:012X}", n * 3 + k);
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AMApplicationBuild</key>
+	<string>523</string>
+	<key>AMApplicationVersion</key>
+	<string>2.10</string>
+	<key>AMDocumentVersion</key>
+	<string>2</string>
+	<key>actions</key>
+	<array>
+		<dict>
+			<key>action</key>
+			<dict>
+				<key>AMAccepts</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Optional</key>
+					<true/>
+					<key>Types</key>
+					<array>
+						<string>com.apple.cocoa.string</string>
+					</array>
+				</dict>
+				<key>AMActionVersion</key>
+				<string>2.0.3</string>
+				<key>AMApplication</key>
+				<array>
+					<string>Automator</string>
+				</array>
+				<key>AMParameterProperties</key>
+				<dict>
+					<key>COMMAND_STRING</key>
+					<dict/>
+					<key>CheckedForUserDefaultShell</key>
+					<dict/>
+					<key>inputMethod</key>
+					<dict/>
+					<key>shell</key>
+					<dict/>
+					<key>source</key>
+					<dict/>
+				</dict>
+				<key>AMProvides</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Types</key>
+					<array>
+						<string>com.apple.cocoa.string</string>
+					</array>
+				</dict>
+				<key>ActionBundlePath</key>
+				<string>/System/Library/Automator/Run Shell Script.action</string>
+				<key>ActionName</key>
+				<string>Run Shell Script</string>
+				<key>ActionParameters</key>
+				<dict>
+					<key>COMMAND_STRING</key>
+					<string>{command}</string>
+					<key>CheckedForUserDefaultShell</key>
+					<true/>
+					<key>inputMethod</key>
+					<integer>1</integer>
+					<key>shell</key>
+					<string>/bin/sh</string>
+					<key>source</key>
+					<string></string>
+				</dict>
+				<key>BundleIdentifier</key>
+				<string>com.apple.RunShellScript</string>
+				<key>CFBundleVersion</key>
+				<string>2.0.3</string>
+				<key>CanShowSelectedItemsWhenRun</key>
+				<false/>
+				<key>CanShowWhenRun</key>
+				<true/>
+				<key>Category</key>
+				<array>
+					<string>AMCategoryUtilities</string>
+				</array>
+				<key>Class Name</key>
+				<string>RunShellScriptAction</string>
+				<key>InputUUID</key>
+				<string>{input}</string>
+				<key>Keywords</key>
+				<array>
+					<string>Shell</string>
+					<string>Script</string>
+				</array>
+				<key>OutputUUID</key>
+				<string>{output}</string>
+				<key>UUID</key>
+				<string>{id}</string>
+				<key>UnlocalizedApplications</key>
+				<array>
+					<string>Automator</string>
+				</array>
+				<key>isViewVisible</key>
+				<integer>1</integer>
+				<key>location</key>
+				<string>309.000000:253.000000</string>
+				<key>nibPath</key>
+				<string>/System/Library/Automator/Run Shell Script.action/Contents/Resources/Base.lproj/main.nib</string>
+			</dict>
+			<key>isViewVisible</key>
+			<integer>1</integer>
+		</dict>
+	</array>
+	<key>connectors</key>
+	<dict/>
+	<key>workflowMetaData</key>
+	<dict>
+		<key>applicationBundleIDsByPath</key>
+		<dict/>
+		<key>applicationPaths</key>
+		<array/>
+		<key>inputTypeIdentifier</key>
+		<string>com.apple.Automator.fileSystemObject</string>
+		<key>outputTypeIdentifier</key>
+		<string>com.apple.Automator.nothing</string>
+		<key>presentationMode</key>
+		<integer>15</integer>
+		<key>processesInput</key>
+		<false/>
+		<key>serviceInputTypeIdentifier</key>
+		<string>com.apple.Automator.fileSystemObject</string>
+		<key>serviceOutputTypeIdentifier</key>
+		<string>com.apple.Automator.nothing</string>
+		<key>serviceProcessesInput</key>
+		<false/>
+		<key>systemImageName</key>
+		<string>NSActionTemplate</string>
+		<key>useAutomaticInputType</key>
+		<false/>
+		<key>workflowTypeIdentifier</key>
+		<string>com.apple.Automator.servicesMenu</string>
+	</dict>
+</dict>
+</plist>
+"#,
+            command = xml(command),
+            input = uuid(0),
+            output = uuid(1),
+            id = uuid(2),
+        )
+    }
+}
+
+/// Linux and BSD desktops: Nautilus scripts, Nemo actions and a Dolphin service menu, for the
+/// file managers that are installed.
+#[cfg(all(not(windows), not(target_os = "macos")))]
+mod imp {
+    use super::{sh_quote, write_executable, Selection, ENTRIES};
+    use crate::i18n::tr;
+    use anyhow::{bail, Context, Result};
+    use std::path::{Path, PathBuf};
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    pub(super) enum Manager {
+        Nautilus,
+        Nemo,
+        Dolphin,
+    }
+
+    const MANAGERS: &[(Manager, &str)] = &[
+        (Manager::Nautilus, "nautilus"),
+        (Manager::Nemo, "nemo"),
+        (Manager::Dolphin, "dolphin"),
+    ];
+
+    fn data_dir() -> Option<PathBuf> {
+        match std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()) {
+            Some(d) => Some(PathBuf::from(d)),
+            None => Some(PathBuf::from(std::env::var_os("HOME")?).join(".local/share")),
+        }
+    }
+
+    fn installed() -> Vec<Manager> {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        MANAGERS
+            .iter()
+            .filter(|(_, bin)| std::env::split_paths(&path).any(|d| d.join(bin).is_file()))
+            .map(|(m, _)| *m)
+            .collect()
+    }
+
+    fn nautilus_dir(data: &Path) -> PathBuf {
+        data.join("nautilus/scripts/OxideMerge")
+    }
+
+    fn nemo_action(data: &Path, i: usize) -> PathBuf {
+        data.join(format!("nemo/actions/oxidemerge-{i}.nemo_action"))
+    }
+
+    fn dolphin_menu(data: &Path) -> PathBuf {
+        data.join("kio/servicemenus/oxidemerge.desktop")
+    }
+
+    /// Quotes an argument of a desktop entry's `Exec` key.
+    fn exec_quote(s: &str) -> String {
+        let mut out = String::from("\"");
+        for c in s.chars() {
+            if matches!(c, '"' | '`' | '$' | '\\') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push('"');
+        out
+    }
+
+    pub fn register() -> Result<()> {
+        let managers = installed();
+        if managers.is_empty() {
+            bail!("no supported file manager (Nautilus, Nemo or Dolphin) was found");
+        }
+        let data = data_dir().context("HOME is not set")?;
+        register_in(&data, &std::env::current_exe()?, &managers)
+    }
+
+    pub(super) fn register_in(data: &Path, exe: &Path, managers: &[Manager]) -> Result<()> {
+        unregister_in(data);
+        let exe = exe.display().to_string();
+        for m in managers {
+            match m {
+                Manager::Nautilus => {
+                    for (_, label, option, all) in ENTRIES {
+                        let items = if *all { "\"$@\"" } else { "\"$1\"" };
+                        let script =
+                            format!("#!/bin/sh\nexec {} {option} {items}\n", sh_quote(&exe));
+                        let name = tr(label).replace('/', "-");
+                        write_executable(&nautilus_dir(data).join(name), &script)?;
+                    }
+                }
+                Manager::Nemo => {
+                    for (i, (_, label, option, all)) in ENTRIES.iter().enumerate() {
+                        let selection = if *all { "notnone" } else { "s" };
+                        let text = format!(
+                            "[Nemo Action]\nName=OxideMerge: {}\nExec={} {option} %F\n\
+                             Icon-Name=oxidemerge\nSelection={selection}\nExtensions=any;\n",
+                            tr(label),
+                            exec_quote(&exe)
+                        );
+                        let path = nemo_action(data, i);
+                        std::fs::create_dir_all(path.parent().unwrap())?;
+                        std::fs::write(path, text)?;
+                    }
+                }
+                Manager::Dolphin => {
+                    let ids: Vec<String> = (0..ENTRIES.len()).map(|i| format!("om{i}")).collect();
+                    let mut text = format!(
+                        "[Desktop Entry]\nType=Service\nMimeType=all/all;\n\
+                         X-KDE-ServiceTypes=KonqPopupMenu/Plugin\nX-KDE-Submenu=OxideMerge\n\
+                         Actions={};\n",
+                        ids.join(";")
+                    );
+                    for (id, (_, label, option, all)) in ids.iter().zip(ENTRIES) {
+                        let code = if *all { "%F" } else { "%f" };
+                        text.push_str(&format!(
+                            "\n[Desktop Action {id}]\nName={}\nIcon=oxidemerge\nExec={} {option} {code}\n",
+                            tr(label),
+                            exec_quote(&exe)
+                        ));
+                    }
+                    write_executable(&dolphin_menu(data), &text)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn unregister_in(data: &Path) {
+        let _ = std::fs::remove_dir_all(nautilus_dir(data));
+        for i in 0..ENTRIES.len() {
+            let _ = std::fs::remove_file(nemo_action(data, i));
+        }
+        let _ = std::fs::remove_file(dolphin_menu(data));
+    }
+
+    pub fn unregister() -> Result<()> {
+        if let Some(data) = data_dir() {
+            unregister_in(&data);
+        }
+        Ok(())
+    }
+
+    pub fn is_registered() -> bool {
+        data_dir().is_some_and(|d| {
+            nautilus_dir(&d).exists() || nemo_action(&d, 0).exists() || dolphin_menu(&d).exists()
+        })
     }
 
     pub fn update_labels(_: &Selection) {}
@@ -417,6 +837,46 @@ mod tests {
             clean_arg(Path::new("C:\\dir\\file.txt")),
             PathBuf::from("C:\\dir\\file.txt")
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn writes_finder_quick_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        imp::register_in(dir.path(), Path::new("/Apps/It's here/oxidemerge")).unwrap();
+        let wf = dir.path().join("OxideMerge - Compare.workflow/Contents");
+        let doc = std::fs::read_to_string(wf.join("document.wflow")).unwrap();
+        assert!(doc.contains(
+            r#"nohup '/Apps/It'\''s here/oxidemerge' --compare-selected "$@" &gt;/dev/null 2&gt;&amp;1 &amp;"#
+        ));
+        assert!(std::fs::read_to_string(wf.join("Info.plist"))
+            .unwrap()
+            .contains("com.apple.finder"));
+        assert!(dir
+            .path()
+            .join("OxideMerge - Select Left.workflow/Contents/document.wflow")
+            .exists());
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn writes_linux_file_manager_entries() {
+        use imp::Manager;
+        let dir = tempfile::tempdir().unwrap();
+        let all = [Manager::Nautilus, Manager::Nemo, Manager::Dolphin];
+        imp::register_in(dir.path(), Path::new("/opt/om/oxidemerge"), &all).unwrap();
+        let d = dir.path();
+        let script =
+            std::fs::read_to_string(d.join("nautilus/scripts/OxideMerge/Compare")).unwrap();
+        assert!(script.contains("exec '/opt/om/oxidemerge' --compare-selected \"$@\""));
+        let nemo =
+            std::fs::read_to_string(d.join("nemo/actions/oxidemerge-1.nemo_action")).unwrap();
+        assert!(
+            nemo.contains("Exec=\"/opt/om/oxidemerge\" --select-left %F")
+                && nemo.contains("Selection=s")
+        );
+        let kde = std::fs::read_to_string(d.join("kio/servicemenus/oxidemerge.desktop")).unwrap();
+        assert!(kde.contains("Actions=om0;om1;om2;") && kde.contains("--compare-selected %F"));
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! Shared widgets: buttons, toolbars, chips, segmented controls, scrollbars and the location pane.
 
+use crate::ui::icons;
+pub use crate::ui::icons::Icon;
 use crate::ui::theme::{self, Palette};
 use egui::{
     Align2, Color32, CornerRadius, FontId, Margin, Rect, Response, Sense, Stroke, StrokeKind, Ui,
-    Vec2,
+    Vec2, WidgetInfo, WidgetType,
 };
 
 pub fn pal(ui: &Ui) -> Palette {
@@ -31,9 +33,37 @@ enum Look {
     Segment(bool),
 }
 
+const ICON_SIZE: f32 = 16.0;
+
+/// Formats a tooltip with the keyboard shortcut that does the same thing, written like the
+/// Help & Shortcuts dialog writes it.
+pub fn with_key(tip: &str, key: &str) -> String {
+    let key = if cfg!(target_os = "macos") {
+        key.replace("Ctrl+", "⌘")
+    } else {
+        key.to_string()
+    };
+    format!("{tip}  ({key})")
+}
+
+/// Accent outline around a widget that has keyboard focus (focus only moves with Tab).
+pub fn focus_ring(ui: &Ui, resp: &Response, rect: Rect, radius: f32) {
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(1.5),
+            radius + 1.5,
+            Stroke::new(2.0_f32, pal(ui).accent),
+            StrokeKind::Outside,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn paint_button(
     ui: &mut Ui,
+    icon: Option<Icon>,
     text: &str,
+    a11y_label: &str,
     font: FontId,
     min: Vec2,
     look: Look,
@@ -47,8 +77,18 @@ fn paint_button(
         _ => p.text,
     };
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, fg);
+    let text_w = if text.is_empty() {
+        0.0
+    } else {
+        galley.size().x
+    };
+    let icon_w = match (icon.is_some(), text.is_empty()) {
+        (false, _) => 0.0,
+        (true, true) => ICON_SIZE,
+        (true, false) => ICON_SIZE + 6.0,
+    };
     let size = Vec2::new(
-        (galley.size().x + 20.0).max(min.x),
+        (icon_w + text_w + 20.0).max(min.x),
         min.y.max(galley.size().y + 8.0),
     );
     let (rect, resp) = ui.allocate_exact_size(
@@ -59,6 +99,11 @@ fn paint_button(
             Sense::hover()
         },
     );
+    resp.widget_info(|| match look {
+        Look::Toggle(on) => WidgetInfo::selected(WidgetType::Checkbox, enabled, on, a11y_label),
+        Look::Segment(on) => WidgetInfo::selected(WidgetType::RadioButton, enabled, on, a11y_label),
+        _ => WidgetInfo::labeled(WidgetType::Button, enabled, a11y_label),
+    });
     if ui.is_rect_visible(rect) {
         let hovered = enabled && resp.hovered();
         let pressed = enabled && resp.is_pointer_button_down_on();
@@ -93,8 +138,19 @@ fn paint_button(
             stroke,
             StrokeKind::Inside,
         );
-        let pos = rect.center() - galley.size() / 2.0;
-        ui.painter().galley(pos, galley, fg);
+        let left = rect.center().x - (icon_w + text_w) / 2.0;
+        if let Some(icon) = icon {
+            let r = Rect::from_center_size(
+                egui::pos2(left + ICON_SIZE / 2.0, rect.center().y),
+                Vec2::splat(ICON_SIZE),
+            );
+            icons::paint(ui.painter(), r, icon, fg);
+        }
+        if !text.is_empty() {
+            let pos = egui::pos2(left + icon_w, rect.center().y - galley.size().y / 2.0);
+            ui.painter().galley(pos, galley, fg);
+        }
+        focus_ring(ui, &resp, rect, 7.0);
     }
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -103,16 +159,25 @@ fn paint_button(
     }
 }
 
-/// Square toolbar button showing a single glyph; highlights on hover.
-pub fn icon_button(ui: &mut Ui, icon: &str, tip: &str) -> Response {
+/// Non-interactive icon in the flow of a layout, for example before a label.
+pub fn inline_icon(ui: &mut Ui, icon: Icon, color: Color32) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(ICON_SIZE), Sense::hover());
+    icons::paint(ui.painter(), rect, icon, color);
+    resp
+}
+
+/// Square toolbar button showing an icon; highlights on hover.
+pub fn icon_button(ui: &mut Ui, icon: Icon, tip: &str) -> Response {
     icon_button_enabled(ui, true, icon, tip)
 }
 
-pub fn icon_button_enabled(ui: &mut Ui, enabled: bool, icon: &str, tip: &str) -> Response {
+pub fn icon_button_enabled(ui: &mut Ui, enabled: bool, icon: Icon, tip: &str) -> Response {
     paint_button(
         ui,
-        icon,
-        FontId::proportional(16.0),
+        Some(icon),
+        "",
+        tip,
+        FontId::proportional(13.5),
         Vec2::new(30.0, 28.0),
         Look::Ghost,
         enabled,
@@ -124,6 +189,22 @@ pub fn icon_button_enabled(ui: &mut Ui, enabled: bool, icon: &str, tip: &str) ->
 pub fn ghost_button(ui: &mut Ui, label: &str) -> Response {
     paint_button(
         ui,
+        None,
+        label,
+        label,
+        FontId::proportional(13.5),
+        Vec2::new(0.0, 28.0),
+        Look::Ghost,
+        true,
+    )
+}
+
+/// Frameless button with an icon before its label.
+pub fn ghost_icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
+    paint_button(
+        ui,
+        Some(icon),
+        label,
         label,
         FontId::proportional(13.5),
         Vec2::new(0.0, 28.0),
@@ -136,6 +217,8 @@ pub fn ghost_button(ui: &mut Ui, label: &str) -> Response {
 pub fn primary_button(ui: &mut Ui, label: &str) -> Response {
     paint_button(
         ui,
+        None,
+        label,
         label,
         theme::semibold(14.0),
         Vec2::new(96.0, 32.0),
@@ -157,9 +240,22 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
 
 /// Button that stays highlighted while `on` is true.
 pub fn toggle_button(ui: &mut Ui, on: &mut bool, label: &str, tip: &str) -> Response {
+    toggle_icon_button(ui, on, None, label, tip)
+}
+
+/// Toggle showing an icon, optionally followed by a label.
+pub fn toggle_icon_button(
+    ui: &mut Ui,
+    on: &mut bool,
+    icon: Option<Icon>,
+    label: &str,
+    tip: &str,
+) -> Response {
     let r = paint_button(
         ui,
+        icon,
         label,
+        if label.is_empty() { tip } else { label },
         FontId::proportional(13.5),
         Vec2::new(30.0, 28.0),
         Look::Toggle(*on),
@@ -187,6 +283,8 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T,
                     let sel = *value == *v;
                     if paint_button(
                         ui,
+                        None,
+                        label,
                         label,
                         FontId::proportional(13.0),
                         Vec2::new(0.0, 24.0),
@@ -255,6 +353,144 @@ pub fn chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) -> Response {
             );
         })
         .response
+}
+
+/// Chip showing a setting and its value, with a chevron; clicking it opens an editor.
+pub fn chip_button(ui: &mut Ui, icon: Icon, label: &str, value: &str) -> Response {
+    let p = pal(ui);
+    let label_g =
+        ui.painter()
+            .layout_no_wrap(format!("{label}  "), FontId::proportional(12.0), p.text_dim);
+    let value_g = ui
+        .painter()
+        .layout_no_wrap(value.to_string(), theme::semibold(12.0), p.text);
+    let w = 8.0 + 14.0 + 5.0 + label_g.size().x + value_g.size().x.min(260.0) + 4.0 + 10.0 + 8.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::click());
+    resp.widget_info(|| {
+        WidgetInfo::labeled(WidgetType::ComboBox, true, format!("{label} {value}"))
+    });
+    if ui.is_rect_visible(rect) {
+        let fill = if resp.hovered() || resp.has_focus() {
+            p.control_hover
+        } else {
+            p.control
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, 12.0, fill);
+        let mut x = rect.left() + 8.0;
+        let icon_rect =
+            Rect::from_min_size(egui::pos2(x, rect.center().y - 7.0), Vec2::splat(14.0));
+        icons::paint(painter, icon_rect, icon, p.text_dim);
+        x += 14.0 + 5.0;
+        let y = rect.center().y;
+        let label_w = label_g.size().x;
+        painter.galley(
+            egui::pos2(x, y - label_g.size().y / 2.0),
+            label_g,
+            p.text_dim,
+        );
+        x += label_w;
+        let value_rect = Rect::from_min_max(
+            egui::pos2(x, rect.top()),
+            egui::pos2(rect.right() - 22.0, rect.bottom()),
+        );
+        painter.with_clip_rect(value_rect).galley(
+            egui::pos2(x, y - value_g.size().y / 2.0),
+            value_g,
+            p.text,
+        );
+        let chevron = Rect::from_center_size(egui::pos2(rect.right() - 14.0, y), Vec2::splat(12.0));
+        icons::paint(painter, chevron, Icon::Next, p.text_dim);
+        focus_ring(ui, &resp, rect, 12.0);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Single-line text field with a search icon in front and a clear button once it has text.
+pub fn search_edit(ui: &mut Ui, text: &mut String, hint: &str, width: f32) -> Response {
+    let p = pal(ui);
+    let margin = Margin {
+        left: 28,
+        right: 26,
+        top: 5,
+        bottom: 5,
+    };
+    let mut resp = ui.add(
+        egui::TextEdit::singleline(text)
+            .hint_text(hint)
+            .desired_width(width)
+            .margin(margin),
+    );
+    // The response covers only the text, inside the margin.
+    let r = resp.rect + margin;
+    let icon_rect =
+        Rect::from_center_size(egui::pos2(r.left() + 15.0, r.center().y), Vec2::splat(14.0));
+    icons::paint(ui.painter(), icon_rect, Icon::Search, p.text_dim);
+    if !text.is_empty() {
+        let clear_rect = Rect::from_center_size(
+            egui::pos2(r.right() - 14.0, r.center().y),
+            Vec2::splat(18.0),
+        );
+        let clear = ui
+            .interact(clear_rect, resp.id.with("clear"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        clear.widget_info(|| {
+            WidgetInfo::labeled(
+                WidgetType::Button,
+                true,
+                crate::i18n::tr("btn.clear_search"),
+            )
+        });
+        let color = if clear.hovered() { p.text } else { p.text_dim };
+        icons::paint(ui.painter(), clear_rect.shrink(3.0), Icon::Close, color);
+        if clear.clicked() {
+            text.clear();
+            resp.request_focus();
+            resp.mark_changed();
+        }
+    }
+    resp
+}
+
+/// Tinted strip under a toolbar announcing the state of the compare, e.g. that files are identical.
+pub fn info_bar(ui: &mut Ui, icon: Icon, text: &str, color: Color32) {
+    let p = pal(ui);
+    let r = egui::Frame::new()
+        .fill(color.gamma_multiply(if ui.visuals().dark_mode { 0.16 } else { 0.10 }))
+        .inner_margin(Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                inline_icon(ui, icon, color);
+                ui.add(egui::Label::new(egui::RichText::new(text).color(p.text)).selectable(false));
+            });
+        });
+    let rect = r.response.rect;
+    ui.painter().hline(
+        rect.x_range(),
+        rect.bottom() - 0.5,
+        Stroke::new(1.0_f32, p.border),
+    );
+}
+
+/// Result of the compare shown in a tab, for the status indicator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Outcome {
+    Busy,
+    Identical,
+    Different,
+    Error,
+}
+
+impl Outcome {
+    pub fn color(self, p: &Palette) -> Color32 {
+        match self {
+            Outcome::Busy => p.accent,
+            Outcome::Identical => p.success,
+            Outcome::Different => p.warning,
+            Outcome::Error => p.danger,
+        }
+    }
 }
 
 /// Identity color of a compare side (left / middle / right).
@@ -504,10 +740,11 @@ pub fn logo(ui: &mut Ui, size: f32) -> Response {
 }
 
 /// Full-width sidebar navigation entry.
-pub fn nav_item(ui: &mut Ui, selected: bool, icon: &str, label: &str) -> Response {
+pub fn nav_item(ui: &mut Ui, selected: bool, icon: Icon, label: &str) -> Response {
     let p = pal(ui);
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, label));
     let fill = if selected {
         p.accent_soft
     } else if resp.hovered() {
@@ -517,11 +754,13 @@ pub fn nav_item(ui: &mut Ui, selected: bool, icon: &str, label: &str) -> Respons
     };
     ui.painter().rect_filled(rect, 8.0, fill);
     let fg = if selected { p.accent } else { p.text };
-    ui.painter().text(
-        egui::pos2(rect.left() + 20.0, rect.center().y),
-        Align2::CENTER_CENTER,
+    icons::paint(
+        ui.painter(),
+        Rect::from_center_size(
+            egui::pos2(rect.left() + 20.0, rect.center().y),
+            Vec2::splat(ICON_SIZE),
+        ),
         icon,
-        FontId::proportional(15.0),
         fg,
     );
     let font = if selected {
@@ -536,6 +775,7 @@ pub fn nav_item(ui: &mut Ui, selected: bool, icon: &str, label: &str) -> Respons
         font,
         fg,
     );
+    focus_ring(ui, &resp, rect, 8.0);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -545,7 +785,12 @@ pub fn dialog_title(ui: &mut Ui, title: &str) -> bool {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(title).font(theme::semibold(17.0)));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            close = icon_button(ui, "✖", crate::i18n::tr("btn.cancel")).clicked();
+            close = icon_button(
+                ui,
+                Icon::Close,
+                &with_key(crate::i18n::tr("btn.cancel"), "Esc"),
+            )
+            .clicked();
         });
     });
     ui.add_space(6.0);

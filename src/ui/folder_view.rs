@@ -1,15 +1,15 @@
 //! Folder compare view.
 
 use crate::config::Config;
-use crate::core::diff::DiffOptions;
+use crate::core::diff::{self, DiffOptions};
 use crate::core::filter::{FileFilter, FltFilter};
 use crate::core::folder::{self, CmpStatus, DirItem, FolderOptions, Progress, Scanner};
 use crate::core::patch::{self, PatchStyle};
 use crate::core::report::{self, fmt_size, fmt_time, side_name, status_text, ReportFormat};
-use crate::core::text::FileKind;
+use crate::core::text::{self, FileKind};
 use crate::i18n::{tr, trf};
 use crate::ui::theme::{self, Colors};
-use crate::ui::widgets;
+use crate::ui::widgets::{self, Icon, Outcome};
 use egui::{vec2, Align, Color32, FontId, Key, Layout, Margin, Modifiers, Sense, Stroke, Ui};
 use egui_extras::{Column, TableBuilder};
 use std::collections::{BTreeSet, HashSet};
@@ -24,10 +24,21 @@ pub enum FolderAction {
         paths: Vec<PathBuf>,
         missing: Vec<bool>,
         kind: Option<FileKind>,
+        /// Relative path of the item, to find the next or previous file from it later.
+        rel: String,
     },
     OpenFolders {
         paths: Vec<PathBuf>,
     },
+    /// The filter was changed from the folder view; it becomes the default for new compares.
+    FilterChanged(String),
+    /// The compare method or subfolder option was changed from the folder view.
+    OptionsChanged {
+        method: folder::CompareMethod,
+        recursive: bool,
+    },
+    /// Turn every "Show ... items" view option back on.
+    ShowAll,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,8 +106,31 @@ pub struct FolderView {
     pub status: String,
     confirm: Option<PendingOp>,
     scroll_to: Option<usize>,
+    /// Text of the filter field in the filter popup, while it is open.
+    filter_edit: Option<String>,
+    /// Only items whose name contains this (case-insensitive) are listed, with their folders.
+    search: String,
+    focus_search: bool,
+    /// Quick preview of the item under the cursor (Space).
+    peek: bool,
+    peek_cache: Option<(usize, Vec<(PeekKind, String)>)>,
+    /// Duration of a comparison that just finished, until the app takes it.
+    finished: Option<Duration>,
     id: egui::Id,
 }
+
+#[derive(Clone, Copy)]
+enum PeekKind {
+    Plain,
+    Meta,
+    Hunk,
+    Add,
+    Del,
+}
+
+/// Files larger than this are not loaded for the quick preview.
+const PEEK_MAX_BYTES: u64 = 4 << 20;
+const PEEK_MAX_LINES: usize = 5000;
 
 /// Case-insensitive ordering without allocating lowercase copies.
 fn cmp_ci(a: &str, b: &str) -> std::cmp::Ordering {
@@ -187,6 +221,12 @@ impl FolderView {
             status: String::new(),
             confirm: None,
             scroll_to: None,
+            filter_edit: None,
+            search: String::new(),
+            focus_search: false,
+            peek: false,
+            peek_cache: None,
+            finished: None,
             id: egui::Id::new(("folderview", std::time::Instant::now())),
         };
         v.start_compare();
@@ -199,6 +239,11 @@ impl FolderView {
 
     pub fn set_method(&mut self, method: folder::CompareMethod) {
         self.fopts.method = method;
+    }
+
+    /// Whether subfolders are compared, and how files are compared.
+    pub fn scan_settings(&self) -> (bool, folder::CompareMethod) {
+        (self.fopts.recursive, self.fopts.method)
     }
 
     pub fn n(&self) -> usize {
@@ -267,6 +312,26 @@ impl FolderView {
         self.start_compare();
     }
 
+    pub fn is_running(&self) -> bool {
+        self.running.is_some()
+    }
+
+    /// How long the comparison took, once, right after it finished without being stopped.
+    pub fn take_finished(&mut self) -> Option<Duration> {
+        self.finished.take()
+    }
+
+    /// Notices a comparison finishing while the tab is in the background.
+    pub fn poll_background(&mut self) {
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|r| r.handle.is_finished())
+        {
+            self.poll();
+        }
+    }
+
     pub fn stop(&mut self) {
         if let Some(r) = &self.running {
             r.progress.abort.store(true, Ordering::Relaxed);
@@ -283,8 +348,11 @@ impl FolderView {
             self.elapsed = Some(r.started.elapsed());
             self.selected.retain(|&i| i < self.items.len());
             self.view_key = None;
+            self.peek_cache = None;
             if aborted {
                 self.status = tr("msg.aborted").into();
+            } else {
+                self.finished = self.elapsed;
             }
         } else if r.updated.elapsed() >= UPDATE_INTERVAL.max(self.view_cost * 4) {
             r.updated = Instant::now();
@@ -361,14 +429,20 @@ impl FolderView {
     }
 
     fn visibility(&self, cfg: &Config) -> Vec<bool> {
+        let query = self.search.trim().to_lowercase();
+        let matches = |it: &DirItem| it.name.to_lowercase().contains(&query);
         let mut vis = vec![false; self.items.len()];
         for i in (0..self.items.len()).rev() {
             let it = &self.items[i];
             vis[i] = if it.is_dir && !it.children.is_empty() {
                 it.children.iter().any(|&c| vis[c])
-                    || self.shown(it, cfg) && it.status != CmpStatus::Identical
+                    || if query.is_empty() {
+                        self.shown(it, cfg) && it.status != CmpStatus::Identical
+                    } else {
+                        self.shown(it, cfg) && matches(it)
+                    }
             } else {
-                self.shown(it, cfg)
+                self.shown(it, cfg) && (query.is_empty() || matches(it))
             };
         }
         vis
@@ -391,11 +465,16 @@ impl FolderView {
     }
 
     fn rebuild_visible(&mut self, cfg: &Config) {
+        self.visible = self.display_order(cfg, false);
+    }
+
+    /// Listed items in display order; with `expand_all`, as if every folder were expanded.
+    fn display_order(&self, cfg: &Config, expand_all: bool) -> Vec<usize> {
         if !cfg.tree_mode {
-            self.visible = self.flat_list(cfg);
-            return;
+            return self.flat_list(cfg);
         }
         let vis = self.visibility(cfg);
+        let searching = expand_all || !self.search.trim().is_empty();
         let mut out = Vec::new();
         let mut roots: Vec<usize> = (0..self.items.len())
             .filter(|&i| self.items[i].parent.is_none() && vis[i])
@@ -405,13 +484,48 @@ impl FolderView {
         while let Some(i) = stack.pop() {
             out.push(i);
             let it = &self.items[i];
-            if it.is_dir && self.expanded.contains(&it.rel_path()) {
+            if it.is_dir && (searching || self.expanded.contains(&it.rel_path())) {
                 let mut ch: Vec<usize> = it.children.iter().copied().filter(|&c| vis[c]).collect();
                 ch.sort_by(|&a, &b| self.cmp_items(a, b));
                 stack.extend(ch.into_iter().rev());
             }
         }
-        self.visible = out;
+        out
+    }
+
+    /// The file with differences listed after (or before) the item at `rel`, in display order.
+    pub fn adjacent_different_file(&self, cfg: &Config, rel: &str, forward: bool) -> Option<usize> {
+        let order = self.display_order(cfg, true);
+        let pos = order
+            .iter()
+            .position(|&i| self.items[i].rel_path() == rel)?;
+        let differs = |i: &&usize| {
+            let it = &self.items[**i];
+            !it.is_dir && matches!(it.status, CmpStatus::Different | CmpStatus::Unique)
+        };
+        if forward {
+            order[pos + 1..].iter().find(differs).copied()
+        } else {
+            order[..pos].iter().rev().find(differs).copied()
+        }
+    }
+
+    /// Selects item `i`, expanding its folders and scrolling to it, and returns the action that
+    /// opens it.
+    pub fn reveal_and_open(&mut self, i: usize, cfg: &Config) -> Option<FolderAction> {
+        let mut p = self.items[i].parent;
+        while let Some(pi) = p {
+            self.expanded.insert(self.items[pi].rel_path());
+            p = self.items[pi].parent;
+        }
+        self.rebuild_visible(cfg);
+        if let Some(v) = self.visible.iter().position(|&x| x == i) {
+            self.selected = BTreeSet::from([i]);
+            self.anchor = Some(v);
+            self.cursor = Some(v);
+            self.scroll_to = Some(v);
+        }
+        self.open_action(i, None)
     }
 
     // ---------- operations ----------
@@ -536,7 +650,158 @@ impl FolderView {
             paths,
             missing,
             kind,
+            rel: it.rel_path(),
         })
+    }
+
+    /// Lines shown by the quick preview: a unified diff for text files on both sides,
+    /// otherwise what is known about each side.
+    fn preview(&self, i: usize) -> Vec<(PeekKind, String)> {
+        let it = &self.items[i];
+        let n = self.n();
+        let mut out = Vec::new();
+        let paths: Vec<PathBuf> = self.roots.iter().map(|r| it.path(r)).collect();
+        let small = (0..n).all(|s| it.size[s].unwrap_or(0) <= PEEK_MAX_BYTES);
+        let present: Vec<usize> = (0..n).filter(|&s| it.exists[s]).collect();
+        let push_text = |out: &mut Vec<(PeekKind, String)>, text: &str| {
+            let mut lines = text.lines();
+            for line in lines.by_ref().take(PEEK_MAX_LINES) {
+                let kind = if line.starts_with("+++") || line.starts_with("---") {
+                    PeekKind::Meta
+                } else if line.starts_with("@@") {
+                    PeekKind::Hunk
+                } else if line.starts_with('+') {
+                    PeekKind::Add
+                } else if line.starts_with('-') {
+                    PeekKind::Del
+                } else {
+                    PeekKind::Plain
+                };
+                out.push((kind, line.to_string()));
+            }
+            if lines.next().is_some() {
+                out.push((PeekKind::Meta, "…".into()));
+            }
+        };
+        if !it.is_dir && !it.binary && small {
+            if n == 2 && present.len() == 2 {
+                if let (Ok(a), Ok(b)) = (
+                    text::load_doc(&paths[0], None),
+                    text::load_doc(&paths[1], None),
+                ) {
+                    let refs: Vec<&[String]> = vec![&a.lines, &b.lines];
+                    let d = diff::compute(&refs, &self.dopts);
+                    let rel = it.rel_path();
+                    let input = patch::PatchInput {
+                        name_a: &format!("a/{rel}"),
+                        name_b: &format!("b/{rel}"),
+                        date_a: "",
+                        date_b: "",
+                        a: &a.lines,
+                        b: &b.lines,
+                    };
+                    let p = patch::make_patch(&input, &d, PatchStyle::Unified, 3);
+                    if p.is_empty() {
+                        out.push((PeekKind::Plain, tr("msg.identical").into()));
+                    }
+                    push_text(&mut out, &p);
+                    return out;
+                }
+            } else if let [s] = present[..] {
+                if let Ok(doc) = text::load_doc(&paths[s], None) {
+                    out.push((
+                        PeekKind::Meta,
+                        trf("status.only", &[("side", side_name(s, n).into())]),
+                    ));
+                    push_text(&mut out, &doc.lines.join("\n"));
+                    return out;
+                }
+            }
+        }
+        for s in 0..n {
+            let what = if it.exists[s] {
+                format!("{}  {}", fmt_size(it.size[s]), fmt_time(it.mtime[s]))
+            } else {
+                tr("peek.missing").to_string()
+            };
+            out.push((PeekKind::Meta, format!("{}: {what}", side_name(s, n))));
+        }
+        out.push((PeekKind::Plain, String::new()));
+        out.push((PeekKind::Plain, status_text(it, n)));
+        let note = if it.is_dir {
+            "peek.folder"
+        } else if it.binary {
+            "peek.binary"
+        } else if !small {
+            "peek.too_large"
+        } else {
+            "peek.open_hint"
+        };
+        out.push((PeekKind::Plain, tr(note).into()));
+        out
+    }
+
+    fn peek_window(&mut self, ctx: &egui::Context) {
+        if !self.peek {
+            return;
+        }
+        let Some(&i) = self
+            .cursor
+            .or(self.anchor)
+            .and_then(|v| self.visible.get(v))
+        else {
+            self.peek = false;
+            return;
+        };
+        if self.peek_cache.as_ref().map(|(k, _)| *k) != Some(i) {
+            self.peek_cache = Some((i, self.preview(i)));
+        }
+        let Some((_, lines)) = &self.peek_cache else {
+            return;
+        };
+        let mut open = true;
+        let screen = ctx.screen_rect();
+        egui::Window::new(self.items[i].rel_path())
+            .id(self.id.with("peek"))
+            .open(&mut open)
+            .collapsible(false)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(screen.center())
+            .default_size([720.0_f32.min(screen.width() - 80.0), 460.0])
+            .show(ctx, |ui| {
+                let pal = widgets::pal(ui);
+                ui.label(
+                    egui::RichText::new(tr("peek.hint"))
+                        .size(12.0)
+                        .color(pal.text_dim),
+                );
+                ui.separator();
+                let font = FontId::monospace(12.5);
+                let row_h = ui.fonts(|f| f.row_height(&font));
+                ui.spacing_mut().item_spacing.y = 0.0;
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_h, lines.len(), |ui, range| {
+                        for (kind, text) in &lines[range] {
+                            let color = match kind {
+                                PeekKind::Plain => pal.text,
+                                PeekKind::Meta => pal.text_dim,
+                                PeekKind::Hunk => pal.accent,
+                                PeekKind::Add => pal.success,
+                                PeekKind::Del => pal.danger,
+                            };
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(text).font(font.clone()).color(color),
+                                )
+                                .extend(),
+                            );
+                        }
+                    });
+            });
+        if !open {
+            self.peek = false;
+        }
     }
 
     pub fn copy_selected(&mut self, to_right: bool, cfg: &Config) {
@@ -565,6 +830,20 @@ impl FolderView {
         let items: Vec<&DirItem> = list.iter().map(|&i| &self.items[i]).collect();
         let roots: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
         report::generate(&items, &roots, format)
+    }
+
+    pub fn outcome(&self) -> Outcome {
+        if self.running.is_some() {
+            return Outcome::Busy;
+        }
+        let (_, diff, uniq, err) = folder::status_counts(&self.items);
+        if err > 0 {
+            Outcome::Error
+        } else if diff + uniq > 0 {
+            Outcome::Different
+        } else {
+            Outcome::Identical
+        }
     }
 
     pub fn status_line(&self) -> String {
@@ -619,60 +898,177 @@ impl FolderView {
 
     // ---------- UI ----------
 
-    fn header_bar(&mut self, ui: &mut Ui, cfg: &Config) -> bool {
+    pub fn focus_search(&mut self) {
+        self.focus_search = true;
+    }
+
+    fn header_bar(
+        &mut self,
+        ui: &mut Ui,
+        cfg: &Config,
+        named: &[FltFilter],
+    ) -> (bool, Option<FolderAction>) {
         let mut refresh = false;
+        let mut action = None;
+        let mut new_filter: Option<String> = None;
+        let mut new_options: Option<(folder::CompareMethod, bool)> = None;
         let n = self.n();
         let sel = !self.selected.is_empty();
         widgets::toolbar(ui, |ui| {
-            let pal = widgets::pal(ui);
-            if widgets::ghost_button(ui, &format!("⟳  {}", tr("cmd.refresh")))
+            let key = widgets::with_key;
+            if widgets::ghost_icon_button(ui, Icon::Refresh, tr("cmd.refresh"))
                 .on_hover_text("F5")
                 .clicked()
             {
                 refresh = true;
             }
             if cfg.tree_mode {
-                if widgets::icon_button(ui, "⊞", tr("cmd.expand_all")).clicked() {
+                if widgets::icon_button(ui, Icon::ExpandAll, tr("cmd.expand_all")).clicked() {
                     self.expand_all(true);
                 }
-                if widgets::icon_button(ui, "⊟", tr("cmd.collapse_all")).clicked() {
+                if widgets::icon_button(ui, Icon::CollapseAll, tr("cmd.collapse_all")).clicked() {
                     self.expand_all(false);
                 }
             }
             widgets::toolbar_sep(ui);
             if n == 2 {
-                if widgets::icon_button_enabled(ui, sel, "→", tr("cmd.copy_right")).clicked() {
-                    self.request_op_copy(0, 1, cfg);
-                }
-                if widgets::icon_button_enabled(ui, sel, "←", tr("cmd.copy_left")).clicked() {
-                    self.request_op_copy(1, 0, cfg);
-                }
-            } else {
-                if widgets::icon_button_enabled(ui, sel, "L→M", tr("cmd.copy_from_left")).clicked()
+                if widgets::icon_button_enabled(
+                    ui,
+                    sel,
+                    Icon::CopyRight,
+                    &key(tr("cmd.copy_right"), "Alt+→"),
+                )
+                .clicked()
                 {
                     self.request_op_copy(0, 1, cfg);
                 }
-                if widgets::icon_button_enabled(ui, sel, "M←R", tr("cmd.copy_from_right")).clicked()
+                if widgets::icon_button_enabled(
+                    ui,
+                    sel,
+                    Icon::CopyLeft,
+                    &key(tr("cmd.copy_left"), "Alt+←"),
+                )
+                .clicked()
+                {
+                    self.request_op_copy(1, 0, cfg);
+                }
+            } else {
+                if widgets::icon_button_enabled(ui, sel, Icon::CopyRight, tr("cmd.copy_from_left"))
+                    .clicked()
+                {
+                    self.request_op_copy(0, 1, cfg);
+                }
+                if widgets::icon_button_enabled(ui, sel, Icon::CopyLeft, tr("cmd.copy_from_right"))
+                    .clicked()
                 {
                     self.request_op_copy(2, 1, cfg);
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                widgets::chip(
+                let close = egui::PopupCloseBehavior::CloseOnClickOutside;
+
+                let search = widgets::search_edit(
                     ui,
-                    &format!("{}  {}", tr("label.method"), tr(self.fopts.method.key())),
-                    pal.text_dim,
-                    pal.control,
+                    &mut self.search,
+                    &key(tr("folder.search_hint"), "Ctrl+F"),
+                    170.0,
                 );
-                widgets::chip(
+                if std::mem::take(&mut self.focus_search) {
+                    search.request_focus();
+                }
+                if search.lost_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+                    self.search.clear();
+                    self.view_key = None;
+                }
+                if search.changed() {
+                    self.view_key = None;
+                }
+
+                let method_id = self.id.with("method_popup");
+                let r = widgets::chip_button(
                     ui,
-                    &format!("{}  {}", tr("label.filter"), self.filter_spec),
-                    pal.text_dim,
-                    pal.control,
-                );
+                    Icon::Method,
+                    tr("label.method"),
+                    tr(self.fopts.method.key()),
+                )
+                .on_hover_text(tr("tip.click_change"));
+                if r.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(method_id));
+                }
+                egui::popup::popup_below_widget(ui, method_id, &r, close, |ui| {
+                    ui.set_min_width(220.0);
+                    for m in folder::CompareMethod::ALL {
+                        if ui
+                            .selectable_label(self.fopts.method == m, tr(m.key()))
+                            .clicked()
+                            && self.fopts.method != m
+                        {
+                            new_options = Some((m, self.fopts.recursive));
+                        }
+                    }
+                    ui.separator();
+                    let mut recursive = self.fopts.recursive;
+                    if ui.checkbox(&mut recursive, tr("label.recursive")).changed() {
+                        new_options = Some((self.fopts.method, recursive));
+                    }
+                });
+
+                let filter_id = self.id.with("filter_popup");
+                let r =
+                    widgets::chip_button(ui, Icon::Filter, tr("label.filter"), &self.filter_spec)
+                        .on_hover_text(tr("tip.click_change"));
+                let opened = r.clicked();
+                if opened {
+                    self.filter_edit = Some(self.filter_spec.clone());
+                    ui.memory_mut(|m| m.toggle_popup(filter_id));
+                }
+                egui::popup::popup_below_widget(ui, filter_id, &r, close, |ui| {
+                    ui.set_min_width(300.0);
+                    let edit = self
+                        .filter_edit
+                        .get_or_insert_with(|| self.filter_spec.clone());
+                    let field = ui.add(
+                        egui::TextEdit::singleline(edit)
+                            .margin(vec2(8.0, 4.0))
+                            .desired_width(f32::INFINITY),
+                    );
+                    if opened {
+                        field.request_focus();
+                    }
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        new_filter = Some(edit.clone());
+                    }
+                    ui.separator();
+                    let listed = cfg.recent_filters.iter().cloned().chain(
+                        named
+                            .iter()
+                            .map(|f| format!("{}{}", crate::core::filter::FLT_PREFIX, f.name)),
+                    );
+                    for f in listed {
+                        if ui.selectable_label(f == self.filter_spec, &f).clicked() {
+                            new_filter = Some(f);
+                        }
+                    }
+                });
             });
         });
+        if let Some((method, recursive)) = new_options {
+            if method != self.fopts.method {
+                ui.memory_mut(|m| m.close_popup());
+            }
+            self.set_method(method);
+            self.set_recursive(recursive);
+            self.start_compare();
+            action = Some(FolderAction::OptionsChanged { method, recursive });
+        }
+        if let Some(spec) = new_filter.filter(|s| !s.trim().is_empty()) {
+            ui.memory_mut(|m| m.close_popup());
+            self.filter_edit = None;
+            self.filter_spec = spec.clone();
+            refresh = true;
+            action = Some(FolderAction::FilterChanged(spec));
+        }
         let pal = widgets::pal(ui);
         let paths = egui::Frame::new()
             .fill(pal.surface)
@@ -744,7 +1140,85 @@ impl FolderView {
                 self.stop();
             }
         }
-        refresh
+        (refresh, action)
+    }
+
+    /// Shown instead of the list when a finished comparison has nothing to list.
+    fn empty_state(
+        &mut self,
+        ui: &mut Ui,
+        cfg: &Config,
+        named: &[FltFilter],
+    ) -> Option<FolderAction> {
+        let pal = widgets::pal(ui);
+        let hidden = !self.items.is_empty();
+        let default_filter = matches!(self.filter_spec.trim(), "" | "*.*" | "*");
+        let mut action = None;
+        if !self.search.trim().is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() * 0.3).max(24.0));
+                let (rect, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
+                ui.painter().rect_filled(rect, 12.0, pal.control);
+                crate::ui::icons::paint(
+                    ui.painter(),
+                    rect.shrink(10.0),
+                    Icon::Search,
+                    pal.text_dim,
+                );
+                ui.add_space(10.0);
+                let query = self.search.trim().to_string();
+                ui.label(
+                    egui::RichText::new(trf("folder.no_match", &[("text", query)]))
+                        .font(theme::semibold(15.0)),
+                );
+                ui.add_space(12.0);
+                if widgets::secondary_button(ui, tr("btn.clear_search")).clicked() {
+                    self.search.clear();
+                    self.view_key = None;
+                }
+            });
+            return None;
+        }
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() * 0.3).max(24.0));
+            let (rect, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
+            ui.painter().rect_filled(rect, 12.0, pal.control);
+            crate::ui::icons::paint(
+                ui.painter(),
+                rect.shrink(10.0),
+                if hidden { Icon::Filter } else { Icon::Folder },
+                pal.text_dim,
+            );
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(if hidden {
+                    tr("folder.empty_hidden")
+                } else {
+                    tr("folder.empty_none")
+                })
+                .font(theme::semibold(15.0)),
+            );
+            if !hidden && !default_filter {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(format!("{}  {}", tr("label.filter"), self.filter_spec))
+                        .color(pal.text_dim),
+                );
+            }
+            ui.add_space(12.0);
+            if hidden {
+                if widgets::secondary_button(ui, tr("btn.show_all")).clicked() {
+                    action = Some(FolderAction::ShowAll);
+                }
+            } else if !default_filter
+                && widgets::secondary_button(ui, tr("filters.clear")).clicked()
+            {
+                self.filter_spec = "*.*".into();
+                self.refresh(cfg, named);
+                action = Some(FolderAction::FilterChanged(self.filter_spec.clone()));
+            }
+        });
+        action
     }
 
     pub fn ui(
@@ -760,7 +1234,8 @@ impl FolderView {
             // Also repaints once after finishing, as the status bar was drawn before this poll.
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
-        if self.header_bar(ui, cfg) {
+        let (refresh, header_action) = self.header_bar(ui, cfg, named);
+        if refresh {
             self.refresh(cfg, named);
         }
         let key = (
@@ -775,8 +1250,11 @@ impl FolderView {
             self.rebuild_visible(cfg);
             self.view_cost += t.elapsed();
         }
+        if self.running.is_none() && self.visible.is_empty() {
+            return header_action.or_else(|| self.empty_state(ui, cfg, named));
+        }
 
-        let mut result: Option<FolderAction> = None;
+        let mut result: Option<FolderAction> = header_action;
         let mut toggle: Option<usize> = None;
         let mut click: Option<(usize, Modifiers)> = None;
         let mut double: Option<usize> = None;
@@ -798,8 +1276,13 @@ impl FolderView {
             let mut target = None;
             let mut extend = false;
             let mut select_all = false;
+            let mut peek = false;
             ui.input_mut(|i| {
                 extend = i.modifiers.shift;
+                peek = i.consume_key(Modifiers::NONE, Key::Space);
+                if self.peek && i.consume_key(Modifiers::NONE, Key::Escape) {
+                    self.peek = false;
+                }
                 for (key, to) in [
                     (Key::ArrowDown, (cur + 1).min(last)),
                     (Key::ArrowUp, cur.saturating_sub(1)),
@@ -850,6 +1333,14 @@ impl FolderView {
             }
             if select_all {
                 self.selected = self.visible.iter().copied().collect();
+            }
+            if peek {
+                self.peek = !self.peek;
+                if self.peek && self.cursor.or(self.anchor).is_none() {
+                    self.selected = BTreeSet::from([self.visible[cur]]);
+                    self.anchor = Some(cur);
+                    self.cursor = Some(cur);
+                }
             }
         }
 
@@ -915,6 +1406,7 @@ impl FolderView {
         let visible = &self.visible;
         let selected = &self.selected;
         let expanded = &self.expanded;
+        let searching = !self.search.trim().is_empty();
         let tree = cfg.tree_mode;
         table
             .header(row_h, |mut header| {
@@ -977,7 +1469,7 @@ impl FolderView {
                         if tree {
                             ui.add_space(it.depth as f32 * 16.0);
                             if it.is_dir && !it.children.is_empty() {
-                                let open = expanded.contains(&it.rel_path());
+                                let open = searching || expanded.contains(&it.rel_path());
                                 let arrow = egui::RichText::new(if open { "⏷" } else { "⏵" })
                                     .color(pal.text_dim);
                                 if ui
@@ -991,14 +1483,11 @@ impl FolderView {
                             }
                         }
                         let (icon, icon_color) = if it.is_dir {
-                            ("📁", Color32::from_rgb(0xE0, 0xA4, 0x2E))
+                            (Icon::Folder, Color32::from_rgb(0xE0, 0xA4, 0x2E))
                         } else {
-                            ("📄", pal.text_dim)
+                            (Icon::File, pal.text_dim)
                         };
-                        ui.add(
-                            egui::Label::new(txt(icon.to_string()).color(icon_color))
-                                .selectable(false),
-                        );
+                        widgets::inline_icon(ui, icon, icon_color);
                         ui.add(
                             egui::Label::new(txt(it.name.clone()))
                                 .selectable(false)
@@ -1183,8 +1672,10 @@ impl FolderView {
                 self.view_key = None;
             } else {
                 result = self.open_action(i, None);
+                self.peek = false;
             }
         }
+        self.peek_window(ui.ctx());
         if let Some(m) = menu {
             match m {
                 MenuCmd::Open(i, kind) => result = self.open_action(i, kind),
@@ -1266,5 +1757,58 @@ impl FolderView {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steps_through_files_with_differences_in_display_order() {
+        let cfg = Config::default();
+        let roots = ["samples/left", "samples/right"]
+            .map(PathBuf::from)
+            .to_vec();
+        let display = roots.iter().map(|r| r.display().to_string()).collect();
+        let mut v = FolderView::new(roots, display, Vec::new(), "", &[], &cfg);
+        while v.running.is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+            v.poll();
+        }
+        let order = v.display_order(&cfg, true);
+        let differs: Vec<String> = order
+            .iter()
+            .map(|&i| &v.items[i])
+            .filter(|it| {
+                !it.is_dir && matches!(it.status, CmpStatus::Different | CmpStatus::Unique)
+            })
+            .map(|it| it.rel_path())
+            .collect();
+        assert!(differs.len() >= 3, "{differs:?}");
+        assert!(!differs.iter().any(|r| r == "same.txt"));
+
+        let mut walked = vec![differs[0].clone()];
+        while let Some(i) = v.adjacent_different_file(&cfg, walked.last().unwrap(), true) {
+            walked.push(v.items[i].rel_path());
+        }
+        assert_eq!(walked, differs);
+        let mut back = vec![differs.last().unwrap().clone()];
+        while let Some(i) = v.adjacent_different_file(&cfg, back.last().unwrap(), false) {
+            back.push(v.items[i].rel_path());
+        }
+        back.reverse();
+        assert_eq!(back, differs);
+
+        let nested = order
+            .iter()
+            .copied()
+            .find(|&i| v.items[i].parent.is_some() && !v.items[i].is_dir)
+            .expect("a file inside a folder");
+        let Some(FolderAction::OpenFiles { rel, .. }) = v.reveal_and_open(nested, &cfg) else {
+            panic!("expected files to open");
+        };
+        assert_eq!(rel, v.items[nested].rel_path());
+        assert_eq!(v.cursor.map(|c| v.visible[c]), Some(nested));
     }
 }

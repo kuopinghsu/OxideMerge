@@ -3,6 +3,7 @@
 # Used as-is by the Linux packages.
 assets/AppRun text eol=lf
 scripts/package-appimage.sh text eol=lf
+scripts/release-notes.sh text eol=lf
 *.desktop text eol=lf
 
 # Sample inputs must stay byte-identical on every platform (sizes and line endings are compared).

@@ -8,11 +8,41 @@ use crate::core::web::WebMode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    pub const ALL: [ThemeMode; 3] = [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            ThemeMode::System => "theme.system",
+            ThemeMode::Light => "theme.light",
+            ThemeMode::Dark => "theme.dark",
+        }
+    }
+}
+
+/// A tab of the previous session: what was compared, and how.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
+pub struct SessionTab {
+    pub paths: Vec<String>,
+    /// "text", "binary", "image" or "web"; none for folder compares.
+    pub kind: Option<String>,
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct Config {
     /// Language code ("" = follow the system language).
     pub language: String,
+    pub theme: ThemeMode,
+    /// Whether the dark palette is in use; follows `theme`, and the system when it is `System`.
     pub dark_mode: bool,
     pub font_size: f32,
     pub tab_size: usize,
@@ -20,6 +50,8 @@ pub struct Config {
     pub folder: FolderOptions,
     pub filter: String,
     pub recent_paths: Vec<String>,
+    /// Recent comparisons, newest first: the 2 or 3 paths or URLs of each.
+    pub recent_compares: Vec<Vec<String>>,
     pub recent_filters: Vec<String>,
     pub syntax_highlight: bool,
     pub show_location_pane: bool,
@@ -42,12 +74,22 @@ pub struct Config {
     pub web_width: u32,
     pub web_height: u32,
     pub web_mode: WebMode,
+    pub restore_session: bool,
+    /// Text compares fold long runs of unchanged lines.
+    pub collapse_unchanged: bool,
+    /// Text compares wrap long lines instead of scrolling sideways.
+    pub word_wrap: bool,
+    /// Saving over a file keeps its previous contents as `<name>.bak`.
+    pub backup_on_save: bool,
+    pub session: Vec<SessionTab>,
+    pub session_active: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             language: String::new(),
+            theme: ThemeMode::System,
             dark_mode: false,
             font_size: 14.0,
             tab_size: 4,
@@ -55,6 +97,7 @@ impl Default for Config {
             folder: FolderOptions::default(),
             filter: "*.*".into(),
             recent_paths: Vec::new(),
+            recent_compares: Vec::new(),
             recent_filters: vec![
                 "*.*".into(),
                 "*.c;*.cpp;*.h".into(),
@@ -85,6 +128,12 @@ impl Default for Config {
             web_width: 1280,
             web_height: 1600,
             web_mode: WebMode::Screenshot,
+            restore_session: true,
+            collapse_unchanged: false,
+            word_wrap: false,
+            backup_on_save: false,
+            session: Vec::new(),
+            session_active: 0,
         }
     }
 }
@@ -110,8 +159,19 @@ impl Config {
     pub fn load() -> Config {
         config_path()
             .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|s| Config::parse(&s))
             .unwrap_or_default()
+    }
+
+    fn parse(s: &str) -> Option<Config> {
+        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let has_theme = value.get("theme").is_some();
+        let mut cfg: Config = serde_json::from_value(value).ok()?;
+        // Settings from before the theme choice existed: keep an explicit dark mode.
+        if !has_theme && cfg.dark_mode {
+            cfg.theme = ThemeMode::Dark;
+        }
+        Some(cfg)
     }
 
     pub fn save(&self) {
@@ -134,6 +194,19 @@ impl Config {
         self.recent_paths.truncate(20);
     }
 
+    pub fn add_recent_compare(&mut self, paths: &[String]) {
+        if paths.len() < 2 || paths.iter().any(|p| p.trim().is_empty()) {
+            return;
+        }
+        self.recent_compares.retain(|x| x != paths);
+        self.recent_compares.insert(0, paths.to_vec());
+        self.recent_compares.truncate(20);
+    }
+
+    pub fn remove_recent_compare(&mut self, paths: &[String]) {
+        self.recent_compares.retain(|x| x != paths);
+    }
+
     pub fn add_recent_filter(&mut self, f: &str) {
         if f.trim().is_empty() {
             return;
@@ -141,5 +214,20 @@ impl Config {
         self.recent_filters.retain(|x| x != f);
         self.recent_filters.insert(0, f.to_string());
         self.recent_filters.truncate(20);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_dark_mode_becomes_explicit_theme() {
+        let cfg = Config::parse(r#"{"dark_mode": true}"#).unwrap();
+        assert_eq!(cfg.theme, ThemeMode::Dark);
+        let cfg = Config::parse(r#"{"dark_mode": false}"#).unwrap();
+        assert_eq!(cfg.theme, ThemeMode::System);
+        let cfg = Config::parse(r#"{"dark_mode": true, "theme": "System"}"#).unwrap();
+        assert_eq!(cfg.theme, ThemeMode::System);
     }
 }

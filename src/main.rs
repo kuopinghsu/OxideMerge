@@ -108,7 +108,14 @@ struct Cli {
     ignore_eol: bool,
     #[arg(long)]
     ignore_numbers: bool,
-    /// Write a folder compare report (.html, .csv or .txt) without opening the GUI
+    /// Ignore changes in comments (for languages whose comment syntax is known)
+    #[arg(long)]
+    ignore_comments: bool,
+    /// Reformat JSON and XML files before comparing them
+    #[arg(long)]
+    prettify: bool,
+    /// Write a report without opening the GUI: folder compares as .html, .csv or .txt, text
+    /// compares as side-by-side .html
     #[arg(long)]
     report: Option<PathBuf>,
     /// Write a patch file without opening the GUI
@@ -128,10 +135,11 @@ struct Cli {
     /// List available languages
     #[arg(long)]
     list_languages: bool,
-    /// Add "OxideMerge" entries to the Windows Explorer context menu
+    /// Add "OxideMerge" entries to the file manager's context menu (Windows Explorer, Finder
+    /// Quick Actions, Nautilus, Nemo or Dolphin)
     #[arg(long)]
     register_shell: bool,
-    /// Remove the Windows Explorer context menu entries
+    /// Remove the file manager context menu entries
     #[arg(long)]
     unregister_shell: bool,
     /// Remember a path as the left side for a later compare (Explorer integration)
@@ -146,6 +154,10 @@ struct Cli {
     /// Explorer's Compare entry: compares all items selected together, or one item like --compare-to
     #[arg(long, hide = true)]
     shell_compare: Option<PathBuf>,
+    /// File manager entries (Finder, Nautilus, ...): compares the given items, or one item like
+    /// --compare-to
+    #[arg(long, hide = true)]
+    compare_selected: bool,
 }
 
 /// Translates WinMerge style "/switch" arguments into the equivalent long options.
@@ -206,6 +218,8 @@ fn apply_cli_options(cli: &Cli, cfg: &mut Config) {
     cfg.diff.ignore_blank_lines |= cli.ignore_blank;
     cfg.diff.ignore_eol |= cli.ignore_eol;
     cfg.diff.ignore_numbers |= cli.ignore_numbers;
+    cfg.diff.ignore_comments |= cli.ignore_comments;
+    cfg.diff.prettify |= cli.prettify;
     if let Some(m) = cli.method {
         cfg.folder.method = method(m);
     }
@@ -331,7 +345,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         }
         return Ok(u8::from(!ranges.is_empty()));
     }
-    let docs: Vec<core::text::TextDoc> = if kind == FileKind::Web {
+    let mut docs: Vec<core::text::TextDoc> = if kind == FileKind::Web {
         let urls = paths
             .iter()
             .map(|p| core::web::location(p))
@@ -352,8 +366,28 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             .map(|p| core::text::load_doc(p, None))
             .collect::<Result<_, _>>()?
     };
+    if cfg.diff.prettify {
+        for d in &mut docs {
+            let text = d.text();
+            let pretty = core::prettify::detect(d.path.as_deref(), &text)
+                .and_then(|f| core::prettify::format(&text, f));
+            if let Some(p) = pretty {
+                d.lines = core::text::split_lines(&p).0;
+            }
+        }
+    }
+    let syntax = paths.iter().find_map(|p| core::comments::for_path(p));
     let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
-    let result = core::diff::compute(&refs, &cfg.diff);
+    let result = core::diff::compute_with(&refs, &cfg.diff, syntax);
+    if let Some(r) = &cli.report {
+        let titles: Vec<String> = (0..docs.len())
+            .map(|i| cli_desc(cli, i).unwrap_or_else(|| paths[i].display().to_string()))
+            .collect();
+        std::fs::write(
+            r,
+            core::report::text_html(&titles, &refs, &result, &cfg.diff),
+        )?;
+    }
     if docs.len() == 2 {
         let name = |i: usize| cli_desc(cli, i).unwrap_or_else(|| paths[i].display().to_string());
         let (na, nb) = (name(0), name(1));
@@ -466,7 +500,7 @@ fn main() -> ExitCode {
     if cli.register_shell {
         return match shell::register() {
             Ok(()) => {
-                println!("{}", i18n::tr("msg.shell_registered"));
+                println!("{}", i18n::tr(ui::app::SHELL_KEYS[2]));
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -477,7 +511,7 @@ fn main() -> ExitCode {
     }
     if cli.unregister_shell {
         let _ = shell::unregister();
-        println!("{}", i18n::tr("msg.shell_unregistered"));
+        println!("{}", i18n::tr(ui::app::SHELL_KEYS[3]));
         return ExitCode::SUCCESS;
     }
     let selected = [(&cli.select_left, false), (&cli.select_middle, true)];
@@ -495,6 +529,8 @@ fn main() -> ExitCode {
         }
     } else if let Some(p) = &cli.compare_to {
         paths = shell::compare_paths(vec![shell::clean_arg(p)]);
+    } else if cli.compare_selected {
+        paths = shell::compare_paths(paths);
     }
 
     apply_cli_options(&cli, &mut cfg);
@@ -535,14 +571,22 @@ fn main() -> ExitCode {
         })
     };
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("OxideMerge")
+        .with_app_id("oxidemerge")
+        .with_inner_size([1280.0, 820.0])
+        .with_min_inner_size([640.0, 400.0])
+        .with_drag_and_drop(true)
+        .with_icon(std::sync::Arc::new(app_icon()));
+    if cfg!(target_os = "macos") {
+        // The menu bar draws into the title bar, next to the window buttons.
+        viewport = viewport
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("OxideMerge")
-            .with_app_id("oxidemerge")
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([640.0, 400.0])
-            .with_drag_and_drop(true)
-            .with_icon(std::sync::Arc::new(app_icon())),
+        viewport,
         ..Default::default()
     };
     let result = eframe::run_native(

@@ -1,22 +1,27 @@
 //! File compare / merge view for text files (2-way and 3-way).
 
 use crate::config::Config;
+use crate::core::comments;
 use crate::core::diff::{self, BlockKind, DiffOptions, DiffResult, InlineMode};
 use crate::core::patch::{self, PatchStyle};
+use crate::core::prettify;
 use crate::core::table;
 use crate::core::text::{self, Eol, TextDoc, TextEncoding, COMMON_ENCODINGS};
 use crate::i18n::{tr, trf};
+use crate::ui::icons;
 use crate::ui::syntax::{self, LineSpans};
 use crate::ui::theme::{self, Colors};
-use crate::ui::widgets::{self, Mark};
+use crate::ui::widgets::{self, Icon, Mark, Outcome};
 use egui::text::LayoutJob;
 use egui::{
-    pos2, vec2, Align2, Color32, FontId, Key, Modifiers, Rect, Sense, Stroke, StrokeKind,
-    TextFormat, Ui,
+    pos2, vec2, Align2, Color32, FontId, Galley, Key, Modifiers, Rect, RichText, Sense, Stroke,
+    StrokeKind, TextFormat, Ui,
 };
-use std::collections::HashMap;
+use regex::Regex;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 pub struct Pane {
@@ -29,6 +34,8 @@ pub struct Pane {
     saves: u64,
     /// Modification time of the file when it was loaded or saved.
     disk_time: Option<SystemTime>,
+    /// The document as loaded while a reformatted (JSON / XML) copy is shown instead.
+    original: Option<TextDoc>,
 }
 
 /// Modification time of a document's file. Documents with a description (unpacked or
@@ -51,8 +58,47 @@ impl Pane {
             hl_dark: false,
             saves: 0,
             disk_time,
+            original: None,
         }
     }
+}
+
+/// Where each line of `old` ended up in `new` (deleted lines map to where they were).
+fn line_map(old: &[String], new: &[String]) -> Vec<usize> {
+    let mut map = vec![0; old.len()];
+    for op in similar::capture_diff_slices(similar::Algorithm::Myers, old, new) {
+        let (tag, o, n) = op.as_tag_tuple();
+        for (k, i) in o.enumerate() {
+            map[i] = if tag == similar::DiffTag::Equal {
+                n.start + k
+            } else {
+                n.start
+            };
+        }
+    }
+    map
+}
+
+/// A reformatted, read-only copy of `doc` when it is JSON or XML whose layout changes.
+fn prettified(doc: &TextDoc) -> Option<TextDoc> {
+    let text = doc.text();
+    let format = prettify::detect(doc.path.as_deref(), &text)?;
+    let pretty = prettify::format(&text, format)?;
+    let mut d = TextDoc::from_text(doc.path.clone(), &pretty);
+    if d.lines == doc.lines {
+        return None;
+    }
+    d.encoding = doc.encoding;
+    d.bom = doc.bom;
+    d.syntax = doc.syntax.clone();
+    d.read_only = true;
+    let name = doc
+        .description
+        .clone()
+        .or_else(|| doc.path.as_ref().map(|p| p.display().to_string()))
+        .unwrap_or_else(|| tr("untitled").to_string());
+    d.description = Some(format!("{name} [{}]", tr("label.formatted")));
+    Some(d)
 }
 
 struct EditState {
@@ -67,13 +113,189 @@ pub struct FindState {
     pub open: bool,
     pub query: String,
     pub match_case: bool,
+    pub whole_word: bool,
+    pub regex: bool,
     pub focus: bool,
+    pub show_replace: bool,
+    pub replace: String,
+}
+
+/// The query, match case, whole word and regular expression settings of a search.
+type FindKey = (String, bool, bool, bool);
+
+impl FindState {
+    fn key(&self) -> FindKey {
+        (
+            self.query.clone(),
+            self.match_case,
+            self.whole_word,
+            self.regex,
+        )
+    }
+}
+
+/// The pattern of a find query: the text itself unless `regex`, case-insensitive unless
+/// `match_case`, and only at word boundaries with `whole_word`.
+pub fn find_regex(
+    query: &str,
+    match_case: bool,
+    whole_word: bool,
+    regex: bool,
+) -> Result<Regex, regex::Error> {
+    let body = if regex {
+        query.to_string()
+    } else {
+        regex::escape(query)
+    };
+    let body = if whole_word {
+        format!(r"\b(?:{body})\b")
+    } else {
+        body
+    };
+    regex::RegexBuilder::new(&body)
+        .case_insensitive(!match_case)
+        .build()
+}
+
+/// Replaces every match of `re` in `lines`; `$1`-style groups are expanded only for regex
+/// searches. Returns how many matches were replaced.
+pub fn replace_all(lines: &mut [String], re: &Regex, with: &str, expand: bool) -> usize {
+    let mut n = 0;
+    for line in lines.iter_mut() {
+        let hits = re.find_iter(line).filter(|m| !m.is_empty()).count();
+        if hits == 0 {
+            continue;
+        }
+        n += hits;
+        *line = if expand {
+            re.replace_all(line, with).into_owned()
+        } else {
+            re.replace_all(line, regex::NoExpand(with)).into_owned()
+        };
+    }
+    n
 }
 
 struct Snapshot {
     lines: Vec<Vec<String>>,
     modified: Vec<bool>,
     saves: Vec<u64>,
+}
+
+/// Makes the merge result pane (the middle of three, else the right one) save to `out`.
+/// It counts as modified when `out` is another file, so saving always writes the result.
+pub fn redirect_output(docs: &mut [TextDoc], out: &std::path::Path) {
+    let target = if docs.len() == 3 { 1 } else { docs.len() - 1 };
+    let d = &mut docs[target];
+    if d.description.is_none() {
+        d.description = Some(format!("{} → {}", d.title(), out.display()));
+    }
+    if d.path.as_deref() != Some(out) {
+        d.modified = true;
+    }
+    d.path = Some(out.to_path_buf());
+    d.read_only = false;
+}
+
+/// Opens the find bar with the replace field.
+pub const REPLACE_KEY: &str = if cfg!(target_os = "macos") {
+    "Ctrl+Alt+F"
+} else {
+    "Ctrl+H"
+};
+
+/// Unchanged lines kept visible around each difference when folding.
+const FOLD_CONTEXT: usize = 3;
+/// Shorter unchanged runs are not worth folding.
+const MIN_FOLD: usize = 4;
+const SCROLL_ANIM_SECS: f64 = 0.18;
+
+/// One line on screen: a wrapped segment of a diff row, or a fold of unchanged rows.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum VLine {
+    Row(usize, u32),
+    /// Rows `start..end` hidden behind a clickable bar.
+    Fold(usize, usize),
+}
+
+/// Copy direction on a divider: from pane, to pane, icon, tooltip key.
+type MergeArrow = (usize, usize, Icon, &'static str);
+
+#[derive(Default)]
+struct Layout {
+    /// (wrap columns or 0, tab size, folding, layout generation) the lines were built for.
+    key: Option<(usize, usize, bool, u64)>,
+    lines: Vec<VLine>,
+    /// First display line of every diff row (the fold line for hidden rows).
+    row_line: Vec<usize>,
+}
+
+fn is_wide(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x115F
+        | 0x2E80..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F
+        | 0x1F900..=0x1F9FF
+        | 0x20000..=0x3FFFD)
+}
+
+/// Very long lines are cut before layout to keep painting fast.
+fn clip_line(text: &str) -> &str {
+    if text.len() <= 8000 {
+        return text;
+    }
+    let mut end = 8000;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Display columns where each wrapped segment of `text` starts, breaking after
+/// whitespace when possible. Wide characters take two columns.
+fn wrap_starts(text: &str, tab: usize, cols: usize) -> Vec<usize> {
+    let tab = tab.max(1);
+    let mut starts = vec![0];
+    let (mut col, mut tcol, mut seg, mut brk) = (0, 0, 0, 0);
+    for ch in clip_line(text).chars() {
+        let (w, n, space) = match ch {
+            '\t' => (1, tab - tcol % tab, true),
+            ' ' => (1, 1, true),
+            c => (if is_wide(c) { 2 } else { 1 }, 1, false),
+        };
+        tcol += n;
+        for _ in 0..n {
+            if col + w > seg + cols {
+                seg = if brk > seg { brk } else { col };
+                starts.push(seg);
+            }
+            col += w;
+            if space {
+                brk = col;
+            }
+        }
+    }
+    starts
+}
+
+/// X offsets inside `galley` of the display columns in `starts`.
+fn segment_x(galley: &Galley, starts: &[usize]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(starts.len());
+    let mut next = starts.iter().peekable();
+    let mut col = 0;
+    for g in galley.rows.iter().flat_map(|r| &r.glyphs) {
+        while next.next_if(|&&s| s <= col).is_some() {
+            out.push(g.pos.x);
+        }
+        col += if is_wide(g.chr) { 2 } else { 1 };
+    }
+    out.extend(next.map(|_| galley.size().x));
+    out
 }
 
 #[derive(Clone, Copy)]
@@ -83,6 +305,10 @@ enum MenuAction {
     InsertBelow(usize, usize),
     DeleteLine(usize, usize),
     CopyText(usize, usize),
+    /// Copy the selected lines from one pane to another.
+    CopyLines(usize, usize),
+    ToggleBookmark(usize, usize),
+    TakeBoth(usize, bool),
 }
 
 pub struct TextView {
@@ -94,22 +320,42 @@ pub struct TextView {
     hscroll: f32,
     pub active_pane: usize,
     pub cursor_row: Option<usize>,
+    /// Other end of the selected rows; the cursor row is one end.
+    sel_anchor: Option<usize>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     inline_cache: HashMap<usize, [Vec<Range<usize>>; 3]>,
     edit: Option<EditState>,
     pub find: FindState,
+    /// The compiled find query, rebuilt when the query or its options change.
+    find_re: Option<(FindKey, Result<Regex, String>)>,
     pub goto: Option<String>,
     pub table_mode: bool,
     pub table_delim: Option<char>,
     col_widths: Vec<usize>,
     pub status: String,
+    /// Message about an edit that changed many differences at once, for an undo toast.
+    pub bulk_edit: Option<String>,
     scroll_to: Option<usize>,
     max_cols: usize,
     ctx_target: Option<(usize, usize)>,
     page_rows: usize,
     /// Modified panes whose file was changed by another program.
     disk_changed: Vec<usize>,
+    layout: Layout,
+    /// Bumped whenever rows or folds change so the layout is rebuilt.
+    layout_gen: u64,
+    /// Folds (by first hidden row) the user opened.
+    expanded: HashSet<usize>,
+    pub collapse: bool,
+    pub wrap: bool,
+    /// Animated scroll: (from, to, start time).
+    scroll_anim: Option<(f32, f32, f64)>,
+    /// Set when difference navigation ran past the last (true) or first (false) difference,
+    /// so the app can move on to the next or previous file of the folder compare.
+    pub step_file: Option<bool>,
+    /// Bookmarked lines of each pane.
+    pub bookmarks: Vec<BTreeSet<usize>>,
     id: egui::Id,
 }
 
@@ -119,6 +365,7 @@ impl TextView {
             .iter()
             .filter_map(|d| d.path.as_deref())
             .find_map(table::delimiter_for);
+        let bookmarks = vec![BTreeSet::new(); docs.len()];
         let mut v = TextView {
             panes: docs.into_iter().map(Pane::new).collect(),
             diff: DiffResult::default(),
@@ -128,23 +375,35 @@ impl TextView {
             hscroll: 0.0,
             active_pane: 0,
             cursor_row: None,
+            sel_anchor: None,
             undo: Vec::new(),
             redo: Vec::new(),
             inline_cache: HashMap::new(),
             edit: None,
             find: FindState::default(),
+            find_re: None,
             goto: None,
             table_mode: table_delim.is_some(),
             table_delim,
             col_widths: Vec::new(),
             status: String::new(),
+            bulk_edit: None,
             scroll_to: None,
             max_cols: 0,
             ctx_target: None,
             page_rows: 30,
             disk_changed: Vec::new(),
+            layout: Layout::default(),
+            layout_gen: 0,
+            expanded: HashSet::new(),
+            collapse: cfg.collapse_unchanged,
+            wrap: cfg.word_wrap,
+            scroll_anim: None,
+            step_file: None,
+            bookmarks,
             id: egui::Id::new(("textview", std::time::Instant::now())),
         };
+        v.apply_prettify();
         v.rediff();
         v.first_diff();
         v
@@ -184,14 +443,57 @@ impl TextView {
     pub fn set_options(&mut self, opts: &DiffOptions) {
         if self.opts != *opts {
             self.opts = opts.clone();
+            self.apply_prettify();
             self.rediff();
         }
     }
 
+    /// Shows JSON / XML panes reformatted while the option is on, and the loaded text otherwise.
+    /// Panes with unsaved edits are left alone.
+    fn apply_prettify(&mut self) {
+        for (p, pane) in self.panes.iter_mut().enumerate() {
+            if pane.doc.modified {
+                continue;
+            }
+            let swap = if self.opts.prettify {
+                match pane.original {
+                    None => prettified(&pane.doc).map(|d| {
+                        pane.original = Some(std::mem::replace(&mut pane.doc, d));
+                    }),
+                    Some(_) => None,
+                }
+            } else {
+                pane.original.take().map(|o| pane.doc = o)
+            };
+            if swap.is_some() {
+                pane.hl_dirty = true;
+                self.bookmarks[p].clear();
+            }
+        }
+    }
+
+    /// Comment syntax of the compared files, from the first pane whose language is known.
+    fn comment_syntax(&self) -> Option<&'static comments::CommentSyntax> {
+        self.panes.iter().find_map(|p| {
+            p.doc
+                .path
+                .as_deref()
+                .and_then(comments::for_path)
+                .or_else(|| p.doc.syntax.as_deref().and_then(comments::for_extension))
+        })
+    }
+
     pub fn rediff(&mut self) {
+        let syntax = self.comment_syntax();
         let refs: Vec<&[String]> = self.panes.iter().map(|p| p.doc.lines.as_slice()).collect();
-        self.diff = diff::compute(&refs, &self.opts);
+        self.diff = diff::compute_with(&refs, &self.opts, syntax);
+        for (p, marks) in self.bookmarks.iter_mut().enumerate() {
+            let n = self.panes[p].doc.lines.len();
+            marks.retain(|&l| l < n);
+        }
         self.inline_cache.clear();
+        self.sel_anchor = None;
+        self.layout_gen += 1;
         if let Some(b) = self.cur_block {
             if b >= self.diff.blocks.len() {
                 self.cur_block = None;
@@ -224,8 +526,101 @@ impl TextView {
         for &p in panes {
             self.panes[p].doc.modified = true;
             self.panes[p].hl_dirty = true;
+            if let Some(before) = self.undo.last().map(|s| s.lines[p].clone()) {
+                self.remap_bookmarks(p, &before);
+            }
         }
         self.rediff();
+    }
+
+    /// Moves the bookmarks of pane `p` along with its lines after they changed from `before`.
+    fn remap_bookmarks(&mut self, p: usize, before: &[String]) {
+        if self.bookmarks[p].is_empty() {
+            return;
+        }
+        let map = line_map(before, &self.panes[p].doc.lines);
+        self.bookmarks[p] = self.bookmarks[p]
+            .iter()
+            .filter_map(|&l| map.get(l).copied())
+            .collect();
+    }
+
+    // ---------- bookmarks ----------
+
+    /// The pane and line a bookmark toggled on `row` refers to: the active pane's line, or the
+    /// first line on that row.
+    fn bookmark_target(&self, row: usize, pane: usize) -> Option<(usize, usize)> {
+        let r = self.diff.rows.get(row)?;
+        r.line[pane]
+            .map(|l| (pane, l))
+            .or_else(|| (0..self.n()).find_map(|p| r.line[p].map(|l| (p, l))))
+    }
+
+    pub fn toggle_bookmark(&mut self) {
+        if let Some(r) = self.cursor_row {
+            self.toggle_bookmark_at(r, self.active_pane);
+        }
+    }
+
+    fn toggle_bookmark_at(&mut self, row: usize, pane: usize) {
+        if let Some((p, l)) = self.bookmark_target(row, pane) {
+            if !self.bookmarks[p].remove(&l) {
+                self.bookmarks[p].insert(l);
+            }
+        }
+    }
+
+    pub fn has_bookmarks(&self) -> bool {
+        self.bookmarks.iter().any(|b| !b.is_empty())
+    }
+
+    pub fn clear_bookmarks(&mut self) {
+        self.bookmarks.iter_mut().for_each(BTreeSet::clear);
+    }
+
+    /// Diff rows that hold a bookmark, sorted.
+    fn bookmark_rows(&self) -> Vec<usize> {
+        let mut rows: Vec<usize> = self
+            .bookmarks
+            .iter()
+            .enumerate()
+            .flat_map(|(p, ls)| ls.iter().map(move |&l| (p, l)))
+            .map(|(p, l)| self.diff.row_of_line(p, l))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    fn row_bookmarked(&self, r: usize, p: usize) -> bool {
+        self.diff.rows[r].line[p].is_some_and(|l| self.bookmarks[p].contains(&l))
+    }
+
+    /// Moves the cursor to the next (or previous) bookmark, wrapping around.
+    pub fn goto_bookmark(&mut self, forward: bool) {
+        let rows = self.bookmark_rows();
+        let cur = self.cursor_row;
+        let found = if forward {
+            rows.iter()
+                .find(|&&r| cur.is_none_or(|c| r > c))
+                .or(rows.first())
+        } else {
+            rows.iter()
+                .rev()
+                .find(|&&r| cur.is_some_and(|c| r < c))
+                .or(rows.last())
+        };
+        match found {
+            Some(&row) => {
+                self.sel_anchor = None;
+                self.cursor_row = Some(row);
+                self.scroll_to = Some(row);
+                self.cur_block = self.diff.rows[row]
+                    .block
+                    .filter(|&b| !self.diff.blocks[b].ignored);
+            }
+            None => self.status = tr("msg.no_bookmarks").to_string(),
+        }
     }
 
     // ---------- navigation ----------
@@ -260,7 +655,8 @@ impl TextView {
         }
     }
 
-    pub fn next_diff(&mut self, conflicts_only: bool) {
+    /// Selects the next difference; false when there is none after the cursor.
+    pub fn next_diff(&mut self, conflicts_only: bool) -> bool {
         let row = self.cursor_row;
         let found = self
             .significant()
@@ -269,9 +665,11 @@ impl TextView {
         if let Some(b) = found {
             self.select_block(b);
         }
+        found.is_some()
     }
 
-    pub fn prev_diff(&mut self, conflicts_only: bool) {
+    /// Selects the previous difference; false when there is none before the cursor.
+    pub fn prev_diff(&mut self, conflicts_only: bool) -> bool {
         let row = self.cursor_row.unwrap_or(self.diff.rows.len());
         let containing = self.diff.rows.get(row).and_then(|r| r.block);
         let found = self
@@ -282,6 +680,7 @@ impl TextView {
         if let Some(b) = found {
             self.select_block(b);
         }
+        found.is_some()
     }
 
     pub fn diff_position(&self) -> (Option<usize>, usize) {
@@ -315,11 +714,15 @@ impl TextView {
     }
 
     fn restore(&mut self, s: Snapshot) {
-        for (i, (p, lines)) in self.panes.iter_mut().zip(s.lines).enumerate() {
-            if p.doc.lines != lines {
-                p.hl_dirty = true;
+        for (i, lines) in s.lines.into_iter().enumerate() {
+            if self.panes[i].doc.lines == lines {
+                continue;
             }
-            p.doc.lines = lines;
+            let before = std::mem::replace(&mut self.panes[i].doc.lines, lines);
+            self.panes[i].hl_dirty = true;
+            self.remap_bookmarks(i, &before);
+        }
+        for (i, p) in self.panes.iter_mut().enumerate() {
             p.doc.modified = s.modified[i] || s.saves[i] != p.saves;
         }
         self.rediff();
@@ -389,7 +792,89 @@ impl TextView {
     }
 
     /// Alt+Right / Alt+Left semantics.
+    /// The selected rows, when more than one row is selected.
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let (a, c) = (self.sel_anchor?, self.cursor_row?);
+        (a != c && a.max(c) < self.diff.rows.len()).then(|| (a.min(c), a.max(c)))
+    }
+
+    /// The lines of `pane` in the selected rows, or on the cursor row.
+    pub fn selected_text(&self, pane: usize) -> Option<String> {
+        let (r0, r1) = self
+            .selection()
+            .or_else(|| self.cursor_row.map(|r| (r, r)))?;
+        let rows = self.diff.rows.get(r0..=r1)?;
+        let doc = &self.panes[pane].doc;
+        let lines: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r.line[pane])
+            .map(|l| doc.lines[l].as_str())
+            .collect();
+        (!lines.is_empty()).then(|| {
+            let mut text = lines.join(doc.eol.as_str());
+            if lines.len() > 1 {
+                text.push_str(doc.eol.as_str());
+            }
+            text
+        })
+    }
+
+    /// Replaces the lines of `to` in rows `r0..=r1` with the lines of `from` in those rows.
+    pub fn copy_rows(&mut self, r0: usize, r1: usize, from: usize, to: usize) {
+        if from == to || to >= self.n() || r1 >= self.diff.rows.len() || !self.writable(to) {
+            return;
+        }
+        let rows = &self.diff.rows[r0..=r1];
+        let src: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.line[from])
+            .map(|l| self.panes[from].doc.lines[l].clone())
+            .collect();
+        let dst: Vec<usize> = rows.iter().filter_map(|r| r.line[to]).collect();
+        let range = match (dst.first(), dst.last()) {
+            (Some(&a), Some(&b)) => a..b + 1,
+            _ => {
+                let at = self.insert_index(to, r0);
+                at..at
+            }
+        };
+        if self.panes[to].doc.lines[range.clone()] == src[..] {
+            return;
+        }
+        let n = src.len().max(range.len());
+        let start = range.start;
+        self.push_undo();
+        self.panes[to].doc.lines.splice(range, src);
+        self.mark_changed(&[to]);
+        let row = self.diff.row_of_line(to, start);
+        self.cursor_row = Some(row);
+        self.cur_block = self.diff.rows.get(row).and_then(|r| r.block);
+        self.status = trf("msg.copied_lines", &[("n", n.to_string())]);
+    }
+
+    /// Source and target panes of copying to the right or to the left.
+    fn copy_direction(&self, to_right: bool) -> (usize, usize) {
+        if self.n() == 2 {
+            if to_right {
+                (0, 1)
+            } else {
+                (1, 0)
+            }
+        } else if to_right {
+            let from = self.active_pane.min(1);
+            (from, from + 1)
+        } else {
+            let from = self.active_pane.max(1);
+            (from, from - 1)
+        }
+    }
+
     pub fn copy_current(&mut self, to_right: bool) {
+        if let Some((r0, r1)) = self.selection() {
+            let (from, to) = self.copy_direction(to_right);
+            self.copy_rows(r0, r1, from, to);
+            return;
+        }
         let Some(b) = self.cur_block else { return };
         let (from, to) = if self.n() == 2 {
             if to_right {
@@ -419,6 +904,45 @@ impl TextView {
         self.mark_changed(&[to]);
         self.cur_block = None;
         self.status = trf("msg.copied_blocks", &[("n", blocks.len().to_string())]);
+        if !blocks.is_empty() {
+            self.bulk_edit = Some(self.status.clone());
+        }
+    }
+
+    /// Three-way: replaces the middle of the current difference with the left lines followed by
+    /// the right lines (`left_first`), or the other way round.
+    pub fn take_both(&mut self, left_first: bool) {
+        let Some(b) = self.cur_block else { return };
+        self.take_both_at(b, left_first);
+    }
+
+    fn take_both_at(&mut self, b: usize, left_first: bool) {
+        if self.n() != 3 || b >= self.diff.blocks.len() || !self.writable(1) {
+            return;
+        }
+        let blk = self.diff.blocks[b].clone();
+        let (first, second) = if left_first { (0, 2) } else { (2, 0) };
+        let mut lines = self.panes[first].doc.lines[blk.ranges[first].clone()].to_vec();
+        lines.extend_from_slice(&self.panes[second].doc.lines[blk.ranges[second].clone()]);
+        if self.panes[1].doc.lines[blk.ranges[1].clone()] == lines[..] {
+            return;
+        }
+        self.push_undo();
+        let start = blk.ranges[1].start;
+        self.panes[1].doc.lines.splice(blk.ranges[1].clone(), lines);
+        self.mark_changed(&[1]);
+        let row = self.diff.row_of_line(1, start);
+        self.cursor_row = Some(row);
+        self.cur_block = self.diff.rows.get(row).and_then(|r| r.block);
+    }
+
+    /// Whether "take both" applies to the current difference.
+    pub fn can_take_both(&self) -> bool {
+        self.n() == 3
+            && !self.panes[1].doc.read_only
+            && self
+                .cur_block
+                .is_some_and(|b| self.diff.blocks.get(b).is_some_and(|b| !b.ignored))
     }
 
     /// Three-way: merges all non-conflicting changes into the middle pane.
@@ -450,6 +974,9 @@ impl TextView {
                 ("c", self.diff.conflicts().to_string()),
             ],
         );
+        if merged > 0 {
+            self.bulk_edit = Some(self.status.clone());
+        }
         if self.diff.conflicts() > 0 {
             self.cursor_row = Some(0);
             self.next_diff(true);
@@ -527,6 +1054,56 @@ impl TextView {
         let r = self.diff.row_of_line(pane, at);
         self.cursor_row = Some(r);
         self.begin_edit(r, pane);
+    }
+
+    /// Pastes `text` into the active pane: it replaces an empty document or the selected lines,
+    /// and is otherwise inserted below the cursor row.
+    pub fn paste(&mut self, text: &str) {
+        let p = self.active_pane;
+        if p >= self.n() || !self.writable(p) {
+            return;
+        }
+        let (new_lines, _, _, final_newline) = text::split_lines(text);
+        if new_lines.is_empty() {
+            return;
+        }
+        let doc = &self.panes[p].doc;
+        let blank = doc.lines.len() <= 1 && doc.lines.iter().all(String::is_empty);
+        let range = if blank {
+            0..doc.lines.len()
+        } else if let Some((r0, r1)) = self.selection() {
+            let lines: Vec<usize> = self.diff.rows[r0..=r1]
+                .iter()
+                .filter_map(|r| r.line[p])
+                .collect();
+            match (lines.first(), lines.last()) {
+                (Some(&a), Some(&b)) => a..b + 1,
+                _ => {
+                    let at = self.insert_index(p, r0);
+                    at..at
+                }
+            }
+        } else if let Some(r) = self.cursor_row {
+            let at = self.insert_index(p, r + 1);
+            at..at
+        } else {
+            doc.lines.len()..doc.lines.len()
+        };
+        let n = new_lines.len();
+        let last = range.start + n - 1;
+        self.push_undo();
+        let doc = &mut self.panes[p].doc;
+        if blank {
+            doc.final_newline = final_newline;
+        }
+        doc.lines.splice(range, new_lines);
+        self.mark_changed(&[p]);
+        self.sel_anchor = None;
+        let row = self.diff.row_of_line(p, last);
+        self.cursor_row = Some(row);
+        self.scroll_to = Some(row);
+        self.cur_block = self.diff.rows.get(row).and_then(|r| r.block);
+        self.status = trf("msg.pasted_lines", &[("n", n.to_string())]);
     }
 
     fn delete_line(&mut self, row: usize, pane: usize) {
@@ -630,6 +1207,7 @@ impl TextView {
         let Some(path) = dlg.save_file() else {
             return Ok(false);
         };
+        self.panes[p].original = None;
         let doc = &mut self.panes[p].doc;
         doc.save_as(&path)?;
         doc.read_only = false;
@@ -711,6 +1289,13 @@ impl TextView {
         Some(patch::make_patch(&input, &self.diff, style, context))
     }
 
+    /// Side-by-side HTML report of the compare as currently shown.
+    pub fn html_report(&self) -> String {
+        let titles: Vec<String> = self.panes.iter().map(|p| p.doc.title()).collect();
+        let refs: Vec<&[String]> = self.panes.iter().map(|p| p.doc.lines.as_slice()).collect();
+        crate::core::report::text_html(&titles, &refs, &self.diff, &self.opts)
+    }
+
     // ---------- find ----------
 
     pub fn open_find(&mut self) {
@@ -718,21 +1303,47 @@ impl TextView {
         self.find.focus = true;
     }
 
-    pub fn find_next(&mut self, forward: bool) {
+    pub fn open_replace(&mut self) {
+        self.open_find();
+        self.find.show_replace = true;
+    }
+
+    /// The compiled find query, or why it does not compile.
+    fn matcher(&mut self) -> Option<Result<Regex, String>> {
         if self.find.query.is_empty() {
-            return;
+            return None;
         }
-        let q = if self.find.match_case {
-            self.find.query.clone()
-        } else {
-            self.find.query.to_lowercase()
+        let key = self.find.key();
+        if self.find_re.as_ref().map(|(k, _)| k) != Some(&key) {
+            let re = find_regex(&key.0, key.1, key.2, key.3).map_err(|e| e.to_string());
+            self.find_re = Some((key, re));
+        }
+        self.find_re.as_ref().map(|(_, re)| re.clone())
+    }
+
+    /// The compiled find query, with a status message when it is not a valid pattern.
+    fn valid_matcher(&mut self) -> Option<Regex> {
+        match self.matcher()? {
+            Ok(re) => Some(re),
+            Err(e) => {
+                self.status = trf("msg.bad_regex", &[("error", e)]);
+                None
+            }
+        }
+    }
+
+    pub fn find_next(&mut self, forward: bool) {
+        let Some(re) = self.valid_matcher() else {
+            return;
         };
         let pane = self.active_pane;
         let total = self.diff.rows.len();
         if total == 0 {
             return;
         }
-        let start = self.cursor_row.unwrap_or(0);
+        let start = self
+            .cursor_row
+            .unwrap_or(if forward { total - 1 } else { 0 });
         for k in 1..=total {
             let r = if forward {
                 (start + k) % total
@@ -740,13 +1351,7 @@ impl TextView {
                 (start + total * 2 - k) % total
             };
             if let Some(l) = self.diff.rows[r].line[pane] {
-                let line = &self.panes[pane].doc.lines[l];
-                let hit = if self.find.match_case {
-                    line.contains(&q)
-                } else {
-                    line.to_lowercase().contains(&q)
-                };
-                if hit {
+                if re.is_match(&self.panes[pane].doc.lines[l]) {
                     self.cursor_row = Some(r);
                     self.scroll_to = Some(r);
                     self.cur_block = self.diff.rows[r].block;
@@ -758,12 +1363,81 @@ impl TextView {
         self.status = trf("msg.not_found", &[("text", self.find.query.clone())]);
     }
 
+    /// Replaces the first match on the current line of the active pane, then finds the next one.
+    pub fn replace_next(&mut self) {
+        let Some(re) = self.valid_matcher() else {
+            return;
+        };
+        let pane = self.active_pane;
+        let line = self
+            .cursor_row
+            .and_then(|r| self.diff.rows.get(r))
+            .and_then(|r| r.line[pane]);
+        if let Some(l) = line.filter(|&l| re.is_match(&self.panes[pane].doc.lines[l])) {
+            if !self.writable(pane) {
+                return;
+            }
+            let row = self.cursor_row;
+            let text = &self.panes[pane].doc.lines[l];
+            let new = if self.find.regex {
+                re.replacen(text, 1, self.find.replace.as_str())
+            } else {
+                re.replacen(text, 1, regex::NoExpand(&self.find.replace))
+            }
+            .into_owned();
+            self.push_undo();
+            self.panes[pane].doc.lines[l] = new;
+            self.mark_changed(&[pane]);
+            self.cursor_row = row.map(|_| self.diff.row_of_line(pane, l));
+        }
+        self.find_next(true);
+    }
+
+    /// Replaces every match in the active pane, as one undoable edit.
+    pub fn replace_everywhere(&mut self) {
+        let Some(re) = self.valid_matcher() else {
+            return;
+        };
+        let pane = self.active_pane;
+        if !self.writable(pane) {
+            return;
+        }
+        let mut lines = self.panes[pane].doc.lines.clone();
+        let n = replace_all(&mut lines, &re, &self.find.replace, self.find.regex);
+        if n == 0 {
+            self.status = trf("msg.not_found", &[("text", self.find.query.clone())]);
+            return;
+        }
+        self.push_undo();
+        self.panes[pane].doc.lines = lines;
+        self.mark_changed(&[pane]);
+        self.bulk_edit = Some(trf("msg.replaced", &[("n", n.to_string())]));
+    }
+
     pub fn goto_line(&mut self, line: usize) {
         let r = self
             .diff
             .row_of_line(self.active_pane, line.saturating_sub(1));
         self.cursor_row = Some(r);
         self.scroll_to = Some(r);
+    }
+
+    pub fn outcome(&self) -> Outcome {
+        if self.diff_position().1 == 0 {
+            Outcome::Identical
+        } else {
+            Outcome::Different
+        }
+    }
+
+    /// Lines removed from the left and added on the right of a 2-way compare.
+    pub fn change_counts(&self) -> Option<(usize, usize)> {
+        (self.n() == 2).then(|| {
+            self.significant().fold((0, 0), |(del, add), b| {
+                let r = &self.diff.blocks[b].ranges;
+                (del + r[0].len(), add + r[1].len())
+            })
+        })
     }
 
     pub fn status_line(&self) -> String {
@@ -779,6 +1453,9 @@ impl TextView {
                 None => trf("msg.diff_count", &[("total", total.to_string())]),
             }
         };
+        if let Some((del, add)) = self.change_counts().filter(|&(d, a)| d + a > 0) {
+            s.push_str(&format!("  (+{add} −{del})"));
+        }
         if self.n() == 3 {
             s.push_str(&format!(
                 "  |  {}: {}",
@@ -795,6 +1472,13 @@ impl TextView {
             {
                 s.push_str(&format!("  |  {} {}", tr("label.line"), l + 1));
             }
+        }
+        if let Some((r0, r1)) = self.selection() {
+            let n = r1 - r0 + 1;
+            s.push_str(&format!(
+                "  |  {}",
+                trf("text.rows_selected", &[("n", n.to_string())])
+            ));
         }
         if !self.status.is_empty() {
             s.push_str("  |  ");
@@ -923,15 +1607,7 @@ impl TextView {
         tab: usize,
         show_ws: bool,
     ) -> LayoutJob {
-        let text = if text.len() > 8000 {
-            let mut end = 8000;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            &text[..end]
-        } else {
-            text
-        };
+        let text = clip_line(text);
         let mut cuts: Vec<usize> = vec![0, text.len()];
         if let Some(sp) = spans {
             for (r, _) in sp {
@@ -1004,28 +1680,32 @@ impl TextView {
     }
 
     fn find_hits(&self, line: &str) -> Vec<Range<usize>> {
-        if !self.find.open || self.find.query.is_empty() {
+        if !self.find.open {
             return Vec::new();
         }
-        let (hay, q) = if self.find.match_case {
-            (line.to_string(), self.find.query.clone())
-        } else {
-            (line.to_lowercase(), self.find.query.to_lowercase())
-        };
-        if hay.len() != line.len() {
-            return Vec::new();
+        match &self.find_re {
+            Some((key, Ok(re))) if *key == self.find.key() => re
+                .find_iter(line)
+                .filter(|m| !m.is_empty())
+                .map(|m| m.range())
+                .collect(),
+            _ => Vec::new(),
         }
-        hay.match_indices(&q).map(|(i, m)| i..i + m.len()).collect()
     }
 
     fn toolbar(&mut self, ui: &mut Ui) {
         widgets::toolbar(ui, |ui| {
             let pal = widgets::pal(ui);
-            if widgets::icon_button(ui, "⇈", tr("cmd.first_diff")).clicked() {
+            let key = widgets::with_key;
+            if widgets::icon_button(ui, Icon::First, &key(tr("cmd.first_diff"), "Alt+Home"))
+                .clicked()
+            {
                 self.first_diff();
             }
-            if widgets::icon_button(ui, "↑", tr("cmd.prev_diff")).clicked() {
-                self.prev_diff(false);
+            if widgets::icon_button(ui, Icon::Prev, &key(tr("cmd.prev_diff"), "Alt+↑")).clicked()
+                && !self.prev_diff(false)
+            {
+                self.step_file = Some(false);
             }
             let (pos, total) = self.diff_position();
             let counter = match pos {
@@ -1033,75 +1713,163 @@ impl TextView {
                 None => format!("– / {total}"),
             };
             widgets::chip(ui, &counter, pal.text, pal.control).on_hover_text(self.status_line());
-            if widgets::icon_button(ui, "↓", tr("cmd.next_diff")).clicked() {
-                self.next_diff(false);
+            if let Some((del, add)) = self.change_counts().filter(|&(d, a)| d + a > 0) {
+                let (added, removed) = (format!("+{add}"), format!("−{del}"));
+                ui.label(RichText::new(&added).monospace().color(pal.success));
+                ui.label(RichText::new(&removed).monospace().color(pal.danger))
+                    .on_hover_text(trf(
+                        "text.change_counts",
+                        &[("add", add.to_string()), ("del", del.to_string())],
+                    ));
             }
-            if widgets::icon_button(ui, "⇊", tr("cmd.last_diff")).clicked() {
+            if widgets::icon_button(ui, Icon::Next, &key(tr("cmd.next_diff"), "Alt+↓")).clicked()
+                && !self.next_diff(false)
+            {
+                self.step_file = Some(true);
+            }
+            if widgets::icon_button(ui, Icon::Last, &key(tr("cmd.last_diff"), "Alt+End")).clicked()
+            {
                 self.last_diff();
             }
             widgets::toolbar_sep(ui);
             if self.n() == 2 {
-                if widgets::icon_button(ui, "→", tr("cmd.copy_right")).clicked() {
+                if widgets::icon_button(ui, Icon::CopyRight, &key(tr("cmd.copy_right"), "Alt+→"))
+                    .clicked()
+                {
                     self.copy_current(true);
                 }
-                if widgets::icon_button(ui, "←", tr("cmd.copy_left")).clicked() {
+                if widgets::icon_button(ui, Icon::CopyLeft, &key(tr("cmd.copy_left"), "Alt+←"))
+                    .clicked()
+                {
                     self.copy_current(false);
                 }
-                if widgets::icon_button(ui, "⇉", tr("cmd.copy_all_right")).clicked() {
+                if widgets::icon_button(
+                    ui,
+                    Icon::CopyAllRight,
+                    &key(tr("cmd.copy_all_right"), "Ctrl+Alt+→"),
+                )
+                .clicked()
+                {
                     self.copy_all(0, 1);
                 }
-                if widgets::icon_button(ui, "⇇", tr("cmd.copy_all_left")).clicked() {
+                if widgets::icon_button(
+                    ui,
+                    Icon::CopyAllLeft,
+                    &key(tr("cmd.copy_all_left"), "Ctrl+Alt+←"),
+                )
+                .clicked()
+                {
                     self.copy_all(1, 0);
                 }
             } else {
-                if widgets::icon_button(ui, "⚠↑", tr("cmd.prev_conflict")).clicked() {
+                if widgets::icon_button(
+                    ui,
+                    Icon::PrevConflict,
+                    &key(tr("cmd.prev_conflict"), "Alt+PgUp"),
+                )
+                .clicked()
+                {
                     self.prev_diff(true);
                 }
-                if widgets::icon_button(ui, "⚠↓", tr("cmd.next_conflict")).clicked() {
+                if widgets::icon_button(
+                    ui,
+                    Icon::NextConflict,
+                    &key(tr("cmd.next_conflict"), "Alt+PgDn"),
+                )
+                .clicked()
+                {
                     self.next_diff(true);
                 }
                 widgets::toolbar_sep(ui);
-                if widgets::icon_button(ui, "L→M", tr("cmd.copy_from_left")).clicked() {
+                if widgets::icon_button(ui, Icon::CopyRight, tr("cmd.copy_from_left")).clicked() {
                     if let Some(b) = self.cur_block {
                         self.copy_block(b, 0, 1);
                     }
                 }
-                if widgets::icon_button(ui, "M←R", tr("cmd.copy_from_right")).clicked() {
+                if widgets::icon_button(ui, Icon::CopyLeft, tr("cmd.copy_from_right")).clicked() {
                     if let Some(b) = self.cur_block {
                         self.copy_block(b, 2, 1);
                     }
                 }
-                if widgets::icon_button(ui, "⇉M", tr("cmd.copy_all_from_left")).clicked() {
+                if widgets::icon_button(ui, Icon::CopyAllRight, tr("cmd.copy_all_from_left"))
+                    .clicked()
+                {
                     self.copy_all(0, 1);
                 }
-                if widgets::icon_button(ui, "M⇇", tr("cmd.copy_all_from_right")).clicked() {
+                if widgets::icon_button(ui, Icon::CopyAllLeft, tr("cmd.copy_all_from_right"))
+                    .clicked()
+                {
                     self.copy_all(2, 1);
                 }
-                if widgets::ghost_button(ui, &format!("⚡ {}", tr("cmd.auto_merge"))).clicked() {
+                if widgets::ghost_icon_button(ui, Icon::Bolt, tr("cmd.auto_merge")).clicked() {
                     self.auto_merge();
                 }
             }
             widgets::toolbar_sep(ui);
-            if widgets::icon_button_enabled(ui, self.can_undo(), "↶", tr("cmd.undo")).clicked() {
+            if widgets::icon_button_enabled(
+                ui,
+                self.can_undo(),
+                Icon::Undo,
+                &key(tr("cmd.undo"), "Ctrl+Z"),
+            )
+            .clicked()
+            {
                 self.undo();
             }
-            if widgets::icon_button_enabled(ui, self.can_redo(), "↷", tr("cmd.redo")).clicked() {
+            if widgets::icon_button_enabled(
+                ui,
+                self.can_redo(),
+                Icon::Redo,
+                &key(tr("cmd.redo"), "Ctrl+Y"),
+            )
+            .clicked()
+            {
                 self.redo();
             }
             widgets::toolbar_sep(ui);
             let mut find_open = self.find.open;
-            if widgets::toggle_button(ui, &mut find_open, "🔍", tr("cmd.find")).clicked() {
+            if widgets::toggle_icon_button(
+                ui,
+                &mut find_open,
+                Some(Icon::Search),
+                "",
+                &key(tr("cmd.find"), "Ctrl+F"),
+            )
+            .clicked()
+            {
                 if find_open {
                     self.open_find();
                 } else {
                     self.find.open = false;
                 }
             }
+            let mut collapse = self.collapse;
+            if widgets::toggle_icon_button(
+                ui,
+                &mut collapse,
+                Some(Icon::Fold),
+                "",
+                &key(tr("cmd.collapse_unchanged"), "Alt+C"),
+            )
+            .clicked()
+            {
+                self.set_collapse(collapse);
+            }
+            ui.add_enabled_ui(!self.table_mode, |ui| {
+                widgets::toggle_icon_button(
+                    ui,
+                    &mut self.wrap,
+                    Some(Icon::Wrap),
+                    "",
+                    &key(tr("cmd.word_wrap"), "Alt+Z"),
+                );
+            });
             if self.table_delim.is_some() {
-                widgets::toggle_button(
+                widgets::toggle_icon_button(
                     ui,
                     &mut self.table_mode,
-                    &format!("▦ {}", tr("cmd.table_mode")),
+                    Some(Icon::Table),
+                    tr("cmd.table_mode"),
                     tr("cmd.table_mode"),
                 );
             }
@@ -1118,12 +1886,11 @@ impl TextView {
         let mut ignore = false;
         widgets::toolbar(ui, |ui| {
             let pal = widgets::pal(ui);
+            widgets::inline_icon(ui, Icon::Warning, pal.warning);
+            ui.add_space(4.0);
             ui.label(
-                egui::RichText::new(format!(
-                    "⚠ {}",
-                    trf("msg.changed_on_disk", &[("file", names.join(", "))])
-                ))
-                .color(pal.warning),
+                egui::RichText::new(trf("msg.changed_on_disk", &[("file", names.join(", "))]))
+                    .color(pal.warning),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ignore = widgets::ghost_button(ui, tr("btn.ignore")).clicked();
@@ -1140,9 +1907,13 @@ impl TextView {
     fn find_bar(&mut self, ui: &mut Ui) {
         widgets::toolbar(ui, |ui| {
             let hint = tr("label.find").trim_end_matches([':', '：']);
+            let dim = widgets::pal(ui).text_dim;
+            ui.add_space(4.0);
+            widgets::inline_icon(ui, Icon::Search, dim);
+            ui.add_space(4.0);
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.find.query)
-                    .hint_text(format!("🔍 {hint}"))
+                    .hint_text(hint)
                     .margin(vec2(8.0, 4.0))
                     .desired_width(280.0),
             );
@@ -1162,19 +1933,62 @@ impl TextView {
             {
                 self.find.open = false;
             }
+            if let Some(Err(e)) = self.matcher() {
+                let danger = widgets::pal(ui).danger;
+                ui.painter().rect_stroke(
+                    r.rect.expand2(vec2(8.0, 4.0)),
+                    4.0,
+                    Stroke::new(1.5_f32, danger),
+                    egui::StrokeKind::Outside,
+                );
+                r.on_hover_text(e);
+            }
             ui.add_space(4.0);
             widgets::toggle_button(ui, &mut self.find.match_case, "Aa", tr("label.match_case"));
-            if widgets::icon_button(ui, "↑", tr("cmd.find_prev")).clicked() {
+            widgets::toggle_button(ui, &mut self.find.whole_word, "ab", tr("label.whole_word"));
+            widgets::toggle_button(ui, &mut self.find.regex, ".*", tr("label.regex"));
+            let key = widgets::with_key;
+            if widgets::icon_button(ui, Icon::Prev, &key(tr("cmd.find_prev"), "Shift+F3")).clicked()
+            {
                 self.find_next(false);
             }
-            if widgets::icon_button(ui, "↓", tr("cmd.find_next")).clicked() {
+            if widgets::icon_button(ui, Icon::Next, &key(tr("cmd.find_next"), "F3")).clicked() {
                 self.find_next(true);
             }
+            widgets::toggle_button(
+                ui,
+                &mut self.find.show_replace,
+                tr("cmd.replace"),
+                &key(tr("cmd.replace"), REPLACE_KEY),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if widgets::icon_button(ui, "✖", tr("btn.cancel")).clicked() {
+                if widgets::icon_button(ui, Icon::Close, &key(tr("btn.close"), "Esc")).clicked() {
                     self.find.open = false;
                 }
             });
+        });
+        if !self.find.show_replace {
+            return;
+        }
+        widgets::toolbar(ui, |ui| {
+            ui.add_space(24.0);
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.find.replace)
+                    .hint_text(tr("label.replace_with"))
+                    .margin(vec2(8.0, 4.0))
+                    .desired_width(280.0),
+            );
+            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                self.replace_next();
+                r.request_focus();
+            }
+            ui.add_space(4.0);
+            if widgets::secondary_button(ui, tr("cmd.replace")).clicked() {
+                self.replace_next();
+            }
+            if widgets::secondary_button(ui, tr("cmd.replace_all")).clicked() {
+                self.replace_everywhere();
+            }
         });
     }
 
@@ -1224,9 +2038,15 @@ impl TextView {
                     widgets::side_chip(ui, p, n);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        let lock = if ro { "🔒" } else { "🔓" };
-                        if widgets::toggle_button(ui, &mut ro, lock, tr("label.read_only"))
-                            .clicked()
+                        let lock = if ro { Icon::Lock } else { Icon::Unlock };
+                        if widgets::toggle_icon_button(
+                            ui,
+                            &mut ro,
+                            Some(lock),
+                            "",
+                            tr("label.read_only"),
+                        )
+                        .clicked()
                         {
                             self.panes[p].doc.read_only = ro;
                         }
@@ -1319,6 +2139,149 @@ impl TextView {
         );
     }
 
+    /// Rebuilds the display lines when folding, wrapping or the diff changed.
+    fn ensure_layout(&mut self, wrap_cols: usize, tab: usize) {
+        let key = (wrap_cols, tab, self.collapse, self.layout_gen);
+        let rows = self.diff.rows.len();
+        if self.layout.key == Some(key) && self.layout.row_line.len() == rows {
+            return;
+        }
+        let top = self
+            .layout
+            .lines
+            .get(self.scroll as usize)
+            .map(|l| match *l {
+                VLine::Row(r, _) => r,
+                VLine::Fold(s, _) => s,
+            });
+        let unchanged = |r: usize| {
+            self.diff.rows[r]
+                .block
+                .is_none_or(|b| self.diff.blocks[b].ignored)
+        };
+        let mut lines = Vec::with_capacity(rows);
+        let mut row_line = vec![0; rows];
+        let mut r = 0;
+        while r < rows {
+            let (lo, hi, end) = if self.collapse && unchanged(r) {
+                let mut e = r;
+                while e < rows && unchanged(e) {
+                    e += 1;
+                }
+                let lo = if r == 0 { 0 } else { r + FOLD_CONTEXT };
+                let hi = if e == rows {
+                    e
+                } else {
+                    e.saturating_sub(FOLD_CONTEXT)
+                };
+                if hi >= lo + MIN_FOLD && !self.expanded.contains(&lo) {
+                    (lo, hi, e)
+                } else {
+                    (e, e, e)
+                }
+            } else {
+                (r + 1, r + 1, r + 1)
+            };
+            for k in r..end {
+                if k == lo && hi > lo {
+                    row_line[lo..hi].fill(lines.len());
+                    lines.push(VLine::Fold(lo, hi));
+                }
+                if (lo..hi).contains(&k) {
+                    continue;
+                }
+                row_line[k] = lines.len();
+                let segs = if wrap_cols > 0 {
+                    self.row_segments(k, wrap_cols, tab)
+                } else {
+                    1
+                };
+                lines.extend((0..segs).map(|s| VLine::Row(k, s)));
+            }
+            r = end;
+        }
+        self.layout = Layout {
+            key: Some(key),
+            lines,
+            row_line,
+        };
+        if let Some(&v) = top.and_then(|t| self.layout.row_line.get(t)) {
+            self.scroll = v as f32 + self.scroll.fract();
+        }
+    }
+
+    fn row_segments(&self, r: usize, cols: usize, tab: usize) -> u32 {
+        let row = &self.diff.rows[r];
+        (0..self.n())
+            .filter_map(|p| row.line[p].map(|l| &self.panes[p].doc.lines[l]))
+            .map(|line| wrap_starts(line, tab, cols).len() as u32)
+            .max()
+            .unwrap_or(1)
+    }
+
+    /// Expands the fold hiding `row`, if any.
+    fn reveal_row(&mut self, row: usize, wrap_cols: usize, tab: usize) {
+        let Some(&v) = self.layout.row_line.get(row) else {
+            return;
+        };
+        if let Some(VLine::Fold(s, _)) = self.layout.lines.get(v) {
+            self.expanded.insert(*s);
+            self.layout_gen += 1;
+            self.ensure_layout(wrap_cols, tab);
+        }
+    }
+
+    /// First display line of a row and the line after its last wrapped segment.
+    fn row_span(&self, r: usize) -> Option<(usize, usize)> {
+        let lines = &self.layout.lines;
+        let v0 = *self.layout.row_line.get(r)?;
+        if !matches!(lines.get(v0), Some(VLine::Row(..))) {
+            return None;
+        }
+        let mut v1 = v0 + 1;
+        while matches!(lines.get(v1), Some(VLine::Row(x, _)) if *x == r) {
+            v1 += 1;
+        }
+        Some((v0, v1))
+    }
+
+    /// Display lines covered by a block.
+    fn block_span(&self, b: usize) -> (usize, usize) {
+        let blk = &self.diff.blocks[b];
+        let map = &self.layout.row_line;
+        let v0 = map.get(blk.first_row).copied().unwrap_or(0);
+        let v1 = map
+            .get(blk.first_row + blk.rows)
+            .copied()
+            .unwrap_or(self.layout.lines.len());
+        (v0, v1.max(v0 + 1))
+    }
+
+    /// The row shown nearest to display line `v`, looking in the given direction first.
+    fn row_near(&self, v: usize, forward: bool) -> Option<usize> {
+        let lines = &self.layout.lines;
+        let v = v.min(lines.len().checked_sub(1)?);
+        let row = |l: &VLine| match *l {
+            VLine::Row(r, _) => Some(r),
+            VLine::Fold(..) => None,
+        };
+        let find = |fwd: bool| {
+            if fwd {
+                lines[v..].iter().find_map(row)
+            } else {
+                lines[..=v].iter().rev().find_map(row)
+            }
+        };
+        find(forward).or_else(|| find(!forward))
+    }
+
+    pub fn set_collapse(&mut self, on: bool) {
+        self.collapse = on;
+        self.expanded.clear();
+        self.layout_gen += 1;
+        self.scroll_to = self.cursor_row;
+    }
+
     fn handle_keys(&mut self, ui: &Ui) {
         if ui.ctx().wants_keyboard_input()
             || self.edit.is_some()
@@ -1327,37 +2290,66 @@ impl TextView {
         {
             return;
         }
-        let total = self.diff.rows.len();
+        let pasted = ui.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Paste(s) => Some(s.clone()),
+                _ => None,
+            })
+        });
+        if let Some(text) = pasted {
+            self.paste(&text);
+        }
+        let total = self.layout.lines.len();
         if total == 0 {
             return;
         }
         let page = self.page_rows.max(1);
-        let mut row = self.cursor_row.unwrap_or(self.scroll as usize);
-        let mut moved = false;
+        let (cur, below) = match self.cursor_row.and_then(|r| self.row_span(r)) {
+            Some(span) => span,
+            None => {
+                let v = (self.scroll as usize).min(total - 1);
+                (v, v)
+            }
+        };
+        let mut target: Option<(usize, bool)> = None;
+        let mut extend = false;
+        let mut copy = false;
         ui.input_mut(|i| {
+            copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+            // Unshifted patterns also match with Shift held, so the Shift ones go first.
+            for (key, fwd) in [
+                (Key::ArrowDown, true),
+                (Key::ArrowUp, false),
+                (Key::PageDown, true),
+                (Key::PageUp, false),
+            ] {
+                if i.consume_key(Modifiers::SHIFT, key) {
+                    target = Some(match (key, fwd) {
+                        (Key::ArrowDown, _) => (below, true),
+                        (Key::ArrowUp, _) => (cur.saturating_sub(1), false),
+                        (_, true) => (cur + page, true),
+                        _ => (cur.saturating_sub(page), false),
+                    });
+                    extend = true;
+                }
+            }
             if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
-                row = (row + 1).min(total - 1);
-                moved = true;
+                target = Some((below, true));
             }
             if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
-                row = row.saturating_sub(1);
-                moved = true;
+                target = Some((cur.saturating_sub(1), false));
             }
             if i.consume_key(Modifiers::NONE, Key::PageDown) {
-                row = (row + page).min(total - 1);
-                moved = true;
+                target = Some((cur + page, true));
             }
             if i.consume_key(Modifiers::NONE, Key::PageUp) {
-                row = row.saturating_sub(page);
-                moved = true;
+                target = Some((cur.saturating_sub(page), false));
             }
             if i.consume_key(Modifiers::COMMAND, Key::Home) {
-                row = 0;
-                moved = true;
+                target = Some((0, true));
             }
             if i.consume_key(Modifiers::COMMAND, Key::End) {
-                row = total - 1;
-                moved = true;
+                target = Some((total - 1, false));
             }
             if i.consume_key(Modifiers::NONE, Key::ArrowLeft) && self.active_pane > 0 {
                 self.active_pane -= 1;
@@ -1368,14 +2360,26 @@ impl TextView {
                 self.active_pane += 1;
             }
         });
-        if moved {
+        if copy {
+            if let Some(text) = self.selected_text(self.active_pane) {
+                ui.ctx().copy_text(text);
+            }
+        }
+        if let Some(row) = target.and_then(|(v, fwd)| self.row_near(v, fwd)) {
+            self.sel_anchor = if extend {
+                self.sel_anchor.or(self.cursor_row)
+            } else {
+                None
+            };
             self.cursor_row = Some(row);
             self.scroll_to = Some(row);
             self.cur_block = self.diff.rows[row]
                 .block
                 .filter(|&b| !self.diff.blocks[b].ignored);
         }
-        if ui.input(|i| i.key_pressed(Key::F2) || i.key_pressed(Key::Enter)) {
+        if ui.input(|i| {
+            i.modifiers.is_none() && (i.key_pressed(Key::F2) || i.key_pressed(Key::Enter))
+        }) {
             if let Some(r) = self.cursor_row {
                 self.begin_edit(r, self.active_pane);
             }
@@ -1389,18 +2393,22 @@ impl TextView {
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.toolbar(ui);
+        if self.outcome() == Outcome::Identical {
+            let color = widgets::pal(ui).success;
+            widgets::info_bar(ui, Icon::Check, tr("msg.identical"), color);
+        }
         if !self.disk_changed.is_empty() {
             self.disk_changed_bar(ui);
         }
         if self.find.open {
             self.find_bar(ui);
         }
-        self.handle_keys(ui);
 
         let n = self.n();
         let avail = ui.available_rect_before_wrap();
         let header_h = 36.0;
-        let hbar_h = 12.0;
+        let wrap = self.wrap && !self.table_mode;
+        let hbar_h = if wrap { 0.0 } else { 12.0 };
         let loc_w = if cfg.show_location_pane {
             14.0 + 8.0 * n as f32
         } else {
@@ -1418,7 +2426,6 @@ impl TextView {
         let body_h = body_bottom - body_top;
         let visible = body_h / row_h;
         self.page_rows = (visible as usize).saturating_sub(1).max(1);
-        let total = self.diff.rows.len();
 
         // headers
         for p in 0..n {
@@ -1433,22 +2440,7 @@ impl TextView {
             pos2(content_left, body_top),
             pos2(content_right, body_bottom),
         );
-        let resp = ui.interact(body_rect, self.id.with("body"), Sense::click());
-
-        // scrolling
-        if ui.rect_contains_pointer(body_rect) {
-            let d = ui.input(|i| i.smooth_scroll_delta);
-            self.scroll -= d.y / row_h;
-            self.hscroll -= d.x;
-        }
-        if let Some(row) = self.scroll_to.take() {
-            let r = row as f32;
-            if r < self.scroll || r > self.scroll + visible - 2.0 {
-                self.scroll = r - (visible / 3.0).floor();
-            }
-        }
-        let max_scroll = (total as f32 - visible + 1.0).max(0.0);
-        self.scroll = self.scroll.clamp(0.0, max_scroll);
+        let resp = ui.interact(body_rect, self.id.with("body"), Sense::click_and_drag());
 
         let digits = self
             .panes
@@ -1465,6 +2457,54 @@ impl TextView {
             6.0
         };
         let text_w = pane_w - gutter_w - 2.0;
+        let tab = cfg.tab_size;
+        let wrap_cols = if wrap {
+            (((text_w - 8.0) / char_w).floor() as usize).max(8)
+        } else {
+            0
+        };
+        let fresh = self.layout.key.is_none();
+        self.ensure_layout(wrap_cols, tab);
+        self.handle_keys(ui);
+
+        // scrolling
+        let now = ui.input(|i| i.time);
+        if ui.rect_contains_pointer(body_rect) {
+            let d = ui.input(|i| i.smooth_scroll_delta);
+            if d != egui::Vec2::ZERO {
+                self.scroll_anim = None;
+                self.scroll -= d.y / row_h;
+                self.hscroll -= d.x;
+            }
+        }
+        if let Some(row) = self.scroll_to.take() {
+            self.reveal_row(row, wrap_cols, tab);
+            if let Some(&v) = self.layout.row_line.get(row) {
+                let v = v as f32;
+                if v < self.scroll || v > self.scroll + visible - 2.0 {
+                    let target = v - (visible / 3.0).floor();
+                    if fresh || ui.style().animation_time <= 0.0 {
+                        self.scroll = target;
+                    } else {
+                        self.scroll_anim = Some((self.scroll, target, now));
+                    }
+                }
+            }
+        }
+        let total = self.layout.lines.len();
+        let max_scroll = (total as f32 - visible + 1.0).max(0.0);
+        if let Some((from, to, start)) = self.scroll_anim {
+            let t = ((now - start) / SCROLL_ANIM_SECS).clamp(0.0, 1.0) as f32;
+            let ease = 1.0 - (1.0 - t).powi(3);
+            self.scroll = from + (to.clamp(0.0, max_scroll) - from) * ease;
+            if t >= 1.0 {
+                self.scroll_anim = None;
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
+        self.scroll = self.scroll.clamp(0.0, max_scroll);
+
         let content_w = if self.table_mode {
             self.col_widths
                 .iter()
@@ -1474,40 +2514,120 @@ impl TextView {
         } else {
             self.max_cols as f32 * char_w + 40.0
         };
-        self.hscroll = self.hscroll.clamp(0.0, (content_w - text_w).max(0.0));
+        self.hscroll = if wrap {
+            0.0
+        } else {
+            self.hscroll.clamp(0.0, (content_w - text_w).max(0.0))
+        };
 
-        let first = self.scroll.floor() as usize;
+        let first = (self.scroll.floor() as usize).min(total);
         let last = (first + visible.ceil() as usize + 1).min(total);
-        for r in first..last {
-            self.ensure_inline(r);
+        let shown: Vec<VLine> = self.layout.lines[first..last].to_vec();
+        for l in &shown {
+            if let VLine::Row(r, _) = *l {
+                self.ensure_inline(r);
+            }
+        }
+        let line_at = |scroll: f32, y: f32| {
+            let v = (scroll + (y - body_top) / row_h).floor();
+            (v >= 0.0 && (v as usize) < total).then_some(v as usize)
+        };
+        let hover_v = ui
+            .input(|i| i.pointer.hover_pos())
+            .filter(|p| body_rect.contains(*p))
+            .and_then(|p| line_at(self.scroll, p.y));
+        let hover_block = hover_v
+            .and_then(|v| match self.layout.lines[v] {
+                VLine::Row(r, _) => self.diff.rows[r].block,
+                VLine::Fold(..) => None,
+            })
+            .filter(|&b| !self.diff.blocks[b].ignored);
+        let hover_fold = hover_v.filter(|&v| matches!(self.layout.lines[v], VLine::Fold(..)));
+        if hover_fold.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
         // clicks
         if resp.clicked() || resp.double_clicked() || resp.secondary_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let r = (self.scroll + (pos.y - body_top) / row_h).floor() as usize;
                 let p = (((pos.x - content_left) / pane_w).floor() as usize).min(n - 1);
-                if r < total {
-                    self.active_pane = p;
-                    self.cursor_row = Some(r);
-                    if let Some(b) = self.diff.rows[r].block {
-                        if !self.diff.blocks[b].ignored {
-                            self.cur_block = Some(b);
+                match line_at(self.scroll, pos.y).map(|v| self.layout.lines[v]) {
+                    Some(VLine::Row(r, _)) => {
+                        let in_sel = self.selection().is_some_and(|(a, b)| (a..=b).contains(&r));
+                        // Right-clicking the selection keeps it for the context menu.
+                        if !(resp.secondary_clicked() && in_sel && p == self.active_pane) {
+                            self.sel_anchor = if ui.input(|i| i.modifiers.shift) {
+                                self.sel_anchor.or(self.cursor_row)
+                            } else {
+                                None
+                            };
+                            self.active_pane = p;
+                            self.cursor_row = Some(r);
+                            if let Some(b) = self.diff.rows[r].block {
+                                if !self.diff.blocks[b].ignored {
+                                    self.cur_block = Some(b);
+                                }
+                            }
+                            if resp.double_clicked() {
+                                self.begin_edit(r, p);
+                            }
+                        }
+                        if resp.secondary_clicked() {
+                            self.ctx_target = Some((r, p));
                         }
                     }
-                    if resp.double_clicked() {
-                        self.begin_edit(r, p);
+                    Some(VLine::Fold(s, _)) if resp.clicked() => {
+                        self.expanded.insert(s);
+                        self.layout_gen += 1;
                     }
-                    if resp.secondary_clicked() {
-                        self.ctx_target = Some((r, p));
-                    }
+                    _ => {}
                 }
             }
         }
 
+        // dragging selects rows of the pane where the drag started
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                if resp.drag_started() {
+                    let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
+                    self.active_pane =
+                        (((origin.x - content_left) / pane_w).floor() as usize).min(n - 1);
+                    if !ui.input(|i| i.modifiers.shift) {
+                        self.sel_anchor =
+                            match line_at(self.scroll, origin.y).map(|v| self.layout.lines[v]) {
+                                Some(VLine::Row(r, _)) => Some(r),
+                                _ => None,
+                            };
+                    }
+                }
+                let edge = if pos.y < body_top {
+                    pos.y - body_top
+                } else {
+                    (pos.y - body_bottom).max(0.0)
+                };
+                if edge != 0.0 {
+                    self.scroll = (self.scroll + edge / row_h * 0.5).clamp(0.0, max_scroll);
+                    ui.ctx().request_repaint();
+                }
+                let y = pos.y.clamp(body_top, body_bottom - 1.0);
+                if let Some(VLine::Row(r, _)) =
+                    line_at(self.scroll, y).map(|v| self.layout.lines[v])
+                {
+                    if self.sel_anchor.is_none() {
+                        self.sel_anchor = Some(r);
+                    }
+                    self.cursor_row = Some(r);
+                    self.cur_block = self.diff.rows[r]
+                        .block
+                        .filter(|&b| !self.diff.blocks[b].ignored);
+                }
+            }
+        }
+        let selection = self.selection();
+
         // painting
         let painter = ui.painter();
-        let tab = cfg.tab_size;
+        let line_y = |v: usize| body_top + (v as f32 - self.scroll) * row_h;
         for p in 0..n {
             let x0 = content_left + p as f32 * pane_w;
             let gutter_rect =
@@ -1521,8 +2641,11 @@ impl TextView {
             let gp = ui.painter_at(gutter_rect);
             let tp = ui.painter_at(text_rect);
             let pane = &self.panes[p];
-            for r in first..last {
-                let y = body_top + (r as f32 - self.scroll) * row_h;
+            let mut laid: Option<(usize, Arc<Galley>, Vec<f32>)> = None;
+            for (k, l) in shown.iter().enumerate() {
+                let VLine::Row(r, seg) = *l else { continue };
+                let seg = seg as usize;
+                let y = line_y(first + k);
                 let row_rect =
                     Rect::from_min_size(pos2(text_rect.left(), y), vec2(text_rect.width(), row_h));
                 if let Some(bg) = self.row_bg(r, p, c) {
@@ -1538,15 +2661,34 @@ impl TextView {
                         );
                     }
                 }
+                if p == self.active_pane && selection.is_some_and(|(a, b)| (a..=b).contains(&r)) {
+                    tp.rect_filled(
+                        row_rect,
+                        0.0,
+                        ui.visuals().selection.bg_fill.gamma_multiply(0.7),
+                    );
+                }
                 let row = self.diff.rows[r];
                 let Some(l) = row.line[p] else { continue };
-                if cfg.show_line_numbers {
+                let bookmarked = self.bookmarks[p].contains(&l);
+                if bookmarked && seg == 0 {
+                    gp.rect_filled(
+                        Rect::from_min_size(pos2(x0 + 1.0, y + 2.0), vec2(4.0, row_h - 4.0)),
+                        2.0,
+                        c.ui.warning,
+                    );
+                }
+                if cfg.show_line_numbers && seg == 0 {
                     gp.text(
                         pos2(gutter_rect.right() - 6.0, y + row_h / 2.0),
                         Align2::RIGHT_CENTER,
                         (l + 1).to_string(),
                         font.clone(),
-                        c.gutter_text,
+                        if bookmarked {
+                            c.ui.warning
+                        } else {
+                            c.gutter_text
+                        },
                     );
                 }
                 let line = &pane.doc.lines[l];
@@ -1594,42 +2736,60 @@ impl TextView {
                     }
                     continue;
                 }
-                let spans = if ignored {
-                    None
-                } else {
-                    pane.hl.as_ref().and_then(|h| h.get(l))
+                if laid.as_ref().map(|(lr, ..)| *lr) != Some(r) {
+                    let spans = if ignored {
+                        None
+                    } else {
+                        pane.hl.as_ref().and_then(|h| h.get(l))
+                    };
+                    let inline = self
+                        .inline_cache
+                        .get(&r)
+                        .map(|v| v[p].as_slice())
+                        .unwrap_or(&[]);
+                    let hits = self.find_hits(line);
+                    let job = Self::line_job(
+                        line,
+                        spans,
+                        inline,
+                        &hits,
+                        inline_bg,
+                        c.find_hit,
+                        fg,
+                        &font,
+                        tab,
+                        cfg.show_whitespace,
+                    );
+                    let galley = ui.fonts(|f| f.layout_job(job));
+                    let xs = if wrap {
+                        segment_x(&galley, &wrap_starts(line, tab, wrap_cols))
+                    } else {
+                        vec![0.0]
+                    };
+                    laid = Some((r, galley, xs));
+                }
+                let Some((_, galley, xs)) = &laid else {
+                    continue;
                 };
-                let inline = self
-                    .inline_cache
-                    .get(&r)
-                    .map(|v| v[p].as_slice())
-                    .unwrap_or(&[]);
-                let hits = self.find_hits(line);
-                let job = Self::line_job(
-                    line,
-                    spans,
-                    inline,
-                    &hits,
-                    inline_bg,
-                    c.find_hit,
-                    fg,
-                    &font,
-                    tab,
-                    cfg.show_whitespace,
-                );
-                let galley = ui.fonts(|f| f.layout_job(job));
-                tp.galley(
-                    pos2(text_rect.left() + 4.0 - self.hscroll, y + 1.0),
-                    galley,
-                    fg,
-                );
+                let left = text_rect.left() + 4.0;
+                if !wrap {
+                    tp.galley(pos2(left - self.hscroll, y + 1.0), galley.clone(), fg);
+                } else if let Some(&sx) = xs.get(seg) {
+                    let right = xs
+                        .get(seg + 1)
+                        .map_or(text_rect.right(), |&e| left + e - sx);
+                    let clip =
+                        Rect::from_min_max(pos2(text_rect.left(), y), pos2(right, y + row_h))
+                            .intersect(text_rect);
+                    tp.with_clip_rect(clip)
+                        .galley(pos2(left - sx, y + 1.0), galley.clone(), fg);
+                }
             }
-            if let Some(cr) = self.cursor_row {
-                if cr >= first && cr < last {
-                    let y = body_top + (cr as f32 - self.scroll) * row_h;
-                    let rr = Rect::from_min_size(
-                        pos2(text_rect.left() + 1.0, y),
-                        vec2(text_rect.width() - 2.0, row_h),
+            if let Some((v0, v1)) = self.cursor_row.and_then(|cr| self.row_span(cr)) {
+                if v1 > first && v0 < last {
+                    let rr = Rect::from_min_max(
+                        pos2(text_rect.left() + 1.0, line_y(v0)),
+                        pos2(text_rect.right() - 1.0, line_y(v1)),
                     );
                     let color = if p == self.active_pane {
                         c.cursor_row
@@ -1648,26 +2808,152 @@ impl TextView {
             );
         }
 
-        // inline editor
-        if let Some(e) = &mut self.edit {
-            let visible_row = e.row >= first && e.row < last;
-            let mut done: Option<bool> = None;
-            if visible_row {
-                let x0 = content_left + e.pane as f32 * pane_w + gutter_w;
-                let y = body_top + (e.row as f32 - self.scroll) * row_h;
-                let rect = Rect::from_min_size(pos2(x0, y - 1.0), vec2(text_w, row_h + 2.0));
-                let te = egui::TextEdit::singleline(&mut e.text)
-                    .font(font.clone())
-                    .desired_width(text_w);
-                let r = ui.put(rect, te);
-                if e.focus {
-                    r.request_focus();
-                    e.focus = false;
-                } else if r.lost_focus() {
-                    done = Some(!ui.input(|i| i.key_pressed(Key::Escape)));
+        // folded runs of unchanged lines
+        let bp = ui.painter_at(body_rect);
+        for (k, l) in shown.iter().enumerate() {
+            let VLine::Fold(s, e) = *l else { continue };
+            let y = line_y(first + k);
+            let rect = Rect::from_min_max(pos2(content_left, y), pos2(content_right, y + row_h));
+            let hovered = hover_fold == Some(first + k);
+            bp.rect_filled(
+                rect,
+                0.0,
+                if hovered {
+                    c.ui.control_hover
+                } else {
+                    c.ui.surface_alt
+                },
+            );
+            for edge in [rect.top() + 0.5, rect.bottom() - 0.5] {
+                bp.hline(rect.x_range(), edge, Stroke::new(1.0_f32, c.ui.border));
+            }
+            let fg = if hovered { c.ui.accent } else { c.ui.text_dim };
+            let label = trf("text.folded", &[("n", (e - s).to_string())]);
+            let small = FontId::proportional((cfg.font_size - 1.0).max(10.0));
+            let galley = ui.fonts(|f| f.layout_no_wrap(label, small, fg));
+            let icon = row_h - 6.0;
+            let w = icon + 6.0 + galley.size().x;
+            let x = (rect.center().x - w / 2.0).max(rect.left() + 8.0);
+            icons::paint(
+                &bp,
+                Rect::from_min_size(pos2(x, y + 3.0), vec2(icon, icon)),
+                Icon::Fold,
+                fg,
+            );
+            bp.galley(
+                pos2(x + icon + 6.0, rect.center().y - galley.size().y / 2.0),
+                galley,
+                fg,
+            );
+        }
+
+        // merge arrows on the dividers
+        let mut merge: Option<(usize, usize, usize)> = None;
+        let arrow_block = hover_block.or(self.cur_block).filter(|&b| {
+            self.edit.is_none() && b < self.diff.blocks.len() && !self.diff.blocks[b].ignored
+        });
+        if let Some(b) = arrow_block {
+            let (v0, v1) = self.block_span(b);
+            if v1 > first && v0 < last {
+                let blk = &self.diff.blocks[b];
+                let y = line_y(v0.max(first)).clamp(body_top, body_bottom - row_h);
+                let cy = y + row_h / 2.0;
+                let pairs: &[(usize, [MergeArrow; 2])] = if n == 2 {
+                    &[(
+                        0,
+                        [
+                            (0, 1, Icon::CopyRight, "cmd.copy_right"),
+                            (1, 0, Icon::CopyLeft, "cmd.copy_left"),
+                        ],
+                    )]
+                } else {
+                    &[
+                        (
+                            0,
+                            [
+                                (0, 1, Icon::CopyRight, "cmd.copy_from_left"),
+                                (1, 0, Icon::CopyLeft, "cmd.copy_middle_left"),
+                            ],
+                        ),
+                        (
+                            1,
+                            [
+                                (1, 2, Icon::CopyRight, "cmd.copy_middle_right"),
+                                (2, 1, Icon::CopyLeft, "cmd.copy_from_right"),
+                            ],
+                        ),
+                    ]
+                };
+                let d = (row_h + 2.0).clamp(18.0, 24.0);
+                for (div, arrows) in pairs {
+                    let x = content_left + (*div + 1) as f32 * pane_w - 1.0;
+                    for (i, &(from, to, icon, key)) in arrows.iter().enumerate() {
+                        let lines = |q: usize| &self.panes[q].doc.lines[blk.ranges[q].clone()];
+                        if self.panes[to].doc.read_only || lines(from) == lines(to) {
+                            continue;
+                        }
+                        let cx = if i == 0 {
+                            x - d / 2.0 - 1.0
+                        } else {
+                            x + d / 2.0 + 1.0
+                        };
+                        let rect = Rect::from_center_size(pos2(cx, cy), vec2(d, d));
+                        let r = ui
+                            .interact(rect, self.id.with(("merge", from, to)), Sense::click())
+                            .on_hover_text(tr(key))
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        r.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr(key))
+                        });
+                        let hot = r.hovered();
+                        let painter = ui.painter();
+                        painter.circle(
+                            rect.center(),
+                            d / 2.0,
+                            if hot { c.ui.accent } else { c.ui.surface },
+                            Stroke::new(
+                                1.0_f32,
+                                if hot { c.ui.accent } else { c.ui.border_strong },
+                            ),
+                        );
+                        icons::paint(
+                            painter,
+                            rect.shrink(d * 0.22),
+                            icon,
+                            if hot { c.ui.on_accent } else { c.ui.text },
+                        );
+                        if r.clicked() {
+                            merge = Some((b, from, to));
+                        }
+                    }
                 }
-            } else {
-                done = Some(true);
+            }
+        }
+        if let Some((b, from, to)) = merge {
+            self.copy_block(b, from, to);
+        }
+
+        // inline editor
+        let edit_line = self.edit.as_ref().and_then(|e| self.row_span(e.row));
+        if let Some(e) = &mut self.edit {
+            let mut done: Option<bool> = None;
+            match edit_line.filter(|&(v0, _)| v0 >= first && v0 < last) {
+                Some((v0, _)) => {
+                    let x0 = content_left + e.pane as f32 * pane_w + gutter_w;
+                    let y = body_top + (v0 as f32 - self.scroll) * row_h;
+                    let rect = Rect::from_min_size(pos2(x0, y - 1.0), vec2(text_w, row_h + 2.0));
+                    let te = egui::TextEdit::singleline(&mut e.text)
+                        .font(font.clone())
+                        .desired_width(text_w);
+                    let r = ui.put(rect, te);
+                    if e.focus {
+                        r.request_focus();
+                        e.focus = false;
+                    } else if r.lost_focus() {
+                        done = Some(!ui.input(|i| i.key_pressed(Key::Escape)));
+                    }
+                }
+                None => done = Some(true),
             }
             if let Some(commit) = done {
                 let e = self.edit.take().unwrap();
@@ -1681,27 +2967,30 @@ impl TextView {
         let mut action: Option<MenuAction> = None;
         if let Some((r, p)) = self.ctx_target {
             let block = self.diff.rows.get(r).and_then(|row| row.block);
+            let lines = selection.filter(|&(a, b)| (a..=b).contains(&r));
             resp.context_menu(|ui| {
-                if let Some(b) = block {
-                    if n == 2 {
-                        if ui.button(format!("→  {}", tr("cmd.copy_right"))).clicked() {
-                            action = Some(MenuAction::Copy(b, 0, 1));
-                        }
-                        if ui.button(format!("←  {}", tr("cmd.copy_left"))).clicked() {
-                            action = Some(MenuAction::Copy(b, 1, 0));
-                        }
+                let copy = |from, to| match (lines, block) {
+                    (Some(_), _) => Some(MenuAction::CopyLines(from, to)),
+                    (None, Some(b)) => Some(MenuAction::Copy(b, from, to)),
+                    _ => None,
+                };
+                if lines.is_some() || block.is_some() {
+                    let items: &[(String, usize, usize)] = if n == 2 {
+                        &[
+                            (format!("→  {}", tr("cmd.copy_right")), 0, 1),
+                            (format!("←  {}", tr("cmd.copy_left")), 1, 0),
+                        ]
                     } else {
-                        if ui.button(tr("cmd.copy_from_left")).clicked() {
-                            action = Some(MenuAction::Copy(b, 0, 1));
-                        }
-                        if ui.button(tr("cmd.copy_from_right")).clicked() {
-                            action = Some(MenuAction::Copy(b, 2, 1));
-                        }
-                        if ui.button(tr("cmd.copy_middle_left")).clicked() {
-                            action = Some(MenuAction::Copy(b, 1, 0));
-                        }
-                        if ui.button(tr("cmd.copy_middle_right")).clicked() {
-                            action = Some(MenuAction::Copy(b, 1, 2));
+                        &[
+                            (tr("cmd.copy_from_left").to_string(), 0, 1),
+                            (tr("cmd.copy_from_right").to_string(), 2, 1),
+                            (tr("cmd.copy_middle_left").to_string(), 1, 0),
+                            (tr("cmd.copy_middle_right").to_string(), 1, 2),
+                        ]
+                    };
+                    for (label, from, to) in items {
+                        if ui.button(label).clicked() {
+                            action = copy(*from, *to);
                         }
                     }
                     ui.separator();
@@ -1719,6 +3008,28 @@ impl TextView {
                 if ui.button(tr("cmd.copy_text")).clicked() {
                     action = Some(MenuAction::CopyText(r, p));
                 }
+                let mark = if self
+                    .bookmark_target(r, p)
+                    .is_some_and(|(bp, _)| self.row_bookmarked(r, bp))
+                {
+                    "cmd.remove_bookmark"
+                } else {
+                    "cmd.add_bookmark"
+                };
+                if ui.button(tr(mark)).clicked() {
+                    action = Some(MenuAction::ToggleBookmark(r, p));
+                }
+                if n == 3 {
+                    if let Some(b) = block.filter(|_| !self.panes[1].doc.read_only) {
+                        ui.separator();
+                        if ui.button(tr("cmd.take_left_right")).clicked() {
+                            action = Some(MenuAction::TakeBoth(b, true));
+                        }
+                        if ui.button(tr("cmd.take_right_left")).clicked() {
+                            action = Some(MenuAction::TakeBoth(b, false));
+                        }
+                    }
+                }
                 if action.is_some() {
                     ui.close_menu();
                 }
@@ -1731,26 +3042,42 @@ impl TextView {
                 MenuAction::InsertBelow(r, p) => self.insert_below(r, p),
                 MenuAction::DeleteLine(r, p) => self.delete_line(r, p),
                 MenuAction::CopyText(r, p) => {
-                    if let Some(l) = self.diff.rows.get(r).and_then(|row| row.line[p]) {
-                        ui.ctx().copy_text(self.panes[p].doc.lines[l].clone());
+                    let text = match selection {
+                        Some((a, b)) if (a..=b).contains(&r) && p == self.active_pane => {
+                            self.selected_text(p)
+                        }
+                        _ => self
+                            .diff
+                            .rows
+                            .get(r)
+                            .and_then(|row| row.line[p])
+                            .map(|l| self.panes[p].doc.lines[l].clone()),
+                    };
+                    if let Some(t) = text {
+                        ui.ctx().copy_text(t);
                     }
                 }
+                MenuAction::CopyLines(from, to) => {
+                    if let Some((a, b)) = selection {
+                        self.copy_rows(a, b, from, to);
+                    }
+                }
+                MenuAction::ToggleBookmark(r, p) => self.toggle_bookmark_at(r, p),
+                MenuAction::TakeBoth(b, left_first) => self.take_both_at(b, left_first),
             }
         }
 
         // location pane
-        if cfg.show_location_pane {
+        let scroll_before = self.scroll;
+        if cfg.show_location_pane && self.layout.row_line.len() == self.diff.rows.len() {
             let loc_rect = Rect::from_min_max(
                 pos2(avail.left(), body_top),
                 pos2(avail.left() + loc_w - 2.0, body_bottom),
             );
-            let marks: Vec<Mark> = self
-                .diff
-                .blocks
-                .iter()
-                .enumerate()
-                .filter(|(_, b)| !b.ignored)
-                .map(|(i, b)| {
+            let mut marks: Vec<Mark> = self
+                .significant()
+                .map(|i| {
+                    let b = &self.diff.blocks[i];
                     let sel = self.cur_block == Some(i);
                     let columns = std::array::from_fn(|p| {
                         Some(if b.ranges[p].is_empty() {
@@ -1763,13 +3090,26 @@ impl TextView {
                             c.change_bar
                         })
                     });
+                    let (start, end) = self.block_span(i);
                     Mark {
-                        start: b.first_row,
-                        len: b.rows,
+                        start,
+                        len: end - start,
                         columns,
                     }
                 })
                 .collect();
+            if self.has_bookmarks() {
+                for r in self.bookmark_rows() {
+                    marks.push(Mark {
+                        start: self.layout.row_line[r],
+                        len: 1,
+                        columns: std::array::from_fn(|p| {
+                            (p < n && self.row_bookmarked(r, p)).then_some(c.ui.warning)
+                        }),
+                    });
+                }
+                marks.sort_by_key(|m| m.start);
+            }
             if let Some(target) = widgets::location_pane(
                 ui,
                 self.id.with("loc"),
@@ -1797,18 +3137,23 @@ impl TextView {
             total + 1,
             visible,
         );
-        let hbar = Rect::from_min_max(
-            pos2(content_left, body_bottom),
-            pos2(content_right, avail.bottom()),
-        );
-        widgets::hscrollbar(
-            ui,
-            self.id.with("hbar"),
-            hbar,
-            &mut self.hscroll,
-            content_w,
-            text_w,
-        );
+        if self.scroll != scroll_before {
+            self.scroll_anim = None;
+        }
+        if !wrap {
+            let hbar = Rect::from_min_max(
+                pos2(content_left, body_bottom),
+                pos2(content_right, avail.bottom()),
+            );
+            widgets::hscrollbar(
+                ui,
+                self.id.with("hbar"),
+                hbar,
+                &mut self.hscroll,
+                content_w,
+                text_w,
+            );
+        }
         ui.allocate_rect(avail, Sense::hover());
 
         // go to line dialog
@@ -1850,6 +3195,25 @@ impl TextView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_words_and_patterns_and_replaces_them() {
+        let re = find_regex("foo", false, false, false).unwrap();
+        assert!(re.is_match("a FOO b"));
+        let re = find_regex("foo", true, true, false).unwrap();
+        assert!(!re.is_match("a FOO b") && !re.is_match("food") && re.is_match("a foo."));
+        let re = find_regex("a.c", true, false, false).unwrap();
+        assert!(re.is_match("xa.cx") && !re.is_match("abc"));
+        assert!(find_regex("(", true, false, true).is_err());
+
+        let mut lines = vec!["x = 1; y = 2".to_string(), "none".into(), "z = 3".into()];
+        let re = find_regex(r"(\w) = (\d)", true, false, true).unwrap();
+        assert_eq!(replace_all(&mut lines, &re, "$2 = $1", true), 3);
+        assert_eq!(lines, ["1 = x; 2 = y", "none", "3 = z"]);
+        let re = find_regex("none", true, false, false).unwrap();
+        assert_eq!(replace_all(&mut lines, &re, "$1", false), 1);
+        assert_eq!(lines[1], "$1");
+    }
     use std::time::Duration;
 
     fn touch(path: &std::path::Path, text: &str, age: u64) {
@@ -1861,6 +3225,220 @@ mod tests {
             .unwrap()
             .set_modified(t)
             .unwrap();
+    }
+
+    #[test]
+    fn wraps_after_spaces_and_counts_wide_chars_twice() {
+        assert_eq!(wrap_starts("hello world foo", 4, 8), [0, 6, 12]);
+        assert_eq!(wrap_starts("abcdefghij", 4, 4), [0, 4, 8]);
+        assert_eq!(wrap_starts("漢字漢字漢", 4, 4), [0, 4, 8]);
+        assert_eq!(wrap_starts("", 4, 8), [0]);
+    }
+
+    fn two_way(a: &str, b: &str) -> TextView {
+        let docs = vec![TextDoc::from_text(None, a), TextDoc::from_text(None, b)];
+        TextView::new(docs, &Config::default())
+    }
+
+    fn lines(v: &TextView, p: usize) -> Vec<&str> {
+        v.panes[p].doc.lines.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn takes_both_sides_pastes_and_keeps_bookmarks_on_their_lines() {
+        let docs = ["a\nL\nz\n", "a\nb\nz\n", "a\nR\nz\n"]
+            .iter()
+            .map(|t| TextDoc::from_text(None, t))
+            .collect();
+        let mut v = TextView::new(docs, &Config::default());
+        assert!(v.can_take_both());
+        v.take_both(true);
+        assert_eq!(lines(&v, 1), ["a", "L", "R", "z"]);
+        v.undo();
+        v.take_both(false);
+        assert_eq!(lines(&v, 1), ["a", "R", "L", "z"]);
+
+        let mut empty = TextDoc::empty(None);
+        empty.lines.push(String::new());
+        let mut v = TextView::new(vec![empty.clone(), empty], &Config::default());
+        v.active_pane = 1;
+        v.paste("x\ny\n");
+        assert_eq!(lines(&v, 1), ["x", "y"]);
+        assert!(v.panes[1].doc.final_newline && v.panes[1].doc.modified);
+        v.cursor_row = Some(v.diff.row_of_line(1, 0));
+        v.paste("between");
+        assert_eq!(lines(&v, 1), ["x", "between", "y"]);
+
+        let mut v = two_way("one\ntwo\nthree\n", "one\ntwo\nthree\n");
+        v.active_pane = 0;
+        v.cursor_row = Some(2);
+        v.toggle_bookmark();
+        v.cursor_row = Some(0);
+        v.paste("zero");
+        assert_eq!(v.bookmarks[0].iter().copied().collect::<Vec<_>>(), [3]);
+        v.cursor_row = Some(0);
+        v.goto_bookmark(true);
+        assert_eq!(v.cursor_row, Some(v.diff.row_of_line(0, 3)));
+        v.undo();
+        assert_eq!(v.bookmarks[0].iter().copied().collect::<Vec<_>>(), [2]);
+        v.toggle_bookmark_at(v.diff.row_of_line(0, 2), 0);
+        assert!(!v.has_bookmarks());
+    }
+
+    #[test]
+    fn shows_json_reformatted_while_the_option_is_on() {
+        let dir = std::env::temp_dir().join(format!("om_pretty_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.json"), dir.join("b.json"));
+        std::fs::write(&a, r#"{"b":1,"a":[1,2]}"#).unwrap();
+        std::fs::write(&b, "{\n  \"a\": [1, 2],\n  \"b\": 1\n}\n").unwrap();
+        let docs = vec![
+            text::load_doc(&a, None).unwrap(),
+            text::load_doc(&b, None).unwrap(),
+        ];
+        let mut v = TextView::new(docs, &Config::default());
+        assert!(!v.diff.is_identical());
+        let mut opts = DiffOptions {
+            prettify: true,
+            ..Default::default()
+        };
+        v.set_options(&opts);
+        assert!(v.panes[0].original.is_some() && v.diff.is_identical());
+        assert!(v.panes[0].doc.read_only);
+        opts.prettify = false;
+        v.set_options(&opts);
+        assert!(v.panes[0].original.is_none() && lines(&v, 0) == [r#"{"b":1,"a":[1,2]}"#]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copies_selected_lines_and_undoes() {
+        let mut v = two_way("a\nb\nc\nd\n", "a\nB\nC\nd\n");
+        v.cursor_row = Some(0);
+        assert_eq!(v.selected_text(0).as_deref(), Some("a"));
+        v.sel_anchor = Some(0);
+        v.cursor_row = Some(1);
+        assert_eq!(v.selection(), Some((0, 1)));
+        assert_eq!(v.selected_text(1).as_deref(), Some("a\nB\n"));
+
+        // copy only the first changed line of the block to the right
+        let row_b = v.diff.row_of_line(0, 1);
+        v.sel_anchor = Some(row_b);
+        v.cursor_row = Some(v.diff.row_of_line(0, 0));
+        v.copy_current(true);
+        assert_eq!(lines(&v, 1), ["a", "b", "C", "d"]);
+        assert!(v.panes[1].doc.modified && v.selection().is_none());
+
+        v.undo();
+        assert_eq!(lines(&v, 1), ["a", "B", "C", "d"]);
+        v.redo();
+        assert_eq!(lines(&v, 1), ["a", "b", "C", "d"]);
+
+        // copying into a pane with no lines in those rows inserts them
+        let mut v = two_way("a\nnew\nb\n", "a\nb\n");
+        let r = v.diff.row_of_line(0, 1);
+        v.copy_rows(r, r, 0, 1);
+        assert_eq!(lines(&v, 1), ["a", "new", "b"]);
+        assert_eq!(v.outcome(), Outcome::Identical);
+    }
+
+    #[test]
+    fn merges_three_way_and_replaces_in_the_active_pane() {
+        let base = "one\ntwo\nthree\nfour\n";
+        let docs = vec![
+            TextDoc::from_text(None, "one\nTWO\nthree\nfour\n"),
+            TextDoc::from_text(None, base),
+            TextDoc::from_text(None, "one\ntwo\nthree\nFOUR\n"),
+        ];
+        let mut v = TextView::new(docs, &Config::default());
+        v.auto_merge();
+        assert_eq!(lines(&v, 1), ["one", "TWO", "three", "FOUR"]);
+        assert_eq!(v.diff.conflicts(), 0);
+
+        v.active_pane = 1;
+        v.find.query = "t(\\w+)".into();
+        v.find.regex = true;
+        v.find.replace = "T$1".into();
+        v.replace_everywhere();
+        assert_eq!(lines(&v, 1), ["one", "TWO", "Three", "FOUR"]);
+        v.find.match_case = true;
+        v.find.query = "one".into();
+        v.find.regex = false;
+        v.find.replace = "1".into();
+        v.cursor_row = None;
+        v.replace_next();
+        assert_eq!(v.cursor_row, Some(0));
+        v.replace_next();
+        assert_eq!(lines(&v, 1), ["1", "TWO", "Three", "FOUR"]);
+        v.panes[0].doc.read_only = true;
+        v.active_pane = 0;
+        v.find.query = "TWO".into();
+        v.replace_everywhere();
+        assert_eq!(lines(&v, 0)[1], "TWO");
+    }
+
+    #[test]
+    fn merges_into_the_output_file_like_git_mergetool() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, text: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, text).unwrap();
+            p
+        };
+        let local = file("local", "a\nLOCAL\nc\nd\n");
+        let base = file("base", "a\nb\nc\nd\n");
+        let remote = file("remote", "a\nb\nc\nREMOTE\n");
+        let merged = file("merged", "<<<<<<< conflict markers from git\n");
+        let mut docs: Vec<TextDoc> = [&local, &base, &remote]
+            .iter()
+            .map(|p| text::load_doc(p, None).unwrap())
+            .collect();
+        redirect_output(&mut docs, &merged);
+        let mut v = TextView::new(docs, &Config::default());
+        assert!(v.panes[1].doc.modified);
+        v.auto_merge();
+        v.save_modified().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&merged).unwrap(),
+            "a\nLOCAL\nc\nREMOTE\n"
+        );
+        assert_eq!(std::fs::read_to_string(&base).unwrap(), "a\nb\nc\nd\n");
+        assert!(!v.is_modified());
+
+        // two files: the right one is the result, even when nothing was changed
+        let docs = vec![
+            text::load_doc(&local, None).unwrap(),
+            text::load_doc(&remote, None).unwrap(),
+        ];
+        let out = dir.path().join("out");
+        let mut docs = docs;
+        redirect_output(&mut docs, &out);
+        let mut v = TextView::new(docs, &Config::default());
+        v.save_modified().unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "a\nb\nc\nREMOTE\n");
+    }
+
+    #[test]
+    fn folds_unchanged_runs_around_differences() {
+        let a: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let b = a.replace("line 9\n", "changed\n");
+        let docs = vec![TextDoc::from_text(None, &a), TextDoc::from_text(None, &b)];
+        let mut v = TextView::new(docs, &Config::default());
+        let folds = |v: &TextView| {
+            v.layout
+                .lines
+                .iter()
+                .filter(|l| matches!(l, VLine::Fold(..)))
+                .count()
+        };
+        v.collapse = true;
+        v.ensure_layout(0, 4);
+        assert_eq!(folds(&v), 2);
+        assert_eq!(v.layout.row_line.len(), v.diff.rows.len());
+        assert_eq!(v.layout.lines[0], VLine::Fold(0, 6));
+        v.reveal_row(2, 0, 4);
+        assert_eq!(folds(&v), 1);
+        assert_eq!(v.layout.lines[2], VLine::Row(2, 0));
     }
 
     #[test]
