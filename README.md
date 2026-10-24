@@ -29,6 +29,13 @@ The name comes from the language it is written in: rust is iron oxide.
 - Compare methods: full contents, quick contents, binary contents, modified date, date and size, size only.
 - Show or hide identical, different and unique items. Copy items between sides or delete them,
   with optional Recycle Bin support and confirmation prompts.
+- Copy the selected items of any side to another folder, keeping their relative paths, and select
+  items by name with wildcards (`*.c; *.h`).
+- File compare below the folder list (View menu): the selected file's differences are shown right
+  under the list, without opening a tab.
+- 3-way auto merge of folders into the middle (common ancestor) folder: changes made on one side
+  are copied, removals are applied, and text files changed on both sides are merged line by line
+  when the changes don't overlap. Conflicts are listed and left alone.
 - Keyboard selection: arrow keys, Page Up/Down, Home/End, Shift to extend, Ctrl+A to select all.
 - Quick preview: press Space to see a colored diff of the selected file without opening a tab.
 - A long comparison that finishes while the window is in the background asks for attention.
@@ -36,7 +43,9 @@ The name comes from the language it is written in: rust is iron oxide.
 - Archives are extracted and compared as folders: zip-based formats (`.zip`, `.jar`, `.apk`,
   `.docx`, `.xlsx`, `.odt`, `.epub`, `.nupkg`, ...), `.tar`, `.tar.gz`/`.tgz`,
   `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz` and `.7z`.
-- Reports in HTML, CSV and plain text.
+- Reports in HTML, CSV and plain text. An HTML report can also include the side-by-side
+  differences of every changed text file (File → Generate report with file differences).
+- Statistics (Tools menu): counts of identical, different and unique files, and total sizes.
 - Project files (`.oxmproj`) save what a tab compares (paths, filter, subfolders and compare
   method) to open it again later; WinMerge `.WinMerge` projects open too.
 
@@ -51,13 +60,27 @@ The name comes from the language it is written in: rust is iron oxide.
   shows how many lines were added and removed.
 - WinMerge-style ignore options: whitespace (changes or all), case, blank lines, end-of-line style,
   numbers and code page.
+- Numeric tolerance: numbers at most a set amount apart (for example `0.001`) count as equal, for
+  comparing measurements and generated data.
+- Block filters: ignore everything between a start line and an end line matching regular
+  expressions, such as generated sections or license headers.
 - Ignore comment changes, for languages whose comment syntax is known (C-like languages, scripts,
   SQL, HTML/XML, CSS, Lua, Haskell, ...), and format JSON and XML before comparing (re-indented,
   JSON keys sorted) so only real content changes remain. Both also apply to folder compares.
 - File → New (Ctrl+N) opens two empty sides to paste text into (Ctrl+V) or type; Ctrl+V also
   inserts the clipboard below the current line, or replaces the selected lines, in any editable side.
 - Bookmarks: Ctrl+F2 sets or removes one, F4 / Shift+F4 jump to the next / previous; they are marked
-  in the gutter and the location pane.
+  in the gutter and the location pane. A bookmark can carry a comment (Edit → Bookmark comment),
+  shown when hovering the gutter and in HTML reports.
+- Save comparison (File menu): the text of every side with its bookmarks and comments in one
+  `.oxmcmp` file, to review later or send to someone else.
+- Compare with a Git revision (File menu, or `--git-rev`): a file or folder against how it was
+  in `HEAD`, a branch, tag or commit.
+- Line detail pane (View menu): the current line of every side, one above the other and wrapped,
+  to spot small differences in long lines.
+- Edit markers in the gutter show which lines were changed since the files were opened.
+- Statistics (Tools menu): identical, changed, added, removed and ignored lines, per pair of sides.
+- Indent or unindent the selected lines (Ctrl+] / Ctrl+[).
 - 3-way merges can take both sides of a difference (left then right, or right then left).
 - Copy differences left or right, copy all, auto merge for 3-way compares, undo and redo, and in-place editing.
 - Select lines by dragging, Shift+click or Shift+arrow keys; copy them to the clipboard with
@@ -236,6 +259,8 @@ oxidemerge -t web old.html new.html             # compare local HTML files as we
 oxidemerge left.txt right.txt -o merged.txt     # save the merge result to another file
 oxidemerge release.oxmproj                      # open a saved project (or a .WinMerge project)
 oxidemerge -r old.tar.gz new.tar.gz             # compare archives as folders
+oxidemerge --git-rev HEAD~1 src/main.rs         # compare a file with an earlier Git revision
+oxidemerge review.oxmcmp                        # open a saved comparison with its bookmarks
 ```
 
 A web page compare tab has a mode bar (Screenshot, HTML source, Text, Resource tree) and a reload
@@ -246,7 +271,7 @@ button. The last mode used is remembered. Screenshot size and the browser path a
 
 | Option | Description |
 | --- | --- |
-| `PATHS...` | 2 or 3 files, folders or URLs, or a single conflict file or project file |
+| `PATHS...` | 2 or 3 files, folders or URLs, or a single conflict file, project file or saved comparison |
 | `-r, --recursive` | Include subfolders in folder compares |
 | `-f, --filter <MASK>` | File filter, for example `*.c;*.h` or `!*.bak` |
 | `-m, --method <M>` | Folder compare method: `full`, `quick`, `binary`, `date`, `datesize`, `size` |
@@ -258,7 +283,10 @@ button. The last mode used is remembered. Screenshot size and the browser path a
 | `--ignore-case`, `--ignore-blank`, `--ignore-eol`, `--ignore-numbers` | Ignore options |
 | `--ignore-comments` | Ignore changes in comments |
 | `--prettify` | Reformat JSON and XML before comparing |
+| `--numeric-tolerance <AMOUNT>` | Treat numbers at most this far apart as equal |
+| `--git-rev <REV>` | Compare the single path given with how it was in a Git revision |
 | `--report <FILE>` | Write a report: folder compares as `.html`, `.csv` or `.txt`, text compares as side-by-side `.html` |
+| `--report-diffs` | Add the differences of every changed text file to an HTML folder report |
 | `--patch <FILE>` | Write a patch for two files or folders |
 | `--patch-style <S>` | `normal`, `context` or `unified` (default) |
 | `--context <N>` | Context lines for patches (default 3) |
@@ -280,6 +308,9 @@ oxidemerge --cli -r dirA dirB && echo identical
 
 # HTML report of a folder compare (--report and --patch never open a window)
 oxidemerge -r dirA dirB --report report.html
+
+# HTML folder report followed by the differences of every changed file
+oxidemerge -r dirA dirB --report report.html --report-diffs
 
 # Side-by-side HTML report of two files, ignoring comment changes
 oxidemerge old.c new.c --ignore-comments --report diff.html
@@ -343,6 +374,7 @@ file is stored.
 | `Ctrl+Alt+Right`, `Ctrl+Alt+Left` | Copy all differences right or left |
 | `Ctrl+Z`, `Ctrl+Y` / `Ctrl+Shift+Z` | Undo, redo |
 | `F2`, `Enter` | Edit the current line |
+| `Ctrl+]`, `Ctrl+[` | Indent or unindent the selected lines |
 | `Alt+C`, `Alt+Z` | Collapse unchanged lines, word wrap |
 | `Space` | Quick preview of the selected file in a folder compare |
 | `Ctrl++`, `Ctrl+-`, `Ctrl+0` | Zoom in, zoom out, reset zoom |

@@ -50,6 +50,13 @@ pub struct DiffOptions {
     pub ignore_comments: bool,
     /// JSON and XML files are reformatted before comparing.
     pub prettify: bool,
+    /// Lines that differ only in numbers at most `numeric_tolerance` apart do not count.
+    pub numeric_tolerance_enabled: bool,
+    pub numeric_tolerance: f64,
+    /// Lines from one matching a start regex to the next one matching its end regex do not
+    /// count as differences.
+    pub block_filters_enabled: bool,
+    pub block_filters: Vec<(String, String)>,
 }
 
 impl Default for DiffOptions {
@@ -70,6 +77,10 @@ impl Default for DiffOptions {
             substitutions: Vec::new(),
             ignore_comments: false,
             prettify: false,
+            numeric_tolerance_enabled: false,
+            numeric_tolerance: 0.001,
+            block_filters_enabled: false,
+            block_filters: Vec::new(),
         }
     }
 }
@@ -79,6 +90,13 @@ pub struct Normalizer {
     opts: DiffOptions,
     line_res: Vec<Regex>,
     subs: Vec<(Regex, String)>,
+    blocks: Vec<(Regex, Regex)>,
+    tolerance: Option<f64>,
+}
+
+fn number_re() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?").unwrap())
 }
 
 impl Normalizer {
@@ -101,10 +119,89 @@ impl Normalizer {
         } else {
             Vec::new()
         };
+        let blocks = if opts.block_filters_enabled {
+            opts.block_filters
+                .iter()
+                .filter(|(s, e)| !s.is_empty() && !e.is_empty())
+                .filter_map(|(s, e)| Some((Regex::new(s).ok()?, Regex::new(e).ok()?)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let tolerance = (opts.numeric_tolerance_enabled && opts.numeric_tolerance >= 0.0)
+            .then_some(opts.numeric_tolerance);
         Normalizer {
             opts: opts.clone(),
             line_res,
             subs,
+            blocks,
+            tolerance,
+        }
+    }
+
+    /// Whether equality needs a full diff: block filters and the numeric tolerance cannot be
+    /// decided one line at a time.
+    pub fn needs_diff(&self) -> bool {
+        !self.blocks.is_empty() || self.tolerance.is_some()
+    }
+
+    /// The lines inside block filters, start and end lines included. A block without an end
+    /// line is not a block.
+    pub fn block_mask(&self, lines: &[String]) -> Option<Vec<bool>> {
+        if self.blocks.is_empty() {
+            return None;
+        }
+        let mut mask = vec![false; lines.len()];
+        let mut open: Option<(usize, &Regex)> = None;
+        for (i, line) in lines.iter().enumerate() {
+            match open {
+                Some((start, end)) if end.is_match(line) => {
+                    mask[start..=i].fill(true);
+                    open = None;
+                }
+                Some(_) => {}
+                None => {
+                    open = self
+                        .blocks
+                        .iter()
+                        .find(|(s, _)| s.is_match(line))
+                        .map(|(_, e)| (i, e));
+                }
+            }
+        }
+        Some(mask)
+    }
+
+    /// Whether the lines are the same apart from numbers within the numeric tolerance.
+    pub fn close(&self, a: &str, b: &str) -> bool {
+        let (ka, kb) = (self.key(a), self.key(b));
+        if ka == kb {
+            return true;
+        }
+        let Some(tol) = self.tolerance else {
+            return false;
+        };
+        let re = number_re();
+        let (mut na, mut nb) = (re.find_iter(&ka), re.find_iter(&kb));
+        let (mut pa, mut pb) = (0, 0);
+        loop {
+            match (na.next(), nb.next()) {
+                (None, None) => return ka[pa..] == kb[pb..],
+                (Some(x), Some(y)) => {
+                    if ka[pa..x.start()] != kb[pb..y.start()] {
+                        return false;
+                    }
+                    let (Ok(u), Ok(v)) = (x.as_str().parse::<f64>(), y.as_str().parse::<f64>())
+                    else {
+                        return false;
+                    };
+                    if (u - v).abs() > tol * (1.0 + 1e-9) {
+                        return false;
+                    }
+                    (pa, pb) = (x.end(), y.end());
+                }
+                _ => return false,
+            }
         }
     }
 
@@ -188,6 +285,16 @@ pub struct Row {
     pub block: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub identical: usize,
+    pub changed: usize,
+    pub added: usize,
+    pub removed: usize,
+    pub ignored: usize,
+    pub differences: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DiffResult {
     pub panes: usize,
@@ -210,6 +317,26 @@ impl DiffResult {
 
     pub fn is_identical(&self) -> bool {
         self.significant_blocks() == 0
+    }
+
+    /// Line counts of a 2-way result: lines only on the right are added, lines only on the
+    /// left removed.
+    pub fn stats(&self) -> Stats {
+        let mut s = Stats {
+            differences: self.significant_blocks(),
+            ..Default::default()
+        };
+        for row in &self.rows {
+            let (a, b) = (row.line[0].is_some(), row.line[1].is_some());
+            match row.block.map(|b| self.blocks[b].ignored) {
+                None => s.identical += 1,
+                Some(true) => s.ignored += 1,
+                Some(false) if a && b => s.changed += 1,
+                Some(false) if a => s.removed += 1,
+                Some(false) => s.added += 1,
+            }
+        }
+        s
     }
 
     /// Row index displaying `line` of `pane` (or the nearest row).
@@ -440,13 +567,23 @@ pub fn compute_with(
     } else {
         code.iter().map(Vec::as_slice).collect()
     };
+    let skip = panes
+        .iter()
+        .enumerate()
+        .map(|(p, lines)| {
+            let comment_only = stripped.get(p).map(|s| s.iter().map(|s| s.comment_only));
+            match (norm.block_mask(lines), comment_only) {
+                (Some(mask), Some(c)) => mask.iter().zip(c).map(|(&m, c)| m || c).collect(),
+                (Some(mask), None) => mask,
+                (None, Some(c)) => c.collect(),
+                (None, None) => Vec::new(),
+            }
+        })
+        .collect();
     let ignorable = Ignorable {
         norm: &norm,
         panes: &keyed,
-        comment_only: stripped
-            .iter()
-            .map(|p| p.iter().map(|s| s.comment_only).collect())
-            .collect(),
+        skip,
     };
     let mut interner = Interner {
         map: HashMap::new(),
@@ -467,8 +604,9 @@ pub fn compute_with(
 struct Ignorable<'a> {
     norm: &'a Normalizer,
     panes: &'a [&'a [String]],
-    /// Per pane, lines that hold only comments (empty when comments are not ignored).
-    comment_only: Vec<Vec<bool>>,
+    /// Per pane, lines that hold only comments or are inside a block filter (empty when
+    /// neither option applies).
+    skip: Vec<Vec<bool>>,
 }
 
 impl Ignorable<'_> {
@@ -479,10 +617,45 @@ impl Ignorable<'_> {
             .enumerate()
             .all(|(p, (lines, r))| {
                 r.clone().all(|i| {
-                    self.comment_only.get(p).is_some_and(|c| c[i])
+                    self.skip.get(p).is_some_and(|c| c.get(i) == Some(&true))
                         || self.norm.is_ignorable(&lines[i])
                 })
             })
+    }
+
+    /// With a numeric tolerance, splits a changed block whose sides have the same number of
+    /// lines into runs of rows that do (`true`) and do not differ only in close numbers. Each
+    /// row is compared with the left side, or with the base in a 3-way compare.
+    fn split_close(&self, ranges: &[Range<usize>]) -> Vec<(Vec<Range<usize>>, bool)> {
+        let whole = vec![(ranges.to_vec(), false)];
+        let n = ranges[0].len();
+        if self.norm.tolerance.is_none() || n == 0 || ranges.iter().any(|r| r.len() != n) {
+            return whole;
+        }
+        let base = if ranges.len() == 3 { 1 } else { 0 };
+        let close = |k: usize| {
+            let b = &self.panes[base][ranges[base].start + k];
+            (0..ranges.len())
+                .filter(|&p| p != base)
+                .all(|p| self.norm.close(&self.panes[p][ranges[p].start + k], b))
+        };
+        let flags: Vec<bool> = (0..n).map(close).collect();
+        if !flags.iter().any(|&c| c) {
+            return whole;
+        }
+        let mut out = Vec::new();
+        let mut start = 0;
+        for k in 1..=n {
+            if k == n || flags[k] != flags[start] {
+                let sub = ranges
+                    .iter()
+                    .map(|r| r.start + start..r.start + k)
+                    .collect();
+                out.push((sub, flags[start]));
+                start = k;
+            }
+        }
+        out
     }
 }
 
@@ -522,8 +695,11 @@ fn diff2(a: &[u32], b: &[u32], ignorable: &Ignorable, opts: &DiffOptions) -> Dif
     let mut pending: Option<(Range<usize>, Range<usize>)> = None;
     let flush = |result: &mut DiffResult, pending: &mut Option<(Range<usize>, Range<usize>)>| {
         if let Some((ra, rb)) = pending.take() {
-            let ignored = ignorable.all(&[ra.clone(), rb.clone()]);
-            push_block(result, [ra, rb, 0..0], BlockKind::Diff, ignored);
+            for (r, close) in ignorable.split_close(&[ra, rb]) {
+                let ignored = close || ignorable.all(&r);
+                let [ra, rb] = [r[0].clone(), r[1].clone()];
+                push_block(result, [ra, rb, 0..0], BlockKind::Diff, ignored);
+            }
         }
     };
     for (tag, o, n) in line_ops(a, b, opts.algorithm) {
@@ -588,41 +764,82 @@ fn diff3(ids: &[Vec<u32>], ignorable: &Ignorable, opts: &DiffOptions) -> DiffRes
         } else {
             (nl, nr)
         };
-        let (rl, rb, rr) = (l..le, i..j, r..re);
-        let lc = left[rl.clone()] != base[rb.clone()];
-        let rc = right[rr.clone()] != base[rb.clone()];
-        let kind = match (lc, rc) {
-            (true, false) => Some(BlockKind::LeftOnly),
-            (false, true) => Some(BlockKind::RightOnly),
-            (true, true) => {
-                if left[rl.clone()] == right[rr.clone()] {
-                    Some(BlockKind::BothSame)
-                } else {
-                    Some(BlockKind::Conflict)
+        let ranges = [l..le, i..j, r..re];
+        if kind3(ids, &ranges).is_some() {
+            for (sub, close) in ignorable.split_close(&ranges) {
+                let sub = [sub[0].clone(), sub[1].clone(), sub[2].clone()];
+                match kind3(ids, &sub) {
+                    Some(kind) => {
+                        let ignored = close || ignorable.all(&sub);
+                        push_block(&mut result, sub, kind, ignored);
+                    }
+                    None => push_equal3(&mut result, &sub),
                 }
             }
-            (false, false) => None,
-        };
-        match kind {
-            Some(kind) => {
-                let ranges = [rl.clone(), rb.clone(), rr.clone()];
-                let ignored = ignorable.all(&ranges);
-                push_block(&mut result, ranges, kind, ignored);
-            }
-            None => {
-                for k in 0..rb.len() {
-                    result.rows.push(Row {
-                        line: [Some(l + k), Some(i + k), Some(r + k)],
-                        block: None,
-                    });
-                }
-            }
+        } else {
+            push_equal3(&mut result, &ranges);
         }
         i = j;
         l = le;
         r = re;
     }
     result
+}
+
+/// The 3-way merge of `left` and `right` with their common ancestor `base`, taking every
+/// change made on one side (or the same on both), or `None` when the sides conflict.
+pub fn merge3(left: &[String], base: &[String], right: &[String]) -> Option<Vec<String>> {
+    let opts = DiffOptions {
+        ignore_eol: false,
+        detect_moved: false,
+        ..Default::default()
+    };
+    let d = compute(&[left, base, right], &opts);
+    let mut out = Vec::with_capacity(base.len());
+    let mut row = 0;
+    while row < d.rows.len() {
+        let r = d.rows[row];
+        let Some(b) = r.block else {
+            out.extend(r.line[1].map(|l| base[l].clone()));
+            row += 1;
+            continue;
+        };
+        let block = &d.blocks[b];
+        let (src, range) = match block.kind {
+            BlockKind::LeftOnly | BlockKind::BothSame => (left, &block.ranges[0]),
+            BlockKind::RightOnly => (right, &block.ranges[2]),
+            BlockKind::Conflict | BlockKind::Diff => return None,
+        };
+        out.extend_from_slice(&src[range.clone()]);
+        row = block.first_row + block.rows;
+    }
+    Some(out)
+}
+
+/// How the left and right lines of a 3-way block changed relative to the base, or `None`
+/// when they did not.
+fn kind3(ids: &[Vec<u32>], [rl, rb, rr]: &[Range<usize>; 3]) -> Option<BlockKind> {
+    let (left, base, right) = (
+        &ids[0][rl.clone()],
+        &ids[1][rb.clone()],
+        &ids[2][rr.clone()],
+    );
+    match (left != base, right != base) {
+        (true, false) => Some(BlockKind::LeftOnly),
+        (false, true) => Some(BlockKind::RightOnly),
+        (true, true) if left == right => Some(BlockKind::BothSame),
+        (true, true) => Some(BlockKind::Conflict),
+        (false, false) => None,
+    }
+}
+
+fn push_equal3(result: &mut DiffResult, [rl, rb, rr]: &[Range<usize>; 3]) {
+    for k in 0..rb.len() {
+        result.rows.push(Row {
+            line: [Some(rl.start + k), Some(rb.start + k), Some(rr.start + k)],
+            block: None,
+        });
+    }
 }
 
 fn detect_moved(result: &mut DiffResult, ids: &[Vec<u32>]) {
@@ -862,6 +1079,67 @@ mod tests {
             compute_with(&[&a, &c], &o, Some(syn)).significant_blocks(),
             1
         );
+    }
+
+    #[test]
+    fn numbers_within_tolerance_and_filtered_blocks_ignored() {
+        let o = DiffOptions {
+            numeric_tolerance_enabled: true,
+            numeric_tolerance: 0.01,
+            ..Default::default()
+        };
+        let a = v(&["x = 1.000, y = -2", "name a", "z = 3e2", "w = 5"]);
+        let b = v(&["x = 1.004, y = -2.00", "name b", "z = 300.001", "w = 6"]);
+        let r = compute(&[&a, &b], &o);
+        let sig: Vec<_> = r.blocks.iter().filter(|b| !b.ignored).collect();
+        assert_eq!(sig.len(), 2, "{:?}", r.blocks);
+        assert_eq!(sig[0].ranges[0], 1..2);
+        assert_eq!(sig[1].ranges[0], 3..4);
+        assert_eq!(compute(&[&a, &b], &DiffOptions::default()).blocks.len(), 1);
+        assert_eq!(
+            r.stats(),
+            Stats {
+                changed: 2,
+                ignored: 2,
+                differences: 2,
+                ..Default::default()
+            }
+        );
+
+        let base = v(&["t = 10.0", "keep"]);
+        let left = v(&["t = 10.001", "keep"]);
+        let right = v(&["t = 10.0", "changed"]);
+        let r = compute(&[&left, &base, &right], &o);
+        assert_eq!(r.significant_blocks(), 1);
+        assert_eq!(
+            r.blocks.iter().find(|b| !b.ignored).unwrap().kind,
+            BlockKind::RightOnly
+        );
+
+        let o = DiffOptions {
+            block_filters_enabled: true,
+            block_filters: vec![("^// BEGIN GENERATED".into(), "^// END GENERATED".into())],
+            ..Default::default()
+        };
+        let a = v(&["a", "// BEGIN GENERATED", "1", "// END GENERATED", "b"]);
+        let b = v(&["a", "// BEGIN GENERATED", "2", "3", "// END GENERATED", "b"]);
+        assert!(compute(&[&a, &b], &o).is_identical());
+        let unterminated = v(&["a", "// BEGIN GENERATED", "2", "b"]);
+        let c = v(&["a", "// BEGIN GENERATED", "3", "b"]);
+        assert!(!compute(&[&unterminated, &c], &o).is_identical());
+    }
+
+    #[test]
+    fn merges_three_way_without_conflicts() {
+        let base = v(&["a", "b", "c", "d"]);
+        let left = v(&["a", "B", "c", "d"]);
+        let right = v(&["a", "b", "c", "d", "e"]);
+        assert_eq!(
+            merge3(&left, &base, &right).unwrap(),
+            v(&["a", "B", "c", "d", "e"])
+        );
+        let other = v(&["a", "X", "c", "d"]);
+        assert!(merge3(&left, &base, &other).is_none());
     }
 
     #[test]

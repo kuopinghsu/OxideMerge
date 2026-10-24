@@ -81,6 +81,12 @@ pub struct Config {
     pub word_wrap: bool,
     /// Saving over a file keeps its previous contents as `<name>.bak`.
     pub backup_on_save: bool,
+    /// Text compares show the current line of every side one above the other.
+    pub show_line_detail: bool,
+    /// Text compares mark lines edited or copied since the files were opened.
+    pub show_edit_markers: bool,
+    /// Folder compares show the selected file's differences below the list.
+    pub folder_file_pane: bool,
     pub session: Vec<SessionTab>,
     pub session_active: usize,
 }
@@ -132,6 +138,9 @@ impl Default for Config {
             collapse_unchanged: false,
             word_wrap: false,
             backup_on_save: false,
+            show_line_detail: false,
+            show_edit_markers: true,
+            folder_file_pane: false,
             session: Vec::new(),
             session_active: 0,
         }

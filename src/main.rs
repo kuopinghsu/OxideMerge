@@ -114,10 +114,20 @@ struct Cli {
     /// Reformat JSON and XML files before comparing them
     #[arg(long)]
     prettify: bool,
+    /// Treat numbers at most this far apart as equal (for example 0.001)
+    #[arg(long, value_name = "AMOUNT")]
+    numeric_tolerance: Option<f64>,
     /// Write a report without opening the GUI: folder compares as .html, .csv or .txt, text
     /// compares as side-by-side .html
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Add the differences of every changed text file to an HTML folder report
+    #[arg(long)]
+    report_diffs: bool,
+    /// Compare the single path given with how it was in this Git revision (e.g. HEAD, HEAD~1,
+    /// a branch, tag or commit)
+    #[arg(long, value_name = "REV")]
+    git_rev: Option<String>,
     /// Write a patch file without opening the GUI
     #[arg(long)]
     patch: Option<PathBuf>,
@@ -220,6 +230,10 @@ fn apply_cli_options(cli: &Cli, cfg: &mut Config) {
     cfg.diff.ignore_numbers |= cli.ignore_numbers;
     cfg.diff.ignore_comments |= cli.ignore_comments;
     cfg.diff.prettify |= cli.prettify;
+    if let Some(t) = cli.numeric_tolerance {
+        cfg.diff.numeric_tolerance_enabled = true;
+        cfg.diff.numeric_tolerance = t.abs();
+    }
     if let Some(m) = cli.method {
         cfg.folder.method = method(m);
     }
@@ -256,9 +270,35 @@ fn patch_style(p: PatchArg) -> PatchStyle {
     }
 }
 
+/// `path` as it was in Git revision `rev`, in a temporary folder that lives as long as the
+/// returned guard.
+fn git_copy(path: &std::path::Path, rev: &str) -> anyhow::Result<(tempfile::TempDir, PathBuf)> {
+    if path.is_dir() {
+        return core::git::export_folder(path, rev);
+    }
+    let bytes = core::git::show_file(path, rev)?;
+    let dir = tempfile::tempdir()?;
+    let copy = dir.path().join(path.file_name().unwrap_or_default());
+    std::fs::write(&copy, bytes)?;
+    Ok((dir, copy))
+}
+
 /// Non-interactive operations (console compare, report, patch). Returns the process exit code.
 fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
-    let paths = &cli.paths;
+    let mut cli_paths = cli.paths.clone();
+    let mut _git_temp = None;
+    let mut git_desc = None;
+    if let (Some(rev), [path]) = (&cli.git_rev, &cli.paths[..]) {
+        let (temp, copy) = git_copy(path, rev)?;
+        git_desc = Some(format!("{} @ {rev}", path.display()));
+        cli_paths = vec![copy, path.clone()];
+        _git_temp = Some(temp);
+    }
+    let paths = &cli_paths;
+    let cli_desc = |cli: &Cli, i: usize| match (i, &git_desc) {
+        (0, Some(d)) if cli.dl.is_none() => Some(d.clone()),
+        _ => cli_desc(cli, i),
+    };
     if paths.len() < 2 {
         anyhow::bail!("two or three paths are required");
     }
@@ -283,10 +323,13 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             .collect();
         let different = files.iter().any(|i| i.status != CmpStatus::Identical);
         if let Some(r) = &cli.report {
-            std::fs::write(
-                r,
-                core::report::generate(&files, paths, ReportFormat::from_path(r)),
-            )?;
+            let format = ReportFormat::from_path(r);
+            let text = if cli.report_diffs && format == ReportFormat::Html {
+                core::report::folder_html_with_diffs(&files, paths, paths, &cfg.diff)
+            } else {
+                core::report::generate(&files, paths, format)
+            };
+            std::fs::write(r, text)?;
         }
         if let Some(p) = &cli.patch {
             let text = core::patch::folder_patch(
@@ -385,7 +428,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             .collect();
         std::fs::write(
             r,
-            core::report::text_html(&titles, &refs, &result, &cfg.diff),
+            core::report::text_html(&titles, &refs, &result, &cfg.diff, &[]),
         )?;
     }
     if docs.len() == 2 {
@@ -545,7 +588,13 @@ fn main() -> ExitCode {
         };
     }
 
-    let initial = if paths.is_empty() {
+    let initial = if let (Some(rev), [_]) = (&cli.git_rev, &paths[..]) {
+        Some(OpenRequest {
+            paths,
+            git_rev: Some(rev.clone()),
+            ..Default::default()
+        })
+    } else if paths.is_empty() {
         None
     } else {
         let n = paths.len();

@@ -100,7 +100,7 @@ fn extract_zip(file: std::fs::File, dir: &Path) -> Result<()> {
 
 /// Entries that cannot be created here (links on Windows, device files) are skipped;
 /// `unpack_in` also skips any that would land outside `dir`.
-fn extract_tar(input: impl Read, dir: &Path) -> Result<()> {
+pub(crate) fn extract_tar(input: impl Read, dir: &Path) -> Result<()> {
     let mut ar = tar::Archive::new(input);
     for entry in ar.entries()? {
         let mut entry = entry?;

@@ -3,6 +3,31 @@
 All notable changes to OxideMerge are listed here, newest first. Each release on GitHub uses its
 section of this file as the release notes.
 
+## [0.9.3] - Unreleased
+
+### Added
+
+- **Numeric tolerance** (Options → Compare, or `--numeric-tolerance`): numbers at most a set amount
+  apart count as equal, in text and folder compares.
+- **Block filters** (Options → Compare): ignore everything between a start line and an end line
+  matching regular expressions.
+- **Line detail pane** (View menu): the current line of every side, one above the other and
+  wrapped.
+- **Edit markers** in the gutter for lines changed since the files were opened.
+- **Statistics** (Tools menu): line counts per pair of sides for text compares, and file counts and
+  sizes for folder compares.
+- **Indent and unindent** the selected lines (`Ctrl+]` / `Ctrl+[`).
+- **Bookmark comments**, shown when hovering the gutter, in the status bar and in HTML reports.
+- **Save comparison** (File menu): every side's text with its bookmarks and comments in one
+  `.oxmcmp` file, which opens again read-only.
+- **Compare with a Git revision** (File menu, or `--git-rev`) for files and folders.
+- **File compare below the folder list** (View menu): the selected file's differences without
+  opening a tab.
+- **Folder report with file differences** (File menu, or `--report-diffs`).
+- **Copy to folder** and **select by name** in folder compares.
+- **3-way folder auto merge** into the middle folder, merging text files changed on both sides when
+  the changes don't overlap.
+
 ## [0.9.2] - 2026-10-24
 
 ### Added

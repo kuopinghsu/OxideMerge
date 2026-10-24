@@ -100,9 +100,8 @@ pub fn plan(items: &[DirItem], roots: &[PathBuf]) -> Plan {
         return Plan::default();
     }
     for (i, it) in items.iter().enumerate() {
-        let covered = std::iter::successors(it.parent, |&p| items[p].parent).any(|p| {
-            matches!(steps.get(&p), Some(Step::Copy(_) | Step::Delete))
-        });
+        let covered = std::iter::successors(it.parent, |&p| items[p].parent)
+            .any(|p| matches!(steps.get(&p), Some(Step::Copy(_) | Step::Delete)));
         if covered || matches!(it.status, CmpStatus::Identical | CmpStatus::Error) {
             continue;
         }
@@ -181,7 +180,8 @@ pub fn apply(
         let r = match step {
             Step::Copy(from) => {
                 if target.is_dir() && !it.is_dir {
-                    delete_path(&target, false).and_then(|_| copy_recursive(&it.path(&roots[from]), &target))
+                    delete_path(&target, false)
+                        .and_then(|_| copy_recursive(&it.path(&roots[from]), &target))
                 } else {
                     copy_recursive(&it.path(&roots[from]), &target)
                 }

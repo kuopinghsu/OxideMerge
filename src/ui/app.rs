@@ -6,9 +6,11 @@ use crate::core::conflict;
 use crate::core::diff::{DiffAlgorithm, InlineMode, WhitespaceMode};
 use crate::core::filter::{self, FltFilter, FLT_PREFIX};
 use crate::core::folder::CompareMethod;
+use crate::core::git;
 use crate::core::patch::{self, PatchStyle};
 use crate::core::project::{self, Project};
-use crate::core::report::ReportFormat;
+use crate::core::report::{side_name, ReportFormat};
+use crate::core::saved::{self, SavedCompare};
 use crate::core::text::{self, FileKind, TextDoc};
 use crate::core::unpacker::{self, Unpacker};
 use crate::core::web;
@@ -40,6 +42,8 @@ pub struct OpenRequest {
     pub output: Option<PathBuf>,
     /// Not added to the recent comparisons (opened from a folder compare, or a restored session).
     pub skip_recent: bool,
+    /// Compare the single path with how it was in this Git revision.
+    pub git_rev: Option<String>,
 }
 
 pub enum Content {
@@ -99,6 +103,8 @@ pub struct Tab {
     pub source: Vec<PathBuf>,
     /// The folder compare this tab was opened from, for moving on to its next or previous file.
     origin: Option<Origin>,
+    /// Temporary copy of a side (a Git revision), deleted with the tab.
+    _temp: Option<tempfile::TempDir>,
 }
 
 #[derive(Clone)]
@@ -240,6 +246,14 @@ pub enum Cmd {
     ToggleCollapse,
     ToggleWrap,
     Palette,
+    Statistics,
+    /// Indent (false) or outdent (true) the selected lines.
+    Indent(bool),
+    BookmarkComment,
+    SaveComparison,
+    GitCompare,
+    ReportWithDiffs,
+    SelectPattern,
 }
 
 /// What a command palette entry does.
@@ -267,6 +281,14 @@ const PALETTE_CMDS: &[(&str, &str, Cmd, Icon)] = &[
     ("menu.patch", "", Cmd::Patch, Icon::Text),
     ("menu.apply_patch", "", Cmd::ApplyPatch, Icon::Text),
     ("menu.report", "", Cmd::Report, Icon::Text),
+    ("menu.report_diffs", "", Cmd::ReportWithDiffs, Icon::Text),
+    ("menu.save_comparison", "", Cmd::SaveComparison, Icon::File),
+    ("menu.git_compare", "", Cmd::GitCompare, Icon::Compare),
+    ("menu.statistics", "", Cmd::Statistics, Icon::Method),
+    ("cmd.indent", "Ctrl+]", Cmd::Indent(false), Icon::Next),
+    ("cmd.outdent", "Ctrl+[", Cmd::Indent(true), Icon::Prev),
+    ("cmd.bookmark_comment", "", Cmd::BookmarkComment, Icon::Text),
+    ("cmd.select_pattern", "", Cmd::SelectPattern, Icon::Check),
     (
         "cmd.toggle_bookmark",
         "Ctrl+F2",
@@ -444,6 +466,8 @@ const OPT_INDEX: &[(OptTab, &str)] = &[
     (OptTab::Compare, "opt.inline"),
     (OptTab::Compare, "opt.line_filters"),
     (OptTab::Compare, "opt.substitutions"),
+    (OptTab::Compare, "opt.numeric_tolerance"),
+    (OptTab::Compare, "opt.block_filters"),
     (OptTab::Folder, "label.method"),
     (OptTab::Folder, "label.recursive"),
     (OptTab::Folder, "opt.unique_subfolders"),
@@ -461,6 +485,25 @@ const OPT_INDEX: &[(OptTab, &str)] = &[
     (OptTab::Plugins, "opt.pattern"),
     (OptTab::Plugins, "opt.command"),
 ];
+
+/// `a => b` lines, as edited in the options dialog.
+fn arrow_pairs(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(a, b)| format!("{a} => {b}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_arrow_pairs(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| {
+            l.split_once("=>")
+                .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))
+        })
+        .filter(|(a, _)| !a.is_empty())
+        .collect()
+}
 
 /// Settings whose label contains `query` (case-insensitive), with the tab that holds them.
 fn search_options(query: &str) -> Vec<(OptTab, String)> {
@@ -481,6 +524,21 @@ struct OptionsDialog {
     search: String,
     line_filters: String,
     substitutions: String,
+    block_filters: String,
+}
+
+/// Line or item counts of the active compare.
+struct StatsDialog {
+    columns: Vec<String>,
+    rows: Vec<(String, Vec<String>)>,
+}
+
+struct GitDialog {
+    path: String,
+    rev: String,
+    /// Recent commits of `commits_for`: short hash and subject.
+    commits: Vec<(String, String)>,
+    commits_for: String,
 }
 
 struct PatchDialog {
@@ -521,6 +579,8 @@ pub struct OxideMergeApp {
     open_dlg: Option<OpenDialog>,
     options_dlg: Option<OptionsDialog>,
     patch_dlg: Option<PatchDialog>,
+    stats_dlg: Option<StatsDialog>,
+    git_dlg: Option<GitDialog>,
     filters_dlg: bool,
     about: bool,
     help: bool,
@@ -884,6 +944,8 @@ impl OxideMergeApp {
             open_dlg: None,
             options_dlg: None,
             patch_dlg: None,
+            stats_dlg: None,
+            git_dlg: None,
             filters_dlg: false,
             about: false,
             help: false,
@@ -1064,6 +1126,17 @@ impl OxideMergeApp {
             }
             return self.try_open(opened);
         }
+        if let (Some(rev), [path]) = (&req.git_rev, &paths[..]) {
+            return self.open_git_revision(path, rev);
+        }
+        if paths.len() == 1 && saved::is_saved_compare(&paths[0]) {
+            let s = SavedCompare::load(&paths[0])?;
+            let mut v = TextView::from_saved(&s, &self.cfg);
+            v.status = trf("msg.saved_compare", &[("date", s.saved.clone())]);
+            self.cfg.add_recent_path(&paths[0].display().to_string());
+            self.push_tab(Content::Text(v), Vec::new());
+            return Ok(());
+        }
         if paths.len() == 1 {
             let p = &paths[0];
             if p.is_file() && conflict::has_markers(p) {
@@ -1222,6 +1295,56 @@ impl OxideMergeApp {
         Ok(())
     }
 
+    /// Compares `path` with how it was in Git revision `rev` (the left side, read-only).
+    fn open_git_revision(&mut self, path: &Path, rev: &str) -> anyhow::Result<()> {
+        let rev = match rev.trim() {
+            "" => "HEAD",
+            r => r,
+        };
+        let label = format!("{} @ {rev}", path.display());
+        let (temp, content) = if path.is_dir() {
+            let (temp, copy) = git::export_folder(path, rev)?;
+            let display = vec![label, path.display().to_string()];
+            let v = FolderView::new(
+                vec![copy, path.to_path_buf()],
+                display,
+                Vec::new(),
+                &self.cfg.filter,
+                &self.named_filters,
+                &self.cfg,
+            );
+            (temp, Content::Folder(v))
+        } else {
+            let bytes = git::show_file(path, rev)?;
+            let temp = tempfile::tempdir()?;
+            let copy = temp.path().join(path.file_name().unwrap_or_default());
+            std::fs::write(&copy, bytes)?;
+            let paths = vec![copy.clone(), path.to_path_buf()];
+            let content = if text::is_image_path(path) {
+                Content::Image(ImageView::load(paths, &self.cfg)?)
+            } else if text::detect_kind(&copy) == FileKind::Binary {
+                let mut v = BinaryView::load(paths)?;
+                v.read_only[0] = true;
+                Content::Binary(v)
+            } else {
+                let mut left = text::load_doc(&copy, None)?;
+                left.path = None;
+                left.syntax = Some(text::extension(path));
+                left.description = Some(label);
+                left.read_only = true;
+                let right = self.load_text(path, !path.exists())?;
+                Content::Text(TextView::new(vec![left, right], &self.cfg))
+            };
+            (temp, content)
+        };
+        self.cfg.add_recent_path(&path.display().to_string());
+        self.push_tab(content, Vec::new());
+        if let Some(t) = self.tabs.last_mut() {
+            t._temp = Some(temp);
+        }
+        Ok(())
+    }
+
     fn open_conflict(&mut self, path: &Path) -> anyhow::Result<()> {
         let doc = text::load_doc(path, None)?;
         let parts = conflict::parse(&doc.lines)
@@ -1275,6 +1398,7 @@ impl OxideMergeApp {
             content,
             source,
             origin: None,
+            _temp: None,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -1407,14 +1531,8 @@ impl OxideMergeApp {
     fn open_options(&mut self, tab: OptTab) {
         self.options_dlg = Some(OptionsDialog {
             line_filters: self.cfg.diff.line_filters.join("\n"),
-            substitutions: self
-                .cfg
-                .diff
-                .substitutions
-                .iter()
-                .map(|(a, b)| format!("{a} => {b}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
+            substitutions: arrow_pairs(&self.cfg.diff.substitutions),
+            block_filters: arrow_pairs(&self.cfg.diff.block_filters),
             cfg: self.cfg.clone(),
             tab,
             search: String::new(),
@@ -1450,9 +1568,12 @@ impl OxideMergeApp {
             ));
         }
         let on = tr("palette.on").to_string();
-        let toggles: [(&str, ConfigFlag); 5] = [
+        let toggles: [(&str, ConfigFlag); 8] = [
             ("view.line_numbers", |c| &mut c.show_line_numbers),
             ("view.location_pane", |c| &mut c.show_location_pane),
+            ("view.line_detail", |c| &mut c.show_line_detail),
+            ("view.edit_markers", |c| &mut c.show_edit_markers),
+            ("view.folder_file_pane", |c| &mut c.folder_file_pane),
             ("view.whitespace", |c| &mut c.show_whitespace),
             ("view.syntax", |c| &mut c.syntax_highlight),
             ("view.tree_mode", |c| &mut c.tree_mode),
@@ -1619,6 +1740,7 @@ impl OxideMergeApp {
                         tr("label.project"),
                         &[project::EXT, "WinMerge", project::WINMERGE_EXT],
                     )
+                    .add_filter(tr("label.saved_compare"), &[saved::EXT])
                     .pick_file()
                 {
                     self.open(OpenRequest {
@@ -1687,6 +1809,23 @@ impl OxideMergeApp {
                 })
             }
             Cmd::Report => self.save_report(),
+            Cmd::ReportWithDiffs => self.save_report_with_diffs(),
+            Cmd::SaveComparison => self.save_comparison(),
+            Cmd::Statistics => self.show_statistics(),
+            Cmd::GitCompare => {
+                let path = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|t| t.source.last())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                self.git_dlg = Some(GitDialog {
+                    path,
+                    rev: "HEAD".into(),
+                    commits: Vec::new(),
+                    commits_for: String::new(),
+                });
+            }
             Cmd::CompareAs(kind) => {
                 if let Some(tab) = self.tabs.get(self.active) {
                     if !matches!(tab.content, Content::Folder(_)) {
@@ -1754,6 +1893,8 @@ impl OxideMergeApp {
                         Cmd::PrevBookmark => v.goto_bookmark(false),
                         Cmd::ClearBookmarks => v.clear_bookmarks(),
                         Cmd::TakeBoth(left_first) => v.take_both(left_first),
+                        Cmd::Indent(outdent) => v.indent(outdent),
+                        Cmd::BookmarkComment => v.edit_note(),
                         _ => {}
                     },
                     Content::Binary(v) => match cmd {
@@ -1798,6 +1939,8 @@ impl OxideMergeApp {
                         Cmd::Find => v.focus_search(),
                         Cmd::CopyRight => v.copy_selected(true, &cfg),
                         Cmd::CopyLeft => v.copy_selected(false, &cfg),
+                        Cmd::AutoMerge => v.request_merge(),
+                        Cmd::SelectPattern => v.open_select_pattern(),
                         _ => {}
                     },
                     Content::Web(_) => {}
@@ -1860,6 +2003,227 @@ impl OxideMergeApp {
         match std::fs::write(&path, text) {
             Ok(()) => self.notify(trf("msg.saved", &[("file", path.display().to_string())])),
             Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    fn save_report_with_diffs(&mut self) {
+        let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
+            self.error(tr("msg.report_folder_only"));
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(tr("menu.report_diffs"))
+            .add_filter("HTML", &["html", "htm"])
+            .set_file_name("report.html")
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&path, v.report_with_diffs(&self.cfg)) {
+            Ok(()) => self.notify(trf("msg.saved", &[("file", path.display().to_string())])),
+            Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    /// Saves the active text compare with its bookmarks and their comments as one file.
+    fn save_comparison(&mut self) {
+        let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
+            self.error(tr("msg.text_compare_only"));
+            return;
+        };
+        let Some(mut path) = rfd::FileDialog::new()
+            .set_title(tr("menu.save_comparison"))
+            .add_filter(tr("label.saved_compare"), &[saved::EXT])
+            .set_file_name(format!("comparison.{}", saved::EXT))
+            .save_file()
+        else {
+            return;
+        };
+        if text::extension(&path) != saved::EXT {
+            path.set_extension(saved::EXT);
+        }
+        match v.saved_compare().save(&path) {
+            Ok(()) => self.notify(trf("msg.saved", &[("file", path.display().to_string())])),
+            Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    fn show_statistics(&mut self) {
+        self.stats_dlg = match self.tabs.get(self.active).map(|t| t.content.view()) {
+            Some(Content::Text(v)) => {
+                let stats = v.statistics();
+                let row = |key: &'static str, f: fn(&crate::core::diff::Stats) -> usize| {
+                    (
+                        tr(key).to_string(),
+                        stats.iter().map(|(_, s)| f(s).to_string()).collect(),
+                    )
+                };
+                Some(StatsDialog {
+                    columns: stats.iter().map(|(name, _)| name.clone()).collect(),
+                    rows: vec![
+                        row("stats.identical_lines", |s| s.identical),
+                        row("stats.changed_lines", |s| s.changed),
+                        row("stats.added_lines", |s| s.added),
+                        row("stats.removed_lines", |s| s.removed),
+                        row("stats.ignored_lines", |s| s.ignored),
+                        row("stats.differences", |s| s.differences),
+                    ],
+                })
+            }
+            Some(Content::Folder(v)) => Some(StatsDialog {
+                columns: vec![String::new()],
+                rows: v
+                    .statistics()
+                    .into_iter()
+                    .map(|(k, v)| (k, vec![v]))
+                    .collect(),
+            }),
+            _ => {
+                self.error(tr("msg.stats_unavailable"));
+                None
+            }
+        };
+    }
+
+    fn stats_dialog(&mut self, ctx: &egui::Context) {
+        let Some(d) = &self.stats_dlg else {
+            return;
+        };
+        let mut keep = true;
+        let modal = egui::Modal::new(egui::Id::new("stats_dialog")).show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            if widgets::dialog_title(ui, &plain(tr("menu.statistics"))) {
+                keep = false;
+            }
+            egui::Grid::new("stats_grid")
+                .num_columns(d.columns.len() + 1)
+                .striped(true)
+                .spacing([24.0, 6.0])
+                .show(ui, |ui| {
+                    if d.columns.iter().any(|c| !c.is_empty()) {
+                        ui.label("");
+                        for c in &d.columns {
+                            ui.strong(c);
+                        }
+                        ui.end_row();
+                    }
+                    for (label, values) in &d.rows {
+                        ui.label(label);
+                        for v in values {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(egui::RichText::new(v).monospace());
+                            });
+                        }
+                        ui.end_row();
+                    }
+                });
+            widgets::dialog_footer(ui, |ui| {
+                if widgets::primary_button(ui, tr("btn.ok")).clicked() {
+                    keep = false;
+                }
+                if widgets::secondary_button(ui, tr("btn.copy")).clicked() {
+                    let mut text = format!("\t{}\n", d.columns.join("\t"));
+                    for (label, values) in &d.rows {
+                        text.push_str(&format!("{label}\t{}\n", values.join("\t")));
+                    }
+                    ui.ctx().copy_text(text);
+                }
+            });
+        });
+        if !keep || modal.should_close() {
+            self.stats_dlg = None;
+        }
+    }
+
+    fn git_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.git_dlg.take() else {
+            return;
+        };
+        let path = PathBuf::from(d.path.trim());
+        if d.commits_for != d.path && path.exists() {
+            d.commits = git::recent_commits(&path, 20);
+            d.commits_for = d.path.clone();
+        }
+        let (mut keep, mut go) = (true, false);
+        let modal = egui::Modal::new(egui::Id::new("git_dialog")).show(ctx, |ui| {
+            ui.set_width(560.0);
+            if widgets::dialog_title(ui, &plain(tr("menu.git_compare"))) {
+                keep = false;
+            }
+            ui.label(egui::RichText::new(tr("hint.git_compare")).color(pal(ui).text_dim));
+            ui.add_space(6.0);
+            egui::Grid::new("git_grid")
+                .num_columns(2)
+                .spacing([12.0, 10.0])
+                .show(ui, |ui| {
+                    ui.label(tr("label.path"));
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.path)
+                                .margin(vec2(8.0, 5.0))
+                                .desired_width(ui.available_width() - 72.0),
+                        );
+                        if widgets::icon_button(ui, Icon::File, tr("btn.browse_file")).clicked() {
+                            if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                d.path = p.display().to_string();
+                            }
+                        }
+                        if widgets::icon_button(ui, Icon::Folder, tr("btn.browse_folder")).clicked()
+                        {
+                            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                d.path = p.display().to_string();
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    ui.label(tr("label.revision"));
+                    ui.horizontal(|ui| {
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut d.rev)
+                                .margin(vec2(8.0, 5.0))
+                                .hint_text("HEAD, HEAD~1, main, v1.0 …")
+                                .desired_width(ui.available_width() - 36.0),
+                        );
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            go = true;
+                        }
+                        ui.add_enabled_ui(!d.commits.is_empty(), |ui| {
+                            ui.menu_button("⏷", |ui| {
+                                ui.set_min_width(420.0);
+                                for (hash, subject) in &d.commits {
+                                    let text = egui::RichText::new(format!("{hash}  {subject}"));
+                                    if ui.button(text).clicked() {
+                                        d.rev = hash.clone();
+                                        ui.close_menu();
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(tr("label.recent_commits"));
+                        });
+                    });
+                    ui.end_row();
+                });
+            widgets::dialog_footer(ui, |ui| {
+                if widgets::primary_button(ui, tr("btn.compare")).clicked() {
+                    go = true;
+                }
+                if widgets::secondary_button(ui, tr("btn.cancel")).clicked() {
+                    keep = false;
+                }
+            });
+        });
+        if modal.should_close() {
+            keep = false;
+        }
+        if go && !d.path.trim().is_empty() {
+            let rev = d.rev.clone();
+            if let Err(e) = self.open_git_revision(&path, &rev) {
+                self.error(e.to_string());
+                self.git_dlg = Some(d);
+            }
+        } else if keep {
+            self.git_dlg = Some(d);
         }
     }
 
@@ -2077,6 +2441,8 @@ impl OxideMergeApp {
                 sc(Modifiers::ALT, Key::C, Cmd::ToggleCollapse);
                 sc(Modifiers::ALT, Key::Z, Cmd::ToggleWrap);
                 sc(Modifiers::COMMAND, Key::F2, Cmd::ToggleBookmark);
+                sc(Modifiers::COMMAND, Key::CloseBracket, Cmd::Indent(false));
+                sc(Modifiers::COMMAND, Key::OpenBracket, Cmd::Indent(true));
                 sc(Modifiers::SHIFT, Key::F4, Cmd::PrevBookmark);
                 sc(Modifiers::NONE, Key::F4, Cmd::NextBookmark);
             }
@@ -2160,6 +2526,7 @@ impl OxideMergeApp {
                     &mut cmd,
                 );
                 item(ui, tr("menu.open_project"), "", Cmd::OpenProject, &mut cmd);
+                item(ui, tr("menu.git_compare"), "", Cmd::GitCompare, &mut cmd);
                 if ui
                     .add_enabled(has_source, egui::Button::new(tr("menu.save_project")))
                     .clicked()
@@ -2179,17 +2546,35 @@ impl OxideMergeApp {
                 for p in 0..n_panes {
                     let label = trf(
                         "menu.save_side_as",
-                        &[("side", crate::core::report::side_name(p, n_panes).into())],
+                        &[("side", side_name(p, n_panes).into())],
                     );
                     if ui.button(label).clicked() {
                         cmd = Some(Cmd::SaveAs(p));
                         ui.close_menu();
                     }
                 }
+                if n_panes > 0 {
+                    item(
+                        ui,
+                        tr("menu.save_comparison"),
+                        "",
+                        Cmd::SaveComparison,
+                        &mut cmd,
+                    );
+                }
                 ui.separator();
                 item(ui, tr("menu.patch"), "", Cmd::Patch, &mut cmd);
                 if is_folder || n_panes > 0 {
                     item(ui, tr("menu.report"), "", Cmd::Report, &mut cmd);
+                }
+                if is_folder {
+                    item(
+                        ui,
+                        tr("menu.report_diffs"),
+                        "",
+                        Cmd::ReportWithDiffs,
+                        &mut cmd,
+                    );
                 }
                 ui.separator();
                 item(ui, tr("menu.close_tab"), "Ctrl+W", Cmd::CloseTab, &mut cmd);
@@ -2229,9 +2614,29 @@ impl OxideMergeApp {
                     );
                     item(
                         ui,
+                        tr("cmd.bookmark_comment"),
+                        "",
+                        Cmd::BookmarkComment,
+                        &mut cmd,
+                    );
+                    item(
+                        ui,
                         tr("cmd.clear_bookmarks"),
                         "",
                         Cmd::ClearBookmarks,
+                        &mut cmd,
+                    );
+                    ui.separator();
+                    item(ui, tr("cmd.indent"), "Ctrl+]", Cmd::Indent(false), &mut cmd);
+                    item(ui, tr("cmd.outdent"), "Ctrl+[", Cmd::Indent(true), &mut cmd);
+                }
+                if is_folder {
+                    ui.separator();
+                    item(
+                        ui,
+                        tr("cmd.select_pattern"),
+                        "",
+                        Cmd::SelectPattern,
                         &mut cmd,
                     );
                 }
@@ -2245,11 +2650,14 @@ impl OxideMergeApp {
                 ui.checkbox(&mut self.cfg.show_unique[0], tr("view.show_left_unique"));
                 ui.checkbox(&mut self.cfg.show_unique[1], tr("view.show_middle_unique"));
                 ui.checkbox(&mut self.cfg.show_unique[2], tr("view.show_right_unique"));
+                ui.checkbox(&mut self.cfg.folder_file_pane, tr("view.folder_file_pane"));
                 ui.separator();
                 ui.checkbox(&mut self.cfg.show_location_pane, tr("view.location_pane"));
                 ui.checkbox(&mut self.cfg.show_line_numbers, tr("view.line_numbers"));
                 ui.checkbox(&mut self.cfg.show_whitespace, tr("view.whitespace"));
                 ui.checkbox(&mut self.cfg.syntax_highlight, tr("view.syntax"));
+                ui.checkbox(&mut self.cfg.show_line_detail, tr("view.line_detail"));
+                ui.checkbox(&mut self.cfg.show_edit_markers, tr("view.edit_markers"));
                 ui.checkbox(
                     &mut self.cfg.collapse_unchanged,
                     tr("cmd.collapse_unchanged"),
@@ -2368,7 +2776,12 @@ impl OxideMergeApp {
                     Cmd::CopyAllLeft,
                     &mut cmd,
                 );
-                item(ui, tr("cmd.auto_merge"), "", Cmd::AutoMerge, &mut cmd);
+                let merge_label = if is_folder {
+                    tr("cmd.folder_merge")
+                } else {
+                    tr("cmd.auto_merge")
+                };
+                item(ui, merge_label, "", Cmd::AutoMerge, &mut cmd);
                 if n_panes == 3 {
                     ui.separator();
                     for (key, left_first) in [
@@ -2388,6 +2801,7 @@ impl OxideMergeApp {
             ui.menu_button(tr("menu.tools"), |ui| {
                 item(ui, tr("menu.filters"), "", Cmd::Filters, &mut cmd);
                 item(ui, tr("menu.apply_patch"), "", Cmd::ApplyPatch, &mut cmd);
+                item(ui, tr("menu.statistics"), "", Cmd::Statistics, &mut cmd);
                 ui.menu_button(tr("cmd.compare_as"), |ui| {
                     item(
                         ui,
@@ -3323,6 +3737,33 @@ impl OxideMergeApp {
                                             .desired_rows(3)
                                             .desired_width(f32::INFINITY),
                                     );
+                                    ui.checkbox(
+                                        &mut o.block_filters_enabled,
+                                        tr("opt.block_filters"),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(tr("opt.block_filters_hint")).small(),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut d.block_filters)
+                                            .code_editor()
+                                            .desired_rows(2)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.checkbox(
+                                            &mut o.numeric_tolerance_enabled,
+                                            tr("opt.numeric_tolerance"),
+                                        )
+                                        .on_hover_text(tr("opt.numeric_tolerance_hint"));
+                                        ui.add_enabled(
+                                            o.numeric_tolerance_enabled,
+                                            egui::DragValue::new(&mut o.numeric_tolerance)
+                                                .range(0.0..=f64::MAX)
+                                                .speed(0.0001)
+                                                .max_decimals(9),
+                                        );
+                                    });
                                 }
                                 OptTab::Folder => {
                                     let f = &mut d.cfg.folder;
@@ -3481,6 +3922,7 @@ impl OxideMergeApp {
                         d.cfg = defaults;
                         d.line_filters.clear();
                         d.substitutions.clear();
+                        d.block_filters.clear();
                     }
                 });
             });
@@ -3496,14 +3938,10 @@ impl OxideMergeApp {
                 .filter(|l| !l.is_empty())
                 .map(String::from)
                 .collect();
-            d.cfg.diff.substitutions = d
-                .substitutions
-                .lines()
-                .filter_map(|l| {
-                    l.split_once("=>")
-                        .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))
-                })
-                .filter(|(a, _)| !a.is_empty())
+            d.cfg.diff.substitutions = parse_arrow_pairs(&d.substitutions);
+            d.cfg.diff.block_filters = parse_arrow_pairs(&d.block_filters)
+                .into_iter()
+                .filter(|(_, b)| !b.is_empty())
                 .collect();
             let folder_changed = d.cfg.folder != self.cfg.folder || d.cfg.diff != self.cfg.diff;
             self.cfg = d.cfg;
@@ -3997,6 +4435,8 @@ impl eframe::App for OxideMergeApp {
             || self.open_dlg.is_some()
             || self.options_dlg.is_some()
             || self.patch_dlg.is_some()
+            || self.stats_dlg.is_some()
+            || self.git_dlg.is_some()
             || self.filters_dlg
             || self.help
             || self.about
@@ -4110,6 +4550,8 @@ impl eframe::App for OxideMergeApp {
         self.options_dialog(ctx);
         self.filters_dialog(ctx);
         self.patch_dialog(ctx);
+        self.stats_dialog(ctx);
+        self.git_dialog(ctx);
         self.about_window(ctx);
         self.prompts(ctx);
         let mut bulk = Vec::new();

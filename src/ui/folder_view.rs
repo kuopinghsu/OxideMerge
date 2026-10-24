@@ -4,16 +4,18 @@ use crate::config::Config;
 use crate::core::diff::{self, DiffOptions};
 use crate::core::filter::{FileFilter, FltFilter};
 use crate::core::folder::{self, CmpStatus, DirItem, FolderOptions, Progress, Scanner};
+use crate::core::folder_merge::{self, Step};
 use crate::core::patch::{self, PatchStyle};
 use crate::core::report::{self, fmt_size, fmt_time, side_name, status_text, ReportFormat};
-use crate::core::text::{self, FileKind};
+use crate::core::text::{self, FileKind, TextDoc};
 use crate::i18n::{tr, trf};
+use crate::ui::text_view::TextView;
 use crate::ui::theme::{self, Colors};
 use crate::ui::widgets::{self, Icon, Outcome};
 use egui::{vec2, Align, Color32, FontId, Key, Layout, Margin, Modifiers, Sense, Stroke, Ui};
 use egui_extras::{Column, TableBuilder};
 use std::collections::{BTreeSet, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -68,6 +70,8 @@ enum MenuCmd {
     SystemOpen(usize, usize),
     Reveal(usize, usize),
     CopyPath(usize, usize),
+    CopyTo(usize),
+    SelectPattern,
 }
 
 /// How often a running comparison refreshes the list with what it has found so far, at most.
@@ -116,6 +120,12 @@ pub struct FolderView {
     peek_cache: Option<(usize, Vec<(PeekKind, String)>)>,
     /// Duration of a comparison that just finished, until the app takes it.
     finished: Option<Duration>,
+    /// The item shown in the docked file compare, and its compare when it is a text file.
+    dock: Option<(usize, Option<Box<TextView>>)>,
+    /// Text of the "select by name" dialog while it is open.
+    select_pattern: Option<String>,
+    /// A 3-way auto merge waiting for confirmation.
+    merge_plan: Option<folder_merge::Plan>,
     id: egui::Id,
 }
 
@@ -131,6 +141,8 @@ enum PeekKind {
 /// Files larger than this are not loaded for the quick preview.
 const PEEK_MAX_BYTES: u64 = 4 << 20;
 const PEEK_MAX_LINES: usize = 5000;
+/// Files larger than this are not loaded into the docked file compare.
+const DOCK_MAX_BYTES: u64 = 8 << 20;
 
 /// Case-insensitive ordering without allocating lowercase copies.
 fn cmp_ci(a: &str, b: &str) -> std::cmp::Ordering {
@@ -227,6 +239,9 @@ impl FolderView {
             peek: false,
             peek_cache: None,
             finished: None,
+            dock: None,
+            select_pattern: None,
+            merge_plan: None,
             id: egui::Id::new(("folderview", std::time::Instant::now())),
         };
         v.start_compare();
@@ -293,6 +308,7 @@ impl FolderView {
         });
         self.items.clear();
         self.visible.clear();
+        self.dock = None;
         self.selected.clear();
         self.anchor = None;
         self.cursor = None;
@@ -582,6 +598,7 @@ impl FolderView {
     }
 
     fn execute(&mut self, op: PendingOp, cfg: &Config) {
+        self.dock = None;
         let mut errors = Vec::new();
         let mut any_dir = false;
         let mut done = 0;
@@ -804,6 +821,297 @@ impl FolderView {
         }
     }
 
+    /// Copies the selected items of side `side` into `dest`, keeping their relative paths.
+    pub fn copy_to_folder(&mut self, side: usize, dest: &Path) {
+        let mut done = 0;
+        let mut errors = Vec::new();
+        for i in self.selected_targets() {
+            let it = &self.items[i];
+            if !it.exists[side] {
+                continue;
+            }
+            let rel = it.rel_path();
+            match folder::copy_recursive(&it.path(&self.roots[side]), &dest.join(&rel)) {
+                Ok(()) => done += 1,
+                Err(e) => errors.push(format!("{rel}: {e}")),
+            }
+        }
+        self.status = trf("msg.op_done", &[("n", done.to_string())]);
+        if !errors.is_empty() {
+            self.status
+                .push_str(&format!(" — {}: {}", tr("status.error"), errors.join("; ")));
+        }
+    }
+
+    /// Asks where to copy the selected items of side `side`.
+    fn pick_copy_destination(&mut self, side: usize) {
+        if self.selected.is_empty() {
+            return;
+        }
+        if let Some(dest) = rfd::FileDialog::new()
+            .set_title(tr("cmd.copy_to_folder"))
+            .pick_folder()
+        {
+            self.copy_to_folder(side, &dest);
+        }
+    }
+
+    /// Selects the listed items whose name matches one of the `;`-separated wildcards.
+    pub fn select_matching(&mut self, patterns: &str) {
+        let res: Vec<regex::Regex> = patterns
+            .split(';')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .filter_map(crate::core::filter::wildcard_to_regex)
+            .collect();
+        self.selected = self
+            .visible
+            .iter()
+            .copied()
+            .filter(|&i| res.iter().any(|re| re.is_match(&self.items[i].name)))
+            .collect();
+        let first = self.visible.iter().position(|i| self.selected.contains(i));
+        self.anchor = first;
+        self.cursor = first;
+        self.scroll_to = first;
+        self.status = format!("{} {}", self.selected.len(), tr("label.selected"));
+    }
+
+    pub fn open_select_pattern(&mut self) {
+        self.select_pattern = Some(String::new());
+    }
+
+    /// Counts of the compared items: a label and a value per row.
+    pub fn statistics(&self) -> Vec<(String, String)> {
+        let n = self.n();
+        let (same, diff, uniq, err) = folder::status_counts(&self.items);
+        let files = self.items.iter().filter(|i| !i.is_dir);
+        let mut rows = vec![
+            (tr("stats.files").to_string(), files.clone().count()),
+            (
+                tr("stats.folders").to_string(),
+                self.items.iter().filter(|i| i.is_dir).count(),
+            ),
+            (tr("stats.identical").to_string(), same),
+            (tr("stats.different").to_string(), diff),
+            (tr("stats.unique").to_string(), uniq),
+            (tr("stats.errors").to_string(), err),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k, v.to_string()))
+        .collect::<Vec<_>>();
+        for s in 0..n {
+            let only = files
+                .clone()
+                .filter(|it| (0..n).all(|o| it.exists[o] == (o == s)))
+                .count();
+            rows.push((
+                trf("stats.only_in", &[("side", side_name(s, n).into())]),
+                only.to_string(),
+            ));
+        }
+        for s in 0..n {
+            let size: u64 = files.clone().filter_map(|it| it.size[s]).sum();
+            rows.push((
+                trf("stats.total_size", &[("side", side_name(s, n).into())]),
+                fmt_size(Some(size)),
+            ));
+        }
+        rows
+    }
+
+    /// Plans a 3-way merge into the middle folder, to be confirmed.
+    pub fn request_merge(&mut self) {
+        if self.n() != 3 || self.running.is_some() {
+            return;
+        }
+        let plan = folder_merge::plan(&self.items, &self.roots);
+        if plan.steps.is_empty() {
+            self.status = tr("msg.folder_merge_nothing").to_string();
+        } else {
+            self.merge_plan = Some(plan);
+        }
+    }
+
+    fn merge_dialog(&mut self, ui: &Ui, cfg: &Config) {
+        let Some(plan) = self.merge_plan.take() else {
+            return;
+        };
+        let (mut keep, mut run) = (true, false);
+        let c = plan.counts();
+        egui::Modal::new(self.id.with("merge")).show(ui.ctx(), |ui| {
+            ui.set_min_width(400.0);
+            ui.set_max_width(520.0);
+            let pal = widgets::pal(ui);
+            ui.heading(tr("cmd.folder_merge"));
+            ui.label(trf(
+                "msg.folder_merge_plan",
+                &[
+                    ("copies", c.copies.to_string()),
+                    ("deletes", c.deletes.to_string()),
+                    ("merges", c.merges.to_string()),
+                ],
+            ));
+            if c.conflicts > 0 {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(trf(
+                        "msg.folder_merge_conflicts",
+                        &[("n", c.conflicts.to_string())],
+                    ))
+                    .color(pal.warning),
+                );
+                egui::Frame::new()
+                    .fill(pal.surface_alt)
+                    .corner_radius(8)
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let conflicts = plan
+                            .steps
+                            .iter()
+                            .filter(|(_, s)| matches!(s, Step::Conflict))
+                            .map(|(i, _)| *i);
+                        for i in conflicts.clone().take(10) {
+                            ui.label(
+                                egui::RichText::new(self.items[i].rel_path())
+                                    .monospace()
+                                    .color(pal.text_dim),
+                            );
+                        }
+                        if conflicts.count() > 10 {
+                            ui.label("…");
+                        }
+                    });
+            }
+            widgets::dialog_footer(ui, |ui| {
+                let ok = ui.add_enabled_ui(plan.changes() > 0, |ui| {
+                    widgets::primary_button(ui, tr("btn.ok"))
+                });
+                if ok.inner.clicked() {
+                    run = true;
+                    keep = false;
+                }
+                if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
+                    || ui.input(|i| i.key_pressed(Key::Escape))
+                {
+                    keep = false;
+                }
+            });
+        });
+        if run {
+            let (done, errors) =
+                folder_merge::apply(plan, &self.items, &self.roots, cfg.use_recycle_bin);
+            self.start_compare();
+            self.status = trf("msg.op_done", &[("n", done.to_string())]);
+            if !errors.is_empty() {
+                self.status
+                    .push_str(&format!(" — {}: {}", tr("status.error"), errors.join("; ")));
+            }
+        } else if keep {
+            self.merge_plan = Some(plan);
+        }
+    }
+
+    fn select_pattern_dialog(&mut self, ui: &Ui) {
+        let Some(mut text) = self.select_pattern.take() else {
+            return;
+        };
+        let (mut keep, mut run) = (true, false);
+        egui::Modal::new(self.id.with("select_pattern")).show(ui.ctx(), |ui| {
+            ui.set_min_width(380.0);
+            ui.heading(tr("cmd.select_pattern"));
+            ui.label(tr("hint.select_pattern"));
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .hint_text("*.c; *.h")
+                    .desired_width(f32::INFINITY),
+            );
+            r.request_focus();
+            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                run = true;
+            }
+            widgets::dialog_footer(ui, |ui| {
+                if widgets::primary_button(ui, tr("btn.ok")).clicked() {
+                    run = true;
+                }
+                if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
+                    || ui.input(|i| i.key_pressed(Key::Escape))
+                {
+                    keep = false;
+                }
+            });
+        });
+        if run {
+            self.select_matching(&text);
+        } else if keep {
+            self.select_pattern = Some(text);
+        }
+    }
+
+    /// A read-only compare of item `i` for the docked file compare, when it is a text file.
+    fn dock_view(&self, i: usize, cfg: &Config) -> Option<Box<TextView>> {
+        let it = &self.items[i];
+        let n = self.n();
+        if it.is_dir || it.binary || (0..n).any(|s| it.size[s].unwrap_or(0) > DOCK_MAX_BYTES) {
+            return None;
+        }
+        let docs = (0..n)
+            .map(|s| {
+                let p = it.path(&self.roots[s]);
+                let mut d = if it.exists[s] {
+                    if text::detect_kind(&p) == FileKind::Binary {
+                        return None;
+                    }
+                    text::load_doc(&p, None).ok()?
+                } else {
+                    let mut d = TextDoc::empty(None);
+                    d.description = Some(format!("{} — {}", p.display(), tr("peek.missing")));
+                    d
+                };
+                d.read_only = true;
+                Some(d)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut v = TextView::new(docs, cfg);
+        v.keys_enabled = false;
+        v.set_options(&self.dopts);
+        Some(Box::new(v))
+    }
+
+    fn dock_ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
+        let cur = self
+            .cursor
+            .or(self.anchor)
+            .and_then(|v| self.visible.get(v))
+            .copied();
+        if cur != self.dock.as_ref().map(|d| d.0) {
+            self.dock = cur.map(|i| (i, self.dock_view(i, cfg)));
+        }
+        let avail = ui.available_height();
+        egui::TopBottomPanel::bottom(self.id.with("dock"))
+            .resizable(true)
+            .default_height(avail * 0.45)
+            .height_range(100.0..=(avail - 120.0).max(100.0))
+            .frame(egui::Frame::new())
+            .show_inside(ui, |ui| match &mut self.dock {
+                Some((_, Some(v))) => {
+                    v.set_options(&self.dopts);
+                    v.ui(ui, cfg, c);
+                }
+                other => {
+                    let key = match other {
+                        Some((i, None)) if self.items[*i].is_dir => "peek.folder",
+                        Some(_) => "dock.not_text",
+                        None => "dock.hint",
+                    };
+                    ui.centered_and_justified(|ui| {
+                        ui.label(egui::RichText::new(tr(key)).color(widgets::pal(ui).text_dim));
+                    });
+                }
+            });
+    }
+
     pub fn copy_selected(&mut self, to_right: bool, cfg: &Config) {
         let n = self.n();
         let (from, to) = if to_right { (0, 1) } else { (n - 1, n - 2) };
@@ -830,6 +1138,14 @@ impl FolderView {
         let items: Vec<&DirItem> = list.iter().map(|&i| &self.items[i]).collect();
         let roots: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
         report::generate(&items, &roots, format)
+    }
+
+    /// HTML report of the listed items followed by the differences of every changed text file.
+    pub fn report_with_diffs(&self, cfg: &Config) -> String {
+        let list = self.flat_list(cfg);
+        let items: Vec<&DirItem> = list.iter().map(|&i| &self.items[i]).collect();
+        let display: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
+        report::folder_html_with_diffs(&items, &self.roots, &display, &self.dopts)
     }
 
     pub fn outcome(&self) -> Outcome {
@@ -963,6 +1279,20 @@ impl FolderView {
                 {
                     self.request_op_copy(2, 1, cfg);
                 }
+                if widgets::icon_button_enabled(
+                    ui,
+                    self.running.is_none(),
+                    Icon::Bolt,
+                    tr("cmd.folder_merge"),
+                )
+                .clicked()
+                {
+                    self.request_merge();
+                }
+            }
+            widgets::toolbar_sep(ui);
+            if widgets::icon_button(ui, Icon::Check, tr("cmd.select_pattern")).clicked() {
+                self.open_select_pattern();
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -1253,6 +1583,11 @@ impl FolderView {
         if self.running.is_none() && self.visible.is_empty() {
             return header_action.or_else(|| self.empty_state(ui, cfg, named));
         }
+        if cfg.folder_file_pane {
+            self.dock_ui(ui, cfg, c);
+        } else {
+            self.dock = None;
+        }
 
         let mut result: Option<FolderAction> = header_action;
         let mut toggle: Option<usize> = None;
@@ -1266,6 +1601,8 @@ impl FolderView {
         if !ui.ctx().wants_keyboard_input()
             && !widgets::modal_open(ui.ctx())
             && self.confirm.is_none()
+            && self.merge_plan.is_none()
+            && self.select_pattern.is_none()
             && !self.visible.is_empty()
         {
             let last = self.visible.len() - 1;
@@ -1363,6 +1700,10 @@ impl FolderView {
                 }
             }
         };
+        let list_rect = ui.available_rect_before_wrap();
+        let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list_rect));
+        list_ui.set_clip_rect(list_rect.intersect(ui.clip_rect()));
+        let ui = &mut list_ui;
         let mut table = TableBuilder::new(ui)
             .id_salt(self.id)
             .striped(false)
@@ -1581,6 +1922,16 @@ impl FolderView {
                                 }
                             }
                         }
+                        ui.menu_button(tr("cmd.copy_to_folder"), |ui| {
+                            for s in 0..n {
+                                if ui
+                                    .add_enabled(it.exists[s], egui::Button::new(side_name(s, n)))
+                                    .clicked()
+                                {
+                                    menu = Some(MenuCmd::CopyTo(s));
+                                }
+                            }
+                        });
                         ui.menu_button(tr("cmd.delete"), |ui| {
                             for s in 0..n {
                                 if ui
@@ -1622,6 +1973,10 @@ impl FolderView {
                                 }
                             }
                         });
+                        ui.separator();
+                        if ui.button(tr("cmd.select_pattern")).clicked() {
+                            menu = Some(MenuCmd::SelectPattern);
+                        }
                         if menu.is_some() {
                             ui.close_menu();
                         }
@@ -1685,6 +2040,8 @@ impl FolderView {
                 MenuCmd::CopyPath(i, s) => ui
                     .ctx()
                     .copy_text(self.items[i].path(&self.roots[s]).display().to_string()),
+                MenuCmd::CopyTo(s) => self.pick_copy_destination(s),
+                MenuCmd::SelectPattern => self.open_select_pattern(),
             }
         }
 
@@ -1756,6 +2113,8 @@ impl FolderView {
                 self.confirm = Some(op);
             }
         }
+        self.merge_dialog(ui, cfg);
+        self.select_pattern_dialog(ui);
         result
     }
 }
@@ -1810,5 +2169,43 @@ mod tests {
         };
         assert_eq!(rel, v.items[nested].rel_path());
         assert_eq!(v.cursor.map(|c| v.visible[c]), Some(nested));
+    }
+
+    #[test]
+    fn selects_by_name_docks_text_files_and_copies_to_a_folder() {
+        let cfg = Config::default();
+        let roots = ["samples/left", "samples/right"]
+            .map(PathBuf::from)
+            .to_vec();
+        let display = roots.iter().map(|r| r.display().to_string()).collect();
+        let mut v = FolderView::new(roots, display, Vec::new(), "", &[], &cfg);
+        while v.running.is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+            v.poll();
+        }
+        v.rebuild_visible(&cfg);
+        v.select_matching("*.CSV; same.*");
+        let names: Vec<&str> = v
+            .selected
+            .iter()
+            .map(|&i| v.items[i].name.as_str())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.contains(&"data.csv") && names.contains(&"same.txt"));
+
+        let find = |name: &str| v.items.iter().position(|it| it.name == name).unwrap();
+        let docked = v.dock_view(find("data.csv"), &cfg).expect("a text compare");
+        assert_eq!(docked.n(), 2);
+        assert!(!docked.keys_enabled);
+        assert!(v.dock_view(find("blob.bin"), &cfg).is_none());
+
+        let dest = tempfile::tempdir().unwrap();
+        v.copy_to_folder(1, dest.path());
+        assert!(dest.path().join("data.csv").is_file());
+        assert!(dest.path().join("same.txt").is_file());
+
+        let stats = v.statistics();
+        let get = |key: &'static str| stats.iter().find(|(k, _)| k == tr(key)).unwrap().1.clone();
+        assert_eq!(get("stats.identical"), "1");
     }
 }

@@ -4,6 +4,7 @@
 use super::diff::{inline_diff, BlockKind, DiffOptions, DiffResult};
 use super::folder::{CmpStatus, DirItem};
 use crate::i18n::{tr, trf};
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -147,38 +148,28 @@ fn esc_marked(line: &str, marks: &[std::ops::Range<usize>]) -> String {
     out
 }
 
-/// Side-by-side HTML report of a 2-way or 3-way text compare.
-pub fn text_html(
+/// Styles of the side-by-side tables written by `text_table`.
+const DIFF_CSS: &str = "table.diff{border-collapse:collapse;width:100%;table-layout:fixed;margin-bottom:1em}\
+     table.diff td,table.diff th{border:none;padding:0 4px;vertical-align:top}\
+     table.diff th{background:#ddd;text-align:left;border:1px solid #bbb}\
+     table.diff td.n{width:4em;color:#888;text-align:right;user-select:none;background:#f4f4f4}\
+     table.diff td.t{font-family:Consolas,Menlo,monospace;white-space:pre-wrap;word-break:break-all}\
+     table.diff .chg{background:#efcbd0}table.diff .conf{background:#ffb3b3}\
+     table.diff .same{background:#fff3b0}table.diff .gap{background:#e4e4e4}\
+     table.diff .ign{background:#ececf8}table.diff .w{background:#e48a96}\
+     table.diff tr.note td{background:#fff8d6;border:1px solid #e6cf6a;padding:2px 6px;font-style:italic}";
+
+/// Side-by-side table of a 2-way or 3-way text compare. `notes` holds, per pane, comments
+/// shown under the line they belong to (it may be shorter than `panes`).
+pub fn text_table(
     titles: &[String],
     panes: &[&[String]],
     result: &DiffResult,
     opts: &DiffOptions,
+    notes: &[BTreeMap<usize, String>],
 ) -> String {
     let n = panes.len();
-    let mut out = String::new();
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    out.push_str("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n");
-    let _ = writeln!(out, "<title>{}</title>", esc(tr("report.text_title")));
-    out.push_str(
-        "<style>body{font-family:Segoe UI,Arial,sans-serif;font-size:13px}\
-         table{border-collapse:collapse;width:100%;table-layout:fixed}\
-         td,th{padding:0 4px;vertical-align:top}th{background:#ddd;text-align:left;border:1px solid #bbb}\
-         td.n{width:4em;color:#888;text-align:right;user-select:none;background:#f4f4f4}\
-         td.t{font-family:Consolas,Menlo,monospace;white-space:pre-wrap;word-break:break-all}\
-         .chg{background:#efcbd0}.conf{background:#ffb3b3}.same{background:#fff3b0}\
-         .gap{background:#e4e4e4}.ign{background:#ececf8}.w{background:#e48a96}</style></head><body>\n",
-    );
-    let _ = writeln!(
-        out,
-        "<h2>{}</h2><p>{}<br>{}</p>",
-        esc(tr("report.text_title")),
-        now,
-        esc(&trf(
-            "report.text_summary",
-            &[("n", result.significant_blocks().to_string())]
-        ))
-    );
-    out.push_str("<table><tr>");
+    let mut out = String::from("<table class=\"diff\"><tr>");
     for (p, t) in titles.iter().enumerate().take(n) {
         let _ = write!(
             out,
@@ -227,8 +218,118 @@ pub fn text_html(
             }
         }
         out.push_str("</tr>\n");
+        for (p, marks) in notes.iter().enumerate().take(n) {
+            let Some(text) = row.line[p].and_then(|l| marks.get(&l)) else {
+                continue;
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let _ = writeln!(
+                out,
+                "<tr class=\"note\"><td colspan=\"{}\">{} {}: {}</td></tr>",
+                2 * n,
+                esc(side_name(p, n)),
+                row.line[p].map_or(0, |l| l + 1),
+                esc(text)
+            );
+        }
     }
-    out.push_str("</table></body></html>\n");
+    out.push_str("</table>\n");
+    out
+}
+
+/// Side-by-side HTML report of a 2-way or 3-way text compare, with bookmark comments.
+pub fn text_html(
+    titles: &[String],
+    panes: &[&[String]],
+    result: &DiffResult,
+    opts: &DiffOptions,
+    notes: &[BTreeMap<usize, String>],
+) -> String {
+    let mut out = String::new();
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    out.push_str("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n");
+    let _ = writeln!(out, "<title>{}</title>", esc(tr("report.text_title")));
+    let _ = writeln!(
+        out,
+        "<style>body{{font-family:Segoe UI,Arial,sans-serif;font-size:13px}}{DIFF_CSS}</style></head><body>"
+    );
+    let _ = writeln!(
+        out,
+        "<h2>{}</h2><p>{}<br>{}</p>",
+        esc(tr("report.text_title")),
+        now,
+        esc(&trf(
+            "report.text_summary",
+            &[("n", result.significant_blocks().to_string())]
+        ))
+    );
+    out.push_str(&text_table(titles, panes, result, opts, notes));
+    out.push_str("</body></html>\n");
+    out
+}
+
+/// Text files larger than this are listed in a folder report without their differences.
+const REPORT_MAX_LINES: usize = 50_000;
+
+/// HTML folder report followed by the side-by-side differences of every changed text file.
+/// `roots` are the compared folders and `display` the names to show for them.
+pub fn folder_html_with_diffs(
+    items: &[&DirItem],
+    roots: &[PathBuf],
+    display: &[PathBuf],
+    opts: &DiffOptions,
+) -> String {
+    let mut out = generate(items, display, ReportFormat::Html);
+    let mut index = String::new();
+    let mut sections = String::new();
+    let changed = items
+        .iter()
+        .filter(|it| !it.is_dir && !it.binary && it.status == CmpStatus::Different);
+    for (k, it) in changed.enumerate() {
+        let paths: Vec<PathBuf> = roots.iter().map(|r| it.path(r)).collect();
+        let Some(docs) = paths
+            .iter()
+            .map(|p| super::text::load_doc(p, None).ok())
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if docs.iter().any(|d| d.lines.len() > REPORT_MAX_LINES) {
+            continue;
+        }
+        let lines: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
+        let result = super::diff::compute_with(&lines, opts, super::comments::for_path(&paths[0]));
+        if result.is_identical() {
+            continue;
+        }
+        let rel = it.rel_path();
+        let titles: Vec<String> = display
+            .iter()
+            .map(|d| format!("{}/{rel}", d.display()))
+            .collect();
+        let _ = writeln!(index, "<li><a href=\"#f{k}\">{}</a></li>", esc(&rel));
+        let _ = writeln!(
+            sections,
+            "<h3 id=\"f{k}\">{}</h3><p>{}</p>",
+            esc(&rel),
+            esc(&trf(
+                "report.text_summary",
+                &[("n", result.significant_blocks().to_string())]
+            ))
+        );
+        sections.push_str(&text_table(&titles, &lines, &result, opts, &[]));
+    }
+    if sections.is_empty() {
+        return out;
+    }
+    let body_end = out.rfind("</body>").unwrap_or(out.len());
+    let extra = format!(
+        "<style>{DIFF_CSS}</style><h2>{}</h2><ul>{index}</ul>{sections}",
+        esc(tr("report.file_diffs"))
+    );
+    out.insert_str(body_end, &extra);
     out
 }
 
@@ -375,6 +476,8 @@ pub fn generate(items: &[&DirItem], roots: &[PathBuf], format: ReportFormat) -> 
 mod tests {
     use super::*;
     use crate::core::diff::compute;
+    use crate::core::filter::FileFilter;
+    use crate::core::folder::{FolderOptions, Progress, Scanner};
 
     #[test]
     fn text_report_marks_changed_rows_and_words() {
@@ -388,11 +491,43 @@ mod tests {
             .collect();
         let opts = DiffOptions::default();
         let r = compute(&[&a, &b], &opts);
-        let html = text_html(&["a.txt".into(), "b.txt".into()], &[&a, &b], &r, &opts);
+        let notes = vec![BTreeMap::from([(2, "why <removed>?".to_string())])];
+        let html = text_html(
+            &["a.txt".into(), "b.txt".into()],
+            &[&a, &b],
+            &r,
+            &opts,
+            &notes,
+        );
+        assert!(html.contains("Left 3: why &lt;removed&gt;?"), "{html}");
         assert!(html.contains("<td class=\"t \">same</td>"));
         assert!(html.contains("<span class=\"w\">old</span> &lt;word&gt;"));
         assert!(html.contains(
             "<td class=\"t chg\">gone</td><td class=\"n\"></td><td class=\"t gap\"></td>"
         ));
+    }
+
+    #[test]
+    fn folder_report_includes_file_differences() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(a.path().join("same.txt"), "x\n").unwrap();
+        std::fs::write(b.path().join("same.txt"), "x\n").unwrap();
+        std::fs::write(a.path().join("changed.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(b.path().join("changed.txt"), "one\n2\n").unwrap();
+        let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        let items = Scanner {
+            roots: &roots,
+            filter: &FileFilter::default(),
+            fopts: &FolderOptions::default(),
+            dopts: &DiffOptions::default(),
+            progress: &Progress::default(),
+        }
+        .run();
+        let refs: Vec<&DirItem> = items.iter().collect();
+        let html = folder_html_with_diffs(&refs, &roots, &roots, &DiffOptions::default());
+        assert!(html.contains("<a href=\"#f0\">changed.txt</a>"), "{html}");
+        assert!(html.contains("<td class=\"t chg\"><span class=\"w\">two</span></td>"));
+        assert!(!html.contains("same.txt</a>"));
+        assert!(html.trim_end().ends_with("</body></html>"));
     }
 }

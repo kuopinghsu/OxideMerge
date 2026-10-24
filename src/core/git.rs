@@ -70,7 +70,9 @@ pub fn export_folder(path: &Path, rev: &str) -> Result<(tempfile::TempDir, PathB
         args.extend(["--", rel.as_str()]);
     }
     let tar = git(&root, &args)?;
-    let dir = tempfile::Builder::new().prefix("oxidemerge-git-").tempdir()?;
+    let dir = tempfile::Builder::new()
+        .prefix("oxidemerge-git-")
+        .tempdir()?;
     super::archive::extract_tar(tar.as_slice(), dir.path())?;
     let copy = dir.path().join(&rel);
     std::fs::create_dir_all(&copy)?;

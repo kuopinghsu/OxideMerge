@@ -5,6 +5,8 @@ use crate::core::comments;
 use crate::core::diff::{self, BlockKind, DiffOptions, DiffResult, InlineMode};
 use crate::core::patch::{self, PatchStyle};
 use crate::core::prettify;
+use crate::core::report::side_name;
+use crate::core::saved::{SavedCompare, SavedPane};
 use crate::core::table;
 use crate::core::text::{self, Eol, TextDoc, TextEncoding, COMMON_ENCODINGS};
 use crate::i18n::{tr, trf};
@@ -18,7 +20,7 @@ use egui::{
     StrokeKind, TextFormat, Ui,
 };
 use regex::Regex;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -36,6 +38,10 @@ pub struct Pane {
     disk_time: Option<SystemTime>,
     /// The document as loaded while a reformatted (JSON / XML) copy is shown instead.
     original: Option<TextDoc>,
+    /// The lines as loaded, to tell which lines were edited since.
+    baseline: Vec<String>,
+    /// Lines inserted or changed since the document was loaded.
+    edited: HashSet<usize>,
 }
 
 /// Modification time of a document's file. Documents with a description (unpacked or
@@ -50,6 +56,7 @@ fn disk_time(doc: &TextDoc) -> Option<SystemTime> {
 impl Pane {
     fn new(doc: TextDoc) -> Self {
         let disk_time = disk_time(&doc);
+        let baseline = doc.lines.clone();
         Pane {
             doc,
             hl: None,
@@ -59,8 +66,36 @@ impl Pane {
             saves: 0,
             disk_time,
             original: None,
+            baseline,
+            edited: HashSet::new(),
         }
     }
+
+    /// Takes the current lines as the unedited state.
+    fn reset_baseline(&mut self) {
+        self.baseline = self.doc.lines.clone();
+        self.edited.clear();
+    }
+}
+
+/// Lines of `new` inserted or changed since `old`.
+fn edited_lines(old: &[String], new: &[String]) -> HashSet<usize> {
+    if old == new {
+        return HashSet::new();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    similar::capture_diff_deadline(
+        similar::Algorithm::Myers,
+        old,
+        0..old.len(),
+        new,
+        0..new.len(),
+        Some(deadline),
+    )
+    .iter()
+    .filter(|op| op.tag() != similar::DiffTag::Equal)
+    .flat_map(|op| op.new_range())
+    .collect()
 }
 
 /// Where each line of `old` ended up in `new` (deleted lines map to where they were).
@@ -308,8 +343,12 @@ enum MenuAction {
     /// Copy the selected lines from one pane to another.
     CopyLines(usize, usize),
     ToggleBookmark(usize, usize),
+    EditNote(usize, usize),
     TakeBoth(usize, bool),
 }
+
+/// A bookmark comment being edited: pane, line, text, and whether the field needs focus.
+type NoteEdit = (usize, usize, String, bool);
 
 pub struct TextView {
     pub panes: Vec<Pane>,
@@ -354,8 +393,12 @@ pub struct TextView {
     /// Set when difference navigation ran past the last (true) or first (false) difference,
     /// so the app can move on to the next or previous file of the folder compare.
     pub step_file: Option<bool>,
-    /// Bookmarked lines of each pane.
-    pub bookmarks: Vec<BTreeSet<usize>>,
+    /// Bookmarked lines of each pane, with their comments (empty when there is none).
+    pub bookmarks: Vec<BTreeMap<usize, String>>,
+    note_edit: Option<NoteEdit>,
+    /// Off for a preview that must leave the keyboard to the view around it.
+    pub keys_enabled: bool,
+    tab_size: usize,
     id: egui::Id,
 }
 
@@ -365,7 +408,7 @@ impl TextView {
             .iter()
             .filter_map(|d| d.path.as_deref())
             .find_map(table::delimiter_for);
-        let bookmarks = vec![BTreeSet::new(); docs.len()];
+        let bookmarks = vec![BTreeMap::new(); docs.len()];
         let mut v = TextView {
             panes: docs.into_iter().map(Pane::new).collect(),
             diff: DiffResult::default(),
@@ -401,6 +444,9 @@ impl TextView {
             scroll_anim: None,
             step_file: None,
             bookmarks,
+            note_edit: None,
+            keys_enabled: true,
+            tab_size: cfg.tab_size,
             id: egui::Id::new(("textview", std::time::Instant::now())),
         };
         v.apply_prettify();
@@ -467,6 +513,7 @@ impl TextView {
             };
             if swap.is_some() {
                 pane.hl_dirty = true;
+                pane.reset_baseline();
                 self.bookmarks[p].clear();
             }
         }
@@ -489,7 +536,10 @@ impl TextView {
         self.diff = diff::compute_with(&refs, &self.opts, syntax);
         for (p, marks) in self.bookmarks.iter_mut().enumerate() {
             let n = self.panes[p].doc.lines.len();
-            marks.retain(|&l| l < n);
+            marks.retain(|&l, _| l < n);
+        }
+        for pane in &mut self.panes {
+            pane.edited = edited_lines(&pane.baseline, &pane.doc.lines);
         }
         self.inline_cache.clear();
         self.sel_anchor = None;
@@ -539,10 +589,13 @@ impl TextView {
             return;
         }
         let map = line_map(before, &self.panes[p].doc.lines);
-        self.bookmarks[p] = self.bookmarks[p]
-            .iter()
-            .filter_map(|&l| map.get(l).copied())
-            .collect();
+        let mut moved = BTreeMap::new();
+        for (l, note) in std::mem::take(&mut self.bookmarks[p]) {
+            if let Some(&to) = map.get(l) {
+                moved.entry(to).or_insert(note);
+            }
+        }
+        self.bookmarks[p] = moved;
     }
 
     // ---------- bookmarks ----------
@@ -564,8 +617,8 @@ impl TextView {
 
     fn toggle_bookmark_at(&mut self, row: usize, pane: usize) {
         if let Some((p, l)) = self.bookmark_target(row, pane) {
-            if !self.bookmarks[p].remove(&l) {
-                self.bookmarks[p].insert(l);
+            if self.bookmarks[p].remove(&l).is_none() {
+                self.bookmarks[p].insert(l, String::new());
             }
         }
     }
@@ -575,7 +628,7 @@ impl TextView {
     }
 
     pub fn clear_bookmarks(&mut self) {
-        self.bookmarks.iter_mut().for_each(BTreeSet::clear);
+        self.bookmarks.iter_mut().for_each(BTreeMap::clear);
     }
 
     /// Diff rows that hold a bookmark, sorted.
@@ -584,7 +637,7 @@ impl TextView {
             .bookmarks
             .iter()
             .enumerate()
-            .flat_map(|(p, ls)| ls.iter().map(move |&l| (p, l)))
+            .flat_map(|(p, ls)| ls.keys().map(move |&l| (p, l)))
             .map(|(p, l)| self.diff.row_of_line(p, l))
             .collect();
         rows.sort_unstable();
@@ -593,7 +646,30 @@ impl TextView {
     }
 
     fn row_bookmarked(&self, r: usize, p: usize) -> bool {
-        self.diff.rows[r].line[p].is_some_and(|l| self.bookmarks[p].contains(&l))
+        self.diff.rows[r].line[p].is_some_and(|l| self.bookmarks[p].contains_key(&l))
+    }
+
+    /// The comment of a bookmark on row `r`, in the pane that has one.
+    fn row_note(&self, r: usize) -> Option<&str> {
+        let row = self.diff.rows.get(r)?;
+        (0..self.n()).find_map(|p| {
+            let note = self.bookmarks[p].get(&row.line[p]?)?;
+            (!note.is_empty()).then_some(note.as_str())
+        })
+    }
+
+    /// Opens the comment of the bookmark on `row` for editing, adding the bookmark if needed.
+    fn edit_note_at(&mut self, row: usize, pane: usize) {
+        if let Some((p, l)) = self.bookmark_target(row, pane) {
+            let text = self.bookmarks[p].get(&l).cloned().unwrap_or_default();
+            self.note_edit = Some((p, l, text, true));
+        }
+    }
+
+    pub fn edit_note(&mut self) {
+        if let Some(r) = self.cursor_row {
+            self.edit_note_at(r, self.active_pane);
+        }
     }
 
     /// Moves the cursor to the next (or previous) bookmark, wrapping around.
@@ -618,6 +694,7 @@ impl TextView {
                 self.cur_block = self.diff.rows[row]
                     .block
                     .filter(|&b| !self.diff.blocks[b].ignored);
+                self.status = self.row_note(row).unwrap_or_default().to_string();
             }
             None => self.status = tr("msg.no_bookmarks").to_string(),
         }
@@ -1187,6 +1264,7 @@ impl TextView {
                     pane.hl_dirty = true;
                     pane.saves += 1;
                     pane.disk_time = disk_time(&pane.doc);
+                    pane.reset_baseline();
                 }
                 Err(e) => self.status = e.to_string(),
             }
@@ -1238,6 +1316,7 @@ impl TextView {
                 self.panes[p].doc = d;
                 self.panes[p].hl_dirty = true;
                 self.panes[p].disk_time = disk_time(&self.panes[p].doc);
+                self.panes[p].reset_baseline();
                 self.rediff();
             }
             Err(e) => self.status = e.to_string(),
@@ -1258,6 +1337,7 @@ impl TextView {
                     }
                     p.doc = d;
                     p.disk_time = disk_time(&p.doc);
+                    p.reset_baseline();
                 }
             }
         }
@@ -1293,7 +1373,144 @@ impl TextView {
     pub fn html_report(&self) -> String {
         let titles: Vec<String> = self.panes.iter().map(|p| p.doc.title()).collect();
         let refs: Vec<&[String]> = self.panes.iter().map(|p| p.doc.lines.as_slice()).collect();
-        crate::core::report::text_html(&titles, &refs, &self.diff, &self.opts)
+        crate::core::report::text_html(&titles, &refs, &self.diff, &self.opts, &self.bookmarks)
+    }
+
+    /// The compare with its bookmarks, to save as one file.
+    pub fn saved_compare(&self) -> SavedCompare {
+        SavedCompare::new(
+            self.panes
+                .iter()
+                .zip(&self.bookmarks)
+                .map(|(p, marks)| SavedPane {
+                    title: p.doc.title(),
+                    path: p.doc.path.as_ref().map(|p| p.display().to_string()),
+                    text: p.doc.text(),
+                    syntax: p
+                        .doc
+                        .path
+                        .as_deref()
+                        .map(text::extension)
+                        .or_else(|| p.doc.syntax.clone()),
+                    bookmarks: marks.iter().map(|(&l, n)| (l + 1, n.clone())).collect(),
+                })
+                .collect(),
+        )
+    }
+
+    /// A read-only compare of a saved comparison, with its bookmarks.
+    pub fn from_saved(saved: &SavedCompare, cfg: &Config) -> TextView {
+        let docs = saved
+            .panes
+            .iter()
+            .map(|p| {
+                let mut d = TextDoc::from_text(None, &p.text);
+                d.description = Some(p.title.clone());
+                d.syntax = p.syntax.clone();
+                d.read_only = true;
+                d
+            })
+            .collect();
+        let mut v = TextView::new(docs, cfg);
+        for (p, pane) in saved.panes.iter().enumerate() {
+            let n = v.panes[p].doc.lines.len();
+            v.bookmarks[p] = pane
+                .bookmarks
+                .iter()
+                .filter(|(&l, _)| (1..=n).contains(&l))
+                .map(|(&l, c)| (l - 1, c.clone()))
+                .collect();
+        }
+        v
+    }
+
+    /// Line statistics of every pair of sides: the pair's name, then its counts.
+    pub fn statistics(&self) -> Vec<(String, diff::Stats)> {
+        let n = self.n();
+        let name = |a: usize, b: usize| format!("{} ↔ {}", side_name(a, n), side_name(b, n));
+        if n == 2 {
+            return vec![(name(0, 1), self.diff.stats())];
+        }
+        let syntax = self.comment_syntax();
+        [(0, 1), (1, 2), (0, 2)]
+            .into_iter()
+            .map(|(a, b)| {
+                let refs = [
+                    self.panes[a].doc.lines.as_slice(),
+                    self.panes[b].doc.lines.as_slice(),
+                ];
+                (
+                    name(a, b),
+                    diff::compute_with(&refs, &self.opts, syntax).stats(),
+                )
+            })
+            .collect()
+    }
+
+    /// Indents (or outdents) the active pane's lines in the selected rows, or on the cursor
+    /// row, by a tab when the file indents with tabs and by the tab size in spaces otherwise.
+    pub fn indent(&mut self, outdent: bool) {
+        let p = self.active_pane;
+        let Some((r0, r1)) = self.selection().or_else(|| self.cursor_row.map(|r| (r, r))) else {
+            return;
+        };
+        let lines: Vec<usize> = self.diff.rows[r0..=r1]
+            .iter()
+            .filter_map(|r| r.line[p])
+            .collect();
+        let (Some(&first), Some(&last)) = (lines.first(), lines.last()) else {
+            return;
+        };
+        if !self.writable(p) {
+            return;
+        }
+        let tab = self.tab_size.max(1);
+        let doc = &self.panes[p].doc;
+        let (tabs, spaces) = doc.lines.iter().take(5000).fold((0, 0), |(t, s), l| {
+            (
+                t + l.starts_with('\t') as usize,
+                s + l.starts_with(' ') as usize,
+            )
+        });
+        let unit = if tabs > spaces {
+            "\t".to_string()
+        } else {
+            " ".repeat(tab)
+        };
+        let changed: Vec<String> = lines
+            .iter()
+            .map(|&l| {
+                let line = &doc.lines[l];
+                if outdent {
+                    let cut = if line.starts_with('\t') {
+                        1
+                    } else {
+                        line.len() - line.trim_start_matches(' ').len()
+                    };
+                    line[cut.min(tab)..].to_string()
+                } else if line.trim().is_empty() {
+                    line.clone()
+                } else {
+                    format!("{unit}{line}")
+                }
+            })
+            .collect();
+        if lines.iter().zip(&changed).all(|(&l, c)| doc.lines[l] == *c) {
+            return;
+        }
+        let forward = self.sel_anchor.is_none_or(|a| Some(a) <= self.cursor_row);
+        self.push_undo();
+        for (&l, c) in lines.iter().zip(changed) {
+            self.panes[p].doc.lines[l] = c;
+        }
+        self.mark_changed(&[p]);
+        let (a, b) = (
+            self.diff.row_of_line(p, first),
+            self.diff.row_of_line(p, last),
+        );
+        let (anchor, cursor) = if forward { (a, b) } else { (b, a) };
+        self.sel_anchor = (r0 != r1).then_some(anchor);
+        self.cursor_row = Some(cursor);
     }
 
     // ---------- find ----------
@@ -2283,7 +2500,8 @@ impl TextView {
     }
 
     fn handle_keys(&mut self, ui: &Ui) {
-        if ui.ctx().wants_keyboard_input()
+        if !self.keys_enabled
+            || ui.ctx().wants_keyboard_input()
             || self.edit.is_some()
             || self.goto.is_some()
             || widgets::modal_open(ui.ctx())
@@ -2386,6 +2604,120 @@ impl TextView {
         }
     }
 
+    /// The cursor row of every side one above the other, wrapped to the full width.
+    fn line_detail(&mut self, ui: &Ui, rect: Rect, cfg: &Config, c: &Colors) {
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, c.ui.surface_alt);
+        painter.line_segment(
+            [rect.left_top(), rect.right_top()],
+            Stroke::new(1.0_f32, c.ui.border),
+        );
+        let Some(r) = self.cursor_row.filter(|&r| r < self.diff.rows.len()) else {
+            return;
+        };
+        self.ensure_inline(r);
+        let n = self.n();
+        let font = FontId::monospace(cfg.font_size);
+        let label_w = 70.0;
+        let slot_h = (rect.height() - 6.0) / n as f32;
+        let row = self.diff.rows[r];
+        let sel = row.block.is_some() && row.block == self.cur_block;
+        let inline_bg = if sel { c.inline_sel } else { c.inline };
+        for p in 0..n {
+            let slot = Rect::from_min_size(
+                pos2(rect.left(), rect.top() + 3.0 + p as f32 * slot_h),
+                vec2(rect.width(), slot_h),
+            )
+            .shrink2(vec2(6.0, 2.0));
+            if let Some(bg) = self.row_bg(r, p, c) {
+                painter.rect_filled(slot, 3.0, bg);
+            }
+            let label = match row.line[p] {
+                Some(l) => format!("{} {}", side_name(p, n), l + 1),
+                None => side_name(p, n).to_string(),
+            };
+            painter.text(
+                slot.left_top() + vec2(4.0, 1.0),
+                Align2::LEFT_TOP,
+                label,
+                FontId::proportional(cfg.font_size - 1.0),
+                c.gutter_text,
+            );
+            let Some(l) = row.line[p] else { continue };
+            let line = &self.panes[p].doc.lines[l];
+            let inline = self
+                .inline_cache
+                .get(&r)
+                .map(|v| v[p].as_slice())
+                .unwrap_or(&[]);
+            let mut job = Self::line_job(
+                line,
+                None,
+                inline,
+                &[],
+                inline_bg,
+                c.find_hit,
+                c.text,
+                &font,
+                cfg.tab_size,
+                cfg.show_whitespace,
+            );
+            job.wrap.max_width = slot.width() - label_w - 4.0;
+            let galley = ui.fonts(|f| f.layout_job(job));
+            painter.with_clip_rect(slot).galley(
+                slot.left_top() + vec2(label_w, 1.0),
+                galley,
+                c.text,
+            );
+        }
+    }
+
+    /// The dialog editing a bookmark's comment.
+    fn note_window(&mut self, ui: &Ui) {
+        let Some((p, l, mut text, focus)) = self.note_edit.take() else {
+            return;
+        };
+        let mut open = !ui.input(|i| i.key_pressed(Key::Escape));
+        let mut done = false;
+        let mut cancel = false;
+        egui::Window::new(tr("dlg.bookmark_comment"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "{} {} {}",
+                    side_name(p, self.n()),
+                    tr("label.line"),
+                    l + 1
+                ));
+                let r = ui.add(
+                    egui::TextEdit::multiline(&mut text)
+                        .desired_rows(4)
+                        .desired_width(360.0),
+                );
+                if focus {
+                    r.request_focus();
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(tr("btn.ok")).clicked() {
+                        done = true;
+                    }
+                    if ui.button(tr("btn.cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if done {
+            if l < self.panes[p].doc.lines.len() {
+                self.bookmarks[p].insert(l, text.trim().to_string());
+            }
+        } else if open && !cancel {
+            self.note_edit = Some((p, l, text, false));
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
         self.poll_highlight(cfg);
         if self.panes.iter().any(|p| p.hl_rx.is_some()) {
@@ -2405,7 +2737,16 @@ impl TextView {
         }
 
         let n = self.n();
-        let avail = ui.available_rect_before_wrap();
+        self.tab_size = cfg.tab_size;
+        let full = ui.available_rect_before_wrap();
+        let detail_h = if cfg.show_line_detail {
+            let row = ui.fonts(|f| f.row_height(&FontId::monospace(cfg.font_size)));
+            (n as f32 * (2.0 * row + 6.0) + 6.0).min(full.height() / 2.0)
+        } else {
+            0.0
+        };
+        let mut avail = full;
+        avail.max.y -= detail_h;
         let header_h = 36.0;
         let wrap = self.wrap && !self.table_mode;
         let hbar_h = if wrap { 0.0 } else { 12.0 };
@@ -2547,6 +2888,24 @@ impl TextView {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
+        if let Some(pos) = ui
+            .input(|i| i.pointer.hover_pos())
+            .filter(|p| body_rect.contains(*p))
+        {
+            let p = (((pos.x - content_left) / pane_w).floor() as usize).min(n - 1);
+            let in_gutter = pos.x - (content_left + p as f32 * pane_w) < gutter_w;
+            let note = match hover_v.map(|v| self.layout.lines[v]) {
+                Some(VLine::Row(r, _)) if in_gutter => self.diff.rows[r].line[p]
+                    .and_then(|l| self.bookmarks[p].get(&l))
+                    .filter(|n| !n.is_empty())
+                    .cloned(),
+                _ => None,
+            };
+            if let Some(note) = note {
+                resp.clone().on_hover_text_at_pointer(note);
+            }
+        }
+
         // clicks
         if resp.clicked() || resp.double_clicked() || resp.secondary_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
@@ -2670,12 +3029,19 @@ impl TextView {
                 }
                 let row = self.diff.rows[r];
                 let Some(l) = row.line[p] else { continue };
-                let bookmarked = self.bookmarks[p].contains(&l);
+                let bookmarked = self.bookmarks[p].contains_key(&l);
                 if bookmarked && seg == 0 {
                     gp.rect_filled(
                         Rect::from_min_size(pos2(x0 + 1.0, y + 2.0), vec2(4.0, row_h - 4.0)),
                         2.0,
                         c.ui.warning,
+                    );
+                }
+                if cfg.show_edit_markers && pane.edited.contains(&l) {
+                    gp.rect_filled(
+                        Rect::from_min_size(pos2(x0 + 6.0, y), vec2(3.0, row_h)),
+                        0.0,
+                        c.ui.accent,
                     );
                 }
                 if cfg.show_line_numbers && seg == 0 {
@@ -3019,6 +3385,9 @@ impl TextView {
                 if ui.button(tr(mark)).clicked() {
                     action = Some(MenuAction::ToggleBookmark(r, p));
                 }
+                if ui.button(tr("cmd.bookmark_comment")).clicked() {
+                    action = Some(MenuAction::EditNote(r, p));
+                }
                 if n == 3 {
                     if let Some(b) = block.filter(|_| !self.panes[1].doc.read_only) {
                         ui.separator();
@@ -3063,6 +3432,7 @@ impl TextView {
                     }
                 }
                 MenuAction::ToggleBookmark(r, p) => self.toggle_bookmark_at(r, p),
+                MenuAction::EditNote(r, p) => self.edit_note_at(r, p),
                 MenuAction::TakeBoth(b, left_first) => self.take_both_at(b, left_first),
             }
         }
@@ -3155,6 +3525,12 @@ impl TextView {
             );
         }
         ui.allocate_rect(avail, Sense::hover());
+        if detail_h > 0.0 {
+            let rect = Rect::from_min_max(pos2(full.left(), avail.bottom()), full.max);
+            self.line_detail(ui, rect, cfg, c);
+            ui.allocate_rect(rect, Sense::hover());
+        }
+        self.note_window(ui);
 
         // go to line dialog
         if let Some(mut g) = self.goto.take() {
@@ -3275,14 +3651,72 @@ mod tests {
         v.toggle_bookmark();
         v.cursor_row = Some(0);
         v.paste("zero");
-        assert_eq!(v.bookmarks[0].iter().copied().collect::<Vec<_>>(), [3]);
+        assert_eq!(v.bookmarks[0].keys().copied().collect::<Vec<_>>(), [3]);
         v.cursor_row = Some(0);
         v.goto_bookmark(true);
         assert_eq!(v.cursor_row, Some(v.diff.row_of_line(0, 3)));
         v.undo();
-        assert_eq!(v.bookmarks[0].iter().copied().collect::<Vec<_>>(), [2]);
+        assert_eq!(v.bookmarks[0].keys().copied().collect::<Vec<_>>(), [2]);
         v.toggle_bookmark_at(v.diff.row_of_line(0, 2), 0);
         assert!(!v.has_bookmarks());
+    }
+
+    #[test]
+    fn keeps_bookmark_comments_and_marks_edited_lines() {
+        let mut v = two_way("one\ntwo\nthree\n", "one\nTWO\nthree\n");
+        v.active_pane = 0;
+        v.edit_note_at(2, 0);
+        let (p, l, ..) = v.note_edit.take().unwrap();
+        v.bookmarks[p].insert(l, "check this".into());
+        v.cursor_row = Some(0);
+        v.paste("zero");
+        assert_eq!(
+            v.bookmarks[0].get(&3).map(String::as_str),
+            Some("check this")
+        );
+        assert_eq!(v.panes[0].edited, HashSet::from([1]));
+        assert_eq!(v.row_note(v.diff.row_of_line(0, 3)), Some("check this"));
+
+        let saved = v.saved_compare();
+        assert_eq!(
+            saved.panes[0].bookmarks.get(&4).map(String::as_str),
+            Some("check this")
+        );
+        let r = TextView::from_saved(&saved, &Config::default());
+        assert_eq!(r.bookmarks[0], v.bookmarks[0]);
+        assert_eq!(lines(&r, 0), lines(&v, 0));
+        assert!(r.panes.iter().all(|p| p.doc.read_only));
+    }
+
+    #[test]
+    fn indents_selected_lines_and_counts_statistics() {
+        let mut v = two_way("a\n\tb\nc\n", "a\nx\nc\nd\n");
+        v.active_pane = 1;
+        v.tab_size = 4;
+        v.sel_anchor = Some(0);
+        v.cursor_row = Some(1);
+        v.indent(false);
+        assert_eq!(lines(&v, 1), ["    a", "    x", "c", "d"]);
+        v.indent(true);
+        assert_eq!(lines(&v, 1), ["a", "x", "c", "d"]);
+        v.active_pane = 0;
+        v.sel_anchor = None;
+        v.cursor_row = Some(v.diff.row_of_line(0, 1));
+        v.indent(true);
+        assert_eq!(lines(&v, 0), ["a", "b", "c"]);
+
+        let stats = v.statistics();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(
+            stats[0].1,
+            diff::Stats {
+                identical: 2,
+                changed: 1,
+                added: 1,
+                differences: 2,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]

@@ -627,6 +627,16 @@ fn text_equal(a: &Loaded, b: &Loaded, norm: &Normalizer, dopts: &DiffOptions, pa
             return false;
         }
     }
+    if norm.needs_diff() {
+        let lines = |t: &str| -> Vec<String> { text::lines(t).map(|(l, _)| l.into()).collect() };
+        let (la, lb) = (lines(&ta), lines(&tb));
+        let opts = DiffOptions {
+            detect_moved: false,
+            ..dopts.clone()
+        };
+        return super::diff::compute_with(&[&la, &lb], &opts, comments::for_path(path))
+            .is_identical();
+    }
     match comments::for_path(path).filter(|_| dopts.ignore_comments) {
         Some(syn) => {
             let code = |t: &str| -> Vec<String> {
