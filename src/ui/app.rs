@@ -533,12 +533,16 @@ struct StatsDialog {
     rows: Vec<(String, Vec<String>)>,
 }
 
+type CommitsRx = std::sync::mpsc::Receiver<Vec<(String, String)>>;
+
 struct GitDialog {
     path: String,
     rev: String,
     /// Recent commits of `commits_for`: short hash and subject.
     commits: Vec<(String, String)>,
     commits_for: String,
+    /// Recent commits being read with `git log`, for the path it was started for.
+    commits_job: Option<(String, CommitsRx)>,
 }
 
 struct PatchDialog {
@@ -581,6 +585,8 @@ pub struct OxideMergeApp {
     patch_dlg: Option<PatchDialog>,
     stats_dlg: Option<StatsDialog>,
     git_dlg: Option<GitDialog>,
+    /// A folder report with file differences being written on another thread: its file.
+    report_job: Option<(PathBuf, std::sync::mpsc::Receiver<std::io::Result<()>>)>,
     filters_dlg: bool,
     about: bool,
     help: bool,
@@ -946,6 +952,7 @@ impl OxideMergeApp {
             patch_dlg: None,
             stats_dlg: None,
             git_dlg: None,
+            report_job: None,
             filters_dlg: false,
             about: false,
             help: false,
@@ -1824,6 +1831,7 @@ impl OxideMergeApp {
                     rev: "HEAD".into(),
                     commits: Vec::new(),
                     commits_for: String::new(),
+                    commits_job: None,
                 });
             }
             Cmd::CompareAs(kind) => {
@@ -2019,9 +2027,39 @@ impl OxideMergeApp {
         else {
             return;
         };
-        match std::fs::write(&path, v.report_with_diffs(&self.cfg)) {
-            Ok(()) => self.notify(trf("msg.saved", &[("file", path.display().to_string())])),
-            Err(e) => self.error(e.to_string()),
+        let job = v.report_with_diffs_job(&self.cfg);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let file = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(std::fs::write(&file, job()));
+        });
+        self.report_job = Some((path, rx));
+        self.notify(tr("msg.report_writing"));
+    }
+
+    /// Announces a report written on another thread once it is done.
+    fn poll_report(&mut self, ctx: &egui::Context) {
+        let Some((path, rx)) = &self.report_job else {
+            return;
+        };
+        let done = match rx.try_recv() {
+            Ok(r) => Some(r.map_err(|e| e.to_string())),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Some(Err(tr("status.error").to_string()))
+            }
+        };
+        let file = path.display().to_string();
+        match done {
+            None => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+            Some(Ok(())) => {
+                self.report_job = None;
+                self.notify(trf("msg.saved", &[("file", file)]));
+            }
+            Some(Err(e)) => {
+                self.report_job = None;
+                self.error(format!("{file}: {e}"));
+            }
         }
     }
 
@@ -2140,9 +2178,30 @@ impl OxideMergeApp {
             return;
         };
         let path = PathBuf::from(d.path.trim());
-        if d.commits_for != d.path && path.exists() {
-            d.commits = git::recent_commits(&path, 20);
-            d.commits_for = d.path.clone();
+        if let Some((for_path, rx)) = &d.commits_job {
+            match rx.try_recv() {
+                Ok(commits) => {
+                    d.commits = commits;
+                    d.commits_for = for_path.clone();
+                    d.commits_job = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => d.commits_job = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+        let started_for = d.commits_job.as_ref().map(|(p, _)| p.as_str());
+        if d.commits_for != d.path && started_for != Some(d.path.as_str()) && path.exists() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let p = path.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(git::recent_commits(&p, 20));
+            });
+            d.commits_job = Some((d.path.clone(), rx));
+        }
+        if d.commits_for != d.path {
+            d.commits.clear();
         }
         let (mut keep, mut go) = (true, false);
         let modal = egui::Modal::new(egui::Id::new("git_dialog")).show(ctx, |ui| {
@@ -4440,7 +4499,11 @@ impl eframe::App for OxideMergeApp {
             || self.filters_dlg
             || self.help
             || self.about
-            || self.palette.is_some();
+            || self.palette.is_some()
+            || matches!(
+                self.tabs.get(self.active).map(|t| t.content.view()),
+                Some(Content::Folder(v)) if v.has_dialog()
+            );
         widgets::set_modal_open(ctx, modal);
         if !modal {
             self.handle_shortcuts(ctx);
@@ -4552,6 +4615,7 @@ impl eframe::App for OxideMergeApp {
         self.patch_dialog(ctx);
         self.stats_dialog(ctx);
         self.git_dialog(ctx);
+        self.poll_report(ctx);
         self.about_window(ctx);
         self.prompts(ctx);
         let mut bulk = Vec::new();

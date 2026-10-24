@@ -93,7 +93,8 @@ fn merge_text(paths: &[PathBuf]) -> Option<TextDoc> {
 }
 
 /// Decides what the merge does with every item. Items inside a folder that is copied or
-/// deleted as a whole get no step of their own.
+/// deleted as a whole get no step of their own. Files are compared byte for byte: the folder
+/// compare may have called them identical under its ignore options.
 pub fn plan(items: &[DirItem], roots: &[PathBuf]) -> Plan {
     let mut steps: BTreeMap<usize, Step> = BTreeMap::new();
     if roots.len() != 3 {
@@ -102,7 +103,7 @@ pub fn plan(items: &[DirItem], roots: &[PathBuf]) -> Plan {
     for (i, it) in items.iter().enumerate() {
         let covered = std::iter::successors(it.parent, |&p| items[p].parent)
             .any(|p| matches!(steps.get(&p), Some(Step::Copy(_) | Step::Delete)));
-        if covered || matches!(it.status, CmpStatus::Identical | CmpStatus::Error) {
+        if covered || it.status == CmpStatus::Error {
             continue;
         }
         let path = |s: usize| it.path(&roots[s]);
@@ -242,24 +243,32 @@ mod tests {
         write(r, "new/added.txt", "new\n");
         write(b, "removed.txt", "keep?\n");
         write(l, "removed.txt", "keep?\n");
+        for root in [b, r] {
+            write(root, "spaces.txt", "a b\n");
+        }
+        write(l, "spaces.txt", "a  b\n");
         std::fs::remove_dir_all(r.join("gone")).unwrap();
 
         let roots: Vec<PathBuf> = [l, b, r].iter().map(|p| p.to_path_buf()).collect();
-        let items = scan(&roots);
+        let mut items = scan(&roots);
+        // as a compare ignoring whitespace would report it
+        let spaces = items.iter().position(|i| i.name == "spaces.txt").unwrap();
+        items[spaces].status = CmpStatus::Identical;
         let plan = plan(&items, &roots);
         assert_eq!(
             plan.counts(),
             Counts {
-                copies: 2,
+                copies: 3,
                 deletes: 2,
                 merges: 1,
                 conflicts: 1
             }
         );
         let (done, errors) = apply(plan, &items, &roots, false);
-        assert_eq!((done, errors.len()), (5, 0), "{errors:?}");
+        assert_eq!((done, errors.len()), (6, 0), "{errors:?}");
         let read = |rel: &str| std::fs::read_to_string(b.join(rel)).unwrap();
         assert_eq!(read("left_changed.txt"), "left\n");
+        assert_eq!(read("spaces.txt"), "a  b\n");
         assert_eq!(read("both.txt"), "one\n2\n3\n4\nfive\n");
         assert_eq!(read("conflict.txt"), "x\n");
         assert_eq!(read("new/added.txt"), "new\n");

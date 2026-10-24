@@ -28,6 +28,12 @@ section of this file as the release notes.
 - **3-way folder auto merge** into the middle folder, merging text files changed on both sides when
   the changes don't overlap.
 
+### Fixed
+
+- Copying a file or folder onto itself (both sides pointing at the same place) no longer empties
+  the file; copying a folder into itself is refused.
+- Opening a Git revision gives the same line endings as the working copy on Windows.
+
 ## [0.9.2] - 2026-10-24
 
 ### Added

@@ -316,7 +316,11 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             progress: &progress,
         }
         .run();
-        let display: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        let mut shown: Vec<PathBuf> = paths.clone();
+        if let Some(d) = &git_desc {
+            shown[0] = PathBuf::from(d);
+        }
+        let display: Vec<String> = shown.iter().map(|p| p.display().to_string()).collect();
         let files: Vec<&core::folder::DirItem> = items
             .iter()
             .filter(|i| !i.is_dir || i.children.is_empty())
@@ -324,10 +328,13 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         let different = files.iter().any(|i| i.status != CmpStatus::Identical);
         if let Some(r) = &cli.report {
             let format = ReportFormat::from_path(r);
+            if cli.report_diffs && format != ReportFormat::Html {
+                eprintln!("note: --report-diffs only applies to .html reports");
+            }
             let text = if cli.report_diffs && format == ReportFormat::Html {
-                core::report::folder_html_with_diffs(&files, paths, paths, &cfg.diff)
+                core::report::folder_html_with_diffs(&files, paths, &shown, &cfg.diff)
             } else {
-                core::report::generate(&files, paths, format)
+                core::report::generate(&files, &shown, format)
             };
             std::fs::write(r, text)?;
         }
@@ -350,10 +357,13 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
                 .collect();
             print!(
                 "{}",
-                core::report::generate(&changed, paths, ReportFormat::Text)
+                core::report::generate(&changed, &shown, ReportFormat::Text)
             );
         }
         return Ok(u8::from(different));
+    }
+    if cli.report_diffs {
+        eprintln!("note: --report-diffs only applies to folder compares");
     }
     let kind = match cli.kind {
         Some(k) => file_kind(k),
@@ -577,6 +587,10 @@ fn main() -> ExitCode {
     }
 
     apply_cli_options(&cli, &mut cfg);
+    if cli.git_rev.is_some() && paths.len() != 1 {
+        eprintln!("error: --git-rev compares exactly one file or folder with a revision");
+        return ExitCode::from(2);
+    }
 
     if cli.cli || cli.report.is_some() || cli.patch.is_some() {
         return match run_batch(&cli, &cfg) {

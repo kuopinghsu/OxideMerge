@@ -585,10 +585,21 @@ impl TextView {
 
     /// Moves the bookmarks of pane `p` along with its lines after they changed from `before`.
     fn remap_bookmarks(&mut self, p: usize, before: &[String]) {
-        if self.bookmarks[p].is_empty() {
+        let editing = self.note_edit.as_ref().is_some_and(|n| n.0 == p);
+        if self.bookmarks[p].is_empty() && !editing {
             return;
         }
         let map = line_map(before, &self.panes[p].doc.lines);
+        if editing {
+            match self.note_edit.as_ref().and_then(|n| map.get(n.1).copied()) {
+                Some(to) => {
+                    if let Some(n) = &mut self.note_edit {
+                        n.1 = to;
+                    }
+                }
+                None => self.note_edit = None,
+            }
+        }
         let mut moved = BTreeMap::new();
         for (l, note) in std::mem::take(&mut self.bookmarks[p]) {
             if let Some(&to) = map.get(l) {
@@ -3668,8 +3679,10 @@ mod tests {
         v.edit_note_at(2, 0);
         let (p, l, ..) = v.note_edit.take().unwrap();
         v.bookmarks[p].insert(l, "check this".into());
+        v.edit_note_at(2, 0);
         v.cursor_row = Some(0);
         v.paste("zero");
+        assert_eq!(v.note_edit.take().map(|n| n.1), Some(3));
         assert_eq!(
             v.bookmarks[0].get(&3).map(String::as_str),
             Some("check this")

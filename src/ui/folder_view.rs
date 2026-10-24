@@ -120,11 +120,12 @@ pub struct FolderView {
     peek_cache: Option<(usize, Vec<(PeekKind, String)>)>,
     /// Duration of a comparison that just finished, until the app takes it.
     finished: Option<Duration>,
-    /// The item shown in the docked file compare, and its compare when it is a text file.
-    dock: Option<(usize, Option<Box<TextView>>)>,
+    /// The item shown in the docked file compare, and how far its compare has got.
+    dock: Option<(usize, Dock)>,
     /// Text of the "select by name" dialog while it is open.
     select_pattern: Option<String>,
-    /// A 3-way auto merge waiting for confirmation.
+    /// A 3-way auto merge being planned, then waiting for confirmation.
+    merge_job: Option<JoinHandle<folder_merge::Plan>>,
     merge_plan: Option<folder_merge::Plan>,
     id: egui::Id,
 }
@@ -143,6 +144,42 @@ const PEEK_MAX_BYTES: u64 = 4 << 20;
 const PEEK_MAX_LINES: usize = 5000;
 /// Files larger than this are not loaded into the docked file compare.
 const DOCK_MAX_BYTES: u64 = 8 << 20;
+/// The docked file compare loads once the selection has stayed this long on an item, so
+/// moving through the list with the arrow keys does not load every file on the way.
+const DOCK_DELAY: Duration = Duration::from_millis(150);
+
+enum Dock {
+    Waiting(Instant),
+    Loading(std::sync::mpsc::Receiver<Option<Vec<TextDoc>>>),
+    /// The compare, or `None` when the item is not a text file.
+    Ready(Option<Box<TextView>>),
+}
+
+/// The sides of `it` as read-only documents for the docked file compare, or `None` when it
+/// is not a text file small enough to show.
+fn load_dock_docs(it: &DirItem, roots: &[PathBuf]) -> Option<Vec<TextDoc>> {
+    let n = roots.len();
+    if it.is_dir || it.binary || (0..n).any(|s| it.size[s].unwrap_or(0) > DOCK_MAX_BYTES) {
+        return None;
+    }
+    (0..n)
+        .map(|s| {
+            let p = it.path(&roots[s]);
+            let mut d = if it.exists[s] {
+                if text::detect_kind(&p) == FileKind::Binary {
+                    return None;
+                }
+                text::load_doc(&p, None).ok()?
+            } else {
+                let mut d = TextDoc::empty(None);
+                d.description = Some(format!("{} — {}", p.display(), tr("peek.missing")));
+                d
+            };
+            d.read_only = true;
+            Some(d)
+        })
+        .collect()
+}
 
 /// Case-insensitive ordering without allocating lowercase copies.
 fn cmp_ci(a: &str, b: &str) -> std::cmp::Ordering {
@@ -241,6 +278,7 @@ impl FolderView {
             finished: None,
             dock: None,
             select_pattern: None,
+            merge_job: None,
             merge_plan: None,
             id: egui::Id::new(("folderview", std::time::Instant::now())),
         };
@@ -309,6 +347,10 @@ impl FolderView {
         self.items.clear();
         self.visible.clear();
         self.dock = None;
+        // They refer to items by index.
+        self.confirm = None;
+        self.merge_job = None;
+        self.merge_plan = None;
         self.selected.clear();
         self.anchor = None;
         self.cursor = None;
@@ -599,6 +641,8 @@ impl FolderView {
 
     fn execute(&mut self, op: PendingOp, cfg: &Config) {
         self.dock = None;
+        self.merge_job = None;
+        self.merge_plan = None;
         let mut errors = Vec::new();
         let mut any_dir = false;
         let mut done = 0;
@@ -856,20 +900,31 @@ impl FolderView {
         }
     }
 
-    /// Selects the listed items whose name matches one of the `;`-separated wildcards.
-    pub fn select_matching(&mut self, patterns: &str) {
+    /// Selects the items whose name matches one of the `;`-separated wildcards, among those
+    /// the view options show, opening the folders that hold them.
+    pub fn select_matching(&mut self, patterns: &str, cfg: &Config) {
         let res: Vec<regex::Regex> = patterns
             .split(';')
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .filter_map(crate::core::filter::wildcard_to_regex)
             .collect();
-        self.selected = self
-            .visible
-            .iter()
-            .copied()
-            .filter(|&i| res.iter().any(|re| re.is_match(&self.items[i].name)))
+        let vis = self.visibility(cfg);
+        self.selected = (0..self.items.len())
+            .filter(|&i| {
+                let it = &self.items[i];
+                vis[i] && self.shown(it, cfg) && res.iter().any(|re| re.is_match(&it.name))
+            })
             .collect();
+        for &i in &self.selected {
+            let mut p = self.items[i].parent;
+            while let Some(pi) = p {
+                self.expanded.insert(self.items[pi].rel_path());
+                p = self.items[pi].parent;
+            }
+        }
+        self.rebuild_visible(cfg);
+        self.view_key = None;
         let first = self.visible.iter().position(|i| self.selected.contains(i));
         self.anchor = first;
         self.cursor = first;
@@ -925,12 +980,39 @@ impl FolderView {
         if self.n() != 3 || self.running.is_some() {
             return;
         }
-        let plan = folder_merge::plan(&self.items, &self.roots);
-        if plan.steps.is_empty() {
-            self.status = tr("msg.folder_merge_nothing").to_string();
-        } else {
-            self.merge_plan = Some(plan);
+        if self.merge_job.is_some() {
+            return;
         }
+        let (items, roots) = (self.items.clone(), self.roots.clone());
+        self.merge_job = Some(std::thread::spawn(move || {
+            folder_merge::plan(&items, &roots)
+        }));
+        self.status = tr("msg.folder_merge_planning").to_string();
+    }
+
+    /// Takes the merge plan once it is ready.
+    fn poll_merge(&mut self, ctx: &egui::Context) {
+        if !self.merge_job.as_ref().is_some_and(|j| j.is_finished()) {
+            if self.merge_job.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            return;
+        }
+        match self.merge_job.take().map(JoinHandle::join) {
+            Some(Ok(plan)) if plan.steps.is_empty() => {
+                self.status = tr("msg.folder_merge_nothing").to_string();
+            }
+            Some(Ok(plan)) => {
+                self.status.clear();
+                self.merge_plan = Some(plan);
+            }
+            _ => self.status = tr("status.error").to_string(),
+        }
+    }
+
+    /// Whether one of the view's dialogs is open, so the app leaves the keyboard to it.
+    pub fn has_dialog(&self) -> bool {
+        self.confirm.is_some() || self.merge_plan.is_some() || self.select_pattern.is_some()
     }
 
     fn merge_dialog(&mut self, ui: &Ui, cfg: &Config) {
@@ -1013,7 +1095,7 @@ impl FolderView {
         }
     }
 
-    fn select_pattern_dialog(&mut self, ui: &Ui) {
+    fn select_pattern_dialog(&mut self, ui: &Ui, cfg: &Config) {
         let Some(mut text) = self.select_pattern.take() else {
             return;
         };
@@ -1043,51 +1125,66 @@ impl FolderView {
             });
         });
         if run {
-            self.select_matching(&text);
+            self.select_matching(&text, cfg);
         } else if keep {
             self.select_pattern = Some(text);
         }
     }
 
-    /// A read-only compare of item `i` for the docked file compare, when it is a text file.
-    fn dock_view(&self, i: usize, cfg: &Config) -> Option<Box<TextView>> {
-        let it = &self.items[i];
-        let n = self.n();
-        if it.is_dir || it.binary || (0..n).any(|s| it.size[s].unwrap_or(0) > DOCK_MAX_BYTES) {
-            return None;
-        }
-        let docs = (0..n)
-            .map(|s| {
-                let p = it.path(&self.roots[s]);
-                let mut d = if it.exists[s] {
-                    if text::detect_kind(&p) == FileKind::Binary {
-                        return None;
-                    }
-                    text::load_doc(&p, None).ok()?
-                } else {
-                    let mut d = TextDoc::empty(None);
-                    d.description = Some(format!("{} — {}", p.display(), tr("peek.missing")));
-                    d
-                };
-                d.read_only = true;
-                Some(d)
-            })
-            .collect::<Option<Vec<_>>>()?;
+    fn dock_view_of(&self, docs: Vec<TextDoc>, cfg: &Config) -> Box<TextView> {
         let mut v = TextView::new(docs, cfg);
         v.keys_enabled = false;
         v.set_options(&self.dopts);
-        Some(Box::new(v))
+        Box::new(v)
     }
 
-    fn dock_ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
+    /// A read-only compare of item `i` for the docked file compare, when it is a text file.
+    #[cfg(test)]
+    fn dock_view(&self, i: usize, cfg: &Config) -> Option<Box<TextView>> {
+        load_dock_docs(&self.items[i], &self.roots).map(|d| self.dock_view_of(d, cfg))
+    }
+
+    /// Moves the docked file compare along: it waits for the selection to settle, loads the
+    /// files in the background, then shows them.
+    fn update_dock(&mut self, ctx: &egui::Context, cfg: &Config) {
         let cur = self
             .cursor
             .or(self.anchor)
             .and_then(|v| self.visible.get(v))
             .copied();
         if cur != self.dock.as_ref().map(|d| d.0) {
-            self.dock = cur.map(|i| (i, self.dock_view(i, cfg)));
+            self.dock = cur.map(|i| (i, Dock::Waiting(Instant::now())));
         }
+        let Some((i, state)) = &self.dock else {
+            return;
+        };
+        let i = *i;
+        let next = match state {
+            Dock::Waiting(since) if since.elapsed() >= DOCK_DELAY => {
+                let (it, roots) = (self.items[i].clone(), self.roots.clone());
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(load_dock_docs(&it, &roots));
+                });
+                Some(Dock::Loading(rx))
+            }
+            Dock::Loading(rx) => match rx.try_recv() {
+                Ok(docs) => Some(Dock::Ready(docs.map(|d| self.dock_view_of(d, cfg)))),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Dock::Ready(None)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            },
+            _ => None,
+        };
+        if let Some(state) = next {
+            self.dock = Some((i, state));
+        }
+        if !matches!(self.dock, Some((_, Dock::Ready(_)))) {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    fn dock_ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
+        self.update_dock(ui.ctx(), cfg);
         let avail = ui.available_height();
         egui::TopBottomPanel::bottom(self.id.with("dock"))
             .resizable(true)
@@ -1095,14 +1192,15 @@ impl FolderView {
             .height_range(100.0..=(avail - 120.0).max(100.0))
             .frame(egui::Frame::new())
             .show_inside(ui, |ui| match &mut self.dock {
-                Some((_, Some(v))) => {
+                Some((_, Dock::Ready(Some(v)))) => {
                     v.set_options(&self.dopts);
                     v.ui(ui, cfg, c);
                 }
                 other => {
                     let key = match other {
-                        Some((i, None)) if self.items[*i].is_dir => "peek.folder",
-                        Some(_) => "dock.not_text",
+                        Some((i, Dock::Ready(None))) if self.items[*i].is_dir => "peek.folder",
+                        Some((_, Dock::Ready(None))) => "dock.not_text",
+                        Some(_) => "msg.comparing",
                         None => "dock.hint",
                     };
                     ui.centered_and_justified(|ui| {
@@ -1140,12 +1238,20 @@ impl FolderView {
         report::generate(&items, &roots, format)
     }
 
-    /// HTML report of the listed items followed by the differences of every changed text file.
-    pub fn report_with_diffs(&self, cfg: &Config) -> String {
-        let list = self.flat_list(cfg);
-        let items: Vec<&DirItem> = list.iter().map(|&i| &self.items[i]).collect();
+    /// Writes the HTML report of the listed items followed by the differences of every changed
+    /// text file; it reads every changed file, so it can run on another thread.
+    pub fn report_with_diffs_job(&self, cfg: &Config) -> impl FnOnce() -> String + Send + 'static {
+        let items: Vec<DirItem> = self
+            .flat_list(cfg)
+            .into_iter()
+            .map(|i| self.items[i].clone())
+            .collect();
         let display: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
-        report::folder_html_with_diffs(&items, &self.roots, &display, &self.dopts)
+        let (roots, dopts) = (self.roots.clone(), self.dopts.clone());
+        move || {
+            let refs: Vec<&DirItem> = items.iter().collect();
+            report::folder_html_with_diffs(&refs, &roots, &display, &dopts)
+        }
     }
 
     pub fn outcome(&self) -> Outcome {
@@ -1281,7 +1387,7 @@ impl FolderView {
                 }
                 if widgets::icon_button_enabled(
                     ui,
-                    self.running.is_none(),
+                    self.running.is_none() && self.merge_job.is_none(),
                     Icon::Bolt,
                     tr("cmd.folder_merge"),
                 )
@@ -2113,8 +2219,9 @@ impl FolderView {
                 self.confirm = Some(op);
             }
         }
+        self.poll_merge(ui.ctx());
         self.merge_dialog(ui, cfg);
-        self.select_pattern_dialog(ui);
+        self.select_pattern_dialog(ui, cfg);
         result
     }
 }
@@ -2184,7 +2291,7 @@ mod tests {
             v.poll();
         }
         v.rebuild_visible(&cfg);
-        v.select_matching("*.CSV; same.*");
+        v.select_matching("*.CSV; same.*", &cfg);
         let names: Vec<&str> = v
             .selected
             .iter()
@@ -2204,8 +2311,31 @@ mod tests {
         assert!(dest.path().join("data.csv").is_file());
         assert!(dest.path().join("same.txt").is_file());
 
+        let mut tree = cfg.clone();
+        tree.tree_mode = true;
+        v.expanded.clear();
+        v.rebuild_visible(&tree);
+        let nested = (0..v.items.len())
+            .find(|&i| v.items[i].parent.is_some() && !v.items[i].is_dir)
+            .unwrap();
+        assert!(!v.visible.contains(&nested));
+        let name = v.items[nested].name.clone();
+        v.select_matching(&name, &tree);
+        assert!(v.selected.contains(&nested));
+        assert!(v.visible.contains(&nested));
+
+        v.confirm = Some(PendingOp {
+            kind: OpKind::Delete { side: None },
+            targets: vec![nested],
+        });
+        v.merge_plan = Some(folder_merge::Plan::default());
+        assert!(v.has_dialog());
+
         let stats = v.statistics();
         let get = |key: &'static str| stats.iter().find(|(k, _)| k == tr(key)).unwrap().1.clone();
         assert_eq!(get("stats.identical"), "1");
+
+        v.start_compare();
+        assert!(!v.has_dialog());
     }
 }

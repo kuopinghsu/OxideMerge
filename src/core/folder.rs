@@ -3,6 +3,7 @@
 use super::diff::{DiffOptions, Normalizer};
 use super::filter::FileFilter;
 use super::{comments, prettify, text};
+use crate::i18n::tr;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -828,13 +829,42 @@ pub fn refresh_file_item(
     aggregate(items, n);
 }
 
+/// Copies a file or folder over `to`. Refuses to copy a file onto itself, which would empty
+/// it, and a folder into itself, which would never end.
 pub fn copy_recursive(from: &Path, to: &Path) -> Result<()> {
+    let src = std::fs::canonicalize(from).with_context(|| format!("{}", from.display()))?;
+    let mut dest = to.to_path_buf();
+    let mut missing = Vec::new();
+    let dest = loop {
+        match std::fs::canonicalize(&dest) {
+            Ok(d) => break missing.into_iter().rev().fold(d, |d, n| d.join(n)),
+            Err(_) => match (dest.parent(), dest.file_name()) {
+                (Some(parent), Some(name)) => {
+                    missing.push(name.to_owned());
+                    dest = parent.to_path_buf();
+                }
+                _ => break to.to_path_buf(),
+            },
+        }
+    };
+    if dest == src || (src.is_dir() && dest.starts_with(&src)) {
+        bail!(
+            "{}: {} -> {}",
+            tr("msg.copy_into_itself"),
+            from.display(),
+            to.display()
+        );
+    }
+    copy_tree(from, to)
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     let md = std::fs::metadata(from).with_context(|| format!("{}", from.display()))?;
     if md.is_dir() {
         std::fs::create_dir_all(to)?;
         for e in std::fs::read_dir(from)? {
             let e = e?;
-            copy_recursive(&e.path(), &to.join(e.file_name()))?;
+            copy_tree(&e.path(), &to.join(e.file_name()))?;
         }
     } else {
         if let Some(parent) = to.parent() {
@@ -886,6 +916,23 @@ pub fn status_counts(items: &[DirItem]) -> (usize, usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuses_to_copy_onto_itself_or_into_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
+        std::fs::write(root.join("sub/f.txt"), "keep\n").unwrap();
+        assert!(copy_recursive(&root.join("sub/f.txt"), &root.join("sub/./f.txt")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("sub/f.txt")).unwrap(),
+            "keep\n"
+        );
+        assert!(copy_recursive(&root.join("sub"), &root.join("sub/deeper/new/sub")).is_err());
+        copy_recursive(&root.join("sub"), &root.join("copy/sub")).unwrap();
+        assert!(root.join("copy/sub/f.txt").is_file());
+        copy_recursive(&root.join("sub/f.txt"), &root.join("copy/sub/f.txt")).unwrap();
+    }
 
     #[test]
     fn folder_compare() {

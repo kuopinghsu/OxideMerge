@@ -55,15 +55,27 @@ fn dunce_canonical(path: &Path) -> Result<PathBuf> {
     Ok(p)
 }
 
-/// The contents of file `path` in revision `rev` (a commit, branch, tag, `HEAD~2`, ...).
+/// A revision is passed to git as an argument, so it must not look like an option.
+fn check_rev(rev: &str) -> Result<&str> {
+    let rev = rev.trim();
+    if rev.is_empty() || rev.starts_with('-') {
+        bail!("invalid revision: {rev}");
+    }
+    Ok(rev)
+}
+
+/// The contents of file `path` in revision `rev` (a commit, branch, tag, `HEAD~2`, ...), with
+/// the line endings and filters a checkout would apply, like the working copy it is compared to.
 pub fn show_file(path: &Path, rev: &str) -> Result<Vec<u8>> {
+    let rev = check_rev(rev)?;
     let (root, rel) = locate(path)?;
-    git(&root, &["show", &format!("{rev}:{rel}")])
+    git(&root, &["cat-file", "--filters", &format!("{rev}:{rel}")])
 }
 
 /// Folder `path` as it was in revision `rev`, extracted to a temporary folder. Returns the
 /// temporary folder (deleted when dropped) and the extracted copy of `path` inside it.
 pub fn export_folder(path: &Path, rev: &str) -> Result<(tempfile::TempDir, PathBuf)> {
+    let rev = check_rev(rev)?;
     let (root, rel) = locate(path)?;
     let mut args = vec!["archive", "--format=tar", rev];
     if !rel.is_empty() {
@@ -115,6 +127,7 @@ mod tests {
         run(&["config", "user.email", "t@example.com"]);
         run(&["config", "user.name", "T"]);
         run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "core.autocrlf", "false"]);
         std::fs::create_dir(repo.join("src")).unwrap();
         std::fs::write(repo.join("src/a.txt"), "one\n").unwrap();
         run(&["add", "."]);
@@ -123,12 +136,18 @@ mod tests {
 
         let file = repo.join("src/a.txt");
         assert_eq!(locate(&file).unwrap().1, "src/a.txt");
-        assert_eq!(show_file(&file, "HEAD").unwrap(), b"one\n");
-        let (_tmp, copy) = export_folder(&repo.join("src"), "HEAD").unwrap();
-        assert_eq!(std::fs::read(copy.join("a.txt")).unwrap(), b"one\n");
+        // Files and folders get the line endings of a checkout, as Windows' autocrlf does.
+        for (autocrlf, expected) in [("false", &b"one\n"[..]), ("true", b"one\r\n")] {
+            run(&["config", "core.autocrlf", autocrlf]);
+            assert_eq!(show_file(&file, "HEAD").unwrap(), expected);
+            let (_tmp, copy) = export_folder(&repo.join("src"), "HEAD").unwrap();
+            assert_eq!(std::fs::read(copy.join("a.txt")).unwrap(), expected);
+        }
         let commits = recent_commits(&file, 5);
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].1, "first");
         assert!(show_file(&file, "nosuchrev").is_err());
+        assert!(export_folder(repo, "--output=x").is_err());
+        assert!(!repo.join("x").exists());
     }
 }
