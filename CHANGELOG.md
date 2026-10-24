@@ -3,7 +3,7 @@
 All notable changes to OxideMerge are listed here, newest first. Each release on GitHub uses its
 section of this file as the release notes.
 
-## [0.9.2] - Unreleased
+## [0.9.2] - 2026-10-24
 
 ### Added
 

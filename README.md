@@ -196,7 +196,28 @@ tag must match the version in `Cargo.toml`, and tags containing `-` (for example
 marked as pre-releases. The release notes are the version's section of
 [`CHANGELOG.md`](CHANGELOG.md), followed by download instructions, so add that section before
 tagging; the build fails early if it is missing. `scripts/release-notes.sh 0.9.2` prints the notes
-for a version.
+for a version. CI only reads `CHANGELOG.md`; it never edits it.
+
+To make a release:
+
+1. Set `version` in `Cargo.toml` and run `cargo build` so `Cargo.lock` picks it up.
+2. In `CHANGELOG.md`, change the version's heading from `## [0.9.2] - Unreleased` to the release
+   date, for example `## [0.9.2] - 2026-10-24`, and check its entries.
+3. Run `make fmt-check ci` and preview the notes with `scripts/release-notes.sh 0.9.2`.
+4. Commit and push to `main`, then wait for CI to pass on every platform. Tagging builds the commit
+   the tag points at, so a commit that fails CI fails the release too.
+5. Tag that commit and push the tag:
+
+   ```sh
+   git tag -a v0.9.2 -m "OxideMerge 0.9.2"
+   git push origin v0.9.2
+   ```
+
+6. Start the next version: add a `## [0.9.3] - Unreleased` section at the top of `CHANGELOG.md`
+   and record changes there as they land.
+
+If a release build fails, fix it on `main`, then move the tag to the new commit and push it again
+(`git tag -f -a v0.9.2 -m "OxideMerge 0.9.2"` and `git push -f origin v0.9.2`).
 
 ## Usage
 
