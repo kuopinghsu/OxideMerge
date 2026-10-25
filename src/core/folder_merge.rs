@@ -1,31 +1,48 @@
 //! Automatic 3-way folder merge. The middle folder is the common ancestor and receives the
 //! result: changes made on one side only (or the same on both) are copied into it, and text
 //! files changed on both sides are merged line by line when their changes do not overlap.
+//! Only the listed items are touched, so files the filter hides are left alone.
 
 use super::diff::merge3;
 use super::folder::{copy_recursive, delete_path, CmpStatus, DirItem};
 use super::text::{self, TextDoc};
+use crate::i18n::tr;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 const BASE: usize = 1;
 
 pub enum Step {
-    /// Copy the item of this side over the middle one.
+    /// Copy the file of this side over the middle one, or create the folder.
     Copy(usize),
     /// Delete the middle item: the other sides removed it without changing it.
     Delete,
+    /// Remove the middle folder once its listed contents are deleted, if nothing is left in it.
+    Prune,
     /// Save this merge of both sides' changes as the middle file.
     Merge(TextDoc),
     /// Changed differently on both sides, or changed on one and removed on the other.
     Conflict,
 }
 
+/// Size and modification time of a file on each side, or `None` where it is missing.
+type Stamp = [Option<(u64, Option<SystemTime>)>; 3];
+
+fn stamp(it: &DirItem, roots: &[PathBuf]) -> Stamp {
+    std::array::from_fn(|s| {
+        let md = std::fs::metadata(it.path(&roots[s])).ok()?;
+        Some((md.len(), md.modified().ok()))
+    })
+}
+
 #[derive(Default)]
 pub struct Plan {
     /// Item index and what to do with it, in item order.
     pub steps: Vec<(usize, Step)>,
+    /// The files of the steps as they were planned, so files changed since are left alone.
+    stamps: BTreeMap<usize, Stamp>,
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -42,7 +59,7 @@ impl Plan {
         for (_, s) in &self.steps {
             match s {
                 Step::Copy(_) => c.copies += 1,
-                Step::Delete => c.deletes += 1,
+                Step::Delete | Step::Prune => c.deletes += 1,
                 Step::Merge(_) => c.merges += 1,
                 Step::Conflict => c.conflicts += 1,
             }
@@ -92,9 +109,9 @@ fn merge_text(paths: &[PathBuf]) -> Option<TextDoc> {
     Some(doc)
 }
 
-/// Decides what the merge does with every item. Items inside a folder that is copied or
-/// deleted as a whole get no step of their own. Files are compared byte for byte: the folder
-/// compare may have called them identical under its ignore options.
+/// Decides what the merge does with every item. Items inside a folder removed on both sides
+/// get no step of their own. Files are compared byte for byte: the folder compare may have
+/// called them identical under its ignore options.
 pub fn plan(items: &[DirItem], roots: &[PathBuf]) -> Plan {
     let mut steps: BTreeMap<usize, Step> = BTreeMap::new();
     if roots.len() != 3 {
@@ -102,7 +119,7 @@ pub fn plan(items: &[DirItem], roots: &[PathBuf]) -> Plan {
     }
     for (i, it) in items.iter().enumerate() {
         let covered = std::iter::successors(it.parent, |&p| items[p].parent)
-            .any(|p| matches!(steps.get(&p), Some(Step::Copy(_) | Step::Delete)));
+            .any(|p| matches!(steps.get(&p), Some(Step::Delete)));
         if covered || it.status == CmpStatus::Error {
             continue;
         }
@@ -145,7 +162,7 @@ pub fn plan(items: &[DirItem], roots: &[PathBuf]) -> Plan {
             steps.insert(i, step);
         }
     }
-    // A folder removed on one side whose contents all go is removed as a whole.
+    // A folder removed on one side whose listed contents all go is removed after them.
     for (i, it) in items.iter().enumerate().rev() {
         let removed_on_one_side = it.is_dir && it.exists[BASE] && it.exists[0] != it.exists[2];
         if removed_on_one_side
@@ -153,16 +170,19 @@ pub fn plan(items: &[DirItem], roots: &[PathBuf]) -> Plan {
             && it
                 .children
                 .iter()
-                .all(|c| matches!(steps.get(c), Some(Step::Delete)))
+                .all(|c| matches!(steps.get(c), Some(Step::Delete | Step::Prune)))
         {
-            for c in &it.children {
-                steps.remove(c);
-            }
-            steps.insert(i, Step::Delete);
+            steps.insert(i, Step::Prune);
         }
     }
+    let stamps = steps
+        .keys()
+        .filter(|&&i| !items[i].is_dir)
+        .map(|&i| (i, stamp(&items[i], roots)))
+        .collect();
     Plan {
         steps: steps.into_iter().collect(),
+        stamps,
     }
 }
 
@@ -175,25 +195,47 @@ pub fn apply(
 ) -> (usize, Vec<String>) {
     let mut done = 0;
     let mut errors = Vec::new();
+    let mut prune = Vec::new();
     for (i, step) in plan.steps {
         let it = &items[i];
         let target = it.path(&roots[BASE]);
+        if plan.stamps.get(&i).is_some_and(|s| *s != stamp(it, roots)) {
+            errors.push(format!(
+                "{}: {}",
+                it.rel_path(),
+                tr("msg.changed_since_plan")
+            ));
+            continue;
+        }
         let r = match step {
+            Step::Copy(_) if it.is_dir => std::fs::create_dir_all(&target).map_err(Into::into),
             Step::Copy(from) => {
-                if target.is_dir() && !it.is_dir {
-                    delete_path(&target, false)
+                if target.is_dir() {
+                    delete_path(&target, use_recycle_bin)
                         .and_then(|_| copy_recursive(&it.path(&roots[from]), &target))
                 } else {
                     copy_recursive(&it.path(&roots[from]), &target)
                 }
             }
             Step::Delete => delete_path(&target, use_recycle_bin),
+            Step::Prune => {
+                prune.push(i);
+                continue;
+            }
             Step::Merge(mut doc) => doc.save(),
             Step::Conflict => continue,
         };
         match r {
             Ok(()) => done += 1,
             Err(e) => errors.push(format!("{}: {e}", it.rel_path())),
+        }
+    }
+    // innermost folders first; a folder still holding files the filter hides stays
+    for i in prune.into_iter().rev() {
+        match std::fs::remove_dir(items[i].path(&roots[BASE])) {
+            Ok(()) => done += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(e) => errors.push(format!("{}: {e}", items[i].rel_path())),
         }
     }
     (done, errors)
@@ -215,7 +257,7 @@ mod tests {
     fn scan(roots: &[PathBuf]) -> Vec<DirItem> {
         Scanner {
             roots,
-            filter: &FileFilter::default(),
+            filter: &FileFilter::parse_mask("!*.log"),
             fopts: &FolderOptions::default(),
             dopts: &DiffOptions::default(),
             progress: &Progress::default(),
@@ -248,24 +290,30 @@ mod tests {
         }
         write(l, "spaces.txt", "a  b\n");
         std::fs::remove_dir_all(r.join("gone")).unwrap();
+        // hidden by the filter: left alone
+        write(b, "gone/hidden.log", "keep\n");
+        write(l, "only_left/hidden.log", "not copied\n");
+        write(l, "only_left/shown.txt", "copied\n");
 
         let roots: Vec<PathBuf> = [l, b, r].iter().map(|p| p.to_path_buf()).collect();
         let mut items = scan(&roots);
         // as a compare ignoring whitespace would report it
         let spaces = items.iter().position(|i| i.name == "spaces.txt").unwrap();
         items[spaces].status = CmpStatus::Identical;
+        assert!(items.iter().all(|i| !i.name.ends_with(".log")));
         let plan = plan(&items, &roots);
         assert_eq!(
             plan.counts(),
             Counts {
-                copies: 3,
-                deletes: 2,
+                copies: 6,
+                deletes: 3,
                 merges: 1,
                 conflicts: 1
             }
         );
         let (done, errors) = apply(plan, &items, &roots, false);
-        assert_eq!((done, errors.len()), (6, 0), "{errors:?}");
+        // every step but the pruned folder, which still holds the hidden file
+        assert_eq!((done, errors.len()), (9, 0), "{errors:?}");
         let read = |rel: &str| std::fs::read_to_string(b.join(rel)).unwrap();
         assert_eq!(read("left_changed.txt"), "left\n");
         assert_eq!(read("spaces.txt"), "a  b\n");
@@ -273,6 +321,30 @@ mod tests {
         assert_eq!(read("conflict.txt"), "x\n");
         assert_eq!(read("new/added.txt"), "new\n");
         assert!(!b.join("removed.txt").exists());
-        assert!(!b.join("gone").exists());
+        assert!(!b.join("gone/old.txt").exists());
+        assert_eq!(read("gone/hidden.log"), "keep\n");
+        assert_eq!(read("only_left/shown.txt"), "copied\n");
+        assert!(!b.join("only_left/hidden.log").exists());
+
+        // a folder whose listed contents all go is removed once empty
+        let fresh: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let fresh_roots: Vec<PathBuf> = fresh.iter().map(|d| d.path().to_path_buf()).collect();
+        for root in &fresh_roots[..2] {
+            write(root, "d/x.txt", "x\n");
+        }
+        let items = scan(&fresh_roots);
+        let p = super::plan(&items, &fresh_roots);
+        assert_eq!(apply(p, &items, &fresh_roots, false), (2, Vec::new()));
+        assert!(!fresh_roots[BASE].join("d").exists());
+
+        // a file changed after planning is not overwritten
+        write(l, "late.txt", "left\n");
+        let items = scan(&roots);
+        let p = super::plan(&items, &roots);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(b, "late.txt", "edited meanwhile\n");
+        let (_, errors) = apply(p, &items, &roots, false);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(read("late.txt"), "edited meanwhile\n");
     }
 }

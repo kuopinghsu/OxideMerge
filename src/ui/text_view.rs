@@ -38,8 +38,8 @@ pub struct Pane {
     disk_time: Option<SystemTime>,
     /// The document as loaded while a reformatted (JSON / XML) copy is shown instead.
     original: Option<TextDoc>,
-    /// The lines as loaded, to tell which lines were edited since.
-    baseline: Vec<String>,
+    /// Hashes of the lines as loaded, to tell which lines were edited since.
+    baseline: Vec<u64>,
     /// Lines inserted or changed since the document was loaded.
     edited: HashSet<usize>,
 }
@@ -56,7 +56,7 @@ fn disk_time(doc: &TextDoc) -> Option<SystemTime> {
 impl Pane {
     fn new(doc: TextDoc) -> Self {
         let disk_time = disk_time(&doc);
-        let baseline = doc.lines.clone();
+        let baseline = line_hashes(&doc.lines);
         Pane {
             doc,
             hl: None,
@@ -73,13 +73,26 @@ impl Pane {
 
     /// Takes the current lines as the unedited state.
     fn reset_baseline(&mut self) {
-        self.baseline = self.doc.lines.clone();
+        self.baseline = line_hashes(&self.doc.lines);
         self.edited.clear();
     }
 }
 
-/// Lines of `new` inserted or changed since `old`.
-fn edited_lines(old: &[String], new: &[String]) -> HashSet<usize> {
+fn line_hashes(lines: &[String]) -> Vec<u64> {
+    use std::hash::{Hash, Hasher};
+    lines
+        .iter()
+        .map(|l| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            l.hash(&mut h);
+            h.finish()
+        })
+        .collect()
+}
+
+/// Lines of `new` inserted or changed since the lines hashed in `old`.
+fn edited_lines(old: &[u64], new: &[String]) -> HashSet<usize> {
+    let new = line_hashes(new);
     if old == new {
         return HashSet::new();
     }
@@ -88,7 +101,7 @@ fn edited_lines(old: &[String], new: &[String]) -> HashSet<usize> {
         similar::Algorithm::Myers,
         old,
         0..old.len(),
-        new,
+        &new,
         0..new.len(),
         Some(deadline),
     )
@@ -98,16 +111,17 @@ fn edited_lines(old: &[String], new: &[String]) -> HashSet<usize> {
     .collect()
 }
 
-/// Where each line of `old` ended up in `new` (deleted lines map to where they were).
-fn line_map(old: &[String], new: &[String]) -> Vec<usize> {
-    let mut map = vec![0; old.len()];
+/// Where each line of `old` ended up in `new`, and whether it is still there (deleted lines map
+/// to where they were).
+fn line_map(old: &[String], new: &[String]) -> Vec<(usize, bool)> {
+    let mut map = vec![(0, false); old.len()];
     for op in similar::capture_diff_slices(similar::Algorithm::Myers, old, new) {
         let (tag, o, n) = op.as_tag_tuple();
         for (k, i) in o.enumerate() {
             map[i] = if tag == similar::DiffTag::Equal {
-                n.start + k
+                (n.start + k, true)
             } else {
-                n.start
+                (n.start, false)
             };
         }
     }
@@ -398,6 +412,8 @@ pub struct TextView {
     note_edit: Option<NoteEdit>,
     /// Off for a preview that must leave the keyboard to the view around it.
     pub keys_enabled: bool,
+    /// Whether edited lines are marked, so they are only worked out when shown.
+    edit_markers: bool,
     tab_size: usize,
     id: egui::Id,
 }
@@ -446,6 +462,7 @@ impl TextView {
             bookmarks,
             note_edit: None,
             keys_enabled: true,
+            edit_markers: cfg.show_edit_markers,
             tab_size: cfg.tab_size,
             id: egui::Id::new(("textview", std::time::Instant::now())),
         };
@@ -538,9 +555,7 @@ impl TextView {
             let n = self.panes[p].doc.lines.len();
             marks.retain(|&l, _| l < n);
         }
-        for pane in &mut self.panes {
-            pane.edited = edited_lines(&pane.baseline, &pane.doc.lines);
-        }
+        self.update_edited();
         self.inline_cache.clear();
         self.sel_anchor = None;
         self.layout_gen += 1;
@@ -592,7 +607,7 @@ impl TextView {
         let map = line_map(before, &self.panes[p].doc.lines);
         if editing {
             match self.note_edit.as_ref().and_then(|n| map.get(n.1).copied()) {
-                Some(to) => {
+                Some((to, _)) => {
                     if let Some(n) = &mut self.note_edit {
                         n.1 = to;
                     }
@@ -600,10 +615,24 @@ impl TextView {
                 None => self.note_edit = None,
             }
         }
-        let mut moved = BTreeMap::new();
-        for (l, note) in std::mem::take(&mut self.bookmarks[p]) {
-            if let Some(&to) = map.get(l) {
-                moved.entry(to).or_insert(note);
+        // Bookmarks of deleted lines join the line they land on, after its own comment.
+        let notes = std::mem::take(&mut self.bookmarks[p]);
+        let mut moved: BTreeMap<usize, String> = BTreeMap::new();
+        for kept_pass in [true, false] {
+            for (&l, note) in &notes {
+                let Some(&(to, kept)) = map.get(l) else {
+                    continue;
+                };
+                if kept != kept_pass {
+                    continue;
+                }
+                let joined = moved.entry(to).or_default();
+                if !note.is_empty() {
+                    if !joined.is_empty() {
+                        joined.push('\n');
+                    }
+                    joined.push_str(note);
+                }
             }
         }
         self.bookmarks[p] = moved;
@@ -2729,8 +2758,23 @@ impl TextView {
         }
     }
 
+    /// Works out the edited lines of every pane, when they are marked.
+    fn update_edited(&mut self) {
+        for pane in &mut self.panes {
+            pane.edited = if self.edit_markers {
+                edited_lines(&pane.baseline, &pane.doc.lines)
+            } else {
+                HashSet::new()
+            };
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
         self.poll_highlight(cfg);
+        if self.edit_markers != cfg.show_edit_markers {
+            self.edit_markers = cfg.show_edit_markers;
+            self.update_edited();
+        }
         if self.panes.iter().any(|p| p.hl_rx.is_some()) {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
@@ -3689,6 +3733,22 @@ mod tests {
         );
         assert_eq!(v.panes[0].edited, HashSet::from([1]));
         assert_eq!(v.row_note(v.diff.row_of_line(0, 3)), Some("check this"));
+
+        let mut d = two_way("a\nb\nc\nd\n", "a\nb\nc\nd\n");
+        d.bookmarks[0].insert(1, String::new());
+        d.bookmarks[0].insert(2, "keep me".into());
+        d.bookmarks[1].insert(1, "first".into());
+        d.bookmarks[1].insert(2, "second".into());
+        for p in 0..2 {
+            let before = d.panes[p].doc.lines.clone();
+            d.panes[p].doc.lines.remove(1);
+            d.remap_bookmarks(p, &before);
+        }
+        assert_eq!(d.bookmarks[0].get(&1).map(String::as_str), Some("keep me"));
+        assert_eq!(
+            d.bookmarks[1].get(&1).map(String::as_str),
+            Some("second\nfirst")
+        );
 
         let saved = v.saved_compare();
         assert_eq!(

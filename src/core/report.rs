@@ -273,8 +273,9 @@ pub fn text_html(
 /// Text files larger than this are listed in a folder report without their differences.
 const REPORT_MAX_LINES: usize = 50_000;
 
-/// HTML folder report followed by the side-by-side differences of every changed text file.
-/// `roots` are the compared folders and `display` the names to show for them.
+/// HTML folder report followed by the side-by-side differences of every changed text file,
+/// including files missing on some side. `roots` are the compared folders and `display` the
+/// names to show for them.
 pub fn folder_html_with_diffs(
     items: &[&DirItem],
     roots: &[PathBuf],
@@ -284,19 +285,38 @@ pub fn folder_html_with_diffs(
     let mut out = generate(items, display, ReportFormat::Html);
     let mut index = String::new();
     let mut sections = String::new();
-    let changed = items
-        .iter()
-        .filter(|it| !it.is_dir && !it.binary && it.status == CmpStatus::Different);
+    let changed = items.iter().filter(|it| {
+        !it.is_dir && !it.binary && matches!(it.status, CmpStatus::Different | CmpStatus::Unique)
+    });
     for (k, it) in changed.enumerate() {
         let paths: Vec<PathBuf> = roots.iter().map(|r| it.path(r)).collect();
         let Some(docs) = paths
             .iter()
-            .map(|p| super::text::load_doc(p, None).ok())
+            .zip(&it.exists)
+            .map(|(p, &exists)| match exists {
+                true => super::text::load_doc(p, None).ok(),
+                false => Some(super::text::TextDoc::empty(None)),
+            })
             .collect::<Option<Vec<_>>>()
         else {
             continue;
         };
-        if docs.iter().any(|d| d.lines.len() > REPORT_MAX_LINES) {
+        let rel = it.rel_path();
+        let longest = docs.iter().map(|d| d.lines.len()).max().unwrap_or(0);
+        let mut heading = |sections: &mut String, summary: String| {
+            let _ = writeln!(index, "<li><a href=\"#f{k}\">{}</a></li>", esc(&rel));
+            let _ = writeln!(
+                sections,
+                "<h3 id=\"f{k}\">{}</h3><p>{}</p>",
+                esc(&rel),
+                esc(&summary)
+            );
+        };
+        if longest > REPORT_MAX_LINES {
+            heading(
+                &mut sections,
+                trf("report.too_long", &[("n", longest.to_string())]),
+            );
             continue;
         }
         let lines: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
@@ -304,20 +324,16 @@ pub fn folder_html_with_diffs(
         if result.is_identical() {
             continue;
         }
-        let rel = it.rel_path();
         let titles: Vec<String> = display
             .iter()
             .map(|d| format!("{}/{rel}", d.display()))
             .collect();
-        let _ = writeln!(index, "<li><a href=\"#f{k}\">{}</a></li>", esc(&rel));
-        let _ = writeln!(
-            sections,
-            "<h3 id=\"f{k}\">{}</h3><p>{}</p>",
-            esc(&rel),
-            esc(&trf(
+        heading(
+            &mut sections,
+            trf(
                 "report.text_summary",
-                &[("n", result.significant_blocks().to_string())]
-            ))
+                &[("n", result.significant_blocks().to_string())],
+            ),
         );
         sections.push_str(&text_table(&titles, &lines, &result, opts, &[]));
     }
@@ -514,6 +530,10 @@ mod tests {
         std::fs::write(b.path().join("same.txt"), "x\n").unwrap();
         std::fs::write(a.path().join("changed.txt"), "one\ntwo\n").unwrap();
         std::fs::write(b.path().join("changed.txt"), "one\n2\n").unwrap();
+        std::fs::write(b.path().join("new.txt"), "fresh\n").unwrap();
+        let long: String = (0..=REPORT_MAX_LINES).map(|i| format!("{i}\n")).collect();
+        std::fs::write(a.path().join("long.txt"), &long).unwrap();
+        std::fs::write(b.path().join("long.txt"), long + "end\n").unwrap();
         let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
         let items = Scanner {
             roots: &roots,
@@ -528,6 +548,15 @@ mod tests {
         assert!(html.contains("<a href=\"#f0\">changed.txt</a>"), "{html}");
         assert!(html.contains("<td class=\"t chg\"><span class=\"w\">two</span></td>"));
         assert!(!html.contains("same.txt</a>"));
+        assert!(
+            html.contains("new.txt</a>") && html.contains("fresh"),
+            "{html}"
+        );
+        let too_long = trf(
+            "report.too_long",
+            &[("n", (REPORT_MAX_LINES + 2).to_string())],
+        );
+        assert!(html.contains(&esc(&too_long)), "{too_long}");
         assert!(html.trim_end().ends_with("</body></html>"));
     }
 }

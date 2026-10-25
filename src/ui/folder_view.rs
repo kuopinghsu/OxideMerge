@@ -19,12 +19,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub enum FolderAction {
     OpenFiles {
         paths: Vec<PathBuf>,
         missing: Vec<bool>,
+        /// Sides that must not be edited, such as a Git revision, and what to call them.
+        read_only: Vec<bool>,
+        descriptions: Vec<Option<String>>,
         kind: Option<FileKind>,
         /// Relative path of the item, to find the next or previous file from it later.
         rel: String,
@@ -73,6 +76,9 @@ enum MenuCmd {
     CopyTo(usize),
     SelectPattern,
 }
+
+/// How many items a file operation changed, and its errors.
+type OpResult = (usize, Vec<String>);
 
 /// How often a running comparison refreshes the list with what it has found so far, at most.
 const UPDATE_INTERVAL: Duration = Duration::from_millis(250);
@@ -127,6 +133,11 @@ pub struct FolderView {
     /// A 3-way auto merge being planned, then waiting for confirmation.
     merge_job: Option<JoinHandle<folder_merge::Plan>>,
     merge_plan: Option<folder_merge::Plan>,
+    /// Copying or merging files on another thread: how many items it changed and the errors,
+    /// and whether to compare again afterwards.
+    file_job: Option<(JoinHandle<OpResult>, bool)>,
+    /// Sides nothing may be copied to or deleted from, such as an extracted Git revision.
+    pub read_only: Vec<bool>,
     id: egui::Id,
 }
 
@@ -150,9 +161,24 @@ const DOCK_DELAY: Duration = Duration::from_millis(150);
 
 enum Dock {
     Waiting(Instant),
-    Loading(std::sync::mpsc::Receiver<Option<Vec<TextDoc>>>),
-    /// The compare, or `None` when the item is not a text file.
-    Ready(Option<Box<TextView>>),
+    Loading(std::sync::mpsc::Receiver<Option<Box<TextView>>>),
+    /// The compare, or `None` when the item is not a text file, with the files' modification
+    /// times and when they were last checked, to load it again when a file is saved.
+    Ready(Option<Box<TextView>>, Vec<Option<SystemTime>>, Instant),
+}
+
+/// How often the docked file compare checks whether its files changed.
+const DOCK_RECHECK: Duration = Duration::from_secs(1);
+
+fn mtimes(it: &DirItem, roots: &[PathBuf]) -> Vec<Option<SystemTime>> {
+    roots
+        .iter()
+        .map(|r| {
+            std::fs::metadata(it.path(r))
+                .and_then(|m| m.modified())
+                .ok()
+        })
+        .collect()
 }
 
 /// The sides of `it` as read-only documents for the docked file compare, or `None` when it
@@ -179,6 +205,24 @@ fn load_dock_docs(it: &DirItem, roots: &[PathBuf]) -> Option<Vec<TextDoc>> {
             Some(d)
         })
         .collect()
+}
+
+/// The read-only compare of `it` for the docked file compare, when it is a text file. It reads
+/// and diffs the files, so it runs on another thread.
+fn load_dock_view(
+    it: &DirItem,
+    roots: &[PathBuf],
+    cfg: &Config,
+    dopts: &DiffOptions,
+) -> Option<Box<TextView>> {
+    let docs = load_dock_docs(it, roots)?;
+    let cfg = Config {
+        diff: dopts.clone(),
+        ..cfg.clone()
+    };
+    let mut v = TextView::new(docs, &cfg);
+    v.keys_enabled = false;
+    Some(Box::new(v))
 }
 
 /// Case-insensitive ordering without allocating lowercase copies.
@@ -280,8 +324,11 @@ impl FolderView {
             select_pattern: None,
             merge_job: None,
             merge_plan: None,
+            file_job: None,
+            read_only: Vec::new(),
             id: egui::Id::new(("folderview", std::time::Instant::now())),
         };
+        v.read_only = vec![false; v.n()];
         v.start_compare();
         v
     }
@@ -606,7 +653,15 @@ impl FolderView {
             .collect()
     }
 
+    /// Whether files can be copied to or deleted from side `s` now.
+    fn writable(&self, s: usize) -> bool {
+        !self.read_only.get(s).copied().unwrap_or(false) && self.file_job.is_none()
+    }
+
     pub fn request_op_copy(&mut self, from: usize, to: usize, cfg: &Config) {
+        if !self.writable(to) {
+            return;
+        }
         let targets: Vec<usize> = self
             .selected_targets()
             .into_iter()
@@ -629,7 +684,10 @@ impl FolderView {
     fn request_op(&mut self, kind: OpKind, cfg: &Config) {
         match kind {
             OpKind::Copy { from, to } => self.request_op_copy(from, to, cfg),
-            OpKind::Delete { .. } => {
+            OpKind::Delete { side } => {
+                if side.map_or(self.file_job.is_some(), |s| !self.writable(s)) {
+                    return;
+                }
                 let targets = self.selected_targets();
                 if !targets.is_empty() {
                     // deletions are always confirmed
@@ -658,12 +716,10 @@ impl FolderView {
                         Some(s) => vec![s],
                         None => (0..self.n()).filter(|&s| it.exists[s]).collect(),
                     };
-                    sides
-                        .into_iter()
-                        .filter(|&s| it.exists[s])
-                        .try_for_each(|s| {
-                            folder::delete_path(&it.path(&self.roots[s]), cfg.use_recycle_bin)
-                        })
+                    let sides = sides.into_iter().filter(|&s| !self.read_only[s]);
+                    sides.filter(|&s| it.exists[s]).try_for_each(|s| {
+                        folder::delete_path(&it.path(&self.roots[s]), cfg.use_recycle_bin)
+                    })
                 }
             };
             match r {
@@ -707,9 +763,18 @@ impl FolderView {
             return None;
         }
         let missing: Vec<bool> = (0..n).map(|s| !it.exists[s]).collect();
+        let rel = it.rel_path();
+        let descriptions = (0..n)
+            .map(|s| {
+                let root = self.display_roots.get(s).filter(|_| self.read_only[s])?;
+                Some(format!("{root}/{rel}"))
+            })
+            .collect();
         Some(FolderAction::OpenFiles {
             paths,
             missing,
+            read_only: self.read_only.clone(),
+            descriptions,
             kind,
             rel: it.rel_path(),
         })
@@ -865,26 +930,61 @@ impl FolderView {
         }
     }
 
-    /// Copies the selected items of side `side` into `dest`, keeping their relative paths.
+    /// Copies the selected items of side `side` into `dest` on another thread, keeping their
+    /// relative paths.
     pub fn copy_to_folder(&mut self, side: usize, dest: &Path) {
-        let mut done = 0;
-        let mut errors = Vec::new();
-        for i in self.selected_targets() {
-            let it = &self.items[i];
-            if !it.exists[side] {
-                continue;
-            }
-            let rel = it.rel_path();
-            match folder::copy_recursive(&it.path(&self.roots[side]), &dest.join(&rel)) {
-                Ok(()) => done += 1,
-                Err(e) => errors.push(format!("{rel}: {e}")),
-            }
+        if self.file_job.is_some() {
+            return;
+        }
+        let jobs: Vec<(String, PathBuf)> = self
+            .selected_targets()
+            .into_iter()
+            .filter(|&i| self.items[i].exists[side])
+            .map(|i| {
+                (
+                    self.items[i].rel_path(),
+                    self.items[i].path(&self.roots[side]),
+                )
+            })
+            .collect();
+        let dest = dest.to_path_buf();
+        self.status = tr("msg.copying").to_string();
+        self.file_job = Some((
+            std::thread::spawn(move || {
+                let mut done = 0;
+                let mut errors = Vec::new();
+                for (rel, from) in jobs {
+                    match folder::copy_recursive(&from, &dest.join(&rel)) {
+                        Ok(()) => done += 1,
+                        Err(e) => errors.push(format!("{rel}: {e}")),
+                    }
+                }
+                (done, errors)
+            }),
+            false,
+        ));
+    }
+
+    /// Takes the result of a finished copy or merge. Returns whether one is still running.
+    fn poll_file_job(&mut self) -> bool {
+        if !self.file_job.as_ref().is_some_and(|(j, _)| j.is_finished()) {
+            return self.file_job.is_some();
+        }
+        let Some((job, rescan)) = self.file_job.take() else {
+            return false;
+        };
+        let (done, errors) = job
+            .join()
+            .unwrap_or_else(|_| (0, vec![tr("status.error").to_string()]));
+        if rescan {
+            self.start_compare();
         }
         self.status = trf("msg.op_done", &[("n", done.to_string())]);
         if !errors.is_empty() {
             self.status
                 .push_str(&format!(" — {}: {}", tr("status.error"), errors.join("; ")));
         }
+        false
     }
 
     /// Asks where to copy the selected items of side `side`.
@@ -977,7 +1077,7 @@ impl FolderView {
 
     /// Plans a 3-way merge into the middle folder, to be confirmed.
     pub fn request_merge(&mut self) {
-        if self.n() != 3 || self.running.is_some() {
+        if self.n() != 3 || self.running.is_some() || !self.writable(1) {
             return;
         }
         if self.merge_job.is_some() {
@@ -1082,14 +1182,13 @@ impl FolderView {
             });
         });
         if run {
-            let (done, errors) =
-                folder_merge::apply(plan, &self.items, &self.roots, cfg.use_recycle_bin);
-            self.start_compare();
-            self.status = trf("msg.op_done", &[("n", done.to_string())]);
-            if !errors.is_empty() {
-                self.status
-                    .push_str(&format!(" — {}: {}", tr("status.error"), errors.join("; ")));
-            }
+            let (items, roots) = (self.items.clone(), self.roots.clone());
+            let recycle = cfg.use_recycle_bin;
+            self.status = tr("msg.folder_merge_applying").to_string();
+            self.file_job = Some((
+                std::thread::spawn(move || folder_merge::apply(plan, &items, &roots, recycle)),
+                true,
+            ));
         } else if keep {
             self.merge_plan = Some(plan);
         }
@@ -1131,17 +1230,9 @@ impl FolderView {
         }
     }
 
-    fn dock_view_of(&self, docs: Vec<TextDoc>, cfg: &Config) -> Box<TextView> {
-        let mut v = TextView::new(docs, cfg);
-        v.keys_enabled = false;
-        v.set_options(&self.dopts);
-        Box::new(v)
-    }
-
-    /// A read-only compare of item `i` for the docked file compare, when it is a text file.
     #[cfg(test)]
     fn dock_view(&self, i: usize, cfg: &Config) -> Option<Box<TextView>> {
-        load_dock_docs(&self.items[i], &self.roots).map(|d| self.dock_view_of(d, cfg))
+        load_dock_view(&self.items[i], &self.roots, cfg, &self.dopts)
     }
 
     /// Moves the docked file compare along: it waits for the selection to settle, loads the
@@ -1155,6 +1246,15 @@ impl FolderView {
         if cur != self.dock.as_ref().map(|d| d.0) {
             self.dock = cur.map(|i| (i, Dock::Waiting(Instant::now())));
         }
+        if let Some((i, Dock::Ready(_, stamp, checked))) = &mut self.dock {
+            if checked.elapsed() >= DOCK_RECHECK {
+                *checked = Instant::now();
+                if mtimes(&self.items[*i], &self.roots) != *stamp {
+                    let since = Instant::now().checked_sub(DOCK_DELAY);
+                    self.dock = Some((*i, Dock::Waiting(since.unwrap_or_else(Instant::now))));
+                }
+            }
+        }
         let Some((i, state)) = &self.dock else {
             return;
         };
@@ -1162,15 +1262,22 @@ impl FolderView {
         let next = match state {
             Dock::Waiting(since) if since.elapsed() >= DOCK_DELAY => {
                 let (it, roots) = (self.items[i].clone(), self.roots.clone());
+                let (cfg, dopts) = (cfg.clone(), self.dopts.clone());
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let _ = tx.send(load_dock_docs(&it, &roots));
+                    let _ = tx.send(load_dock_view(&it, &roots, &cfg, &dopts));
                 });
                 Some(Dock::Loading(rx))
             }
             Dock::Loading(rx) => match rx.try_recv() {
-                Ok(docs) => Some(Dock::Ready(docs.map(|d| self.dock_view_of(d, cfg)))),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Dock::Ready(None)),
+                Ok(view) => Some(Dock::Ready(
+                    view,
+                    mtimes(&self.items[i], &self.roots),
+                    Instant::now(),
+                )),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Dock::Ready(None, Vec::new(), Instant::now()))
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => None,
             },
             _ => None,
@@ -1178,7 +1285,7 @@ impl FolderView {
         if let Some(state) = next {
             self.dock = Some((i, state));
         }
-        if !matches!(self.dock, Some((_, Dock::Ready(_)))) {
+        if !matches!(self.dock, Some((_, Dock::Ready(..)))) {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
@@ -1192,14 +1299,14 @@ impl FolderView {
             .height_range(100.0..=(avail - 120.0).max(100.0))
             .frame(egui::Frame::new())
             .show_inside(ui, |ui| match &mut self.dock {
-                Some((_, Dock::Ready(Some(v)))) => {
+                Some((_, Dock::Ready(Some(v), ..))) => {
                     v.set_options(&self.dopts);
                     v.ui(ui, cfg, c);
                 }
                 other => {
                     let key = match other {
-                        Some((i, Dock::Ready(None))) if self.items[*i].is_dir => "peek.folder",
-                        Some((_, Dock::Ready(None))) => "dock.not_text",
+                        Some((i, Dock::Ready(None, ..))) if self.items[*i].is_dir => "peek.folder",
+                        Some((_, Dock::Ready(None, ..))) => "dock.not_text",
                         Some(_) => "msg.comparing",
                         None => "dock.hint",
                     };
@@ -1255,7 +1362,7 @@ impl FolderView {
     }
 
     pub fn outcome(&self) -> Outcome {
-        if self.running.is_some() {
+        if self.running.is_some() || self.file_job.is_some() {
             return Outcome::Busy;
         }
         let (_, diff, uniq, err) = folder::status_counts(&self.items);
@@ -1356,7 +1463,7 @@ impl FolderView {
             if n == 2 {
                 if widgets::icon_button_enabled(
                     ui,
-                    sel,
+                    sel && self.writable(1),
                     Icon::CopyRight,
                     &key(tr("cmd.copy_right"), "Alt+→"),
                 )
@@ -1366,7 +1473,7 @@ impl FolderView {
                 }
                 if widgets::icon_button_enabled(
                     ui,
-                    sel,
+                    sel && self.writable(0),
                     Icon::CopyLeft,
                     &key(tr("cmd.copy_left"), "Alt+←"),
                 )
@@ -1375,6 +1482,7 @@ impl FolderView {
                     self.request_op_copy(1, 0, cfg);
                 }
             } else {
+                let sel = sel && self.writable(1);
                 if widgets::icon_button_enabled(ui, sel, Icon::CopyRight, tr("cmd.copy_from_left"))
                     .clicked()
                 {
@@ -1387,7 +1495,7 @@ impl FolderView {
                 }
                 if widgets::icon_button_enabled(
                     ui,
-                    self.running.is_none() && self.merge_job.is_none(),
+                    self.running.is_none() && self.merge_job.is_none() && self.writable(1),
                     Icon::Bolt,
                     tr("cmd.folder_merge"),
                 )
@@ -2020,7 +2128,10 @@ impl FolderView {
                                         ],
                                     );
                                     if ui
-                                        .add_enabled(it.exists[from], egui::Button::new(label))
+                                        .add_enabled(
+                                            it.exists[from] && self.writable(to),
+                                            egui::Button::new(label),
+                                        )
                                         .clicked()
                                     {
                                         menu = Some(MenuCmd::Op(OpKind::Copy { from, to }));
@@ -2041,7 +2152,10 @@ impl FolderView {
                         ui.menu_button(tr("cmd.delete"), |ui| {
                             for s in 0..n {
                                 if ui
-                                    .add_enabled(it.exists[s], egui::Button::new(side_name(s, n)))
+                                    .add_enabled(
+                                        it.exists[s] && self.writable(s),
+                                        egui::Button::new(side_name(s, n)),
+                                    )
                                     .clicked()
                                 {
                                     menu = Some(MenuCmd::Op(OpKind::Delete { side: Some(s) }));
@@ -2220,6 +2334,9 @@ impl FolderView {
             }
         }
         self.poll_merge(ui.ctx());
+        if self.poll_file_job() {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
         self.merge_dialog(ui, cfg);
         self.select_pattern_dialog(ui, cfg);
         result
@@ -2308,6 +2425,9 @@ mod tests {
 
         let dest = tempfile::tempdir().unwrap();
         v.copy_to_folder(1, dest.path());
+        while v.poll_file_job() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(dest.path().join("data.csv").is_file());
         assert!(dest.path().join("same.txt").is_file());
 
@@ -2323,6 +2443,27 @@ mod tests {
         v.select_matching(&name, &tree);
         assert!(v.selected.contains(&nested));
         assert!(v.visible.contains(&nested));
+
+        v.read_only[0] = true;
+        v.selected = BTreeSet::from([nested]);
+        v.request_op_copy(1, 0, &cfg);
+        v.request_op(OpKind::Delete { side: Some(0) }, &cfg);
+        assert!(v.confirm.is_none());
+        let Some(FolderAction::OpenFiles {
+            read_only,
+            descriptions,
+            ..
+        }) = v.open_action(nested, None)
+        else {
+            panic!("a file opens");
+        };
+        assert_eq!(read_only, [true, false]);
+        let rel = v.items[nested].rel_path();
+        assert!(descriptions[0]
+            .as_deref()
+            .is_some_and(|d| d.ends_with(&rel)));
+        assert!(descriptions[1].is_none());
+        v.read_only[0] = false;
 
         v.confirm = Some(PendingOp {
             kind: OpKind::Delete { side: None },

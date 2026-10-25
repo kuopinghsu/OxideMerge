@@ -2757,6 +2757,7 @@ dependencies = [
  "quick-xml 0.42.0",
  "regex",
  "rfd",
+ "same-file",
  "serde",
  "serde_json",
  "sevenz-rust2",

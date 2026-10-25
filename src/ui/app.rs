@@ -103,8 +103,9 @@ pub struct Tab {
     pub source: Vec<PathBuf>,
     /// The folder compare this tab was opened from, for moving on to its next or previous file.
     origin: Option<Origin>,
-    /// Temporary copy of a side (a Git revision), deleted with the tab.
-    _temp: Option<tempfile::TempDir>,
+    /// Temporary copy of a side (a Git revision), deleted with the last tab showing it: the
+    /// folder compare and the files opened from it.
+    temp: Option<std::sync::Arc<tempfile::TempDir>>,
 }
 
 #[derive(Clone)]
@@ -495,14 +496,31 @@ fn arrow_pairs(pairs: &[(String, String)]) -> String {
         .join("\n")
 }
 
+/// Reads `a => b` lines. The spaced arrow is looked for first, so a pattern may hold `=>`.
 fn parse_arrow_pairs(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|l| {
-            l.split_once("=>")
+            l.split_once(" => ")
+                .or_else(|| l.split_once("=>"))
                 .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))
         })
         .filter(|(a, _)| !a.is_empty())
         .collect()
+}
+
+/// A warning naming the first of `patterns` that is not a valid regular expression; such
+/// patterns are left out of the compare.
+fn regex_warning(ui: &mut egui::Ui, patterns: impl IntoIterator<Item = String>) {
+    let bad = patterns
+        .into_iter()
+        .find(|p| !p.is_empty() && regex::Regex::new(p).is_err());
+    if let Some(bad) = bad {
+        ui.label(
+            egui::RichText::new(trf("opt.invalid_regex", &[("pattern", bad)]))
+                .small()
+                .color(pal(ui).danger),
+        );
+    }
 }
 
 /// Settings whose label contains `query` (case-insensitive), with the tab that holds them.
@@ -543,7 +561,12 @@ struct GitDialog {
     commits_for: String,
     /// Recent commits being read with `git log`, for the path it was started for.
     commits_job: Option<(String, CommitsRx)>,
+    /// The path as last typed and when, so `git log` waits until typing pauses.
+    typed: (String, std::time::Instant),
 }
+
+/// How long the Git dialog's path must stay unchanged before its commits are read.
+const GIT_LOG_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
 struct PatchDialog {
     style: PatchStyle,
@@ -1312,7 +1335,7 @@ impl OxideMergeApp {
         let (temp, content) = if path.is_dir() {
             let (temp, copy) = git::export_folder(path, rev)?;
             let display = vec![label, path.display().to_string()];
-            let v = FolderView::new(
+            let mut v = FolderView::new(
                 vec![copy, path.to_path_buf()],
                 display,
                 Vec::new(),
@@ -1320,6 +1343,7 @@ impl OxideMergeApp {
                 &self.named_filters,
                 &self.cfg,
             );
+            v.read_only[0] = true;
             (temp, Content::Folder(v))
         } else {
             let bytes = git::show_file(path, rev)?;
@@ -1347,7 +1371,7 @@ impl OxideMergeApp {
         self.cfg.add_recent_path(&path.display().to_string());
         self.push_tab(content, Vec::new());
         if let Some(t) = self.tabs.last_mut() {
-            t._temp = Some(temp);
+            t.temp = Some(std::sync::Arc::new(temp));
         }
         Ok(())
     }
@@ -1405,7 +1429,7 @@ impl OxideMergeApp {
             content,
             source,
             origin: None,
-            _temp: None,
+            temp: None,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -1444,6 +1468,7 @@ impl OxideMergeApp {
         let Some(Origin { folder, rel }) = self.tabs.get(ti).and_then(|t| t.origin.clone()) else {
             return;
         };
+        let temp = self.tabs[ti].temp.clone();
         let cfg = &self.cfg;
         let Some(Content::Folder(f)) = self
             .tabs
@@ -1456,6 +1481,8 @@ impl OxideMergeApp {
         let Some(FolderAction::OpenFiles {
             paths,
             missing,
+            read_only,
+            descriptions,
             kind,
             rel,
         }) = f
@@ -1468,6 +1495,8 @@ impl OxideMergeApp {
         self.open(OpenRequest {
             paths,
             missing,
+            read_only,
+            descriptions,
             kind,
             skip_recent: true,
             ..Default::default()
@@ -1489,6 +1518,7 @@ impl OxideMergeApp {
         }
         self.notify(trf("msg.file_switched", &[("file", rel.clone())]));
         tab.origin = Some(Origin { folder, rel });
+        tab.temp = temp;
         self.tabs[ti] = tab;
         self.active = ti;
     }
@@ -1832,6 +1862,7 @@ impl OxideMergeApp {
                     commits: Vec::new(),
                     commits_for: String::new(),
                     commits_job: None,
+                    typed: (String::new(), std::time::Instant::now()),
                 });
             }
             Cmd::CompareAs(kind) => {
@@ -2015,6 +2046,10 @@ impl OxideMergeApp {
     }
 
     fn save_report_with_diffs(&mut self) {
+        if self.report_job.is_some() {
+            self.notify(tr("msg.report_writing"));
+            return;
+        }
         let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
             self.error(tr("msg.report_folder_only"));
             return;
@@ -2191,8 +2226,15 @@ impl OxideMergeApp {
                 }
             }
         }
+        if d.typed.0 != d.path {
+            d.typed = (d.path.clone(), std::time::Instant::now());
+        }
+        let wait = GIT_LOG_DELAY.saturating_sub(d.typed.1.elapsed());
         let started_for = d.commits_job.as_ref().map(|(p, _)| p.as_str());
-        if d.commits_for != d.path && started_for != Some(d.path.as_str()) && path.exists() {
+        let pending = d.commits_for != d.path && started_for != Some(d.path.as_str());
+        if pending && !wait.is_zero() {
+            ctx.request_repaint_after(wait);
+        } else if pending && path.exists() {
             let (tx, rx) = std::sync::mpsc::channel();
             let p = path.clone();
             std::thread::spawn(move || {
@@ -3783,6 +3825,10 @@ impl OxideMergeApp {
                                             .desired_rows(3)
                                             .desired_width(f32::INFINITY),
                                     );
+                                    regex_warning(
+                                        ui,
+                                        d.line_filters.lines().map(|l| l.trim().to_string()),
+                                    );
                                     ui.checkbox(
                                         &mut o.substitutions_enabled,
                                         tr("opt.substitutions"),
@@ -3796,6 +3842,12 @@ impl OxideMergeApp {
                                             .desired_rows(3)
                                             .desired_width(f32::INFINITY),
                                     );
+                                    regex_warning(
+                                        ui,
+                                        parse_arrow_pairs(&d.substitutions)
+                                            .into_iter()
+                                            .map(|(a, _)| a),
+                                    );
                                     ui.checkbox(
                                         &mut o.block_filters_enabled,
                                         tr("opt.block_filters"),
@@ -3808,6 +3860,12 @@ impl OxideMergeApp {
                                             .code_editor()
                                             .desired_rows(2)
                                             .desired_width(f32::INFINITY),
+                                    );
+                                    regex_warning(
+                                        ui,
+                                        parse_arrow_pairs(&d.block_filters)
+                                            .into_iter()
+                                            .flat_map(|(a, b)| [a, b]),
                                     );
                                     ui.horizontal(|ui| {
                                         ui.checkbox(
@@ -4567,14 +4625,19 @@ impl eframe::App for OxideMergeApp {
                 FolderAction::OpenFiles {
                     paths,
                     missing,
+                    read_only,
+                    descriptions,
                     kind,
                     rel,
                 } => {
                     let folder = self.tabs.get(self.active).map(|t| t.id);
+                    let temp = self.tabs.get(self.active).and_then(|t| t.temp.clone());
                     let count = self.tabs.len();
                     self.open(OpenRequest {
                         paths,
                         missing,
+                        read_only,
+                        descriptions,
                         kind,
                         skip_recent: true,
                         ..Default::default()
@@ -4582,6 +4645,7 @@ impl eframe::App for OxideMergeApp {
                     if let (Some(folder), true) = (folder, self.tabs.len() > count) {
                         if let Some(t) = self.tabs.last_mut() {
                             t.origin = Some(Origin { folder, rel });
+                            t.temp = temp;
                         }
                     }
                 }

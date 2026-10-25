@@ -20,19 +20,21 @@ section of this file as the release notes.
 - **Bookmark comments**, shown when hovering the gutter, in the status bar and in HTML reports.
 - **Save comparison** (File menu): every side's text with its bookmarks and comments in one
   `.oxmcmp` file, which opens again read-only.
-- **Compare with a Git revision** (File menu, or `--git-rev`) for files and folders.
+- **Compare with a Git revision** (File menu, or `--git-rev`) for files and folders. The revision
+  side is read-only and has the files as a checkout would, including Git LFS files and
+  submodules.
 - **File compare below the folder list** (View menu): the selected file's differences without
   opening a tab.
 - **Folder report with file differences** (File menu, or `--report-diffs`).
 - **Copy to folder** and **select by name** in folder compares.
 - **3-way folder auto merge** into the middle folder, merging text files changed on both sides when
-  the changes don't overlap.
+  the changes don't overlap. Files hidden by the filter, and files changed after the merge was
+  planned, are left alone.
 
 ### Fixed
 
 - Copying a file or folder onto itself (both sides pointing at the same place) no longer empties
-  the file; copying a folder into itself is refused.
-- Opening a Git revision gives the same line endings as the working copy on Windows.
+  the file; copying a folder into itself, or through a link back to itself, is refused.
 
 ## [0.9.2] - 2026-10-24
 

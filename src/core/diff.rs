@@ -99,6 +99,41 @@ fn number_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?").unwrap())
 }
 
+/// The numbers in `s`, leaving out digits that are part of a word or a dotted version such as
+/// `v1.2` or `1.2.3`.
+fn numbers(s: &str) -> impl Iterator<Item = regex::Match<'_>> {
+    number_re().find_iter(s).filter(move |m| {
+        let before = s[..m.start()].chars().next_back();
+        let after = s[m.end()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            && !(after == Some('.') && s[m.end() + 1..].starts_with(|c: char| c.is_ascii_digit()))
+    })
+}
+
+/// Whether two numbers are at most `tol` apart. Whole numbers are compared exactly, as
+/// floating point cannot tell long ones apart.
+fn numbers_close(a: &str, b: &str, tol: f64) -> bool {
+    let whole = |s: &str| !s.contains(['.', 'e', 'E']);
+    if whole(a) && whole(b) {
+        let int = |s: &str| s.trim_start_matches('+').parse::<i128>();
+        return match (int(a), int(b)) {
+            (Ok(u), Ok(v)) => u.abs_diff(v) as f64 <= tol * (1.0 + 1e-9),
+            _ => {
+                let digits = |s: &str| {
+                    let neg = s.starts_with('-');
+                    let d = s.trim_start_matches(['+', '-']).trim_start_matches('0');
+                    (neg && !d.is_empty(), d.to_string())
+                };
+                digits(a) == digits(b)
+            }
+        };
+    }
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(u), Ok(v)) => (u - v).abs() <= tol * (1.0 + 1e-9),
+        _ => false,
+    }
+}
+
 impl Normalizer {
     pub fn new(opts: &DiffOptions) -> Self {
         let line_res = if opts.line_filters_enabled {
@@ -145,8 +180,8 @@ impl Normalizer {
         !self.blocks.is_empty() || self.tolerance.is_some()
     }
 
-    /// The lines inside block filters, start and end lines included. A block without an end
-    /// line is not a block.
+    /// The lines inside block filters, start and end lines included. The end may be on the
+    /// start line, after the start. A block without an end line is not a block.
     pub fn block_mask(&self, lines: &[String]) -> Option<Vec<bool>> {
         if self.blocks.is_empty() {
             return None;
@@ -161,11 +196,17 @@ impl Normalizer {
                 }
                 Some(_) => {}
                 None => {
-                    open = self
+                    let start = self
                         .blocks
                         .iter()
-                        .find(|(s, _)| s.is_match(line))
-                        .map(|(_, e)| (i, e));
+                        .find_map(|(s, e)| s.find(line).map(|m| (m.end(), e)));
+                    if let Some((after, end)) = start {
+                        if end.is_match(&line[after..]) {
+                            mask[i] = true;
+                        } else {
+                            open = Some((i, end));
+                        }
+                    }
                 }
             }
         }
@@ -181,21 +222,15 @@ impl Normalizer {
         let Some(tol) = self.tolerance else {
             return false;
         };
-        let re = number_re();
-        let (mut na, mut nb) = (re.find_iter(&ka), re.find_iter(&kb));
+        let (mut na, mut nb) = (numbers(&ka), numbers(&kb));
         let (mut pa, mut pb) = (0, 0);
         loop {
             match (na.next(), nb.next()) {
                 (None, None) => return ka[pa..] == kb[pb..],
                 (Some(x), Some(y)) => {
-                    if ka[pa..x.start()] != kb[pb..y.start()] {
-                        return false;
-                    }
-                    let (Ok(u), Ok(v)) = (x.as_str().parse::<f64>(), y.as_str().parse::<f64>())
-                    else {
-                        return false;
-                    };
-                    if (u - v).abs() > tol * (1.0 + 1e-9) {
+                    if ka[pa..x.start()] != kb[pb..y.start()]
+                        || !numbers_close(x.as_str(), y.as_str(), tol)
+                    {
                         return false;
                     }
                     (pa, pb) = (x.end(), y.end());
@@ -1106,6 +1141,19 @@ mod tests {
             }
         );
 
+        let exact = Normalizer::new(&DiffOptions {
+            numeric_tolerance: 0.0,
+            ..o.clone()
+        });
+        assert!(!exact.close("id=9007199254740993", "id=9007199254740992"));
+        assert!(!exact.close("n=123456789012345678901234567890123456789012", "n=1"));
+        assert!(exact.close("n=+007", "n=7"));
+        let n = Normalizer::new(&o);
+        assert!(!n.close("v1.2", "v1.3"));
+        assert!(!n.close("1.2.3", "1.2.4"));
+        assert!(!n.close("x1", "x2") && n.close("x 1", "x 1.001"));
+        assert!(n.close("-5", "-5.005"));
+
         let base = v(&["t = 10.0", "keep"]);
         let left = v(&["t = 10.001", "keep"]);
         let right = v(&["t = 10.0", "changed"]);
@@ -1124,6 +1172,23 @@ mod tests {
         let a = v(&["a", "// BEGIN GENERATED", "1", "// END GENERATED", "b"]);
         let b = v(&["a", "// BEGIN GENERATED", "2", "3", "// END GENERATED", "b"]);
         assert!(compute(&[&a, &b], &o).is_identical());
+        let o = DiffOptions {
+            block_filters: vec![(r"/\*".into(), r"\*/".into())],
+            ..o
+        };
+        let a = v(&["/* note */", "code", "same", "/* one", "two */", "end"]);
+        let b = v(&["/* other */", "CODE", "same", "/* three", "four */", "end"]);
+        let r = compute(&[&a, &b], &o);
+        assert_eq!(r.significant_blocks(), 1, "{:?}", r.blocks);
+        assert!(r
+            .blocks
+            .iter()
+            .any(|b| !b.ignored && b.ranges[0].contains(&1)));
+        assert!(r.blocks.iter().any(|b| b.ignored && b.ranges[0] == (3..5)));
+        let o = DiffOptions {
+            block_filters: vec![("^// BEGIN GENERATED".into(), "^// END GENERATED".into())],
+            ..o
+        };
         let unterminated = v(&["a", "// BEGIN GENERATED", "2", "b"]);
         let c = v(&["a", "// BEGIN GENERATED", "3", "b"]);
         assert!(!compute(&[&unterminated, &c], &o).is_identical());

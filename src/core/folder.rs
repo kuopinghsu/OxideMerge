@@ -829,8 +829,8 @@ pub fn refresh_file_item(
     aggregate(items, n);
 }
 
-/// Copies a file or folder over `to`. Refuses to copy a file onto itself, which would empty
-/// it, and a folder into itself, which would never end.
+/// Copies a file or folder over `to`. Refuses to copy a file onto itself (also through a link),
+/// which would empty it, and a folder into itself, which would never end.
 pub fn copy_recursive(from: &Path, to: &Path) -> Result<()> {
     let src = std::fs::canonicalize(from).with_context(|| format!("{}", from.display()))?;
     let mut dest = to.to_path_buf();
@@ -847,7 +847,10 @@ pub fn copy_recursive(from: &Path, to: &Path) -> Result<()> {
             },
         }
     };
-    if dest == src || (src.is_dir() && dest.starts_with(&src)) {
+    if dest == src
+        || (src.is_dir() && dest.starts_with(&src))
+        || same_file::is_same_file(from, to).unwrap_or(false)
+    {
         bail!(
             "{}: {} -> {}",
             tr("msg.copy_into_itself"),
@@ -855,17 +858,25 @@ pub fn copy_recursive(from: &Path, to: &Path) -> Result<()> {
             to.display()
         );
     }
-    copy_tree(from, to)
+    copy_tree(from, to, &mut Vec::new())
 }
 
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+/// `inside` holds the folders being copied around `from`, so a link back to one of them stops
+/// the copy instead of repeating it forever.
+fn copy_tree(from: &Path, to: &Path, inside: &mut Vec<PathBuf>) -> Result<()> {
     let md = std::fs::metadata(from).with_context(|| format!("{}", from.display()))?;
     if md.is_dir() {
+        let real = std::fs::canonicalize(from)?;
+        if inside.contains(&real) {
+            bail!("{}: {}", tr("msg.copy_into_itself"), from.display());
+        }
         std::fs::create_dir_all(to)?;
+        inside.push(real);
         for e in std::fs::read_dir(from)? {
             let e = e?;
-            copy_tree(&e.path(), &to.join(e.file_name()))?;
+            copy_tree(&e.path(), &to.join(e.file_name()), inside)?;
         }
+        inside.pop();
     } else {
         if let Some(parent) = to.parent() {
             std::fs::create_dir_all(parent)?;
@@ -932,6 +943,18 @@ mod tests {
         copy_recursive(&root.join("sub"), &root.join("copy/sub")).unwrap();
         assert!(root.join("copy/sub/f.txt").is_file());
         copy_recursive(&root.join("sub/f.txt"), &root.join("copy/sub/f.txt")).unwrap();
+
+        std::fs::hard_link(root.join("sub/f.txt"), root.join("hard.txt")).unwrap();
+        assert!(copy_recursive(&root.join("sub/f.txt"), &root.join("hard.txt")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("hard.txt")).unwrap(),
+            "keep\n"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("sub"), root.join("sub/deeper/up")).unwrap();
+            assert!(copy_recursive(&root.join("sub"), &root.join("looped")).is_err());
+        }
     }
 
     #[test]
