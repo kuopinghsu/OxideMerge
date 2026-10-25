@@ -268,6 +268,8 @@ mod tests {
             ],
         );
         if added.is_ok() {
+            // the clone `submodule add` made, which the export reads from
+            git(&repo.join("module"), &["config", "core.autocrlf", "false"]).unwrap();
             run(&["commit", "-q", "-m", "module"]);
             std::fs::write(repo.join("module/m.txt"), "edited\n").unwrap();
             let (_tmp, copy) = export_folder(repo, "HEAD").unwrap();
