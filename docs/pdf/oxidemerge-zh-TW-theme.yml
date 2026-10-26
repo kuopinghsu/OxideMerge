@@ -1,0 +1,7 @@
+# PDF theme of the Traditional Chinese user guide: the English one, in Noto Sans TC.
+extends: oxidemerge-theme.yml
+base:
+  font_family: Noto Sans TC
+  line_height: 1.4
+heading:
+  font_family: Noto Sans TC

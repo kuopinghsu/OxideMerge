@@ -1,0 +1,946 @@
+= OxideMerge User Guide
+:description: User guide for OxideMerge, an open source differencing and merging tool.
+:revnumber: 0.9.3
+:doctype: book
+:toc: left
+:toclevels: 3
+:sectnums:
+:sectanchors:
+:icons: font
+:experimental:
+:imagesdir: images/en
+ifdef::env-github[]
+:tip-caption: :bulb:
+:note-caption: :information_source:
+:important-caption: :heavy_exclamation_mark:
+:warning-caption: :warning:
+endif::[]
+
+[.lead]
+OxideMerge compares and merges folders, text files, binary files, images and web pages.
+It is written in Rust, runs on Windows, macOS and Linux, and is modeled on WinMerge.
+
+This guide is also available in xref:user-guide.zh-TW.adoc[繁體中文].
+
+[NOTE]
+====
+*Keys on macOS.* The shortcuts in this guide are written the Windows and Linux way.
+On macOS, kbd:[Ctrl] is the Command key (kbd:[⌘]), except in kbd:[Ctrl+Tab], which is the
+Control key there too.
+kbd:[Alt] is the Option key (kbd:[⌥]).
+The menus and tooltips show the keys the macOS way, for example kbd:[⇧⌘S] and kbd:[⌥↓].
+====
+
+== Introduction
+
+With OxideMerge you can:
+
+* compare two or three folders, including archives such as `.zip`, `.tar.gz` and `.7z`, and
+  copy, delete or auto merge their items;
+* compare two or three text files side by side, edit them, copy differences between them, and
+  resolve version control conflict files;
+* compare binary files in a hex view, images in five view modes, and web pages as screenshots,
+  HTML source, visible text or downloaded resources;
+* ignore differences that don't matter with compare options and reusable *compare rules* files;
+* write HTML, CSV and text reports and patches, and save comparisons and projects to open again;
+* run comparisons from scripts and use OxideMerge as the diff and merge tool for Git.
+
+The interface comes in 10 languages: English, 繁體中文, 简体中文, 日本語, 한국어, Deutsch, Français,
+Español, Русский and Português (Brasil).
+
+== Installing
+
+Every https://github.com/kuopinghsu/OxideMerge/releases[GitHub release] has these packages,
+and `SHA256SUMS.txt` to check them against.
+
+[cols="1,3"]
+|===
+|Platform |Package
+
+|Windows x64 / Arm64
+|`oxidemerge-<version>-windows-x64.exe` or `-windows-arm64.exe`, which runs as it is, or the
+`.zip` of the same name.
+
+|Linux x64 / Arm64
+|`.AppImage` (no install needed), `.deb` (Ubuntu 22.04 and newer) or `.tar.gz`.
+
+|macOS 11 and newer
+|`oxidemerge-<version>-macos-universal.dmg` (Apple silicon and Intel), or the same app in a `.zip`.
+|===
+
+Linux::
+Run `chmod +x oxidemerge-*.AppImage` before starting the AppImage.
+Without FUSE, start it with `--appimage-extract-and-run`.
+Install the Debian package with `sudo apt install ./oxidemerge-*.deb`.
+File dialogs need `xdg-desktop-portal`, which desktop environments normally include.
+
+macOS::
+The app is ad-hoc signed but not notarized.
+The first time, Control-click it and choose *Open*, or allow it in
+*System Settings → Privacy & Security*.
+To start it from the terminal, link it into your `PATH`:
++
+[source,sh]
+----
+sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin/oxidemerge
+----
+
+Building from source::
+Install a Rust toolchain from https://rustup.rs/ and run `cargo build --release`.
+The program is `target/release/oxidemerge`.
+
+== Getting started
+
+=== The main window
+
+.The start page
+image::start.png[Start page]
+
+The window has these parts:
+
+Menu bar:: *File*, *Edit*, *View*, *Compare*, *Merge*, *Tools* and *Help*.
+Commands that do nothing in the current tab are greyed out.
+Buttons at the top right:: *Open*, light or dark theme, *Options*, *Command palette* and
+*Help & Shortcuts*.
+Tabs:: Every comparison opens in its own tab.
+Right-click a tab to close it, the others, the tabs to its right, or all of them.
+kbd:[Ctrl+Tab] and kbd:[Ctrl+Shift+Tab] switch tabs, and kbd:[Ctrl+W] closes the current one.
+Status bar:: The number of differences and the current line or offset.
+The language button at its right end changes the interface language.
+
+Starting OxideMerge without a comparison shows the start page.
+It has *Compare files or folders*, *Open conflict file*, and the list of recent comparisons.
+Right-click a recent comparison to change its paths or remove it from the list.
+
+=== Opening a comparison
+
+There are several ways to start a comparison:
+
+* *File → Open...* (kbd:[Ctrl+O]) or *Compare files or folders* on the start page opens the
+  *Select files or folders* dialog.
+* Drop two or three files or folders onto the window.
+  Dropping a single item opens the dialog with that item filled in.
+* Pick a recent comparison on the start page, from *File → Open recent*, or in the command palette.
+* Start OxideMerge from the command line (see <<command-line>>) or from the file manager
+  (see <<file-manager>>).
+
+In the *Select files or folders* dialog:
+
+. Enter or browse for the *Left* and *Right* paths.
+  A path can be a file, a folder or an `http://` or `https://` address.
+  Check *3-way compare* to add a *Middle* path.
+. Check *Read-only* next to a side to protect it from changes.
+  *Swap left/right* exchanges the two sides.
+. For folders, choose *Include subfolders*, a *Filter* and the *Compare method*.
+. Choose *Compare as* to force a text, binary, image or web page compare.
+  *Automatic* chooses from the file contents.
+. Click *Compare*.
+
+TIP: *File → New text compare* (kbd:[Ctrl+N]) opens two empty sides.
+Paste text into them with kbd:[Ctrl+V], or double-click a line to type.
+
+=== Getting help
+
+* *Help → Help & Shortcuts* (kbd:[F1] or kbd:[?]) lists every keyboard shortcut and mouse
+  action by view, and shows where the settings file is stored.
+* *Help → Command palette* (kbd:[Ctrl+K] or kbd:[Ctrl+Shift+P]) searches commands, recent
+  comparisons and settings.
+  Type part of a name, then press kbd:[Enter].
+  Settings that can be switched on and off show whether they are on.
+
+== Folder compare
+
+.A folder compare
+image::folder.png[Folder compare]
+
+A folder compare lists the items of two or three folders and how they compare.
+Results appear while the comparison runs: files are compared during the folder scan, and
+differences and unique items are listed as soon as they are found.
+When a long comparison finishes while the window is in the background, OxideMerge asks for
+attention.
+
+=== The folder list
+
+Each row shows the *Name*, the *Folder* it is in, the *Comparison result*, the dates and sizes on
+each side, and the *Extension*.
+Click a column header to sort by it.
+
+The comparison result is one of these:
+
+* *Text files are identical* or *Text files are different*;
+* *Binary files are identical* or *Binary files are different*;
+* *Folders are identical* or *Folders are different*;
+* *Left only*, *Right only* or *Middle only*, for items found on one side;
+* *Left is different*, *Middle is different* or *Right is different*, in a 3-way compare;
+* *Error*, when an item could not be read.
+
+The status bar counts the identical, different and unique items and the errors.
+
+In *View → Folder list*:
+
+* *Tree mode* shows subfolders as a tree.
+  Turn it off for a flat list.
+  kbd:[Right] and kbd:[Left] expand and collapse a folder, and the toolbar has *Expand all* and
+  *Collapse all*.
+* *Show* hides or shows *Identical*, *Different*, *Left only*, *Middle only* and *Right only*
+  items.
+* *File compare below the folder list* shows the differences of the selected file under the list,
+  without opening a tab.
+
+=== The toolbar
+
+From left to right:
+
+* *Refresh* (kbd:[F5]) compares again.
+* *Expand all* and *Collapse all*, in tree mode.
+* *Copy to right* and *Copy to left* copy the selected items.
+* *Select by name...* selects the items whose names match wildcards such as `*.c; *.h`.
+* *All differences* opens every changed text file in one tab (see <<all-differences>>).
+* *Export HTML* saves an HTML report (see <<reports>>).
+* *Filter* chooses which files and folders are compared (see <<filters>>).
+* *Rules* chooses the compare rules file for this compare (see <<compare-rules>>).
+* *Compare method* chooses how files are compared.
+* *Find by name* (kbd:[Ctrl+F]) shows only the items whose names contain the text.
+
+=== Compare methods
+
+[cols="1,3"]
+|===
+|Method |How files are compared
+
+|Full contents
+|Text files are compared line by line, using the compare options and rules.
+Files differing only in ignored ways count as identical.
+
+|Quick contents
+|The bytes are compared.
+Files of different sizes are told apart without reading them.
+
+|Binary contents
+|Like quick contents, for every kind of file.
+
+|Modified date
+|The modification dates are compared, within the *Date tolerance* set under *Options → Folder*.
+
+|Modified date and size
+|Both the dates and the sizes must match.
+
+|Size
+|Only the sizes are compared.
+|===
+
+Large files are compared in chunks, so identical and binary files are never loaded whole.
+
+=== Working with items
+
+Select items with the mouse or the keyboard: the arrow keys, kbd:[PgUp], kbd:[PgDn],
+kbd:[Home] and kbd:[End], with kbd:[Shift] to extend the selection and kbd:[Ctrl+A] to select all.
+kbd:[Ctrl]+click adds an item to the selection or removes it.
+
+* Double-click an item, or press kbd:[Enter], to compare it in its own tab.
+  A folder opens its own folder compare.
+* Press kbd:[Space] for a *quick preview*: a colored diff of the selected file, without opening a
+  tab.
+  kbd:[↑] and kbd:[↓] move to the next item, kbd:[Enter] opens it, and kbd:[Space] or
+  kbd:[Esc] closes the preview.
+* kbd:[Alt+Right] and kbd:[Alt+Left] copy the selected items to the right or left.
+
+Right-click an item for more:
+
+* *Copy* to another side, and *Copy to folder...*, which copies the selected items of a side into
+  another folder and keeps their relative paths;
+* *Delete* from a side;
+* *Open with associated application*;
+* *Show in file manager*;
+* *Copy full path*;
+* *Select by name...*.
+
+Under *Options → General* you can have OxideMerge ask before copying (*Confirm copy operations*),
+move deleted items to the recycle bin or trash (*Use the recycle bin when deleting*), and keep a
+`.bak` copy of each file it overwrites.
+
+=== Auto merging folders
+
+In a 3-way folder compare, the middle folder is the common ancestor.
+*Merge → Auto merge folders...* brings the changes of both sides into it:
+
+* items changed, added or removed on one side only are copied or removed;
+* text files changed on both sides are merged line by line when the changes don't overlap.
+
+OxideMerge first shows what it is going to do: how many items it will copy, delete and merge,
+and which items changed on both sides and are left as they are.
+Nothing is changed until you confirm.
+
+=== Archives
+
+Archives are extracted and compared as folders: zip-based formats (`.zip`, `.jar`, `.apk`,
+`.docx`, `.xlsx`, `.odt`, `.epub`, `.nupkg` and more), `.tar`, `.tar.gz` / `.tgz`,
+`.tar.bz2` / `.tbz2`, `.tar.xz` / `.txz` and `.7z`.
+The extracted sides are read-only, because changes could not be saved back into the archive.
+
+[[all-differences]]
+== All differences
+
+.All differences
+image::alldiffs.png[All differences]
+
+*All differences*, on the folder compare toolbar or in *Compare → All differences*, shows every
+changed text file of the folder compare in one tab.
+The filters and *Show* settings of the folder compare apply.
+
+* The list on the left has every file, with its number of differences.
+  *Filter files...* (kbd:[Ctrl+F]) narrows it down, and clicking a file scrolls to it.
+* Each file is a card with its differences side by side.
+  The arrow in a card header collapses or expands it, and the toolbar collapses or expands all of
+  them.
+* kbd:[Alt+Down] and kbd:[Alt+Up] step through the differences across files.
+* The arrows next to a difference copy it to another side.
+  In a 2-way compare the buttons in a card header copy the whole file.
+* *Undo* takes back the last change.
+  *Save* writes the changed files, and the folder compare refreshes afterwards.
+* The button at the right of a card header opens the file in its own tab.
+
+Copying from a side where a file is missing deletes the file when you save, along with folders
+left empty.
+A file changed on disk after it was read is not saved over: its card offers to discard your
+changes to it and read it again.
+
+== Text compare
+
+.A 2-way text compare
+image::text.png[Text compare]
+
+Each side has a header with its file name and folder, the *encoding* and the *end of line* style
+used when saving, and a lock button that makes the side read-only.
+Choosing another encoding reads the file again in that encoding.
+
+The *location pane* on the left is an overview of the whole file.
+Click it to jump to that place.
+Differences are colored: changed lines in amber, and lines only on one side in blue.
+Within changed lines, the changed words or characters are highlighted.
+
+=== Moving between differences
+
+[cols="1,2"]
+|===
+|Keys |Action
+
+|kbd:[Alt+Down], kbd:[Alt+Up]
+|Next or previous difference
+
+|kbd:[Alt+Home], kbd:[Alt+End]
+|First or last difference
+
+|kbd:[Alt+PgDn], kbd:[Alt+PgUp]
+|Next or previous conflict, in a 3-way compare
+
+|kbd:[Ctrl+G]
+|Go to line
+|===
+
+When a file was opened from a folder compare, going past the last or first difference opens the
+next or previous file with differences.
+
+=== Merging
+
+* The arrows on the divider between the sides copy the hovered or current difference.
+* kbd:[Alt+Right] and kbd:[Alt+Left] copy the current difference, or the selected lines, to the
+  right or left.
+* kbd:[Ctrl+Alt+Right] and kbd:[Ctrl+Alt+Left] copy all differences.
+* kbd:[Ctrl+Z] undoes and kbd:[Ctrl+Y] or kbd:[Ctrl+Shift+Z] redoes.
+* kbd:[Ctrl+S] saves the current file and kbd:[Ctrl+Shift+S] saves all of them.
+  *File → Save as* saves one side under another name.
+
+Saving writes a temporary file and renames it over the original, so a crash or a full disk never
+leaves a half-written file.
+
+=== Editing
+
+Every side that isn't read-only can be edited, one line at a time.
+
+* Double-click a line, or press kbd:[F2] or kbd:[Enter], to edit it.
+* Select lines by dragging, with kbd:[Shift]+click, or with kbd:[Shift+Up] and kbd:[Shift+Down].
+* kbd:[Ctrl+C] copies the selected lines, and kbd:[Ctrl+V] pastes below the current line or over
+  the selected lines.
+* kbd:[Ctrl+\]] and kbd:[Ctrl+[] indent and unindent the selected lines.
+
+Right-click a line to edit it, insert a line below it, delete it, copy its text, set a bookmark,
+or add a compare rule built from it (see <<add-rule>>).
+
+Edit markers in the gutter show which lines changed since the files were opened.
+When another program changes a file, OxideMerge notices it as soon as the window gets the focus
+again: files without unsaved changes reload by themselves, and files with unsaved changes show a
+bar that offers to reload them.
+
+=== Find and replace
+
+* kbd:[Ctrl+F] opens the find bar.
+  kbd:[F3] and kbd:[Shift+F3] find the next and previous match, and kbd:[Esc] closes the bar.
+* kbd:[Ctrl+H] (kbd:[Cmd+Alt+F] on macOS) finds and replaces.
+* The options are *Match case*, *Whole word* and *Regular expression*.
+  With a regular expression, `$1` in the replacement is the first captured group.
+* *Replace all* is a single undo step.
+
+=== Bookmarks
+
+* kbd:[Ctrl+F2] sets or removes a bookmark on the current line.
+* kbd:[F4] and kbd:[Shift+F4] jump to the next and previous bookmark.
+* *Edit → Bookmarks → Bookmark comment...* attaches a comment.
+  The comment shows when you hover over the gutter, and in HTML reports.
+* *Edit → Bookmarks → Clear bookmarks* removes all of them.
+
+Bookmarks are marked in the gutter and in the location pane.
+
+=== View options
+
+*View → Text compare* has:
+
+* *Location pane* and *Line detail pane*.
+  The line detail pane shows the current line of every side, one above the other and wrapped, to
+  spot small differences in long lines.
+* *Line numbers*, *Edit markers*, *View whitespace* and *Syntax highlighting*.
+* *Collapse unchanged lines* (kbd:[Alt+C]) folds unchanged lines into a bar, keeping three lines
+  around each difference.
+  Click the bar to show them.
+* *Word wrap* (kbd:[Alt+Z]).
+
+*View → Zoom* (kbd:[Ctrl+{plus}], kbd:[Ctrl+-] and kbd:[Ctrl+0]) changes the text size.
+For CSV and TSV files, the toolbar has a *Table view* that shows the columns aligned.
+
+=== 3-way compare and merge
+
+.A 3-way compare
+image::three.png[3-way compare]
+
+With three files, the middle one is the common ancestor (base) and is usually where the result
+goes.
+
+* *Merge → Auto merge* takes every change made on one side only into the middle.
+  Changes made on both sides are conflicts and are left for you.
+* Copy each conflict from the left or right into the middle, or edit the middle.
+* Right-click a difference and choose *Take left, then right* or *Take right, then left* to keep
+  both changes.
+* kbd:[Alt+PgDn] and kbd:[Alt+PgUp] step through the conflicts.
+
+=== Conflict files
+
+.A conflict file opened in the 3-way view
+image::conflict.png[Conflict file]
+
+A file with version control conflict markers (`<<<<<<<`, `|||||||`, `=======` and `>>>>>>>`)
+can be resolved in the 3-way view.
+Open it with *File → Open conflict file...*, *Open conflict file* on the start page, or
+`oxidemerge conflict.txt`.
+
+The left side is *Mine*, the right side is *Theirs*, and the middle is the *Merged result*.
+Resolve every conflict, then save: the merged result is written back to the conflict file.
+
+=== Comparing with a Git revision
+
+*File → Compare with Git revision...* compares a file or folder with how it was in a Git
+revision: `HEAD`, a branch, a tag or a commit.
+The dialog lists recent commits to pick from.
+The revision is shown read-only on the left.
+
+From the command line, use `--git-rev`:
+
+[source,sh]
+----
+oxidemerge --git-rev HEAD~1 src/main.rs
+----
+
+=== Saving a comparison
+
+*File → Save comparison...* saves the text of every side, with its bookmarks and comments, in one
+`.oxmcmp` file.
+Open it later, or send it to someone else, to review the comparison as it was.
+
+=== Patches
+
+*File → Export → Generate patch...* writes the differences between two files or folders as a
+patch in *Normal*, *Context* or *Unified* format, with the number of context lines you choose.
+Patches can be made from 2-way compares only.
+
+*File → Apply patch...* applies a unified diff, including the output of `git diff` and
+`svn diff`.
+OxideMerge finds each hunk even when lines have moved, and opens every patched file next to its
+original so you can review the result and save it.
+Hunks that don't fit are reported.
+
+== Binary compare
+
+.A binary compare
+image::binary.png[Binary compare]
+
+Binary files open in a side-by-side hex view with the differing bytes highlighted.
+The sides scroll together.
+
+* kbd:[Alt+Down] and kbd:[Alt+Up] step through the differences.
+* kbd:[Ctrl+F] finds hex bytes, such as `DE AD BE EF`, or text.
+* kbd:[Ctrl+G] goes to an offset, written as `0x1F00`, `1F00h` or a decimal number.
+* Differences can be copied to the other side and saved, like in a text compare.
+
+The number of bytes per line is set under *Options → Image / Binary / Web*.
+
+== Image compare
+
+.An image compare
+image::image.png[Image compare]
+
+Images open in an image compare with these modes:
+
+Side by side:: The images next to each other.
+Overlay:: One image over the other, with an adjustable *Opacity*.
+Swipe:: One image left of a divider and the other right of it.
+Drag the divider to move it.
+Blink:: The images take turns.
+Difference:: The pixel differences.
+
+* *Highlight differences* marks the differing regions.
+  *Color distance threshold* sets how different two pixels must be to count, and *Block size*
+  sets the size of the marked blocks.
+* Zoom with the buttons, the mouse wheel or a pinch, around the pointer.
+  *Fit* fits the images to the window and *1:1* shows them at their real size.
+* Drag, or scroll with two fingers, to move all the images together.
+* Click a differing region to select it.
+  kbd:[Alt+Down] and kbd:[Alt+Up] step through the regions, and kbd:[Alt+Right] and
+  kbd:[Alt+Left] copy the current region to the other image.
+  *Undo* takes a copy back, and kbd:[Ctrl+S] saves the changed image.
+
+The status bar shows how many pixels differ and in how many regions.
+
+== Web page compare
+
+Compare two or three `http://` or `https://` addresses, or local HTML files compared with
+*Compare as → Web page* (`-t web` on the command line).
+The bar at the top of the tab chooses the mode, and the last mode used is remembered:
+
+Screenshot:: Renders each page with a headless Chromium-based browser (Edge, Chrome, Chromium or
+Brave, found automatically) and opens the images in the image compare.
+HTML source:: The page source, with long minified lines split between tags, in the text compare.
+Text:: The visible text of each page, without scripts, styles and markup, in the text compare.
+Resource tree:: Downloads each page with its stylesheets, scripts, images, frames and media, and
+compares the downloaded files in the folder compare.
+
+Pages are decoded using the charset from HTTP or `<meta>`.
+HTTP status codes other than 2xx are shown in the pane header.
+The screenshot size and the browser are set under *Options → Image / Binary / Web*.
+Leave the browser empty to find one automatically.
+
+NOTE: Only Screenshot mode runs the scripts of a page.
+The other modes see the HTML as the server sent it.
+There is no cookie or login support.
+
+== Ignoring differences
+
+[[compare-options]]
+=== Compare options
+
+*Compare → Compare options* switches these quickly, and *Options → Compare* holds them all:
+
+Whitespace::
+*Compare* counts every space, *Ignore changes* ignores changes in the amount of whitespace, and
+*Ignore all* ignores whitespace altogether.
+Ignore blank lines:: Lines that are blank on one side only don't count.
+Ignore case:: Upper and lower case letters are equal.
+Ignore carriage return differences (Windows/Unix/Mac):: `CRLF`, `LF` and `CR` line endings are
+equal.
+Ignore numbers:: Digits are ignored.
+Ignore code page differences:: Files in different encodings with the same text are equal.
+Ignore comment changes:: Changes only in comments don't count, for languages whose comment syntax
+is known (C-like languages, scripts, SQL, HTML/XML, CSS, Lua, Haskell and more).
+Format JSON and XML before comparing:: JSON and XML files are shown re-indented, with JSON keys
+sorted, and read-only, so only real content changes remain.
+Detect moved lines:: Blocks of lines that moved are shown as moves.
+Diff algorithm:: *Myers*, *Patience* or *LCS*.
+Inline differences:: *Off*, *Word level* or *Character level*.
+Treat numbers as equal within:: Numbers at most this far apart, for example `0.001`, count as
+equal.
+Useful for measurements and generated data.
+
+The compare options apply to folder compares too, with the *Full contents* method.
+
+[[compare-rules]]
+=== Compare rules
+
+A compare rules file (`.oxrules`) holds three kinds of rules:
+
+Ignore lines matching:: One regular expression per line.
+Differences made up only of matching lines are ignored.
+Substitutions:: One rule per line, written `+regex => replacement+`.
+They are applied to both sides before comparing, so text that differs in an expected way
+compares equal.
+Ignore blocks between start and end lines:: One block per line, written
+`+start regex => end regex+`.
+Differences inside a block, such as a generated section or a license header, are ignored.
+
+Patterns are regular expressions in the syntax of the Rust `regex` crate.
+
+.Options → Compare rules
+image::rules.png[Compare rules options]
+
+*Options → Compare rules* manages the files:
+
+* Choose *None* or a rules file.
+  The selected file is used by default by every compare.
+* *Edit* changes a file in the rules editor, and *Delete* removes it.
+* *New rules file* creates one.
+* *Open rules folder* shows the folder in the file manager, and *Reload* reads it again after you
+  change files there.
+* *Import...* adds rules files shared by others, and *Export* saves one file, or all of them to a
+  folder.
+
+A folder compare can use a different file: pick it from *Rules* on its toolbar, or from
+*Compare → Compare rules*.
+*Refresh* (kbd:[F5]) reads the rules file again.
+
+When you import a file, or drop `.oxrules` files on the window:
+
+* a file with the same name and rules as one already there is skipped;
+* a file named like an existing one but with other rules is added under a numbered name;
+* a file with the same rules under another name is added as it is.
+
+The files live in the `Rules` folder next to the settings file (see <<configuration>>).
+A `Rules` folder next to the program is read too.
+A rules file is plain JSON, and its name is the file name without `.oxrules`:
+
+.Build logs.oxrules
+[source,json]
+----
+{
+  "description": "Timestamps and generated headers in build logs",
+  "ignore_lines": ["^\\[\\d{2}:\\d{2}:\\d{2}\\]", "^// Generated on .*$"],
+  "substitutions": [{ "find": "\\b0x[0-9a-fA-F]{8,}\\b", "replace": "0xADDR" }],
+  "ignore_blocks": [{ "start": "^/\\* BEGIN LICENSE", "end": "END LICENSE \\*/$" }]
+}
+----
+
+[[add-rule]]
+=== Adding a rule from a text compare
+
+Right-click a line in a text compare and choose *Add compare rule*, then the kind of rule:
+
+Ignore lines like this:: A pattern matching the line, or every side of a changed line.
+Substitute:: A substitution that turns the text of one side into the other.
+Ignore block:: A block starting at the line.
+
+The dialog suggests a pattern built from the line, which you can change.
+Choose the *Rules file* to add it to, or give a *File name* to create a new one.
+The compare uses the rule at once.
+Other folder compares that use the same file pick up the change when refreshed (kbd:[F5]).
+
+[[filters]]
+=== Filters
+
+Filters decide which files and folders a folder compare includes.
+Choose one from *Filter* on the folder compare toolbar, or manage them in *Tools → Filters...*.
+
+A filter mask is a list of wildcards separated by `;`.
+A leading `!` excludes matches, and a trailing `\` or `/` matches folders:
+
+----
+*.rs;*.toml;!target\
+----
+
+WinMerge `.flt` filter files in the `Filters` folder of the configuration folder are listed too.
+*Tools → Filters...* shows them, opens the filters folder, and creates new ones.
+
+[[unpackers]]
+=== Unpacker plugins
+
+Unpackers turn files into text before comparing, for example to compare documents.
+Add them under *Options → Plugins*: a *File pattern*, such as `*.docx`, and a *Command line* in
+which `${file}` is replaced by the path of the file.
+The command's standard output is compared.
+
+----
+pandoc -t plain ${file}
+----
+
+[[reports]]
+== Reports, statistics and projects
+
+=== HTML reports
+
+*Export HTML* on the toolbar of a text or folder compare, or *File → Export → Export HTML
+report...* (kbd:[Ctrl+Shift+E]), saves a report and opens it in the browser.
+The file name is made from the compared names, with spaces replaced by `_`.
+
+The report is a single self-contained page.
+It lists every difference as a card with line numbers, three lines of context and changed words
+highlighted.
+It has summary cards, an index, side-by-side or unified view, light and dark themes, and file
+filters and search.
+kbd:[N] and kbd:[P] step through the differences.
+It names the compare rules file used and counts the differences it ignored.
+
+A folder report includes the differences of every changed text file.
+Turn off *File → Export → Open reports in the browser after saving* to only save it.
+
+=== Other reports
+
+* *File → Export → Generate report...* writes a folder report as HTML, CSV or plain text.
+* *File → Export → Generate report with file differences...* adds the differences of every
+  changed text file to an HTML folder report.
+
+=== Statistics
+
+*Tools → Statistics...* shows:
+
+* for a folder compare, the numbers of identical, different and unique files, errors, and the
+  total size of each side;
+* for a text compare, the identical, changed, added, removed and ignored lines, for each pair of
+  sides.
+
+=== Projects
+
+*File → Save as project...* saves what the current tab compares to an `.oxmproj` file: the paths,
+descriptions, read-only sides, compare type, filter, subfolders, compare method and compare rules
+file.
+*File → Open project...* opens it again.
+Paths are stored relative to the project file, so a project can be moved along with the files it
+compares.
+WinMerge `.WinMerge` projects open too.
+
+== Options
+
+*Edit → Options...*, or the gear button at the top right, opens the options.
+*Search settings* finds an option by name, and *Reset to defaults* restores the defaults.
+
+General::
+*Language*, *Theme* (*Light*, *Dark* or *Match system*), *Font size* and *Tab size*; *Line
+numbers*, *Location pane*, *View whitespace* and *Syntax highlighting*; *Keep a .bak copy when
+saving over a file*; *Use the recycle bin when deleting*; *Confirm copy operations*; and
+*Reopen previous comparisons at startup*.
+Compare::
+The compare options (see <<compare-options>>).
+Compare rules::
+The compare rules files (see <<compare-rules>>).
+Folder::
+*Compare method*, *Include subfolders*, *Include unique subfolders contents*, *Skip hidden files
+and folders*, *Date tolerance (seconds)* and *Worker threads* (0 means automatic).
+Image / Binary / Web::
+*Bytes per line* in binary compares, the *Browser used for screenshots*, and the *Screenshot
+width* and *Screenshot height*.
+Plugins::
+The unpacker plugins (see <<unpackers>>).
+
+== Keyboard shortcuts
+
+[cols="2,3"]
+|===
+|Keys |Action
+
+|kbd:[F1], kbd:[?] |Show or hide Help & Shortcuts
+|kbd:[Ctrl+K], kbd:[Ctrl+Shift+P] |Command palette
+|kbd:[Ctrl+N] |New text compare
+|kbd:[Ctrl+O] |Open
+|kbd:[Ctrl+S] |Save
+|kbd:[Ctrl+Shift+S] |Save all
+|kbd:[Ctrl+Shift+E] |Export HTML report
+|kbd:[Ctrl+W], kbd:[Ctrl+F4] |Close tab
+|kbd:[Ctrl+Tab], kbd:[Ctrl+Shift+Tab] |Next or previous tab
+|kbd:[Alt+F4] (kbd:[Cmd+Q] on macOS) |Exit, asking about unsaved changes first
+|kbd:[Ctrl+F], kbd:[F3], kbd:[Shift+F3], kbd:[Esc] |Find, find next, find previous, close the find bar
+|kbd:[Ctrl+H] (kbd:[Cmd+Alt+F] on macOS) |Find and replace
+|kbd:[Ctrl+G] |Go to line (go to offset in a binary compare)
+|kbd:[Shift+Up], kbd:[Shift+Down], kbd:[Shift+PgUp], kbd:[Shift+PgDn] |Select lines
+|kbd:[Ctrl+C] |Copy the selected lines
+|kbd:[Ctrl+V] |Paste below the current line, or over the selected lines
+|kbd:[Ctrl+F2], kbd:[F4], kbd:[Shift+F4] |Set or remove a bookmark, next bookmark, previous bookmark
+|kbd:[F5] |Refresh
+|kbd:[Alt+Down], kbd:[Alt+Up] |Next or previous difference
+|kbd:[Alt+Home], kbd:[Alt+End] |First or last difference
+|kbd:[Alt+PgDn], kbd:[Alt+PgUp] |Next or previous conflict
+|kbd:[Alt+Right], kbd:[Alt+Left] |Copy the current difference, or the selected lines, right or left
+|kbd:[Ctrl+Alt+Right], kbd:[Ctrl+Alt+Left] |Copy all differences right or left
+|kbd:[Ctrl+Z], kbd:[Ctrl+Y] / kbd:[Ctrl+Shift+Z] |Undo, redo
+|kbd:[F2], kbd:[Enter] |Edit the current line
+|kbd:[Ctrl+\]], kbd:[Ctrl+[] |Indent or unindent the selected lines
+|kbd:[Alt+C], kbd:[Alt+Z] |Collapse unchanged lines, word wrap
+|kbd:[Space] |Quick preview of the selected file in a folder compare
+|kbd:[Ctrl+{plus}], kbd:[Ctrl+-], kbd:[Ctrl+0] |Zoom in, zoom out, reset zoom
+|===
+
+[[command-line]]
+== Command line
+
+[source,sh]
+----
+oxidemerge left.txt right.txt                   # 2-way text compare
+oxidemerge mine.txt base.txt theirs.txt         # 3-way compare (middle = base)
+oxidemerge -r C:\project\v1 C:\project\v2       # recursive folder compare
+oxidemerge -r -f "*.rs;!target/" old new        # folder compare with a filter
+oxidemerge conflict.txt                         # resolve a file with conflict markers
+oxidemerge -t image a.png b.png                 # force the compare type
+oxidemerge https://example.com https://example.org   # web page compare
+oxidemerge left.txt right.txt -o merged.txt     # save the merge result to another file
+oxidemerge release.oxmproj                      # open a saved project
+oxidemerge -r old.tar.gz new.tar.gz             # compare archives as folders
+oxidemerge --git-rev HEAD~1 src/main.rs         # compare with an earlier Git revision
+oxidemerge review.oxmcmp                        # open a saved comparison
+----
+
+=== Options
+
+[cols="2,3"]
+|===
+|Option |Description
+
+|`PATHS...` |2 or 3 files, folders or URLs, or a single conflict file, project file or saved comparison
+|`-r`, `--recursive` |Include subfolders in folder compares
+|`-f`, `--filter <MASK>` |File filter, for example `*.c;*.h` or `!*.bak`
+|`-m`, `--method <M>` |Folder compare method: `full`, `quick`, `binary`, `date`, `datesize`, `size`
+|`-t`, `--compare-as <T>` |Force `text`, `binary`, `image` or `web`
+|`-o`, `--output <PATH>` |Output path for the merge result
+|`--dl`, `--dm`, `--dr <TEXT>` |Descriptions shown instead of the left, middle and right paths
+|`--wl`, `--wm`, `--wr` |Open the left, middle or right side read-only
+|`--ignore-ws <MODE>` |Ignore whitespace: `compare`, `change` or `all`
+|`--ignore-case`, `--ignore-blank`, `--ignore-eol`, `--ignore-numbers` |Ignore options
+|`--ignore-comments` |Ignore changes in comments
+|`--prettify` |Reformat JSON and XML before comparing
+|`--numeric-tolerance <AMOUNT>` |Treat numbers at most this far apart as equal
+|`--rules <NAME>` |Compare rules file: a name from the rules folder, or the path of an `.oxrules` file; `""` for none
+|`--git-rev <REV>` |Compare the single path given with how it was in a Git revision
+|`--report <FILE>` |Write a report: folder compares as `.html`, `.csv` or `.txt`, text compares as `.html`
+|`--report-diffs` |Add the differences of every changed text file to an HTML folder report
+|`--patch <FILE>` |Write a patch for two files or folders
+|`--patch-style <S>` |`normal`, `context` or `unified` (default)
+|`--context <N>` |Context lines for patches (default 3)
+|`--cli` |Run without a window; exit code 0 = identical, 1 = different, 2 = error
+|`--lang <CODE>` |Interface language, for example `ja` or `zh-TW`
+|`--list-languages` |Print the available languages
+|`--register-shell`, `--unregister-shell` |Add or remove the file manager entries
+|`--select-left <PATH>`, `--select-middle <PATH>` |Remember a side for a later `--compare-to`
+|`--compare-to <PATH>` |Compare a path with the remembered left (and middle) side
+|===
+
+On Windows, WinMerge-style switches such as `/r`, `/f`, `/o`, `/dl`, `/dr`, `/wl` and `/wr` work
+too, so existing scripts keep working.
+
+=== Scripting
+
+`--cli`, `--report` and `--patch` never open a window.
+
+[source,sh]
+----
+# Exit code only
+oxidemerge --cli -r dirA dirB && echo identical
+
+# HTML report of a folder compare, with the differences of every changed file
+oxidemerge -r dirA dirB --report report.html --report-diffs
+
+# HTML report of two files, ignoring comment changes
+oxidemerge old.c new.c --ignore-comments --report diff.html
+
+# Unified diff with 5 lines of context
+oxidemerge old.c new.c --patch changes.patch --context 5
+
+# Use a compare rules file
+oxidemerge --cli -r build1 build2 --rules "Build logs"
+----
+
+=== Git integration
+
+Use OxideMerge as the diff and merge tool for Git:
+
+[source,sh]
+----
+git config --global diff.tool oxidemerge
+git config --global difftool.oxidemerge.cmd 'oxidemerge "$LOCAL" "$REMOTE"'
+git config --global merge.tool oxidemerge
+git config --global mergetool.oxidemerge.cmd \
+  'oxidemerge "$LOCAL" "$BASE" "$REMOTE" -o "$MERGED" --dl Local --dr Remote --wl --wr'
+git config --global mergetool.oxidemerge.trustExitCode false
+----
+
+* `git difftool` opens each changed file.
+  `git difftool --dir-diff` opens one folder compare of all of them, and kbd:[Alt+Down] past the
+  last difference moves on to the next changed file.
+* `git mergetool` opens a 3-way merge with the common ancestor in the middle.
+  Auto merge, or copy differences into the middle, then save: the middle is written to the merged
+  file, never to the base.
+  Closing without saving leaves the conflict unresolved.
+* On macOS, use the full path `/Applications/OxideMerge.app/Contents/MacOS/oxidemerge`, unless you
+  linked it into your `PATH`.
+  On Windows, use the path of `oxidemerge.exe`.
+
+[[file-manager]]
+== File manager integration
+
+The *Tools* menu, or `oxidemerge --register-shell`, adds OxideMerge to the file manager:
+
+Windows:: *Tools → Add to Explorer context menu* adds an *OxideMerge* submenu for files, folders,
+drives and folder backgrounds.
+On Windows 11 it is under *Show more options*.
+macOS:: *Tools → Add Finder Quick Actions* adds *OxideMerge: Compare*, *OxideMerge: Select Left*
+and *OxideMerge: Select Middle* to the Quick Actions and Services menus of Finder.
+Linux:: *Tools → Add to file manager context menu* adds the same entries to Nautilus, Nemo and
+Dolphin.
+
+The entries work like this:
+
+* *Compare* compares the two or three selected files or folders.
+  With one item selected, it compares the item with the side chosen earlier, or opens the
+  *Select files or folders* dialog with the item filled in.
+* *Select Left* and *Select Middle* remember an item, for example in another folder.
+  *Compare* then reads *Compare to "name"*.
+* *Compare as* (Windows, files only) compares as text, binary, image or web page.
+
+The entries point at the program you added them from.
+Add them again after moving the program.
+The same menu item removes them.
+
+[[configuration]]
+== Configuration
+
+The options are stored as JSON in the configuration folder:
+
+[cols="1,3"]
+|===
+|System |Settings file
+
+|Windows |`%APPDATA%\OxideMerge\config.json`
+|macOS |`~/Library/Application Support/OxideMerge/config.json`
+|Linux |`~/.config/OxideMerge/config.json`
+|===
+
+*Help & Shortcuts* shows where the settings file is.
+
+The configuration folder also holds:
+
+* `Rules`: the compare rules files;
+* `Filters`: WinMerge `.flt` filter files;
+* `Languages`: extra or changed language packs.
+
+Portable use:: Create an empty `oxidemerge.json` next to the program.
+OxideMerge then keeps its options in that file.
+
+Languages:: To add or change a language, copy `lang/en.json` from the source code to
+`<code>.json`, translate the values, keeping every `{placeholder}` as it is, and put the file in a
+`Languages` folder next to the program or in the configuration folder.
+
+== Troubleshooting and limitations
+
+A web page compare says that no browser was found::
+Screenshot mode needs Edge, Chrome, Chromium or Brave.
+Set the browser under *Options → Image / Binary / Web*.
+
+A side can't be edited::
+It is read-only: the lock in its header is closed, it was opened with `--wl`, `--wm` or `--wr`,
+it was extracted from an archive, or it is JSON or XML shown formatted.
+Turn off *Format JSON and XML before comparing* to edit and merge those files.
+
+A file was not saved because of its encoding::
+The encoding of the file can't hold some of the characters you added.
+Undo the change that added them, or choose another encoding in the side header.
+
+macOS refuses to open the app::
+Control-click it and choose *Open*, or allow it in *System Settings → Privacy & Security*.
+
+Known limitations::
+* Archive support covers zip-based formats, tar (plain, gzip, bzip2 and xz) and 7z; rar is not
+  supported.
+* Text editing is line based; OxideMerge is not a full code editor.
+* Unpacker plugins are external commands, not WinMerge plugin DLLs or scripts.
+* Web page compare doesn't support cookies or logins.
