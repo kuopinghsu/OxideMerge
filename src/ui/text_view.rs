@@ -6,10 +6,12 @@ use crate::core::diff::{self, BlockKind, DiffOptions, DiffResult, InlineMode};
 use crate::core::patch::{self, PatchStyle};
 use crate::core::prettify;
 use crate::core::report::side_name;
+use crate::core::rules::{self, RuleDraft, RuleKind, RuleSet};
 use crate::core::saved::{SavedCompare, SavedPane};
 use crate::core::table;
 use crate::core::text::{self, Eol, TextDoc, TextEncoding, COMMON_ENCODINGS};
 use crate::i18n::{tr, trf};
+use crate::ui::commands::Cmd;
 use crate::ui::icons;
 use crate::ui::syntax::{self, LineSpans};
 use crate::ui::theme::{self, Colors};
@@ -246,13 +248,6 @@ pub fn redirect_output(docs: &mut [TextDoc], out: &std::path::Path) {
     d.read_only = false;
 }
 
-/// Opens the find bar with the replace field.
-pub const REPLACE_KEY: &str = if cfg!(target_os = "macos") {
-    "Ctrl+Alt+F"
-} else {
-    "Ctrl+H"
-};
-
 /// Unchanged lines kept visible around each difference when folding.
 const FOLD_CONTEXT: usize = 3;
 /// Shorter unchanged runs are not worth folding.
@@ -359,6 +354,7 @@ enum MenuAction {
     ToggleBookmark(usize, usize),
     EditNote(usize, usize),
     TakeBoth(usize, bool),
+    AddRule(RuleKind, usize, usize),
 }
 
 /// A bookmark comment being edited: pane, line, text, and whether the field needs focus.
@@ -415,6 +411,14 @@ pub struct TextView {
     /// Whether edited lines are marked, so they are only worked out when shown.
     edit_markers: bool,
     tab_size: usize,
+    /// Compare rules file of this compare (a name or path, "" = none); `None` follows the
+    /// options.
+    pub rules: Option<String>,
+    rule_set: Option<RuleSet>,
+    /// A rule to add, picked from the context menu, until the app takes it.
+    pub rule_request: Option<RuleDraft>,
+    /// Whether the HTML report was asked for from the toolbar, until the app takes it.
+    pub export_request: bool,
     id: egui::Id,
 }
 
@@ -464,6 +468,10 @@ impl TextView {
             keys_enabled: true,
             edit_markers: cfg.show_edit_markers,
             tab_size: cfg.tab_size,
+            rules: None,
+            rule_set: None,
+            rule_request: None,
+            export_request: false,
             id: egui::Id::new(("textview", std::time::Instant::now())),
         };
         v.apply_prettify();
@@ -499,8 +507,90 @@ impl TextView {
         names.join(" ↔ ")
     }
 
+    /// Whether there are unsaved changes, counting a line still being typed.
     pub fn is_modified(&self) -> bool {
         self.panes.iter().any(|p| p.doc.modified)
+            || self.edit.as_ref().is_some_and(|e| {
+                let line = self.diff.rows.get(e.row).and_then(|r| r.line[e.pane]);
+                match line {
+                    Some(l) => self.panes[e.pane].doc.lines[l] != e.text,
+                    None => !e.text.is_empty(),
+                }
+            })
+    }
+
+    /// Takes in a line still being typed, as if it had been left.
+    pub fn commit_pending_edit(&mut self) {
+        if let Some(e) = self.edit.take() {
+            self.commit_edit(e);
+        }
+    }
+
+    /// Uses the compare rules file `rules` ("" = none, `None` = the one of the options).
+    pub fn set_rules(&mut self, rules: Option<String>) {
+        self.rules = rules;
+        self.reload_rules();
+    }
+
+    /// Reads the compare rules file again.
+    pub fn reload_rules(&mut self) {
+        self.rule_set = self.rules.as_deref().and_then(rules::find);
+    }
+
+    /// The options to compare with: `base` with this compare's rules, when it has its own.
+    pub fn options_for(&self, base: &DiffOptions) -> Option<DiffOptions> {
+        self.rules
+            .as_ref()
+            .map(|_| rules::options_with(base, self.rule_set.as_ref()))
+    }
+
+    /// A rule of `kind` taken from the line at row `r` of pane `p`, or from the selected lines.
+    fn rule_draft(&self, kind: RuleKind, r: usize, p: usize) -> RuleDraft {
+        let line = |row: usize, pane: usize| {
+            let l = self.diff.rows.get(row)?.line[pane]?;
+            self.panes[pane].doc.lines.get(l).map(String::as_str)
+        };
+        let text = line(r, p)
+            .or_else(|| (0..self.n()).find_map(|q| line(r, q)))
+            .unwrap_or("");
+        // The line on every side of a row, so a pattern built from it matches all of them.
+        let sides = |row: usize| -> Option<String> {
+            let mut all: Vec<&str> = line(row, p).into_iter().collect();
+            all.extend(
+                (0..self.n())
+                    .filter(|&q| q != p)
+                    .filter_map(|q| line(row, q)),
+            );
+            (!all.is_empty()).then(|| rules::lines_pattern(&all))
+        };
+        let (a, b) = match kind {
+            RuleKind::IgnoreLine => (
+                sides(r).unwrap_or_else(|| rules::line_pattern(text)),
+                String::new(),
+            ),
+            RuleKind::Substitute => {
+                let other = (0..self.n())
+                    .filter(|&q| q != p)
+                    .find_map(|q| line(r, q).filter(|o| *o != text))
+                    .unwrap_or(text);
+                let s = rules::substitution_for(text, other);
+                (s.find, s.replace)
+            }
+            RuleKind::IgnoreBlock => {
+                let (r0, r1) = self
+                    .selection()
+                    .filter(|&(a, b)| (a..=b).contains(&r))
+                    .unwrap_or((r, r));
+                let first = (r0..=r1).find_map(|row| line(row, p).and(sides(row)));
+                let last = (r0..=r1).rev().find_map(|row| line(row, p).and(sides(row)));
+                let end = match (r1 > r0, last) {
+                    (true, Some(l)) => l,
+                    _ => String::new(),
+                };
+                (first.unwrap_or_else(|| rules::line_pattern(text)), end)
+            }
+        };
+        RuleDraft { kind, a, b }
     }
 
     pub fn set_options(&mut self, opts: &DiffOptions) {
@@ -1237,6 +1327,7 @@ impl TextView {
     // ---------- files ----------
 
     pub fn save_pane(&mut self, p: usize) -> anyhow::Result<bool> {
+        self.commit_pending_edit();
         let doc = &mut self.panes[p].doc;
         if doc.read_only {
             anyhow::bail!("{}", tr("msg.readonly"));
@@ -1266,9 +1357,15 @@ impl TextView {
     /// Reacts to files changed by another program: unmodified panes are reloaded, and panes with
     /// unsaved edits are listed in a warning bar.
     pub fn check_disk(&mut self) {
+        let times: Vec<_> = self.panes.iter().map(|p| disk_time(&p.doc)).collect();
+        let changed = |(p, now): (&Pane, &Option<SystemTime>)| now.is_some() && *now != p.disk_time;
+        if !self.panes.iter().zip(&times).any(changed) {
+            return;
+        }
+        // A line still being typed is an edit of its file, which is then not reloaded.
+        self.commit_pending_edit();
         let mut reload = Vec::new();
-        for (i, p) in self.panes.iter_mut().enumerate() {
-            let now = disk_time(&p.doc);
+        for (i, (p, now)) in self.panes.iter_mut().zip(times).enumerate() {
             if now.is_none() || now == p.disk_time {
                 continue;
             }
@@ -1313,6 +1410,7 @@ impl TextView {
     }
 
     pub fn save_pane_as(&mut self, p: usize) -> anyhow::Result<bool> {
+        self.commit_pending_edit();
         let mut dlg = rfd::FileDialog::new().set_title(tr("dlg.save_as"));
         if let Some(path) = &self.panes[p].doc.path {
             if let Some(dir) = path.parent() {
@@ -1336,6 +1434,7 @@ impl TextView {
     }
 
     pub fn save_modified(&mut self) -> anyhow::Result<()> {
+        self.commit_pending_edit();
         for p in 0..self.n() {
             if self.panes[p].doc.modified {
                 self.save_pane(p)?;
@@ -1363,8 +1462,14 @@ impl TextView {
         }
     }
 
-    /// Reloads unmodified files from disk and recomputes the differences.
+    /// Reloads unmodified files and the compare rules file from disk and recomputes the
+    /// differences.
     pub fn refresh(&mut self) {
+        self.commit_pending_edit();
+        self.reload_rules();
+        if let Some(o) = self.options_for(&self.opts) {
+            self.opts = o;
+        }
         for p in &mut self.panes {
             if p.doc.modified || p.doc.description.is_some() {
                 continue;
@@ -1409,11 +1514,31 @@ impl TextView {
         Some(patch::make_patch(&input, &self.diff, style, context))
     }
 
-    /// Side-by-side HTML report of the compare as currently shown.
-    pub fn html_report(&self) -> String {
-        let titles: Vec<String> = self.panes.iter().map(|p| p.doc.title()).collect();
-        let refs: Vec<&[String]> = self.panes.iter().map(|p| p.doc.lines.as_slice()).collect();
-        crate::core::report::text_html(&titles, &refs, &self.diff, &self.opts, &self.bookmarks)
+    /// The title of every side.
+    pub fn titles(&self) -> Vec<String> {
+        self.panes.iter().map(|p| p.doc.title()).collect()
+    }
+
+    /// Makes the HTML report of the compare as it is now, on any thread; `default_rules` is the
+    /// compare rules file of the options, used when the compare has none of its own. A rules
+    /// file that could not be read is not named: the compare runs without it.
+    pub fn html_report_job(&self, default_rules: &str) -> crate::core::report::ReportJob {
+        let titles = self.titles();
+        let lines: Vec<Vec<String>> = self.panes.iter().map(|p| p.doc.lines.clone()).collect();
+        let found = match &self.rules {
+            Some(_) => self.rule_set.is_some(),
+            None => rules::find(default_rules).is_some(),
+        };
+        let rules = match &self.rules {
+            Some(r) if found => r.clone(),
+            None if found => default_rules.to_string(),
+            _ => String::new(),
+        };
+        let (diff, opts, notes) = (self.diff.clone(), self.opts.clone(), self.bookmarks.clone());
+        Box::new(move || {
+            let refs: Vec<&[String]> = lines.iter().map(Vec::as_slice).collect();
+            crate::core::report::text_html(&titles, &refs, &diff, &opts, &notes, &rules)
+        })
     }
 
     /// The compare with its bookmarks, to save as one file.
@@ -1953,13 +2078,13 @@ impl TextView {
     fn toolbar(&mut self, ui: &mut Ui) {
         widgets::toolbar(ui, |ui| {
             let pal = widgets::pal(ui);
-            let key = widgets::with_key;
-            if widgets::icon_button(ui, Icon::First, &key(tr("cmd.first_diff"), "Alt+Home"))
+            if widgets::icon_button(ui, Icon::First, &Cmd::FirstDiff.tip_if(self.keys_enabled))
                 .clicked()
             {
                 self.first_diff();
             }
-            if widgets::icon_button(ui, Icon::Prev, &key(tr("cmd.prev_diff"), "Alt+↑")).clicked()
+            if widgets::icon_button(ui, Icon::Prev, &Cmd::PrevDiff.tip_if(self.keys_enabled))
+                .clicked()
                 && !self.prev_diff(false)
             {
                 self.step_file = Some(false);
@@ -1979,31 +2104,41 @@ impl TextView {
                         &[("add", add.to_string()), ("del", del.to_string())],
                     ));
             }
-            if widgets::icon_button(ui, Icon::Next, &key(tr("cmd.next_diff"), "Alt+↓")).clicked()
+            if widgets::icon_button(ui, Icon::Next, &Cmd::NextDiff.tip_if(self.keys_enabled))
+                .clicked()
                 && !self.next_diff(false)
             {
                 self.step_file = Some(true);
             }
-            if widgets::icon_button(ui, Icon::Last, &key(tr("cmd.last_diff"), "Alt+End")).clicked()
+            if widgets::icon_button(ui, Icon::Last, &Cmd::LastDiff.tip_if(self.keys_enabled))
+                .clicked()
             {
                 self.last_diff();
             }
             widgets::toolbar_sep(ui);
             if self.n() == 2 {
-                if widgets::icon_button(ui, Icon::CopyRight, &key(tr("cmd.copy_right"), "Alt+→"))
-                    .clicked()
+                if widgets::icon_button(
+                    ui,
+                    Icon::CopyRight,
+                    &Cmd::CopyRight.tip_if(self.keys_enabled),
+                )
+                .clicked()
                 {
                     self.copy_current(true);
                 }
-                if widgets::icon_button(ui, Icon::CopyLeft, &key(tr("cmd.copy_left"), "Alt+←"))
-                    .clicked()
+                if widgets::icon_button(
+                    ui,
+                    Icon::CopyLeft,
+                    &Cmd::CopyLeft.tip_if(self.keys_enabled),
+                )
+                .clicked()
                 {
                     self.copy_current(false);
                 }
                 if widgets::icon_button(
                     ui,
                     Icon::CopyAllRight,
-                    &key(tr("cmd.copy_all_right"), "Ctrl+Alt+→"),
+                    &Cmd::CopyAllRight.tip_if(self.keys_enabled),
                 )
                 .clicked()
                 {
@@ -2012,7 +2147,7 @@ impl TextView {
                 if widgets::icon_button(
                     ui,
                     Icon::CopyAllLeft,
-                    &key(tr("cmd.copy_all_left"), "Ctrl+Alt+←"),
+                    &Cmd::CopyAllLeft.tip_if(self.keys_enabled),
                 )
                 .clicked()
                 {
@@ -2022,7 +2157,7 @@ impl TextView {
                 if widgets::icon_button(
                     ui,
                     Icon::PrevConflict,
-                    &key(tr("cmd.prev_conflict"), "Alt+PgUp"),
+                    &Cmd::PrevConflict.tip_if(self.keys_enabled),
                 )
                 .clicked()
                 {
@@ -2031,7 +2166,7 @@ impl TextView {
                 if widgets::icon_button(
                     ui,
                     Icon::NextConflict,
-                    &key(tr("cmd.next_conflict"), "Alt+PgDn"),
+                    &Cmd::NextConflict.tip_if(self.keys_enabled),
                 )
                 .clicked()
                 {
@@ -2067,7 +2202,7 @@ impl TextView {
                 ui,
                 self.can_undo(),
                 Icon::Undo,
-                &key(tr("cmd.undo"), "Ctrl+Z"),
+                &Cmd::Undo.tip_if(self.keys_enabled),
             )
             .clicked()
             {
@@ -2077,7 +2212,7 @@ impl TextView {
                 ui,
                 self.can_redo(),
                 Icon::Redo,
-                &key(tr("cmd.redo"), "Ctrl+Y"),
+                &Cmd::Redo.tip_if(self.keys_enabled),
             )
             .clicked()
             {
@@ -2090,7 +2225,7 @@ impl TextView {
                 &mut find_open,
                 Some(Icon::Search),
                 "",
-                &key(tr("cmd.find"), "Ctrl+F"),
+                &Cmd::Find.tip_if(self.keys_enabled),
             )
             .clicked()
             {
@@ -2106,7 +2241,7 @@ impl TextView {
                 &mut collapse,
                 Some(Icon::Fold),
                 "",
-                &key(tr("cmd.collapse_unchanged"), "Alt+C"),
+                &Cmd::ToggleCollapse.tip_if(self.keys_enabled),
             )
             .clicked()
             {
@@ -2118,7 +2253,7 @@ impl TextView {
                     &mut self.wrap,
                     Some(Icon::Wrap),
                     "",
-                    &key(tr("cmd.word_wrap"), "Alt+Z"),
+                    &Cmd::ToggleWrap.tip_if(self.keys_enabled),
                 );
             });
             if self.table_delim.is_some() {
@@ -2129,6 +2264,14 @@ impl TextView {
                     tr("cmd.table_mode"),
                     tr("cmd.table_mode"),
                 );
+            }
+            widgets::toolbar_sep(ui);
+            let tip = Cmd::ExportHtml.tip_if(self.keys_enabled);
+            if widgets::ghost_icon_button(ui, Icon::Export, tr("btn.export_html"))
+                .on_hover_text(tip)
+                .clicked()
+            {
+                self.export_request = true;
             }
         });
     }
@@ -2205,18 +2348,21 @@ impl TextView {
             widgets::toggle_button(ui, &mut self.find.whole_word, "ab", tr("label.whole_word"));
             widgets::toggle_button(ui, &mut self.find.regex, ".*", tr("label.regex"));
             let key = widgets::with_key;
-            if widgets::icon_button(ui, Icon::Prev, &key(tr("cmd.find_prev"), "Shift+F3")).clicked()
+            if widgets::icon_button(ui, Icon::Prev, &Cmd::FindPrev.tip_if(self.keys_enabled))
+                .clicked()
             {
                 self.find_next(false);
             }
-            if widgets::icon_button(ui, Icon::Next, &key(tr("cmd.find_next"), "F3")).clicked() {
+            if widgets::icon_button(ui, Icon::Next, &Cmd::FindNext.tip_if(self.keys_enabled))
+                .clicked()
+            {
                 self.find_next(true);
             }
             widgets::toggle_button(
                 ui,
                 &mut self.find.show_replace,
                 tr("cmd.replace"),
-                &key(tr("cmd.replace"), REPLACE_KEY),
+                &Cmd::Replace.tip_if(self.keys_enabled),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if widgets::icon_button(ui, Icon::Close, &key(tr("btn.close"), "Esc")).clicked() {
@@ -2541,7 +2687,7 @@ impl TextView {
 
     fn handle_keys(&mut self, ui: &Ui) {
         if !self.keys_enabled
-            || ui.ctx().wants_keyboard_input()
+            || widgets::typing(ui.ctx())
             || self.edit.is_some()
             || self.goto.is_some()
             || widgets::modal_open(ui.ctx())
@@ -3443,6 +3589,13 @@ impl TextView {
                 if ui.button(tr("cmd.bookmark_comment")).clicked() {
                     action = Some(MenuAction::EditNote(r, p));
                 }
+                ui.menu_button(tr("cmd.add_rule"), |ui| {
+                    for kind in RuleKind::ALL {
+                        if ui.button(tr(kind.key())).clicked() {
+                            action = Some(MenuAction::AddRule(kind, r, p));
+                        }
+                    }
+                });
                 if n == 3 {
                     if let Some(b) = block.filter(|_| !self.panes[1].doc.read_only) {
                         ui.separator();
@@ -3489,6 +3642,9 @@ impl TextView {
                 MenuAction::ToggleBookmark(r, p) => self.toggle_bookmark_at(r, p),
                 MenuAction::EditNote(r, p) => self.edit_note_at(r, p),
                 MenuAction::TakeBoth(b, left_first) => self.take_both_at(b, left_first),
+                MenuAction::AddRule(kind, r, p) => {
+                    self.rule_request = Some(self.rule_draft(kind, r, p));
+                }
             }
         }
 

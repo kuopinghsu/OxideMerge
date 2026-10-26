@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::core::binary;
 use crate::i18n::{tr, trf};
+use crate::ui::commands::Cmd;
 use crate::ui::theme::Colors;
 use crate::ui::widgets::{self, Icon, Mark, Outcome};
 use egui::text::LayoutJob;
@@ -332,12 +333,10 @@ impl BinaryView {
         widgets::toolbar(ui, |ui| {
             let pal = widgets::pal(ui);
             let key = widgets::with_key;
-            if widgets::icon_button(ui, Icon::First, &key(tr("cmd.first_diff"), "Alt+Home"))
-                .clicked()
-            {
+            if widgets::icon_button(ui, Icon::First, &Cmd::FirstDiff.tip()).clicked() {
                 self.first_diff();
             }
-            if widgets::icon_button(ui, Icon::Prev, &key(tr("cmd.prev_diff"), "Alt+↑")).clicked()
+            if widgets::icon_button(ui, Icon::Prev, &Cmd::PrevDiff.tip()).clicked()
                 && !self.prev_diff()
             {
                 self.step_file = Some(false);
@@ -347,53 +346,42 @@ impl BinaryView {
                 None => format!("– / {}", self.diffs.len()),
             };
             widgets::chip(ui, &counter, pal.text, pal.control);
-            if widgets::icon_button(ui, Icon::Next, &key(tr("cmd.next_diff"), "Alt+↓")).clicked()
+            if widgets::icon_button(ui, Icon::Next, &Cmd::NextDiff.tip()).clicked()
                 && !self.next_diff()
             {
                 self.step_file = Some(true);
             }
-            if widgets::icon_button(ui, Icon::Last, &key(tr("cmd.last_diff"), "Alt+End")).clicked()
-            {
+            if widgets::icon_button(ui, Icon::Last, &Cmd::LastDiff.tip()).clicked() {
                 self.last_diff();
             }
             widgets::toolbar_sep(ui);
-            if widgets::icon_button(ui, Icon::CopyRight, &key(tr("cmd.copy_right"), "Alt+→"))
-                .clicked()
-            {
+            if widgets::icon_button(ui, Icon::CopyRight, &Cmd::CopyRight.tip()).clicked() {
                 self.copy_current(true);
             }
-            if widgets::icon_button(ui, Icon::CopyLeft, &key(tr("cmd.copy_left"), "Alt+←"))
-                .clicked()
-            {
+            if widgets::icon_button(ui, Icon::CopyLeft, &Cmd::CopyLeft.tip()).clicked() {
                 self.copy_current(false);
             }
             widgets::toolbar_sep(ui);
-            if widgets::icon_button_enabled(
-                ui,
-                !self.undo.is_empty(),
-                Icon::Undo,
-                &key(tr("cmd.undo"), "Ctrl+Z"),
-            )
-            .clicked()
+            if widgets::icon_button_enabled(ui, !self.undo.is_empty(), Icon::Undo, &Cmd::Undo.tip())
+                .clicked()
             {
                 self.undo();
             }
-            if widgets::icon_button_enabled(
-                ui,
-                !self.redo.is_empty(),
-                Icon::Redo,
-                &key(tr("cmd.redo"), "Ctrl+Y"),
-            )
-            .clicked()
+            if widgets::icon_button_enabled(ui, !self.redo.is_empty(), Icon::Redo, &Cmd::Redo.tip())
+                .clicked()
             {
                 self.redo();
             }
             widgets::toolbar_sep(ui);
-            if widgets::icon_button(ui, Icon::Search, &key(tr("cmd.find"), "Ctrl+F")).clicked() {
+            if widgets::icon_button(ui, Icon::Search, &Cmd::Find.tip()).clicked() {
                 self.open_find();
             }
-            if widgets::icon_button(ui, Icon::Method, &key(tr("cmd.goto_offset"), "Ctrl+G"))
-                .clicked()
+            if widgets::icon_button(
+                ui,
+                Icon::Method,
+                &key(tr("cmd.goto_offset"), Cmd::GotoLine.key()),
+            )
+            .clicked()
             {
                 self.goto = Some(String::new());
             }
@@ -664,11 +652,10 @@ impl BinaryView {
                 self.hit = None;
             }
             let key = widgets::with_key;
-            if widgets::icon_button(ui, Icon::Prev, &key(tr("cmd.find_prev"), "Shift+F3")).clicked()
-            {
+            if widgets::icon_button(ui, Icon::Prev, &Cmd::FindPrev.tip()).clicked() {
                 self.find_next(false);
             }
-            if widgets::icon_button(ui, Icon::Next, &key(tr("cmd.find_next"), "F3")).clicked() {
+            if widgets::icon_button(ui, Icon::Next, &Cmd::FindNext.tip()).clicked() {
                 self.find_next(true);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

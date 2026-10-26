@@ -25,6 +25,9 @@ pub struct Project {
     pub recursive: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<CompareMethod>,
+    /// Compare rules file (a name or path, "" = none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<String>,
 }
 
 pub fn is_project(path: &Path) -> bool {
@@ -170,6 +173,7 @@ mod tests {
             filter: Some("*.rs".into()),
             recursive: Some(true),
             method: Some(CompareMethod::Size),
+            rules: Some("Logs".into()),
             ..Default::default()
         };
         p.save(&file).unwrap();

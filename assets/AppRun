@@ -12,13 +12,22 @@
 here=$(dirname "$(readlink -f "$0")")
 
 tab=$(printf '\t')
+# The ABI the image was built for, written when it was packaged: under
+# emulation, uname tells the machine's, not the program's.
+abi=$(cat "$here/usr/share/oxidemerge/abi" 2>/dev/null)
+if [ -z "$abi" ]; then
+    case $(uname -m) in
+        aarch64) abi=AArch64 ;;
+        *) abi=x86-64 ;;
+    esac
+fi
 installed=$({ /sbin/ldconfig -p || ldconfig -p; } 2>/dev/null)
 bundled=
 for dir in "$here"/usr/lib/oxidemerge/*/; do
     dir=${dir%/}
     name=${dir##*/}
     case $installed in
-        *"$tab$name (libc6,x86-64"*) ;;
+        *"$tab$name (libc6,$abi"*) ;;
         *) bundled=$bundled${bundled:+:}$dir ;;
     esac
 done

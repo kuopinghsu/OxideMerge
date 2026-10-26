@@ -13,14 +13,17 @@ VERSION := $(lastword $(subst @, ,$(subst $(HASH), ,$(shell $(CARGO) pkgid))))
 ifeq ($(OS),Windows_NT)
   EXE      := .exe
   PLATFORM := windows
+  # AMD64 or ARM64, named as the CI packages name them.
+  MACHINE  := $(subst AMD64,x64,$(subst ARM64,arm64,$(PROCESSOR_ARCHITECTURE)))
 else
   EXE      :=
   PLATFORM := $(shell uname -s | tr A-Z a-z)
+  MACHINE  := $(shell uname -m)
 endif
 
 TARGET_DIR  := $(if $(CARGO_TARGET_DIR),$(subst \,/,$(CARGO_TARGET_DIR)),target)
 RELEASE_BIN := $(TARGET_DIR)/release/$(BIN)$(EXE)
-DIST_NAME   := $(BIN)-$(VERSION)-$(PLATFORM)
+DIST_NAME   := $(BIN)-$(VERSION)-$(PLATFORM)-$(MACHINE)
 DIST_DIR    := dist/$(DIST_NAME)
 
 .DEFAULT_GOAL := all
@@ -52,7 +55,7 @@ help:
 	@echo '  shell-unregister  Remove the file manager entries'
 	@echo '  languages         List the available UI languages'
 	@echo '  dist              Release build packaged into dist/$(DIST_NAME)'
-	@echo '  appimage          Linux x86_64 AppImage in dist/'
+	@echo '  appimage          Linux AppImage (x86_64 or aarch64) in dist/'
 	@echo '  clean             Remove build output and dist/'
 
 all: release
@@ -111,12 +114,15 @@ install:
 uninstall:
 	$(CARGO) uninstall $(BIN)
 
-# The context menu points at the binary that registers it, so use the installed one.
+# The context menu points at the binary that registers it, so use the installed one,
+# where `cargo install` put it, whatever is first on the PATH.
+INSTALLED := $(subst \,/,$(or $(CARGO_INSTALL_ROOT),$(CARGO_HOME),$(or $(HOME),$(USERPROFILE))/.cargo))/bin/$(BIN)$(EXE)
+
 shell-register: install
-	$(BIN)$(EXE) --register-shell
+	"$(INSTALLED)" --register-shell
 
 shell-unregister:
-	$(BIN)$(EXE) --unregister-shell
+	"$(INSTALLED)" --unregister-shell
 
 languages: build
 	$(CARGO) run -- --list-languages
@@ -132,12 +138,12 @@ else
 	@echo Created $(DIST_DIR).tar.gz
 endif
 
-# Same AppDir as the CI AppImage job. Linux x86_64 only.
+# Same AppDir as the CI AppImage job. Linux x86_64 or aarch64 only.
 appimage: release
 ifeq ($(PLATFORM),linux)
 	VERSION='$(VERSION)' bash scripts/package-appimage.sh
 else
-	@echo AppImage packages are built on Linux x86_64 >&2
+	@echo AppImage packages are built on Linux x86_64 or aarch64 >&2
 	@exit 1
 endif
 

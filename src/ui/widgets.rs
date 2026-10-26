@@ -38,12 +38,49 @@ const ICON_SIZE: f32 = 16.0;
 /// Formats a tooltip with the keyboard shortcut that does the same thing, written like the
 /// Help & Shortcuts dialog writes it.
 pub fn with_key(tip: &str, key: &str) -> String {
-    let key = if cfg!(target_os = "macos") {
-        key.replace("Ctrl+", "⌘")
+    format!("{tip}  ({})", key_text(key))
+}
+
+/// A shortcut written like "Ctrl+Shift+S", as this platform shows it. Ctrl stands for Command on
+/// macOS, which writes modifiers as symbols in its own order: ⇧⌘S. "Control+" is the Control key
+/// on every platform.
+pub fn key_text(keys: &str) -> String {
+    if cfg!(target_os = "macos") {
+        mac_keys(keys)
     } else {
-        key.to_string()
-    };
-    format!("{tip}  ({key})")
+        keys.replace("Control+", "Ctrl+")
+    }
+}
+
+fn mac_keys(keys: &str) -> String {
+    let mut rest = keys;
+    let mut held = [false; 4];
+    'strip: loop {
+        for (i, prefix) in ["Control+", "Alt+", "Shift+", "Ctrl+"]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(r) = rest.strip_prefix(prefix).filter(|r| !r.is_empty()) {
+                held[i] = true;
+                rest = r;
+                continue 'strip;
+            }
+        }
+        break;
+    }
+    let mut out: String = ['⌃', '⌥', '⇧', '⌘']
+        .into_iter()
+        .zip(held)
+        .filter_map(|(symbol, on)| on.then_some(symbol))
+        .collect();
+    out.push_str(rest);
+    out
+}
+
+/// Whether a text field has keyboard focus, so keys type rather than run commands.
+pub fn typing(ctx: &egui::Context) -> bool {
+    ctx.memory(|m| m.focused())
+        .is_some_and(|id| egui::text_edit::TextEditState::load(ctx, id).is_some())
 }
 
 /// Accent outline around a widget that has keyboard focus (focus only moves with Tab).
@@ -816,4 +853,20 @@ pub fn caption(ui: &mut Ui, text: &str) {
             .font(theme::semibold(12.5))
             .color(p.text_dim),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mac_shortcuts_use_symbols_in_mac_order() {
+        assert_eq!(mac_keys("Ctrl+Shift+S"), "⇧⌘S");
+        assert_eq!(mac_keys("Ctrl+Alt+→"), "⌥⌘→");
+        assert_eq!(mac_keys("Ctrl++"), "⌘+");
+        assert_eq!(mac_keys("Shift+F3"), "⇧F3");
+        assert_eq!(mac_keys("F5"), "F5");
+        assert_eq!(mac_keys("Shift+↑ ↓"), "⇧↑ ↓");
+        assert_eq!(mac_keys("Control+Shift+Tab"), "⌃⇧Tab");
+    }
 }

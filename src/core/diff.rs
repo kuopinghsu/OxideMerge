@@ -929,7 +929,9 @@ pub fn inline_diff(a: &str, b: &str, opts: &DiffOptions) -> (Vec<Range<usize>>, 
     let tb = tokenize(b, opts);
     let ka: Vec<&str> = ta.iter().map(|t| t.1.as_str()).collect();
     let kb: Vec<&str> = tb.iter().map(|t| t.1.as_str()).collect();
-    let ops = similar::capture_diff_slices(Algorithm::Myers, &ka, &kb);
+    // Long lines of many tokens could take long; past the deadline the result is coarser.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    let ops = similar::capture_diff_slices_deadline(Algorithm::Myers, &ka, &kb, Some(deadline));
     let mut ra = Vec::new();
     let mut rb = Vec::new();
     for op in ops {

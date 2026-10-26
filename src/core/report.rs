@@ -1,7 +1,7 @@
 //! Folder compare reports (HTML, CSV, plain text), text compare HTML reports and status
 //! descriptions.
 
-use super::diff::{inline_diff, BlockKind, DiffOptions, DiffResult};
+use super::diff::{DiffOptions, DiffResult};
 use super::folder::{CmpStatus, DirItem};
 use crate::i18n::{tr, trf};
 use std::collections::BTreeMap;
@@ -116,7 +116,7 @@ pub fn fmt_size(s: Option<u64>) -> String {
     }
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -124,15 +124,23 @@ fn esc(s: &str) -> String {
 }
 
 fn csv_field(s: &str) -> String {
-    if s.contains([',', '"', '\n']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
+    // Spreadsheets run a cell starting like a formula; a leading ' keeps it text.
+    let formula = s.starts_with(['=', '+', '@', '\t', '\r'])
+        || (s.starts_with('-') && !s[1..].starts_with(|c: char| c.is_ascii_digit()) && s.len() > 1);
+    let s = if formula {
+        format!("'{s}")
     } else {
         s.to_string()
+    };
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s
     }
 }
 
 /// Escapes `line`, marking the byte ranges in `marks` (which must be sorted and on char boundaries).
-fn esc_marked(line: &str, marks: &[std::ops::Range<usize>]) -> String {
+pub(crate) fn esc_marked(line: &str, marks: &[std::ops::Range<usize>]) -> String {
     let mut out = String::new();
     let mut pos = 0;
     for r in marks {
@@ -141,215 +149,143 @@ fn esc_marked(line: &str, marks: &[std::ops::Range<usize>]) -> String {
             continue;
         }
         out.push_str(&esc(&line[pos..start]));
-        let _ = write!(out, "<span class=\"w\">{}</span>", esc(&line[start..end]));
+        let _ = write!(out, "<span class=\"m\">{}</span>", esc(&line[start..end]));
         pos = end;
     }
     out.push_str(&esc(&line[pos..]));
     out
 }
 
-/// Styles of the side-by-side tables written by `text_table`.
-const DIFF_CSS: &str = "table.diff{border-collapse:collapse;width:100%;table-layout:fixed;margin-bottom:1em}\
-     table.diff td,table.diff th{border:none;padding:0 4px;vertical-align:top}\
-     table.diff th{background:#ddd;text-align:left;border:1px solid #bbb}\
-     table.diff td.n{width:4em;color:#888;text-align:right;user-select:none;background:#f4f4f4}\
-     table.diff td.t{font-family:Consolas,Menlo,monospace;white-space:pre-wrap;word-break:break-all}\
-     table.diff .chg{background:#efcbd0}table.diff .conf{background:#ffb3b3}\
-     table.diff .same{background:#fff3b0}table.diff .gap{background:#e4e4e4}\
-     table.diff .ign{background:#ececf8}table.diff .w{background:#e48a96}\
-     table.diff tr.note td{background:#fff8d6;border:1px solid #e6cf6a;padding:2px 6px;font-style:italic}";
-
-/// Side-by-side table of a 2-way or 3-way text compare. `notes` holds, per pane, comments
-/// shown under the line they belong to (it may be shorter than `panes`).
-pub fn text_table(
-    titles: &[String],
-    panes: &[&[String]],
-    result: &DiffResult,
-    opts: &DiffOptions,
-    notes: &[BTreeMap<usize, String>],
-) -> String {
-    let n = panes.len();
-    let mut out = String::from("<table class=\"diff\"><tr>");
-    for (p, t) in titles.iter().enumerate().take(n) {
-        let _ = write!(
-            out,
-            "<th class=\"n\"></th><th>{}: {}</th>",
-            esc(side_name(p, n)),
-            esc(t)
-        );
-    }
-    out.push_str("</tr>\n");
-    for row in &result.rows {
-        let block = row.block.map(|b| &result.blocks[b]);
-        let class = match block {
-            None => "",
-            Some(b) if b.ignored => "ign",
-            Some(b) => match b.kind {
-                BlockKind::Conflict => "conf",
-                BlockKind::BothSame => "same",
-                _ => "chg",
-            },
-        };
-        let inline = |p: usize| -> Vec<std::ops::Range<usize>> {
-            let other = if n == 3 { 1 } else { 1 - p };
-            if class.is_empty() || class == "ign" || (n == 3 && p == 1) {
-                return Vec::new();
-            }
-            match (row.line[p], row.line[other]) {
-                (Some(a), Some(b)) => inline_diff(&panes[p][a], &panes[other][b], opts).0,
-                _ => Vec::new(),
-            }
-        };
-        out.push_str("<tr>");
-        for (p, lines) in panes.iter().enumerate() {
-            match row.line[p] {
-                Some(l) => {
-                    let _ = write!(
-                        out,
-                        "<td class=\"n\">{}</td><td class=\"t {class}\">{}</td>",
-                        l + 1,
-                        esc_marked(&lines[l], &inline(p))
-                    );
-                }
-                None => {
-                    let gap = if class.is_empty() { "" } else { "gap" };
-                    let _ = write!(out, "<td class=\"n\"></td><td class=\"t {gap}\"></td>");
-                }
-            }
-        }
-        out.push_str("</tr>\n");
-        for (p, marks) in notes.iter().enumerate().take(n) {
-            let Some(text) = row.line[p].and_then(|l| marks.get(&l)) else {
-                continue;
-            };
-            if text.trim().is_empty() {
-                continue;
-            }
-            let _ = writeln!(
-                out,
-                "<tr class=\"note\"><td colspan=\"{}\">{} {}: {}</td></tr>",
-                2 * n,
-                esc(side_name(p, n)),
-                row.line[p].map_or(0, |l| l + 1),
-                esc(text)
-            );
-        }
-    }
-    out.push_str("</table>\n");
-    out
-}
-
-/// Side-by-side HTML report of a 2-way or 3-way text compare, with bookmark comments.
+/// Report of a 2-way or 3-way text compare, listing every difference, with bookmark comments
+/// and the compare rules file `rules` ("" = none) used.
 pub fn text_html(
     titles: &[String],
     panes: &[&[String]],
     result: &DiffResult,
     opts: &DiffOptions,
     notes: &[BTreeMap<usize, String>],
+    rules: &str,
 ) -> String {
-    let mut out = String::new();
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    out.push_str("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n");
-    let _ = writeln!(out, "<title>{}</title>", esc(tr("report.text_title")));
-    let _ = writeln!(
-        out,
-        "<style>body{{font-family:Segoe UI,Arial,sans-serif;font-size:13px}}{DIFF_CSS}</style></head><body>"
-    );
-    let _ = writeln!(
-        out,
-        "<h2>{}</h2><p>{}<br>{}</p>",
-        esc(tr("report.text_title")),
-        now,
-        esc(&trf(
-            "report.text_summary",
-            &[("n", result.significant_blocks().to_string())]
-        ))
-    );
-    out.push_str(&text_table(titles, panes, result, opts, notes));
-    out.push_str("</body></html>\n");
-    out
+    super::html_report::text_report(titles, panes, result, opts, notes, rules)
 }
 
-/// Text files larger than this are listed in a folder report without their differences.
-const REPORT_MAX_LINES: usize = 50_000;
-
-/// HTML folder report followed by the side-by-side differences of every changed text file,
-/// including files missing on some side. `roots` are the compared folders and `display` the
-/// names to show for them.
+/// HTML folder report followed by the differences of every changed text file, including files
+/// missing on some side. `roots` are the compared folders and `display` the names to show for
+/// them, and `rules` the compare rules file used ("" = none).
 pub fn folder_html_with_diffs(
     items: &[&DirItem],
     roots: &[PathBuf],
     display: &[PathBuf],
     opts: &DiffOptions,
+    rules: &str,
 ) -> String {
-    let mut out = generate(items, display, ReportFormat::Html);
-    let mut index = String::new();
-    let mut sections = String::new();
-    let changed = items.iter().filter(|it| {
-        !it.is_dir && !it.binary && matches!(it.status, CmpStatus::Different | CmpStatus::Unique)
-    });
-    for (k, it) in changed.enumerate() {
-        let paths: Vec<PathBuf> = roots.iter().map(|r| it.path(r)).collect();
-        let Some(docs) = paths
-            .iter()
-            .zip(&it.exists)
-            .map(|(p, &exists)| match exists {
-                true => super::text::load_doc(p, None).ok(),
-                false => Some(super::text::TextDoc::empty(None)),
-            })
-            .collect::<Option<Vec<_>>>()
-        else {
-            continue;
-        };
-        let rel = it.rel_path();
-        let longest = docs.iter().map(|d| d.lines.len()).max().unwrap_or(0);
-        let mut heading = |sections: &mut String, summary: String| {
-            let _ = writeln!(index, "<li><a href=\"#f{k}\">{}</a></li>", esc(&rel));
-            let _ = writeln!(
-                sections,
-                "<h3 id=\"f{k}\">{}</h3><p>{}</p>",
-                esc(&rel),
-                esc(&summary)
-            );
-        };
-        if longest > REPORT_MAX_LINES {
-            heading(
-                &mut sections,
-                trf("report.too_long", &[("n", longest.to_string())]),
-            );
+    super::html_report::folder_report(items, roots, display, Some(opts), rules)
+}
+
+/// Makes a report; it may run on another thread.
+pub type ReportJob = Box<dyn FnOnce() -> String + Send>;
+
+/// A file name for the HTML report of a compare of `names` (paths or titles of the sides).
+pub fn html_file_name(names: &[String]) -> String {
+    let mut parts: Vec<String> = names
+        .iter()
+        .map(|n| {
+            let t = n.trim().trim_end_matches(['/', '\\']);
+            std::path::Path::new(t)
+                .file_name()
+                .map_or_else(|| t.to_string(), |f| f.to_string_lossy().into_owned())
+        })
+        .filter(|n| !n.is_empty())
+        .collect();
+    parts.dedup();
+    let stem = match parts.as_slice() {
+        [] => "report".to_string(),
+        [one] => format!("{one} compare"),
+        all => short_versus(all),
+    };
+    // File names are limited to 255 bytes.
+    let mut bytes = 0;
+    let stem: String = stem
+        .chars()
+        .take(80)
+        .take_while(|c| {
+            bytes += c.len_utf8();
+            bytes <= 200
+        })
+        .collect();
+    format!("{}.html", no_spaces(&super::rules::file_name(&stem)))
+}
+
+/// `s` with each run of white space written as `_`, or left out next to a `-` or `_`.
+fn no_spaces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            space = true;
             continue;
         }
-        let lines: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
-        let result = super::diff::compute_with(&lines, opts, super::comments::for_path(&paths[0]));
-        if result.is_identical() {
-            continue;
+        if space && !out.is_empty() && !matches!(c, '-' | '_') && !out.ends_with(['-', '_']) {
+            out.push('_');
         }
-        let titles: Vec<String> = display
-            .iter()
-            .map(|d| format!("{}/{rel}", d.display()))
-            .collect();
-        heading(
-            &mut sections,
-            trf(
-                "report.text_summary",
-                &[("n", result.significant_blocks().to_string())],
-            ),
-        );
-        sections.push_str(&text_table(&titles, &lines, &result, opts, &[]));
+        space = false;
+        out.push(c);
     }
-    if sections.is_empty() {
-        return out;
-    }
-    let body_end = out.rfind("</body>").unwrap_or(out.len());
-    let extra = format!(
-        "<style>{DIFF_CSS}</style><h2>{}</h2><ul>{index}</ul>{sections}",
-        esc(tr("report.file_diffs"))
-    );
-    out.insert_str(body_end, &extra);
     out
 }
 
-pub fn generate(items: &[&DirItem], roots: &[PathBuf], format: ReportFormat) -> String {
+/// "a vs b" for names that may share a long start: the shared words are written once, cut to a
+/// few words, and only the parts that differ are compared.
+fn short_versus(names: &[String]) -> String {
+    const HEAD: usize = 24;
+    const PART: usize = 32;
+    // Not '.', which also separates the parts of version numbers.
+    let is_sep = |c: char| matches!(c, '_' | '-' | ' ');
+    let chars: Vec<Vec<char>> = names.iter().map(|n| n.chars().collect()).collect();
+    let common = (0..)
+        .take_while(|&i| {
+            let c = chars[0].get(i);
+            c.is_some() && chars.iter().all(|n| n.get(i) == c)
+        })
+        .count();
+    // Shared words only: stop after the last separator of the shared start.
+    let cut = chars[0][..common]
+        .iter()
+        .rposition(|&c| is_sep(c))
+        .map_or(0, |i| i + 1);
+    let rests: Vec<String> = chars
+        .iter()
+        .map(|n| n[cut..].iter().take(PART).collect())
+        .collect();
+    if cut == 0 || rests.iter().any(|r| r.is_empty()) {
+        return names
+            .iter()
+            .map(|n| n.chars().take(PART).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" vs ");
+    }
+    let shared = &chars[0][..cut];
+    // Whole words that fit, or the start of a first word too long to fit.
+    let end = (0..shared.len().min(HEAD + 1))
+        .rev()
+        .find(|&i| is_sep(shared[i]))
+        .filter(|&i| i > 0)
+        .unwrap_or(HEAD.min(shared.len()));
+    let head: String = shared[..end].iter().collect();
+    let head = head.trim_matches(is_sep);
+    if head.is_empty() {
+        return rests.join(" vs ");
+    }
+    format!("{head} {}", rests.join(" vs "))
+}
+
+/// Folder report of `items`; HTML reports also name the compare rules file `rules` ("" = none).
+pub fn generate(
+    items: &[&DirItem],
+    roots: &[PathBuf],
+    format: ReportFormat,
+    rules: &str,
+) -> String {
     let panes = roots.len();
     let mut header: Vec<String> = vec![
         tr("col.name").into(),
@@ -381,6 +317,8 @@ pub fn generate(items: &[&DirItem], roots: &[PathBuf], format: ReportFormat) -> 
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     match format {
         ReportFormat::Csv => {
+            // Spreadsheets read a CSV file as UTF-8 only when it starts with a byte order mark.
+            out.push('\u{feff}');
             for (s, r) in roots.iter().enumerate() {
                 let _ = writeln!(
                     out,
@@ -440,49 +378,7 @@ pub fn generate(items: &[&DirItem], roots: &[PathBuf], format: ReportFormat) -> 
             }
         }
         ReportFormat::Html => {
-            out.push_str("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n");
-            let _ = writeln!(out, "<title>{}</title>", esc(tr("report.title")));
-            out.push_str(
-                "<style>body{font-family:Segoe UI,Arial,sans-serif;font-size:13px}table{border-collapse:collapse}\
-                 th,td{border:1px solid #bbb;padding:2px 6px;text-align:left}th{background:#ddd}\
-                 .identical{background:#fff}.different{background:#efcbd0}.unique{background:#c0c0c0}\
-                 .error{background:#ffa0a0}</style></head><body>\n",
-            );
-            let _ = writeln!(
-                out,
-                "<h2>{}</h2><p>{}</p><ul>",
-                esc(tr("report.title")),
-                now
-            );
-            for (s, r) in roots.iter().enumerate() {
-                let _ = writeln!(
-                    out,
-                    "<li><b>{}</b>: {}</li>",
-                    esc(side_name(s, panes)),
-                    esc(&r.display().to_string())
-                );
-            }
-            out.push_str("</ul><table><tr>");
-            for h in &header {
-                let _ = write!(out, "<th>{}</th>", esc(h));
-            }
-            out.push_str("</tr>\n");
-            for (st, r) in &rows {
-                let class = match st {
-                    CmpStatus::Identical | CmpStatus::NotCompared | CmpStatus::Pending => {
-                        "identical"
-                    }
-                    CmpStatus::Different => "different",
-                    CmpStatus::Unique => "unique",
-                    CmpStatus::Error => "error",
-                };
-                let _ = write!(out, "<tr class=\"{class}\">");
-                for c in r {
-                    let _ = write!(out, "<td>{}</td>", esc(c));
-                }
-                out.push_str("</tr>\n");
-            }
-            out.push_str("</table></body></html>\n");
+            return super::html_report::folder_report(items, roots, roots, None, rules);
         }
     }
     out
@@ -491,72 +387,55 @@ pub fn generate(items: &[&DirItem], roots: &[PathBuf], format: ReportFormat) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::diff::compute;
-    use crate::core::filter::FileFilter;
-    use crate::core::folder::{FolderOptions, Progress, Scanner};
 
     #[test]
-    fn text_report_marks_changed_rows_and_words() {
-        let a: Vec<String> = ["same", "old <word>", "gone"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let b: Vec<String> = ["same", "new <word>"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let opts = DiffOptions::default();
-        let r = compute(&[&a, &b], &opts);
-        let notes = vec![BTreeMap::from([(2, "why <removed>?".to_string())])];
-        let html = text_html(
-            &["a.txt".into(), "b.txt".into()],
-            &[&a, &b],
-            &r,
-            &opts,
-            &notes,
-        );
-        assert!(html.contains("Left 3: why &lt;removed&gt;?"), "{html}");
-        assert!(html.contains("<td class=\"t \">same</td>"));
-        assert!(html.contains("<span class=\"w\">old</span> &lt;word&gt;"));
-        assert!(html.contains(
-            "<td class=\"t chg\">gone</td><td class=\"n\"></td><td class=\"t gap\"></td>"
-        ));
+    fn csv_fields_stay_text() {
+        assert_eq!(csv_field("=cmd()"), "'=cmd()");
+        assert_eq!(csv_field("-x"), "'-x");
+        assert_eq!(csv_field("-5"), "-5");
+        assert_eq!(csv_field("a\rb"), "\"a\rb\"");
+        assert_eq!(csv_field("a,\"b\""), "\"a,\"\"b\"\"\"");
+        assert_eq!(csv_field("plain.txt"), "plain.txt");
     }
 
     #[test]
-    fn folder_report_includes_file_differences() {
-        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        std::fs::write(a.path().join("same.txt"), "x\n").unwrap();
-        std::fs::write(b.path().join("same.txt"), "x\n").unwrap();
-        std::fs::write(a.path().join("changed.txt"), "one\ntwo\n").unwrap();
-        std::fs::write(b.path().join("changed.txt"), "one\n2\n").unwrap();
-        std::fs::write(b.path().join("new.txt"), "fresh\n").unwrap();
-        let long: String = (0..=REPORT_MAX_LINES).map(|i| format!("{i}\n")).collect();
-        std::fs::write(a.path().join("long.txt"), &long).unwrap();
-        std::fs::write(b.path().join("long.txt"), long + "end\n").unwrap();
-        let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
-        let items = Scanner {
-            roots: &roots,
-            filter: &FileFilter::default(),
-            fopts: &FolderOptions::default(),
-            dopts: &DiffOptions::default(),
-            progress: &Progress::default(),
-        }
-        .run();
-        let refs: Vec<&DirItem> = items.iter().collect();
-        let html = folder_html_with_diffs(&refs, &roots, &roots, &DiffOptions::default());
-        assert!(html.contains("<a href=\"#f0\">changed.txt</a>"), "{html}");
-        assert!(html.contains("<td class=\"t chg\"><span class=\"w\">two</span></td>"));
-        assert!(!html.contains("same.txt</a>"));
-        assert!(
-            html.contains("new.txt</a>") && html.contains("fresh"),
-            "{html}"
+    fn html_file_names_from_compared_sides() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            html_file_name(&names(&["/a/L/main.rs", "/b/R/main.rs"])),
+            "main.rs_compare.html"
         );
-        let too_long = trf(
-            "report.too_long",
-            &[("n", (REPORT_MAX_LINES + 2).to_string())],
+        assert_eq!(
+            html_file_name(&names(&["/tmp/v1/", "/tmp/v2"])),
+            "v1_vs_v2.html"
         );
-        assert!(html.contains(&esc(&too_long)), "{too_long}");
-        assert!(html.trim_end().ends_with("</body></html>"));
+        assert_eq!(
+            html_file_name(&names(&["base:a.txt", "b?.txt"])),
+            "base_a.txt_vs_b_.txt.html"
+        );
+        assert_eq!(html_file_name(&[]), "report.html");
+        let long = html_file_name(&names(&[&"比較".repeat(60), &"差分".repeat(60)]));
+        assert!(long.len() <= 255 && long.ends_with(".html"));
+        let long = "cdn_ucie_ips_skhynix_ucie_axi_512_gearbox_strm_async_ns_2026";
+        assert_eq!(
+            html_file_name(&names(&[
+                &format!("/hdl/{long}0903_R005v0p5"),
+                &format!("/hdl/{long}1005_R005v0p5a"),
+            ])),
+            "cdn_ucie_ips_skhynix_20260903_R005v0p5_vs_20261005_R005v0p5a.html"
+        );
+        assert_eq!(
+            html_file_name(&names(&["app-1.2.0", "app-1.3.0"])),
+            "app_1.2.0_vs_1.3.0.html"
+        );
+        assert_eq!(
+            html_file_name(&names(&["report_old.txt", "report_new.txt"])),
+            "report_old.txt_vs_new.txt.html"
+        );
+        assert_eq!(
+            html_file_name(&names(&["My  Project - v1", "My  Project - v2"])),
+            "My_Project_v1_vs_v2.html"
+        );
+        assert_eq!(no_spaces("a\u{a0}b \t_ c d__e - f"), "a_b_c_d__e-f");
     }
 }

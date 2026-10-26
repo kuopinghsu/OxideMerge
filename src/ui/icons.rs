@@ -53,6 +53,7 @@ pub enum Icon {
     Fold,
     Wrap,
     Palette,
+    Export,
 }
 
 /// Maps 16×16 design-grid coordinates into `rect`.
@@ -329,6 +330,11 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.closed(&[(8.0, 2.0), (14.5, 13.5), (1.5, 13.5)]);
             pen.line(&[(8.0, 6.5), (8.0, 9.5)]);
             pen.dot(8.0, 11.6, 0.9);
+        }
+        Icon::Export => {
+            pen.line(&[(8.0, 10.0), (8.0, 2.0)]);
+            pen.line(&[(4.5, 5.5), (8.0, 2.0), (11.5, 5.5)]);
+            pen.line(&[(2.5, 9.0), (2.5, 13.5), (13.5, 13.5), (13.5, 9.0)]);
         }
         Icon::Drop => {
             pen.line(&[(8.0, 2.0), (8.0, 10.0)]);

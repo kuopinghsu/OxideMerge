@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::core::image_cmp::{self, ImageDiff};
 use crate::i18n::{tr, trf};
+use crate::ui::commands::Cmd;
 use crate::ui::theme::Colors;
 use crate::ui::widgets::{self, Icon, Outcome};
 use egui::{
@@ -364,34 +365,24 @@ impl ImageView {
                 ui.add(egui::Slider::new(&mut self.overlay_alpha, 0.0..=1.0).show_value(false));
             }
             widgets::toolbar_sep(ui);
-            let key = widgets::with_key;
-            if widgets::icon_button(ui, Icon::Prev, &key(tr("cmd.prev_diff"), "Alt+↑")).clicked()
+            if widgets::icon_button(ui, Icon::Prev, &Cmd::PrevDiff.tip()).clicked()
                 && !self.prev_diff()
             {
                 self.step_file = Some(false);
             }
-            if widgets::icon_button(ui, Icon::Next, &key(tr("cmd.next_diff"), "Alt+↓")).clicked()
+            if widgets::icon_button(ui, Icon::Next, &Cmd::NextDiff.tip()).clicked()
                 && !self.next_diff()
             {
                 self.step_file = Some(true);
             }
-            if widgets::icon_button(ui, Icon::CopyRight, &key(tr("cmd.copy_right"), "Alt+→"))
-                .clicked()
-            {
+            if widgets::icon_button(ui, Icon::CopyRight, &Cmd::CopyRight.tip()).clicked() {
                 self.copy_current(true);
             }
-            if widgets::icon_button(ui, Icon::CopyLeft, &key(tr("cmd.copy_left"), "Alt+←"))
-                .clicked()
-            {
+            if widgets::icon_button(ui, Icon::CopyLeft, &Cmd::CopyLeft.tip()).clicked() {
                 self.copy_current(false);
             }
-            if widgets::icon_button_enabled(
-                ui,
-                !self.undo.is_empty(),
-                Icon::Undo,
-                &key(tr("cmd.undo"), "Ctrl+Z"),
-            )
-            .clicked()
+            if widgets::icon_button_enabled(ui, !self.undo.is_empty(), Icon::Undo, &Cmd::Undo.tip())
+                .clicked()
             {
                 self.undo();
             }

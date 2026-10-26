@@ -34,6 +34,9 @@ pub struct SessionTab {
     pub paths: Vec<String>,
     /// "text", "binary", "image" or "web"; none for folder compares.
     pub kind: Option<String>,
+    /// Compare rules file of the tab when it has its own ("" = none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
@@ -47,6 +50,12 @@ pub struct Config {
     pub font_size: f32,
     pub tab_size: usize,
     pub diff: DiffOptions,
+    /// Compare rules file used by default ("" = none); `diff` holds its rules.
+    pub rules: String,
+    /// Whether the rules of the options of earlier versions were moved to rules files.
+    pub rules_migrated: bool,
+    /// Whether HTML reports open in the browser once saved.
+    pub open_reports: bool,
     pub folder: FolderOptions,
     pub filter: String,
     pub recent_paths: Vec<String>,
@@ -100,6 +109,9 @@ impl Default for Config {
             font_size: 14.0,
             tab_size: 4,
             diff: DiffOptions::default(),
+            rules: String::new(),
+            rules_migrated: false,
+            open_reports: true,
             folder: FolderOptions::default(),
             filter: "*.*".into(),
             recent_paths: Vec::new(),

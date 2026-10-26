@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::core::comments;
 use crate::core::diff::{self, DiffOptions, DiffResult};
 use crate::core::folder::{CmpStatus, DirItem};
+use crate::core::fsutil;
 use crate::core::html_report::{self, FileDiffs};
 use crate::core::report::side_name;
 use crate::core::rules;
@@ -53,8 +54,25 @@ fn stamp(path: &Path) -> Stamp {
         .map(|m| (m.modified().ok(), m.len()))
 }
 
-/// A file read on another thread: its index, then what [`read_card`] returns.
-type Read = (usize, DirItem, FileDiffs, Vec<Stamp>);
+/// A hash of the bytes of a file: tells apart a change that keeps its size and modification time.
+fn digest(path: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(path).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    Some(h.finish())
+}
+
+/// A file read and compared: what is known of it now, its differences and how it was on disk.
+struct Loaded {
+    item: DirItem,
+    found: FileDiffs,
+    stamps: Vec<Stamp>,
+    digests: Vec<Option<u64>>,
+}
+
+/// A file read on another thread, and its index.
+type Read = (usize, Loaded);
 
 /// How each side of a row is shown and the byte ranges that differ.
 type Cells = Vec<(&'static str, Vec<Range<usize>>)>;
@@ -79,21 +97,25 @@ struct Diffs {
     /// file is deleted when saved).
     absent: Vec<bool>,
     stamps: Vec<Stamp>,
+    digests: Vec<Option<u64>>,
     /// Why no differences are listed, as a language key, when there are none.
     quiet: Option<&'static str>,
+    stats: diff::Stats,
     /// Bytes the text takes in memory; 0 once dropped to save memory.
     size: usize,
 }
 
 impl Diffs {
-    fn new(docs: Vec<TextDoc>, result: DiffResult, absent: Vec<bool>, stamps: Vec<Stamp>) -> Self {
+    fn new(docs: Vec<TextDoc>, result: DiffResult, absent: Vec<bool>, loaded: &mut Loaded) -> Self {
         let mut d = Diffs {
             docs,
             result,
             hunks: Vec::new(),
             absent,
-            stamps,
+            stamps: std::mem::take(&mut loaded.stamps),
+            digests: std::mem::take(&mut loaded.digests),
             quiet: None,
+            stats: diff::Stats::default(),
             size: 0,
         };
         d.settle();
@@ -125,14 +147,19 @@ impl Diffs {
                 .collect();
             let same_files = self.absent.iter().all(|&a| a == self.absent[0])
                 && present.windows(2).all(|w| w[0] == w[1]);
+            let empty = self.docs.iter().all(|d| d.lines.is_empty());
+            let absent_differs = self.absent.iter().any(|&a| a != self.absent[0]);
             if same_lines && same_files {
                 "report.no_diffs"
+            } else if same_lines && empty && absent_differs {
+                "diffs.empty_or_missing"
             } else if same_lines {
                 "diffs.format_only"
             } else {
                 "diffs.ignored_only"
             }
         });
+        self.stats = self.result.stats();
         self.size = self
             .docs
             .iter()
@@ -158,8 +185,8 @@ impl Diffs {
 
 enum Body {
     Loading,
-    /// Why no differences are shown.
-    Note(String),
+    /// Why no differences are shown, and the stamps of the files when read.
+    Note(String, Vec<Stamp>),
     Diffs(Box<Diffs>),
 }
 
@@ -190,18 +217,22 @@ impl Card {
     fn differs(&self) -> bool {
         match &self.body {
             Body::Diffs(d) => !d.same(),
-            Body::Note(_) => true,
+            Body::Note(..) => true,
             Body::Loading => false,
+        }
+    }
+
+    fn stamps(&self) -> Option<&[Stamp]> {
+        match &self.body {
+            Body::Diffs(d) => Some(&d.stamps),
+            Body::Note(_, s) => Some(s),
+            Body::Loading => None,
         }
     }
 }
 
 /// Reads and compares the sides of `item` as they are now on disk.
-fn read_card(
-    mut item: DirItem,
-    roots: &[PathBuf],
-    opts: &DiffOptions,
-) -> (DirItem, FileDiffs, Vec<Stamp>) {
+fn read_card(mut item: DirItem, roots: &[PathBuf], opts: &DiffOptions) -> Loaded {
     // Taken before reading: a change while reading shows as a change on disk.
     let stamps: Vec<Stamp> = roots.iter().map(|r| stamp(&item.path(r))).collect();
     for (s, st) in stamps.iter().enumerate() {
@@ -209,18 +240,56 @@ fn read_card(
         item.size[s] = st.map(|x| x.1);
     }
     let found = html_report::file_docs(&item, roots, opts);
-    (item, found, stamps)
+    // Read after the text: a change in between shows in the stamps.
+    let digests = match &found {
+        FileDiffs::Diffs(..) => roots.iter().map(|r| digest(&item.path(r))).collect(),
+        _ => Vec::new(),
+    };
+    Loaded {
+        item,
+        found,
+        stamps,
+        digests,
+    }
 }
 
-fn body_of(item: &DirItem, found: FileDiffs, stamps: Vec<Stamp>) -> Body {
-    match found {
-        FileDiffs::Diffs(docs, result) => {
-            let absent = (0..docs.len()).map(|s| !item.exists[s]).collect();
-            Body::Diffs(Box::new(Diffs::new(docs, result, absent, stamps)))
+/// Reads `items` on another thread, sending each when read.
+fn spawn_reader(
+    items: Vec<(usize, DirItem)>,
+    roots: Vec<PathBuf>,
+    dopts: DiffOptions,
+) -> Receiver<Read> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for (f, it) in items {
+            let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                read_card(it.clone(), &roots, &dopts)
+            }));
+            let loaded = read.unwrap_or_else(|_| Loaded {
+                item: it,
+                found: FileDiffs::Note(tr("status.error").into()),
+                stamps: Vec::new(),
+                digests: Vec::new(),
+            });
+            if tx.send((f, loaded)).is_err() {
+                return;
+            }
         }
-        FileDiffs::Note(note) => Body::Note(note),
-        FileDiffs::None => Body::Note(tr("report.no_diffs").into()),
-    }
+    });
+    rx
+}
+
+fn body_of(mut loaded: Loaded) -> (DirItem, Body) {
+    let found = std::mem::replace(&mut loaded.found, FileDiffs::None);
+    let body = match found {
+        FileDiffs::Diffs(docs, result) => {
+            let absent = (0..docs.len()).map(|s| !loaded.item.exists[s]).collect();
+            Body::Diffs(Box::new(Diffs::new(docs, result, absent, &mut loaded)))
+        }
+        FileDiffs::Note(note) => Body::Note(note, loaded.stamps),
+        FileDiffs::None => Body::Note(tr("report.no_diffs").into(), loaded.stamps),
+    };
+    (loaded.item, body)
 }
 
 /// A line of the scrolled list of cards.
@@ -268,6 +337,8 @@ pub struct DiffsView {
     names: String,
     cards: Vec<Card>,
     loading: Option<Receiver<Read>>,
+    /// Files whose text, dropped to save memory, is being read again; one reader each.
+    refills: Vec<(usize, Receiver<Read>)>,
     lines: Vec<Line>,
     /// Top of every line, and the height of all of them.
     tops: Vec<f32>,
@@ -293,6 +364,11 @@ pub struct DiffsView {
     pub open_request: Option<FolderAction>,
     /// Files were saved, so the folder compare should compare again; until the app takes it.
     pub saved: bool,
+    /// The folder compare was stopped, so files it didn't compare are missing.
+    stopped: bool,
+    /// An error to show, until the app takes it.
+    pub error: Option<String>,
+    _temps: Vec<std::sync::Arc<tempfile::TempDir>>,
     id: egui::Id,
 }
 
@@ -305,25 +381,33 @@ pub struct Source {
     pub title: String,
     /// The files with differences, in the order to list them.
     pub items: Vec<DirItem>,
+    /// The folder compare was stopped before comparing every file.
+    pub stopped: bool,
+    /// Folders holding extracted archives, kept while their files are shown.
+    pub temps: Vec<std::sync::Arc<tempfile::TempDir>>,
+}
+
+/// Whether `it` is a file whose differences are shown.
+fn listed(it: &DirItem) -> bool {
+    !it.is_dir && !it.binary && matches!(it.status, CmpStatus::Different | CmpStatus::Unique)
+}
+
+fn cards_of(items: Vec<DirItem>) -> Vec<Card> {
+    items
+        .into_iter()
+        .filter(listed)
+        .map(|item| Card {
+            item,
+            body: Body::Loading,
+            open: true,
+            seen: 0,
+        })
+        .collect()
 }
 
 impl DiffsView {
     pub fn new(src: Source, folder: u64) -> Self {
-        let cards: Vec<Card> = src
-            .items
-            .into_iter()
-            .filter(|it| {
-                !it.is_dir
-                    && !it.binary
-                    && matches!(it.status, CmpStatus::Different | CmpStatus::Unique)
-            })
-            .map(|item| Card {
-                item,
-                body: Body::Loading,
-                open: true,
-                seen: 0,
-            })
-            .collect();
+        let cards = cards_of(src.items);
         let mut v = DiffsView {
             roots: src.roots,
             display_roots: src.display_roots,
@@ -333,6 +417,7 @@ impl DiffsView {
             names: src.title,
             cards,
             loading: None,
+            refills: Vec::new(),
             lines: Vec::new(),
             tops: Vec::new(),
             height: 0.0,
@@ -351,10 +436,54 @@ impl DiffsView {
             folder,
             open_request: None,
             saved: false,
+            stopped: src.stopped,
+            error: None,
+            _temps: src.temps,
             id: egui::Id::new(("diffs_view", folder, SystemTime::now())),
         };
         v.load((0..v.cards.len()).collect());
         v
+    }
+
+    /// Every file `src` has differences in is listed here already.
+    pub fn lists_all(&self, src: &Source) -> bool {
+        let have: std::collections::HashSet<String> =
+            self.cards.iter().map(|c| c.item.rel_path()).collect();
+        src.items
+            .iter()
+            .filter(|it| listed(it))
+            .all(|it| have.contains(&it.rel_path()))
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    /// Lists the files of newer results of the folder compare, keeping which are collapsed.
+    /// Only without changes or anything to undo here, which would be lost.
+    pub fn update_from(&mut self, src: Source) {
+        let closed: std::collections::HashSet<String> = self
+            .cards
+            .iter()
+            .filter(|c| !c.open)
+            .map(|c| c.item.rel_path())
+            .collect();
+        self.cards = cards_of(src.items);
+        for c in &mut self.cards {
+            c.open = !closed.contains(&c.item.rel_path());
+        }
+        (self.roots, self.display_roots, self.read_only) =
+            (src.roots, src.display_roots, src.read_only);
+        (self.dopts, self.rules, self.names) = (src.dopts, src.rules, src.title);
+        self.stopped = src.stopped;
+        self._temps = src.temps;
+        self.cells.clear();
+        self.undo.clear();
+        self.current = None;
+        self.scroll_to = None;
+        self.top_line = 0;
+        self.status.clear();
+        self.load((0..self.cards.len()).collect());
     }
 
     /// No file of the folder compare can be shown.
@@ -372,63 +501,141 @@ impl DiffsView {
 
     /// Reads and compares the files `which` on another thread.
     fn load(&mut self, which: Vec<usize>) {
-        let (tx, rx) = mpsc::channel();
         let items: Vec<(usize, DirItem)> = which
             .iter()
             .map(|&f| (f, self.cards[f].item.clone()))
             .collect();
-        let (roots, dopts) = (self.roots.clone(), self.dopts.clone());
-        std::thread::spawn(move || {
-            for (f, it) in items {
-                let (it, found, stamps) = read_card(it, &roots, &dopts);
-                if tx.send((f, it, found, stamps)).is_err() {
-                    return;
-                }
-            }
-        });
+        let rx = spawn_reader(items, self.roots.clone(), self.dopts.clone());
         for f in which {
             self.cards[f].body = Body::Loading;
             self.forget_cells(f);
         }
         self.loading = Some(rx);
+        self.refills.clear();
         self.stale = true;
     }
 
     fn poll(&mut self) {
-        let Some(rx) = &self.loading else { return };
-        loop {
-            match rx.try_recv() {
-                Ok((f, item, found, stamps)) => {
-                    self.cards[f].body = body_of(&item, found, stamps);
-                    self.cards[f].item = item;
-                    self.stale = true;
+        if let Some(rx) = &self.loading {
+            loop {
+                match rx.try_recv() {
+                    Ok((f, loaded)) => {
+                        let (item, body) = body_of(loaded);
+                        self.cards[f].body = body;
+                        self.cards[f].item = item;
+                        self.stale = true;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.loading = None;
+                        for c in &mut self.cards {
+                            if matches!(c.body, Body::Loading) {
+                                c.body = Body::Note(tr("status.error").into(), Vec::new());
+                                self.stale = true;
+                            }
+                        }
+                        break;
+                    }
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.loading = None;
-                    break;
-                }
+            }
+        }
+        let mut got = Vec::new();
+        self.refills.retain(|(_, rx)| match rx.try_recv() {
+            Ok(read) => {
+                got.push(read);
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
+        });
+        for (f, loaded) in got {
+            // Only text still missing: a file read again meanwhile is newer.
+            if self.cards[f].diffs().is_some_and(|d| !d.loaded()) {
+                self.apply_read(f, loaded);
             }
         }
     }
 
-    /// Reads file `f` again now. Returns whether it was the same on disk as before.
-    fn reload_card(&mut self, f: usize) -> bool {
-        let before = self.cards[f].diffs().map(|d| d.stamps.clone());
-        let (item, found, stamps) = read_card(self.cards[f].item.clone(), &self.roots, &self.dopts);
-        let same = before.as_ref() == Some(&stamps);
-        self.cards[f].body = body_of(&item, found, stamps);
+    /// Reads the text of file `f`, dropped to save memory, again on another thread.
+    fn refill(&mut self, f: usize) {
+        if self.refills.iter().any(|(rf, _)| *rf == f) {
+            return;
+        }
+        let items = vec![(f, self.cards[f].item.clone())];
+        let rx = spawn_reader(items, self.roots.clone(), self.dopts.clone());
+        self.refills.push((f, rx));
+    }
+
+    /// Shows what reading file `f` again found. Returns whether it was the same on disk.
+    fn apply_read(&mut self, f: usize, loaded: Loaded) -> bool {
+        let before = self.cards[f].stamps().map(<[Stamp]>::to_vec);
+        let shape = |c: &Card| (matches!(c.body, Body::Diffs(_)), c.hunk_count());
+        let was = shape(&self.cards[f]);
+        let same = before.as_deref() == Some(&loaded.stamps[..]);
+        let (item, body) = body_of(loaded);
+        self.cards[f].body = body;
         self.cards[f].item = item;
         self.forget_cells(f);
         if !same {
             self.undo.retain(|u| u.file != f);
-            let left = self.cards[f].hunk_count();
-            if let Some((cf, h)) = self.current.filter(|&(cf, _)| cf == f) {
-                self.current = (left > 0).then_some((cf, h.min(left.saturating_sub(1))));
-            }
+            self.clamp_current(f);
         }
-        self.stale = true;
+        if !same || shape(&self.cards[f]) != was {
+            self.stale = true;
+        }
         same
+    }
+
+    /// Reads file `f` again now. Returns whether it was the same on disk as before.
+    fn reload_card(&mut self, f: usize) -> bool {
+        let loaded = read_card(self.cards[f].item.clone(), &self.roots, &self.dopts);
+        self.apply_read(f, loaded)
+    }
+
+    /// File `f` is no longer on disk as it was read.
+    fn changed_on_disk(&self, f: usize) -> bool {
+        let c = &self.cards[f];
+        let stamps = c.stamps().unwrap_or_default();
+        self.roots
+            .iter()
+            .zip(stamps)
+            .any(|(r, st)| stamp(&c.item.path(r)) != *st)
+    }
+
+    /// Makes sure file `f` is in memory and, without changes here, as it is on disk now. When
+    /// it had to be read again because it changed, says so and returns false.
+    fn ready(&mut self, f: usize) -> bool {
+        let fresh = match self.ensure_loaded(f) {
+            None => return false,
+            Some(same) => same && (self.cards[f].modified() || !self.changed_on_disk(f)),
+        };
+        if !fresh {
+            if self.cards[f].diffs().is_some_and(|d| d.loaded()) && !self.cards[f].modified() {
+                self.reload_card(f);
+            }
+            self.status = trf("diffs.reread", &[("file", self.cards[f].item.rel_path())]);
+        }
+        fresh
+    }
+
+    /// Keeps the selection on a difference file `f` still has, after its differences changed.
+    fn clamp_current(&mut self, f: usize) {
+        let left = self.cards[f].hunk_count();
+        if let Some((cf, h)) = self.current.filter(|&(cf, _)| cf == f) {
+            self.current = (left > 0).then_some((cf, h.min(left - 1)));
+        }
+    }
+
+    /// Drops the changes to file `f` and reads it again, such as after it changed on disk.
+    fn discard(&mut self, f: usize) {
+        self.undo.retain(|u| u.file != f);
+        self.reload_card(f);
+        self.clamp_current(f);
+        self.stale = true;
+        self.status = trf(
+            "diffs.discarded",
+            &[("file", self.cards[f].item.rel_path())],
+        );
     }
 
     /// Makes sure the text of file `f` is in memory. `None` when it has no differences to
@@ -460,9 +667,6 @@ impl DiffsView {
         }
         let refs: Vec<&[String]> = d.docs.iter().map(|d| d.lines.as_slice()).collect();
         let cells = html_report::row_cells(&d.result, &refs, &self.dopts, r);
-        if self.cells.len() >= CELL_CACHE {
-            self.cells.clear();
-        }
         self.cells.insert((f, r), cells);
     }
 
@@ -500,26 +704,24 @@ impl DiffsView {
         }
     }
 
+    /// Files in view without changes here: the ones whose changes on disk are picked up.
+    fn watched(&self) -> impl Iterator<Item = usize> + '_ {
+        let frame = self.frame;
+        (0..self.cards.len()).filter(move |&f| {
+            let c = &self.cards[f];
+            c.seen + 1 >= frame && !c.modified() && c.stamps().is_some_and(|s| !s.is_empty())
+        })
+    }
+
     /// Reads again the files in view that changed on disk and have no changes here.
     fn check_disk(&mut self) {
         if self.disk_checked.elapsed() < DISK_CHECK || self.loading.is_some() {
             return;
         }
         self.disk_checked = Instant::now();
-        let frame = self.frame;
-        let changed: Vec<usize> = (0..self.cards.len())
-            .filter(|&f| {
-                let c = &self.cards[f];
-                c.seen + 1 >= frame
-                    && c.diffs().is_some_and(|d| {
-                        !d.modified()
-                            && self
-                                .roots
-                                .iter()
-                                .zip(&d.stamps)
-                                .any(|(r, st)| stamp(&c.item.path(r)) != *st)
-                    })
-            })
+        let changed: Vec<usize> = self
+            .watched()
+            .filter(|&f| self.changed_on_disk(f))
             .collect();
         for f in changed {
             self.reload_card(f);
@@ -582,6 +784,7 @@ impl DiffsView {
             if let Body::Diffs(d) = &mut self.cards[f].body {
                 d.recompute(&self.dopts);
             }
+            self.clamp_current(f);
         }
         self.undo.retain(|u| kept.contains(&u.file));
         if self.current.is_some_and(|(f, _)| !kept.contains(&f)) {
@@ -605,9 +808,11 @@ impl DiffsView {
     }
 
     pub fn save_modified(&mut self) -> anyhow::Result<()> {
-        let mut saved = 0;
+        let mut saved = Vec::new();
         let mut errors = Vec::new();
-        for card in &mut self.cards {
+        // Files whose mixed line endings were written as one kind.
+        let mut unified = Vec::new();
+        for (f, card) in self.cards.iter_mut().enumerate() {
             let Body::Diffs(d) = &mut card.body else {
                 continue;
             };
@@ -618,36 +823,54 @@ impl DiffsView {
                 let Some(path) = d.docs[side].path.clone() else {
                     continue;
                 };
-                if stamp(&path) != d.stamps[side] {
+                let now = stamp(&path);
+                if now != d.stamps[side] || (now.is_some() && digest(&path) != d.digests[side]) {
                     let file = path.display().to_string();
                     errors.push(trf("diffs.changed_on_disk", &[("file", file)]));
                     continue;
                 }
+                let mixed = d.docs[side].mixed_eol && !d.absent[side];
                 let done = if !d.absent[side] {
                     d.docs[side].save()
                 } else if path.exists() {
-                    crate::core::fsutil::remove(&path)
+                    fsutil::remove(&path).inspect(|()| {
+                        if let Some(dir) = path.parent() {
+                            fsutil::remove_empty_dirs(dir, &self.roots[side]);
+                        }
+                    })
                 } else {
                     Ok(())
                 };
                 match done {
                     Ok(()) => {
-                        saved += 1;
+                        if mixed {
+                            let eol = d.docs[side].eol.label();
+                            unified.push(format!("{} ({eol})", card.item.rel_path()));
+                        }
+                        saved.push((f, side));
                         d.docs[side].modified = false;
                         card.item.exists[side] = !d.absent[side];
                         d.stamps[side] = stamp(&path);
+                        d.digests[side] = digest(&path);
                     }
                     Err(e) => errors.push(format!("{}: {e}", path.display())),
                 }
             }
         }
-        if saved > 0 {
+        if !saved.is_empty() {
             // Undoing a saved copy changes the file again.
             for u in &mut self.undo {
-                u.modified = true;
+                if saved.contains(&(u.file, u.side)) {
+                    u.modified = true;
+                }
             }
             self.saved = true;
-            self.status = trf("diffs.saved", &[("n", saved.to_string())]);
+            self.status = trf("diffs.saved", &[("n", saved.len().to_string())]);
+            if !unified.is_empty() {
+                let files = unified.join(", ");
+                let note = trf("diffs.eol_unified", &[("files", files)]);
+                self.status = format!("{} · {note}", self.status);
+            }
         }
         if errors.is_empty() {
             Ok(())
@@ -750,10 +973,23 @@ impl DiffsView {
             Some(k) => k.wrapping_sub(1),
             None => {
                 // From what is in view: the first difference at or below its top.
+                // Where each difference is listed, or its file when collapsed.
+                let mut pos = HashMap::new();
+                for (i, &l) in self.lines.iter().enumerate() {
+                    match l {
+                        Line::File(f) => {
+                            pos.insert((f, usize::MAX), i);
+                        }
+                        Line::Hunk(f, h) => {
+                            pos.insert((f, h), i);
+                        }
+                        _ => {}
+                    }
+                }
                 let at = |&(f, h): &(usize, usize)| {
-                    self.lines
-                        .iter()
-                        .position(|&l| l == Line::Hunk(f, h) || l == Line::File(f))
+                    pos.get(&(f, h))
+                        .or_else(|| pos.get(&(f, usize::MAX)))
+                        .copied()
                         .unwrap_or(0)
                 };
                 let i = all.partition_point(|x| at(x) < self.top_line);
@@ -813,7 +1049,7 @@ impl DiffsView {
             self.status = tr("msg.readonly").into();
             return;
         }
-        if self.ensure_loaded(f) != Some(true) {
+        if !self.ready(f) {
             return;
         }
         let Some(d) = self.cards[f].diffs() else {
@@ -822,6 +1058,9 @@ impl DiffsView {
         let Some(&(b, _)) = d.hunks.get(h) else {
             return;
         };
+        if !copy_changes(d, b, from, to) {
+            return;
+        }
         let blk = &d.result.blocks[b];
         let new = d.docs[from].lines[blk.ranges[from].clone()].to_vec();
         let at = blk.ranges[to].clone();
@@ -836,7 +1075,7 @@ impl DiffsView {
             self.status = tr("msg.readonly").into();
             return;
         }
-        if self.ensure_loaded(f) != Some(true) {
+        if !self.ready(f) {
             return;
         }
         let Some(d) = self.cards[f].diffs() else {
@@ -891,6 +1130,8 @@ impl DiffsView {
     pub fn undo(&mut self) {
         let Some(u) = self.undo.pop() else { return };
         if self.ensure_loaded(u.file) != Some(true) {
+            let file = self.cards[u.file].item.rel_path();
+            self.status = trf("diffs.undo_lost", &[("file", file)]);
             return;
         }
         let Body::Diffs(d) = &mut self.cards[u.file].body else {
@@ -945,9 +1186,12 @@ impl DiffsView {
         self.poll();
         self.check_disk();
         self.trim_memory();
-        if self.loading.is_some() {
+        if self.cells.len() >= CELL_CACHE {
+            self.cells.clear();
+        }
+        if self.loading.is_some() || !self.refills.is_empty() {
             ui.ctx().request_repaint_after(Duration::from_millis(60));
-        } else {
+        } else if ui.ctx().input(|i| i.focused) && self.watched().next().is_some() {
             ui.ctx().request_repaint_after(DISK_CHECK);
         }
         self.toolbar(ui, cfg);
@@ -1041,7 +1285,7 @@ impl DiffsView {
                 .clicked()
             {
                 if let Err(e) = self.save_modified() {
-                    self.status = e.to_string();
+                    self.error = Some(e.to_string());
                 }
             }
         });
@@ -1061,6 +1305,14 @@ impl DiffsView {
             );
             ui.label(egui::RichText::new(self.cards.len().to_string()).color(p.text_dim));
         });
+        if self.stopped {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(tr("diffs.stopped"))
+                    .size(12.0)
+                    .color(p.warning),
+            );
+        }
         ui.add_space(6.0);
         let hint = widgets::with_key(tr("report.search"), Cmd::Find.key());
         let search = widgets::search_edit(ui, &mut self.search, &hint, ui.available_width() - 56.0);
@@ -1095,7 +1347,7 @@ impl DiffsView {
                     painter.circle_filled(pos2(rect.left() + 10.0, rect.center().y), 3.5, dot);
                     let count = match &card.body {
                         Body::Loading => "…".to_string(),
-                        Body::Note(_) => "–".to_string(),
+                        Body::Note(..) => "–".to_string(),
                         Body::Diffs(d) => d.hunks.len().to_string(),
                     };
                     let count_g =
@@ -1227,8 +1479,10 @@ impl DiffsView {
                     }
                     Line::Row(f, r) => {
                         self.cards[f].seen = self.frame;
-                        if self.ensure_loaded(f) == Some(true) {
-                            self.ensure_cells(f, r);
+                        match self.cards[f].diffs() {
+                            Some(d) if d.loaded() => self.ensure_cells(f, r),
+                            Some(_) => self.refill(f),
+                            None => {}
                         }
                     }
                     Line::Gap => {}
@@ -1280,6 +1534,7 @@ impl DiffsView {
             }
             Some(Act::CopyFile(f, from, to)) => self.copy_file(f, from, to),
             Some(Act::Open(f)) => self.open_file(f),
+            Some(Act::Discard(f)) => self.discard(f),
             None => {}
         }
     }
@@ -1331,7 +1586,7 @@ impl DiffsView {
 
         // Buttons on the right, then what is known of the file before them.
         let buttons = Rect::from_min_max(
-            pos2(rect.right() - 120.0, rect.top()),
+            pos2(rect.right() - 150.0, rect.top()),
             pos2(rect.right() - 6.0, rect.bottom()),
         );
         let mut act = None;
@@ -1344,6 +1599,11 @@ impl DiffsView {
         bui.spacing_mut().item_spacing.x = 2.0;
         if widgets::icon_button(&mut bui, Icon::Compare, tr("diffs.open")).clicked() {
             act = Some(Act::Open(f));
+        }
+        if card.modified()
+            && widgets::icon_button(&mut bui, Icon::Refresh, tr("diffs.discard")).clicked()
+        {
+            act = Some(Act::Discard(f));
         }
         if n == 2 && card.diffs().is_some_and(|d| !d.same()) {
             let tip = tr("cmd.copy_all_left");
@@ -1369,12 +1629,12 @@ impl DiffsView {
                 0.0,
                 TextFormat::simple(small.clone(), p.text_dim),
             ),
-            Body::Note(_) => {}
+            Body::Note(..) => {}
             Body::Diffs(d) => {
                 let count = trf("report.text_summary", &[("n", d.hunks.len().to_string())]);
                 summary.append(&count, 0.0, TextFormat::simple(small.clone(), p.text_dim));
                 if n == 2 {
-                    let st = d.result.stats();
+                    let st = d.stats;
                     for (v, sign, color) in [
                         (st.added, "+", p.success),
                         (st.removed, "−", p.danger),
@@ -1510,7 +1770,8 @@ impl DiffsView {
             ]
         };
         for (from, to, icon, tip) in copies {
-            if widgets::icon_button_enabled(&mut bui, self.writable(to), icon, tip).clicked() {
+            let useful = self.writable(to) && copy_changes(d, b, from, to);
+            if widgets::icon_button_enabled(&mut bui, useful, icon, tip).clicked() {
                 act = Some(Act::Copy(f, h, from, to));
             }
         }
@@ -1584,7 +1845,10 @@ impl DiffsView {
         let border = Stroke::new(1.0_f32, p.border);
         painter.vline(rect.left() + 0.5, rect.y_range(), border);
         painter.vline(rect.right() - 0.5, rect.y_range(), border);
-        let h = d.hunks.iter().position(|(_, rows)| rows.contains(&r))?;
+        let h = d.hunks.partition_point(|(_, rows)| rows.end <= r);
+        if !d.hunks.get(h)?.1.contains(&r) {
+            return None;
+        }
         if self.current == Some((f, h)) && row.block == Some(d.hunks[h].0) {
             painter.rect_filled(
                 Rect::from_min_size(rect.min, vec2(3.0, rect.height())),
@@ -1603,7 +1867,7 @@ impl DiffsView {
         let p = pal(ui);
         let text = match &self.cards[f].body {
             Body::Loading => tr("msg.comparing").to_string(),
-            Body::Note(note) => note.clone(),
+            Body::Note(note, _) => note.clone(),
             Body::Diffs(d) => tr(d.quiet.unwrap_or("report.no_diffs")).to_string(),
         };
         let painter = ui.painter();
@@ -1637,6 +1901,20 @@ enum Act {
     Copy(usize, usize, usize, usize),
     CopyFile(usize, usize, usize),
     Open(usize),
+    Discard(usize),
+}
+
+/// Copying block `b` from side `from` to side `to` changes something: with three sides, a side
+/// may already hold the lines of the other. Unknown while the text is dropped to save memory.
+fn copy_changes(d: &Diffs, b: usize, from: usize, to: usize) -> bool {
+    let Some(blk) = d.result.blocks.get(b) else {
+        return false;
+    };
+    if !d.loaded() {
+        return true;
+    }
+    let lines = |s: usize| d.docs[s].lines.get(blk.ranges[s].clone());
+    lines(from) != lines(to)
 }
 
 /// Color of a file's marks: the same, missing on a side, or different.
@@ -1763,7 +2041,9 @@ mod tests {
             for (s, text) in sides.iter().enumerate() {
                 std::fs::create_dir_all(&roots[s]).unwrap();
                 if let Some(t) = text {
-                    std::fs::write(roots[s].join(name), t).unwrap();
+                    let path = roots[s].join(name);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, t).unwrap();
                     exists[s] = true;
                 }
             }
@@ -1782,6 +2062,8 @@ mod tests {
             rules: String::new(),
             title: "test".into(),
             items,
+            stopped: false,
+            temps: Vec::new(),
         };
         let mut v = DiffsView::new(src, 1);
         wait(&mut v);
@@ -1789,7 +2071,12 @@ mod tests {
     }
 
     fn wait(v: &mut DiffsView) {
-        while v.loading.is_some() {
+        let start = Instant::now();
+        while v.loading.is_some() || !v.refills.is_empty() {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "files never read"
+            );
             v.poll();
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1856,13 +2143,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut v, roots) = view(
             dir.path(),
-            &[("old.txt", &[Some("a\nb\n"), None])],
+            &[("sub/deeper/old.txt", &[Some("a\nb\n"), None])],
             vec![false, false],
         );
         v.copy_file(0, 1, 0);
         assert!(v.cards[0].diffs().unwrap().same());
         v.save_modified().unwrap();
-        assert!(!roots[0].join("old.txt").exists());
+        assert!(!roots[0].join("sub").exists());
+        assert!(roots[0].exists());
     }
 
     #[test]
@@ -1870,25 +2158,112 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut v, roots) = view(
             dir.path(),
-            &[("a.txt", &[Some("x\n"), Some("y\n")])],
+            &[
+                ("a.txt", &[Some("x\n"), Some("y\n")]),
+                ("b.txt", &[Some("p\n"), Some("q\n")]),
+            ],
             vec![false, false],
         );
         v.first();
         v.copy_current(true);
+        v.copy_hunk(1, 0, 0, 1);
         std::fs::write(roots[1].join("a.txt"), "edited elsewhere, longer\n").unwrap();
         assert!(v.save_modified().is_err());
         assert_eq!(read(roots[1].join("a.txt")), "edited elsewhere, longer\n");
-        assert!(v.is_modified());
+        assert_eq!(read(roots[1].join("b.txt")), "p\n");
+        assert!(v.cards[0].modified());
+
+        // Its changes can be dropped without undoing those made to other files since.
+        v.discard(0);
+        assert!(!v.cards[0].modified());
+        let d = v.cards[0].diffs().unwrap();
+        assert_eq!(d.docs[1].lines, ["edited elsewhere, longer"]);
+        assert!(v.undo.iter().all(|u| u.file == 1) && v.undo.len() == 1);
 
         // Without changes here, a file changed on disk is simply read again.
-        v.undo();
-        assert!(!v.is_modified());
+        std::fs::write(roots[1].join("a.txt"), "again\n").unwrap();
         v.frame = 5;
         v.cards[0].seen = 5;
         v.disk_checked = Instant::now() - DISK_CHECK;
         v.check_disk();
         let d = v.cards[0].diffs().unwrap();
-        assert_eq!(d.docs[1].lines, ["edited elsewhere, longer"]);
+        assert_eq!(d.docs[1].lines, ["again"]);
+    }
+
+    #[test]
+    fn files_shown_as_a_note_are_checked_on_disk_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut v, roots) = view(
+            dir.path(),
+            &[("a.txt", &[Some("same\n"), Some("same\n")])],
+            vec![false, false],
+        );
+        v.cards[0].body = Body::Note("old".into(), v.cards[0].stamps().unwrap().to_vec());
+        std::fs::write(roots[1].join("a.txt"), "now different\n").unwrap();
+        v.frame = 5;
+        v.cards[0].seen = 5;
+        v.disk_checked = Instant::now() - DISK_CHECK;
+        v.check_disk();
+        assert_eq!(v.cards[0].hunk_count(), 1);
+    }
+
+    #[test]
+    fn files_left_unread_by_a_stopped_reader_tell_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut v, _) = view(
+            dir.path(),
+            &[("a.txt", &[Some("x\n"), Some("y\n")])],
+            vec![false, false],
+        );
+        let (tx, rx) = mpsc::channel();
+        drop(tx);
+        v.cards[0].body = Body::Loading;
+        v.loading = Some(rx);
+        v.poll();
+        assert!(v.loading.is_none());
+        assert!(matches!(&v.cards[0].body, Body::Note(n, _) if n == tr("status.error")));
+    }
+
+    #[test]
+    fn newer_folder_results_replace_the_files_keeping_collapsed_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut v, roots) = view(
+            dir.path(),
+            &[
+                ("a.txt", &[Some("x\n"), Some("y\n")]),
+                ("b.txt", &[Some("p\n"), Some("q\n")]),
+            ],
+            vec![false, false],
+        );
+        v.cards[1].open = false;
+        std::fs::write(roots[0].join("c.txt"), "new\n").unwrap();
+        let src = |items: Vec<DirItem>| Source {
+            roots: roots.clone(),
+            display_roots: roots.iter().map(|r| r.display().to_string()).collect(),
+            read_only: vec![false, true],
+            dopts: DiffOptions::default(),
+            rules: String::new(),
+            title: "test".into(),
+            items,
+            stopped: true,
+            temps: Vec::new(),
+        };
+        // Fewer files, such as after saving made some the same, keep the tab as it is.
+        let mut same = v.cards[0].item.clone();
+        same.status = CmpStatus::Identical;
+        assert!(v.lists_all(&src(vec![same, v.cards[1].item.clone()])));
+        let items = vec![
+            v.cards[1].item.clone(),
+            item("c.txt", [true, false, false], CmpStatus::Unique),
+        ];
+        assert!(!v.lists_all(&src(items.clone())));
+        v.update_from(src(items));
+        wait(&mut v);
+        let names: Vec<String> = v.cards.iter().map(|c| c.item.rel_path()).collect();
+        assert_eq!(names, ["b.txt", "c.txt"]);
+        assert!(!v.cards[0].open && v.cards[1].open);
+        assert!(v.stopped && v.read_only == [false, true]);
+        assert_eq!(v.all_hunks(), vec![(0, 0), (1, 0)]);
     }
 
     #[test]
@@ -1963,6 +2338,132 @@ mod tests {
         }
         assert_eq!(v.ensure_loaded(0), Some(true));
         assert_eq!(v.cards[0].diffs().unwrap().docs[0].lines, ["1"]);
+
+        // Scrolled into view, it is read again on another thread.
+        if let Body::Diffs(d) = &mut v.cards[0].body {
+            d.docs.iter_mut().for_each(|doc| doc.lines.clear());
+            d.size = 0;
+        }
+        v.refill(0);
+        v.refill(0);
+        assert_eq!(v.refills.len(), 1);
+        wait(&mut v);
+        assert_eq!(v.cards[0].diffs().unwrap().docs[1].lines, ["2"]);
+    }
+
+    #[test]
+    fn stepping_from_the_view_goes_to_the_next_difference_below_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let left: String = (0..40).map(|i| format!("{i}\n")).collect();
+        let right: String = (0..40)
+            .map(|i| match i {
+                1 => "one\n".to_string(),
+                30 => "thirty\n".to_string(),
+                _ => format!("{i}\n"),
+            })
+            .collect();
+        let (mut v, _) = view(
+            dir.path(),
+            &[
+                ("a.txt", &[Some(&left), Some(&right)]),
+                ("b.txt", &[Some("p\n"), Some("q\n")]),
+            ],
+            vec![false, false],
+        );
+        assert_eq!(v.cards[0].hunk_count(), 2);
+        v.top_line = v.lines.iter().position(|&l| l == Line::Hunk(0, 1)).unwrap();
+        v.step(true);
+        assert_eq!(v.current, Some((0, 1)));
+        v.current = None;
+        v.step(false);
+        assert_eq!(v.current, Some((0, 0)));
+    }
+
+    #[test]
+    fn only_files_saved_have_their_undo_marked_as_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut v, roots) = view(
+            dir.path(),
+            &[
+                ("a.txt", &[Some("x\n"), Some("y\n")]),
+                ("b.txt", &[Some("p\n"), Some("q\n")]),
+            ],
+            vec![false, false],
+        );
+        v.copy_hunk(0, 0, 0, 1);
+        v.copy_hunk(1, 0, 0, 1);
+        std::fs::write(roots[1].join("a.txt"), "changed elsewhere\n").unwrap();
+        assert!(v.save_modified().is_err());
+        let marked =
+            |v: &DiffsView, f: usize| v.undo.iter().find(|u| u.file == f).unwrap().modified;
+        assert!(!marked(&v, 0));
+        assert!(marked(&v, 1));
+    }
+
+    #[test]
+    fn saving_mixed_line_endings_tells_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut v, roots) = view(
+            dir.path(),
+            &[("m.txt", &[Some("a\nb\n"), Some("a\r\nc\r\nd\n")])],
+            vec![false, false],
+        );
+        v.copy_hunk(0, 0, 0, 1);
+        v.save_modified().unwrap();
+        let note = trf("diffs.eol_unified", &[("files", "m.txt (CRLF)".into())]);
+        assert!(v.status.ends_with(&note), "{}", v.status);
+        let saved = std::fs::read_to_string(roots[1].join("m.txt")).unwrap();
+        assert_eq!(saved, "a\r\nb\r\n");
+    }
+
+    #[test]
+    fn a_change_keeping_size_and_time_is_not_saved_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut v, roots) = view(
+            dir.path(),
+            &[("a.txt", &[Some("x\n"), Some("y\n")])],
+            vec![false, false],
+        );
+        v.copy_hunk(0, 0, 0, 1);
+        let path = roots[1].join("a.txt");
+        let time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "z\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        assert!(v.save_modified().is_err());
+        assert_eq!(read(path), "z\n");
+    }
+
+    #[test]
+    fn three_sides_skip_copies_that_change_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut v, _) = view(
+            dir.path(),
+            &[("m.txt", &[Some("L\n"), Some("base\n"), Some("base\n")])],
+            vec![false, false, false],
+        );
+        v.copy_hunk(0, 0, 2, 1);
+        assert!(!v.is_modified() && v.undo.is_empty());
+        v.copy_hunk(0, 0, 0, 1);
+        assert!(v.is_modified());
+    }
+
+    #[test]
+    fn an_empty_file_against_a_missing_one_is_told_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (v, _) = view(
+            dir.path(),
+            &[("e.txt", &[Some(""), None])],
+            vec![false, false],
+        );
+        assert_eq!(
+            v.cards[0].diffs().unwrap().quiet,
+            Some("diffs.empty_or_missing")
+        );
     }
 
     #[test]

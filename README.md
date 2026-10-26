@@ -31,23 +31,45 @@ The name comes from the language it is written in: rust is iron oxide.
   with optional Recycle Bin support and confirmation prompts.
 - Copy the selected items of any side to another folder, keeping their relative paths, and select
   items by name with wildcards (`*.c; *.h`).
-- File compare below the folder list (View menu): the selected file's differences are shown right
+- File compare below the folder list (View → Folder list): the selected file's differences are shown right
   under the list, without opening a tab.
 - 3-way auto merge of folders into the middle (common ancestor) folder: changes made on one side
   are copied, removals are applied, and text files changed on both sides are merged line by line
   when the changes don't overlap. Conflicts are listed and left alone.
 - Keyboard selection: arrow keys, Page Up/Down, Home/End, Shift to extend, Ctrl+A to select all.
 - Quick preview: press Space to see a colored diff of the selected file without opening a tab.
+- **All differences** (folder toolbar, or Compare → All differences): every changed text file
+  the folder compare shows (its filters apply) in one tab, as cards with their differences side by
+  side like the HTML report, beside a list of the files with filter search. Expand or collapse
+  every card, step through the differences across files, copy a difference to another side (or,
+  with two sides, a whole file), undo, and save; the folder compare refreshes after saving.
+  Copying from a side where a file is missing deletes it when saved, along with folders left
+  empty; with backups on, the file is kept as `.bak`, so its folder stays. A file changed on disk
+  after it was read is not saved over; its card can discard the changes to it and read it again.
+  Files in view without changes here are read again when they change on disk, and text compares
+  of the saved files notice the change. Refresh (F5) reads the compare rules and options again,
+  and opening All differences again lists the files with differences found since, unless there
+  are changes to keep. The text of files far out of view is let go and read again when needed,
+  which keeps memory use down in large compares. A card opens its file in its own tab too.
 - A long comparison that finishes while the window is in the background asks for attention.
 - File filters: wildcard masks such as `*.c;*.h;!*.bak;!.git\` and WinMerge `.flt` filter files.
 - Archives are extracted and compared as folders: zip-based formats (`.zip`, `.jar`, `.apk`,
   `.docx`, `.xlsx`, `.odt`, `.epub`, `.nupkg`, ...), `.tar`, `.tar.gz`/`.tgz`,
-  `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz` and `.7z`.
-- Reports in HTML, CSV and plain text. An HTML report can also include the side-by-side
-  differences of every changed text file (File → Generate report with file differences).
+  `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz` and `.7z`. The extracted sides are read-only, since
+  changes to them could not be saved back into the archive.
+- Reports in HTML, CSV and plain text. The HTML report is a single self-contained page that lists
+  every difference as its own card, with line numbers, three lines of context and changed words
+  highlighted. It has summary cards, an index, side-by-side or unified view, light and dark
+  themes, file filters and search, and `N` / `P` to step through the differences. It names the
+  compare rules file used and counts the differences it ignored. **Export HTML** on the toolbar
+  of a text or folder compare (or File → Export → Export HTML report, `Ctrl+Shift+E`) saves it, with the
+  differences of every changed text file for a folder compare, and opens it in the browser
+  (File → Export → Open reports in the browser after saving turns that off). File → Export →
+  Generate report
+  writes folder reports as HTML, CSV or plain text.
 - Statistics (Tools menu): counts of identical, different and unique files, and total sizes.
-- Project files (`.oxmproj`) save what a tab compares (paths, filter, subfolders and compare
-  method) to open it again later; WinMerge `.WinMerge` projects open too.
+- Project files (`.oxmproj`) save what a tab compares (paths, filter, subfolders, compare
+  method and compare rules file) to open it again later; WinMerge `.WinMerge` projects open too.
 
 **Text compare and merge**
 - 2-way and 3-way comparison with Myers, Patience or LCS diff algorithms. Large files are first
@@ -64,19 +86,28 @@ The name comes from the language it is written in: rust is iron oxide.
   comparing measurements and generated data.
 - Block filters: ignore everything between a start line and an end line matching regular
   expressions, such as generated sections or license headers.
+- Compare rules files (`.oxrules`) hold the lines to ignore, substitutions and blocks to ignore.
+  Options → Compare rules picks the default file and edits them; a folder compare picks its own from the
+  toolbar (Refresh reads it again), and right-clicking a line in a text compare adds a rule built
+  from it ("Add compare rule"). The files live in the `Rules` folder next to the settings. To share
+  them, use Export in Options → Compare rules (one file, or all of them to a folder) and Import
+  there, or drop an `.oxrules` file on the window (or several on the options; dropping two on the
+  window compares them). A file with the same name and rules as one already there is skipped,
+  one named like an existing file but with other rules is added under a numbered name, and one
+  with the same rules under another name is added as it is.
 - Ignore comment changes, for languages whose comment syntax is known (C-like languages, scripts,
   SQL, HTML/XML, CSS, Lua, Haskell, ...), and format JSON and XML before comparing (re-indented,
   JSON keys sorted) so only real content changes remain. Both also apply to folder compares.
 - File → New (Ctrl+N) opens two empty sides to paste text into (Ctrl+V) or type; Ctrl+V also
   inserts the clipboard below the current line, or replaces the selected lines, in any editable side.
 - Bookmarks: Ctrl+F2 sets or removes one, F4 / Shift+F4 jump to the next / previous; they are marked
-  in the gutter and the location pane. A bookmark can carry a comment (Edit → Bookmark comment),
+  in the gutter and the location pane. A bookmark can carry a comment (Edit → Bookmarks → Bookmark comment),
   shown when hovering the gutter and in HTML reports.
 - Save comparison (File menu): the text of every side with its bookmarks and comments in one
   `.oxmcmp` file, to review later or send to someone else.
 - Compare with a Git revision (File menu, or `--git-rev`): a file or folder against how it was
   in `HEAD`, a branch, tag or commit.
-- Line detail pane (View menu): the current line of every side, one above the other and wrapped,
+- Line detail pane (View → Text compare): the current line of every side, one above the other and wrapped,
   to spot small differences in long lines.
 - Edit markers in the gutter show which lines were changed since the files were opened.
 - Statistics (Tools menu): identical, changed, added, removed and ignored lines, per pair of sides.
@@ -92,7 +123,7 @@ The name comes from the language it is written in: rust is iron oxide.
 - Saving writes a temporary file and renames it over the original, so a crash or a full disk never
   leaves a half-written file; optionally the previous contents are kept as `<name>.bak`.
 - Patch generation in normal, context and unified formats, and side-by-side HTML reports.
-- Apply patch (Tools menu): applies a unified diff (plain, `git diff` or `svn diff`), finding each
+- Apply patch (File menu): applies a unified diff (plain, `git diff` or `svn diff`), finding each
   hunk even when lines have moved, and opens every patched file next to its original to review and
   save. Hunks that don't fit are reported.
 - Files changed by another program are detected when the window regains focus: unmodified files
@@ -152,8 +183,8 @@ Every [GitHub release](https://github.com/kuopinghsu/OxideMerge/releases) has th
 
 | Platform | Package |
 | --- | --- |
-| Windows x64 | `oxidemerge-<version>-windows-x64.exe` (runs as is) or `.zip` |
-| Linux x64 | `.AppImage` (Ubuntu 20.04, RHEL 8, Debian 10 and newer; no install needed), `.deb` (Ubuntu 22.04 and newer), or `.tar.gz` |
+| Windows x64 / Arm64 | `oxidemerge-<version>-windows-x64.exe` or `-windows-arm64.exe` (runs as is), or the `.zip` of the same name |
+| Linux x64 / Arm64 (aarch64) | `oxidemerge-<version>-linux-x64.*` or `-linux-arm64.*`: `.AppImage` (Ubuntu 20.04, RHEL 8, Debian 10 and newer; no install needed), `.deb` (Ubuntu 22.04 and newer), or `.tar.gz` |
 | macOS 11+ (Apple silicon and Intel) | `oxidemerge-<version>-macos-universal.dmg`, or the same app in a `.zip` |
 
 - **Linux:** run `chmod +x oxidemerge-*.AppImage` before starting the AppImage. Without FUSE, start
@@ -194,7 +225,7 @@ A `Makefile` for GNU Make wraps the common tasks. It works on Windows and Unix.
 | `make install` / `uninstall` | `cargo install` into `~/.cargo/bin` |
 | `make shell-register` | Install, then add the file manager entries (Explorer, Finder Quick Actions, Nautilus, Nemo, Dolphin) |
 | `make dist` | Package the release binary into `dist/` (`.zip` on Windows, `.tar.gz` elsewhere) |
-| `make appimage` | Linux x86_64 AppImage in `dist/` (same layout as CI; needs the X11, Wayland and keyboard libraries installed, and downloads `appimagetool`) |
+| `make appimage` | Linux AppImage (x86_64 or aarch64, matching the machine) in `dist/` (same layout as CI; needs the X11, Wayland and keyboard libraries installed, and downloads `appimagetool`) |
 | `make clean` | Remove build output |
 | `make help` | List all targets |
 
@@ -203,14 +234,16 @@ A `Makefile` for GNU Make wraps the common tasks. It works on Windows and Unix.
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main` and on every
 pull request. On Windows, Linux and macOS it runs clippy with warnings treated as errors, runs the
 unit tests, builds a release, and smoke-tests the command line (`--version`, `--list-languages` and
-the `--cli` exit codes). It then uploads these packages as workflow artifacts:
+the `--cli` exit codes). The Arm64 packages are built and tested natively on GitHub's Arm runners
+(`windows-11-arm`, `ubuntu-22.04-arm`, `ubuntu-24.04-arm`). It then uploads these packages as workflow artifacts:
 
-- **Windows:** the `.exe` and a `.zip`.
-- **Linux:** a `.tar.gz` and a `.deb`, built on Ubuntu 22.04.
-- **Linux AppImage:** built on AlmaLinux 8 (glibc 2.28). It bundles the X11, Wayland and keyboard
-  libraries, and [`assets/AppRun`](assets/AppRun) uses them only when the system lacks them. The
-  AppImage is then checked on Ubuntu 22.04 and 24.04 and on AlmaLinux 8 and 9: every bundled
-  library must resolve, the command line must work, and the window must stay open under Xvfb.
+- **Windows x64 and Arm64:** the `.exe` and a `.zip`.
+- **Linux x64 and Arm64:** a `.tar.gz` and a `.deb`, built on Ubuntu 22.04.
+- **Linux AppImage, x64 and Arm64:** built on AlmaLinux 8 (glibc 2.28). It bundles the X11, Wayland
+  and keyboard libraries, and [`assets/AppRun`](assets/AppRun) uses them only when the system lacks
+  them. Each AppImage is then checked on Ubuntu 22.04 and 24.04 and on AlmaLinux 8 and 9: every
+  bundled library must resolve, the command line must work, and the window must stay open under
+  Xvfb.
 - **macOS:** a universal (Apple silicon and Intel) `OxideMerge.app`, ad-hoc signed, in a `.dmg` and
   a `.zip`.
 
@@ -284,8 +317,9 @@ button. The last mode used is remembered. Screenshot size and the browser path a
 | `--ignore-comments` | Ignore changes in comments |
 | `--prettify` | Reformat JSON and XML before comparing |
 | `--numeric-tolerance <AMOUNT>` | Treat numbers at most this far apart as equal |
+| `--rules <NAME>` | Compare rules file to use: a name from the rules folder, or the path of an `.oxrules` file; `""` for none |
 | `--git-rev <REV>` | Compare the single path given with how it was in a Git revision |
-| `--report <FILE>` | Write a report: folder compares as `.html`, `.csv` or `.txt`, text compares as side-by-side `.html` |
+| `--report <FILE>` | Write a report: folder compares as `.html`, `.csv` or `.txt`, text compares as `.html` listing every difference |
 | `--report-diffs` | Add the differences of every changed text file to an HTML folder report |
 | `--patch <FILE>` | Write a patch for two files or folders |
 | `--patch-style <S>` | `normal`, `context` or `unified` (default) |
@@ -312,7 +346,7 @@ oxidemerge -r dirA dirB --report report.html
 # HTML folder report followed by the differences of every changed file
 oxidemerge -r dirA dirB --report report.html --report-diffs
 
-# Side-by-side HTML report of two files, ignoring comment changes
+# HTML report of every difference between two files, ignoring comment changes
 oxidemerge old.c new.c --ignore-comments --report diff.html
 
 # Unified diff with 5 lines of context
@@ -347,7 +381,14 @@ git config --global mergetool.oxidemerge.trustExitCode false
 
 Press `F1` or `?`, or click the `?` button at the top right, to open the Help & Shortcuts
 dialog. It lists every keyboard shortcut and mouse action by view, and shows where the settings
-file is stored.
+file is stored. On macOS, `Ctrl` in these shortcuts is the Command key, except in `Ctrl+Tab`, which
+is the Control key there too (`⌃Tab`), and the menus, tooltips and the dialog write the keys the
+macOS way (`⇧⌘S`, `⌥↓`).
+
+The menus are grouped by what they act on: File (open, save, export, close), Edit (undo, find,
+bookmarks), View (folder list and text compare display, zoom, theme), Compare (step through
+differences, compare as, compare rules, compare options, refresh), Merge (copy and auto merge),
+Tools and Help. Commands that do nothing in the current tab are greyed out.
 
 | Keys | Action |
 | --- | --- |
@@ -357,8 +398,10 @@ file is stored.
 | `Ctrl+O` | Open |
 | `Ctrl+S` | Save |
 | `Ctrl+Shift+S` | Save all |
+| `Ctrl+Shift+E` | Export HTML report |
 | `Ctrl+W`, `Ctrl+F4` | Close tab (right-click a tab to close others, to the right, or all) |
 | `Ctrl+Tab`, `Ctrl+Shift+Tab` | Next or previous tab |
+| `Alt+F4` (`Cmd+Q` on macOS) | Exit, asking first about unsaved changes |
 | `Ctrl+F`, `F3`, `Shift+F3`, `Esc` | Find, find next, find previous, close the find bar |
 | `Ctrl+H` (`Cmd+Alt+F` on macOS) | Find and replace |
 | `Ctrl+G` | Go to line (go to offset in a binary compare) |

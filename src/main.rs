@@ -115,8 +115,12 @@ struct Cli {
     #[arg(long)]
     prettify: bool,
     /// Treat numbers at most this far apart as equal (for example 0.001)
-    #[arg(long, value_name = "AMOUNT")]
+    #[arg(long, value_name = "AMOUNT", value_parser = finite_number)]
     numeric_tolerance: Option<f64>,
+    /// Compare rules file (lines to ignore, substitutions, blocks to ignore): the name of a file
+    /// in the rules folder, or the path of an .oxrules file; "" for none
+    #[arg(long, value_name = "NAME")]
+    rules: Option<String>,
     /// Write a report without opening the GUI: folder compares as .html, .csv or .txt, text
     /// compares as side-by-side .html
     #[arg(long)]
@@ -283,6 +287,42 @@ fn git_copy(path: &std::path::Path, rev: &str) -> anyhow::Result<(tempfile::Temp
     Ok((dir, copy))
 }
 
+/// Tells about the patterns of the rules that are not valid regular expressions: the compare
+/// goes on without them.
+fn warn_bad_patterns(d: &core::diff::DiffOptions) {
+    let mut patterns: Vec<&str> = Vec::new();
+    if d.line_filters_enabled {
+        patterns.extend(d.line_filters.iter().map(String::as_str));
+    }
+    if d.substitutions_enabled {
+        patterns.extend(d.substitutions.iter().map(|(f, _)| f.as_str()));
+    }
+    if d.block_filters_enabled {
+        patterns.extend(
+            d.block_filters
+                .iter()
+                .flat_map(|(s, e)| [s.as_str(), e.as_str()]),
+        );
+    }
+    for p in patterns {
+        if !p.is_empty() && regex::Regex::new(p).is_err() {
+            let pattern = p.to_string();
+            eprintln!(
+                "note: {}",
+                i18n::trf("opt.invalid_regex", &[("pattern", pattern)])
+            );
+        }
+    }
+}
+
+fn finite_number(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v.is_finite() => Ok(v),
+        Ok(_) => Err("expected a finite number".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Non-interactive operations (console compare, report, patch). Returns the process exit code.
 fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     let mut cli_paths = cli.paths.clone();
@@ -302,6 +342,16 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     if paths.len() < 2 {
         anyhow::bail!("two or three paths are required");
     }
+    if cli.report_diffs && cli.report.is_none() {
+        eprintln!("note: --report-diffs needs --report");
+    }
+    let patch = match &cli.patch {
+        Some(_) if paths.len() != 2 => {
+            eprintln!("note: --patch needs two paths; no patch written");
+            None
+        }
+        p => p.as_ref(),
+    };
     if paths.iter().all(|p| p.is_dir()) {
         let filter_spec = cli.filter.clone().unwrap_or_else(|| cfg.filter.clone());
         let filter = FileFilter::resolve(&filter_spec, &core::filter::load_all_filters());
@@ -325,20 +375,24 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             .iter()
             .filter(|i| !i.is_dir || i.children.is_empty())
             .collect();
-        let different = files.iter().any(|i| i.status != CmpStatus::Identical);
+        // Folders left uncompared (not recursive) say nothing about their files.
+        let different = files.iter().any(|i| {
+            i.status != CmpStatus::Identical && !(i.is_dir && i.status == CmpStatus::NotCompared)
+        });
+        let failed = files.iter().any(|i| i.status == CmpStatus::Error);
         if let Some(r) = &cli.report {
             let format = ReportFormat::from_path(r);
             if cli.report_diffs && format != ReportFormat::Html {
                 eprintln!("note: --report-diffs only applies to .html reports");
             }
             let text = if cli.report_diffs && format == ReportFormat::Html {
-                core::report::folder_html_with_diffs(&files, paths, &shown, &cfg.diff)
+                core::report::folder_html_with_diffs(&files, paths, &shown, &cfg.diff, &cfg.rules)
             } else {
-                core::report::generate(&files, &shown, format)
+                core::report::generate(&files, &shown, format, &cfg.rules)
             };
             std::fs::write(r, text)?;
         }
-        if let Some(p) = &cli.patch {
+        if let Some(p) = patch {
             let text = core::patch::folder_patch(
                 paths,
                 &display,
@@ -353,16 +407,19 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             let changed: Vec<&core::folder::DirItem> = files
                 .iter()
                 .copied()
-                .filter(|i| i.status != CmpStatus::Identical)
+                .filter(|i| {
+                    i.status != CmpStatus::Identical
+                        && !(i.is_dir && i.status == CmpStatus::NotCompared)
+                })
                 .collect();
             print!(
                 "{}",
-                core::report::generate(&changed, &shown, ReportFormat::Text)
+                core::report::generate(&changed, &shown, ReportFormat::Text, &cfg.rules)
             );
         }
-        return Ok(u8::from(different));
+        return Ok(if failed { 2 } else { u8::from(different) });
     }
-    if cli.report_diffs {
+    if cli.report_diffs && cli.report.is_some() {
         eprintln!("note: --report-diffs only applies to folder compares");
     }
     let kind = match cli.kind {
@@ -385,6 +442,9 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         }
     };
     if matches!(kind, FileKind::Binary | FileKind::Image) {
+        if cli.report.is_some() {
+            eprintln!("note: --report is not written for binary or image files");
+        }
         let a = std::fs::read(&paths[0])?;
         let b = std::fs::read(&paths[1])?;
         let ranges = core::binary::diff_ranges(&[&a, &b]);
@@ -433,12 +493,15 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
     let result = core::diff::compute_with(&refs, &cfg.diff, syntax);
     if let Some(r) = &cli.report {
+        if ReportFormat::from_path(r) != ReportFormat::Html {
+            eprintln!("note: text compares are reported as HTML only");
+        }
         let titles: Vec<String> = (0..docs.len())
             .map(|i| cli_desc(cli, i).unwrap_or_else(|| paths[i].display().to_string()))
             .collect();
         std::fs::write(
             r,
-            core::report::text_html(&titles, &refs, &result, &cfg.diff, &[]),
+            core::report::text_html(&titles, &refs, &result, &cfg.diff, &[], &cfg.rules),
         )?;
     }
     if docs.len() == 2 {
@@ -461,7 +524,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         };
         let text =
             core::patch::make_patch(&input, &result, patch_style(cli.patch_style), cli.context);
-        if let Some(p) = &cli.patch {
+        if let Some(p) = patch {
             std::fs::write(p, &text)?;
         }
         if cli.cli {
@@ -539,6 +602,9 @@ fn main() -> ExitCode {
     attach_console();
     let cli = Cli::parse_from(winmerge_args());
     let mut cfg = Config::load();
+    if core::rules::load_selected(&mut cfg) {
+        cfg.save();
+    }
     if let Some(l) = &cli.lang {
         cfg.language = l.clone();
     }
@@ -592,7 +658,36 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let cli_rules = cli
+        .rules
+        .as_deref()
+        .map(|r| core::rules::absolute_spec(r, &cwd));
+    // `Some(None)` turns the rules of the options off ("--rules ''").
+    let rules = match cli_rules.as_deref() {
+        None => None,
+        Some("") => Some(None),
+        Some(name) => match core::rules::find(name) {
+            Some(set) => Some(Some(set)),
+            None => {
+                eprintln!("error: no compare rules named {name:?}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+
     if cli.cli || cli.report.is_some() || cli.patch.is_some() {
+        if let (Some(set), Some(name)) = (&rules, &cli_rules) {
+            cfg.diff = core::rules::options_with(&cfg.diff, set.as_ref());
+            cfg.rules = name.clone();
+        } else if !cfg.rules.is_empty() && core::rules::find(&cfg.rules).is_none() {
+            eprintln!(
+                "note: the selected compare rules {:?} are missing; comparing without them",
+                cfg.rules
+            );
+            cfg.rules.clear();
+        }
+        warn_bad_patterns(&cfg.diff);
         return match run_batch(&cli, &cfg) {
             Ok(code) => ExitCode::from(code),
             Err(e) => {
@@ -606,6 +701,7 @@ fn main() -> ExitCode {
         Some(OpenRequest {
             paths,
             git_rev: Some(rev.clone()),
+            rules: cli_rules.clone(),
             ..Default::default()
         })
     } else if paths.is_empty() {
@@ -630,6 +726,7 @@ fn main() -> ExitCode {
             filter: cli.filter.clone(),
             method: cli.method.map(method),
             output: cli.output.clone(),
+            rules: cli_rules.clone(),
             ..Default::default()
         })
     };

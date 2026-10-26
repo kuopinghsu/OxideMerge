@@ -53,18 +53,24 @@ impl RuleSet {
 
     pub fn load(path: &Path) -> Option<RuleSet> {
         let text = std::fs::read_to_string(path).ok()?;
-        let mut set: RuleSet = serde_json::from_str(&text).ok()?;
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        let mut set: RuleSet = serde_json::from_str(text).ok()?;
         set.name = path.file_stem()?.to_string_lossy().into_owned();
         set.path = path.to_path_buf();
         Some(set)
     }
 
+    /// Writes the file through a temporary one, so it is never left half written, keeping what
+    /// the file was (its permissions, or a link to it). No backup is kept: the Rules folder would
+    /// fill with them.
     pub fn save(&self) -> std::io::Result<()> {
-        if let Some(d) = self.path.parent() {
+        if let Some(d) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(d)?;
         }
-        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(&self.path, text + "\n")
+        let mut text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        text.push('\n');
+        crate::core::fsutil::write_atomic_with(&self.path, text.as_bytes(), false)
+            .map_err(std::io::Error::other)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -181,8 +187,18 @@ pub fn options_with(base: &DiffOptions, set: Option<&RuleSet>) -> DiffOptions {
 
 /// A name usable as a file name.
 pub fn file_name(name: &str) -> String {
+    let name = name.trim();
+    let name = match name.len().checked_sub(EXT.len() + 1) {
+        Some(i)
+            if name.is_char_boundary(i)
+                && name[i..].starts_with('.')
+                && name[i + 1..].eq_ignore_ascii_case(EXT) =>
+        {
+            &name[..i]
+        }
+        _ => name,
+    };
     let s: String = name
-        .trim()
         .chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
@@ -227,17 +243,14 @@ pub fn list_in(dirs: &[PathBuf]) -> Vec<RuleSet> {
         let Ok(rd) = std::fs::read_dir(dir) else {
             continue;
         };
-        for e in rd.flatten() {
-            let p = e.path();
-            let ours = p
-                .extension()
-                .map(|x| x.eq_ignore_ascii_case(EXT))
-                .unwrap_or(false);
-            if let Some(set) = ours.then(|| RuleSet::load(&p)).flatten() {
-                all.retain(|x| !x.name.eq_ignore_ascii_case(&set.name));
-                all.push(set);
-            }
-        }
+        let here: Vec<RuleSet> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter_map(|p| is_rules_file(&p).then(|| RuleSet::load(&p)).flatten())
+            .collect();
+        // Folders where case matters can hold names differing only in case; both are listed.
+        all.retain(|x| !here.iter().any(|h| same_name(&h.name, &x.name)));
+        all.extend(here);
     }
     all.sort_by_key(|s| s.name.to_lowercase());
     all
@@ -253,16 +266,21 @@ pub fn find_in(dirs: &[PathBuf], name: &str) -> Option<RuleSet> {
         return None;
     }
     let p = Path::new(name);
-    if p.extension()
-        .map(|x| x.eq_ignore_ascii_case(EXT))
-        .unwrap_or(false)
-        && p.is_file()
-    {
+    if is_rules_file(p) && p.is_file() {
         return RuleSet::load(p);
     }
-    list_in(dirs)
-        .into_iter()
-        .find(|s| s.name.eq_ignore_ascii_case(name))
+    // "Logs.oxrules" names the rules "Logs"; a path to a missing file names nothing.
+    let bare = p.parent().is_some_and(|d| d.as_os_str().is_empty());
+    let name = if bare { display_name(name) } else { name };
+    let all = list_in(dirs);
+    let exact = all.iter().position(|s| s.name == name);
+    let at = exact.or_else(|| all.iter().position(|s| same_name(&s.name, name)))?;
+    all.into_iter().nth(at)
+}
+
+/// Whether two rules names are the same, letters compared regardless of case.
+pub fn same_name(a: &str, b: &str) -> bool {
+    a == b || a.to_lowercase() == b.to_lowercase()
 }
 
 pub fn find(name: &str) -> Option<RuleSet> {
@@ -280,14 +298,15 @@ pub fn display_name(name: &str) -> &str {
 
 /// Moves the rules of the options of earlier versions into rules files in `dir`, once: the
 /// enabled ones into "Default", which becomes the selected set, and the others into
-/// "Default (off)".
-pub fn migrate_in(dir: &Path, cfg: &mut Config) {
+/// "Default (off)". Returns whether `cfg` changed; on an error it is left as it was, to try
+/// again next time.
+pub fn migrate_in(dir: &Path, cfg: &mut Config) -> std::io::Result<bool> {
     if cfg.rules_migrated {
-        return;
+        return Ok(false);
     }
-    cfg.rules_migrated = true;
     if !cfg.rules.is_empty() {
-        return;
+        cfg.rules_migrated = true;
+        return Ok(true);
     }
     let d = &cfg.diff;
     let mut sets = [
@@ -313,12 +332,12 @@ pub fn migrate_in(dir: &Path, cfg: &mut Config) {
         })
         .collect();
     let existing = list_in(&[dir.to_path_buf()]);
-    let keep = |set: RuleSet| -> Option<String> {
+    let keep = |set: RuleSet| -> std::io::Result<Option<String>> {
         if set.is_empty() {
-            return None;
+            return Ok(None);
         }
         if let Some(e) = existing.iter().find(|e| e.same_rules(&set)) {
-            return Some(e.name.clone());
+            return Ok(Some(e.name.clone()));
         }
         let mut set = set;
         let base = set.name.clone();
@@ -329,26 +348,41 @@ pub fn migrate_in(dir: &Path, cfg: &mut Config) {
             set.path = fresh.path;
             n += 1;
         }
-        set.save().ok().map(|_| set.name)
+        set.save()?;
+        Ok(Some(set.name))
     };
     let [on, off] = sets;
-    let selected = keep(on);
-    keep(off);
+    let selected = keep(on)?;
+    keep(off)?;
+    cfg.rules_migrated = true;
     if let Some(name) = selected {
         cfg.rules = name;
     }
+    Ok(true)
 }
 
-/// Brings the options up to date with the selected rules file.
+/// Brings the options up to date with the selected rules file. A selected file that cannot be
+/// read stays selected, compared without, so a broken or unplugged one is not forgotten.
 pub fn apply_selected(cfg: &mut Config) {
-    let set = find(&cfg.rules);
-    if set.is_none() {
-        cfg.rules.clear();
-    }
-    cfg.diff = options_with(&cfg.diff, set.as_ref());
+    cfg.diff = options_with(&cfg.diff, find(&cfg.rules).as_ref());
 }
 
 /// Whether `path` names a rules file.
+/// `name` (a rules name or path) with a relative path made absolute against `base`, where it was
+/// given: a bare `Logs.oxrules` stays a name unless that file is there.
+pub fn absolute_spec(name: &str, base: &Path) -> String {
+    let p = Path::new(name);
+    let bare = p.parent().is_some_and(|d| d.as_os_str().is_empty());
+    if name.is_empty() || p.is_absolute() || (bare && !is_rules_file(p)) {
+        return name.to_string();
+    }
+    let abs = base.join(p);
+    if bare && !abs.is_file() {
+        return name.to_string();
+    }
+    abs.display().to_string()
+}
+
 pub fn is_rules_file(path: &Path) -> bool {
     path.extension()
         .is_some_and(|x| x.eq_ignore_ascii_case(EXT))
@@ -360,13 +394,16 @@ pub struct Imported {
     pub added: Vec<String>,
     /// Files whose rules were already there under the same name.
     pub present: Vec<String>,
-    /// Files that could not be read as rules files, or not saved.
+    /// Files that could not be read as rules files.
     pub failed: Vec<String>,
+    /// Rules that could not be saved, with the reason.
+    pub unsaved: Vec<String>,
 }
 
 /// Copies the rules files `files` into `dir`. A file with the name of one already there but
-/// other rules is added under a free name ("Name 2", ...).
-pub fn import_into(dir: &Path, files: &[PathBuf]) -> Imported {
+/// other rules is added under a free name ("Name 2", ...); one with the same name and rules there
+/// or in `others` is left out.
+pub fn import_into(dir: &Path, files: &[PathBuf], others: &[PathBuf]) -> Imported {
     let mut done = Imported::default();
     for file in files {
         let shown = file.file_name().map_or_else(
@@ -378,14 +415,16 @@ pub fn import_into(dir: &Path, files: &[PathBuf]) -> Imported {
             continue;
         };
         let existing = list_in(&[dir.to_path_buf()]);
-        if existing
+        let base = file_name(&set.name);
+        let mut known = others.to_vec();
+        known.push(dir.to_path_buf());
+        if let Some(e) = list_in(&known)
             .iter()
-            .any(|e| e.name.eq_ignore_ascii_case(&set.name) && e.same_rules(&set))
+            .find(|e| same_name(&e.name, &base) && e.same_rules(&set))
         {
-            done.present.push(set.name);
+            done.present.push(e.name.clone());
             continue;
         }
-        let base = file_name(&set.name);
         let mut copy = RuleSet {
             path: PathBuf::new(),
             ..set
@@ -398,10 +437,8 @@ pub fn import_into(dir: &Path, files: &[PathBuf]) -> Imported {
                 format!("{base} {n}")
             };
             let fresh = RuleSet::new(dir, &name);
-            let taken = fresh.path.exists()
-                || existing
-                    .iter()
-                    .any(|e| e.name.eq_ignore_ascii_case(&fresh.name));
+            let taken =
+                fresh.path.exists() || existing.iter().any(|e| same_name(&e.name, &fresh.name));
             if !taken {
                 copy.name = fresh.name;
                 copy.path = fresh.path;
@@ -411,7 +448,7 @@ pub fn import_into(dir: &Path, files: &[PathBuf]) -> Imported {
         }
         match copy.save() {
             Ok(()) => done.added.push(copy.name),
-            Err(_) => done.failed.push(shown),
+            Err(e) => done.unsaved.push(format!("{} ({e})", copy.name)),
         }
     }
     done
@@ -426,23 +463,25 @@ pub fn export_to(set: &RuleSet, path: &Path) -> std::io::Result<()> {
     .save()
 }
 
-/// Writes every one of `sets` into the folder `dir`, each under its own name; returns how many.
-pub fn export_all(sets: &[RuleSet], dir: &Path) -> std::io::Result<usize> {
-    for set in sets {
-        let target = dir.join(format!("{}.{EXT}", set.name));
-        if target != set.path {
-            export_to(set, &target)?;
-        }
-    }
-    Ok(sets.len())
+/// Writes every one of `sets` into the folder `dir`, as importing them there would: files already
+/// there are never overwritten.
+pub fn export_all(sets: &[RuleSet], dir: &Path) -> Imported {
+    let files: Vec<PathBuf> = sets.iter().map(|s| s.path.clone()).collect();
+    import_into(dir, &files, &[])
 }
 
-/// Takes over the rules of earlier versions, then applies the selected rules file.
-pub fn load_selected(cfg: &mut Config) {
-    if let Some(d) = dir() {
-        migrate_in(&d, cfg);
-    }
+/// Takes over the rules of earlier versions, then applies the selected rules file. Returns
+/// whether `cfg` has to be saved for the rules to stay taken over.
+pub fn load_selected(cfg: &mut Config) -> bool {
+    // Until they could be moved, the old rules stay in the options and are used from there.
+    let Some(dir) = dir() else {
+        return false;
+    };
+    let Ok(changed) = migrate_in(&dir, cfg) else {
+        return false;
+    };
     apply_selected(cfg);
+    changed
 }
 
 /// A regex matching `line` as a whole, give or take the spaces around it.
@@ -493,7 +532,9 @@ pub fn lines_pattern(lines: &[&str]) -> String {
         suf -= tail(suf).chars().next().map_or(0, char::len_utf8);
     }
     let (prefix, suffix) = (&first[..pre], tail(suf));
-    if prefix.trim().is_empty() && suffix.trim().is_empty() {
+    // Shared punctuation alone, like the ";" ending every statement, would match far too much.
+    let telling = |s: &str| s.chars().any(char::is_alphanumeric);
+    if !telling(prefix) && !telling(suffix) {
         let alts: Vec<String> = lines.iter().map(|l| regex::escape(l)).collect();
         return format!(r"^\s*(?:{})\s*$", alts.join("|"));
     }
@@ -528,6 +569,13 @@ pub fn substitution_for(a: &str, b: &str) -> Substitution {
             replace: a.replace('$', "$$"),
         };
     }
+    if da.is_empty() {
+        // Text only `b` has: taking it out of `b` makes them equal.
+        return Substitution {
+            find: regex::escape(db),
+            replace: String::new(),
+        };
+    }
     Substitution {
         find: regex::escape(da),
         replace: db.replace('$', "$$"),
@@ -538,6 +586,29 @@ pub fn substitution_for(a: &str, b: &str) -> Substitution {
 mod tests {
     use super::*;
     use crate::core::diff::compute;
+
+    #[test]
+    fn relative_paths_are_taken_from_where_they_were_given() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("team.oxrules"), "{}").unwrap();
+        let abs = |n: &str| absolute_spec(n, dir.path());
+        let team = dir.path().join("team.oxrules").display().to_string();
+        assert_eq!(abs("team.oxrules"), team);
+        assert_eq!(abs("Logs.oxrules"), "Logs.oxrules");
+        assert_eq!(abs("Logs"), "Logs");
+        assert_eq!(abs(""), "");
+        let sub = dir
+            .path()
+            .join("rules")
+            .join("a.oxrules")
+            .display()
+            .to_string();
+        assert_eq!(
+            abs(&format!("rules{}a.oxrules", std::path::MAIN_SEPARATOR)),
+            sub
+        );
+        assert_eq!(absolute_spec(&team, Path::new("/elsewhere")), team);
+    }
 
     #[test]
     fn save_list_find() {
@@ -564,6 +635,43 @@ mod tests {
         assert!(find_in(std::slice::from_ref(&dir), "").is_none());
         let by_path = find_in(&[], set.path.to_str().unwrap()).unwrap();
         assert_eq!(by_path.name, "Logs_ dated");
+        let by_file_name = find_in(std::slice::from_ref(&dir), "Logs_ dated.oxrules").unwrap();
+        assert_eq!(by_file_name, set);
+        let gone = dir.join("sub").join("another.oxrules");
+        assert!(find_in(std::slice::from_ref(&dir), gone.to_str().unwrap()).is_none());
+        // Saving again replaces the file whole, leaving no temporary file behind.
+        set.description = "changed".into();
+        set.save().unwrap();
+        assert_eq!(RuleSet::load(&set.path).unwrap().description, "changed");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 4);
+    }
+
+    #[test]
+    fn names_as_files_name_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = [tmp.path().to_path_buf()];
+        std::fs::write(
+            dir[0].join("Bom.oxrules"),
+            "\u{feff}{\"description\":\"d\"}",
+        )
+        .unwrap();
+        assert_eq!(find_in(&dir, "Bom").unwrap().description, "d");
+
+        let notes = RuleSet::new(&dir[0], "notes.OXRULES");
+        assert_eq!(notes.name, "notes");
+        notes.save().unwrap();
+        assert!(find_in(&dir, "notes.oxrules").is_some());
+
+        RuleSet::new(&dir[0], "Ärger").save().unwrap();
+        assert!(same_name("ärger", "ÄRGER"));
+        assert_eq!(find_in(&dir, "ärger").unwrap().name, "Ärger");
+        // Where names keep their case, both files are listed and each is found by its name.
+        RuleSet::new(&dir[0], "ärger").save().unwrap();
+        if std::fs::read_dir(&dir[0]).unwrap().count() == 4 {
+            assert_eq!(list_in(&dir).len(), 4);
+            assert_eq!(find_in(&dir, "ärger").unwrap().name, "ärger");
+            assert_eq!(find_in(&dir, "Ärger").unwrap().name, "Ärger");
+        }
     }
 
     #[test]
@@ -595,7 +703,14 @@ mod tests {
         cfg.diff.line_filters_enabled = true;
         cfg.diff.line_filters = vec!["^#".into()];
         cfg.diff.substitutions = vec![("a".into(), "b".into())];
-        migrate_in(tmp.path(), &mut cfg);
+
+        // Rules that cannot be written stay in the options, to be moved next time.
+        let blocked = tmp.path().join("file");
+        std::fs::write(&blocked, "").unwrap();
+        assert!(migrate_in(&blocked, &mut cfg).is_err());
+        assert!(!cfg.rules_migrated && cfg.rules.is_empty());
+
+        assert!(migrate_in(tmp.path(), &mut cfg).unwrap());
         assert_eq!(cfg.rules, DEFAULT_NAME);
         let all = list_in(&[tmp.path().to_path_buf()]);
         assert_eq!(all.len(), 2);
@@ -606,18 +721,18 @@ mod tests {
 
         // Once done, choosing no rules stays that way.
         cfg.rules.clear();
-        migrate_in(tmp.path(), &mut cfg);
+        assert!(!migrate_in(tmp.path(), &mut cfg).unwrap());
         assert!(cfg.rules.is_empty());
 
         // Run again because the options were not saved: the same files are picked, none added.
         cfg.rules_migrated = false;
-        migrate_in(tmp.path(), &mut cfg);
+        migrate_in(tmp.path(), &mut cfg).unwrap();
         assert_eq!(cfg.rules, DEFAULT_NAME);
         assert_eq!(list_in(&[tmp.path().to_path_buf()]).len(), 2);
 
         let mut fresh = Config::default();
-        migrate_in(tmp.path(), &mut fresh);
-        assert!(fresh.rules.is_empty());
+        migrate_in(tmp.path(), &mut fresh).unwrap();
+        assert!(fresh.rules.is_empty() && fresh.rules_migrated);
     }
 
     #[test]
@@ -639,7 +754,7 @@ mod tests {
         let junk = out.path().join("junk.oxrules");
         std::fs::write(&junk, "not json").unwrap();
 
-        let done = import_into(rules_dir.path(), &[shared, changed, fresh, junk]);
+        let done = import_into(rules_dir.path(), &[shared, changed, fresh, junk], &[]);
         assert_eq!(done.present, ["Logs"]);
         assert_eq!(done.added, ["Logs 2", "New one"]);
         assert_eq!(done.failed, ["junk.oxrules"]);
@@ -650,8 +765,17 @@ mod tests {
         assert_eq!(all[1].description, "log noise");
 
         let back = tempfile::tempdir().unwrap();
-        assert_eq!(export_all(&all, back.path()).unwrap(), 3);
+        assert_eq!(export_all(&all, back.path()).added.len(), 3);
         assert!(back.path().join("Logs 2.oxrules").is_file());
+        // Exporting again leaves the files there alone, even when they were changed.
+        let theirs = back.path().join("Logs.oxrules");
+        let mut changed = RuleSet::load(&theirs).unwrap();
+        changed.ignore_lines = vec!["theirs".into()];
+        changed.save().unwrap();
+        let again = export_all(&all, back.path());
+        assert_eq!(again.present, ["Logs 2", "New one"]);
+        assert_eq!(again.added, ["Logs 3"]);
+        assert_eq!(RuleSet::load(&theirs).unwrap().ignore_lines, ["theirs"]);
         assert!(is_rules_file(&back.path().join("Logs 2.OXRULES")));
     }
 
@@ -673,6 +797,8 @@ mod tests {
         assert!(re.is_match("alpha") && re.is_match(" beta ") && !re.is_match("gamma"));
         let re = regex::Regex::new(&lines_pattern(&["名稱：甲", "名稱：乙"])).unwrap();
         assert!(re.is_match("名稱：丙"));
+        let re = regex::Regex::new(&lines_pattern(&["x = 1;", "y = 2;"])).unwrap();
+        assert!(re.is_match("x = 1;") && re.is_match("y = 2;") && !re.is_match("z = 3;"));
     }
 
     #[test]
@@ -688,6 +814,8 @@ mod tests {
         let s = substitution_for("a$1", "a$1");
         assert_eq!(s.find, r"a\$1");
         assert_eq!(s.replace, "a$$1");
+        let s = substitution_for("x = 1;", "x = 1; // new");
+        assert_eq!((s.find.as_str(), s.replace.as_str()), (" // new", ""));
 
         let s = substitution_for("version = 1.2.3", "version = 1.4.0");
         let draft = RuleDraft {

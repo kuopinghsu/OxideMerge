@@ -16,6 +16,13 @@ const CONTEXT: usize = 3;
 const HUNK_MAX_ROWS: usize = 400;
 /// Text files longer than this are listed without their differences.
 pub(crate) const MAX_LINES: usize = 50_000;
+/// Files larger than this are listed in folder reports without their differences.
+const MAX_BYTES: u64 = 16 << 20;
+/// Characters of a line shown; the rest is cut off.
+const LINE_CHARS: usize = 2_000;
+/// Rows shown in a text report, all differences together; the differences after them are only
+/// counted, keeping the page small enough for a browser.
+const REPORT_ROWS: usize = 20_000;
 
 const DARK: &str = "--bg:#0f1218;--surface:#171b23;--surface2:#1e232d;--border:#2a303c;\
 --text:#e6e9ef;--dim:#98a2b3;--accent:#8b96ff;--accent-bg:#232a4d;--add:#12301f;--add-m:#1f6b3e;\
@@ -104,7 +111,8 @@ table.u{display:none}body.unified table.u{display:table}body.unified table.s2.tw
 .foot{color:var(--dim);font-size:12px;text-align:center;margin-top:24px}
 kbd{font-family:var(--mono);font-size:11px;padding:0 5px;border:1px solid var(--border);border-bottom-width:2px;border-radius:4px;background:var(--surface)}
 @media (max-width:900px){.layout{grid-template-columns:minmax(0,1fr)}.toc{display:none}input.q{width:150px}}
-@media print{.top .ctl,.toc{display:none}.layout{grid-template-columns:1fr}.file{break-inside:avoid-page;box-shadow:none}body{background:#fff}}
+[hidden]{display:none!important}
+@media print{*{-webkit-print-color-adjust:exact;print-color-adjust:exact}.top .ctl,.toc{display:none}.layout{grid-template-columns:1fr}.file{break-inside:avoid-page;box-shadow:none}body{background:#fff}}
 "#;
 
 const JS: &str = r##"
@@ -137,21 +145,22 @@ window.oxmOpen=function(o){$('details.file').forEach(d=>d.open=o)};
 let opened=null;
 addEventListener('beforeprint',()=>{opened=$('details.file').map(d=>d.open);oxmOpen(true)});
 addEventListener('afterprint',()=>{if(opened)$('details.file').forEach((d,i)=>d.open=opened[i]);opened=null});
-let status='all';
+let status='all',toc;
+function tocLink(id){if(!toc)toc=new Map($('.toc a').map(a=>[a.getAttribute('href').slice(1),a]));return toc.get(id)}
 function apply(){const q=(document.getElementById('q')||{value:''}).value.trim().toLowerCase();let shown=0;
 $('.file').forEach(f=>{const ok=(status==='all'||f.dataset.status===status)&&(!q||f.dataset.name.toLowerCase().includes(q));f.hidden=!ok;if(ok)shown++;
-const a=document.querySelector('.toc a[href="#'+f.id+'"]');if(a)a.hidden=!ok});
+const a=tocLink(f.id);if(a)a.hidden=!ok});
 const e=document.getElementById('empty');if(e)e.hidden=shown>0}
 window.oxmStatus=function(b){status=b.dataset.status;$('.chip').forEach(c=>c.classList.toggle('on',c===b));apply()};
 const q=document.getElementById('q');if(q)q.addEventListener('input',apply);
 document.addEventListener('click',e=>{const a=e.target.closest('a[href^="#"]');if(!a)return;const t=document.getElementById(a.getAttribute('href').slice(1));if(t){const d=t.closest('details')||t;if(d.tagName==='DETAILS')d.open=true}});
 function jump(dir){const hs=$('.hunk').filter(h=>!h.closest('.file').hidden);if(!hs.length)return;
 const c=hs.indexOf(document.querySelector('.hunk.focus'));let k;
-if(c>=0)k=c+dir;else{let i=hs.findIndex(h=>h.getBoundingClientRect().top>82);if(i<0)i=hs.length;k=dir>0?i:i-1}
+if(c>=0)k=c+dir;else{const top=h=>{const d=h.closest('details');return(d&&!d.open?d:h).getBoundingClientRect().top};let i=hs.findIndex(h=>top(h)>82);if(i<0)i=hs.length;k=dir>0?i:i-1}
 k=Math.max(0,Math.min(hs.length-1,k));const h=hs[k];const d=h.closest('details');if(d)d.open=true;
 $('.hunk.focus').forEach(x=>x.classList.remove('focus'));h.classList.add('focus');h.scrollIntoView({block:'start',behavior:'smooth'})}
 document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'||e.ctrlKey||e.metaKey||e.altKey)return;
-if(e.key==='n'||e.key==='j')jump(1);else if(e.key==='p'||e.key==='k')jump(-1);else if(e.key==='/'&&q){e.preventDefault();q.focus()}});
+const key=e.key.toLowerCase();if(key==='n'||key==='j')jump(1);else if(key==='p'||key==='k')jump(-1);else if(key==='/'&&q){e.preventDefault();q.focus()}});
 })();
 "##;
 
@@ -181,7 +190,7 @@ pub(crate) fn hunks(result: &DiffResult) -> Vec<(usize, Range<usize>)> {
 }
 
 /// The kind of a difference, as a CSS class and a label.
-fn kind(result: &DiffResult, b: usize) -> (&'static str, &'static str) {
+pub(crate) fn kind(result: &DiffResult, b: usize) -> (&'static str, &'static str) {
     let blk = &result.blocks[b];
     if result.panes == 2 {
         return match (blk.ranges[0].is_empty(), blk.ranges[1].is_empty()) {
@@ -199,7 +208,7 @@ fn kind(result: &DiffResult, b: usize) -> (&'static str, &'static str) {
     }
 }
 
-fn line_range(r: &Range<usize>) -> String {
+pub(crate) fn line_range(r: &Range<usize>) -> String {
     match r.len() {
         0 => "—".into(),
         1 => (r.start + 1).to_string(),
@@ -209,7 +218,7 @@ fn line_range(r: &Range<usize>) -> String {
 
 /// How the line of each pane in row `r` is shown, and the parts that differ from the other
 /// side (from the middle one with three sides).
-fn row_cells(
+pub(crate) fn row_cells(
     result: &DiffResult,
     panes: &[&[String]],
     opts: &DiffOptions,
@@ -233,6 +242,17 @@ fn row_cells(
         .collect();
     let text = |p: usize| row.line[p].map(|l| panes[p][l].as_str());
     let changed = |c: &str| matches!(c, "del" | "add" | "chg" | "conf");
+    // Three sides: a side still as the middle one is unchanged; the middle is changed only when
+    // both sides moved away from it.
+    if n == 3 && cells.iter().any(|c| c.0 == "chg") {
+        let same = |p: usize| text(p).is_some() && text(p) == text(1);
+        let (left, right) = (same(0), same(2));
+        for (p, kept) in [(0, left), (2, right), (1, left || right)] {
+            if kept && cells[p].0 == "chg" {
+                cells[p].0 = "ctx";
+            }
+        }
+    }
     if n == 2 {
         if let (Some(a), Some(b)) = (text(0), text(1)) {
             if changed(cells[0].0) {
@@ -322,11 +342,18 @@ fn hunk_html(
         for (p, (lines, (class, marks))) in panes.iter().zip(&cells).enumerate() {
             match result.rows[r].line[p] {
                 Some(l) => {
+                    let line = &lines[l];
+                    let cut = line.char_indices().nth(LINE_CHARS).map(|(i, _)| i);
+                    let more = match cut {
+                        Some(c) if marks.iter().any(|m| m.end > c) => "<span class=\"m\">…</span>",
+                        Some(_) => "…",
+                        None => "",
+                    };
                     let _ = write!(
                         out,
-                        "<td class=\"n\">{}</td><td class=\"{class}\">{}</td>",
+                        "<td class=\"n\">{}</td><td class=\"{class}\">{}{more}</td>",
                         l + 1,
-                        esc_marked(&lines[l], marks)
+                        esc_marked(&line[..cut.unwrap_or(line.len())], marks),
                     );
                 }
                 None => {
@@ -503,7 +530,18 @@ pub fn text_report(
     rules: &str,
 ) -> String {
     let n = panes.len();
-    let list = hunks(result);
+    let mut list = hunks(result);
+    let mut rows = 0;
+    let fits = list
+        .iter()
+        .take_while(|(_, r)| {
+            rows += r.len().min(HUNK_MAX_ROWS);
+            rows <= REPORT_ROWS
+        })
+        .count()
+        .max(1);
+    let total = list.len();
+    list.truncate(fits);
     let mut out = String::new();
     let title = tr("report.text_title");
     page_start(
@@ -529,7 +567,15 @@ pub fn text_report(
         );
         for (k, (b, _)) in list.iter().enumerate() {
             let (_, label) = kind(result, *b);
-            let pos = line_range(&result.blocks[*b].ranges[if n == 3 { 1 } else { 0 }]);
+            // The line of the base side, or of the first side that has lines here.
+            let ranges = &result.blocks[*b].ranges;
+            let order: &[usize] = if n == 3 { &[1, 0, 2] } else { &[0, 1] };
+            let range = order
+                .iter()
+                .map(|&p| &ranges[p])
+                .find(|r| !r.is_empty())
+                .unwrap_or(&ranges[order[0]]);
+            let pos = line_range(range);
             let _ = write!(
                 out,
                 "<a href=\"#d{k}\"><span>{}. {}</span><span class=\"c\">{pos}</span></a>",
@@ -543,7 +589,7 @@ pub fn text_report(
     sides(&mut out, titles);
     rules_note(&mut out, rules);
     let s = result.stats();
-    let mut cards = vec![("acc", list.len().to_string(), tr("report.differences"))];
+    let mut cards = vec![("acc", total.to_string(), tr("report.differences"))];
     if n == 2 {
         cards.push(("ok", s.added.to_string(), tr("report.added")));
         cards.push(("bad", s.removed.to_string(), tr("report.removed")));
@@ -594,7 +640,7 @@ pub fn text_report(
         );
     } else {
         out.push_str("<div class=\"file\"><div class=\"body\" style=\"border-top:0\">");
-        let total = list.len();
+        let shown = list.len();
         for (k, h) in list.into_iter().enumerate() {
             let doc = Doc {
                 panes,
@@ -603,6 +649,10 @@ pub fn text_report(
                 notes,
             };
             hunk_html(&mut out, &doc, &format!("d{k}"), (k, total), h);
+        }
+        if shown < total {
+            let more = trf("report.more_diffs", &[("n", (total - shown).to_string())]);
+            let _ = write!(out, "<div class=\"note\">{}</div>", esc(&more));
         }
         out.push_str("</div></div>");
     }
@@ -620,40 +670,61 @@ fn status_class(st: CmpStatus) -> &'static str {
     }
 }
 
-/// What a folder report shows of a file besides its status: its differences, or why not.
-enum FileDiffs {
+/// What a folder report shows of a file besides its status: its differences, or why not. A side
+/// the file is missing from is an empty document named where the file would be.
+pub(crate) enum FileDiffs {
     None,
     Note(String),
-    Diffs(Vec<Vec<String>>, DiffResult),
+    Diffs(Vec<super::text::TextDoc>, DiffResult),
 }
 
-fn file_diffs(it: &DirItem, roots: &[PathBuf], opts: &DiffOptions) -> FileDiffs {
+pub(crate) fn file_diffs(it: &DirItem, roots: &[PathBuf], opts: &DiffOptions) -> FileDiffs {
+    match file_docs(it, roots, opts) {
+        FileDiffs::Diffs(_, result) if result.is_identical() => {
+            FileDiffs::Note(tr("report.no_diffs").into())
+        }
+        found => found,
+    }
+}
+
+/// Like [`file_diffs`], but files whose lines compare equal are compared too.
+pub(crate) fn file_docs(it: &DirItem, roots: &[PathBuf], opts: &DiffOptions) -> FileDiffs {
     if it.is_dir || it.binary || !matches!(it.status, CmpStatus::Different | CmpStatus::Unique) {
         return FileDiffs::None;
     }
     let paths: Vec<PathBuf> = roots.iter().map(|r| it.path(r)).collect();
-    let docs = paths
-        .iter()
-        .zip(&it.exists)
-        .map(|(p, &exists)| match exists {
-            true => super::text::load_doc(p, None).ok(),
-            false => Some(super::text::TextDoc::empty(None)),
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(docs) = docs else {
-        return FileDiffs::None;
-    };
+    let largest = it.size.iter().take(paths.len()).flatten().max().copied();
+    if let Some(size) = largest.filter(|&s| s > MAX_BYTES) {
+        return FileDiffs::Note(trf("report.too_big", &[("size", fmt_size(Some(size)))]));
+    }
+    let mut docs = Vec::with_capacity(paths.len());
+    for (p, &exists) in paths.iter().zip(&it.exists) {
+        if !exists {
+            docs.push(super::text::TextDoc::empty(Some(p.clone())));
+            continue;
+        }
+        let bytes = match std::fs::read(p) {
+            Ok(b) => b,
+            Err(e) => return FileDiffs::Note(format!("{}: {e}", tr("status.error"))),
+        };
+        if bytes.len() as u64 > MAX_BYTES {
+            return FileDiffs::Note(trf(
+                "report.too_big",
+                &[("size", fmt_size(Some(bytes.len() as u64)))],
+            ));
+        }
+        if super::text::looks_binary(&bytes) {
+            return FileDiffs::Note(tr("report.binary").into());
+        }
+        docs.push(super::text::doc_from_bytes(Some(p.clone()), &bytes, None));
+    }
     let longest = docs.iter().map(|d| d.lines.len()).max().unwrap_or(0);
     if longest > MAX_LINES {
         return FileDiffs::Note(trf("report.too_long", &[("n", longest.to_string())]));
     }
-    let lines: Vec<Vec<String>> = docs.into_iter().map(|d| d.lines).collect();
-    let refs: Vec<&[String]> = lines.iter().map(Vec::as_slice).collect();
+    let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
     let result = super::diff::compute_with(&refs, opts, super::comments::for_path(&paths[0]));
-    if result.is_identical() {
-        return FileDiffs::Note(tr("report.no_diffs").into());
-    }
-    FileDiffs::Diffs(lines, result)
+    FileDiffs::Diffs(docs, result)
 }
 
 /// The report of a folder compare: a summary and the files listed, with the differences of every
@@ -695,6 +766,8 @@ pub fn folder_report(
     let mut total_diffs = 0;
     let mut total_ignored = 0;
     let mut any_hunks = false;
+    // All files share the size limit of a text report.
+    let mut budget = REPORT_ROWS;
     let dopts = opts.cloned().unwrap_or_default();
     for (k, it) in listed.iter().enumerate() {
         let st = status_class(it.status);
@@ -717,8 +790,8 @@ pub fn folder_report(
         );
         let mut body = String::new();
         match &diffs {
-            FileDiffs::Diffs(lines, result) => {
-                let refs: Vec<&[String]> = lines.iter().map(Vec::as_slice).collect();
+            FileDiffs::Diffs(docs, result) => {
+                let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
                 let list = hunks(result);
                 total_diffs += list.len();
                 any_hunks = true;
@@ -758,8 +831,19 @@ pub fn folder_report(
                     notes: &[],
                 };
                 let total = list.len();
+                let mut shown = 0;
                 for (j, h) in list.into_iter().enumerate() {
+                    let cost = h.1.len().min(HUNK_MAX_ROWS);
+                    if cost > budget {
+                        break;
+                    }
+                    budget -= cost;
+                    shown += 1;
                     hunk_html(&mut body, &doc, &format!("f{k}d{j}"), (j, total), h);
+                }
+                if shown < total {
+                    let more = trf("report.more_diffs", &[("n", (total - shown).to_string())]);
+                    let _ = write!(body, "<div class=\"note\">{}</div>", esc(&more));
                 }
             }
             FileDiffs::Note(note) => {
@@ -944,6 +1028,99 @@ mod tests {
     }
 
     #[test]
+    fn text_report_stops_listing_after_its_rows() {
+        let a: Vec<String> = (0..60_000).map(|i| i.to_string()).collect();
+        let b: Vec<String> = a
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if i % 10 == 5 {
+                    format!("{l}x")
+                } else {
+                    l.clone()
+                }
+            })
+            .collect();
+        let opts = DiffOptions::default();
+        let r = compute(&[&a, &b], &opts);
+        let total = hunks(&r).len();
+        let html = text_report(&["a".into(), "b".into()], &[&a, &b], &r, &opts, &[], "");
+        let shown = html.matches(" id=\"d").count();
+        assert!(shown > 0 && shown < total, "{shown} of {total}");
+        let more = trf("report.more_diffs", &[("n", (total - shown).to_string())]);
+        assert!(html.contains(&esc(&more)));
+
+        let added = text_report(
+            &["a".into(), "b".into()],
+            &[&a[..3], &a[..4]],
+            &compute(&[&a[..3], &a[..4]], &opts),
+            &opts,
+            &[],
+            "",
+        );
+        assert!(added.contains("<span class=\"c\">4</span>"), "{added}");
+    }
+
+    #[test]
+    fn three_sides_colour_only_the_sides_that_changed() {
+        let (l, m, r) = (v(&["a", "L"]), v(&["a", "b"]), v(&["a", "b"]));
+        let opts = DiffOptions::default();
+        let res = compute(&[&l, &m, &r], &opts);
+        let row = res.rows.iter().position(|x| x.block.is_some()).unwrap();
+        let classes: Vec<&str> = row_cells(&res, &[&l, &m, &r], &opts, row)
+            .iter()
+            .map(|c| c.0)
+            .collect();
+        assert_eq!(classes, ["chg", "ctx", "ctx"]);
+
+        let both = v(&["a", "B"]);
+        let res = compute(&[&both, &m, &both], &opts);
+        let row = res.rows.iter().position(|x| x.block.is_some()).unwrap();
+        let classes: Vec<&str> = row_cells(&res, &[&both, &m, &both], &opts, row)
+            .iter()
+            .map(|c| c.0)
+            .collect();
+        assert_eq!(classes, ["chg", "chg", "chg"]);
+    }
+
+    #[test]
+    fn folder_reports_share_one_size_limit() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let lines: Vec<String> = (0..20_000).map(|i| format!("{i}\n")).collect();
+        let changed: String = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if i % 10 == 5 {
+                    format!("x{l}")
+                } else {
+                    l.clone()
+                }
+            })
+            .collect();
+        for f in ["1.txt", "2.txt", "3.txt"] {
+            std::fs::write(a.path().join(f), lines.concat()).unwrap();
+            std::fs::write(b.path().join(f), &changed).unwrap();
+        }
+        let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        let items = Scanner {
+            roots: &roots,
+            filter: &FileFilter::default(),
+            fopts: &FolderOptions::default(),
+            dopts: &DiffOptions::default(),
+            progress: &Progress::default(),
+        }
+        .run();
+        let refs: Vec<&DirItem> = items.iter().collect();
+        let html = folder_report(&refs, &roots, &roots, Some(&DiffOptions::default()), "");
+        let shown = html.matches("class=\"hunk").count();
+        assert!(shown > 0 && shown < 3 * 2000, "{shown}");
+        assert!(html.contains("data-name=\"3.txt\""));
+        let more = trf("report.more_diffs", &[("n", "2000".into())]);
+        assert!(html.contains(&esc(&more)), "the last file lists none");
+    }
+
+    #[test]
     fn folder_report_with_and_without_differences() {
         let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         std::fs::write(a.path().join("same.txt"), "x\n").unwrap();
@@ -954,6 +1131,11 @@ mod tests {
         let long: String = (0..=MAX_LINES).map(|i| format!("{i}\n")).collect();
         std::fs::write(a.path().join("long.txt"), &long).unwrap();
         std::fs::write(b.path().join("long.txt"), long + "end\n").unwrap();
+        std::fs::write(b.path().join("new.bin"), b"PNG\0\x01\x02").unwrap();
+        // Only the last word differs, after the cut.
+        let wide = "w ".repeat(LINE_CHARS);
+        std::fs::write(a.path().join("wide.txt"), format!("{wide}a\n")).unwrap();
+        std::fs::write(b.path().join("wide.txt"), format!("{wide}b\n")).unwrap();
         let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
         let items = Scanner {
             roots: &roots,
@@ -975,6 +1157,9 @@ mod tests {
         assert!(html.contains("fresh"));
         let too_long = trf("report.too_long", &[("n", (MAX_LINES + 2).to_string())]);
         assert!(html.contains(&esc(&too_long)));
+        assert!(html.contains(&esc(tr("report.binary"))), "{html}");
+        assert!(html.contains("<span class=\"m\">…</span></td>"));
+        assert!(!html.contains(&"w ".repeat(LINE_CHARS / 2 + 1)));
         assert!(html.contains("class=\"toc\""));
 
         let plain = folder_report(&refs, &roots, &roots, None, "");

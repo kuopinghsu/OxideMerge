@@ -74,6 +74,8 @@ pub enum Cmd {
     SelectPattern,
     ExportHtml,
     CompareOptions,
+    /// Show the differences of every changed file of a folder compare in one tab.
+    AllDiffs,
 }
 
 impl Cmd {
@@ -145,6 +147,7 @@ impl Cmd {
             SelectPattern => "cmd.select_pattern",
             ExportHtml => "menu.export_html",
             CompareOptions => "view.more_compare",
+            AllDiffs => "cmd.all_diffs",
         }
     }
 
@@ -158,7 +161,7 @@ impl Cmd {
             Save | SaveAll | SaveAs(_) | SaveProject | SaveComparison => Icon::File,
             Patch | ApplyPatch | Report | ReportWithDiffs | BookmarkComment => Icon::Text,
             ExportHtml => Icon::Export,
-            GitCompare | TakeBoth(_) => Icon::Compare,
+            GitCompare | TakeBoth(_) | AllDiffs => Icon::Compare,
             Statistics | GotoLine => Icon::Method,
             Indent(false) | NextBookmark | FindNext | NextDiff | NextTab => Icon::Next,
             Indent(true) | PrevBookmark | FindPrev | PrevDiff | PrevTab => Icon::Prev,
@@ -211,6 +214,16 @@ impl Cmd {
     pub fn tip(self) -> String {
         widgets::with_key(tr(self.label()), self.key())
     }
+
+    /// [`Self::tip`], without the key when the keys don't reach the view, such as the file compare
+    /// docked in a folder compare, where they act on the folder.
+    pub fn tip_if(self, keys: bool) -> String {
+        if keys {
+            self.tip()
+        } else {
+            tr(self.label()).to_string()
+        }
+    }
 }
 
 /// When a key runs its command.
@@ -220,10 +233,11 @@ pub enum Scope {
     Always,
     /// Only while no text field has keyboard focus.
     View,
-    /// Shown only: the system or window manager handles the key.
+    /// Shown only: the system, or [`crate::ui::app`] before egui sees the key, handles it.
     System,
 }
 
+#[derive(Clone, Copy)]
 pub struct Binding {
     pub key: KeyboardShortcut,
     /// The key as the Help & Shortcuts dialog writes it.
@@ -238,6 +252,9 @@ const ALT: Modifiers = Modifiers::ALT;
 const CTRL: Modifiers = Modifiers::COMMAND;
 const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 const CTRL_ALT: Modifiers = Modifiers::COMMAND.plus(Modifiers::ALT);
+/// The Control key itself, also on macOS (where ⌘Tab switches applications).
+const CONTROL: Modifiers = Modifiers::CTRL;
+const CONTROL_SHIFT: Modifiers = Modifiers::CTRL.plus(Modifiers::SHIFT);
 
 const fn bind(
     scope: Scope,
@@ -281,7 +298,7 @@ const EXIT: Binding = if MAC {
 /// Shift variants come first. Menus and the palette show the first key of each command.
 pub const BINDINGS: &[Binding] = {
     use Cmd::*;
-    use Scope::{Always as A, View as V};
+    use Scope::{Always as A, System as S, View as V};
     &[
         bind(A, CTRL, Key::K, "Ctrl+K", Palette),
         bind(A, CTRL_SHIFT, Key::P, "Ctrl+Shift+P", Palette),
@@ -295,8 +312,9 @@ pub const BINDINGS: &[Binding] = {
         REPLACE,
         bind(A, CTRL, Key::F, "Ctrl+F", Find),
         bind(A, CTRL, Key::G, "Ctrl+G", GotoLine),
-        bind(A, CTRL_SHIFT, Key::Tab, "Ctrl+Shift+Tab", PrevTab),
-        bind(A, CTRL, Key::Tab, "Ctrl+Tab", NextTab),
+        // Taken from the input before egui moves the keyboard focus with Tab.
+        bind(S, CONTROL_SHIFT, Key::Tab, "Control+Shift+Tab", PrevTab),
+        bind(S, CONTROL, Key::Tab, "Control+Tab", NextTab),
         bind(A, CTRL, Key::Plus, "Ctrl++", ZoomIn),
         bind(A, CTRL, Key::Equals, "Ctrl+=", ZoomIn),
         bind(A, CTRL, Key::Minus, "Ctrl+-", ZoomOut),
@@ -330,8 +348,43 @@ pub const BINDINGS: &[Binding] = {
     ]
 };
 
+/// Keys that some keyboard layouts type with AltGr, which arrives as Ctrl+Alt.
+fn typed_with_alt(key: Key) -> bool {
+    matches!(
+        key,
+        Key::Plus
+            | Key::Equals
+            | Key::Minus
+            | Key::OpenBracket
+            | Key::CloseBracket
+            | Key::Questionmark
+    )
+}
+
+/// Takes a press of `b` from the input. Unlike [`egui::InputState::consume_shortcut`], a held Alt
+/// that the key does not use keeps it from matching, so Alt+F4 is not also F4.
+pub fn consume(i: &mut egui::InputState, b: &Binding) -> bool {
+    let KeyboardShortcut {
+        modifiers: want,
+        logical_key,
+    } = b.key;
+    if typed_with_alt(logical_key) {
+        return i.consume_shortcut(&b.key);
+    }
+    let mut hit = false;
+    i.events.retain(|e| {
+        let m = matches!(e, egui::Event::Key { key, pressed: true, modifiers, .. }
+            if *key == logical_key && modifiers.alt == want.alt && modifiers.matches_logically(want));
+        hit |= m;
+        !m
+    });
+    hit
+}
+
 /// Shortcut of Replace, as the Help & Shortcuts dialog writes it.
 pub const REPLACE_KEY: &str = REPLACE.written;
+/// Shortcut of Exit, as the Help & Shortcuts dialog writes it.
+pub const EXIT_KEY: &str = EXIT.written;
 
 /// Commands offered by the command palette.
 pub const PALETTE: &[Cmd] = {
@@ -349,6 +402,7 @@ pub const PALETTE: &[Cmd] = {
         ExportHtml,
         Report,
         ReportWithDiffs,
+        AllDiffs,
         SaveComparison,
         GitCompare,
         Statistics,
@@ -407,6 +461,7 @@ mod tests {
         let mut modifiers = Modifiers::NONE;
         let mut rest = written;
         for (prefix, m) in [
+            ("Control+", Modifiers::CTRL),
             ("Ctrl+", Modifiers::COMMAND),
             ("Alt+", Modifiers::ALT),
             ("Shift+", Modifiers::SHIFT),
@@ -445,10 +500,33 @@ mod tests {
                 let shifted = later.key.modifiers.shift
                     && later.key.logical_key == b.key.logical_key
                     && later.key.modifiers.command == b.key.modifiers.command
+                    && later.key.modifiers.ctrl == b.key.modifiers.ctrl
                     && later.key.modifiers.alt == b.key.modifiers.alt;
                 assert!(!shifted, "{} must come before {}", later.written, b.written);
             }
         }
+    }
+
+    #[test]
+    fn a_held_alt_the_key_does_not_use_keeps_it_from_matching() {
+        let press = |key, modifiers| {
+            let mut i = egui::InputState::default();
+            i.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            });
+            i
+        };
+        let f4 = BINDINGS.iter().find(|b| b.written == "F4").unwrap();
+        assert!(!consume(&mut press(Key::F4, Modifiers::ALT), f4));
+        assert!(consume(&mut press(Key::F4, Modifiers::NONE), f4));
+        let find = BINDINGS.iter().find(|b| b.written == "Ctrl+F").unwrap();
+        assert!(!consume(&mut press(Key::F, CTRL_ALT), find));
+        let indent = BINDINGS.iter().find(|b| b.written == "Ctrl+]").unwrap();
+        assert!(consume(&mut press(Key::CloseBracket, CTRL_ALT), indent));
     }
 
     #[test]

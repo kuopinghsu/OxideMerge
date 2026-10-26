@@ -1,7 +1,7 @@
 //! Help & Shortcuts dialog, opened with F1, `?`, the Help menu, or the help button in the header.
 
 use crate::i18n::{tr, trf};
-use crate::ui::text_view::REPLACE_KEY;
+use crate::ui::commands::{EXIT_KEY, REPLACE_KEY};
 use crate::ui::{about, theme, widgets};
 use egui::{FontId, Key, Margin, Modifiers, RichText, Stroke, Vec2};
 use std::path::Path;
@@ -21,12 +21,14 @@ const KEYBOARD: &[Section] = &[
             (&["Ctrl+O"], "help.open"),
             (&["Ctrl+S"], "menu.save"),
             (&["Ctrl+Shift+S"], "btn.save_all"),
+            (&["Ctrl+Shift+E"], "menu.export_html"),
             (&["Ctrl+W", "Ctrl+F4"], "help.close_tab"),
-            (&["Ctrl+Tab", "Ctrl+Shift+Tab"], "help.next_prev_tab"),
+            (&["Control+Tab", "Control+Shift+Tab"], "help.next_prev_tab"),
             (&["F5"], "cmd.refresh"),
             (&["Ctrl++", "Ctrl+−"], "help.zoom"),
             (&["Ctrl+0"], "cmd.zoom_reset"),
             (&["Esc"], "help.close_dialog"),
+            (&[EXIT_KEY], "menu.exit"),
         ],
     ),
     (
@@ -151,7 +153,7 @@ const PANEL: f32 = KEYS + GAP + ACTION + 2.0 * PANEL_MARGIN as f32 + 2.0;
 
 /// Draws the dialog with the settings file at the bottom. Returns true once it should close.
 pub fn show(ctx: &egui::Context, settings: Option<&Path>) -> bool {
-    let mut close = !ctx.wants_keyboard_input()
+    let mut close = !crate::ui::widgets::typing(ctx)
         && ctx.input_mut(|i| {
             i.consume_key(Modifiers::NONE, Key::F1)
                 || i.consume_key(Modifiers::NONE, Key::Questionmark)
@@ -265,25 +267,20 @@ fn row(ui: &mut egui::Ui, inputs: &str, action: &str) {
     });
 }
 
-/// Inputs joined with " / ". Ctrl reads as ⌘ on macOS, where the same shortcuts use Command.
+/// Inputs joined with " / ", as this platform writes shortcuts.
 fn input_text(inputs: &[&'static str], mouse: bool) -> String {
-    let text = inputs
+    inputs
         .iter()
         .map(|&input| match input.rfind('+') {
             Some(at) if mouse => {
                 let (modifiers, gesture) = input.split_at(at + 1);
-                format!("{modifiers}{}", tr(gesture))
+                widgets::key_text(&format!("{modifiers}{}", tr(gesture)))
             }
             _ if mouse => tr(input).to_string(),
-            _ => input.to_string(),
+            _ => widgets::key_text(input),
         })
         .collect::<Vec<_>>()
-        .join(" / ");
-    if cfg!(target_os = "macos") {
-        text.replace("Ctrl+", "⌘")
-    } else {
-        text
-    }
+        .join(" / ")
 }
 
 /// Key cap in the accent color. Latin text uses the monospace font, which has no CJK glyphs,

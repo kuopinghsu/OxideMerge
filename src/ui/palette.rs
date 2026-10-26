@@ -68,13 +68,20 @@ pub fn fuzzy_match(query: &str, text: &str) -> Option<(i32, Vec<usize>)> {
 }
 
 impl Palette {
-    pub fn show<A: Clone>(&mut self, ctx: &egui::Context, entries: &[Entry<A>]) -> Outcome<A> {
+    /// The entries matching the query, best first: score, index and matched characters.
+    fn ranked<A>(&self, entries: &[Entry<A>]) -> Vec<(i32, usize, Vec<usize>)> {
         let mut matches: Vec<(i32, usize, Vec<usize>)> = entries
             .iter()
             .enumerate()
             .filter_map(|(i, e)| fuzzy_match(&self.query, &e.label).map(|(s, p)| (s, i, p)))
             .collect();
         matches.sort_by_key(|m| std::cmp::Reverse(m.0));
+        matches
+    }
+
+    pub fn show<A: Clone>(&mut self, ctx: &egui::Context, entries: &[Entry<A>]) -> Outcome<A> {
+        let matches = self.ranked(entries);
+        let typed = self.query.clone();
         self.selected = self.selected.min(matches.len().saturating_sub(1));
         let mut moved = false;
         let mut enter = false;
@@ -131,7 +138,10 @@ impl Palette {
                     });
             });
         if enter {
-            picked = matches.get(self.selected).map(|m| m.1);
+            // What was typed with Enter in the same frame changes the matches.
+            let fresh = (self.query != typed).then(|| self.ranked(entries));
+            let now = fresh.as_ref().unwrap_or(&matches);
+            picked = now.get(self.selected).map(|m| m.1);
         }
         if let Some(i) = picked {
             return Outcome::Pick(entries[i].action.clone());

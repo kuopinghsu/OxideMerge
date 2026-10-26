@@ -168,7 +168,20 @@ impl TextDoc {
     }
 
     pub fn save_as(&mut self, path: &Path) -> Result<()> {
-        let bytes = encode(&self.text(), self.encoding, self.bom);
+        let text = self.text();
+        // encoding_rs writes characters a legacy encoding can't hold as HTML entities.
+        if let TextEncoding::Other(e) = self.encoding {
+            if e.encode(&text).2 {
+                anyhow::bail!(crate::i18n::trf(
+                    "msg.unmappable",
+                    &[
+                        ("file", path.display().to_string()),
+                        ("encoding", e.name().to_string()),
+                    ],
+                ));
+            }
+        }
+        let bytes = encode(&text, self.encoding, self.bom);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).ok();
@@ -177,6 +190,7 @@ impl TextDoc {
         super::fsutil::write_atomic(path, &bytes)?;
         self.path = Some(path.to_path_buf());
         self.modified = false;
+        self.mixed_eol = false;
         Ok(())
     }
 }
@@ -471,5 +485,20 @@ mod tests {
         assert_eq!(text, "héllo\n");
         assert_eq!(enc, TextEncoding::Utf16Le);
         assert!(bom);
+    }
+
+    #[test]
+    fn refuses_to_save_characters_the_encoding_cannot_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latin1.txt");
+        let mut doc = TextDoc::from_text(Some(path.clone()), "café\n");
+        doc.encoding = TextEncoding::Other(encoding_rs::WINDOWS_1252);
+        doc.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"caf\xe9\n");
+        doc.lines = vec!["→ 日本".into()];
+        doc.modified = true;
+        assert!(doc.save().is_err());
+        assert!(doc.modified);
+        assert_eq!(std::fs::read(&path).unwrap(), b"caf\xe9\n");
     }
 }

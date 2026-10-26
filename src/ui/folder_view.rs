@@ -7,8 +7,10 @@ use crate::core::folder::{self, CmpStatus, DirItem, FolderOptions, Progress, Sca
 use crate::core::folder_merge::{self, Step};
 use crate::core::patch::{self, PatchStyle};
 use crate::core::report::{self, fmt_size, fmt_time, side_name, status_text, ReportFormat};
+use crate::core::rules::{self, RuleDraft};
 use crate::core::text::{self, FileKind, TextDoc};
 use crate::i18n::{tr, trf};
+use crate::ui::commands::Cmd;
 use crate::ui::text_view::TextView;
 use crate::ui::theme::{self, Colors};
 use crate::ui::widgets::{self, Icon, Outcome};
@@ -31,6 +33,8 @@ pub enum FolderAction {
         kind: Option<FileKind>,
         /// Relative path of the item, to find the next or previous file from it later.
         rel: String,
+        /// Compare rules file of the folder compare.
+        rules: String,
     },
     OpenFolders {
         paths: Vec<PathBuf>,
@@ -44,6 +48,20 @@ pub enum FolderAction {
     },
     /// Turn every "Show ... items" view option back on.
     ShowAll,
+    /// Add a rule, picked in the docked file compare, to the compare rules file.
+    AddRule(RuleDraft),
+    /// Open the compare rules files in the options.
+    EditRules,
+    /// Save the HTML report of the folder compare with the differences of every changed file.
+    ExportHtml,
+    /// Show the differences of every changed file in one tab.
+    AllDiffs,
+    /// Save the HTML report of the docked file compare: a file name to suggest, and what makes
+    /// the report.
+    ExportFileReport {
+        name: String,
+        job: report::ReportJob,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,7 +111,8 @@ struct Running {
 pub struct FolderView {
     pub roots: Vec<PathBuf>,
     pub display_roots: Vec<String>,
-    _temps: Vec<tempfile::TempDir>,
+    /// Extracted archives, shared with the tabs that show their files.
+    temps: Vec<std::sync::Arc<tempfile::TempDir>>,
     pub items: Vec<DirItem>,
     pub filter_spec: String,
     filter: FileFilter,
@@ -138,6 +157,18 @@ pub struct FolderView {
     file_job: Option<(JoinHandle<OpResult>, bool)>,
     /// Sides nothing may be copied to or deleted from, such as an extracted Git revision.
     pub read_only: Vec<bool>,
+    /// Compare rules file used (a name or path, "" = none); read again on every refresh.
+    pub rules: String,
+    /// Whether `rules` named a file that could be read the last time it was applied.
+    rules_found: bool,
+    /// Names of the rules files, listed while the rules popup is open.
+    rule_names: Vec<String>,
+    /// A rule picked in the docked file compare, until the app takes it.
+    rule_request: Option<RuleDraft>,
+    /// The HTML report asked for in the docked file compare, until the app takes it.
+    file_report: Option<(String, report::ReportJob)>,
+    /// The last comparison was stopped before comparing every file.
+    stopped: bool,
     id: egui::Id,
 }
 
@@ -249,7 +280,8 @@ fn sort_ext(it: &DirItem) -> &str {
         .unwrap_or("")
 }
 
-fn system_open(path: &std::path::Path) {
+/// Opens `path` with the program the system uses for it.
+pub(crate) fn system_open(path: &std::path::Path) {
     #[cfg(windows)]
     let _ = std::process::Command::new("cmd")
         .args(["/C", "start", ""])
@@ -292,10 +324,15 @@ impl FolderView {
         named: &[FltFilter],
         cfg: &Config,
     ) -> Self {
+        // Extracted archives are copies: changes to them would be lost.
+        let read_only = roots
+            .iter()
+            .map(|r| temps.iter().any(|t| r.starts_with(t.path())))
+            .collect();
         let mut v = FolderView {
             roots,
             display_roots,
-            _temps: temps,
+            temps: temps.into_iter().map(std::sync::Arc::new).collect(),
             items: Vec::new(),
             filter_spec: filter_spec.to_string(),
             filter: FileFilter::resolve(filter_spec, named),
@@ -326,9 +363,16 @@ impl FolderView {
             merge_plan: None,
             file_job: None,
             read_only: Vec::new(),
+            rules: cfg.rules.clone(),
+            rules_found: false,
+            rule_names: Vec::new(),
+            rule_request: None,
+            file_report: None,
+            stopped: false,
             id: egui::Id::new(("folderview", std::time::Instant::now())),
         };
-        v.read_only = vec![false; v.n()];
+        v.read_only = read_only;
+        v.set_rules(cfg, cfg.rules.clone());
         v.start_compare();
         v
     }
@@ -339,6 +383,24 @@ impl FolderView {
 
     pub fn set_method(&mut self, method: folder::CompareMethod) {
         self.fopts.method = method;
+    }
+
+    /// Uses the compare rules file `rules` ("" = none) from the next comparison on.
+    pub fn set_rules(&mut self, cfg: &Config, rules: String) {
+        self.rules = rules;
+        let set = rules::find(&self.rules);
+        self.rules_found = set.is_some();
+        self.dopts = rules::options_with(&cfg.diff, set.as_ref());
+    }
+
+    /// The compare rules file as reports name it: none when it could not be read, as the
+    /// files were then compared without it.
+    fn used_rules(&self) -> &str {
+        if self.rules_found {
+            &self.rules
+        } else {
+            ""
+        }
     }
 
     /// Whether subfolders are compared, and how files are compared.
@@ -412,7 +474,7 @@ impl FolderView {
         self.fopts = cfg.folder.clone();
         self.fopts.recursive = recursive;
         self.fopts.method = method;
-        self.dopts = cfg.diff.clone();
+        self.set_rules(cfg, self.rules.clone());
         self.filter = FileFilter::resolve(&self.filter_spec, named);
         self.start_compare();
     }
@@ -450,6 +512,7 @@ impl FolderView {
             let aborted = r.progress.abort.load(Ordering::Relaxed);
             // Same items in the same order as the streamed ones, so the selection stays valid.
             self.items = r.handle.join().unwrap_or_default();
+            self.stopped = aborted;
             self.elapsed = Some(r.started.elapsed());
             self.selected.retain(|&i| i < self.items.len());
             self.view_key = None;
@@ -777,6 +840,7 @@ impl FolderView {
             descriptions,
             kind,
             rel: it.rel_path(),
+            rules: self.rules.clone(),
         })
     }
 
@@ -1293,6 +1357,7 @@ impl FolderView {
     fn dock_ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
         self.update_dock(ui.ctx(), cfg);
         let avail = ui.available_height();
+        let rules = self.used_rules().to_string();
         egui::TopBottomPanel::bottom(self.id.with("dock"))
             .resizable(true)
             .default_height(avail * 0.45)
@@ -1302,6 +1367,13 @@ impl FolderView {
                 Some((_, Dock::Ready(Some(v), ..))) => {
                     v.set_options(&self.dopts);
                     v.ui(ui, cfg, c);
+                    if let Some(r) = v.rule_request.take() {
+                        self.rule_request = Some(r);
+                    }
+                    if std::mem::take(&mut v.export_request) {
+                        let name = report::html_file_name(&v.titles());
+                        self.file_report = Some((name, v.html_report_job(&rules)));
+                    }
                 }
                 other => {
                     let key = match other {
@@ -1342,7 +1414,7 @@ impl FolderView {
         let list = self.flat_list(cfg);
         let items: Vec<&DirItem> = list.iter().map(|&i| &self.items[i]).collect();
         let roots: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
-        report::generate(&items, &roots, format)
+        report::generate(&items, &roots, format, self.used_rules())
     }
 
     /// Writes the HTML report of the listed items followed by the differences of every changed
@@ -1355,9 +1427,29 @@ impl FolderView {
             .collect();
         let display: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
         let (roots, dopts) = (self.roots.clone(), self.dopts.clone());
+        let rules = self.used_rules().to_string();
         move || {
             let refs: Vec<&DirItem> = items.iter().collect();
-            report::folder_html_with_diffs(&refs, &roots, &display, &dopts)
+            report::folder_html_with_diffs(&refs, &roots, &display, &dopts, &rules)
+        }
+    }
+
+    /// What the tab of all the differences shows: the changed files listed, in display order.
+    pub fn diffs_source(&self, cfg: &Config) -> crate::ui::diffs_view::Source {
+        crate::ui::diffs_view::Source {
+            roots: self.roots.clone(),
+            display_roots: self.display_roots.clone(),
+            read_only: self.read_only.clone(),
+            dopts: self.dopts.clone(),
+            rules: self.rules.clone(),
+            title: self.title(),
+            items: self
+                .display_order(cfg, true)
+                .into_iter()
+                .map(|i| self.items[i].clone())
+                .collect(),
+            stopped: self.stopped,
+            temps: self.temps.clone(),
         }
     }
 
@@ -1441,6 +1533,7 @@ impl FolderView {
         let mut action = None;
         let mut new_filter: Option<String> = None;
         let mut new_options: Option<(folder::CompareMethod, bool)> = None;
+        let mut new_rules: Option<String> = None;
         let n = self.n();
         let sel = !self.selected.is_empty();
         widgets::toolbar(ui, |ui| {
@@ -1465,7 +1558,7 @@ impl FolderView {
                     ui,
                     sel && self.writable(1),
                     Icon::CopyRight,
-                    &key(tr("cmd.copy_right"), "Alt+→"),
+                    &Cmd::CopyRight.tip(),
                 )
                 .clicked()
                 {
@@ -1475,7 +1568,7 @@ impl FolderView {
                     ui,
                     sel && self.writable(0),
                     Icon::CopyLeft,
-                    &key(tr("cmd.copy_left"), "Alt+←"),
+                    &Cmd::CopyLeft.tip(),
                 )
                 .clicked()
                 {
@@ -1508,6 +1601,25 @@ impl FolderView {
             if widgets::icon_button(ui, Icon::Check, tr("cmd.select_pattern")).clicked() {
                 self.open_select_pattern();
             }
+            widgets::toolbar_sep(ui);
+            let ready = self.running.is_none();
+            if ui
+                .add_enabled_ui(ready, |ui| {
+                    widgets::ghost_icon_button(ui, Icon::Compare, tr("cmd.all_diffs"))
+                        .on_hover_text(tr("diffs.tip"))
+                        .on_disabled_hover_text(tr("msg.comparing"))
+                })
+                .inner
+                .clicked()
+            {
+                action = Some(FolderAction::AllDiffs);
+            }
+            if widgets::ghost_icon_button(ui, Icon::Export, tr("btn.export_html"))
+                .on_hover_text(Cmd::ExportHtml.tip())
+                .clicked()
+            {
+                action = Some(FolderAction::ExportHtml);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 let close = egui::PopupCloseBehavior::CloseOnClickOutside;
@@ -1515,7 +1627,7 @@ impl FolderView {
                 let search = widgets::search_edit(
                     ui,
                     &mut self.search,
-                    &key(tr("folder.search_hint"), "Ctrl+F"),
+                    &key(tr("folder.search_hint"), Cmd::Find.key()),
                     170.0,
                 );
                 if std::mem::take(&mut self.focus_search) {
@@ -1555,6 +1667,39 @@ impl FolderView {
                     let mut recursive = self.fopts.recursive;
                     if ui.checkbox(&mut recursive, tr("label.recursive")).changed() {
                         new_options = Some((self.fopts.method, recursive));
+                    }
+                });
+
+                let rules_id = self.id.with("rules_popup");
+                let shown = if self.rules.is_empty() {
+                    tr("rules.none")
+                } else {
+                    rules::display_name(&self.rules)
+                };
+                let r = widgets::chip_button(ui, Icon::Settings, tr("label.rules"), shown)
+                    .on_hover_text(tr("tip.rules"));
+                if r.clicked() {
+                    self.rule_names = rules::list().into_iter().map(|s| s.name).collect();
+                    ui.memory_mut(|m| m.toggle_popup(rules_id));
+                }
+                egui::popup::popup_below_widget(ui, rules_id, &r, close, |ui| {
+                    ui.set_min_width(220.0);
+                    if ui
+                        .selectable_label(self.rules.is_empty(), tr("rules.none"))
+                        .clicked()
+                    {
+                        new_rules = Some(String::new());
+                    }
+                    for name in &self.rule_names {
+                        let on = rules::same_name(rules::display_name(&self.rules), name);
+                        if ui.selectable_label(on, name).clicked() {
+                            new_rules = Some(name.clone());
+                        }
+                    }
+                    ui.separator();
+                    if ui.button(tr("cmd.edit_rules")).clicked() {
+                        ui.memory_mut(|m| m.close_popup());
+                        action = Some(FolderAction::EditRules);
                     }
                 });
 
@@ -1605,6 +1750,11 @@ impl FolderView {
             self.set_recursive(recursive);
             self.start_compare();
             action = Some(FolderAction::OptionsChanged { method, recursive });
+        }
+        if let Some(name) = new_rules {
+            ui.memory_mut(|m| m.close_popup());
+            self.rules = name;
+            refresh = true;
         }
         if let Some(spec) = new_filter.filter(|s| !s.trim().is_empty()) {
             ui.memory_mut(|m| m.close_popup());
@@ -1803,7 +1953,13 @@ impl FolderView {
             self.dock = None;
         }
 
-        let mut result: Option<FolderAction> = header_action;
+        let mut result: Option<FolderAction> = header_action
+            .or_else(|| self.rule_request.take().map(FolderAction::AddRule))
+            .or_else(|| {
+                self.file_report
+                    .take()
+                    .map(|(name, job)| FolderAction::ExportFileReport { name, job })
+            });
         let mut toggle: Option<usize> = None;
         let mut click: Option<(usize, Modifiers)> = None;
         let mut double: Option<usize> = None;
@@ -1812,7 +1968,7 @@ impl FolderView {
 
         // keyboard navigation
         let row_h = ui.text_style_height(&egui::TextStyle::Body) + 12.0;
-        if !ui.ctx().wants_keyboard_input()
+        if !widgets::typing(ui.ctx())
             && !widgets::modal_open(ui.ctx())
             && self.confirm.is_none()
             && self.merge_plan.is_none()
@@ -2346,6 +2502,30 @@ impl FolderView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracted_sides_are_read_only_in_all_differences() {
+        let cfg = Config::default();
+        let left = tempfile::tempdir().unwrap();
+        let extracted = tempfile::tempdir().unwrap();
+        std::fs::write(left.path().join("a.txt"), "x\n").unwrap();
+        std::fs::write(extracted.path().join("a.txt"), "y\n").unwrap();
+        let roots = vec![left.path().to_path_buf(), extracted.path().to_path_buf()];
+        let display = roots.iter().map(|r| r.display().to_string()).collect();
+        let mut v = FolderView::new(roots, display, vec![extracted], "", &[], &cfg);
+        let wait = |v: &mut FolderView| {
+            while v.running.is_some() {
+                std::thread::sleep(Duration::from_millis(10));
+                v.poll();
+            }
+        };
+        wait(&mut v);
+        assert_eq!(v.read_only, [false, true]);
+        let src = v.diffs_source(&cfg);
+        assert_eq!(src.read_only, [false, true]);
+        assert_eq!(src.items.len(), 1);
+        assert!(!src.stopped);
+    }
 
     #[test]
     fn steps_through_files_with_differences_in_display_order() {

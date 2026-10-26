@@ -9,24 +9,24 @@ use crate::core::folder::CompareMethod;
 use crate::core::git;
 use crate::core::patch::{self, PatchStyle};
 use crate::core::project::{self, Project};
-use crate::core::report::{side_name, ReportFormat};
+use crate::core::report::{self, side_name, ReportFormat};
+use crate::core::rules::{self, RuleDraft, RuleKind, RuleSet};
 use crate::core::saved::{self, SavedCompare};
 use crate::core::text::{self, FileKind, TextDoc};
 use crate::core::unpacker::{self, Unpacker};
 use crate::core::web;
 use crate::i18n::{self, tr, trf};
 use crate::ui::binary_view::BinaryView;
+use crate::ui::commands::{self, Cmd, Scope, BINDINGS};
+use crate::ui::diffs_view::DiffsView;
 use crate::ui::folder_view::{FolderAction, FolderView};
 use crate::ui::image_view::ImageView;
 use crate::ui::palette::{Entry as PaletteEntry, Outcome as PaletteOutcome, Palette};
-use crate::ui::text_view::{TextView, REPLACE_KEY};
+use crate::ui::text_view::TextView;
 use crate::ui::web_view::WebView;
 use crate::ui::widgets::{self, pal, Icon, Outcome};
 use crate::ui::{about, fonts, help, theme};
-use egui::{
-    vec2, Align, Align2, CornerRadius, FontId, Key, KeyboardShortcut, Layout, Margin, Modifiers,
-    Sense, Stroke,
-};
+use egui::{vec2, Align, Align2, CornerRadius, FontId, Key, Layout, Margin, Sense, Stroke};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Default)]
@@ -44,6 +44,8 @@ pub struct OpenRequest {
     pub skip_recent: bool,
     /// Compare the single path with how it was in this Git revision.
     pub git_rev: Option<String>,
+    /// Compare rules file to use instead of the one of the options ("" = none).
+    pub rules: Option<String>,
 }
 
 pub enum Content {
@@ -52,6 +54,7 @@ pub enum Content {
     Binary(BinaryView),
     Image(ImageView),
     Web(WebView),
+    Diffs(DiffsView),
 }
 
 impl Content {
@@ -81,6 +84,7 @@ impl Content {
             Content::Binary(v) => v.status_line(),
             Content::Image(v) => v.status_line(),
             Content::Web(v) => v.status_line(v.inner.as_deref().map(Content::status_line)),
+            Content::Diffs(v) => v.status_line(),
         }
     }
 
@@ -91,6 +95,7 @@ impl Content {
             Content::Binary(v) => Some(v.outcome()),
             Content::Image(v) => Some(v.outcome()),
             Content::Web(v) => v.outcome(v.inner.as_deref().and_then(Content::outcome)),
+            Content::Diffs(v) => Some(v.outcome()),
         }
     }
 }
@@ -124,6 +129,7 @@ impl Tab {
             Content::Binary(v) => v.title(),
             Content::Image(v) => v.title(),
             Content::Web(v) => v.title(),
+            Content::Diffs(v) => v.title(),
         }
     }
 
@@ -134,6 +140,7 @@ impl Tab {
             Content::Binary(_) => Icon::Binary,
             Content::Image(_) => Icon::Image,
             Content::Web(_) => Icon::Globe,
+            Content::Diffs(_) => Icon::Compare,
         }
     }
 
@@ -143,6 +150,7 @@ impl Tab {
             Content::Text(v) => v.is_modified(),
             Content::Binary(v) => v.is_modified(),
             Content::Image(v) => v.is_modified(),
+            Content::Diffs(v) => v.is_modified(),
         }
     }
 
@@ -156,6 +164,7 @@ impl Tab {
             Content::Text(v) => v.save_modified(),
             Content::Binary(v) => v.save(),
             Content::Image(v) => v.save(),
+            Content::Diffs(v) => v.save_modified(),
         }
     }
 }
@@ -169,7 +178,10 @@ fn content_ui(
 ) -> Option<FolderAction> {
     match content {
         Content::Text(v) => {
-            v.set_options(&cfg.diff);
+            match v.options_for(&cfg.diff) {
+                Some(o) => v.set_options(&o),
+                None => v.set_options(&cfg.diff),
+            }
             v.ui(ui, cfg, colors);
             None
         }
@@ -182,6 +194,10 @@ fn content_ui(
             None
         }
         Content::Folder(v) => v.ui(ui, cfg, colors, named),
+        Content::Diffs(v) => {
+            v.ui(ui, cfg, colors);
+            v.open_request.take()
+        }
         Content::Web(v) => {
             v.header(ui, cfg, named);
             v.inner
@@ -189,72 +205,6 @@ fn content_ui(
                 .and_then(|c| content_ui(c, ui, cfg, colors, named))
         }
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Cmd {
-    New,
-    Open,
-    OpenConflict,
-    OpenProject,
-    SaveProject,
-    ApplyPatch,
-    ToggleBookmark,
-    NextBookmark,
-    PrevBookmark,
-    ClearBookmarks,
-    /// Three-way: take the left then the right lines (true), or right then left.
-    TakeBoth(bool),
-    Save,
-    SaveAll,
-    SaveAs(usize),
-    CloseTab,
-    CloseTabAt(usize),
-    CloseOtherTabs(usize),
-    CloseTabsToRight(usize),
-    CloseAllTabs,
-    Exit,
-    Undo,
-    Redo,
-    Find,
-    Replace,
-    FindNext,
-    FindPrev,
-    GotoLine,
-    Options,
-    Help,
-    NextDiff,
-    PrevDiff,
-    FirstDiff,
-    LastDiff,
-    NextConflict,
-    PrevConflict,
-    CopyRight,
-    CopyLeft,
-    CopyAllRight,
-    CopyAllLeft,
-    AutoMerge,
-    Refresh,
-    Patch,
-    Report,
-    ZoomIn,
-    ZoomOut,
-    ZoomReset,
-    NextTab,
-    PrevTab,
-    CompareAs(FileKind),
-    Filters,
-    ToggleCollapse,
-    ToggleWrap,
-    Palette,
-    Statistics,
-    /// Indent (false) or outdent (true) the selected lines.
-    Indent(bool),
-    BookmarkComment,
-    SaveComparison,
-    GitCompare,
-    ReportWithDiffs,
-    SelectPattern,
 }
 
 /// What a command palette entry does.
@@ -269,113 +219,6 @@ enum PaletteAction {
 
 /// Selects one on/off setting.
 type ConfigFlag = fn(&mut Config) -> &mut bool;
-
-/// Menu commands offered by the command palette: label key, shortcut, command, icon.
-const PALETTE_CMDS: &[(&str, &str, Cmd, Icon)] = &[
-    ("menu.new", "Ctrl+N", Cmd::New, Icon::Plus),
-    ("menu.open", "Ctrl+O", Cmd::Open, Icon::Folder),
-    ("menu.open_conflict", "", Cmd::OpenConflict, Icon::Warning),
-    ("menu.open_project", "", Cmd::OpenProject, Icon::Folder),
-    ("menu.save_project", "", Cmd::SaveProject, Icon::File),
-    ("menu.save", "Ctrl+S", Cmd::Save, Icon::File),
-    ("btn.save_all", "Ctrl+Shift+S", Cmd::SaveAll, Icon::File),
-    ("menu.patch", "", Cmd::Patch, Icon::Text),
-    ("menu.apply_patch", "", Cmd::ApplyPatch, Icon::Text),
-    ("menu.report", "", Cmd::Report, Icon::Text),
-    ("menu.report_diffs", "", Cmd::ReportWithDiffs, Icon::Text),
-    ("menu.save_comparison", "", Cmd::SaveComparison, Icon::File),
-    ("menu.git_compare", "", Cmd::GitCompare, Icon::Compare),
-    ("menu.statistics", "", Cmd::Statistics, Icon::Method),
-    ("cmd.indent", "Ctrl+]", Cmd::Indent(false), Icon::Next),
-    ("cmd.outdent", "Ctrl+[", Cmd::Indent(true), Icon::Prev),
-    ("cmd.bookmark_comment", "", Cmd::BookmarkComment, Icon::Text),
-    ("cmd.select_pattern", "", Cmd::SelectPattern, Icon::Check),
-    (
-        "cmd.toggle_bookmark",
-        "Ctrl+F2",
-        Cmd::ToggleBookmark,
-        Icon::Check,
-    ),
-    ("cmd.next_bookmark", "F4", Cmd::NextBookmark, Icon::Next),
-    (
-        "cmd.prev_bookmark",
-        "Shift+F4",
-        Cmd::PrevBookmark,
-        Icon::Prev,
-    ),
-    ("cmd.clear_bookmarks", "", Cmd::ClearBookmarks, Icon::Close),
-    (
-        "cmd.take_left_right",
-        "",
-        Cmd::TakeBoth(true),
-        Icon::Compare,
-    ),
-    (
-        "cmd.take_right_left",
-        "",
-        Cmd::TakeBoth(false),
-        Icon::Compare,
-    ),
-    ("menu.close_tab", "Ctrl+W", Cmd::CloseTab, Icon::Close),
-    ("cmd.undo", "Ctrl+Z", Cmd::Undo, Icon::Undo),
-    ("cmd.redo", "Ctrl+Y", Cmd::Redo, Icon::Redo),
-    ("cmd.find", "Ctrl+F", Cmd::Find, Icon::Search),
-    ("cmd.replace", REPLACE_KEY, Cmd::Replace, Icon::Search),
-    ("cmd.find_next", "F3", Cmd::FindNext, Icon::Next),
-    ("cmd.find_prev", "Shift+F3", Cmd::FindPrev, Icon::Prev),
-    ("dlg.goto", "Ctrl+G", Cmd::GotoLine, Icon::Method),
-    ("cmd.next_diff", "Alt+Down", Cmd::NextDiff, Icon::Next),
-    ("cmd.prev_diff", "Alt+Up", Cmd::PrevDiff, Icon::Prev),
-    ("cmd.first_diff", "Alt+Home", Cmd::FirstDiff, Icon::First),
-    ("cmd.last_diff", "Alt+End", Cmd::LastDiff, Icon::Last),
-    (
-        "cmd.next_conflict",
-        "Alt+PgDn",
-        Cmd::NextConflict,
-        Icon::NextConflict,
-    ),
-    (
-        "cmd.prev_conflict",
-        "Alt+PgUp",
-        Cmd::PrevConflict,
-        Icon::PrevConflict,
-    ),
-    (
-        "cmd.copy_right",
-        "Alt+Right",
-        Cmd::CopyRight,
-        Icon::CopyRight,
-    ),
-    ("cmd.copy_left", "Alt+Left", Cmd::CopyLeft, Icon::CopyLeft),
-    (
-        "cmd.copy_all_right",
-        "Ctrl+Alt+Right",
-        Cmd::CopyAllRight,
-        Icon::CopyAllRight,
-    ),
-    (
-        "cmd.copy_all_left",
-        "Ctrl+Alt+Left",
-        Cmd::CopyAllLeft,
-        Icon::CopyAllLeft,
-    ),
-    ("cmd.auto_merge", "", Cmd::AutoMerge, Icon::Bolt),
-    (
-        "cmd.collapse_unchanged",
-        "Alt+C",
-        Cmd::ToggleCollapse,
-        Icon::Fold,
-    ),
-    ("cmd.word_wrap", "Alt+Z", Cmd::ToggleWrap, Icon::Wrap),
-    ("cmd.refresh", "F5", Cmd::Refresh, Icon::Refresh),
-    ("cmd.zoom_in", "Ctrl++", Cmd::ZoomIn, Icon::ZoomIn),
-    ("cmd.zoom_out", "Ctrl+-", Cmd::ZoomOut, Icon::ZoomOut),
-    ("cmd.zoom_reset", "Ctrl+0", Cmd::ZoomReset, Icon::Fit),
-    ("menu.filters", "", Cmd::Filters, Icon::Filter),
-    ("menu.options", "", Cmd::Options, Icon::Settings),
-    ("help.title", "F1", Cmd::Help, Icon::Help),
-    ("menu.exit", "Alt+F4", Cmd::Exit, Icon::Close),
-];
 
 /// Labels of the file manager integration: add, remove, added, removed.
 pub const SHELL_KEYS: [&str; 4] = if cfg!(windows) {
@@ -420,15 +263,17 @@ struct OpenDialog {
 enum OptTab {
     General,
     Compare,
+    Rules,
     Folder,
     Media,
     Plugins,
 }
 
 impl OptTab {
-    const ALL: [(OptTab, Icon, &'static str); 5] = [
+    const ALL: [(OptTab, Icon, &'static str); 6] = [
         (OptTab::General, Icon::Settings, "opt.tab_general"),
         (OptTab::Compare, Icon::Compare, "opt.tab_compare"),
+        (OptTab::Rules, Icon::Check, "opt.rules"),
         (OptTab::Folder, Icon::Folder, "opt.tab_folder"),
         (OptTab::Media, Icon::Image, "opt.tab_media"),
         (OptTab::Plugins, Icon::Bolt, "opt.tab_plugins"),
@@ -465,10 +310,11 @@ const OPT_INDEX: &[(OptTab, &str)] = &[
     (OptTab::Compare, "opt.detect_moved"),
     (OptTab::Compare, "opt.algorithm"),
     (OptTab::Compare, "opt.inline"),
-    (OptTab::Compare, "opt.line_filters"),
-    (OptTab::Compare, "opt.substitutions"),
     (OptTab::Compare, "opt.numeric_tolerance"),
-    (OptTab::Compare, "opt.block_filters"),
+    (OptTab::Rules, "opt.rules"),
+    (OptTab::Rules, "rules.lines"),
+    (OptTab::Rules, "rules.substitutions"),
+    (OptTab::Rules, "rules.blocks"),
     (OptTab::Folder, "label.method"),
     (OptTab::Folder, "label.recursive"),
     (OptTab::Folder, "opt.unique_subfolders"),
@@ -496,13 +342,69 @@ fn arrow_pairs(pairs: &[(String, String)]) -> String {
         .join("\n")
 }
 
-/// Reads `a => b` lines. The spaced arrow is looked for first, so a pattern may hold `=>`.
+/// Reads `a => b` lines like [`parse_arrow_pairs`], except that a line left as [`arrow_pairs`]
+/// wrote it is the pair it was written from, whose patterns may hold " => " themselves.
+fn edited_pairs(text: &str, old: &[(String, String)]) -> Vec<(String, String)> {
+    text.lines()
+        .flat_map(|l| {
+            old.iter()
+                .find(|(a, b)| format!("{a} => {b}") == l)
+                .cloned()
+                .map_or_else(|| parse_arrow_pairs(l), |p| vec![p])
+        })
+        .collect()
+}
+
+/// Lines (1-based) of `a => b` text that are not read as one pair: without an arrow, or with
+/// more than one " => ".
+fn unclear_arrow_lines(text: &str, old: &[(String, String)], both: bool) -> Vec<usize> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .filter(|(_, l)| !old.iter().any(|(a, b)| format!("{a} => {b}") == *l))
+        .filter(|(_, l)| {
+            let pair = parse_arrow_pairs(l);
+            let empty = pair
+                .first()
+                .is_none_or(|(a, b)| a.is_empty() || (both && b.is_empty()));
+            empty || l.matches(" => ").count() > 1
+        })
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+/// Warns about the lines [`unclear_arrow_lines`] finds.
+fn arrow_warning(ui: &mut egui::Ui, lines: &[usize]) {
+    if lines.is_empty() {
+        return;
+    }
+    let lines = lines
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    ui.label(
+        egui::RichText::new(trf("rules.unclear_lines", &[("lines", lines)]))
+            .small()
+            .color(pal(ui).warning),
+    );
+}
+
+/// Reads `a => b` lines. The spaced arrow is looked for first, so a pattern may hold `=>`; spaces
+/// around the patterns are kept, as they are part of them.
 fn parse_arrow_pairs(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|l| {
             l.split_once(" => ")
-                .or_else(|| l.split_once("=>"))
-                .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))
+                .or_else(|| {
+                    // "a =>" or "=> b": the space on the arrow's side goes with the arrow.
+                    let (a, b) = l.split_once("=>")?;
+                    Some((
+                        a.strip_suffix(' ').unwrap_or(a),
+                        b.strip_prefix(' ').unwrap_or(b),
+                    ))
+                })
+                .map(|(a, b)| (a.to_string(), b.to_string()))
         })
         .filter(|(a, _)| !a.is_empty())
         .collect()
@@ -511,15 +413,452 @@ fn parse_arrow_pairs(text: &str) -> Vec<(String, String)> {
 /// A warning naming the first of `patterns` that is not a valid regular expression; such
 /// patterns are left out of the compare.
 fn regex_warning(ui: &mut egui::Ui, patterns: impl IntoIterator<Item = String>) {
-    let bad = patterns
-        .into_iter()
-        .find(|p| !p.is_empty() && regex::Regex::new(p).is_err());
+    thread_local! {
+        static VALID: std::cell::RefCell<std::collections::HashMap<String, bool>> = Default::default();
+    }
+    let valid = |p: &String| {
+        VALID.with_borrow_mut(|known| {
+            if known.len() > 512 {
+                known.clear();
+            }
+            *known
+                .entry(p.clone())
+                .or_insert_with(|| regex::Regex::new(p).is_ok())
+        })
+    };
+    let bad = patterns.into_iter().find(|p| !p.is_empty() && !valid(p));
     if let Some(bad) = bad {
         ui.label(
             egui::RichText::new(trf("opt.invalid_regex", &[("pattern", bad)]))
                 .small()
                 .color(pal(ui).danger),
         );
+    }
+}
+
+/// Saves the rules file being edited in the options; false, with the reason shown, when it
+/// cannot be.
+fn save_rule_edit(d: &mut OptionsDialog) -> bool {
+    let Some(e) = &d.rule_edit else {
+        return true;
+    };
+    let dir = e
+        .original
+        .as_ref()
+        .and_then(|o| o.path.parent().map(Path::to_path_buf))
+        .or_else(rules::dir);
+    let Some(dir) = dir else {
+        d.rule_error = Some(tr("msg.no_config").into());
+        return false;
+    };
+    if e.unclear() {
+        d.rule_error = Some(tr("rules.fix_unclear").into());
+        return false;
+    }
+    let set = e.to_set(&dir);
+    let old = e.original.clone();
+    let renamed = old.as_ref().filter(|o| o.path != set.path);
+    // A new case of the name is the same file where names ignore case (macOS, Windows), unless
+    // the folder lists a file of exactly that name.
+    let listed = |p: &Path| {
+        let name = p.file_name();
+        p.parent()
+            .and_then(|dir| std::fs::read_dir(dir).ok())
+            .is_some_and(|rd| {
+                rd.flatten()
+                    .any(|e| Some(e.file_name().as_os_str()) == name)
+            })
+    };
+    let same_name = rules::same_name;
+    let recased = renamed.is_some_and(|o| same_name(&o.name, &set.name)) && !listed(&set.path);
+    // Names that differ in case only would be two files where names keep their case (Linux),
+    // of which the list shows one.
+    let taken = d
+        .rule_sets
+        .iter()
+        .any(|s| same_name(&s.name, &set.name) && !old.as_ref().is_some_and(|o| o.path == s.path));
+    if (old.is_none() || renamed.is_some()) && (taken || (!recased && set.path.exists())) {
+        d.rule_error = Some(trf("rules.exists", &[("name", set.name.clone())]));
+        return false;
+    }
+    let moved = match renamed {
+        Some(o) if recased => std::fs::rename(&o.path, &set.path),
+        _ => Ok(()),
+    };
+    if let Err(err) = moved.and_then(|()| set.save()) {
+        d.rule_error = Some(err.to_string());
+        return false;
+    }
+    let mut left = None;
+    if let Some(o) = renamed {
+        if !recased {
+            if let Err(err) = std::fs::remove_file(&o.path) {
+                let file = o.path.display().to_string();
+                left = Some(format!(
+                    "{}: {err}",
+                    trf("msg.cannot_delete", &[("file", file)])
+                ));
+            }
+        }
+        if rules::same_name(&d.cfg.rules, &o.name) {
+            d.cfg.rules = set.name.clone();
+        }
+        d.rules_renamed.push((o.clone(), set.name.clone()));
+    }
+    d.rule_edit = None;
+    d.rule_error = left;
+    d.rule_discard = false;
+    d.rule_sets = rules::list();
+    d.rules_touched = true;
+    true
+}
+
+/// Whether the rules file being edited may be left: unchanged, or left once already since its
+/// changes were shown to be unsaved.
+fn may_leave_rule_edit(d: &mut OptionsDialog) -> bool {
+    if d.rule_discard || !d.rule_edit.as_ref().is_some_and(RuleEdit::changed) {
+        d.rule_discard = false;
+        return true;
+    }
+    d.rule_discard = true;
+    d.tab = OptTab::Rules;
+    d.rule_error = Some(tr("rules.unsaved_edit").into());
+    false
+}
+
+/// Imports rules files into the rules folder; what happened, and whether some failed.
+fn import_rules(files: &[PathBuf]) -> (String, bool) {
+    let Some(dir) = rules::dir() else {
+        return (tr("msg.no_config").into(), true);
+    };
+    copied_rules(
+        &rules::import_into(&dir, files, &rules::dirs()),
+        "rules.imported",
+    )
+}
+
+/// What copying rules files did, the copies named with `added_key`; and whether some failed.
+fn copied_rules(done: &rules::Imported, added_key: &'static str) -> (String, bool) {
+    let mut parts = Vec::new();
+    for (key, names) in [
+        (added_key, &done.added),
+        ("rules.present", &done.present),
+        ("rules.not_rules", &done.failed),
+        ("rules.not_saved", &done.unsaved),
+    ] {
+        if !names.is_empty() {
+            parts.push(trf(key, &[("names", names.join(", "))]));
+        }
+    }
+    let failed = !done.failed.is_empty() || !done.unsaved.is_empty();
+    (parts.join(" · "), failed)
+}
+
+/// The compare rules files in the options: which one is used by default, and editing them.
+fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
+    ui.label(egui::RichText::new(tr("opt.rules_hint")).small());
+    let mut edit: Option<Option<RuleSet>> = None;
+    let mut delete: Option<RuleSet> = None;
+    let mut import: Vec<PathBuf> = Vec::new();
+    // `Some(None)` exports every rules file.
+    let mut export: Option<Option<RuleSet>> = None;
+    egui::Grid::new("rules_grid")
+        .num_columns(4)
+        .striped(true)
+        .show(ui, |ui| {
+            if ui.radio(d.cfg.rules.is_empty(), tr("rules.none")).clicked() {
+                d.cfg.rules.clear();
+            }
+            ui.end_row();
+            for set in &d.rule_sets {
+                let on = rules::same_name(rules::display_name(&d.cfg.rules), &set.name);
+                if ui
+                    .radio(on, &set.name)
+                    .on_hover_text(set.path.display().to_string())
+                    .clicked()
+                {
+                    d.cfg.rules = set.name.clone();
+                }
+                let about = if set.description.is_empty() {
+                    trf("rules.count", &[("n", set.count().to_string())])
+                } else {
+                    set.description.clone()
+                };
+                ui.label(egui::RichText::new(about).small().color(pal(ui).text_dim));
+                let editing = d
+                    .rule_edit
+                    .as_ref()
+                    .and_then(|e| e.original.as_ref())
+                    .is_some_and(|o| o.path == set.path);
+                if ui
+                    .add(egui::Button::new(tr("btn.edit")).selected(editing))
+                    .clicked()
+                {
+                    edit = Some(Some(set.clone()));
+                }
+                let confirming = d.rule_delete.as_deref() == Some(set.name.as_str());
+                let label = tr(if confirming {
+                    "rules.confirm_delete"
+                } else {
+                    "cmd.delete"
+                });
+                if ui.button(label).clicked() {
+                    if confirming {
+                        delete = Some(set.clone());
+                    } else {
+                        d.rule_delete = Some(set.name.clone());
+                    }
+                }
+                ui.end_row();
+            }
+        });
+    ui.horizontal(|ui| {
+        if widgets::ghost_icon_button(ui, Icon::Plus, tr("rules.new")).clicked() {
+            edit = Some(None);
+        }
+        if ui.button(tr("rules.open_folder")).clicked() {
+            if let Some(dir) = rules::dir() {
+                open_folder(&dir);
+            }
+        }
+        if ui.button(tr("filters.reload")).clicked() {
+            d.rule_sets = rules::list();
+        }
+        ui.separator();
+        if ui.button(tr("rules.import")).clicked() {
+            let files = rfd::FileDialog::new()
+                .set_title(tr("rules.import"))
+                .add_filter(tr("rules.file_type"), &[rules::EXT])
+                .pick_files();
+            if let Some(files) = files {
+                import = files;
+            }
+        }
+        ui.add_enabled_ui(!d.rule_sets.is_empty(), |ui| {
+            ui.menu_button(tr("rules.export"), |ui| {
+                for set in &d.rule_sets {
+                    if ui.button(&set.name).clicked() {
+                        export = Some(Some(set.clone()));
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if ui.button(tr("rules.export_all")).clicked() {
+                    export = Some(None);
+                    ui.close_menu();
+                }
+            });
+        });
+    });
+    if !import.is_empty() {
+        let (msg, failed) = import_rules(&import);
+        if failed {
+            (d.rule_error, d.rule_note) = (Some(msg), None);
+        } else {
+            (d.rule_error, d.rule_note) = (None, Some(msg));
+        }
+        d.rule_sets = rules::list();
+        d.rules_touched = true;
+    }
+    match export {
+        Some(Some(set)) => {
+            let path = rfd::FileDialog::new()
+                .set_title(tr("rules.export"))
+                .add_filter(tr("rules.file_type"), &[rules::EXT])
+                .set_file_name(format!("{}.{}", set.name, rules::EXT))
+                .save_file();
+            if let Some(path) = path {
+                match rules::export_to(&set, &path) {
+                    Ok(()) => {
+                        d.rule_note =
+                            Some(trf("msg.saved", &[("file", path.display().to_string())]));
+                        d.rule_error = None;
+                    }
+                    Err(e) => d.rule_error = Some(e.to_string()),
+                }
+            }
+        }
+        Some(None) => {
+            let dir = rfd::FileDialog::new()
+                .set_title(tr("rules.export_all"))
+                .pick_folder();
+            if let Some(dir) = dir {
+                let done = rules::export_all(&d.rule_sets, &dir);
+                let (mut msg, failed) = copied_rules(&done, "rules.exported");
+                if done.present.is_empty() && !failed {
+                    msg = trf(
+                        "rules.exported_all",
+                        &[
+                            ("n", done.added.len().to_string()),
+                            ("folder", dir.display().to_string()),
+                        ],
+                    );
+                }
+                if failed {
+                    (d.rule_error, d.rule_note) = (Some(msg), None);
+                } else {
+                    (d.rule_error, d.rule_note) = (None, Some(msg));
+                }
+            }
+        }
+        None => {}
+    }
+    if let Some(set) = delete {
+        d.rule_delete = None;
+        match std::fs::remove_file(&set.path) {
+            Ok(()) => {
+                if rules::same_name(&d.cfg.rules, &set.name) {
+                    d.cfg.rules.clear();
+                }
+                let path = d
+                    .rule_edit
+                    .as_ref()
+                    .and_then(|e| e.original.as_ref())
+                    .map(|o| &o.path);
+                if path == Some(&set.path) {
+                    d.rule_edit = None;
+                }
+                d.rule_sets = rules::list();
+                d.rules_touched = true;
+                d.rules_renamed.push((set, String::new()));
+            }
+            Err(e) => d.rule_error = Some(e.to_string()),
+        }
+    }
+    if edit.is_some() && d.rule_edit.as_ref().is_some_and(RuleEdit::changed) {
+        d.rule_error = Some(tr("rules.editing").into());
+        edit = None;
+    }
+    let started = edit.is_some();
+    if let Some(original) = edit {
+        let mut name = tr("rules.new_name").to_string();
+        let mut k = 2;
+        while d.rule_sets.iter().any(|s| rules::same_name(&s.name, &name)) {
+            name = format!("{} {k}", tr("rules.new_name"));
+            k += 1;
+        }
+        d.rule_edit = Some(RuleEdit::new(original, &name));
+        d.rule_error = None;
+        d.rule_discard = false;
+    }
+    let mut save = false;
+    let mut cancel = false;
+    if let Some(e) = &mut d.rule_edit {
+        ui.add_space(6.0);
+        let editor = egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            egui::Grid::new("rule_edit_grid")
+                .num_columns(2)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label(tr("col.name"));
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut e.name).desired_width(320.0));
+                        let saved = rules::file_name(&e.name);
+                        if saved != e.name.trim() {
+                            ui.label(
+                                egui::RichText::new(trf("rules.saved_as", &[("name", saved)]))
+                                    .small()
+                                    .color(pal(ui).warning),
+                            );
+                        }
+                    });
+                    ui.end_row();
+                    ui.label(tr("filters.desc"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut e.description).desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
+                });
+            let list = |ui: &mut egui::Ui,
+                        title: &'static str,
+                        hint: &'static str,
+                        text: &mut String,
+                        rows| {
+                ui.label(egui::RichText::new(tr(title)).strong());
+                ui.label(egui::RichText::new(tr(hint)).small());
+                ui.add(
+                    egui::TextEdit::multiline(text)
+                        .code_editor()
+                        .desired_rows(rows)
+                        .desired_width(f32::INFINITY),
+                );
+            };
+            list(ui, "rules.lines", "opt.line_filters_hint", &mut e.lines, 3);
+            regex_warning(ui, e.lines.lines().map(String::from));
+            list(
+                ui,
+                "rules.substitutions",
+                "opt.substitutions_hint",
+                &mut e.substitutions,
+                3,
+            );
+            regex_warning(
+                ui,
+                parse_arrow_pairs(&e.substitutions)
+                    .into_iter()
+                    .map(|(a, _)| a),
+            );
+            let old_subs: Vec<(String, String)> = e
+                .original
+                .iter()
+                .flat_map(|o| &o.substitutions)
+                .map(|s| (s.find.clone(), s.replace.clone()))
+                .collect();
+            arrow_warning(ui, &unclear_arrow_lines(&e.substitutions, &old_subs, false));
+            list(
+                ui,
+                "rules.blocks",
+                "opt.block_filters_hint",
+                &mut e.blocks,
+                2,
+            );
+            regex_warning(
+                ui,
+                parse_arrow_pairs(&e.blocks)
+                    .into_iter()
+                    .flat_map(|(a, b)| [a, b]),
+            );
+            let old_blocks: Vec<(String, String)> = e
+                .original
+                .iter()
+                .flat_map(|o| &o.ignore_blocks)
+                .map(|b| (b.start.clone(), b.end.clone()))
+                .collect();
+            arrow_warning(ui, &unclear_arrow_lines(&e.blocks, &old_blocks, true));
+            ui.horizontal(|ui| {
+                if widgets::primary_button(ui, tr("rules.save")).clicked() {
+                    save = true;
+                }
+                if widgets::secondary_button(ui, tr("btn.cancel")).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if started {
+            editor.response.scroll_to_me(Some(Align::Min));
+        }
+    }
+    if let Some(err) = &d.rule_error {
+        ui.label(
+            egui::RichText::new(err.as_str())
+                .small()
+                .color(pal(ui).danger),
+        );
+    }
+    if let Some(note) = &d.rule_note {
+        ui.label(
+            egui::RichText::new(note.as_str())
+                .small()
+                .color(pal(ui).success),
+        );
+    }
+    if save {
+        save_rule_edit(d);
+    }
+    if cancel && may_leave_rule_edit(d) {
+        d.rule_edit = None;
+        d.rule_error = None;
     }
 }
 
@@ -540,9 +879,149 @@ struct OptionsDialog {
     cfg: Config,
     tab: OptTab,
     search: String,
-    line_filters: String,
+    rule_sets: Vec<RuleSet>,
+    rule_edit: Option<RuleEdit>,
+    /// Rules file waiting for a second click on Delete.
+    rule_delete: Option<String>,
+    rule_error: Option<String>,
+    /// Whether leaving the rules file being edited was refused once, its changes being unsaved.
+    rule_discard: bool,
+    /// What the last import or export did.
+    rule_note: Option<String>,
+    /// Whether rules files were saved or deleted.
+    rules_touched: bool,
+    /// Rules files renamed, with their new names, or deleted ("").
+    rules_renamed: Vec<(RuleSet, String)>,
+}
+
+/// A compare rules file being edited in the options, its lists as text.
+struct RuleEdit {
+    /// The file as it was; none for a new one.
+    original: Option<RuleSet>,
+    name: String,
+    description: String,
+    lines: String,
     substitutions: String,
-    block_filters: String,
+    blocks: String,
+    /// The texts as the editor opened with them.
+    start: [String; 5],
+}
+
+impl RuleEdit {
+    fn new(original: Option<RuleSet>, name: &str) -> RuleEdit {
+        let set = original.clone().unwrap_or_default();
+        let pairs = |v: Vec<(String, String)>| arrow_pairs(&v);
+        let mut edit = RuleEdit {
+            name: original
+                .as_ref()
+                .map_or(name.to_string(), |s| s.name.clone()),
+            description: set.description.clone(),
+            lines: set.ignore_lines.join("\n"),
+            substitutions: pairs(
+                set.substitutions
+                    .iter()
+                    .map(|s| (s.find.clone(), s.replace.clone()))
+                    .collect(),
+            ),
+            blocks: pairs(
+                set.ignore_blocks
+                    .iter()
+                    .map(|b| (b.start.clone(), b.end.clone()))
+                    .collect(),
+            ),
+            original,
+            start: Default::default(),
+        };
+        edit.start = edit.texts();
+        edit
+    }
+
+    fn texts(&self) -> [String; 5] {
+        [
+            self.name.clone(),
+            self.description.clone(),
+            self.lines.clone(),
+            self.substitutions.clone(),
+            self.blocks.clone(),
+        ]
+    }
+
+    fn changed(&self) -> bool {
+        self.texts() != self.start
+    }
+
+    /// Whether some `a => b` line is not read as one rule.
+    fn unclear(&self) -> bool {
+        let old = self.original.clone().unwrap_or_default();
+        let subs: Vec<(String, String)> = old
+            .substitutions
+            .into_iter()
+            .map(|s| (s.find, s.replace))
+            .collect();
+        let blocks: Vec<(String, String)> = old
+            .ignore_blocks
+            .into_iter()
+            .map(|b| (b.start, b.end))
+            .collect();
+        !unclear_arrow_lines(&self.substitutions, &subs, false).is_empty()
+            || !unclear_arrow_lines(&self.blocks, &blocks, true).is_empty()
+    }
+
+    /// The edited rules, as a file in `dir` unless it keeps the name it had.
+    fn to_set(&self, dir: &Path) -> RuleSet {
+        let mut set = RuleSet::new(dir, &self.name);
+        if let Some(o) = self.original.as_ref().filter(|o| o.name == set.name) {
+            set.path = o.path.clone();
+        }
+        set.description = self.description.trim().to_string();
+        set.ignore_lines = self
+            .lines
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(String::from)
+            .collect();
+        let old = self.original.clone().unwrap_or_default();
+        let subs: Vec<(String, String)> = old
+            .substitutions
+            .into_iter()
+            .map(|s| (s.find, s.replace))
+            .collect();
+        set.substitutions = edited_pairs(&self.substitutions, &subs)
+            .into_iter()
+            .map(|(find, replace)| rules::Substitution { find, replace })
+            .collect();
+        let blocks: Vec<(String, String)> = old
+            .ignore_blocks
+            .into_iter()
+            .map(|b| (b.start, b.end))
+            .collect();
+        set.ignore_blocks = edited_pairs(&self.blocks, &blocks)
+            .into_iter()
+            .filter(|(_, end)| !end.is_empty())
+            .map(|(start, end)| rules::Block { start, end })
+            .collect();
+        set
+    }
+}
+
+/// Adding a rule picked in a compare to a compare rules file.
+struct RuleDialog {
+    /// Tab the rule was picked in.
+    tab: u64,
+    draft: RuleDraft,
+    names: Vec<String>,
+    /// Rules file to add to (a name or path); a new one when there is no such file.
+    target: String,
+}
+
+fn open_folder(dir: &Path) {
+    let _ = std::fs::create_dir_all(dir);
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(dir).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
 }
 
 /// Line or item counts of the active compare.
@@ -605,16 +1084,21 @@ pub struct OxideMergeApp {
     active: usize,
     open_dlg: Option<OpenDialog>,
     options_dlg: Option<OptionsDialog>,
+    rule_dlg: Option<RuleDialog>,
     patch_dlg: Option<PatchDialog>,
     stats_dlg: Option<StatsDialog>,
     git_dlg: Option<GitDialog>,
     /// A folder report with file differences being written on another thread: its file.
     report_job: Option<(PathBuf, std::sync::mpsc::Receiver<std::io::Result<()>>)>,
+    /// Ctrl+Tab presses taken from the input before egui saw them.
+    tab_keys: Vec<Cmd>,
     filters_dlg: bool,
     about: bool,
     help: bool,
     named_filters: Vec<FltFilter>,
     prompt: Option<Prompt>,
+    /// Tabs with unsaved changes still to ask about after the one prompted, to close them all.
+    close_queue: Vec<u64>,
     toasts: Vec<Toast>,
     font_lang: String,
     applied_lang: String,
@@ -657,6 +1141,7 @@ fn kind_from_name(s: &str) -> Option<FileKind> {
 /// What opening the project file `path` compares.
 fn project_request(path: &Path) -> anyhow::Result<OpenRequest> {
     let p = Project::load(path)?;
+    let base = path.parent().unwrap_or(Path::new(""));
     Ok(OpenRequest {
         paths: p.resolved_paths(path),
         descriptions: p.descriptions.clone(),
@@ -665,6 +1150,7 @@ fn project_request(path: &Path) -> anyhow::Result<OpenRequest> {
         recursive: p.recursive,
         filter: p.filter.clone(),
         method: p.method,
+        rules: p.rules.as_deref().map(|r| rules::absolute_spec(r, base)),
         ..Default::default()
     })
 }
@@ -685,6 +1171,173 @@ fn kind_label(k: Option<FileKind>) -> &'static str {
         Some(FileKind::Image) => tr("kind.image"),
         Some(FileKind::Web) => tr("kind.web"),
     }
+}
+
+/// The kind of view the active tab shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewKind {
+    Empty,
+    Text,
+    Binary,
+    Image,
+    Folder,
+    Web,
+    Diffs,
+}
+
+/// What the menus know about the active tab, and what was picked from them.
+struct Menus {
+    view: ViewKind,
+    /// Sides of a text compare (0 otherwise).
+    panes: usize,
+    /// Sides of a text or folder compare (0 otherwise).
+    sides: usize,
+    can_take_both: bool,
+    /// The tab compares two or more paths.
+    has_source: bool,
+    /// The folder compare of the tab is still running.
+    folder_busy: bool,
+    tabs: usize,
+    picked: Option<Cmd>,
+    /// Compare rules file picked for the active tab ("" = none).
+    rules: Option<String>,
+    recent: Option<Vec<String>>,
+}
+
+impl Menus {
+    /// Whether `c` does something for the active tab, matching what [`App::run`] handles.
+    fn enabled(&self, c: Cmd) -> bool {
+        use Cmd::*;
+        use ViewKind::{Binary, Diffs, Folder, Image, Text, Web};
+        match (c, self.view) {
+            (SaveAs(p), _) => p < self.panes,
+            (TakeBoth(_), _) => self.can_take_both,
+            (SaveProject, _) => self.has_source,
+            (NextTab | PrevTab, _) => self.tabs > 1,
+            (CloseTab | CloseAllTabs | SaveAll, _) => self.tabs > 0,
+            (CompareAs(_), Text | Binary | Image | Web) => self.has_source,
+            (
+                Save | Undo | NextDiff | PrevDiff | FirstDiff | LastDiff | CopyRight | CopyLeft,
+                Text | Binary | Image,
+            ) => true,
+            (
+                Redo | Find | FindNext | FindPrev | GotoLine | CopyAllRight | CopyAllLeft,
+                Text | Binary,
+            ) => true,
+            (NextConflict | PrevConflict, Text) | (AutoMerge, Text | Folder) => self.sides == 3,
+            (
+                Replace | ToggleBookmark | NextBookmark | PrevBookmark | ClearBookmarks
+                | BookmarkComment | Indent(_) | SaveComparison,
+                Text,
+            ) => true,
+            (Find | CopyRight | CopyLeft | SelectPattern | ReportWithDiffs, Folder) => true,
+            (Patch, Text | Folder) => self.sides == 2,
+            (ExportHtml | Report | Statistics, Text | Folder) => true,
+            (Refresh, Text | Folder | Web) => true,
+            (AllDiffs, Folder) => !self.folder_busy,
+            (
+                Save | Undo | NextDiff | PrevDiff | FirstDiff | LastDiff | CopyRight | CopyLeft
+                | Refresh | Find,
+                Diffs,
+            ) => true,
+            (
+                New | Open | OpenConflict | OpenProject | GitCompare | ApplyPatch | Options
+                | CompareOptions | Filters | EditRules | Help | Palette | Exit | ZoomIn | ZoomOut
+                | ZoomReset | ToggleCollapse | ToggleWrap | CloseTabAt(_) | CloseOtherTabs(_)
+                | CloseTabsToRight(_),
+                _,
+            ) => true,
+            _ => false,
+        }
+    }
+
+    /// A menu item that runs `c` with its key, greyed out when it does nothing for the active tab.
+    fn item(&mut self, ui: &mut egui::Ui, c: Cmd) {
+        self.item_as(ui, tr(c.label()), c);
+    }
+
+    fn item_as(&mut self, ui: &mut egui::Ui, label: &str, c: Cmd) {
+        let button = egui::Button::new(label).shortcut_text(c.shown_key());
+        if ui.add_enabled(self.enabled(c), button).clicked() {
+            self.picked = Some(c);
+            ui.close_menu();
+        }
+    }
+}
+
+fn edit_menu(ui: &mut egui::Ui, m: &mut Menus) {
+    m.item(ui, Cmd::Undo);
+    m.item(ui, Cmd::Redo);
+    ui.separator();
+    for c in [
+        Cmd::Find,
+        Cmd::Replace,
+        Cmd::FindNext,
+        Cmd::FindPrev,
+        Cmd::GotoLine,
+    ] {
+        m.item(ui, c);
+    }
+    ui.separator();
+    ui.add_enabled_ui(m.view == ViewKind::Text, |ui| {
+        ui.menu_button(tr("menu.bookmarks"), |ui| {
+            for c in [
+                Cmd::ToggleBookmark,
+                Cmd::NextBookmark,
+                Cmd::PrevBookmark,
+                Cmd::BookmarkComment,
+            ] {
+                m.item(ui, c);
+            }
+            ui.separator();
+            m.item(ui, Cmd::ClearBookmarks);
+        });
+    });
+    m.item(ui, Cmd::Indent(false));
+    m.item(ui, Cmd::Indent(true));
+    m.item(ui, Cmd::SelectPattern);
+    ui.separator();
+    m.item(ui, Cmd::Options);
+}
+
+fn merge_menu(ui: &mut egui::Ui, m: &mut Menus) {
+    for c in [
+        Cmd::CopyRight,
+        Cmd::CopyLeft,
+        Cmd::CopyAllRight,
+        Cmd::CopyAllLeft,
+    ] {
+        m.item(ui, c);
+    }
+    ui.separator();
+    let merge = if m.view == ViewKind::Folder {
+        tr("cmd.folder_merge")
+    } else {
+        tr("cmd.auto_merge")
+    };
+    m.item_as(ui, merge, Cmd::AutoMerge);
+    m.item(ui, Cmd::TakeBoth(true));
+    m.item(ui, Cmd::TakeBoth(false));
+}
+
+/// File name of a compared path, or the whole URL.
+fn recent_name(s: &str) -> String {
+    if web::is_url(s) {
+        return s.to_string();
+    }
+    Path::new(s)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| s.to_string())
+}
+
+/// One recent compare on a line: the names of its sides.
+fn recent_label(paths: &[String]) -> String {
+    paths
+        .iter()
+        .map(|p| recent_name(p))
+        .collect::<Vec<_>>()
+        .join(" ↔ ")
 }
 
 /// Large clickable card on the start page.
@@ -754,15 +1407,6 @@ fn recent_row(ui: &mut egui::Ui, paths: &[String]) -> egui::Response {
         icon,
         p.text_dim,
     );
-    let name = |s: &String| -> String {
-        if web::is_url(s) {
-            return s.clone();
-        }
-        Path::new(s)
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_else(|| s.clone())
-    };
     let dir = |s: &String| -> String {
         if web::is_url(s) {
             return String::new();
@@ -772,7 +1416,7 @@ fn recent_row(ui: &mut egui::Ui, paths: &[String]) -> egui::Response {
             .map(|d| d.display().to_string())
             .unwrap_or_default()
     };
-    let names: Vec<String> = paths.iter().map(name).collect();
+    let names: Vec<String> = paths.iter().map(|p| recent_name(p)).collect();
     let mut dirs: Vec<String> = paths.iter().map(dir).collect();
     dirs.dedup();
     let clip = ui.painter().with_clip_rect(egui::Rect::from_min_max(
@@ -964,6 +1608,8 @@ impl OxideMergeApp {
     ) -> Self {
         let lang = i18n::current_language().to_string();
         fonts::setup(&cc.egui_ctx, &lang);
+        #[cfg(target_os = "macos")]
+        crate::ui::macos::ask_before_quitting();
         let applied_lang = cfg.language.clone();
         let mut app = OxideMergeApp {
             saved_cfg: cfg.clone(),
@@ -976,11 +1622,14 @@ impl OxideMergeApp {
             stats_dlg: None,
             git_dlg: None,
             report_job: None,
+            tab_keys: Vec::new(),
             filters_dlg: false,
+            rule_dlg: None,
             about: false,
             help: false,
             named_filters: filter::load_all_filters(),
             prompt: None,
+            close_queue: Vec::new(),
             toasts: Vec::new(),
             font_lang: lang,
             applied_lang,
@@ -999,6 +1648,10 @@ impl OxideMergeApp {
             app.open(req);
         } else if app.cfg.restore_session {
             app.restore_session();
+        }
+        if !app.cfg.rules.is_empty() && rules::find(&app.cfg.rules).is_none() {
+            let name = rules::display_name(&app.cfg.rules).to_string();
+            app.error(trf("rules.missing", &[("name", name)]));
         }
         app
     }
@@ -1021,6 +1674,7 @@ impl OxideMergeApp {
                 paths: s.paths.iter().map(PathBuf::from).collect(),
                 kind,
                 skip_recent: true,
+                rules: s.rules.clone(),
                 ..Default::default()
             };
             if self.try_open(req).is_ok()
@@ -1052,10 +1706,17 @@ impl OxideMergeApp {
                 Content::Binary(_) => Some("binary"),
                 Content::Image(_) => Some("image"),
                 Content::Web(_) => Some("web"),
+                Content::Diffs(_) => return None,
+            };
+            let rules = match &t.content {
+                Content::Text(v) => v.rules.clone(),
+                Content::Folder(v) => Some(v.rules.clone()).filter(|r| *r != self.cfg.rules),
+                _ => None,
             };
             Some(SessionTab {
                 paths: t.source.iter().map(|p| p.display().to_string()).collect(),
                 kind: kind.map(str::to_string),
+                rules,
             })
         };
         let session: Vec<SessionTab> = if self.cfg.restore_session {
@@ -1142,6 +1803,12 @@ impl OxideMergeApp {
         let mut paths = req.paths.clone();
         if paths.is_empty() {
             return Ok(());
+        }
+        if let Some(r) = req.rules.as_deref().filter(|r| !r.is_empty()) {
+            if rules::find(r).is_none() {
+                let name = rules::display_name(r).to_string();
+                self.error(trf("rules.missing", &[("name", name)]));
+            }
         }
         if paths.len() == 1 && project::is_project(&paths[0]) {
             let mut opened = project_request(&paths[0])?;
@@ -1247,6 +1914,10 @@ impl OxideMergeApp {
                 v.set_method(m);
                 restart = true;
             }
+            if let Some(r) = &req.rules {
+                v.set_rules(&app.cfg, r.clone());
+                restart = true;
+            }
             if restart {
                 v.start_compare();
             }
@@ -1302,7 +1973,14 @@ impl OxideMergeApp {
                 if let Some(out) = &req.output {
                     crate::ui::text_view::redirect_output(&mut docs, out);
                 }
-                Content::Text(TextView::new(docs, &self.cfg))
+                let mut v = TextView::new(docs, &self.cfg);
+                if req.rules.is_some() {
+                    v.set_rules(req.rules.clone());
+                    if let Some(o) = v.options_for(&self.cfg.diff) {
+                        v.set_options(&o);
+                    }
+                }
+                Content::Text(v)
             }
             FileKind::Binary => {
                 let mut v = BinaryView::load(paths)?;
@@ -1485,6 +2163,7 @@ impl OxideMergeApp {
             descriptions,
             kind,
             rel,
+            rules,
         }) = f
             .adjacent_different_file(cfg, &rel, forward)
             .and_then(|i| f.reveal_and_open(i, cfg))
@@ -1499,6 +2178,7 @@ impl OxideMergeApp {
             descriptions,
             kind,
             skip_recent: true,
+            rules: Some(rules),
             ..Default::default()
         });
         if self.tabs.len() == count {
@@ -1531,24 +2211,29 @@ impl OxideMergeApp {
             self.prompt = Some(Prompt::CloseTab(i));
             return;
         }
+        self.refresh_saved_folders();
         self.tabs.remove(i);
+        self.shown_active = None;
+        if i < self.active {
+            self.active -= 1;
+        }
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
         }
     }
 
-    /// Closes the tabs selected by `close`. Tabs with unsaved changes stay open and the first of
-    /// them asks whether to save.
+    /// Closes the tabs selected by `close`. Tabs with unsaved changes stay open and ask, one after
+    /// the other, whether to save.
     fn close_tabs(&mut self, close: impl Fn(usize) -> bool) {
         let mut kept = Vec::new();
         let mut active = 0;
-        let mut ask = None;
+        let mut ask = Vec::new();
         for (i, t) in std::mem::take(&mut self.tabs).into_iter().enumerate() {
             if close(i) {
                 if !t.is_modified() {
                     continue;
                 }
-                ask.get_or_insert(kept.len());
+                ask.push(t.id);
             }
             if i <= self.active {
                 active = kept.len();
@@ -1557,9 +2242,20 @@ impl OxideMergeApp {
         }
         self.tabs = kept;
         self.active = active;
-        if let Some(i) = ask {
-            self.active = i;
-            self.prompt = Some(Prompt::CloseTab(i));
+        self.shown_active = None;
+        self.close_queue = ask;
+        self.ask_next_close();
+    }
+
+    /// Asks about the next tab of [`Self::close_queue`] still unsaved.
+    fn ask_next_close(&mut self) {
+        while !self.close_queue.is_empty() {
+            let id = self.close_queue.remove(0);
+            if let Some(i) = self.tabs.iter().position(|t| t.id == id && t.is_modified()) {
+                self.active = i;
+                self.prompt = Some(Prompt::CloseTab(i));
+                return;
+            }
         }
     }
 
@@ -1567,13 +2263,265 @@ impl OxideMergeApp {
 
     fn open_options(&mut self, tab: OptTab) {
         self.options_dlg = Some(OptionsDialog {
-            line_filters: self.cfg.diff.line_filters.join("\n"),
-            substitutions: arrow_pairs(&self.cfg.diff.substitutions),
-            block_filters: arrow_pairs(&self.cfg.diff.block_filters),
             cfg: self.cfg.clone(),
             tab,
             search: String::new(),
+            rule_sets: rules::list(),
+            rule_edit: None,
+            rule_discard: false,
+            rule_delete: None,
+            rule_error: None,
+            rule_note: None,
+            rules_touched: false,
+            rules_renamed: Vec::new(),
         });
+    }
+
+    /// Compare rules file of tab `i` (a name or path, "" = none), for the compares that use one.
+    fn tab_rules(&self, i: usize) -> Option<String> {
+        match self.tabs.get(i).map(|t| t.content.view())? {
+            Content::Text(v) => Some(v.rules.clone().unwrap_or_else(|| self.cfg.rules.clone())),
+            Content::Folder(v) => Some(v.rules.clone()),
+            _ => None,
+        }
+    }
+
+    /// Makes tab `i` compare with the rules file `name` ("" = none).
+    fn use_rules(&mut self, i: usize, name: String) {
+        match self.tabs.get_mut(i).map(|t| t.content.view_mut()) {
+            Some(Content::Text(v)) => v.set_rules(Some(name)),
+            Some(Content::Folder(v)) => {
+                v.rules = name;
+                v.refresh(&self.cfg, &self.named_filters);
+            }
+            _ => {}
+        }
+    }
+
+    /// Points the options and the compares that use the rules file `old` at `new` ("" = none).
+    fn rules_renamed(&mut self, old: &RuleSet, new: &str) {
+        let uses = |r: &str| rules::same_name(r, &old.name) || Path::new(r) == old.path;
+        if uses(&self.cfg.rules) {
+            self.cfg.rules = new.to_string();
+        }
+        let cfg = self.cfg.clone();
+        for t in &mut self.tabs {
+            match t.content.view_mut() {
+                Content::Text(v) if v.rules.as_deref().is_some_and(uses) => {
+                    v.set_rules(Some(new.to_string()));
+                }
+                Content::Folder(f) if uses(&f.rules) => f.set_rules(&cfg, new.to_string()),
+                Content::Diffs(v) if uses(v.rules()) => v.rules_renamed(new),
+                _ => {}
+            }
+        }
+    }
+
+    /// Rules files were changed: the options and the text compares use them at once, folder
+    /// compares when refreshed.
+    fn rules_changed(&mut self) {
+        rules::apply_selected(&mut self.cfg);
+        for t in &mut self.tabs {
+            if let Content::Text(v) = t.content.view_mut() {
+                v.reload_rules();
+            }
+        }
+    }
+
+    fn open_rule_dialog(&mut self, i: usize, draft: RuleDraft) {
+        let Some(id) = self.tabs.get(i).map(|t| t.id) else {
+            return;
+        };
+        let target = self
+            .tab_rules(i)
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(|| rules::DEFAULT_NAME.to_string());
+        self.rule_dlg = Some(RuleDialog {
+            tab: id,
+            draft,
+            names: rules::list().into_iter().map(|s| s.name).collect(),
+            target,
+        });
+    }
+
+    /// Adds the rule of the dialog to its rules file, which the compare it was picked in then
+    /// uses, and so does the folder compare that file compare was opened from when they used the
+    /// same rules: its name, and whether that folder compare has to be refreshed.
+    fn save_rule(&mut self, d: &RuleDialog) -> std::io::Result<(String, bool)> {
+        let mut set = match rules::find(&d.target) {
+            Some(set) => set,
+            None => {
+                let target = Path::new(&d.target);
+                let bare = target.parent().is_none_or(|p| p.as_os_str().is_empty());
+                let set = if bare {
+                    let dir =
+                        rules::dir().ok_or_else(|| std::io::Error::other(tr("msg.no_config")))?;
+                    RuleSet::new(&dir, rules::display_name(&d.target))
+                } else {
+                    RuleSet {
+                        name: rules::display_name(&d.target).to_string(),
+                        path: target.to_path_buf(),
+                        ..RuleSet::default()
+                    }
+                };
+                if set.path.exists() {
+                    return Err(std::io::Error::other(trf(
+                        "rules.unreadable",
+                        &[("name", set.name)],
+                    )));
+                }
+                set
+            }
+        };
+        set.add(&d.draft);
+        set.save()?;
+        let picked_file = Path::new(&d.target);
+        let spec = if rules::is_rules_file(picked_file) && picked_file.is_file() {
+            d.target.clone()
+        } else {
+            set.name.clone()
+        };
+        self.rules_changed();
+        let cfg = self.cfg.clone();
+        let mut folder_stale = false;
+        if let Some(i) = self.tabs.iter().position(|t| t.id == d.tab) {
+            let before = self.tab_rules(i);
+            let origin = self.tabs[i].origin.as_ref().map(|o| o.folder);
+            let folder = self.tabs.iter_mut().find(|t| Some(t.id) == origin);
+            if let Some(Content::Folder(f)) = folder.map(|t| t.content.view_mut()) {
+                if Some(&f.rules) == before.as_ref() || f.rules == spec {
+                    f.set_rules(&cfg, spec.clone());
+                    folder_stale = true;
+                }
+            }
+            let follows =
+                matches!(self.tabs[i].content.view(), Content::Text(v) if v.rules.is_none());
+            if !(follows && self.cfg.rules == spec) {
+                self.use_rules(i, spec);
+            }
+        }
+        Ok((set.name, folder_stale))
+    }
+
+    fn rule_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.rule_dlg.take() else {
+            return;
+        };
+        let mut keep = true;
+        let mut save = false;
+        let problem = d.draft.problem();
+        let modal = egui::Modal::new(egui::Id::new("rule_dialog")).show(ctx, |ui| {
+            ui.set_width(600.0);
+            if widgets::dialog_title(ui, tr("cmd.add_rule")) {
+                keep = false;
+            }
+            let kinds: Vec<(RuleKind, &str)> =
+                RuleKind::ALL.iter().map(|&k| (k, tr(k.key()))).collect();
+            widgets::segmented(ui, &mut d.draft.kind, &kinds);
+            ui.add_space(8.0);
+            let (a, b) = match d.draft.kind {
+                RuleKind::IgnoreLine => ("rules.lines", None),
+                RuleKind::Substitute => ("rules.find", Some("rules.replace")),
+                RuleKind::IgnoreBlock => ("rules.block_start", Some("rules.block_end")),
+            };
+            egui::Grid::new("rule_grid")
+                .num_columns(2)
+                .spacing([12.0, 10.0])
+                .show(ui, |ui| {
+                    let field = |ui: &mut egui::Ui, text: &mut String| {
+                        ui.add(
+                            egui::TextEdit::singleline(text)
+                                .code_editor()
+                                .margin(vec2(8.0, 5.0))
+                                .desired_width(440.0),
+                        );
+                    };
+                    ui.label(tr(a));
+                    field(ui, &mut d.draft.a);
+                    ui.end_row();
+                    if let Some(b) = b {
+                        ui.label(tr(b));
+                        field(ui, &mut d.draft.b);
+                        ui.end_row();
+                    }
+                    ui.label(tr("rules.file"));
+                    let shown = rules::display_name(&d.target).to_string();
+                    egui::ComboBox::from_id_salt("rule_target")
+                        .selected_text(&shown)
+                        .width(440.0)
+                        .show_ui(ui, |ui| {
+                            for name in &d.names {
+                                ui.selectable_value(&mut d.target, name.clone(), name);
+                            }
+                        });
+                    ui.end_row();
+                    ui.label(tr("rules.new_file"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.target)
+                            .margin(vec2(8.0, 5.0))
+                            .desired_width(440.0),
+                    );
+                    ui.end_row();
+                });
+            let shown_name = rules::display_name(&d.target);
+            let new_file = !Path::new(&d.target).is_file()
+                && !d.names.iter().any(|n| rules::same_name(n, shown_name));
+            let note = match &problem {
+                Some(p) if p.trim().is_empty() => Some(tr("rules.need_pattern").to_string()),
+                Some(p) => Some(trf("opt.invalid_regex", &[("pattern", p.clone())])),
+                None => None,
+            };
+            if let Some(note) = note {
+                ui.label(egui::RichText::new(note).small().color(pal(ui).danger));
+            } else if new_file {
+                ui.label(
+                    egui::RichText::new(trf(
+                        "rules.will_create",
+                        &[("name", rules::file_name(shown_name))],
+                    ))
+                    .small()
+                    .color(pal(ui).text_dim),
+                );
+            }
+            ui.label(
+                egui::RichText::new(tr("rules.add_hint"))
+                    .small()
+                    .color(pal(ui).text_dim),
+            );
+            widgets::dialog_footer(ui, |ui| {
+                let ok = ui
+                    .add_enabled_ui(problem.is_none() && !d.target.trim().is_empty(), |ui| {
+                        widgets::primary_button(ui, tr("btn.ok")).clicked()
+                    });
+                if ok.inner {
+                    save = true;
+                }
+                if widgets::secondary_button(ui, tr("btn.cancel")).clicked() {
+                    keep = false;
+                }
+            });
+        });
+        if modal.should_close() {
+            keep = false;
+        }
+        if save {
+            match self.save_rule(&d) {
+                Ok((name, refresh)) => self.notify(trf(
+                    if refresh {
+                        "msg.rule_added_refresh"
+                    } else {
+                        "msg.rule_added"
+                    },
+                    &[("name", name)],
+                )),
+                Err(e) => {
+                    self.error(e.to_string());
+                    self.rule_dlg = Some(d);
+                }
+            }
+        } else if keep {
+            self.rule_dlg = Some(d);
+        }
     }
 
     fn palette_entries(&self) -> Vec<PaletteEntry<PaletteAction>> {
@@ -1583,29 +2531,32 @@ impl OxideMergeApp {
             detail,
             action,
         };
-        let mut out: Vec<_> = PALETTE_CMDS
+        // Only what does something in the active tab.
+        let menus = self.menus();
+        let mut out: Vec<_> = commands::PALETTE
             .iter()
-            .map(|&(key, sc, c, icon)| {
-                entry(icon, plain(tr(key)), sc.to_string(), PaletteAction::Cmd(c))
+            .filter(|&&c| menus.enabled(c))
+            .map(|&c| {
+                let label = plain(tr(c.label()));
+                entry(c.icon(), label, c.shown_key(), PaletteAction::Cmd(c))
             })
             .collect();
         let compare_as = plain(tr("cmd.compare_as"));
-        for (k, icon) in [
-            (FileKind::Text, Icon::Text),
-            (FileKind::Binary, Icon::Binary),
-            (FileKind::Image, Icon::Image),
-            (FileKind::Web, Icon::Globe),
+        for k in [
+            FileKind::Text,
+            FileKind::Binary,
+            FileKind::Image,
+            FileKind::Web,
         ] {
+            let c = Cmd::CompareAs(k);
+            if !menus.enabled(c) {
+                continue;
+            }
             let label = format!("{compare_as}: {}", kind_label(Some(k)));
-            out.push(entry(
-                icon,
-                label,
-                String::new(),
-                PaletteAction::Cmd(Cmd::CompareAs(k)),
-            ));
+            out.push(entry(c.icon(), label, String::new(), PaletteAction::Cmd(c)));
         }
         let on = tr("palette.on").to_string();
-        let toggles: [(&str, ConfigFlag); 8] = [
+        let toggles: [(&str, ConfigFlag); 9] = [
             ("view.line_numbers", |c| &mut c.show_line_numbers),
             ("view.location_pane", |c| &mut c.show_location_pane),
             ("view.line_detail", |c| &mut c.show_line_detail),
@@ -1614,6 +2565,7 @@ impl OxideMergeApp {
             ("view.whitespace", |c| &mut c.show_whitespace),
             ("view.syntax", |c| &mut c.syntax_highlight),
             ("view.tree_mode", |c| &mut c.tree_mode),
+            ("menu.open_reports", |c| &mut c.open_reports),
         ];
         let mut cfg = self.cfg.clone();
         for (key, f) in toggles {
@@ -1645,16 +2597,7 @@ impl OxideMergeApp {
         }
         let recent = plain(tr("label.recent"));
         for paths in &self.cfg.recent_compares {
-            let name = |s: &String| {
-                if web::is_url(s) {
-                    return s.clone();
-                }
-                Path::new(s)
-                    .file_name()
-                    .map(|f| f.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| s.clone())
-            };
-            let label = paths.iter().map(name).collect::<Vec<_>>().join(" ↔ ");
+            let label = recent_label(paths);
             let icon = if paths.first().is_some_and(|p| web::is_url(p)) {
                 Icon::Globe
             } else {
@@ -1763,6 +2706,19 @@ impl OxideMergeApp {
     }
 
     fn run(&mut self, cmd: Cmd, ctx: &egui::Context) {
+        if cmd == Cmd::Refresh {
+            self.rules_changed();
+        }
+        if matches!(
+            cmd,
+            Cmd::ExportHtml | Cmd::Report | Cmd::Patch | Cmd::Statistics | Cmd::SaveComparison
+        ) {
+            if let Some(Content::Text(v)) =
+                self.tabs.get_mut(self.active).map(|t| t.content.view_mut())
+            {
+                v.commit_pending_edit();
+            }
+        }
         let cfg = self.cfg.clone();
         match cmd {
             Cmd::New => {
@@ -1802,6 +2758,7 @@ impl OxideMergeApp {
             Cmd::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Cmd::Help => self.help = true,
             Cmd::Options => self.open_options(OptTab::General),
+            Cmd::CompareOptions => self.open_options(OptTab::Compare),
             Cmd::ToggleCollapse => self.cfg.collapse_unchanged ^= true,
             Cmd::ToggleWrap => self.cfg.word_wrap ^= true,
             Cmd::Palette => {
@@ -1809,6 +2766,7 @@ impl OxideMergeApp {
                 self.palette = Some((Palette::default(), entries));
             }
             Cmd::Filters => self.filters_dlg = true,
+            Cmd::EditRules => self.open_options(OptTab::Rules),
             Cmd::ZoomIn => self.cfg.font_size = (self.cfg.font_size + 1.0).min(40.0),
             Cmd::ZoomOut => self.cfg.font_size = (self.cfg.font_size - 1.0).max(7.0),
             Cmd::ZoomReset => self.cfg.font_size = 14.0,
@@ -1845,6 +2803,8 @@ impl OxideMergeApp {
                     path: String::new(),
                 })
             }
+            Cmd::ExportHtml => self.export_html(),
+            Cmd::AllDiffs => self.show_all_diffs(),
             Cmd::Report => self.save_report(),
             Cmd::ReportWithDiffs => self.save_report_with_diffs(),
             Cmd::SaveComparison => self.save_comparison(),
@@ -1867,11 +2827,16 @@ impl OxideMergeApp {
             }
             Cmd::CompareAs(kind) => {
                 if let Some(tab) = self.tabs.get(self.active) {
-                    if !matches!(tab.content, Content::Folder(_)) {
+                    if !matches!(tab.content, Content::Folder(_)) && tab.source.len() >= 2 {
                         let paths = tab.source.clone();
+                        let rules = match tab.content.view() {
+                            Content::Text(v) => v.rules.clone(),
+                            _ => None,
+                        };
                         self.open(OpenRequest {
                             paths,
                             kind: Some(kind),
+                            rules,
                             ..Default::default()
                         });
                     }
@@ -1982,6 +2947,23 @@ impl OxideMergeApp {
                         Cmd::SelectPattern => v.open_select_pattern(),
                         _ => {}
                     },
+                    Content::Diffs(v) => match cmd {
+                        Cmd::Save => {
+                            if let Err(e) = v.save_modified() {
+                                err = Some(e.to_string());
+                            }
+                        }
+                        Cmd::Undo => v.undo(),
+                        Cmd::Find => v.focus_search(),
+                        Cmd::Refresh => v.refresh(&cfg),
+                        Cmd::NextDiff => v.step(true),
+                        Cmd::PrevDiff => v.step(false),
+                        Cmd::FirstDiff => v.first(),
+                        Cmd::LastDiff => v.last(),
+                        Cmd::CopyRight => v.copy_current(true),
+                        Cmd::CopyLeft => v.copy_current(false),
+                        _ => {}
+                    },
                     Content::Web(_) => {}
                 }
                 if let Some(e) = err {
@@ -2009,43 +2991,10 @@ impl OxideMergeApp {
     }
 
     fn save_report(&mut self) {
-        if let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) {
-            let Some(path) = rfd::FileDialog::new()
-                .set_title(tr("menu.report"))
-                .add_filter("HTML", &["html", "htm"])
-                .set_file_name("report.html")
-                .save_file()
-            else {
-                return;
-            };
-            match std::fs::write(&path, v.html_report()) {
-                Ok(()) => self.notify(trf("msg.saved", &[("file", path.display().to_string())])),
-                Err(e) => self.error(e.to_string()),
-            }
+        if let Some(Content::Text(_)) = self.tabs.get(self.active).map(|t| t.content.view()) {
+            self.export_text_html(tr("menu.report"));
             return;
         }
-        let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
-            self.error(tr("msg.report_folder_only"));
-            return;
-        };
-        let Some(path) = rfd::FileDialog::new()
-            .set_title(tr("menu.report"))
-            .add_filter("HTML", &["html", "htm"])
-            .add_filter("CSV", &["csv"])
-            .add_filter("Text", &["txt"])
-            .set_file_name("report.html")
-            .save_file()
-        else {
-            return;
-        };
-        let text = v.report(ReportFormat::from_path(&path), &self.cfg);
-        match std::fs::write(&path, text) {
-            Ok(()) => self.notify(trf("msg.saved", &[("file", path.display().to_string())])),
-            Err(e) => self.error(e.to_string()),
-        }
-    }
-
-    fn save_report_with_diffs(&mut self) {
         if self.report_job.is_some() {
             self.notify(tr("msg.report_writing"));
             return;
@@ -2054,15 +3003,168 @@ impl OxideMergeApp {
             self.error(tr("msg.report_folder_only"));
             return;
         };
-        let Some(path) = rfd::FileDialog::new()
-            .set_title(tr("menu.report_diffs"))
+        // Without an extension, the dialog adds the one of the type picked.
+        let name = report::html_file_name(&v.display_roots);
+        let Some(mut path) = rfd::FileDialog::new()
+            .set_title(tr("menu.report"))
             .add_filter("HTML", &["html", "htm"])
-            .set_file_name("report.html")
+            .add_filter("CSV", &["csv"])
+            .add_filter("Text", &["txt"])
+            .set_file_name(name.strip_suffix(".html").unwrap_or(&name))
             .save_file()
         else {
             return;
         };
+        let ext = crate::core::text::extension(&path);
+        if !matches!(ext.as_str(), "html" | "htm" | "csv" | "txt") {
+            path = PathBuf::from(format!("{}.html", path.display()));
+        }
+        let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
+            return;
+        };
+        let text = v.report(ReportFormat::from_path(&path), &self.cfg);
+        self.spawn_report(path, move || text);
+    }
+
+    fn save_report_with_diffs(&mut self) {
+        if let Some(Content::Text(_)) = self.tabs.get(self.active).map(|t| t.content.view()) {
+            self.export_text_html(tr("menu.report_diffs"));
+            return;
+        }
+        let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
+            self.error(tr("msg.report_folder_only"));
+            return;
+        };
+        let name = report::html_file_name(&v.display_roots);
         let job = v.report_with_diffs_job(&self.cfg);
+        self.write_html_report(tr("menu.report_diffs"), &name, job);
+    }
+
+    /// Opens the differences of every changed file of the active folder compare in one tab.
+    fn show_all_diffs(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Content::Folder(f) = tab.content.view() else {
+            return;
+        };
+        if f.is_running() {
+            self.notify(tr("msg.comparing"));
+            return;
+        }
+        let folder = tab.id;
+        let src = f.diffs_source(&self.cfg);
+        if let Some(i) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(&t.content, Content::Diffs(v) if v.folder == folder))
+        {
+            self.active = i;
+            let Content::Diffs(v) = &mut self.tabs[i].content else {
+                return;
+            };
+            if !v.lists_all(&src) {
+                if v.is_modified() || v.can_undo() {
+                    self.notify(tr("diffs.outdated"));
+                } else {
+                    v.update_from(src);
+                }
+            }
+            return;
+        }
+        let view = DiffsView::new(src, folder);
+        if view.is_empty() {
+            self.notify(tr("diffs.empty"));
+            return;
+        }
+        let temp = tab.temp.clone();
+        self.push_tab(Content::Diffs(view), Vec::new());
+        if let Some(t) = self.tabs.last_mut() {
+            t.temp = temp;
+        }
+    }
+
+    /// Shows the errors of tabs of all differences, and after they saved files, compares their
+    /// folder compares again and has text compares notice the files that changed.
+    fn refresh_saved_folders(&mut self) {
+        let mut folders = Vec::new();
+        let mut errors = Vec::new();
+        for t in &mut self.tabs {
+            if let Content::Diffs(v) = &mut t.content {
+                if std::mem::take(&mut v.saved) {
+                    folders.push(v.folder);
+                }
+                errors.extend(v.error.take());
+            }
+        }
+        for e in errors {
+            self.error(e);
+        }
+        if folders.is_empty() {
+            return;
+        }
+        let (cfg, named) = (self.cfg.clone(), self.named_filters.clone());
+        for t in &mut self.tabs {
+            let id = t.id;
+            match t.content.view_mut() {
+                Content::Folder(f) if folders.contains(&id) => f.refresh(&cfg, &named),
+                Content::Text(v) => v.check_disk(),
+                _ => {}
+            }
+        }
+    }
+
+    fn export_html(&mut self) {
+        match self.tabs.get(self.active).map(|t| t.content.view()) {
+            Some(Content::Text(_)) => self.export_text_html(tr("menu.export_html")),
+            Some(Content::Folder(_)) => self.save_report_with_diffs(),
+            _ => self.error(tr("msg.report_folder_only")),
+        }
+    }
+
+    /// Saves the HTML report of the active text compare, made on another thread once the file is
+    /// picked.
+    fn export_text_html(&mut self, title: &str) {
+        let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
+            return;
+        };
+        let Some(path) = self.html_report_path(title, &report::html_file_name(&v.titles())) else {
+            return;
+        };
+        let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
+            return;
+        };
+        let job = v.html_report_job(&self.cfg.rules);
+        self.spawn_report(path, job);
+    }
+
+    /// Asks where to save an HTML report, suggesting `name`, then writes what `job` makes on
+    /// another thread.
+    fn write_html_report(
+        &mut self,
+        title: &str,
+        name: &str,
+        job: impl FnOnce() -> String + Send + 'static,
+    ) {
+        if let Some(path) = self.html_report_path(title, name) {
+            self.spawn_report(path, job);
+        }
+    }
+
+    /// Where to save an HTML report, unless one is still being written.
+    fn html_report_path(&mut self, title: &str, name: &str) -> Option<PathBuf> {
+        if self.report_job.is_some() {
+            self.notify(tr("msg.report_writing"));
+            return None;
+        }
+        rfd::FileDialog::new()
+            .set_title(title)
+            .add_filter("HTML", &["html", "htm"])
+            .set_file_name(name)
+            .save_file()
+    }
+
+    fn spawn_report(&mut self, path: PathBuf, job: impl FnOnce() -> String + Send + 'static) {
         let (tx, rx) = std::sync::mpsc::channel();
         let file = path.clone();
         std::thread::spawn(move || {
@@ -2070,6 +3172,17 @@ impl OxideMergeApp {
         });
         self.report_job = Some((path, rx));
         self.notify(tr("msg.report_writing"));
+    }
+
+    /// Announces a saved report, and opens it in the browser when it is HTML and set to.
+    fn report_saved(&mut self, path: &Path) {
+        self.notify(trf("msg.saved", &[("file", path.display().to_string())]));
+        let html = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"));
+        if html && self.cfg.open_reports {
+            crate::ui::folder_view::system_open(path);
+        }
     }
 
     /// Announces a report written on another thread once it is done.
@@ -2084,12 +3197,13 @@ impl OxideMergeApp {
                 Some(Err(tr("status.error").to_string()))
             }
         };
+        let path = path.clone();
         let file = path.display().to_string();
         match done {
             None => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
             Some(Ok(())) => {
                 self.report_job = None;
-                self.notify(trf("msg.saved", &[("file", file)]));
+                self.report_saved(&path);
             }
             Some(Err(e)) => {
                 self.report_job = None;
@@ -2347,11 +3461,16 @@ impl OxideMergeApp {
                 proj.filter = Some(v.filter_spec.clone());
                 proj.recursive = Some(recursive);
                 proj.method = Some(method);
+                proj.rules = Some(v.rules.clone());
             }
-            Content::Text(_) => proj.kind = Some(kind_name(FileKind::Text).into()),
+            Content::Text(v) => {
+                proj.kind = Some(kind_name(FileKind::Text).into());
+                proj.rules = v.rules.clone();
+            }
             Content::Binary(_) => proj.kind = Some(kind_name(FileKind::Binary).into()),
             Content::Image(_) => proj.kind = Some(kind_name(FileKind::Image).into()),
             Content::Web(_) => proj.kind = Some(kind_name(FileKind::Web).into()),
+            Content::Diffs(_) => return,
         }
         let Some(mut path) = rfd::FileDialog::new()
             .set_title(tr("menu.save_project"))
@@ -2478,74 +3597,20 @@ impl OxideMergeApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let typing = ctx.wants_keyboard_input();
-        let mut cmds = Vec::new();
+        let typing = widgets::typing(ctx);
+        let menus = self.menus();
+        let mut cmds = std::mem::take(&mut self.tab_keys);
         ctx.input_mut(|i| {
-            let mut sc = |m: Modifiers, k: Key, c: Cmd| {
-                if i.consume_shortcut(&KeyboardShortcut::new(m, k)) {
-                    cmds.push(c);
+            for b in BINDINGS {
+                let active = match b.scope {
+                    Scope::Always => true,
+                    Scope::View => !typing,
+                    Scope::System => false,
+                };
+                // A key whose command does nothing here is left to the focused widget.
+                if active && menus.enabled(b.cmd) && commands::consume(i, b) {
+                    cmds.push(b.cmd);
                 }
-            };
-            sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::P, Cmd::Palette);
-            sc(Modifiers::COMMAND, Key::K, Cmd::Palette);
-            sc(Modifiers::COMMAND, Key::N, Cmd::New);
-            sc(Modifiers::COMMAND, Key::O, Cmd::Open);
-            sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::S, Cmd::SaveAll);
-            sc(Modifiers::COMMAND, Key::S, Cmd::Save);
-            sc(Modifiers::COMMAND, Key::W, Cmd::CloseTab);
-            sc(Modifiers::COMMAND, Key::F4, Cmd::CloseTab);
-            if cfg!(target_os = "macos") {
-                sc(Modifiers::COMMAND | Modifiers::ALT, Key::F, Cmd::Replace);
-            } else {
-                sc(Modifiers::COMMAND, Key::H, Cmd::Replace);
-            }
-            sc(Modifiers::COMMAND, Key::F, Cmd::Find);
-            sc(Modifiers::COMMAND, Key::G, Cmd::GotoLine);
-            // A pattern without Shift also matches with Shift held, so Shift variants go first.
-            sc(
-                Modifiers::COMMAND | Modifiers::SHIFT,
-                Key::Tab,
-                Cmd::PrevTab,
-            );
-            sc(Modifiers::COMMAND, Key::Tab, Cmd::NextTab);
-            sc(Modifiers::COMMAND, Key::Plus, Cmd::ZoomIn);
-            sc(Modifiers::COMMAND, Key::Equals, Cmd::ZoomIn);
-            sc(Modifiers::COMMAND, Key::Minus, Cmd::ZoomOut);
-            sc(Modifiers::COMMAND, Key::Num0, Cmd::ZoomReset);
-            sc(Modifiers::SHIFT, Key::F3, Cmd::FindPrev);
-            sc(Modifiers::NONE, Key::F3, Cmd::FindNext);
-            sc(Modifiers::NONE, Key::F5, Cmd::Refresh);
-            sc(Modifiers::NONE, Key::F1, Cmd::Help);
-            if !typing {
-                sc(Modifiers::NONE, Key::Questionmark, Cmd::Help);
-                sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z, Cmd::Redo);
-                sc(Modifiers::COMMAND, Key::Z, Cmd::Undo);
-                sc(Modifiers::COMMAND, Key::Y, Cmd::Redo);
-                sc(
-                    Modifiers::COMMAND | Modifiers::ALT,
-                    Key::ArrowRight,
-                    Cmd::CopyAllRight,
-                );
-                sc(
-                    Modifiers::COMMAND | Modifiers::ALT,
-                    Key::ArrowLeft,
-                    Cmd::CopyAllLeft,
-                );
-                sc(Modifiers::ALT, Key::ArrowDown, Cmd::NextDiff);
-                sc(Modifiers::ALT, Key::ArrowUp, Cmd::PrevDiff);
-                sc(Modifiers::ALT, Key::Home, Cmd::FirstDiff);
-                sc(Modifiers::ALT, Key::End, Cmd::LastDiff);
-                sc(Modifiers::ALT, Key::PageDown, Cmd::NextConflict);
-                sc(Modifiers::ALT, Key::PageUp, Cmd::PrevConflict);
-                sc(Modifiers::ALT, Key::ArrowRight, Cmd::CopyRight);
-                sc(Modifiers::ALT, Key::ArrowLeft, Cmd::CopyLeft);
-                sc(Modifiers::ALT, Key::C, Cmd::ToggleCollapse);
-                sc(Modifiers::ALT, Key::Z, Cmd::ToggleWrap);
-                sc(Modifiers::COMMAND, Key::F2, Cmd::ToggleBookmark);
-                sc(Modifiers::COMMAND, Key::CloseBracket, Cmd::Indent(false));
-                sc(Modifiers::COMMAND, Key::OpenBracket, Cmd::Indent(true));
-                sc(Modifiers::SHIFT, Key::F4, Cmd::PrevBookmark);
-                sc(Modifiers::NONE, Key::F4, Cmd::NextBookmark);
             }
         });
         for c in cmds {
@@ -2555,34 +3620,41 @@ impl OxideMergeApp {
 
     // ---------- menus ----------
 
+    /// What the menus act on: the view of the active tab.
+    fn menus(&self) -> Menus {
+        let tab = self.tabs.get(self.active);
+        let view = tab.map(|t| t.content.view());
+        Menus {
+            view: match view {
+                None => ViewKind::Empty,
+                Some(Content::Text(_)) => ViewKind::Text,
+                Some(Content::Binary(_)) => ViewKind::Binary,
+                Some(Content::Image(_)) => ViewKind::Image,
+                Some(Content::Folder(_)) => ViewKind::Folder,
+                Some(Content::Web(_)) => ViewKind::Web,
+                Some(Content::Diffs(_)) => ViewKind::Diffs,
+            },
+            panes: match view {
+                Some(Content::Text(v)) => v.n(),
+                _ => 0,
+            },
+            sides: match view {
+                Some(Content::Text(v)) => v.n(),
+                Some(Content::Folder(v)) => v.n(),
+                _ => 0,
+            },
+            can_take_both: matches!(view, Some(Content::Text(v)) if v.can_take_both()),
+            has_source: tab.is_some_and(|t| t.source.len() >= 2),
+            folder_busy: matches!(view, Some(Content::Folder(v)) if v.is_running()),
+            tabs: self.tabs.len(),
+            picked: None,
+            rules: None,
+            recent: None,
+        }
+    }
+
     fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let mut cmd: Option<Cmd> = None;
-        let n_panes = match self.tabs.get(self.active).map(|t| t.content.view()) {
-            Some(Content::Text(v)) => v.n(),
-            _ => 0,
-        };
-        let is_folder = matches!(
-            self.tabs.get(self.active).map(|t| t.content.view()),
-            Some(Content::Folder(_))
-        );
-        let has_source = self
-            .tabs
-            .get(self.active)
-            .is_some_and(|t| t.source.len() >= 2);
-        let can_take_both = matches!(
-            self.tabs.get(self.active).map(|t| t.content.view()),
-            Some(Content::Text(v)) if v.can_take_both()
-        );
-        let item =
-            |ui: &mut egui::Ui, label: &str, shortcut: &str, c: Cmd, cmd: &mut Option<Cmd>| {
-                if ui
-                    .add(egui::Button::new(label).shortcut_text(shortcut))
-                    .clicked()
-                {
-                    *cmd = Some(c);
-                    ui.close_menu();
-                }
-            };
+        let mut m = self.menus();
         if cfg!(target_os = "macos") {
             // The menu bar is the title bar: its empty parts move and zoom the window.
             let bar = ui.interact(
@@ -2616,370 +3688,31 @@ impl OxideMergeApp {
             }
             ui.label(egui::RichText::new("OxideMerge").font(theme::semibold(14.5)));
             ui.add_space(12.0);
-            ui.menu_button(tr("menu.file"), |ui| {
-                item(ui, tr("menu.new"), "Ctrl+N", Cmd::New, &mut cmd);
-                item(ui, tr("menu.open"), "Ctrl+O", Cmd::Open, &mut cmd);
-                item(
-                    ui,
-                    tr("menu.open_conflict"),
-                    "",
-                    Cmd::OpenConflict,
-                    &mut cmd,
-                );
-                item(ui, tr("menu.open_project"), "", Cmd::OpenProject, &mut cmd);
-                item(ui, tr("menu.git_compare"), "", Cmd::GitCompare, &mut cmd);
-                if ui
-                    .add_enabled(has_source, egui::Button::new(tr("menu.save_project")))
-                    .clicked()
-                {
-                    cmd = Some(Cmd::SaveProject);
-                    ui.close_menu();
-                }
-                ui.separator();
-                item(ui, tr("menu.save"), "Ctrl+S", Cmd::Save, &mut cmd);
-                item(
-                    ui,
-                    tr("btn.save_all"),
-                    "Ctrl+Shift+S",
-                    Cmd::SaveAll,
-                    &mut cmd,
-                );
-                for p in 0..n_panes {
-                    let label = trf(
-                        "menu.save_side_as",
-                        &[("side", side_name(p, n_panes).into())],
-                    );
-                    if ui.button(label).clicked() {
-                        cmd = Some(Cmd::SaveAs(p));
-                        ui.close_menu();
-                    }
-                }
-                if n_panes > 0 {
-                    item(
-                        ui,
-                        tr("menu.save_comparison"),
-                        "",
-                        Cmd::SaveComparison,
-                        &mut cmd,
-                    );
-                }
-                ui.separator();
-                item(ui, tr("menu.patch"), "", Cmd::Patch, &mut cmd);
-                if is_folder || n_panes > 0 {
-                    item(ui, tr("menu.report"), "", Cmd::Report, &mut cmd);
-                }
-                if is_folder {
-                    item(
-                        ui,
-                        tr("menu.report_diffs"),
-                        "",
-                        Cmd::ReportWithDiffs,
-                        &mut cmd,
-                    );
-                }
-                ui.separator();
-                item(ui, tr("menu.close_tab"), "Ctrl+W", Cmd::CloseTab, &mut cmd);
-                item(ui, tr("menu.exit"), "Alt+F4", Cmd::Exit, &mut cmd);
-            });
-            ui.menu_button(tr("menu.edit"), |ui| {
-                item(ui, tr("cmd.undo"), "Ctrl+Z", Cmd::Undo, &mut cmd);
-                item(ui, tr("cmd.redo"), "Ctrl+Y", Cmd::Redo, &mut cmd);
-                ui.separator();
-                item(ui, tr("cmd.find"), "Ctrl+F", Cmd::Find, &mut cmd);
-                item(ui, tr("cmd.replace"), REPLACE_KEY, Cmd::Replace, &mut cmd);
-                item(ui, tr("cmd.find_next"), "F3", Cmd::FindNext, &mut cmd);
-                item(ui, tr("cmd.find_prev"), "Shift+F3", Cmd::FindPrev, &mut cmd);
-                item(ui, tr("dlg.goto"), "Ctrl+G", Cmd::GotoLine, &mut cmd);
-                if n_panes > 0 {
-                    ui.separator();
-                    item(
-                        ui,
-                        tr("cmd.toggle_bookmark"),
-                        "Ctrl+F2",
-                        Cmd::ToggleBookmark,
-                        &mut cmd,
-                    );
-                    item(
-                        ui,
-                        tr("cmd.next_bookmark"),
-                        "F4",
-                        Cmd::NextBookmark,
-                        &mut cmd,
-                    );
-                    item(
-                        ui,
-                        tr("cmd.prev_bookmark"),
-                        "Shift+F4",
-                        Cmd::PrevBookmark,
-                        &mut cmd,
-                    );
-                    item(
-                        ui,
-                        tr("cmd.bookmark_comment"),
-                        "",
-                        Cmd::BookmarkComment,
-                        &mut cmd,
-                    );
-                    item(
-                        ui,
-                        tr("cmd.clear_bookmarks"),
-                        "",
-                        Cmd::ClearBookmarks,
-                        &mut cmd,
-                    );
-                    ui.separator();
-                    item(ui, tr("cmd.indent"), "Ctrl+]", Cmd::Indent(false), &mut cmd);
-                    item(ui, tr("cmd.outdent"), "Ctrl+[", Cmd::Indent(true), &mut cmd);
-                }
-                if is_folder {
-                    ui.separator();
-                    item(
-                        ui,
-                        tr("cmd.select_pattern"),
-                        "",
-                        Cmd::SelectPattern,
-                        &mut cmd,
-                    );
-                }
-                ui.separator();
-                item(ui, tr("menu.options"), "", Cmd::Options, &mut cmd);
-            });
-            ui.menu_button(tr("menu.view"), |ui| {
-                ui.checkbox(&mut self.cfg.tree_mode, tr("view.tree_mode"));
-                ui.checkbox(&mut self.cfg.show_identical, tr("view.show_identical"));
-                ui.checkbox(&mut self.cfg.show_different, tr("view.show_different"));
-                ui.checkbox(&mut self.cfg.show_unique[0], tr("view.show_left_unique"));
-                ui.checkbox(&mut self.cfg.show_unique[1], tr("view.show_middle_unique"));
-                ui.checkbox(&mut self.cfg.show_unique[2], tr("view.show_right_unique"));
-                ui.checkbox(&mut self.cfg.folder_file_pane, tr("view.folder_file_pane"));
-                ui.separator();
-                ui.checkbox(&mut self.cfg.show_location_pane, tr("view.location_pane"));
-                ui.checkbox(&mut self.cfg.show_line_numbers, tr("view.line_numbers"));
-                ui.checkbox(&mut self.cfg.show_whitespace, tr("view.whitespace"));
-                ui.checkbox(&mut self.cfg.syntax_highlight, tr("view.syntax"));
-                ui.checkbox(&mut self.cfg.show_line_detail, tr("view.line_detail"));
-                ui.checkbox(&mut self.cfg.show_edit_markers, tr("view.edit_markers"));
-                ui.checkbox(
-                    &mut self.cfg.collapse_unchanged,
-                    tr("cmd.collapse_unchanged"),
-                );
-                ui.checkbox(&mut self.cfg.word_wrap, tr("cmd.word_wrap"));
-                ui.separator();
-                ui.menu_button(tr("opt.whitespace"), |ui| {
-                    ui.radio_value(
-                        &mut self.cfg.diff.whitespace,
-                        WhitespaceMode::Compare,
-                        tr("opt.ws_compare"),
-                    );
-                    ui.radio_value(
-                        &mut self.cfg.diff.whitespace,
-                        WhitespaceMode::IgnoreChange,
-                        tr("opt.ws_change"),
-                    );
-                    ui.radio_value(
-                        &mut self.cfg.diff.whitespace,
-                        WhitespaceMode::IgnoreAll,
-                        tr("opt.ws_all"),
-                    );
-                });
-                ui.checkbox(&mut self.cfg.diff.ignore_case, tr("opt.ignore_case"));
-                ui.checkbox(
-                    &mut self.cfg.diff.ignore_blank_lines,
-                    tr("opt.ignore_blank"),
-                );
-                ui.checkbox(&mut self.cfg.diff.ignore_eol, tr("opt.ignore_eol"));
-                ui.checkbox(&mut self.cfg.diff.ignore_numbers, tr("opt.ignore_numbers"));
-                ui.checkbox(
-                    &mut self.cfg.diff.ignore_comments,
-                    tr("opt.ignore_comments"),
-                );
-                ui.checkbox(&mut self.cfg.diff.prettify, tr("opt.prettify"));
-                ui.checkbox(&mut self.cfg.diff.detect_moved, tr("opt.detect_moved"));
-                ui.menu_button(tr("opt.inline"), |ui| {
-                    ui.radio_value(
-                        &mut self.cfg.diff.inline,
-                        InlineMode::Off,
-                        tr("opt.inline_off"),
-                    );
-                    ui.radio_value(
-                        &mut self.cfg.diff.inline,
-                        InlineMode::Word,
-                        tr("opt.inline_word"),
-                    );
-                    ui.radio_value(
-                        &mut self.cfg.diff.inline,
-                        InlineMode::Char,
-                        tr("opt.inline_char"),
-                    );
-                });
-                ui.separator();
-                item(ui, tr("cmd.zoom_in"), "Ctrl++", Cmd::ZoomIn, &mut cmd);
-                item(ui, tr("cmd.zoom_out"), "Ctrl+-", Cmd::ZoomOut, &mut cmd);
-                item(ui, tr("cmd.zoom_reset"), "Ctrl+0", Cmd::ZoomReset, &mut cmd);
-                ui.menu_button(tr("view.theme"), |ui| {
-                    for m in ThemeMode::ALL {
-                        if ui
-                            .radio_value(&mut self.cfg.theme, m, tr(m.key()))
-                            .clicked()
-                        {
-                            ui.close_menu();
-                        }
-                    }
-                });
-                ui.separator();
-                item(ui, tr("cmd.refresh"), "F5", Cmd::Refresh, &mut cmd);
-            });
-            ui.menu_button(tr("menu.merge"), |ui| {
-                item(ui, tr("cmd.next_diff"), "Alt+Down", Cmd::NextDiff, &mut cmd);
-                item(ui, tr("cmd.prev_diff"), "Alt+Up", Cmd::PrevDiff, &mut cmd);
-                item(
-                    ui,
-                    tr("cmd.first_diff"),
-                    "Alt+Home",
-                    Cmd::FirstDiff,
-                    &mut cmd,
-                );
-                item(ui, tr("cmd.last_diff"), "Alt+End", Cmd::LastDiff, &mut cmd);
-                item(
-                    ui,
-                    tr("cmd.next_conflict"),
-                    "Alt+PgDn",
-                    Cmd::NextConflict,
-                    &mut cmd,
-                );
-                item(
-                    ui,
-                    tr("cmd.prev_conflict"),
-                    "Alt+PgUp",
-                    Cmd::PrevConflict,
-                    &mut cmd,
-                );
-                ui.separator();
-                item(
-                    ui,
-                    tr("cmd.copy_right"),
-                    "Alt+Right",
-                    Cmd::CopyRight,
-                    &mut cmd,
-                );
-                item(ui, tr("cmd.copy_left"), "Alt+Left", Cmd::CopyLeft, &mut cmd);
-                item(
-                    ui,
-                    tr("cmd.copy_all_right"),
-                    "Ctrl+Alt+Right",
-                    Cmd::CopyAllRight,
-                    &mut cmd,
-                );
-                item(
-                    ui,
-                    tr("cmd.copy_all_left"),
-                    "Ctrl+Alt+Left",
-                    Cmd::CopyAllLeft,
-                    &mut cmd,
-                );
-                let merge_label = if is_folder {
-                    tr("cmd.folder_merge")
-                } else {
-                    tr("cmd.auto_merge")
-                };
-                item(ui, merge_label, "", Cmd::AutoMerge, &mut cmd);
-                if n_panes == 3 {
-                    ui.separator();
-                    for (key, left_first) in [
-                        ("cmd.take_left_right", true),
-                        ("cmd.take_right_left", false),
-                    ] {
-                        if ui
-                            .add_enabled(can_take_both, egui::Button::new(tr(key)))
-                            .clicked()
-                        {
-                            cmd = Some(Cmd::TakeBoth(left_first));
-                            ui.close_menu();
-                        }
-                    }
-                }
-            });
-            ui.menu_button(tr("menu.tools"), |ui| {
-                item(ui, tr("menu.filters"), "", Cmd::Filters, &mut cmd);
-                item(ui, tr("menu.apply_patch"), "", Cmd::ApplyPatch, &mut cmd);
-                item(ui, tr("menu.statistics"), "", Cmd::Statistics, &mut cmd);
-                ui.menu_button(tr("cmd.compare_as"), |ui| {
-                    item(
-                        ui,
-                        tr("kind.text"),
-                        "",
-                        Cmd::CompareAs(FileKind::Text),
-                        &mut cmd,
-                    );
-                    item(
-                        ui,
-                        tr("kind.binary"),
-                        "",
-                        Cmd::CompareAs(FileKind::Binary),
-                        &mut cmd,
-                    );
-                    item(
-                        ui,
-                        tr("kind.image"),
-                        "",
-                        Cmd::CompareAs(FileKind::Image),
-                        &mut cmd,
-                    );
-                    item(
-                        ui,
-                        tr("kind.web"),
-                        "",
-                        Cmd::CompareAs(FileKind::Web),
-                        &mut cmd,
-                    );
-                });
-                ui.separator();
-                let [add, remove, added, removed] = SHELL_KEYS;
-                let registered = crate::shell::is_registered();
-                if ui
-                    .add_enabled(!registered, egui::Button::new(tr(add)))
-                    .clicked()
-                {
-                    match crate::shell::register() {
-                        Ok(()) => self.notify(tr(added)),
-                        Err(e) => self.error(e.to_string()),
-                    }
-                    ui.close_menu();
-                }
-                if ui
-                    .add_enabled(registered, egui::Button::new(tr(remove)))
-                    .clicked()
-                {
-                    let _ = crate::shell::unregister();
-                    self.notify(tr(removed));
-                    ui.close_menu();
-                }
-            });
+            ui.menu_button(tr("menu.file"), |ui| self.file_menu(ui, &mut m));
+            ui.menu_button(tr("menu.edit"), |ui| edit_menu(ui, &mut m));
+            ui.menu_button(tr("menu.view"), |ui| self.view_menu(ui, &mut m));
+            ui.menu_button(tr("menu.compare"), |ui| self.compare_menu(ui, &mut m));
+            ui.menu_button(tr("menu.merge"), |ui| merge_menu(ui, &mut m));
+            ui.menu_button(tr("menu.tools"), |ui| self.tools_menu(ui, &mut m));
             ui.menu_button(tr("menu.help"), |ui| {
-                item(ui, tr("help.title"), "F1", Cmd::Help, &mut cmd);
+                m.item(ui, Cmd::Help);
+                m.item(ui, Cmd::Palette);
+                ui.separator();
                 if ui.button(tr("menu.about")).clicked() {
                     self.about = true;
                     ui.close_menu();
                 }
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if widgets::icon_button(ui, Icon::Help, &widgets::with_key(tr("help.title"), "F1"))
-                    .clicked()
-                {
-                    cmd = Some(Cmd::Help);
+                if widgets::icon_button(ui, Icon::Help, &Cmd::Help.tip()).clicked() {
+                    m.picked = Some(Cmd::Help);
                 }
-                if widgets::icon_button(
-                    ui,
-                    Icon::Palette,
-                    &widgets::with_key(tr("palette.title"), "Ctrl+K"),
-                )
-                .clicked()
-                {
-                    cmd = Some(Cmd::Palette);
+                if widgets::icon_button(ui, Icon::Palette, &Cmd::Palette.tip()).clicked() {
+                    m.picked = Some(Cmd::Palette);
                 }
                 let options = tr("menu.options").trim_end_matches(['.', '…']);
                 if widgets::icon_button(ui, Icon::Settings, options).clicked() {
-                    cmd = Some(Cmd::Options);
+                    m.picked = Some(Cmd::Options);
                 }
                 let theme_icon = if self.cfg.dark_mode {
                     Icon::Sun
@@ -2994,15 +3727,240 @@ impl OxideMergeApp {
                     };
                 }
                 let open = tr("menu.open").trim_end_matches(['.', '…']);
-                if widgets::icon_button(ui, Icon::Folder, &widgets::with_key(open, "Ctrl+O"))
+                if widgets::icon_button(ui, Icon::Folder, &widgets::with_key(open, Cmd::Open.key()))
                     .clicked()
                 {
-                    cmd = Some(Cmd::Open);
+                    m.picked = Some(Cmd::Open);
                 }
             });
         });
-        if let Some(c) = cmd {
+        if let Some(name) = m.rules {
+            self.use_rules(self.active, name);
+        }
+        if let Some(paths) = m.recent {
+            self.open(OpenRequest {
+                paths: paths.iter().map(PathBuf::from).collect(),
+                ..Default::default()
+            });
+        }
+        if let Some(c) = m.picked {
             self.run(c, ctx);
+        }
+    }
+
+    fn file_menu(&mut self, ui: &mut egui::Ui, m: &mut Menus) {
+        m.item(ui, Cmd::New);
+        m.item(ui, Cmd::Open);
+        let recent = &self.cfg.recent_compares;
+        ui.add_enabled_ui(!recent.is_empty(), |ui| {
+            ui.menu_button(tr("menu.open_recent"), |ui| {
+                for paths in recent.iter().take(10) {
+                    if ui.button(recent_label(paths)).clicked() {
+                        m.recent = Some(paths.clone());
+                        ui.close_menu();
+                    }
+                }
+            });
+        });
+        m.item(ui, Cmd::OpenConflict);
+        m.item(ui, Cmd::GitCompare);
+        ui.separator();
+        m.item(ui, Cmd::OpenProject);
+        m.item(ui, Cmd::SaveProject);
+        ui.separator();
+        m.item(ui, Cmd::Save);
+        m.item(ui, Cmd::SaveAll);
+        let panes = m.panes;
+        ui.add_enabled_ui(panes > 0, |ui| {
+            ui.menu_button(tr("menu.save_as"), |ui| {
+                for p in 0..panes {
+                    let side = side_name(p, panes).into();
+                    m.item_as(
+                        ui,
+                        &trf("menu.save_side_as", &[("side", side)]),
+                        Cmd::SaveAs(p),
+                    );
+                }
+            });
+        });
+        m.item(ui, Cmd::SaveComparison);
+        ui.separator();
+        ui.menu_button(tr("menu.export"), |ui| {
+            m.item(ui, Cmd::ExportHtml);
+            m.item(ui, Cmd::Report);
+            m.item(ui, Cmd::ReportWithDiffs);
+            m.item(ui, Cmd::Patch);
+            ui.separator();
+            ui.checkbox(&mut self.cfg.open_reports, tr("menu.open_reports"));
+        });
+        m.item(ui, Cmd::ApplyPatch);
+        ui.separator();
+        m.item(ui, Cmd::CloseTab);
+        m.item(ui, Cmd::CloseAllTabs);
+        m.item(ui, Cmd::Exit);
+    }
+
+    fn view_menu(&mut self, ui: &mut egui::Ui, m: &mut Menus) {
+        let cfg = &mut self.cfg;
+        ui.menu_button(tr("view.folder_menu"), |ui| {
+            ui.checkbox(&mut cfg.tree_mode, tr("view.tree_mode"));
+            ui.checkbox(&mut cfg.folder_file_pane, tr("view.folder_file_pane"));
+            ui.separator();
+            ui.label(egui::RichText::new(tr("view.show")).weak().small());
+            ui.checkbox(&mut cfg.show_identical, tr("view.identical"));
+            ui.checkbox(&mut cfg.show_different, tr("view.different"));
+            ui.checkbox(&mut cfg.show_unique[0], tr("view.left_only"));
+            ui.checkbox(&mut cfg.show_unique[1], tr("view.middle_only"));
+            ui.checkbox(&mut cfg.show_unique[2], tr("view.right_only"));
+        });
+        ui.menu_button(tr("view.text_menu"), |ui| {
+            ui.checkbox(&mut cfg.show_location_pane, tr("view.location_pane"));
+            ui.checkbox(&mut cfg.show_line_detail, tr("view.line_detail"));
+            ui.checkbox(&mut cfg.show_line_numbers, tr("view.line_numbers"));
+            ui.checkbox(&mut cfg.show_edit_markers, tr("view.edit_markers"));
+            ui.separator();
+            ui.checkbox(&mut cfg.show_whitespace, tr("view.whitespace"));
+            ui.checkbox(&mut cfg.syntax_highlight, tr("view.syntax"));
+            let collapse = ui.checkbox(&mut cfg.collapse_unchanged, tr("cmd.collapse_unchanged"));
+            collapse.on_hover_text(Cmd::ToggleCollapse.shown_key());
+            let wrap = ui.checkbox(&mut cfg.word_wrap, tr("cmd.word_wrap"));
+            wrap.on_hover_text(Cmd::ToggleWrap.shown_key());
+        });
+        ui.separator();
+        ui.menu_button(tr("label.zoom"), |ui| {
+            m.item(ui, Cmd::ZoomIn);
+            m.item(ui, Cmd::ZoomOut);
+            m.item(ui, Cmd::ZoomReset);
+        });
+        ui.menu_button(tr("view.theme"), |ui| {
+            for mode in ThemeMode::ALL {
+                if ui
+                    .radio_value(&mut cfg.theme, mode, tr(mode.key()))
+                    .clicked()
+                {
+                    ui.close_menu();
+                }
+            }
+        });
+        ui.separator();
+        m.item(ui, Cmd::NextTab);
+        m.item(ui, Cmd::PrevTab);
+    }
+
+    fn compare_menu(&mut self, ui: &mut egui::Ui, m: &mut Menus) {
+        for c in [Cmd::NextDiff, Cmd::PrevDiff, Cmd::FirstDiff, Cmd::LastDiff] {
+            m.item(ui, c);
+        }
+        m.item(ui, Cmd::NextConflict);
+        m.item(ui, Cmd::PrevConflict);
+        ui.separator();
+        ui.add_enabled_ui(m.enabled(Cmd::CompareAs(FileKind::Text)), |ui| {
+            ui.menu_button(tr("cmd.compare_as"), |ui| {
+                for kind in [
+                    FileKind::Text,
+                    FileKind::Binary,
+                    FileKind::Image,
+                    FileKind::Web,
+                ] {
+                    m.item_as(ui, kind_label(Some(kind)), Cmd::CompareAs(kind));
+                }
+            });
+        });
+        m.item(ui, Cmd::AllDiffs);
+        let tab_rules = self.tab_rules(self.active);
+        // Listed when the menu opens, not every frame it stays open.
+        let names_id = egui::Id::new("menu_rule_names");
+        ui.add_enabled_ui(tab_rules.is_some(), |ui| {
+            let shown = ui.menu_button(tr("menu.rules"), |ui| {
+                let current = rules::display_name(tab_rules.as_deref().unwrap_or_default());
+                if ui.radio(current.is_empty(), tr("rules.none")).clicked() {
+                    m.rules = Some(String::new());
+                }
+                let names = ui.ctx().memory_mut(|mem| {
+                    mem.data
+                        .get_temp_mut_or_insert_with(names_id, || {
+                            rules::list()
+                                .into_iter()
+                                .map(|s| s.name)
+                                .collect::<Vec<_>>()
+                        })
+                        .clone()
+                });
+                for name in names {
+                    if ui.radio(rules::same_name(current, &name), &name).clicked() {
+                        m.rules = Some(name);
+                    }
+                }
+                ui.separator();
+                m.item(ui, Cmd::EditRules);
+                if m.rules.is_some() {
+                    ui.close_menu();
+                }
+            });
+            if shown.inner.is_none() {
+                ui.ctx()
+                    .memory_mut(|mem| mem.data.remove::<Vec<String>>(names_id));
+            }
+        });
+        let d = &mut self.cfg.diff;
+        ui.menu_button(tr("view.compare_menu"), |ui| {
+            ui.menu_button(tr("opt.whitespace"), |ui| {
+                for (mode, key) in [
+                    (WhitespaceMode::Compare, "opt.ws_compare"),
+                    (WhitespaceMode::IgnoreChange, "opt.ws_change"),
+                    (WhitespaceMode::IgnoreAll, "opt.ws_all"),
+                ] {
+                    ui.radio_value(&mut d.whitespace, mode, tr(key));
+                }
+            });
+            ui.menu_button(tr("opt.inline"), |ui| {
+                for (mode, key) in [
+                    (InlineMode::Off, "opt.inline_off"),
+                    (InlineMode::Word, "opt.inline_word"),
+                    (InlineMode::Char, "opt.inline_char"),
+                ] {
+                    ui.radio_value(&mut d.inline, mode, tr(key));
+                }
+            });
+            ui.separator();
+            ui.checkbox(&mut d.ignore_case, tr("opt.ignore_case"));
+            ui.checkbox(&mut d.ignore_blank_lines, tr("opt.ignore_blank"));
+            ui.checkbox(&mut d.ignore_eol, tr("opt.ignore_eol"));
+            ui.checkbox(&mut d.ignore_numbers, tr("opt.ignore_numbers"));
+            ui.checkbox(&mut d.ignore_comments, tr("opt.ignore_comments"));
+            ui.separator();
+            ui.checkbox(&mut d.prettify, tr("opt.prettify"));
+            ui.checkbox(&mut d.detect_moved, tr("opt.detect_moved"));
+            ui.separator();
+            m.item(ui, Cmd::CompareOptions);
+        });
+        ui.separator();
+        m.item(ui, Cmd::Refresh);
+    }
+
+    fn tools_menu(&mut self, ui: &mut egui::Ui, m: &mut Menus) {
+        m.item(ui, Cmd::Filters);
+        m.item(ui, Cmd::Statistics);
+        ui.separator();
+        let [add, remove, added, removed] = SHELL_KEYS;
+        let registered = crate::shell::is_registered();
+        if ui
+            .add_enabled(!registered, egui::Button::new(tr(add)))
+            .clicked()
+        {
+            match crate::shell::register() {
+                Ok(()) => self.notify(tr(added)),
+                Err(e) => self.error(e.to_string()),
+            }
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(registered, egui::Button::new(tr(remove)))
+            .clicked()
+        {
+            let _ = crate::shell::unregister();
+            self.notify(tr(removed));
+            ui.close_menu();
         }
     }
 
@@ -3121,8 +4079,7 @@ impl OxideMergeApp {
                             painter.circle_filled(close_rect.center(), 3.5, p.warning);
                         }
                         widgets::focus_ring(ui, &resp, rect.shrink2(vec2(0.0, 3.0)), 8.0);
-                        let close_resp = close_resp
-                            .on_hover_text(widgets::with_key(tr("menu.close_tab"), "Ctrl+W"));
+                        let close_resp = close_resp.on_hover_text(Cmd::CloseTab.tip());
                         if close_resp.clicked() || resp.middle_clicked() {
                             close = Some(i);
                         } else if resp.clicked() {
@@ -3189,8 +4146,12 @@ impl OxideMergeApp {
                     }
                     ui.add_space(4.0);
                     let open = tr("menu.open").trim_end_matches(['.', '…']);
-                    if widgets::icon_button(ui, Icon::Plus, &widgets::with_key(open, "Ctrl+O"))
-                        .clicked()
+                    if widgets::icon_button(
+                        ui,
+                        Icon::Plus,
+                        &widgets::with_key(open, Cmd::Open.key()),
+                    )
+                    .clicked()
                     {
                         new_tab = true;
                     }
@@ -3634,11 +4595,12 @@ impl OxideMergeApp {
         };
         let mut keep = true;
         let mut apply = false;
+        let mut leave = false;
         let results = search_options(&d.search);
         let modal = egui::Modal::new(egui::Id::new("options_dialog")).show(ctx, |ui| {
             ui.set_width(780.0);
             if widgets::dialog_title(ui, tr("menu.options")) {
-                keep = false;
+                leave = true;
             }
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
@@ -3811,62 +4773,6 @@ impl OxideMergeApp {
                                                 tr("opt.inline_char"),
                                             );
                                         });
-                                    ui.separator();
-                                    ui.checkbox(
-                                        &mut o.line_filters_enabled,
-                                        tr("opt.line_filters"),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(tr("opt.line_filters_hint")).small(),
-                                    );
-                                    ui.add(
-                                        egui::TextEdit::multiline(&mut d.line_filters)
-                                            .code_editor()
-                                            .desired_rows(3)
-                                            .desired_width(f32::INFINITY),
-                                    );
-                                    regex_warning(
-                                        ui,
-                                        d.line_filters.lines().map(|l| l.trim().to_string()),
-                                    );
-                                    ui.checkbox(
-                                        &mut o.substitutions_enabled,
-                                        tr("opt.substitutions"),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(tr("opt.substitutions_hint")).small(),
-                                    );
-                                    ui.add(
-                                        egui::TextEdit::multiline(&mut d.substitutions)
-                                            .code_editor()
-                                            .desired_rows(3)
-                                            .desired_width(f32::INFINITY),
-                                    );
-                                    regex_warning(
-                                        ui,
-                                        parse_arrow_pairs(&d.substitutions)
-                                            .into_iter()
-                                            .map(|(a, _)| a),
-                                    );
-                                    ui.checkbox(
-                                        &mut o.block_filters_enabled,
-                                        tr("opt.block_filters"),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(tr("opt.block_filters_hint")).small(),
-                                    );
-                                    ui.add(
-                                        egui::TextEdit::multiline(&mut d.block_filters)
-                                            .code_editor()
-                                            .desired_rows(2)
-                                            .desired_width(f32::INFINITY),
-                                    );
-                                    regex_warning(
-                                        ui,
-                                        parse_arrow_pairs(&d.block_filters)
-                                            .into_iter()
-                                            .flat_map(|(a, b)| [a, b]),
-                                    );
                                     ui.horizontal(|ui| {
                                         ui.checkbox(
                                             &mut o.numeric_tolerance_enabled,
@@ -3882,6 +4788,7 @@ impl OxideMergeApp {
                                         );
                                     });
                                 }
+                                OptTab::Rules => rules_options(ui, &mut d),
                                 OptTab::Folder => {
                                     let f = &mut d.cfg.folder;
                                     egui::ComboBox::from_label(tr("label.method"))
@@ -4026,7 +4933,7 @@ impl OxideMergeApp {
                     keep = false;
                 }
                 if widgets::secondary_button(ui, tr("btn.cancel")).clicked() {
-                    keep = false;
+                    leave = true;
                 }
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     if widgets::ghost_icon_button(ui, Icon::Undo, tr("btn.defaults")).clicked() {
@@ -4037,29 +4944,28 @@ impl OxideMergeApp {
                             ..Config::default()
                         };
                         d.cfg = defaults;
-                        d.line_filters.clear();
-                        d.substitutions.clear();
-                        d.block_filters.clear();
                     }
                 });
             });
         });
-        if modal.should_close() {
+        if (leave || modal.should_close()) && may_leave_rule_edit(&mut d) {
             keep = false;
         }
+        if apply && d.rule_edit.as_ref().is_some_and(RuleEdit::changed) && !save_rule_edit(&mut d) {
+            apply = false;
+            keep = true;
+            d.tab = OptTab::Rules;
+        }
+        if apply || !keep {
+            for (old, new) in std::mem::take(&mut d.rules_renamed) {
+                self.rules_renamed(&old, &new);
+            }
+        }
+        if d.rules_touched && (apply || !keep) {
+            self.rules_changed();
+        }
         if apply {
-            d.cfg.diff.line_filters = d
-                .line_filters
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(String::from)
-                .collect();
-            d.cfg.diff.substitutions = parse_arrow_pairs(&d.substitutions);
-            d.cfg.diff.block_filters = parse_arrow_pairs(&d.block_filters)
-                .into_iter()
-                .filter(|(_, b)| !b.is_empty())
-                .collect();
+            rules::apply_selected(&mut d.cfg);
             let folder_changed = d.cfg.folder != self.cfg.folder || d.cfg.diff != self.cfg.diff;
             self.cfg = d.cfg;
             if folder_changed {
@@ -4271,7 +5177,7 @@ impl OxideMergeApp {
                 };
                 let title = self.tabs.get(i).map(|t| t.title()).unwrap_or_default();
                 let mut action = 0;
-                egui::Modal::new(egui::Id::new("close_tab")).show(ctx, |ui| {
+                let modal = egui::Modal::new(egui::Id::new("close_tab")).show(ctx, |ui| {
                     ui.set_min_width(420.0);
                     ui.heading(tr("dlg.unsaved"));
                     ui.label(trf("msg.save_changes", &[("name", title)]));
@@ -4287,26 +5193,44 @@ impl OxideMergeApp {
                         }
                     });
                 });
+                if action == 0 && modal.should_close() {
+                    action = 3;
+                }
+                let queued = matches!(p, Prompt::CloseTab(_));
                 match action {
                     1 => {
                         keep = false;
                         match self.tabs[i].save() {
-                            Ok(()) if !self.tabs[i].is_modified() => finish(self),
-                            Ok(()) => {}
-                            Err(e) => self.error(e.to_string()),
+                            Ok(()) if !self.tabs[i].is_modified() => {
+                                finish(self);
+                                if queued {
+                                    self.ask_next_close();
+                                }
+                            }
+                            Ok(()) => self.close_queue.clear(),
+                            Err(e) => {
+                                self.close_queue.clear();
+                                self.error(e.to_string());
+                            }
                         }
                     }
                     2 => {
                         keep = false;
                         finish(self);
+                        if queued {
+                            self.ask_next_close();
+                        }
                     }
-                    3 => keep = false,
+                    3 => {
+                        keep = false;
+                        self.close_queue.clear();
+                    }
                     _ => {}
                 }
             }
             Prompt::Exit => {
                 let mut action = 0;
-                egui::Modal::new(egui::Id::new("exit")).show(ctx, |ui| {
+                let modal = egui::Modal::new(egui::Id::new("exit")).show(ctx, |ui| {
                     ui.set_min_width(420.0);
                     ui.heading(tr("dlg.unsaved"));
                     ui.label(tr("msg.exit_unsaved"));
@@ -4322,6 +5246,9 @@ impl OxideMergeApp {
                         }
                     });
                 });
+                if action == 0 && modal.should_close() {
+                    action = 3;
+                }
                 match action {
                     1 => {
                         keep = false;
@@ -4470,7 +5397,39 @@ impl OxideMergeApp {
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
-        if dropped.is_empty() {
+        let busy = self.prompt.is_some()
+            || self.patch_dlg.is_some()
+            || self.stats_dlg.is_some()
+            || self.git_dlg.is_some()
+            || self.rule_dlg.is_some()
+            || self.palette.is_some()
+            || self.help
+            || self.about
+            || matches!(
+                self.tabs.get(self.active).map(|t| t.content.view()),
+                Some(Content::Folder(v)) if v.has_dialog()
+            );
+        if dropped.is_empty() || busy {
+            return;
+        }
+        // One rules file is imported, as are any dropped on the options; more are compared.
+        let import = self.options_dlg.is_some() || dropped.len() == 1;
+        let (rule_files, dropped): (Vec<PathBuf>, Vec<PathBuf>) = dropped
+            .into_iter()
+            .partition(|p| import && rules::is_rules_file(p));
+        if !rule_files.is_empty() {
+            let (msg, failed) = import_rules(&rule_files);
+            if failed {
+                self.error(msg);
+            } else {
+                self.notify(msg);
+            }
+            if let Some(d) = &mut self.options_dlg {
+                d.rule_sets = rules::list();
+                d.rules_touched = true;
+            }
+        }
+        if dropped.is_empty() || self.options_dlg.is_some() {
             return;
         }
         if let Some(d) = &mut self.open_dlg {
@@ -4504,6 +5463,29 @@ impl OxideMergeApp {
 }
 
 impl eframe::App for OxideMergeApp {
+    /// Takes Ctrl+Tab before egui sees it: egui moves the keyboard focus on Tab whatever the
+    /// modifiers, which would leave a button focused and the view's keys off.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        raw.events.retain(|e| match e {
+            egui::Event::Key {
+                key: egui::Key::Tab,
+                pressed,
+                modifiers,
+                ..
+            } if modifiers.ctrl => {
+                if *pressed {
+                    self.tab_keys.push(if modifiers.shift {
+                        Cmd::PrevTab
+                    } else {
+                        Cmd::NextTab
+                    });
+                }
+                false
+            }
+            _ => true,
+        });
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.cfg.dark_mode = match self.cfg.theme {
             ThemeMode::Light => false,
@@ -4525,10 +5507,10 @@ impl eframe::App for OxideMergeApp {
             fonts::setup(ctx, &self.font_lang);
         }
 
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self.allow_close
-            && self.tabs.iter().any(|t| t.is_modified())
-        {
+        let unsaved = self.tabs.iter().any(|t| t.is_modified());
+        #[cfg(target_os = "macos")]
+        crate::ui::macos::set_unsaved(unsaved && !self.allow_close);
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && unsaved {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.prompt = Some(Prompt::Exit);
         }
@@ -4554,7 +5536,7 @@ impl eframe::App for OxideMergeApp {
             || self.patch_dlg.is_some()
             || self.stats_dlg.is_some()
             || self.git_dlg.is_some()
-            || self.filters_dlg
+            || self.rule_dlg.is_some()
             || self.help
             || self.about
             || self.palette.is_some()
@@ -4563,7 +5545,9 @@ impl eframe::App for OxideMergeApp {
                 Some(Content::Folder(v)) if v.has_dialog()
             );
         widgets::set_modal_open(ctx, modal);
-        if !modal {
+        if modal {
+            self.tab_keys.clear();
+        } else {
             self.handle_shortcuts(ctx);
         }
 
@@ -4620,6 +5604,7 @@ impl eframe::App for OxideMergeApp {
         crate::core::fsutil::set_backup(self.cfg.backup_on_save);
         self.announce_finished(ctx);
         self.take_step_file();
+        self.refresh_saved_folders();
         if let Some(a) = folder_action {
             match a {
                 FolderAction::OpenFiles {
@@ -4629,8 +5614,12 @@ impl eframe::App for OxideMergeApp {
                     descriptions,
                     kind,
                     rel,
+                    rules,
                 } => {
-                    let folder = self.tabs.get(self.active).map(|t| t.id);
+                    let folder = self.tabs.get(self.active).map(|t| match &t.content {
+                        Content::Diffs(v) => v.folder,
+                        _ => t.id,
+                    });
                     let temp = self.tabs.get(self.active).and_then(|t| t.temp.clone());
                     let count = self.tabs.len();
                     self.open(OpenRequest {
@@ -4640,6 +5629,7 @@ impl eframe::App for OxideMergeApp {
                         descriptions,
                         kind,
                         skip_recent: true,
+                        rules: Some(rules),
                         ..Default::default()
                     });
                     if let (Some(folder), true) = (folder, self.tabs.len() > count) {
@@ -4669,7 +5659,26 @@ impl eframe::App for OxideMergeApp {
                     self.cfg.show_different = true;
                     self.cfg.show_unique = [true; 3];
                 }
+                FolderAction::AddRule(draft) => self.open_rule_dialog(self.active, draft),
+                FolderAction::EditRules => self.open_options(OptTab::Rules),
+                FolderAction::ExportHtml => self.export_html(),
+                FolderAction::AllDiffs => self.show_all_diffs(),
+                FolderAction::ExportFileReport { name, job } => {
+                    self.write_html_report(tr("menu.export_html"), &name, job);
+                }
             }
+        }
+        let (request, export) = match self.tabs.get_mut(self.active).map(|t| t.content.view_mut()) {
+            Some(Content::Text(v)) => {
+                (v.rule_request.take(), std::mem::take(&mut v.export_request))
+            }
+            _ => (None, false),
+        };
+        if let Some(draft) = request {
+            self.open_rule_dialog(self.active, draft);
+        }
+        if export {
+            self.export_html();
         }
 
         self.palette_ui(ctx);
@@ -4677,6 +5686,7 @@ impl eframe::App for OxideMergeApp {
         self.options_dialog(ctx);
         self.filters_dialog(ctx);
         self.patch_dialog(ctx);
+        self.rule_dialog(ctx);
         self.stats_dialog(ctx);
         self.git_dialog(ctx);
         self.poll_report(ctx);
@@ -4704,5 +5714,41 @@ impl eframe::App for OxideMergeApp {
             self.cfg.save();
             self.saved_cfg = self.cfg.clone();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn untouched_arrow_lines_keep_their_pairs() {
+        let old = vec![
+            (r"a\) => a".to_string(), "b) => b".to_string()),
+            ("x".to_string(), "y".to_string()),
+        ];
+        let text = arrow_pairs(&old);
+        assert_eq!(edited_pairs(&text, &old), old);
+        assert!(unclear_arrow_lines(&text, &old, true).is_empty());
+        let edited = format!("{text}\nv1 => v\nno arrow\np => q => r");
+        let pairs = edited_pairs(&edited, &old);
+        assert_eq!(pairs[..2], old[..]);
+        assert_eq!(pairs[2], ("v1".to_string(), "v".to_string()));
+        assert_eq!(unclear_arrow_lines(&edited, &old, true), [4, 5]);
+    }
+
+    #[test]
+    fn arrows_without_spaces_and_empty_sides() {
+        assert_eq!(
+            parse_arrow_pairs("\\d+ =>\na=>b\nx =>y"),
+            [
+                (r"\d+".to_string(), String::new()),
+                ("a".to_string(), "b".to_string()),
+                ("x".to_string(), "y".to_string()),
+            ]
+        );
+        let text = "start =>\n=> end\nfind =>";
+        assert_eq!(unclear_arrow_lines(text, &[], true), [1, 2, 3]);
+        assert_eq!(unclear_arrow_lines(text, &[], false), [2]);
     }
 }
