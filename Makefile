@@ -5,7 +5,7 @@ CARGO ?= cargo
 BIN   := oxidemerge
 ARGS  ?=
 
-# `cargo pkgid` prints ".../OxideMerge#oxidemerge@0.9.2" (or "...#0.9.2").
+# `cargo pkgid` prints ".../OxideMerge#oxidemerge@0.9.3" (or "...#0.9.3").
 # Make before 4.3 (macOS ships 3.81) treats a bare `#` inside a function call as a comment.
 HASH    := \#
 VERSION := $(lastword $(subst @, ,$(subst $(HASH), ,$(shell $(CARGO) pkgid))))
@@ -13,12 +13,16 @@ VERSION := $(lastword $(subst @, ,$(subst $(HASH), ,$(shell $(CARGO) pkgid))))
 ifeq ($(OS),Windows_NT)
   EXE      := .exe
   PLATFORM := windows
-  # AMD64 or ARM64, named as the CI packages name them.
-  MACHINE  := $(subst AMD64,x64,$(subst ARM64,arm64,$(PROCESSOR_ARCHITECTURE)))
+  # AMD64 or ARM64, named as the CI packages name them; a 32-bit make on 64-bit Windows
+  # finds the machine in PROCESSOR_ARCHITEW6432.
+  MACHINE  := $(subst AMD64,x64,$(subst ARM64,arm64,$(or $(PROCESSOR_ARCHITEW6432),$(PROCESSOR_ARCHITECTURE))))
+  # Where cargo puts its home: the user profile, whatever HOME a Unix-like shell sets.
+  USER_HOME := $(or $(USERPROFILE),$(HOME))
 else
   EXE      :=
   PLATFORM := $(shell uname -s | tr A-Z a-z)
   MACHINE  := $(shell uname -m)
+  USER_HOME := $(HOME)
 endif
 
 TARGET_DIR  := $(if $(CARGO_TARGET_DIR),$(subst \,/,$(CARGO_TARGET_DIR)),target)
@@ -30,7 +34,7 @@ DIST_DIR    := dist/$(DIST_NAME)
 
 .PHONY: all help build release run run-release demo demo-text demo-3way demo-conflict \
         test check check-platforms lint fmt fmt-check ci install uninstall shell-register shell-unregister \
-        languages dist appimage clean
+        languages dist appimage user-guide clean
 
 help:
 	@echo 'OxideMerge $(VERSION) - make targets'
@@ -56,6 +60,7 @@ help:
 	@echo '  languages         List the available UI languages'
 	@echo '  dist              Release build packaged into dist/$(DIST_NAME)'
 	@echo '  appimage          Linux AppImage (x86_64 or aarch64) in dist/'
+	@echo '  user-guide        User guide PDF files (English, Traditional Chinese) in dist/'
 	@echo '  clean             Remove build output and dist/'
 
 all: release
@@ -116,7 +121,7 @@ uninstall:
 
 # The context menu points at the binary that registers it, so use the installed one,
 # where `cargo install` put it, whatever is first on the PATH.
-INSTALLED := $(subst \,/,$(or $(CARGO_INSTALL_ROOT),$(CARGO_HOME),$(or $(HOME),$(USERPROFILE))/.cargo))/bin/$(BIN)$(EXE)
+INSTALLED := $(subst \,/,$(or $(CARGO_INSTALL_ROOT),$(CARGO_HOME),$(USER_HOME)/.cargo))/bin/$(BIN)$(EXE)
 
 shell-register: install
 	"$(INSTALLED)" --register-shell
@@ -146,6 +151,10 @@ else
 	@echo AppImage packages are built on Linux x86_64 or aarch64 >&2
 	@exit 1
 endif
+
+# Same PDF files as the CI user-guide job; scripts/build-user-guide.sh lists what it needs.
+user-guide:
+	VERSION='$(VERSION)' bash scripts/build-user-guide.sh dist
 
 clean:
 	$(CARGO) clean

@@ -489,6 +489,7 @@
   "report.search": "Filter files…",
   "report.side_by_side": "Side by side",
   "report.text_summary": "{n} differences",
+  "report.text_summary_one": "{n} difference",
   "report.text_title": "File compare report",
   "report.theme": "Light or dark theme",
   "report.title": "Folder compare report",

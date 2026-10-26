@@ -489,6 +489,7 @@
   "report.search": "Filtrer les fichiers…",
   "report.side_by_side": "Côte à côte",
   "report.text_summary": "{n} différences",
+  "report.text_summary_one": "{n} différence",
   "report.text_title": "Rapport de comparaison de fichiers",
   "report.theme": "Thème clair ou sombre",
   "report.title": "Rapport de comparaison de dossiers",

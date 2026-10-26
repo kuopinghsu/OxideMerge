@@ -489,6 +489,7 @@
   "report.search": "Filtrar arquivos…",
   "report.side_by_side": "Lado a lado",
   "report.text_summary": "{n} diferenças",
+  "report.text_summary_one": "{n} diferença",
   "report.text_title": "Relatório de comparação de arquivos",
   "report.theme": "Tema claro ou escuro",
   "report.title": "Relatório de comparação de pastas",

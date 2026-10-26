@@ -1,6 +1,7 @@
 # PDF theme of the user guides, for asciidoctor-pdf. The fonts named here are not in the
 # repository: scripts/build-user-guide.sh puts them in the folder it passes as pdf-fontsdir.
-# DejaVu Sans holds the macOS key symbols (⌘ ⌥ ⇧ ⌃), Noto Sans TC the Chinese text.
+# DejaVu Sans holds the macOS key symbols (⌘ ⌥ ⇧ ⌃), Noto Sans TC the Chinese text, and
+# Noto Sans SC and KR the names of the Simplified Chinese and Korean languages.
 extends: default-sans-with-font-fallbacks
 font:
   catalog:
@@ -15,4 +16,15 @@ font:
       bold: NotoSansTC-Bold.ttf
       italic: NotoSansTC-Regular.ttf
       bold_italic: NotoSansTC-Bold.ttf
-  fallbacks: [M+ 1p Fallback, DejaVu Sans, Noto Sans TC, Noto Emoji]
+    Noto Sans SC:
+      normal: NotoSansSC-Regular.ttf
+      bold: NotoSansSC-Bold.ttf
+      italic: NotoSansSC-Regular.ttf
+      bold_italic: NotoSansSC-Bold.ttf
+    Noto Sans KR:
+      normal: NotoSansKR-Regular.ttf
+      bold: NotoSansKR-Bold.ttf
+      italic: NotoSansKR-Regular.ttf
+      bold_italic: NotoSansKR-Bold.ttf
+  # Chinese written before the Japanese M+ 1p, which would draw 繁體中文 the Japanese way.
+  fallbacks: [DejaVu Sans, Noto Sans TC, Noto Sans SC, Noto Sans KR, M+ 1p Fallback, Noto Emoji]

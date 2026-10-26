@@ -27,12 +27,17 @@ pub fn make_patch(
     style: PatchStyle,
     context: usize,
 ) -> String {
+    // As with `diff -B`, differences the compare options ignore stay out of the patch, unless a
+    // hunk with other changes takes them in: its context lines come from one side only.
     let blocks: Vec<&Block> = result.blocks.iter().collect();
-    if blocks.is_empty() {
+    if blocks.iter().all(|b| b.ignored) {
         return String::new();
     }
     match style {
-        PatchStyle::Normal => normal(input, &blocks),
+        PatchStyle::Normal => {
+            let shown: Vec<&Block> = blocks.into_iter().filter(|b| !b.ignored).collect();
+            normal(input, &shown)
+        }
         PatchStyle::Context => context_fmt(input, &blocks, context),
         PatchStyle::Unified => unified(input, &blocks, context),
     }
@@ -121,7 +126,7 @@ fn normal(input: &PatchInput, blocks: &[&Block]) -> String {
     out
 }
 
-/// Groups blocks into hunks whose context regions overlap.
+/// Groups blocks into hunks whose context regions overlap, leaving out hunks of ignored blocks.
 fn hunks<'a>(blocks: &[&'a Block], ctx: usize) -> Vec<Vec<&'a Block>> {
     let mut out: Vec<Vec<&Block>> = Vec::new();
     for b in blocks {
@@ -134,6 +139,7 @@ fn hunks<'a>(blocks: &[&'a Block], ctx: usize) -> Vec<Vec<&'a Block>> {
         }
         out.push(vec![b]);
     }
+    out.retain(|h| h.iter().any(|b| !b.ignored));
     out
 }
 
@@ -562,5 +568,42 @@ mod tests {
         assert!(p.contains("-b\n+x\n"));
         let n = make_patch(&input, &r, PatchStyle::Normal, 3);
         assert!(n.starts_with("2c2\n< b\n---\n> x\n"));
+    }
+
+    #[test]
+    fn ignored_changes_in_a_hunk_stay_and_the_others_go() {
+        let far: Vec<String> = (1..=10).map(|i| format!("k{i}")).collect();
+        let mut a = v(&["x", "", "y", "1"]);
+        a.extend(far.iter().cloned());
+        a.extend(v(&["", "z"]));
+        let mut b = v(&["x", "y", "2"]);
+        b.extend(far.iter().cloned());
+        b.push("z".into());
+        let opts = DiffOptions {
+            ignore_blank_lines: true,
+            ..DiffOptions::default()
+        };
+        let r = compute(&[&a, &b], &opts);
+        let input = PatchInput {
+            name_a: "a.txt",
+            name_b: "b.txt",
+            date_a: "",
+            date_b: "",
+            a: &a,
+            b: &b,
+        };
+        let p = make_patch(&input, &r, PatchStyle::Unified, 3);
+        assert_eq!(p.matches("@@ -").count(), 1, "{p}");
+        let mut want = b.clone();
+        want.insert(want.len() - 1, String::new());
+        let files = parse_unified(&p).unwrap();
+        assert_eq!(apply(&a, &files[0]).lines, want);
+        // Every hunk holds as many lines as its header says.
+        let body: Vec<&str> = p.lines().skip(3).collect();
+        let old = body.iter().filter(|l| !l.starts_with('+')).count();
+        let new = body.iter().filter(|l| !l.starts_with('-')).count();
+        assert!(p.contains(&format!("@@ -1,{old} +1,{new} @@")), "{p}");
+        let n = make_patch(&input, &r, PatchStyle::Normal, 3);
+        assert_eq!(n, "4c3\n< 1\n---\n> 2\n");
     }
 }

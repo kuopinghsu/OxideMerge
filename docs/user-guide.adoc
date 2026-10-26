@@ -105,8 +105,9 @@ Buttons at the top right:: *Open*, light or dark theme, *Options*, *Command pale
 Tabs:: Every comparison opens in its own tab.
 Right-click a tab to close it, the others, the tabs to its right, or all of them.
 kbd:[Ctrl+Tab] and kbd:[Ctrl+Shift+Tab] switch tabs, and kbd:[Ctrl+W] closes the current one.
-Status bar:: The number of differences and the current line or offset.
-The language button at its right end changes the interface language.
+Status bar:: The number of differences, the current line or offset, and at the right end the
+interface language.
+Change the language under *Options → General*, or start OxideMerge with `--lang`.
 
 Starting OxideMerge without a comparison shows the start page.
 It has *Compare files or folders*, *Open conflict file*, and the list of recent comparisons.
@@ -594,7 +595,9 @@ A folder compare can use a different file: pick it from *Rules* on its toolbar, 
 *Compare → Compare rules*.
 *Refresh* (kbd:[F5]) reads the rules file again.
 
-When you import a file, or drop `.oxrules` files on the window:
+Dropping a single `.oxrules` file on the window imports it too, as does dropping any number of
+them on the options; dropping two on the window compares them instead.
+When rules files are imported:
 
 * a file with the same name and rules as one already there is skipped;
 * a file named like an existing one but with other rules is added under a numbered name;

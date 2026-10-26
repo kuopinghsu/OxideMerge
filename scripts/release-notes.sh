@@ -2,7 +2,7 @@
 # Prints the CHANGELOG.md section of a version, without its heading, for use
 # as release notes. Fails when the version has no section or it is empty.
 #
-#   scripts/release-notes.sh 0.9.2 [CHANGELOG.md]
+#   scripts/release-notes.sh 0.9.3 [CHANGELOG.md]
 set -euo pipefail
 
 version=${1:?usage: $0 VERSION [CHANGELOG]}

@@ -445,12 +445,14 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         if cli.report.is_some() {
             eprintln!("note: --report is not written for binary or image files");
         }
-        let a = std::fs::read(&paths[0])?;
-        let b = std::fs::read(&paths[1])?;
-        let ranges = core::binary::diff_ranges(&[&a, &b]);
+        let data = paths
+            .iter()
+            .map(std::fs::read)
+            .collect::<Result<Vec<_>, _>>()?;
+        let ranges = core::binary::diff_ranges(&data.iter().map(Vec::as_slice).collect::<Vec<_>>());
         if cli.cli {
             for r in ranges.iter().take(100) {
-                println!("0x{:08X}-0x{:08X} differ", r.start, r.end);
+                println!("0x{:08X}-0x{:08X} differ", r.start, r.end - 1);
             }
             if ranges.is_empty() {
                 println!("{}", i18n::tr("msg.binary_identical"));
@@ -605,6 +607,7 @@ fn main() -> ExitCode {
     if core::rules::load_selected(&mut cfg) {
         cfg.save();
     }
+    let stored = cfg.clone();
     if let Some(l) = &cli.lang {
         cfg.language = l.clone();
     }
@@ -752,7 +755,7 @@ fn main() -> ExitCode {
     let result = eframe::run_native(
         "OxideMerge",
         options,
-        Box::new(move |cc| Ok(Box::new(OxideMergeApp::new(cc, cfg, initial)))),
+        Box::new(move |cc| Ok(Box::new(OxideMergeApp::new(cc, cfg, stored, initial)))),
     );
     match result {
         Ok(()) => ExitCode::SUCCESS,

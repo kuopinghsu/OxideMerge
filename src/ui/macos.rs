@@ -29,6 +29,11 @@ extern "C" fn should_terminate(_this: &AnyObject, _cmd: Sel, _sender: *mut AnyOb
     let app = NSApplication::sharedApplication(mtm);
     // SAFETY: plain AppKit messages sent on the main thread, which `mtm` proves.
     unsafe {
+        // A hidden app (⌘H) has no visible window; it is shown again to ask.
+        let hidden: bool = msg_send![&app, isHidden];
+        if hidden {
+            let _: () = msg_send![&app, unhide: std::ptr::null::<AnyObject>()];
+        }
         let windows: *mut AnyObject = msg_send![&app, windows];
         if windows.is_null() {
             return TERMINATE_NOW;
@@ -39,13 +44,22 @@ extern "C" fn should_terminate(_this: &AnyObject, _cmd: Sel, _sender: *mut AnyOb
             let main: bool = msg_send![w, canBecomeMainWindow];
             let mini: bool = msg_send![w, isMiniaturized];
             let visible: bool = msg_send![w, isVisible];
-            if !main || !(mini || visible) {
+            if !main || !(mini || visible || hidden) {
                 continue;
             }
             if mini {
                 let _: () = msg_send![w, deminiaturize: std::ptr::null::<AnyObject>()];
             }
-            let _: () = msg_send![w, performClose: std::ptr::null::<AnyObject>()];
+            // Asked straight, the window delegate turns the close into the app's prompt;
+            // `performClose:` would also beep, as the window does not close at once.
+            let delegate: *mut AnyObject = msg_send![w, delegate];
+            let asks: bool = !delegate.is_null()
+                && msg_send![delegate, respondsToSelector: sel!(windowShouldClose:)];
+            if asks {
+                let _: bool = msg_send![delegate, windowShouldClose: w];
+            } else {
+                let _: () = msg_send![w, performClose: std::ptr::null::<AnyObject>()];
+            }
             return TERMINATE_CANCEL;
         }
     }
@@ -67,7 +81,8 @@ pub fn ask_before_quitting() {
         }
         let class = ffi::object_getClass(delegate as *const ffi::objc_object);
         let imp: unsafe extern "C" fn(&AnyObject, Sel, *mut AnyObject) -> usize = should_terminate;
-        ffi::class_addMethod(
+        // Replacing adds the method when the class has none, and takes over one it has.
+        ffi::class_replaceMethod(
             class as *mut ffi::objc_class,
             sel!(applicationShouldTerminate:).as_ptr(),
             Some(std::mem::transmute::<

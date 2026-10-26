@@ -489,6 +489,7 @@
   "report.search": "Фильтр файлов…",
   "report.side_by_side": "Рядом",
   "report.text_summary": "Различий: {n}",
+  "report.text_summary_one": "Различий: {n}",
   "report.text_title": "Отчёт о сравнении файлов",
   "report.theme": "Светлая или тёмная тема",
   "report.title": "Отчёт о сравнении папок",

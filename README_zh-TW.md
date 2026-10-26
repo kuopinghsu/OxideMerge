@@ -10,6 +10,8 @@ OxideMerge 是以 Rust 撰寫的開放原始碼跨平台差異比較與合併工
 
 名稱源自撰寫它的程式語言 Rust：鐵鏽（rust）的成分正是氧化鐵（iron oxide）。
 
+[使用者指南](docs/user-guide.zh-TW.adoc)（[English](docs/user-guide.adoc)）逐步說明每個檢視、選項與命令。每個發行版本也附有 PDF 檔。
+
 ![起始頁](images/start.png)
 
 | 資料夾比較 | 文字比較 |
@@ -145,6 +147,7 @@ cargo test
 | `make shell-register` | 安裝後加入檔案管理員項目（檔案總管、Finder 快速動作、Nautilus、Nemo、Dolphin） |
 | `make dist` | 將正式版執行檔打包到 `dist/`（Windows 為 `.zip`，其他平台為 `.tar.gz`） |
 | `make appimage` | 在 `dist/` 產生 Linux AppImage（x86_64 或 aarch64，依本機架構而定）（結構與 CI 相同；需已安裝 X11、Wayland 與鍵盤程式庫，並會下載 `appimagetool`） |
+| `make user-guide` | 在 `dist/` 產生英文與繁體中文的使用者指南 PDF 檔（與 CI 相同；需要 `asciidoctor-pdf`、`curl`、`shasum`、含 `fontTools` 的 Python 3、fontconfig（`fc-match`）與 DejaVu Sans 字型，並會下載 Noto Sans CJK 字型） |
 | `make clean` | 刪除建置產出 |
 | `make help` | 列出所有目標 |
 
@@ -156,25 +159,26 @@ cargo test
 - **Linux x64 與 Arm64：** 在 Ubuntu 22.04 上建置的 `.tar.gz` 與 `.deb`。
 - **Linux AppImage（x64 與 Arm64）：** 在 AlmaLinux 8（glibc 2.28）上建置，內含 X11、Wayland 與鍵盤程式庫，而 [`assets/AppRun`](assets/AppRun) 只會在系統缺少這些程式庫時才使用內附的版本。建置完成後，會在 Ubuntu 22.04、24.04 及 AlmaLinux 8、9 上檢查每個 AppImage：每個內附的程式庫都必須能正確解析，指令列必須能正常運作，視窗也必須能在 Xvfb 下持續開啟。
 - **macOS：** 經臨時簽署的通用版（Apple 晶片與 Intel）`OxideMerge.app`，分別包裝成 `.dmg` 與 `.zip`。
+- **使用者指南：** 以 Asciidoctor PDF 建置的英文與繁體中文指南 PDF 檔。若有任何字元在所有字型中都找不到，建置即失敗。
 
-推送 `v0.9.2` 這類標籤時，會在 GitHub 發行版本頁面發布所有安裝套件與 `SHA256SUMS.txt`。標籤必須與 `Cargo.toml` 中的版本一致；含有 `-` 的標籤（例如 `v1.0.0-rc1`）會標示為搶先版。發行說明取自 [`CHANGELOG.md`](CHANGELOG.md) 中該版本的段落，後面再附上下載說明，因此請在推送標籤前先寫好該段落；缺少時建置會提早失敗。執行 `scripts/release-notes.sh 0.9.2` 可預覽某個版本的發行說明。CI 只會讀取 `CHANGELOG.md`，不會修改它。
+推送 `v0.9.3` 這類標籤時，會在 GitHub 發行版本頁面發布所有安裝套件、使用者指南與 `SHA256SUMS.txt`。標籤必須與 `Cargo.toml` 中的版本一致；含有 `-` 的標籤（例如 `v1.0.0-rc1`）會標示為搶先版。發行說明取自 [`CHANGELOG.md`](CHANGELOG.md) 中該版本的段落，後面再附上下載說明，因此請在推送標籤前先寫好該段落；缺少時建置會提早失敗。執行 `scripts/release-notes.sh 0.9.3` 可預覽某個版本的發行說明。CI 只會讀取 `CHANGELOG.md`，不會修改它。
 
 發行新版本的步驟：
 
 1. 修改 `Cargo.toml` 中的 `version`，並執行 `cargo build` 讓 `Cargo.lock` 一併更新。
-2. 在 `CHANGELOG.md` 中，把該版本的標題從 `## [0.9.2] - Unreleased` 改成發行日期，例如 `## [0.9.2] - 2026-10-24`，並檢查內容。
-3. 執行 `make fmt-check ci`，再用 `scripts/release-notes.sh 0.9.2` 預覽發行說明。
+2. 在 `CHANGELOG.md` 中，把該版本的標題從 `## [0.9.3] - Unreleased` 改成發行日期，例如 `## [0.9.3] - 2026-10-26`，並檢查內容。
+3. 執行 `make fmt-check ci`，再用 `scripts/release-notes.sh 0.9.3` 預覽發行說明。
 4. 提交並推送到 `main`，等待所有平台的 CI 都通過。標籤會建置它所指向的提交，若該提交的 CI 失敗，發行也會失敗。
 5. 為該提交加上標籤並推送：
 
    ```sh
-   git tag -a v0.9.2 -m "OxideMerge 0.9.2"
-   git push origin v0.9.2
+   git tag -a v0.9.3 -m "OxideMerge 0.9.3"
+   git push origin v0.9.3
    ```
 
-6. 開始下一個版本：在 `CHANGELOG.md` 最上方加入 `## [0.9.3] - Unreleased` 段落，之後的變更都記錄在這裡。
+6. 開始下一個版本：在 `CHANGELOG.md` 最上方加入 `## [0.9.4] - Unreleased` 段落，之後的變更都記錄在這裡。
 
-若發行建置失敗，請先在 `main` 上修正，再把標籤移到新的提交並重新推送（`git tag -f -a v0.9.2 -m "OxideMerge 0.9.2"` 與 `git push -f origin v0.9.2`）。
+若發行建置失敗，請先在 `main` 上修正，再把標籤移到新的提交並重新推送（`git tag -f -a v0.9.3 -m "OxideMerge 0.9.3"` 與 `git push -f origin v0.9.3`）。
 
 ## 使用方式
 
@@ -359,7 +363,9 @@ src/
   ui/               egui 應用程式、各種檢視、主題與介面元件
 build.rs            將圖示與版本資訊嵌入 Windows 執行檔
 assets/             應用程式圖示（.png、.ico）、Linux 桌面項目檔與 AppImage 啟動程式
-scripts/            `make appimage` 與 CI 使用的 Linux AppImage 打包指令碼，以及從 CHANGELOG.md 擷取發行說明的指令碼
+scripts/            `make appimage` 與 CI 使用的 Linux AppImage 打包指令碼、`make user-guide` 與 CI
+                    使用的使用者指南 PDF 建置指令碼，以及從 CHANGELOG.md 擷取發行說明的指令碼
+docs/               AsciiDoc 格式的使用者指南、其螢幕截圖與 PDF 佈景主題
 lang/               內建翻譯
 samples/            make 示範目標使用的檔案
 ```

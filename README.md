@@ -12,6 +12,9 @@ multilingual UI.
 
 The name comes from the language it is written in: rust is iron oxide.
 
+The [User Guide](docs/user-guide.adoc) ([繁體中文](docs/user-guide.zh-TW.adoc)) explains every view,
+option and command step by step. Each release also has it as PDF files.
+
 ![Start page](images/start.png)
 
 | Folder compare | Text compare |
@@ -226,6 +229,7 @@ A `Makefile` for GNU Make wraps the common tasks. It works on Windows and Unix.
 | `make shell-register` | Install, then add the file manager entries (Explorer, Finder Quick Actions, Nautilus, Nemo, Dolphin) |
 | `make dist` | Package the release binary into `dist/` (`.zip` on Windows, `.tar.gz` elsewhere) |
 | `make appimage` | Linux AppImage (x86_64 or aarch64, matching the machine) in `dist/` (same layout as CI; needs the X11, Wayland and keyboard libraries installed, and downloads `appimagetool`) |
+| `make user-guide` | User guide PDF files, English and Traditional Chinese, in `dist/` (same as CI; needs `asciidoctor-pdf`, `curl`, `shasum`, Python 3 with `fontTools`, fontconfig (`fc-match`) and the DejaVu Sans fonts, and downloads the Noto Sans CJK fonts) |
 | `make clean` | Remove build output |
 | `make help` | List all targets |
 
@@ -246,34 +250,36 @@ the `--cli` exit codes). The Arm64 packages are built and tested natively on Git
   Xvfb.
 - **macOS:** a universal (Apple silicon and Intel) `OxideMerge.app`, ad-hoc signed, in a `.dmg` and
   a `.zip`.
+- **User guide:** PDF files of the English and Traditional Chinese guides, built with
+  Asciidoctor PDF. A character that no font holds fails the build.
 
-Pushing a tag such as `v0.9.2` publishes all packages and `SHA256SUMS.txt` on a GitHub release. The
-tag must match the version in `Cargo.toml`, and tags containing `-` (for example `v1.0.0-rc1`) are
-marked as pre-releases. The release notes are the version's section of
+Pushing a tag such as `v0.9.3` publishes all packages, the user guides and `SHA256SUMS.txt` on a
+GitHub release. The tag must match the version in `Cargo.toml`, and tags containing `-` (for
+example `v1.0.0-rc1`) are marked as pre-releases. The release notes are the version's section of
 [`CHANGELOG.md`](CHANGELOG.md), followed by download instructions, so add that section before
-tagging; the build fails early if it is missing. `scripts/release-notes.sh 0.9.2` prints the notes
+tagging; the build fails early if it is missing. `scripts/release-notes.sh 0.9.3` prints the notes
 for a version. CI only reads `CHANGELOG.md`; it never edits it.
 
 To make a release:
 
 1. Set `version` in `Cargo.toml` and run `cargo build` so `Cargo.lock` picks it up.
-2. In `CHANGELOG.md`, change the version's heading from `## [0.9.2] - Unreleased` to the release
-   date, for example `## [0.9.2] - 2026-10-24`, and check its entries.
-3. Run `make fmt-check ci` and preview the notes with `scripts/release-notes.sh 0.9.2`.
+2. In `CHANGELOG.md`, change the version's heading from `## [0.9.3] - Unreleased` to the release
+   date, for example `## [0.9.3] - 2026-10-26`, and check its entries.
+3. Run `make fmt-check ci` and preview the notes with `scripts/release-notes.sh 0.9.3`.
 4. Commit and push to `main`, then wait for CI to pass on every platform. Tagging builds the commit
    the tag points at, so a commit that fails CI fails the release too.
 5. Tag that commit and push the tag:
 
    ```sh
-   git tag -a v0.9.2 -m "OxideMerge 0.9.2"
-   git push origin v0.9.2
+   git tag -a v0.9.3 -m "OxideMerge 0.9.3"
+   git push origin v0.9.3
    ```
 
-6. Start the next version: add a `## [0.9.3] - Unreleased` section at the top of `CHANGELOG.md`
+6. Start the next version: add a `## [0.9.4] - Unreleased` section at the top of `CHANGELOG.md`
    and record changes there as they land.
 
 If a release build fails, fix it on `main`, then move the tag to the new commit and push it again
-(`git tag -f -a v0.9.2 -m "OxideMerge 0.9.2"` and `git push -f origin v0.9.2`).
+(`git tag -f -a v0.9.3 -m "OxideMerge 0.9.3"` and `git push -f origin v0.9.3`).
 
 ## Usage
 
@@ -496,8 +502,10 @@ src/
   ui/               egui application, views, theme and widgets
 build.rs            embeds the icon and version details in the Windows executable
 assets/             application icon (.png, .ico), Linux desktop entry and AppImage launcher
-scripts/            Linux AppImage packaging used by `make appimage` and CI, and release notes
-                    taken from CHANGELOG.md
+scripts/            Linux AppImage packaging used by `make appimage` and CI, the user guide
+                    PDF build used by `make user-guide` and CI, and release notes taken
+                    from CHANGELOG.md
+docs/               user guide in AsciiDoc, its screenshots and PDF themes
 lang/               built-in translations
 samples/            files used by the make demo targets
 ```

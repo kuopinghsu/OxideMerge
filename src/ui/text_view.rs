@@ -78,6 +78,22 @@ impl Pane {
         self.baseline = line_hashes(&self.doc.lines);
         self.edited.clear();
     }
+
+    /// Reads the file of the pane again, as it is on disk now.
+    fn reload(&mut self) -> Result<(), String> {
+        let Some(path) = self.doc.path.clone() else {
+            return Ok(());
+        };
+        let mut d = text::load_doc(&path, Some(self.doc.encoding)).map_err(|e| e.to_string())?;
+        d.read_only = self.doc.read_only;
+        if d.lines != self.doc.lines {
+            self.hl_dirty = true;
+        }
+        self.doc = d;
+        self.disk_time = disk_time(&self.doc);
+        self.reset_baseline();
+        Ok(())
+    }
 }
 
 fn line_hashes(lines: &[String]) -> Vec<u64> {
@@ -1364,24 +1380,31 @@ impl TextView {
         }
         // A line still being typed is an edit of its file, which is then not reloaded.
         self.commit_pending_edit();
-        let mut reload = Vec::new();
+        let mut reloaded = Vec::new();
+        let mut failed = None;
         for (i, (p, now)) in self.panes.iter_mut().zip(times).enumerate() {
             if now.is_none() || now == p.disk_time {
                 continue;
             }
-            p.disk_time = now;
-            if p.doc.modified {
-                if !self.disk_changed.contains(&i) {
+            if p.doc.modified || p.doc.description.is_some() {
+                p.disk_time = now;
+                if p.doc.modified && !self.disk_changed.contains(&i) {
                     self.disk_changed.push(i);
                 }
-            } else {
-                reload.push(i);
+                continue;
+            }
+            // A file that cannot be read (say, still being written) is tried again next time.
+            match p.reload() {
+                Ok(()) => reloaded.push(p.doc.title()),
+                Err(e) => failed = Some(e),
             }
         }
-        if !reload.is_empty() {
-            self.refresh();
-            let names: Vec<String> = reload.iter().map(|&i| self.panes[i].doc.title()).collect();
-            self.status = trf("msg.reloaded", &[("file", names.join(", "))]);
+        if !reloaded.is_empty() {
+            self.rediff();
+            self.status = trf("msg.reloaded", &[("file", reloaded.join(", "))]);
+        }
+        if let Some(e) = failed {
+            self.status = e;
         }
     }
 
@@ -1474,17 +1497,7 @@ impl TextView {
             if p.doc.modified || p.doc.description.is_some() {
                 continue;
             }
-            if let Some(path) = p.doc.path.clone() {
-                if let Ok(mut d) = text::load_doc(&path, Some(p.doc.encoding)) {
-                    d.read_only = p.doc.read_only;
-                    if d.lines != p.doc.lines {
-                        p.hl_dirty = true;
-                    }
-                    p.doc = d;
-                    p.disk_time = disk_time(&p.doc);
-                    p.reset_baseline();
-                }
-            }
+            let _ = p.reload();
         }
         self.rediff();
     }

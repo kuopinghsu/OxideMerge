@@ -36,7 +36,8 @@ esac
 
 if [ -z "${VERSION:-}" ]; then
     VERSION=$(cargo pkgid)
-    VERSION=${VERSION##*@}
+    # "…#name@1.2.3", or "…#1.2.3" where the folder has the name of the package.
+    VERSION=${VERSION##*[#@]}
 fi
 
 target_dir=${CARGO_TARGET_DIR:-target}

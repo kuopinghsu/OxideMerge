@@ -404,15 +404,22 @@ fn rules_note(out: &mut String, rules: &str) {
     }
 }
 
+/// "{n} differences", or the wording for one.
+pub fn diff_count(n: usize) -> String {
+    let key = if n == 1 {
+        "report.text_summary_one"
+    } else {
+        "report.text_summary"
+    };
+    trf(key, &[("n", n.to_string())])
+}
+
 /// Line count badges of a 2-way result.
 fn stat_badges(out: &mut String, s: &Stats) {
     let _ = write!(
         out,
         "<span class=\"badge acc\">{}</span>",
-        esc(&trf(
-            "report.text_summary",
-            &[("n", s.differences.to_string())]
-        ))
+        esc(&diff_count(s.differences))
     );
     for (class, sign, n, key) in [
         ("add", "+", s.added, "report.added"),
@@ -801,10 +808,7 @@ pub fn folder_report(
                     let _ = write!(
                         files,
                         "<span class=\"badge acc\">{}</span>",
-                        esc(&trf(
-                            "report.text_summary",
-                            &[("n", list.len().to_string())]
-                        ))
+                        esc(&diff_count(list.len()))
                     );
                 }
                 let ignored = ignored_blocks(result);
@@ -1132,8 +1136,8 @@ mod tests {
         std::fs::write(a.path().join("long.txt"), &long).unwrap();
         std::fs::write(b.path().join("long.txt"), long + "end\n").unwrap();
         std::fs::write(b.path().join("new.bin"), b"PNG\0\x01\x02").unwrap();
-        // Only the last word differs, after the cut.
-        let wide = "w ".repeat(LINE_CHARS);
+        // Only the last word differs, after the cut; short enough to be compared by words.
+        let wide = "w ".repeat(LINE_CHARS / 2 + 100);
         std::fs::write(a.path().join("wide.txt"), format!("{wide}a\n")).unwrap();
         std::fs::write(b.path().join("wide.txt"), format!("{wide}b\n")).unwrap();
         let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];

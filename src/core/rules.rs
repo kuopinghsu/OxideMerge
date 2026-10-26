@@ -266,11 +266,12 @@ pub fn find_in(dirs: &[PathBuf], name: &str) -> Option<RuleSet> {
         return None;
     }
     let p = Path::new(name);
-    if is_rules_file(p) && p.is_file() {
+    // "Logs.oxrules" names the rules "Logs", not a file in the working folder; a path to a
+    // missing file names nothing.
+    let bare = p.parent().is_some_and(|d| d.as_os_str().is_empty());
+    if !bare && is_rules_file(p) && p.is_file() {
         return RuleSet::load(p);
     }
-    // "Logs.oxrules" names the rules "Logs"; a path to a missing file names nothing.
-    let bare = p.parent().is_some_and(|d| d.as_os_str().is_empty());
     let name = if bare { display_name(name) } else { name };
     let all = list_in(dirs);
     let exact = all.iter().position(|s| s.name == name);
@@ -281,6 +282,54 @@ pub fn find_in(dirs: &[PathBuf], name: &str) -> Option<RuleSet> {
 /// Whether two rules names are the same, letters compared regardless of case.
 pub fn same_name(a: &str, b: &str) -> bool {
     a == b || a.to_lowercase() == b.to_lowercase()
+}
+
+/// Which of the rules `names` the rules choice `spec` picks, as [`find_in`] takes it: that very
+/// name, else one differing in case only.
+pub fn picked<'a>(spec: &str, names: &[&'a str]) -> Option<&'a str> {
+    let name = display_name(spec);
+    if name.is_empty() {
+        return None;
+    }
+    let exact = names.iter().find(|n| **n == name);
+    exact
+        .or_else(|| names.iter().find(|n| same_name(n, name)))
+        .copied()
+}
+
+/// [`picked`] for a menu of the rules files `names` listed from [`dirs`]: a path picks the one
+/// listed at that path, if any.
+pub fn chosen<'a>(spec: &str, names: &[&'a str]) -> Option<&'a str> {
+    chosen_in(&dirs(), spec, names)
+}
+
+fn chosen_in<'a>(dirs: &[PathBuf], spec: &str, names: &[&'a str]) -> Option<&'a str> {
+    let p = Path::new(spec);
+    if p.parent().is_some_and(|d| !d.as_os_str().is_empty()) {
+        // Files hidden by one of the same name in a later folder are not listed.
+        let set = list_in(dirs).into_iter().find(|s| s.path == p)?;
+        return names.iter().find(|n| **n == set.name).copied();
+    }
+    picked(spec, names)
+}
+
+/// Whether the rules choice `spec` picks `set`, given the other rules files `all` (which may
+/// hold `set` too, or not anymore).
+pub fn picks(spec: &str, set: &RuleSet, all: &[RuleSet]) -> bool {
+    let p = Path::new(spec);
+    if p == set.path {
+        return true;
+    }
+    if p.parent().is_some_and(|d| !d.as_os_str().is_empty()) {
+        return false;
+    }
+    let mut names: Vec<&str> = all
+        .iter()
+        .filter(|s| s.path != set.path)
+        .map(|s| s.name.as_str())
+        .collect();
+    names.insert(0, &set.name);
+    picked(spec, &names) == Some(set.name.as_str())
 }
 
 pub fn find(name: &str) -> Option<RuleSet> {
@@ -400,9 +449,9 @@ pub struct Imported {
     pub unsaved: Vec<String>,
 }
 
-/// Copies the rules files `files` into `dir`. A file with the name of one already there but
-/// other rules is added under a free name ("Name 2", ...); one with the same name and rules there
-/// or in `others` is left out.
+/// Copies the rules files `files` into `dir`. A file with the name of one already there or in
+/// `others` but other rules is added under a free name ("Name 2", ...); one with the same name
+/// and rules is left out.
 pub fn import_into(dir: &Path, files: &[PathBuf], others: &[PathBuf]) -> Imported {
     let mut done = Imported::default();
     for file in files {
@@ -414,11 +463,12 @@ pub fn import_into(dir: &Path, files: &[PathBuf], others: &[PathBuf]) -> Importe
             done.failed.push(shown);
             continue;
         };
-        let existing = list_in(&[dir.to_path_buf()]);
         let base = file_name(&set.name);
-        let mut known = others.to_vec();
-        known.push(dir.to_path_buf());
-        if let Some(e) = list_in(&known)
+        let mut dirs = others.to_vec();
+        dirs.push(dir.to_path_buf());
+        // A name used in another folder is taken too: a copy would hide the rules there.
+        let known = list_in(&dirs);
+        if let Some(e) = known
             .iter()
             .find(|e| same_name(&e.name, &base) && e.same_rules(&set))
         {
@@ -438,7 +488,7 @@ pub fn import_into(dir: &Path, files: &[PathBuf], others: &[PathBuf]) -> Importe
             };
             let fresh = RuleSet::new(dir, &name);
             let taken =
-                fresh.path.exists() || existing.iter().any(|e| same_name(&e.name, &fresh.name));
+                fresh.path.exists() || known.iter().any(|e| same_name(&e.name, &fresh.name));
             if !taken {
                 copy.name = fresh.name;
                 copy.path = fresh.path;
@@ -647,6 +697,36 @@ mod tests {
     }
 
     #[test]
+    fn choices_pick_rules_as_finding_them_does() {
+        let dir = Path::new("/rules");
+        let (upper, lower) = (RuleSet::new(dir, "Logs"), RuleSet::new(dir, "logs"));
+        let both = [upper.clone(), lower.clone()];
+        assert!(picks("Logs", &upper, &both) && !picks("Logs", &lower, &both));
+        assert!(picks("logs", &lower, &both) && !picks("logs", &upper, &both));
+        assert!(picks("LOGS", &upper, std::slice::from_ref(&upper)));
+        assert!(picks("Logs", &upper, &[]));
+        assert!(picks(upper.path.to_str().unwrap(), &upper, &both));
+        assert!(!picks("/elsewhere/Logs.oxrules", &upper, &both));
+        assert_eq!(picked("Logs.oxrules", &["logs", "Logs"]), Some("Logs"));
+        assert_eq!(picked("LOGS", &["logs", "Logs"]), Some("logs"));
+        assert_eq!(picked("", &["Logs"]), None);
+    }
+
+    #[test]
+    fn a_path_chooses_the_file_listed_there_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = [tmp.path().to_path_buf()];
+        let logs = RuleSet::new(tmp.path(), "Logs");
+        logs.save().unwrap();
+        let path = logs.path.display().to_string();
+        assert_eq!(chosen_in(&dirs, &path, &["Logs"]), Some("Logs"));
+        let elsewhere = tempfile::tempdir().unwrap();
+        let other = elsewhere.path().join("Logs.oxrules").display().to_string();
+        assert_eq!(chosen_in(&dirs, &other, &["Logs"]), None);
+        assert_eq!(chosen_in(&dirs, "logs", &["Logs"]), Some("Logs"));
+    }
+
+    #[test]
     fn names_as_files_name_them() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = [tmp.path().to_path_buf()];
@@ -777,6 +857,19 @@ mod tests {
         assert_eq!(again.added, ["Logs 3"]);
         assert_eq!(RuleSet::load(&theirs).unwrap().ignore_lines, ["theirs"]);
         assert!(is_rules_file(&back.path().join("Logs 2.OXRULES")));
+
+        // A name of the folder next to the program is not hidden by an import.
+        let next_to_exe = tempfile::tempdir().unwrap();
+        let mut team = RuleSet::new(next_to_exe.path(), "Team");
+        team.ignore_lines = vec!["^x".into()];
+        team.save().unwrap();
+        let mine = out.path().join("Team.oxrules");
+        export_to(&RuleSet::new(out.path(), "Team"), &mine).unwrap();
+        let others = [next_to_exe.path().to_path_buf()];
+        assert_eq!(
+            import_into(rules_dir.path(), &[mine], &others).added,
+            ["Team 2"]
+        );
     }
 
     #[test]

@@ -489,6 +489,7 @@
   "report.search": "筛选文件…",
   "report.side_by_side": "并排",
   "report.text_summary": "{n} 处差异",
+  "report.text_summary_one": "{n} 处差异",
   "report.text_title": "文件比较报告",
   "report.theme": "浅色或深色主题",
   "report.title": "文件夹比较报告",

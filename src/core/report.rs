@@ -126,7 +126,7 @@ pub(crate) fn esc(s: &str) -> String {
 fn csv_field(s: &str) -> String {
     // Spreadsheets run a cell starting like a formula; a leading ' keeps it text.
     let formula = s.starts_with(['=', '+', '@', '\t', '\r'])
-        || (s.starts_with('-') && !s[1..].starts_with(|c: char| c.is_ascii_digit()) && s.len() > 1);
+        || (s.starts_with('-') && s.len() > 1 && s.parse::<f64>().is_err());
     let s = if formula {
         format!("'{s}")
     } else {
@@ -393,6 +393,8 @@ mod tests {
         assert_eq!(csv_field("=cmd()"), "'=cmd()");
         assert_eq!(csv_field("-x"), "'-x");
         assert_eq!(csv_field("-5"), "-5");
+        assert_eq!(csv_field("-2.5e3"), "-2.5e3");
+        assert_eq!(csv_field("-2+3+cmd|x"), "'-2+3+cmd|x");
         assert_eq!(csv_field("a\rb"), "\"a\rb\"");
         assert_eq!(csv_field("a,\"b\""), "\"a,\"\"b\"\"\"");
         assert_eq!(csv_field("plain.txt"), "plain.txt");

@@ -489,6 +489,7 @@
   "report.search": "Dateien filtern…",
   "report.side_by_side": "Nebeneinander",
   "report.text_summary": "{n} Unterschiede",
+  "report.text_summary_one": "{n} Unterschied",
   "report.text_title": "Dateivergleichsbericht",
   "report.theme": "Helles oder dunkles Design",
   "report.title": "Ordnervergleichsbericht",

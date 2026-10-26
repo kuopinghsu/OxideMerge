@@ -3,10 +3,14 @@
 All notable changes to OxideMerge are listed here, newest first. Each release on GitHub uses its
 section of this file as the release notes.
 
-## [0.9.3] - Unreleased
+## [0.9.3] - 2026-10-26
 
 ### Added
 
+- A user guide in AsciiDoc, in English (`docs/user-guide.adoc`) and Traditional Chinese
+  (`docs/user-guide.zh-TW.adoc`), with screenshots of each view in both languages, linked from the
+  READMEs. CI builds both as PDF files, attached to each GitHub release; `make user-guide` builds
+  them locally.
 - **All differences** (folder toolbar, Compare menu or command palette): every changed text file
   of a folder compare in one tab, with its differences side by side as in the HTML report, a file
   list with search, expand and collapse all, next and previous difference across files, copying a
@@ -87,8 +91,8 @@ section of this file as the release notes.
 ### Fixed
 
 - `⌘Q` on macOS asks about unsaved changes like closing the window does, instead of quitting at
-  once, also when the window is minimized and when quitting from the Dock, at logout or from a
-  script.
+  once, also when the window is minimized or the app hidden and when quitting from the Dock, at
+  logout or from a script.
 - Saving text in a legacy encoding (Big5, Shift_JIS, ...) that can't hold some of its characters
   is refused with a message, instead of writing them as `&#...;` entities.
 - A relative path given to `--rules` or in a project file is read from where it was given (the
@@ -107,17 +111,51 @@ section of this file as the release notes.
   it.
 - Saving in All differences says which files had mixed line endings written as one kind, and a
   text compare stops showing "mixed" for a file once it is saved.
+- A file with one difference says "1 difference" in All differences and in HTML reports.
 - Three-way reports colour only the sides that changed. The CSV report starts with a byte order
-  mark so spreadsheets read it as UTF-8.
+  mark so spreadsheets read it as UTF-8, and keeps names like `-2+3+cmd|...` as text.
+- Saving no longer empties a file when the disk is full or the disk quota is used up: a save that
+  fails leaves the file as it was, and no empty file when it was new. The options are saved the
+  same way.
+- Compare options given on the command line (`--ignore-case`, `--lang`, ...) apply to that run
+  only, instead of becoming the saved options the next time an option changed. Each one is kept
+  only if it was changed in the program afterwards.
+- Patches leave out the differences the compare options ignore, as `diff -B` does, except inside
+  a hunk with other changes, where leaving them out would make the patch drop lines. The console
+  compare of three binary files reads the third one, and its byte ranges end at the last byte that
+  differs.
+- Reports and patches of a folder compare wait until it has finished, and quitting waits for a
+  report still being written. Report file names get `.html` when typed without it.
+- Adding a rule to a typed name with a folder in it (`Team/Logs`) saves it in the rules folder
+  (as `Team_Logs`) instead of a file without extension in the current folder. Importing a rules
+  file named like one next to the program adds it under a free name instead of hiding that one,
+  and a rules file dropped on the window updates the open compares. Renaming or deleting a rules
+  file updates the compares using that very file, telling names apart by case where file names
+  keep it. A project opened by a relative path reads its rules file from the project's folder.
+  The Compare rules menus tick a rules file used by its path only when it is the one listed, not
+  another file of the same name.
+- The rules editor keeps the file of a rules file whose name is not a usual file name while the
+  name is unchanged, renames it back when saving after a change of case fails, warns again about
+  unsaved edits after further typing, and checks the patterns that will be saved.
+- All differences reads files only as fast as the tab shows them and also lets go of their rows
+  far out of view, keeping memory down; reads files changed on disk in the background, a few at a
+  time; no longer replaces saved text with a reading made before the save; takes the line endings
+  along with a whole-file copy; counts files saved rather than sides; says when files are still
+  being compared, when an undo can't be applied, and drops the "stopped" note once the folder
+  compare has finished.
+- Closing several tabs and then quitting no longer goes back to asking about the other tabs, and
+  files opened from an archive compare keep its extracted copy after the folder compare closes.
 - The console compare exits with 2 when files could not be compared, and folders left uncompared
   (not recursive) no longer count as differences. `--numeric-tolerance` refuses NaN and infinity,
   and options that are ignored (`--patch` with three paths, `--report-diffs` without `--report` or
   for files, a text report not named `.html`) say so.
-- Shortcuts of commands that do nothing in the current tab are left to the focused field, the
+- Shortcuts of commands that do nothing in the current tab do nothing (`Ctrl+Shift+Z` no longer
+  runs Undo where there is no Redo), F5 refreshes web pages shown as screenshots, the
   Filters window no longer turns the shortcuts off, files dropped while a dialog is open are
   ignored, and Enter in the command palette runs the command matching what was just typed.
 - A text compare whose file changed on disk while one of its lines was being edited no longer
-  says it reloaded it.
+  says it reloaded it, and a file that could not be read when it changed is tried again instead of
+  being reported as reloaded.
 - `Ctrl+Tab` no longer leaves the keyboard focus on a button, which turned off the arrow keys and
   the other keys of the compare until it was clicked.
 - `Ctrl+S`, closing a tab and quitting take in a line still being typed in place, instead of

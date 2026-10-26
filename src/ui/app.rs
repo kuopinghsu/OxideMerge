@@ -108,9 +108,9 @@ pub struct Tab {
     pub source: Vec<PathBuf>,
     /// The folder compare this tab was opened from, for moving on to its next or previous file.
     origin: Option<Origin>,
-    /// Temporary copy of a side (a Git revision), deleted with the last tab showing it: the
-    /// folder compare and the files opened from it.
-    temp: Option<std::sync::Arc<tempfile::TempDir>>,
+    /// Temporary copies of sides (a Git revision, extracted archives), deleted with the last
+    /// tab showing them: the folder compare and the files opened from it.
+    temps: Vec<std::sync::Arc<tempfile::TempDir>>,
 }
 
 #[derive(Clone)]
@@ -122,6 +122,18 @@ struct Origin {
 }
 
 impl Tab {
+    /// The temporary copies files opened from this tab need kept: its own and the extracted
+    /// archives its folder compare shows.
+    fn shown_temps(&self) -> Vec<std::sync::Arc<tempfile::TempDir>> {
+        let mut temps = self.temps.clone();
+        match self.content.view() {
+            Content::Folder(v) => temps.extend(v.temps().iter().cloned()),
+            Content::Diffs(v) => temps.extend(v.temps().iter().cloned()),
+            _ => {}
+        }
+        temps
+    }
+
     fn title(&self) -> String {
         match &self.content {
             Content::Folder(v) => v.title(),
@@ -482,10 +494,18 @@ fn save_rule_edit(d: &mut OptionsDialog) -> bool {
         return false;
     }
     let moved = match renamed {
-        Some(o) if recased => std::fs::rename(&o.path, &set.path),
-        _ => Ok(()),
+        Some(o) if recased => std::fs::rename(&o.path, &set.path).map(|()| Some(o)),
+        _ => Ok(None),
     };
-    if let Err(err) = moved.and_then(|()| set.save()) {
+    let saved = moved.and_then(|moved| {
+        set.save().inspect_err(|_| {
+            // The file goes back to its name, which the editor still knows it by.
+            if let Some(o) = moved {
+                let _ = std::fs::rename(&set.path, &o.path);
+            }
+        })
+    });
+    if let Err(err) = saved {
         d.rule_error = Some(err.to_string());
         return false;
     }
@@ -500,7 +520,7 @@ fn save_rule_edit(d: &mut OptionsDialog) -> bool {
                 ));
             }
         }
-        if rules::same_name(&d.cfg.rules, &o.name) {
+        if rules::picks(&d.cfg.rules, o, &d.rule_sets) {
             d.cfg.rules = set.name.clone();
         }
         d.rules_renamed.push((o.clone(), set.name.clone()));
@@ -571,7 +591,7 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
             }
             ui.end_row();
             for set in &d.rule_sets {
-                let on = rules::same_name(rules::display_name(&d.cfg.rules), &set.name);
+                let on = rules::picks(&d.cfg.rules, set, &d.rule_sets);
                 if ui
                     .radio(on, &set.name)
                     .on_hover_text(set.path.display().to_string())
@@ -650,6 +670,11 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
             });
         });
     });
+    // Another action disarms a delete waiting to be confirmed, and replaces an earlier note.
+    if edit.is_some() || !import.is_empty() || export.is_some() {
+        d.rule_delete = None;
+        d.rule_note = None;
+    }
     if !import.is_empty() {
         let (msg, failed) = import_rules(&import);
         if failed {
@@ -707,7 +732,7 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
         d.rule_delete = None;
         match std::fs::remove_file(&set.path) {
             Ok(()) => {
-                if rules::same_name(&d.cfg.rules, &set.name) {
+                if rules::picks(&d.cfg.rules, &set, &d.rule_sets) {
                     d.cfg.rules.clear();
                 }
                 let path = d
@@ -743,6 +768,7 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
     }
     let mut save = false;
     let mut cancel = false;
+    let mut edited = false;
     if let Some(e) = &mut d.rule_edit {
         ui.add_space(6.0);
         let editor = egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -753,7 +779,9 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
                 .show(ui, |ui| {
                     ui.label(tr("col.name"));
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut e.name).desired_width(320.0));
+                        edited |= ui
+                            .add(egui::TextEdit::singleline(&mut e.name).desired_width(320.0))
+                            .changed();
                         let saved = rules::file_name(&e.name);
                         if saved != e.name.trim() {
                             ui.label(
@@ -765,9 +793,12 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
                     });
                     ui.end_row();
                     ui.label(tr("filters.desc"));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut e.description).desired_width(f32::INFINITY),
-                    );
+                    edited |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut e.description)
+                                .desired_width(f32::INFINITY),
+                        )
+                        .changed();
                     ui.end_row();
                 });
             let list = |ui: &mut egui::Ui,
@@ -782,22 +813,17 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
                         .code_editor()
                         .desired_rows(rows)
                         .desired_width(f32::INFINITY),
-                );
+                )
+                .changed()
             };
-            list(ui, "rules.lines", "opt.line_filters_hint", &mut e.lines, 3);
+            edited |= list(ui, "rules.lines", "opt.line_filters_hint", &mut e.lines, 3);
             regex_warning(ui, e.lines.lines().map(String::from));
-            list(
+            edited |= list(
                 ui,
                 "rules.substitutions",
                 "opt.substitutions_hint",
                 &mut e.substitutions,
                 3,
-            );
-            regex_warning(
-                ui,
-                parse_arrow_pairs(&e.substitutions)
-                    .into_iter()
-                    .map(|(a, _)| a),
             );
             let old_subs: Vec<(String, String)> = e
                 .original
@@ -805,19 +831,19 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
                 .flat_map(|o| &o.substitutions)
                 .map(|s| (s.find.clone(), s.replace.clone()))
                 .collect();
+            regex_warning(
+                ui,
+                edited_pairs(&e.substitutions, &old_subs)
+                    .into_iter()
+                    .map(|(a, _)| a),
+            );
             arrow_warning(ui, &unclear_arrow_lines(&e.substitutions, &old_subs, false));
-            list(
+            edited |= list(
                 ui,
                 "rules.blocks",
                 "opt.block_filters_hint",
                 &mut e.blocks,
                 2,
-            );
-            regex_warning(
-                ui,
-                parse_arrow_pairs(&e.blocks)
-                    .into_iter()
-                    .flat_map(|(a, b)| [a, b]),
             );
             let old_blocks: Vec<(String, String)> = e
                 .original
@@ -825,6 +851,12 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
                 .flat_map(|o| &o.ignore_blocks)
                 .map(|b| (b.start.clone(), b.end.clone()))
                 .collect();
+            regex_warning(
+                ui,
+                edited_pairs(&e.blocks, &old_blocks)
+                    .into_iter()
+                    .flat_map(|(a, b)| [a, b]),
+            );
             arrow_warning(ui, &unclear_arrow_lines(&e.blocks, &old_blocks, true));
             ui.horizontal(|ui| {
                 if widgets::primary_button(ui, tr("rules.save")).clicked() {
@@ -838,6 +870,11 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
         if started {
             editor.response.scroll_to_me(Some(Align::Min));
         }
+    }
+    if edited {
+        // The changes shown to be unsaved are not these anymore.
+        d.rule_discard = false;
+        d.rule_note = None;
     }
     if let Some(err) = &d.rule_error {
         ui.label(
@@ -970,7 +1007,13 @@ impl RuleEdit {
     /// The edited rules, as a file in `dir` unless it keeps the name it had.
     fn to_set(&self, dir: &Path) -> RuleSet {
         let mut set = RuleSet::new(dir, &self.name);
-        if let Some(o) = self.original.as_ref().filter(|o| o.name == set.name) {
+        // A file whose name is not one made for a new file (say "a:b") keeps it while unchanged.
+        if let Some(o) = self
+            .original
+            .as_ref()
+            .filter(|o| o.name == set.name || o.name == self.name.trim())
+        {
+            set.name = o.name.clone();
             set.path = o.path.clone();
         }
         set.description = self.description.trim().to_string();
@@ -1054,10 +1097,11 @@ struct PatchDialog {
 }
 
 #[derive(Clone, Copy)]
+/// Questions about unsaved changes; tabs are named by id, as others may close meanwhile.
 enum Prompt {
-    CloseTab(usize),
+    CloseTab(u64),
     /// Replace the tab with the next (true) or previous (false) file of its folder compare.
-    SwitchFile(usize, bool),
+    SwitchFile(u64, bool),
     Exit,
 }
 
@@ -1080,6 +1124,8 @@ struct Toast {
 pub struct OxideMergeApp {
     cfg: Config,
     saved_cfg: Config,
+    /// The config with the options of the command line, and as loaded without them.
+    cli_options: Option<(Config, Config)>,
     tabs: Vec<Tab>,
     active: usize,
     open_dlg: Option<OpenDialog>,
@@ -1141,9 +1187,10 @@ fn kind_from_name(s: &str) -> Option<FileKind> {
 /// What opening the project file `path` compares.
 fn project_request(path: &Path) -> anyhow::Result<OpenRequest> {
     let p = Project::load(path)?;
-    let base = path.parent().unwrap_or(Path::new(""));
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let base = abs.parent().unwrap_or(Path::new(""));
     Ok(OpenRequest {
-        paths: p.resolved_paths(path),
+        paths: p.resolved_paths(&abs),
         descriptions: p.descriptions.clone(),
         read_only: p.read_only.clone(),
         kind: p.kind.as_deref().and_then(kind_from_name),
@@ -1153,6 +1200,36 @@ fn project_request(path: &Path) -> anyhow::Result<OpenRequest> {
         rules: p.rules.as_deref().map(|r| rules::absolute_spec(r, base)),
         ..Default::default()
     })
+}
+
+/// `now`, with each field still as the command line set it (`cli`) put back as it was loaded.
+fn unchanged_as_loaded<T>(now: &T, cli: &T, loaded: &T) -> T
+where
+    T: Clone + serde::Serialize + serde::de::DeserializeOwned,
+{
+    let as_map = |v: &T| match serde_json::to_value(v) {
+        Ok(serde_json::Value::Object(m)) => Some(m),
+        _ => None,
+    };
+    let (Some(mut out), Some(cli), Some(loaded)) = (as_map(now), as_map(cli), as_map(loaded))
+    else {
+        return now.clone();
+    };
+    for (k, v) in out.iter_mut() {
+        if cli.get(k) == Some(v) {
+            if let Some(l) = loaded.get(k) {
+                *v = l.clone();
+            }
+        }
+    }
+    serde_json::from_value(serde_json::Value::Object(out)).unwrap_or_else(|_| now.clone())
+}
+
+/// `path` with ".html" added to its name.
+fn with_html_ext(path: PathBuf) -> PathBuf {
+    let mut name = path.into_os_string();
+    name.push(".html");
+    name.into()
 }
 
 /// An empty editable document for File → New.
@@ -1197,6 +1274,8 @@ struct Menus {
     has_source: bool,
     /// The folder compare of the tab is still running.
     folder_busy: bool,
+    /// The tab compares web pages, whichever way it shows them.
+    web: bool,
     tabs: usize,
     picked: Option<Cmd>,
     /// Compare rules file picked for the active tab ("" = none).
@@ -1213,6 +1292,7 @@ impl Menus {
             (SaveAs(p), _) => p < self.panes,
             (TakeBoth(_), _) => self.can_take_both,
             (SaveProject, _) => self.has_source,
+            (Refresh, _) if self.web => true,
             (NextTab | PrevTab, _) => self.tabs > 1,
             (CloseTab | CloseAllTabs | SaveAll, _) => self.tabs > 0,
             (CompareAs(_), Text | Binary | Image | Web) => self.has_source,
@@ -1230,9 +1310,12 @@ impl Menus {
                 | BookmarkComment | Indent(_) | SaveComparison,
                 Text,
             ) => true,
-            (Find | CopyRight | CopyLeft | SelectPattern | ReportWithDiffs, Folder) => true,
-            (Patch, Text | Folder) => self.sides == 2,
-            (ExportHtml | Report | Statistics, Text | Folder) => true,
+            (Find | CopyRight | CopyLeft | SelectPattern | Statistics, Folder) => true,
+            // A report or patch of a folder compare still running would miss files.
+            (ReportWithDiffs | ExportHtml | Report, Folder) => !self.folder_busy,
+            (Patch, Folder) => self.sides == 2 && !self.folder_busy,
+            (Patch, Text) => self.sides == 2,
+            (ExportHtml | Report | Statistics, Text) => true,
             (Refresh, Text | Folder | Web) => true,
             (AllDiffs, Folder) => !self.folder_busy,
             (
@@ -1601,9 +1684,11 @@ fn dashed_rect(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
 }
 
 impl OxideMergeApp {
+    /// `stored` is the config as loaded, before the options of the command line went into `cfg`.
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         cfg: Config,
+        stored: Config,
         initial: Option<OpenRequest>,
     ) -> Self {
         let lang = i18n::current_language().to_string();
@@ -1613,6 +1698,7 @@ impl OxideMergeApp {
         let applied_lang = cfg.language.clone();
         let mut app = OxideMergeApp {
             saved_cfg: cfg.clone(),
+            cli_options: (cfg != stored).then(|| (cfg.clone(), stored)),
             cfg,
             tabs: Vec::new(),
             active: 0,
@@ -2049,7 +2135,7 @@ impl OxideMergeApp {
         self.cfg.add_recent_path(&path.display().to_string());
         self.push_tab(content, Vec::new());
         if let Some(t) = self.tabs.last_mut() {
-            t.temp = Some(std::sync::Arc::new(temp));
+            t.temps = vec![std::sync::Arc::new(temp)];
         }
         Ok(())
     }
@@ -2107,7 +2193,7 @@ impl OxideMergeApp {
             content,
             source,
             origin: None,
-            temp: None,
+            temps: Vec::new(),
         });
         self.active = self.tabs.len() - 1;
     }
@@ -2123,7 +2209,7 @@ impl OxideMergeApp {
             .tabs
             .iter()
             .find(|t| t.id == folder)
-            .map(|t| &t.content)
+            .map(|t| t.content.view())
         else {
             return;
         };
@@ -2136,7 +2222,7 @@ impl OxideMergeApp {
                 "msg.no_prev_file"
             }));
         } else if self.tabs[ti].is_modified() {
-            self.prompt = Some(Prompt::SwitchFile(ti, forward));
+            self.prompt = Some(Prompt::SwitchFile(self.tabs[ti].id, forward));
         } else {
             self.switch_file(ti, forward);
         }
@@ -2146,13 +2232,13 @@ impl OxideMergeApp {
         let Some(Origin { folder, rel }) = self.tabs.get(ti).and_then(|t| t.origin.clone()) else {
             return;
         };
-        let temp = self.tabs[ti].temp.clone();
+        let temps = self.tabs[ti].temps.clone();
         let cfg = &self.cfg;
         let Some(Content::Folder(f)) = self
             .tabs
             .iter_mut()
             .find(|t| t.id == folder)
-            .map(|t| &mut t.content)
+            .map(|t| t.content.view_mut())
         else {
             return;
         };
@@ -2198,7 +2284,7 @@ impl OxideMergeApp {
         }
         self.notify(trf("msg.file_switched", &[("file", rel.clone())]));
         tab.origin = Some(Origin { folder, rel });
-        tab.temp = temp;
+        tab.temps = temps;
         self.tabs[ti] = tab;
         self.active = ti;
     }
@@ -2208,7 +2294,8 @@ impl OxideMergeApp {
             return;
         }
         if !force && self.tabs[i].is_modified() {
-            self.prompt = Some(Prompt::CloseTab(i));
+            self.close_queue.clear();
+            self.prompt = Some(Prompt::CloseTab(self.tabs[i].id));
             return;
         }
         self.refresh_saved_folders();
@@ -2253,10 +2340,29 @@ impl OxideMergeApp {
             let id = self.close_queue.remove(0);
             if let Some(i) = self.tabs.iter().position(|t| t.id == id && t.is_modified()) {
                 self.active = i;
-                self.prompt = Some(Prompt::CloseTab(i));
+                self.prompt = Some(Prompt::CloseTab(id));
                 return;
             }
         }
+    }
+
+    /// The config to write: options given on the command line are for this run only, so
+    /// those not changed since are written as they were loaded.
+    fn stored_cfg(&self) -> Config {
+        let mut c = self.cfg.clone();
+        if let Some((cli, loaded)) = &self.cli_options {
+            if c.language == cli.language {
+                c.language = loaded.language.clone();
+            }
+            c.diff = unchanged_as_loaded(&c.diff, &cli.diff, &loaded.diff);
+            if c.folder.method == cli.folder.method {
+                c.folder.method = loaded.folder.method;
+            }
+            if c.folder.recursive == cli.folder.recursive {
+                c.folder.recursive = loaded.folder.recursive;
+            }
+        }
+        c
     }
 
     // ---------- commands ----------
@@ -2300,7 +2406,8 @@ impl OxideMergeApp {
 
     /// Points the options and the compares that use the rules file `old` at `new` ("" = none).
     fn rules_renamed(&mut self, old: &RuleSet, new: &str) {
-        let uses = |r: &str| rules::same_name(r, &old.name) || Path::new(r) == old.path;
+        let all = rules::list();
+        let uses = |r: &str| rules::picks(r, old, &all);
         if uses(&self.cfg.rules) {
             self.cfg.rules = new.to_string();
         }
@@ -2348,21 +2455,31 @@ impl OxideMergeApp {
     /// uses, and so does the folder compare that file compare was opened from when they used the
     /// same rules: its name, and whether that folder compare has to be refreshed.
     fn save_rule(&mut self, d: &RuleDialog) -> std::io::Result<(String, bool)> {
-        let mut set = match rules::find(&d.target) {
+        let target = Path::new(&d.target);
+        // Only a whole path names a file; anything else is a name, made fit to be one.
+        let is_file = target.is_absolute() && rules::is_rules_file(target);
+        let name = if is_file {
+            rules::display_name(&d.target).to_string()
+        } else {
+            rules::file_name(&d.target)
+        };
+        let found = match rules::find(&d.target) {
+            None if !is_file => rules::find(&name),
+            found => found,
+        };
+        let mut set = match found {
             Some(set) => set,
             None => {
-                let target = Path::new(&d.target);
-                let bare = target.parent().is_none_or(|p| p.as_os_str().is_empty());
-                let set = if bare {
-                    let dir =
-                        rules::dir().ok_or_else(|| std::io::Error::other(tr("msg.no_config")))?;
-                    RuleSet::new(&dir, rules::display_name(&d.target))
-                } else {
+                let set = if is_file {
                     RuleSet {
-                        name: rules::display_name(&d.target).to_string(),
+                        name,
                         path: target.to_path_buf(),
                         ..RuleSet::default()
                     }
+                } else {
+                    let dir =
+                        rules::dir().ok_or_else(|| std::io::Error::other(tr("msg.no_config")))?;
+                    RuleSet::new(&dir, &name)
                 };
                 if set.path.exists() {
                     return Err(std::io::Error::other(trf(
@@ -2375,11 +2492,11 @@ impl OxideMergeApp {
         };
         set.add(&d.draft);
         set.save()?;
-        let picked_file = Path::new(&d.target);
-        let spec = if rules::is_rules_file(picked_file) && picked_file.is_file() {
-            d.target.clone()
-        } else {
+        // The name, unless it finds other rules (or none): then the file.
+        let spec = if rules::find(&set.name).is_some_and(|s| s.path == set.path) {
             set.name.clone()
+        } else {
+            set.path.display().to_string()
         };
         self.rules_changed();
         let cfg = self.cfg.clone();
@@ -2796,6 +2913,12 @@ impl OxideMergeApp {
                     self.error(errors.join("\n"));
                 }
             }
+            Cmd::Patch | Cmd::ExportHtml | Cmd::Report | Cmd::ReportWithDiffs
+                if matches!(self.tabs.get(self.active).map(|t| t.content.view()),
+                    Some(Content::Folder(v)) if v.is_running()) =>
+            {
+                self.notify(tr("msg.comparing"));
+            }
             Cmd::Patch => {
                 self.patch_dlg = Some(PatchDialog {
                     style: self.cfg.patch_style,
@@ -3015,9 +3138,11 @@ impl OxideMergeApp {
         else {
             return;
         };
-        let ext = crate::core::text::extension(&path);
-        if !matches!(ext.as_str(), "html" | "htm" | "csv" | "txt") {
-            path = PathBuf::from(format!("{}.html", path.display()));
+        if !matches!(
+            crate::core::text::extension(&path).as_str(),
+            "html" | "htm" | "csv" | "txt"
+        ) {
+            path = with_html_ext(path);
         }
         let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
             return;
@@ -3063,12 +3188,12 @@ impl OxideMergeApp {
             let Content::Diffs(v) = &mut self.tabs[i].content else {
                 return;
             };
-            if !v.lists_all(&src) {
-                if v.is_modified() || v.can_undo() {
-                    self.notify(tr("diffs.outdated"));
-                } else {
-                    v.update_from(src);
-                }
+            if v.lists_all(&src) {
+                v.set_stopped(src.stopped);
+            } else if v.is_modified() || v.can_undo() {
+                self.notify(tr("diffs.outdated"));
+            } else {
+                v.update_from(src);
             }
             return;
         }
@@ -3077,10 +3202,10 @@ impl OxideMergeApp {
             self.notify(tr("diffs.empty"));
             return;
         }
-        let temp = tab.temp.clone();
+        let temps = tab.temps.clone();
         self.push_tab(Content::Diffs(view), Vec::new());
         if let Some(t) = self.tabs.last_mut() {
-            t.temp = temp;
+            t.temps = temps;
         }
     }
 
@@ -3162,6 +3287,10 @@ impl OxideMergeApp {
             .add_filter("HTML", &["html", "htm"])
             .set_file_name(name)
             .save_file()
+            .map(|p| match crate::core::text::extension(&p).as_str() {
+                "html" | "htm" => p,
+                _ => with_html_ext(p),
+            })
     }
 
     fn spawn_report(&mut self, path: PathBuf, job: impl FnOnce() -> String + Send + 'static) {
@@ -3607,8 +3736,9 @@ impl OxideMergeApp {
                     Scope::View => !typing,
                     Scope::System => false,
                 };
-                // A key whose command does nothing here is left to the focused widget.
-                if active && menus.enabled(b.cmd) && commands::consume(i, b) {
+                // A key whose command does nothing here is still taken: left in, Ctrl+Shift+Z of a
+                // disabled Redo would go on to match Ctrl+Z (Undo), which ignores Shift.
+                if active && commands::consume(i, b) && menus.enabled(b.cmd) {
                     cmds.push(b.cmd);
                 }
             }
@@ -3646,6 +3776,7 @@ impl OxideMergeApp {
             can_take_both: matches!(view, Some(Content::Text(v)) if v.can_take_both()),
             has_source: tab.is_some_and(|t| t.source.len() >= 2),
             folder_busy: matches!(view, Some(Content::Folder(v)) if v.is_running()),
+            web: matches!(tab.map(|t| &t.content), Some(Content::Web(_))),
             tabs: self.tabs.len(),
             picked: None,
             rules: None,
@@ -3872,7 +4003,7 @@ impl OxideMergeApp {
         let names_id = egui::Id::new("menu_rule_names");
         ui.add_enabled_ui(tab_rules.is_some(), |ui| {
             let shown = ui.menu_button(tr("menu.rules"), |ui| {
-                let current = rules::display_name(tab_rules.as_deref().unwrap_or_default());
+                let current = tab_rules.as_deref().unwrap_or_default();
                 if ui.radio(current.is_empty(), tr("rules.none")).clicked() {
                     m.rules = Some(String::new());
                 }
@@ -3886,8 +4017,10 @@ impl OxideMergeApp {
                         })
                         .clone()
                 });
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                let picked = rules::chosen(current, &refs).map(str::to_string);
                 for name in names {
-                    if ui.radio(rules::same_name(current, &name), &name).clicked() {
+                    if ui.radio(picked.as_ref() == Some(&name), &name).clicked() {
                         m.rules = Some(name);
                     }
                 }
@@ -5169,8 +5302,13 @@ impl OxideMergeApp {
         let Some(p) = self.prompt.take() else { return };
         let mut keep = true;
         match &p {
-            Prompt::CloseTab(i) | Prompt::SwitchFile(i, _) => {
-                let i = *i;
+            Prompt::CloseTab(id) | Prompt::SwitchFile(id, _) => {
+                let Some(i) = self.tabs.iter().position(|t| t.id == *id) else {
+                    if matches!(p, Prompt::CloseTab(_)) {
+                        self.ask_next_close();
+                    }
+                    return;
+                };
                 let finish = |app: &mut Self| match p {
                     Prompt::SwitchFile(_, forward) => app.switch_file(i, forward),
                     _ => app.close_tab(i, true),
@@ -5427,6 +5565,8 @@ impl OxideMergeApp {
             if let Some(d) = &mut self.options_dlg {
                 d.rule_sets = rules::list();
                 d.rules_touched = true;
+            } else {
+                self.rules_changed();
             }
         }
         if dropped.is_empty() || self.options_dlg.is_some() {
@@ -5463,6 +5603,13 @@ impl OxideMergeApp {
 }
 
 impl eframe::App for OxideMergeApp {
+    /// A report still being written is finished before the program ends, which would cut it.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some((_, rx)) = self.report_job.take() {
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
+        }
+    }
+
     /// Takes Ctrl+Tab before egui sees it: egui moves the keyboard focus on Tab whatever the
     /// modifiers, which would leave a button focused and the view's keys off.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
@@ -5512,6 +5659,7 @@ impl eframe::App for OxideMergeApp {
         crate::ui::macos::set_unsaved(unsaved && !self.allow_close);
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && unsaved {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_queue.clear();
             self.prompt = Some(Prompt::Exit);
         }
 
@@ -5620,7 +5768,7 @@ impl eframe::App for OxideMergeApp {
                         Content::Diffs(v) => v.folder,
                         _ => t.id,
                     });
-                    let temp = self.tabs.get(self.active).and_then(|t| t.temp.clone());
+                    let temps = self.tabs.get(self.active).map(Tab::shown_temps);
                     let count = self.tabs.len();
                     self.open(OpenRequest {
                         paths,
@@ -5635,7 +5783,7 @@ impl eframe::App for OxideMergeApp {
                     if let (Some(folder), true) = (folder, self.tabs.len() > count) {
                         if let Some(t) = self.tabs.last_mut() {
                             t.origin = Some(Origin { folder, rel });
-                            t.temp = temp;
+                            t.temps = temps.unwrap_or_default();
                         }
                     }
                 }
@@ -5711,7 +5859,7 @@ impl eframe::App for OxideMergeApp {
         self.save_session();
 
         if self.cfg != self.saved_cfg {
-            self.cfg.save();
+            self.stored_cfg().save();
             self.saved_cfg = self.cfg.clone();
         }
     }
@@ -5720,6 +5868,29 @@ impl eframe::App for OxideMergeApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn options_of_the_command_line_are_not_kept_unless_changed() {
+        use crate::core::diff::{DiffOptions, WhitespaceMode};
+        let loaded = DiffOptions::default();
+        let cli = DiffOptions {
+            whitespace: WhitespaceMode::IgnoreAll,
+            ..loaded.clone()
+        };
+        let now = DiffOptions {
+            ignore_case: true,
+            ..cli.clone()
+        };
+        let kept = unchanged_as_loaded(&now, &cli, &loaded);
+        assert_eq!(kept.whitespace, loaded.whitespace);
+        assert!(kept.ignore_case);
+        let changed = DiffOptions {
+            whitespace: WhitespaceMode::IgnoreChange,
+            ..cli.clone()
+        };
+        let kept = unchanged_as_loaded(&changed, &cli, &loaded);
+        assert_eq!(kept.whitespace, WhitespaceMode::IgnoreChange);
+    }
 
     #[test]
     fn untouched_arrow_lines_keep_their_pairs() {

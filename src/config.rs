@@ -201,7 +201,7 @@ impl Config {
                 let _ = std::fs::create_dir_all(d);
             }
             if let Ok(s) = serde_json::to_string_pretty(self) {
-                let _ = std::fs::write(p, s);
+                let _ = crate::core::fsutil::write_atomic_with(&p, s.as_bytes(), false);
             }
         }
     }

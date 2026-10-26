@@ -39,6 +39,7 @@ pub fn write_atomic_with(path: &Path, bytes: &[u8], backup: bool) -> Result<()> 
         let bak = backup_path(&target);
         std::fs::copy(&target, &bak).with_context(|| writing(&bak))?;
     }
+    let mut placeholder = false;
     if old.is_none() {
         // The temporary file is private; a new file gets the permissions files are made with.
         if std::fs::OpenOptions::new()
@@ -47,6 +48,7 @@ pub fn write_atomic_with(path: &Path, bytes: &[u8], backup: bool) -> Result<()> 
             .open(&target)
             .is_ok()
         {
+            placeholder = true;
             old = std::fs::metadata(&target).ok();
         }
     }
@@ -54,21 +56,45 @@ pub fn write_atomic_with(path: &Path, bytes: &[u8], backup: bool) -> Result<()> 
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => Path::new("."),
     };
-    let staged = (|| -> std::io::Result<tempfile::NamedTempFile> {
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".oxidemerge-")
-            .tempfile_in(dir)?;
-        tmp.write_all(bytes)?;
-        tmp.as_file().sync_all()?;
-        if let Some(m) = &old {
-            tmp.as_file().set_permissions(m.permissions())?;
+    let written = write_staged(&target, dir, bytes, old.as_ref());
+    if written.is_err() && placeholder {
+        let _ = std::fs::remove_file(&target);
+    }
+    written.with_context(|| writing(path))
+}
+
+/// Writes `bytes` to a temporary file in `dir`, then renames it over `target`. Writing straight
+/// into `target` is left for when the rename route is impossible, never for a write that failed
+/// (a full disk would then empty the file).
+fn write_staged(
+    target: &Path,
+    dir: &Path,
+    bytes: &[u8],
+    old: Option<&std::fs::Metadata>,
+) -> std::io::Result<()> {
+    let mut tmp = match tempfile::Builder::new()
+        .prefix(".oxidemerge-")
+        .tempfile_in(dir)
+    {
+        Ok(tmp) => tmp,
+        // A folder that may not hold new files; a full disk or quota would empty the file.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return std::fs::write(target, bytes)
         }
-        Ok(tmp)
-    })();
-    match staged.map(|tmp| tmp.persist(&target)) {
-        Ok(Ok(_)) => Ok(()),
-        // A folder that cannot hold new files, or a file that cannot be replaced: write in place.
-        _ => std::fs::write(&target, bytes).with_context(|| writing(path)),
+        Err(e) => return Err(e),
+    };
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    if let Some(m) = old {
+        let _ = tmp.as_file().set_permissions(m.permissions());
+    }
+    match tmp.persist(target) {
+        Ok(_) => Ok(()),
+        // A file that cannot be replaced; the temporary file goes first, freeing its space.
+        Err(e) => {
+            drop(e);
+            std::fs::write(target, bytes)
+        }
     }
 }
 

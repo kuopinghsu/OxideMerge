@@ -489,6 +489,7 @@
   "report.search": "파일 필터…",
   "report.side_by_side": "나란히",
   "report.text_summary": "차이 {n}개",
+  "report.text_summary_one": "차이 {n}개",
   "report.text_title": "파일 비교 보고서",
   "report.theme": "밝은 테마 / 어두운 테마",
   "report.title": "폴더 비교 보고서",

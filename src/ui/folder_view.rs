@@ -479,6 +479,11 @@ impl FolderView {
         self.start_compare();
     }
 
+    /// Extracted archives the compared folders are in.
+    pub fn temps(&self) -> &[std::sync::Arc<tempfile::TempDir>] {
+        &self.temps
+    }
+
     pub fn is_running(&self) -> bool {
         self.running.is_some()
     }
@@ -1690,8 +1695,10 @@ impl FolderView {
                     {
                         new_rules = Some(String::new());
                     }
+                    let refs: Vec<&str> = self.rule_names.iter().map(String::as_str).collect();
+                    let picked = rules::chosen(&self.rules, &refs);
                     for name in &self.rule_names {
-                        let on = rules::same_name(rules::display_name(&self.rules), name);
+                        let on = picked == Some(name.as_str());
                         if ui.selectable_label(on, name).clicked() {
                             new_rules = Some(name.clone());
                         }

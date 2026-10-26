@@ -489,6 +489,7 @@
   "report.search": "ファイルを絞り込み…",
   "report.side_by_side": "左右に並べる",
   "report.text_summary": "差異 {n} 個",
+  "report.text_summary_one": "差異 {n} 個",
   "report.text_title": "ファイル比較レポート",
   "report.theme": "ライト / ダークテーマ",
   "report.title": "フォルダー比較レポート",
