@@ -6,7 +6,8 @@ all-features = true
 
 [advisories]
 # Every advisory fails the check, also for unmaintained crates, until it is fixed or reviewed
-# and listed here with the reason.
+# and listed here with the reason. So does a crate version its authors withdrew.
+yanked = "deny"
 ignore = [
   { id = "RUSTSEC-2026-0367", reason = "zip: archives are read entry by entry into regular files; ZipArchive::extract and Unix modes are not used" },
   { id = "RUSTSEC-2026-0368", reason = "zip: no symbolic links are created; link entries are extracted as small regular files" },

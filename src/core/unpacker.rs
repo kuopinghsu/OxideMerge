@@ -41,10 +41,15 @@ impl Unpacker {
         } else {
             "\"$1\""
         };
-        let cmdline = if self.command.contains("${file}") {
-            self.command.replace("${file}", quoted)
+        // Quotes written around the placeholder would pair with these and leave the path bare.
+        let command = self
+            .command
+            .replace("\"${file}\"", "${file}")
+            .replace("'${file}'", "${file}");
+        let cmdline = if command.contains("${file}") {
+            command.replace("${file}", quoted)
         } else {
-            format!("{} {}", self.command, quoted)
+            format!("{command} {quoted}")
         };
         #[cfg(windows)]
         let output = {
@@ -96,6 +101,10 @@ mod tests {
             assert!(u.matches(&file));
             assert_eq!(u.run(&file).unwrap(), b"content\n", "{name}");
             assert_eq!(cat("cat").run(&file).unwrap(), b"content\n", "{name}");
+            // Quoting the placeholder as well changes nothing.
+            for quoted in ["cat \"${file}\"", "cat '${file}'"] {
+                assert_eq!(cat(quoted).run(&file).unwrap(), b"content\n", "{name}");
+            }
             for ran in ["ran", "ran2", "ran3"] {
                 assert!(!dir.path().join(ran).exists(), "{name} ran a command");
             }
@@ -132,6 +141,11 @@ mod windows_tests {
             assert_eq!(u.run(&file).unwrap(), b"content\r\n", "{name}");
             assert_eq!(
                 unpacker("type").run(&file).unwrap(),
+                b"content\r\n",
+                "{name}"
+            );
+            assert_eq!(
+                unpacker("type \"${file}\"").run(&file).unwrap(),
                 b"content\r\n",
                 "{name}"
             );

@@ -1026,6 +1026,21 @@ impl TextView {
         }
     }
 
+    /// Writes `pane` with the line ending `e` from now on, as a step that can be undone.
+    fn set_eol(&mut self, pane: usize, e: Eol) {
+        let d = &self.panes[pane].doc;
+        if e == d.eol && !d.mixed_eol {
+            return;
+        }
+        let old = format_of(d);
+        self.push_undo();
+        if let Some(s) = self.undo.last_mut() {
+            s.formats[pane] = Some(old);
+        }
+        let d = &mut self.panes[pane].doc;
+        (d.eol, d.mixed_eol, d.modified) = (e, false, true);
+    }
+
     fn writable(&mut self, pane: usize) -> bool {
         if self.panes[pane].doc.read_only {
             self.status = tr("msg.readonly").to_string();
@@ -2614,11 +2629,7 @@ impl TextView {
                         self.reload_encoding(p, e);
                     }
                     if let Some(e) = eol_choice {
-                        if e != self.panes[p].doc.eol || self.panes[p].doc.mixed_eol {
-                            self.panes[p].doc.eol = e;
-                            self.panes[p].doc.mixed_eol = false;
-                            self.panes[p].doc.modified = true;
-                        }
+                        self.set_eol(p, e);
                     }
                 });
             },
@@ -4301,12 +4312,29 @@ mod tests {
         v.copy_all(0, 1);
         assert!(!v.panes[1].doc.mixed_eol);
 
+        // A line ending chosen is undone like an edit, and with it the mark of a change.
+        let mut v = TextView::new(
+            vec![
+                TextDoc::from_text(None, "x\n"),
+                TextDoc::from_text(None, "a\nb\n"),
+            ],
+            &Config::default(),
+        );
+        v.set_eol(1, Eol::CrLf);
+        assert!(v.panes[1].doc.modified);
+        v.undo();
+        assert_eq!(v.panes[1].doc.eol, Eol::Lf);
+        assert!(!v.panes[1].doc.modified);
+        v.redo();
+        assert_eq!(v.panes[1].doc.eol, Eol::CrLf);
+        assert!(v.panes[1].doc.modified);
+
         // A line ending chosen for a new file before typing into it survives undo.
         let mut v = TextView::new(
             vec![TextDoc::from_text(None, "x\n"), TextDoc::empty(None)],
             &Config::default(),
         );
-        v.panes[1].doc.eol = Eol::Cr;
+        v.set_eol(1, Eol::Cr);
         v.push_undo();
         v.panes[1].doc.lines = vec!["typed".into()];
         v.mark_changed(&[1]);

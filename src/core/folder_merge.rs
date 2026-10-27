@@ -167,10 +167,28 @@ fn merge_text(paths: &[PathBuf]) -> Option<TextDoc> {
     let [l, b, r] = [&docs[0], &docs[BASE], &docs[2]];
     let lines = merge3(&l.lines, &b.lines, &r.lines)?;
     let mut doc = b.clone();
-    doc.encoding = merged(l.encoding, b.encoding, r.encoding)?;
-    doc.bom = merged(l.bom, b.bom, r.bom)?;
-    doc.eol = merged(l.eol, b.eol, r.eol)?;
-    doc.final_newline = merged(l.final_newline, b.final_newline, r.final_newline)?;
+    // Merged together: UTF-16 written without its byte order mark would read as binary.
+    let enc = |d: &TextDoc| (d.encoding, d.bom);
+    (doc.encoding, doc.bom) = merged(enc(l), enc(b), enc(r))?;
+    // A side without a line break says nothing of its line ending, nor an empty one of its
+    // final newline: they count as unchanged.
+    let eol = |d: &TextDoc| {
+        let breaks = d.lines.len() > 1 || (d.lines.len() == 1 && d.final_newline);
+        if breaks {
+            d.eol
+        } else {
+            b.eol
+        }
+    };
+    let nl = |d: &TextDoc| {
+        if d.lines.is_empty() {
+            b.final_newline
+        } else {
+            d.final_newline
+        }
+    };
+    doc.eol = merged(eol(l), b.eol, eol(r))?;
+    doc.final_newline = merged(nl(l), b.final_newline, nl(r))?;
     doc.lines = lines;
     Some(doc)
 }
@@ -559,6 +577,18 @@ mod tests {
         put(b, "apart.txt", b"a\nb\nc\nd\ne\n");
         put(l, "apart.txt", b"A\r\nb\r\nc\r\nd\r\ne\r\n");
         put(r, "apart.txt", b"a\rb\rc\rd\rE\r");
+        // a side left without line breaks keeps the others' line endings
+        put(b, "oneline.txt", b"a\r\nb");
+        put(l, "oneline.txt", b"a");
+        put(r, "oneline.txt", b"z\r\na\r\nb");
+        // UTF-16 on one side, the byte order mark dropped on the other
+        let utf16: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain("a\nb\nc\nd\ne\n".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        put(b, "utf16.txt", b"\xEF\xBB\xBFa\nb\nc\nd\ne\n");
+        put(l, "utf16.txt", &utf16);
+        put(r, "utf16.txt", b"a\nb\nc\nd\nE\n");
         // folders added empty on both sides
         for root in [l, r] {
             std::fs::create_dir(root.join("empty")).unwrap();
@@ -568,7 +598,7 @@ mod tests {
             it.binary = false;
         }
         let plan = plan(&items, &roots);
-        for name in ["data.bin", "mixed.txt", "apart.txt"] {
+        for name in ["data.bin", "mixed.txt", "apart.txt", "utf16.txt"] {
             assert!(
                 matches!(step_of(&plan, &items, name), Some(Step::Conflict)),
                 "{name}"
@@ -587,6 +617,7 @@ mod tests {
         );
         assert_eq!(read(b, "mixed.txt"), "a\nb\r\nc\nd\ne\n");
         assert_eq!(read(b, "apart.txt"), "a\nb\nc\nd\ne\n");
+        assert_eq!(read(b, "oneline.txt"), "z\r\na");
         assert!(b.join("empty").is_dir());
     }
 

@@ -484,12 +484,13 @@ pub fn apply(lines: &[String], patch: &FilePatch) -> Applied {
             })
         });
         match found {
-            Some(at) => {
+            Some(found) => {
                 let new = h.new_lines();
                 let added = new.len();
-                out.splice(at..at + old.len(), new);
-                delta += added as isize - old.len() as isize;
-                floor = at + added;
+                out.splice(found..found + old.len(), new);
+                // The hunks after it are as far from their stated lines as this one was.
+                delta += found as isize - at + added as isize - old.len() as isize;
+                floor = found + added;
             }
             None => failed.push(n + 1),
         }

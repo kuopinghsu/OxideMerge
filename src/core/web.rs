@@ -459,12 +459,15 @@ fn tokens_in(html: &str, in_head: bool) -> Vec<Token<'_>> {
                 if let Some(t) = lower[i..close].find("<title") {
                     let t = i + t;
                     let t_end = tag_end(b, t + 1) + 1;
-                    let t_close = lower[t_end..close]
-                        .find("</title")
-                        .map_or(close, |j| t_end + j);
-                    out.push(Token::Tag("title".into(), "", false));
-                    out.push(Token::Text(&html[t_end.min(t_close)..t_close]));
-                    out.push(Token::Tag("title".into(), "", true));
+                    // A title tag left open runs past the end of <head>: no title then.
+                    if t_end <= close {
+                        let t_close = lower[t_end..close]
+                            .find("</title")
+                            .map_or(close, |j| t_end + j);
+                        out.push(Token::Tag("title".into(), "", false));
+                        out.push(Token::Text(&html[t_end..t_close]));
+                        out.push(Token::Tag("title".into(), "", true));
+                    }
                 }
                 // Resources in <head> (stylesheets, scripts) are still reported as tags.
                 for tok in tokens_in(&html[i..close], true) {
@@ -870,6 +873,11 @@ pub struct TreeOutcome {
 /// and only one on this computer or a private network (`page_local`) loads from there.
 fn may_load(page: &Url, page_local: bool, res: &Url, local: &mut impl FnMut(&Url) -> bool) -> bool {
     match (page.scheme(), res.scheme()) {
+        // Another computer's file (`file://host/share`) is opened over the network, which
+        // on Windows hands that computer the user's credentials.
+        ("file", "file") => res
+            .host_str()
+            .is_none_or(|h| h.is_empty() || h == "localhost"),
         ("file", _) => true,
         (_, "file") => false,
         _ => page_local || !local(res),
@@ -919,12 +927,12 @@ pub fn download_trees(pages: &[Page], roots: &[PathBuf], progress: &Progress) ->
                 outcome.failed += 1;
                 continue;
             }
+            let name = path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let mut k = 2;
             while used.contains(&path) {
-                let name = path
-                    .file_name()
-                    .map(|f| f.to_string_lossy().into_owned())
-                    .unwrap_or_default();
                 path.set_file_name(format!("{name}~{k}"));
                 k += 1;
             }
@@ -1197,6 +1205,38 @@ mod tests {
     fn nested_heads_are_read_without_going_deeper() {
         let html = format!("{}<title>t</title>", "<head>".repeat(50_000));
         assert_eq!(html_to_text(&html).trim(), "t");
+        // A title tag still open at the end of <head> or of the page.
+        for html in [
+            "<head><title</head>x",
+            "<head><title",
+            "<head><title x='</head>'>y",
+        ] {
+            html_to_text(html);
+        }
+    }
+
+    #[test]
+    fn resources_of_one_name_are_numbered() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.css"), "p {}").unwrap();
+        let page = Page {
+            url: Url::from_file_path(src.path().join("index.html")).unwrap(),
+            status: 200,
+            html: (1..=4)
+                .map(|i| format!("<link rel=stylesheet href=a.css?{i}>"))
+                .collect(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        download_trees(&[page], &[dir.path().to_path_buf()], &Progress::default());
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["a.css", "a.css~2", "a.css~3", "a.css~4", "index.html"]
+        );
     }
 
     #[test]
@@ -1331,6 +1371,8 @@ mod tests {
         assert!(may(&lan, "http://8.8.8.8/a.js"));
         assert!(!may(&lan, "file:///etc/passwd"));
         assert!(may(&file, "file:///tmp/a.css"));
+        assert!(may(&file, "file://localhost/tmp/a.css"));
+        assert!(!may(&file, "file://attacker.example/share/a.png"));
         assert!(may(&file, "http://127.0.0.1/a.css"));
 
         let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];

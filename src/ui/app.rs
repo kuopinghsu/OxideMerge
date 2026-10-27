@@ -1145,6 +1145,8 @@ pub struct OxideMergeApp {
     applied_lang: String,
     visuals_dark: Option<bool>,
     allow_close: bool,
+    /// When to try saving the settings again after saving them failed.
+    settings_retry: Option<f64>,
     /// Tab last scrolled into view in the tab strip.
     shown_active: Option<usize>,
     /// Whether the window had focus on the previous frame; files are checked for outside changes
@@ -1757,6 +1759,7 @@ impl OxideMergeApp {
             applied_lang,
             visuals_dark: None,
             allow_close: false,
+            settings_retry: None,
             shown_active: None,
             was_focused: true,
             next_tab_id: 0,
@@ -3947,15 +3950,19 @@ impl OxideMergeApp {
     }
 
     /// The width all menus of the menu bar open with, so that they match: that of the widest,
-    /// measured once per language, fonts and text size by laying the menus out unseen.
+    /// measured once per language, fonts, text size, display scale and kind of view by laying
+    /// the menus out unseen.
     fn menu_width(&mut self, ctx: &egui::Context, m: &mut Menus) -> f32 {
         let size = ctx.style().text_styles[&egui::TextStyle::Button].size;
         // The fonts in use: after a change of language they follow a frame later.
         let fonts = ctx.fonts(|f| egui::Id::new(&f.lock().fonts.definitions().families));
+        // The Merge menu names its first item after the view.
         let id = egui::Id::new("menu_width")
             .with(i18n::current_language())
             .with(fonts)
-            .with(size.to_bits());
+            .with(size.to_bits())
+            .with(ctx.pixels_per_point().to_bits())
+            .with(m.view == ViewKind::Folder);
         if let Some(width) = ctx.data(|d| d.get_temp::<f32>(id)) {
             return width;
         }
@@ -5716,6 +5723,9 @@ impl eframe::App for OxideMergeApp {
         if let Some((_, rx)) = self.report_job.take() {
             let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
         }
+        if self.cfg != self.saved_cfg {
+            let _ = self.stored_cfg().save();
+        }
     }
 
     /// Takes Ctrl+Tab before egui sees it: egui moves the keyboard focus on Tab whatever the
@@ -5966,12 +5976,25 @@ impl eframe::App for OxideMergeApp {
         drop_overlay(ctx, self.open_dlg.is_some());
         self.save_session();
 
-        if self.cfg != self.saved_cfg {
-            if let Err(e) = self.stored_cfg().save() {
-                let msg = trf("msg.settings_not_saved", &[("err", format!("{e:#}"))]);
-                self.push_toast(msg, true, None);
+        // Settings that could not be read are left alone, as the message at startup said.
+        let refused = matches!(crate::config::unreadable(), Some(Err(_)));
+        let now = ctx.input(|i| i.time);
+        if self.cfg != self.saved_cfg && !refused && self.settings_retry.is_none_or(|t| now >= t) {
+            match self.stored_cfg().save() {
+                Ok(()) => {
+                    self.saved_cfg = self.cfg.clone();
+                    self.settings_retry = None;
+                }
+                Err(e) => {
+                    // Said once, then tried again now and then until it works.
+                    if self.settings_retry.is_none() {
+                        let msg = trf("msg.settings_not_saved", &[("err", format!("{e:#}"))]);
+                        self.push_toast(msg, true, None);
+                    }
+                    self.settings_retry = Some(now + 5.0);
+                    ctx.request_repaint_after(std::time::Duration::from_secs(5));
+                }
             }
-            self.saved_cfg = self.cfg.clone();
         }
         self.smoke_report(ctx);
     }

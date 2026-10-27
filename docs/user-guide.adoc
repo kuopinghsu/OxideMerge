@@ -314,6 +314,7 @@ Archives are extracted and compared as folders: zip-based formats (`.zip`, `.jar
 `.docx`, `.xlsx`, `.odt`, `.epub`, `.nupkg` and more), `.tar`, `.tar.gz` / `.tgz`,
 `.tar.bz2` / `.tbz2`, `.tar.xz` / `.txz` and `.7z`.
 The extracted sides are read-only, because changes could not be saved back into the archive.
+An archive that would unpack to more than 8 GB or 500,000 files is not opened.
 
 [[all-differences]]
 == All differences
@@ -701,7 +702,7 @@ WinMerge `.flt` filter files in the `Filters` folder of the configuration folder
 
 Unpackers turn files into text before comparing, for example to compare documents.
 Add them under *Options → Plugins*: a *File pattern*, such as `*.docx`, and a *Command line* in
-which `${file}` is replaced by the path of the file.
+which `${file}` is replaced by the path of the file, already quoted.
 The command's standard output is compared.
 
 ----

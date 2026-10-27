@@ -19,13 +19,14 @@ following as **untrusted** and handles them without running anything they contai
   written until you save, copy, delete or merge, and folder merges re-check every file before
   changing it (see the user guide).
 - **Archives** (zip, tar, 7z) are extracted to a private temporary folder. Entries that would land
-  outside it are skipped, and so are links that point outside the archive. Extracted sides are
-  read-only.
+  outside it are skipped, and so are links that point outside the archive. An archive that
+  unpacks to more than 8 GB or 500,000 files is refused. Extracted sides are read-only.
 - **Web pages.** Text, HTML source and resource tree modes don't run scripts. A web page may not
   load local files, and only a page on this computer or a private network may load resources from
   one or redirect to one. Responses are limited in size, count and time (see the user guide);
   the size counts what a compressed response unpacks to. Resource tree downloads are written
-  only inside the folder you chose, whatever the addresses contain.
+  only inside the folder you chose, whatever the addresses contain. A local page may load files
+  from this computer, but not from another one (`file://host/share`).
   Screenshot mode hands the page to your Chromium-based browser, in a fresh profile, so the
   browser's own security applies there.
 - **Reports.** Every file name, path and line written into an HTML report is escaped.
@@ -39,14 +40,16 @@ The following are **trusted**, because they configure what OxideMerge runs:
   shell. On Linux and macOS, file names are passed to the shell as arguments, never as part of
   the command, so a file name can't run commands. On Windows the command line names the path
   as an environment variable in double quotes (`"%OXIDEMERGE_FILE%"`): in quotes nothing in a
-  Windows file name is special, and the name can't contain a quote to end them.
+  Windows file name is special, and the name can't contain a quote to end them. Quotes written
+  around `${file}` are dropped, as they would pair with these and leave the path unquoted.
 - **Compare rules and filter files** in the configuration folder.
 - **Project files** (`.oxmproj`, `.winmerge`) only name paths and compare options; they can't
   name commands.
 
 OxideMerge also starts `git` for Git revisions and conflict files, the browser for screenshots,
-and the system's file opener when you choose *Open with* or *Show in folder*. On Windows files
-are opened through the shell's file associations, never through a command line.
+and the system's file opener when you choose *Open with associated application* or *Show in file
+manager*. On Windows files are opened through the shell's file associations, and Explorer gets
+the path to show in quotes; neither goes through `cmd`.
 
 OxideMerge doesn't collect or send anything. It connects to the network only for the web
 addresses you compare and the resources those pages name.

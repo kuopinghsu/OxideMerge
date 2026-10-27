@@ -30,7 +30,10 @@ pub fn backup_path(path: &Path) -> PathBuf {
 fn clear_backup(path: &Path) -> Result<PathBuf> {
     let bak = backup_path(path);
     if let Ok(md) = std::fs::symlink_metadata(&bak) {
-        make_writable(&bak);
+        // Only Windows keeps a read-only file from being deleted.
+        if cfg!(windows) {
+            make_writable(&bak);
+        }
         if !md.is_dir() {
             std::fs::remove_file(&bak).with_context(|| writing(&bak))?;
         }
@@ -46,9 +49,12 @@ fn keep_backup(path: &Path) -> Result<()> {
 }
 
 /// A device, pipe or terminal (`/dev/stdout`), written straight to, as it can't be replaced.
+/// Files kept under `/dev/` (`/dev/shm`) are not.
 fn is_special(path: &Path) -> bool {
-    cfg!(unix) && path.starts_with("/dev/")
-        || std::fs::metadata(path).is_ok_and(|m| !m.is_file() && !m.is_dir())
+    let in_dev = cfg!(unix)
+        && path.starts_with("/dev/")
+        && !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
+    in_dev || std::fs::metadata(path).is_ok_and(|m| !m.is_file() && !m.is_dir())
 }
 
 /// Writes `bytes` to a temporary file next to `path` and renames it over `path`, so a crash or
@@ -152,8 +158,17 @@ fn make_writable(path: &Path) -> bool {
     if !md.is_file() || !perm.readonly() {
         return false;
     }
-    #[allow(clippy::permissions_set_readonly_false)]
-    perm.set_readonly(false);
+    // For the owner only: clearing read-only on Unix would let everyone write.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perm.set_mode(perm.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
+    {
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+    }
     std::fs::set_permissions(path, perm).is_ok()
 }
 
@@ -212,14 +227,19 @@ pub fn copy_atomic(from: &Path, to: &Path, backup: bool) -> Result<()> {
 
 /// [`std::fs::copy`] over a file that may be read-only, or over a symbolic link.
 fn copy_in_place(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut locked = None;
     if let Ok(md) = std::fs::symlink_metadata(to) {
         if md.file_type().is_symlink() {
             std::fs::remove_file(to)?;
-        } else {
-            make_writable(to);
+        } else if make_writable(to) {
+            locked = Some(md.permissions());
         }
     }
-    std::fs::copy(from, to).map(|_| ())
+    let copied = std::fs::copy(from, to).map(|_| ());
+    if let (Err(_), Some(p)) = (&copied, locked) {
+        let _ = std::fs::set_permissions(to, p);
+    }
+    copied
 }
 
 /// Deletes a file, or with backups on, renames it to `<name>.bak`.
@@ -361,6 +381,20 @@ mod tests {
     fn devices_are_written_in_place() {
         write_atomic_with(Path::new("/dev/null"), b"x", true).unwrap();
         assert!(!Path::new("/dev/null.bak").exists());
+        assert!(is_special(Path::new("/dev/stdout")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_files_become_writable_for_their_owner_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ro.txt");
+        std::fs::write(&file, "x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(make_writable(&file));
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //! Zip based formats, tar (plain or compressed with gzip, bzip2 or xz) and 7z are supported.
 
 use anyhow::{Context, Result};
-use std::io::Read;
+use std::cell::Cell;
+use std::io::{Read, Seek, Write};
 use std::path::{Component, Path};
 
 pub const ZIP_EXTS: &[&str] = &[
@@ -47,27 +48,134 @@ pub fn is_archive(path: &Path) -> bool {
     path.is_file() && kind(path).is_some()
 }
 
-pub fn extract_to_temp(path: &Path) -> Result<tempfile::TempDir> {
-    let dir = tempfile::Builder::new().prefix("oxidemerge-").tempdir()?;
-    let open = || std::fs::File::open(path).with_context(|| format!("open {}", path.display()));
-    match kind(path).unwrap_or(Kind::Zip) {
-        Kind::Zip => extract_zip(open()?, dir.path())
-            .with_context(|| format!("{} is not a zip archive", path.display()))?,
-        Kind::Tar => extract_tar(open()?, dir.path())?,
-        Kind::TarGz => extract_tar(flate2::read::MultiGzDecoder::new(open()?), dir.path())?,
-        Kind::TarBz2 => extract_tar(bzip2::read::MultiBzDecoder::new(open()?), dir.path())?,
-        Kind::TarXz => {
-            let mut input = std::io::BufReader::new(open()?);
-            let mut tar = Vec::new();
-            lzma_rs::xz_decompress(&mut input, &mut tar)
-                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-            extract_tar(tar.as_slice(), dir.path())?
+/// The most an archive is unpacked to, so that a small one can't fill the disk.
+const LIMITS: Limits = Limits {
+    bytes: 8 << 30,
+    entries: 500_000,
+};
+
+#[derive(Clone, Copy)]
+struct Limits {
+    bytes: u64,
+    entries: u64,
+}
+
+/// What is left of the [`Limits`] while unpacking: `None` once a limit was passed.
+struct Budget {
+    bytes: Cell<Option<u64>>,
+    entries: Cell<Option<u64>>,
+    limits: Limits,
+}
+
+impl Budget {
+    fn new(limits: Limits) -> Self {
+        Budget {
+            bytes: Cell::new(Some(limits.bytes)),
+            entries: Cell::new(Some(limits.entries)),
+            limits,
         }
-        Kind::SevenZ => sevenz_rust2::decompress_file(path, dir.path())
-            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?,
     }
+
+    fn take(left: &Cell<Option<u64>>, n: u64) -> std::io::Result<()> {
+        let rest = left.get().and_then(|l| l.checked_sub(n));
+        left.set(rest);
+        match rest {
+            Some(_) => Ok(()),
+            None => Err(std::io::Error::other("archive too large")),
+        }
+    }
+
+    fn entry(&self) -> std::io::Result<()> {
+        Budget::take(&self.entries, 1)
+    }
+
+    fn passed(&self) -> bool {
+        self.bytes.get().is_none() || self.entries.get().is_none()
+    }
+
+    /// The error for an archive that passed a limit; `e` otherwise.
+    fn error(&self, path: &Path, e: anyhow::Error) -> anyhow::Error {
+        if !self.passed() {
+            return e;
+        }
+        anyhow::anyhow!(
+            "{}: unpacks to more than {} GB or {} files",
+            path.display(),
+            self.limits.bytes >> 30,
+            self.limits.entries
+        )
+    }
+}
+
+/// Reads or writes through `inner`, failing once the bytes of `budget` are used up.
+struct Counted<'a, T> {
+    inner: T,
+    budget: &'a Budget,
+}
+
+impl<T: Read> Read for Counted<'_, T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        Budget::take(&self.budget.bytes, n as u64)?;
+        Ok(n)
+    }
+}
+
+impl<T: Write> Write for Counted<'_, T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Budget::take(&self.budget.bytes, buf.len() as u64)?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+pub fn extract_to_temp(path: &Path) -> Result<tempfile::TempDir> {
+    extract_with(path, LIMITS)
+}
+
+fn extract_with(path: &Path, limits: Limits) -> Result<tempfile::TempDir> {
+    let dir = tempfile::Builder::new().prefix("oxidemerge-").tempdir()?;
+    let budget = Budget::new(limits);
+    extract(path, dir.path(), &budget).map_err(|e| budget.error(path, e))?;
     remove_links_outside(dir.path())?;
     Ok(dir)
+}
+
+fn extract(path: &Path, dir: &Path, budget: &Budget) -> Result<()> {
+    let open = || std::fs::File::open(path).with_context(|| format!("open {}", path.display()));
+    match kind(path).unwrap_or(Kind::Zip) {
+        Kind::Zip => extract_zip(open()?, dir, budget)
+            .with_context(|| format!("{} is not a zip archive", path.display())),
+        Kind::Tar => extract_tar(open()?, dir, budget),
+        Kind::TarGz => extract_tar(flate2::read::MultiGzDecoder::new(open()?), dir, budget),
+        Kind::TarBz2 => extract_tar(bzip2::read::MultiBzDecoder::new(open()?), dir, budget),
+        Kind::TarXz => {
+            // Unpacked to a file first, as the tar inside may be larger than memory.
+            let mut input = std::io::BufReader::new(open()?);
+            let mut tar = tempfile::tempfile()?;
+            let mut out = Counted {
+                inner: std::io::BufWriter::new(&mut tar),
+                budget,
+            };
+            lzma_rs::xz_decompress(&mut input, &mut out)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            out.flush()?;
+            drop(out);
+            tar.rewind()?;
+            // The bytes were counted as they were unpacked.
+            budget.bytes.set(Some(budget.limits.bytes));
+            extract_tar(std::io::BufReader::new(tar), dir, budget)
+        }
+        Kind::SevenZ => sevenz_rust2::decompress_file_with_extract_fn(path, dir, |e, r, dest| {
+            budget.entry()?;
+            let mut r = Counted { inner: r, budget };
+            sevenz_rust2::default_entry_extract_fn(e, &mut r, dest)
+        })
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display())),
+    }
 }
 
 /// Removes the symbolic links under `root` that lead outside it, or nowhere. Each link is
@@ -102,10 +210,11 @@ fn apple_metadata(rel: &Path) -> bool {
     })
 }
 
-fn extract_zip(file: std::fs::File, dir: &Path) -> Result<()> {
+fn extract_zip(file: std::fs::File, dir: &Path, budget: &Budget) -> Result<()> {
     let mut ar = zip::ZipArchive::new(file)?;
     for i in 0..ar.len() {
-        let mut f = ar.by_index(i)?;
+        budget.entry()?;
+        let f = ar.by_index(i)?;
         let Some(rel) = f.enclosed_name().filter(|r| !apple_metadata(r)) else {
             continue;
         };
@@ -117,7 +226,7 @@ fn extract_zip(file: std::fs::File, dir: &Path) -> Result<()> {
                 std::fs::create_dir_all(p)?;
             }
             let mut w = std::fs::File::create(&out)?;
-            std::io::copy(&mut f, &mut w)?;
+            std::io::copy(&mut Counted { inner: f, budget }, &mut w)?;
         }
     }
     Ok(())
@@ -152,9 +261,13 @@ fn link_inside(rel: &Path, target: &Path, hard: bool) -> bool {
 /// Entries that cannot be created here (links on Windows, device files) are skipped, and so
 /// are links to anything outside the archive; `unpack_in` also skips any that would land
 /// outside `dir`.
-fn extract_tar(input: impl Read, dir: &Path) -> Result<()> {
-    let mut ar = tar::Archive::new(input);
+fn extract_tar(input: impl Read, dir: &Path, budget: &Budget) -> Result<()> {
+    let mut ar = tar::Archive::new(Counted {
+        inner: input,
+        budget,
+    });
     for entry in ar.entries()? {
+        budget.entry()?;
         let mut entry = entry?;
         let Ok(rel) = entry.path().map(|p| p.into_owned()) else {
             continue;
@@ -174,6 +287,10 @@ fn extract_tar(input: impl Read, dir: &Path) -> Result<()> {
             }
         }
         let _ = entry.unpack_in(dir);
+    }
+    // A limit passed inside an entry fails only that entry.
+    if budget.passed() {
+        anyhow::bail!("archive too large");
     }
     Ok(())
 }
@@ -221,6 +338,51 @@ mod tests {
             let text = std::fs::read_to_string(out.path().join("dir/a.txt")).unwrap();
             assert_eq!(text, "hello\n", "{}", archive.display());
             assert!(!out.path().join("dir/._a.txt").exists());
+        }
+    }
+
+    #[test]
+    fn archives_that_unpack_to_too_much_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let tgz = dir.path().join("a.tgz");
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar_bytes()).unwrap();
+        std::fs::write(&tgz, gz.finish().unwrap()).unwrap();
+        let txz = dir.path().join("a.tar.xz");
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut tar_bytes().as_slice(), &mut xz).unwrap();
+        std::fs::write(&txz, xz).unwrap();
+        let zip = dir.path().join("a.zip");
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+        for name in ["big.txt", "other.txt"] {
+            w.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            w.write_all(&[b'0'; 10_000]).unwrap();
+        }
+        w.finish().unwrap();
+
+        let small = Limits {
+            bytes: 1000,
+            entries: 100,
+        };
+        let few = Limits {
+            bytes: 1 << 20,
+            entries: 1,
+        };
+        let roomy = Limits {
+            bytes: 1 << 20,
+            entries: 100,
+        };
+        for archive in [&tgz, &txz, &zip] {
+            for limits in [small, few] {
+                let err = format!("{:#}", extract_with(archive, limits).unwrap_err());
+                assert!(err.contains("unpacks to more than"), "{err}");
+            }
+            assert!(
+                extract_with(archive, roomy).is_ok(),
+                "{}",
+                archive.display()
+            );
         }
     }
 

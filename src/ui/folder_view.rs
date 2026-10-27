@@ -336,8 +336,11 @@ pub(crate) fn system_open(path: &std::path::Path) -> Result<(), String> {
 fn reveal(path: &std::path::Path) -> Result<(), String> {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+        // Explorer reads `/select,"path"` itself and not as quoting of the whole argument
+        // would have it; Windows paths can't contain quotes.
         let mut cmd = std::process::Command::new("explorer");
-        cmd.arg(format!("/select,{}", path.display()));
+        cmd.raw_arg(format!("/select,\"{}\"", path.display()));
         launch(cmd, path)
     }
     #[cfg(target_os = "macos")]

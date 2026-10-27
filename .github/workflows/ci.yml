@@ -283,6 +283,10 @@ jobs:
               echo "::error::CHANGELOG.md has no section for $version"
               exit 1
             }
+            grep -Eq "^## \[${version//./\\.}\] - [0-9]{4}-[0-9]{2}-[0-9]{2}\$" CHANGELOG.md || {
+              echo "::error::CHANGELOG.md gives no release date for $version"
+              exit 1
+            }
             label=$version
           else
             label="$version-${GITHUB_SHA::7}"
@@ -559,6 +563,8 @@ jobs:
           cargo build --release --locked --target x86_64-apple-darwin
 
       - name: Window smoke test
+        env:
+          GUI_SMOKE_STRICT: "1"
         run: bash scripts/gui-smoke.sh target/aarch64-apple-darwin/release/oxidemerge target/gui-smoke
 
       - name: Keep test output
@@ -702,11 +708,18 @@ jobs:
   # is not needed for a release. A failure prints the seed that replays it:
   # OXIDEMERGE_TEST_SEED=<seed> cargo test regress
   stress:
-    name: Randomized tests (${{ inputs.stress_cases }} cases)
+    name: Randomized tests
     if: github.event_name == 'workflow_dispatch' && inputs.stress_cases != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
+      - name: Check the number of cases
+        env:
+          CASES: ${{ inputs.stress_cases }}
+        run: |
+          [[ "$CASES" =~ ^[0-9]+$ ]] || { echo "::error::stress_cases must be a number"; exit 1; }
+          echo "::notice::$CASES cases per test"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install build dependencies
@@ -727,7 +740,7 @@ jobs:
 
   # Started by hand; the numbers are kept, not checked (see docs/benchmarks.md).
   benchmarks:
-    name: Benchmarks (${{ matrix.os }})
+    name: Benchmarks
     if: github.event_name == 'workflow_dispatch' && inputs.benchmarks
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60

@@ -586,6 +586,21 @@ fn patches_meet_files_changed_since() {
 }
 
 #[test]
+fn hunks_follow_the_offset_found_for_the_one_before() {
+    // Two lines more at the top than the patch was made against.
+    let file = v(&[
+        "x", "y", "one", "two", "three", "four", "five", "six", "seven", "eight",
+    ]);
+    let text = "--- a\n+++ b\n@@ -2 +2 @@\n-two\n+TWO\n@@ -8,0 +9 @@\n+nine\n";
+    let done = apply(&file, &parse_unified(text).unwrap()[0]);
+    assert!(done.failed.is_empty());
+    assert_eq!(
+        done.lines,
+        v(&["x", "y", "one", "TWO", "three", "four", "five", "six", "seven", "eight", "nine"])
+    );
+}
+
+#[test]
 fn patches_without_context_insert_after_the_stated_line() {
     let base = v(&["1", "2", "3"]);
     let cases = [

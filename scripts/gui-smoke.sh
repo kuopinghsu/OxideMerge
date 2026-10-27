@@ -29,6 +29,7 @@ trap cleanup EXIT
 if [ "$(uname -s)" = Linux ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
   if ! command -v Xvfb >/dev/null; then
     echo "gui-smoke: skipped, no display and no Xvfb"
+    [ "${GUI_SMOKE_STRICT:-0}" = 1 ] && exit 1
     exit 0
   fi
   Xvfb -displayfd 3 -screen 0 1600x1000x24 -nolisten tcp 3>"$work/display" 2>"$artifacts/xvfb.log" &

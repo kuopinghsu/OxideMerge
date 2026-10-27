@@ -215,11 +215,17 @@ impl Config {
     }
 
     /// The settings in `p`. Ones that are there but can't be read are copied to
-    /// `<name>.bad` first, as saving the defaults would replace them.
+    /// `<name>.bad` first, as saving the defaults would replace them. An empty file, as made
+    /// for portable use, holds the defaults.
     fn load_from(p: &std::path::Path) -> (Config, Option<Unreadable>) {
-        let Ok(bytes) = std::fs::read(p) else {
-            return (Config::default(), None);
+        let bytes = match std::fs::read(p) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Config::default(), None),
+            Err(_) => return (Config::default(), Some(Err(p.to_path_buf()))),
         };
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return (Config::default(), None);
+        }
         if let Some(cfg) = std::str::from_utf8(&bytes).ok().and_then(Config::parse) {
             return (cfg, None);
         }
@@ -324,6 +330,20 @@ mod tests {
             assert_eq!(std::fs::read(&kept).unwrap(), bad);
             assert_eq!(std::fs::read(&p).unwrap(), bad);
         }
+        // An empty file is how portable use starts.
+        std::fs::remove_file(dir.path().join("config.json.bad")).unwrap();
+        for empty in [&b""[..], b" \n"] {
+            std::fs::write(&p, empty).unwrap();
+            assert_eq!(Config::load_from(&p), (Config::default(), None));
+        }
+        assert!(!dir.path().join("config.json.bad").exists());
+        // A file that is there but can't be read is never saved over.
+        let unreadable = dir.path().join("folder.json");
+        std::fs::create_dir(&unreadable).unwrap();
+        assert_eq!(
+            Config::load_from(&unreadable),
+            (Config::default(), Some(Err(unreadable.clone())))
+        );
     }
 
     #[test]

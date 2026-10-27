@@ -3,7 +3,7 @@
 All notable changes to OxideMerge are listed here, newest first. Each release on GitHub uses its
 section of this file as the release notes.
 
-## [0.9.4] - Unreleased
+## [0.9.4] - 2026-10-27
 
 ### Added
 
@@ -58,15 +58,20 @@ section of this file as the release notes.
 ### Fixed
 
 - Applying a patch made without context lines (`diff -U0`) put added lines one line too early,
-  and in the wrong place when hunks before them were left out of the patch.
+  and in the wrong place when hunks before them were left out of the patch. A hunk found away
+  from its stated line now moves the hunks after it by as much, as GNU patch does, so a line
+  added after it no longer lands too early.
 - A difference next to a moved insertion or deletion could point at the wrong line of the side
   where it is empty.
 - A folder compare that broke off with an internal error showed the folders as identical; it now
   says it failed and counts as an error.
 - A text compare whose syntax highlighting stopped with an error kept redrawing the window.
-- Settings that could not be saved were dropped without a word; the error is now shown.
+- Settings that could not be saved were dropped without a word; the error is now shown once,
+  and saving is tried again until it works and when the program closes.
 - Settings that could not be read were replaced by the defaults when settings were next saved.
-  The file is now kept as `config.json.bad` (or `oxidemerge.json.bad`) and a message says so.
+  The file is now kept as `config.json.bad` (or `oxidemerge.json.bad`) and a message says so; a
+  settings file that can't be opened at all is not saved over. An empty file still holds the
+  defaults, as for portable use.
 - With the Recycle Bin option on, a file or folder that could not be moved to the trash was
   deleted for good without a word; it is now left where it is and the error is shown.
 - Folder auto merge could miss a file that changed while the merge was being planned.
@@ -75,14 +80,25 @@ section of this file as the release notes.
   copy fails.
 - The Filters window opened folders with `xdg-open` on macOS; errors opening files and folders
   from the folder compare and the dialogs are now shown.
+- On Windows, *Show in file manager* did not select files whose path has a space or a comma.
+- Changing a file's line ending in a text compare could not be undone, and undoing an earlier
+  change cleared the mark that the file was modified, so closing it lost the new line ending.
 - Folder auto merge merged binary files as text, and dropped a change of encoding, byte order
   mark, line endings or final newline made on one side. Only text files that read back to the
   same bytes are merged now, the change of either side is kept, and different changes on both
-  sides are a conflict.
+  sides are a conflict. A side left without line breaks no longer counts as changing the line
+  ending, and the encoding and byte order mark are merged together, so UTF-16 never loses its
+  byte order mark.
 - Folder auto merge with backups on could replace a compared file with another file's `.bak`;
   such a step is now left alone. A folder added on both sides is now made in the middle folder,
   even when it is empty, and its contents are merged item by item.
-- A read-only `.bak` left from before stopped the next backup of that file.
+- A read-only `.bak` left from before stopped the next backup of that file. On Linux and macOS,
+  a read-only file written in place is made writable for its owner only, and read-only again
+  when the write fails.
+- Files kept under `/dev/`, such as `/dev/shm`, were written in place and without a backup, like
+  devices.
+- Resources of a web page saved under one name were numbered `a~2`, `a~2~3`, ... until the name
+  got too long; they are now `a~2`, `a~3`, ...
 - On Windows, saving over a read-only file failed and left a temporary file next to it; the file
   is now replaced and stays read-only, as on Linux and macOS.
 - Text copied into a new or empty file in a text compare got this computer's line endings; the
@@ -94,14 +110,20 @@ section of this file as the release notes.
 
 - Unpacker commands could run part of a file name as a command; the file path is now passed as an
   argument (`"$1"`) on Linux and macOS, and as an environment variable the command line quotes on
-  Windows, where unpackers given the quoted path in the command line also failed to run.
+  Windows, where unpackers given the quoted path in the command line also failed to run. Quotes
+  written around `${file}` are dropped, as they would leave the path unquoted.
 - On Windows, *Open with* and opening a file from the folder compare went through `cmd start`, so
   a file name containing `&` could run a command; files are now opened by the shell directly.
 - Resource tree downloads could write outside the chosen folder through an encoded `/` (`%2F`) in
   a resource address.
 - The web size limit counted compressed bytes, so a small compressed response could unpack to
-  fill memory; it now counts the bytes unpacked. A page of deeply nested `<head>` tags crashed
-  the program.
+  fill memory; it now counts the bytes unpacked. A page of deeply nested `<head>` tags, or with a
+  title tag left open in `<head>`, crashed the program.
+- On Windows, a local page in a resource tree compare could load `file://host/share` resources,
+  which opens a connection to that computer and hands it the user's credentials; files of other
+  computers are now skipped.
+- Archives that unpack to more than 8 GB or 500,000 files are refused, so a small archive can no
+  longer fill the disk; `.tar.xz` archives are no longer unpacked into memory.
 - Links in `.tar` archives that point outside the archive, directly or through other links, are
   no longer extracted.
 - Web pages can no longer read local files or reach this computer and the private network
@@ -397,7 +419,7 @@ First release.
   on Windows.
 - Chinese, Japanese and Korean fonts on Linux and WSL, and GPU acceleration under WSL2.
 
-[0.9.4]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.3...HEAD
+[0.9.4]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.0...v0.9.1
