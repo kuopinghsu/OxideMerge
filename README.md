@@ -151,7 +151,10 @@ option and command step by step. Each release also has it as PDF files.
   - **Text**: the visible text of each page (scripts, styles and markup removed), in the text compare.
   - **Resource tree**: downloads each page with its stylesheets, scripts, images, frames and media,
     and compares the downloaded files in the folder compare.
-- Pages are decoded using the HTTP or `<meta>` charset. Non-2xx HTTP status codes are shown in the pane header.
+- Pages are decoded as browsers do (byte order mark, then the HTTP charset, then `<meta>`). Non-2xx
+  HTTP status codes are shown in the pane header.
+- The resource tree loads at most 400 resources of 20 MB each per page. A web page may not load
+  local files, nor resources on this computer or a private network unless it is there itself.
 
 **Interface**
 - Tabbed documents, a start page with recent comparisons, and drag and drop of files and folders.
@@ -194,9 +197,17 @@ Every [GitHub release](https://github.com/kuopinghsu/OxideMerge/releases) has th
   it with `--appimage-extract-and-run`. To install the Debian package, run
   `sudo apt install ./oxidemerge-*.deb`. File dialogs need `xdg-desktop-portal`, which desktop
   environments normally include.
-- **macOS:** the app is ad-hoc signed but not notarized. The first time, Control-click it and choose
-  **Open**, or allow it in **System Settings → Privacy & Security**. To use it from the terminal, run
+- **macOS:** the app is ad-hoc signed but not notarized, so macOS blocks it the first time. Try
+  to open it once, then choose **Open Anyway** in **System Settings → Privacy & Security**. (Up to
+  macOS 14, Control-clicking the app and choosing **Open** also works.) Or clear the download
+  flag with `xattr -dr com.apple.quarantine /Applications/OxideMerge.app`. To use it from the
+  terminal, run
   `sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin/oxidemerge`.
+  [docs/macos-signing.md](docs/macos-signing.md) explains why the app isn't notarized yet.
+
+Each release also has `SHA256SUMS.txt`. To check your downloads against it, run
+`sha256sum -c --ignore-missing SHA256SUMS.txt` on Linux, `shasum -a 256 -c --ignore-missing
+SHA256SUMS.txt` on macOS, or `Get-FileHash <file>` in PowerShell and compare the value.
 
 ## Building
 
@@ -222,7 +233,8 @@ A `Makefile` for GNU Make wraps the common tasks. It works on Windows and Unix.
 | `make run ARGS="a.txt b.txt"` | Run the debug build with arguments |
 | `make demo` | Folder compare of `samples/left` and `samples/right` |
 | `make demo-text` / `demo-3way` / `demo-conflict` | Text, 3-way and conflict-file demos |
-| `make test` / `check` / `lint` | Unit tests, type check, clippy with warnings as errors |
+| `make test` / `check` / `lint` | Unit, window and command line tests, type check, clippy with warnings as errors |
+| `make gui-smoke` | Open real windows with the release build and check what they show (see [Testing](#testing)) |
 | `make ci` | `check`, `lint` and `test` |
 | `make check-platforms` | Type-check for Windows, macOS and Linux (needs `rustup target add` for each) |
 | `make install` / `uninstall` | `cargo install` into `~/.cargo/bin` |
@@ -233,12 +245,44 @@ A `Makefile` for GNU Make wraps the common tasks. It works on Windows and Unix.
 | `make clean` | Remove build output |
 | `make help` | List all targets |
 
+### Testing
+
+`cargo test` runs three kinds of tests:
+
+- **Unit tests** of the diff, merge, patch, folder and file code. The randomized diff, merge and
+  patch tests in `src/core/regress.rs` check hundreds of generated cases. A failure prints its
+  seed: `OXIDEMERGE_TEST_SEED=<seed> cargo test regress` replays that case, and
+  `OXIDEMERGE_TEST_CASES=20000 cargo test --release regress` runs a longer search.
+- **Window tests** in `src/ui/gui_tests.rs`. They drive the real views without a screen: they
+  click buttons and menus, type, drop files, and check what each view shows and what reaches the
+  disk. When one fails, what the window showed is written to `target/gui-tests/<test>.txt`.
+- **Command line tests** in `tests/cli.rs`, which run the built program for exit codes, reports,
+  patches and error messages.
+
+None of them read or change your settings. Tests use a configuration folder of their own, and the
+program does too when `OXIDEMERGE_CONFIG_DIR` names one.
+
+`make gui-smoke` (or `scripts/gui-smoke.sh path/to/oxidemerge`) opens real windows. It compares
+two files, three files and two folders, then checks what each window showed. With
+`OXIDEMERGE_SMOKE_REPORT=<file>` set, the program writes the tabs it shows and any messages to
+that file once the compare finishes, then closes. On Linux without a display, the script starts
+an Xvfb display of its own.
+
+The benchmarks run separately; [docs/benchmarks.md](docs/benchmarks.md) explains them and records
+a baseline.
+
 ### Continuous integration
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main` and on every
 pull request. On Windows, Linux and macOS it runs clippy with warnings treated as errors, runs the
-unit tests, builds a release, and smoke-tests the command line (`--version`, `--list-languages` and
-the `--cli` exit codes). The Arm64 packages are built and tested natively on GitHub's Arm runners
+unit, window and command line tests, builds a release, smoke-tests the command line (`--version`,
+`--list-languages` and the `--cli` exit codes), and opens real windows with
+`scripts/gui-smoke.sh` (on Windows and Linux with Mesa's software renderer, on Linux under Xvfb). If a test fails, its
+output is kept as a `test-output-*` artifact. Starting the workflow by hand with a number of
+stress cases also runs the randomized tests that many times, and ticking *benchmarks* runs the
+benchmarks of [`docs/benchmarks.md`](docs/benchmarks.md); releases don't wait for either run. A
+separate job checks the dependencies with `cargo deny` (see [Security](#security)). The Arm64
+packages are built and tested natively on GitHub's Arm runners
 (`windows-11-arm`, `ubuntu-22.04-arm`, `ubuntu-24.04-arm`). It then uploads these packages as workflow artifacts:
 
 - **Windows x64 and Arm64:** the `.exe` and a `.zip`.
@@ -253,38 +297,71 @@ the `--cli` exit codes). The Arm64 packages are built and tested natively on Git
 - **User guide:** PDF files of the English and Traditional Chinese guides, built with
   Asciidoctor PDF. A character that no font holds fails the build.
 
-Pushing a tag such as `v0.9.3` publishes all packages, the user guides and `SHA256SUMS.txt` on a
+The packages are checked after they are built: the Windows `.zip` must hold the program, README and
+license; the Linux `.deb` is installed, run and removed again, leaving the user's settings alone;
+the macOS app must hold both architectures, and its Intel half is run through Rosetta.
+
+Pushing a tag such as `v0.9.4` publishes all packages, the user guides and `SHA256SUMS.txt` on a
 GitHub release. The tag must match the version in `Cargo.toml`, and tags containing `-` (for
 example `v1.0.0-rc1`) are marked as pre-releases. The release notes are the version's section of
 [`CHANGELOG.md`](CHANGELOG.md), followed by download instructions, so add that section before
-tagging; the build fails early if it is missing. `scripts/release-notes.sh 0.9.3` prints the notes
-for a version. CI only reads `CHANGELOG.md`; it never edits it.
+tagging; the build fails early if it is missing. `scripts/release-notes.sh 0.9.4` prints the notes
+for a version. CI only reads `CHANGELOG.md`; it never edits it. Before publishing, the release job
+checks that every package is there and that no release of that version exists yet, and the notes
+name the commit the packages were built from.
 
 To make a release:
 
 1. Set `version` in `Cargo.toml` and run `cargo build` so `Cargo.lock` picks it up.
-2. In `CHANGELOG.md`, change the version's heading from `## [0.9.3] - Unreleased` to the release
-   date, for example `## [0.9.3] - 2026-10-26`, and check its entries.
-3. Run `make fmt-check ci` and preview the notes with `scripts/release-notes.sh 0.9.3`.
+2. In `CHANGELOG.md`, change the version's heading from `## [0.9.4] - Unreleased` to
+   `## [0.9.4] - YYYY-MM-DD` with the release date, and check its entries.
+3. Run `make fmt-check ci` and preview the notes with `scripts/release-notes.sh 0.9.4`.
 4. Commit and push to `main`, then wait for CI to pass on every platform. Tagging builds the commit
    the tag points at, so a commit that fails CI fails the release too.
 5. Tag that commit and push the tag:
 
    ```sh
-   git tag -a v0.9.3 -m "OxideMerge 0.9.3"
-   git push origin v0.9.3
+   git tag -a v0.9.4 -m "OxideMerge 0.9.4"
+   git push origin v0.9.4
    ```
 
-6. Start the next version: add a `## [0.9.4] - Unreleased` section at the top of `CHANGELOG.md`
+6. Start the next version: add a `## [0.9.5] - Unreleased` section at the top of `CHANGELOG.md`
    and record changes there as they land.
 
-If a release build fails, fix it on `main`, then move the tag to the new commit and push it again
-(`git tag -f -a v0.9.3 -m "OxideMerge 0.9.3"` and `git push -f origin v0.9.3`).
+A pushed tag is never moved or reused: someone may already have its packages, and their checksums
+must keep matching. If a release build fails or a published release has a problem, fix it on
+`main` and release the next patch version (for example `v0.9.5`). A tag whose build failed
+published nothing, since the release job waits for every build; leave it in place all the same.
 
 ## Usage
 
 Start `oxidemerge` without arguments to open the start page. From there you can open files or
 folders, drag them onto the window, or pick a recent comparison.
+
+### Quick start
+
+The five most common tasks, from the window or the command line. The
+[User Guide](docs/user-guide.adoc) covers each in detail, and its *Compare types* section explains
+how OxideMerge picks a text, binary, image, folder or web page compare.
+
+1. **Compare two files.** `oxidemerge old.txt new.txt`, or drop both files on the window.
+   `Alt+Down` and `Alt+Up` step through the differences, `Alt+Right` and `Alt+Left` copy the
+   current one across, and `Ctrl+S` saves.
+2. **Merge three files.** `oxidemerge mine.txt base.txt theirs.txt -o merged.txt` puts the common
+   ancestor in the middle. **Merge → Auto merge** takes every change made on one side only;
+   `Alt+PgDn` steps to the conflicts left over, which you copy in from either side or edit. Saving
+   writes the middle to `merged.txt`. A file with conflict markers opens the same way:
+   `oxidemerge conflict.txt`.
+3. **Merge two changed copies of a folder.** `oxidemerge -r mine base theirs` compares three
+   folders, the common ancestor in the middle. **Merge → Auto merge folders...** lists what it
+   will copy, delete and merge into the middle, and changes nothing until you confirm. For two
+   folders, `oxidemerge -r left right`, select items and copy them with `Alt+Right` or `Alt+Left`.
+4. **Make or apply a patch.** **File → Export → Generate patch...** in a 2-way compare, or
+   `oxidemerge old new --patch changes.patch` for files or folders. **File → Apply patch...**
+   applies a unified diff, `git diff` output included, and opens each patched file for review.
+5. **Share an HTML report.** **Export HTML** on the toolbar (`Ctrl+Shift+E`) saves a single page
+   listing every difference, or `oxidemerge -r old new --report report.html --report-diffs` for
+   a folder report with the differences of every changed file.
 
 ```sh
 oxidemerge left.txt right.txt                   # 2-way text compare
@@ -450,8 +527,9 @@ configuration folder show up in the filter list as `[F] <name>`.
 Built-in language packs live in [`lang/`](lang) and are embedded in the executable. To add or
 override a language, copy `lang/en.json` to `<code>.json`, translate the values (keep any
 `{placeholder}` names unchanged), and put the file in a `Languages` folder next to the executable
-or in the configuration folder. The unit tests check that every built-in pack has every key and keeps
-all placeholders.
+or in the configuration folder. Messages missing from the file, and translations that drop or add
+a placeholder, are shown in English. The unit tests check that every built-in pack has every key,
+keeps all placeholders, and, for Chinese, keeps to Traditional or Simplified characters.
 
 ### Explorer integration (Windows)
 
@@ -499,13 +577,16 @@ src/
                     conflict parsing, filters, archives, patches, reports, projects,
                     comment stripping, JSON/XML formatting,
                     web page download, text extraction and screenshots
-  ui/               egui application, views, theme and widgets
+  ui/               egui application, views, theme and widgets, and the window tests
+tests/              command line tests
 build.rs            embeds the icon and version details in the Windows executable
+deny.toml           allowed dependency licenses and reviewed security advisories
 assets/             application icon (.png, .ico), Linux desktop entry and AppImage launcher
 scripts/            Linux AppImage packaging used by `make appimage` and CI, the user guide
-                    PDF build used by `make user-guide` and CI, and release notes taken
-                    from CHANGELOG.md
-docs/               user guide in AsciiDoc, its screenshots and PDF themes
+                    PDF build used by `make user-guide` and CI, the window smoke test, and
+                    release notes taken from CHANGELOG.md
+docs/               user guide in AsciiDoc, its screenshots and PDF themes, benchmark results,
+                    and notes on macOS signing
 lang/               built-in translations
 samples/            files used by the make demo targets
 ```
@@ -517,10 +598,17 @@ samples/            files used by the make demo targets
 - Formatted JSON and XML are shown read-only; turn the option off to edit and merge those files.
 - Web page compare fetches pages without running their scripts, except in Screenshot mode. Text,
   HTML source and resource tree modes therefore see the HTML as served, not as rendered by
-  JavaScript. Screenshots need a Chromium-based browser. There is no cookie or login support.
+  JavaScript, and miss content loaded later. Screenshots need a Chromium-based browser, which loads
+  the page and everything it asks for itself, so the resource limits above don't apply to them.
+  There is no cookie or login support, so pages behind a login show their login page.
 - Text editing is line-based, so it is not a full code editor.
 - Unpacker plugins are external commands rather than WinMerge plugin DLLs or scripts.
 - Machine-assisted translations have not been reviewed by native speakers.
+
+## Security
+
+[SECURITY.md](SECURITY.md) explains how to report a vulnerability, what OxideMerge treats as
+untrusted input, and how dependencies are checked.
 
 ## License
 

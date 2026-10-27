@@ -33,7 +33,7 @@ DIST_DIR    := dist/$(DIST_NAME)
 .DEFAULT_GOAL := all
 
 .PHONY: all help build release run run-release demo demo-text demo-3way demo-conflict \
-        test check check-platforms lint fmt fmt-check ci install uninstall shell-register shell-unregister \
+        test gui-smoke check check-platforms lint fmt fmt-check ci install uninstall shell-register shell-unregister \
         languages dist appimage user-guide clean
 
 help:
@@ -47,7 +47,8 @@ help:
 	@echo '  demo-text         2-way text compare of the sample main.rs files'
 	@echo '  demo-3way         3-way text compare of samples/three'
 	@echo '  demo-conflict     Resolve the sample Git conflict file'
-	@echo '  test              Run the unit tests'
+	@echo '  test              Run the unit, window and command line tests'
+	@echo '  gui-smoke         Open real windows with the release build and check what they show'
 	@echo '  check             Type-check all targets'
 	@echo '  check-platforms   Type-check for Windows, macOS and Linux'
 	@echo '  lint              Clippy with warnings treated as errors'
@@ -92,6 +93,9 @@ demo-conflict:
 
 test:
 	$(CARGO) test
+
+gui-smoke: release
+	bash scripts/gui-smoke.sh $(RELEASE_BIN)
 
 check:
 	$(CARGO) check --all-targets

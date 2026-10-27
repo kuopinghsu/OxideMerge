@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
+#[cfg(not(test))]
+use std::sync::RwLock;
 
 type Table = HashMap<String, &'static str>;
 
@@ -36,12 +38,68 @@ enum Source {
 
 static LANGS: OnceLock<Vec<LanguageInfo>> = OnceLock::new();
 static ENGLISH: OnceLock<Table> = OnceLock::new();
-static CURRENT: RwLock<Option<(&'static str, &'static Table)>> = RwLock::new(None);
+type Current = Option<(&'static str, &'static Table)>;
+
+#[cfg(not(test))]
+static CURRENT: RwLock<Current> = RwLock::new(None);
+
+// Tests run in parallel; one switching the language must not change the text others check.
+#[cfg(test)]
+thread_local! {
+    static CURRENT: std::cell::Cell<Current> = const { std::cell::Cell::new(None) };
+}
+
+fn current() -> Current {
+    #[cfg(not(test))]
+    return *CURRENT.read().unwrap();
+    #[cfg(test)]
+    return CURRENT.get();
+}
+
+fn set_current(c: Current) {
+    #[cfg(not(test))]
+    {
+        *CURRENT.write().unwrap() = c;
+    }
+    #[cfg(test)]
+    CURRENT.set(c);
+}
 
 fn parse(text: &str) -> Table {
     let raw: HashMap<String, String> = serde_json::from_str(text).unwrap_or_default();
     raw.into_iter()
         .map(|(k, v)| (k, &*Box::leak(v.into_boxed_str())))
+        .collect()
+}
+
+/// The `{name}` placeholders in `s`, sorted.
+fn placeholders(s: &str) -> Vec<&str> {
+    let mut v: Vec<&str> = s
+        .match_indices('{')
+        .filter_map(|(i, _)| {
+            let rest = &s[i + 1..];
+            let end = rest.find('}')?;
+            let name = &rest[..end];
+            (!name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase()))
+                .then_some(&s[i..i + end + 2])
+        })
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+/// A language pack from a file: only text values of known keys, with the same placeholders
+/// as in English, are used. English is shown for anything else.
+fn parse_pack(text: &str) -> Table {
+    let raw: HashMap<String, serde_json::Value> = serde_json::from_str(text).unwrap_or_default();
+    let en = english();
+    raw.into_iter()
+        .filter_map(|(k, v)| {
+            let v = v.as_str()?;
+            let e = en.get(&k)?;
+            (k == "_name" || placeholders(e) == placeholders(v))
+                .then(|| (k, &*Box::leak(v.to_owned().into_boxed_str())))
+        })
         .collect()
 }
 
@@ -142,21 +200,21 @@ pub fn set_language(code: &str) {
     let info = languages().iter().find(|l| l.code == code).cloned();
     let table: &'static Table = match info.map(|i| i.source) {
         Some(Source::Embedded(text)) => Box::leak(Box::new(parse(text))),
-        Some(Source::File(p)) => Box::leak(Box::new(parse(
+        Some(Source::File(p)) => Box::leak(Box::new(parse_pack(
             &std::fs::read_to_string(p).unwrap_or_default(),
         ))),
         None => english(),
     };
     let code: &'static str = Box::leak(code.into_boxed_str());
-    *CURRENT.write().unwrap() = Some((code, table));
+    set_current(Some((code, table)));
 }
 
 pub fn current_language() -> &'static str {
-    CURRENT.read().unwrap().map(|(c, _)| c).unwrap_or("en")
+    current().map(|(c, _)| c).unwrap_or("en")
 }
 
 pub fn tr(key: &'static str) -> &'static str {
-    if let Some((_, t)) = *CURRENT.read().unwrap() {
+    if let Some((_, t)) = current() {
         if let Some(v) = t.get(key) {
             return v;
         }
@@ -190,19 +248,69 @@ mod tests {
 
     #[test]
     fn translations_keep_placeholders() {
-        let re = regex::Regex::new(r"\{[a-z]+\}").unwrap();
-        let names = |s: &str| {
-            let mut v: Vec<String> = re.find_iter(s).map(|m| m.as_str().to_string()).collect();
-            v.sort();
-            v
-        };
         let en = english();
         for (code, text) in EMBEDDED {
-            for (k, v) in parse(text) {
-                if let Some(e) = en.get(&k) {
-                    assert_eq!(names(e), names(v), "{code}: placeholders differ in {k}");
-                }
+            let t = parse(text);
+            let extra: Vec<&String> = t.keys().filter(|k| !en.contains_key(*k)).collect();
+            assert!(extra.is_empty(), "{code} has unknown keys {extra:?}");
+            for (k, v) in t {
+                assert!(!v.trim().is_empty(), "{code}: {k} is empty");
+                assert_eq!(
+                    placeholders(en[&k]),
+                    placeholders(v),
+                    "{code}: placeholders differ in {k}"
+                );
             }
         }
+        assert_eq!(placeholders("{b} of {a}, {} {X}"), ["{a}", "{b}"]);
+    }
+
+    #[test]
+    fn chinese_packs_keep_to_their_script() {
+        // Simplified and Traditional forms of common characters in the interface.
+        let pairs = [
+            "们們", "这這", "设設", "页頁", "时時", "读讀", "写寫", "过過", "发發", "开開", "关關",
+            "选選", "项項", "错錯", "误誤", "输輸", "档檔", "网網", "络絡", "图圖", "应應", "则則",
+            "体體", "说說", "认認", "显顯", "无無", "区區", "资資", "转轉", "换換", "复複", "删刪",
+            "贴貼", "件件", "夹夾", "较較", "实實", "务務", "并並", "后後", "从從", "个個", "为為",
+        ];
+        let pairs: Vec<(char, char)> = pairs
+            .iter()
+            .map(|p| {
+                let mut c = p.chars();
+                (c.next().unwrap(), c.next().unwrap())
+            })
+            .filter(|(s, t)| s != t)
+            .collect();
+        let pack = |code: &str| parse(EMBEDDED.iter().find(|(c, _)| *c == code).unwrap().1);
+        for (k, v) in pack("zh-TW") {
+            let wrong: String = pairs
+                .iter()
+                .map(|p| p.0)
+                .filter(|c| v.contains(*c))
+                .collect();
+            assert!(wrong.is_empty(), "zh-TW {k} has Simplified {wrong}: {v}");
+        }
+        for (k, v) in pack("zh-CN") {
+            let wrong: String = pairs
+                .iter()
+                .map(|p| p.1)
+                .filter(|c| v.contains(*c))
+                .collect();
+            assert!(wrong.is_empty(), "zh-CN {k} has Traditional {wrong}: {v}");
+        }
+    }
+
+    #[test]
+    fn language_files_fall_back_to_english_for_broken_entries() {
+        let pack = parse_pack(
+            r#"{"_name": "Test", "status.error": "Fehler", "msg.saved": "Gespeichert",
+                "msg.op_done": "{n} erledigt", "menu.file": 3, "no.such.key": "x"}"#,
+        );
+        assert_eq!(pack.get("status.error"), Some(&"Fehler"));
+        assert_eq!(pack.get("msg.op_done"), Some(&"{n} erledigt"));
+        assert!(!pack.contains_key("msg.saved"), "drops {{file}}");
+        assert!(!pack.contains_key("menu.file") && !pack.contains_key("no.such.key"));
+        assert!(parse_pack("not json").is_empty());
     }
 }

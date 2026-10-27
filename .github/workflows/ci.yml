@@ -17,12 +17,22 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      stress_cases:
+        description: Random cases per diff, merge and patch test (blank to skip the stress run)
+        required: false
+        default: ""
+      benchmarks:
+        description: Run benchmarks
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+# Runs started by hand (stress tests, benchmarks) neither cancel nor are cancelled by pushes.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
@@ -97,6 +107,44 @@ jobs:
           "$bin" --cli -r samples/left samples/right >/dev/null || code=$?
           test "$code" -eq 1 || { echo "::error::Expected exit code 1 for differing folders, got $code"; exit 1; }
 
+      # Hosted Windows runners have no OpenGL beyond 1.1, so Mesa's llvmpipe
+      # renders in software. Its opengl32.dll goes next to a copy of the
+      # program, never into the package.
+      - name: Window smoke test
+        shell: bash
+        env:
+          MESA_VERSION: 26.2.5
+          MESA_SHA256_x64: d1b713ca2a7fba47a50c058099f13c435ddb76a16a422c334e4d787f9755a31d
+          MESA_SHA256_arm64: e7df75398d50e07a68bbffa5cff2ece4c85e5f8ef8bda497f560dd04fe60cbbd
+          GALLIUM_DRIVER: llvmpipe
+          GUI_SMOKE_STRICT: "1"
+        run: |
+          set -euo pipefail
+          archive=mesa-llvmpipe-$ARCH-$MESA_VERSION.7z
+          sum=MESA_SHA256_$ARCH
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/mmozeiko/build-mesa/releases/download/$MESA_VERSION/$archive"
+          echo "${!sum}  $RUNNER_TEMP/$archive" | sha256sum -c -
+          dir=target/gui-smoke-bin
+          mkdir -p "$dir"
+          if command -v 7z >/dev/null; then
+            7z e -y -o"$dir" "$RUNNER_TEMP/$archive" opengl32.dll >/dev/null
+          else
+            "$SYSTEMROOT/System32/tar.exe" -xf "$(cygpath -w "$RUNNER_TEMP/$archive")" -C "$dir" opengl32.dll
+          fi
+          cp "target/$TARGET/release/oxidemerge.exe" "$dir/"
+          bash scripts/gui-smoke.sh "$dir/oxidemerge.exe" target/gui-smoke
+
+      - name: Keep test output
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: test-output-windows-${{ matrix.arch }}
+          path: |
+            target/gui-tests
+            target/gui-smoke
+          if-no-files-found: ignore
+
       - name: Package
         id: package
         shell: pwsh
@@ -127,6 +175,15 @@ jobs:
           Copy-Item $exe "dist/$name.exe"
           Copy-Item $exe, README.md, LICENSE "staging/$name/"
           Compress-Archive -Path "staging/$name" -DestinationPath "dist/$name.zip"
+          Expand-Archive "dist/$name.zip" -DestinationPath check
+          foreach ($f in 'oxidemerge.exe', 'README.md', 'LICENSE') {
+            if (-not (Test-Path "check/$name/$f")) {
+              Write-Error "$name.zip lacks $f"
+              exit 1
+            }
+          }
+          & "check/$name/oxidemerge.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
           Get-ChildItem dist | Format-Table Name, Length
           "name=$name" >> $env:GITHUB_OUTPUT
@@ -160,7 +217,8 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev libgl1-mesa-dev
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev libgl1-mesa-dev \
+            xvfb libgl1-mesa-dri libegl-mesa0 libxkbcommon-x11-0 libx11-xcb1 libxcursor1 libxi6
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -189,6 +247,23 @@ jobs:
           code=0
           "$bin" --cli -r samples/left samples/right >/dev/null || code=$?
           test "$code" -eq 1 || { echo "::error::Expected exit code 1 for differing folders, got $code"; exit 1; }
+
+      # Mesa's software renderer under a virtual display.
+      - name: Window smoke test
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          GUI_SMOKE_STRICT: "1"
+        run: bash scripts/gui-smoke.sh target/release/oxidemerge target/gui-smoke
+
+      - name: Keep test output
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: test-output-linux-${{ matrix.arch }}
+          path: |
+            target/gui-tests
+            target/gui-smoke
+          if-no-files-found: ignore
 
       - name: Package
         id: package
@@ -255,6 +330,37 @@ jobs:
 
           ls -l dist
           echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      # What the packages hold, and that the .deb installs, runs, and uninstalls without
+      # touching the user's settings.
+      - name: Check packages
+        env:
+          NAME: ${{ steps.package.outputs.name }}
+        run: |
+          set -euo pipefail
+          listing=$(tar -tzf "dist/$NAME.tar.gz")
+          for f in oxidemerge README.md LICENSE oxidemerge.desktop oxidemerge.png; do
+            grep -qx "$NAME/$f" <<<"$listing" || { echo "::error::$NAME.tar.gz lacks $f"; exit 1; }
+          done
+          deb="dist/$NAME.deb"
+          test "$(dpkg-deb -f "$deb" Architecture)" = "$DEB_ARCH"
+          contents=$(dpkg-deb -c "$deb")
+          for f in usr/bin/oxidemerge usr/share/applications/oxidemerge.desktop \
+            usr/share/icons/hicolor/256x256/apps/oxidemerge.png usr/share/doc/oxidemerge/copyright; do
+            grep -q " \./$f\$" <<<"$contents" || { echo "::error::$deb lacks /$f"; exit 1; }
+          done
+          # The installed program keeps the user's settings, and options given on
+          # the command line apply to that run only.
+          mkdir -p ~/.config/OxideMerge
+          echo '{"language":"de"}' > ~/.config/OxideMerge/config.json
+          sudo apt-get install -y "./$deb"
+          oxidemerge --version
+          oxidemerge --cli --ignore-case samples/left/same.txt samples/right/same.txt
+          jq -e '.language == "de" and (.diff.ignore_case // false) == false' \
+            ~/.config/OxideMerge/config.json >/dev/null ||
+            { echo "::error::Running the installed program changed the settings"; exit 1; }
+          sudo apt-get remove -y oxidemerge
+          test ! -e /usr/bin/oxidemerge || { echo "::error::/usr/bin/oxidemerge is still there"; exit 1; }
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -447,6 +553,19 @@ jobs:
           cargo build --release --locked --target aarch64-apple-darwin
           cargo build --release --locked --target x86_64-apple-darwin
 
+      - name: Window smoke test
+        run: bash scripts/gui-smoke.sh target/aarch64-apple-darwin/release/oxidemerge target/gui-smoke
+
+      - name: Keep test output
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: test-output-macos
+          path: |
+            target/gui-tests
+            target/gui-smoke
+          if-no-files-found: ignore
+
       - name: Package
         id: package
         shell: bash
@@ -472,6 +591,10 @@ jobs:
             target/x86_64-apple-darwin/release/oxidemerge
           strip -x "$app/Contents/MacOS/oxidemerge"
           lipo -info "$app/Contents/MacOS/oxidemerge"
+          lipo "$app/Contents/MacOS/oxidemerge" -verify_arch arm64 x86_64 || {
+            echo "::error::OxideMerge.app is not universal"
+            exit 1
+          }
 
           iconset=staging/oxidemerge.iconset
           mkdir -p "$iconset"
@@ -514,8 +637,8 @@ jobs:
           cp README.md LICENSE staging/dmg/
 
           # Ad-hoc signature: Apple silicon refuses to run unsigned code. The
-          # app is not notarized, so the first launch needs Open from the
-          # context menu, or System Settings > Privacy & Security > Open Anyway.
+          # app is not notarized (see docs/macos-signing.md), so the first launch
+          # needs System Settings > Privacy & Security > Open Anyway.
           codesign --force --deep --sign - "$app"
           codesign --verify --deep --strict "$app"
 
@@ -551,6 +674,86 @@ jobs:
           name: ${{ steps.package.outputs.name }}
           path: dist/*
           if-no-files-found: error
+
+  # deny.toml lists the licenses allowed and the advisories reviewed. New advisories appear
+  # without any change here, so outside of release tags they warn instead of failing.
+  dependencies:
+    name: Dependencies (${{ matrix.checks }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        checks: [advisories, bans licenses sources]
+    continue-on-error: ${{ matrix.checks == 'advisories' && !startsWith(github.ref, 'refs/tags/') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check ${{ matrix.checks }}
+
+  # A long run of the randomized diff, merge and patch tests, started by hand. It
+  # is not needed for a release. A failure prints the seed that replays it:
+  # OXIDEMERGE_TEST_SEED=<seed> cargo test regress
+  stress:
+    name: Randomized tests (${{ inputs.stress_cases }} cases)
+    if: github.event_name == 'workflow_dispatch' && inputs.stress_cases != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Test
+        env:
+          OXIDEMERGE_TEST_CASES: ${{ inputs.stress_cases }}
+        run: cargo test --release --locked --bin oxidemerge regress
+
+  # Started by hand; the numbers are kept, not checked (see docs/benchmarks.md).
+  benchmarks:
+    name: Benchmarks (${{ matrix.os }})
+    if: github.event_name == 'workflow_dispatch' && inputs.benchmarks
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-14]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev libgl1-mesa-dev time
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Run
+        shell: bash
+        env:
+          OXIDEMERGE_BENCH_LARGE: "1"
+        run: |
+          cargo test --release --locked --bin oxidemerge bench -- --ignored --nocapture --test-threads 1
+          cat target/bench/results.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: benchmarks-${{ matrix.os }}
+          path: target/bench/results.md
 
   user-guide:
     name: User guide PDF
@@ -596,7 +799,7 @@ jobs:
 
   release:
     name: GitHub release
-    needs: [windows, linux, appimage, appimage-test, macos, user-guide]
+    needs: [windows, linux, appimage, appimage-test, macos, user-guide, dependencies]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
@@ -614,6 +817,36 @@ jobs:
           pattern: oxidemerge-*
           path: dist
           merge-multiple: true
+
+      # A published release is never replaced: a problem is fixed in the next patch version.
+      - name: Check the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Only "not found" lets the release go ahead; any other answer stops it.
+          if out=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" 2>&1); then
+            echo "::error::Release $GITHUB_REF_NAME exists already; release a new patch version instead"
+            exit 1
+          elif ! grep -q 'HTTP 404' <<<"$out"; then
+            echo "::error::Could not check for an existing release: $out"
+            exit 1
+          fi
+          v=${GITHUB_REF_NAME#v}
+          missing=0
+          for f in \
+            "windows-x64.exe" "windows-x64.zip" "windows-arm64.exe" "windows-arm64.zip" \
+            "linux-x64.tar.gz" "linux-x64.deb" "linux-x64.AppImage" \
+            "linux-arm64.tar.gz" "linux-arm64.deb" "linux-arm64.AppImage" \
+            "macos-universal.dmg" "macos-universal.zip" \
+            "user-guide.pdf" "user-guide.zh-TW.pdf"; do
+            if [ ! -s "dist/oxidemerge-$v-$f" ]; then
+              echo "::error::dist/oxidemerge-$v-$f is missing"
+              missing=1
+            fi
+          done
+          ls -l dist
+          exit $missing
 
       - name: Checksums
         working-directory: dist
@@ -636,12 +869,14 @@ jobs:
 
           **Linux (x64 or Arm64):** pick the `linux-x64` packages for Intel and AMD machines and the `linux-arm64` ones for 64-bit Arm (aarch64). `oxidemerge-*-linux-<arch>.AppImage` runs without installing anything on Ubuntu 20.04, RHEL 8, Debian 10, and newer: `chmod +x` it, then run it. It carries the libraries OxideMerge needs besides glibc and the graphics driver. Without FUSE, start it with `--appimage-extract-and-run`. On Ubuntu 22.04 or newer, `sudo apt install ./oxidemerge-*-linux-<arch>.deb` installs OxideMerge instead, and `oxidemerge-*-linux-<arch>.tar.gz` holds the bare program. File dialogs use the XDG desktop portal (`xdg-desktop-portal`).
 
-          **macOS 11 or later (Apple silicon and Intel):** open `oxidemerge-*-macos-universal.dmg` and drag OxideMerge to Applications. The app is not notarized, so the first time, Control-click it and choose **Open**, or allow it in **System Settings → Privacy & Security**. `oxidemerge-*-macos-universal.zip` holds the same app. To use it from the terminal, run `sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin/oxidemerge`.
+          **macOS 11 or later (Apple silicon and Intel):** open `oxidemerge-*-macos-universal.dmg` and drag OxideMerge to Applications. The app is not notarized, so macOS blocks it the first time: try to open it once, then choose **Open Anyway** in **System Settings → Privacy & Security** (up to macOS 14, Control-clicking it and choosing **Open** also works), or run `xattr -dr com.apple.quarantine /Applications/OxideMerge.app`. `oxidemerge-*-macos-universal.zip` holds the same app. To use it from the terminal, run `sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin/oxidemerge`.
 
           **User guide:** `oxidemerge-*-user-guide.pdf` in English and `oxidemerge-*-user-guide.zh-TW.pdf` in Traditional Chinese.
 
           Check downloads against `SHA256SUMS.txt`. Web page screenshots need a Chromium-based browser (Edge, Chrome, Chromium or Brave); every other compare works without one.
           EOF
+            echo
+            echo "Built from commit \`$GITHUB_SHA\` by [this workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
           } > release-notes.md
           cat release-notes.md
 
@@ -649,4 +884,5 @@ jobs:
         with:
           files: dist/*
           body_path: release-notes.md
+          overwrite_files: false
           prerelease: ${{ contains(github.ref_name, '-') }}

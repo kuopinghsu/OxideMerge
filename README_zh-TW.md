@@ -21,14 +21,14 @@ OxideMerge 是以 Rust 撰寫的開放原始碼跨平台差異比較與合併工
 ## 功能
 
 **資料夾比較與合併**
-- 支援雙向與三向資料夾比較，可選擇是否包含子資料夾，並以樹狀檢視或平面清單呈現。
+- 支援雙向與三方資料夾比較，可選擇是否包含子資料夾，並以樹狀檢視或平面清單呈現。
 - 比較進行中就會顯示結果：掃描資料夾的同時即比較檔案，一發現差異或單側獨有的項目便立即列出。
 - 大型檔案會分段比較，相同的檔案與二進位檔絕不會整個載入記憶體；使用「快速內容」與「二進位內容」比較方法時，大小不同的檔案不必讀取內容即可判定為不同。
 - 比較方法：完整內容、快速內容、二進位內容、修改日期、修改日期與大小、僅比較大小。
 - 可分別顯示或隱藏相同、不同與單側獨有的項目。可在兩側之間複製或刪除項目，並可選擇使用資源回收筒及顯示確認提示。
 - 可將任一側所選的項目複製到其他資料夾並保留相對路徑，也可用萬用字元（`*.c; *.h`）依名稱選取項目。
 - 資料夾清單下方的檔案比較（「檢視 → 資料夾清單」）：所選檔案的差異直接顯示在清單下方，不必另開分頁。
-- 三向資料夾自動合併到中間（共同祖先）資料夾：只在一側所做的變更會複製過去、刪除會一併套用，兩側都有變更的文字檔若變更沒有重疊，會逐行合併。衝突會列出並維持原狀。
+- 三方資料夾自動合併到中間（共同的祖先版本）資料夾：只在一側所做的變更會複製過去、刪除會一併套用，兩側都有變更的文字檔若變更沒有重疊，會逐行合併。衝突會列出並維持原狀。
 - 鍵盤選取：方向鍵、Page Up／Page Down、Home／End，按住 Shift 可擴大選取範圍，按 Ctrl+A 全選。
 - 快速預覽：按空白鍵即可查看所選檔案以色彩標示的差異，不必另開分頁。
 - 視窗在背景時若耗時較久的比較已完成，會發出通知提醒你。
@@ -40,7 +40,7 @@ OxideMerge 是以 Rust 撰寫的開放原始碼跨平台差異比較與合併工
 - 專案檔（`.oxmproj`）可儲存分頁所比較的內容（路徑、篩選器、子資料夾、比較方式與比較規則檔），之後再次開啟；也可開啟 WinMerge 的 `.WinMerge` 專案檔。
 
 **文字比較與合併**
-- 雙向與三向比較，可選用 Myers、Patience 或 LCS 差異演算法。大型檔案會先以兩側各只出現一次的行切分，即使有數萬處差異，也能在一秒內完成比較。
+- 雙向與三方比較，可選用 Myers、Patience 或 LCS 差異演算法。大型檔案會先以兩側各只出現一次的行切分，即使有數萬處差異，也能在一秒內完成比較。
 - 行內差異（字詞與字元層級）、搬移區塊偵測，以及可綜覽全部差異的位置窗格。
 - 可將未變更的行摺疊成一列，點按即可展開（每個差異前後保留三行作為上下文），長行也可自動換行。
 - 將指標移到差異上，即可點按兩欄分隔線上的箭頭直接複製；工具列會顯示新增與刪除的行數。
@@ -57,8 +57,8 @@ OxideMerge 是以 Rust 撰寫的開放原始碼跨平台差異比較與合併工
 - 行號欄的編輯標記會顯示開啟檔案後變更過的行。
 - 統計資料（「工具」選單）：每一對比較側的相同、變更、新增、移除與忽略的行數。
 - 增加或減少選取行的縮排（Ctrl+]／Ctrl+[）。
-- 三向合併可採用差異的兩側（先左後右，或先右後左）。
-- 可將差異複製到左側或右側、全部複製、在三向比較中自動合併、復原與重做，並可直接編輯內容。
+- 三方合併可採用差異的兩側（先左後右，或先右後左）。
+- 可將差異複製到左側或右側、全部複製、在三方比較中自動合併、復原與重做，並可直接編輯內容。
 - 可用拖曳、Shift＋點按或 Shift＋方向鍵選取多行；按 Ctrl+C 複製到剪貼簿，或按 Alt+Right／Alt+Left 複製到另一側。
 - 可解決含有 `<<<<<<<`、`|||||||`、`=======` 與 `>>>>>>>` 標記的版本控制衝突檔案。
 - 自動偵測編碼與換行字元，並提供語法醒目提示、跳至指定行，以及 CSV／TSV 表格模式。
@@ -84,7 +84,8 @@ OxideMerge 是以 Rust 撰寫的開放原始碼跨平台差異比較與合併工
   - **HTML 原始碼**：網頁的原始碼，經過壓縮而過長的單行會在標籤之間斷開，以文字比較開啟。
   - **文字**：各網頁中看得見的文字（已移除指令碼、樣式與標記），以文字比較開啟。
   - **資源樹**：下載各網頁及其樣式表、指令碼、圖片、框架與多媒體檔案，再以資料夾比較來比較下載的檔案。
-- 依 HTTP 標頭或 `<meta>` 標籤指定的字元集解碼網頁。HTTP 狀態碼不是 2xx 時，會顯示在窗格標題列。
+- 以與瀏覽器相同的方式解碼網頁（先看位元組順序標記，其次是 HTTP 字元集，再來是 `<meta>`）。HTTP 狀態碼不是 2xx 時，會顯示在窗格標題列。
+- 資源樹每個網頁最多載入 400 個資源，每個最多 20 MB。網頁不得載入本機檔案；除非網頁本身就在本機或私人網路上，否則也不會從這類位址載入資源。
 
 **介面**
 - 分頁式文件、列出最近比較紀錄的起始頁，並支援拖放檔案與資料夾。
@@ -115,8 +116,11 @@ OxideMerge 是以 Rust 撰寫的開放原始碼跨平台差異比較與合併工
 | macOS 11 以上（Apple 晶片與 Intel） | `oxidemerge-<版本>-macos-universal.dmg`，或內含同一個應用程式的 `.zip` |
 
 - **Linux：** 啟動 AppImage 前，請先執行 `chmod +x oxidemerge-*.AppImage`。若系統沒有 FUSE，請加上 `--appimage-extract-and-run` 參數啟動。安裝 Debian 套件請執行 `sudo apt install ./oxidemerge-*.deb`。檔案對話框需要 `xdg-desktop-portal`，一般桌面環境都已內建。
-- **macOS：** 本應用程式僅經過臨時簽署（ad-hoc），未經 Apple 公證。第一次開啟時，請按住 Control 鍵再點按應用程式並選擇「**打開**」，或在「**系統設定 → 隱私權與安全性**」中允許執行。若要在終端機中使用，請執行
+- **macOS：** 本應用程式僅經過臨時簽署（ad-hoc），未經 Apple 公證，因此第一次開啟時會被 macOS 阻擋。請先嘗試開啟一次，再到「**系統設定 → 隱私權與安全性**」中選擇「**強制打開**」。（macOS 14 以前，按住 Control 鍵再點按應用程式並選擇「**打開**」也可以。）或執行 `xattr -dr com.apple.quarantine /Applications/OxideMerge.app` 清除下載標記。若要在終端機中使用，請執行
   `sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin/oxidemerge`。
+  [docs/macos-signing.md](docs/macos-signing.md)（英文）說明目前為何尚未進行公證。
+
+每個發行版本都附有 `SHA256SUMS.txt`。若要用它檢查下載的檔案，請在 Linux 上執行 `sha256sum -c --ignore-missing SHA256SUMS.txt`，在 macOS 上執行 `shasum -a 256 -c --ignore-missing SHA256SUMS.txt`，或在 PowerShell 中執行 `Get-FileHash <檔案>` 並比對數值。
 
 ## 建置
 
@@ -139,8 +143,9 @@ cargo test
 | `make build` | 偵錯版建置 |
 | `make run ARGS="a.txt b.txt"` | 帶參數執行偵錯版 |
 | `make demo` | 比較 `samples/left` 與 `samples/right` 資料夾 |
-| `make demo-text` / `demo-3way` / `demo-conflict` | 文字、三向與衝突檔案示範 |
-| `make test` / `check` / `lint` | 單元測試、型別檢查、將警告視為錯誤的 clippy 靜態檢查 |
+| `make demo-text` / `demo-3way` / `demo-conflict` | 文字、三方與衝突檔案示範 |
+| `make test` / `check` / `lint` | 單元測試、視窗測試與指令列測試，型別檢查，將警告視為錯誤的 clippy 靜態檢查 |
+| `make gui-smoke` | 以正式版開啟真正的視窗，並檢查視窗顯示的內容（見[測試](#測試)） |
 | `make ci` | 依序執行 `check`、`lint` 與 `test` |
 | `make check-platforms` | 針對 Windows、macOS 與 Linux 進行型別檢查（每個平台都需先以 `rustup target add` 加入目標） |
 | `make install` / `uninstall` | 以 `cargo install` 安裝到 `~/.cargo/bin`，或解除安裝 |
@@ -151,9 +156,23 @@ cargo test
 | `make clean` | 刪除建置產出 |
 | `make help` | 列出所有目標 |
 
+### 測試
+
+`cargo test` 會執行三類測試：
+
+- **單元測試**：涵蓋差異、合併、修補檔、資料夾與檔案相關程式碼。`src/core/regress.rs` 中的隨機差異、合併與修補檔測試會檢查數百個自動產生的案例。失敗時會印出種子值：`OXIDEMERGE_TEST_SEED=<種子值> cargo test regress` 可重現該案例，`OXIDEMERGE_TEST_CASES=20000 cargo test --release regress` 則會搜尋更多案例。
+- **視窗測試**：位於 `src/ui/gui_tests.rs`。這些測試不需要螢幕就能操作真正的檢視畫面：點按按鈕與選單、輸入文字、拖放檔案，並檢查每個檢視畫面顯示的內容與寫入磁碟的結果。測試失敗時，視窗當時顯示的內容會寫入 `target/gui-tests/<測試名稱>.txt`。
+- **指令列測試**：位於 `tests/cli.rs`，會執行建置出的程式，檢查結束代碼、報告、修補檔與錯誤訊息。
+
+這些測試都不會讀取或變更你的設定。測試使用專屬的設定資料夾；設定 `OXIDEMERGE_CONFIG_DIR` 時，程式本身也會改用該資料夾。
+
+`make gui-smoke`（或 `scripts/gui-smoke.sh path/to/oxidemerge`）會開啟真正的視窗，比較兩個檔案、三個檔案與兩個資料夾，再檢查每個視窗顯示的內容。設定 `OXIDEMERGE_SMOKE_REPORT=<檔案>` 時，程式會在比較完成後，把顯示的分頁與訊息寫入該檔案，然後自行關閉。在沒有顯示器的 Linux 上，指令碼會自行啟動一個 Xvfb 顯示器。
+
+效能基準測試需另外執行；[docs/benchmarks.md](docs/benchmarks.md)（英文）說明其執行方式，並記錄了基準結果。
+
 ### 持續整合
 
-每次推送到 `main` 分支及每個拉取要求（pull request），都會執行 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。它會在 Windows、Linux 與 macOS 上執行將警告視為錯誤的 clippy 靜態檢查、執行單元測試、建置正式版，並對指令列功能進行冒煙測試（`--version`、`--list-languages` 與 `--cli` 的結束代碼）。Arm64 安裝套件在 GitHub 的 Arm 執行器（`windows-11-arm`、`ubuntu-22.04-arm`、`ubuntu-24.04-arm`）上原生建置與測試。接著將下列安裝套件上傳為工作流程成品：
+每次推送到 `main` 分支及每個拉取要求（pull request），都會執行 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。它會在 Windows、Linux 與 macOS 上執行將警告視為錯誤的 clippy 靜態檢查、執行單元測試、視窗測試與指令列測試、建置正式版、對指令列功能進行冒煙測試（`--version`、`--list-languages` 與 `--cli` 的結束代碼），並以 `scripts/gui-smoke.sh` 開啟真正的視窗（在 Windows 與 Linux 上使用 Mesa 軟體算繪器，Linux 上則在 Xvfb 下執行）。測試失敗時，其輸出會保留為 `test-output-*` 成品。手動啟動工作流程並填入壓力測試案例數時，還會以該數量執行隨機測試；勾選 *benchmarks* 則會執行 [`docs/benchmarks.md`](docs/benchmarks.md)（英文）中的效能測試；發行版本不會等待這兩項測試。另有一項工作以 `cargo deny` 檢查相依套件（見[安全性](#安全性)）。Arm64 安裝套件在 GitHub 的 Arm 執行器（`windows-11-arm`、`ubuntu-22.04-arm`、`ubuntu-24.04-arm`）上原生建置與測試。接著將下列安裝套件上傳為工作流程成品：
 
 - **Windows x64 與 Arm64：** `.exe` 與 `.zip`。
 - **Linux x64 與 Arm64：** 在 Ubuntu 22.04 上建置的 `.tar.gz` 與 `.deb`。
@@ -161,32 +180,44 @@ cargo test
 - **macOS：** 經臨時簽署的通用版（Apple 晶片與 Intel）`OxideMerge.app`，分別包裝成 `.dmg` 與 `.zip`。
 - **使用者指南：** 以 Asciidoctor PDF 建置的英文與繁體中文指南 PDF 檔。若有任何字元在所有字型中都找不到，建置即失敗。
 
-推送 `v0.9.3` 這類標籤時，會在 GitHub 發行版本頁面發布所有安裝套件、使用者指南與 `SHA256SUMS.txt`。標籤必須與 `Cargo.toml` 中的版本一致；含有 `-` 的標籤（例如 `v1.0.0-rc1`）會標示為搶先版。發行說明取自 [`CHANGELOG.md`](CHANGELOG.md) 中該版本的段落，後面再附上下載說明，因此請在推送標籤前先寫好該段落；缺少時建置會提早失敗。執行 `scripts/release-notes.sh 0.9.3` 可預覽某個版本的發行說明。CI 只會讀取 `CHANGELOG.md`，不會修改它。
+安裝套件建置完成後會再經過檢查：Windows 的 `.zip` 必須包含程式、README 與授權條款；Linux 的 `.deb` 會實際安裝、執行，再移除，且不得動到使用者的設定；macOS 應用程式必須同時包含兩種架構，並透過 Rosetta 執行其中的 Intel 版本。
+
+推送 `v0.9.4` 這類標籤時，會在 GitHub 發行版本頁面發布所有安裝套件、使用者指南與 `SHA256SUMS.txt`。標籤必須與 `Cargo.toml` 中的版本一致；含有 `-` 的標籤（例如 `v1.0.0-rc1`）會標示為搶先版。發行說明取自 [`CHANGELOG.md`](CHANGELOG.md) 中該版本的段落，後面再附上下載說明，因此請在推送標籤前先寫好該段落；缺少時建置會提早失敗。執行 `scripts/release-notes.sh 0.9.4` 可預覽某個版本的發行說明。CI 只會讀取 `CHANGELOG.md`，不會修改它。發布前，發行工作會檢查所有安裝套件是否齊全、該版本是否尚未發行過，而發行說明會註明這些安裝套件建置自哪一個提交。
 
 發行新版本的步驟：
 
 1. 修改 `Cargo.toml` 中的 `version`，並執行 `cargo build` 讓 `Cargo.lock` 一併更新。
-2. 在 `CHANGELOG.md` 中，把該版本的標題從 `## [0.9.3] - Unreleased` 改成發行日期，例如 `## [0.9.3] - 2026-10-26`，並檢查內容。
-3. 執行 `make fmt-check ci`，再用 `scripts/release-notes.sh 0.9.3` 預覽發行說明。
+2. 在 `CHANGELOG.md` 中，把該版本的標題從 `## [0.9.4] - Unreleased` 改成 `## [0.9.4] - YYYY-MM-DD`（填入發行日期），並檢查內容。
+3. 執行 `make fmt-check ci`，再用 `scripts/release-notes.sh 0.9.4` 預覽發行說明。
 4. 提交並推送到 `main`，等待所有平台的 CI 都通過。標籤會建置它所指向的提交，若該提交的 CI 失敗，發行也會失敗。
 5. 為該提交加上標籤並推送：
 
    ```sh
-   git tag -a v0.9.3 -m "OxideMerge 0.9.3"
-   git push origin v0.9.3
+   git tag -a v0.9.4 -m "OxideMerge 0.9.4"
+   git push origin v0.9.4
    ```
 
-6. 開始下一個版本：在 `CHANGELOG.md` 最上方加入 `## [0.9.4] - Unreleased` 段落，之後的變更都記錄在這裡。
+6. 開始下一個版本：在 `CHANGELOG.md` 最上方加入 `## [0.9.5] - Unreleased` 段落，之後的變更都記錄在這裡。
 
-若發行建置失敗，請先在 `main` 上修正，再把標籤移到新的提交並重新推送（`git tag -f -a v0.9.3 -m "OxideMerge 0.9.3"` 與 `git push -f origin v0.9.3`）。
+已推送的標籤絕不移動或重複使用：可能已有人下載了它的安裝套件，其總和檢查碼必須始終相符。若發行建置失敗，或已發布的版本有問題，請在 `main` 上修正後發行下一個修補版本（例如 `v0.9.5`）。建置失敗的標籤不會發布任何東西，因為發行工作會等待所有建置完成；即使如此，也請保留該標籤。
 
 ## 使用方式
 
 不帶任何參數執行 `oxidemerge` 會開啟起始頁。你可以從起始頁開啟檔案或資料夾、將它們拖放到視窗中，或選擇最近的比較紀錄。
 
+### 快速入門
+
+以下是最常見的五項工作，可以從視窗操作，也可以使用指令列。[使用者指南](docs/user-guide.zh-TW.adoc)會詳細說明每一項，其中「比較類型」一節則說明 OxideMerge 如何決定要進行文字、二進位、影像、資料夾或網頁比較。
+
+1. **比較兩個檔案。** 執行 `oxidemerge old.txt new.txt`，或將兩個檔案拖放到視窗中。`Alt+Down` 與 `Alt+Up` 會逐一移到各個差異，`Alt+Right` 與 `Alt+Left` 會將目前的差異複製到另一側，`Ctrl+S` 則會儲存。
+2. **合併三個檔案。** `oxidemerge mine.txt base.txt theirs.txt -o merged.txt` 會將共同的祖先版本放在中間。「**合併 → 自動合併**」會套用只在其中一側所做的每項變更；`Alt+PgDn` 會移到剩下的衝突，你可以從任一側複製過來，或直接編輯。儲存時會將中間的內容寫入 `merged.txt`。含衝突標記的檔案也用同樣方式開啟：`oxidemerge conflict.txt`。
+3. **合併資料夾的兩份修改版本。** `oxidemerge -r mine base theirs` 會比較三個資料夾，共同的祖先版本在中間。「**合併 → 自動合併資料夾...**」會先列出要複製、刪除與合併到中間的項目，在你確認前不會做任何變更。若只有兩個資料夾，請執行 `oxidemerge -r left right`，選取項目後以 `Alt+Right` 或 `Alt+Left` 複製。
+4. **產生或套用修補檔。** 在雙向比較中選擇「**檔案 → 匯出 → 產生修補檔...**」，或對檔案或資料夾執行 `oxidemerge old new --patch changes.patch`。「**檔案 → 套用修補檔...**」可套用統一格式的差異（包括 `git diff` 的輸出），並開啟每個修補後的檔案供你檢查。
+5. **分享 HTML 報告。** 工具列上的「**匯出 HTML**」（`Ctrl+Shift+E`）會儲存一個列出所有差異的單一網頁；或執行 `oxidemerge -r old new --report report.html --report-diffs`，產生包含每個變更檔案差異的資料夾報告。
+
 ```sh
 oxidemerge left.txt right.txt                   # 雙向文字比較
-oxidemerge mine.txt base.txt theirs.txt         # 三向比較（中間為共同基礎版本）
+oxidemerge mine.txt base.txt theirs.txt         # 三方比較（中間為共同的祖先版本）
 oxidemerge -r C:\project\v1 C:\project\v2       # 包含子資料夾的資料夾比較
 oxidemerge -r -f "*.rs;!target/" old new        # 套用篩選器的資料夾比較
 oxidemerge conflict.txt                         # 解決含衝突標記的檔案
@@ -271,7 +302,7 @@ git config --global mergetool.oxidemerge.trustExitCode false
 ```
 
 - `git difftool` 會逐一開啟每個變更的檔案；`git difftool --dir-diff` 則以一個資料夾比對開啟全部檔案，在最後一個差異按 Alt+Down 會接著開啟下一個變更的檔案。
-- `git mergetool` 會開啟三方合併，中間是共同祖先。使用自動合併（或把差異複製到中間）後存檔：中間窗格會寫入合併結果檔，不會改動共同祖先。未存檔就關閉時，衝突會維持未解決。
+- `git mergetool` 會開啟三方合併，中間是共同的祖先版本。使用自動合併（或把差異複製到中間）後存檔：中間窗格會寫入合併結果檔，不會改動祖先版本。未存檔就關閉時，衝突會維持未解決。
 - 在 macOS 上，除非已將程式連結到 `PATH`（請參閱安裝一節），請使用完整路徑 `/Applications/OxideMerge.app/Contents/MacOS/oxidemerge`；在 Windows 上請使用 `oxidemerge.exe` 的路徑。
 
 ### 快速鍵
@@ -328,13 +359,13 @@ git config --global mergetool.oxidemerge.trustExitCode false
 
 ### 語言
 
-內建的語言套件位於 [`lang/`](lang) 資料夾，並會嵌入執行檔中。若要新增或覆寫某種語言，請將 `lang/en.json` 複製為 `<語言代碼>.json`，翻譯其中的值（所有 `{預留位置}` 名稱請保持不變），再將檔案放到執行檔旁的 `Languages` 資料夾或設定資料夾中。單元測試會檢查每個內建語言套件是否包含所有鍵值，且保留了所有預留位置。
+內建的語言套件位於 [`lang/`](lang) 資料夾，並會嵌入執行檔中。若要新增或覆寫某種語言，請將 `lang/en.json` 複製為 `<語言代碼>.json`，翻譯其中的值（所有 `{預留位置}` 名稱請保持不變），再將檔案放到執行檔旁的 `Languages` 資料夾或設定資料夾中。檔案中缺少的訊息，以及刪除或增加了預留位置的翻譯，都會改以英文顯示。單元測試會檢查每個內建語言套件是否包含所有鍵值、保留了所有預留位置，以及中文套件是否只使用各自的繁體或簡體字。
 
 ### 檔案總管整合（Windows）
 
 執行 `oxidemerge --register-shell`（或使用「**工具 → 加入檔案總管右鍵選單**」），即可為目前的使用者在檔案、資料夾、磁碟機及資料夾空白處的檔案總管右鍵選單中，加入 **OxideMerge** 子選單。其運作方式與 WinMerge 的殼層擴充功能相同：
 
-- **比較**：選取兩個或三個檔案或資料夾，在同一個視窗中比較（選取三個時為三向比較）。若只選取一個項目，則會與先前以「選為左側」（及「選為中間」）選定的項目比較；若未曾選定，則會開啟「選擇檔案或資料夾」對話框並預先填入該項目。
+- **比較**：選取兩個或三個檔案或資料夾，在同一個視窗中比較（選取三個時為三方比較）。若只選取一個項目，則會與先前以「選為左側」（及「選為中間」）選定的項目比較；若未曾選定，則會開啟「選擇檔案或資料夾」對話框並預先填入該項目。
 - **選為左側**／**選為中間**：記住某個項目（例如位於另一個資料夾中的項目）。之後「比較」項目會改為顯示「**與「名稱」比較**」。
 - **比較方式**（僅限檔案）：以文字、二進位、影像或網頁方式比較。
 
@@ -360,12 +391,15 @@ src/
                     衝突解析、篩選器、壓縮檔、修補檔、報告、專案檔、
                     註解剝除、JSON／XML 格式化、
                     網頁下載、文字擷取與螢幕截圖
-  ui/               egui 應用程式、各種檢視、主題與介面元件
+  ui/               egui 應用程式、各種檢視、主題與介面元件，以及視窗測試
+tests/              指令列測試
 build.rs            將圖示與版本資訊嵌入 Windows 執行檔
+deny.toml           允許的相依套件授權與已審查的安全公告
 assets/             應用程式圖示（.png、.ico）、Linux 桌面項目檔與 AppImage 啟動程式
 scripts/            `make appimage` 與 CI 使用的 Linux AppImage 打包指令碼、`make user-guide` 與 CI
-                    使用的使用者指南 PDF 建置指令碼，以及從 CHANGELOG.md 擷取發行說明的指令碼
-docs/               AsciiDoc 格式的使用者指南、其螢幕截圖與 PDF 佈景主題
+                    使用的使用者指南 PDF 建置指令碼、視窗冒煙測試，以及從 CHANGELOG.md 擷取發行說明的指令碼
+docs/               AsciiDoc 格式的使用者指南、其螢幕截圖與 PDF 佈景主題、效能測試結果，
+                    以及 macOS 簽署說明
 lang/               內建翻譯
 samples/            make 示範目標使用的檔案
 ```
@@ -374,10 +408,14 @@ samples/            make 示範目標使用的檔案
 
 - 壓縮檔支援以 Zip 為基礎的格式、tar（未壓縮、gzip、bzip2、xz）與 7z，不支援 rar。
 - 格式化後的 JSON 與 XML 以唯讀方式顯示；若要編輯或合併這些檔案，請關閉此選項。
-- 除了螢幕截圖模式之外，網頁比較在擷取網頁時不會執行其中的指令碼。因此文字、HTML 原始碼與資源樹模式看到的是伺服器傳回的 HTML，而不是經 JavaScript 處理後的畫面。螢幕截圖需要 Chromium 系列瀏覽器，且不支援 Cookie 或登入。
+- 除了螢幕截圖模式之外，網頁比較在擷取網頁時不會執行其中的指令碼。因此文字、HTML 原始碼與資源樹模式看到的是伺服器傳回的 HTML，而不是經 JavaScript 處理後的畫面，也看不到之後才載入的內容。螢幕截圖需要 Chromium 系列瀏覽器，由瀏覽器自行載入網頁及其要求的所有內容，因此上述資源限制不適用於截圖。不支援 Cookie 或登入，需要登入的網頁只會顯示其登入頁面。
 - 文字編輯以行為單位，並非完整的程式碼編輯器。
 - 解譯器外掛程式是外部指令，而非 WinMerge 的外掛 DLL 或指令碼。
 - 由機器輔助完成的翻譯尚未經過母語人士審閱。
+
+## 安全性
+
+[SECURITY.md](SECURITY.md)（英文）說明如何回報安全漏洞、OxideMerge 將哪些輸入視為不受信任，以及如何檢查相依套件。
 
 ## 授權
 

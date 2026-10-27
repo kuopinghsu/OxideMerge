@@ -323,6 +323,11 @@ fn finite_number(s: &str) -> Result<f64, String> {
     }
 }
 
+/// Writes a report or patch whole or not at all, so a failed run leaves no file that looks done.
+fn export(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
+    core::fsutil::write_atomic_with(path, text.as_bytes(), false)
+}
+
 /// Non-interactive operations (console compare, report, patch). Returns the process exit code.
 fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     let mut cli_paths = cli.paths.clone();
@@ -390,7 +395,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             } else {
                 core::report::generate(&files, &shown, format, &cfg.rules)
             };
-            std::fs::write(r, text)?;
+            export(r, &text)?;
         }
         if let Some(p) = patch {
             let text = core::patch::folder_patch(
@@ -401,7 +406,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
                 patch_style(cli.patch_style),
                 cli.context,
             );
-            std::fs::write(p, text)?;
+            export(p, &text)?;
         }
         if cli.cli {
             let changed: Vec<&core::folder::DirItem> = files
@@ -501,9 +506,9 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         let titles: Vec<String> = (0..docs.len())
             .map(|i| cli_desc(cli, i).unwrap_or_else(|| paths[i].display().to_string()))
             .collect();
-        std::fs::write(
+        export(
             r,
-            core::report::text_html(&titles, &refs, &result, &cfg.diff, &[], &cfg.rules),
+            &core::report::text_html(&titles, &refs, &result, &cfg.diff, &[], &cfg.rules),
         )?;
     }
     if docs.len() == 2 {
@@ -527,7 +532,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         let text =
             core::patch::make_patch(&input, &result, patch_style(cli.patch_style), cli.context);
         if let Some(p) = patch {
-            std::fs::write(p, &text)?;
+            export(p, &text)?;
         }
         if cli.cli {
             print!("{text}");
@@ -605,7 +610,9 @@ fn main() -> ExitCode {
     let cli = Cli::parse_from(winmerge_args());
     let mut cfg = Config::load();
     if core::rules::load_selected(&mut cfg) {
-        cfg.save();
+        if let Err(e) = cfg.save() {
+            eprintln!("note: {e:#}");
+        }
     }
     let stored = cfg.clone();
     if let Some(l) = &cli.lang {
@@ -750,6 +757,8 @@ fn main() -> ExitCode {
     }
     let options = eframe::NativeOptions {
         viewport,
+        // Automated window checks leave the user's window size and place alone.
+        persist_window: std::env::var_os("OXIDEMERGE_SMOKE_REPORT").is_none(),
         ..Default::default()
     };
     let result = eframe::run_native(

@@ -159,12 +159,27 @@ impl Default for Config {
     }
 }
 
+/// The settings folder: `OXIDEMERGE_CONFIG_DIR` when set (for scripts and tests that must not
+/// see the user's settings), else the platform's. Unit tests use a folder of their own.
 pub fn config_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join("oxidemerge-test-config"));
+    }
+    if let Some(d) = std::env::var_os("OXIDEMERGE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(d));
+    }
     dirs::config_dir().map(|d| d.join("OxideMerge"))
+}
+
+fn config_dir_overridden() -> bool {
+    cfg!(test) || std::env::var_os("OXIDEMERGE_CONFIG_DIR").is_some_and(|d| !d.is_empty())
 }
 
 /// A `oxidemerge.json` next to the executable enables portable mode.
 pub fn config_path() -> Option<PathBuf> {
+    if config_dir_overridden() {
+        return config_dir().map(|d| d.join("config.json"));
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let p = dir.join("oxidemerge.json");
@@ -195,15 +210,15 @@ impl Config {
         Some(cfg)
     }
 
-    pub fn save(&self) {
-        if let Some(p) = config_path() {
-            if let Some(d) = p.parent() {
-                let _ = std::fs::create_dir_all(d);
-            }
-            if let Ok(s) = serde_json::to_string_pretty(self) {
-                let _ = crate::core::fsutil::write_atomic_with(&p, s.as_bytes(), false);
-            }
+    pub fn save(&self) -> anyhow::Result<()> {
+        let Some(p) = config_path() else {
+            anyhow::bail!("{}", crate::i18n::tr("msg.no_config"));
+        };
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d).map_err(|e| anyhow::anyhow!("{}: {e}", d.display()))?;
         }
+        let s = serde_json::to_string_pretty(self)?;
+        crate::core::fsutil::write_atomic_with(&p, s.as_bytes(), false)
     }
 
     pub fn add_recent_path(&mut self, p: &str) {

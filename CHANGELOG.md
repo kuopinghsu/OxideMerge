@@ -3,6 +3,86 @@
 All notable changes to OxideMerge are listed here, newest first. Each release on GitHub uses its
 section of this file as the release notes.
 
+## [0.9.4] - Unreleased
+
+### Added
+
+- **Tests:** randomized diff, 3-way merge and patch tests that check every result against the
+  inputs (`OXIDEMERGE_TEST_CASES` and `OXIDEMERGE_TEST_SEED` for longer runs or to repeat one),
+  tests that draw the views without a window, and command line tests of the built program
+  (`tests/cli.rs`). `OXIDEMERGE_CONFIG_DIR` points the program at another settings folder, so tests
+  never touch the real one.
+- **Window smoke test** (`make gui-smoke`, `scripts/gui-smoke.sh`): opens real windows with the
+  release build, two files, three files, two folders, and checks what each tab shows. CI runs it on
+  Windows (with Mesa's software renderer), Linux (Xvfb) and macOS and keeps the output of a failed
+  test.
+- **Benchmarks** of text, 3-way, binary, image and folder compares, timed with their peak memory
+  (`OXIDEMERGE_BENCH_*`); `docs/benchmarks.md` has the method and a first baseline, and a CI run
+  started by hand can run them on every platform.
+- **Dependency checks** with `cargo deny` (`deny.toml`) for known vulnerabilities, licenses and
+  sources, in CI and before every release, and `SECURITY.md` on reporting vulnerabilities and on
+  which inputs OxideMerge treats as untrusted.
+- **CI checks the packages:** the Windows `.zip` must hold the program, README and license; the
+  Linux `.deb` is installed, run and removed, leaving the user's settings alone; the macOS app must
+  hold both architectures. Before publishing, the release job checks that every package is there
+  and that the version was not released before, and the release notes name the commit built.
+- **Documentation:** a Quick start in the READMEs, a Compare types section and a longer
+  Troubleshooting and limitations chapter in the user guides, and `docs/macos-signing.md` on
+  Gatekeeper and notarization.
+
+### Changed
+
+- **Folder auto merge** checks each item again just before it changes it. Files are replaced
+  through a temporary file, so a crash or a full disk leaves them whole, and are kept as `.bak`
+  with backups on. Nothing is changed when the folders changed since they were compared. A file
+  and a folder of the same name, symbolic links, special files and items the compare could not
+  read are conflicts left alone; links are never followed, and names that would lead outside the
+  middle folder are refused. A step that fails is reported and the others still run. Copies in
+  the folder compare are made through a temporary file too, and keep the file's modification
+  time.
+- Reports, patches and saved comparisons are written through a temporary file, so a failed export
+  never leaves half a file behind. Devices such as `/dev/stdout` are written directly.
+- **Web page compare:** a web page may not load local files, and only a page on this computer or a
+  private network may load resources from one or be redirected to one; such resources are skipped
+  and counted. A page counts as local only when every address of its host is; IPv4 addresses
+  inside IPv6 ones (mapped, NAT64, 6to4) are judged by the address they hold. Redirects are
+  followed by OxideMerge itself, at most 10; a redirect without a target is shown as it is, and
+  one to anything but a web address says so. A byte order mark now
+  decides the encoding before the HTTP header and the `<meta>` charset.
+- Language files in a `Languages` folder are checked: messages with other placeholders than the
+  English ones, unknown keys and non-text values are left out, and English is shown instead.
+- macOS instructions describe **Open Anyway** in System Settings, as Control-click → Open no longer
+  bypasses Gatekeeper from macOS 15 on.
+
+### Fixed
+
+- Applying a patch made without context lines (`diff -U0`) put added lines one line too early.
+- A difference next to a moved insertion or deletion could point at the wrong line of the side
+  where it is empty.
+- A folder compare that broke off with an internal error showed the folders as identical; it now
+  says it failed and counts as an error.
+- A text compare whose syntax highlighting stopped with an error kept redrawing the window.
+- Settings that could not be saved were dropped without a word; the error is now shown.
+- The Filters window opened folders with `xdg-open` on macOS; errors opening files and folders
+  from the folder compare and the dialogs are now shown.
+- Folder auto merge merged binary files as text, and dropped a change of encoding, byte order
+  mark, line endings or final newline made on one side. Only text files that read back to the
+  same bytes are merged now, the change of either side is kept, and different changes on both
+  sides are a conflict.
+- Folder auto merge with backups on could replace a compared file with another file's `.bak`;
+  such a step is now left alone. A folder added on both sides is now made in the middle folder,
+  even when it is empty, and its contents are merged item by item.
+- A read-only `.bak` left from before stopped the next backup of that file.
+
+### Security
+
+- Unpacker commands could run part of a file name as a command; the file path is now passed as an
+  argument (`"$1"`) on Linux and macOS and quoted on Windows.
+- Links in `.tar` archives that point outside the archive, directly or through other links, are
+  no longer extracted.
+- Web pages can no longer read local files or reach this computer and the private network
+  through their resources or redirects (see Changed).
+
 ## [0.9.3] - 2026-10-26
 
 ### Added
@@ -293,7 +373,8 @@ First release.
   on Windows.
 - Chinese, Japanese and Korean fonts on Linux and WSL, and GPU acceleration under WSL2.
 
-[0.9.3]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.2...HEAD
+[0.9.4]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/kuopinghsu/OxideMerge/releases/tag/v0.9.0
