@@ -814,7 +814,9 @@ mod tests {
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        let leaders: Vec<_> = results.into_iter().flatten().collect();
+        // One leader gathers them all; a busy machine may start the threads in another order.
+        let mut leaders: Vec<_> = results.into_iter().flatten().collect();
+        leaders.iter_mut().for_each(|paths| paths.sort());
         assert_eq!(
             leaders,
             vec![vec![
