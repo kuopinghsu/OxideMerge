@@ -168,6 +168,16 @@ impl TextDoc {
     }
 
     pub fn save_as(&mut self, path: &Path) -> Result<()> {
+        self.write(path, super::fsutil::backup_on())
+    }
+
+    /// [`Self::save`], keeping the file it replaces as `<name>.bak` with `backup`.
+    pub fn save_with(&mut self, backup: bool) -> Result<()> {
+        let path = self.path.clone().context("no file name")?;
+        self.write(&path, backup)
+    }
+
+    fn write(&mut self, path: &Path, backup: bool) -> Result<()> {
         let text = self.text();
         // encoding_rs writes characters a legacy encoding can't hold as HTML entities.
         if let TextEncoding::Other(e) = self.encoding {
@@ -187,7 +197,7 @@ impl TextDoc {
                 std::fs::create_dir_all(parent).ok();
             }
         }
-        super::fsutil::write_atomic(path, &bytes)?;
+        super::fsutil::write_atomic_with(path, &bytes, backup)?;
         self.path = Some(path.to_path_buf());
         self.modified = false;
         self.mixed_eol = false;

@@ -535,11 +535,16 @@ fn ops_between(
     } else {
         ops
     };
-    let (oa, ob) = offset;
+    // The ops cover both sides in order; their positions are rebuilt from the lengths, as
+    // compacting can leave a stale position on the empty side of a moved insertion or deletion.
+    let (mut pa, mut pb) = offset;
     ops.iter()
         .map(|op| {
             let (tag, ra, rb) = op.as_tag_tuple();
-            (tag, ra.start + oa..ra.end + oa, rb.start + ob..rb.end + ob)
+            let o = pa..pa + ra.len();
+            let n = pb..pb + rb.len();
+            (pa, pb) = (o.end, n.end);
+            (tag, o, n)
         })
         .collect()
 }

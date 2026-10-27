@@ -638,7 +638,7 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
         }
         if ui.button(tr("rules.open_folder")).clicked() {
             if let Some(dir) = rules::dir() {
-                open_folder(&dir);
+                d.rule_error = open_folder(&dir).err();
             }
         }
         if ui.button(tr("filters.reload")).clicked() {
@@ -1057,14 +1057,9 @@ struct RuleDialog {
     target: String,
 }
 
-fn open_folder(dir: &Path) {
-    let _ = std::fs::create_dir_all(dir);
-    #[cfg(windows)]
-    let _ = std::process::Command::new("explorer").arg(dir).spawn();
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(dir).spawn();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+fn open_folder(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    crate::ui::folder_view::system_open(dir)
 }
 
 /// Line or item counts of the active compare.
@@ -1135,7 +1130,7 @@ pub struct OxideMergeApp {
     stats_dlg: Option<StatsDialog>,
     git_dlg: Option<GitDialog>,
     /// A folder report with file differences being written on another thread: its file.
-    report_job: Option<(PathBuf, std::sync::mpsc::Receiver<std::io::Result<()>>)>,
+    report_job: Option<(PathBuf, std::sync::mpsc::Receiver<Result<(), String>>)>,
     /// Ctrl+Tab presses taken from the input before egui saw them.
     tab_keys: Vec<Cmd>,
     filters_dlg: bool,
@@ -1162,6 +1157,9 @@ pub struct OxideMergeApp {
     palette: Option<(Palette, Vec<PaletteEntry<PaletteAction>>)>,
     /// Folding and wrapping last applied to the text views, to tell which side changed.
     text_layout: (bool, bool),
+    /// `OXIDEMERGE_SMOKE_REPORT`: where to write what the window shows once its compares are
+    /// done, then close; and the frames drawn so far.
+    smoke: Option<(PathBuf, u32)>,
 }
 
 fn kind_name(k: FileKind) -> &'static str {
@@ -1727,6 +1725,9 @@ impl OxideMergeApp {
             track_session: initial.is_none(),
             palette: None,
             text_layout: (false, false),
+            smoke: std::env::var_os("OXIDEMERGE_SMOKE_REPORT")
+                .filter(|p| !p.is_empty())
+                .map(|p| (PathBuf::from(p), 0)),
         };
         app.text_layout = (app.cfg.collapse_unchanged, app.cfg.word_wrap);
         crate::core::fsutil::set_backup(app.cfg.backup_on_save);
@@ -3253,9 +3254,12 @@ impl OxideMergeApp {
         let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
             return;
         };
-        let Some(path) = self.html_report_path(title, &report::html_file_name(&v.titles())) else {
-            return;
-        };
+        if let Some(path) = self.html_report_path(title, &report::html_file_name(&v.titles())) {
+            self.export_text_html_to(path);
+        }
+    }
+
+    fn export_text_html_to(&mut self, path: PathBuf) {
         let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
             return;
         };
@@ -3297,7 +3301,8 @@ impl OxideMergeApp {
         let (tx, rx) = std::sync::mpsc::channel();
         let file = path.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(std::fs::write(&file, job()));
+            let written = crate::core::fsutil::write_atomic_with(&file, job().as_bytes(), false);
+            let _ = tx.send(written.map_err(|e| format!("{e:#}")));
         });
         self.report_job = Some((path, rx));
         self.notify(tr("msg.report_writing"));
@@ -3310,7 +3315,9 @@ impl OxideMergeApp {
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"));
         if html && self.cfg.open_reports {
-            crate::ui::folder_view::system_open(path);
+            if let Err(e) = crate::ui::folder_view::system_open(path) {
+                self.error(e);
+            }
         }
     }
 
@@ -3320,14 +3327,13 @@ impl OxideMergeApp {
             return;
         };
         let done = match rx.try_recv() {
-            Ok(r) => Some(r.map_err(|e| e.to_string())),
+            Ok(r) => Some(r),
             Err(std::sync::mpsc::TryRecvError::Empty) => None,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Some(Err(tr("status.error").to_string()))
+                Some(Err(format!("{}: {}", path.display(), tr("status.error"))))
             }
         };
         let path = path.clone();
-        let file = path.display().to_string();
         match done {
             None => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
             Some(Ok(())) => {
@@ -3336,7 +3342,7 @@ impl OxideMergeApp {
             }
             Some(Err(e)) => {
                 self.report_job = None;
-                self.error(format!("{file}: {e}"));
+                self.error(e);
             }
         }
     }
@@ -3621,14 +3627,18 @@ impl OxideMergeApp {
     /// Applies a unified diff: every patched file opens next to its original, to be reviewed and
     /// saved.
     fn apply_patch(&mut self) {
-        let Some(patch_path) = rfd::FileDialog::new()
+        if let Some(patch_path) = rfd::FileDialog::new()
             .set_title(tr("menu.apply_patch"))
             .add_filter(tr("label.patch_files"), &["patch", "diff"])
             .pick_file()
-        else {
-            return;
-        };
-        let parsed = std::fs::read(&patch_path)
+        {
+            self.apply_patch_file(&patch_path);
+        }
+    }
+
+    /// Opens the files `patch_path` changes, patched, each in a tab to review before saving.
+    fn apply_patch_file(&mut self, patch_path: &Path) {
+        let parsed = std::fs::read(patch_path)
             .map_err(|e| e.to_string())
             .and_then(|b| patch::parse_unified(&text::decode(&b, None).0));
         let files = match parsed {
@@ -5120,6 +5130,7 @@ impl OxideMergeApp {
         }
         let mut open = true;
         let mut reload = false;
+        let mut failed = None;
         let mut apply: Option<String> = None;
         let default_filter = Config::default().filter;
         let can_clear = self.cfg.filter != default_filter
@@ -5159,30 +5170,30 @@ impl OxideMergeApp {
                 ui.horizontal(|ui| {
                     if ui.button(tr("filters.new")).clicked() {
                         if let Some(dir) = crate::config::config_dir().map(|d| d.join("Filters")) {
-                            let _ = std::fs::create_dir_all(&dir);
                             let mut k = 1;
                             let mut path = dir.join("MyFilter.flt");
                             while path.exists() {
                                 k += 1;
                                 path = dir.join(format!("MyFilter{k}.flt"));
                             }
-                            let _ = std::fs::write(
-                                &path,
-                                filter::FLT_TEMPLATE
-                                    .replace("My Filter", &format!("My Filter {k}")),
-                            );
-                            #[cfg(windows)]
-                            let _ = std::process::Command::new("notepad").arg(&path).spawn();
-                            reload = true;
+                            let text = filter::FLT_TEMPLATE
+                                .replace("My Filter", &format!("My Filter {k}"));
+                            let written = std::fs::create_dir_all(&dir)
+                                .and_then(|()| std::fs::write(&path, text));
+                            match written {
+                                Ok(()) => {
+                                    #[cfg(windows)]
+                                    let _ =
+                                        std::process::Command::new("notepad").arg(&path).spawn();
+                                    reload = true;
+                                }
+                                Err(e) => failed = Some(format!("{}: {e}", path.display())),
+                            }
                         }
                     }
                     if ui.button(tr("filters.open_folder")).clicked() {
                         if let Some(dir) = crate::config::config_dir().map(|d| d.join("Filters")) {
-                            let _ = std::fs::create_dir_all(&dir);
-                            #[cfg(windows)]
-                            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
-                            #[cfg(not(windows))]
-                            let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+                            failed = open_folder(&dir).err();
                         }
                     }
                     if ui.button(tr("filters.reload")).clicked() {
@@ -5201,6 +5212,9 @@ impl OxideMergeApp {
             });
         if reload {
             self.named_filters = filter::load_all_filters();
+        }
+        if let Some(e) = failed {
+            self.error(e);
         }
         if let Some(spec) = apply {
             self.cfg.filter = spec;
@@ -5288,10 +5302,13 @@ impl OxideMergeApp {
             match text {
                 None => self.error(tr("msg.patch_two_way")),
                 Some(_) if d.path.trim().is_empty() => self.patch_dlg = Some(d),
-                Some(t) => match std::fs::write(d.path.trim(), t) {
-                    Ok(()) => self.notify(trf("msg.saved", &[("file", d.path.clone())])),
-                    Err(e) => self.error(e.to_string()),
-                },
+                Some(t) => {
+                    let path = Path::new(d.path.trim());
+                    match crate::core::fsutil::write_atomic_with(path, t.as_bytes(), false) {
+                        Ok(()) => self.notify(trf("msg.saved", &[("file", d.path.clone())])),
+                        Err(e) => self.error(format!("{e:#}")),
+                    }
+                }
             }
         } else if keep {
             self.patch_dlg = Some(d);
@@ -5859,11 +5876,59 @@ impl eframe::App for OxideMergeApp {
         self.save_session();
 
         if self.cfg != self.saved_cfg {
-            self.stored_cfg().save();
+            if let Err(e) = self.stored_cfg().save() {
+                let msg = trf("msg.settings_not_saved", &[("err", format!("{e:#}"))]);
+                self.push_toast(msg, true, None);
+            }
             self.saved_cfg = self.cfg.clone();
         }
+        self.smoke_report(ctx);
     }
 }
+
+impl OxideMergeApp {
+    /// For automated checks of a real window: after a few frames, and once compares are done
+    /// (or after about a minute), writes what the window shows and closes it.
+    fn smoke_report(&mut self, ctx: &egui::Context) {
+        let Some((path, frames)) = &mut self.smoke else {
+            return;
+        };
+        *frames += 1;
+        ctx.request_repaint();
+        let busy = self
+            .tabs
+            .iter()
+            .any(|t| matches!(t.content.outcome(), Some(Outcome::Busy)));
+        let frames = *frames;
+        if frames < 10 || (busy && frames < 3600) {
+            return;
+        }
+        let path = path.clone();
+        self.smoke = None;
+        let mut out = format!("frames {frames}\nbusy {busy}\n");
+        for (i, t) in self.tabs.iter().enumerate() {
+            let outcome = t.content.outcome();
+            let mark = if i == self.active { "*" } else { "" };
+            out.push_str(&format!(
+                "tab{mark} {} | {outcome:?} | {}\n",
+                t.title(),
+                t.status_line()
+            ));
+        }
+        for t in &self.toasts {
+            let kind = if t.error { "error" } else { "note" };
+            out.push_str(&format!("{kind} {}\n", t.text.replace('\n', " / ")));
+        }
+        if let Err(e) = std::fs::write(&path, out) {
+            eprintln!("{}: {e}", path.display());
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}
+
+#[cfg(test)]
+#[path = "gui_tests.rs"]
+mod gui_tests;
 
 #[cfg(test)]
 mod tests {

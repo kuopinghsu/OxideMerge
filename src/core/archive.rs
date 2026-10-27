@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Component, Path};
 
 pub const ZIP_EXTS: &[&str] = &[
     "zip", "jar", "war", "ear", "apk", "aar", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub",
@@ -66,7 +66,32 @@ pub fn extract_to_temp(path: &Path) -> Result<tempfile::TempDir> {
         Kind::SevenZ => sevenz_rust2::decompress_file(path, dir.path())
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?,
     }
+    remove_links_outside(dir.path())?;
     Ok(dir)
+}
+
+/// Removes the symbolic links under `root` that lead outside it, or nowhere. Each link is
+/// resolved as the system resolves it, through the other links on the way.
+fn remove_links_outside(root: &Path) -> Result<()> {
+    let real_root = std::fs::canonicalize(root)?;
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let md = std::fs::symlink_metadata(&path)?;
+            if md.file_type().is_symlink() {
+                let inside = std::fs::canonicalize(&path).is_ok_and(|p| p.starts_with(&real_root));
+                if !inside {
+                    std::fs::remove_file(&path)
+                        .or_else(|_| std::fs::remove_dir(&path))
+                        .with_context(|| path.display().to_string())?;
+                }
+            } else if md.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Finder metadata that macOS adds to archives it creates (`._name` and `__MACOSX/`).
@@ -98,14 +123,55 @@ fn extract_zip(file: std::fs::File, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Entries that cannot be created here (links on Windows, device files) are skipped;
-/// `unpack_in` also skips any that would land outside `dir`.
+/// Whether a link at `rel` (a path in the archive) pointing to `target` stays in the archive,
+/// judged by the names alone; [`remove_links_outside`] then checks where links really lead.
+fn link_inside(rel: &Path, target: &Path, hard: bool) -> bool {
+    let start = if hard {
+        0
+    } else {
+        rel.components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .count()
+            .saturating_sub(1)
+    };
+    let mut depth = start as isize;
+    for c in target.components() {
+        match c {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => depth -= 1,
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Entries that cannot be created here (links on Windows, device files) are skipped, and so
+/// are links to anything outside the archive; `unpack_in` also skips any that would land
+/// outside `dir`.
 fn extract_tar(input: impl Read, dir: &Path) -> Result<()> {
     let mut ar = tar::Archive::new(input);
     for entry in ar.entries()? {
         let mut entry = entry?;
-        if entry.path().is_ok_and(|p| apple_metadata(&p)) {
+        let Ok(rel) = entry.path().map(|p| p.into_owned()) else {
             continue;
+        };
+        if apple_metadata(&rel) {
+            continue;
+        }
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            let inside = entry
+                .link_name()
+                .ok()
+                .flatten()
+                .is_some_and(|t| link_inside(&rel, &t, kind.is_hard_link()));
+            if !inside {
+                continue;
+            }
         }
         let _ = entry.unpack_in(dir);
     }
@@ -155,6 +221,56 @@ mod tests {
             let text = std::fs::read_to_string(out.path().join("dir/a.txt")).unwrap();
             assert_eq!(text, "hello\n", "{}", archive.display());
             assert!(!out.path().join("dir/._a.txt").exists());
+        }
+    }
+
+    #[test]
+    fn links_out_of_the_archive_are_left_out() {
+        let p = Path::new;
+        assert!(link_inside(p("a/b/link"), p("../c.txt"), false));
+        assert!(link_inside(p("a/link"), p("./b/../c"), false));
+        assert!(!link_inside(p("a/link"), p("../../etc"), false));
+        assert!(!link_inside(p("link"), p("/etc/passwd"), false));
+        assert!(link_inside(p("a/b/hard"), p("a/c.txt"), true));
+        assert!(!link_inside(p("a/hard"), p("../x"), true));
+
+        #[cfg(unix)]
+        {
+            let mut b = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu();
+            h.set_size(3);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "dir/a.txt", &b"hi\n"[..]).unwrap();
+            // `s2` looks inside by its name, but leads out through the link `a/s1`
+            let links = [
+                ("dir/ok", "a.txt"),
+                ("dir/home", "/"),
+                ("dir/up", "../.."),
+                ("./dir/dot_up", "../.."),
+                ("a/s1", ".."),
+                ("s2", "a/s1/.."),
+            ];
+            for (name, target) in links {
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(tar::EntryType::Symlink);
+                h.set_size(0);
+                b.append_link(&mut h, name, target).unwrap();
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("links.tar");
+            std::fs::write(&archive, b.into_inner().unwrap()).unwrap();
+            let out = extract_to_temp(&archive).unwrap();
+            let read = |n: &str| std::fs::read_to_string(out.path().join(n)).ok();
+            assert_eq!(read("dir/ok").as_deref(), Some("hi\n"));
+            assert!(std::fs::symlink_metadata(out.path().join("dir/home")).is_err());
+            for gone in ["dir/up", "dir/dot_up", "s2"] {
+                assert!(
+                    std::fs::symlink_metadata(out.path().join(gone)).is_err(),
+                    "{gone}"
+                );
+            }
+            assert!(out.path().join("a/s1").is_dir());
         }
     }
 }

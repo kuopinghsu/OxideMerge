@@ -254,6 +254,8 @@ pub enum HunkLine {
 pub struct Hunk {
     /// 1-based first line in the original file (0 when the hunk adds to an empty file).
     pub old_start: usize,
+    /// 1-based first line in the patched file (0 when the hunk empties the file).
+    pub new_start: usize,
     pub lines: Vec<HunkLine>,
 }
 
@@ -374,9 +376,10 @@ pub fn parse_unified(text: &str) -> Result<Vec<FilePatch>, String> {
             let (ranges, _) = rest.split_once(" @@").ok_or_else(bad)?;
             let (old, new) = ranges.split_once(" +").ok_or_else(bad)?;
             let (old_start, mut old_left) = parse_range(old).ok_or_else(bad)?;
-            let (_, mut new_left) = parse_range(new).ok_or_else(bad)?;
+            let (new_start, mut new_left) = parse_range(new).ok_or_else(bad)?;
             let mut hunk = Hunk {
                 old_start,
+                new_start,
                 lines: Vec::new(),
             };
             i += 1;
@@ -454,11 +457,19 @@ pub fn apply(lines: &[String], patch: &FilePatch) -> Applied {
     let mut out = lines.to_vec();
     let mut failed = Vec::new();
     let mut delta: isize = 0;
+    let mut stated: isize = 0;
     let mut floor = 0usize;
     for (n, h) in patch.hunks.iter().enumerate() {
         let old = h.old_lines();
-        let expected =
-            (h.old_start.saturating_sub(1) as isize + delta).max(floor as isize) as usize;
+        // A hunk without old lines (from `diff -U0`) goes after line `old_start`; its new start
+        // says the same and is also right for diffs that write `-1,0` for the top of the file.
+        let at = if old.is_empty() {
+            h.new_start.saturating_sub(1) as isize - stated + delta
+        } else {
+            h.old_start.saturating_sub(1) as isize + delta
+        };
+        stated += h.new_lines().len() as isize - old.len() as isize;
+        let expected = at.max(floor as isize) as usize;
         let last = out.len().saturating_sub(old.len());
         let found = [false, true].into_iter().find_map(|loose| {
             (0..=out.len()).find_map(|d| {

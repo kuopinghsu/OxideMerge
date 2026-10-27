@@ -24,7 +24,7 @@ use egui::{
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -1887,9 +1887,16 @@ impl TextView {
     fn poll_highlight(&mut self, cfg: &Config) {
         for p in &mut self.panes {
             if let Some(rx) = &p.hl_rx {
-                if let Ok(res) = rx.try_recv() {
-                    p.hl = res;
-                    p.hl_rx = None;
+                match rx.try_recv() {
+                    Ok(res) => {
+                        p.hl = res;
+                        p.hl_rx = None;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        p.hl = None;
+                        p.hl_rx = None;
+                    }
                 }
             }
             if !cfg.syntax_highlight {
@@ -4115,6 +4122,22 @@ mod tests {
         v.reveal_row(2, 0, 4);
         assert_eq!(folds(&v), 1);
         assert_eq!(v.layout.lines[2], VLine::Row(2, 0));
+    }
+
+    #[test]
+    fn stops_waiting_for_a_highlighter_that_died() {
+        let cfg = Config::default();
+        let docs = vec![
+            text::TextDoc::from_text(Some("a.rs".into()), "fn main() {}\n"),
+            text::TextDoc::from_text(Some("b.rs".into()), ""),
+        ];
+        let mut v = TextView::new(docs, &cfg);
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        let p = &mut v.panes[0];
+        (p.hl_rx, p.hl_dirty, p.hl_dark) = (Some(rx), false, cfg.dark_mode);
+        v.poll_highlight(&cfg);
+        assert!(v.panes[0].hl_rx.is_none() && v.panes[0].hl.is_none());
     }
 
     #[test]

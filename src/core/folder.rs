@@ -263,7 +263,9 @@ fn list_dir(dir: &Path, skip_hidden: bool) -> Option<Vec<Entry>> {
     Some(v)
 }
 
-fn name_key(name: &str, is_dir: bool) -> (bool, String) {
+/// How the scan matches names across sides: folders apart from files, and ignoring case where
+/// the file system usually does.
+pub(crate) fn name_key(name: &str, is_dir: bool) -> (bool, String) {
     let n = if cfg!(windows) || cfg!(target_os = "macos") {
         name.to_lowercase()
     } else {
@@ -878,19 +880,7 @@ fn copy_tree(from: &Path, to: &Path, inside: &mut Vec<PathBuf>) -> Result<()> {
         }
         inside.pop();
     } else {
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if to.exists() {
-            let mut perm = std::fs::metadata(to)?.permissions();
-            if perm.readonly() {
-                #[allow(clippy::permissions_set_readonly_false)]
-                perm.set_readonly(false);
-                std::fs::set_permissions(to, perm).ok();
-            }
-        }
-        std::fs::copy(from, to)
-            .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
+        super::fsutil::copy_atomic(from, to, false)?;
     }
     Ok(())
 }

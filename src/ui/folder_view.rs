@@ -169,6 +169,10 @@ pub struct FolderView {
     file_report: Option<(String, report::ReportJob)>,
     /// The last comparison was stopped before comparing every file.
     stopped: bool,
+    /// The last comparison broke off with an internal error.
+    failed: bool,
+    /// The last comparison listed every subfolder, also those on one side only.
+    whole_tree: bool,
     id: egui::Id,
 }
 
@@ -280,38 +284,47 @@ fn sort_ext(it: &DirItem) -> &str {
         .unwrap_or("")
 }
 
-/// Opens `path` with the program the system uses for it.
-pub(crate) fn system_open(path: &std::path::Path) {
-    #[cfg(windows)]
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", ""])
-        .arg(path)
-        .spawn();
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(path).spawn();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+/// Starts `cmd` without waiting for it; an error names the file it was started for.
+fn launch(mut cmd: std::process::Command, path: &std::path::Path) -> Result<(), String> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
-fn reveal(path: &std::path::Path) {
+/// Opens `path` (a file or folder) with the program the system uses for it.
+pub(crate) fn system_open(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(path);
+    launch(cmd, path)
+}
+
+fn reveal(path: &std::path::Path) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
-            .spawn();
+        let mut cmd = std::process::Command::new("explorer");
+        cmd.arg(format!("/select,{}", path.display()));
+        launch(cmd, path)
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open")
-            .arg("-R")
-            .arg(path)
-            .spawn();
+        let mut cmd = std::process::Command::new("open");
+        cmd.arg("-R").arg(path);
+        launch(cmd, path)
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        if let Some(parent) = path.parent() {
-            system_open(parent);
-        }
+        system_open(path.parent().unwrap_or(path))
     }
 }
 
@@ -369,6 +382,8 @@ impl FolderView {
             rule_request: None,
             file_report: None,
             stopped: false,
+            failed: false,
+            whole_tree: false,
             id: egui::Id::new(("folderview", std::time::Instant::now())),
         };
         v.read_only = read_only;
@@ -430,6 +445,7 @@ impl FolderView {
             r.progress.abort.store(true, Ordering::Relaxed);
         }
         let progress = Arc::new(Progress::live());
+        self.whole_tree = self.fopts.recursive && self.fopts.include_unique_subfolders;
         let (roots, filter, fopts, dopts, pr) = (
             self.roots.clone(),
             self.filter.clone(),
@@ -488,6 +504,12 @@ impl FolderView {
         self.running.is_some()
     }
 
+    /// Whether a compare, a merge plan or file operations are still under way.
+    #[cfg(test)]
+    pub fn busy(&self) -> bool {
+        self.running.is_some() || self.merge_job.is_some() || self.file_job.is_some()
+    }
+
     /// How long the comparison took, once, right after it finished without being stopped.
     pub fn take_finished(&mut self) -> Option<Duration> {
         self.finished.take()
@@ -516,13 +538,17 @@ impl FolderView {
             let r = self.running.take().unwrap();
             let aborted = r.progress.abort.load(Ordering::Relaxed);
             // Same items in the same order as the streamed ones, so the selection stays valid.
-            self.items = r.handle.join().unwrap_or_default();
-            self.stopped = aborted;
+            let joined = r.handle.join();
+            self.failed = joined.is_err();
+            self.items = joined.unwrap_or_default();
+            self.stopped = aborted || self.failed;
             self.elapsed = Some(r.started.elapsed());
             self.selected.retain(|&i| i < self.items.len());
             self.view_key = None;
             self.peek_cache = None;
-            if aborted {
+            if self.failed {
+                self.status = tr("status.error").into();
+            } else if aborted {
                 self.status = tr("msg.aborted").into();
             } else {
                 self.finished = self.elapsed;
@@ -1152,6 +1178,11 @@ impl FolderView {
         if self.merge_job.is_some() {
             return;
         }
+        // Folders not listed would be merged as empty ones, and their files left out.
+        if self.stopped || !self.whole_tree {
+            self.status = tr("msg.folder_merge_incomplete").to_string();
+            return;
+        }
         let (items, roots) = (self.items.clone(), self.roots.clone());
         self.merge_job = Some(std::thread::spawn(move || {
             folder_merge::plan(&items, &roots)
@@ -1168,6 +1199,15 @@ impl FolderView {
             return;
         }
         match self.merge_job.take().map(JoinHandle::join) {
+            Some(Ok(plan)) if !plan.stale.is_empty() => {
+                self.status = trf(
+                    "msg.folder_merge_stale",
+                    &[
+                        ("n", plan.stale.len().to_string()),
+                        ("file", self.items[plan.stale[0]].rel_path()),
+                    ],
+                );
+            }
             Some(Ok(plan)) if plan.steps.is_empty() => {
                 self.status = tr("msg.folder_merge_nothing").to_string();
             }
@@ -1203,6 +1243,33 @@ impl FolderView {
                     ("merges", c.merges.to_string()),
                 ],
             ));
+            let list = |ui: &mut Ui, items: Vec<usize>| {
+                egui::Frame::new()
+                    .fill(pal.surface_alt)
+                    .corner_radius(8)
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for &i in items.iter().take(10) {
+                            ui.label(
+                                egui::RichText::new(self.items[i].rel_path())
+                                    .monospace()
+                                    .color(pal.text_dim),
+                            );
+                        }
+                        if items.len() > 10 {
+                            ui.label("…");
+                        }
+                    });
+            };
+            if c.deletes > 0 {
+                ui.add_space(4.0);
+                ui.label(tr("msg.folder_merge_deletes"));
+                list(
+                    ui,
+                    plan.items_where(|s| matches!(s, Step::Delete | Step::Prune)),
+                );
+            }
             if c.conflicts > 0 {
                 ui.add_space(4.0);
                 ui.label(
@@ -1212,28 +1279,7 @@ impl FolderView {
                     ))
                     .color(pal.warning),
                 );
-                egui::Frame::new()
-                    .fill(pal.surface_alt)
-                    .corner_radius(8)
-                    .inner_margin(Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        let conflicts = plan
-                            .steps
-                            .iter()
-                            .filter(|(_, s)| matches!(s, Step::Conflict))
-                            .map(|(i, _)| *i);
-                        for i in conflicts.clone().take(10) {
-                            ui.label(
-                                egui::RichText::new(self.items[i].rel_path())
-                                    .monospace()
-                                    .color(pal.text_dim),
-                            );
-                        }
-                        if conflicts.count() > 10 {
-                            ui.label("…");
-                        }
-                    });
+                list(ui, plan.items_where(|s| matches!(s, Step::Conflict)));
             }
             widgets::dialog_footer(ui, |ui| {
                 let ok = ui.add_enabled_ui(plan.changes() > 0, |ui| {
@@ -1463,7 +1509,7 @@ impl FolderView {
             return Outcome::Busy;
         }
         let (_, diff, uniq, err) = folder::status_counts(&self.items);
-        if err > 0 {
+        if err > 0 || self.failed {
             Outcome::Error
         } else if diff + uniq > 0 {
             Outcome::Different
@@ -2418,8 +2464,16 @@ impl FolderView {
             match m {
                 MenuCmd::Open(i, kind) => result = self.open_action(i, kind),
                 MenuCmd::Op(kind) => self.request_op(kind, cfg),
-                MenuCmd::SystemOpen(i, s) => system_open(&self.items[i].path(&self.roots[s])),
-                MenuCmd::Reveal(i, s) => reveal(&self.items[i].path(&self.roots[s])),
+                MenuCmd::SystemOpen(i, s) => {
+                    if let Err(e) = system_open(&self.items[i].path(&self.roots[s])) {
+                        self.status = e;
+                    }
+                }
+                MenuCmd::Reveal(i, s) => {
+                    if let Err(e) = reveal(&self.items[i].path(&self.roots[s])) {
+                        self.status = e;
+                    }
+                }
                 MenuCmd::CopyPath(i, s) => ui
                     .ctx()
                     .copy_text(self.items[i].path(&self.roots[s]).display().to_string()),
@@ -2532,6 +2586,30 @@ mod tests {
         assert_eq!(src.read_only, [false, true]);
         assert_eq!(src.items.len(), 1);
         assert!(!src.stopped);
+    }
+
+    #[test]
+    fn a_comparison_that_breaks_off_shows_an_error() {
+        let cfg = Config::default();
+        let roots = ["samples/left", "samples/right"]
+            .map(PathBuf::from)
+            .to_vec();
+        let display = roots.iter().map(|r| r.display().to_string()).collect();
+        let mut v = FolderView::new(roots, display, Vec::new(), "", &[], &cfg);
+        v.running.take().unwrap().handle.join().unwrap();
+        v.running = Some(Running {
+            progress: Arc::new(Progress::live()),
+            handle: std::thread::spawn(|| panic!("comparison broke off")),
+            started: Instant::now(),
+            updated: Instant::now(),
+        });
+        while v.running.is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+            v.poll();
+        }
+        assert_eq!(v.outcome(), Outcome::Error);
+        assert!(v.status_line().ends_with(tr("status.error")));
+        assert!(v.diffs_source(&cfg).stopped);
     }
 
     #[test]

@@ -4,12 +4,13 @@
 use crate::core::text::{self, TextEncoding};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use url::Url;
+use url::{Host, Url};
 
 const PAGE_LIMIT: u64 = 50 << 20;
 const RESOURCE_LIMIT: u64 = 20 << 20;
@@ -84,6 +85,8 @@ fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
+        // `fetch` follows them itself, to check where each one leads.
+        .max_redirects(0)
         .user_agent(concat!(
             "Mozilla/5.0 (compatible; OxideMerge/",
             env!("CARGO_PKG_VERSION"),
@@ -100,7 +103,99 @@ struct Fetched {
     bytes: Vec<u8>,
 }
 
-fn fetch(agent: &ureq::Agent, url: &Url, limit: u64) -> Result<Fetched> {
+/// Whether an address is a public unicast one: not this computer, a private network, or a
+/// range set aside (multicast, reserved, benchmarking), also when wrapped in an IPv6 address.
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || a == 0
+                || a >= 240
+                || (a == 100 && (64..128).contains(&b))
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 192 && b == 0 && c == 0))
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let embedded =
+                |hi: u16, lo: u16| std::net::Ipv4Addr::from((hi as u32) << 16 | lo as u32);
+            if let Some(v4) = v6.to_ipv4() {
+                // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d)
+                is_public_ip(IpAddr::V4(v4))
+            } else if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                // NAT64
+                is_public_ip(IpAddr::V4(embedded(s[6], s[7])))
+            } else if s[0] == 0x2002 {
+                // 6to4
+                is_public_ip(IpAddr::V4(embedded(s[1], s[2])))
+            } else {
+                !(v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || (s[0] & 0xfe00) == 0xfc00
+                    || (s[0] & 0xffc0) == 0xfe80
+                    || (s[0] & 0xffc0) == 0xfec0
+                    || (s[0] == 0x64 && s[1] == 0xff9b))
+            }
+        }
+    }
+}
+
+/// Whether `url` leads to this computer or a private network: `Some(true)` for a local file,
+/// `localhost` or a private address, `Some(false)` for a public one, and `None` for a host name
+/// with addresses of both kinds. A host name that cannot be looked up counts as public, as its
+/// request fails anyway.
+fn locality(url: &Url) -> Option<bool> {
+    match url.host() {
+        _ if url.scheme() == "file" => Some(true),
+        Some(Host::Ipv4(ip)) => Some(!is_public_ip(ip.into())),
+        Some(Host::Ipv6(ip)) => Some(!is_public_ip(ip.into())),
+        Some(Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            if d == "localhost" || d.ends_with(".localhost") {
+                return Some(true);
+            }
+            let port = url.port_or_known_default().unwrap_or(80);
+            let ips: Vec<IpAddr> = (d.as_str(), port)
+                .to_socket_addrs()
+                .map(|a| a.map(|a| a.ip()).collect())
+                .unwrap_or_default();
+            classify(&ips)
+        }
+        None => Some(true),
+    }
+}
+
+/// [`locality`] of a host with these addresses.
+fn classify(ips: &[IpAddr]) -> Option<bool> {
+    match ips.iter().filter(|&&ip| !is_public_ip(ip)).count() {
+        0 => Some(false),
+        n if n == ips.len() => Some(true),
+        _ => None,
+    }
+}
+
+/// Whether `url` may lead to this computer or a private network, so that a web page may not
+/// load it or be redirected there.
+fn is_local(url: &Url) -> bool {
+    locality(url) != Some(false)
+}
+
+/// Whether the page at `url` is on this computer or a private network, so that it may load
+/// from there: every address of its host must be.
+fn is_local_page(url: &Url) -> bool {
+    locality(url) == Some(true)
+}
+
+/// Downloads `url`, following up to 10 redirects. Unless `local_ok`, a redirect to a local
+/// file, this computer or a private network is refused.
+fn fetch(agent: &ureq::Agent, url: &Url, limit: u64, local_ok: bool) -> Result<Fetched> {
     if url.scheme() == "file" {
         let path = url
             .to_file_path()
@@ -113,12 +208,38 @@ fn fetch(agent: &ureq::Agent, url: &Url, limit: u64) -> Result<Fetched> {
             bytes,
         });
     }
-    use ureq::ResponseExt;
+    let mut final_url = url.clone();
     let mut resp = agent
-        .get(url.as_str())
+        .get(final_url.as_str())
         .call()
         .with_context(|| url.to_string())?;
-    let final_url = Url::parse(&resp.get_uri().to_string()).unwrap_or_else(|_| url.clone());
+    let mut hops = 0;
+    // A redirection without a usable Location is kept as the response.
+    while resp.status().is_redirection() {
+        let Some(next) = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|l| final_url.join(l.trim()).ok())
+        else {
+            break;
+        };
+        if hops == 10 {
+            bail!("{url}: too many redirects");
+        }
+        if !matches!(next.scheme(), "http" | "https") {
+            bail!("{url}: redirected to {next}, which is not a web address");
+        }
+        if !local_ok && is_local(&next) {
+            bail!("{url}: redirected to {next}, which is not followed from a public address");
+        }
+        hops += 1;
+        final_url = next;
+        resp = agent
+            .get(final_url.as_str())
+            .call()
+            .with_context(|| final_url.to_string())?;
+    }
     let content_type = resp
         .headers()
         .get("content-type")
@@ -151,12 +272,31 @@ fn charset_of(s: &str) -> Option<&str> {
     (end > 0).then(|| &rest[..end])
 }
 
+/// Decodes a page as browsers do: a byte order mark first, then the charset of the
+/// `Content-Type` header, then one declared in the page, then a guess from the bytes.
 fn decode_html(bytes: &[u8], content_type: Option<&str>) -> String {
-    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
-    let label = content_type
-        .and_then(charset_of)
-        .or_else(|| charset_of(&head));
-    text::decode(bytes, label.and_then(TextEncoding::from_label)).0
+    let bom = [&[0xEF, 0xBB, 0xBF][..], &[0xFF, 0xFE], &[0xFE, 0xFF]]
+        .iter()
+        .any(|b| bytes.starts_with(b));
+    let declared = || {
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+        // A page that can declare its charset in ASCII is not UTF-16.
+        charset_of(&head)
+            .and_then(TextEncoding::from_label)
+            .map(|e| match e {
+                TextEncoding::Utf16Le | TextEncoding::Utf16Be => TextEncoding::Utf8,
+                e => e,
+            })
+    };
+    let forced = if bom {
+        None
+    } else {
+        content_type
+            .and_then(charset_of)
+            .and_then(TextEncoding::from_label)
+            .or_else(declared)
+    };
+    text::decode(bytes, forced).0
 }
 
 /// Downloads every page in parallel.
@@ -168,7 +308,7 @@ pub fn fetch_pages(urls: &[Url]) -> Result<Vec<Page>> {
             .map(|u| {
                 let agent = agent.clone();
                 s.spawn(move || -> Result<Page> {
-                    let f = fetch(&agent, u, PAGE_LIMIT)?;
+                    let f = fetch(&agent, u, PAGE_LIMIT, is_local_page(u))?;
                     let html = decode_html(&f.bytes, f.content_type.as_deref());
                     Ok(Page {
                         url: f.url,
@@ -695,19 +835,63 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Saves each page with its resources into the matching root folder. Returns how many resources failed.
-pub fn download_trees(pages: &[Page], roots: &[PathBuf], progress: &Progress) -> usize {
+/// What happened to the resources of the pages.
+#[derive(Debug, Default, PartialEq)]
+pub struct TreeOutcome {
+    /// Resources that could not be downloaded or saved.
+    pub failed: usize,
+    /// Resources on this computer or a private network, named by a page that is not.
+    pub skipped: usize,
+}
+
+/// Whether a page at `page` may load the resource at `res`: a web page loads no local files,
+/// and only one on this computer or a private network (`page_local`) loads from there.
+fn may_load(page: &Url, page_local: bool, res: &Url, local: &mut impl FnMut(&Url) -> bool) -> bool {
+    match (page.scheme(), res.scheme()) {
+        ("file", _) => true,
+        (_, "file") => false,
+        _ => page_local || !local(res),
+    }
+}
+
+/// Saves each page with its resources into the matching root folder.
+pub fn download_trees(pages: &[Page], roots: &[PathBuf], progress: &Progress) -> TreeOutcome {
     struct Job {
         side: usize,
         url: Url,
         path: PathBuf,
+        local_ok: bool,
     }
     let mut jobs = Vec::new();
+    let mut outcome = TreeOutcome::default();
+    let mut hosts: HashMap<(String, String, Option<u16>), Option<bool>> = HashMap::new();
+    let mut lookup = |u: &Url| {
+        let key = (
+            u.scheme().to_string(),
+            u.host_str().unwrap_or_default().to_string(),
+            u.port_or_known_default(),
+        );
+        *hosts.entry(key).or_insert_with(|| locality(u))
+    };
     let bases = tree_bases(&pages.iter().map(|p| p.url.clone()).collect::<Vec<_>>());
     for (side, ((page, root), base)) in pages.iter().zip(roots).zip(&bases).enumerate() {
-        let _ = std::fs::write(root.join(PAGE_FILE), &page.html);
+        if progress.abort.load(Ordering::Relaxed) {
+            break;
+        }
+        if std::fs::write(root.join(PAGE_FILE), &page.html).is_err() {
+            outcome.failed += 1;
+        }
+        let local_ok = lookup(&page.url) == Some(true);
         let mut used: HashSet<PathBuf> = HashSet::from([PathBuf::from(PAGE_FILE)]);
         for url in resources(&page.html, &page.url) {
+            if progress.abort.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut local = |u: &Url| lookup(u) != Some(false);
+            if !may_load(&page.url, local_ok, &url, &mut local) {
+                outcome.skipped += 1;
+                continue;
+            }
             let mut path = resource_path(&page.url, base, &url);
             let mut k = 2;
             while used.contains(&path) {
@@ -719,7 +903,12 @@ pub fn download_trees(pages: &[Page], roots: &[PathBuf], progress: &Progress) ->
                 k += 1;
             }
             used.insert(path.clone());
-            jobs.push(Job { side, url, path });
+            jobs.push(Job {
+                side,
+                url,
+                path,
+                local_ok,
+            });
         }
     }
     progress.total.store(jobs.len(), Ordering::Relaxed);
@@ -737,7 +926,7 @@ pub fn download_trees(pages: &[Page], roots: &[PathBuf], progress: &Progress) ->
                     break;
                 };
                 let dest = roots[job.side].join(&job.path);
-                let ok = fetch(&agent, &job.url, RESOURCE_LIMIT)
+                let ok = fetch(&agent, &job.url, RESOURCE_LIMIT, job.local_ok)
                     .ok()
                     .is_some_and(|f| {
                         dest.parent()
@@ -752,7 +941,8 @@ pub fn download_trees(pages: &[Page], roots: &[PathBuf], progress: &Progress) ->
             });
         }
     });
-    failed.into_inner()
+    outcome.failed += failed.into_inner();
+    outcome
 }
 
 // ---------- screenshots ----------
@@ -996,5 +1186,237 @@ mod tests {
         );
         assert_eq!(charset_of(r#"<meta charset="big5">"#), Some("big5"));
         assert_eq!(charset_of("text/html"), None);
+    }
+
+    #[test]
+    fn decodes_pages_by_bom_header_declaration_then_content() {
+        let latin1 = b"<p>caf\xe9</p>";
+        let meta = b"<meta charset=\"iso-8859-1\"><p>caf\xe9</p>";
+        let big5 = b"<meta charset=big5><p>\xa4\xa4\xa4\xe5</p>";
+        let utf8 = "<p>café</p>".as_bytes();
+        let bom = [&[0xEF, 0xBB, 0xBF], utf8].concat();
+        let html = "text/html; charset=ISO-8859-1";
+        assert_eq!(decode_html(utf8, None), "<p>café</p>");
+        assert_eq!(decode_html(latin1, Some(html)), "<p>café</p>");
+        assert!(decode_html(meta, None).ends_with("<p>café</p>"));
+        assert!(decode_html(big5, None).ends_with("<p>中文</p>"));
+        // The header outranks the page, and a byte order mark outranks both.
+        assert!(decode_html(meta, Some("text/html; charset=utf-8")).ends_with("caf\u{FFFD}</p>"));
+        assert_eq!(decode_html(&bom, Some(html)), "<p>café</p>");
+        let claims_utf16 = "<meta charset=utf-16><p>café</p>";
+        assert!(decode_html(claims_utf16.as_bytes(), None).ends_with("<p>café</p>"));
+        // Unknown labels are ignored.
+        assert_eq!(
+            decode_html(utf8, Some("text/html; charset=nonsense")),
+            "<p>café</p>"
+        );
+    }
+
+    #[test]
+    fn tells_local_and_private_addresses_from_public_ones() {
+        let local = |s: &str| is_local(&Url::parse(s).unwrap());
+        for s in [
+            "http://127.0.0.1/",
+            "http://10.1.2.3:8080/",
+            "http://172.16.0.1/",
+            "http://192.168.1.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.64.0.1/",
+            "http://0.0.0.0/",
+            "http://[::1]/",
+            "http://[fd00::1]/",
+            "http://[fe80::1]/",
+            "http://[::ffff:192.168.0.1]/",
+            "http://[::127.0.0.1]/",
+            "http://[64:ff9b::7f00:1]/",
+            "http://[2002:7f00:1::]/",
+            "http://[fec0::1]/",
+            "http://[ff02::1]/",
+            "http://224.0.0.1/",
+            "http://240.0.0.1/",
+            "http://198.18.0.1/",
+            "http://192.0.0.1/",
+            "http://2130706433/",
+            "http://0x7f.1/",
+            "http://localhost:3000/",
+            "http://app.localhost./",
+            "file:///tmp/a.html",
+        ] {
+            assert!(local(s), "{s}");
+        }
+        for s in [
+            "http://93.184.215.14/",
+            "https://8.8.8.8/",
+            "http://[2606:4700::1111]/",
+            "http://172.32.0.1/",
+            "http://[64:ff9b::808:808]/",
+            "http://[2002:808:808::]/",
+        ] {
+            assert!(!local(s), "{s}");
+        }
+        // a page is local only when every address of its host is; a resource when any is
+        let page = |s: &str| is_local_page(&Url::parse(s).unwrap());
+        assert!(page("http://localhost/") && page("file:///tmp/a.html"));
+        assert!(page("http://192.168.1.1/") && !page("http://8.8.8.8/"));
+        assert_eq!(
+            locality(&Url::parse("http://8.8.8.8/").unwrap()),
+            Some(false)
+        );
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(classify(&[ip("1.2.3.4"), ip("10.0.0.1")]), None);
+        assert_eq!(classify(&[ip("10.0.0.1"), ip("::1")]), Some(true));
+        assert_eq!(classify(&[ip("1.2.3.4")]), Some(false));
+        assert_eq!(classify(&[]), Some(false));
+    }
+
+    #[test]
+    fn web_pages_load_no_local_files_nor_private_addresses() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        let public = u("http://93.184.215.14/index.html");
+        let lan = u("http://192.168.1.10/index.html");
+        let file = u("file:///tmp/page.html");
+        let may =
+            |page: &Url, res: &str| may_load(page, is_local_page(page), &u(res), &mut is_local);
+        assert!(may(&public, "http://8.8.8.8/a.js"));
+        assert!(!may(&public, "http://127.0.0.1:631/"));
+        assert!(!may(&public, "http://169.254.169.254/"));
+        assert!(!may(&public, "file:///etc/passwd"));
+        assert!(may(&lan, "http://192.168.1.11/a.css"));
+        assert!(may(&lan, "http://8.8.8.8/a.js"));
+        assert!(!may(&lan, "file:///etc/passwd"));
+        assert!(may(&file, "file:///tmp/a.css"));
+        assert!(may(&file, "http://127.0.0.1/a.css"));
+
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let roots: Vec<PathBuf> = dirs.iter().map(|d| d.path().to_path_buf()).collect();
+        let html = r#"<link rel=stylesheet href="http://127.0.0.1:9/a.css">
+            <img src="file:///etc/hosts"><script src="http://[::1]:9/b.js"></script>"#;
+        let page = |url: &Url| Page {
+            url: url.clone(),
+            status: 200,
+            html: html.into(),
+        };
+        let outcome = download_trees(
+            &[page(&public), page(&public)],
+            &roots,
+            &Progress::default(),
+        );
+        assert_eq!(
+            outcome,
+            TreeOutcome {
+                failed: 0,
+                skipped: 6
+            }
+        );
+        assert!(roots[0].join(PAGE_FILE).is_file());
+        assert_eq!(std::fs::read_dir(&roots[0]).unwrap().count(), 1);
+    }
+
+    /// Answers each request on a local port with `reply(path)`, one connection per request.
+    fn serve(reply: fn(&str, u16) -> Vec<u8>) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap_or_default();
+                let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let mut header = String::new();
+                while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
+                    header.clear();
+                }
+                let _ = reader.get_mut().write_all(&reply(&path, port));
+            }
+        });
+        port
+    }
+
+    fn response(status: &str, headers: &str, body: &[u8]) -> Vec<u8> {
+        let head = format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        [head.as_bytes(), body].concat()
+    }
+
+    #[test]
+    fn fetches_follow_safe_redirects_and_report_failures() {
+        let port = serve(|path, port| match path {
+            "/page" => response(
+                "200 OK",
+                "Content-Type: text/html; charset=iso-8859-1\r\n",
+                b"<p>caf\xe9</p>",
+            ),
+            "/moved" => response("301 Moved", "Location: /page\r\n", b""),
+            "/loop" => response("302 Found", "Location: /loop\r\n", b""),
+            "/nowhere" => response("302 Found", "", b"moved"),
+            "/to-file" => response("302 Found", "Location: file:///etc/passwd\r\n", b""),
+            "/to-self" => response(
+                "302 Found",
+                &format!("Location: http://127.0.0.1:{port}/page\r\n"),
+                b"",
+            ),
+            "/missing" => response("404 Not Found", "", b"<h1>gone</h1>"),
+            "/big" => response("200 OK", "", &[b'x'; 4096]),
+            _ => b"not http at all\r\n\r\n".to_vec(),
+        });
+        let agent = agent();
+        let url = |p: &str| Url::parse(&format!("http://127.0.0.1:{port}{p}")).unwrap();
+        let get = |p: &str, local_ok| fetch(&agent, &url(p), 1 << 20, local_ok);
+
+        let f = get("/moved", true).unwrap();
+        assert_eq!((f.url, f.status), (url("/page"), 200));
+        assert_eq!(
+            decode_html(&f.bytes, f.content_type.as_deref()),
+            "<p>café</p>"
+        );
+        let f = get("/nowhere", true).unwrap();
+        assert_eq!((f.status, f.bytes), (302, b"moved".to_vec()));
+        let f = get("/missing", true).unwrap();
+        assert_eq!((f.status, f.bytes), (404, b"<h1>gone</h1>".to_vec()));
+
+        let err = |r: Result<Fetched>| format!("{:#}", r.err().expect("an error"));
+        assert!(err(get("/loop", true)).contains("too many redirects"));
+        assert!(err(get("/to-file", true)).contains("not a web address"));
+        assert!(err(get("/to-self", false)).contains("not followed"));
+        assert!(get("/to-self", true).is_ok());
+        assert!(err(get("/garbage", true)).contains(url("/garbage").as_str()));
+        assert!(err(fetch(&agent, &url("/big"), 1024, true)).contains(url("/big").as_str()));
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gone = Url::parse(&format!("http://{}/", closed.local_addr().unwrap())).unwrap();
+        drop(closed);
+        assert!(err(fetch(&agent, &gone, 1024, true)).contains(gone.as_str()));
+    }
+
+    #[test]
+    fn local_pages_download_their_resources() {
+        let port = serve(|path, _| match path {
+            "/index.html" => response(
+                "200 OK",
+                "",
+                b"<link rel=stylesheet href=site.css><img src=gone.png>",
+            ),
+            "/site.css" => response("200 OK", "", b"p {}"),
+            _ => response("404 Not Found", "", b""),
+        });
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/index.html")).unwrap();
+        let pages = fetch_pages(std::slice::from_ref(&url)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let roots = [dir.path().to_path_buf()];
+        let outcome = download_trees(&pages, &roots, &Progress::default());
+        assert_eq!(
+            outcome,
+            TreeOutcome {
+                failed: 1,
+                skipped: 0
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("site.css")).unwrap(),
+            "p {}"
+        );
     }
 }

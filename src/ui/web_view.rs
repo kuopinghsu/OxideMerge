@@ -22,7 +22,7 @@ use url::Url;
 enum Loaded {
     Pages(Arc<Vec<Page>>),
     Shots(tempfile::TempDir, Vec<PathBuf>),
-    Tree(Arc<Vec<Page>>, Vec<tempfile::TempDir>, usize),
+    Tree(Arc<Vec<Page>>, Vec<tempfile::TempDir>, web::TreeOutcome),
 }
 
 struct Job {
@@ -218,15 +218,22 @@ impl WebView {
                 self.shots = Some(dir);
                 Content::Image(v)
             }
-            Loaded::Tree(pages, temps, failed) => {
+            Loaded::Tree(pages, temps, outcome) => {
                 let roots = temps.iter().map(|t| t.path().to_path_buf()).collect();
                 let display = pages.iter().map(label).collect();
                 let mut v = FolderView::new(roots, display, temps, "*.*", named, cfg);
                 v.set_recursive(true);
                 v.start_compare();
-                if failed > 0 {
-                    self.note = trf("web.failed", &[("n", failed.to_string())]);
-                }
+                let notes = [
+                    ("web.failed", outcome.failed),
+                    ("web.skipped", outcome.skipped),
+                ];
+                self.note = notes
+                    .iter()
+                    .filter(|(_, n)| *n > 0)
+                    .map(|(key, n)| trf(key, &[("n", n.to_string())]))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
                 self.pages = Some(pages);
                 Content::Folder(v)
             }

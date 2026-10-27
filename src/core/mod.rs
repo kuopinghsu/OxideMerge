@@ -1,4 +1,6 @@
 pub mod archive;
+#[cfg(test)]
+mod bench;
 pub mod binary;
 pub mod comments;
 pub mod conflict;
@@ -13,6 +15,8 @@ pub mod image_cmp;
 pub mod patch;
 pub mod prettify;
 pub mod project;
+#[cfg(test)]
+mod regress;
 pub mod report;
 pub mod rules;
 pub mod saved;

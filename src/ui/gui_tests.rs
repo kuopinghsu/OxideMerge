@@ -1,0 +1,810 @@
+//! Headless end-to-end tests of the main window. Each test drives the real application one
+//! frame at a time with pointer, keyboard, text and file-drop input, finds widgets by the names
+//! they give assistive technologies, and checks the views and files that result. A failing test
+//! leaves what the window last showed in `target/gui-tests/<test>.txt`.
+
+use super::*;
+use crate::core::diff::BlockKind;
+use egui::{accesskit, Event, Modifiers, PointerButton, Pos2, Rect};
+use std::time::{Duration, Instant};
+
+const SCREEN: egui::Vec2 = egui::vec2(1280.0, 820.0);
+
+struct Widget {
+    role: accesskit::Role,
+    label: String,
+    rect: Rect,
+    enabled: bool,
+}
+
+struct Gui {
+    name: &'static str,
+    ctx: egui::Context,
+    app: OxideMergeApp,
+    frame: eframe::Frame,
+    time: f64,
+    events: Vec<Event>,
+    modifiers: Modifiers,
+    dropped: Vec<PathBuf>,
+    focused: bool,
+    /// In drawing order, so later widgets are on top.
+    widgets: Vec<Widget>,
+    copied: Vec<String>,
+    closed: bool,
+}
+
+fn config() -> Config {
+    Config {
+        language: "en".into(),
+        theme: ThemeMode::Light,
+        restore_session: false,
+        open_reports: false,
+        ..Default::default()
+    }
+}
+
+impl Gui {
+    fn start(name: &'static str, initial: Option<OpenRequest>) -> Gui {
+        Gui::with_config(name, config(), initial)
+    }
+
+    fn with_config(name: &'static str, cfg: Config, initial: Option<OpenRequest>) -> Gui {
+        i18n::set_language(&cfg.language);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let app = OxideMergeApp::new(&cc, cfg.clone(), cfg, initial);
+        let mut gui = Gui {
+            name,
+            ctx,
+            app,
+            frame: eframe::Frame::_new_kittest(),
+            time: 0.0,
+            events: Vec::new(),
+            modifiers: Modifiers::NONE,
+            dropped: Vec::new(),
+            focused: true,
+            widgets: Vec::new(),
+            copied: Vec::new(),
+            closed: false,
+        };
+        gui.settle();
+        gui
+    }
+
+    fn frame(&mut self) {
+        let mut raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
+            time: Some(self.time),
+            modifiers: self.modifiers,
+            events: std::mem::take(&mut self.events),
+            dropped_files: self
+                .dropped
+                .drain(..)
+                .map(|p| egui::DroppedFile {
+                    path: Some(p),
+                    ..Default::default()
+                })
+                .collect(),
+            focused: self.focused,
+            ..Default::default()
+        };
+        self.time += 1.0 / 60.0;
+        eframe::App::raw_input_hook(&mut self.app, &self.ctx, &mut raw);
+        let (app, frame) = (&mut self.app, &mut self.frame);
+        let out = self
+            .ctx
+            .run(raw, |ctx| eframe::App::update(app, ctx, frame));
+        for c in &out.platform_output.commands {
+            if let egui::OutputCommand::CopyText(t) = c {
+                self.copied.push(t.clone());
+            }
+        }
+        if let Some(tree) = &out.platform_output.accesskit_update {
+            self.widgets = widgets_of(tree);
+        }
+        self.closed |= out
+            .viewport_output
+            .values()
+            .any(|v| v.commands.contains(&egui::ViewportCommand::Close));
+    }
+
+    fn frames(&mut self, n: usize) {
+        for _ in 0..n {
+            self.frame();
+        }
+    }
+
+    /// Runs frames until background work (compares, merges, reports) is done.
+    fn settle(&mut self) {
+        let start = Instant::now();
+        loop {
+            self.frame();
+            if !self.busy() {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "{}: still busy after a minute",
+                self.name
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.frames(3);
+    }
+
+    fn busy(&self) -> bool {
+        self.app.report_job.is_some()
+            || self
+                .app
+                .tabs
+                .iter()
+                .any(|t| matches!(t.content.view(), Content::Folder(v) if v.busy()))
+    }
+
+    /// The topmost widget named `label`, with or without the key that runs it ("Open  (⌘O)").
+    fn widget(&self, label: &str) -> &Widget {
+        self.widgets
+            .iter()
+            .rev()
+            .find(|w| named(w, label))
+            .unwrap_or_else(|| panic!("{}: no widget {label:?}", self.name))
+    }
+
+    fn shows(&self, label: &str) -> bool {
+        self.widgets.iter().any(|w| named(w, label))
+    }
+
+    fn shows_text(&self, part: &str) -> bool {
+        self.widgets.iter().any(|w| w.label.contains(part))
+    }
+
+    fn click(&mut self, label: &str) {
+        let w = self.widget(label);
+        assert!(w.enabled, "{}: {label:?} is disabled", self.name);
+        self.click_at(w.rect.center());
+    }
+
+    /// Clicks the widget of kind `role` named `label`, not a caption next to it.
+    fn click_a(&mut self, role: accesskit::Role, label: &str) {
+        let w = self
+            .widgets
+            .iter()
+            .rev()
+            .find(|w| w.role == role && named(w, label))
+            .unwrap_or_else(|| panic!("{}: no {role:?} {label:?}", self.name));
+        self.click_at(w.rect.center());
+    }
+
+    /// Picks an item of the menu bar: `["File", "Export", "Generate patch..."]`. Items are told
+    /// from buttons of the same name by where they are: under their menu, or beside it.
+    fn menu(&mut self, path: &[&str]) {
+        let mut anchor = self.widget(path[0]).rect;
+        self.click(path[0]);
+        for (depth, item) in path.iter().enumerate().skip(1) {
+            let found = self.widgets.iter().rev().find(|w| {
+                let r = w.rect;
+                named(w, item)
+                    && if depth == 1 {
+                        (r.left() - anchor.left()).abs() < 2.0 && r.top() >= anchor.bottom()
+                    } else {
+                        r.left() >= anchor.right() - 4.0 && r.left() <= anchor.right() + 24.0
+                    }
+            });
+            let Some(w) = found else {
+                panic!("{}: no item {item:?} in the menu", self.name);
+            };
+            assert!(w.enabled, "{}: {item:?} is disabled", self.name);
+            anchor = w.rect;
+            self.click_at(anchor.center());
+        }
+    }
+
+    fn click_at(&mut self, at: Pos2) {
+        self.events.push(Event::PointerMoved(at));
+        self.frame();
+        for pressed in [true, false] {
+            self.events.push(Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: self.modifiers,
+            });
+            self.frame();
+        }
+        self.settle();
+    }
+
+    fn key(&mut self, modifiers: Modifiers, key: Key) {
+        self.modifiers = modifiers;
+        for pressed in [true, false] {
+            self.events.push(Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers,
+            });
+            self.frame();
+        }
+        self.modifiers = Modifiers::NONE;
+        self.settle();
+    }
+
+    fn type_text(&mut self, text: &str) {
+        self.events.push(Event::Text(text.into()));
+        self.frames(2);
+    }
+
+    fn drop_files(&mut self, paths: &[PathBuf]) {
+        self.dropped.extend(paths.iter().cloned());
+        self.settle();
+    }
+
+    /// Leaves the window and comes back, as switching to another program does.
+    fn refocus(&mut self) {
+        self.focused = false;
+        self.frame();
+        self.focused = true;
+        self.settle();
+    }
+
+    fn text_view(&self) -> &TextView {
+        match self.app.tabs.get(self.app.active).map(|t| t.content.view()) {
+            Some(Content::Text(v)) => v,
+            _ => panic!("{}: the active tab is not a text compare", self.name),
+        }
+    }
+
+    fn toasts(&self) -> Vec<(bool, String)> {
+        self.app
+            .toasts
+            .iter()
+            .map(|t| (t.error, t.text.clone()))
+            .collect()
+    }
+
+    fn errors(&self) -> Vec<String> {
+        self.toasts()
+            .into_iter()
+            .filter_map(|(error, t)| error.then_some(t))
+            .collect()
+    }
+
+    fn describe(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(out, "test: {}", self.name);
+        let _ = writeln!(out, "language: {}", i18n::current_language());
+        for (i, t) in self.app.tabs.iter().enumerate() {
+            let mark = if i == self.app.active { '*' } else { ' ' };
+            let _ = writeln!(out, "tab{mark} {} | {}", t.title(), t.status_line());
+        }
+        for (error, t) in self.toasts() {
+            let _ = writeln!(out, "toast{} {t}", if error { " (error)" } else { "" });
+        }
+        for w in &self.widgets {
+            let _ = writeln!(
+                out,
+                "{:?} {:?} {:?}{}",
+                w.role,
+                w.label,
+                w.rect,
+                if w.enabled { "" } else { " disabled" }
+            );
+        }
+        out
+    }
+}
+
+/// When a test fails, keeps what the window showed for the report.
+impl Drop for Gui {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"))
+            .join("gui-tests");
+        let file = dir.join(format!("{}.txt", self.name));
+        if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&file, self.describe()).is_ok() {
+            eprintln!("window state: {}", file.display());
+        }
+    }
+}
+
+fn named(w: &Widget, label: &str) -> bool {
+    w.label
+        .strip_prefix(label)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("  ("))
+}
+
+/// The named widgets of an accessibility tree, in drawing order.
+fn widgets_of(tree: &accesskit::TreeUpdate) -> Vec<Widget> {
+    let nodes: std::collections::HashMap<accesskit::NodeId, &accesskit::Node> =
+        tree.nodes.iter().map(|(id, n)| (*id, n)).collect();
+    let mut out = Vec::new();
+    let mut stack = vec![tree.focus];
+    if let Some(t) = &tree.tree {
+        stack = vec![t.root];
+    }
+    let mut order = Vec::new();
+    while let Some(id) = stack.pop() {
+        let Some(n) = nodes.get(&id) else { continue };
+        order.push(*n);
+        stack.extend(n.children().iter().rev());
+    }
+    for n in order {
+        // Plain text has its words as the value.
+        let (Some(label), Some(b)) = (n.label().or(n.value()), n.bounds()) else {
+            continue;
+        };
+        out.push(Widget {
+            role: n.role(),
+            label: label.to_string(),
+            rect: Rect::from_min_max(
+                Pos2::new(b.x0 as f32, b.y0 as f32),
+                Pos2::new(b.x1 as f32, b.y1 as f32),
+            ),
+            enabled: !n.is_disabled(),
+        });
+    }
+    out
+}
+
+fn write(dir: &Path, files: &[(&str, &str)]) {
+    for (name, text) in files {
+        let p = dir.join(name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+}
+
+fn read(p: &Path) -> String {
+    std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+}
+
+/// Gives `p` a modification time of its own, as file systems may round close ones together.
+fn touch_later(p: &Path, secs: u64) {
+    let f = std::fs::File::options().write(true).open(p).unwrap();
+    f.set_modified(std::time::SystemTime::now() + Duration::from_secs(secs))
+        .unwrap();
+}
+
+fn compare(paths: &[PathBuf]) -> Option<OpenRequest> {
+    Some(OpenRequest {
+        paths: paths.to_vec(),
+        ..Default::default()
+    })
+}
+
+const ALT: Modifiers = Modifiers::ALT;
+const CMD: Modifiers = Modifiers::COMMAND;
+
+#[test]
+fn files_dropped_on_the_open_dialog_are_compared_and_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[("a.txt", "one\ntwo\nthree\n"), ("b.txt", "one\n2\nthree\n")],
+    );
+    let mut gui = Gui::start("open_dialog", None);
+    assert!(gui.app.tabs.is_empty());
+
+    gui.key(CMD, Key::O);
+    assert!(gui.app.open_dlg.is_some());
+    gui.drop_files(&[d.join("a.txt"), d.join("b.txt")]);
+    let paths = gui.app.open_dlg.as_ref().unwrap().paths.clone();
+    assert_eq!(paths[0], d.join("a.txt").display().to_string());
+    assert_eq!(paths[2], d.join("b.txt").display().to_string());
+    gui.click(tr("btn.compare"));
+    assert!(gui.app.open_dlg.is_none());
+    assert_eq!(gui.app.tabs.len(), 1);
+    assert_eq!(gui.text_view().diff.blocks.len(), 1);
+    assert!(gui.shows(&gui.app.tabs[0].title()));
+
+    // Keys move to the difference and copy it; the toolbar undoes and redoes.
+    gui.key(ALT, Key::ArrowDown);
+    assert_eq!(gui.text_view().cur_block, Some(0));
+    gui.key(ALT, Key::ArrowRight);
+    assert_eq!(gui.text_view().panes[1].doc.lines[1], "two");
+    assert!(gui.text_view().diff.blocks.is_empty());
+    gui.click(tr("cmd.undo"));
+    assert_eq!(gui.text_view().panes[1].doc.lines[1], "2");
+    gui.click(tr("cmd.redo"));
+    assert!(gui.app.tabs[0].is_modified());
+    gui.key(CMD, Key::S);
+    assert!(!gui.app.tabs[0].is_modified());
+    assert_eq!(read(&d.join("b.txt")), "one\ntwo\nthree\n");
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn three_way_conflicts_are_resolved_and_the_middle_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("left.txt", "a\nleft\nc\nd\ne\n"),
+            ("base.txt", "a\nb\nc\nd\ne\n"),
+            ("right.txt", "a\nright\nc\nd\nE\n"),
+        ],
+    );
+    let paths = ["left.txt", "base.txt", "right.txt"].map(|f| d.join(f));
+    let mut gui = Gui::start("three_way", compare(&paths));
+    assert_eq!(gui.text_view().n(), 3);
+    assert_eq!(gui.text_view().diff.blocks.len(), 2);
+
+    gui.menu(&[tr("menu.merge"), tr("cmd.auto_merge")]);
+    assert_eq!(gui.text_view().panes[1].doc.lines[4], "E");
+    assert_eq!(gui.text_view().panes[1].doc.lines[1], "b");
+
+    gui.key(ALT, Key::PageDown);
+    let b = gui.text_view().cur_block.expect("a conflict is selected");
+    assert_eq!(gui.text_view().diff.blocks[b].kind, BlockKind::Conflict);
+    gui.key(ALT, Key::ArrowRight);
+    gui.key(CMD, Key::S);
+    assert_eq!(read(&paths[1]), "a\nleft\nc\nd\nE\n");
+    assert_eq!(read(&paths[0]), "a\nleft\nc\nd\ne\n");
+    assert_eq!(read(&paths[2]), "a\nright\nc\nd\nE\n");
+}
+
+fn merge_folders(d: &Path) -> [PathBuf; 3] {
+    write(
+        d,
+        &[
+            ("left/same.txt", "same\n"),
+            ("left/changed.txt", "left\n"),
+            ("left/both.txt", "left\n"),
+            ("left/gone.txt", "gone\n"),
+            ("mid/same.txt", "same\n"),
+            ("mid/changed.txt", "base\n"),
+            ("mid/both.txt", "base\n"),
+            ("mid/gone.txt", "gone\n"),
+            ("right/same.txt", "same\n"),
+            ("right/changed.txt", "base\n"),
+            ("right/both.txt", "right\n"),
+            ("right/sub/added.txt", "added\n"),
+        ],
+    );
+    ["left", "mid", "right"].map(|f| d.join(f))
+}
+
+fn compare_folders(paths: &[PathBuf]) -> Option<OpenRequest> {
+    Some(OpenRequest {
+        paths: paths.to_vec(),
+        recursive: Some(true),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn folder_merges_are_previewed_then_carried_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let roots = merge_folders(dir.path());
+    let mut gui = Gui::start("folder_merge", compare_folders(&roots));
+    assert!(matches!(gui.app.tabs[0].content, Content::Folder(_)));
+
+    gui.menu(&[tr("menu.merge"), tr("cmd.folder_merge")]);
+    let plan = trf(
+        "msg.folder_merge_plan",
+        &[
+            ("copies", "3".into()),
+            ("deletes", "1".into()),
+            ("merges", "0".into()),
+        ],
+    );
+    assert!(gui.shows(&plan), "the merge is not previewed");
+    assert!(gui.shows_text("gone.txt"), "the deletion is not listed");
+    assert!(gui.shows_text("both.txt"), "the conflict is not listed");
+    let mid = &roots[1];
+    assert_eq!(read(&mid.join("changed.txt")), "base\n", "merged before OK");
+
+    gui.click(tr("btn.ok"));
+    assert_eq!(read(&mid.join("changed.txt")), "left\n");
+    assert_eq!(read(&mid.join("sub/added.txt")), "added\n");
+    assert!(!mid.join("gone.txt").exists());
+    assert_eq!(read(&mid.join("both.txt")), "base\n");
+    let status = gui.app.tabs[0].status_line();
+    assert!(
+        status.contains(&trf("msg.op_done", &[("n", "4".into())])),
+        "{status}"
+    );
+    assert!(
+        !status.contains(&format!(" — {}:", tr("status.error"))),
+        "{status}"
+    );
+}
+
+#[test]
+fn folder_merges_leave_alone_what_changed_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let roots = merge_folders(dir.path());
+    let mut gui = Gui::start("folder_merge_stale", compare_folders(&roots));
+
+    // An item gone since the compare stops the merge until compared again.
+    std::fs::remove_file(roots[0].join("gone.txt")).unwrap();
+    gui.menu(&[tr("menu.merge"), tr("cmd.folder_merge")]);
+    let stale = trf(
+        "msg.folder_merge_stale",
+        &[("n", "1".into()), ("file", "gone.txt".into())],
+    );
+    let status = gui.app.tabs[0].status_line();
+    assert!(status.contains(&stale), "{status}");
+    assert!(!gui.shows(tr("btn.ok")), "a merge was offered");
+
+    // A file changed between the preview and OK is kept as it is, and named.
+    gui.key(Modifiers::NONE, Key::F5);
+    gui.click(tr("cmd.folder_merge"));
+    let target = roots[1].join("changed.txt");
+    std::fs::write(&target, "mine\n").unwrap();
+    touch_later(&target, 5);
+    gui.click(tr("btn.ok"));
+    assert_eq!(read(&target), "mine\n");
+    assert_eq!(read(&roots[1].join("sub/added.txt")), "added\n");
+    assert!(!roots[1].join("gone.txt").exists());
+    let status = gui.app.tabs[0].status_line();
+    assert!(
+        status.contains(tr("status.error")) && status.contains("changed.txt"),
+        "{status}"
+    );
+}
+
+#[test]
+fn tabs_switch_and_ask_before_closing_with_unsaved_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("a1.txt", "x\n1\n"),
+            ("a2.txt", "x\n2\n"),
+            ("b1.txt", "y\n1\n"),
+            ("b2.txt", "y\n2\n"),
+        ],
+    );
+    let mut gui = Gui::start("tabs", compare(&[d.join("a1.txt"), d.join("a2.txt")]));
+    gui.drop_files(&[d.join("b1.txt"), d.join("b2.txt")]);
+    assert_eq!(gui.app.tabs.len(), 2);
+    assert_eq!(gui.app.active, 1);
+    gui.key(Modifiers::CTRL, Key::Tab);
+    assert_eq!(gui.app.active, 0);
+    let first = gui.app.tabs[1].title();
+    gui.click(&first);
+    assert_eq!(gui.app.active, 1);
+
+    gui.key(ALT, Key::ArrowDown);
+    gui.key(ALT, Key::ArrowRight);
+    gui.key(CMD, Key::W);
+    assert!(gui.shows(tr("dlg.unsaved")));
+    gui.click(tr("btn.cancel"));
+    assert_eq!(gui.app.tabs.len(), 2);
+    gui.key(CMD, Key::W);
+    gui.click(tr("btn.discard"));
+    assert_eq!(gui.app.tabs.len(), 1);
+    assert_eq!(read(&d.join("b2.txt")), "y\n2\n");
+
+    gui.key(ALT, Key::ArrowDown);
+    gui.key(ALT, Key::ArrowRight);
+    gui.key(CMD, Key::W);
+    gui.click(tr("btn.save"));
+    assert!(gui.app.tabs.is_empty());
+    assert_eq!(read(&d.join("a2.txt")), "x\n1\n");
+}
+
+#[test]
+fn lines_are_found_copied_and_pasted_with_the_keyboard() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("a.txt", "alpha\nbeta\ngamma\n"),
+            ("b.txt", "alpha\ngamma\n"),
+        ],
+    );
+    let mut gui = Gui::start("keyboard", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    gui.key(CMD, Key::F);
+    assert!(gui.text_view().find.open);
+    gui.type_text("gam");
+    gui.key(Modifiers::NONE, Key::Enter);
+    assert_eq!(gui.text_view().find.query, "gam");
+    let row = gui.text_view().cursor_row.expect("the match is selected");
+    assert_eq!(gui.text_view().diff.rows[row].line[0], Some(2));
+    gui.key(Modifiers::NONE, Key::Escape);
+    assert!(!gui.text_view().find.open);
+
+    gui.key(CMD, Key::Home);
+    gui.key(Modifiers::SHIFT, Key::ArrowDown);
+    gui.events.push(Event::Copy);
+    gui.frames(2);
+    assert_eq!(gui.copied.last().map(String::as_str), Some("alpha\nbeta\n"));
+
+    gui.key(Modifiers::NONE, Key::ArrowRight);
+    assert_eq!(gui.text_view().active_pane, 1);
+    gui.key(CMD, Key::End);
+    gui.events.push(Event::Paste("delta\n".into()));
+    gui.frames(2);
+    assert_eq!(
+        gui.text_view().panes[1].doc.lines,
+        ["alpha", "gamma", "delta"]
+    );
+}
+
+#[test]
+fn theme_and_language_follow_the_settings() {
+    let mut gui = Gui::start("theme_language", None);
+    assert!(!gui.ctx.style().visuals.dark_mode);
+    gui.click(tr("view.dark_mode"));
+    assert!(gui.ctx.style().visuals.dark_mode);
+
+    gui.click(tr("menu.options").trim_end_matches(['.', '…']));
+    gui.click_a(accesskit::Role::ComboBox, tr("menu.language"));
+    gui.click("Deutsch");
+    gui.click(tr("btn.ok"));
+    assert_eq!(i18n::current_language(), "de");
+    assert_eq!(gui.app.cfg.language, "de");
+    assert!(gui.shows(tr("menu.file")));
+    assert_ne!(tr("menu.file"), "File");
+}
+
+#[test]
+fn patches_are_generated_and_applied_for_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[("a.txt", "one\ntwo\nthree\n"), ("b.txt", "one\n2\nthree\n")],
+    );
+    let mut gui = Gui::start("patch", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    gui.menu(&[tr("menu.file"), tr("menu.export"), tr("menu.patch")]);
+    let field = gui
+        .widgets
+        .iter()
+        .rev()
+        .find(|w| w.role == accesskit::Role::TextInput)
+        .expect("the patch dialog asks for a file")
+        .rect;
+    gui.events.push(Event::PointerMoved(field.center()));
+    gui.click_at(field.center());
+    let out = d.join("changes.patch");
+    gui.type_text(&out.display().to_string());
+    gui.click(tr("btn.ok"));
+    let written = read(&out);
+    let parsed = patch::parse_unified(&written).unwrap();
+    let original = vec!["one".to_string(), "two".into(), "three".into()];
+    assert_eq!(
+        patch::apply(&original, &parsed[0]).lines,
+        ["one", "2", "three"]
+    );
+
+    // A patch whose names lead to a file next to it opens that file patched, to review.
+    write(
+        d,
+        &[
+            ("target.txt", "one\ntwo\nthree\n"),
+            (
+                "fix.patch",
+                "--- a/target.txt\n+++ b/target.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+2\n three\n",
+            ),
+        ],
+    );
+    gui.app.apply_patch_file(&d.join("fix.patch"));
+    gui.settle();
+    assert_eq!(gui.app.tabs.len(), 2);
+    assert_eq!(gui.text_view().panes[1].doc.lines, ["one", "2", "three"]);
+    assert_eq!(read(&d.join("target.txt")), "one\ntwo\nthree\n");
+    gui.key(CMD, Key::S);
+    assert_eq!(read(&d.join("target.txt")), "one\n2\nthree\n");
+
+    // Hunks that no longer fit are reported, naming the file.
+    write(
+        d,
+        &[(
+            "stale.patch",
+            "--- a/target.txt\n+++ b/target.txt\n@@ -1,3 +1,3 @@\n one\n-zwei\n+2\n three\n",
+        )],
+    );
+    gui.app.apply_patch_file(&d.join("stale.patch"));
+    gui.settle();
+    let errors = gui.errors();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("target.txt") && e.contains('1')),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn html_reports_are_saved_or_their_failure_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "one\n<two>\n"), ("b.txt", "one\n2\n")]);
+    let mut gui = Gui::start("report", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    let out = d.join("report.html");
+    gui.app.export_text_html_to(out.clone());
+    gui.settle();
+    let html = read(&out);
+    assert!(html.contains("a.txt") && html.contains("&lt;two&gt;"));
+    let saved = trf("msg.saved", &[("file", out.display().to_string())]);
+    assert!(gui.toasts().contains(&(false, saved)), "{:?}", gui.toasts());
+
+    let bad = d.join("missing folder").join("report.html");
+    gui.app.export_text_html_to(bad.clone());
+    gui.settle();
+    assert!(!bad.exists());
+    let errors = gui.errors();
+    assert!(
+        errors.iter().any(|e| e.contains("missing folder")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn files_changed_outside_are_reloaded_unless_edited() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "one\ntwo\n"), ("b.txt", "one\n2\n")]);
+    let mut gui = Gui::start(
+        "outside_changes",
+        compare(&[d.join("a.txt"), d.join("b.txt")]),
+    );
+
+    std::fs::write(d.join("b.txt"), "one\ntwo\n").unwrap();
+    touch_later(&d.join("b.txt"), 5);
+    gui.refocus();
+    assert_eq!(gui.text_view().panes[1].doc.lines, ["one", "two"]);
+    assert!(gui.text_view().diff.blocks.is_empty());
+
+    // An edited side is kept, and reloading it is offered.
+    gui.key(Modifiers::NONE, Key::ArrowRight);
+    gui.key(CMD, Key::End);
+    gui.events.push(Event::Paste("mine\n".into()));
+    gui.frames(2);
+    std::fs::write(d.join("b.txt"), "theirs\n").unwrap();
+    touch_later(&d.join("b.txt"), 10);
+    gui.refocus();
+    assert_eq!(gui.text_view().panes[1].doc.lines, ["one", "two", "mine"]);
+    gui.click(tr("btn.reload"));
+    assert_eq!(gui.text_view().panes[1].doc.lines, ["theirs"]);
+}
+
+#[test]
+fn a_missing_side_opens_empty_to_be_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "one\n")]);
+    let mut gui = Gui::start(
+        "missing_side",
+        compare(&[d.join("a.txt"), d.join("new.txt")]),
+    );
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    gui.key(CMD.plus(ALT), Key::ArrowRight);
+    gui.key(CMD, Key::S);
+    assert_eq!(read(&d.join("new.txt")), "one\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn files_that_cannot_be_read_are_reported() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "one\n"), ("locked.txt", "two\n")]);
+    let locked = d.join("locked.txt");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&locked).is_ok() {
+        return; // running as root
+    }
+    let gui = Gui::start("open_error", compare(&[d.join("a.txt"), locked]));
+    assert!(gui.app.tabs.is_empty());
+    let errors = gui.errors();
+    assert!(
+        errors.iter().any(|e| e.contains("locked.txt")),
+        "{errors:?}"
+    );
+}

@@ -1,6 +1,6 @@
 = OxideMerge User Guide
 :description: User guide for OxideMerge, an open source differencing and merging tool.
-:revnumber: 0.9.3
+:revnumber: 0.9.4
 :doctype: book
 :toc: left
 :toclevels: 3
@@ -75,9 +75,9 @@ Install the Debian package with `sudo apt install ./oxidemerge-*.deb`.
 File dialogs need `xdg-desktop-portal`, which desktop environments normally include.
 
 macOS::
-The app is ad-hoc signed but not notarized.
-The first time, Control-click it and choose *Open*, or allow it in
-*System Settings → Privacy & Security*.
+The app is ad-hoc signed but not notarized, so macOS blocks it the first time.
+Try to open it once, then choose *Open Anyway* in *System Settings → Privacy & Security*.
+Up to macOS 14, Control-clicking the app and choosing *Open* also works.
 To start it from the terminal, link it into your `PATH`:
 +
 [source,sh]
@@ -139,6 +139,41 @@ In the *Select files or folders* dialog:
 
 TIP: *File → New text compare* (kbd:[Ctrl+N]) opens two empty sides.
 Paste text into them with kbd:[Ctrl+V], or double-click a line to type.
+
+[[compare-types]]
+=== Compare types
+
+With *Compare as* set to *Automatic*, OxideMerge chooses the compare from the paths, in this order:
+
+. An `http://` or `https://` address on any side opens a web page compare.
+. Folders on every side open a folder compare.
+. Archives on every side are extracted and compared as folders.
+. Files that all have image extensions (`.png`, `.jpg`, `.gif`, `.bmp`, `.tif`, `.webp` and more)
+  open an image compare.
+. A file with a zero byte in its first 8 KB opens a binary compare, unless an unpacker plugin
+  turns it into text (see <<unpackers>>).
+  UTF-16 text with a byte order mark still counts as text.
+. Anything else opens a text compare.
+
+*Compare as* in the dialog, *Compare → Compare as* in an open tab, or `-t` on the command line
+overrides the choice.
+The compare types differ in what they show and what they can change:
+
+Text:: Lines side by side, with changed words highlighted.
+Two or three sides can be edited and merged, and the compare options and rules decide what counts
+as a difference.
+Use it for source code, configuration files, CSV and anything else that is readable text.
+Binary:: Bytes in a hex view.
+Differences can be copied and saved, but there is no line alignment: a byte inserted near the
+start shifts everything after it.
+Image:: Pixels, side by side, overlaid, swiped, blinking or as a difference image.
+Differing regions can be copied between images.
+Folder:: The items of two or three folders, compared by the chosen compare method.
+Items are copied, deleted and merged here, and each file opens in its own compare.
+Web page:: Two or three pages, as screenshots, HTML source, visible text or downloaded resources.
+Web pages are read-only: nothing is saved back to a server.
+
+Each type is described in its own chapter below.
 
 === Getting help
 
@@ -203,6 +238,7 @@ From left to right:
 * *Compare method* chooses how files are compared.
 * *Find by name* (kbd:[Ctrl+F]) shows only the items whose names contain the text.
 
+[[compare-methods]]
 === Compare methods
 
 [cols="1,3"]
@@ -523,8 +559,20 @@ Text:: The visible text of each page, without scripts, styles and markup, in the
 Resource tree:: Downloads each page with its stylesheets, scripts, images, frames and media, and
 compares the downloaded files in the folder compare.
 
-Pages are decoded using the charset from HTTP or `<meta>`.
-HTTP status codes other than 2xx are shown in the pane header.
+Pages are decoded as browsers do: a byte order mark comes first, then the charset of the HTTP
+`Content-Type` header, then a `<meta>` charset, then a guess from the content.
+HTTP status codes other than 2xx are shown in the pane header, and the page that came with them
+is compared.
+A page that can't be reached, times out after 30 seconds, sends a malformed response or is larger
+than 50 MB is reported with its address.
+
+The resource tree reads the resources named in each page itself, at most 400 per page and 20 MB
+each; it does not follow the links in stylesheets or scripts.
+Resources that can't be downloaded are counted in the status bar, and the rest are still compared.
+A web page may not load local files, and only a page on this computer or a private network
+(such as `localhost` or `192.168.x.x`) may load resources from one, or be redirected to one;
+other such resources are skipped and counted.
+The addresses you enter are always loaded.
 The screenshot size and the browser are set under *Options → Image / Binary / Web*.
 Leave the browser empty to find one automatically.
 
@@ -922,6 +970,7 @@ OxideMerge then keeps its options in that file.
 Languages:: To add or change a language, copy `lang/en.json` from the source code to
 `<code>.json`, translate the values, keeping every `{placeholder}` as it is, and put the file in a
 `Languages` folder next to the program or in the configuration folder.
+Messages the file lacks, and translations that drop or add a placeholder, are shown in English.
 
 == Troubleshooting and limitations
 
@@ -939,11 +988,65 @@ The encoding of the file can't hold some of the characters you added.
 Undo the change that added them, or choose another encoding in the side header.
 
 macOS refuses to open the app::
-Control-click it and choose *Open*, or allow it in *System Settings → Privacy & Security*.
+Try to open it once, then choose *Open Anyway* in *System Settings → Privacy & Security*.
+Or clear the download flag in Terminal:
+`xattr -dr com.apple.quarantine /Applications/OxideMerge.app`.
+
+macOS asks for access to a folder, or a compare shows files as errors::
+macOS asks once before OxideMerge reads Desktop, Documents, Downloads, removable or network
+volumes; allow it, or turn it on later in *System Settings → Privacy & Security → Files and
+Folders*.
+On any system, a file that can't be read is shown as an error, and the message names the file.
+Check its permissions.
+
+The AppImage doesn't start::
+Make it executable with `chmod +x`.
+If the message mentions FUSE, start it with `--appimage-extract-and-run`.
+
+The window stays blank or doesn't open on Linux::
+OxideMerge draws with OpenGL.
+Without a working graphics driver (in a virtual machine, for example), start it with
+`LIBGL_ALWAYS_SOFTWARE=1 oxidemerge` to use Mesa's software renderer.
+
+File dialogs don't open on Linux::
+They use the XDG desktop portal.
+Install `xdg-desktop-portal` and the one for your desktop, such as `xdg-desktop-portal-gtk` or
+`xdg-desktop-portal-kde`.
+
+The file manager entries are missing::
+On Windows 11 they are under *Show more options*.
+They point at the program that added them, so after moving or updating it to another folder, add
+them again from the new copy.
+On Linux, restart the file manager (`nautilus -q`, for example) to see new entries.
+
+The settings are not kept::
+OxideMerge says so when it can't save them, with the reason.
+Check that the configuration folder (see <<configuration>>) can be written and that the disk
+isn't full.
+
+An auto merge of folders doesn't start, or leaves files out::
+It needs a complete comparison of subfolders, also those on one side only, that wasn't stopped.
+Files that changed since the comparison are left alone and listed; compare again and merge
+again.
+
+A web page compare shows less than the browser::
+Only Screenshot mode runs scripts.
+The other modes see the page as the server sent it, without anything that scripts add later.
+Resources that couldn't be downloaded, or were skipped as being on this computer or a private
+network, are counted in the status bar.
+
+Large files are slow or use a lot of memory::
+A text compare needs about 7 times the size of its files in memory, and binary and image
+compares hold the files whole.
+Compare files of several hundred MB as binary, or compare folders by size and date instead of
+contents (see <<compare-methods>>).
 
 Known limitations::
 * Archive support covers zip-based formats, tar (plain, gzip, bzip2 and xz) and 7z; rar is not
   supported.
 * Text editing is line based; OxideMerge is not a full code editor.
 * Unpacker plugins are external commands, not WinMerge plugin DLLs or scripts.
-* Web page compare doesn't support cookies or logins.
+* Web page compare doesn't support cookies or logins; a page behind a login shows its login page.
+  Only Screenshot mode runs scripts, so the other modes miss content that scripts add later.
+  In Screenshot mode the browser loads everything the page asks for, without the resource tree's
+  limits.
