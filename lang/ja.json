@@ -362,6 +362,8 @@
   "msg.new_hint": "Ctrl+V でアクティブな側にテキストを貼り付けるか、行をダブルクリックして入力します",
   "msg.no_bookmarks": "ブックマークはありません",
   "msg.no_config": "設定フォルダが見つかりません。",
+  "msg.config_kept": "{file} の設定を読み込めなかったため、既定値を使用します。コピーを {kept} に保存しました。",
+  "msg.config_left": "{file} の設定を読み込めなかったため、既定値を使用します。このファイルには上書き保存しません。",
   "msg.settings_not_saved": "設定を保存できませんでした: {err}",
   "msg.no_conflicts": "このファイルには競合マーカーがありません",
   "msg.no_next_file": "これより後に差分のあるファイルはありません",

@@ -604,4 +604,8 @@ fn patches_without_context_insert_after_the_stated_line() {
         assert!(done.failed.is_empty(), "{hunks}");
         assert_eq!(done.lines, want, "{hunks}");
     }
+    // The second hunk of `@@ -1 +0,0 @@ -1`, alone: its new start counts the line removed.
+    let text = "--- a\n+++ b\n@@ -2,0 +2 @@\n+x\n";
+    let done = apply(&base, &parse_unified(text).unwrap()[0]);
+    assert_eq!(done.lines, v(&["1", "2", "x", "3"]));
 }

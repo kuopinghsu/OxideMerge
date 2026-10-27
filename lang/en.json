@@ -362,6 +362,8 @@
   "msg.new_hint": "Paste text with Ctrl+V into the active side, or double-click a line to type",
   "msg.no_bookmarks": "No bookmarks",
   "msg.no_config": "The settings folder could not be found.",
+  "msg.config_kept": "The settings in {file} could not be read, so the defaults are used. A copy was kept as {kept}.",
+  "msg.config_left": "The settings in {file} could not be read, so the defaults are used and settings are not saved over it.",
   "msg.settings_not_saved": "The settings could not be saved: {err}",
   "msg.no_conflicts": "The file contains no conflict markers",
   "msg.no_next_file": "No more files with differences after this one",

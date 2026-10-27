@@ -10,8 +10,8 @@ section of this file as the release notes.
 - **Tests:** randomized diff, 3-way merge and patch tests that check every result against the
   inputs (`OXIDEMERGE_TEST_CASES` and `OXIDEMERGE_TEST_SEED` for longer runs or to repeat one),
   tests that draw the views without a window, and command line tests of the built program
-  (`tests/cli.rs`). `OXIDEMERGE_CONFIG_DIR` points the program at another settings folder, so tests
-  never touch the real one.
+  (`tests/cli.rs`). `OXIDEMERGE_CONFIG_DIR` points the program at another settings folder, window
+  size and place included, so tests never touch the real one.
 - **Window smoke test** (`make gui-smoke`, `scripts/gui-smoke.sh`): opens real windows with the
   release build, two files, three files, two folders, and checks what each tab shows. CI runs it on
   Windows (with Mesa's software renderer), Linux (Xvfb) and macOS and keeps the output of a failed
@@ -57,13 +57,22 @@ section of this file as the release notes.
 
 ### Fixed
 
-- Applying a patch made without context lines (`diff -U0`) put added lines one line too early.
+- Applying a patch made without context lines (`diff -U0`) put added lines one line too early,
+  and in the wrong place when hunks before them were left out of the patch.
 - A difference next to a moved insertion or deletion could point at the wrong line of the side
   where it is empty.
 - A folder compare that broke off with an internal error showed the folders as identical; it now
   says it failed and counts as an error.
 - A text compare whose syntax highlighting stopped with an error kept redrawing the window.
 - Settings that could not be saved were dropped without a word; the error is now shown.
+- Settings that could not be read were replaced by the defaults when settings were next saved.
+  The file is now kept as `config.json.bad` (or `oxidemerge.json.bad`) and a message says so.
+- With the Recycle Bin option on, a file or folder that could not be moved to the trash was
+  deleted for good without a word; it is now left where it is and the error is shown.
+- Folder auto merge could miss a file that changed while the merge was being planned.
+- On Windows, copying a file over a read-only one in the folder compare or folder auto merge
+  wrote into it in place; it is now replaced through a temporary file and stays whole if the
+  copy fails.
 - The Filters window opened folders with `xdg-open` on macOS; errors opening files and folders
   from the folder compare and the dialogs are now shown.
 - Folder auto merge merged binary files as text, and dropped a change of encoding, byte order
@@ -78,11 +87,21 @@ section of this file as the release notes.
   is now replaced and stays read-only, as on Linux and macOS.
 - Text copied into a new or empty file in a text compare got this computer's line endings; the
   file now takes the encoding and line endings of the file copied from, as in All differences.
+  Take both and Auto merge into an empty middle file do the same, and undo puts back only what
+  copying changed.
 
 ### Security
 
 - Unpacker commands could run part of a file name as a command; the file path is now passed as an
-  argument (`"$1"`) on Linux and macOS and quoted on Windows.
+  argument (`"$1"`) on Linux and macOS, and as an environment variable the command line quotes on
+  Windows, where unpackers given the quoted path in the command line also failed to run.
+- On Windows, *Open with* and opening a file from the folder compare went through `cmd start`, so
+  a file name containing `&` could run a command; files are now opened by the shell directly.
+- Resource tree downloads could write outside the chosen folder through an encoded `/` (`%2F`) in
+  a resource address.
+- The web size limit counted compressed bytes, so a small compressed response could unpack to
+  fill memory; it now counts the bytes unpacked. A page of deeply nested `<head>` tags crashed
+  the program.
 - Links in `.tar` archives that point outside the archive, directly or through other links, are
   no longer extracted.
 - Web pages can no longer read local files or reach this computer and the private network

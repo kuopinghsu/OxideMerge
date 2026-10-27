@@ -833,6 +833,26 @@ fn menu_widths(gui: &mut Gui) -> Vec<(&'static str, f32)> {
 }
 
 #[test]
+fn submenus_are_measured_with_their_arrow() {
+    let ctx = egui::Context::default();
+    let mut widths = Vec::new();
+    for _ in 0..2 {
+        widths.clear();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            for layer in [MENU_MEASURE, "elsewhere"] {
+                let shown = egui::Area::new(egui::Id::new(layer)).show(ctx, |ui| {
+                    submenu(ui, "Export", |_| ());
+                });
+                widths.push(shown.response.rect.width());
+            }
+        });
+    }
+    // Only where the menus are measured, as menus draw the arrow themselves.
+    let spacing = ctx.style().spacing.item_spacing.x;
+    assert!(widths[0] > widths[1] + spacing, "{widths:?}");
+}
+
+#[test]
 fn menus_open_equally_wide() {
     let same = |widths: &[(&str, f32)]| widths.iter().all(|(_, w)| (w - widths[0].1).abs() < 0.01);
     let mut fresh = Vec::new();

@@ -759,6 +759,11 @@ fn main() -> ExitCode {
         viewport,
         // Automated window checks leave the user's window size and place alone.
         persist_window: std::env::var_os("OXIDEMERGE_SMOKE_REPORT").is_none(),
+        // A settings folder of its own keeps the window state there too.
+        persistence_path: config::config_dir_overridden()
+            .then(config::config_dir)
+            .flatten()
+            .map(|d| d.join("app.ron")),
         ..Default::default()
     };
     let result = eframe::run_native(

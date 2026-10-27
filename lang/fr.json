@@ -362,6 +362,8 @@
   "msg.new_hint": "Collez du texte avec Ctrl+V dans le côté actif, ou double-cliquez sur une ligne pour saisir",
   "msg.no_bookmarks": "Aucun signet",
   "msg.no_config": "Le dossier des réglages est introuvable.",
+  "msg.config_kept": "Les réglages de {file} n'ont pas pu être lus ; les valeurs par défaut sont utilisées. Une copie a été conservée sous {kept}.",
+  "msg.config_left": "Les réglages de {file} n'ont pas pu être lus ; les valeurs par défaut sont utilisées et le fichier ne sera pas écrasé.",
   "msg.settings_not_saved": "Impossible d’enregistrer les réglages : {err}",
   "msg.no_conflicts": "Le fichier ne contient aucun marqueur de conflit",
   "msg.no_next_file": "Plus aucun fichier avec des différences après celui-ci",

@@ -457,18 +457,19 @@ pub fn apply(lines: &[String], patch: &FilePatch) -> Applied {
     let mut out = lines.to_vec();
     let mut failed = Vec::new();
     let mut delta: isize = 0;
-    let mut stated: isize = 0;
     let mut floor = 0usize;
     for (n, h) in patch.hunks.iter().enumerate() {
         let old = h.old_lines();
-        // A hunk without old lines (from `diff -U0`) goes after line `old_start`; its new start
-        // says the same and is also right for diffs that write `-1,0` for the top of the file.
-        let at = if old.is_empty() {
-            h.new_start.saturating_sub(1) as isize - stated + delta
+        // A hunk without old lines (from `diff -U0`) goes after line `old_start`. Its new start
+        // also counts hunks left out of the patch, but tells `-1,0 +1`, which some diffs write
+        // for the top of the file, from a line after the first, which would start at 2.
+        let at = if old.is_empty() && (h.old_start, h.new_start) == (1, 1) {
+            delta
+        } else if old.is_empty() {
+            h.old_start as isize + delta
         } else {
             h.old_start.saturating_sub(1) as isize + delta
         };
-        stated += h.new_lines().len() as isize - old.len() as isize;
         let expected = at.max(floor as isize) as usize;
         let last = out.len().saturating_sub(old.len());
         let found = [false, true].into_iter().find_map(|loose| {

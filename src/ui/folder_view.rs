@@ -294,13 +294,37 @@ fn launch(mut cmd: std::process::Command, path: &std::path::Path) -> Result<(), 
 }
 
 /// Opens `path` (a file or folder) with the program the system uses for it.
+#[cfg(windows)]
 pub(crate) fn system_open(path: &std::path::Path) -> Result<(), String> {
-    #[cfg(windows)]
-    let mut cmd = {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", ""]);
-        c
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+    // The shell gets the path as a file to open, never inside a command line it parses.
+    let file: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let code = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
     };
+    // Values above 32 mean success.
+    if code as isize > 32 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+/// Opens `path` (a file or folder) with the program the system uses for it.
+#[cfg(not(windows))]
+pub(crate) fn system_open(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut cmd = std::process::Command::new("open");
     #[cfg(all(unix, not(target_os = "macos")))]

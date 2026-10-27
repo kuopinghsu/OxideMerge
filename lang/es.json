@@ -362,6 +362,8 @@
   "msg.new_hint": "Pegue texto con Ctrl+V en el lado activo o haga doble clic en una línea para escribir",
   "msg.no_bookmarks": "No hay marcadores",
   "msg.no_config": "No se encontró la carpeta de configuración.",
+  "msg.config_kept": "No se pudo leer la configuración de {file}, así que se usan los valores predeterminados. Se guardó una copia como {kept}.",
+  "msg.config_left": "No se pudo leer la configuración de {file}, así que se usan los valores predeterminados y no se sobrescribirá.",
   "msg.settings_not_saved": "No se pudo guardar la configuración: {err}",
   "msg.no_conflicts": "El archivo no contiene marcadores de conflicto",
   "msg.no_next_file": "No hay más archivos con diferencias después de este",

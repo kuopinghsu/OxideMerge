@@ -889,8 +889,9 @@ pub fn delete_path(path: &Path, use_recycle_bin: bool) -> Result<()> {
     if !path.exists() {
         bail!("{} does not exist", path.display());
     }
-    if use_recycle_bin && trash::delete(path).is_ok() {
-        return Ok(());
+    if use_recycle_bin {
+        // Never deleted for good instead: whoever chose the trash expects to get it back.
+        return trash::delete(path).context("not moved to the trash, so not deleted");
     }
     if path.is_dir() {
         std::fs::remove_dir_all(path)?;

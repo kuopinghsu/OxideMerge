@@ -210,6 +210,7 @@ pub fn plan(items: &[DirItem], roots: &[PathBuf]) -> Plan {
     }
     let clashes = type_clashes(items);
     let mut stale = Vec::new();
+    let mut stamps = BTreeMap::new();
     for (i, it) in items.iter().enumerate() {
         let covered = std::iter::successors(it.parent, |&p| items[p].parent)
             .any(|p| matches!(steps.get(&p), Some(Step::Conflict)));
@@ -220,6 +221,10 @@ pub fn plan(items: &[DirItem], roots: &[PathBuf]) -> Plan {
         if clashes.contains(&i) {
             steps.insert(i, Step::Conflict);
             continue;
+        }
+        // Taken before the files are read, so a change while they are is seen as one.
+        if !it.is_dir {
+            stamps.insert(i, stamp(it, roots));
         }
         let path = |s: usize| it.path(&roots[s]);
         let kinds: [Kind; 3] = std::array::from_fn(|s| kind(&path(s)));
@@ -285,11 +290,7 @@ pub fn plan(items: &[DirItem], roots: &[PathBuf]) -> Plan {
             steps.insert(i, Step::Prune);
         }
     }
-    let stamps = steps
-        .keys()
-        .filter(|&&i| !items[i].is_dir)
-        .map(|&i| (i, stamp(&items[i], roots)))
-        .collect();
+    stamps.retain(|i, _| steps.contains_key(i));
     Plan {
         steps: steps.into_iter().collect(),
         stamps,

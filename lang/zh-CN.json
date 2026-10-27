@@ -362,6 +362,8 @@
   "msg.new_hint": "按 Ctrl+V 将文本粘贴到当前侧，或双击某行输入",
   "msg.no_bookmarks": "没有书签",
   "msg.no_config": "找不到设置文件夹。",
+  "msg.config_kept": "无法读取 {file} 中的设置，因此使用默认值。已将副本保留为 {kept}。",
+  "msg.config_left": "无法读取 {file} 中的设置，因此使用默认值，且不会覆盖该文件。",
   "msg.settings_not_saved": "无法保存设置：{err}",
   "msg.no_conflicts": "此文件不包含冲突标记",
   "msg.no_next_file": "后面没有其他存在差异的文件",

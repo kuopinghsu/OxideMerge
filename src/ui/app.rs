@@ -1357,15 +1357,18 @@ impl Menus {
     }
 }
 
-/// A submenu of a menu bar menu. Laid out unseen by [`OxideMergeApp::menu_width`], it is a plain
-/// button, so it also takes the room of the arrow it has in a menu.
+/// The layer [`OxideMergeApp::menu_width`] lays the menus out on.
+const MENU_MEASURE: &str = "menu_measure";
+
+/// A submenu of a menu bar menu. Laid out by [`OxideMergeApp::menu_width`], it is a plain
+/// button, so there it also takes the room of the arrow it has in a menu.
 fn submenu<R>(
     ui: &mut egui::Ui,
     title: &str,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
     let shown = ui.menu_button(title, add);
-    if !ui.is_visible() {
+    if ui.layer_id().id == egui::Id::new(MENU_MEASURE) {
         let arrow = egui::WidgetText::from("⏵")
             .into_galley(
                 ui,
@@ -1770,6 +1773,12 @@ impl OxideMergeApp {
             app.open(req);
         } else if app.cfg.restore_session {
             app.restore_session();
+        }
+        if let (Some(u), Some(p)) = (crate::config::unreadable(), crate::config::config_path()) {
+            app.error(crate::config::unreadable_message(
+                &p,
+                u.as_ref().ok().map(|k| k.as_path()),
+            ));
         }
         if !app.cfg.rules.is_empty() && rules::find(&app.cfg.rules).is_none() {
             let name = rules::display_name(&app.cfg.rules).to_string();
@@ -3846,7 +3855,7 @@ impl OxideMergeApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!zoomed));
             }
         }
-        let (width_id, width) = self.menu_width(ctx, &mut m);
+        let width = self.menu_width(ctx, &mut m);
         egui::menu::bar(ui, |ui| {
             ui.spacing_mut().button_padding = vec2(9.0, 4.0);
             let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -3869,10 +3878,6 @@ impl OxideMergeApp {
                 ui.menu_button(tr(key), |ui| {
                     ui.set_min_width(width);
                     self.menu(ui, &mut m, i);
-                    let shown = ui.min_rect().width();
-                    if shown > width + 0.5 {
-                        ui.ctx().data_mut(|d| d.insert_temp(width_id, shown));
-                    }
                 });
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3942,9 +3947,8 @@ impl OxideMergeApp {
     }
 
     /// The width all menus of the menu bar open with, so that they match: that of the widest,
-    /// measured once per language, fonts and text size by laying the menus out unseen. A menu
-    /// found wider when it opens raises it.
-    fn menu_width(&mut self, ctx: &egui::Context, m: &mut Menus) -> (egui::Id, f32) {
+    /// measured once per language, fonts and text size by laying the menus out unseen.
+    fn menu_width(&mut self, ctx: &egui::Context, m: &mut Menus) -> f32 {
         let size = ctx.style().text_styles[&egui::TextStyle::Button].size;
         // The fonts in use: after a change of language they follow a frame later.
         let fonts = ctx.fonts(|f| egui::Id::new(&f.lock().fonts.definitions().families));
@@ -3953,9 +3957,9 @@ impl OxideMergeApp {
             .with(fonts)
             .with(size.to_bits());
         if let Some(width) = ctx.data(|d| d.get_temp::<f32>(id)) {
-            return (id, width);
+            return width;
         }
-        let width = egui::Area::new(id)
+        let width = egui::Area::new(egui::Id::new(MENU_MEASURE))
             .order(egui::Order::Background)
             .fixed_pos(egui::pos2(-10_000.0, -10_000.0))
             .constrain(false)
@@ -3973,7 +3977,7 @@ impl OxideMergeApp {
             })
             .inner;
         ctx.data_mut(|d| d.insert_temp(id, width));
-        (id, width)
+        width
     }
 
     fn file_menu(&mut self, ui: &mut egui::Ui, m: &mut Menus) {
@@ -6009,6 +6013,8 @@ impl OxideMergeApp {
         if let Err(e) = std::fs::write(&path, out) {
             eprintln!("{}: {e}", path.display());
         }
+        // An automated check never waits for an answer about unsaved files.
+        self.allow_close = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 }

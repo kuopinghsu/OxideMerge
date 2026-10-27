@@ -33,26 +33,33 @@ impl Unpacker {
     }
 
     pub fn run(&self, path: &Path) -> Result<Vec<u8>> {
-        // The shell gets the path as an argument, never as part of the command it parses, so
-        // no file name can run commands. Windows file names can't contain quotes.
+        // The shell gets the path as an argument or variable, never as part of the command it
+        // parses, so no file name can run commands. In quotes, nothing in a Windows name is
+        // special to `cmd`, and the name can't contain a quote to end them.
         let quoted = if cfg!(windows) {
-            format!("\"{}\"", path.display())
+            "\"%OXIDEMERGE_FILE%\""
         } else {
-            "\"$1\"".to_string()
+            "\"$1\""
         };
         let cmdline = if self.command.contains("${file}") {
-            self.command.replace("${file}", &quoted)
+            self.command.replace("${file}", quoted)
         } else {
             format!("{} {}", self.command, quoted)
         };
-        let output = if cfg!(windows) {
-            Command::new("cmd").args(["/C", &cmdline]).output()?
-        } else {
-            Command::new("sh")
-                .args(["-c", &cmdline, "sh"])
-                .arg(path)
+        #[cfg(windows)]
+        let output = {
+            use std::os::windows::process::CommandExt;
+            // Passed as is: `cmd` doesn't undo the escaping other arguments get.
+            Command::new("cmd")
+                .raw_arg(format!("/D /V:OFF /S /C \"{cmdline}\""))
+                .env("OXIDEMERGE_FILE", path)
                 .output()?
         };
+        #[cfg(not(windows))]
+        let output = Command::new("sh")
+            .args(["-c", &cmdline, "sh"])
+            .arg(path)
+            .output()?;
         if !output.status.success() && output.stdout.is_empty() {
             bail!("{}", String::from_utf8_lossy(&output.stderr));
         }
@@ -93,6 +100,41 @@ mod tests {
                 assert!(!dir.path().join(ran).exists(), "{name} ran a command");
             }
             assert!(cat("false").run(&file).is_err());
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn file_names_are_never_run_as_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let unpacker = |command: &str| Unpacker {
+            enabled: true,
+            pattern: "*.txt".into(),
+            command: command.into(),
+        };
+        // Any of these read as part of the command would make `type` miss the file.
+        for name in [
+            "plain b.txt",
+            "a & exit 3 & b.txt",
+            "a ^& b.txt",
+            "a %PATH% b.txt",
+            "a !PATH! b.txt",
+            "a (b); c, d.txt",
+        ] {
+            let file = dir.path().join(name);
+            std::fs::write(&file, "content\r\n").unwrap();
+            let u = unpacker("type ${file}");
+            assert!(u.matches(&file));
+            assert_eq!(u.run(&file).unwrap(), b"content\r\n", "{name}");
+            assert_eq!(
+                unpacker("type").run(&file).unwrap(),
+                b"content\r\n",
+                "{name}"
+            );
         }
     }
 }

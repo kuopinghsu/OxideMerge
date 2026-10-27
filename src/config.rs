@@ -171,7 +171,7 @@ pub fn config_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("OxideMerge"))
 }
 
-fn config_dir_overridden() -> bool {
+pub fn config_dir_overridden() -> bool {
     cfg!(test) || std::env::var_os("OXIDEMERGE_CONFIG_DIR").is_some_and(|d| !d.is_empty())
 }
 
@@ -191,12 +191,47 @@ pub fn config_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("config.json"))
 }
 
+/// A settings file that could not be read: `Ok` with the copy of it kept, or `Err` with the
+/// file itself when no copy could be made, which saving then leaves alone.
+pub type Unreadable = Result<PathBuf, PathBuf>;
+
+static UNREADABLE: std::sync::OnceLock<Unreadable> = std::sync::OnceLock::new();
+
+/// The settings file [`Config::load`] could not read, if any.
+pub fn unreadable() -> Option<&'static Unreadable> {
+    UNREADABLE.get()
+}
+
 impl Config {
     pub fn load() -> Config {
-        config_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| Config::parse(&s))
-            .unwrap_or_default()
+        let Some(p) = config_path() else {
+            return Config::default();
+        };
+        let (cfg, unreadable) = Config::load_from(&p);
+        if let Some(u) = unreadable {
+            let _ = UNREADABLE.set(u);
+        }
+        cfg
+    }
+
+    /// The settings in `p`. Ones that are there but can't be read are copied to
+    /// `<name>.bad` first, as saving the defaults would replace them.
+    fn load_from(p: &std::path::Path) -> (Config, Option<Unreadable>) {
+        let Ok(bytes) = std::fs::read(p) else {
+            return (Config::default(), None);
+        };
+        if let Some(cfg) = std::str::from_utf8(&bytes).ok().and_then(Config::parse) {
+            return (cfg, None);
+        }
+        let mut kept = p.as_os_str().to_owned();
+        kept.push(".bad");
+        let kept = PathBuf::from(kept);
+        let copied = crate::core::fsutil::write_atomic_with(&kept, &bytes, false);
+        let unreadable = match copied {
+            Ok(()) => Ok(kept),
+            Err(_) => Err(p.to_path_buf()),
+        };
+        (Config::default(), Some(unreadable))
     }
 
     fn parse(s: &str) -> Option<Config> {
@@ -214,6 +249,9 @@ impl Config {
         let Some(p) = config_path() else {
             anyhow::bail!("{}", crate::i18n::tr("msg.no_config"));
         };
+        if let Some(Err(left)) = unreadable() {
+            anyhow::bail!("{}", unreadable_message(left, None));
+        }
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d).map_err(|e| anyhow::anyhow!("{}: {e}", d.display()))?;
         }
@@ -253,9 +291,40 @@ impl Config {
     }
 }
 
+/// What the user is told about a settings file [`Config::load`] could not read.
+pub fn unreadable_message(file: &std::path::Path, kept: Option<&std::path::Path>) -> String {
+    let file = ("file", file.display().to_string());
+    match kept {
+        Some(k) => crate::i18n::trf(
+            "msg.config_kept",
+            &[file, ("kept", k.display().to_string())],
+        ),
+        None => crate::i18n::trf("msg.config_left", &[file]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_settings_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        assert_eq!(Config::load_from(&p), (Config::default(), None));
+        std::fs::write(&p, r#"{"language": "ja"}"#).unwrap();
+        assert_eq!(Config::load_from(&p).0.language, "ja");
+        for bad in [&br#"{"language": 3}"#[..], b"{", b"\xff\xfe"] {
+            std::fs::write(&p, bad).unwrap();
+            let kept = dir.path().join("config.json.bad");
+            assert_eq!(
+                Config::load_from(&p),
+                (Config::default(), Some(Ok(kept.clone())))
+            );
+            assert_eq!(std::fs::read(&kept).unwrap(), bad);
+            assert_eq!(std::fs::read(&p).unwrap(), bad);
+        }
+    }
 
     #[test]
     fn old_dark_mode_becomes_explicit_theme() {

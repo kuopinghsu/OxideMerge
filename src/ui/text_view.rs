@@ -247,7 +247,8 @@ struct Snapshot {
     lines: Vec<Vec<String>>,
     modified: Vec<bool>,
     saves: Vec<u64>,
-    formats: Vec<Format>,
+    /// The format of each pane before this step, where the step changed it.
+    formats: Vec<Option<Format>>,
 }
 
 /// How a file is written: encoding, byte order mark, line ending, final newline, mixed endings.
@@ -929,7 +930,7 @@ impl TextView {
             lines: self.panes.iter().map(|p| p.doc.lines.clone()).collect(),
             modified: self.panes.iter().map(|p| p.doc.modified).collect(),
             saves: self.panes.iter().map(|p| p.saves).collect(),
-            formats: self.panes.iter().map(|p| format_of(&p.doc)).collect(),
+            formats: vec![None; self.panes.len()],
         }
     }
 
@@ -946,14 +947,15 @@ impl TextView {
     }
 
     fn restore(&mut self, s: Snapshot) {
+        for (i, f) in s.formats.into_iter().enumerate() {
+            if let Some(f) = f {
+                let d = &mut self.panes[i].doc;
+                (d.encoding, d.bom, d.eol, d.final_newline, d.mixed_eol) = f;
+            }
+        }
         for (i, lines) in s.lines.into_iter().enumerate() {
             if self.panes[i].doc.lines == lines {
                 continue;
-            }
-            // Only an empty pane took the format of the one copied into it.
-            if lines.is_empty() != self.panes[i].doc.lines.is_empty() {
-                let d = &mut self.panes[i].doc;
-                (d.encoding, d.bom, d.eol, d.final_newline, d.mixed_eol) = s.formats[i];
             }
             let before = std::mem::replace(&mut self.panes[i].doc.lines, lines);
             self.panes[i].hl_dirty = true;
@@ -975,7 +977,7 @@ impl TextView {
 
     pub fn undo(&mut self) {
         if let Some(s) = self.undo.pop() {
-            let cur = self.snapshot();
+            let cur = self.snapshot_for(&s);
             self.redo.push(cur);
             self.restore(s);
         }
@@ -983,10 +985,21 @@ impl TextView {
 
     pub fn redo(&mut self) {
         if let Some(s) = self.redo.pop() {
-            let cur = self.snapshot();
+            let cur = self.snapshot_for(&s);
             self.undo.push(cur);
             self.restore(s);
         }
+    }
+
+    /// The panes as they are, to go back to after restoring `s`: with the formats `s` changes.
+    fn snapshot_for(&self, s: &Snapshot) -> Snapshot {
+        let mut cur = self.snapshot();
+        for (i, f) in s.formats.iter().enumerate() {
+            if f.is_some() {
+                cur.formats[i] = Some(format_of(&self.panes[i].doc));
+            }
+        }
+        cur
     }
 
     fn replace_block_lines(&mut self, b: usize, from: usize, to: usize) {
@@ -996,13 +1009,20 @@ impl TextView {
     }
 
     /// A new or empty file is written like the one it is first copied from, with one kind of
-    /// line ending.
-    fn take_format(&mut self, from: usize, to: usize) {
-        if self.panes[to].doc.lines.is_empty() && !self.panes[from].doc.lines.is_empty() {
-            let f = format_of(&self.panes[from].doc);
-            let d = &mut self.panes[to].doc;
-            (d.encoding, d.bom, d.eol, d.final_newline) = (f.0, f.1, f.2, f.3);
-            d.mixed_eol = false;
+    /// line ending: `to`, `was_empty` before the last undo step, now has lines of `from`.
+    fn take_format(&mut self, from: usize, to: usize, was_empty: bool) {
+        if !was_empty || self.panes[to].doc.lines.is_empty() {
+            return;
+        }
+        let (f, old) = (
+            format_of(&self.panes[from].doc),
+            format_of(&self.panes[to].doc),
+        );
+        let d = &mut self.panes[to].doc;
+        (d.encoding, d.bom, d.eol, d.final_newline) = (f.0, f.1, f.2, f.3);
+        d.mixed_eol = false;
+        if let Some(s) = self.undo.last_mut() {
+            s.formats[to] = Some(old);
         }
     }
 
@@ -1025,9 +1045,10 @@ impl TextView {
             return;
         }
         self.push_undo();
-        self.take_format(from, to);
+        let was_empty = self.panes[to].doc.lines.is_empty();
         let row = self.diff.blocks[b].first_row;
         self.replace_block_lines(b, from, to);
+        self.take_format(from, to, was_empty);
         self.mark_changed(&[to]);
         // stay near the merged position
         self.cur_block = None;
@@ -1093,8 +1114,9 @@ impl TextView {
         let n = src.len().max(range.len());
         let start = range.start;
         self.push_undo();
-        self.take_format(from, to);
+        let was_empty = self.panes[to].doc.lines.is_empty();
         self.panes[to].doc.lines.splice(range, src);
+        self.take_format(from, to, was_empty);
         self.mark_changed(&[to]);
         let row = self.diff.row_of_line(to, start);
         self.cursor_row = Some(row);
@@ -1147,11 +1169,12 @@ impl TextView {
             return;
         }
         self.push_undo();
-        self.take_format(from, to);
+        let was_empty = self.panes[to].doc.lines.is_empty();
         let blocks: Vec<usize> = self.significant().collect();
         for &b in blocks.iter().rev() {
             self.replace_block_lines(b, from, to);
         }
+        self.take_format(from, to, was_empty);
         self.mark_changed(&[to]);
         self.cur_block = None;
         self.status = trf("msg.copied_blocks", &[("n", blocks.len().to_string())]);
@@ -1179,8 +1202,15 @@ impl TextView {
             return;
         }
         self.push_undo();
+        let was_empty = self.panes[1].doc.lines.is_empty();
         let start = blk.ranges[1].start;
         self.panes[1].doc.lines.splice(blk.ranges[1].clone(), lines);
+        let from = if blk.ranges[first].is_empty() {
+            second
+        } else {
+            first
+        };
+        self.take_format(from, 1, was_empty);
         self.mark_changed(&[1]);
         let row = self.diff.row_of_line(1, start);
         self.cursor_row = Some(row);
@@ -1202,11 +1232,14 @@ impl TextView {
             return;
         }
         self.push_undo();
+        let was_empty = self.panes[1].doc.lines.is_empty();
         let blocks: Vec<(usize, BlockKind)> = self
             .significant()
             .map(|b| (b, self.diff.blocks[b].kind))
             .collect();
         let mut merged = 0;
+        // Of the first block merged, as the blocks are merged from the end.
+        let mut first_from = 0;
         for &(b, kind) in blocks.iter().rev() {
             let from = match kind {
                 BlockKind::LeftOnly | BlockKind::BothSame => 0,
@@ -1214,8 +1247,10 @@ impl TextView {
                 _ => continue,
             };
             self.replace_block_lines(b, from, 1);
+            first_from = from;
             merged += 1;
         }
+        self.take_format(first_from, 1, was_empty);
         self.mark_changed(&[1]);
         self.cur_block = None;
         self.status = trf(
@@ -4265,5 +4300,56 @@ mod tests {
         v.panes[0].doc.mixed_eol = true;
         v.copy_all(0, 1);
         assert!(!v.panes[1].doc.mixed_eol);
+
+        // A line ending chosen for a new file before typing into it survives undo.
+        let mut v = TextView::new(
+            vec![TextDoc::from_text(None, "x\n"), TextDoc::empty(None)],
+            &Config::default(),
+        );
+        v.panes[1].doc.eol = Eol::Cr;
+        v.push_undo();
+        v.panes[1].doc.lines = vec!["typed".into()];
+        v.mark_changed(&[1]);
+        v.undo();
+        assert_eq!(v.panes[1].doc.eol, Eol::Cr);
+        v.redo();
+        assert_eq!(v.panes[1].doc.eol, Eol::Cr);
+
+        // Copying nothing into an empty file leaves its format alone.
+        let mut v = TextView::new(
+            vec![TextDoc::empty(None), TextDoc::empty(None)],
+            &Config::default(),
+        );
+        v.panes[0].doc.eol = Eol::Cr;
+        v.copy_all(0, 1);
+        assert_eq!(v.panes[1].doc.eol, Eol::platform());
+
+        // Taking both sides or merging into an empty middle takes a side's format too.
+        let three = || {
+            let crlf = TextDoc::from_text(None, "a\r\nb\r\n");
+            let lf = TextDoc::from_text(None, "c\n");
+            TextView::new(vec![crlf, TextDoc::empty(None), lf], &Config::default())
+        };
+        let mut v = three();
+        let b = v.significant().next().unwrap();
+        v.take_both_at(b, true);
+        assert_eq!(v.panes[1].doc.eol, Eol::CrLf);
+        v.undo();
+        assert_eq!(v.panes[1].doc.eol, Eol::platform());
+        let mut v = three();
+        let b = v.significant().next().unwrap();
+        v.take_both_at(b, false);
+        assert_eq!(v.panes[1].doc.eol, Eol::Lf);
+        let mut v = TextView::new(
+            vec![
+                TextDoc::from_text(None, "a\r\n"),
+                TextDoc::empty(None),
+                TextDoc::empty(None),
+            ],
+            &Config::default(),
+        );
+        v.auto_merge();
+        assert_eq!(v.panes[1].doc.lines, vec!["a".to_string()]);
+        assert_eq!(v.panes[1].doc.eol, Eol::CrLf);
     }
 }

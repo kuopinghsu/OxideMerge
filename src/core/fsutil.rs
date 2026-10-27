@@ -189,16 +189,23 @@ pub fn copy_atomic(from: &Path, to: &Path, backup: bool) -> Result<()> {
         let _ = tmp.as_file().set_modified(t);
     }
     tmp.as_file().sync_all().with_context(copying)?;
-    // Set once in place: a read-only temporary file could not be removed on Windows.
+    // Set once in place: a read-only temporary file could not be removed on Windows, which
+    // can't rename over a read-only file either, so that is made writable for the rename.
+    let old = std::fs::symlink_metadata(to).map(|m| m.permissions());
+    let unlocked = cfg!(windows) && make_writable(to);
     match tmp.persist(to) {
         Ok(_) => {
             let _ = std::fs::set_permissions(to, perm);
             Ok(())
         }
-        // A file that cannot be replaced (read-only on Windows); the temporary file goes first.
+        // A file that cannot be replaced; the temporary file goes first.
         Err(e) => {
             drop(e);
-            copy_in_place(from, to).with_context(copying)
+            let copied = copy_in_place(from, to);
+            if let (Err(_), true, Ok(p)) = (&copied, unlocked, old) {
+                let _ = std::fs::set_permissions(to, p);
+            }
+            copied.with_context(copying)
         }
     }
 }
@@ -383,6 +390,17 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&to).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(backup_path(&to)).unwrap(), "old");
         assert!(!std::fs::metadata(&to).unwrap().permissions().readonly());
+        // A read-only file is replaced, not written into: a link to it keeps the old content.
+        std::fs::write(&to, "old").unwrap();
+        let alias = dir.path().join("alias.txt");
+        std::fs::hard_link(&to, &alias).unwrap();
+        let mut perm = std::fs::metadata(&to).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&to, perm).unwrap();
+        copy_atomic(&from, &to, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), "old");
+        make_writable(&alias);
         #[cfg(unix)]
         {
             let elsewhere = dir.path().join("elsewhere.txt");

@@ -362,6 +362,8 @@
   "msg.new_hint": "Text mit Strg+V in die aktive Seite einfügen oder per Doppelklick auf eine Zeile tippen",
   "msg.no_bookmarks": "Keine Lesezeichen",
   "msg.no_config": "Der Einstellungsordner wurde nicht gefunden.",
+  "msg.config_kept": "Die Einstellungen in {file} konnten nicht gelesen werden, daher gelten die Standardwerte. Eine Kopie wurde als {kept} aufbewahrt.",
+  "msg.config_left": "Die Einstellungen in {file} konnten nicht gelesen werden, daher gelten die Standardwerte, und die Datei wird nicht überschrieben.",
   "msg.settings_not_saved": "Die Einstellungen konnten nicht gespeichert werden: {err}",
   "msg.no_conflicts": "Die Datei enthält keine Konfliktmarkierungen",
   "msg.no_next_file": "Keine weiteren Dateien mit Unterschieden danach",

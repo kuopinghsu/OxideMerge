@@ -5,8 +5,9 @@ use crate::core::text::{self, TextEncoding};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::net::{IpAddr, ToSocketAddrs};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -94,6 +95,19 @@ fn agent() -> ureq::Agent {
         ))
         .build()
         .into()
+}
+
+/// Reads `r` to the end, failing once it gives more than `limit` bytes.
+fn read_limited(r: impl Read, limit: u64) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    r.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::other(format!(
+            "larger than {} MB",
+            limit >> 20
+        )));
+    }
+    Ok(bytes)
 }
 
 struct Fetched {
@@ -200,7 +214,11 @@ fn fetch(agent: &ureq::Agent, url: &Url, limit: u64, local_ok: bool) -> Result<F
         let path = url
             .to_file_path()
             .map_err(|_| anyhow::anyhow!("{url}: not a local file"))?;
-        let bytes = std::fs::read(&path).with_context(|| path.display().to_string())?;
+        if !path.is_file() {
+            bail!("{}: not a file", path.display());
+        }
+        let file = std::fs::File::open(&path).with_context(|| path.display().to_string())?;
+        let bytes = read_limited(file, limit).with_context(|| path.display().to_string())?;
         return Ok(Fetched {
             url: url.clone(),
             status: 200,
@@ -246,12 +264,9 @@ fn fetch(agent: &ureq::Agent, url: &Url, limit: u64, local_ok: bool) -> Result<F
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let status = resp.status().as_u16();
-    let bytes = resp
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()
-        .with_context(|| url.to_string())?;
+    // The limit applies to the bytes as decompressed, which a small download can make huge.
+    let reader = resp.body_mut().with_config().limit(u64::MAX).reader();
+    let bytes = read_limited(reader, limit).with_context(|| url.to_string())?;
     Ok(Fetched {
         url: final_url,
         status,
@@ -389,6 +404,12 @@ enum Token<'a> {
 /// Minimal HTML tokenizer: text runs and tags. Comments, doctypes and the contents of raw-text
 /// elements (`script`, `style`, ...) and `head`/`svg` are skipped, apart from `<title>`.
 fn tokens(html: &str) -> Vec<Token<'_>> {
+    tokens_in(html, false)
+}
+
+/// [`tokens`]; `in_head` while scanning the contents of `<head>`, where a nested `<head>` is
+/// an ordinary tag, so the scan never goes deeper.
+fn tokens_in(html: &str, in_head: bool) -> Vec<Token<'_>> {
     let b = html.as_bytes();
     let lower = html.to_ascii_lowercase();
     let mut out = Vec::new();
@@ -430,7 +451,8 @@ fn tokens(html: &str) -> Vec<Token<'_>> {
         let attrs = &body[name_len..];
         let self_closing = attrs.trim_end().ends_with('/');
         out.push(Token::Tag(name.clone(), attrs, closing));
-        if !closing && !self_closing && SKIP_CONTENT.contains(&name.as_str()) {
+        let skip = SKIP_CONTENT.contains(&name.as_str()) && !(in_head && name == "head");
+        if !closing && !self_closing && skip {
             if name == "head" {
                 // Keep the title, which is visible in the browser's tab.
                 let close = lower[i..].find("</head").map_or(b.len(), |j| i + j);
@@ -445,7 +467,7 @@ fn tokens(html: &str) -> Vec<Token<'_>> {
                     out.push(Token::Tag("title".into(), "", true));
                 }
                 // Resources in <head> (stylesheets, scripts) are still reported as tags.
-                for tok in tokens(&html[i..close]) {
+                for tok in tokens_in(&html[i..close], true) {
                     if let Token::Tag(n, a, false) = tok {
                         if n == "link" || n == "script" || n == "base" {
                             out.push(Token::Tag(n, a, false));
@@ -729,7 +751,7 @@ fn sanitize(seg: &str) -> String {
     let mut s: String = seg
         .chars()
         .map(|c| {
-            if c.is_control() || r#"<>:"|?*\"#.contains(c) {
+            if c.is_control() || r#"<>:"|?*\/"#.contains(c) {
                 '_'
             } else {
                 c
@@ -893,6 +915,10 @@ pub fn download_trees(pages: &[Page], roots: &[PathBuf], progress: &Progress) ->
                 continue;
             }
             let mut path = resource_path(&page.url, base, &url);
+            if !path.components().all(|c| matches!(c, Component::Normal(_))) {
+                outcome.failed += 1;
+                continue;
+            }
             let mut k = 2;
             while used.contains(&path) {
                 let name = path
@@ -1151,6 +1177,26 @@ mod tests {
             p("https://example.com/docs/a%20b/con.txt"),
             Path::new("a b").join("_con.txt")
         );
+        // Decoded slashes and dots never lead out of the tree.
+        for u in [
+            "https://example.com/docs/%2Fetc%2Fpasswd",
+            "https://example.com/docs/..%2F..%2Fx",
+            "https://example.com/docs/%2E%2E/x",
+            "https://example.com/docs/a%5C..%5C..%5Cx",
+            "https://evil.example/%2F%2Fhost%2Fshare",
+        ] {
+            let path = p(u);
+            assert!(
+                path.components().all(|c| matches!(c, Component::Normal(_))),
+                "{u}: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_heads_are_read_without_going_deeper() {
+        let html = format!("{}<title>t</title>", "<head>".repeat(50_000));
+        assert_eq!(html_to_text(&html).trim(), "t");
     }
 
     #[test]
@@ -1333,6 +1379,15 @@ mod tests {
         port
     }
 
+    /// 100,000 `0` characters, gzipped.
+    fn gzip_of_zeros() -> Vec<u8> {
+        let hex = "1f8b08000000000000ffedc13101000000c2a04aeb9fce1a1e4001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000af0685c24dc5a0860100";
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
     fn response(status: &str, headers: &str, body: &[u8]) -> Vec<u8> {
         let head = format!(
             "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1360,6 +1415,7 @@ mod tests {
             ),
             "/missing" => response("404 Not Found", "", b"<h1>gone</h1>"),
             "/big" => response("200 OK", "", &[b'x'; 4096]),
+            "/bomb" => response("200 OK", "Content-Encoding: gzip\r\n", &gzip_of_zeros()),
             _ => b"not http at all\r\n\r\n".to_vec(),
         });
         let agent = agent();
@@ -1384,6 +1440,15 @@ mod tests {
         assert!(get("/to-self", true).is_ok());
         assert!(err(get("/garbage", true)).contains(url("/garbage").as_str()));
         assert!(err(fetch(&agent, &url("/big"), 1024, true)).contains(url("/big").as_str()));
+        // 133 bytes that decompress to 100,000
+        assert!(err(fetch(&agent, &url("/bomb"), 1024, true)).contains("larger than"));
+        assert_eq!(
+            fetch(&agent, &url("/bomb"), 1 << 20, true)
+                .unwrap()
+                .bytes
+                .len(),
+            100_000
+        );
 
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let gone = Url::parse(&format!("http://{}/", closed.local_addr().unwrap())).unwrap();

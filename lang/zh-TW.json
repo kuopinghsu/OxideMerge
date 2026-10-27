@@ -362,6 +362,8 @@
   "msg.new_hint": "按 Ctrl+V 將文字貼到目前這一側，或按兩下某一行輸入",
   "msg.no_bookmarks": "沒有書籤",
   "msg.no_config": "找不到設定資料夾。",
+  "msg.config_kept": "無法讀取 {file} 中的設定，因此使用預設值。已將副本保留為 {kept}。",
+  "msg.config_left": "無法讀取 {file} 中的設定，因此使用預設值，且不會覆寫該檔案。",
   "msg.settings_not_saved": "無法儲存設定：{err}",
   "msg.no_conflicts": "此檔案不含衝突標記",
   "msg.no_next_file": "後面沒有其他有差異的檔案",

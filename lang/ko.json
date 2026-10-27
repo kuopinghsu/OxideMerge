@@ -362,6 +362,8 @@
   "msg.new_hint": "Ctrl+V로 활성 쪽에 텍스트를 붙여 넣거나 줄을 두 번 클릭하여 입력하세요",
   "msg.no_bookmarks": "책갈피가 없습니다",
   "msg.no_config": "설정 폴더를 찾을 수 없습니다.",
+  "msg.config_kept": "{file}의 설정을 읽을 수 없어 기본값을 사용합니다. 사본을 {kept}(으)로 보관했습니다.",
+  "msg.config_left": "{file}의 설정을 읽을 수 없어 기본값을 사용하며, 이 파일에 덮어써서 저장하지 않습니다.",
   "msg.settings_not_saved": "설정을 저장할 수 없습니다: {err}",
   "msg.no_conflicts": "이 파일에는 충돌 표시가 없습니다",
   "msg.no_next_file": "이 뒤로 차이가 있는 파일이 없습니다",

@@ -43,6 +43,7 @@ jobs:
   windows:
     name: Windows ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -198,6 +199,7 @@ jobs:
     name: Linux ${{ matrix.arch }}
     # The oldest supported runners, so the binary runs on older glibc too.
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -373,6 +375,7 @@ jobs:
     # AlmaLinux 8 has glibc 2.28, so the AppImage runs on RHEL 8, Ubuntu 20.04,
     # Debian 10, and newer.
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     container: almalinux:8
     strategy:
       fail-fast: false
@@ -436,6 +439,7 @@ jobs:
     name: AppImage ${{ matrix.arch }} on ${{ matrix.system }}
     needs: appimage
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
     container: ${{ matrix.image }}
     strategy:
       fail-fast: false
@@ -529,6 +533,7 @@ jobs:
   macos:
     name: macOS universal
     runs-on: macos-14
+    timeout-minutes: 45
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
@@ -680,6 +685,7 @@ jobs:
   dependencies:
     name: Dependencies (${{ matrix.checks }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -699,6 +705,7 @@ jobs:
     name: Randomized tests (${{ inputs.stress_cases }} cases)
     if: github.event_name == 'workflow_dispatch' && inputs.stress_cases != ''
     runs-on: ubuntu-24.04
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -723,6 +730,7 @@ jobs:
     name: Benchmarks (${{ matrix.os }})
     if: github.event_name == 'workflow_dispatch' && inputs.benchmarks
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -758,6 +766,7 @@ jobs:
   user-guide:
     name: User guide PDF
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -800,8 +809,9 @@ jobs:
   release:
     name: GitHub release
     needs: [windows, linux, appimage, appimage-test, macos, user-guide, dependencies]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:

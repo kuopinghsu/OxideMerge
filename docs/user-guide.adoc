@@ -294,7 +294,7 @@ Right-click an item for more:
 
 Under *Options → General* you can have OxideMerge ask before copying (*Confirm copy operations*),
 move deleted items to the recycle bin or trash (*Use the recycle bin when deleting*), and keep a
-`.bak` copy of each file it overwrites.
+`.bak` copy of each file it overwrites. An item that can't be moved to the trash is not deleted.
 
 === Auto merging folders
 
@@ -956,7 +956,8 @@ The options are stored as JSON in the configuration folder:
 |Linux |`~/.config/OxideMerge/config.json`
 |===
 
-*Help & Shortcuts* shows where the settings file is.
+*Help & Shortcuts* shows where the settings file is. A settings file that can't be read is kept
+as `config.json.bad` before the defaults are used, so it can be fixed and put back.
 
 The configuration folder also holds:
 

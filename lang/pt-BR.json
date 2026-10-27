@@ -362,6 +362,8 @@
   "msg.new_hint": "Cole texto com Ctrl+V no lado ativo ou clique duas vezes em uma linha para digitar",
   "msg.no_bookmarks": "Nenhum marcador",
   "msg.no_config": "A pasta de configurações não foi encontrada.",
+  "msg.config_kept": "Não foi possível ler as configurações em {file}, então os padrões são usados. Uma cópia foi mantida como {kept}.",
+  "msg.config_left": "Não foi possível ler as configurações em {file}, então os padrões são usados e o arquivo não será sobrescrito.",
   "msg.settings_not_saved": "Não foi possível salvar as configurações: {err}",
   "msg.no_conflicts": "O arquivo não contém marcadores de conflito",
   "msg.no_next_file": "Não há mais arquivos com diferenças depois deste",
