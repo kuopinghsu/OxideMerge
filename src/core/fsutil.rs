@@ -30,12 +30,7 @@ pub fn backup_path(path: &Path) -> PathBuf {
 fn clear_backup(path: &Path) -> Result<PathBuf> {
     let bak = backup_path(path);
     if let Ok(md) = std::fs::symlink_metadata(&bak) {
-        let mut perm = md.permissions();
-        if md.is_file() && perm.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            perm.set_readonly(false);
-            let _ = std::fs::set_permissions(&bak, perm);
-        }
+        make_writable(&bak);
         if !md.is_dir() {
             std::fs::remove_file(&bak).with_context(|| writing(&bak))?;
         }
@@ -121,17 +116,45 @@ fn write_staged(
     };
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
-    if let Some(m) = old {
-        let _ = tmp.as_file().set_permissions(m.permissions());
-    }
-    match tmp.persist(target) {
+    let perm = old.map(std::fs::Metadata::permissions);
+    // Windows can neither remove a read-only temporary file nor rename over a read-only file,
+    // so there a read-only file is made writable for the rename and read-only again after it.
+    let unlocked = if cfg!(unix) {
+        if let Some(p) = &perm {
+            let _ = tmp.as_file().set_permissions(p.clone());
+        }
+        false
+    } else {
+        perm.as_ref().is_some_and(|p| p.readonly()) && make_writable(target)
+    };
+    let written = match tmp.persist(target) {
         Ok(_) => Ok(()),
         // A file that cannot be replaced; the temporary file goes first, freeing its space.
         Err(e) => {
             drop(e);
             std::fs::write(target, bytes)
         }
+    };
+    if unlocked {
+        if let Some(p) = perm {
+            let _ = std::fs::set_permissions(target, p);
+        }
     }
+    written
+}
+
+/// Clears the read-only flag of the file `path`; whether it was set and is now cleared.
+fn make_writable(path: &Path) -> bool {
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let mut perm = md.permissions();
+    if !md.is_file() || !perm.readonly() {
+        return false;
+    }
+    #[allow(clippy::permissions_set_readonly_false)]
+    perm.set_readonly(false);
+    std::fs::set_permissions(path, perm).is_ok()
 }
 
 /// Copies the file `from` over `to` as [`write_atomic`] writes, so a crash or a full disk
@@ -185,12 +208,8 @@ fn copy_in_place(from: &Path, to: &Path) -> std::io::Result<()> {
     if let Ok(md) = std::fs::symlink_metadata(to) {
         if md.file_type().is_symlink() {
             std::fs::remove_file(to)?;
-        }
-        let mut perm = md.permissions();
-        if md.is_file() && perm.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            perm.set_readonly(false);
-            let _ = std::fs::set_permissions(to, perm);
+        } else {
+            make_writable(to);
         }
     }
     std::fs::copy(from, to).map(|_| ())
@@ -298,6 +317,8 @@ mod tests {
         perm.set_readonly(true);
         std::fs::set_permissions(&file, perm).unwrap();
         write_atomic_with(&file, b"third", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "third");
+        assert!(std::fs::metadata(&file).unwrap().permissions().readonly());
         assert_eq!(
             std::fs::read_to_string(backup_path(&file)).unwrap(),
             "second"
@@ -320,6 +341,12 @@ mod tests {
             std::fs::read_to_string(backup_path(&file)).unwrap(),
             "fourth"
         );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().starts_with(".oxidemerge-"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[cfg(unix)]

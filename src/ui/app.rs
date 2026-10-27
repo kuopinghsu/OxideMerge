@@ -1260,6 +1260,17 @@ enum ViewKind {
     Diffs,
 }
 
+/// The menus of the menu bar, by title.
+const MENUS: [&str; 7] = [
+    "menu.file",
+    "menu.edit",
+    "menu.view",
+    "menu.compare",
+    "menu.merge",
+    "menu.tools",
+    "menu.help",
+];
+
 /// What the menus know about the active tab, and what was picked from them.
 struct Menus {
     view: ViewKind,
@@ -1346,6 +1357,30 @@ impl Menus {
     }
 }
 
+/// A submenu of a menu bar menu. Laid out unseen by [`OxideMergeApp::menu_width`], it is a plain
+/// button, so it also takes the room of the arrow it has in a menu.
+fn submenu<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    let shown = ui.menu_button(title, add);
+    if !ui.is_visible() {
+        let arrow = egui::WidgetText::from("⏵")
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                egui::TextStyle::Button,
+            )
+            .size()
+            .x;
+        let width = shown.response.rect.width() + ui.spacing().item_spacing.x + arrow;
+        ui.allocate_exact_size(vec2(width, 0.0), Sense::hover());
+    }
+    shown
+}
+
 fn edit_menu(ui: &mut egui::Ui, m: &mut Menus) {
     m.item(ui, Cmd::Undo);
     m.item(ui, Cmd::Redo);
@@ -1361,7 +1396,7 @@ fn edit_menu(ui: &mut egui::Ui, m: &mut Menus) {
     }
     ui.separator();
     ui.add_enabled_ui(m.view == ViewKind::Text, |ui| {
-        ui.menu_button(tr("menu.bookmarks"), |ui| {
+        submenu(ui, tr("menu.bookmarks"), |ui| {
             for c in [
                 Cmd::ToggleBookmark,
                 Cmd::NextBookmark,
@@ -3811,6 +3846,7 @@ impl OxideMergeApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!zoomed));
             }
         }
+        let (width_id, width) = self.menu_width(ctx, &mut m);
         egui::menu::bar(ui, |ui| {
             ui.spacing_mut().button_padding = vec2(9.0, 4.0);
             let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -3829,21 +3865,16 @@ impl OxideMergeApp {
             }
             ui.label(egui::RichText::new("OxideMerge").font(theme::semibold(14.5)));
             ui.add_space(12.0);
-            ui.menu_button(tr("menu.file"), |ui| self.file_menu(ui, &mut m));
-            ui.menu_button(tr("menu.edit"), |ui| edit_menu(ui, &mut m));
-            ui.menu_button(tr("menu.view"), |ui| self.view_menu(ui, &mut m));
-            ui.menu_button(tr("menu.compare"), |ui| self.compare_menu(ui, &mut m));
-            ui.menu_button(tr("menu.merge"), |ui| merge_menu(ui, &mut m));
-            ui.menu_button(tr("menu.tools"), |ui| self.tools_menu(ui, &mut m));
-            ui.menu_button(tr("menu.help"), |ui| {
-                m.item(ui, Cmd::Help);
-                m.item(ui, Cmd::Palette);
-                ui.separator();
-                if ui.button(tr("menu.about")).clicked() {
-                    self.about = true;
-                    ui.close_menu();
-                }
-            });
+            for (i, key) in MENUS.into_iter().enumerate() {
+                ui.menu_button(tr(key), |ui| {
+                    ui.set_min_width(width);
+                    self.menu(ui, &mut m, i);
+                    let shown = ui.min_rect().width();
+                    if shown > width + 0.5 {
+                        ui.ctx().data_mut(|d| d.insert_temp(width_id, shown));
+                    }
+                });
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if widgets::icon_button(ui, Icon::Help, &Cmd::Help.tip()).clicked() {
                     m.picked = Some(Cmd::Help);
@@ -3889,12 +3920,68 @@ impl OxideMergeApp {
         }
     }
 
+    /// The contents of menu `i` of [`MENUS`].
+    fn menu(&mut self, ui: &mut egui::Ui, m: &mut Menus, i: usize) {
+        match i {
+            0 => self.file_menu(ui, m),
+            1 => edit_menu(ui, m),
+            2 => self.view_menu(ui, m),
+            3 => self.compare_menu(ui, m),
+            4 => merge_menu(ui, m),
+            5 => self.tools_menu(ui, m),
+            _ => {
+                m.item(ui, Cmd::Help);
+                m.item(ui, Cmd::Palette);
+                ui.separator();
+                if ui.button(tr("menu.about")).clicked() {
+                    self.about = true;
+                    ui.close_menu();
+                }
+            }
+        }
+    }
+
+    /// The width all menus of the menu bar open with, so that they match: that of the widest,
+    /// measured once per language, fonts and text size by laying the menus out unseen. A menu
+    /// found wider when it opens raises it.
+    fn menu_width(&mut self, ctx: &egui::Context, m: &mut Menus) -> (egui::Id, f32) {
+        let size = ctx.style().text_styles[&egui::TextStyle::Button].size;
+        // The fonts in use: after a change of language they follow a frame later.
+        let fonts = ctx.fonts(|f| egui::Id::new(&f.lock().fonts.definitions().families));
+        let id = egui::Id::new("menu_width")
+            .with(i18n::current_language())
+            .with(fonts)
+            .with(size.to_bits());
+        if let Some(width) = ctx.data(|d| d.get_temp::<f32>(id)) {
+            return (id, width);
+        }
+        let width = egui::Area::new(id)
+            .order(egui::Order::Background)
+            .fixed_pos(egui::pos2(-10_000.0, -10_000.0))
+            .constrain(false)
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.scope_builder(egui::UiBuilder::new().invisible().sizing_pass(), |ui| {
+                    // As egui styles its menus.
+                    ui.spacing_mut().button_padding = vec2(2.0, 0.0);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    (0..MENUS.len())
+                        .map(|i| ui.scope(|ui| self.menu(ui, m, i)).response.rect.width())
+                        .fold(0.0, f32::max)
+                })
+                .inner
+            })
+            .inner;
+        ctx.data_mut(|d| d.insert_temp(id, width));
+        (id, width)
+    }
+
     fn file_menu(&mut self, ui: &mut egui::Ui, m: &mut Menus) {
         m.item(ui, Cmd::New);
         m.item(ui, Cmd::Open);
         let recent = &self.cfg.recent_compares;
         ui.add_enabled_ui(!recent.is_empty(), |ui| {
-            ui.menu_button(tr("menu.open_recent"), |ui| {
+            submenu(ui, tr("menu.open_recent"), |ui| {
                 for paths in recent.iter().take(10) {
                     if ui.button(recent_label(paths)).clicked() {
                         m.recent = Some(paths.clone());
@@ -3913,7 +4000,7 @@ impl OxideMergeApp {
         m.item(ui, Cmd::SaveAll);
         let panes = m.panes;
         ui.add_enabled_ui(panes > 0, |ui| {
-            ui.menu_button(tr("menu.save_as"), |ui| {
+            submenu(ui, tr("menu.save_as"), |ui| {
                 for p in 0..panes {
                     let side = side_name(p, panes).into();
                     m.item_as(
@@ -3926,7 +4013,7 @@ impl OxideMergeApp {
         });
         m.item(ui, Cmd::SaveComparison);
         ui.separator();
-        ui.menu_button(tr("menu.export"), |ui| {
+        submenu(ui, tr("menu.export"), |ui| {
             m.item(ui, Cmd::ExportHtml);
             m.item(ui, Cmd::Report);
             m.item(ui, Cmd::ReportWithDiffs);
@@ -3943,7 +4030,7 @@ impl OxideMergeApp {
 
     fn view_menu(&mut self, ui: &mut egui::Ui, m: &mut Menus) {
         let cfg = &mut self.cfg;
-        ui.menu_button(tr("view.folder_menu"), |ui| {
+        submenu(ui, tr("view.folder_menu"), |ui| {
             ui.checkbox(&mut cfg.tree_mode, tr("view.tree_mode"));
             ui.checkbox(&mut cfg.folder_file_pane, tr("view.folder_file_pane"));
             ui.separator();
@@ -3954,7 +4041,7 @@ impl OxideMergeApp {
             ui.checkbox(&mut cfg.show_unique[1], tr("view.middle_only"));
             ui.checkbox(&mut cfg.show_unique[2], tr("view.right_only"));
         });
-        ui.menu_button(tr("view.text_menu"), |ui| {
+        submenu(ui, tr("view.text_menu"), |ui| {
             ui.checkbox(&mut cfg.show_location_pane, tr("view.location_pane"));
             ui.checkbox(&mut cfg.show_line_detail, tr("view.line_detail"));
             ui.checkbox(&mut cfg.show_line_numbers, tr("view.line_numbers"));
@@ -3968,12 +4055,12 @@ impl OxideMergeApp {
             wrap.on_hover_text(Cmd::ToggleWrap.shown_key());
         });
         ui.separator();
-        ui.menu_button(tr("label.zoom"), |ui| {
+        submenu(ui, tr("label.zoom"), |ui| {
             m.item(ui, Cmd::ZoomIn);
             m.item(ui, Cmd::ZoomOut);
             m.item(ui, Cmd::ZoomReset);
         });
-        ui.menu_button(tr("view.theme"), |ui| {
+        submenu(ui, tr("view.theme"), |ui| {
             for mode in ThemeMode::ALL {
                 if ui
                     .radio_value(&mut cfg.theme, mode, tr(mode.key()))
@@ -3996,7 +4083,7 @@ impl OxideMergeApp {
         m.item(ui, Cmd::PrevConflict);
         ui.separator();
         ui.add_enabled_ui(m.enabled(Cmd::CompareAs(FileKind::Text)), |ui| {
-            ui.menu_button(tr("cmd.compare_as"), |ui| {
+            submenu(ui, tr("cmd.compare_as"), |ui| {
                 for kind in [
                     FileKind::Text,
                     FileKind::Binary,
@@ -4012,7 +4099,7 @@ impl OxideMergeApp {
         // Listed when the menu opens, not every frame it stays open.
         let names_id = egui::Id::new("menu_rule_names");
         ui.add_enabled_ui(tab_rules.is_some(), |ui| {
-            let shown = ui.menu_button(tr("menu.rules"), |ui| {
+            let shown = submenu(ui, tr("menu.rules"), |ui| {
                 let current = tab_rules.as_deref().unwrap_or_default();
                 if ui.radio(current.is_empty(), tr("rules.none")).clicked() {
                     m.rules = Some(String::new());
@@ -4046,7 +4133,7 @@ impl OxideMergeApp {
             }
         });
         let d = &mut self.cfg.diff;
-        ui.menu_button(tr("view.compare_menu"), |ui| {
+        submenu(ui, tr("view.compare_menu"), |ui| {
             ui.menu_button(tr("opt.whitespace"), |ui| {
                 for (mode, key) in [
                     (WhitespaceMode::Compare, "opt.ws_compare"),

@@ -51,6 +51,7 @@ section of this file as the release notes.
   decides the encoding before the HTTP header and the `<meta>` charset.
 - Language files in a `Languages` folder are checked: messages with other placeholders than the
   English ones, unknown keys and non-text values are left out, and English is shown instead.
+- The menus of the menu bar all open as wide as the widest one, in every language.
 - macOS instructions describe **Open Anyway** in System Settings, as Control-click → Open no longer
   bypasses Gatekeeper from macOS 15 on.
 
@@ -73,6 +74,10 @@ section of this file as the release notes.
   such a step is now left alone. A folder added on both sides is now made in the middle folder,
   even when it is empty, and its contents are merged item by item.
 - A read-only `.bak` left from before stopped the next backup of that file.
+- On Windows, saving over a read-only file failed and left a temporary file next to it; the file
+  is now replaced and stays read-only, as on Linux and macOS.
+- Text copied into a new or empty file in a text compare got this computer's line endings; the
+  file now takes the encoding and line endings of the file copied from, as in All differences.
 
 ### Security
 

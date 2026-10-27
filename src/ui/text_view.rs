@@ -247,6 +247,14 @@ struct Snapshot {
     lines: Vec<Vec<String>>,
     modified: Vec<bool>,
     saves: Vec<u64>,
+    formats: Vec<Format>,
+}
+
+/// How a file is written: encoding, byte order mark, line ending, final newline, mixed endings.
+type Format = (TextEncoding, bool, Eol, bool, bool);
+
+fn format_of(d: &TextDoc) -> Format {
+    (d.encoding, d.bom, d.eol, d.final_newline, d.mixed_eol)
 }
 
 /// Makes the merge result pane (the middle of three, else the right one) save to `out`.
@@ -921,6 +929,7 @@ impl TextView {
             lines: self.panes.iter().map(|p| p.doc.lines.clone()).collect(),
             modified: self.panes.iter().map(|p| p.doc.modified).collect(),
             saves: self.panes.iter().map(|p| p.saves).collect(),
+            formats: self.panes.iter().map(|p| format_of(&p.doc)).collect(),
         }
     }
 
@@ -940,6 +949,11 @@ impl TextView {
         for (i, lines) in s.lines.into_iter().enumerate() {
             if self.panes[i].doc.lines == lines {
                 continue;
+            }
+            // Only an empty pane took the format of the one copied into it.
+            if lines.is_empty() != self.panes[i].doc.lines.is_empty() {
+                let d = &mut self.panes[i].doc;
+                (d.encoding, d.bom, d.eol, d.final_newline, d.mixed_eol) = s.formats[i];
             }
             let before = std::mem::replace(&mut self.panes[i].doc.lines, lines);
             self.panes[i].hl_dirty = true;
@@ -981,6 +995,17 @@ impl TextView {
         self.panes[to].doc.lines.splice(blk.ranges[to].clone(), src);
     }
 
+    /// A new or empty file is written like the one it is first copied from, with one kind of
+    /// line ending.
+    fn take_format(&mut self, from: usize, to: usize) {
+        if self.panes[to].doc.lines.is_empty() && !self.panes[from].doc.lines.is_empty() {
+            let f = format_of(&self.panes[from].doc);
+            let d = &mut self.panes[to].doc;
+            (d.encoding, d.bom, d.eol, d.final_newline) = (f.0, f.1, f.2, f.3);
+            d.mixed_eol = false;
+        }
+    }
+
     fn writable(&mut self, pane: usize) -> bool {
         if self.panes[pane].doc.read_only {
             self.status = tr("msg.readonly").to_string();
@@ -1000,6 +1025,7 @@ impl TextView {
             return;
         }
         self.push_undo();
+        self.take_format(from, to);
         let row = self.diff.blocks[b].first_row;
         self.replace_block_lines(b, from, to);
         self.mark_changed(&[to]);
@@ -1067,6 +1093,7 @@ impl TextView {
         let n = src.len().max(range.len());
         let start = range.start;
         self.push_undo();
+        self.take_format(from, to);
         self.panes[to].doc.lines.splice(range, src);
         self.mark_changed(&[to]);
         let row = self.diff.row_of_line(to, start);
@@ -1120,6 +1147,7 @@ impl TextView {
             return;
         }
         self.push_undo();
+        self.take_format(from, to);
         let blocks: Vec<usize> = self.significant().collect();
         for &b in blocks.iter().rev() {
             self.replace_block_lines(b, from, to);
@@ -4191,5 +4219,51 @@ mod tests {
         );
         v.redo();
         assert!(!v.panes[0].doc.modified, "back to the saved text");
+    }
+
+    #[test]
+    fn a_new_file_is_written_like_the_one_copied_into_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let new = dir.path().join("new.txt");
+        let docs = vec![
+            TextDoc::from_text(None, "one\r\ntwo"),
+            TextDoc::empty(Some(new.clone())),
+        ];
+        let mut v = TextView::new(docs, &Config::default());
+        v.copy_all(0, 1);
+        let d = &v.panes[1].doc;
+        assert_eq!((d.eol, d.final_newline), (Eol::CrLf, false));
+        v.save_pane(1).unwrap();
+        assert_eq!(std::fs::read(&new).unwrap(), b"one\r\ntwo");
+        v.undo();
+        assert_eq!(v.panes[1].doc.eol, Eol::platform());
+        assert!(v.panes[1].doc.final_newline);
+        v.redo();
+        assert_eq!(v.panes[1].doc.eol, Eol::CrLf);
+
+        // Undoing an edit keeps the line ending chosen since, and a mixed file stays mixed only
+        // until saved.
+        let mixed = TextDoc::from_text(Some(dir.path().join("mixed.txt")), "a\nb\r\n");
+        let mut v = TextView::new(
+            vec![TextDoc::from_text(None, "x\n"), mixed],
+            &Config::default(),
+        );
+        v.push_undo();
+        v.panes[1].doc.lines[0] = "edited".into();
+        v.mark_changed(&[1]);
+        v.panes[1].doc.eol = Eol::Cr;
+        v.save_pane(1).unwrap();
+        assert!(!v.panes[1].doc.mixed_eol);
+        v.undo();
+        assert_eq!(v.panes[1].doc.eol, Eol::Cr);
+        assert!(!v.panes[1].doc.mixed_eol);
+
+        let mut v = TextView::new(
+            vec![v.panes[0].doc.clone(), TextDoc::empty(None)],
+            &Config::default(),
+        );
+        v.panes[0].doc.mixed_eol = true;
+        v.copy_all(0, 1);
+        assert!(!v.panes[1].doc.mixed_eol);
     }
 }

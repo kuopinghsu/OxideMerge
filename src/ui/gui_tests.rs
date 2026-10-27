@@ -39,6 +39,8 @@ fn config() -> Config {
         theme: ThemeMode::Light,
         restore_session: false,
         open_reports: false,
+        // The Trash on macOS goes through Finder, which may wait for a permission prompt.
+        use_recycle_bin: false,
         ..Default::default()
     }
 }
@@ -806,5 +808,55 @@ fn files_that_cannot_be_read_are_reported() {
     assert!(
         errors.iter().any(|e| e.contains("locked.txt")),
         "{errors:?}"
+    );
+}
+
+/// The widths of the menus of the menu bar, opened one by one.
+fn menu_widths(gui: &mut Gui) -> Vec<(&'static str, f32)> {
+    let mut widths = Vec::new();
+    for key in MENUS {
+        gui.click(tr(key));
+        gui.frames(3);
+        let open: Vec<f32> = gui.ctx.memory(|m| {
+            m.layer_ids()
+                .filter(|l| l.order == egui::Order::Foreground && m.areas().visible_last_frame(l))
+                .filter_map(|l| m.area_rect(l.id))
+                .map(|r| r.width())
+                .collect()
+        });
+        assert_eq!(open.len(), 1, "{key}: {open:?}");
+        widths.push((key, open[0]));
+        gui.click(tr(key));
+        gui.frames(3);
+    }
+    widths
+}
+
+#[test]
+fn menus_open_equally_wide() {
+    let same = |widths: &[(&str, f32)]| widths.iter().all(|(_, w)| (w - widths[0].1).abs() < 0.01);
+    let mut fresh = Vec::new();
+    for lang in ["en", "ja", "zh-TW"] {
+        let cfg = Config {
+            language: lang.into(),
+            ..config()
+        };
+        let widths = menu_widths(&mut Gui::with_config("menus_open_equally_wide", cfg, None));
+        assert!(same(&widths), "{lang}: {widths:?}");
+        fresh.push(widths[0].1);
+    }
+    // The fonts change a frame after the language.
+    let cfg = Config {
+        language: "ja".into(),
+        ..config()
+    };
+    let mut gui = Gui::with_config("menus_open_equally_wide", cfg, None);
+    gui.app.cfg.language = "zh-TW".into();
+    gui.settle();
+    let widths = menu_widths(&mut gui);
+    assert!(same(&widths), "switched: {widths:?}");
+    assert!(
+        (widths[0].1 - fresh[2]).abs() < 0.01,
+        "{widths:?} {fresh:?}"
     );
 }
