@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Aurora Notes - Release 2.2</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; color: #222; background: #f6f7f9; }
+  header { background: #2b4c7e; color: #fff; padding: 24px 40px; }
+  header p { margin: 4px 0 0; opacity: .85; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 40px; background: #fff; }
+  h2 { border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  table { border-collapse: collapse; }
+  th, td { border: 1px solid #ccc; padding: 6px 12px; text-align: left; }
+  .note { background: #eef4ff; border-left: 4px solid #2b4c7e; padding: 8px 12px; }
+  .spacer { height: 900px; background: linear-gradient(#fff, #eef1f6); margin: 24px 0;
+            display: flex; align-items: center; justify-content: center; color: #999; }
+  .tracking { display: none; }
+  footer { max-width: 760px; margin: 0 auto; padding: 16px 40px; color: #666; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Aurora Notes 2.2</h1>
+  <p>Released January 9 for Windows, macOS and Linux</p>
+</header>
+<main>
+  <p class="note">This release focuses on sync reliability and faster search.</p>
+
+  <h2>What's new</h2>
+  <ul>
+    <li>Search results appear after you press Enter</li>
+    <li>Notes sync in the background every 5 minutes</li>
+    <li>Export to Markdown and PDF</li>
+  </ul>
+
+  <h2>Fixed</h2>
+  <ul>
+    <li>Dark mode used the wrong color for links</li>
+  </ul>
+
+  <!-- Hidden text is not part of the page as you see it, so the Text mode ignores it. -->
+  <p class="tracking">build 0b9d44 · campaign=winter</p>
+
+  <h2>Downloads</h2>
+  <table>
+    <tr><th>Platform</th><th>Package</th><th>Size</th></tr>
+    <tr><td>Windows</td><td>AuroraNotes-2.2.msi</td><td>47.9 MB</td></tr>
+    <tr><td>macOS</td><td>AuroraNotes-2.2.dmg</td><td>52.7 MB</td></tr>
+    <tr><td>Linux</td><td>AuroraNotes-2.2.AppImage</td><td>55.1 MB</td></tr>
+  </table>
+
+  <div class="spacer">(scroll down: the rest of the page is below the first screen)</div>
+
+  <h2>System requirements</h2>
+  <p>Windows 10 or later, macOS 12 or later, or a Linux desktop with glibc 2.31.
+     At least 4 GB of memory.</p>
+
+  <h2>Known issues</h2>
+  <!-- Filled in by the script below: only modes that run scripts see these items. -->
+  <ul id="issues"></ul>
+</main>
+<footer>
+  <p>Questions? Visit the community forum.</p>
+</footer>
+<script>
+  const issues = [
+    "Printing a note with images may cut the last page",
+    "Sync can pause when the computer wakes from sleep",
+  ];
+  document.getElementById("issues").innerHTML = issues.map(i => "<li>" + i + "</li>").join("");
+</script>
+</body>
+</html>
