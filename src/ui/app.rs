@@ -1225,6 +1225,10 @@ where
     serde_json::from_value(serde_json::Value::Object(out)).unwrap_or_else(|_| now.clone())
 }
 
+/// Save dialog filters of report types: name and extensions.
+const HTML: (&str, &[&str]) = ("HTML", &["html", "htm"]);
+const XML: (&str, &[&str]) = ("XML", &["xml"]);
+
 /// `path` with ".html" added to its name.
 fn with_html_ext(path: PathBuf) -> PathBuf {
     let mut name = path.into_os_string();
@@ -3219,26 +3223,10 @@ impl OxideMergeApp {
     fn save_report(&mut self) {
         if let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) {
             // A text compare's report is HTML or XML, by the type picked.
-            if self.report_job.is_some() {
-                self.notify(tr("msg.report_writing"));
-                return;
-            }
             let name = report::html_file_name(&v.titles());
-            let Some(mut path) = rfd::FileDialog::new()
-                .set_title(tr("menu.report"))
-                .add_filter("HTML", &["html", "htm"])
-                .add_filter("XML", &["xml"])
-                .set_file_name(name.strip_suffix(".html").unwrap_or(&name))
-                .save_file()
-            else {
+            let Some(path) = self.report_path(tr("menu.report"), &name, &[HTML, XML]) else {
                 return;
             };
-            if !matches!(
-                crate::core::text::extension(&path).as_str(),
-                "html" | "htm" | "xml"
-            ) {
-                path = with_html_ext(path);
-            }
             let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view())
             else {
                 return;
@@ -3247,33 +3235,15 @@ impl OxideMergeApp {
             self.spawn_report(path, job);
             return;
         }
-        if self.report_job.is_some() {
-            self.notify(tr("msg.report_writing"));
-            return;
-        }
         let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
             self.error(tr("msg.report_folder_only"));
             return;
         };
-        // Without an extension, the dialog adds the one of the type picked.
         let name = report::html_file_name(&v.display_roots);
-        let Some(mut path) = rfd::FileDialog::new()
-            .set_title(tr("menu.report"))
-            .add_filter("HTML", &["html", "htm"])
-            .add_filter("CSV", &["csv"])
-            .add_filter("Text", &["txt"])
-            .add_filter("XML", &["xml"])
-            .set_file_name(name.strip_suffix(".html").unwrap_or(&name))
-            .save_file()
-        else {
+        let filters = [HTML, ("CSV", &["csv"][..]), ("Text", &["txt"][..]), XML];
+        let Some(path) = self.report_path(tr("menu.report"), &name, &filters) else {
             return;
         };
-        if !matches!(
-            crate::core::text::extension(&path).as_str(),
-            "html" | "htm" | "csv" | "txt" | "xml"
-        ) {
-            path = with_html_ext(path);
-        }
         let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
             return;
         };
@@ -3436,19 +3406,32 @@ impl OxideMergeApp {
 
     /// Where to save an HTML report, unless one is still being written.
     fn html_report_path(&mut self, title: &str, name: &str) -> Option<PathBuf> {
+        self.report_path(title, name, &[HTML])
+    }
+
+    /// Where to save a report of one of the types `filters` (name, extensions), unless one is
+    /// still being written. A path without one of their extensions gets ".html".
+    fn report_path(
+        &mut self,
+        title: &str,
+        name: &str,
+        filters: &[(&str, &[&str])],
+    ) -> Option<PathBuf> {
         if self.report_job.is_some() {
             self.notify(tr("msg.report_writing"));
             return None;
         }
-        rfd::FileDialog::new()
-            .set_title(title)
-            .add_filter("HTML", &["html", "htm"])
-            .set_file_name(name)
-            .save_file()
-            .map(|p| match crate::core::text::extension(&p).as_str() {
-                "html" | "htm" => p,
-                _ => with_html_ext(p),
-            })
+        // Without an extension, the dialog adds the one of the type picked.
+        let mut dlg = rfd::FileDialog::new().set_title(title);
+        for (kind, exts) in filters {
+            dlg = dlg.add_filter(*kind, exts);
+        }
+        let path = dlg
+            .set_file_name(name.strip_suffix(".html").unwrap_or(name))
+            .save_file()?;
+        let ext = crate::core::text::extension(&path);
+        let known = filters.iter().any(|(_, exts)| exts.contains(&ext.as_str()));
+        Some(if known { path } else { with_html_ext(path) })
     }
 
     fn spawn_report(&mut self, path: PathBuf, job: impl FnOnce() -> String + Send + 'static) {

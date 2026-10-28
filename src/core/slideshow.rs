@@ -7,8 +7,8 @@
 use super::diff::{DiffOptions, DiffResult};
 use super::folder::{CmpStatus, DirItem};
 use super::html_report::{
-    file_diffs, hunks, kind, line_range, row_cells, status_class, FileDiffs, DARK, HUNK_MAX_ROWS,
-    LIGHT,
+    file_diffs, has_text_diffs, hunks, kind, line_range, row_cells, status_class, too_big,
+    FileDiffs, DARK, HUNK_MAX_ROWS, LIGHT,
 };
 use super::report::{esc, esc_marked, side_name, status_text};
 use crate::i18n::{tr, trf};
@@ -360,14 +360,15 @@ pub fn folder_slideshow(
     let mut others: Vec<(&DirItem, String)> = Vec::new();
     let mut total = 0;
     let mut skipped = 0;
-    // Changed text files not read at all, once there are slides enough.
+    // Changed text files not read at all, once there are slides enough; ones known to be too
+    // large are still listed, with why.
     let mut skipped_files = 0;
     for it in &files {
-        let readable = !it.is_dir
-            && !it.binary
-            && matches!(it.status, CmpStatus::Different | CmpStatus::Unique);
-        if total >= MAX_SLIDES && readable {
-            skipped_files += 1;
+        if total >= MAX_SLIDES && has_text_diffs(it) {
+            match too_big(it, n) {
+                Some(note) => others.push((it, note)),
+                None => skipped_files += 1,
+            }
             continue;
         }
         match file_diffs(it, roots, opts) {
@@ -436,7 +437,10 @@ pub fn folder_slideshow(
         let _ = write!(
             extra,
             "<div class=\"sub\">{}</div>",
-            esc(&trf("slides.more_files", &[("n", skipped_files.to_string())]))
+            esc(&trf(
+                "slides.more_files",
+                &[("n", skipped_files.to_string())]
+            ))
         );
     }
     if !others.is_empty() {

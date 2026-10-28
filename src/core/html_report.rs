@@ -694,15 +694,28 @@ pub(crate) fn file_diffs(it: &DirItem, roots: &[PathBuf], opts: &DiffOptions) ->
     }
 }
 
+/// Whether `it` is a changed text file, whose differences [`file_diffs`] reads.
+pub(crate) fn has_text_diffs(it: &DirItem) -> bool {
+    !it.is_dir && !it.binary && matches!(it.status, CmpStatus::Different | CmpStatus::Unique)
+}
+
+/// Why `it` is listed without its differences, when the sizes found by the compare of its
+/// `panes` sides already tell: one is too large.
+pub(crate) fn too_big(it: &DirItem, panes: usize) -> Option<String> {
+    let largest = it.size.iter().take(panes).flatten().max().copied();
+    largest
+        .filter(|&s| s > MAX_BYTES)
+        .map(|size| trf("report.too_big", &[("size", fmt_size(Some(size)))]))
+}
+
 /// Like [`file_diffs`], but files whose lines compare equal are compared too.
 pub(crate) fn file_docs(it: &DirItem, roots: &[PathBuf], opts: &DiffOptions) -> FileDiffs {
-    if it.is_dir || it.binary || !matches!(it.status, CmpStatus::Different | CmpStatus::Unique) {
+    if !has_text_diffs(it) {
         return FileDiffs::None;
     }
     let paths: Vec<PathBuf> = roots.iter().map(|r| it.path(r)).collect();
-    let largest = it.size.iter().take(paths.len()).flatten().max().copied();
-    if let Some(size) = largest.filter(|&s| s > MAX_BYTES) {
-        return FileDiffs::Note(trf("report.too_big", &[("size", fmt_size(Some(size)))]));
+    if let Some(note) = too_big(it, paths.len()) {
+        return FileDiffs::Note(note);
     }
     let mut docs = Vec::with_capacity(paths.len());
     for (p, &exists) in paths.iter().zip(&it.exists) {

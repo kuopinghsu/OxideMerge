@@ -862,6 +862,8 @@ fn menus_are_measured_with_their_submenus_contents() {
                         egui::Order::Middle,
                         egui::Id::new(layer),
                     )));
+                    // As the menus are measured (see `OxideMergeApp::menu_width`).
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                     let add = |ui: &mut egui::Ui| {
                         let _ = ui.button(long);
                     };

@@ -291,7 +291,11 @@ mod tests {
     #[test]
     fn control_characters_are_replaced() {
         assert_eq!(esc("a\u{1}b\tc"), "a\u{FFFD}b&#9;c");
-        assert_eq!(esc("x\r\ny"), "x&#13;&#10;y", "line breaks are kept by readers");
+        assert_eq!(
+            esc("x\r\ny"),
+            "x&#13;&#10;y",
+            "line breaks are kept by readers"
+        );
     }
 
     #[test]

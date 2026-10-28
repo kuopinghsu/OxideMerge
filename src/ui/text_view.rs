@@ -130,13 +130,16 @@ fn edited_lines(old: &[u64], new: &[String]) -> HashSet<usize> {
 }
 
 /// Where each line of `old` ended up in `new`, and whether it is still there (deleted lines map
-/// to where they were).
-fn line_map(old: &[String], new: &[String]) -> Vec<(usize, bool)> {
+/// to where they were). With `edited`, lines replaced by as many others count as still there,
+/// each as the line that took its place.
+fn line_map(old: &[String], new: &[String], edited: bool) -> Vec<(usize, bool)> {
     let mut map = vec![(0, false); old.len()];
     for op in similar::capture_diff_slices(similar::Algorithm::Myers, old, new) {
         let (tag, o, n) = op.as_tag_tuple();
+        let kept = tag == similar::DiffTag::Equal
+            || (edited && tag == similar::DiffTag::Replace && o.len() == n.len());
         for (k, i) in o.enumerate() {
-            map[i] = if tag == similar::DiffTag::Equal {
+            map[i] = if kept {
                 (n.start + k, true)
             } else {
                 (n.start, false)
@@ -249,6 +252,9 @@ struct Snapshot {
     saves: Vec<u64>,
     /// The format of each pane before this step, where the step changed it.
     formats: Vec<Option<Format>>,
+    /// The synchronization points before this step, so that undo brings back the ones whose
+    /// lines the step deleted.
+    sync_points: Vec<SyncPoint>,
 }
 
 /// How a file is written: encoding, byte order mark, line ending, final newline, mixed endings.
@@ -732,7 +738,7 @@ impl TextView {
         if self.bookmarks[p].is_empty() && !editing {
             return;
         }
-        let map = line_map(before, &self.panes[p].doc.lines);
+        let map = line_map(before, &self.panes[p].doc.lines, false);
         if editing {
             match self.note_edit.as_ref().and_then(|n| map.get(n.1).copied()) {
                 Some((to, _)) => {
@@ -767,12 +773,13 @@ impl TextView {
     }
 
     /// Moves the synchronization points of pane `p` along with its lines after they changed
-    /// from `before`; a point whose line was deleted is dropped.
+    /// from `before`, also when the line itself was edited; a point whose line was deleted is
+    /// dropped (undo brings it back).
     fn remap_sync_points(&mut self, p: usize, before: &[String]) {
         if self.sync_points.is_empty() && self.sync_pending[p].is_none() {
             return;
         }
-        let map = line_map(before, &self.panes[p].doc.lines);
+        let map = line_map(before, &self.panes[p].doc.lines, true);
         let moved = |l: usize| map.get(l).filter(|(_, kept)| *kept).map(|&(to, _)| to);
         self.sync_points.retain_mut(|s| match moved(s[p]) {
             Some(to) => {
@@ -1059,6 +1066,7 @@ impl TextView {
             modified: self.panes.iter().map(|p| p.doc.modified).collect(),
             saves: self.panes.iter().map(|p| p.saves).collect(),
             formats: vec![None; self.panes.len()],
+            sync_points: self.sync_points.clone(),
         }
     }
 
@@ -1090,6 +1098,11 @@ impl TextView {
             self.remap_bookmarks(i, &before);
             self.remap_sync_points(i, &before);
         }
+        // Points set since the step stay; ones the step dropped come back (crossing ones are
+        // left out by the compare).
+        self.sync_points.extend(s.sync_points);
+        self.sync_points.sort_unstable();
+        self.sync_points.dedup();
         for (i, p) in self.panes.iter_mut().enumerate() {
             p.doc.modified = s.modified[i] || s.saves[i] != p.saves;
         }
@@ -4148,9 +4161,9 @@ mod tests {
         let row = v.diff.row_of_line(0, 0);
         assert_eq!(v.diff.rows[row].line[..2], [Some(0), Some(0)]);
         // An edit above the point on the left moves it along with its line.
-        v.active_pane = 0;
-        v.cursor_row = Some(0);
-        v.paste("zero");
+        v.push_undo();
+        v.panes[0].doc.lines.insert(0, "zero".into());
+        v.mark_changed(&[0]);
         assert_eq!(lines(&v, 0)[1], "intro");
         assert_eq!(v.sync_points, [[1, 0, 0]]);
         // Undo and redo move it back and forth with its line.
@@ -4173,6 +4186,17 @@ mod tests {
         v.set_sync_point_at(v.diff.row_of_line(0, 1), 0);
         v.set_sync_point_at(v.diff.row_of_line(1, 3), 1);
         assert_eq!(v.sync_points, [[3, 1, 0]], "the first point is kept");
+        // Editing a point's line keeps the point; deleting it drops it until undone.
+        v.push_undo();
+        v.panes[0].doc.lines[3] = "end!".into();
+        v.mark_changed(&[0]);
+        assert_eq!(v.sync_points, [[3, 1, 0]], "edited");
+        v.delete_line(v.diff.row_of_line(0, 3), 0);
+        assert!(v.sync_points.is_empty(), "deleted");
+        v.undo();
+        assert_eq!(v.sync_points, [[3, 1, 0]], "undo brings it back");
+        v.redo();
+        assert!(v.sync_points.is_empty(), "redo drops it again");
         v.clear_sync_points();
         assert!(!v.has_sync_points());
     }

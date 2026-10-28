@@ -407,8 +407,14 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         let failed = files.iter().any(|i| i.status == CmpStatus::Error);
         if let Some(r) = &cli.report {
             let format = report_format(r);
-            if cli.report_diffs && format != ReportFormat::Html {
-                eprintln!("note: --report-diffs only applies to .html reports");
+            if cli.report_diffs {
+                match format {
+                    ReportFormat::Html => {}
+                    ReportFormat::Slideshow => {
+                        eprintln!("note: a slideshow shows the differences; --report-diffs ignored")
+                    }
+                    _ => eprintln!("note: --report-diffs only applies to .html reports"),
+                }
             }
             let text = match format {
                 ReportFormat::Slideshow => {

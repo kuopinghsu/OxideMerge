@@ -677,11 +677,16 @@ pub fn compute_synced(
             ..Default::default()
         };
         let mut start = [0usize; 3];
+        // Rows where a difference before a point's row could run on into it, or one in it
+        // into the next part: such neighbors are one difference.
+        let mut seams = Vec::new();
         for point in sync.iter().map(Some).chain([None]) {
             let end: Vec<usize> = (0..n).map(|p| point.map_or(lens[p], |s| s[p])).collect();
             let part = segment(&ids, &ignorable, &start[..n], &end, opts);
             append(&mut result, part, &start);
             if let Some(s) = point {
+                seams.push(result.rows.len());
+                seams.push(result.rows.len() + 1);
                 let ranges: Vec<Range<usize>> = (0..n).map(|p| s[p]..s[p] + 1).collect();
                 let same = (1..n).all(|p| ids[p][s[p]] == ids[0][s[0]]);
                 if same {
@@ -706,6 +711,7 @@ pub fn compute_synced(
                 }
             }
         }
+        join_at_seams(&mut result, &seams, &ids);
         result
     };
     if opts.detect_moved {
@@ -714,11 +720,15 @@ pub fn compute_synced(
     result
 }
 
-fn diff_segment(ids: &[Vec<u32>], ignorable: &Ignorable, opts: &DiffOptions) -> DiffResult {
+fn diff_segment<T: AsRef<[u32]>>(
+    ids: &[T],
+    ignorable: &Ignorable,
+    opts: &DiffOptions,
+) -> DiffResult {
     if ids.len() == 3 {
         diff3(ids, ignorable, opts)
     } else {
-        diff2(&ids[0], &ids[1], ignorable, opts)
+        diff2(ids[0].as_ref(), ids[1].as_ref(), ignorable, opts)
     }
 }
 
@@ -730,9 +740,7 @@ fn segment(
     end: &[usize],
     opts: &DiffOptions,
 ) -> DiffResult {
-    let part_ids: Vec<Vec<u32>> = (0..ids.len())
-        .map(|p| ids[p][start[p]..end[p]].to_vec())
-        .collect();
+    let part_ids: Vec<&[u32]> = (0..ids.len()).map(|p| &ids[p][start[p]..end[p]]).collect();
     let part_panes: Vec<&[String]> = (0..ids.len())
         .map(|p| &ignorable.panes[p][start[p]..end[p]])
         .collect();
@@ -765,6 +773,46 @@ fn append(result: &mut DiffResult, part: DiffResult, start: &[usize; 3]) {
         }
         b.first_row += rows;
         result.blocks.push(b);
+    }
+}
+
+/// Makes one difference of each two that meet at one of the rows `seams` (a difference ending
+/// on the row before and one starting on it), when both are ignored or neither is.
+fn join_at_seams(result: &mut DiffResult, seams: &[usize], ids: &[Vec<u32>]) {
+    let mut join = vec![false; result.blocks.len()];
+    for &r in seams {
+        if r == 0 || r >= result.rows.len() {
+            continue;
+        }
+        if let (Some(a), Some(b)) = (result.rows[r - 1].block, result.rows[r].block) {
+            if a != b && result.blocks[a].ignored == result.blocks[b].ignored {
+                join[b] = true;
+            }
+        }
+    }
+    if !join.contains(&true) {
+        return;
+    }
+    let mut to = vec![0; join.len()];
+    let mut blocks: Vec<Block> = Vec::with_capacity(join.len());
+    for (i, b) in std::mem::take(&mut result.blocks).into_iter().enumerate() {
+        match blocks.last_mut() {
+            Some(last) if join[i] => {
+                for (r, next) in last.ranges.iter_mut().zip(&b.ranges) {
+                    r.end = next.end;
+                }
+                last.rows += b.rows;
+                if result.panes == 3 {
+                    last.kind = kind3(ids, &last.ranges).unwrap_or(BlockKind::Conflict);
+                }
+            }
+            _ => blocks.push(b),
+        }
+        to[i] = blocks.len() - 1;
+    }
+    result.blocks = blocks;
+    for row in &mut result.rows {
+        row.block = row.block.map(|b| to[b]);
     }
 }
 
@@ -902,8 +950,8 @@ fn matches(a: &[u32], b: &[u32], alg: DiffAlgorithm) -> Vec<Option<usize>> {
     m
 }
 
-fn diff3(ids: &[Vec<u32>], ignorable: &Ignorable, opts: &DiffOptions) -> DiffResult {
-    let (left, base, right) = (&ids[0], &ids[1], &ids[2]);
+fn diff3<T: AsRef<[u32]>>(ids: &[T], ignorable: &Ignorable, opts: &DiffOptions) -> DiffResult {
+    let (left, base, right) = (ids[0].as_ref(), ids[1].as_ref(), ids[2].as_ref());
     let ml = matches(base, left, opts.algorithm);
     let mr = matches(base, right, opts.algorithm);
     let mut result = DiffResult {
@@ -986,11 +1034,11 @@ pub fn merge3(left: &[String], base: &[String], right: &[String]) -> Option<Vec<
 
 /// How the left and right lines of a 3-way block changed relative to the base, or `None`
 /// when they did not.
-fn kind3(ids: &[Vec<u32>], [rl, rb, rr]: &[Range<usize>; 3]) -> Option<BlockKind> {
+fn kind3<T: AsRef<[u32]>>(ids: &[T], [rl, rb, rr]: &[Range<usize>; 3]) -> Option<BlockKind> {
     let (left, base, right) = (
-        &ids[0][rl.clone()],
-        &ids[1][rb.clone()],
-        &ids[2][rr.clone()],
+        &ids[0].as_ref()[rl.clone()],
+        &ids[1].as_ref()[rb.clone()],
+        &ids[2].as_ref()[rr.clone()],
     );
     match (left != base, right != base) {
         (true, false) => Some(BlockKind::LeftOnly),
@@ -1254,6 +1302,30 @@ mod tests {
     }
 
     #[test]
+    fn sync_points_that_differ_join_the_differences_next_to_them() {
+        let opts = DiffOptions::default();
+        let a = v(&["same", "X", "anchor L", "P", "tail"]);
+        let b = v(&["same", "Y", "anchor R", "Q", "tail"]);
+        let d = compute_synced(&[&a, &b], &opts, None, &[[2, 2, 0]]);
+        assert_consistent(&d, &[5, 5]);
+        assert_eq!(d.blocks.len(), 1, "{:?}", d.blocks);
+        assert_eq!(d.blocks[0].ranges[..2], [1..4, 1..4]);
+        // Equal sync lines keep the differences around them apart.
+        let b = v(&["same", "Y", "anchor L", "Q", "tail"]);
+        let d = compute_synced(&[&a, &b], &opts, None, &[[2, 2, 0]]);
+        assert_consistent(&d, &[5, 5]);
+        assert_eq!(d.blocks.len(), 2);
+        // 3-way: the joined difference is classified as a whole.
+        let base = v(&["x", "anchor", "y"]);
+        let left = v(&["x", "anchor", "y"]);
+        let right = v(&["X", "ANCHOR", "y"]);
+        let d = compute_synced(&[&left, &base, &right], &opts, None, &[[1, 1, 1]]);
+        assert_consistent(&d, &[3, 3, 3]);
+        assert_eq!(d.blocks.len(), 1);
+        assert_eq!(d.blocks[0].kind, BlockKind::RightOnly);
+    }
+
+    #[test]
     fn sync_points_that_cross_or_fall_outside_are_left_out() {
         let lens = [5, 5];
         assert_eq!(
@@ -1281,11 +1353,13 @@ mod tests {
         assert_consistent(&d, &[3, 3, 3]);
         let r = row_with(&d, &[0, 1, 2]).expect("one row");
         assert_eq!(r.block, None);
-        // A sync point whose lines differ is classified like any 3-way change.
+        // A sync point whose lines differ is classified like any 3-way change, together with
+        // the change before it: "x" left out on the left, "y" and "other" added on the right.
         let right2 = v(&["x", "y", "other"]);
         let d = compute_synced(&[&left, &base, &right2], &opts, None, &[[0, 1, 2]]);
+        assert_consistent(&d, &[3, 3, 3]);
         let r = row_with(&d, &[0, 1, 2]).unwrap();
-        assert_eq!(d.blocks[r.block.unwrap()].kind, BlockKind::RightOnly);
+        assert_eq!(d.blocks[r.block.unwrap()].kind, BlockKind::Conflict);
     }
 
     #[test]
