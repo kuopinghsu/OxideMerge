@@ -644,11 +644,13 @@
   "opt.web_render": "文字與 HTML 模式使用瀏覽器轉譯頁面（會執行頁面指令碼）",
   "cmd.sync_point": "設定同步點",
   "cmd.remove_sync_point": "移除同步點",
+  "cmd.unpick_sync_point": "取消選取的行",
   "cmd.clear_sync_points": "清除同步點",
   "sync.no_line": "這裡沒有可同步的行",
   "sync.pick": "已選擇{side}第 {line} 行作為同步點：請在{others}中選擇對應的行",
   "sync.added": "已新增同步點（此比較共 {n} 個）",
   "sync.removed": "已移除同步點",
+  "sync.unpicked": "已取消選取同步點的行",
   "sync.crossing": "未新增：這些行會與另一個同步點交叉",
   "sync.cleared": "已清除同步點",
   "menu.slideshow": "產生投影片報告...",
@@ -657,5 +659,6 @@
   "slides.difference": "差異 {n} / {total}",
   "slides.end": "差異結束",
   "slides.no_diffs": "沒有差異",
-  "slides.other_files": "以其他方式不同的檔案"
+  "slides.other_files": "以其他方式不同的檔案",
+  "slides.more_files": "另有 {n} 個檔案未顯示。"
 }

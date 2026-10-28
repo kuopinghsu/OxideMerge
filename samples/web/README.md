@@ -26,6 +26,6 @@ What to look for in each mode:
 - **Screenshot (visible area):** the top of each page only.
 - **HTML source:** the HTML after the script has run, so the generated `<li>` items are in it.
 
-Text, Full page, Screenshot and the script-generated content need Edge, Chrome, Chromium or
-Brave. Without one, or if it fails, Text and HTML source use the files as they are, and the
-known issues list is empty.
+Full page, Screenshot and the script-generated content need Edge, Chrome, Chromium or Brave.
+Without one, or if it fails, Text and HTML source use the files as they are: the known issues
+list is empty, and the hidden build line shows up in Text as a difference.

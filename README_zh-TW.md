@@ -170,7 +170,8 @@ oxidemerge -r old-folder new-folder --report report.html --report-diffs
 - `--ignore-case`、`--ignore-eol`、`--ignore-comments`：忽略指定類型的變更。
 - `--rules <name-or-path>`：使用比較規則檔。
 - `--git-rev <revision>`：將單一檔案或資料夾與 Git 修訂版本比較。
-- `--report <file>`：匯出報告；加上 `--report-diffs` 可在 HTML 資料夾報告中包含文字差異。
+- `--report <file>`：匯出 `.html` 或 `.xml` 報告，資料夾比較也可匯出 `.csv` 或 `.txt`；加上 `--report-diffs`
+  可在 HTML 資料夾報告中包含文字差異，加上 `--slideshow` 則匯出一次顯示一個差異的 HTML 投影片。
 - `--patch <file>`：從雙向檔案或資料夾比較產生修補檔。
 
 `--cli`、`--report` 與 `--patch` 都不會開啟視窗。Windows 也接受 `/r`、`/f`、`/o` 等支援的
