@@ -17,7 +17,8 @@ use std::fmt::Write;
 use std::ops::Range;
 use std::path::PathBuf;
 
-/// Most difference slides in one report; the rest are counted on the closing slide.
+/// Most difference slides in one report. The closing slide counts the differences left out, and
+/// in a folder slideshow the changed files not read once the slides are full.
 const MAX_SLIDES: usize = 2_000;
 /// Most files the closing slide of a folder slideshow lists.
 const MAX_LISTED: usize = 500;
@@ -411,7 +412,12 @@ pub fn folder_slideshow(
     let cards = vec![
         (
             "acc",
-            (total + skipped).to_string(),
+            // Files not read may hold more differences.
+            format!(
+                "{}{}",
+                total + skipped,
+                if skipped_files > 0 { "+" } else { "" }
+            ),
             tr("report.differences"),
         ),
         (
@@ -436,7 +442,10 @@ pub fn folder_slideshow(
         let _ = write!(
             extra,
             "<div class=\"sub\">{}</div>",
-            esc(&trf("slides.more_files", &[("n", skipped_files.to_string())]))
+            esc(&trf(
+                "slides.more_files",
+                &[("n", skipped_files.to_string())]
+            ))
         );
     }
     if !others.is_empty() {
@@ -572,6 +581,10 @@ mod tests {
         let html = folder_slideshow(&[&a, &b], &roots, &roots, &DiffOptions::default(), "");
         // Title, the slides it holds, end; b.txt is not read and is counted instead.
         assert_eq!(html.matches("<section").count(), MAX_SLIDES + 2);
+        assert!(
+            html.contains(&format!(">{}+<", MAX_SLIDES + 1)),
+            "at least this many"
+        );
         assert!(!html.contains(">B<"), "b.txt was not shown");
         assert!(html.contains(&esc(&trf("report.more_diffs", &[("n", "1".into())]))));
         assert!(html.contains(&esc(&trf("slides.more_files", &[("n", "1".into())]))));
