@@ -529,8 +529,10 @@ tell it which lines belong together:
 
 Those lines are shown on one row, and the text before and after them is compared separately.
 Add as many points as needed; a point that would cross another one is refused.
-Synchronization points are marked in the gutter, follow their lines through edits, undo and
-reloads, and are kept in saved comparisons. Choose the command again on a picked line to cancel
+Synchronization points are marked in the gutter and follow their lines when you edit, when a
+changed file is reloaded, and through undo and redo; a point whose line is replaced or deleted is
+removed, and undo brings it back. They are kept in saved comparisons; turning automatic
+formatting on or off removes them. Choose the command again on a picked line to cancel
 the pick, on a point's line to remove the point, or *Merge → Clear synchronization points* to
 remove them all.
 

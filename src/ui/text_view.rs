@@ -249,6 +249,9 @@ struct Snapshot {
     saves: Vec<u64>,
     /// The format of each pane before this step, where the step changed it.
     formats: Vec<Option<Format>>,
+    /// The synchronization points then: going back to these lines brings back the ones the
+    /// step dropped along with their lines.
+    sync_points: Vec<SyncPoint>,
 }
 
 /// How a file is written: encoding, byte order mark, line ending, final newline, mixed endings.
@@ -1059,6 +1062,7 @@ impl TextView {
             modified: self.panes.iter().map(|p| p.doc.modified).collect(),
             saves: self.panes.iter().map(|p| p.saves).collect(),
             formats: vec![None; self.panes.len()],
+            sync_points: self.sync_points.clone(),
         }
     }
 
@@ -1075,6 +1079,7 @@ impl TextView {
     }
 
     fn restore(&mut self, s: Snapshot) {
+        let back = self.dropped_sync_points(&s);
         for (i, f) in s.formats.into_iter().enumerate() {
             if let Some(f) = f {
                 let d = &mut self.panes[i].doc;
@@ -1093,7 +1098,43 @@ impl TextView {
         for (i, p) in self.panes.iter_mut().enumerate() {
             p.doc.modified = s.modified[i] || s.saves[i] != p.saves;
         }
+        let n = self.n();
+        for q in back {
+            let crosses = self
+                .sync_points
+                .iter()
+                .any(|e| !(0..n).all(|p| q[p] < e[p]) && !(0..n).all(|p| q[p] > e[p]));
+            if !crosses {
+                self.sync_points.push(q);
+            }
+        }
+        self.sync_points.sort_unstable();
         self.rediff();
+    }
+
+    /// The synchronization points of `s` that going from its lines to the current ones dropped
+    /// with their lines: restoring `s` brings them back. Points that outlived the change but are
+    /// gone now were removed on purpose, and stay removed.
+    fn dropped_sync_points(&self, s: &Snapshot) -> Vec<SyncPoint> {
+        if s.sync_points.is_empty() {
+            return Vec::new();
+        }
+        let maps: Vec<Option<Vec<(usize, bool)>>> = s
+            .lines
+            .iter()
+            .zip(&self.panes)
+            .map(|(old, pane)| (*old != pane.doc.lines).then(|| line_map(old, &pane.doc.lines)))
+            .collect();
+        s.sync_points
+            .iter()
+            .filter(|q| {
+                maps.iter().enumerate().any(|(p, map)| {
+                    map.as_ref()
+                        .is_some_and(|m| !m.get(q[p]).is_some_and(|&(_, kept)| kept))
+                })
+            })
+            .copied()
+            .collect()
     }
 
     pub fn can_undo(&self) -> bool {
@@ -4262,6 +4303,29 @@ mod tests {
         assert_eq!(lines(&r, 0), lines(&v, 0));
         assert!(r.panes.iter().all(|p| p.doc.read_only));
         assert!(saved.sync_points.is_empty());
+    }
+
+    #[test]
+    fn undo_brings_back_sync_points_an_edit_dropped() {
+        let mut v = two_way("a\nX\nc\n", "a\nY\nc\n");
+        v.sync_points = vec![[1, 1, 0]];
+        v.rediff();
+        // Copying the change over replaces the point's line, and the point goes with it.
+        let b = v.diff.rows[v.diff.row_of_line(0, 1)].block.unwrap();
+        v.copy_block(b, 1, 0);
+        assert_eq!(lines(&v, 0)[1], "Y");
+        assert!(v.sync_points.is_empty());
+        v.undo();
+        assert_eq!(v.sync_points, [[1, 1, 0]], "undo brings it back");
+        v.redo();
+        assert!(v.sync_points.is_empty(), "redo drops it again");
+        v.undo();
+        assert_eq!(v.sync_points, [[1, 1, 0]]);
+        // A point removed on purpose stays removed through redo and undo.
+        v.clear_sync_points();
+        v.redo();
+        v.undo();
+        assert!(v.sync_points.is_empty());
     }
 
     #[test]

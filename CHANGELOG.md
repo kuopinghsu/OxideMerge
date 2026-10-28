@@ -9,8 +9,8 @@ section of this file as the release notes.
 
 - **Synchronization points** (*Merge → Set synchronization point*, Alt+S, or right-click a
   line): line up lines the compare pairs wrongly, as in WinMerge. The text before and after each
-  point is compared separately. Points are marked in the gutter, follow edits and are kept in
-  saved comparisons.
+  point is compared separately. Points are marked in the gutter, follow edits, reloads and undo,
+  and are kept in saved comparisons.
 - **XML reports** of text and folder compares, for other programs to read: choose the `.xml`
   type in *Generate report...*, or `--report <name>.xml`. Text reports list every difference
   with its lines and the bookmarks; folder reports list every item with its status, dates and
