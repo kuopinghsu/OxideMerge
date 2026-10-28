@@ -1,6 +1,6 @@
 [package]
 name = "oxidemerge"
-version = "0.9.4"
+version = "0.9.6"
 edition = "2021"
 description = "OxideMerge - a cross-platform differencing and merging tool for Windows, macOS and Linux, modeled on WinMerge"
 license = "MIT"

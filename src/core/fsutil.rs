@@ -100,26 +100,17 @@ pub fn write_atomic_with(path: &Path, bytes: &[u8], backup: bool) -> Result<()> 
     written.with_context(|| writing(path))
 }
 
-/// Writes `bytes` to a temporary file in `dir`, then renames it over `target`. Writing straight
-/// into `target` is left for when the rename route is impossible, never for a write that failed
-/// (a full disk would then empty the file).
+/// Writes `bytes` to a temporary file in `dir`, then renames it over `target`.
+/// If staging or replacement fails, return the error without writing into the original.
 fn write_staged(
     target: &Path,
     dir: &Path,
     bytes: &[u8],
     old: Option<&std::fs::Metadata>,
 ) -> std::io::Result<()> {
-    let mut tmp = match tempfile::Builder::new()
+    let mut tmp = tempfile::Builder::new()
         .prefix(".oxidemerge-")
-        .tempfile_in(dir)
-    {
-        Ok(tmp) => tmp,
-        // A folder that may not hold new files; a full disk or quota would empty the file.
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return std::fs::write(target, bytes)
-        }
-        Err(e) => return Err(e),
-    };
+        .tempfile_in(dir)?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     let perm = old.map(std::fs::Metadata::permissions);
@@ -133,14 +124,7 @@ fn write_staged(
     } else {
         perm.as_ref().is_some_and(|p| p.readonly()) && make_writable(target)
     };
-    let written = match tmp.persist(target) {
-        Ok(_) => Ok(()),
-        // A file that cannot be replaced; the temporary file goes first, freeing its space.
-        Err(e) => {
-            drop(e);
-            std::fs::write(target, bytes)
-        }
-    };
+    let written = tmp.persist(target).map(|_| ()).map_err(|e| e.error);
     if unlocked {
         if let Some(p) = perm {
             let _ = std::fs::set_permissions(target, p);
@@ -189,16 +173,10 @@ pub fn copy_atomic(from: &Path, to: &Path, backup: bool) -> Result<()> {
     let mut src = std::fs::File::open(from).with_context(copying)?;
     let md = src.metadata().with_context(copying)?;
     let (perm, modified) = (md.permissions(), md.modified().ok());
-    let mut tmp = match tempfile::Builder::new()
+    let mut tmp = tempfile::Builder::new()
         .prefix(".oxidemerge-")
         .tempfile_in(dir)
-    {
-        Ok(tmp) => tmp,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return copy_in_place(from, to).with_context(copying);
-        }
-        Err(e) => return Err(e).with_context(copying),
-    };
+        .with_context(copying)?;
     std::io::copy(&mut src, tmp.as_file_mut()).with_context(copying)?;
     if let Some(t) = modified {
         let _ = tmp.as_file().set_modified(t);
@@ -213,33 +191,13 @@ pub fn copy_atomic(from: &Path, to: &Path, backup: bool) -> Result<()> {
             let _ = std::fs::set_permissions(to, perm);
             Ok(())
         }
-        // A file that cannot be replaced; the temporary file goes first.
         Err(e) => {
-            drop(e);
-            let copied = copy_in_place(from, to);
-            if let (Err(_), true, Ok(p)) = (&copied, unlocked, old) {
+            if let (true, Ok(p)) = (unlocked, old) {
                 let _ = std::fs::set_permissions(to, p);
             }
-            copied.with_context(copying)
+            Err(e.error).with_context(copying)
         }
     }
-}
-
-/// [`std::fs::copy`] over a file that may be read-only, or over a symbolic link.
-fn copy_in_place(from: &Path, to: &Path) -> std::io::Result<()> {
-    let mut locked = None;
-    if let Ok(md) = std::fs::symlink_metadata(to) {
-        if md.file_type().is_symlink() {
-            std::fs::remove_file(to)?;
-        } else if make_writable(to) {
-            locked = Some(md.permissions());
-        }
-    }
-    let copied = std::fs::copy(from, to).map(|_| ());
-    if let (Err(_), Some(p)) = (&copied, locked) {
-        let _ = std::fs::set_permissions(to, p);
-    }
-    copied
 }
 
 /// Deletes a file, or with backups on, renames it to `<name>.bak`.
@@ -451,6 +409,51 @@ mod tests {
         }
         assert!(copy_atomic(&dir.path().join("missing"), &to, false).is_err());
         assert_eq!(std::fs::read_to_string(&to).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_and_replacement_failures_preserve_existing_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let protected = dir.path().join("protected");
+        std::fs::create_dir(&protected).unwrap();
+        let target = protected.join("target.txt");
+        let source = dir.path().join("source.txt");
+        std::fs::write(&target, b"original").unwrap();
+        std::fs::write(&source, b"replacement").unwrap();
+        let old = std::fs::metadata(&target).unwrap();
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Privileged users can bypass directory permissions, so they cannot exercise this case.
+        let probe = protected.join("probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        // The file is writable, but its directory prevents staging and replacement.
+        let staging = write_atomic_with(&target, b"replacement", false);
+        let after_staging = std::fs::read(&target).unwrap();
+        let copying = copy_atomic(&source, &target, false);
+        let after_copying = std::fs::read(&target).unwrap();
+        // Stage outside the protected directory to reach the failed rename independently.
+        let replacing = write_staged(&target, dir.path(), b"replacement", Some(&old));
+        let after_replacing = std::fs::read(&target).unwrap();
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(staging.is_err());
+        assert_eq!(after_staging, b"original");
+        assert!(copying.is_err());
+        assert_eq!(after_copying, b"original");
+        assert!(replacing.is_err());
+        assert_eq!(after_replacing, b"original");
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".oxidemerge-")));
     }
 
     #[test]

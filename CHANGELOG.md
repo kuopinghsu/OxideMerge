@@ -3,6 +3,14 @@
 All notable changes to OxideMerge are listed here, newest first. Each release on GitHub uses its
 section of this file as the release notes.
 
+## [0.9.6] - Unreleased
+
+### Fixed
+
+- **File safety:** saving and copying now report an error if a temporary file cannot be created
+  or cannot replace the destination. They no longer fall back to overwriting the original file
+  directly, which could truncate it if a subsequent write failed.
+
 ## [0.9.4] - 2026-10-27
 
 ### Added
@@ -419,6 +427,7 @@ First release.
   on Windows.
 - Chinese, Japanese and Korean fonts on Linux and WSL, and GPU acceleration under WSL2.
 
+[0.9.6]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.4...v0.9.6
 [0.9.4]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.1...v0.9.2
