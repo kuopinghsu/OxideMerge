@@ -876,14 +876,12 @@ fn menus_are_measured_with_their_submenus_contents() {
             }
         });
     }
+    // The style first: `fonts` holds the context's lock, which `style` also needs.
+    let font = egui::TextStyle::Button.resolve(&ctx.style());
     let text = ctx.fonts(|f| {
-        f.layout_no_wrap(
-            long.into(),
-            egui::TextStyle::Button.resolve(&ctx.style()),
-            egui::Color32::WHITE,
-        )
-        .size()
-        .x
+        f.layout_no_wrap(long.into(), font, egui::Color32::WHITE)
+            .size()
+            .x
     });
     // A submenu's items widen every menu; a list of recent paths never does.
     assert!(widths[0] >= text, "{widths:?} {text}");
