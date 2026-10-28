@@ -7,6 +7,18 @@ section of this file as the release notes.
 
 ### Added
 
+- **Synchronization points** (*Merge → Set synchronization point*, Alt+S, or right-click a
+  line): line up lines the compare pairs wrongly, as in WinMerge. The text before and after each
+  point is compared separately. Points are marked in the gutter, follow edits and are kept in
+  saved comparisons.
+- **XML reports** of text and folder compares, for other programs to read: choose the `.xml`
+  type in *Generate report...*, or `--report <name>.xml`. Text reports list every difference
+  with its lines and the bookmarks; folder reports list every item with its status, dates and
+  sizes. The layout is described in the user guide.
+- **HTML slideshow reports** (*File → Export → Generate slideshow report...*, or `--report
+  <name>.html --slideshow`): one difference per slide, with a title slide, keyboard navigation,
+  full screen, a link for each slide and one slide per printed page, as Araxis Merge makes them.
+  Folder slideshows cover every changed text file.
 - **Web page compare, full page:** a new *Full page* mode captures each whole page, top to bottom,
   instead of only the first screen (up to 16384 pixels tall).
 - **Web page compare, highlighted differences:** the screenshot modes compare the pages' text and
@@ -31,7 +43,8 @@ section of this file as the release notes.
   downloaded and the status bar says why, instead of showing only an error. The console compare
   (`--cli -t web`) also renders the pages in the browser, so it matches the app. On macOS and
   Linux the browser is driven over a private pipe instead of a local port. Tests that need a real
-  browser run only when `OXIDEMERGE_TEST_BROWSER` is set; CI sets it on the x64 runners.
+  browser run only when `OXIDEMERGE_TEST_BROWSER` is set; CI sets it on the Windows and Linux
+  x64 runners.
 - **Release files:** a release now holds nine files: a `.zip` per Windows architecture holding
   only `oxidemerge.exe`, an AppImage and a `.tar.gz` per Linux architecture, the macOS `.dmg`,
   and the two PDF user guides. The separate Windows `.exe` downloads, the Linux `.deb`
@@ -41,6 +54,9 @@ section of this file as the release notes.
 
 ### Fixed
 
+- **Four or more paths:** opening four or more files or folders, from the command line, a drop
+  or a file manager, no longer crashes the folder compare; it says that two or three paths are
+  needed.
 - **File safety:** saving and copying now report an error if a temporary file cannot be created
   or cannot replace the destination. They no longer fall back to overwriting the original file
   directly, which could truncate it if a subsequent write failed.

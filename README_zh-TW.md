@@ -51,6 +51,7 @@ OxideMerge 以 [WinMerge](https://github.com/WinMerge/winmerge) 為設計參考�
 - 忽略空白字元、註解或符合指定模式的內容，聚焦於需要檢查的變更。
   可重複使用的比較規則與數值容許誤差設定，也適合用來比較自動產生的檔案與量測資料。
 - 提供語法醒目提示、尋找與取代、書籤，以及 CSV／TSV 表格檢視。
+- 可設定同步點，讓比較配錯的行重新對齊。
 
 ### 比較其他內容
 
@@ -60,7 +61,7 @@ OxideMerge 以 [WinMerge](https://github.com/WinMerge/winmerge) 為設計參考�
 
 ### 儲存與分享成果
 
-- 匯出 HTML 報告供瀏覽器檢閱，或將資料夾比較摘要匯出為 CSV 與純文字。
+- 匯出 HTML 報告供瀏覽器檢閱、一次顯示一個差異的 HTML 投影片、供其他程式讀取的 XML 報告，或將資料夾比較摘要匯出為 CSV 與純文字。
 - 產生修補檔，或套用統一格式的修補檔，檢查結果後再儲存。
 - 將比較設定儲存為專案檔，或將文字比較連同書籤與註記一起儲存。
 - 搭配 Git 使用，或透過指令列與系統的檔案管理員啟動比較。
@@ -169,7 +170,8 @@ oxidemerge -r old-folder new-folder --report report.html --report-diffs
 - `--ignore-case`、`--ignore-eol`、`--ignore-comments`：忽略指定類型的變更。
 - `--rules <name-or-path>`：使用比較規則檔。
 - `--git-rev <revision>`：將單一檔案或資料夾與 Git 修訂版本比較。
-- `--report <file>`：匯出報告；加上 `--report-diffs` 可在 HTML 資料夾報告中包含文字差異。
+- `--report <file>`：匯出 `.html` 或 `.xml` 報告，資料夾比較也可匯出 `.csv` 或 `.txt`；加上 `--report-diffs`
+  可在 HTML 資料夾報告中包含文字差異，加上 `--slideshow` 則匯出一次顯示一個差異的 HTML 投影片。
 - `--patch <file>`：從雙向檔案或資料夾比較產生修補檔。
 
 `--cli`、`--report` 與 `--patch` 都不會開啟視窗。Windows 也接受 `/r`、`/f`、`/o` 等支援的

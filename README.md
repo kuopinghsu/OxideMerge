@@ -52,6 +52,7 @@ It supports text and folder merging, as well as binary, image and web page compa
 - Focus on relevant changes with options to ignore whitespace, comments or selected patterns.
   Reusable comparison rules and numeric tolerance help with generated files and measurement data.
 - Use syntax highlighting, search and replace, bookmarks, and CSV/TSV table views.
+- Set synchronization points to line up lines the compare pairs wrongly.
 
 ### Compare other content
 
@@ -62,7 +63,8 @@ It supports text and folder merging, as well as binary, image and web page compa
 
 ### Save and share your work
 
-- Export HTML reports for review in a browser, or folder summaries in CSV and plain text.
+- Export HTML reports for review in a browser, HTML slideshows that show one difference at a
+  time, XML reports for other programs, or folder summaries in CSV and plain text.
 - Create patches and apply unified patches for review before saving.
 - Save comparison settings as project files, or save text comparisons with bookmarks and comments.
 - Use OxideMerge with Git, from the command line, or from your system's file manager.
@@ -176,7 +178,9 @@ Common options include:
 - `--ignore-case`, `--ignore-eol`, `--ignore-comments`: ignore selected types of changes.
 - `--rules <name-or-path>`: use a comparison rules file.
 - `--git-rev <revision>`: compare a single file or folder with a Git revision.
-- `--report <file>`: export a report; add `--report-diffs` for text differences in a folder HTML report.
+- `--report <file>`: export a report as `.html`, `.xml`, or for folders also `.csv` or `.txt`; add
+  `--report-diffs` for text differences in a folder HTML report, or `--slideshow` for an HTML
+  slideshow with one difference per slide.
 - `--patch <file>`: export a patch from a two-way file or folder comparison.
 
 `--cli`, `--report` and `--patch` run without opening a window. On Windows, supported

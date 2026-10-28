@@ -1,5 +1,5 @@
-//! Folder compare reports (HTML, CSV, plain text), text compare HTML reports and status
-//! descriptions.
+//! Folder compare reports (HTML, CSV, plain text, XML), text compare reports (HTML, XML), HTML
+//! slideshows of either, and status descriptions.
 
 use super::diff::{DiffOptions, DiffResult};
 use super::folder::{CmpStatus, DirItem};
@@ -14,13 +14,18 @@ pub enum ReportFormat {
     Html,
     Csv,
     Text,
+    Xml,
+    /// An HTML page showing one difference at a time (see [`super::slideshow`]).
+    Slideshow,
 }
 
 impl ReportFormat {
+    /// The format a report file's extension asks for; a slideshow is asked for explicitly.
     pub fn from_path(p: &Path) -> ReportFormat {
         match super::text::extension(p).as_str() {
             "htm" | "html" => ReportFormat::Html,
             "csv" => ReportFormat::Csv,
+            "xml" => ReportFormat::Xml,
             _ => ReportFormat::Text,
         }
     }
@@ -169,6 +174,38 @@ pub fn text_html(
     super::html_report::text_report(titles, panes, result, opts, notes, rules)
 }
 
+/// Report of a 2-way or 3-way text compare as `format`: XML, an HTML slideshow, or else the
+/// HTML report (see [`text_html`]).
+pub fn text_report(
+    format: ReportFormat,
+    titles: &[String],
+    panes: &[&[String]],
+    result: &DiffResult,
+    opts: &DiffOptions,
+    notes: &[BTreeMap<usize, String>],
+    rules: &str,
+) -> String {
+    match format {
+        ReportFormat::Xml => super::xml_report::text_xml(titles, panes, result, notes, rules),
+        ReportFormat::Slideshow => {
+            super::slideshow::text_slideshow(titles, panes, result, opts, notes, rules)
+        }
+        _ => text_html(titles, panes, result, opts, notes, rules),
+    }
+}
+
+/// HTML slideshow of a folder compare: a slide for each difference of every changed text file.
+/// `roots` are the compared folders and `display` the names to show for them.
+pub fn folder_slideshow(
+    items: &[&DirItem],
+    roots: &[PathBuf],
+    display: &[PathBuf],
+    opts: &DiffOptions,
+    rules: &str,
+) -> String {
+    super::slideshow::folder_slideshow(items, roots, display, opts, rules)
+}
+
 /// HTML folder report followed by the differences of every changed text file, including files
 /// missing on some side. `roots` are the compared folders and `display` the names to show for
 /// them, and `rules` the compare rules file used ("" = none).
@@ -279,13 +316,17 @@ fn short_versus(names: &[String]) -> String {
     format!("{head} {}", rests.join(" vs "))
 }
 
-/// Folder report of `items`; HTML reports also name the compare rules file `rules` ("" = none).
+/// Folder report of `items`; HTML and XML reports also name the compare rules file `rules`
+/// ("" = none). A slideshow needs the files' differences: see [`folder_slideshow`].
 pub fn generate(
     items: &[&DirItem],
     roots: &[PathBuf],
     format: ReportFormat,
     rules: &str,
 ) -> String {
+    if format == ReportFormat::Xml {
+        return super::xml_report::folder_xml(items, roots, rules);
+    }
     let panes = roots.len();
     let mut header: Vec<String> = vec![
         tr("col.name").into(),
@@ -377,7 +418,8 @@ pub fn generate(
                 let _ = writeln!(out, "{}", line(r));
             }
         }
-        ReportFormat::Html => {
+        // XML returned above; a slideshow without the files' differences is the HTML report.
+        ReportFormat::Html | ReportFormat::Xml | ReportFormat::Slideshow => {
             return super::html_report::folder_report(items, roots, roots, None, rules);
         }
     }

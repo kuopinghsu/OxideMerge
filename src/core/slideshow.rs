@@ -19,6 +19,8 @@ use std::path::PathBuf;
 
 /// Most difference slides in one report; the rest are counted on the closing slide.
 const MAX_SLIDES: usize = 2_000;
+/// Most files the closing slide of a folder slideshow lists.
+const MAX_LISTED: usize = 500;
 
 const CSS: &str = r#"
 *{box-sizing:border-box}
@@ -358,7 +360,16 @@ pub fn folder_slideshow(
     let mut others: Vec<(&DirItem, String)> = Vec::new();
     let mut total = 0;
     let mut skipped = 0;
+    // Changed text files not read at all, once there are slides enough.
+    let mut skipped_files = 0;
     for it in &files {
+        let readable = !it.is_dir
+            && !it.binary
+            && matches!(it.status, CmpStatus::Different | CmpStatus::Unique);
+        if total >= MAX_SLIDES && readable {
+            skipped_files += 1;
+            continue;
+        }
         match file_diffs(it, roots, opts) {
             FileDiffs::Diffs(docs, result) => {
                 let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
@@ -421,13 +432,20 @@ pub fn folder_slideshow(
             esc(&trf("report.more_diffs", &[("n", skipped.to_string())]))
         );
     }
+    if skipped_files > 0 {
+        let _ = write!(
+            extra,
+            "<div class=\"sub\">{}</div>",
+            esc(&trf("slides.more_files", &[("n", skipped_files.to_string())]))
+        );
+    }
     if !others.is_empty() {
         let _ = write!(
             extra,
             "<div class=\"sub\">{}</div><div class=\"list\">",
             esc(tr("slides.other_files"))
         );
-        for (it, why) in others.iter().take(500) {
+        for (it, why) in others.iter().take(MAX_LISTED) {
             let _ = write!(
                 extra,
                 "<div class=\"st-{}\" title=\"{}\"><span class=\"dot\"></span>{} — {}</div>",
@@ -438,8 +456,18 @@ pub fn folder_slideshow(
             );
         }
         extra.push_str("</div>");
+        if others.len() > MAX_LISTED {
+            let _ = write!(
+                extra,
+                "<div class=\"sub\">{}</div>",
+                esc(&trf(
+                    "slides.more_files",
+                    &[("n", (others.len() - MAX_LISTED).to_string())]
+                ))
+            );
+        }
     }
-    let end = if total + skipped == 0 {
+    let end = if total + skipped + skipped_files == 0 {
         tr("slides.no_diffs")
     } else {
         tr("slides.end")
@@ -506,5 +534,46 @@ mod tests {
         );
         assert_eq!(html.matches("<section").count(), 2);
         assert!(html.contains(tr("slides.no_diffs")));
+    }
+
+    #[test]
+    fn folder_slideshows_stop_reading_files_once_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = [dir.path().join("l"), dir.path().join("r")];
+        for r in &roots {
+            std::fs::create_dir(r).unwrap();
+        }
+        // a.txt alone has one difference more than a slideshow holds.
+        let side = |tag: &str| -> String {
+            (0..=MAX_SLIDES)
+                .map(|i| format!("same {i}\n{tag} {i}\n"))
+                .collect()
+        };
+        std::fs::write(roots[0].join("a.txt"), side("left")).unwrap();
+        std::fs::write(roots[1].join("a.txt"), side("right")).unwrap();
+        std::fs::write(roots[0].join("b.txt"), "b\n").unwrap();
+        std::fs::write(roots[1].join("b.txt"), "B\n").unwrap();
+        let item = |name: &str| DirItem {
+            rel_dir: String::new(),
+            name: name.into(),
+            is_dir: false,
+            exists: [true, true, false],
+            size: [Some(1), Some(1), None],
+            mtime: [None; 3],
+            status: CmpStatus::Different,
+            diff_side: None,
+            binary: false,
+            error: None,
+            depth: 0,
+            parent: None,
+            children: Vec::new(),
+        };
+        let (a, b) = (item("a.txt"), item("b.txt"));
+        let html = folder_slideshow(&[&a, &b], &roots, &roots, &DiffOptions::default(), "");
+        // Title, the slides it holds, end; b.txt is not read and is counted instead.
+        assert_eq!(html.matches("<section").count(), MAX_SLIDES + 2);
+        assert!(!html.contains(">B<"), "b.txt was not shown");
+        assert!(html.contains(&esc(&trf("report.more_diffs", &[("n", "1".into())]))));
+        assert!(html.contains(&esc(&trf("slides.more_files", &[("n", "1".into())]))));
     }
 }

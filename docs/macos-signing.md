@@ -1,8 +1,8 @@
 # macOS signing and notarization
 
-OxideMerge for macOS is a universal `OxideMerge.app` (Apple silicon and Intel) shipped in a `.dmg`
-and a `.zip`. It is signed ad hoc and is not notarized. This note explains what that means for
-users, what notarization would take, and why it hasn't been adopted yet.
+OxideMerge for macOS is a universal `OxideMerge.app` (Apple silicon and Intel) shipped in a
+`.dmg`. It is signed ad hoc and is not notarized. This note explains what that means for users,
+what notarization would take, and why it hasn't been adopted yet.
 
 ## What users see
 
@@ -44,8 +44,9 @@ The macOS job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
 - **Hardened runtime:** sign with `codesign --options runtime --timestamp`. OxideMerge loads no
   plug-ins and needs no JIT, so it should need no extra entitlements; the `.app` must be signed
   from the inside out rather than with `--deep`.
-- **Notarization:** submit the `.zip` and the `.dmg` with `xcrun notarytool submit --wait`, using an
-  App Store Connect API key (key ID, issuer ID and `.p8` file as CI secrets).
+- **Notarization:** submit the `.dmg` (holding the signed app) with
+  `xcrun notarytool submit --wait`, using an App Store Connect API key (key ID, issuer ID and
+  `.p8` file as CI secrets).
 - **Stapling:** `xcrun stapler staple` on the app and the `.dmg`, so Gatekeeper accepts them
   offline.
 - **Verification in CI:** `spctl --assess --type execute -vv OxideMerge.app` and

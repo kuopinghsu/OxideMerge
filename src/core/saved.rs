@@ -1,5 +1,6 @@
 //! Saved comparisons (`.oxmcmp`): the text of every side with its bookmarks and their
-//! comments, in one file that can be reviewed later or on another machine.
+//! comments, and the synchronization points, in one file that can be reviewed later or on
+//! another machine.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,10 @@ pub struct SavedCompare {
     pub version: u32,
     pub saved: String,
     pub panes: Vec<SavedPane>,
+    /// Lines (1-based) put on one row, one per side (see `diff::SyncPoint`); files saved before
+    /// these were kept have none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sync_points: Vec<Vec<usize>>,
 }
 
 pub fn is_saved_compare(path: &Path) -> bool {
@@ -40,6 +45,7 @@ impl SavedCompare {
             version: VERSION,
             saved: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             panes,
+            sync_points: Vec::new(),
         }
     }
 

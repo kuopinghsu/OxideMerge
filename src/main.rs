@@ -122,13 +122,16 @@ struct Cli {
     /// in the rules folder, or the path of an .oxrules file; "" for none
     #[arg(long, value_name = "NAME")]
     rules: Option<String>,
-    /// Write a report without opening the GUI: folder compares as .html, .csv or .txt, text
-    /// compares as side-by-side .html
+    /// Write a report without opening the GUI: folder compares as .html, .csv, .txt or .xml,
+    /// text compares as side-by-side .html or as .xml
     #[arg(long)]
     report: Option<PathBuf>,
     /// Add the differences of every changed text file to an HTML folder report
     #[arg(long)]
     report_diffs: bool,
+    /// Write the .html report as a slideshow, one difference per slide
+    #[arg(long)]
+    slideshow: bool,
     /// Compare the single path given with how it was in this Git revision (e.g. HEAD, HEAD~1,
     /// a branch, tag or commit)
     #[arg(long, value_name = "REV")]
@@ -354,6 +357,19 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     if cli.report_diffs && cli.report.is_none() {
         eprintln!("note: --report-diffs needs --report");
     }
+    if cli.slideshow && cli.report.is_none() {
+        eprintln!("note: --slideshow needs --report");
+    }
+    // A slideshow is an HTML report.
+    let report_format = |r: &std::path::Path| match ReportFormat::from_path(r) {
+        ReportFormat::Html if cli.slideshow => ReportFormat::Slideshow,
+        f => {
+            if cli.slideshow {
+                eprintln!("note: --slideshow only applies to .html reports");
+            }
+            f
+        }
+    };
     let patch = match &cli.patch {
         Some(_) if paths.len() != 2 => {
             eprintln!("note: --patch needs two paths; no patch written");
@@ -390,14 +406,18 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         });
         let failed = files.iter().any(|i| i.status == CmpStatus::Error);
         if let Some(r) = &cli.report {
-            let format = ReportFormat::from_path(r);
+            let format = report_format(r);
             if cli.report_diffs && format != ReportFormat::Html {
                 eprintln!("note: --report-diffs only applies to .html reports");
             }
-            let text = if cli.report_diffs && format == ReportFormat::Html {
-                core::report::folder_html_with_diffs(&files, paths, &shown, &cfg.diff, &cfg.rules)
-            } else {
-                core::report::generate(&files, &shown, format, &cfg.rules)
+            let text = match format {
+                ReportFormat::Slideshow => {
+                    core::report::folder_slideshow(&files, paths, &shown, &cfg.diff, &cfg.rules)
+                }
+                ReportFormat::Html if cli.report_diffs => core::report::folder_html_with_diffs(
+                    &files, paths, &shown, &cfg.diff, &cfg.rules,
+                ),
+                f => core::report::generate(&files, &shown, f, &cfg.rules),
             };
             export(r, &text)?;
         }
@@ -514,15 +534,26 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
     let result = core::diff::compute_with(&refs, &cfg.diff, syntax);
     if let Some(r) = &cli.report {
-        if ReportFormat::from_path(r) != ReportFormat::Html {
-            eprintln!("note: text compares are reported as HTML only");
-        }
+        // One note per problem: another type is written as HTML, a slideshow if asked for.
+        let format = match ReportFormat::from_path(r) {
+            ReportFormat::Html | ReportFormat::Xml => report_format(r),
+            _ if cli.slideshow => {
+                eprintln!(
+                    "note: text compares are reported as .html or .xml; writing an HTML slideshow"
+                );
+                ReportFormat::Slideshow
+            }
+            _ => {
+                eprintln!("note: text compares are reported as .html or .xml; writing HTML");
+                ReportFormat::Html
+            }
+        };
         let titles: Vec<String> = (0..docs.len())
             .map(|i| cli_desc(cli, i).unwrap_or_else(|| paths[i].display().to_string()))
             .collect();
         export(
             r,
-            &core::report::text_html(&titles, &refs, &result, &cfg.diff, &[], &cfg.rules),
+            &core::report::text_report(format, &titles, &refs, &result, &cfg.diff, &[], &cfg.rules),
         )?;
     }
     if docs.len() == 2 {

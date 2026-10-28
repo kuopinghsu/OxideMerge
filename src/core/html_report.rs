@@ -13,7 +13,7 @@ use std::path::PathBuf;
 /// Unchanged lines shown before and after each difference.
 const CONTEXT: usize = 3;
 /// Rows of one difference shown at most; the rest are summed up in a note.
-const HUNK_MAX_ROWS: usize = 400;
+pub(crate) const HUNK_MAX_ROWS: usize = 400;
 /// Text files longer than this are listed without their differences.
 pub(crate) const MAX_LINES: usize = 50_000;
 /// Files larger than this are listed in folder reports without their differences.
@@ -24,12 +24,12 @@ const LINE_CHARS: usize = 2_000;
 /// counted, keeping the page small enough for a browser.
 const REPORT_ROWS: usize = 20_000;
 
-const DARK: &str = "--bg:#0f1218;--surface:#171b23;--surface2:#1e232d;--border:#2a303c;\
+pub(crate) const DARK: &str = "--bg:#0f1218;--surface:#171b23;--surface2:#1e232d;--border:#2a303c;\
 --text:#e6e9ef;--dim:#98a2b3;--accent:#8b96ff;--accent-bg:#232a4d;--add:#12301f;--add-m:#1f6b3e;\
 --del:#3a161b;--del-m:#7a2631;--chg:#33290f;--chg-m:#6b5414;--conf:#4a1717;--ign:#1f2340;\
 --gap:#14181f;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--uniq:#c084fc;--shadow:0 1px 2px #0006";
 
-const LIGHT: &str = "--bg:#f6f7f9;--surface:#fff;--surface2:#f1f3f6;--border:#e3e6eb;\
+pub(crate) const LIGHT: &str = "--bg:#f6f7f9;--surface:#fff;--surface2:#f1f3f6;--border:#e3e6eb;\
 --text:#1d2330;--dim:#667085;--accent:#5b6cff;--accent-bg:#eef0ff;--add:#e7f7ed;--add-m:#a9e5bf;\
 --del:#fdecee;--del-m:#f5b8c1;--chg:#fff5dc;--chg-m:#f6d98a;--conf:#ffe0e0;--ign:#eef0fb;\
 --gap:#f7f8fa;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--uniq:#7c3aed;\
@@ -667,7 +667,7 @@ pub fn text_report(
     out
 }
 
-fn status_class(st: CmpStatus) -> &'static str {
+pub(crate) fn status_class(st: CmpStatus) -> &'static str {
     match st {
         CmpStatus::Different => "different",
         CmpStatus::Unique => "unique",
