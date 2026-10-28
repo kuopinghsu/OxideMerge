@@ -275,7 +275,11 @@ impl BinaryView {
     pub fn save(&mut self) -> anyhow::Result<()> {
         for i in 0..self.n() {
             if self.modified[i] {
+                anyhow::ensure!(!self.read_only[i], "{}", tr("msg.readonly"));
                 crate::core::fsutil::write_atomic(&self.paths[i], &self.data[i])?;
+                for (data, modified) in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+                    modified[i] = data[i] != self.data[i];
+                }
                 self.modified[i] = false;
                 self.status = trf(
                     "msg.saved",
@@ -700,5 +704,37 @@ impl BinaryView {
         } else if open {
             self.goto = Some(g);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn undo_and_redo_remain_relative_to_the_latest_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = ["a.bin", "b.bin"]
+            .iter()
+            .map(|n| dir.path().join(n))
+            .collect();
+        std::fs::write(&paths[0], b"aaa").unwrap();
+        std::fs::write(&paths[1], b"bbb").unwrap();
+        let mut v = BinaryView::load(paths.clone()).unwrap();
+        v.copy_all(true);
+        v.save().unwrap();
+        v.undo();
+        assert!(v.is_modified());
+        assert_eq!(v.data[1], b"bbb");
+        v.redo();
+        assert!(!v.is_modified());
+        v.undo();
+        v.save().unwrap();
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), b"bbb");
+        v.redo();
+        assert!(v.is_modified());
+        v.read_only[1] = true;
+        assert!(v.save().is_err());
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), b"bbb");
     }
 }

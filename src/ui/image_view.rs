@@ -49,6 +49,7 @@ pub struct ImageView {
     block: u32,
     cur: Option<usize>,
     pub modified: Vec<bool>,
+    pub read_only: Vec<bool>,
     undo: Vec<(Vec<RgbaImage>, Vec<bool>)>,
     pub status: String,
     /// Set when difference navigation ran past the last (true) or first (false) difference,
@@ -88,6 +89,7 @@ impl ImageView {
             block: cfg.image_block.max(1),
             cur: None,
             modified: vec![false; n],
+            read_only: vec![false; n],
             undo: Vec::new(),
             status: String::new(),
             id: egui::Id::new(("imgview", std::time::Instant::now())),
@@ -185,6 +187,10 @@ impl ImageView {
             (_, true) => (0, 1),
             (_, false) => (2, 1),
         };
+        if self.read_only[to] {
+            self.status = tr("msg.readonly").into();
+            return;
+        }
         let [x, y, w, h] = self.diff.regions[i];
         self.undo.push((self.images.clone(), self.modified.clone()));
         let (src, dst) = if from < to {
@@ -218,10 +224,16 @@ impl ImageView {
     pub fn save(&mut self) -> anyhow::Result<()> {
         for i in 0..self.n() {
             if self.modified[i] {
+                anyhow::ensure!(!self.read_only[i], "{}", tr("msg.readonly"));
                 let format = image::ImageFormat::from_path(&self.paths[i])?;
                 let mut bytes = std::io::Cursor::new(Vec::new());
                 self.images[i].write_to(&mut bytes, format)?;
                 crate::core::fsutil::write_atomic(&self.paths[i], bytes.get_ref())?;
+                // Undo snapshots must describe dirtiness relative to this save, not the
+                // disk contents that existed when the snapshot was taken.
+                for (images, modified) in &mut self.undo {
+                    modified[i] = images[i] != self.images[i];
+                }
                 self.modified[i] = false;
                 self.status = trf(
                     "msg.saved",
@@ -742,5 +754,45 @@ impl ImageView {
         } else {
             self.n() - 1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_locks_and_undo_after_save_protect_disk_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = ["a.png", "b.png"]
+            .iter()
+            .map(|n| dir.path().join(n))
+            .collect();
+        for (i, path) in paths.iter().enumerate() {
+            RgbaImage::from_pixel(1, 1, image::Rgba([i as u8 * 255, 0, 0, 255]))
+                .save(path)
+                .unwrap();
+        }
+        let original = std::fs::read(&paths[1]).unwrap();
+        let mut v = ImageView::load(paths.clone(), &Config::default()).unwrap();
+        v.first_diff();
+        v.read_only[1] = true;
+        v.copy_current(true);
+        assert!(!v.is_modified());
+        v.save().unwrap();
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), original);
+        v.read_only[1] = false;
+        v.copy_current(true);
+        v.save().unwrap();
+        v.undo();
+        assert!(v.is_modified());
+        v.read_only[1] = true;
+        assert!(v.save().is_err());
+        v.read_only[1] = false;
+        v.save().unwrap();
+        assert_eq!(
+            image::open(&paths[1]).unwrap().to_rgba8().get_pixel(0, 0).0,
+            [255, 0, 0, 255]
+        );
     }
 }

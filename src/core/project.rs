@@ -55,6 +55,48 @@ impl Project {
         super::fsutil::write_atomic(path, text.as_bytes())
     }
 
+    /// A portable copy of this live comparison, whose input paths are relative to the
+    /// process working directory. URLs and paths on another Windows drive stay unchanged.
+    pub fn relative_to(&self, project_file: &Path) -> Result<Project> {
+        let project_file = std::path::absolute(project_file)?;
+        let base = project_file.parent().unwrap_or(Path::new(""));
+        let relative = |value: &str| -> Result<String> {
+            if super::web::is_url(value) {
+                return Ok(value.to_string());
+            }
+            let path = std::path::absolute(value)?;
+            let a: Vec<_> = path.components().collect();
+            let b: Vec<_> = base.components().collect();
+            let common = a.iter().zip(&b).take_while(|(a, b)| a == b).count();
+            if common == 0 {
+                return Ok(path.display().to_string());
+            }
+            let mut rel = PathBuf::new();
+            for _ in &b[common..] {
+                rel.push("..");
+            }
+            for c in &a[common..] {
+                rel.push(c.as_os_str());
+            }
+            if rel.as_os_str().is_empty() {
+                rel.push(".");
+            }
+            Ok(rel.display().to_string())
+        };
+        let mut copy = self.clone();
+        copy.paths = self
+            .paths
+            .iter()
+            .map(|p| relative(p))
+            .collect::<Result<_>>()?;
+        if let Some(r) = &self.rules {
+            if Path::new(r).is_absolute() {
+                copy.rules = Some(relative(r)?);
+            }
+        }
+        Ok(copy)
+    }
+
     /// The paths, with relative ones resolved against the folder of the project file.
     pub fn resolved_paths(&self, project_file: &Path) -> Vec<PathBuf> {
         let base = project_file.parent().unwrap_or(Path::new(""));

@@ -97,6 +97,7 @@ pub fn kind(result: &DiffResult, b: usize) -> &'static str {
         BlockKind::LeftOnly => "left-only",
         BlockKind::RightOnly => "right-only",
         BlockKind::BothSame => "both-same",
+        BlockKind::Compatible => "compatible",
         BlockKind::Diff => "changed",
     }
 }

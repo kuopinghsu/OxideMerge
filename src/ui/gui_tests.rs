@@ -955,3 +955,127 @@ fn menus_open_equally_wide() {
         "{widths:?} {fresh:?}"
     );
 }
+
+#[test]
+fn requested_locks_reach_folder_and_image_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let roots: Vec<_> = ["left", "right"].iter().map(|n| d.join(n)).collect();
+    for p in &roots {
+        std::fs::create_dir(p).unwrap();
+    }
+    let request = |paths| {
+        Some(OpenRequest {
+            paths,
+            read_only: vec![true, true],
+            ..Default::default()
+        })
+    };
+    let gui = Gui::start("locked_folders", request(roots));
+    let Content::Folder(v) = &gui.app.tabs[0].content else {
+        panic!("folder view");
+    };
+    assert_eq!(v.read_only, [true, true]);
+    let images: Vec<_> = ["left.png", "right.png"]
+        .iter()
+        .map(|n| d.join(n))
+        .collect();
+    for (i, path) in images.iter().enumerate() {
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([i as u8 * 255, 0, 0, 255]))
+            .save(path)
+            .unwrap();
+    }
+    let before = std::fs::read(&images[0]).unwrap();
+    let mut gui = Gui::start("locked_images", request(images.clone()));
+    let Content::Image(v) = &mut gui.app.tabs[0].content else {
+        panic!("image view");
+    };
+    assert_eq!(v.read_only, [true, true]);
+    v.first_diff();
+    v.copy_current(false);
+    v.save().unwrap();
+    assert!(!v.is_modified());
+    assert_eq!(std::fs::read(&images[0]).unwrap(), before);
+}
+
+#[test]
+fn projects_round_trip_labels_locks_and_move_with_their_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("original");
+    std::fs::create_dir(&original).unwrap();
+    write(&original, &[("a.txt", "old\n"), ("b.txt", "new\n")]);
+    let paths = vec![original.join("a.txt"), original.join("b.txt")];
+    let labels = vec![Some("Original".into()), Some("Edited".into())];
+    let gui = Gui::start(
+        "project_metadata",
+        Some(OpenRequest {
+            paths,
+            descriptions: labels.clone(),
+            read_only: vec![true, false],
+            ..Default::default()
+        }),
+    );
+    let file = original.join("compare.oxmproj");
+    let project = gui.app.tabs[0]
+        .project()
+        .unwrap()
+        .relative_to(&file)
+        .unwrap();
+    assert_eq!(project.paths, ["a.txt", "b.txt"]);
+    assert_eq!(project.descriptions, labels);
+    assert_eq!(project.read_only, [true, false]);
+    project.save(&file).unwrap();
+    let moved = dir.path().join("moved");
+    std::fs::rename(&original, &moved).unwrap();
+    let request = project_request(&moved.join("compare.oxmproj")).unwrap();
+    let gui = Gui::start("project_reopened", Some(request));
+    let view = gui.text_view();
+    assert!(view.panes[0].doc.read_only);
+    assert!(!view.panes[1].doc.read_only);
+    assert_eq!(view.panes[0].doc.description.as_deref(), Some("Original"));
+    assert_eq!(view.panes[1].doc.description.as_deref(), Some("Edited"));
+    assert_eq!(
+        view.panes[0].doc.path.as_deref(),
+        Some(moved.join("a.txt").as_path())
+    );
+}
+
+#[test]
+fn applying_byte_patches_preserves_boms_and_crlf() {
+    for (old, new) in [
+        ("foo\nbar\n", "foo"),
+        ("one\r\n", "one\n"),
+        ("", "\u{feff}"),
+        ("\u{feff}old\r\n", "\u{feff}new\r\n"),
+        ("one\r\ntwo\n", "ONE\r\ntwo\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        write(d, &[("target.txt", old)]);
+        let a = text::doc_from_bytes(None, old.as_bytes(), Some(text::TextEncoding::Utf8));
+        let b = text::doc_from_bytes(None, new.as_bytes(), Some(text::TextEncoding::Utf8));
+        let input = patch::PatchInput {
+            name_a: "a/target.txt",
+            name_b: "b/target.txt",
+            date_a: "",
+            date_b: "",
+            a: &a.lines,
+            b: &b.lines,
+            final_newline_a: a.final_newline,
+            final_newline_b: b.final_newline,
+        };
+        let opts = crate::core::diff::DiffOptions {
+            ignore_eol: false,
+            ignore_codepage: false,
+            ..Default::default()
+        };
+        let patch =
+            patch::make_doc_patch(&input, &[&a, &b], &opts, PatchStyle::Unified, 3).unwrap();
+        std::fs::write(d.join("fix.patch"), patch).unwrap();
+        let mut gui = Gui::start("patch_formats", None);
+        gui.app.apply_patch_file(&d.join("fix.patch"));
+        assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+        gui.app.tabs.last_mut().unwrap().save().unwrap();
+        assert_eq!(std::fs::read(d.join("target.txt")).unwrap(), new.as_bytes());
+    }
+}

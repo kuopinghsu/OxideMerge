@@ -203,7 +203,7 @@ pub(crate) fn kind(result: &DiffResult, b: usize) -> (&'static str, &'static str
         BlockKind::Conflict => ("conf", tr("report.kind_conflict")),
         BlockKind::LeftOnly => ("chg", tr("report.kind_left")),
         BlockKind::RightOnly => ("chg", tr("report.kind_right")),
-        BlockKind::BothSame => ("chg", tr("report.kind_both")),
+        BlockKind::BothSame | BlockKind::Compatible => ("chg", tr("report.kind_both")),
         BlockKind::Diff => ("chg", tr("report.kind_changed")),
     }
 }

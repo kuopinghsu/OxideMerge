@@ -481,3 +481,163 @@ fn files_compare_with_their_git_revision() {
     assert_eq!(run.code, 1, "{}", run.stderr);
     assert!(run.stdout.contains("-old\n+new"), "{}", run.stdout);
 }
+
+#[test]
+fn text_file_format_settings_affect_cli_exit_status() {
+    let d = tmp();
+    let d = d.path();
+    files(
+        d,
+        &[("a.txt", "one\r\n"), ("b.txt", "one\n"), ("end.txt", "one")],
+    );
+    assert_eq!(oxidemerge(d, &["--cli", "a.txt", "b.txt"]).code, 0);
+    std::fs::create_dir_all(d.join(".config")).unwrap();
+    std::fs::write(
+        d.join(".config/config.json"),
+        r#"{"diff":{"ignore_eol":false,"ignore_codepage":false}}"#,
+    )
+    .unwrap();
+    assert_eq!(oxidemerge(d, &["--cli", "a.txt", "b.txt"]).code, 1);
+    assert_eq!(oxidemerge(d, &["--cli", "b.txt", "end.txt"]).code, 1);
+    std::fs::write(
+        d.join("utf16.txt"),
+        [0xff, 0xfe, b'o', 0, b'n', 0, b'e', 0, 10, 0],
+    )
+    .unwrap();
+    assert_eq!(oxidemerge(d, &["--cli", "b.txt", "utf16.txt"]).code, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn generated_patches_apply_with_the_system_patch_utility() {
+    for (old, new) in [
+        ("old", "new"),
+        ("old\n", "new"),
+        ("old", "new\n"),
+        ("one\n", "one"),
+        ("one", "one\n"),
+        ("head\nold", "HEAD\nold"),
+        ("foo\nbar\n", "foo"),
+        ("foo", "foo\nbar\n"),
+    ] {
+        let dir = tmp();
+        let d = dir.path();
+        files(d, &[("a.txt", old), ("b.txt", new), ("target.txt", old)]);
+        for style in ["unified", "context", "normal"] {
+            std::fs::write(d.join("target.txt"), old).unwrap();
+            let run = oxidemerge(
+                d,
+                &[
+                    "--cli",
+                    "--patch-style",
+                    style,
+                    "--patch",
+                    "fix.patch",
+                    "a.txt",
+                    "b.txt",
+                ],
+            );
+            assert_eq!(run.code, 1, "{}", run.stderr);
+            let mut native = Command::new("diff");
+            native.current_dir(d);
+            match style {
+                "unified" => {
+                    native.arg("-u");
+                }
+                "context" => {
+                    native.arg("-c");
+                }
+                _ => {}
+            }
+            let native = native.args(["a.txt", "b.txt"]).output().unwrap();
+            assert_eq!(native.status.code(), Some(1));
+            let generated = read(d.join("fix.patch"));
+            let native = String::from_utf8(native.stdout).unwrap();
+            let skip = if style == "normal" { 0 } else { 2 };
+            assert_eq!(
+                generated.lines().skip(skip).collect::<Vec<_>>(),
+                native.lines().skip(skip).collect::<Vec<_>>(),
+                "{style}"
+            );
+            // Apple's legacy patch does not support EOF markers in normal/context patches,
+            // including patches produced by its own diff. Unified patches are portable.
+            if style != "unified" {
+                continue;
+            }
+            let applied = Command::new("patch")
+                .current_dir(d)
+                .args(["target.txt", "fix.patch"])
+                .output()
+                .unwrap();
+            assert!(
+                applied.status.success(),
+                "{old:?} -> {new:?} ({style}): {} {}",
+                String::from_utf8_lossy(&applied.stdout),
+                String::from_utf8_lossy(&applied.stderr)
+            );
+            assert_eq!(
+                std::fs::read(d.join("target.txt")).unwrap(),
+                new.as_bytes(),
+                "{style}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn format_patches_apply_as_bytes_and_unsupported_encodings_leave_no_output() {
+    let dir = tmp();
+    let d = dir.path();
+    std::fs::create_dir(d.join(".config")).unwrap();
+    std::fs::write(
+        d.join(".config/config.json"),
+        r#"{"diff":{"ignore_eol":false,"ignore_codepage":false}}"#,
+    )
+    .unwrap();
+    for (a, b) in [
+        ("one\r\n", "one\n"),
+        ("", "\u{feff}"),
+        ("\u{feff}old\r\n", "new\n"),
+        ("one\r\ntwo\n", "one\ntwo\r\n"),
+    ] {
+        files(d, &[("a.txt", a), ("b.txt", b), ("target.txt", a)]);
+        let run = oxidemerge(d, &["--cli", "--patch", "fix.patch", "a.txt", "b.txt"]);
+        assert_eq!(run.code, 1, "{}", run.stderr);
+        let applied = Command::new("patch")
+            .current_dir(d)
+            .args(["target.txt", "fix.patch"])
+            .output()
+            .unwrap();
+        assert!(
+            applied.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&applied.stdout),
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        assert_eq!(std::fs::read(d.join("target.txt")).unwrap(), b.as_bytes());
+    }
+    std::fs::write(
+        d.join("a.txt"),
+        [0xff, 0xfe, b'o', 0, b'l', 0, b'd', 0, 10, 0],
+    )
+    .unwrap();
+    files(d, &[("b.txt", "new\n")]);
+    let run = oxidemerge(
+        d,
+        &[
+            "--cli",
+            "-t",
+            "text",
+            "--patch",
+            "unsupported.patch",
+            "a.txt",
+            "b.txt",
+        ],
+    );
+    assert_eq!(run.code, 2);
+    assert!(run.stderr.contains("UTF-8"), "{}", run.stderr);
+    assert!(!d.join("unsupported.patch").exists());
+    let run = oxidemerge(d, &["--cli", "-t", "text", "a.txt", "b.txt"]);
+    assert_eq!(run.code, 1);
+}

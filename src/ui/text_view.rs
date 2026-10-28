@@ -258,10 +258,17 @@ struct Snapshot {
 }
 
 /// How a file is written: encoding, byte order mark, line ending, final newline, mixed endings.
-type Format = (TextEncoding, bool, Eol, bool, bool);
+type Format = (TextEncoding, bool, Eol, bool, bool, Vec<Option<Eol>>);
 
 fn format_of(d: &TextDoc) -> Format {
-    (d.encoding, d.bom, d.eol, d.final_newline, d.mixed_eol)
+    (
+        d.encoding,
+        d.bom,
+        d.eol,
+        d.final_newline,
+        d.mixed_eol,
+        d.original_eols.clone(),
+    )
 }
 
 /// Makes the merge result pane (the middle of three, else the right one) save to `out`.
@@ -684,6 +691,11 @@ impl TextView {
         let lens: Vec<usize> = refs.iter().map(|l| l.len()).collect();
         self.sync_points = diff::valid_sync_points(&self.sync_points, &lens);
         self.diff = diff::compute_synced(&refs, &self.opts, syntax, &self.sync_points);
+        diff::include_doc_formats(
+            &mut self.diff,
+            &self.panes.iter().map(|p| &p.doc).collect::<Vec<_>>(),
+            &self.opts,
+        );
         for (p, marks) in self.bookmarks.iter_mut().enumerate() {
             let n = self.panes[p].doc.lines.len();
             marks.retain(|&l, _| l < n);
@@ -1086,7 +1098,14 @@ impl TextView {
         for (i, f) in s.formats.into_iter().enumerate() {
             if let Some(f) = f {
                 let d = &mut self.panes[i].doc;
-                (d.encoding, d.bom, d.eol, d.final_newline, d.mixed_eol) = f;
+                (
+                    d.encoding,
+                    d.bom,
+                    d.eol,
+                    d.final_newline,
+                    d.mixed_eol,
+                    d.original_eols,
+                ) = f;
             }
         }
         for (i, lines) in s.lines.into_iter().enumerate() {
@@ -1147,7 +1166,29 @@ impl TextView {
     fn replace_block_lines(&mut self, b: usize, from: usize, to: usize) {
         let blk = self.diff.blocks[b].clone();
         let src: Vec<String> = self.panes[from].doc.lines[blk.ranges[from].clone()].to_vec();
-        self.panes[to].doc.lines.splice(blk.ranges[to].clone(), src);
+        let eof = blk.ranges[from].end == self.panes[from].doc.lines.len()
+            && blk.ranges[to].end == self.panes[to].doc.lines.len();
+        let whole = eof && blk.ranges[from].start == 0 && blk.ranges[to].start == 0;
+        let source = format_of(&self.panes[from].doc);
+        let old = format_of(&self.panes[to].doc);
+        let d = &mut self.panes[to].doc;
+        d.lines.splice(blk.ranges[to].clone(), src);
+        if eof {
+            d.final_newline = source.3;
+        }
+        if whole && !self.opts.ignore_eol {
+            d.eol = source.2;
+            d.mixed_eol = false;
+        }
+        if whole && !self.opts.ignore_codepage {
+            d.encoding = source.0;
+            d.bom = source.1;
+        }
+        if format_of(d) != old {
+            if let Some(s) = self.undo.last_mut() {
+                s.formats[to].get_or_insert(old);
+            }
+        }
     }
 
     /// A new or empty file is written like the one it is first copied from, with one kind of
@@ -1164,7 +1205,7 @@ impl TextView {
         (d.encoding, d.bom, d.eol, d.final_newline) = (f.0, f.1, f.2, f.3);
         d.mixed_eol = false;
         if let Some(s) = self.undo.last_mut() {
-            s.formats[to] = Some(old);
+            s.formats[to].get_or_insert(old);
         }
     }
 
@@ -1181,6 +1222,7 @@ impl TextView {
         }
         let d = &mut self.panes[pane].doc;
         (d.eol, d.mixed_eol, d.modified) = (e, false, true);
+        self.rediff();
     }
 
     fn writable(&mut self, pane: usize) -> bool {
@@ -1332,6 +1374,18 @@ impl TextView {
             self.replace_block_lines(b, from, to);
         }
         self.take_format(from, to, was_empty);
+        let old = format_of(&self.panes[to].doc);
+        let source = format_of(&self.panes[from].doc);
+        let d = &mut self.panes[to].doc;
+        if !self.opts.ignore_eol {
+            (d.eol, d.mixed_eol, d.original_eols) = (source.2, source.4, source.5);
+        }
+        if !self.opts.ignore_codepage {
+            (d.encoding, d.bom) = (source.0, source.1);
+        }
+        if format_of(d) != old {
+            self.undo.last_mut().unwrap().formats[to].get_or_insert(old);
+        }
         self.mark_changed(&[to]);
         self.cur_block = None;
         self.status = trf("msg.copied_blocks", &[("n", blocks.len().to_string())]);
@@ -1388,6 +1442,10 @@ impl TextView {
         if self.n() != 3 || !self.writable(1) {
             return;
         }
+        let formats: Vec<_> = self.panes.iter().map(|p| format_of(&p.doc)).collect();
+        let refs: Vec<&[String]> = self.panes.iter().map(|p| p.doc.lines.as_slice()).collect();
+        self.diff =
+            diff::compute_synced(&refs, &self.opts, self.comment_syntax(), &self.sync_points);
         self.push_undo();
         let was_empty = self.panes[1].doc.lines.is_empty();
         let blocks: Vec<(usize, BlockKind)> = self
@@ -1408,6 +1466,30 @@ impl TextView {
             merged += 1;
         }
         self.take_format(first_from, 1, was_empty);
+        fn merge<T: PartialEq + Clone>(left: &T, base: &T, right: &T) -> T {
+            if left == base {
+                right.clone()
+            } else if right == base || left == right {
+                left.clone()
+            } else {
+                base.clone()
+            }
+        }
+        let [l, b, r] = [&formats[0], &formats[1], &formats[2]];
+        let d = &mut self.panes[1].doc;
+        // These are independent properties: a text edit need not conflict with a BOM edit.
+        if !self.opts.ignore_codepage {
+            d.encoding = merge(&l.0, &b.0, &r.0);
+            d.bom = merge(&l.1, &b.1, &r.1);
+        }
+        if !self.opts.ignore_eol {
+            let endings = |f: &Format| (f.2, f.4, f.5.clone());
+            (d.eol, d.mixed_eol, d.original_eols) = merge(&endings(l), &endings(b), &endings(r));
+        }
+        d.final_newline = merge(&l.3, &b.3, &r.3);
+        if format_of(d) != formats[1] {
+            self.undo.last_mut().unwrap().formats[1].get_or_insert(formats[1].clone());
+        }
         self.mark_changed(&[1]);
         self.cur_block = None;
         self.status = trf(
@@ -1580,6 +1662,7 @@ impl TextView {
         doc.save()?;
         self.status = trf("msg.saved", &[("file", doc.title())]);
         self.saved(p);
+        self.rediff();
         Ok(true)
     }
 
@@ -1676,6 +1759,7 @@ impl TextView {
         doc.description = None;
         self.status = trf("msg.saved", &[("file", doc.title())]);
         self.saved(p);
+        self.rediff();
         Ok(true)
     }
 
@@ -1725,9 +1809,9 @@ impl TextView {
         self.rediff();
     }
 
-    pub fn make_patch(&self, style: PatchStyle, context: usize) -> Option<String> {
+    pub fn make_patch(&self, style: PatchStyle, context: usize) -> Result<Option<String>, String> {
         if self.n() != 2 {
-            return None;
+            return Ok(None);
         }
         let a = &self.panes[0].doc;
         let b = &self.panes[1].doc;
@@ -1746,8 +1830,10 @@ impl TextView {
             date_b: &date(b),
             a: &a.lines,
             b: &b.lines,
+            final_newline_a: a.final_newline,
+            final_newline_b: b.final_newline,
         };
-        Some(patch::make_patch(&input, &self.diff, style, context))
+        patch::make_doc_patch(&input, &[a, b], &self.opts, style, context).map(Some)
     }
 
     /// The title of every side.
@@ -4097,6 +4183,128 @@ impl TextView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strict_config() -> Config {
+        Config {
+            diff: DiffOptions {
+                ignore_eol: false,
+                ignore_codepage: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn copy_all_transfers_formats_across_content_blocks_and_undoes() {
+        let cfg = strict_config();
+        let mut a = TextDoc::from_text(None, "one\r\nTWO\r\nthree\r\n");
+        a.encoding = TextEncoding::Utf16Le;
+        a.bom = true;
+        let b = TextDoc::from_text(None, "one\ntwo\nthree\n");
+        let old = format_of(&b);
+        let mut v = TextView::new(vec![a.clone(), b], &cfg);
+        assert!(v.diff.blocks.len() > 1);
+        v.copy_all(0, 1);
+        assert!(v.diff.is_identical());
+        assert_eq!(format_of(&v.panes[1].doc), format_of(&a));
+        v.undo();
+        assert_eq!(format_of(&v.panes[1].doc), old);
+        assert_eq!(v.panes[1].doc.lines[1], "two");
+        v.redo();
+        assert!(v.diff.is_identical());
+    }
+
+    #[test]
+    fn auto_merge_combines_text_and_each_independent_format_property() {
+        let cfg = strict_config();
+        let left = TextDoc::from_text(None, "ONE\ntwo\n");
+        let base = TextDoc::from_text(None, "one\ntwo\n");
+        let mut right = TextDoc::from_text(None, "one\r\ntwo\r\n");
+        right.bom = true;
+        right.encoding = TextEncoding::Utf16Le;
+        let original = format_of(&base);
+        let mut v = TextView::new(vec![left, base, right.clone()], &cfg);
+        assert_eq!(v.diff.conflicts(), 0);
+        assert!(v
+            .diff
+            .blocks
+            .iter()
+            .any(|b| b.kind == BlockKind::Compatible));
+        v.auto_merge();
+        assert_eq!(v.panes[1].doc.lines, ["ONE", "two"]);
+        assert_eq!(format_of(&v.panes[1].doc), format_of(&right));
+        assert_eq!(v.diff.conflicts(), 0);
+        v.undo();
+        assert_eq!(v.panes[1].doc.lines, ["one", "two"]);
+        assert_eq!(format_of(&v.panes[1].doc), original);
+        v.redo();
+        assert_eq!(v.panes[1].doc.lines, ["ONE", "two"]);
+        assert_eq!(format_of(&v.panes[1].doc), format_of(&right));
+    }
+
+    #[test]
+    fn automatic_merge_keeps_real_format_conflicts_visible() {
+        let cfg = strict_config();
+        let left = TextDoc::from_text(None, "one\r\n");
+        let base = TextDoc::from_text(None, "one\n");
+        let right = TextDoc::from_text(None, "one\r");
+        let mut v = TextView::new(vec![left, base, right], &cfg);
+        assert_eq!(v.diff.conflicts(), 1);
+        v.auto_merge();
+        assert_eq!(v.panes[1].doc.eol, Eol::Lf);
+        assert_eq!(v.diff.conflicts(), 1);
+    }
+
+    #[test]
+    fn saving_mixed_endings_refreshes_the_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = [dir.path().join("a.txt"), dir.path().join("b.txt")];
+        std::fs::write(&paths[0], b"ONE\r\ntwo\nthree\n").unwrap();
+        std::fs::write(&paths[1], b"one\r\ntwo\nthree\n").unwrap();
+        let docs = paths
+            .iter()
+            .map(|p| text::load_doc(p, None).unwrap())
+            .collect();
+        let mut v = TextView::new(docs, &strict_config());
+        v.copy_block(0, 0, 1);
+        assert!(v.diff.is_identical());
+        v.save_pane(1).unwrap();
+        assert!(!v.diff.is_identical());
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), b"ONE\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn rediff_and_eol_changes_use_document_formats() {
+        let cfg = Config {
+            diff: DiffOptions {
+                ignore_eol: false,
+                ignore_codepage: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let a = TextDoc::from_text(None, "one\r\n");
+        let b = TextDoc::from_text(None, "one\n");
+        let mut v = TextView::new(vec![a, b], &cfg);
+        assert!(!v.diff.is_identical());
+        v.copy_block(0, 0, 1);
+        assert!(v.diff.is_identical());
+        v.undo();
+        assert!(!v.diff.is_identical());
+        v.set_eol(1, Eol::CrLf);
+        assert!(v.diff.is_identical());
+        v.undo();
+        assert!(!v.diff.is_identical());
+        let a = TextDoc::from_text(None, "one\n");
+        let b = TextDoc::from_text(None, "one");
+        let mut v = TextView::new(vec![a, b], &cfg);
+        v.copy_block(0, 0, 1);
+        assert!(v.diff.is_identical());
+        assert!(v.panes[1].doc.final_newline);
+        v.undo();
+        assert!(!v.panes[1].doc.final_newline);
+    }
 
     #[test]
     fn finds_words_and_patterns_and_replaces_them() {

@@ -140,6 +140,8 @@ fn unified(a: &[String], b: &[String], r: &DiffResult, context: usize) -> String
         date_b: "",
         a,
         b,
+        final_newline_a: true,
+        final_newline_b: true,
     };
     make_patch(&input, r, PatchStyle::Unified, context)
 }

@@ -49,6 +49,11 @@ The following are **trusted**, because they configure what OxideMerge runs:
   as an environment variable in double quotes (`"%OXIDEMERGE_FILE%"`): in quotes nothing in a
   Windows file name is special, and the name can't contain a quote to end them. Quotes written
   around `${file}` are dropped, as they would pair with these and leave the path unquoted.
+- **Git configuration** (repository, user and system), including checkout/smudge filters.
+  Git revision comparisons honor these filters, so configured filter commands can execute
+  with your permissions. Repository attributes select configured filters; attributes alone
+  do not define executable commands. Git LFS and custom filters may download content or
+  otherwise access the network. Compare revisions only with Git configuration you trust.
 - **Compare rules and filter files** in the configuration folder.
 - **Project files** (`.oxmproj`, `.winmerge`) only name paths and compare options; they can't
   name commands.
@@ -58,8 +63,9 @@ and the system's file opener when you choose *Open with associated application* 
 manager*. On Windows files are opened through the shell's file associations, and Explorer gets
 the path to show in quotes; neither goes through `cmd`.
 
-OxideMerge doesn't collect or send anything. It connects to the network only for the web
-addresses you compare and the resources those pages name.
+OxideMerge has no application telemetry. Its own downloads are for the web addresses you
+compare and the resources those pages name. The browser, Git LFS, configured Git filters and
+unpacker commands can also access the network under their own configuration.
 
 ## Dependencies
 

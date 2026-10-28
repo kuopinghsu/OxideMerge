@@ -19,6 +19,8 @@ pub struct PatchInput<'a> {
     pub date_b: &'a str,
     pub a: &'a [String],
     pub b: &'a [String],
+    pub final_newline_a: bool,
+    pub final_newline_b: bool,
 }
 
 pub fn make_patch(
@@ -27,9 +29,44 @@ pub fn make_patch(
     style: PatchStyle,
     context: usize,
 ) -> String {
+    let mut formatted;
+    let result = if input.final_newline_a != input.final_newline_b {
+        formatted = result.clone();
+        let mut a = super::text::TextDoc::empty(None);
+        let mut b = super::text::TextDoc::empty(None);
+        a.lines = input.a.to_vec();
+        b.lines = input.b.to_vec();
+        a.final_newline = input.final_newline_a;
+        b.final_newline = input.final_newline_b;
+        super::diff::include_doc_formats(
+            &mut formatted,
+            &[&a, &b],
+            &super::diff::DiffOptions::default(),
+        );
+        &formatted
+    } else {
+        result
+    };
     // As with `diff -B`, differences the compare options ignore stay out of the patch, unless a
     // hunk with other changes takes them in: its context lines come from one side only.
-    let blocks: Vec<&Block> = result.blocks.iter().collect();
+    // Metadata can split one replacement into adjacent blocks. Coalesce those before
+    // emitting removals/additions so a hunk has the same ordering as a native diff.
+    let mut merged: Vec<Block> = Vec::new();
+    for block in &result.blocks {
+        if let Some(last) = merged.last_mut() {
+            if last.ignored == block.ignored
+                && (0..2).all(|p| last.ranges[p].end == block.ranges[p].start)
+            {
+                for p in 0..2 {
+                    last.ranges[p].end = block.ranges[p].end;
+                }
+                last.rows += block.rows;
+                continue;
+            }
+        }
+        merged.push(block.clone());
+    }
+    let blocks: Vec<&Block> = merged.iter().collect();
     if blocks.iter().all(|b| b.ignored) {
         return String::new();
     }
@@ -43,6 +80,95 @@ pub fn make_patch(
     }
 }
 
+/// Raw UTF-8 patch lines, retaining CRs and BOMs as bytes represented in the patch.
+/// Unified patches are line oriented; other encodings and lone-CR terminators cannot
+/// safely be written as UTF-8 patch text.
+pub fn document_lines(doc: &super::text::TextDoc) -> Result<(Vec<String>, bool), String> {
+    raw_lines(doc, None, doc.bom)
+}
+
+fn raw_lines(
+    doc: &super::text::TextDoc,
+    eols: Option<&super::text::TextDoc>,
+    bom: bool,
+) -> Result<(Vec<String>, bool), String> {
+    if doc.encoding != super::text::TextEncoding::Utf8 {
+        return Err(format!(
+            "Cannot export/apply a text patch for {}: {} encoding is not supported; use UTF-8.",
+            doc.title(),
+            doc.encoding.name()
+        ));
+    }
+    let mut text = String::new();
+    if bom {
+        text.push('\u{feff}');
+    }
+    for (i, line) in doc.lines.iter().enumerate() {
+        text.push_str(line);
+        if let Some(eol) = doc.line_eol(i) {
+            let eol = eols.map_or(eol, |source| source.line_eol(i).unwrap_or(source.eol));
+            if eol == super::text::Eol::Cr {
+                return Err(format!("Cannot export/apply a text patch for {}: lone-CR line endings are not supported; use LF or CRLF.", doc.title()));
+            }
+            text.push_str(eol.as_str());
+        }
+    }
+    let final_newline = text.is_empty() || text.ends_with('\n');
+    Ok((
+        text.split_terminator('\n').map(str::to_string).collect(),
+        final_newline,
+    ))
+}
+
+/// Produces a patch of the document bytes, subject to the selected ignore options.
+/// Errors are returned before any patch file is created instead of exporting a no-op
+/// patch for a format the text patch format cannot represent.
+pub fn make_doc_patch(
+    input: &PatchInput,
+    docs: &[&super::text::TextDoc],
+    opts: &super::diff::DiffOptions,
+    style: PatchStyle,
+    context: usize,
+) -> Result<String, String> {
+    let syntax = docs
+        .iter()
+        .find_map(|d| d.path.as_deref().and_then(super::comments::for_path));
+    let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
+    let mut visible = super::diff::compute_with(&refs, opts, syntax);
+    super::diff::include_doc_formats(&mut visible, docs, opts);
+    if visible.is_identical() {
+        return Ok(String::new());
+    }
+    let (a, na) = document_lines(docs[0])?;
+    // Ignored document-wide style changes stay out of the patch, like ignored text changes.
+    let (b, nb) = raw_lines(
+        docs[1],
+        opts.ignore_eol.then_some(docs[0]),
+        if opts.ignore_codepage {
+            docs[0].bom
+        } else {
+            docs[1].bom
+        },
+    )?;
+    let mut result = super::diff::compute_with(&[&a, &b], opts, syntax);
+    // Whitespace-ignore options must not erase explicitly requested EOL differences.
+    let mut da = docs[0].clone();
+    let mut db = docs[1].clone();
+    da.lines = a.clone();
+    da.final_newline = na;
+    db.lines = b.clone();
+    db.final_newline = nb;
+    super::diff::include_doc_formats(&mut result, &[&da, &db], opts);
+    let input = PatchInput {
+        a: &a,
+        b: &b,
+        final_newline_a: na,
+        final_newline_b: nb,
+        ..*input
+    };
+    Ok(make_patch(&input, &result, style, context))
+}
+
 /// Patch of all differing or unique text files of a 2-way folder compare.
 pub fn folder_patch(
     roots: &[std::path::PathBuf],
@@ -51,7 +177,7 @@ pub fn folder_patch(
     opts: &super::diff::DiffOptions,
     style: PatchStyle,
     context: usize,
-) -> String {
+) -> Result<String, String> {
     use super::folder::CmpStatus;
     let mut out = String::new();
     for it in items
@@ -61,36 +187,41 @@ pub fn folder_patch(
         if it.binary {
             continue;
         }
-        let load = |s: usize| -> Option<(Vec<String>, String, String)> {
-            let name = format!("{}/{}", display_roots[s].replace('\\', "/"), it.rel_path());
-            if !it.exists[s] {
-                return Some((Vec::new(), name, String::new()));
+        let load = |side: usize| -> Result<super::text::TextDoc, String> {
+            if !it.exists[side] {
+                return Ok(super::text::TextDoc::empty(None));
             }
-            let bytes = std::fs::read(it.path(&roots[s])).ok()?;
-            if super::text::looks_binary(&bytes) {
-                return None;
-            }
-            let doc = super::text::doc_from_bytes(None, &bytes, None);
-            Some((doc.lines, name, super::report::fmt_time(it.mtime[s])))
+            super::text::load_doc(&it.path(&roots[side]), None).map_err(|e| e.to_string())
         };
-        let (Some(a), Some(b)) = (load(0), load(1)) else {
-            continue;
-        };
-        let r = super::diff::compute(&[&a.0, &b.0], opts);
-        if r.blocks.is_empty() {
-            continue;
-        }
+        let (a, b) = (load(0)?, load(1)?);
         let input = PatchInput {
-            name_a: &a.1,
-            name_b: &b.1,
-            date_a: &a.2,
-            date_b: &b.2,
-            a: &a.0,
-            b: &b.0,
+            name_a: &format!("{}/{}", display_roots[0].replace('\\', "/"), it.rel_path()),
+            name_b: &format!("{}/{}", display_roots[1].replace('\\', "/"), it.rel_path()),
+            date_a: &super::report::fmt_time(it.mtime[0]),
+            date_b: &super::report::fmt_time(it.mtime[1]),
+            a: &a.lines,
+            b: &b.lines,
+            final_newline_a: a.final_newline,
+            final_newline_b: b.final_newline,
         };
-        out.push_str(&make_patch(&input, &r, style, context));
+        out.push_str(&make_doc_patch(&input, &[&a, &b], opts, style, context)?);
     }
-    out
+    Ok(out)
+}
+
+fn write_lines(
+    out: &mut String,
+    prefix: &str,
+    lines: &[String],
+    range: Range<usize>,
+    final_newline: bool,
+) {
+    for i in range {
+        let _ = writeln!(out, "{prefix}{}", lines[i]);
+        if i + 1 == lines.len() && !final_newline {
+            out.push_str("\\ No newline at end of file\n");
+        }
+    }
 }
 
 fn range_normal(r: &Range<usize>) -> String {
@@ -113,15 +244,11 @@ fn normal(input: &PatchInput, blocks: &[&Block]) -> String {
             ('c', range_normal(ra), range_normal(rb))
         };
         let _ = writeln!(out, "{la}{cmd}{lb}");
-        for l in &input.a[ra.clone()] {
-            let _ = writeln!(out, "< {l}");
-        }
+        write_lines(&mut out, "< ", input.a, ra.clone(), input.final_newline_a);
         if cmd == 'c' {
             out.push_str("---\n");
         }
-        for l in &input.b[rb.clone()] {
-            let _ = writeln!(out, "> {l}");
-        }
+        write_lines(&mut out, "> ", input.b, rb.clone(), input.final_newline_b);
     }
     out
 }
@@ -172,20 +299,30 @@ fn unified(input: &PatchInput, blocks: &[&Block], ctx: usize) -> String {
         let _ = writeln!(out, "@@ -{} +{} @@", unified_range(&ra), unified_range(&rb));
         let mut pos = ra.start;
         for b in &h {
-            for l in &input.a[pos..b.ranges[0].start] {
-                let _ = writeln!(out, " {l}");
-            }
-            for l in &input.a[b.ranges[0].clone()] {
-                let _ = writeln!(out, "-{l}");
-            }
-            for l in &input.b[b.ranges[1].clone()] {
-                let _ = writeln!(out, "+{l}");
-            }
+            write_lines(
+                &mut out,
+                " ",
+                input.a,
+                pos..b.ranges[0].start,
+                input.final_newline_a,
+            );
+            write_lines(
+                &mut out,
+                "-",
+                input.a,
+                b.ranges[0].clone(),
+                input.final_newline_a,
+            );
+            write_lines(
+                &mut out,
+                "+",
+                input.b,
+                b.ranges[1].clone(),
+                input.final_newline_b,
+            );
             pos = b.ranges[0].end;
         }
-        for l in &input.a[pos..ra.end] {
-            let _ = writeln!(out, " {l}");
-        }
+        write_lines(&mut out, " ", input.a, pos..ra.end, input.final_newline_a);
     }
     out
 }
@@ -209,35 +346,47 @@ fn context_fmt(input: &PatchInput, blocks: &[&Block], ctx: usize) -> String {
         if h.iter().any(|b| !b.ranges[0].is_empty()) {
             let mut pos = ra.start;
             for b in &h {
-                for l in &input.a[pos..b.ranges[0].start] {
-                    let _ = writeln!(out, "  {l}");
-                }
+                write_lines(
+                    &mut out,
+                    "  ",
+                    input.a,
+                    pos..b.ranges[0].start,
+                    input.final_newline_a,
+                );
                 let mark = if b.ranges[1].is_empty() { '-' } else { '!' };
-                for l in &input.a[b.ranges[0].clone()] {
-                    let _ = writeln!(out, "{mark} {l}");
-                }
+                write_lines(
+                    &mut out,
+                    &format!("{mark} "),
+                    input.a,
+                    b.ranges[0].clone(),
+                    input.final_newline_a,
+                );
                 pos = b.ranges[0].end;
             }
-            for l in &input.a[pos..ra.end] {
-                let _ = writeln!(out, "  {l}");
-            }
+            write_lines(&mut out, "  ", input.a, pos..ra.end, input.final_newline_a);
         }
         let _ = writeln!(out, "--- {} ----", context_range(&rb));
         if h.iter().any(|b| !b.ranges[1].is_empty()) {
             let mut pos = rb.start;
             for b in &h {
-                for l in &input.b[pos..b.ranges[1].start] {
-                    let _ = writeln!(out, "  {l}");
-                }
+                write_lines(
+                    &mut out,
+                    "  ",
+                    input.b,
+                    pos..b.ranges[1].start,
+                    input.final_newline_b,
+                );
                 let mark = if b.ranges[0].is_empty() { '+' } else { '!' };
-                for l in &input.b[b.ranges[1].clone()] {
-                    let _ = writeln!(out, "{mark} {l}");
-                }
+                write_lines(
+                    &mut out,
+                    &format!("{mark} "),
+                    input.b,
+                    b.ranges[1].clone(),
+                    input.final_newline_b,
+                );
                 pos = b.ranges[1].end;
             }
-            for l in &input.b[pos..rb.end] {
-                let _ = writeln!(out, "  {l}");
-            }
+            write_lines(&mut out, "  ", input.b, pos..rb.end, input.final_newline_b);
         }
     }
     out
@@ -257,6 +406,8 @@ pub struct Hunk {
     /// 1-based first line in the patched file (0 when the hunk empties the file).
     pub new_start: usize,
     pub lines: Vec<HunkLine>,
+    pub old_no_newline: bool,
+    pub new_no_newline: bool,
 }
 
 impl Hunk {
@@ -351,7 +502,8 @@ fn parse_range(s: &str) -> Option<(usize, usize)> {
 
 /// Parses a unified diff (plain, `git diff` or `svn diff` output) into per-file patches.
 pub fn parse_unified(text: &str) -> Result<Vec<FilePatch>, String> {
-    let lines: Vec<&str> = text.lines().collect();
+    // A CR at the end of a hunk body is file data (a CRLF terminator), not patch framing.
+    let lines: Vec<&str> = text.split_terminator('\n').collect();
     let mut files: Vec<FilePatch> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -381,19 +533,34 @@ pub fn parse_unified(text: &str) -> Result<Vec<FilePatch>, String> {
                 old_start,
                 new_start,
                 lines: Vec::new(),
+                old_no_newline: false,
+                new_no_newline: false,
             };
             i += 1;
-            while i < lines.len() && (old_left > 0 || new_left > 0) {
+            while i < lines.len()
+                && (old_left > 0 || new_left > 0 || lines[i] == "\\ No newline at end of file")
+            {
                 let h = lines[i];
+                if h == "\\ No newline at end of file" {
+                    match hunk.lines.last() {
+                        Some(HunkLine::Context(_)) => {
+                            hunk.old_no_newline = true;
+                            hunk.new_no_newline = true;
+                        }
+                        Some(HunkLine::Remove(_)) => hunk.old_no_newline = true,
+                        Some(HunkLine::Add(_)) => hunk.new_no_newline = true,
+                        None => {
+                            return Err(format!("line {}: newline marker without a line", i + 1))
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
                 let (kind, body) = match h.chars().next() {
                     Some(' ') => (' ', &h[1..]),
                     None => (' ', ""),
                     Some('-') => ('-', &h[1..]),
                     Some('+') => ('+', &h[1..]),
-                    Some('\\') => {
-                        i += 1;
-                        continue;
-                    }
                     _ => return Err(format!("line {}: unexpected line inside a hunk", i + 1)),
                 };
                 match kind {
@@ -436,6 +603,8 @@ pub fn parse_unified(text: &str) -> Result<Vec<FilePatch>, String> {
 
 pub struct Applied {
     pub lines: Vec<String>,
+    /// EOF state when an applied hunk reaches the final line; otherwise preserve the input.
+    pub final_newline: Option<bool>,
     /// 1-based numbers of the hunks that could not be placed.
     pub failed: Vec<usize>,
 }
@@ -456,6 +625,7 @@ fn matches_at(lines: &[String], at: usize, old: &[&str], loose: bool) -> bool {
 pub fn apply(lines: &[String], patch: &FilePatch) -> Applied {
     let mut out = lines.to_vec();
     let mut failed = Vec::new();
+    let mut final_newline = None;
     let mut delta: isize = 0;
     let mut floor = 0usize;
     for (n, h) in patch.hunks.iter().enumerate() {
@@ -475,18 +645,28 @@ pub fn apply(lines: &[String], patch: &FilePatch) -> Applied {
         let found = [false, true].into_iter().find_map(|loose| {
             (0..=out.len()).find_map(|d| {
                 let after = expected + d;
-                if after <= last && after >= floor && matches_at(&out, after, &old, loose) {
+                if after <= last
+                    && after >= floor
+                    && (!(h.old_no_newline || h.new_no_newline) || after + old.len() == out.len())
+                    && matches_at(&out, after, &old, loose)
+                {
                     return Some(after);
                 }
                 let before = expected.checked_sub(d)?;
-                (d > 0 && before >= floor && matches_at(&out, before, &old, loose))
-                    .then_some(before)
+                (d > 0
+                    && before >= floor
+                    && (!(h.old_no_newline || h.new_no_newline) || before + old.len() == out.len())
+                    && matches_at(&out, before, &old, loose))
+                .then_some(before)
             })
         });
         match found {
             Some(found) => {
                 let new = h.new_lines();
                 let added = new.len();
+                if found + old.len() == out.len() {
+                    final_newline = Some(!h.new_no_newline);
+                }
                 out.splice(found..found + old.len(), new);
                 // The hunks after it are as far from their stated lines as this one was.
                 delta += found as isize - at + added as isize - old.len() as isize;
@@ -495,7 +675,11 @@ pub fn apply(lines: &[String], patch: &FilePatch) -> Applied {
             None => failed.push(n + 1),
         }
     }
-    Applied { lines: out, failed }
+    Applied {
+        lines: out,
+        final_newline,
+        failed,
+    }
 }
 
 #[cfg(test)]
@@ -505,6 +689,150 @@ mod tests {
 
     fn v(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn patches_round_trip_moving_eof_and_utf8_formats() {
+        use crate::core::text::{self, TextDoc};
+        let texts = [
+            "",
+            "foo",
+            "foo\n",
+            "foo\nbar",
+            "foo\nbar\n",
+            "foo\nbar\nend",
+            "\u{feff}",
+            "\u{feff}foo\r\nbar\n",
+            "foo\r\nbar\r\n",
+        ];
+        let opts = DiffOptions {
+            ignore_eol: false,
+            ignore_codepage: false,
+            ..Default::default()
+        };
+        for old in texts {
+            for new in texts {
+                let a = text::doc_from_bytes(None, old.as_bytes(), Some(text::TextEncoding::Utf8));
+                let b = text::doc_from_bytes(None, new.as_bytes(), Some(text::TextEncoding::Utf8));
+                let input = PatchInput {
+                    name_a: "a/f",
+                    name_b: "b/f",
+                    date_a: "",
+                    date_b: "",
+                    a: &a.lines,
+                    b: &b.lines,
+                    final_newline_a: a.final_newline,
+                    final_newline_b: b.final_newline,
+                };
+                for context in [0, 1, 3] {
+                    let patch =
+                        make_doc_patch(&input, &[&a, &b], &opts, PatchStyle::Unified, context)
+                            .unwrap();
+                    if old == new {
+                        assert!(patch.is_empty());
+                        continue;
+                    }
+                    assert!(!patch.is_empty(), "{old:?} -> {new:?}");
+                    let parsed = parse_unified(&patch).unwrap();
+                    let (lines, nl) = document_lines(&a).unwrap();
+                    let result = apply(&lines, &parsed[0]);
+                    assert!(result.failed.is_empty(), "{old:?} -> {new:?}: {patch}");
+                    assert_eq!(
+                        text::join_lines(
+                            &result.lines,
+                            text::Eol::Lf,
+                            result.final_newline.unwrap_or(nl)
+                        ),
+                        new,
+                        "{old:?} -> {new:?}: {patch}"
+                    );
+                }
+            }
+        }
+        let mut a = TextDoc::from_text(None, "old\n");
+        let b = TextDoc::from_text(None, "new\n");
+        let empty = Vec::new();
+        let input = PatchInput {
+            name_a: "a",
+            name_b: "b",
+            date_a: "",
+            date_b: "",
+            a: &empty,
+            b: &empty,
+            final_newline_a: true,
+            final_newline_b: true,
+        };
+        a.encoding = text::TextEncoding::Utf16Le;
+        assert!(
+            make_doc_patch(&input, &[&a, &b], &opts, PatchStyle::Unified, 3)
+                .unwrap_err()
+                .contains("UTF-8")
+        );
+    }
+
+    #[test]
+    fn patches_preserve_final_newlines_in_both_directions() {
+        for (old, new) in [
+            ("old", "new"),
+            ("old\n", "new"),
+            ("old", "new\n"),
+            ("one\n", "one"),
+            ("one", "one\n"),
+            ("head\nold", "HEAD\nold"),
+            ("", "new"),
+            ("old", ""),
+        ] {
+            let a = super::super::text::TextDoc::from_text(None, old);
+            let b = super::super::text::TextDoc::from_text(None, new);
+            let input = PatchInput {
+                name_a: "a/f.txt",
+                name_b: "b/f.txt",
+                date_a: "",
+                date_b: "",
+                a: &a.lines,
+                b: &b.lines,
+                final_newline_a: a.final_newline,
+                final_newline_b: b.final_newline,
+            };
+            let result = compute(&[&a.lines, &b.lines], &DiffOptions::default());
+            for context in [0, 3] {
+                let text = make_patch(&input, &result, PatchStyle::Unified, context);
+                if context > 0 || old != "head\nold" {
+                    assert!(
+                        text.contains("\\ No newline at end of file"),
+                        "{old:?} -> {new:?}: {text}"
+                    );
+                }
+                let files = parse_unified(&text).unwrap();
+                let patched = apply(&a.lines, &files[0]);
+                assert!(patched.failed.is_empty(), "{text}");
+                assert_eq!(
+                    super::super::text::join_lines(
+                        &patched.lines,
+                        super::super::text::Eol::Lf,
+                        patched.final_newline.unwrap_or(a.final_newline)
+                    ),
+                    new,
+                    "{text}"
+                );
+            }
+            for style in [PatchStyle::Normal, PatchStyle::Context] {
+                if old == "head\nold" && style == PatchStyle::Normal {
+                    continue;
+                }
+                assert!(
+                    make_patch(&input, &result, style, 3).contains("\\ No newline at end of file")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_patch_away_from_eof_preserves_the_original_newline_state() {
+        let files = parse_unified("--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n").unwrap();
+        let result = apply(&v(&["old", "tail"]), &files[0]);
+        assert!(result.failed.is_empty());
+        assert_eq!(result.final_newline, None);
     }
 
     #[test]
@@ -523,6 +851,8 @@ mod tests {
             date_b: "",
             a: &a,
             b: &b,
+            final_newline_a: true,
+            final_newline_b: true,
         };
         let text = format!(
             "diff --git a/dir/f.txt b/dir/f.txt\n{}",
@@ -575,6 +905,8 @@ mod tests {
             date_b: "",
             a: &a,
             b: &b,
+            final_newline_a: true,
+            final_newline_b: true,
         };
         let p = make_patch(&input, &r, PatchStyle::Unified, 3);
         assert!(p.contains("@@ -1,3 +1,3 @@"));
@@ -604,6 +936,8 @@ mod tests {
             date_b: "",
             a: &a,
             b: &b,
+            final_newline_a: true,
+            final_newline_b: true,
         };
         let p = make_patch(&input, &r, PatchStyle::Unified, 3);
         assert_eq!(p.matches("@@ -").count(), 1, "{p}");

@@ -435,7 +435,8 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
                 &cfg.diff,
                 patch_style(cli.patch_style),
                 cli.context,
-            );
+            )
+            .map_err(anyhow::Error::msg)?;
             export(p, &text)?;
         }
         if cli.cli {
@@ -538,7 +539,8 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     }
     let syntax = paths.iter().find_map(|p| core::comments::for_path(p));
     let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
-    let result = core::diff::compute_with(&refs, &cfg.diff, syntax);
+    let mut result = core::diff::compute_with(&refs, &cfg.diff, syntax);
+    core::diff::include_doc_formats(&mut result, &docs.iter().collect::<Vec<_>>(), &cfg.diff);
     if let Some(r) = &cli.report {
         // One note per problem: another type is written as HTML, a slideshow if asked for.
         let format = match ReportFormat::from_path(r) {
@@ -579,14 +581,35 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             date_b: &db,
             a: &docs[0].lines,
             b: &docs[1].lines,
+            final_newline_a: docs[0].final_newline,
+            final_newline_b: docs[1].final_newline,
         };
-        let text =
-            core::patch::make_patch(&input, &result, patch_style(cli.patch_style), cli.context);
-        if let Some(p) = patch {
-            export(p, &text)?;
-        }
-        if cli.cli {
-            print!("{text}");
+        let text = core::patch::make_doc_patch(
+            &input,
+            &[&docs[0], &docs[1]],
+            &cfg.diff,
+            patch_style(cli.patch_style),
+            cli.context,
+        );
+        match text {
+            Ok(text) => {
+                if let Some(p) = patch {
+                    export(p, &text)?;
+                }
+                if cli.cli {
+                    print!("{text}");
+                }
+            }
+            Err(e) if patch.is_some() => return Err(anyhow::anyhow!(e)),
+            Err(e) if cli.cli => println!(
+                "{}\n{e}",
+                if result.is_identical() {
+                    "Identical"
+                } else {
+                    "Different"
+                }
+            ),
+            Err(_) => {}
         }
     } else if cli.cli {
         for b in result.blocks.iter().filter(|b| !b.ignored) {

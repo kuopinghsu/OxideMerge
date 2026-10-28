@@ -106,6 +106,8 @@ pub struct Tab {
     pub content: Content,
     /// Paths used to open this tab (for "compare as" re-opening).
     pub source: Vec<PathBuf>,
+    /// User-provided labels, including view types without editable pane headers.
+    descriptions: Vec<Option<String>>,
     /// The folder compare this tab was opened from, for moving on to its next or previous file.
     origin: Option<Origin>,
     /// Temporary copies of sides (a Git revision, extracted archives), deleted with the last
@@ -122,6 +124,65 @@ struct Origin {
 }
 
 impl Tab {
+    fn project(&self) -> Option<Project> {
+        if self.source.len() < 2 {
+            return None;
+        }
+        let mut proj = Project {
+            paths: self
+                .source
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            descriptions: self.descriptions.clone(),
+            ..Default::default()
+        };
+        match &self.content {
+            Content::Folder(v) => {
+                let (recursive, method) = v.scan_settings();
+                proj.read_only = v.read_only.clone();
+                proj.filter = Some(v.filter_spec.clone());
+                proj.recursive = Some(recursive);
+                proj.method = Some(method);
+                proj.rules = Some(v.rules.clone());
+            }
+            Content::Text(v) => {
+                proj.paths = v
+                    .panes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        p.doc
+                            .path
+                            .as_ref()
+                            .unwrap_or(&self.source[i])
+                            .display()
+                            .to_string()
+                    })
+                    .collect();
+                proj.descriptions = v.panes.iter().map(|p| p.doc.description.clone()).collect();
+                proj.read_only = v.panes.iter().map(|p| p.doc.read_only).collect();
+                proj.kind = Some(kind_name(FileKind::Text).into());
+                proj.rules = v.rules.clone();
+            }
+            Content::Binary(v) => {
+                proj.kind = Some(kind_name(FileKind::Binary).into());
+                proj.read_only = v.read_only.clone();
+            }
+            Content::Image(v) => {
+                proj.kind = Some(kind_name(FileKind::Image).into());
+                proj.descriptions = v.descriptions.clone();
+                proj.read_only = v.read_only.clone();
+            }
+            Content::Web(v) => {
+                proj.kind = Some(kind_name(FileKind::Web).into());
+                proj.read_only = vec![true; v.urls.len()];
+            }
+            Content::Diffs(_) => return None,
+        }
+        Some(proj)
+    }
+
     /// The temporary copies files opened from this tab need kept: its own and the extracted
     /// archives its folder compare shows.
     fn shown_temps(&self) -> Vec<std::sync::Arc<tempfile::TempDir>> {
@@ -2090,6 +2151,9 @@ impl OxideMergeApp {
                 &app.named_filters,
                 &app.cfg,
             );
+            for (i, ro) in req.read_only.iter().enumerate().take(v.read_only.len()) {
+                v.read_only[i] |= *ro;
+            }
             let mut restart = false;
             if let Some(r) = req.recursive {
                 v.set_recursive(r);
@@ -2108,6 +2172,7 @@ impl OxideMergeApp {
             }
             app.cfg.add_recent_filter(&filter_spec);
             app.push_tab(Content::Folder(v), source.clone());
+            app.tabs.last_mut().unwrap().descriptions = req.descriptions.clone();
         };
         if req.kind.is_none() && paths.iter().all(|p| p.is_dir()) {
             let display = paths.iter().map(|p| p.display().to_string()).collect();
@@ -2180,11 +2245,24 @@ impl OxideMergeApp {
                 if missing.iter().any(|&m| m) {
                     anyhow::bail!("{}", tr("msg.image_missing"));
                 }
-                Content::Image(ImageView::load(paths, &self.cfg)?)
+                let mut v = ImageView::load(paths, &self.cfg)?;
+                for (i, desc) in req
+                    .descriptions
+                    .iter()
+                    .enumerate()
+                    .take(v.descriptions.len())
+                {
+                    v.descriptions[i] = desc.clone();
+                }
+                for (i, ro) in req.read_only.iter().enumerate().take(v.read_only.len()) {
+                    v.read_only[i] |= *ro;
+                }
+                Content::Image(v)
             }
             FileKind::Web => unreachable!("web pages are opened above"),
         };
         self.push_tab(content, source);
+        self.tabs.last_mut().unwrap().descriptions = req.descriptions.clone();
         Ok(())
     }
 
@@ -2215,7 +2293,9 @@ impl OxideMergeApp {
             std::fs::write(&copy, bytes)?;
             let paths = vec![copy.clone(), path.to_path_buf()];
             let content = if text::is_image_path(path) {
-                Content::Image(ImageView::load(paths, &self.cfg)?)
+                let mut v = ImageView::load(paths, &self.cfg)?;
+                v.read_only[0] = true;
+                Content::Image(v)
             } else if text::detect_kind(&copy) == FileKind::Binary {
                 let mut v = BinaryView::load(paths)?;
                 v.read_only[0] = true;
@@ -2291,6 +2371,7 @@ impl OxideMergeApp {
             id: self.next_tab_id,
             content,
             source,
+            descriptions: Vec::new(),
             origin: None,
             temps: Vec::new(),
         });
@@ -3723,27 +3804,9 @@ impl OxideMergeApp {
             self.error(tr("msg.project_needs_files"));
             return;
         }
-        let mut proj = Project {
-            paths: tab.source.iter().map(|p| p.display().to_string()).collect(),
-            ..Default::default()
+        let Some(proj) = tab.project() else {
+            return;
         };
-        match &tab.content {
-            Content::Folder(v) => {
-                let (recursive, method) = v.scan_settings();
-                proj.filter = Some(v.filter_spec.clone());
-                proj.recursive = Some(recursive);
-                proj.method = Some(method);
-                proj.rules = Some(v.rules.clone());
-            }
-            Content::Text(v) => {
-                proj.kind = Some(kind_name(FileKind::Text).into());
-                proj.rules = v.rules.clone();
-            }
-            Content::Binary(_) => proj.kind = Some(kind_name(FileKind::Binary).into()),
-            Content::Image(_) => proj.kind = Some(kind_name(FileKind::Image).into()),
-            Content::Web(_) => proj.kind = Some(kind_name(FileKind::Web).into()),
-            Content::Diffs(_) => return,
-        }
         let Some(mut path) = rfd::FileDialog::new()
             .set_title(tr("menu.save_project"))
             .add_filter(tr("label.project"), &[project::EXT])
@@ -3755,7 +3818,7 @@ impl OxideMergeApp {
         if text::extension(&path) != project::EXT {
             path.set_extension(project::EXT);
         }
-        match proj.save(&path) {
+        match proj.relative_to(&path).and_then(|p| p.save(&path)) {
             Ok(()) => self.notify(trf("msg.saved", &[("file", path.display().to_string())])),
             Err(e) => self.error(e.to_string()),
         }
@@ -3839,12 +3902,28 @@ impl OxideMergeApp {
             } else {
                 TextDoc::empty(Some(path.clone()))
             };
-            let result = patch::apply(&original.lines, f);
+            let (raw, original_newline) = match patch::document_lines(&original) {
+                Ok(lines) => lines,
+                Err(e) => {
+                    problems.push(e);
+                    continue;
+                }
+            };
+            let result = patch::apply(&raw, f);
             let mut left = original.clone();
             left.read_only = true;
             left.description = Some(format!("{} ({})", path.display(), tr("label.original")));
-            let mut right = original;
-            right.lines = result.lines;
+            let bytes = text::join_lines(
+                &result.lines,
+                text::Eol::Lf,
+                result.final_newline.unwrap_or(original_newline),
+            );
+            let mut right = text::doc_from_bytes(
+                original.path.clone(),
+                bytes.as_bytes(),
+                Some(text::TextEncoding::Utf8),
+            );
+            right.preserve_eols = true;
             right.modified = true;
             right.description = Some(format!("{} ({})", path.display(), tr("label.patched")));
             let mut v = TextView::new(vec![left, right], &self.cfg);
@@ -5517,13 +5596,16 @@ impl OxideMergeApp {
             self.cfg.patch_context = d.context;
             let text = match self.tabs.get(self.active).map(|t| t.content.view()) {
                 Some(Content::Text(v)) => v.make_patch(d.style, d.context),
-                Some(Content::Folder(v)) if v.n() == 2 => Some(v.make_patch(d.style, d.context)),
-                _ => None,
+                Some(Content::Folder(v)) if v.n() == 2 => {
+                    v.make_patch(d.style, d.context).map(Some)
+                }
+                _ => Ok(None),
             };
             match text {
-                None => self.error(tr("msg.patch_two_way")),
-                Some(_) if d.path.trim().is_empty() => self.patch_dlg = Some(d),
-                Some(t) => {
+                Err(e) => self.error(e),
+                Ok(None) => self.error(tr("msg.patch_two_way")),
+                Ok(Some(_)) if d.path.trim().is_empty() => self.patch_dlg = Some(d),
+                Ok(Some(t)) => {
                     let path = Path::new(d.path.trim());
                     match crate::core::fsutil::write_atomic_with(path, t.as_bytes(), false) {
                         Ok(()) => self.notify(trf("msg.saved", &[("file", d.path.clone())])),

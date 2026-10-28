@@ -111,6 +111,10 @@ pub struct TextDoc {
     pub bom: bool,
     pub eol: Eol,
     pub mixed_eol: bool,
+    /// Patch results retain their exact terminators until the user chooses another EOL style.
+    pub preserve_eols: bool,
+    /// Original terminators of a mixed-EOL document, retained for comparison until normalized.
+    pub(crate) original_eols: Vec<Option<Eol>>,
     pub final_newline: bool,
     pub modified: bool,
     pub read_only: bool,
@@ -128,6 +132,8 @@ impl TextDoc {
             bom: false,
             eol: Eol::platform(),
             mixed_eol: false,
+            preserve_eols: false,
+            original_eols: Vec::new(),
             final_newline: true,
             modified: false,
             read_only: false,
@@ -144,8 +150,22 @@ impl TextDoc {
             doc.eol = eol;
         }
         doc.mixed_eol = mixed;
+        if mixed {
+            doc.original_eols = self::lines(text).map(|(_, eol)| eol).collect();
+        }
         doc.final_newline = nl || doc.lines.is_empty();
         doc
+    }
+
+    /// Terminator of a displayed line; editing or choosing an EOL style can normalize it.
+    pub fn line_eol(&self, line: usize) -> Option<Eol> {
+        if line + 1 == self.lines.len() && !self.final_newline {
+            None
+        } else if self.mixed_eol && self.original_eols.len() == self.lines.len() {
+            self.original_eols[line].or(Some(self.eol))
+        } else {
+            Some(self.eol)
+        }
     }
 
     pub fn title(&self) -> String {
@@ -159,7 +179,17 @@ impl TextDoc {
     }
 
     pub fn text(&self) -> String {
-        join_lines(&self.lines, self.eol, self.final_newline)
+        if !self.preserve_eols {
+            return join_lines(&self.lines, self.eol, self.final_newline);
+        }
+        let mut text = String::new();
+        for (i, line) in self.lines.iter().enumerate() {
+            text.push_str(line);
+            if let Some(eol) = self.line_eol(i) {
+                text.push_str(eol.as_str());
+            }
+        }
+        text
     }
 
     pub fn save(&mut self) -> Result<()> {
@@ -200,7 +230,9 @@ impl TextDoc {
         super::fsutil::write_atomic_with(path, &bytes, backup)?;
         self.path = Some(path.to_path_buf());
         self.modified = false;
-        self.mixed_eol = false;
+        if !self.preserve_eols {
+            self.mixed_eol = false;
+        }
         Ok(())
     }
 }

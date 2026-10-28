@@ -1,7 +1,7 @@
 //! Folder compare view.
 
 use crate::config::Config;
-use crate::core::diff::{self, DiffOptions};
+use crate::core::diff::DiffOptions;
 use crate::core::filter::{FileFilter, FltFilter};
 use crate::core::folder::{self, CmpStatus, DirItem, FolderOptions, Progress, Scanner};
 use crate::core::folder_merge::{self, Step};
@@ -937,8 +937,6 @@ impl FolderView {
                     text::load_doc(&paths[0], None),
                     text::load_doc(&paths[1], None),
                 ) {
-                    let refs: Vec<&[String]> = vec![&a.lines, &b.lines];
-                    let d = diff::compute(&refs, &self.dopts);
                     let rel = it.rel_path();
                     let input = patch::PatchInput {
                         name_a: &format!("a/{rel}"),
@@ -947,8 +945,22 @@ impl FolderView {
                         date_b: "",
                         a: &a.lines,
                         b: &b.lines,
+                        final_newline_a: a.final_newline,
+                        final_newline_b: b.final_newline,
                     };
-                    let p = patch::make_patch(&input, &d, PatchStyle::Unified, 3);
+                    let p = match patch::make_doc_patch(
+                        &input,
+                        &[&a, &b],
+                        &self.dopts,
+                        PatchStyle::Unified,
+                        3,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            out.push((PeekKind::Meta, e));
+                            return out;
+                        }
+                    };
                     if p.is_empty() {
                         out.push((PeekKind::Plain, tr("msg.identical").into()));
                     }
@@ -1474,9 +1486,9 @@ impl FolderView {
     }
 
     /// Patch of all differing/unique text files.
-    pub fn make_patch(&self, style: PatchStyle, context: usize) -> String {
+    pub fn make_patch(&self, style: PatchStyle, context: usize) -> Result<String, String> {
         if self.n() != 2 {
-            return String::new();
+            return Ok(String::new());
         }
         patch::folder_patch(
             &self.roots,

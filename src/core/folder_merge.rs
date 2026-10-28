@@ -235,6 +235,10 @@ pub fn plan(items: &[DirItem], roots: &[PathBuf]) -> Plan {
         if covered {
             continue;
         }
+        if it.status == CmpStatus::Error {
+            steps.insert(i, Step::Conflict);
+            continue;
+        }
         // A file and a folder of one name share their paths, so neither is as listed.
         if clashes.contains(&i) {
             steps.insert(i, Step::Conflict);
@@ -466,6 +470,51 @@ mod tests {
 
     fn read(root: &Path, rel: &str) -> String {
         std::fs::read_to_string(root.join(rel)).unwrap()
+    }
+
+    #[test]
+    fn failed_root_scan_never_turns_into_merge_deletions() {
+        let (_dirs, roots) = folders();
+        write(&roots[1], "keep.txt", "keep\n");
+        write(&roots[2], "keep.txt", "keep\n");
+        std::fs::remove_dir(&roots[0]).unwrap();
+        let items = scan(&roots);
+        assert!(items.iter().any(|it| it.status == CmpStatus::Error));
+        let p = plan(&items, &roots);
+        assert_eq!(p.counts().deletes, 0);
+        assert_eq!(p.counts().conflicts, 1);
+        apply(p, &items, &roots, false);
+        assert_eq!(read(&roots[1], "keep.txt"), "keep\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subtrees_are_errors_instead_of_missing_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dirs, roots) = folders();
+        for root in &roots {
+            write(root, "sub/keep.txt", "keep\n");
+        }
+        let sub = roots[0].join("sub");
+        let perms = std::fs::metadata(&sub).unwrap().permissions();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::read_dir(&sub).is_err();
+        let items = scan(&roots);
+        std::fs::set_permissions(&sub, perms).unwrap();
+        // Root users can enumerate mode-000 directories.
+        if !denied {
+            return;
+        }
+        let it = items.iter().find(|it| it.name == "sub").unwrap();
+        assert_eq!(it.status, CmpStatus::Error);
+        assert!(it.error.is_some());
+        assert_eq!(crate::core::folder::status_counts(&items).3, 1);
+        assert!(!items.iter().any(|it| it.name == "keep.txt"));
+        let p = plan(&items, &roots);
+        assert_eq!(p.counts().deletes, 0);
+        assert_eq!(p.counts().conflicts, 1);
+        apply(p, &items, &roots, false);
+        assert_eq!(read(&roots[1], "sub/keep.txt"), "keep\n");
     }
 
     #[test]

@@ -301,6 +301,8 @@ pub enum BlockKind {
     RightOnly,
     /// Three-way: both sides made the same change (only the middle differs).
     BothSame,
+    /// Three-way: independently mergeable changes to text or different format properties.
+    Compatible,
     /// Three-way: conflicting changes.
     Conflict,
 }
@@ -386,6 +388,135 @@ impl DiffResult {
             }
         }
         best
+    }
+}
+
+/// Adds document format differences to a line diff without inventing lines in the documents.
+/// Final-newline changes are content changes; `ignore_eol` only ignores terminator styles.
+pub fn include_doc_formats(
+    result: &mut DiffResult,
+    docs: &[&super::text::TextDoc],
+    opts: &DiffOptions,
+) {
+    fn kind<T: PartialEq>(values: &[T]) -> Option<BlockKind> {
+        if values.len() == 2 {
+            return (values[0] != values[1]).then_some(BlockKind::Diff);
+        }
+        match (
+            values[0] == values[1],
+            values[2] == values[1],
+            values[0] == values[2],
+        ) {
+            (true, true, _) => None,
+            (false, true, _) => Some(BlockKind::LeftOnly),
+            (true, false, _) => Some(BlockKind::RightOnly),
+            (false, false, true) => Some(BlockKind::BothSame),
+            _ => Some(BlockKind::Conflict),
+        }
+    }
+    fn combine(a: Option<BlockKind>, b: Option<BlockKind>) -> Option<BlockKind> {
+        match (a, b) {
+            (None, k) | (k, None) => k,
+            (Some(BlockKind::Conflict), _) | (_, Some(BlockKind::Conflict)) => {
+                Some(BlockKind::Conflict)
+            }
+            (Some(a), Some(b)) if a == b => Some(a),
+            _ => Some(BlockKind::Compatible),
+        }
+    }
+    let metadata = |row: &Row| {
+        let mut changed = None;
+        if !opts.ignore_codepage {
+            changed = combine(
+                changed,
+                kind(&docs.iter().map(|d| d.encoding).collect::<Vec<_>>()),
+            );
+            changed = combine(
+                changed,
+                kind(&docs.iter().map(|d| d.bom).collect::<Vec<_>>()),
+            );
+        }
+        if row.line[..docs.len()].iter().all(Option::is_some) {
+            let ends: Vec<_> = docs
+                .iter()
+                .enumerate()
+                .map(|(p, d)| d.line_eol(row.line[p].unwrap()))
+                .collect();
+            // A retained line can become the unterminated final line after a later deletion.
+            changed = combine(
+                changed,
+                kind(&ends.iter().map(Option::is_some).collect::<Vec<_>>()),
+            );
+            if !opts.ignore_eol && !opts.prettify {
+                // Missing terminators are handled above independently of their style.
+                if ends.iter().all(Option::is_some) {
+                    changed = combine(changed, kind(&ends));
+                }
+            }
+        }
+        changed
+    };
+    // Empty files can still have different encodings or BOMs.
+    if result.rows.is_empty()
+        && (1..docs.len()).any(|p| {
+            !opts.ignore_codepage
+                && (docs[0].encoding != docs[p].encoding || docs[0].bom != docs[p].bom)
+        })
+    {
+        result.rows.push(Row {
+            line: [None; 3],
+            block: None,
+        });
+    }
+    let mut labels = Vec::with_capacity(result.rows.len());
+    let mut changed = false;
+    for row in &result.rows {
+        let meta = metadata(row);
+        let old = row
+            .block
+            .map(|b| (result.blocks[b].kind, result.blocks[b].ignored, Some(b)));
+        let label = match (old, meta) {
+            (old, None) => old,
+            (Some((kind, false, source)), Some(m)) => {
+                Some((combine(Some(kind), Some(m)).unwrap(), false, source))
+            }
+            (_, Some(m)) => Some((m, false, None)),
+        };
+        changed |= label != old;
+        labels.push(label);
+    }
+    if !changed {
+        return;
+    }
+    result.blocks.clear();
+    let mut positions = [0usize; 3];
+    let mut previous = None;
+    for (i, (row, label)) in result.rows.iter_mut().zip(labels).enumerate() {
+        let start = positions;
+        for (p, line) in row.line.iter().enumerate() {
+            if line.is_some() {
+                positions[p] += 1;
+            }
+        }
+        row.block = label.map(|(kind, ignored, _)| {
+            if previous != Some(label) || result.blocks.is_empty() {
+                result.blocks.push(Block {
+                    ranges: std::array::from_fn(|p| start[p]..positions[p]),
+                    kind,
+                    ignored,
+                    first_row: i,
+                    rows: 1,
+                });
+            } else {
+                let last = result.blocks.last_mut().unwrap();
+                last.rows += 1;
+                for (p, r) in last.ranges.iter_mut().enumerate() {
+                    r.end = positions[p];
+                }
+            }
+            result.blocks.len() - 1
+        });
+        previous = Some(label);
     }
 }
 
@@ -1024,7 +1155,7 @@ pub fn merge3(left: &[String], base: &[String], right: &[String]) -> Option<Vec<
         let (src, range) = match block.kind {
             BlockKind::LeftOnly | BlockKind::BothSame => (left, &block.ranges[0]),
             BlockKind::RightOnly => (right, &block.ranges[2]),
-            BlockKind::Conflict | BlockKind::Diff => return None,
+            BlockKind::Conflict | BlockKind::Diff | BlockKind::Compatible => return None,
         };
         out.extend_from_slice(&src[range.clone()]);
         row = block.first_row + block.rows;
@@ -1199,6 +1330,47 @@ mod tests {
             (i, j) = (ra.end, rb.end);
         }
         assert_eq!((i, j), (a.len(), b.len()));
+    }
+
+    #[test]
+    fn document_format_differences_respect_options_and_three_way_kinds() {
+        use crate::core::text::{TextDoc, TextEncoding};
+        let a = TextDoc::from_text(None, "one\r\ntwo\r\n");
+        let b = TextDoc::from_text(None, "one\ntwo\n");
+        let compare = |docs: &[&TextDoc], opts: &DiffOptions| {
+            let lines: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
+            let mut r = compute(&lines, opts);
+            include_doc_formats(&mut r, docs, opts);
+            r
+        };
+        assert!(compare(&[&a, &b], &DiffOptions::default()).is_identical());
+        let strict = DiffOptions {
+            ignore_eol: false,
+            ignore_codepage: false,
+            ..Default::default()
+        };
+        let r = compare(&[&a, &b], &strict);
+        assert_eq!(r.significant_blocks(), 1);
+        assert_eq!(r.blocks[0].ranges[..2], [0..2, 0..2]);
+        let r = compare(&[&a, &b, &b], &strict);
+        assert_eq!(r.blocks[0].kind, BlockKind::LeftOnly);
+        let r = compare(&[&a, &b, &a], &strict);
+        assert_eq!(r.blocks[0].kind, BlockKind::BothSame);
+        let mut encoded = b.clone();
+        encoded.encoding = TextEncoding::Utf16Le;
+        encoded.bom = true;
+        assert!(!compare(&[&b, &encoded], &strict).is_identical());
+        assert!(compare(&[&b, &encoded], &DiffOptions::default()).is_identical());
+        let unterminated = TextDoc::from_text(None, "one\ntwo");
+        let r = compare(&[&b, &unterminated], &DiffOptions::default());
+        assert_eq!(r.blocks[0].ranges[..2], [1..2, 1..2]);
+        let mixed = TextDoc::from_text(None, "one\r\ntwo\n");
+        assert!(!compare(&[&b, &mixed], &strict).is_identical());
+        assert!(compare(&[&mixed, &mixed], &strict).is_identical());
+        let empty = TextDoc::empty(None);
+        let mut bom = empty.clone();
+        bom.bom = true;
+        assert!(!compare(&[&empty, &bom], &strict).is_identical());
     }
 
     #[test]

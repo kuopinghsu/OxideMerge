@@ -468,7 +468,8 @@ you save it. Check the active pane and the direction of the arrow before copying
   right or left.
 * kbd:[Ctrl+Alt+→] and kbd:[Ctrl+Alt+←] copy all differences.
 * kbd:[Ctrl+Z] undoes and kbd:[Ctrl+Y] or kbd:[Ctrl+Shift+Z] redoes.
-* kbd:[Ctrl+S] saves the current file and kbd:[Ctrl+Shift+S] saves all of them.
+* kbd:[Ctrl+S] saves every modified pane in the active comparison tab.
+  kbd:[Ctrl+Shift+S] saves modified panes across all tabs.
   *File → Save as* saves one side under another name.
 
 For ordinary files, OxideMerge writes to a temporary file in the destination folder, then
@@ -634,7 +635,11 @@ exported differences and context. Check either file for sensitive content before
 
 *File → Export → Generate patch...* writes the differences between two files or folders as a
 patch in *Normal*, *Context* or *Unified* format, with the number of context lines you choose.
-Patches can be made from 2-way compares only.
+Patches can be made from 2-way compares only. Text patches support UTF-8 files, including
+UTF-8 BOMs, LF/CRLF and mixed LF/CRLF endings, and files without a final newline. The active
+ignore options still control which differences are exported. Files in other encodings or with
+lone-CR endings must be converted before patch export/application; unsupported inputs report
+an error rather than creating a patch that cannot reproduce the changes.
 
 *File → Apply patch...* applies a unified diff, including the output of `git diff` and
 `svn diff`.
@@ -939,7 +944,7 @@ Printing the page prints one slide per page.
 An XML report is for other programs: scripts, review tools or a build that checks what changed.
 Choose the `.xml` type when generating a report, or give `--report <name>.xml` on the command line.
 A text compare report lists every difference with its kind (`changed`, `added`, `removed`, or for
-three-way compares `left-only`, `right-only`, `both-same`, `conflict`), whether it is ignored,
+three-way compares `left-only`, `right-only`, `both-same`, `compatible`, `conflict`), whether it is ignored,
 and the lines of each side with their numbers, then the bookmarks with their comments.
 A folder report lists every file and folder with its status, and its date and size on each side.
 
@@ -980,6 +985,7 @@ file.
 *File → Open project...* opens it again.
 Paths are stored relative to the project file, so a project can be moved along with the files it
 compares.
+Paths on a different Windows drive remain absolute. Web addresses are preserved unchanged.
 WinMerge `.WinMerge` projects can also be opened.
 
 A project stores paths and comparison settings; it does not include the compared file contents.

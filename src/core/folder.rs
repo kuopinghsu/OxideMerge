@@ -245,14 +245,15 @@ fn is_hidden(e: &std::fs::DirEntry) -> bool {
     false
 }
 
-fn list_dir(dir: &Path, skip_hidden: bool) -> Option<Vec<Entry>> {
-    let rd = std::fs::read_dir(dir).ok()?;
+fn list_dir(dir: &Path, skip_hidden: bool) -> std::io::Result<Vec<Entry>> {
+    let rd = std::fs::read_dir(dir)?;
     let mut v = Vec::new();
-    for e in rd.flatten() {
+    for e in rd {
+        let e = e?;
         if skip_hidden && is_hidden(&e) {
             continue;
         }
-        let Ok(md) = e.metadata() else { continue };
+        let md = e.metadata()?;
         v.push(Entry {
             name: e.file_name().to_string_lossy().into_owned(),
             is_dir: md.is_dir(),
@@ -260,7 +261,7 @@ fn list_dir(dir: &Path, skip_hidden: bool) -> Option<Vec<Entry>> {
             mtime: md.modified().ok(),
         });
     }
-    Some(v)
+    Ok(v)
 }
 
 /// How the scan matches names across sides: folders apart from files, and ignoring case where
@@ -376,8 +377,55 @@ impl<'a> Scanner<'a> {
                     dir.push(p);
                 }
             }
-            let Some(entries) = list_dir(&dir, self.fopts.skip_hidden) else {
-                continue;
+            let entries = match list_dir(&dir, self.fopts.skip_hidden) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    // An incomplete listing cannot establish that any child is missing.
+                    // Discard this subtree rather than offer destructive merge operations.
+                    let error = format!("{}: {e}", dir.display());
+                    let index = if let Some(p) = parent {
+                        items[p].status = CmpStatus::Error;
+                        items[p].error = Some(error.clone());
+                        p
+                    } else {
+                        let index = items.len();
+                        let item = DirItem {
+                            rel_dir: String::new(),
+                            name: ".".into(),
+                            is_dir: true,
+                            exists: present,
+                            size: [None; 3],
+                            mtime: [None; 3],
+                            status: CmpStatus::Error,
+                            diff_side: None,
+                            binary: false,
+                            error: Some(error.clone()),
+                            depth,
+                            parent: None,
+                            children: Vec::new(),
+                        };
+                        if self.progress.live {
+                            self.progress
+                                .updates
+                                .lock()
+                                .unwrap()
+                                .items
+                                .push(item.clone());
+                        }
+                        items.push(item);
+                        index
+                    };
+                    if self.progress.live {
+                        self.progress.updates.lock().unwrap().results.push(Outcome {
+                            index,
+                            status: CmpStatus::Error,
+                            diff_side: None,
+                            binary: false,
+                            error: Some(error),
+                        });
+                    }
+                    return;
+                }
             };
             for e in entries {
                 let item = merged
@@ -454,6 +502,9 @@ impl<'a> Scanner<'a> {
 
     /// Marks a folder as fully scanned; `aggregate` derives its status from the children.
     fn scanned(&self, index: usize, items: &mut [DirItem]) {
+        if items[index].error.is_some() {
+            return;
+        }
         items[index].status = CmpStatus::Identical;
         if self.progress.live {
             let o = Outcome {
@@ -471,7 +522,7 @@ impl<'a> Scanner<'a> {
 /// Recomputes folder statuses from their children (post-order).
 pub fn aggregate(items: &mut [DirItem], panes: usize) {
     for i in (0..items.len()).rev() {
-        if !items[i].is_dir {
+        if !items[i].is_dir || items[i].error.is_some() {
             continue;
         }
         let all = items[i].exists[..panes].iter().all(|&e| e);
@@ -629,6 +680,9 @@ fn text_equal(a: &Loaded, b: &Loaded, norm: &Normalizer, dopts: &DiffOptions, pa
         if eol(&ea) != eol(&eb) || ea.mixed() || eb.mixed() {
             return false;
         }
+    }
+    if ta.ends_with(['\r', '\n']) != tb.ends_with(['\r', '\n']) {
+        return false;
     }
     if norm.needs_diff() {
         let lines = |t: &str| -> Vec<String> { text::lines(t).map(|(l, _)| l.into()).collect() };
@@ -903,7 +957,13 @@ pub fn delete_path(path: &Path, use_recycle_bin: bool) -> Result<()> {
 
 pub fn status_counts(items: &[DirItem]) -> (usize, usize, usize, usize) {
     let (mut same, mut diff, mut uniq, mut err) = (0, 0, 0, 0);
-    for it in items.iter().filter(|i| !i.is_dir) {
+    for it in items {
+        if it.is_dir {
+            if it.status == CmpStatus::Error && it.error.is_some() {
+                err += 1;
+            }
+            continue;
+        }
         match it.status {
             CmpStatus::Identical => same += 1,
             CmpStatus::Different => diff += 1,

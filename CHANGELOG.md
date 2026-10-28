@@ -54,6 +54,15 @@ section of this file as the release notes.
 
 ### Fixed
 
+- **Text formats and merging:** comparisons account for encodings, BOMs, line endings and
+  final newlines. Copy All transfers selected formats across multiple differences, independent
+  text and format edits merge together, and saving refreshes format differences.
+- **Patches:** UTF-8 patches preserve BOMs, LF/CRLF endings and missing final newlines, including
+  changes that move the last line. Unsupported encodings and lone-CR endings report an error.
+- **Projects:** saved projects retain pane descriptions and read-only flags and use relative
+  input paths where possible. The guides clarify save-shortcut scope, and the security document
+  explains trusted Git filters and their possible command execution and network access.
+
 - **Four or more paths:** opening four or more files or folders, from the command line, a drop
   or a file manager, no longer crashes the folder compare; it says that two or three paths are
   needed.
