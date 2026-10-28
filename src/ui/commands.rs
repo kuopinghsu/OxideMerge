@@ -76,6 +76,11 @@ pub enum Cmd {
     CompareOptions,
     /// Show the differences of every changed file of a folder compare in one tab.
     AllDiffs,
+    /// Pick the line of the active pane for a synchronization point.
+    SyncPoint,
+    ClearSyncPoints,
+    /// Save an HTML slideshow report: one difference per slide.
+    Slideshow,
 }
 
 impl Cmd {
@@ -148,6 +153,9 @@ impl Cmd {
             ExportHtml => "menu.export_html",
             CompareOptions => "view.more_compare",
             AllDiffs => "cmd.all_diffs",
+            SyncPoint => "cmd.sync_point",
+            ClearSyncPoints => "cmd.clear_sync_points",
+            Slideshow => "menu.slideshow",
         }
     }
 
@@ -160,14 +168,15 @@ impl Cmd {
             OpenConflict => Icon::Warning,
             Save | SaveAll | SaveAs(_) | SaveProject | SaveComparison => Icon::File,
             Patch | ApplyPatch | Report | ReportWithDiffs | BookmarkComment => Icon::Text,
+            Slideshow => Icon::Export,
             ExportHtml => Icon::Export,
-            GitCompare | TakeBoth(_) | AllDiffs => Icon::Compare,
+            GitCompare | TakeBoth(_) | AllDiffs | SyncPoint => Icon::Compare,
             Statistics | GotoLine => Icon::Method,
             Indent(false) | NextBookmark | FindNext | NextDiff | NextTab => Icon::Next,
             Indent(true) | PrevBookmark | FindPrev | PrevDiff | PrevTab => Icon::Prev,
             SelectPattern | ToggleBookmark => Icon::Check,
-            ClearBookmarks | CloseTab | CloseTabAt(_) | CloseOtherTabs(_) | CloseTabsToRight(_)
-            | CloseAllTabs | Exit => Icon::Close,
+            ClearBookmarks | ClearSyncPoints | CloseTab | CloseTabAt(_) | CloseOtherTabs(_)
+            | CloseTabsToRight(_) | CloseAllTabs | Exit => Icon::Close,
             Undo => Icon::Undo,
             Redo => Icon::Redo,
             Find | Replace => Icon::Search,
@@ -340,6 +349,7 @@ pub const BINDINGS: &[Binding] = {
         bind(V, ALT, Key::ArrowLeft, "Alt+←", CopyLeft),
         bind(V, ALT, Key::C, "Alt+C", ToggleCollapse),
         bind(V, ALT, Key::Z, "Alt+Z", ToggleWrap),
+        bind(V, ALT, Key::S, "Alt+S", SyncPoint),
         bind(V, CTRL, Key::F2, "Ctrl+F2", ToggleBookmark),
         bind(V, CTRL, Key::CloseBracket, "Ctrl+]", Indent(false)),
         bind(V, CTRL, Key::OpenBracket, "Ctrl+[", Indent(true)),
@@ -402,6 +412,7 @@ pub const PALETTE: &[Cmd] = {
         ExportHtml,
         Report,
         ReportWithDiffs,
+        Slideshow,
         AllDiffs,
         SaveComparison,
         GitCompare,
@@ -416,6 +427,8 @@ pub const PALETTE: &[Cmd] = {
         ClearBookmarks,
         TakeBoth(true),
         TakeBoth(false),
+        SyncPoint,
+        ClearSyncPoints,
         CloseTab,
         CloseAllTabs,
         NextTab,

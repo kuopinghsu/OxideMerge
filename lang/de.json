@@ -640,5 +640,21 @@
   "web.highlight_tip": "Text, der sich zwischen den Seiten unterscheidet, in den Bildschirmfotos hervorheben",
   "web.marked": "Hervorgehobene Textunterschiede: {n}",
   "web.cut": "Seiten, die höher als {n} Pixel sind, werden abgeschnitten",
-  "opt.web_render": "Seiten für Text und HTML im Browser darstellen (führt ihre Skripte aus)"
+  "opt.web_render": "Seiten für Text und HTML im Browser darstellen (führt ihre Skripte aus)",
+  "cmd.sync_point": "Synchronisationspunkt setzen",
+  "cmd.remove_sync_point": "Synchronisationspunkt entfernen",
+  "cmd.clear_sync_points": "Synchronisationspunkte löschen",
+  "sync.no_line": "Hier gibt es keine Zeile zum Synchronisieren",
+  "sync.pick": "Zeile {line} von {side} für einen Synchronisationspunkt gewählt: Wählen Sie jetzt die passende Zeile in {others}",
+  "sync.added": "Synchronisationspunkt hinzugefügt ({n} in diesem Vergleich)",
+  "sync.removed": "Synchronisationspunkt entfernt",
+  "sync.crossing": "Nicht hinzugefügt: Die Zeilen würden einen anderen Synchronisationspunkt kreuzen",
+  "sync.cleared": "Synchronisationspunkte gelöscht",
+  "menu.slideshow": "Diashow-Bericht erstellen...",
+  "slides.title": "Vergleichs-Diashow",
+  "slides.hint": "Mit ← → oder Leertaste zwischen den Folien wechseln, F für Vollbild",
+  "slides.difference": "Unterschied {n} von {total}",
+  "slides.end": "Ende der Unterschiede",
+  "slides.no_diffs": "Keine Unterschiede",
+  "slides.other_files": "Auf andere Weise unterschiedliche Dateien"
 }

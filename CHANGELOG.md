@@ -7,6 +7,18 @@ section of this file as the release notes.
 
 ### Added
 
+- **Synchronization points** (*Merge → Set synchronization point*, Alt+S, or right-click a
+  line): line up lines the compare pairs wrongly, as in WinMerge. The text before and after each
+  point is compared separately. Points are marked in the gutter, follow edits and are kept in
+  saved comparisons.
+- **XML reports** of text and folder compares, for other programs to read: choose the `.xml`
+  type in *Generate report...*, or `--report <name>.xml`. Text reports list every difference
+  with its lines and the bookmarks; folder reports list every item with its status, dates and
+  sizes. The layout is described in the user guide.
+- **HTML slideshow reports** (*File → Export → Generate slideshow report...*, or `--report
+  <name>.html --slideshow`): one difference per slide, with a title slide, keyboard navigation,
+  full screen, a link for each slide and one slide per printed page, as Araxis Merge makes them.
+  Folder slideshows cover every changed text file.
 - **Web page compare, full page:** a new *Full page* mode captures each whole page, top to bottom,
   instead of only the first screen (up to 16384 pixels tall).
 - **Web page compare, highlighted differences:** the screenshot modes compare the pages' text and

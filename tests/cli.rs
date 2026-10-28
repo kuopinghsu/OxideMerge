@@ -209,6 +209,61 @@ fn folder_compares_list_and_report_the_differences() {
     assert!(!html.contains("left <b>"));
 }
 
+#[test]
+fn reports_are_written_as_xml_and_slideshows() {
+    let d = tmp();
+    let d = d.path();
+    folders(d);
+    // Folder compares.
+    let run = oxidemerge(d, &["--report", "f.xml", "-r", "left", "right"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let xml = read(d.join("f.xml"));
+    assert!(
+        xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"),
+        "{xml}"
+    );
+    assert!(xml.contains("type=\"folder\""), "{xml}");
+    assert!(xml.contains("path=\"only-left.txt\"") && xml.contains("status=\"unique\""));
+    let run = oxidemerge(
+        d,
+        &["--report", "f.html", "--slideshow", "-r", "left", "right"],
+    );
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let slides = read(d.join("f.html"));
+    assert!(
+        slides.contains("<section class=\"title\">"),
+        "a title slide"
+    );
+    assert!(
+        slides.contains("changed.txt"),
+        "a slide for the changed file"
+    );
+
+    // Text compares.
+    files(d, &[("a.txt", "one\ntwo\n"), ("b.txt", "one\nTWO\n")]);
+    let run = oxidemerge(d, &["--report", "t.xml", "a.txt", "b.txt"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let xml = read(d.join("t.xml"));
+    assert!(
+        xml.contains("type=\"text\"") && xml.contains("kind=\"changed\""),
+        "{xml}"
+    );
+    assert!(xml.contains("<line number=\"2\">TWO</line>"), "{xml}");
+    let run = oxidemerge(d, &["--report", "t.html", "--slideshow", "a.txt", "b.txt"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    // Title, one difference, end.
+    assert_eq!(read(d.join("t.html")).matches("<section").count(), 3);
+
+    // A slideshow is HTML: other report types say so and are written as asked.
+    let run = oxidemerge(d, &["--report", "t2.xml", "--slideshow", "a.txt", "b.txt"]);
+    assert!(
+        run.stderr.contains("--slideshow only applies"),
+        "{}",
+        run.stderr
+    );
+    assert!(read(d.join("t2.xml")).contains("<comparison "));
+}
+
 #[cfg(unix)]
 #[test]
 fn file_names_in_reports_are_escaped() {
