@@ -439,7 +439,7 @@
   "opt.unique_subfolders": "Inhalt einseitiger Unterordner einbeziehen",
   "opt.unpackers_hint": "Entpacker wandeln Dateien vor dem Vergleich in Text um. ${file} wird durch den Dateipfad ersetzt; die Ausgabe wird von stdout gelesen.",
   "opt.web": "Webseitenvergleich",
-  "opt.web_browser": "Browser für Bildschirmfotos",
+  "opt.web_browser": "Browser zum Darstellen der Seiten",
   "opt.web_browser_hint": "Automatisch (Edge, Chrome, Chromium oder Brave)",
   "opt.web_height": "Höhe des Bildschirmfotos",
   "opt.web_width": "Breite des Bildschirmfotos",
@@ -631,6 +631,12 @@
   "web.no_browser": "Kein Chromium-basierter Browser (Edge, Chrome, Chromium, Brave) gefunden. Legen Sie den Pfad unter Optionen → Bild / Binär / Web fest.",
   "web.reload": "Seiten neu laden",
   "web.resources": "Ressourcenbaum",
-  "web.screenshot": "Bildschirmfoto",
-  "web.text": "Text"
+  "web.screenshot": "Bildschirmfoto (sichtbarer Bereich)",
+  "web.text": "Text",
+  "web.full_screenshot": "Ganze Seite",
+  "web.highlight": "Unterschiede hervorheben",
+  "web.highlight_tip": "Text, der sich zwischen den Seiten unterscheidet, in den Bildschirmfotos hervorheben",
+  "web.marked": "Hervorgehobene Textunterschiede: {n}",
+  "web.cut": "Seiten, die höher als {n} Pixel sind, werden abgeschnitten",
+  "opt.web_render": "Seiten für Text und HTML im Browser darstellen (führt ihre Skripte aus)"
 }

@@ -439,7 +439,7 @@
   "opt.unique_subfolders": "Inclure le contenu des sous-dossiers uniques",
   "opt.unpackers_hint": "Les décompresseurs convertissent les fichiers en texte avant la comparaison. ${file} est remplacé par le chemin du fichier ; la sortie est lue sur stdout.",
   "opt.web": "Comparaison de pages web",
-  "opt.web_browser": "Navigateur pour les captures",
+  "opt.web_browser": "Navigateur pour afficher les pages",
   "opt.web_browser_hint": "Automatique (Edge, Chrome, Chromium ou Brave)",
   "opt.web_height": "Hauteur de la capture",
   "opt.web_width": "Largeur de la capture",
@@ -631,6 +631,12 @@
   "web.no_browser": "Aucun navigateur basé sur Chromium (Edge, Chrome, Chromium, Brave) n'a été trouvé. Indiquez son chemin dans Options → Image / Binaire / Web.",
   "web.reload": "Recharger les pages",
   "web.resources": "Arborescence des ressources",
-  "web.screenshot": "Capture d'écran",
-  "web.text": "Texte"
+  "web.screenshot": "Capture (zone visible)",
+  "web.text": "Texte",
+  "web.full_screenshot": "Page entière",
+  "web.highlight": "Surligner les différences",
+  "web.highlight_tip": "Surligner sur les captures le texte qui diffère entre les pages",
+  "web.marked": "Différences de texte surlignées : {n}",
+  "web.cut": "Les pages de plus de {n} pixels de haut sont coupées",
+  "opt.web_render": "Afficher les pages dans le navigateur pour le texte et le HTML (exécute leurs scripts)"
 }

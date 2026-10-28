@@ -439,7 +439,7 @@
   "opt.unique_subfolders": "한쪽에만 있는 하위 폴더 내용 포함",
   "opt.unpackers_hint": "언패커는 비교 전에 파일을 텍스트로 변환합니다. ${file}은 파일 경로로 바뀌고 출력은 표준 출력에서 읽습니다.",
   "opt.web": "웹 페이지 비교",
-  "opt.web_browser": "스크린샷에 사용할 브라우저",
+  "opt.web_browser": "페이지 렌더링에 사용할 브라우저",
   "opt.web_browser_hint": "자동 (Edge, Chrome, Chromium 또는 Brave)",
   "opt.web_height": "스크린샷 높이",
   "opt.web_width": "스크린샷 너비",
@@ -631,6 +631,12 @@
   "web.no_browser": "Chromium 기반 브라우저(Edge, Chrome, Chromium, Brave)를 찾을 수 없습니다. 옵션 → 이미지 / 바이너리 / 웹에서 경로를 설정하세요.",
   "web.reload": "페이지 새로 고침",
   "web.resources": "리소스 트리",
-  "web.screenshot": "스크린샷",
-  "web.text": "텍스트"
+  "web.screenshot": "스크린샷 (보이는 영역)",
+  "web.text": "텍스트",
+  "web.full_screenshot": "전체 페이지",
+  "web.highlight": "차이점 강조",
+  "web.highlight_tip": "페이지 간에 다른 텍스트를 스크린샷에 강조 표시합니다",
+  "web.marked": "강조된 텍스트 차이: {n}",
+  "web.cut": "높이가 {n}픽셀을 넘는 페이지는 잘립니다",
+  "opt.web_render": "텍스트와 HTML을 위해 브라우저에서 페이지 렌더링 (스크립트 실행)"
 }

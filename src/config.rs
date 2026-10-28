@@ -83,6 +83,11 @@ pub struct Config {
     pub web_width: u32,
     pub web_height: u32,
     pub web_mode: WebMode,
+    /// Whether screenshots show the text differences between the pages highlighted.
+    pub web_highlight: bool,
+    /// Whether the text and HTML modes use the browser, so pages are compared after their
+    /// scripts have run; otherwise the page as downloaded is used.
+    pub web_render: bool,
     pub restore_session: bool,
     /// Text compares fold long runs of unchanged lines.
     pub collapse_unchanged: bool,
@@ -145,7 +150,9 @@ impl Default for Config {
             web_browser: String::new(),
             web_width: 1280,
             web_height: 1600,
-            web_mode: WebMode::Screenshot,
+            web_mode: WebMode::Text,
+            web_highlight: true,
+            web_render: true,
             restore_session: true,
             collapse_unchanged: false,
             word_wrap: false,

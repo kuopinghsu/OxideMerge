@@ -439,7 +439,7 @@
   "opt.unique_subfolders": "Include unique subfolders contents",
   "opt.unpackers_hint": "Unpackers convert files to text before comparing. ${file} is replaced by the file path; the output is read from stdout.",
   "opt.web": "Web page compare",
-  "opt.web_browser": "Browser used for screenshots",
+  "opt.web_browser": "Browser used to render pages",
   "opt.web_browser_hint": "Automatic (Edge, Chrome, Chromium or Brave)",
   "opt.web_height": "Screenshot height",
   "opt.web_width": "Screenshot width",
@@ -631,6 +631,12 @@
   "web.no_browser": "No Chromium based browser (Edge, Chrome, Chromium, Brave) was found. Set its path in Options → Image / Binary / Web.",
   "web.reload": "Reload the pages",
   "web.resources": "Resource tree",
-  "web.screenshot": "Screenshot",
-  "web.text": "Text"
+  "web.screenshot": "Screenshot (visible area)",
+  "web.text": "Text",
+  "web.full_screenshot": "Full page",
+  "web.highlight": "Highlight differences",
+  "web.highlight_tip": "Highlight the text that differs between the pages on the screenshots",
+  "web.marked": "Text differences highlighted: {n}",
+  "web.cut": "Pages taller than {n} pixels are cut",
+  "opt.web_render": "Render pages in the browser for text and HTML (runs their scripts)"
 }

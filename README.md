@@ -57,7 +57,8 @@ It supports text and folder merging, as well as binary, image and web page compa
 
 - **Binary files:** inspect byte differences in a side-by-side hexadecimal view.
 - **Images:** compare images side by side or use overlay, swipe, blink and difference views.
-- **Web pages:** compare screenshots, HTML source, page text or downloaded resources.
+- **Web pages:** compare the text a page shows after its scripts run, full page screenshots with
+  the text differences highlighted on the page, HTML source or downloaded resources.
 
 ### Save and share your work
 
@@ -270,8 +271,8 @@ use Command where Windows and Linux use Ctrl; the interface displays the platfor
   supported.
 - JSON and XML files are read-only while automatic formatting is enabled. Turn it off to
   edit or merge them.
-- Web screenshots require an installed Chromium-based browser. Other web comparison modes
-  do not run JavaScript and may miss dynamically loaded content. Authenticated browsing is
+- Web screenshots require an installed Chromium-based browser. Without one, the text and HTML
+  modes do not run JavaScript and may miss dynamically loaded content. Authenticated browsing is
   not supported; pages that require a login may show the login page instead.
 - Text editing is line-based and is intended for reviewing and merging changes.
 - WinMerge project files and filter files are supported, but WinMerge plugin DLLs and scripts
@@ -306,7 +307,8 @@ Run `make help` to list all targets.
 - `make` or `make release`: build an optimized executable.
 - `make build`: build a debug executable.
 - `make run ARGS="a.txt b.txt"`: run the debug build with comparison paths.
-- `make demo`, `make demo-text`, `make demo-3way`, `make demo-conflict`: open sample comparisons.
+- `make demo`, `make demo-text`, `make demo-3way`, `make demo-conflict`, `make demo-web`,
+  `make demo-web-3way`: open sample comparisons.
 - `make install` or `make uninstall`: install to, or remove from, Cargo's binary directory
   (`~/.cargo/bin` by default).
 - `make shell-register`: install the executable and register file manager integration.

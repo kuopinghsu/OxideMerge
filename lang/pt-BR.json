@@ -439,7 +439,7 @@
   "opt.unique_subfolders": "Incluir conteúdo de subpastas únicas",
   "opt.unpackers_hint": "Descompactadores convertem arquivos em texto antes da comparação. ${file} é substituído pelo caminho do arquivo; a saída é lida do stdout.",
   "opt.web": "Comparação de páginas web",
-  "opt.web_browser": "Navegador para capturas de tela",
+  "opt.web_browser": "Navegador para renderizar as páginas",
   "opt.web_browser_hint": "Automático (Edge, Chrome, Chromium ou Brave)",
   "opt.web_height": "Altura da captura",
   "opt.web_width": "Largura da captura",
@@ -631,6 +631,12 @@
   "web.no_browser": "Nenhum navegador baseado em Chromium (Edge, Chrome, Chromium, Brave) foi encontrado. Defina o caminho em Opções → Imagem / Binário / Web.",
   "web.reload": "Recarregar as páginas",
   "web.resources": "Árvore de recursos",
-  "web.screenshot": "Captura de tela",
-  "web.text": "Texto"
+  "web.screenshot": "Captura (área visível)",
+  "web.text": "Texto",
+  "web.full_screenshot": "Página inteira",
+  "web.highlight": "Destacar diferenças",
+  "web.highlight_tip": "Destacar nas capturas o texto que difere entre as páginas",
+  "web.marked": "Diferenças de texto destacadas: {n}",
+  "web.cut": "Páginas com mais de {n} pixels de altura são cortadas",
+  "opt.web_render": "Renderizar as páginas no navegador para texto e HTML (executa os scripts)"
 }

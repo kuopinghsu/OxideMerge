@@ -1,5 +1,6 @@
 //! Web page compare: fetching pages, extracting their visible text and linked resources, and
-//! taking screenshots with an installed Chromium-based browser (Edge, Chrome, Chromium, Brave).
+//! finding an installed Chromium-based browser (Edge, Chrome, Chromium, Brave), which
+//! `web_render` drives to render pages, read their text and take screenshots.
 
 use crate::core::text::{self, TextEncoding};
 use anyhow::{bail, Context, Result};
@@ -10,37 +11,45 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use url::{Host, Url};
 
 const PAGE_LIMIT: u64 = 50 << 20;
 const RESOURCE_LIMIT: u64 = 20 << 20;
 const MAX_RESOURCES: usize = 400;
 const DOWNLOAD_THREADS: usize = 8;
-const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(90);
 /// File name of the page itself in a resource tree.
 pub const PAGE_FILE: &str = "index.html";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum WebMode {
-    #[default]
+    /// The visible area of each page.
     Screenshot,
+    /// Each whole page, top to bottom.
+    FullScreenshot,
     Html,
+    #[default]
     Text,
     Resources,
 }
 
 impl WebMode {
-    pub const ALL: [WebMode; 4] = [
+    pub const ALL: [WebMode; 5] = [
+        WebMode::Text,
+        WebMode::FullScreenshot,
         WebMode::Screenshot,
         WebMode::Html,
-        WebMode::Text,
         WebMode::Resources,
     ];
+
+    pub fn is_screenshot(self) -> bool {
+        matches!(self, WebMode::Screenshot | WebMode::FullScreenshot)
+    }
 
     pub fn key(self) -> &'static str {
         match self {
             WebMode::Screenshot => "web.screenshot",
+            WebMode::FullScreenshot => "web.full_screenshot",
             WebMode::Html => "web.html",
             WebMode::Text => "web.text",
             WebMode::Resources => "web.resources",
@@ -1035,80 +1044,6 @@ fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|d| d.join(&exe))
         .find(|p| p.is_file())
-}
-
-/// Renders `url` headlessly and saves a PNG of the top `width` x `height` pixels to `out`.
-pub fn screenshot(browser: &Path, url: &Url, out: &Path, width: u32, height: u32) -> Result<()> {
-    let profile = tempfile::tempdir()?;
-    let mut child = std::process::Command::new(browser)
-        .args([
-            "--headless=new",
-            "--disable-gpu",
-            "--hide-scrollbars",
-            "--mute-audio",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--virtual-time-budget=5000",
-        ])
-        .arg(format!("--user-data-dir={}", profile.path().display()))
-        .arg(format!("--window-size={width},{height}"))
-        .arg(format!("--screenshot={}", out.display()))
-        .arg(url.as_str())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .with_context(|| browser.display().to_string())?;
-    let started = Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
-        }
-        if started.elapsed() > SCREENSHOT_TIMEOUT {
-            let _ = child.kill();
-            bail!(
-                "{url}: the browser did not finish within {} seconds",
-                SCREENSHOT_TIMEOUT.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    if !out.is_file() {
-        bail!("{url}: the browser did not produce a screenshot");
-    }
-    Ok(())
-}
-
-/// Takes all screenshots in parallel, saving them as `0.png`, `1.png`, ... in `dir`.
-pub fn screenshots(
-    browser: &Path,
-    urls: &[Url],
-    dir: &Path,
-    width: u32,
-    height: u32,
-) -> Result<Vec<PathBuf>> {
-    let paths: Vec<PathBuf> = (0..urls.len())
-        .map(|i| dir.join(format!("{i}.png")))
-        .collect();
-    let results: Vec<Result<()>> = std::thread::scope(|s| {
-        let handles: Vec<_> = urls
-            .iter()
-            .zip(&paths)
-            .map(|(u, p)| s.spawn(move || screenshot(browser, u, p, width, height)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| bail!("screenshot thread panicked"))
-            })
-            .collect()
-    });
-    for r in results {
-        r?;
-    }
-    Ok(paths)
 }
 
 #[cfg(test)]

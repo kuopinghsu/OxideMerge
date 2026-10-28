@@ -5098,6 +5098,7 @@ impl OxideMergeApp {
                                         .small()
                                         .color(pal(ui).text_dim),
                                     );
+                                    ui.checkbox(&mut c.web_render, tr("opt.web_render"));
                                     ui.add(
                                         egui::Slider::new(&mut c.web_width, 320..=3840)
                                             .text(tr("opt.web_width")),
@@ -5865,6 +5866,7 @@ impl eframe::App for OxideMergeApp {
             });
         if let Some(Content::Web(w)) = self.tabs.get(self.active).map(|t| &t.content) {
             self.cfg.web_mode = w.mode;
+            self.cfg.web_highlight = w.highlight;
         }
         self.sync_text_layout();
         crate::core::fsutil::set_backup(self.cfg.backup_on_save);

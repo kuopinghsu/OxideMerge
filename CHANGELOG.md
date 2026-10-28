@@ -5,6 +5,23 @@ section of this file as the release notes.
 
 ## [0.9.6] - Unreleased
 
+### Added
+
+- **Web page compare, full page:** a new *Full page* mode captures each whole page, top to bottom,
+  instead of only the first screen (up to 16384 pixels tall).
+- **Web page compare, highlighted differences:** the screenshot modes compare the pages' text and
+  highlight what differs on the pages themselves (changed blocks in yellow, changed words in
+  orange), like WinMerge's *View Differences*, so a change that moves the page down no longer
+  marks everything below it. *Highlight differences* in the toolbar turns this off.
+
+### Changed
+
+- **Web page compare** drives the browser over the DevTools protocol, with all pages loading at
+  the same time in one browser. Text and HTML source now come from the page as the browser shows
+  it, after its scripts have run, when a browser is found (*Render pages in the browser for text
+  and HTML* in the options). Text puts each heading, paragraph, list item, table cell and form
+  value on its own line and leaves out hidden elements. Text is the default mode.
+
 ### Fixed
 
 - **File safety:** saving and copying now report an error if a temporary file cannot be created

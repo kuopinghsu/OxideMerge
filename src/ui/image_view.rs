@@ -41,7 +41,7 @@ pub struct ImageView {
     offset: Vec2,
     fit: bool,
     center: bool,
-    show_blocks: bool,
+    pub show_blocks: bool,
     overlay_alpha: f32,
     /// Divider position of the swipe mode, as a fraction of the view width.
     swipe: f32,

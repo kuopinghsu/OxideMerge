@@ -439,7 +439,7 @@
   "opt.unique_subfolders": "包含唯一子資料夾的內容",
   "opt.unpackers_hint": "解譯器會在比較前將檔案轉換為文字。${file} 會替換為檔案路徑，輸出從標準輸出讀取。",
   "opt.web": "網頁比較",
-  "opt.web_browser": "用於螢幕截圖的瀏覽器",
+  "opt.web_browser": "用於轉譯頁面的瀏覽器",
   "opt.web_browser_hint": "自動（Edge、Chrome、Chromium 或 Brave）",
   "opt.web_height": "截圖高度",
   "opt.web_width": "截圖寬度",
@@ -631,6 +631,12 @@
   "web.no_browser": "找不到 Chromium 系列瀏覽器（Edge、Chrome、Chromium、Brave）。請在 選項 → 影像 / 二進位 / 網頁 中設定其路徑。",
   "web.reload": "重新載入網頁",
   "web.resources": "資源樹",
-  "web.screenshot": "螢幕截圖",
-  "web.text": "文字"
+  "web.screenshot": "螢幕截圖（可見區域）",
+  "web.text": "文字",
+  "web.full_screenshot": "整頁",
+  "web.highlight": "醒目提示差異",
+  "web.highlight_tip": "在螢幕截圖上醒目提示頁面之間不同的文字",
+  "web.marked": "已醒目提示的文字差異：{n}",
+  "web.cut": "高度超過 {n} 像素的頁面會被截斷",
+  "opt.web_render": "文字與 HTML 模式使用瀏覽器轉譯頁面（會執行頁面指令碼）"
 }

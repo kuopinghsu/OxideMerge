@@ -439,7 +439,7 @@
   "opt.unique_subfolders": "Incluir el contenido de subcarpetas únicas",
   "opt.unpackers_hint": "Los desempaquetadores convierten archivos a texto antes de comparar. ${file} se sustituye por la ruta del archivo; la salida se lee de stdout.",
   "opt.web": "Comparación de páginas web",
-  "opt.web_browser": "Navegador para las capturas",
+  "opt.web_browser": "Navegador para representar las páginas",
   "opt.web_browser_hint": "Automático (Edge, Chrome, Chromium o Brave)",
   "opt.web_height": "Alto de la captura",
   "opt.web_width": "Ancho de la captura",
@@ -631,6 +631,12 @@
   "web.no_browser": "No se encontró ningún navegador basado en Chromium (Edge, Chrome, Chromium, Brave). Indique su ruta en Opciones → Imagen / Binario / Web.",
   "web.reload": "Recargar las páginas",
   "web.resources": "Árbol de recursos",
-  "web.screenshot": "Captura de pantalla",
-  "web.text": "Texto"
+  "web.screenshot": "Captura (área visible)",
+  "web.text": "Texto",
+  "web.full_screenshot": "Página completa",
+  "web.highlight": "Resaltar diferencias",
+  "web.highlight_tip": "Resaltar en las capturas el texto que difiere entre las páginas",
+  "web.marked": "Diferencias de texto resaltadas: {n}",
+  "web.cut": "Las páginas de más de {n} píxeles de alto se recortan",
+  "opt.web_render": "Representar las páginas en el navegador para texto y HTML (ejecuta sus scripts)"
 }

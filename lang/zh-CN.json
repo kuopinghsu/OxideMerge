@@ -439,7 +439,7 @@
   "opt.unique_subfolders": "包含唯一子文件夹的内容",
   "opt.unpackers_hint": "解包器会在比较前将文件转换为文本。${file} 会被替换为文件路径，输出从标准输出读取。",
   "opt.web": "网页比较",
-  "opt.web_browser": "用于截图的浏览器",
+  "opt.web_browser": "用于渲染页面的浏览器",
   "opt.web_browser_hint": "自动（Edge、Chrome、Chromium 或 Brave）",
   "opt.web_height": "截图高度",
   "opt.web_width": "截图宽度",
@@ -631,6 +631,12 @@
   "web.no_browser": "找不到 Chromium 系浏览器（Edge、Chrome、Chromium、Brave）。请在 选项 → 图像 / 二进制 / 网页 中设置其路径。",
   "web.reload": "重新加载网页",
   "web.resources": "资源树",
-  "web.screenshot": "屏幕截图",
-  "web.text": "文本"
+  "web.screenshot": "截图（可见区域）",
+  "web.text": "文本",
+  "web.full_screenshot": "整页",
+  "web.highlight": "突出显示差异",
+  "web.highlight_tip": "在截图上突出显示页面之间不同的文本",
+  "web.marked": "已突出显示的文本差异：{n}",
+  "web.cut": "高度超过 {n} 像素的页面会被截断",
+  "opt.web_render": "文本和 HTML 模式使用浏览器渲染页面（会执行页面脚本）"
 }

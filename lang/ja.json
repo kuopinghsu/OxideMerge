@@ -439,7 +439,7 @@
   "opt.unique_subfolders": "片方にしかないサブフォルダーの内容を含める",
   "opt.unpackers_hint": "アンパッカーは比較前にファイルをテキストに変換します。${file} はファイル パスに置き換えられ、出力は標準出力から読み取られます。",
   "opt.web": "Web ページ比較",
-  "opt.web_browser": "スクリーンショットに使うブラウザー",
+  "opt.web_browser": "ページの描画に使うブラウザー",
   "opt.web_browser_hint": "自動 (Edge、Chrome、Chromium、Brave)",
   "opt.web_height": "スクリーンショットの高さ",
   "opt.web_width": "スクリーンショットの幅",
@@ -631,6 +631,12 @@
   "web.no_browser": "Chromium 系ブラウザー (Edge、Chrome、Chromium、Brave) が見つかりません。オプション → 画像 / バイナリ / Web でパスを設定してください。",
   "web.reload": "ページを再読み込み",
   "web.resources": "リソースツリー",
-  "web.screenshot": "スクリーンショット",
-  "web.text": "テキスト"
+  "web.screenshot": "スクリーンショット (表示領域)",
+  "web.text": "テキスト",
+  "web.full_screenshot": "ページ全体",
+  "web.highlight": "差異を強調表示",
+  "web.highlight_tip": "ページ間で異なるテキストをスクリーンショット上で強調表示します",
+  "web.marked": "強調表示したテキストの差異: {n}",
+  "web.cut": "高さが {n} ピクセルを超えるページは切り取られます",
+  "opt.web_render": "テキストと HTML のためにページをブラウザーで描画する (スクリプトを実行)"
 }

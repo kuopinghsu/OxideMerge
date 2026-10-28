@@ -221,7 +221,8 @@ Image:: Pixels, side by side, overlaid, swiped, blinking or as a difference imag
 Differing regions can be copied between images.
 Folder:: The items of two or three folders, compared by the chosen compare method.
 Items are copied, deleted and merged here, and each file opens in its own compare.
-Web page:: Two or three pages, as screenshots, HTML source, visible text or downloaded resources.
+Web page:: Two or three pages, as visible text, full page or visible area screenshots with the
+text differences highlighted, HTML source or downloaded resources.
 Web pages are read-only: nothing is saved back to a server.
 
 Each type is described in its own chapter below.
@@ -674,14 +675,29 @@ Compare two or three `http://` or `https://` addresses, or local HTML files comp
 *Compare as → Web page* (`-t web` on the command line).
 Use the mode selector at the top of the tab. OxideMerge remembers the last selected mode:
 
-Screenshot:: Uses a Chromium-based browser without a visible browser window to render each page,
-then opens the screenshots in the image view. Edge, Chrome, Chromium and Brave are detected
-automatically when available.
-HTML source:: The page source, with long minified lines split between tags, in the text compare.
-Text:: Extracts text from the downloaded HTML, excluding scripts, styles and markup, and opens
-it in the text view. Content added later by JavaScript is not included.
+Text:: The text you see on each page, one block per line: each heading, paragraph, list item,
+table cell, form field value and line of preformatted text is one line, and hidden elements are
+left out. It opens in the text compare, so changed words are highlighted within each line, and
+the comparison options, filters and reports all apply. This is the default mode.
+Full page:: A screenshot of each whole page, from top to bottom, in the image view. With
+*Highlight differences* on, the text that differs between the pages is highlighted on the page
+itself before the screenshot: changed blocks in yellow and the changed words in them in orange,
+like WinMerge's *View Differences*. Because text is compared rather than pixels, a change that
+moves the rest of the page down does not mark everything below it. Pages taller than 16384
+pixels are cut.
+Screenshot (visible area):: The same, for the top of each page only (the screenshot width and
+height).
+HTML source:: The page's HTML after its scripts have run, with long minified lines split between
+tags, in the text compare.
 Resource tree:: Downloads each page with its stylesheets, scripts, images, frames and media, and
 compares the downloaded files in the folder compare.
+
+Text, HTML source and the screenshots come from a Chromium-based browser that runs without a
+window (Edge, Chrome, Chromium and Brave are detected automatically), so they show each page
+after its scripts have run, as you would see it. The pages load at the same time, each in its own
+tab, and are taken as they are after 45 seconds. Without a browser, or with *Render pages in the
+browser for text and HTML* turned off, Text and HTML source use the HTML as downloaded instead:
+scripts do not run, and content they add is missing.
 
 Pages are decoded as browsers do: a byte order mark comes first, then the charset of the HTTP
 `Content-Type` header, then a `<meta>` charset, then a guess from the content.
@@ -702,10 +718,10 @@ Leave the browser path empty to detect a supported browser automatically.
 Use *Reload* after changing the page or switching modes. Local HTML files require `-t web`
 or an explicit *Compare as → Web page* selection; otherwise, they normally open as text.
 
-NOTE: Only Screenshot mode runs page scripts. Other modes compare HTML as delivered by the
-server. Authenticated sessions are not supported; a page that requires a login may show its
-login page. Screenshot requests are handled by the browser, so the resource tree limits do
-not apply to them. No mode saves changes back to a web server.
+NOTE: The resource tree compares the HTML as delivered by the server; the other modes run page
+scripts when a browser is used. Authenticated sessions are not supported; a page that requires a
+login may show its login page. Pages rendered by the browser load everything they ask for, so the
+resource tree limits do not apply to them. No mode saves changes back to a web server.
 
 == Controlling which differences are shown
 
@@ -923,8 +939,9 @@ Folder::
 *Compare method*, *Include subfolders*, *Include unique subfolders contents*, *Skip hidden files
 and folders*, *Date tolerance (seconds)* and *Worker threads* (0 means automatic).
 Image / Binary / Web::
-*Bytes per line* in binary compares, the *Browser used for screenshots*, and the *Screenshot
-width* and *Screenshot height*.
+*Bytes per line* in binary compares, the *Browser used to render pages*, *Render pages in the
+browser for text and HTML*, and the *Screenshot width* and *Screenshot height* (the browser's
+window size for every web mode).
 Plugins::
 The unpacker plugins (see <<unpackers>>).
 
@@ -1169,8 +1186,8 @@ Read the error message first and note the affected path. Before repeating a merg
 check the destination, available disk space, permissions and whether another program changed
 the file.
 
-Screenshot mode reports that no browser was found::
-Screenshot mode needs Edge, Chrome, Chromium or Brave.
+A web screenshot mode reports that no browser was found::
+The screenshot modes need Edge, Chrome, Chromium or Brave.
 Set the browser under *Options → Image / Binary / Web*.
 
 A pane cannot be edited::
@@ -1242,8 +1259,9 @@ enabled. Files that changed after comparison are skipped and listed. Refresh the
 and review the merge plan again.
 
 A web comparison is missing content shown in the browser::
-Only Screenshot mode runs JavaScript. Other modes use the HTML delivered by the server
-and cannot include content added later by scripts.
+Check that a browser is found and *Render pages in the browser for text and HTML* is on; without
+them, Text and HTML source use the HTML delivered by the server, and miss content added by
+scripts. The resource tree always uses the delivered HTML. Content inside frames is not included.
 Resources that could not be downloaded, or were skipped as being on this computer or a private
 network, are counted in the status bar.
 
@@ -1260,7 +1278,7 @@ contents (see <<compare-methods>>).
 * Text editing is line-based and intended for reviewing and merging changes.
 * Unpacker plugins use external commands. WinMerge plugin DLLs and scripts are not supported.
 * Web page compare does not support cookies or logins; a page behind a login shows its login page.
-  Only Screenshot mode runs scripts, so the other modes miss content that scripts add later.
-  In Screenshot mode the browser loads everything the page asks for, without the resource tree's
-  limits.
+  Without a Chromium-based browser, page scripts do not run, so content they add is missing.
+  Content inside frames is not compared. A page rendered by the browser loads everything it asks
+  for, without the resource tree's limits.
 * Machine-assisted translations have not been reviewed by native speakers.
