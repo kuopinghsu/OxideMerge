@@ -475,6 +475,9 @@ pub fn render(
     let mut out = Vec::new();
     for (s, frame) in &tabs {
         check()?;
+        // Only the last tab created is active. Activate each page before scrolling it so
+        // Chromium also produces frames for pages that were loaded in the background.
+        b.call(Some(s), "Page.bringToFront", json!({}))?;
         b.eval(s, &format!("{SETTLE_JS}({full})"))?;
         let v = b.eval(s, EXTRACT_JS)?;
         let status = b
@@ -524,6 +527,9 @@ pub fn render(
     }
     for (i, (s, _)) in tabs.iter().enumerate() {
         check()?;
+        // captureScreenshot can wait indefinitely for a compositor frame on an inactive
+        // tab (notably Edge on Windows), even with background throttling disabled.
+        b.call(Some(s), "Page.bringToFront", json!({}))?;
         let mut params = json!({ "format": "png" });
         if full {
             let m = b.call(Some(s), "Page.getLayoutMetrics", json!({}))?;
@@ -689,26 +695,34 @@ mod tests {
             v(&["Hello", "The quick brown fox", "tall", "end", "From script"])
         );
         assert!(text[1].html.contains("<p>From script</p>"));
-        let shots = render(
-            &exe,
-            &[a, b],
-            &RenderOptions {
-                width: 800,
-                height: 600,
-                capture: Capture::FullPage,
-                highlight: true,
-            },
-            &progress,
-        )
-        .unwrap();
-        // Width and height from the PNG header.
-        let png = shots[0].shot.as_ref().unwrap();
-        assert_eq!(&png[1..4], b"PNG");
-        let width = u32::from_be_bytes(png[16..20].try_into().unwrap());
-        let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
-        assert_eq!(width, 800);
-        assert!(height > 3000, "full page, not just the first screen");
-        assert_eq!(shots[0].marked, 1);
-        assert_eq!(shots[1].marked, 1);
+        for capture in [Capture::Viewport, Capture::FullPage] {
+            let shots = render(
+                &exe,
+                &[a.clone(), b.clone()],
+                &RenderOptions {
+                    width: 800,
+                    height: 600,
+                    capture,
+                    highlight: true,
+                },
+                &progress,
+            )
+            .unwrap();
+            // Both tabs must produce screenshots, including the first, inactive tab.
+            for shot in &shots {
+                let png = shot.shot.as_ref().unwrap();
+                let image = image::load_from_memory(png).unwrap();
+                assert_eq!(image.width(), 800);
+                if capture == Capture::FullPage {
+                    assert!(
+                        image.height() > 3000,
+                        "full page, not just the first screen"
+                    );
+                } else {
+                    assert_eq!(image.height(), 600);
+                }
+                assert_eq!(shot.marked, 1);
+            }
+        }
     }
 }
