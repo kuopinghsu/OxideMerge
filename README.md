@@ -84,23 +84,22 @@ Portuguese. Additional translations can be loaded from language files.
 ## Installation
 
 Download a package for your system from [GitHub Releases](https://github.com/kuopinghsu/OxideMerge/releases).
-Release downloads also include PDF user guides in English and Traditional Chinese, and a
-`SHA256SUMS.txt` file for verifying downloads.
+Release downloads also include PDF user guides in English and Traditional Chinese. The release
+page lists each download's SHA-256 digest for verifying it.
 
 ### Windows
 
 Supports Windows 10 and 11 on x64 and Arm64.
 
-Download the `windows-x64.exe` or `windows-arm64.exe` package for your processor and run it.
-A ZIP package is also available. No installer is required. Release filenames include the version, for example
-`oxidemerge-<version>-windows-x64.exe`.
+Download the `windows-x64.zip` or `windows-arm64.zip` package for your processor, unzip it and
+run `oxidemerge.exe`. No installer is required. Release filenames include the version, for
+example `oxidemerge-<version>-windows-x64.zip`.
 
 ### macOS
 
 Supports macOS 11 or later on Apple silicon and Intel Macs.
 
 Open the `macos-universal.dmg` package and drag **OxideMerge** to **Applications**.
-A ZIP package is also available.
 
 The app is signed ad hoc and is not notarized. If macOS blocks the first launch, try opening
 the app once, then choose **Open Anyway** in **System Settings → Privacy & Security**.
@@ -113,9 +112,8 @@ Supports x64 and Arm64 systems with X11 or Wayland.
 - **AppImage:** runs on Ubuntu 20.04, RHEL 8, Debian 10 and newer. Make the downloaded file
   executable with `chmod +x <filename>.AppImage`, then run it. If FUSE is unavailable, add
   `--appimage-extract-and-run` when starting it.
-- **Debian package:** available for Ubuntu 22.04 and newer. Install it with
-  `sudo apt install ./<filename>.deb`.
-- **TAR archive:** available for users who prefer the standalone executable.
+- **TAR archive:** the standalone executable, with a desktop file and icon, for users who
+  prefer it.
 
 File dialogs use `xdg-desktop-portal`, which desktop environments normally provide.
 For Chinese, Japanese and Korean text, install a suitable font such as Noto Sans CJK.
@@ -307,8 +305,8 @@ Run `make help` to list all targets.
 - `make` or `make release`: build an optimized executable.
 - `make build`: build a debug executable.
 - `make run ARGS="a.txt b.txt"`: run the debug build with comparison paths.
-- `make demo`, `make demo-text`, `make demo-3way`, `make demo-conflict`, `make demo-web`,
-  `make demo-web-3way`: open sample comparisons.
+- `make demo`, `make demo-text`, `make demo-3way`, `make demo-conflict`: open sample comparisons.
+  For web page compare, see `samples/web/README.md`.
 - `make install` or `make uninstall`: install to, or remove from, Cargo's binary directory
   (`~/.cargo/bin` by default).
 - `make shell-register`: install the executable and register file manager integration.
@@ -379,15 +377,15 @@ publishing does not depend on these optional runs.
 
 The workflow produces and validates these distribution files:
 
-- **Windows x64 and Arm64:** standalone executables and ZIP packages. ZIP contents are checked
-  for the executable, README and license.
-- **Linux x64 and Arm64:** TAR.GZ and Debian packages built on Ubuntu 22.04. Debian packages are
-  installed, tested and removed without changing application settings.
+- **Windows x64 and Arm64:** ZIP packages holding only `oxidemerge.exe`, which is checked to be
+  for the right processor and to run.
+- **Linux x64 and Arm64:** TAR.GZ packages built on Ubuntu 22.04. The program in them is run
+  and checked not to change application settings.
 - **Linux AppImage:** packages built on AlmaLinux 8 with glibc 2.28. Required X11, Wayland and
   keyboard libraries are bundled and used when system libraries are unavailable. Packages are
   checked on Ubuntu 22.04 and 24.04 and AlmaLinux 8 and 9, including library resolution,
   command-line behavior and window startup.
-- **macOS:** an ad-hoc signed universal application in DMG and ZIP packages. Both Apple silicon
+- **macOS:** an ad-hoc signed universal application in a DMG package. Both Apple silicon
   and Intel architectures are verified, and the Intel executable is tested through Rosetta.
 - **Documentation:** English and Traditional Chinese PDF guides. Missing font coverage fails
   the document build.
@@ -404,8 +402,21 @@ version in `Cargo.toml`, and `CHANGELOG.md` must contain a section for that vers
 
 Release notes come from the matching changelog section, followed by download instructions.
 The workflow reads the changelog without changing it. Before publishing, it checks that all
-expected packages exist and that the release has not already been published. Each release
-includes PDF guides, `SHA256SUMS.txt` and the source commit used for the build.
+expected packages, and nothing else, exist and that the release has not already been published.
+Each release includes PDF guides and the source commit used for the build, and GitHub lists the
+SHA-256 digest of every file. A release holds exactly these files (for version 0.9.6):
+
+```text
+oxidemerge-0.9.6-linux-arm64.AppImage
+oxidemerge-0.9.6-linux-arm64.tar.gz
+oxidemerge-0.9.6-linux-x64.AppImage
+oxidemerge-0.9.6-linux-x64.tar.gz
+oxidemerge-0.9.6-macos-universal.dmg
+oxidemerge-0.9.6-user-guide.pdf
+oxidemerge-0.9.6-user-guide.zh-TW.pdf
+oxidemerge-0.9.6-windows-arm64.zip
+oxidemerge-0.9.6-windows-x64.zip
+```
 
 ### Release procedure
 
@@ -483,8 +494,8 @@ fix as `v0.9.7`. Choose a new, unused patch version; keep the original tag and p
    git push origin v0.9.7
    ```
 
-6. Check the tag's workflow and the new GitHub release. Confirm that all expected packages,
-   PDF guides and `SHA256SUMS.txt` are available and that the release notes describe the fix.
+6. Check the tag's workflow and the new GitHub release. Confirm that all expected packages and
+   PDF guides are available and that the release notes describe the fix.
    Then add an `Unreleased` section for the next version to `CHANGELOG.md`.
 
 If the new release build also fails, repeat this process with another unused patch version.

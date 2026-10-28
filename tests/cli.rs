@@ -325,10 +325,47 @@ fn web_pages_compare_their_visible_text() {
             ),
         ],
     );
+    // The pages as downloaded, whether or not a browser is installed.
+    std::fs::create_dir_all(d.join(".config")).unwrap();
+    std::fs::write(d.join(".config/config.json"), r#"{"web_render": false}"#).unwrap();
     let run = oxidemerge(d, &["--cli", "--compare-as", "web", "a.html", "b.html"]);
     assert_eq!(run.code, 1, "{}", run.stderr);
     assert!(run.stdout.contains("-world") && run.stdout.contains("+there"));
     assert!(!run.stdout.contains("p{}"), "styles are not visible text");
+}
+
+/// With a browser (`OXIDEMERGE_TEST_BROWSER`, see `web_render`), the console compare sees what
+/// the app's text mode shows: the pages after their scripts have run.
+#[test]
+fn web_pages_compare_as_rendered_with_a_browser() {
+    let Some(browser) = std::env::var("OXIDEMERGE_TEST_BROWSER")
+        .ok()
+        .filter(|b| !b.is_empty())
+    else {
+        return;
+    };
+    let d = tmp();
+    let d = d.path();
+    let page = |word: &str| {
+        format!(
+            "<html><body><p>Hello</p><script>document.body.insertAdjacentHTML(\
+             'beforeend', '<p>{word} from a script</p>')</script></body></html>"
+        )
+    };
+    let (a, b) = (page("one"), page("two"));
+    files(d, &[("a.html", a.as_str()), ("b.html", b.as_str())]);
+    if browser != "auto" {
+        let config = serde_json::json!({ "web_browser": browser }).to_string();
+        std::fs::create_dir_all(d.join(".config")).unwrap();
+        std::fs::write(d.join(".config/config.json"), config).unwrap();
+    }
+    let run = oxidemerge(d, &["--cli", "--compare-as", "web", "a.html", "b.html"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(
+        run.stdout.contains("-one from a script") && run.stdout.contains("+two from a script"),
+        "{}",
+        run.stdout
+    );
 }
 
 #[test]

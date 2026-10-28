@@ -626,6 +626,7 @@
   "web.capturing": "Capturing screenshots...",
   "web.downloading": "Downloading resources {done} / {total}",
   "web.failed": "{n} resource(s) could not be downloaded",
+  "web.fallback": "The browser could not render the pages ({error}); showing them as downloaded, without running their scripts",
   "web.skipped": "{n} resource(s) skipped: a web page may not load from this computer or a private network",
   "web.html": "HTML source",
   "web.loading": "Loading pages...",

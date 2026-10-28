@@ -1374,8 +1374,9 @@ fn submenu<R>(
     submenu_measured(ui, title, true, add)
 }
 
-/// [`submenu`] for a list whose entries are not measured, such as recent paths of any length:
-/// they may make it wider than the other menus, but never the other menus wider.
+/// [`submenu`] for a list of the user's own entries, such as recent paths or rule names, which
+/// are not measured: they may make it wider than the other menus, but never the other menus
+/// wider, and the menus need not be measured again when they change.
 fn submenu_list<R>(
     ui: &mut egui::Ui,
     title: &str,
@@ -4164,7 +4165,9 @@ impl OxideMergeApp {
         // Listed when the menu opens, not every frame it stays open.
         let names_id = egui::Id::new("menu_rule_names");
         ui.add_enabled_ui(tab_rules.is_some(), |ui| {
-            let shown = submenu(ui, tr("menu.rules"), |ui| {
+            // Rule names are the user's, like recent paths: not measured, so a long one widens
+            // this submenu only, and new ones need no measuring again.
+            let shown = submenu_list(ui, tr("menu.rules"), |ui| {
                 let current = tab_rules.as_deref().unwrap_or_default();
                 if widgets::menu_check(ui, current.is_empty(), tr("rules.none"), "").clicked() {
                     m.rules = Some(String::new());

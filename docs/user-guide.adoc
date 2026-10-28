@@ -70,30 +70,29 @@ destination and output path. Use read-only panes to protect versions you only ne
 
 Download the package for your operating system and processor from
 https://github.com/kuopinghsu/OxideMerge/releases[GitHub Releases].
-Releases also include English and Traditional Chinese PDF guides and a `SHA256SUMS.txt`
-file for download verification.
+Releases also include English and Traditional Chinese PDF guides. The release page lists each
+download's SHA-256 digest for verifying it.
 
 [cols="1,3"]
 |===
 |Platform |Package
 
 |Windows 10 or 11, x64 / Arm64
-|`oxidemerge-<version>-windows-x64.exe` or `oxidemerge-<version>-windows-arm64.exe`.
-Run the executable directly, or extract the matching ZIP package.
+|`oxidemerge-<version>-windows-x64.zip` or `oxidemerge-<version>-windows-arm64.zip`.
+Extract it and run `oxidemerge.exe`; there is nothing to install.
 
 |Linux x64 / Arm64
-|AppImage (Ubuntu 20.04, RHEL 8, Debian 10 and newer), Debian package (Ubuntu 22.04 and newer),
-or TAR.GZ archive. Choose `linux-x64` for Intel/AMD or `linux-arm64` for 64-bit Arm.
+|AppImage (Ubuntu 20.04, RHEL 8, Debian 10 and newer) or TAR.GZ archive.
+Choose `linux-x64` for Intel/AMD or `linux-arm64` for 64-bit Arm.
 
 |macOS 11 and newer
-|`oxidemerge-<version>-macos-universal.dmg` (Apple silicon and Intel), or the same app in a `.zip`.
+|`oxidemerge-<version>-macos-universal.dmg` (Apple silicon and Intel).
 |===
 
 Linux::
 Use a desktop session with X11 or Wayland.
 Run `chmod +x oxidemerge-*.AppImage` before starting the AppImage.
 Without FUSE, start it with `--appimage-extract-and-run`.
-Install the Debian package with `sudo apt install ./oxidemerge-*.deb`.
 File dialogs require `xdg-desktop-portal`, normally included with your desktop environment.
 Install a suitable CJK font, such as Noto Sans CJK, to display Chinese, Japanese and Korean text.
 
@@ -697,7 +696,11 @@ window (Edge, Chrome, Chromium and Brave are detected automatically), so they sh
 after its scripts have run, as you would see it. The pages load at the same time, each in its own
 tab, and are taken as they are after 45 seconds. Without a browser, or with *Render pages in the
 browser for text and HTML* turned off, Text and HTML source use the HTML as downloaded instead:
-scripts do not run, and content they add is missing.
+scripts do not run, and content they add is missing. If the browser fails, they fall back to the
+HTML as downloaded too, and the status bar says why.
+The console compare (`--cli -t web`) compares the same text, or HTML with the HTML source mode.
+On macOS and Linux OxideMerge talks to the browser over a private pipe; on Windows, over a port
+that only this computer can reach, open while the pages load.
 
 Pages are decoded as browsers do: a byte order mark comes first, then the charset of the HTTP
 `Content-Type` header, then a `<meta>` charset, then a guess from the content.

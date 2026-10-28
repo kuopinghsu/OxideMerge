@@ -33,7 +33,8 @@ enum KindArg {
     Text,
     Binary,
     Image,
-    /// Web pages (URLs or HTML files); the console compare uses the visible text
+    /// Web pages (URLs or HTML files); the console compare uses the visible text, after the
+    /// pages' scripts have run when a browser is found
     Web,
 }
 
@@ -473,15 +474,25 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             .iter()
             .map(|p| core::web::location(p))
             .collect::<Result<Vec<_>, _>>()?;
-        core::web::fetch_pages(&urls)?
+        // As the text and HTML modes show them: rendered by the browser when there is one.
+        let browser = cfg
+            .web_render
+            .then(|| core::web::find_browser(&cfg.web_browser))
+            .flatten();
+        let source = core::web_render::load_text(
+            browser.as_deref(),
+            &urls,
+            cfg.web_width,
+            cfg.web_height,
+            &core::web::Progress::default(),
+        )?;
+        if let core::web_render::TextSource::Downloaded(_, Some(e)) = &source {
+            eprintln!("{}", i18n::trf("web.fallback", &[("error", e.clone())]));
+        }
+        source
+            .texts(cfg.web_mode == core::web::WebMode::Html)
             .iter()
-            .map(|p| {
-                let text = match cfg.web_mode {
-                    core::web::WebMode::Html => core::web::format_html(&p.html),
-                    _ => core::web::html_to_text(&p.html),
-                };
-                core::text::TextDoc::from_text(None, &text)
-            })
+            .map(|text| core::text::TextDoc::from_text(None, text))
             .collect()
     } else {
         paths

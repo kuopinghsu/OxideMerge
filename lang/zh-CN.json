@@ -626,6 +626,7 @@
   "web.capturing": "正在截取屏幕截图...",
   "web.downloading": "正在下载资源 {done} / {total}",
   "web.failed": "有 {n} 个资源无法下载",
+  "web.fallback": "浏览器无法渲染页面（{error}）；改为显示下载的原始内容，不执行页面脚本",
   "web.skipped": "页面不在本机或私有网络上，因此跳过了其中的 {n} 个资源",
   "web.html": "HTML 源代码",
   "web.loading": "正在加载网页...",

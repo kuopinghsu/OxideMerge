@@ -6,9 +6,12 @@ Three versions of a release notes page, for trying web page compare without a ne
 - `right.html`: release 2.4
 - `base.html`: release 2.2, the common base for a 3-way compare
 
-Open them with `make demo-web` (2-way) or `make demo-web-3way`, or:
+Open them from the project folder with:
 
-    oxidemerge -t web samples/web/left.html samples/web/right.html
+    cargo run -- -t web samples/web/left.html samples/web/right.html
+    cargo run -- -t web samples/web/left.html samples/web/base.html samples/web/right.html
+
+or, with OxideMerge installed, `oxidemerge -t web` and the same files.
 
 Local HTML files need `-t web`; without it they open as text.
 
@@ -24,5 +27,5 @@ What to look for in each mode:
 - **HTML source:** the HTML after the script has run, so the generated `<li>` items are in it.
 
 Text, Full page, Screenshot and the script-generated content need Edge, Chrome, Chromium or
-Brave. Without one, Text and HTML source use the files as they are, and the known issues list
-is empty.
+Brave. Without one, or if it fails, Text and HTML source use the files as they are, and the
+known issues list is empty.

@@ -17,8 +17,8 @@ that Apple could not check it for malicious software. The supported ways past th
 - **Terminal:** `xattr -dr com.apple.quarantine /Applications/OxideMerge.app` clears the flag.
   Packages built from source, or copied without a browser, never get it.
 
-Each release publishes `SHA256SUMS.txt`, so the downloaded package can be checked before it is
-allowed to run (see [Installing](../README.md#installing)).
+The release page lists each download's SHA-256 digest, so the downloaded package can be checked
+before it is allowed to run (`shasum -a 256 oxidemerge-*-macos-universal.dmg`).
 
 Once the app is opened, macOS may still ask for access to the Desktop, Documents, Downloads,
 removable volumes or network volumes the first time a compare reads them. That is independent of
@@ -69,7 +69,7 @@ note records the change.
 
 A first launch should be tried on a macOS installation that has never run OxideMerge (a new user
 account, or a virtual machine): download the `.dmg` with a browser so it gets the quarantine flag,
-check it against `SHA256SUMS.txt`, drag the app to Applications, open it through
+check it against the digest on the release page, drag the app to Applications, open it through
 **Open Anyway**, and compare two files and two folders in a protected folder such as Documents.
 GitHub's hosted runners can't do this, because nothing they build is quarantined, so it has to be
 done by hand before a release.

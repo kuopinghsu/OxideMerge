@@ -626,6 +626,7 @@
   "web.capturing": "스크린샷을 캡처하는 중...",
   "web.downloading": "리소스 다운로드 중 {done} / {total}",
   "web.failed": "{n}개의 리소스를 다운로드하지 못했습니다",
+  "web.fallback": "브라우저에서 페이지를 렌더링하지 못했습니다({error}). 스크립트를 실행하지 않고 다운로드한 그대로 표시합니다",
   "web.skipped": "페이지가 이 컴퓨터나 사설 네트워크에 있지 않으므로 그곳의 리소스 {n}개를 건너뛰었습니다",
   "web.html": "HTML 소스",
   "web.loading": "페이지를 불러오는 중...",

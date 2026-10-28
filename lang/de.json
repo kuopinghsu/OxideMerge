@@ -626,6 +626,7 @@
   "web.capturing": "Bildschirmfotos werden erstellt...",
   "web.downloading": "Ressourcen werden heruntergeladen {done} / {total}",
   "web.failed": "{n} Ressource(n) konnten nicht heruntergeladen werden",
+  "web.fallback": "Der Browser konnte die Seiten nicht darstellen ({error}); sie werden wie heruntergeladen gezeigt, ohne ihre Skripte auszuführen",
   "web.skipped": "{n} Ressource(n) auf diesem Computer oder in einem privaten Netzwerk übersprungen, da die Seite nicht dort liegt",
   "web.html": "HTML-Quelltext",
   "web.loading": "Seiten werden geladen...",

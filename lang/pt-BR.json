@@ -626,6 +626,7 @@
   "web.capturing": "Capturando telas...",
   "web.downloading": "Baixando recursos {done} / {total}",
   "web.failed": "{n} recurso(s) não puderam ser baixados",
+  "web.fallback": "O navegador não conseguiu renderizar as páginas ({error}); elas são mostradas como baixadas, sem executar seus scripts",
   "web.skipped": "{n} recurso(s) deste computador ou de uma rede privada ignorado(s), pois a página não está lá",
   "web.html": "Código HTML",
   "web.loading": "Carregando páginas...",

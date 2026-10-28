@@ -626,6 +626,7 @@
   "web.capturing": "正在擷取螢幕截圖...",
   "web.downloading": "正在下載資源 {done} / {total}",
   "web.failed": "有 {n} 個資源無法下載",
+  "web.fallback": "瀏覽器無法轉譯頁面（{error}）；改為顯示下載的原始內容，不執行頁面指令碼",
   "web.skipped": "網頁不在本機或私人網路上，因此略過了其中的 {n} 個資源",
   "web.html": "HTML 原始碼",
   "web.loading": "正在載入網頁...",

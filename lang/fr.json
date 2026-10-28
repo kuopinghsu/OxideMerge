@@ -626,6 +626,7 @@
   "web.capturing": "Capture des écrans...",
   "web.downloading": "Téléchargement des ressources {done} / {total}",
   "web.failed": "{n} ressource(s) n'ont pas pu être téléchargées",
+  "web.fallback": "Le navigateur n'a pas pu afficher les pages ({error}) ; elles sont montrées telles que téléchargées, sans exécuter leurs scripts",
   "web.skipped": "{n} ressource(s) de cet ordinateur ou d’un réseau privé ignorée(s), car la page n’y est pas",
   "web.html": "Source HTML",
   "web.loading": "Chargement des pages...",

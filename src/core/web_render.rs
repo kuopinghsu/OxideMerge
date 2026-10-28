@@ -4,7 +4,7 @@
 //! highlighted on the page itself (like WinMerge's "View Differences").
 
 use crate::core::cdp::{self, Browser};
-use crate::core::web::Progress;
+use crate::core::web::{self, Page, Progress};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use similar::{Algorithm, DiffTag, TextDiff};
@@ -344,6 +344,73 @@ fn session_of(v: &Value) -> Option<&str> {
     v.get("sessionId").and_then(Value::as_str)
 }
 
+/// Pages for the text and HTML modes.
+pub enum TextSource {
+    /// As the browser shows them, after their scripts have run.
+    Rendered(Vec<Rendered>),
+    /// As downloaded, without running their scripts; with why the browser was not used, when
+    /// it failed.
+    Downloaded(Vec<Page>, Option<String>),
+}
+
+impl TextSource {
+    /// The visible text, or the HTML, of each page.
+    pub fn texts(&self, html: bool) -> Vec<String> {
+        match self {
+            TextSource::Rendered(r) => r
+                .iter()
+                .map(|r| {
+                    if html {
+                        web::format_html(&r.html)
+                    } else {
+                        r.text()
+                    }
+                })
+                .collect(),
+            TextSource::Downloaded(pages, _) => pages
+                .iter()
+                .map(|p| {
+                    if html {
+                        web::format_html(&p.html)
+                    } else {
+                        web::html_to_text(&p.html)
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The pages for the text and HTML modes: rendered by `browser` when there is one, otherwise,
+/// or when rendering fails, as downloaded. Stopping (`progress.abort`) is an error either way.
+pub fn load_text(
+    browser: Option<&Path>,
+    urls: &[Url],
+    width: u32,
+    height: u32,
+    progress: &Progress,
+) -> Result<TextSource> {
+    let failed = match browser {
+        None => None,
+        Some(exe) => {
+            let opts = RenderOptions {
+                width,
+                height,
+                capture: Capture::None,
+                highlight: false,
+            };
+            match render(exe, urls, &opts, progress) {
+                Ok(r) => return Ok(TextSource::Rendered(r)),
+                Err(_) if progress.abort.load(Ordering::Relaxed) => {
+                    bail!("{}", crate::i18n::tr("msg.aborted"))
+                }
+                Err(e) => Some(format!("{e:#}")),
+            }
+        }
+    };
+    Ok(TextSource::Downloaded(web::fetch_pages(urls)?, failed))
+}
+
 /// Loads every page in its own tab of one headless browser and extracts, marks and captures
 /// them. `progress.done` counts finished pages.
 pub fn render(
@@ -533,13 +600,52 @@ mod tests {
         assert_eq!(b, vec![(12, 17)]);
     }
 
-    /// Renders two pages in a real browser when one is installed (skipped otherwise).
+    /// The browser to test with: `OXIDEMERGE_TEST_BROWSER` names it, or is `auto` to use the
+    /// one found. Unset or empty, tests needing a browser are skipped, so they run only where
+    /// asked for.
+    fn test_browser() -> Option<std::path::PathBuf> {
+        let name = std::env::var("OXIDEMERGE_TEST_BROWSER")
+            .ok()
+            .filter(|n| !n.is_empty())?;
+        let found = crate::core::web::find_browser(if name == "auto" { "" } else { &name });
+        assert!(
+            found.is_some(),
+            "OXIDEMERGE_TEST_BROWSER={name}: no such browser"
+        );
+        found
+    }
+
+    #[test]
+    fn text_falls_back_to_the_pages_as_downloaded() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("a.html");
+        std::fs::write(&p, "<p>Hello</p>").unwrap();
+        let urls = [
+            Url::from_file_path(&p).unwrap(),
+            Url::from_file_path(&p).unwrap(),
+        ];
+        let progress = Progress::default();
+        // No browser: downloaded, and nothing to report.
+        let source = load_text(None, &urls, 800, 600, &progress).unwrap();
+        assert!(matches!(source, TextSource::Downloaded(_, None)));
+        // A browser that can't start: downloaded, saying why.
+        let missing = d.path().join("no-such-browser");
+        let source = load_text(Some(&missing), &urls, 800, 600, &progress).unwrap();
+        let TextSource::Downloaded(pages, Some(why)) = source else {
+            panic!("expected the pages as downloaded");
+        };
+        assert_eq!(pages.len(), 2);
+        assert!(why.contains("no-such-browser"), "{why}");
+        // Stopped: an error, not the downloaded pages.
+        progress.abort.store(true, Ordering::Relaxed);
+        assert!(load_text(Some(&missing), &urls, 800, 600, &progress).is_err());
+    }
+
+    /// Renders two pages in a real browser (see [`test_browser`]).
     #[test]
     fn renders_pages_in_a_browser() {
-        let Some(exe) = crate::core::web::find_browser(
-            &std::env::var("OXIDEMERGE_TEST_BROWSER").unwrap_or_default(),
-        ) else {
-            eprintln!("no browser; skipped");
+        let Some(exe) = test_browser() else {
+            eprintln!("OXIDEMERGE_TEST_BROWSER not set; skipped");
             return;
         };
         let d = tempfile::tempdir().unwrap();

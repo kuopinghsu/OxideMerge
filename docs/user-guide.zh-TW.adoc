@@ -79,29 +79,28 @@ IMPORTANT: 合併會變更目標內容。複製或儲存前，請確認來源、
 == 安裝
 
 請從 https://github.com/kuopinghsu/OxideMerge/releases[GitHub 發行頁面] 下載適合系統與處理器的套件。
-每個版本也提供英文與繁體中文 PDF 指南，以及用來驗證下載檔案的 `SHA256SUMS.txt`。
+每個版本也提供英文與繁體中文 PDF 指南；發行頁面會列出每個下載檔案的 SHA-256 摘要，可用來驗證檔案。
 
 [cols="1,3"]
 |===
 |平台 |套件
 
 |Windows 10 或 11，x64／Arm64
-|`oxidemerge-<version>-windows-x64.exe` 或 `oxidemerge-<version>-windows-arm64.exe`。
-可直接執行，或解壓縮對應的 ZIP 套件。
+|`oxidemerge-<version>-windows-x64.zip` 或 `oxidemerge-<version>-windows-arm64.zip`。
+解壓縮後執行 `oxidemerge.exe`，不需安裝。
 
 |Linux x64 / Arm64
-|AppImage（Ubuntu 20.04、RHEL 8、Debian 10 及更新版本）、Debian 套件（Ubuntu 22.04 及更新版本），
-或 TAR.GZ 壓縮檔。Intel／AMD 處理器請選 `linux-x64`，64 位元 Arm 請選 `linux-arm64`。
+|AppImage（Ubuntu 20.04、RHEL 8、Debian 10 及更新版本）或 TAR.GZ 壓縮檔。
+Intel／AMD 處理器請選 `linux-x64`，64 位元 Arm 請選 `linux-arm64`。
 
 |macOS 11 以上
-|`oxidemerge-<version>-macos-universal.dmg`（Apple 晶片與 Intel），或包含相同應用程式的 `.zip`。
+|`oxidemerge-<version>-macos-universal.dmg`（Apple 晶片與 Intel）。
 |===
 
 Linux::
 請在使用 X11 或 Wayland 的桌面環境中執行。
 啟動 AppImage 前，請先執行 `chmod +x oxidemerge-*.AppImage`。
 若系統沒有 FUSE，請加上 `--appimage-extract-and-run` 啟動。
-以 `sudo apt install ./oxidemerge-*.deb` 安裝 Debian 套件。
 檔案對話框需要 `xdg-desktop-portal`，一般桌面環境通常已提供。
 若要顯示中文、日文與韓文，請安裝 Noto Sans CJK 等適用字型。
 
@@ -633,6 +632,9 @@ HTML 原始碼:: 網頁執行指令碼後的 HTML，經壓縮的長行會在標�
 文字、HTML 原始碼與截圖都來自不顯示視窗的 Chromium 系列瀏覽器（可自動偵測 Edge、Chrome、Chromium 與 Brave），因此呈現的是網頁執行指令碼後、您實際看到的樣子。
 各網頁在各自的分頁中同時載入，45 秒後即以當時的狀態處理。
 沒有瀏覽器，或關閉「文字與 HTML 模式使用瀏覽器轉譯頁面」時，文字與 HTML 原始碼改用下載的原始 HTML：不會執行指令碼，也不包含指令碼加入的內容。
+瀏覽器發生錯誤時，同樣改用下載的原始 HTML，並在狀態列說明原因。
+主控台比較（`--cli -t web`）比較的是相同的文字；選擇 HTML 原始碼模式時則比較 HTML。
+在 macOS 與 Linux 上，OxideMerge 透過私有管道與瀏覽器溝通；在 Windows 上則透過只有本機能連線的連接埠，只在載入網頁時開啟。
 
 網頁的解碼方式與瀏覽器相同：先看位元組順序標記，其次是 HTTP `Content-Type` 標頭中的字元集，再來是 `<meta>` 中的字元集，最後才依內容推測。
 非 2xx 的 HTTP 狀態碼會顯示在窗格標題中，並比較隨之傳回的網頁。

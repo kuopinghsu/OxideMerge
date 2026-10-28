@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::core::filter::FltFilter;
 use crate::core::text::TextDoc;
 use crate::core::web::{self, Page, Progress, WebMode};
-use crate::core::web_render::{self, Capture, RenderOptions, Rendered};
+use crate::core::web_render::{self, Capture, RenderOptions, Rendered, TextSource};
 use crate::i18n::{tr, trf};
 use crate::ui::app::Content;
 use crate::ui::folder_view::FolderView;
@@ -23,7 +23,9 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 enum Loaded {
-    Pages(Arc<Vec<Page>>),
+    /// Pages as downloaded for the text and HTML modes, with why the browser was not used when
+    /// it failed.
+    Pages(Arc<Vec<Page>>, Option<String>),
     /// Pages rendered by the browser, with their screenshots saved in the folder when taken.
     Rendered(
         Arc<Vec<Rendered>>,
@@ -45,6 +47,9 @@ pub struct WebView {
     pages: Option<Arc<Vec<Page>>>,
     /// Pages rendered by the browser, reused by the text and HTML modes.
     rendered: Option<Arc<Vec<Rendered>>>,
+    /// Set when the text and HTML modes show `pages` as downloaded, with why the browser was not
+    /// used when it failed; switching between the two modes then keeps to them.
+    downloaded_text: Option<Option<String>>,
     /// Whether screenshots show text differences highlighted.
     pub highlight: bool,
     pub inner: Option<Box<Content>>,
@@ -103,6 +108,7 @@ impl WebView {
             mode: cfg.web_mode,
             pages: None,
             rendered: None,
+            downloaded_text: None,
             highlight: cfg.web_highlight,
             inner: None,
             job: None,
@@ -122,6 +128,7 @@ impl WebView {
     pub fn reload(&mut self, cfg: &Config) {
         self.pages = None;
         self.rendered = None;
+        self.downloaded_text = None;
         self.start(cfg);
     }
 
@@ -156,25 +163,25 @@ impl WebView {
             WebMode::Html | WebMode::Text => {
                 if let Some(r) = self.rendered.clone() {
                     let _ = tx.send(Ok(Loaded::Rendered(r, None)));
-                } else if let Some(exe) = cfg
-                    .web_render
-                    .then(|| web::find_browser(&cfg.web_browser))
-                    .flatten()
+                } else if let (Some(p), Some(failed)) =
+                    (self.pages.clone(), self.downloaded_text.clone())
                 {
+                    let _ = tx.send(Ok(Loaded::Pages(p, failed)));
+                } else {
+                    let browser = cfg
+                        .web_render
+                        .then(|| web::find_browser(&cfg.web_browser))
+                        .flatten();
                     let pr = progress.clone();
                     std::thread::spawn(move || {
-                        let opts = RenderOptions {
-                            width: w,
-                            height: h,
-                            capture: Capture::None,
-                            highlight: false,
-                        };
-                        let r = web_render::render(&exe, &render_urls, &opts, &pr);
-                        let _ = tx.send(r.map(|r| Loaded::Rendered(Arc::new(r), None)));
-                    });
-                } else {
-                    std::thread::spawn(move || {
-                        let _ = tx.send(pages().map(Loaded::Pages));
+                        let r = web_render::load_text(browser.as_deref(), &render_urls, w, h, &pr)
+                            .map(|source| match source {
+                                TextSource::Rendered(r) => Loaded::Rendered(Arc::new(r), None),
+                                TextSource::Downloaded(p, failed) => {
+                                    Loaded::Pages(Arc::new(p), failed)
+                                }
+                            });
+                        let _ = tx.send(r);
                     });
                 }
             }
@@ -249,7 +256,7 @@ impl WebView {
 
     fn show(&mut self, loaded: Loaded, cfg: &Config, named: &[FltFilter]) -> anyhow::Result<()> {
         let content = match loaded {
-            Loaded::Pages(pages) => {
+            Loaded::Pages(pages, failed) => {
                 let html = self.mode == WebMode::Html;
                 let docs = pages
                     .iter()
@@ -267,6 +274,10 @@ impl WebView {
                     })
                     .collect();
                 self.pages = Some(pages);
+                if let Some(e) = &failed {
+                    self.note = trf("web.fallback", &[("error", e.clone())]);
+                }
+                self.downloaded_text = Some(failed);
                 Content::Text(TextView::new(docs, cfg))
             }
             Loaded::Rendered(rendered, Some((dir, paths))) => {

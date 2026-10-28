@@ -185,14 +185,105 @@ impl Socket {
             .map_err(|_| anyhow::anyhow!("DevTools connection"))?;
         write_frame(&mut w, 0x1, text.as_bytes()).context("DevTools connection")
     }
+}
 
-    /// Waits up to `timeout` for the next text message. `Ok(None)` when none arrived in time.
+/// The DevTools connection over the pipe the browser is given on file descriptors 3 (what it
+/// reads) and 4 (what it writes), messages ending in a NUL byte (`--remote-debugging-pipe`).
+/// Unlike a port, nothing else on the computer can reach it.
+#[cfg(unix)]
+struct Pipe {
+    writer: std::io::PipeWriter,
+    incoming: Receiver<Incoming>,
+}
+
+#[cfg(unix)]
+impl Pipe {
+    /// Has `cmd` start with the pipe, and starts it.
+    fn spawn(cmd: &mut Command) -> Result<(Child, Pipe)> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let (browser_reads, writer) = std::io::pipe()?;
+        let (reader, browser_writes) = std::io::pipe()?;
+        let (r, w) = (browser_reads.as_raw_fd(), browser_writes.as_raw_fd());
+        // SAFETY: between fork and exec only async-signal-safe calls (fcntl, dup2) are made.
+        // The pipe ends are first copied above 4, so placing one on 3 can't overwrite the other.
+        unsafe {
+            cmd.pre_exec(move || {
+                let high = |fd| match libc::fcntl(fd, libc::F_DUPFD, 10) {
+                    -1 => Err(std::io::Error::last_os_error()),
+                    fd => Ok(fd),
+                };
+                let (r, w) = (high(r)?, high(w)?);
+                for (from, to) in [(r, 3), (w, 4)] {
+                    // dup2 leaves the new descriptor open across exec.
+                    if libc::dup2(from, to) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.arg("--remote-debugging-pipe").spawn()?;
+        // The browser's ends are its own now; closing ours lets a read end when it exits.
+        drop((browser_reads, browser_writes));
+        let (tx, incoming) = channel();
+        std::thread::Builder::new()
+            .name("devtools".into())
+            .spawn(move || {
+                let mut reader = BufReader::new(reader);
+                let reason = loop {
+                    let mut message = Vec::new();
+                    match reader.read_until(0, &mut message) {
+                        Ok(0) => break "the browser closed the DevTools connection".to_string(),
+                        Ok(_) => {
+                            if message.last() == Some(&0) {
+                                message.pop();
+                            }
+                            let text = String::from_utf8_lossy(&message).into_owned();
+                            if tx.send(Incoming::Text(text)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => break format!("DevTools connection: {e}"),
+                    }
+                };
+                let _ = tx.send(Incoming::Closed(reason));
+            })?;
+        Ok((child, Pipe { writer, incoming }))
+    }
+}
+
+/// How the DevTools messages travel.
+enum Conn {
+    Socket(Socket),
+    #[cfg(unix)]
+    Pipe(Pipe),
+}
+
+impl Conn {
+    fn send_text(&mut self, text: &str) -> Result<()> {
+        match self {
+            Conn::Socket(s) => s.send_text(text),
+            #[cfg(unix)]
+            Conn::Pipe(p) => {
+                p.writer.write_all(text.as_bytes())?;
+                p.writer.write_all(&[0])?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Waits up to `timeout` for the next message. `Ok(None)` when none arrived in time.
     fn recv_text(&mut self, timeout: Duration) -> Result<Option<String>> {
-        match self.incoming.recv_timeout(timeout) {
+        let incoming = match self {
+            Conn::Socket(s) => &s.incoming,
+            #[cfg(unix)]
+            Conn::Pipe(p) => &p.incoming,
+        };
+        match incoming.recv_timeout(timeout) {
             Ok(Incoming::Text(text)) => Ok(Some(text)),
             Ok(Incoming::Closed(e)) => bail!("{e}"),
-            Ok(Incoming::Open) => Ok(None),
-            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Ok(Incoming::Open) | Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => {
                 bail!("the browser closed the DevTools connection")
             }
@@ -203,7 +294,7 @@ impl Socket {
 /// A headless browser process and the DevTools connection to it. The process is ended on drop.
 pub struct Browser {
     child: Child,
-    socket: Socket,
+    conn: Conn,
     next_id: u64,
     /// Events received while waiting for a reply, kept for `wait_event`.
     events: VecDeque<Value>,
@@ -236,32 +327,52 @@ impl Browser {
             // Chromium refuses to start its sandbox as root (as in containers).
             cmd.arg("--no-sandbox");
         }
+        cmd.args([
+            "--headless=new",
+            "--disable-gpu",
+            "--hide-scrollbars",
+            "--mute-audio",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--disable-sync",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-features=Translate,MediaRouter",
+        ])
+        .arg(format!("--user-data-dir={}", profile.path().display()))
+        .arg("about:blank")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+        let (child, conn) = Browser::connect(exe, &mut cmd, profile.path())?;
+        Ok(Browser {
+            child,
+            conn,
+            next_id: 0,
+            events: VecDeque::new(),
+            keep,
+            _profile: profile,
+        })
+    }
+
+    /// Starts the browser and connects to it: over a pipe where there are pipes to hand it
+    /// (macOS, Linux), else over a port on this computer only (Windows). Setting
+    /// `OXIDEMERGE_DEVTOOLS_PORT` uses the port everywhere, to test it.
+    fn connect(exe: &Path, cmd: &mut Command, profile: &Path) -> Result<(Child, Conn)> {
+        #[cfg(unix)]
+        if std::env::var_os("OXIDEMERGE_DEVTOOLS_PORT").is_none() {
+            let (child, pipe) = Pipe::spawn(cmd).with_context(|| exe.display().to_string())?;
+            return Ok((child, Conn::Pipe(pipe)));
+        }
         let mut child = cmd
-            .args([
-                "--headless=new",
-                "--remote-debugging-port=0",
-                "--disable-gpu",
-                "--hide-scrollbars",
-                "--mute-audio",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-extensions",
-                "--disable-sync",
-                "--disable-background-networking",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
-                "--disable-features=Translate,MediaRouter",
-            ])
-            .arg(format!("--user-data-dir={}", profile.path().display()))
-            .arg("about:blank")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .arg("--remote-debugging-port=0")
             .spawn()
             .with_context(|| exe.display().to_string())?;
         // The browser writes its port and WebSocket path to this file once it listens.
-        let port_file = profile.path().join("DevToolsActivePort");
+        let port_file = profile.join("DevToolsActivePort");
         let started = Instant::now();
         let (port, path) = loop {
             if let Ok(s) = std::fs::read_to_string(&port_file) {
@@ -281,21 +392,13 @@ impl Browser {
             }
             std::thread::sleep(Duration::from_millis(50));
         };
-        let socket = match Socket::connect(port, &path, Duration::from_secs(10)) {
-            Ok(s) => s,
+        match Socket::connect(port, &path, Duration::from_secs(10)) {
+            Ok(s) => Ok((child, Conn::Socket(s))),
             Err(e) => {
                 let _ = child.kill();
-                return Err(e);
+                Err(e)
             }
-        };
-        Ok(Browser {
-            child,
-            socket,
-            next_id: 0,
-            events: VecDeque::new(),
-            keep,
-            _profile: profile,
-        })
+        }
     }
 
     fn send(&mut self, session: Option<&str>, method: &str, params: Value) -> Result<u64> {
@@ -304,7 +407,7 @@ impl Browser {
         if let Some(s) = session {
             msg["sessionId"] = json!(s);
         }
-        self.socket.send_text(&msg.to_string())?;
+        self.conn.send_text(&msg.to_string())?;
         Ok(self.next_id)
     }
 
@@ -323,7 +426,7 @@ impl Browser {
             if left.is_zero() {
                 bail!("{method}: the browser did not answer");
             }
-            let Some(text) = self.socket.recv_text(left)? else {
+            let Some(text) = self.conn.recv_text(left)? else {
                 continue;
             };
             let v: Value = serde_json::from_str(&text).context("DevTools message")?;
@@ -356,10 +459,7 @@ impl Browser {
             if left.is_zero() || abort() {
                 return Ok(None);
             }
-            if let Some(text) = self
-                .socket
-                .recv_text(left.min(Duration::from_millis(200)))?
-            {
+            if let Some(text) = self.conn.recv_text(left.min(Duration::from_millis(200)))? {
                 let v: Value = serde_json::from_str(&text).context("DevTools message")?;
                 self.stash(v);
             }

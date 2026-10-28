@@ -81,22 +81,21 @@ OxideMerge 以 [WinMerge](https://github.com/WinMerge/winmerge) 為設計參考�
 ## 安裝
 
 請從 [GitHub Releases](https://github.com/kuopinghsu/OxideMerge/releases) 下載適合系統的套件。
-每個發行版本也提供英文與繁體中文 PDF 使用者指南，以及供下載檔案驗證使用的 `SHA256SUMS.txt`。
+每個發行版本也提供英文與繁體中文 PDF 使用者指南；發行頁面會列出每個下載檔案的 SHA-256 摘要，可用來驗證檔案。
 
 ### Windows
 
 支援 Windows 10 與 11，提供 x64 與 Arm64 版本。
 
-依處理器架構下載檔名結尾為 `windows-x64.exe` 或 `windows-arm64.exe` 的執行檔，即可直接執行，
-不必透過安裝程式。另提供 ZIP 壓縮檔。完整檔名包含版本號，例如
-`oxidemerge-<version>-windows-x64.exe`。
+依處理器架構下載檔名結尾為 `windows-x64.zip` 或 `windows-arm64.zip` 的套件，解壓縮後執行
+`oxidemerge.exe` 即可，不必透過安裝程式。完整檔名包含版本號，例如
+`oxidemerge-<version>-windows-x64.zip`。
 
 ### macOS
 
 支援 macOS 11 以上版本，適用於 Apple 晶片與 Intel Mac。
 
 開啟檔名結尾為 `macos-universal.dmg` 的套件，將 **OxideMerge** 拖移至「**應用程式**」。
-另提供 ZIP 壓縮檔。
 
 應用程式採用臨時簽署（ad hoc signing），尚未經過 Apple 公證。若 macOS 阻擋首次啟動，
 請先嘗試開啟一次，再到「**系統設定 → 隱私權與安全性**」選擇「**強制打開**」。
@@ -109,9 +108,7 @@ OxideMerge 以 [WinMerge](https://github.com/WinMerge/winmerge) 為設計參考�
 - **AppImage：** 可在 Ubuntu 20.04、RHEL 8、Debian 10 及更新版本執行。
   先以 `chmod +x <filename>.AppImage` 設為可執行，再啟動檔案。
   若系統無法使用 FUSE，啟動時請加上 `--appimage-extract-and-run`。
-- **Debian 套件：** 適用於 Ubuntu 22.04 及更新版本，以
-  `sudo apt install ./<filename>.deb` 安裝。
-- **TAR 壓縮檔：** 適合希望直接使用獨立執行檔的使用者。
+- **TAR 壓縮檔：** 內含獨立執行檔、桌面項目檔與圖示，適合希望直接使用執行檔的使用者。
 
 檔案對話框使用 `xdg-desktop-portal`，一般桌面環境通常已提供。
 若需要顯示中文、日文與韓文，請安裝 Noto Sans CJK 等適用字型。
@@ -291,7 +288,7 @@ macOS 與 Linux 的執行檔位於 `target/release/oxidemerge`，Windows 則為
 - `make` 或 `make release`：建置最佳化的執行檔。
 - `make build`：建置偵錯版本。
 - `make run ARGS="a.txt b.txt"`：以指定的比較路徑執行偵錯版本。
-- `make demo`、`make demo-text`、`make demo-3way`、`make demo-conflict`、`make demo-web`、`make demo-web-3way`：開啟各類範例比較。
+- `make demo`、`make demo-text`、`make demo-3way`、`make demo-conflict`：開啟各類範例比較。網頁比較請參閱 `samples/web/README.md`。
 - `make install` 或 `make uninstall`：將程式安裝至 Cargo 的執行檔目錄，或從該目錄移除；
   預設目錄為 `~/.cargo/bin`。
 - `make shell-register`：安裝執行檔，並註冊檔案管理員整合。
@@ -357,13 +354,12 @@ Linux 沒有可用顯示環境時，會啟動 Xvfb。設定 `OXIDEMERGE_SMOKE_RE
 
 工作流程會產生並驗證以下發布檔案：
 
-- **Windows x64 與 Arm64：** 獨立執行檔與 ZIP 套件，並檢查 ZIP 是否包含執行檔、README 與授權條款。
-- **Linux x64 與 Arm64：** 在 Ubuntu 22.04 建置的 TAR.GZ 與 Debian 套件。
-  Debian 套件會實際安裝、測試與移除，且不變更應用程式設定。
+- **Windows x64 與 Arm64：** 只包含 `oxidemerge.exe` 的 ZIP 套件，並檢查執行檔的處理器架構與能否執行。
+- **Linux x64 與 Arm64：** 在 Ubuntu 22.04 建置的 TAR.GZ 套件，會實際執行其中的程式，並確認不變更應用程式設定。
 - **Linux AppImage：** 在使用 glibc 2.28 的 AlmaLinux 8 上建置。
   套件內含必要的 X11、Wayland 與鍵盤函式庫，系統缺少時才使用隨附版本。
   會在 Ubuntu 22.04、24.04 與 AlmaLinux 8、9 上檢查函式庫相依性、指令列行為與視窗啟動。
-- **macOS：** 採臨時簽署的通用應用程式，提供 DMG 與 ZIP 套件。
+- **macOS：** 採臨時簽署的通用應用程式，提供 DMG 套件。
   會驗證 Apple 晶片與 Intel 兩種架構，並透過 Rosetta 測試 Intel 執行檔。
 - **說明文件：** 英文與繁體中文 PDF 指南；若字型無法涵蓋所需字元，文件建置會失敗。
 
@@ -378,8 +374,20 @@ Windows 與 Linux 的 Arm64 套件會在原生 Arm 執行環境中建置與測�
 含有 `-` 的標籤，例如 `v1.0.0-rc1`，會發布為預先發行版本。
 
 發行說明取自對應的變更紀錄段落，後面再附上下載說明。工作流程只會讀取變更紀錄，不會修改內容。
-發布前會確認預期的套件均已產生，且該版本尚未發布。每個版本都會附上 PDF 指南、`SHA256SUMS.txt`，
-並註明建置時使用的原始碼提交版本。
+發布前會確認預期的套件均已產生、沒有其他多餘檔案，且該版本尚未發布。每個版本都會附上 PDF 指南，
+並註明建置時使用的原始碼提交版本；GitHub 會列出每個檔案的 SHA-256 摘要。發行版本只包含以下檔案（以 0.9.6 為例）：
+
+```text
+oxidemerge-0.9.6-linux-arm64.AppImage
+oxidemerge-0.9.6-linux-arm64.tar.gz
+oxidemerge-0.9.6-linux-x64.AppImage
+oxidemerge-0.9.6-linux-x64.tar.gz
+oxidemerge-0.9.6-macos-universal.dmg
+oxidemerge-0.9.6-user-guide.pdf
+oxidemerge-0.9.6-user-guide.zh-TW.pdf
+oxidemerge-0.9.6-windows-arm64.zip
+oxidemerge-0.9.6-windows-x64.zip
+```
 
 ### 發布步驟
 
@@ -451,7 +459,7 @@ Windows 與 Linux 的 Arm64 套件會在原生 Arm 執行環境中建置與測�
    git push origin v0.9.7
    ```
 
-6. 檢查新標籤的工作流程與 GitHub 發行頁面，確認預期的套件、PDF 指南與 `SHA256SUMS.txt` 均已提供，
+6. 檢查新標籤的工作流程與 GitHub 發行頁面，確認預期的套件與 PDF 指南均已提供，
    且發行說明包含本次修正。接著在 `CHANGELOG.md` 加入下一個版本的 `Unreleased` 段落。
 
 若新版本的發行建置仍失敗，請使用另一個尚未使用過的修補版本號，重複以上流程。
