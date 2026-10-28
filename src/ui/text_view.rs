@@ -258,7 +258,7 @@ struct Snapshot {
 }
 
 /// How a file is written: encoding, byte order mark, line ending, final newline, mixed endings.
-type Format = (TextEncoding, bool, Eol, bool, bool, Vec<Option<Eol>>);
+type Format = (TextEncoding, bool, Eol, bool, bool, Vec<Option<Eol>>, bool);
 
 fn format_of(d: &TextDoc) -> Format {
     (
@@ -268,6 +268,7 @@ fn format_of(d: &TextDoc) -> Format {
         d.final_newline,
         d.mixed_eol,
         d.original_eols.clone(),
+        d.preserve_eols,
     )
 }
 
@@ -1105,6 +1106,7 @@ impl TextView {
                     d.final_newline,
                     d.mixed_eol,
                     d.original_eols,
+                    d.preserve_eols,
                 ) = f;
             }
         }
@@ -1442,10 +1444,50 @@ impl TextView {
         if self.n() != 3 || !self.writable(1) {
             return;
         }
+        fn merge<T: PartialEq + Clone>(left: &T, base: &T, right: &T) -> T {
+            if left == base {
+                right.clone()
+            } else if right == base || left == right {
+                left.clone()
+            } else {
+                base.clone()
+            }
+        }
         let formats: Vec<_> = self.panes.iter().map(|p| format_of(&p.doc)).collect();
         let refs: Vec<&[String]> = self.panes.iter().map(|p| p.doc.lines.as_slice()).collect();
         self.diff =
             diff::compute_synced(&refs, &self.opts, self.comment_syntax(), &self.sync_points);
+        let mut endings: Vec<Vec<Eol>> = self
+            .panes
+            .iter()
+            .map(|p| {
+                (0..p.doc.lines.len())
+                    .map(|i| p.doc.line_eol(i).unwrap_or(p.doc.eol))
+                    .collect()
+            })
+            .collect();
+        // Reuse text alignment, so terminator changes on retained lines also follow
+        // insertions/deletions. Missing sides do not invent a terminator change.
+        if !self.opts.ignore_eol {
+            for row in &self.diff.rows {
+                if let Some(base) = row.line[1] {
+                    let b = endings[1][base];
+                    let l = row.line[0]
+                        .and_then(|i| self.panes[0].doc.line_eol(i))
+                        .unwrap_or(b);
+                    let r = row.line[2]
+                        .and_then(|i| self.panes[2].doc.line_eol(i))
+                        .unwrap_or(b);
+                    let merged = merge(&l, &b, &r);
+                    for (p, line) in row.line.iter().enumerate() {
+                        if let Some(i) = line {
+                            endings[p][*i] = merged;
+                        }
+                    }
+                }
+            }
+        }
+        let mut output_endings = endings[1].clone();
         self.push_undo();
         let was_empty = self.panes[1].doc.lines.is_empty();
         let blocks: Vec<(usize, BlockKind)> = self
@@ -1461,20 +1503,16 @@ impl TextView {
                 BlockKind::RightOnly => 2,
                 _ => continue,
             };
+            let block = &self.diff.blocks[b];
+            output_endings.splice(
+                block.ranges[1].clone(),
+                endings[from][block.ranges[from].clone()].iter().copied(),
+            );
             self.replace_block_lines(b, from, 1);
             first_from = from;
             merged += 1;
         }
         self.take_format(first_from, 1, was_empty);
-        fn merge<T: PartialEq + Clone>(left: &T, base: &T, right: &T) -> T {
-            if left == base {
-                right.clone()
-            } else if right == base || left == right {
-                left.clone()
-            } else {
-                base.clone()
-            }
-        }
         let [l, b, r] = [&formats[0], &formats[1], &formats[2]];
         let d = &mut self.panes[1].doc;
         // These are independent properties: a text edit need not conflict with a BOM edit.
@@ -1482,11 +1520,32 @@ impl TextView {
             d.encoding = merge(&l.0, &b.0, &r.0);
             d.bom = merge(&l.1, &b.1, &r.1);
         }
-        if !self.opts.ignore_eol {
-            let endings = |f: &Format| (f.2, f.4, f.5.clone());
-            (d.eol, d.mixed_eol, d.original_eols) = merge(&endings(l), &endings(b), &endings(r));
-        }
         d.final_newline = merge(&l.3, &b.3, &r.3);
+        if !self.opts.ignore_eol {
+            let last = output_endings.len().saturating_sub(1);
+            let terminators: Vec<_> = output_endings
+                .iter()
+                .enumerate()
+                .map(|(i, &eol)| {
+                    if i == last && !d.final_newline {
+                        None
+                    } else {
+                        Some(eol)
+                    }
+                })
+                .collect();
+            let mut counts = text::EolCounts::default();
+            for &eol in &terminators {
+                counts.add(eol);
+            }
+            d.eol = counts.dominant().unwrap_or(b.2);
+            d.mixed_eol = counts.mixed();
+            d.original_eols = if d.mixed_eol { terminators } else { Vec::new() };
+            // A successful mixed-EOL merge must retain those edits when it is saved.
+            if d.mixed_eol {
+                d.preserve_eols = true;
+            }
+        }
         if format_of(d) != formats[1] {
             self.undo.last_mut().unwrap().formats[1].get_or_insert(formats[1].clone());
         }
@@ -4241,6 +4300,49 @@ mod tests {
         v.redo();
         assert_eq!(v.panes[1].doc.lines, ["ONE", "two"]);
         assert_eq!(format_of(&v.panes[1].doc), format_of(&right));
+    }
+
+    #[test]
+    fn mixed_eol_edits_merge_per_aligned_line_and_survive_save_undo_redo() {
+        for (base, left, right, expected) in [
+            ("a\nb\nc\n", "a\r\nb\nc\n", "a\nb\nc\r\n", "a\r\nb\nc\r\n"),
+            (
+                "a\nb\nc\nd\n",
+                "added\na\r\nb\nc\nd\n",
+                "a\nb\nc\r\nd\n",
+                "added\na\r\nb\nc\r\nd\n",
+            ),
+            (
+                "a\nb\nc\nd\n",
+                "a\r\nc\nd\n",
+                "a\nb\nc\r\nd\n",
+                "a\r\nc\r\nd\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("merged.txt");
+            std::fs::write(&out, base).unwrap();
+            let docs = vec![
+                TextDoc::from_text(None, left),
+                TextDoc::from_text(Some(out.clone()), base),
+                TextDoc::from_text(None, right),
+            ];
+            let mut v = TextView::new(docs, &strict_config());
+            assert_eq!(v.diff.conflicts(), 0);
+            v.auto_merge();
+            assert_eq!(v.diff.conflicts(), 0);
+            assert_eq!(v.panes[1].doc.text(), expected);
+            assert!(v.panes[1].doc.preserve_eols);
+            v.save_pane(1).unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), expected.as_bytes());
+            v.undo();
+            assert_eq!(v.panes[1].doc.text(), base);
+            assert!(!v.panes[1].doc.preserve_eols);
+            assert!(v.panes[1].doc.modified);
+            v.redo();
+            assert_eq!(v.panes[1].doc.text(), expected);
+            assert!(v.panes[1].doc.preserve_eols);
+        }
     }
 
     #[test]

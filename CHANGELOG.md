@@ -54,6 +54,14 @@ section of this file as the release notes.
 
 ### Fixed
 
+- **Windows CI:** the Git revision CLI test explicitly checks LF and CRLF checkout modes
+  instead of assuming LF output, and isolates the subprocess Git configuration from the runner.
+
+- **Mixed line endings:** automatic merge combines independent terminator edits on aligned
+  lines, including around insertions and deletions, and keeps the merged endings on save.
+- **Patch ignore rules:** anchored filters, substitutions and ignored blocks are evaluated
+  against decoded text so BOMs and CRLF bytes cannot change which edits are exported.
+
 - **Text formats and merging:** comparisons account for encodings, BOMs, line endings and
   final newlines. Copy All transfers selected formats across multiple differences, independent
   text and format edits merge together, and saving refreshes format differences.

@@ -150,15 +150,21 @@ pub fn make_doc_patch(
             docs[1].bom
         },
     )?;
-    let mut result = super::diff::compute_with(&[&a, &b], opts, syntax);
-    // Whitespace-ignore options must not erase explicitly requested EOL differences.
-    let mut da = docs[0].clone();
-    let mut db = docs[1].clone();
-    da.lines = a.clone();
-    da.final_newline = na;
-    db.lines = b.clone();
-    db.final_newline = nb;
-    super::diff::include_doc_formats(&mut result, &[&da, &db], opts);
+    // Keep ignore rules and alignment on decoded content. Re-diffing raw byte lines
+    // would put a BOM before anchored patterns and a CR after end-anchored patterns.
+    let mut result = visible;
+    if a.len() != docs[0].lines.len() || b.len() != docs[1].lines.len() {
+        // A BOM-only file occupies one physical patch line but has no decoded text lines.
+        // Supply an empty comparison key for it; never expose the BOM to the normalizer.
+        let mut da = docs[0].clone();
+        let mut db = docs[1].clone();
+        da.lines.resize(a.len(), String::new());
+        db.lines.resize(b.len(), String::new());
+        da.final_newline = na;
+        db.final_newline = nb;
+        result = super::diff::compute_with(&[&da.lines, &db.lines], opts, syntax);
+        super::diff::include_doc_formats(&mut result, &[&da, &db], opts);
+    }
     let input = PatchInput {
         a: &a,
         b: &b,
@@ -689,6 +695,78 @@ mod tests {
 
     fn v(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn byte_patch_emission_keeps_anchored_rules_on_decoded_text() {
+        use crate::core::text::{self, TextEncoding};
+        let filter = DiffOptions {
+            line_filters_enabled: true,
+            line_filters: vec!["^ignored".into()],
+            ..Default::default()
+        };
+        let ending_filter = DiffOptions {
+            line_filters_enabled: true,
+            line_filters: vec!["ignored$".into()],
+            ..Default::default()
+        };
+        let substitution = DiffOptions {
+            substitutions_enabled: true,
+            substitutions: vec![("^version=.*$".into(), "version".into())],
+            ..Default::default()
+        };
+        let block = DiffOptions {
+            block_filters_enabled: true,
+            block_filters: vec![("^BEGIN$".into(), "^END$".into())],
+            ..Default::default()
+        };
+        for (first_a, first_b, eol, opts) in [
+            ("ignored old", "ignored new", "\n", filter),
+            ("old ignored", "new ignored", "\r\n", ending_filter),
+            ("version=old", "version=new", "\n", substitution),
+            (
+                "BEGIN\nold block\nEND",
+                "BEGIN\nnew block\nEND",
+                "\n",
+                block,
+            ),
+        ] {
+            let gap = (0..20)
+                .map(|i| format!("same {i}{eol}"))
+                .collect::<String>();
+            let old = format!("\u{feff}{first_a}{eol}{gap}old{eol}");
+            let new = format!("\u{feff}{first_b}{eol}{gap}new{eol}");
+            let a = text::doc_from_bytes(None, old.as_bytes(), Some(TextEncoding::Utf8));
+            let b = text::doc_from_bytes(None, new.as_bytes(), Some(TextEncoding::Utf8));
+            let input = PatchInput {
+                name_a: "a/f",
+                name_b: "b/f",
+                date_a: "",
+                date_b: "",
+                a: &a.lines,
+                b: &b.lines,
+                final_newline_a: true,
+                final_newline_b: true,
+            };
+            for context in [0, 3] {
+                let patch =
+                    make_doc_patch(&input, &[&a, &b], &opts, PatchStyle::Unified, context).unwrap();
+                assert_eq!(patch.matches("@@ -").count(), 1, "{patch}");
+                let parsed = parse_unified(&patch).unwrap();
+                let (raw, nl) = document_lines(&a).unwrap();
+                let result = apply(&raw, &parsed[0]);
+                assert!(result.failed.is_empty(), "{patch}");
+                assert_eq!(
+                    text::join_lines(
+                        &result.lines,
+                        text::Eol::Lf,
+                        result.final_newline.unwrap_or(nl)
+                    ),
+                    format!("\u{feff}{first_a}{eol}{gap}new{eol}"),
+                    "{patch}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -12,6 +12,10 @@ struct Run {
 }
 
 fn oxidemerge(dir: &Path, args: &[&str]) -> Run {
+    oxidemerge_with_env(dir, args, &[])
+}
+
+fn oxidemerge_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Run {
     let config = dir.join(".config");
     let Output {
         status,
@@ -21,6 +25,7 @@ fn oxidemerge(dir: &Path, args: &[&str]) -> Run {
         .args(args)
         .current_dir(dir)
         .env("OXIDEMERGE_CONFIG_DIR", &config)
+        .envs(env.iter().copied())
         .output()
         .expect("the program runs");
     Run {
@@ -477,9 +482,30 @@ fn files_compare_with_their_git_revision() {
         assert!(git(args).unwrap().status.success());
     }
     files(d, &[("f.txt", "new\n")]);
-    let run = oxidemerge(d, &["--cli", "--git-rev", "HEAD", "f.txt"]);
-    assert_eq!(run.code, 1, "{}", run.stderr);
-    assert!(run.stdout.contains("-old\n+new"), "{}", run.stdout);
+    // Git revisions use checkout filters. Windows runners normally enable autocrlf,
+    // so assert the actual bytes in both modes instead of assuming LF on every OS.
+    // Set configuration only on the child process: tests run concurrently.
+    let gitconfig = d.join(".gitconfig");
+    let gitconfig = gitconfig.to_str().unwrap();
+    for (autocrlf, eol) in [("false", "\n"), ("true", "\r\n")] {
+        let run = oxidemerge_with_env(
+            d,
+            &["--cli", "--git-rev", "HEAD", "f.txt"],
+            &[
+                ("GIT_CONFIG_GLOBAL", gitconfig),
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "core.autocrlf"),
+                ("GIT_CONFIG_VALUE_0", autocrlf),
+            ],
+        );
+        assert_eq!(run.code, 1, "autocrlf={autocrlf}: {}", run.stderr);
+        assert!(
+            run.stdout.contains(&format!("-old{eol}+new{eol}")),
+            "autocrlf={autocrlf}: {:?}",
+            run.stdout
+        );
+    }
 }
 
 #[test]
@@ -640,4 +666,25 @@ fn format_patches_apply_as_bytes_and_unsupported_encodings_leave_no_output() {
     assert!(!d.join("unsupported.patch").exists());
     let run = oxidemerge(d, &["--cli", "-t", "text", "a.txt", "b.txt"]);
     assert_eq!(run.code, 1);
+}
+
+#[test]
+fn bom_files_keep_anchored_ignore_rules_during_patch_export() {
+    let dir = tmp();
+    let d = dir.path();
+    std::fs::create_dir(d.join(".config")).unwrap();
+    std::fs::write(
+        d.join(".config/config.json"),
+        r#"{"diff":{"line_filters_enabled":true,"line_filters":["^ignored"]}}"#,
+    )
+    .unwrap();
+    let gap = (0..20).map(|i| format!("same {i}\n")).collect::<String>();
+    let a = format!("\u{feff}ignored old\n{gap}old\n");
+    let b = format!("\u{feff}ignored new\n{gap}new\n");
+    files(d, &[("a.txt", &a), ("b.txt", &b)]);
+    let run = oxidemerge(d, &["--cli", "--patch", "fix.patch", "a.txt", "b.txt"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let patch = read(d.join("fix.patch"));
+    assert_eq!(patch.matches("@@ -").count(), 1, "{patch}");
+    assert!(!patch.contains("ignored"), "{patch}");
 }
