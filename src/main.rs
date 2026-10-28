@@ -344,8 +344,11 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         (0, Some(d)) if cli.dl.is_none() => Some(d.clone()),
         _ => cli_desc(cli, i),
     };
-    if paths.len() < 2 {
-        anyhow::bail!("two or three paths are required");
+    if !(2..=3).contains(&paths.len()) {
+        anyhow::bail!(
+            "two or three paths are required, {} were given",
+            paths.len()
+        );
     }
     if cli.report_diffs && cli.report.is_none() {
         eprintln!("note: --report-diffs needs --report");

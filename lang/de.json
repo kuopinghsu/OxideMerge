@@ -369,6 +369,7 @@
   "msg.no_next_file": "Keine weiteren Dateien mit Unterschieden danach",
   "msg.no_prev_file": "Keine weiteren Dateien mit Unterschieden davor",
   "msg.not_exist": "Pfad existiert nicht",
+  "msg.too_many_paths": "{n} Pfade angegeben: Vergleichen Sie jeweils zwei oder drei Dateien oder Ordner",
   "msg.not_found": "\"{text}\" wurde nicht gefunden",
   "msg.op_done": "{n} Element(e) verarbeitet",
   "msg.pasted_lines": "{n} Zeilen eingefügt",

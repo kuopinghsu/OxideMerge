@@ -94,6 +94,16 @@ fn errors_exit_with_2_and_name_the_file() {
     let run = oxidemerge(d, &["--cli", "--rules", "no such rules", "a.txt", "a.txt"]);
     assert_eq!(run.code, 2);
     assert!(run.stderr.contains("no such rules"), "{}", run.stderr);
+
+    // Two or three sides at most, for files and folders alike.
+    std::fs::create_dir_all(d.join("f")).unwrap();
+    for args in [["a.txt"; 4], ["f"; 4]] {
+        let mut all = vec!["--cli"];
+        all.extend(args);
+        let run = oxidemerge(d, &all);
+        assert_eq!(run.code, 2, "{args:?}");
+        assert!(run.stderr.contains("4 were given"), "{}", run.stderr);
+    }
 }
 
 #[test]

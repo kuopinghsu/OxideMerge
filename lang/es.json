@@ -369,6 +369,7 @@
   "msg.no_next_file": "No hay más archivos con diferencias después de este",
   "msg.no_prev_file": "No hay más archivos con diferencias antes de este",
   "msg.not_exist": "La ruta no existe",
+  "msg.too_many_paths": "Se indicaron {n} rutas: compare dos o tres archivos o carpetas a la vez",
   "msg.not_found": "No se encuentra \"{text}\"",
   "msg.op_done": "{n} elemento(s) procesado(s)",
   "msg.pasted_lines": "Se pegaron {n} líneas",

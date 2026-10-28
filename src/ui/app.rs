@@ -1351,7 +1351,8 @@ impl Menus {
     }
 
     fn item_as(&mut self, ui: &mut egui::Ui, label: &str, c: Cmd) {
-        let button = egui::Button::new(label).shortcut_text(c.shown_key());
+        let button =
+            egui::Button::new(label).shortcut_text(widgets::menu_shortcut(ui, &c.shown_key()));
         if ui.add_enabled(self.enabled(c), button).clicked() {
             self.picked = Some(c);
             ui.close_menu();
@@ -1362,28 +1363,59 @@ impl Menus {
 /// The layer [`OxideMergeApp::menu_width`] lays the menus out on.
 const MENU_MEASURE: &str = "menu_measure";
 
-/// A submenu of a menu bar menu. Laid out by [`OxideMergeApp::menu_width`], it is a plain
-/// button, so there it also takes the room of the arrow it has in a menu.
+/// A submenu of a menu bar menu, opening as wide as the menus. Laid out by
+/// [`OxideMergeApp::menu_width`], it is a plain button that also takes the room of the arrow it
+/// has in a menu, followed by its contents, so the widest submenu sets the width of all menus.
 fn submenu<R>(
     ui: &mut egui::Ui,
     title: &str,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
-    let shown = ui.menu_button(title, add);
-    if ui.layer_id().id == egui::Id::new(MENU_MEASURE) {
-        let arrow = egui::WidgetText::from("⏵")
-            .into_galley(
-                ui,
-                Some(egui::TextWrapMode::Extend),
-                f32::INFINITY,
-                egui::TextStyle::Button,
-            )
-            .size()
-            .x;
-        let width = shown.response.rect.width() + ui.spacing().item_spacing.x + arrow;
-        ui.allocate_exact_size(vec2(width, 0.0), Sense::hover());
+    submenu_measured(ui, title, true, add)
+}
+
+/// [`submenu`] for a list whose entries are not measured, such as recent paths of any length:
+/// they may make it wider than the other menus, but never the other menus wider.
+fn submenu_list<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    submenu_measured(ui, title, false, add)
+}
+
+fn submenu_measured<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    contents: bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    if ui.layer_id().id != egui::Id::new(MENU_MEASURE) {
+        return widgets::submenu(ui, title, add);
     }
-    shown
+    let shown = ui.menu_button(title, |_| ());
+    let arrow = egui::WidgetText::from("⏵")
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Button,
+        )
+        .size()
+        .x;
+    let width = shown.response.rect.width() + ui.spacing().item_spacing.x + arrow;
+    ui.allocate_exact_size(vec2(width, 0.0), Sense::hover());
+    if contents {
+        ui.scope(add);
+    }
+    egui::InnerResponse::new(None, shown.response)
+}
+
+/// A menu item turning `on` on or off; see [`widgets::menu_check`].
+fn check(ui: &mut egui::Ui, on: &mut bool, label: &str, keys: &str) {
+    if widgets::menu_check(ui, *on, label, keys).clicked() {
+        *on = !*on;
+    }
 }
 
 fn edit_menu(ui: &mut egui::Ui, m: &mut Menus) {
@@ -1937,6 +1969,14 @@ impl OxideMergeApp {
         let mut paths = req.paths.clone();
         if paths.is_empty() {
             return Ok(());
+        }
+        // Every view compares two or three sides (a single path opens a conflict file, a
+        // project or the open dialog).
+        if paths.len() > 3 {
+            anyhow::bail!(
+                "{}",
+                trf("msg.too_many_paths", &[("n", paths.len().to_string())])
+            );
         }
         if let Some(r) = req.rules.as_deref().filter(|r| !r.is_empty()) {
             if rules::find(r).is_none() {
@@ -3859,6 +3899,7 @@ impl OxideMergeApp {
             }
         }
         let width = self.menu_width(ctx, &mut m);
+        widgets::set_menu_width(ctx, width);
         egui::menu::bar(ui, |ui| {
             ui.spacing_mut().button_padding = vec2(9.0, 4.0);
             let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -3879,7 +3920,7 @@ impl OxideMergeApp {
             ui.add_space(12.0);
             for (i, key) in MENUS.into_iter().enumerate() {
                 ui.menu_button(tr(key), |ui| {
-                    ui.set_min_width(width);
+                    widgets::menu_setup(ui);
                     self.menu(ui, &mut m, i);
                 });
             }
@@ -3949,9 +3990,9 @@ impl OxideMergeApp {
         }
     }
 
-    /// The width all menus of the menu bar open with, so that they match: that of the widest,
-    /// measured once per language, fonts, text size, display scale and kind of view by laying
-    /// the menus out unseen.
+    /// The width all menus open with, so that they match: that of the widest menu of the menu
+    /// bar or of its submenus, measured once per language, fonts, text size, display scale and
+    /// kind of view by laying the menus out unseen.
     fn menu_width(&mut self, ctx: &egui::Context, m: &mut Menus) -> f32 {
         let size = ctx.style().text_styles[&egui::TextStyle::Button].size;
         // The fonts in use: after a change of language they follow a frame later.
@@ -3973,8 +4014,8 @@ impl OxideMergeApp {
             .interactable(false)
             .show(ctx, |ui| {
                 ui.scope_builder(egui::UiBuilder::new().invisible().sizing_pass(), |ui| {
-                    // As egui styles its menus.
-                    ui.spacing_mut().button_padding = vec2(2.0, 0.0);
+                    // As the menus are styled (see `widgets::menu_setup`).
+                    ui.spacing_mut().button_padding = widgets::MENU_ITEM_PADDING;
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                     (0..MENUS.len())
                         .map(|i| ui.scope(|ui| self.menu(ui, m, i)).response.rect.width())
@@ -3992,7 +4033,7 @@ impl OxideMergeApp {
         m.item(ui, Cmd::Open);
         let recent = &self.cfg.recent_compares;
         ui.add_enabled_ui(!recent.is_empty(), |ui| {
-            submenu(ui, tr("menu.open_recent"), |ui| {
+            submenu_list(ui, tr("menu.open_recent"), |ui| {
                 for paths in recent.iter().take(10) {
                     if ui.button(recent_label(paths)).clicked() {
                         m.recent = Some(paths.clone());
@@ -4030,7 +4071,7 @@ impl OxideMergeApp {
             m.item(ui, Cmd::ReportWithDiffs);
             m.item(ui, Cmd::Patch);
             ui.separator();
-            ui.checkbox(&mut self.cfg.open_reports, tr("menu.open_reports"));
+            check(ui, &mut self.cfg.open_reports, tr("menu.open_reports"), "");
         });
         m.item(ui, Cmd::ApplyPatch);
         ui.separator();
@@ -4042,28 +4083,43 @@ impl OxideMergeApp {
     fn view_menu(&mut self, ui: &mut egui::Ui, m: &mut Menus) {
         let cfg = &mut self.cfg;
         submenu(ui, tr("view.folder_menu"), |ui| {
-            ui.checkbox(&mut cfg.tree_mode, tr("view.tree_mode"));
-            ui.checkbox(&mut cfg.folder_file_pane, tr("view.folder_file_pane"));
+            check(ui, &mut cfg.tree_mode, tr("view.tree_mode"), "");
+            check(
+                ui,
+                &mut cfg.folder_file_pane,
+                tr("view.folder_file_pane"),
+                "",
+            );
             ui.separator();
             ui.label(egui::RichText::new(tr("view.show")).weak().small());
-            ui.checkbox(&mut cfg.show_identical, tr("view.identical"));
-            ui.checkbox(&mut cfg.show_different, tr("view.different"));
-            ui.checkbox(&mut cfg.show_unique[0], tr("view.left_only"));
-            ui.checkbox(&mut cfg.show_unique[1], tr("view.middle_only"));
-            ui.checkbox(&mut cfg.show_unique[2], tr("view.right_only"));
+            check(ui, &mut cfg.show_identical, tr("view.identical"), "");
+            check(ui, &mut cfg.show_different, tr("view.different"), "");
+            check(ui, &mut cfg.show_unique[0], tr("view.left_only"), "");
+            check(ui, &mut cfg.show_unique[1], tr("view.middle_only"), "");
+            check(ui, &mut cfg.show_unique[2], tr("view.right_only"), "");
         });
         submenu(ui, tr("view.text_menu"), |ui| {
-            ui.checkbox(&mut cfg.show_location_pane, tr("view.location_pane"));
-            ui.checkbox(&mut cfg.show_line_detail, tr("view.line_detail"));
-            ui.checkbox(&mut cfg.show_line_numbers, tr("view.line_numbers"));
-            ui.checkbox(&mut cfg.show_edit_markers, tr("view.edit_markers"));
+            check(
+                ui,
+                &mut cfg.show_location_pane,
+                tr("view.location_pane"),
+                "",
+            );
+            check(ui, &mut cfg.show_line_detail, tr("view.line_detail"), "");
+            check(ui, &mut cfg.show_line_numbers, tr("view.line_numbers"), "");
+            check(ui, &mut cfg.show_edit_markers, tr("view.edit_markers"), "");
             ui.separator();
-            ui.checkbox(&mut cfg.show_whitespace, tr("view.whitespace"));
-            ui.checkbox(&mut cfg.syntax_highlight, tr("view.syntax"));
-            let collapse = ui.checkbox(&mut cfg.collapse_unchanged, tr("cmd.collapse_unchanged"));
-            collapse.on_hover_text(Cmd::ToggleCollapse.shown_key());
-            let wrap = ui.checkbox(&mut cfg.word_wrap, tr("cmd.word_wrap"));
-            wrap.on_hover_text(Cmd::ToggleWrap.shown_key());
+            check(ui, &mut cfg.show_whitespace, tr("view.whitespace"), "");
+            check(ui, &mut cfg.syntax_highlight, tr("view.syntax"), "");
+            let collapse = Cmd::ToggleCollapse.shown_key();
+            check(
+                ui,
+                &mut cfg.collapse_unchanged,
+                tr("cmd.collapse_unchanged"),
+                &collapse,
+            );
+            let wrap = Cmd::ToggleWrap.shown_key();
+            check(ui, &mut cfg.word_wrap, tr("cmd.word_wrap"), &wrap);
         });
         ui.separator();
         submenu(ui, tr("label.zoom"), |ui| {
@@ -4073,10 +4129,8 @@ impl OxideMergeApp {
         });
         submenu(ui, tr("view.theme"), |ui| {
             for mode in ThemeMode::ALL {
-                if ui
-                    .radio_value(&mut cfg.theme, mode, tr(mode.key()))
-                    .clicked()
-                {
+                if widgets::menu_check(ui, cfg.theme == mode, tr(mode.key()), "").clicked() {
+                    cfg.theme = mode;
                     ui.close_menu();
                 }
             }
@@ -4112,7 +4166,7 @@ impl OxideMergeApp {
         ui.add_enabled_ui(tab_rules.is_some(), |ui| {
             let shown = submenu(ui, tr("menu.rules"), |ui| {
                 let current = tab_rules.as_deref().unwrap_or_default();
-                if ui.radio(current.is_empty(), tr("rules.none")).clicked() {
+                if widgets::menu_check(ui, current.is_empty(), tr("rules.none"), "").clicked() {
                     m.rules = Some(String::new());
                 }
                 let names = ui.ctx().memory_mut(|mem| {
@@ -4128,7 +4182,8 @@ impl OxideMergeApp {
                 let refs: Vec<&str> = names.iter().map(String::as_str).collect();
                 let picked = rules::chosen(current, &refs).map(str::to_string);
                 for name in names {
-                    if ui.radio(picked.as_ref() == Some(&name), &name).clicked() {
+                    if widgets::menu_check(ui, picked.as_ref() == Some(&name), &name, "").clicked()
+                    {
                         m.rules = Some(name);
                     }
                 }
@@ -4145,33 +4200,37 @@ impl OxideMergeApp {
         });
         let d = &mut self.cfg.diff;
         submenu(ui, tr("view.compare_menu"), |ui| {
-            ui.menu_button(tr("opt.whitespace"), |ui| {
+            submenu(ui, tr("opt.whitespace"), |ui| {
                 for (mode, key) in [
                     (WhitespaceMode::Compare, "opt.ws_compare"),
                     (WhitespaceMode::IgnoreChange, "opt.ws_change"),
                     (WhitespaceMode::IgnoreAll, "opt.ws_all"),
                 ] {
-                    ui.radio_value(&mut d.whitespace, mode, tr(key));
+                    if widgets::menu_check(ui, d.whitespace == mode, tr(key), "").clicked() {
+                        d.whitespace = mode;
+                    }
                 }
             });
-            ui.menu_button(tr("opt.inline"), |ui| {
+            submenu(ui, tr("opt.inline"), |ui| {
                 for (mode, key) in [
                     (InlineMode::Off, "opt.inline_off"),
                     (InlineMode::Word, "opt.inline_word"),
                     (InlineMode::Char, "opt.inline_char"),
                 ] {
-                    ui.radio_value(&mut d.inline, mode, tr(key));
+                    if widgets::menu_check(ui, d.inline == mode, tr(key), "").clicked() {
+                        d.inline = mode;
+                    }
                 }
             });
             ui.separator();
-            ui.checkbox(&mut d.ignore_case, tr("opt.ignore_case"));
-            ui.checkbox(&mut d.ignore_blank_lines, tr("opt.ignore_blank"));
-            ui.checkbox(&mut d.ignore_eol, tr("opt.ignore_eol"));
-            ui.checkbox(&mut d.ignore_numbers, tr("opt.ignore_numbers"));
-            ui.checkbox(&mut d.ignore_comments, tr("opt.ignore_comments"));
+            check(ui, &mut d.ignore_case, tr("opt.ignore_case"), "");
+            check(ui, &mut d.ignore_blank_lines, tr("opt.ignore_blank"), "");
+            check(ui, &mut d.ignore_eol, tr("opt.ignore_eol"), "");
+            check(ui, &mut d.ignore_numbers, tr("opt.ignore_numbers"), "");
+            check(ui, &mut d.ignore_comments, tr("opt.ignore_comments"), "");
             ui.separator();
-            ui.checkbox(&mut d.prettify, tr("opt.prettify"));
-            ui.checkbox(&mut d.detect_moved, tr("opt.detect_moved"));
+            check(ui, &mut d.prettify, tr("opt.prettify"), "");
+            check(ui, &mut d.detect_moved, tr("opt.detect_moved"), "");
             ui.separator();
             m.item(ui, Cmd::CompareOptions);
         });
@@ -4339,9 +4398,17 @@ impl OxideMergeApp {
                         });
                         let last = i + 1 == n_tabs;
                         resp.context_menu(|ui| {
+                            widgets::menu_setup(ui);
                             let mut item =
                                 |ui: &mut egui::Ui, label: &str, enabled: bool, c: Cmd| {
-                                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                                    // Closing this tab is the menu's Close (⌘W) on the tab clicked.
+                                    let keys = match c {
+                                        Cmd::CloseTabAt(_) => Cmd::CloseTab.shown_key(),
+                                        c => c.shown_key(),
+                                    };
+                                    let button = egui::Button::new(label)
+                                        .shortcut_text(widgets::menu_shortcut(ui, &keys));
+                                    if ui.add_enabled(enabled, button).clicked() {
                                         tab_cmd = Some(c);
                                         ui.close_menu();
                                     }
@@ -4560,6 +4627,7 @@ impl OxideMergeApp {
                                         compare = Some(paths.clone());
                                     }
                                     resp.context_menu(|ui| {
+                                        widgets::menu_setup(ui);
                                         if ui.button(tr("btn.compare")).clicked() {
                                             compare = Some(paths.clone());
                                             ui.close_menu();
@@ -5705,8 +5773,9 @@ impl OxideMergeApp {
             return;
         }
         if dropped.len() >= 2 {
+            // More than three are refused with a message rather than some silently left out.
             self.open(OpenRequest {
-                paths: dropped.into_iter().take(3).collect(),
+                paths: dropped,
                 ..Default::default()
             });
         } else {

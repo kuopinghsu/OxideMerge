@@ -3630,6 +3630,7 @@ impl TextView {
             let block = self.diff.rows.get(r).and_then(|row| row.block);
             let lines = selection.filter(|&(a, b)| (a..=b).contains(&r));
             resp.context_menu(|ui| {
+                widgets::menu_setup(ui);
                 let copy = |from, to| match (lines, block) {
                     (Some(_), _) => Some(MenuAction::CopyLines(from, to)),
                     (None, Some(b)) => Some(MenuAction::Copy(b, from, to)),
@@ -3683,7 +3684,7 @@ impl TextView {
                 if ui.button(tr("cmd.bookmark_comment")).clicked() {
                     action = Some(MenuAction::EditNote(r, p));
                 }
-                ui.menu_button(tr("cmd.add_rule"), |ui| {
+                widgets::submenu(ui, tr("cmd.add_rule"), |ui| {
                     for kind in RuleKind::ALL {
                         if ui.button(tr(kind.key())).clicked() {
                             action = Some(MenuAction::AddRule(kind, r, p));

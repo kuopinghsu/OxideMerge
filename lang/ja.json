@@ -369,6 +369,7 @@
   "msg.no_next_file": "これより後に差分のあるファイルはありません",
   "msg.no_prev_file": "これより前に差分のあるファイルはありません",
   "msg.not_exist": "パスが存在しません",
+  "msg.too_many_paths": "{n} 個のパスが指定されました。一度に比較できるファイルまたはフォルダーは 2 つか 3 つです",
   "msg.not_found": "「{text}」が見つかりません",
   "msg.op_done": "{n} 個の項目を処理しました",
   "msg.pasted_lines": "{n} 行を貼り付けました",

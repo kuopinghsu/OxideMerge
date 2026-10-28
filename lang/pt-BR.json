@@ -369,6 +369,7 @@
   "msg.no_next_file": "Não há mais arquivos com diferenças depois deste",
   "msg.no_prev_file": "Não há mais arquivos com diferenças antes deste",
   "msg.not_exist": "O caminho não existe",
+  "msg.too_many_paths": "{n} caminhos informados: compare dois ou três arquivos ou pastas por vez",
   "msg.not_found": "Não foi possível encontrar \"{text}\"",
   "msg.op_done": "{n} item(ns) processado(s)",
   "msg.pasted_lines": "{n} linhas coladas",

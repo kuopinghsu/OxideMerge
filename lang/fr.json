@@ -369,6 +369,7 @@
   "msg.no_next_file": "Plus aucun fichier avec des différences après celui-ci",
   "msg.no_prev_file": "Plus aucun fichier avec des différences avant celui-ci",
   "msg.not_exist": "Le chemin n'existe pas",
+  "msg.too_many_paths": "{n} chemins indiqués : comparez deux ou trois fichiers ou dossiers à la fois",
   "msg.not_found": "Impossible de trouver « {text} »",
   "msg.op_done": "{n} élément(s) traité(s)",
   "msg.pasted_lines": "{n} lignes collées",

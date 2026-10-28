@@ -790,6 +790,22 @@ fn a_missing_side_opens_empty_to_be_created() {
     assert_eq!(read(&d.join("new.txt")), "one\n");
 }
 
+#[test]
+fn more_than_three_sides_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let sides: Vec<PathBuf> = ["a", "b", "c", "d"].iter().map(|n| d.join(n)).collect();
+    for s in &sides {
+        std::fs::create_dir_all(s).unwrap();
+        write(s, &[("same.txt", "one\n")]);
+    }
+    let gui = Gui::start("too_many_sides", compare(&sides));
+    assert!(gui.app.tabs.is_empty());
+    let errors = gui.errors();
+    let expected = trf("msg.too_many_paths", &[("n", "4".into())]);
+    assert!(errors.iter().any(|e| e.contains(&expected)), "{errors:?}");
+}
+
 #[cfg(unix)]
 #[test]
 fn files_that_cannot_be_read_are_reported() {
@@ -830,6 +846,65 @@ fn menu_widths(gui: &mut Gui) -> Vec<(&'static str, f32)> {
         gui.frames(3);
     }
     widths
+}
+
+#[test]
+fn menus_are_measured_with_their_submenus_contents() {
+    let ctx = egui::Context::default();
+    let long = "A submenu item much longer than the title of its submenu";
+    let mut widths = Vec::new();
+    for _ in 0..2 {
+        widths.clear();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            for (layer, list) in [(MENU_MEASURE, false), (MENU_MEASURE, true)] {
+                let shown = egui::Area::new(egui::Id::new(layer).with(list)).show(ctx, |ui| {
+                    let mut ui = ui.new_child(egui::UiBuilder::new().layer_id(egui::LayerId::new(
+                        egui::Order::Middle,
+                        egui::Id::new(layer),
+                    )));
+                    let add = |ui: &mut egui::Ui| {
+                        let _ = ui.button(long);
+                    };
+                    let r = if list {
+                        submenu_list(&mut ui, "Export", add)
+                    } else {
+                        submenu(&mut ui, "Export", add)
+                    };
+                    ui.min_rect().width().max(r.response.rect.width())
+                });
+                widths.push(shown.inner);
+            }
+        });
+    }
+    let text = ctx.fonts(|f| {
+        f.layout_no_wrap(
+            long.into(),
+            egui::TextStyle::Button.resolve(&ctx.style()),
+            egui::Color32::WHITE,
+        )
+        .size()
+        .x
+    });
+    // A submenu's items widen every menu; a list of recent paths never does.
+    assert!(widths[0] >= text, "{widths:?} {text}");
+    assert!(widths[1] < text, "{widths:?} {text}");
+    // Menus never open narrower than the minimum.
+    widgets::set_menu_width(&ctx, 10.0);
+    assert_eq!(widgets::menu_width(&ctx), widgets::MENU_MIN_WIDTH);
+}
+
+#[test]
+fn menu_checks_line_up_whether_on_or_off() {
+    let ctx = egui::Context::default();
+    let mut rects = Vec::new();
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::Area::new(egui::Id::new("checks")).show(ctx, |ui| {
+            for on in [true, false] {
+                rects.push(widgets::menu_check(ui, on, "Tree mode", "").rect);
+            }
+        });
+    });
+    assert_eq!(rects[0].width(), rects[1].width(), "{rects:?}");
 }
 
 #[test]

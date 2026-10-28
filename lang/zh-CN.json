@@ -369,6 +369,7 @@
   "msg.no_next_file": "后面没有其他存在差异的文件",
   "msg.no_prev_file": "前面没有其他存在差异的文件",
   "msg.not_exist": "路径不存在",
+  "msg.too_many_paths": "指定了 {n} 个路径：一次只能比较两个或三个文件或文件夹",
   "msg.not_found": "找不到“{text}”",
   "msg.op_done": "已处理 {n} 个项目",
   "msg.pasted_lines": "已粘贴 {n} 行",

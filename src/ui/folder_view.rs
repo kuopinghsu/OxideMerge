@@ -1731,20 +1731,17 @@ impl FolderView {
                     ui.memory_mut(|m| m.toggle_popup(method_id));
                 }
                 egui::popup::popup_below_widget(ui, method_id, &r, close, |ui| {
-                    ui.set_min_width(220.0);
+                    widgets::menu_setup(ui);
                     for m in folder::CompareMethod::ALL {
-                        if ui
-                            .selectable_label(self.fopts.method == m, tr(m.key()))
-                            .clicked()
-                            && self.fopts.method != m
-                        {
+                        let on = self.fopts.method == m;
+                        if widgets::menu_check(ui, on, tr(m.key()), "").clicked() && !on {
                             new_options = Some((m, self.fopts.recursive));
                         }
                     }
                     ui.separator();
-                    let mut recursive = self.fopts.recursive;
-                    if ui.checkbox(&mut recursive, tr("label.recursive")).changed() {
-                        new_options = Some((self.fopts.method, recursive));
+                    let recursive = self.fopts.recursive;
+                    if widgets::menu_check(ui, recursive, tr("label.recursive"), "").clicked() {
+                        new_options = Some((self.fopts.method, !recursive));
                     }
                 });
 
@@ -1761,9 +1758,8 @@ impl FolderView {
                     ui.memory_mut(|m| m.toggle_popup(rules_id));
                 }
                 egui::popup::popup_below_widget(ui, rules_id, &r, close, |ui| {
-                    ui.set_min_width(220.0);
-                    if ui
-                        .selectable_label(self.rules.is_empty(), tr("rules.none"))
+                    widgets::menu_setup(ui);
+                    if widgets::menu_check(ui, self.rules.is_empty(), tr("rules.none"), "")
                         .clicked()
                     {
                         new_rules = Some(String::new());
@@ -1772,7 +1768,7 @@ impl FolderView {
                     let picked = rules::chosen(&self.rules, &refs);
                     for name in &self.rule_names {
                         let on = picked == Some(name.as_str());
-                        if ui.selectable_label(on, name).clicked() {
+                        if widgets::menu_check(ui, on, name, "").clicked() {
                             new_rules = Some(name.clone());
                         }
                     }
@@ -1793,7 +1789,7 @@ impl FolderView {
                     ui.memory_mut(|m| m.toggle_popup(filter_id));
                 }
                 egui::popup::popup_below_widget(ui, filter_id, &r, close, |ui| {
-                    ui.set_min_width(300.0);
+                    ui.set_min_width(widgets::menu_width(ui.ctx()).max(300.0));
                     let edit = self
                         .filter_edit
                         .get_or_insert_with(|| self.filter_spec.clone());
@@ -2336,19 +2332,21 @@ impl FolderView {
                         click = Some((vi, Modifiers::NONE));
                     }
                     resp.context_menu(|ui| {
+                        widgets::menu_setup(ui);
                         if ui.button(tr("cmd.compare")).clicked() {
                             menu = Some(MenuCmd::Open(idx, None));
                         }
                         if !it.is_dir {
-                            ui.menu_button(tr("cmd.compare_as"), |ui| {
-                                if ui.button(tr("kind.text")).clicked() {
-                                    menu = Some(MenuCmd::Open(idx, Some(FileKind::Text)));
-                                }
-                                if ui.button(tr("kind.binary")).clicked() {
-                                    menu = Some(MenuCmd::Open(idx, Some(FileKind::Binary)));
-                                }
-                                if ui.button(tr("kind.image")).clicked() {
-                                    menu = Some(MenuCmd::Open(idx, Some(FileKind::Image)));
+                            widgets::submenu(ui, tr("cmd.compare_as"), |ui| {
+                                for (kind, key) in [
+                                    (FileKind::Text, "kind.text"),
+                                    (FileKind::Binary, "kind.binary"),
+                                    (FileKind::Image, "kind.image"),
+                                    (FileKind::Web, "kind.web"),
+                                ] {
+                                    if ui.button(tr(key)).clicked() {
+                                        menu = Some(MenuCmd::Open(idx, Some(kind)));
+                                    }
                                 }
                             });
                         }
@@ -2375,7 +2373,7 @@ impl FolderView {
                                 }
                             }
                         }
-                        ui.menu_button(tr("cmd.copy_to_folder"), |ui| {
+                        widgets::submenu(ui, tr("cmd.copy_to_folder"), |ui| {
                             for s in 0..n {
                                 if ui
                                     .add_enabled(it.exists[s], egui::Button::new(side_name(s, n)))
@@ -2385,7 +2383,7 @@ impl FolderView {
                                 }
                             }
                         });
-                        ui.menu_button(tr("cmd.delete"), |ui| {
+                        widgets::submenu(ui, tr("cmd.delete"), |ui| {
                             for s in 0..n {
                                 if ui
                                     .add_enabled(
@@ -2402,7 +2400,7 @@ impl FolderView {
                             }
                         });
                         ui.separator();
-                        ui.menu_button(tr("cmd.open_with_app"), |ui| {
+                        widgets::submenu(ui, tr("cmd.open_with_app"), |ui| {
                             for s in 0..n {
                                 if ui
                                     .add_enabled(it.exists[s], egui::Button::new(side_name(s, n)))
@@ -2412,7 +2410,7 @@ impl FolderView {
                                 }
                             }
                         });
-                        ui.menu_button(tr("cmd.reveal"), |ui| {
+                        widgets::submenu(ui, tr("cmd.reveal"), |ui| {
                             for s in 0..n {
                                 if ui
                                     .add_enabled(it.exists[s], egui::Button::new(side_name(s, n)))
@@ -2422,7 +2420,7 @@ impl FolderView {
                                 }
                             }
                         });
-                        ui.menu_button(tr("cmd.copy_path"), |ui| {
+                        widgets::submenu(ui, tr("cmd.copy_path"), |ui| {
                             for s in 0..n {
                                 if ui.button(side_name(s, n)).clicked() {
                                     menu = Some(MenuCmd::CopyPath(idx, s));

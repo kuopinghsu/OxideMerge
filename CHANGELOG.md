@@ -21,6 +21,12 @@ section of this file as the release notes.
   it, after its scripts have run, when a browser is found (*Render pages in the browser for text
   and HTML* in the options). Text puts each heading, paragraph, list item, table cell and form
   value on its own line and leaves out hidden elements. Text is the default mode.
+- **Menus:** every pull-down menu opens equally wide: the menu bar's menus, their submenus, the
+  right-click menus and the folder compare's drop-downs (the widest menu of the menu bar, its
+  submenus included, sets the width, at least 220 points). Options that turn on or off and choices
+  of one show a check mark in a column of their own, so labels line up and an option that is off
+  no longer looks disabled. Shortcuts keep clear of their labels. The tab's right-click menu shows
+  the Close shortcut, and a file's right-click *Compare as* offers Web page like the Compare menu.
 
 ### Fixed
 

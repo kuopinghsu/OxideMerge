@@ -6,35 +6,71 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Largest WebSocket message accepted (a full size screenshot is a large base64 string).
 const MAX_MESSAGE: usize = 512 << 20;
 
-/// A minimal WebSocket client (RFC 6455) for the browser's local DevTools endpoint.
-struct Socket {
-    reader: BufReader<TcpStream>,
-    writer: TcpStream,
+/// What the reader thread of a [`Socket`] passes on.
+enum Incoming {
+    /// The WebSocket handshake succeeded.
+    Open,
+    Text(String),
+    /// The connection failed or closed; the thread has ended.
+    Closed(String),
 }
 
-impl Socket {
-    fn connect(port: u16, path: &str, timeout: Duration) -> Result<Socket> {
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-        let stream = TcpStream::connect_timeout(&addr, timeout)?;
-        stream.set_nodelay(true)?;
-        let mut writer = stream.try_clone()?;
-        write!(
-            writer,
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n\
-             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-             Sec-WebSocket-Version: 13\r\n\r\n"
-        )?;
-        writer.flush()?;
-        let mut reader = BufReader::new(stream);
-        reader.get_ref().set_read_timeout(Some(timeout))?;
+/// A minimal WebSocket client (RFC 6455) for the browser's local DevTools endpoint.
+///
+/// A thread of its own reads the connection with plain blocking reads and passes messages on
+/// through a channel, which is where waits time out. Socket read timeouts are never used: on
+/// Windows a read that times out leaves the socket in an undefined state.
+struct Socket {
+    writer: Arc<Mutex<TcpStream>>,
+    incoming: Receiver<Incoming>,
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        // Ends the reader thread's blocking read.
+        if let Ok(w) = self.writer.lock() {
+            let _ = w.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+fn write_frame(w: &mut TcpStream, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
+    let mut frame = Vec::with_capacity(payload.len() + 14);
+    frame.push(0x80 | opcode);
+    let n = payload.len();
+    if n < 126 {
+        frame.push(0x80 | n as u8);
+    } else if n <= 0xFFFF {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(n as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(n as u64).to_be_bytes());
+    }
+    // Client frames must be masked; the key need not be secret on a loopback connection.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0x5a17_c3e1, |d| d.subsec_nanos());
+    let key = nanos.to_le_bytes();
+    frame.extend_from_slice(&key);
+    frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
+    w.write_all(&frame)
+}
+
+/// Reads the handshake answer, then message after message, until the connection ends.
+fn read_loop(stream: TcpStream, writer: Arc<Mutex<TcpStream>>, tx: Sender<Incoming>) {
+    let mut reader = BufReader::new(stream);
+    let result = (|| -> Result<()> {
         let mut status = String::new();
         reader.read_line(&mut status)?;
         if !status.split_whitespace().nth(1).is_some_and(|c| c == "101") {
@@ -52,81 +88,24 @@ impl Socket {
                 break;
             }
         }
-        Ok(Socket { reader, writer })
-    }
-
-    fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
-        let mut frame = Vec::with_capacity(payload.len() + 14);
-        frame.push(0x80 | opcode);
-        let n = payload.len();
-        if n < 126 {
-            frame.push(0x80 | n as u8);
-        } else if n <= 0xFFFF {
-            frame.push(0x80 | 126);
-            frame.extend_from_slice(&(n as u16).to_be_bytes());
-        } else {
-            frame.push(0x80 | 127);
-            frame.extend_from_slice(&(n as u64).to_be_bytes());
+        if tx.send(Incoming::Open).is_err() {
+            return Ok(());
         }
-        // Client frames must be masked; the key need not be secret on a loopback connection.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0x5a17_c3e1, |d| d.subsec_nanos());
-        let key = nanos.to_le_bytes();
-        frame.extend_from_slice(&key);
-        frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
-        self.writer.write_all(&frame)?;
-        Ok(())
-    }
-
-    fn send_text(&mut self, text: &str) -> Result<()> {
-        self.send_frame(0x1, text.as_bytes())
-    }
-
-    /// Waits up to `timeout` for the next text message. `Ok(None)` when none arrived in time.
-    fn recv_text(&mut self, timeout: Duration) -> Result<Option<String>> {
-        // Wait for the first byte with the caller's timeout; once a frame has started, its rest
-        // is read with a generous timeout, so a timeout never leaves a half-read frame behind.
         let mut message: Vec<u8> = Vec::new();
-        let mut first = true;
         loop {
-            let wait = if first {
-                timeout
-            } else {
-                Duration::from_secs(60)
-            };
-            self.reader
-                .get_ref()
-                .set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
             let mut head = [0u8; 2];
-            match self.reader.read_exact(&mut head[..1]) {
-                Ok(()) => {}
-                Err(e)
-                    if first
-                        && matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                {
-                    return Ok(None)
-                }
-                Err(e) => return Err(e).context("DevTools connection"),
-            }
-            self.reader
-                .get_ref()
-                .set_read_timeout(Some(Duration::from_secs(60)))?;
-            self.reader.read_exact(&mut head[1..])?;
+            reader.read_exact(&mut head)?;
             let fin = head[0] & 0x80 != 0;
             let opcode = head[0] & 0x0F;
             let masked = head[1] & 0x80 != 0;
             let mut len = (head[1] & 0x7F) as u64;
             if len == 126 {
                 let mut b = [0u8; 2];
-                self.reader.read_exact(&mut b)?;
+                reader.read_exact(&mut b)?;
                 len = u16::from_be_bytes(b) as u64;
             } else if len == 127 {
                 let mut b = [0u8; 8];
-                self.reader.read_exact(&mut b)?;
+                reader.read_exact(&mut b)?;
                 len = u64::from_be_bytes(b);
             }
             if len as usize > MAX_MESSAGE || message.len() + len as usize > MAX_MESSAGE {
@@ -134,10 +113,10 @@ impl Socket {
             }
             let mut mask = [0u8; 4];
             if masked {
-                self.reader.read_exact(&mut mask)?;
+                reader.read_exact(&mut mask)?;
             }
             let mut payload = vec![0u8; len as usize];
-            self.reader.read_exact(&mut payload)?;
+            reader.read_exact(&mut payload)?;
             if masked {
                 for (i, b) in payload.iter_mut().enumerate() {
                     *b ^= mask[i % 4];
@@ -146,18 +125,76 @@ impl Socket {
             match opcode {
                 0x8 => bail!("the browser closed the DevTools connection"),
                 0x9 => {
-                    self.send_frame(0xA, &payload)?;
-                    continue;
+                    let mut w = writer.lock().map_err(|_| anyhow::anyhow!("lock"))?;
+                    write_frame(&mut w, 0xA, &payload)?;
                 }
-                0xA => continue,
+                0xA => {}
                 0x0..=0x2 => {
-                    first = false;
                     message.extend_from_slice(&payload);
                     if fin {
-                        return Ok(Some(String::from_utf8_lossy(&message).into_owned()));
+                        let text = String::from_utf8_lossy(&message).into_owned();
+                        message.clear();
+                        if tx.send(Incoming::Text(text)).is_err() {
+                            return Ok(());
+                        }
                     }
                 }
                 _ => bail!("unexpected DevTools frame {opcode}"),
+            }
+        }
+    })();
+    let reason = match result {
+        Ok(()) => "the DevTools connection was closed".to_string(),
+        Err(e) => format!("{e:#}"),
+    };
+    let _ = tx.send(Incoming::Closed(reason));
+}
+
+impl Socket {
+    fn connect(port: u16, path: &str, timeout: Duration) -> Result<Socket> {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let stream = TcpStream::connect_timeout(&addr, timeout)?;
+        stream.set_nodelay(true)?;
+        let mut w = stream.try_clone()?;
+        write!(
+            w,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n"
+        )?;
+        w.flush()?;
+        let writer = Arc::new(Mutex::new(w));
+        let (tx, incoming) = channel();
+        let thread_writer = writer.clone();
+        std::thread::Builder::new()
+            .name("devtools".into())
+            .spawn(move || read_loop(stream, thread_writer, tx))?;
+        let socket = Socket { writer, incoming };
+        match socket.incoming.recv_timeout(timeout) {
+            Ok(Incoming::Open) => Ok(socket),
+            Ok(Incoming::Closed(e)) => bail!("{e}"),
+            Ok(Incoming::Text(_)) => bail!("unexpected DevTools message"),
+            Err(_) => bail!("the browser did not answer the DevTools connection"),
+        }
+    }
+
+    fn send_text(&mut self, text: &str) -> Result<()> {
+        let mut w = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DevTools connection"))?;
+        write_frame(&mut w, 0x1, text.as_bytes()).context("DevTools connection")
+    }
+
+    /// Waits up to `timeout` for the next text message. `Ok(None)` when none arrived in time.
+    fn recv_text(&mut self, timeout: Duration) -> Result<Option<String>> {
+        match self.incoming.recv_timeout(timeout) {
+            Ok(Incoming::Text(text)) => Ok(Some(text)),
+            Ok(Incoming::Closed(e)) => bail!("{e}"),
+            Ok(Incoming::Open) => Ok(None),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("the browser closed the DevTools connection")
             }
         }
     }

@@ -369,6 +369,7 @@
   "msg.no_next_file": "後面沒有其他有差異的檔案",
   "msg.no_prev_file": "前面沒有其他有差異的檔案",
   "msg.not_exist": "路徑不存在",
+  "msg.too_many_paths": "指定了 {n} 個路徑：一次只能比較兩個或三個檔案或資料夾",
   "msg.not_found": "找不到「{text}」",
   "msg.op_done": "已處理 {n} 個項目",
   "msg.pasted_lines": "已貼上 {n} 行",

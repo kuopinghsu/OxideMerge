@@ -855,6 +855,114 @@ pub fn caption(ui: &mut Ui, text: &str) {
     );
 }
 
+// ---------- menus ----------
+//
+// Every pull-down menu (the menu bar's menus and their submenus, context menus and the toolbar's
+// drop-downs) opens equally wide, with the same roomy rows, shortcuts kept clear of their labels
+// and check marks in a gutter of their own.
+
+/// Narrowest a menu opens.
+pub const MENU_MIN_WIDTH: f32 = 220.0;
+/// Padding of menu items: rows of about 28 points instead of egui's dense 22.
+pub const MENU_ITEM_PADDING: Vec2 = Vec2::new(8.0, 4.0);
+
+fn menu_width_id() -> egui::Id {
+    egui::Id::new("oxidemerge_menu_width")
+}
+
+/// Sets the width all menus open with: that of the widest menu of the menu bar, measured with
+/// its submenus, and at least [`MENU_MIN_WIDTH`].
+pub fn set_menu_width(ctx: &egui::Context, width: f32) {
+    let width = width.max(MENU_MIN_WIDTH).ceil();
+    ctx.data_mut(|d| d.insert_temp(menu_width_id(), width));
+}
+
+/// The width all menus open with (see [`set_menu_width`]).
+pub fn menu_width(ctx: &egui::Context) -> f32 {
+    ctx.data(|d| d.get_temp(menu_width_id()))
+        .unwrap_or(MENU_MIN_WIDTH)
+}
+
+/// Styles the contents of a menu: the shared width and row padding. Called first in every menu.
+pub fn menu_setup(ui: &mut Ui) {
+    ui.spacing_mut().button_padding = MENU_ITEM_PADDING;
+    ui.set_min_width(menu_width(ui.ctx()));
+}
+
+/// Room between a menu item's label and its shortcut.
+const MENU_SHORTCUT_GAP: f32 = 24.0;
+/// Room before a check item's label, where its check mark goes.
+const MENU_CHECK_GUTTER: f32 = 20.0;
+
+/// Shortcut text of a menu item, kept clear of its label.
+pub fn menu_shortcut(ui: &Ui, keys: &str) -> egui::WidgetText {
+    if keys.is_empty() {
+        return egui::WidgetText::default();
+    }
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        keys,
+        MENU_SHORTCUT_GAP,
+        egui::TextFormat {
+            font_id: egui::TextStyle::Button.resolve(ui.style()),
+            // Takes the color the button gives its shortcut.
+            color: Color32::PLACEHOLDER,
+            ..Default::default()
+        },
+    );
+    job.into()
+}
+
+/// A submenu of a context menu or drop-down, styled like the menu it opens from.
+pub fn submenu<R>(
+    ui: &mut Ui,
+    title: &str,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    ui.menu_button(title, |ui| {
+        menu_setup(ui);
+        add(ui)
+    })
+}
+
+/// A menu item that turns something on or off, or picks one of a few options: a check mark in a
+/// gutter before the label when `on`, the same room left empty when not, so labels line up.
+/// `keys` is its shortcut, if any. The mark is drawn, so it needs no symbol in the fonts.
+pub fn menu_check(ui: &mut Ui, on: bool, label: &str, keys: &str) -> Response {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        label,
+        MENU_CHECK_GUTTER,
+        egui::TextFormat {
+            font_id: egui::TextStyle::Button.resolve(ui.style()),
+            // Takes the button's own text color: dimmed when disabled, strong when hovered.
+            color: Color32::PLACEHOLDER,
+            ..Default::default()
+        },
+    );
+    let mut button = egui::Button::new(job);
+    if !keys.is_empty() {
+        button = button.shortcut_text(menu_shortcut(ui, keys));
+    }
+    let r = ui.add(button);
+    if on && ui.is_rect_visible(r.rect) {
+        let color = ui.style().interact(&r).text_color();
+        let x = r.rect.left() + ui.spacing().button_padding.x;
+        let c = egui::pos2(x + MENU_CHECK_GUTTER * 0.4, r.rect.center().y);
+        let s = MENU_CHECK_GUTTER * 0.22;
+        ui.painter().add(egui::Shape::line(
+            vec![
+                c + egui::vec2(-s, 0.0),
+                c + egui::vec2(-s * 0.3, s * 0.75),
+                c + egui::vec2(s * 1.1, -s * 0.8),
+            ],
+            Stroke::new(1.6_f32, color),
+        ));
+    }
+    r.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, ui.is_enabled(), on, label));
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
