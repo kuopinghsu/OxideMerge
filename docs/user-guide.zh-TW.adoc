@@ -894,6 +894,8 @@ XML 報告供其他程式讀取，例如指令碼、審查工具，或檢查變�
 |kbd:[Ctrl+F]、kbd:[F3]、kbd:[Shift+F3]、kbd:[Esc] |尋找、找下一個、找上一個、關閉尋找列
 |kbd:[Ctrl+H]（macOS 為 kbd:[Cmd+Alt+F]） |尋找並取代
 |kbd:[Ctrl+G] |跳至行（二進位比較中為跳至位移）
+|kbd:[Ctrl+Home]、kbd:[Ctrl+End] |第一行或最後一行
+|kbd:[←]、kbd:[→] |切換文字比較中作用中的窗格
 |kbd:[Shift+↑]、kbd:[Shift+↓]、kbd:[Shift+PgUp]、kbd:[Shift+PgDn] |選取多行
 |kbd:[Ctrl+C] |複製選取的行
 |kbd:[Ctrl+V] |貼到目前這一行下方，或取代選取的行
@@ -903,13 +905,16 @@ XML 報告供其他程式讀取，例如指令碼、審查工具，或檢查變�
 |kbd:[Alt+↓]、kbd:[Alt+↑] |下一個或上一個差異
 |kbd:[Alt+Home]、kbd:[Alt+End] |第一個或最後一個差異
 |kbd:[Alt+PgDn]、kbd:[Alt+PgUp] |下一個或上一個衝突
-|kbd:[Alt+→]、kbd:[Alt+←] |將目前的差異或選取的行複製到右側或左側
+|kbd:[Alt+→]、kbd:[Alt+←] |將目前的差異、選取的行，或資料夾比較中選取的項目複製到右側或左側
 |kbd:[Ctrl+Alt+→]、kbd:[Ctrl+Alt+←] |將所有差異複製到右側或左側
 |kbd:[Ctrl+Z]、kbd:[Ctrl+Y] / kbd:[Ctrl+Shift+Z] |復原、重做
 |kbd:[F2]、kbd:[Enter] |編輯目前這一行
 |kbd:[Ctrl+\]]、kbd:[Ctrl+[] |增加或減少選取行的縮排
 |kbd:[Alt+C]、kbd:[Alt+Z] |摺疊未變更的行、自動換行
+|kbd:[Enter] |比較資料夾比較中所選的項目
 |kbd:[Space] |資料夾比較中快速預覽所選檔案
+|kbd:[Ctrl+A] |選取資料夾比較中的所有項目
+|kbd:[→]、kbd:[←] |在資料夾比較的樹狀檢視中展開或摺疊資料夾
 |kbd:[Ctrl+{plus}]、kbd:[Ctrl+-]、kbd:[Ctrl+0] |放大、縮小、重設縮放
 |===
 

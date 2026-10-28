@@ -1028,6 +1028,8 @@ The unpacker plugins (see <<unpackers>>).
 |kbd:[Ctrl+F], kbd:[F3], kbd:[Shift+F3], kbd:[Esc] |Find, find next, find previous, close the find bar
 |kbd:[Ctrl+H] (kbd:[Cmd+Alt+F] on macOS) |Find and replace
 |kbd:[Ctrl+G] |Go to line (go to offset in a binary compare)
+|kbd:[Ctrl+Home], kbd:[Ctrl+End] |First or last line
+|kbd:[Left], kbd:[Right] |Switch the active pane of a text compare
 |kbd:[Shift+Up], kbd:[Shift+Down], kbd:[Shift+PgUp], kbd:[Shift+PgDn] |Select lines
 |kbd:[Ctrl+C] |Copy the selected lines
 |kbd:[Ctrl+V] |Paste below the current line, or over the selected lines
@@ -1037,13 +1039,16 @@ The unpacker plugins (see <<unpackers>>).
 |kbd:[Alt+Down], kbd:[Alt+Up] |Next or previous difference
 |kbd:[Alt+Home], kbd:[Alt+End] |First or last difference
 |kbd:[Alt+PgDn], kbd:[Alt+PgUp] |Next or previous conflict
-|kbd:[Alt+Right], kbd:[Alt+Left] |Copy the current difference, or the selected lines, right or left
+|kbd:[Alt+Right], kbd:[Alt+Left] |Copy the current difference, the selected lines, or in a folder compare the selected items, right or left
 |kbd:[Ctrl+Alt+Right], kbd:[Ctrl+Alt+Left] |Copy all differences right or left
 |kbd:[Ctrl+Z], kbd:[Ctrl+Y] / kbd:[Ctrl+Shift+Z] |Undo, redo
 |kbd:[F2], kbd:[Enter] |Edit the current line
 |kbd:[Ctrl+\]], kbd:[Ctrl+[] |Indent or unindent the selected lines
 |kbd:[Alt+C], kbd:[Alt+Z] |Collapse unchanged lines, word wrap
+|kbd:[Enter] |Compare the selected item of a folder compare
 |kbd:[Space] |Quick preview of the selected file in a folder compare
+|kbd:[Ctrl+A] |Select every item of a folder compare
+|kbd:[Right], kbd:[Left] |Expand or collapse a folder in the folder compare's tree view
 |kbd:[Ctrl+{plus}], kbd:[Ctrl+-], kbd:[Ctrl+0] |Zoom in, zoom out, reset zoom
 |===
 
