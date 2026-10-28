@@ -804,8 +804,17 @@ impl TextView {
         };
         if let Some(i) = self.sync_points.iter().position(|s| s[pane] == line) {
             self.sync_points.remove(i);
+            self.sync_pending.iter_mut().for_each(|p| *p = None);
             self.status = tr("sync.removed").to_string();
             self.rediff();
+            self.layout_gen += 1;
+            return;
+        }
+        if self.sync_pending[pane] == Some(line) {
+            // The line picked again: it is no longer picked.
+            self.sync_pending[pane] = None;
+            self.status = tr("sync.unpicked").to_string();
+            self.layout_gen += 1;
             return;
         }
         self.sync_pending[pane] = Some(line);
@@ -1079,6 +1088,7 @@ impl TextView {
             let before = std::mem::replace(&mut self.panes[i].doc.lines, lines);
             self.panes[i].hl_dirty = true;
             self.remap_bookmarks(i, &before);
+            self.remap_sync_points(i, &before);
         }
         for (i, p) in self.panes.iter_mut().enumerate() {
             p.doc.modified = s.modified[i] || s.saves[i] != p.saves;
@@ -1617,11 +1627,14 @@ impl TextView {
             match text::load_doc(&path, Some(pane.doc.encoding)) {
                 Ok(mut d) => {
                     d.read_only = pane.doc.read_only;
-                    pane.doc = d;
+                    let before = std::mem::replace(&mut pane.doc, d).lines;
                     pane.hl_dirty = true;
                     pane.saves += 1;
                     pane.disk_time = disk_time(&pane.doc);
                     pane.reset_baseline();
+                    // Bookmarks and synchronization points stay with their lines.
+                    self.remap_bookmarks(p, &before);
+                    self.remap_sync_points(p, &before);
                 }
                 Err(e) => self.status = e.to_string(),
             }
@@ -3856,8 +3869,12 @@ impl TextView {
                 ui.separator();
                 let synced = self.diff.rows[r].line[p]
                     .is_some_and(|l| self.sync_points.iter().any(|s| s[p] == l));
+                let picked = self.diff.rows[r].line[p].is_some()
+                    && self.sync_pending.get(p).copied().flatten() == self.diff.rows[r].line[p];
                 let sync_label = if synced {
                     "cmd.remove_sync_point"
+                } else if picked {
+                    "cmd.unpick_sync_point"
                 } else {
                     "cmd.sync_point"
                 };
@@ -4135,6 +4152,17 @@ mod tests {
         v.cursor_row = Some(0);
         v.paste("zero");
         assert_eq!(lines(&v, 0)[1], "intro");
+        assert_eq!(v.sync_points, [[1, 0, 0]]);
+        // Undo and redo move it back and forth with its line.
+        v.undo();
+        assert_eq!(v.sync_points, [[0, 0, 0]], "undo");
+        v.redo();
+        assert_eq!(v.sync_points, [[1, 0, 0]], "redo");
+        // Picking a picked line again cancels the pick.
+        v.set_sync_point_at(v.diff.row_of_line(0, 3), 0);
+        assert!(v.has_sync_points() && v.sync_pending[0] == Some(3));
+        v.set_sync_point_at(v.diff.row_of_line(0, 3), 0);
+        assert_eq!(v.sync_pending[0], None);
         assert_eq!(v.sync_points, [[1, 0, 0]]);
         // Picking a line of a point again removes the point.
         v.set_sync_point_at(v.diff.row_of_line(1, 0), 1);

@@ -644,11 +644,13 @@
   "opt.web_render": "Afficher les pages dans le navigateur pour le texte et le HTML (exécute leurs scripts)",
   "cmd.sync_point": "Définir un point de synchronisation",
   "cmd.remove_sync_point": "Supprimer le point de synchronisation",
+  "cmd.unpick_sync_point": "Annuler la ligne choisie",
   "cmd.clear_sync_points": "Effacer les points de synchronisation",
   "sync.no_line": "Aucune ligne à synchroniser ici",
   "sync.pick": "Ligne {line} de {side} choisie pour un point de synchronisation : choisissez maintenant la ligne correspondante dans {others}",
   "sync.added": "Point de synchronisation ajouté ({n} dans cette comparaison)",
   "sync.removed": "Point de synchronisation supprimé",
+  "sync.unpicked": "Ligne retirée du point de synchronisation",
   "sync.crossing": "Non ajouté : les lignes croiseraient un autre point de synchronisation",
   "sync.cleared": "Points de synchronisation effacés",
   "menu.slideshow": "Générer un rapport en diaporama...",
@@ -657,5 +659,6 @@
   "slides.difference": "Différence {n} sur {total}",
   "slides.end": "Fin des différences",
   "slides.no_diffs": "Aucune différence",
-  "slides.other_files": "Fichiers différents d'une autre façon"
+  "slides.other_files": "Fichiers différents d'une autre façon",
+  "slides.more_files": "{n} autres fichiers ne sont pas affichés."
 }

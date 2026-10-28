@@ -178,7 +178,9 @@ Common options include:
 - `--ignore-case`, `--ignore-eol`, `--ignore-comments`: ignore selected types of changes.
 - `--rules <name-or-path>`: use a comparison rules file.
 - `--git-rev <revision>`: compare a single file or folder with a Git revision.
-- `--report <file>`: export a report; add `--report-diffs` for text differences in a folder HTML report.
+- `--report <file>`: export a report as `.html`, `.xml`, or for folders also `.csv` or `.txt`; add
+  `--report-diffs` for text differences in a folder HTML report, or `--slideshow` for an HTML
+  slideshow with one difference per slide.
 - `--patch <file>`: export a patch from a two-way file or folder comparison.
 
 `--cli`, `--report` and `--patch` run without opening a window. On Windows, supported

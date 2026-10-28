@@ -1,8 +1,7 @@
 # Builds, lints, and tests OxideMerge on Windows, Linux, and macOS for every
-# push and pull request, then packages it: oxidemerge.exe plus a .zip for
-# Windows x64 and arm64, a .tar.gz, a .deb, and an AppImage for Linux x64 and
-# arm64, and a universal (Apple silicon and Intel) OxideMerge.app in a .dmg and
-# a .zip for macOS. Arm64 packages are built and tested on Arm runners. The
+# push and pull request, then packages it: a .zip holding oxidemerge.exe for
+# Windows x64 and arm64, a .tar.gz and an AppImage for Linux x64 and arm64, and a
+# universal (Apple silicon and Intel) OxideMerge.app in a .dmg for macOS. Arm64 packages are built and tested on Arm runners. The
 # AppImages are started on Ubuntu and RHEL-compatible systems before they are
 # published. The user guide is built as PDF files, in English and Traditional
 # Chinese. Pushing a tag like `v0.9.3` also publishes every package and the
@@ -90,6 +89,9 @@ jobs:
 
       - name: Test
         run: cargo test --release --locked --target ${{ matrix.target }}
+        env:
+          # Web compare's browser tests, with the runner's Edge or Chrome (x64 runners have both).
+          OXIDEMERGE_TEST_BROWSER: ${{ matrix.arch == 'x64' && 'auto' || '' }}
 
       # An explicit target, so the package is for this architecture even if the
       # toolchain on the runner is not.
@@ -172,18 +174,16 @@ jobs:
             exit 1
           }
 
-          New-Item -ItemType Directory -Force -Path dist, "staging/$name" | Out-Null
-          Copy-Item $exe "dist/$name.exe"
-          Copy-Item $exe, README.md, LICENSE "staging/$name/"
-          Compress-Archive -Path "staging/$name" -DestinationPath "dist/$name.zip"
+          # The .zip holds oxidemerge.exe and nothing else.
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path $exe -DestinationPath "dist/$name.zip"
           Expand-Archive "dist/$name.zip" -DestinationPath check
-          foreach ($f in 'oxidemerge.exe', 'README.md', 'LICENSE') {
-            if (-not (Test-Path "check/$name/$f")) {
-              Write-Error "$name.zip lacks $f"
-              exit 1
-            }
+          $files = @(Get-ChildItem -Recurse -Force check | ForEach-Object { $_.Name })
+          if ($files.Count -ne 1 -or $files[0] -ne 'oxidemerge.exe') {
+            Write-Error "$name.zip should hold only oxidemerge.exe, not: $($files -join ', ')"
+            exit 1
           }
-          & "check/$name/oxidemerge.exe" --version
+          & check/oxidemerge.exe --version
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
           Get-ChildItem dist | Format-Table Name, Length
@@ -206,13 +206,10 @@ jobs:
         include:
           - arch: x64
             runner: ubuntu-22.04
-            deb_arch: amd64
           - arch: arm64
             runner: ubuntu-22.04-arm
-            deb_arch: arm64
     env:
       ARCH: ${{ matrix.arch }}
-      DEB_ARCH: ${{ matrix.deb_arch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -235,6 +232,9 @@ jobs:
 
       - name: Test
         run: cargo test --release --locked
+        env:
+          # Web compare's browser tests, with the runner's Chrome (installed on x64 runners).
+          OXIDEMERGE_TEST_BROWSER: ${{ matrix.arch == 'x64' && 'auto' || '' }}
 
       - name: Build
         run: cargo build --release --locked
@@ -304,41 +304,11 @@ jobs:
           install -m 644 README.md LICENSE assets/oxidemerge.desktop assets/oxidemerge.png "staging/$name/"
           tar -C staging -czf "dist/$name.tar.gz" "$name"
 
-          # Debian versions can't contain "-" without a revision; "~" also
-          # sorts a build or pre-release before the release it leads to.
-          deb_version=$(echo "$label" | tr '-' '~')
-          root=staging/deb
-          install -Dm 755 target/release/oxidemerge "$root/usr/bin/oxidemerge"
-          install -Dm 644 assets/oxidemerge.desktop "$root/usr/share/applications/oxidemerge.desktop"
-          install -Dm 644 assets/oxidemerge.png "$root/usr/share/icons/hicolor/256x256/apps/oxidemerge.png"
-          install -Dm 644 LICENSE "$root/usr/share/doc/oxidemerge/copyright"
-          install -Dm 644 README.md "$root/usr/share/doc/oxidemerge/README.md"
-          mkdir -p "$root/DEBIAN"
-          cat > "$root/DEBIAN/control" <<EOF
-          Package: oxidemerge
-          Version: $deb_version
-          Architecture: $DEB_ARCH
-          Maintainer: ${GITHUB_REPOSITORY_OWNER} <${GITHUB_REPOSITORY_OWNER}@users.noreply.github.com>
-          Installed-Size: $(du -sk "$root/usr" | cut -f1)
-          Depends: libc6 (>= 2.35), libgl1, libegl1, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libx11-xcb1, libxcursor1, libxi6
-          Recommends: xdg-desktop-portal, xdg-utils, fontconfig
-          Suggests: chromium | google-chrome-stable | microsoft-edge-stable
-          Section: devel
-          Priority: optional
-          Homepage: https://github.com/${GITHUB_REPOSITORY}
-          Description: Cross-platform diff and merge tool in the style of WinMerge
-           OxideMerge compares and merges folders, text files, binary files and
-           images, resolves version-control conflict files, and compares web
-           pages.
-          EOF
-          dpkg-deb --build --root-owner-group "$root" "dist/$name.deb"
-          dpkg-deb --info "dist/$name.deb"
-
           ls -l dist
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
-      # What the packages hold, and that the .deb installs, runs, and uninstalls without
-      # touching the user's settings.
+      # What the archive holds, and that the program in it runs without touching the
+      # user's settings.
       - name: Check packages
         env:
           NAME: ${{ steps.package.outputs.name }}
@@ -348,25 +318,17 @@ jobs:
           for f in oxidemerge README.md LICENSE oxidemerge.desktop oxidemerge.png; do
             grep -qx "$NAME/$f" <<<"$listing" || { echo "::error::$NAME.tar.gz lacks $f"; exit 1; }
           done
-          deb="dist/$NAME.deb"
-          test "$(dpkg-deb -f "$deb" Architecture)" = "$DEB_ARCH"
-          contents=$(dpkg-deb -c "$deb")
-          for f in usr/bin/oxidemerge usr/share/applications/oxidemerge.desktop \
-            usr/share/icons/hicolor/256x256/apps/oxidemerge.png usr/share/doc/oxidemerge/copyright; do
-            grep -q " \./$f\$" <<<"$contents" || { echo "::error::$deb lacks /$f"; exit 1; }
-          done
-          # The installed program keeps the user's settings, and options given on
-          # the command line apply to that run only.
+          mkdir -p check
+          tar -C check -xzf "dist/$NAME.tar.gz"
+          bin="check/$NAME/oxidemerge"
+          # Options given on the command line apply to that run only.
           mkdir -p ~/.config/OxideMerge
           echo '{"language":"de"}' > ~/.config/OxideMerge/config.json
-          sudo apt-get install -y "./$deb"
-          oxidemerge --version
-          oxidemerge --cli --ignore-case samples/left/same.txt samples/right/same.txt
+          "$bin" --version
+          "$bin" --cli --ignore-case samples/left/same.txt samples/right/same.txt
           jq -e '.language == "de" and (.diff.ignore_case // false) == false' \
             ~/.config/OxideMerge/config.json >/dev/null ||
-            { echo "::error::Running the installed program changed the settings"; exit 1; }
-          sudo apt-get remove -y oxidemerge
-          test ! -e /usr/bin/oxidemerge || { echo "::error::/usr/bin/oxidemerge is still there"; exit 1; }
+            { echo "::error::Running the program changed the settings"; exit 1; }
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -668,7 +630,6 @@ jobs:
             echo "::warning::Rosetta is not installed; the x86_64 slice was not run"
           fi
 
-          ditto -c -k --keepParent "$app" "dist/$name.zip"
           ln -s /Applications staging/dmg/Applications
           # hdiutil now and then fails with "Resource busy" on hosted runners.
           for attempt in 1 2 3; do
@@ -855,27 +816,25 @@ jobs:
             echo "::error::Could not check for an existing release: $out"
             exit 1
           fi
+          # Exactly these files are published, nothing missing and nothing else.
           v=${GITHUB_REF_NAME#v}
-          missing=0
-          for f in \
-            "windows-x64.exe" "windows-x64.zip" "windows-arm64.exe" "windows-arm64.zip" \
-            "linux-x64.tar.gz" "linux-x64.deb" "linux-x64.AppImage" \
-            "linux-arm64.tar.gz" "linux-arm64.deb" "linux-arm64.AppImage" \
-            "macos-universal.dmg" "macos-universal.zip" \
-            "user-guide.pdf" "user-guide.zh-TW.pdf"; do
-            if [ ! -s "dist/oxidemerge-$v-$f" ]; then
-              echo "::error::dist/oxidemerge-$v-$f is missing"
-              missing=1
-            fi
-          done
+          expected=$(for f in \
+            "linux-arm64.AppImage" "linux-arm64.tar.gz" \
+            "linux-x64.AppImage" "linux-x64.tar.gz" \
+            "macos-universal.dmg" \
+            "user-guide.pdf" "user-guide.zh-TW.pdf" \
+            "windows-arm64.zip" "windows-x64.zip"; do
+            echo "oxidemerge-$v-$f"
+          done | sort)
           ls -l dist
-          exit $missing
-
-      - name: Checksums
-        working-directory: dist
-        run: |
-          sha256sum * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          ok=1
+          for f in $expected; do
+            [ -s "dist/$f" ] || { echo "::error::dist/$f is missing"; ok=0; }
+          done
+          for f in $(ls dist | sort); do
+            grep -qx "$f" <<<"$expected" || { echo "::error::dist/$f is not a release file"; ok=0; }
+          done
+          [ "$ok" = 1 ]
 
       # The release notes are this version's section of CHANGELOG.md, followed
       # by the download instructions.
@@ -888,15 +847,15 @@ jobs:
             echo "## Downloads"
             echo
             cat <<'EOF'
-          **Windows (x64 or Arm64):** download `oxidemerge-*-windows-x64.exe` (Intel and AMD PCs) or `oxidemerge-*-windows-arm64.exe` (Arm PCs such as Snapdragon laptops) and run it, or unzip the `.zip` of the same name. Run `oxidemerge --register-shell` once to add the Explorer context menu.
+          **Windows (x64 or Arm64):** download `oxidemerge-*-windows-x64.zip` (Intel and AMD PCs) or `oxidemerge-*-windows-arm64.zip` (Arm PCs such as Snapdragon laptops), unzip it, and run `oxidemerge.exe`; there is nothing to install. Run `oxidemerge --register-shell` once to add the Explorer context menu.
 
-          **Linux (x64 or Arm64):** pick the `linux-x64` packages for Intel and AMD machines and the `linux-arm64` ones for 64-bit Arm (aarch64). `oxidemerge-*-linux-<arch>.AppImage` runs without installing anything on Ubuntu 20.04, RHEL 8, Debian 10, and newer: `chmod +x` it, then run it. It carries the libraries OxideMerge needs besides glibc and the graphics driver. Without FUSE, start it with `--appimage-extract-and-run`. On Ubuntu 22.04 or newer, `sudo apt install ./oxidemerge-*-linux-<arch>.deb` installs OxideMerge instead, and `oxidemerge-*-linux-<arch>.tar.gz` holds the bare program. File dialogs use the XDG desktop portal (`xdg-desktop-portal`).
+          **Linux (x64 or Arm64):** pick the `linux-x64` packages for Intel and AMD machines and the `linux-arm64` ones for 64-bit Arm (aarch64). `oxidemerge-*-linux-<arch>.AppImage` runs without installing anything on Ubuntu 20.04, RHEL 8, Debian 10, and newer: `chmod +x` it, then run it. It carries the libraries OxideMerge needs besides glibc and the graphics driver. Without FUSE, start it with `--appimage-extract-and-run`. `oxidemerge-*-linux-<arch>.tar.gz` holds the bare program instead, with a desktop file and icon. File dialogs use the XDG desktop portal (`xdg-desktop-portal`).
 
-          **macOS 11 or later (Apple silicon and Intel):** open `oxidemerge-*-macos-universal.dmg` and drag OxideMerge to Applications. The app is not notarized, so macOS blocks it the first time: try to open it once, then choose **Open Anyway** in **System Settings → Privacy & Security** (up to macOS 14, Control-clicking it and choosing **Open** also works), or run `xattr -dr com.apple.quarantine /Applications/OxideMerge.app`. `oxidemerge-*-macos-universal.zip` holds the same app. To use it from the terminal, run `sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin/oxidemerge`.
+          **macOS 11 or later (Apple silicon and Intel):** open `oxidemerge-*-macos-universal.dmg` and drag OxideMerge to Applications. The app is not notarized, so macOS blocks it the first time: try to open it once, then choose **Open Anyway** in **System Settings → Privacy & Security** (up to macOS 14, Control-clicking it and choosing **Open** also works), or run `xattr -dr com.apple.quarantine /Applications/OxideMerge.app`. To use it from the terminal, run `sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin/oxidemerge`.
 
           **User guide:** `oxidemerge-*-user-guide.pdf` in English and `oxidemerge-*-user-guide.zh-TW.pdf` in Traditional Chinese.
 
-          Check downloads against `SHA256SUMS.txt`. Web page screenshots need a Chromium-based browser (Edge, Chrome, Chromium or Brave); every other compare works without one.
+          GitHub lists each download's SHA-256 digest on this page for checking it. Web page screenshots need a Chromium-based browser (Edge, Chrome, Chromium or Brave); every other compare works without one.
           EOF
             echo
             echo "Built from commit \`$GITHUB_SHA\` by [this workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."

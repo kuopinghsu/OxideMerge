@@ -534,8 +534,15 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
     let result = core::diff::compute_with(&refs, &cfg.diff, syntax);
     if let Some(r) = &cli.report {
-        let format = match report_format(r) {
-            f @ (ReportFormat::Html | ReportFormat::Xml | ReportFormat::Slideshow) => f,
+        // One note per problem: another type is written as HTML, a slideshow if asked for.
+        let format = match ReportFormat::from_path(r) {
+            ReportFormat::Html | ReportFormat::Xml => report_format(r),
+            _ if cli.slideshow => {
+                eprintln!(
+                    "note: text compares are reported as .html or .xml; writing an HTML slideshow"
+                );
+                ReportFormat::Slideshow
+            }
             _ => {
                 eprintln!("note: text compares are reported as .html or .xml; writing HTML");
                 ReportFormat::Html

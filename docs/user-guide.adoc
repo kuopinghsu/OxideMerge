@@ -123,7 +123,7 @@ See xref:../README.md#development[Development in the README] for prerequisites a
 . Choose *Compare files or folders* on the start page.
 . Select an older file as *Left* and a newer file as *Right*.
 . Enable *Read-only* for either side that you want to protect, then click *Compare*.
-. Press kbd:[Alt+Down] to move to the next difference.
+. Press kbd:[Alt+↓] to move to the next difference.
 . To merge a difference, check the destination and use the arrow pointing toward that pane.
 . Review the result. Use *File → Save as* for a separate output file, or *Save* to update
   the pane's current file.
@@ -267,7 +267,7 @@ In *View → Folder list*:
 
 * *Tree mode* shows subfolders as a tree.
   Turn it off for a flat list.
-  kbd:[Right] and kbd:[Left] expand and collapse a folder, and the toolbar has *Expand all* and
+  kbd:[→] and kbd:[←] expand and collapse a folder, and the toolbar has *Expand all* and
   *Collapse all*.
 * *Show* hides or shows *Identical*, *Different*, *Left only*, *Middle only* and *Right only*
   items.
@@ -337,7 +337,7 @@ kbd:[Ctrl]+click adds an item to the selection or removes it.
   tab.
   kbd:[↑] and kbd:[↓] move to the next item, kbd:[Enter] opens it, and kbd:[Space] or
   kbd:[Esc] closes the preview.
-* kbd:[Alt+Right] and kbd:[Alt+Left] copy the selected items to the right or left.
+* kbd:[Alt+→] and kbd:[Alt+←] copy the selected items to the right or left.
 
 Right-click an item for more:
 
@@ -403,7 +403,7 @@ The filters and *Show* settings of the folder compare apply.
 * Each file is a card with its differences side by side.
   The arrow in a card header collapses or expands it, and the toolbar collapses or expands all of
   them.
-* kbd:[Alt+Down] and kbd:[Alt+Up] step through the differences across files.
+* kbd:[Alt+↓] and kbd:[Alt+↑] step through the differences across files.
 * The arrows next to a difference copy it to another side.
   In a 2-way compare the buttons in a card header copy the whole file.
 * *Undo* reverses the last change.
@@ -442,7 +442,7 @@ Within changed lines, the changed words or characters are highlighted.
 |===
 |Keys |Action
 
-|kbd:[Alt+Down], kbd:[Alt+Up]
+|kbd:[Alt+↓], kbd:[Alt+↑]
 |Next or previous difference
 
 |kbd:[Alt+Home], kbd:[Alt+End]
@@ -464,9 +464,9 @@ Copying a text difference updates the destination pane. The file on disk changes
 you save it. Check the active pane and the direction of the arrow before copying.
 
 * The arrows on the divider between the sides copy the hovered or current difference.
-* kbd:[Alt+Right] and kbd:[Alt+Left] copy the current difference, or the selected lines, to the
+* kbd:[Alt+→] and kbd:[Alt+←] copy the current difference, or the selected lines, to the
   right or left.
-* kbd:[Ctrl+Alt+Right] and kbd:[Ctrl+Alt+Left] copy all differences.
+* kbd:[Ctrl+Alt+→] and kbd:[Ctrl+Alt+←] copy all differences.
 * kbd:[Ctrl+Z] undoes and kbd:[Ctrl+Y] or kbd:[Ctrl+Shift+Z] redoes.
 * kbd:[Ctrl+S] saves the current file and kbd:[Ctrl+Shift+S] saves all of them.
   *File → Save as* saves one side under another name.
@@ -484,7 +484,7 @@ previous contents as `<name>.bak`. A later save replaces that backup; it is not 
 Each writable pane supports line-based editing.
 
 * Double-click a line, or press kbd:[F2] or kbd:[Enter], to edit it.
-* Select lines by dragging, with kbd:[Shift]+click, or with kbd:[Shift+Up] and kbd:[Shift+Down].
+* Select lines by dragging, with kbd:[Shift]+click, or with kbd:[Shift+↑] and kbd:[Shift+↓].
 * kbd:[Ctrl+C] copies the selected lines, and kbd:[Ctrl+V] pastes below the current line or over
   the selected lines.
 * kbd:[Ctrl+\]] and kbd:[Ctrl+[] indent and unindent the selected lines.
@@ -529,9 +529,10 @@ tell it which lines belong together:
 
 Those lines are shown on one row, and the text before and after them is compared separately.
 Add as many points as needed; a point that would cross another one is refused.
-Synchronization points are marked in the gutter, follow the lines as you edit, and are kept in
-saved comparisons. Choose the command again on a point's line to remove it, or
-*Merge → Clear synchronization points* to remove them all.
+Synchronization points are marked in the gutter, follow their lines through edits, undo and
+reloads, and are kept in saved comparisons. Choose the command again on a picked line to cancel
+the pick, on a point's line to remove the point, or *Merge → Clear synchronization points* to
+remove them all.
 
 === View options
 
@@ -651,7 +652,7 @@ image::binary.png[Binary compare]
 Binary files open in a side-by-side hexadecimal view. Highlighting identifies differing bytes.
 The sides scroll together.
 
-* kbd:[Alt+Down] and kbd:[Alt+Up] step through the differences.
+* kbd:[Alt+↓] and kbd:[Alt+↑] step through the differences.
 * kbd:[Ctrl+F] finds hex bytes, such as `DE AD BE EF`, or text.
 * kbd:[Ctrl+G] goes to an offset, written as `0x1F00`, `1F00h` or a decimal number.
 * Differences can be copied to the other side and saved, like in a text compare.
@@ -679,8 +680,8 @@ Difference:: The pixel differences.
   *Fit* fits the images to the window and *1:1* shows them at their real size.
 * Drag, or scroll with two fingers, to move all the images together.
 * Click a differing region to select it.
-  kbd:[Alt+Down] and kbd:[Alt+Up] step through the regions, and kbd:[Alt+Right] and
-  kbd:[Alt+Left] copy the current region to the other image.
+  kbd:[Alt+↓] and kbd:[Alt+↑] step through the regions, and kbd:[Alt+→] and
+  kbd:[Alt+←] copy the current region to the other image.
   *Undo* reverses the copy, and kbd:[Ctrl+S] saves the changed image.
 
 The status bar shows how many pixels differ and in how many regions.
@@ -735,8 +736,9 @@ other such resources are skipped and counted.
 The addresses you enter are always loaded.
 The screenshot size and the browser are set under *Options → Image / Binary / Web*.
 Leave the browser path empty to detect a supported browser automatically.
-Use *Reload* after changing the page or switching modes. Local HTML files require `-t web`
-or an explicit *Compare as → Web page* selection; otherwise, they normally open as text.
+Switching modes loads the pages again; use *Reload* (kbd:[F5]) after a page changes.
+Local HTML files require `-t web` or an explicit *Compare as → Web page* selection; otherwise,
+they normally open as text.
 
 NOTE: The resource tree compares the HTML as delivered by the server; the other modes run page
 scripts when a browser is used. Authenticated sessions are not supported; a page that requires a
@@ -1029,18 +1031,18 @@ The unpacker plugins (see <<unpackers>>).
 |kbd:[Ctrl+H] (kbd:[Cmd+Alt+F] on macOS) |Find and replace
 |kbd:[Ctrl+G] |Go to line (go to offset in a binary compare)
 |kbd:[Ctrl+Home], kbd:[Ctrl+End] |First or last line
-|kbd:[Left], kbd:[Right] |Switch the active pane of a text compare
-|kbd:[Shift+Up], kbd:[Shift+Down], kbd:[Shift+PgUp], kbd:[Shift+PgDn] |Select lines
+|kbd:[←], kbd:[→] |Switch the active pane of a text compare
+|kbd:[Shift+↑], kbd:[Shift+↓], kbd:[Shift+PgUp], kbd:[Shift+PgDn] |Select lines
 |kbd:[Ctrl+C] |Copy the selected lines
 |kbd:[Ctrl+V] |Paste below the current line, or over the selected lines
 |kbd:[Ctrl+F2], kbd:[F4], kbd:[Shift+F4] |Set or remove a bookmark, next bookmark, previous bookmark
 |kbd:[Alt+S] |Set or remove a synchronization point
 |kbd:[F5] |Refresh
-|kbd:[Alt+Down], kbd:[Alt+Up] |Next or previous difference
+|kbd:[Alt+↓], kbd:[Alt+↑] |Next or previous difference
 |kbd:[Alt+Home], kbd:[Alt+End] |First or last difference
 |kbd:[Alt+PgDn], kbd:[Alt+PgUp] |Next or previous conflict
-|kbd:[Alt+Right], kbd:[Alt+Left] |Copy the current difference, the selected lines, or in a folder compare the selected items, right or left
-|kbd:[Ctrl+Alt+Right], kbd:[Ctrl+Alt+Left] |Copy all differences right or left
+|kbd:[Alt+→], kbd:[Alt+←] |Copy the current difference, the selected lines, or in a folder compare the selected items, right or left
+|kbd:[Ctrl+Alt+→], kbd:[Ctrl+Alt+←] |Copy all differences right or left
 |kbd:[Ctrl+Z], kbd:[Ctrl+Y] / kbd:[Ctrl+Shift+Z] |Undo, redo
 |kbd:[F2], kbd:[Enter] |Edit the current line
 |kbd:[Ctrl+\]], kbd:[Ctrl+[] |Indent or unindent the selected lines
@@ -1048,7 +1050,7 @@ The unpacker plugins (see <<unpackers>>).
 |kbd:[Enter] |Compare the selected item of a folder compare
 |kbd:[Space] |Quick preview of the selected file in a folder compare
 |kbd:[Ctrl+A] |Select every item of a folder compare
-|kbd:[Right], kbd:[Left] |Expand or collapse a folder in the folder compare's tree view
+|kbd:[→], kbd:[←] |Expand or collapse a folder in the folder compare's tree view
 |kbd:[Ctrl+{plus}], kbd:[Ctrl+-], kbd:[Ctrl+0] |Zoom in, zoom out, reset zoom
 |===
 
@@ -1178,7 +1180,7 @@ git config --global mergetool.oxidemerge.trustExitCode false
 ----
 
 * `git difftool` opens each changed file.
-  `git difftool --dir-diff` opens one folder compare of all of them, and kbd:[Alt+Down] past the
+  `git difftool --dir-diff` opens one folder compare of all of them, and kbd:[Alt+↓] past the
   last difference moves on to the next changed file.
 * `git mergetool` opens a 3-way merge with the common ancestor in the middle.
   Auto merge, or copy differences into the middle, then save: the middle is written to the merged

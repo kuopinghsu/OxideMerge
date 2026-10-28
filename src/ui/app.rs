@@ -3312,7 +3312,7 @@ impl OxideMergeApp {
                     return;
                 }
             };
-        // "a vs b.html" becomes "a vs b slides.html".
+        // "a vs b.html" becomes "a vs b_slides.html".
         let name = match name.strip_suffix(".html") {
             Some(stem) => format!("{stem}_slides.html"),
             None => name,

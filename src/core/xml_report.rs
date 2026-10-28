@@ -26,8 +26,10 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::PathBuf;
 
-/// `s` escaped for XML text and attribute values. Characters XML 1.0 can't hold (most control
-/// characters) become U+FFFD.
+/// `s` escaped for XML text and attribute values. Tabs and line breaks are written as character
+/// references, which readers keep as they are (in attributes, and a carriage return in text,
+/// they would otherwise become spaces or line feeds). Characters XML 1.0 can't hold (most
+/// control characters) become U+FFFD.
 pub fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -36,7 +38,9 @@ pub fn esc(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            '\t' | '\n' | '\r' => out.push(c),
+            '\t' => out.push_str("&#9;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
             c if (c as u32) < 0x20 || matches!(c, '\u{FFFE}' | '\u{FFFF}') => out.push('\u{FFFD}'),
             c => out.push(c),
         }
@@ -286,7 +290,8 @@ mod tests {
 
     #[test]
     fn control_characters_are_replaced() {
-        assert_eq!(esc("a\u{1}b\tc"), "a\u{FFFD}b\tc");
+        assert_eq!(esc("a\u{1}b\tc"), "a\u{FFFD}b&#9;c");
+        assert_eq!(esc("x\r\ny"), "x&#13;&#10;y", "line breaks are kept by readers");
     }
 
     #[test]

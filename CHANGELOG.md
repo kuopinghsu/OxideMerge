@@ -43,7 +43,8 @@ section of this file as the release notes.
   downloaded and the status bar says why, instead of showing only an error. The console compare
   (`--cli -t web`) also renders the pages in the browser, so it matches the app. On macOS and
   Linux the browser is driven over a private pipe instead of a local port. Tests that need a real
-  browser run only when `OXIDEMERGE_TEST_BROWSER` is set; CI sets it on the x64 runners.
+  browser run only when `OXIDEMERGE_TEST_BROWSER` is set; CI sets it on the Windows and Linux
+  x64 runners.
 - **Release files:** a release now holds nine files: a `.zip` per Windows architecture holding
   only `oxidemerge.exe`, an AppImage and a `.tar.gz` per Linux architecture, the macOS `.dmg`,
   and the two PDF user guides. The separate Windows `.exe` downloads, the Linux `.deb`
@@ -53,6 +54,9 @@ section of this file as the release notes.
 
 ### Fixed
 
+- **Four or more paths:** opening four or more files or folders, from the command line, a drop
+  or a file manager, no longer crashes the folder compare; it says that two or three paths are
+  needed.
 - **File safety:** saving and copying now report an error if a temporary file cannot be created
   or cannot replace the destination. They no longer fall back to overwriting the original file
   directly, which could truncate it if a subsequent write failed.

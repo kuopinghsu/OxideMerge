@@ -644,11 +644,13 @@
   "opt.web_render": "テキストと HTML のためにページをブラウザーで描画する (スクリプトを実行)",
   "cmd.sync_point": "同期ポイントを設定",
   "cmd.remove_sync_point": "同期ポイントを削除",
+  "cmd.unpick_sync_point": "選択した行を取り消す",
   "cmd.clear_sync_points": "同期ポイントをすべて解除",
   "sync.no_line": "ここには同期する行がありません",
   "sync.pick": "{side} の {line} 行目を同期ポイントに選びました。続けて {others} で対応する行を選んでください",
   "sync.added": "同期ポイントを追加しました (この比較で {n} 個)",
   "sync.removed": "同期ポイントを削除しました",
+  "sync.unpicked": "同期ポイントの行の選択を取り消しました",
   "sync.crossing": "追加できません: 別の同期ポイントと交差します",
   "sync.cleared": "同期ポイントをすべて解除しました",
   "menu.slideshow": "スライドショー レポートを作成...",
@@ -657,5 +659,6 @@
   "slides.difference": "相違 {n} / {total}",
   "slides.end": "相違の終わり",
   "slides.no_diffs": "相違はありません",
-  "slides.other_files": "その他の理由で異なるファイル"
+  "slides.other_files": "その他の理由で異なるファイル",
+  "slides.more_files": "ほかに {n} 個のファイルは表示されていません。"
 }
