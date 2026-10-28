@@ -55,6 +55,7 @@ const KEYBOARD: &[Section] = &[
             (&["F2", "Enter"], "cmd.edit_line"),
             (&["Ctrl+F2"], "cmd.toggle_bookmark"),
             (&["F4", "Shift+F4"], "help.next_prev_bookmark"),
+            (&["Alt+S"], "help.sync_point"),
             (&["Ctrl+]", "Ctrl+["], "help.indent_outdent"),
             (&["Ctrl+F"], "cmd.find"),
             (&[REPLACE_KEY], "cmd.replace"),
