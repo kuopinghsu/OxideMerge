@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::core::comments;
-use crate::core::diff::{self, BlockKind, DiffOptions, DiffResult, InlineMode};
+use crate::core::diff::{self, BlockKind, DiffOptions, DiffResult, InlineMode, SyncPoint};
 use crate::core::patch::{self, PatchStyle};
 use crate::core::prettify;
 use crate::core::report::side_name;
@@ -380,6 +380,8 @@ enum MenuAction {
     EditNote(usize, usize),
     TakeBoth(usize, bool),
     AddRule(RuleKind, usize, usize),
+    SyncPoint(usize, usize),
+    ClearSyncPoints,
 }
 
 /// A bookmark comment being edited: pane, line, text, and whether the field needs focus.
@@ -430,6 +432,10 @@ pub struct TextView {
     pub step_file: Option<bool>,
     /// Bookmarked lines of each pane, with their comments (empty when there is none).
     pub bookmarks: Vec<BTreeMap<usize, String>>,
+    /// Lines the compare puts on one row (see [`SyncPoint`]), in order.
+    pub sync_points: Vec<SyncPoint>,
+    /// The line picked in each pane for a synchronization point being set.
+    sync_pending: Vec<Option<usize>>,
     note_edit: Option<NoteEdit>,
     /// Off for a preview that must leave the keyboard to the view around it.
     pub keys_enabled: bool,
@@ -488,7 +494,9 @@ impl TextView {
             wrap: cfg.word_wrap,
             scroll_anim: None,
             step_file: None,
+            sync_pending: vec![None; bookmarks.len()],
             bookmarks,
+            sync_points: Vec::new(),
             note_edit: None,
             keys_enabled: true,
             edit_markers: cfg.show_edit_markers,
@@ -647,6 +655,8 @@ impl TextView {
                 pane.hl_dirty = true;
                 pane.reset_baseline();
                 self.bookmarks[p].clear();
+                self.sync_pending[p] = None;
+                self.sync_points.clear();
             }
         }
     }
@@ -665,7 +675,9 @@ impl TextView {
     pub fn rediff(&mut self) {
         let syntax = self.comment_syntax();
         let refs: Vec<&[String]> = self.panes.iter().map(|p| p.doc.lines.as_slice()).collect();
-        self.diff = diff::compute_with(&refs, &self.opts, syntax);
+        let lens: Vec<usize> = refs.iter().map(|l| l.len()).collect();
+        self.sync_points = diff::valid_sync_points(&self.sync_points, &lens);
+        self.diff = diff::compute_synced(&refs, &self.opts, syntax, &self.sync_points);
         for (p, marks) in self.bookmarks.iter_mut().enumerate() {
             let n = self.panes[p].doc.lines.len();
             marks.retain(|&l, _| l < n);
@@ -708,6 +720,7 @@ impl TextView {
             self.panes[p].hl_dirty = true;
             if let Some(before) = self.undo.last().map(|s| s.lines[p].clone()) {
                 self.remap_bookmarks(p, &before);
+                self.remap_sync_points(p, &before);
             }
         }
         self.rediff();
@@ -751,6 +764,112 @@ impl TextView {
             }
         }
         self.bookmarks[p] = moved;
+    }
+
+    /// Moves the synchronization points of pane `p` along with its lines after they changed
+    /// from `before`; a point whose line was deleted is dropped.
+    fn remap_sync_points(&mut self, p: usize, before: &[String]) {
+        if self.sync_points.is_empty() && self.sync_pending[p].is_none() {
+            return;
+        }
+        let map = line_map(before, &self.panes[p].doc.lines);
+        let moved = |l: usize| map.get(l).filter(|(_, kept)| *kept).map(|&(to, _)| to);
+        self.sync_points.retain_mut(|s| match moved(s[p]) {
+            Some(to) => {
+                s[p] = to;
+                true
+            }
+            None => false,
+        });
+        self.sync_pending[p] = self.sync_pending[p].and_then(moved);
+    }
+
+    // ---------- synchronization points ----------
+
+    /// Picks the active pane's line on the cursor row for a synchronization point (see
+    /// [`Self::set_sync_point_at`]).
+    pub fn set_sync_point(&mut self) {
+        if let Some(r) = self.cursor_row {
+            self.set_sync_point_at(r, self.active_pane);
+        }
+    }
+
+    /// Picks the line of `pane` on `row` for a synchronization point. Once a line is picked in
+    /// every pane, they are put on one row and the compare is worked out again. Picking a line
+    /// that is part of a synchronization point removes that point.
+    pub fn set_sync_point_at(&mut self, row: usize, pane: usize) {
+        let Some(line) = self.diff.rows.get(row).and_then(|r| r.line[pane]) else {
+            self.status = tr("sync.no_line").to_string();
+            return;
+        };
+        if let Some(i) = self.sync_points.iter().position(|s| s[pane] == line) {
+            self.sync_points.remove(i);
+            self.status = tr("sync.removed").to_string();
+            self.rediff();
+            return;
+        }
+        self.sync_pending[pane] = Some(line);
+        let n = self.n();
+        if let Some(lines) = (0..n)
+            .map(|p| self.sync_pending[p])
+            .collect::<Option<Vec<_>>>()
+        {
+            let mut point = [0; 3];
+            point[..n].copy_from_slice(&lines);
+            self.sync_pending.iter_mut().for_each(|p| *p = None);
+            // Points stay in order: one that would cross an existing point is refused.
+            let crosses = self.sync_points.iter().any(|e| {
+                let before = (0..n).all(|p| point[p] < e[p]);
+                let after = (0..n).all(|p| point[p] > e[p]);
+                !before && !after
+            });
+            if crosses {
+                self.status = tr("sync.crossing").to_string();
+            } else {
+                self.sync_points.push(point);
+                self.sync_points.sort_unstable();
+                self.rediff();
+                if let Some(r) = self
+                    .diff
+                    .rows
+                    .iter()
+                    .position(|r| r.line[0] == Some(point[0]))
+                {
+                    self.cursor_row = Some(r);
+                    self.scroll_to = Some(r);
+                }
+                self.status = trf("sync.added", &[("n", self.sync_points.len().to_string())]);
+            }
+        } else {
+            let missing: Vec<&str> = (0..n)
+                .filter(|&p| self.sync_pending[p].is_none())
+                .map(|p| side_name(p, n))
+                .collect();
+            self.status = trf(
+                "sync.pick",
+                &[
+                    ("line", (line + 1).to_string()),
+                    ("side", side_name(pane, n).to_string()),
+                    ("others", missing.join(" / ")),
+                ],
+            );
+        }
+        self.layout_gen += 1;
+    }
+
+    pub fn has_sync_points(&self) -> bool {
+        !self.sync_points.is_empty() || self.sync_pending.iter().any(Option::is_some)
+    }
+
+    /// Removes every synchronization point, and any line picked for one.
+    pub fn clear_sync_points(&mut self) {
+        self.sync_pending.iter_mut().for_each(|p| *p = None);
+        if !self.sync_points.is_empty() {
+            self.sync_points.clear();
+            self.rediff();
+        }
+        self.status = tr("sync.cleared").to_string();
+        self.layout_gen += 1;
     }
 
     // ---------- bookmarks ----------
@@ -1614,6 +1733,16 @@ impl TextView {
     /// compare rules file of the options, used when the compare has none of its own. A rules
     /// file that could not be read is not named: the compare runs without it.
     pub fn html_report_job(&self, default_rules: &str) -> crate::core::report::ReportJob {
+        self.report_job(crate::core::report::ReportFormat::Html, default_rules)
+    }
+
+    /// Makes the report of this compare as `format` (HTML, XML or a slideshow); it can run on
+    /// another thread.
+    pub fn report_job(
+        &self,
+        format: crate::core::report::ReportFormat,
+        default_rules: &str,
+    ) -> crate::core::report::ReportJob {
         let titles = self.titles();
         let lines: Vec<Vec<String>> = self.panes.iter().map(|p| p.doc.lines.clone()).collect();
         let found = match &self.rules {
@@ -1628,13 +1757,14 @@ impl TextView {
         let (diff, opts, notes) = (self.diff.clone(), self.opts.clone(), self.bookmarks.clone());
         Box::new(move || {
             let refs: Vec<&[String]> = lines.iter().map(Vec::as_slice).collect();
-            crate::core::report::text_html(&titles, &refs, &diff, &opts, &notes, &rules)
+            crate::core::report::text_report(format, &titles, &refs, &diff, &opts, &notes, &rules)
         })
     }
 
     /// The compare with its bookmarks, to save as one file.
     pub fn saved_compare(&self) -> SavedCompare {
-        SavedCompare::new(
+        let n = self.n();
+        let mut saved = SavedCompare::new(
             self.panes
                 .iter()
                 .zip(&self.bookmarks)
@@ -1651,7 +1781,13 @@ impl TextView {
                     bookmarks: marks.iter().map(|(&l, n)| (l + 1, n.clone())).collect(),
                 })
                 .collect(),
-        )
+        );
+        saved.sync_points = self
+            .sync_points
+            .iter()
+            .map(|s| s[..n].iter().map(|l| l + 1).collect())
+            .collect();
+        saved
     }
 
     /// A read-only compare of a saved comparison, with its bookmarks.
@@ -1676,6 +1812,24 @@ impl TextView {
                 .filter(|(&l, _)| (1..=n).contains(&l))
                 .map(|(&l, c)| (l - 1, c.clone()))
                 .collect();
+        }
+        let n = v.n();
+        let points: Vec<SyncPoint> = saved
+            .sync_points
+            .iter()
+            .filter(|s| s.len() == n && s.iter().all(|&l| l >= 1))
+            .map(|s| {
+                let mut p = [0; 3];
+                for (i, &l) in s.iter().enumerate() {
+                    p[i] = l - 1;
+                }
+                p
+            })
+            .collect();
+        if !points.is_empty() {
+            // Ones that don't fit these texts are left out by the compare.
+            v.sync_points = points;
+            v.rediff();
         }
         v
     }
@@ -3324,6 +3478,21 @@ impl TextView {
                 }
                 let row = self.diff.rows[r];
                 let Some(l) = row.line[p] else { continue };
+                if seg == 0 {
+                    if self.sync_points.iter().any(|s| s[p] == l) {
+                        // A synchronization point: a line across the top of the row.
+                        tp.line_segment(
+                            [row_rect.left_top(), row_rect.right_top()],
+                            Stroke::new(2.0_f32, c.ui.accent),
+                        );
+                    } else if self.sync_pending.get(p).copied().flatten() == Some(l) {
+                        tp.rect_filled(row_rect, 0.0, c.ui.accent.gamma_multiply(0.18));
+                        tp.line_segment(
+                            [row_rect.left_top(), row_rect.right_top()],
+                            Stroke::new(1.0_f32, c.ui.accent.gamma_multiply(0.6)),
+                        );
+                    }
+                }
                 let bookmarked = self.bookmarks[p].contains_key(&l);
                 if bookmarked && seg == 0 {
                     gp.rect_filled(
@@ -3684,6 +3853,25 @@ impl TextView {
                 if ui.button(tr("cmd.bookmark_comment")).clicked() {
                     action = Some(MenuAction::EditNote(r, p));
                 }
+                ui.separator();
+                let synced = self.diff.rows[r].line[p]
+                    .is_some_and(|l| self.sync_points.iter().any(|s| s[p] == l));
+                let sync_label = if synced {
+                    "cmd.remove_sync_point"
+                } else {
+                    "cmd.sync_point"
+                };
+                let sync = egui::Button::new(tr(sync_label))
+                    .shortcut_text(widgets::menu_shortcut(ui, &Cmd::SyncPoint.shown_key()));
+                if ui
+                    .add_enabled(self.diff.rows[r].line[p].is_some(), sync)
+                    .clicked()
+                {
+                    action = Some(MenuAction::SyncPoint(r, p));
+                }
+                if self.has_sync_points() && ui.button(tr("cmd.clear_sync_points")).clicked() {
+                    action = Some(MenuAction::ClearSyncPoints);
+                }
                 widgets::submenu(ui, tr("cmd.add_rule"), |ui| {
                     for kind in RuleKind::ALL {
                         if ui.button(tr(kind.key())).clicked() {
@@ -3735,6 +3923,8 @@ impl TextView {
                     }
                 }
                 MenuAction::ToggleBookmark(r, p) => self.toggle_bookmark_at(r, p),
+                MenuAction::SyncPoint(r, p) => self.set_sync_point_at(r, p),
+                MenuAction::ClearSyncPoints => self.clear_sync_points(),
                 MenuAction::EditNote(r, p) => self.edit_note_at(r, p),
                 MenuAction::TakeBoth(b, left_first) => self.take_both_at(b, left_first),
                 MenuAction::AddRule(kind, r, p) => {
@@ -3927,6 +4117,39 @@ mod tests {
     }
 
     #[test]
+    fn sync_points_align_picked_lines_and_follow_edits() {
+        let mut v = two_way("intro\nkeep\nend\n", "head\nmore\nintro\nkeep\nend\n");
+        // Pick "head" on the right and "intro" on the left: they share a row.
+        v.set_sync_point_at(v.diff.row_of_line(1, 0), 1);
+        assert!(
+            v.has_sync_points() && v.sync_points.is_empty(),
+            "one side picked"
+        );
+        assert!(!v.status.is_empty());
+        v.set_sync_point_at(v.diff.row_of_line(0, 0), 0);
+        assert_eq!(v.sync_points, [[0, 0, 0]]);
+        let row = v.diff.row_of_line(0, 0);
+        assert_eq!(v.diff.rows[row].line[..2], [Some(0), Some(0)]);
+        // An edit above the point on the left moves it along with its line.
+        v.active_pane = 0;
+        v.cursor_row = Some(0);
+        v.paste("zero");
+        assert_eq!(lines(&v, 0)[1], "intro");
+        assert_eq!(v.sync_points, [[1, 0, 0]]);
+        // Picking a line of a point again removes the point.
+        v.set_sync_point_at(v.diff.row_of_line(1, 0), 1);
+        assert!(v.sync_points.is_empty() && !v.has_sync_points());
+        // Points that would cross an earlier one are not kept.
+        v.set_sync_point_at(v.diff.row_of_line(0, 3), 0);
+        v.set_sync_point_at(v.diff.row_of_line(1, 1), 1);
+        v.set_sync_point_at(v.diff.row_of_line(0, 1), 0);
+        v.set_sync_point_at(v.diff.row_of_line(1, 3), 1);
+        assert_eq!(v.sync_points, [[3, 1, 0]], "the first point is kept");
+        v.clear_sync_points();
+        assert!(!v.has_sync_points());
+    }
+
+    #[test]
     fn takes_both_sides_pastes_and_keeps_bookmarks_on_their_lines() {
         let docs = ["a\nL\nz\n", "a\nb\nz\n", "a\nR\nz\n"]
             .iter()
@@ -4010,6 +4233,40 @@ mod tests {
         assert_eq!(r.bookmarks[0], v.bookmarks[0]);
         assert_eq!(lines(&r, 0), lines(&v, 0));
         assert!(r.panes.iter().all(|p| p.doc.read_only));
+        assert!(saved.sync_points.is_empty());
+    }
+
+    #[test]
+    fn saved_comparisons_keep_their_sync_points() {
+        let mut v = two_way("a\nb\nc\nd\n", "x\na\nc\nd\n");
+        v.sync_points = vec![[1, 0, 0], [3, 3, 0]];
+        v.rediff();
+        let saved = v.saved_compare();
+        assert_eq!(
+            saved.sync_points,
+            [vec![2, 1], vec![4, 4]],
+            "1-based, one per side"
+        );
+        let r = TextView::from_saved(&saved, &Config::default());
+        assert_eq!(r.sync_points, v.sync_points);
+        assert_eq!(
+            r.diff.rows.len(),
+            v.diff.rows.len(),
+            "compared the same way"
+        );
+        // Points that don't fit the texts are left out, not an error.
+        let mut odd = saved.clone();
+        odd.sync_points = vec![vec![9, 9], vec![1], vec![0, 1]];
+        assert!(TextView::from_saved(&odd, &Config::default())
+            .sync_points
+            .is_empty());
+        // Files saved before sync points were kept still open.
+        let json = serde_json::to_string(&saved.panes).unwrap();
+        let old: crate::core::saved::SavedCompare = serde_json::from_str(&format!(
+            "{{\"version\":1,\"saved\":\"x\",\"panes\":{json}}}"
+        ))
+        .unwrap();
+        assert!(old.sync_points.is_empty());
     }
 
     #[test]

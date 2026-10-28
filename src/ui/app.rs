@@ -1281,6 +1281,8 @@ struct Menus {
     /// Sides of a text or folder compare (0 otherwise).
     sides: usize,
     can_take_both: bool,
+    /// The text compare has synchronization points, or a line picked for one.
+    has_sync_points: bool,
     /// The tab compares two or more paths.
     has_source: bool,
     /// The folder compare of the tab is still running.
@@ -1318,15 +1320,16 @@ impl Menus {
             (NextConflict | PrevConflict, Text) | (AutoMerge, Text | Folder) => self.sides == 3,
             (
                 Replace | ToggleBookmark | NextBookmark | PrevBookmark | ClearBookmarks
-                | BookmarkComment | Indent(_) | SaveComparison,
+                | BookmarkComment | Indent(_) | SaveComparison | SyncPoint,
                 Text,
             ) => true,
+            (ClearSyncPoints, Text) => self.has_sync_points,
             (Find | CopyRight | CopyLeft | SelectPattern | Statistics, Folder) => true,
             // A report or patch of a folder compare still running would miss files.
-            (ReportWithDiffs | ExportHtml | Report, Folder) => !self.folder_busy,
+            (ReportWithDiffs | ExportHtml | Report | Slideshow, Folder) => !self.folder_busy,
             (Patch, Folder) => self.sides == 2 && !self.folder_busy,
             (Patch, Text) => self.sides == 2,
-            (ExportHtml | Report | Statistics, Text) => true,
+            (ExportHtml | Report | Slideshow | Statistics, Text) => true,
             (Refresh, Text | Folder | Web) => true,
             (AllDiffs, Folder) => !self.folder_busy,
             (
@@ -1472,6 +1475,9 @@ fn merge_menu(ui: &mut egui::Ui, m: &mut Menus) {
     m.item_as(ui, merge, Cmd::AutoMerge);
     m.item(ui, Cmd::TakeBoth(true));
     m.item(ui, Cmd::TakeBoth(false));
+    ui.separator();
+    m.item(ui, Cmd::SyncPoint);
+    m.item(ui, Cmd::ClearSyncPoints);
 }
 
 /// File name of a compared path, or the whole URL.
@@ -2917,7 +2923,12 @@ impl OxideMergeApp {
         }
         if matches!(
             cmd,
-            Cmd::ExportHtml | Cmd::Report | Cmd::Patch | Cmd::Statistics | Cmd::SaveComparison
+            Cmd::ExportHtml
+                | Cmd::Report
+                | Cmd::Slideshow
+                | Cmd::Patch
+                | Cmd::Statistics
+                | Cmd::SaveComparison
         ) {
             if let Some(Content::Text(v)) =
                 self.tabs.get_mut(self.active).map(|t| t.content.view_mut())
@@ -3002,7 +3013,7 @@ impl OxideMergeApp {
                     self.error(errors.join("\n"));
                 }
             }
-            Cmd::Patch | Cmd::ExportHtml | Cmd::Report | Cmd::ReportWithDiffs
+            Cmd::Patch | Cmd::ExportHtml | Cmd::Report | Cmd::ReportWithDiffs | Cmd::Slideshow
                 if matches!(self.tabs.get(self.active).map(|t| t.content.view()),
                     Some(Content::Folder(v)) if v.is_running()) =>
             {
@@ -3019,6 +3030,7 @@ impl OxideMergeApp {
             Cmd::AllDiffs => self.show_all_diffs(),
             Cmd::Report => self.save_report(),
             Cmd::ReportWithDiffs => self.save_report_with_diffs(),
+            Cmd::Slideshow => self.save_slideshow(),
             Cmd::SaveComparison => self.save_comparison(),
             Cmd::Statistics => self.show_statistics(),
             Cmd::GitCompare => {
@@ -3108,6 +3120,8 @@ impl OxideMergeApp {
                         Cmd::NextBookmark => v.goto_bookmark(true),
                         Cmd::PrevBookmark => v.goto_bookmark(false),
                         Cmd::ClearBookmarks => v.clear_bookmarks(),
+                        Cmd::SyncPoint => v.set_sync_point(),
+                        Cmd::ClearSyncPoints => v.clear_sync_points(),
                         Cmd::TakeBoth(left_first) => v.take_both(left_first),
                         Cmd::Indent(outdent) => v.indent(outdent),
                         Cmd::BookmarkComment => v.edit_note(),
@@ -3203,8 +3217,34 @@ impl OxideMergeApp {
     }
 
     fn save_report(&mut self) {
-        if let Some(Content::Text(_)) = self.tabs.get(self.active).map(|t| t.content.view()) {
-            self.export_text_html(tr("menu.report"));
+        if let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) {
+            // A text compare's report is HTML or XML, by the type picked.
+            if self.report_job.is_some() {
+                self.notify(tr("msg.report_writing"));
+                return;
+            }
+            let name = report::html_file_name(&v.titles());
+            let Some(mut path) = rfd::FileDialog::new()
+                .set_title(tr("menu.report"))
+                .add_filter("HTML", &["html", "htm"])
+                .add_filter("XML", &["xml"])
+                .set_file_name(name.strip_suffix(".html").unwrap_or(&name))
+                .save_file()
+            else {
+                return;
+            };
+            if !matches!(
+                crate::core::text::extension(&path).as_str(),
+                "html" | "htm" | "xml"
+            ) {
+                path = with_html_ext(path);
+            }
+            let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view())
+            else {
+                return;
+            };
+            let job = v.report_job(ReportFormat::from_path(&path), &self.cfg.rules);
+            self.spawn_report(path, job);
             return;
         }
         if self.report_job.is_some() {
@@ -3222,6 +3262,7 @@ impl OxideMergeApp {
             .add_filter("HTML", &["html", "htm"])
             .add_filter("CSV", &["csv"])
             .add_filter("Text", &["txt"])
+            .add_filter("XML", &["xml"])
             .set_file_name(name.strip_suffix(".html").unwrap_or(&name))
             .save_file()
         else {
@@ -3229,7 +3270,7 @@ impl OxideMergeApp {
         };
         if !matches!(
             crate::core::text::extension(&path).as_str(),
-            "html" | "htm" | "csv" | "txt"
+            "html" | "htm" | "csv" | "txt" | "xml"
         ) {
             path = with_html_ext(path);
         }
@@ -3252,6 +3293,31 @@ impl OxideMergeApp {
         let name = report::html_file_name(&v.display_roots);
         let job = v.report_with_diffs_job(&self.cfg);
         self.write_html_report(tr("menu.report_diffs"), &name, job);
+    }
+
+    /// Saves an HTML slideshow of the active text or folder compare: one difference per slide.
+    fn save_slideshow(&mut self) {
+        let (name, job): (String, Box<dyn FnOnce() -> String + Send>) =
+            match self.tabs.get(self.active).map(|t| t.content.view()) {
+                Some(Content::Text(v)) => (
+                    report::html_file_name(&v.titles()),
+                    v.report_job(ReportFormat::Slideshow, &self.cfg.rules),
+                ),
+                Some(Content::Folder(v)) => (
+                    report::html_file_name(&v.display_roots),
+                    Box::new(v.slideshow_job(&self.cfg)),
+                ),
+                _ => {
+                    self.error(tr("msg.report_folder_only"));
+                    return;
+                }
+            };
+        // "a vs b.html" becomes "a vs b slides.html".
+        let name = match name.strip_suffix(".html") {
+            Some(stem) => format!("{stem}_slides.html"),
+            None => name,
+        };
+        self.write_html_report(tr("menu.slideshow"), &name, job);
     }
 
     /// Opens the differences of every changed file of the active folder compare in one tab.
@@ -3872,6 +3938,7 @@ impl OxideMergeApp {
                 _ => 0,
             },
             can_take_both: matches!(view, Some(Content::Text(v)) if v.can_take_both()),
+            has_sync_points: matches!(view, Some(Content::Text(v)) if v.has_sync_points()),
             has_source: tab.is_some_and(|t| t.source.len() >= 2),
             folder_busy: matches!(view, Some(Content::Folder(v)) if v.is_running()),
             web: matches!(tab.map(|t| &t.content), Some(Content::Web(_))),
@@ -4070,6 +4137,7 @@ impl OxideMergeApp {
             m.item(ui, Cmd::ExportHtml);
             m.item(ui, Cmd::Report);
             m.item(ui, Cmd::ReportWithDiffs);
+            m.item(ui, Cmd::Slideshow);
             m.item(ui, Cmd::Patch);
             ui.separator();
             check(ui, &mut self.cfg.open_reports, tr("menu.open_reports"), "");

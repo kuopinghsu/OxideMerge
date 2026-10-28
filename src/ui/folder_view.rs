@@ -1512,6 +1512,23 @@ impl FolderView {
         }
     }
 
+    /// Makes the HTML slideshow of the listed items: a slide for each difference of every
+    /// changed text file. It reads every changed file, so it can run on another thread.
+    pub fn slideshow_job(&self, cfg: &Config) -> impl FnOnce() -> String + Send + 'static {
+        let items: Vec<DirItem> = self
+            .flat_list(cfg)
+            .into_iter()
+            .map(|i| self.items[i].clone())
+            .collect();
+        let display: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
+        let (roots, dopts) = (self.roots.clone(), self.dopts.clone());
+        let rules = self.used_rules().to_string();
+        move || {
+            let refs: Vec<&DirItem> = items.iter().collect();
+            report::folder_slideshow(&refs, &roots, &display, &dopts, &rules)
+        }
+    }
+
     /// What the tab of all the differences shows: the changed files listed, in display order.
     pub fn diffs_source(&self, cfg: &Config) -> crate::ui::diffs_view::Source {
         crate::ui::diffs_view::Source {

@@ -640,5 +640,21 @@
   "web.highlight_tip": "在截图上突出显示页面之间不同的文本",
   "web.marked": "已突出显示的文本差异：{n}",
   "web.cut": "高度超过 {n} 像素的页面会被截断",
-  "opt.web_render": "文本和 HTML 模式使用浏览器渲染页面（会执行页面脚本）"
+  "opt.web_render": "文本和 HTML 模式使用浏览器渲染页面（会执行页面脚本）",
+  "cmd.sync_point": "设置同步点",
+  "cmd.remove_sync_point": "移除同步点",
+  "cmd.clear_sync_points": "清除同步点",
+  "sync.no_line": "这里没有可同步的行",
+  "sync.pick": "已选择{side}第 {line} 行作为同步点：请在{others}中选择对应的行",
+  "sync.added": "已添加同步点（此比较共 {n} 个）",
+  "sync.removed": "已移除同步点",
+  "sync.crossing": "未添加：这些行会与另一个同步点交叉",
+  "sync.cleared": "已清除同步点",
+  "menu.slideshow": "生成幻灯片报告...",
+  "slides.title": "比较幻灯片",
+  "slides.hint": "按 ← → 或空格键切换幻灯片，按 F 全屏",
+  "slides.difference": "差异 {n} / {total}",
+  "slides.end": "差异结束",
+  "slides.no_diffs": "没有差异",
+  "slides.other_files": "以其他方式不同的文件"
 }

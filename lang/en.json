@@ -640,5 +640,21 @@
   "web.highlight_tip": "Highlight the text that differs between the pages on the screenshots",
   "web.marked": "Text differences highlighted: {n}",
   "web.cut": "Pages taller than {n} pixels are cut",
-  "opt.web_render": "Render pages in the browser for text and HTML (runs their scripts)"
+  "opt.web_render": "Render pages in the browser for text and HTML (runs their scripts)",
+  "cmd.sync_point": "Set synchronization point",
+  "cmd.remove_sync_point": "Remove synchronization point",
+  "cmd.clear_sync_points": "Clear synchronization points",
+  "sync.no_line": "There is no line here to synchronize",
+  "sync.pick": "Line {line} of {side} picked for a synchronization point: now pick the matching line in {others}",
+  "sync.added": "Synchronization point added ({n} in this compare)",
+  "sync.removed": "Synchronization point removed",
+  "sync.crossing": "Not added: the lines would cross another synchronization point",
+  "sync.cleared": "Synchronization points cleared",
+  "menu.slideshow": "Generate slideshow report...",
+  "slides.title": "Comparison slideshow",
+  "slides.hint": "Use ← → or Space to move between slides, and F for full screen",
+  "slides.difference": "Difference {n} of {total}",
+  "slides.end": "End of differences",
+  "slides.no_diffs": "No differences",
+  "slides.other_files": "Files that differ in other ways"
 }

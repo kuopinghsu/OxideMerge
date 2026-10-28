@@ -593,6 +593,41 @@ pub fn compute_with(
     opts: &DiffOptions,
     comments: Option<&CommentSyntax>,
 ) -> DiffResult {
+    compute_synced(panes, opts, comments, &[])
+}
+
+/// A line of each pane (only the first `panes` entries count) that the compare puts on one row:
+/// the differences are worked out separately before and after it, as WinMerge's
+/// synchronization points do when the compare pairs the wrong lines.
+pub type SyncPoint = [usize; 3];
+
+/// The synchronization points that can be kept, in order: each within its panes' lines and
+/// after the previous one in every pane. Others are left out.
+pub fn valid_sync_points(points: &[SyncPoint], lens: &[usize]) -> Vec<SyncPoint> {
+    let mut sorted = points.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out: Vec<SyncPoint> = Vec::new();
+    for s in sorted {
+        let inside = lens.iter().enumerate().all(|(p, &n)| s[p] < n);
+        let after = out
+            .last()
+            .is_none_or(|last| (0..lens.len()).all(|p| s[p] > last[p]));
+        if inside && after {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Like `compute_with`, with the lines of each synchronization point on one row (see
+/// [`SyncPoint`]; ones that can't be kept are left out, see [`valid_sync_points`]).
+pub fn compute_synced(
+    panes: &[&[String]],
+    opts: &DiffOptions,
+    comments: Option<&CommentSyntax>,
+    sync: &[SyncPoint],
+) -> DiffResult {
     let norm = Normalizer::new(opts);
     let stripped: Vec<Vec<Stripped>> = match comments.filter(|_| opts.ignore_comments) {
         Some(syn) => panes.iter().map(|p| strip_comments(p, syn)).collect(),
@@ -629,15 +664,108 @@ pub fn compute_with(
         map: HashMap::new(),
     };
     let ids: Vec<Vec<u32>> = keyed.iter().map(|p| interner.ids(&norm, p)).collect();
-    let mut result = if panes.len() == 3 {
-        diff3(&ids, &ignorable, opts)
+    let lens: Vec<usize> = panes.iter().map(|p| p.len()).collect();
+    let sync = valid_sync_points(sync, &lens);
+    let mut result = if sync.is_empty() {
+        diff_segment(&ids, &ignorable, opts)
     } else {
-        diff2(&ids[0], &ids[1], &ignorable, opts)
+        // Each synchronization point's lines make a row of their own; between them, the
+        // panes are compared as if they held only those lines.
+        let n = panes.len();
+        let mut result = DiffResult {
+            panes: n,
+            ..Default::default()
+        };
+        let mut start = [0usize; 3];
+        for point in sync.iter().map(Some).chain([None]) {
+            let end: Vec<usize> = (0..n).map(|p| point.map_or(lens[p], |s| s[p])).collect();
+            let part = segment(&ids, &ignorable, &start[..n], &end, opts);
+            append(&mut result, part, &start);
+            if let Some(s) = point {
+                let ranges: Vec<Range<usize>> = (0..n).map(|p| s[p]..s[p] + 1).collect();
+                let same = (1..n).all(|p| ids[p][s[p]] == ids[0][s[0]]);
+                if same {
+                    result.rows.push(Row {
+                        line: [Some(s[0]), Some(s[1]), (n == 3).then_some(s[2])],
+                        block: None,
+                    });
+                } else {
+                    let kind = if n == 3 {
+                        let r = [ranges[0].clone(), ranges[1].clone(), ranges[2].clone()];
+                        kind3(&ids, &r).unwrap_or(BlockKind::Conflict)
+                    } else {
+                        BlockKind::Diff
+                    };
+                    let ignored = ignorable.all(&ranges);
+                    let mut r = [0..0, 0..0, 0..0];
+                    r[..n].clone_from_slice(&ranges);
+                    push_block(&mut result, r, kind, ignored);
+                }
+                for p in 0..n {
+                    start[p] = s[p] + 1;
+                }
+            }
+        }
+        result
     };
     if opts.detect_moved {
         detect_moved(&mut result, &ids);
     }
     result
+}
+
+fn diff_segment(ids: &[Vec<u32>], ignorable: &Ignorable, opts: &DiffOptions) -> DiffResult {
+    if ids.len() == 3 {
+        diff3(ids, ignorable, opts)
+    } else {
+        diff2(&ids[0], &ids[1], ignorable, opts)
+    }
+}
+
+/// The compare of lines `start[p]..end[p]` of each pane, numbered from those starts.
+fn segment(
+    ids: &[Vec<u32>],
+    ignorable: &Ignorable,
+    start: &[usize],
+    end: &[usize],
+    opts: &DiffOptions,
+) -> DiffResult {
+    let part_ids: Vec<Vec<u32>> = (0..ids.len())
+        .map(|p| ids[p][start[p]..end[p]].to_vec())
+        .collect();
+    let part_panes: Vec<&[String]> = (0..ids.len())
+        .map(|p| &ignorable.panes[p][start[p]..end[p]])
+        .collect();
+    let part = Ignorable {
+        norm: ignorable.norm,
+        panes: &part_panes,
+        skip: (0..ids.len())
+            .map(|p| match ignorable.skip.get(p) {
+                Some(s) if !s.is_empty() => s[start[p]..end[p]].to_vec(),
+                _ => Vec::new(),
+            })
+            .collect(),
+    };
+    diff_segment(&part_ids, &part, opts)
+}
+
+/// Adds `part`, whose lines are numbered from `start`, after the rows of `result`.
+fn append(result: &mut DiffResult, part: DiffResult, start: &[usize; 3]) {
+    let (rows, blocks) = (result.rows.len(), result.blocks.len());
+    for mut row in part.rows {
+        for (line, s) in row.line.iter_mut().zip(start) {
+            *line = line.map(|l| l + s);
+        }
+        row.block = row.block.map(|b| b + blocks);
+        result.rows.push(row);
+    }
+    for mut b in part.blocks {
+        for (r, s) in b.ranges.iter_mut().zip(start) {
+            *r = r.start + s..r.end + s;
+        }
+        b.first_row += rows;
+        result.blocks.push(b);
+    }
 }
 
 /// Decides which lines do not count as differences on their own.
@@ -1067,6 +1195,97 @@ mod tests {
 
     fn v(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Every line of every pane appears once, in order, and blocks match their rows.
+    fn assert_consistent(d: &DiffResult, lens: &[usize]) {
+        for (p, &n) in lens.iter().enumerate() {
+            let seen: Vec<usize> = d.rows.iter().filter_map(|r| r.line[p]).collect();
+            assert_eq!(seen, (0..n).collect::<Vec<_>>(), "pane {p}");
+        }
+        for (i, b) in d.blocks.iter().enumerate() {
+            for r in &d.rows[b.first_row..b.first_row + b.rows] {
+                assert_eq!(r.block, Some(i));
+            }
+        }
+    }
+
+    fn row_with<'a>(d: &'a DiffResult, lines: &[usize]) -> Option<&'a Row> {
+        d.rows
+            .iter()
+            .find(|r| lines.iter().enumerate().all(|(p, &l)| r.line[p] == Some(l)))
+    }
+
+    #[test]
+    fn sync_points_put_their_lines_on_one_row() {
+        let a = v(&[
+            "intro",
+            "fn one() {",
+            "  body",
+            "}",
+            "fn two() {",
+            "  more",
+            "}",
+        ]);
+        let b = v(&[
+            "fn two() {",
+            "  more",
+            "}",
+            "intro",
+            "fn one() {",
+            "  body",
+            "}",
+        ]);
+        let opts = DiffOptions::default();
+        // Unsynchronized, "intro" (0) pairs with right line 3.
+        let plain = compute(&[&a, &b], &opts);
+        assert!(row_with(&plain, &[0, 3]).is_some());
+        // Anchored at the two "fn two" lines, they share a row, and so does what follows.
+        let d = compute_synced(&[&a, &b], &opts, None, &[[4, 0, 0]]);
+        assert_consistent(&d, &[7, 3 + 4]);
+        let anchor = row_with(&d, &[4, 0]).expect("the sync point is one row");
+        assert_eq!(anchor.block, None, "equal lines");
+        assert!(row_with(&d, &[5, 1]).is_some() && row_with(&d, &[6, 2]).is_some());
+        // Lines that differ still share the row, as a change.
+        let d = compute_synced(&[&a, &b], &opts, None, &[[0, 1, 0]]);
+        assert_consistent(&d, &[7, 7]);
+        let r = row_with(&d, &[0, 1]).unwrap();
+        assert!(r.block.is_some_and(|b| !d.blocks[b].ignored));
+    }
+
+    #[test]
+    fn sync_points_that_cross_or_fall_outside_are_left_out() {
+        let lens = [5, 5];
+        assert_eq!(
+            valid_sync_points(&[[3, 1, 0], [1, 3, 0], [2, 2, 0], [9, 0, 0]], &lens),
+            vec![[1, 3, 0]],
+            "sorted by the first pane: [1,3] is kept, then [2,2] and [3,1] go back in pane 2"
+        );
+        assert_eq!(
+            valid_sync_points(&[[1, 1, 0], [1, 1, 0], [2, 4, 0]], &lens),
+            vec![[1, 1, 0], [2, 4, 0]]
+        );
+        let a = v(&["a", "b"]);
+        let d = compute_synced(&[&a, &a], &DiffOptions::default(), None, &[[7, 7, 0]]);
+        assert!(d.is_identical());
+        assert_consistent(&d, &[2, 2]);
+    }
+
+    #[test]
+    fn three_way_sync_points_align_all_panes() {
+        let base = v(&["x", "shared", "y"]);
+        let left = v(&["shared", "x", "y"]);
+        let right = v(&["x", "y", "shared"]);
+        let opts = DiffOptions::default();
+        let d = compute_synced(&[&left, &base, &right], &opts, None, &[[0, 1, 2]]);
+        assert_consistent(&d, &[3, 3, 3]);
+        let r = row_with(&d, &[0, 1, 2]).expect("one row");
+        assert_eq!(r.block, None);
+        // A sync point whose lines differ is classified like any 3-way change.
+        let right2 = v(&["x", "y", "other"]);
+        let d = compute_synced(&[&left, &base, &right2], &opts, None, &[[0, 1, 2]]);
+        let r = row_with(&d, &[0, 1, 2]).unwrap();
+        assert_eq!(d.blocks[r.block.unwrap()].kind, BlockKind::RightOnly);
     }
 
     #[test]

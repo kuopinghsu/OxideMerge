@@ -640,5 +640,21 @@
   "web.highlight_tip": "Destacar nas capturas o texto que difere entre as páginas",
   "web.marked": "Diferenças de texto destacadas: {n}",
   "web.cut": "Páginas com mais de {n} pixels de altura são cortadas",
-  "opt.web_render": "Renderizar as páginas no navegador para texto e HTML (executa os scripts)"
+  "opt.web_render": "Renderizar as páginas no navegador para texto e HTML (executa os scripts)",
+  "cmd.sync_point": "Definir ponto de sincronização",
+  "cmd.remove_sync_point": "Remover ponto de sincronização",
+  "cmd.clear_sync_points": "Limpar pontos de sincronização",
+  "sync.no_line": "Não há linha aqui para sincronizar",
+  "sync.pick": "Linha {line} de {side} escolhida para um ponto de sincronização: escolha agora a linha correspondente em {others}",
+  "sync.added": "Ponto de sincronização adicionado ({n} nesta comparação)",
+  "sync.removed": "Ponto de sincronização removido",
+  "sync.crossing": "Não adicionado: as linhas cruzariam outro ponto de sincronização",
+  "sync.cleared": "Pontos de sincronização limpos",
+  "menu.slideshow": "Gerar relatório em slides...",
+  "slides.title": "Apresentação da comparação",
+  "slides.hint": "Use ← → ou Espaço para passar entre os slides, e F para tela cheia",
+  "slides.difference": "Diferença {n} de {total}",
+  "slides.end": "Fim das diferenças",
+  "slides.no_diffs": "Nenhuma diferença",
+  "slides.other_files": "Arquivos que diferem de outra forma"
 }

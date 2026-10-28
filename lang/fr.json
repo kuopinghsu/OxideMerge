@@ -640,5 +640,21 @@
   "web.highlight_tip": "Surligner sur les captures le texte qui diffère entre les pages",
   "web.marked": "Différences de texte surlignées : {n}",
   "web.cut": "Les pages de plus de {n} pixels de haut sont coupées",
-  "opt.web_render": "Afficher les pages dans le navigateur pour le texte et le HTML (exécute leurs scripts)"
+  "opt.web_render": "Afficher les pages dans le navigateur pour le texte et le HTML (exécute leurs scripts)",
+  "cmd.sync_point": "Définir un point de synchronisation",
+  "cmd.remove_sync_point": "Supprimer le point de synchronisation",
+  "cmd.clear_sync_points": "Effacer les points de synchronisation",
+  "sync.no_line": "Aucune ligne à synchroniser ici",
+  "sync.pick": "Ligne {line} de {side} choisie pour un point de synchronisation : choisissez maintenant la ligne correspondante dans {others}",
+  "sync.added": "Point de synchronisation ajouté ({n} dans cette comparaison)",
+  "sync.removed": "Point de synchronisation supprimé",
+  "sync.crossing": "Non ajouté : les lignes croiseraient un autre point de synchronisation",
+  "sync.cleared": "Points de synchronisation effacés",
+  "menu.slideshow": "Générer un rapport en diaporama...",
+  "slides.title": "Diaporama de la comparaison",
+  "slides.hint": "← → ou Espace pour passer d'une diapositive à l'autre, F pour le plein écran",
+  "slides.difference": "Différence {n} sur {total}",
+  "slides.end": "Fin des différences",
+  "slides.no_diffs": "Aucune différence",
+  "slides.other_files": "Fichiers différents d'une autre façon"
 }
