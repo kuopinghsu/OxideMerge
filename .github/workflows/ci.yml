@@ -379,10 +379,22 @@ jobs:
       # OxideMerge looks them up by name, as AppRun arranges.
       - name: Install build dependencies
         run: |
-          dnf install -y --setopt=install_weak_deps=False \
-            gcc make pkgconf-pkg-config git curl tar gzip jq file desktop-file-utils \
-            libX11 libX11-xcb libxcb libXcursor libXi libxkbcommon libxkbcommon-x11 \
-            libwayland-client libwayland-cursor libwayland-egl
+          # A mirror can return empty/corrupt repomd.xml. DNF's download retries
+          # do not recover a metadata parse failure; clear it before trying again.
+          for attempt in 1 2 3; do
+            if dnf install -y --setopt=install_weak_deps=False \
+              gcc make pkgconf-pkg-config git curl tar gzip jq file desktop-file-utils \
+              libX11 libX11-xcb libxcb libXcursor libXi libxkbcommon libxkbcommon-x11 \
+              libwayland-client libwayland-cursor libwayland-egl; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::AlmaLinux build dependency installation failed after 3 attempts"
+              exit 1
+            fi
+            dnf clean metadata
+            sleep $((attempt * 5))
+          done
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -497,8 +509,18 @@ jobs:
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               xvfb libgl1 libglx-mesa0 libegl1 libegl-mesa0 libgl1-mesa-dri
           else
-            dnf install -y --setopt=install_weak_deps=False \
-              xorg-x11-server-Xvfb mesa-libGL mesa-libEGL mesa-dri-drivers
+            for attempt in 1 2 3; do
+              if dnf install -y --setopt=install_weak_deps=False \
+                xorg-x11-server-Xvfb mesa-libGL mesa-libEGL mesa-dri-drivers; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::error::AlmaLinux display dependency installation failed after 3 attempts"
+                exit 1
+              fi
+              dnf clean metadata
+              sleep $((attempt * 5))
+            done
           fi
 
       # OxideMerge should open its window and keep running until timeout stops it.
