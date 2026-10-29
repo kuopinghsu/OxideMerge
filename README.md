@@ -359,7 +359,7 @@ sockets.
 Run `cargo test --release --locked format_regression -- --nocapture` for the focused
 format checks. They cover BOM and line-ending patch round trips, ignored text changes,
 mixed-ending merge/save/undo, and Git checkout and patch compatibility. Git must be installed.
-CI runs this group separately on Windows, Linux and macOS before the full suite.
+CI includes these checks in the full test suite on Windows, Linux and macOS.
 
 Randomized test failures print a seed that can be used to reproduce the case:
 
@@ -379,15 +379,21 @@ baseline results.
 ### Continuous integration
 
 The [CI workflow](.github/workflows/ci.yml) runs on pushes to `main` and on pull requests.
-It checks code with Clippy, runs tests, builds release executables and verifies command-line
-and window behavior on Windows, Linux and macOS. Windows and Linux window checks use Mesa's
-software renderer; Linux also uses Xvfb. Failed test output is retained as `test-output-*`
+Routine runs check code with Clippy, run the complete test suite, build release executables,
+and verify command-line and window behavior on Windows x64, Linux x64 and macOS Apple silicon.
+Windows and Linux window checks use Mesa's software renderer; Linux also uses Xvfb. Failed test output is retained as `test-output-*`
 artifacts. A separate `cargo deny` job checks dependencies; see [Security](SECURITY.md).
 
-Manual workflow runs can enable additional randomized test cases and benchmarks. Release
-publishing does not depend on these optional runs.
+Release tags automatically enable the full packaging workflow, including native Windows/Linux
+Arm64 checks and the Intel macOS build. To validate all packages without publishing a release,
+start the workflow manually and enable **packages**. Ordinary pushes and pull requests skip
+AppImage builds, PDF generation and distribution packaging, so slow package mirrors do not
+hold up routine code checks. Full test coverage remains enabled on the three default platforms.
 
-The workflow produces and validates these distribution files:
+Manual runs can also enable randomized test cases and benchmarks. Release publishing does not
+depend on these optional runs.
+
+Release tags and manual packaging runs produce and validate these distribution files:
 
 - **Windows x64 and Arm64:** ZIP packages holding only `oxidemerge.exe`, which is checked to be
   for the right processor and to run.
@@ -395,7 +401,7 @@ The workflow produces and validates these distribution files:
   and checked not to change application settings.
 - **Linux AppImage:** packages built on AlmaLinux 8 with glibc 2.28. Required X11, Wayland and
   keyboard libraries are bundled and used when system libraries are unavailable. Packages are
-  checked on Ubuntu 22.04 and 24.04 and AlmaLinux 8 and 9, including library resolution,
+  checked on Ubuntu 22.04 and AlmaLinux 8 for both architectures, including library resolution,
   command-line behavior and window startup.
 - **macOS:** an ad-hoc signed universal application in a DMG package. Both Apple silicon
   and Intel architectures are verified, and the Intel executable is tested through Rosetta.

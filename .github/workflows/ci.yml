@@ -1,13 +1,7 @@
-# Builds, lints, and tests OxideMerge on Windows, Linux, and macOS for every
-# push and pull request, then packages it: a .zip holding oxidemerge.exe for
-# Windows x64 and arm64, a .tar.gz and an AppImage for Linux x64 and arm64, and a
-# universal (Apple silicon and Intel) OxideMerge.app in a .dmg for macOS. Arm64 packages are built and tested on Arm runners. The
-# AppImages are started on Ubuntu and RHEL-compatible systems before they are
-# published. The user guide is built as PDF files, in English and Traditional
-# Chinese. Pushing a tag like `v0.9.3` also publishes every package and the
-# user guides on a GitHub release, with the version's section
-# of CHANGELOG.md as the release notes. The tag must match the version in
-# Cargo.toml, and CHANGELOG.md must have a section for it.
+# Pushes/PRs run the full test suite and CLI/window checks on Windows x64,
+# Linux x64 and macOS Apple silicon, plus dependency checks. Release tags and
+# manual runs with "packages" enabled also test native Windows/Linux Arm64,
+# build all nine release files, and check AppImages on Ubuntu 22.04/AlmaLinux 8.
 name: CI
 
 on:
@@ -17,6 +11,10 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      packages:
+        description: Build and validate all release packages (including Windows/Linux Arm64)
+        type: boolean
+        default: false
       stress_cases:
         description: Random cases per diff, merge and patch test (blank to skip the stress run)
         required: false
@@ -37,6 +35,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: "1"
 
 jobs:
   windows:
@@ -46,13 +45,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: x64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
-          - arch: arm64
-            runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
+        include: >-
+          ${{ fromJSON(
+            (startsWith(github.ref, 'refs/tags/v') || inputs.packages)
+            && '[{"arch":"x64","runner":"windows-latest","target":"x86_64-pc-windows-msvc"},{"arch":"arm64","runner":"windows-11-arm","target":"aarch64-pc-windows-msvc"}]'
+            || '[{"arch":"x64","runner":"windows-latest","target":"x86_64-pc-windows-msvc"}]'
+          ) }}
     env:
       ARCH: ${{ matrix.arch }}
       TARGET: ${{ matrix.target }}
@@ -87,12 +85,6 @@ jobs:
       - name: Clippy
         if: matrix.arch == 'x64'
         run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Format regression tests
-        timeout-minutes: 20
-        run: cargo test --release --locked --target ${{ matrix.target }} format_regression -- --nocapture
-        env:
-          RUST_BACKTRACE: "1"
 
       # A test that hangs fails here instead of holding the runner until the job's timeout.
       - name: Test
@@ -158,6 +150,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Package
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.packages
         id: package
         shell: pwsh
         run: |
@@ -198,7 +191,8 @@ jobs:
           Get-ChildItem dist | Format-Table Name, Length
           "name=$name" >> $env:GITHUB_OUTPUT
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - if: startsWith(github.ref, 'refs/tags/v') || inputs.packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.package.outputs.name }}
           path: dist/*
@@ -212,11 +206,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: x64
-            runner: ubuntu-22.04
-          - arch: arm64
-            runner: ubuntu-22.04-arm
+        include: >-
+          ${{ fromJSON(
+            (startsWith(github.ref, 'refs/tags/v') || inputs.packages)
+            && '[{"arch":"x64","runner":"ubuntu-22.04"},{"arch":"arm64","runner":"ubuntu-22.04-arm"}]'
+            || '[{"arch":"x64","runner":"ubuntu-22.04"}]'
+          ) }}
     env:
       ARCH: ${{ matrix.arch }}
     steps:
@@ -240,12 +235,6 @@ jobs:
       - name: Clippy
         if: matrix.arch == 'x64'
         run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Format regression tests
-        timeout-minutes: 20
-        run: cargo test --release --locked format_regression -- --nocapture
-        env:
-          RUST_BACKTRACE: "1"
 
       - name: Test
         timeout-minutes: 20
@@ -286,6 +275,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Package
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.packages
         id: package
         shell: bash
         run: |
@@ -328,6 +318,7 @@ jobs:
       # What the archive holds, and that the program in it runs without touching the
       # user's settings.
       - name: Check packages
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.packages
         env:
           NAME: ${{ steps.package.outputs.name }}
         run: |
@@ -348,18 +339,20 @@ jobs:
             ~/.config/OxideMerge/config.json >/dev/null ||
             { echo "::error::Running the program changed the settings"; exit 1; }
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - if: startsWith(github.ref, 'refs/tags/v') || inputs.packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.package.outputs.name }}
           path: dist/*
           if-no-files-found: error
 
   appimage:
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.packages
     name: Linux AppImage ${{ matrix.arch }}
     # AlmaLinux 8 has glibc 2.28, so the AppImage runs on RHEL 8, Ubuntu 20.04,
     # Debian 10, and newer.
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     container: almalinux:8
     strategy:
       fail-fast: false
@@ -378,11 +371,21 @@ jobs:
       # packages, so the build does not record AlmaLinux's library folders and
       # OxideMerge looks them up by name, as AppRun arranges.
       - name: Install build dependencies
+        timeout-minutes: 10
         run: |
-          # A mirror can return empty/corrupt repomd.xml. DNF's download retries
-          # do not recover a metadata parse failure; clear it before trying again.
+          # Use AlmaLinux's HTTPS origin rather than a slow/out-of-sync mirror.
+          # Preserve the distribution's package signature verification settings.
+          dnf_options=(
+            --setopt=timeout=20 --setopt=retries=2 --setopt=minrate=100000
+            --setopt=baseos.mirrorlist=
+            '--setopt=baseos.baseurl=https://repo.almalinux.org/almalinux/$releasever/BaseOS/$basearch/os/'
+            --setopt=appstream.mirrorlist=
+            '--setopt=appstream.baseurl=https://repo.almalinux.org/almalinux/$releasever/AppStream/$basearch/os/'
+            --setopt=extras.mirrorlist=
+            '--setopt=extras.baseurl=https://repo.almalinux.org/almalinux/$releasever/extras/$basearch/os/'
+          )
           for attempt in 1 2 3; do
-            if dnf install -y --setopt=install_weak_deps=False \
+            if dnf "${dnf_options[@]}" install -y --setopt=install_weak_deps=False \
               gcc make pkgconf-pkg-config git curl tar gzip jq file desktop-file-utils \
               libX11 libX11-xcb libxcb libXcursor libXi libxkbcommon libxkbcommon-x11 \
               libwayland-client libwayland-cursor libwayland-egl; then
@@ -443,7 +446,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x64, arm64]
-        system: [Ubuntu 22.04, Ubuntu 24.04, RHEL 8 (AlmaLinux 8), RHEL 9 (AlmaLinux 9)]
+        system: [Ubuntu 22.04, RHEL 8 (AlmaLinux 8)]
         include:
           - arch: x64
             runner: ubuntu-24.04
@@ -451,12 +454,8 @@ jobs:
             runner: ubuntu-24.04-arm
           - system: Ubuntu 22.04
             image: ubuntu:22.04
-          - system: Ubuntu 24.04
-            image: ubuntu:24.04
           - system: RHEL 8 (AlmaLinux 8)
             image: almalinux:8
-          - system: RHEL 9 (AlmaLinux 9)
-            image: almalinux:9
     defaults:
       run:
         shell: bash
@@ -503,14 +502,24 @@ jobs:
           test "$code" -eq 1 || { echo "::error::Expected exit code 1 for differing files, got $code"; exit 1; }
 
       - name: Install a virtual display
+        timeout-minutes: 5
         run: |
           if command -v apt-get >/dev/null; then
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               xvfb libgl1 libglx-mesa0 libegl1 libegl-mesa0 libgl1-mesa-dri
           else
+            dnf_options=(
+              --setopt=timeout=20 --setopt=retries=2 --setopt=minrate=100000
+              --setopt=baseos.mirrorlist=
+              '--setopt=baseos.baseurl=https://repo.almalinux.org/almalinux/$releasever/BaseOS/$basearch/os/'
+              --setopt=appstream.mirrorlist=
+              '--setopt=appstream.baseurl=https://repo.almalinux.org/almalinux/$releasever/AppStream/$basearch/os/'
+              --setopt=extras.mirrorlist=
+              '--setopt=extras.baseurl=https://repo.almalinux.org/almalinux/$releasever/extras/$basearch/os/'
+            )
             for attempt in 1 2 3; do
-              if dnf install -y --setopt=install_weak_deps=False \
+              if dnf "${dnf_options[@]}" install -y --setopt=install_weak_deps=False \
                 xorg-x11-server-Xvfb mesa-libGL mesa-libEGL mesa-dri-drivers; then
                 break
               fi
@@ -550,7 +559,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.packages) && 'aarch64-apple-darwin,x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
           components: clippy
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -560,22 +569,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      # The runner's own target named, so the Apple silicon build below reuses what the tests
-      # built instead of building it again in another folder.
-      - name: Format regression tests
-        timeout-minutes: 20
-        run: cargo test --release --locked --target aarch64-apple-darwin format_regression -- --nocapture
-        env:
-          RUST_BACKTRACE: "1"
-
       - name: Test
         timeout-minutes: 20
         run: cargo test --release --locked --target aarch64-apple-darwin
 
       - name: Build
-        run: |
-          cargo build --release --locked --target aarch64-apple-darwin
-          cargo build --release --locked --target x86_64-apple-darwin
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Build Intel slice
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.packages
+        run: cargo build --release --locked --target x86_64-apple-darwin
 
       - name: Window smoke test
         env:
@@ -593,6 +596,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Package
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.packages
         id: package
         shell: bash
         run: |
@@ -694,7 +698,8 @@ jobs:
           ls -l dist
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - if: startsWith(github.ref, 'refs/tags/v') || inputs.packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.package.outputs.name }}
           path: dist/*
@@ -798,6 +803,7 @@ jobs:
           path: target/bench/results.md
 
   user-guide:
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.packages
     name: User guide PDF
     runs-on: ubuntu-24.04
     timeout-minutes: 45

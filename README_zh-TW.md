@@ -349,20 +349,25 @@ Linux 沒有可用顯示環境時，會啟動 Xvfb。設定 `OXIDEMERGE_SMOKE_RE
 ### 持續整合
 
 推送至 `main` 或提出 Pull Request 時，會執行 [CI 工作流程](.github/workflows/ci.yml)。
-流程會在 Windows、Linux 與 macOS 上執行 Clippy 檢查、測試、建置發行版本，
+一般執行會在 Windows x64、Linux x64 與 macOS Apple 晶片上執行 Clippy 檢查、完整測試、建置發行版本，
 並驗證指令列與視窗行為。Windows 與 Linux 的視窗檢查使用 Mesa 軟體渲染，Linux 另使用 Xvfb。
 失敗的測試輸出會保留為 `test-output-*` 成品。獨立的 `cargo deny` 工作會檢查相依套件，
 詳見[安全性說明](SECURITY.md)。
 
-手動執行工作流程時，可啟用額外的隨機測試與效能測試。版本發布不依賴這些選用測試的結果。
+發行標籤會自動啟用完整套件流程，包括 Windows/Linux Arm64 原生測試與 Intel macOS 建置。
+若只想驗證套件而不發布版本，請手動執行工作流程並勾選 **packages**。
+一般推送與 Pull Request 會略過 AppImage、PDF 與套件製作，避免緩慢的套件鏡像站拖延程式碼檢查；
+三個預設平台仍會執行完整測試。
 
-工作流程會產生並驗證以下發布檔案：
+手動執行時也可啟用額外的隨機測試與效能測試，版本發布不依賴這些選用測試的結果。
+
+發行標籤與手動套件流程會產生並驗證以下發布檔案：
 
 - **Windows x64 與 Arm64：** 只包含 `oxidemerge.exe` 的 ZIP 套件，並檢查執行檔的處理器架構與能否執行。
 - **Linux x64 與 Arm64：** 在 Ubuntu 22.04 建置的 TAR.GZ 套件，會實際執行其中的程式，並確認不變更應用程式設定。
 - **Linux AppImage：** 在使用 glibc 2.28 的 AlmaLinux 8 上建置。
   套件內含必要的 X11、Wayland 與鍵盤函式庫，系統缺少時才使用隨附版本。
-  會在 Ubuntu 22.04、24.04 與 AlmaLinux 8、9 上檢查函式庫相依性、指令列行為與視窗啟動。
+  兩種架構都會在 Ubuntu 22.04 與 AlmaLinux 8 上檢查函式庫相依性、指令列行為與視窗啟動。
 - **macOS：** 採臨時簽署的通用應用程式，提供 DMG 套件。
   會驗證 Apple 晶片與 Intel 兩種架構，並透過 Rosetta 測試 Intel 執行檔。
 - **說明文件：** 英文與繁體中文 PDF 指南；若字型無法涵蓋所需字元，文件建置會失敗。
