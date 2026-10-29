@@ -371,39 +371,39 @@ Windows 與 Linux 的 Arm64 套件會在原生 Arm 執行環境中建置與測�
 
 ### 發布條件
 
-推送 `v0.9.6` 這類標籤時，會觸發 GitHub Releases 套件發布。
+推送 `v0.9.5` 這類標籤時，會觸發 GitHub Releases 套件發布。
 標籤必須與 `Cargo.toml` 的版本一致，且 `CHANGELOG.md` 必須包含對應版本的段落。
 含有 `-` 的標籤，例如 `v1.0.0-rc1`，會發布為預先發行版本。
 
 發行說明取自對應的變更紀錄段落，後面再附上下載說明。工作流程只會讀取變更紀錄，不會修改內容。
 發布前會確認預期的套件均已產生、沒有其他多餘檔案，且該版本尚未發布。每個版本都會附上 PDF 指南，
-並註明建置時使用的原始碼提交版本；GitHub 會列出每個檔案的 SHA-256 摘要。發行版本只包含以下檔案（以 0.9.6 為例）：
+並註明建置時使用的原始碼提交版本；GitHub 會列出每個檔案的 SHA-256 摘要。發行版本只包含以下檔案（以 0.9.5 為例）：
 
 ```text
-oxidemerge-0.9.6-linux-arm64.AppImage
-oxidemerge-0.9.6-linux-arm64.tar.gz
-oxidemerge-0.9.6-linux-x64.AppImage
-oxidemerge-0.9.6-linux-x64.tar.gz
-oxidemerge-0.9.6-macos-universal.dmg
-oxidemerge-0.9.6-user-guide.pdf
-oxidemerge-0.9.6-user-guide.zh-TW.pdf
-oxidemerge-0.9.6-windows-arm64.zip
-oxidemerge-0.9.6-windows-x64.zip
+oxidemerge-0.9.5-linux-arm64.AppImage
+oxidemerge-0.9.5-linux-arm64.tar.gz
+oxidemerge-0.9.5-linux-x64.AppImage
+oxidemerge-0.9.5-linux-x64.tar.gz
+oxidemerge-0.9.5-macos-universal.dmg
+oxidemerge-0.9.5-user-guide.pdf
+oxidemerge-0.9.5-user-guide.zh-TW.pdf
+oxidemerge-0.9.5-windows-arm64.zip
+oxidemerge-0.9.5-windows-x64.zip
 ```
 
 ### 發布步驟
 
-以下以 `0.9.6` 為例，請替換為預計發布的版本號。
+以下以 `0.9.5` 為例，請替換為預計發布的版本號。
 
 1. 更新 `Cargo.toml` 中的 `version`，執行 `cargo build` 以更新 `Cargo.lock`。
 2. 檢查 `CHANGELOG.md` 中對應版本的段落，將標題中的 `Unreleased` 改為 `YYYY-MM-DD` 格式的發行日期。
-3. 執行 `make fmt-check ci`，並以 `scripts/release-notes.sh 0.9.6` 預覽發行說明。
+3. 執行 `make fmt-check ci`，並以 `scripts/release-notes.sh 0.9.5` 預覽發行說明。
 4. 提交並推送至 `main`，等待所有平台的必要 CI 檢查通過。
 5. 為已驗證的提交加上標籤並推送：
 
    ```sh
-   git tag -a v0.9.6 -m "OxideMerge 0.9.6"
-   git push origin v0.9.6
+   git tag -a v0.9.5 -m "OxideMerge 0.9.5"
+   git push origin v0.9.5
    ```
 
 6. 在 `CHANGELOG.md` 加入下一個版本的 `Unreleased` 段落，記錄後續變更。
@@ -414,7 +414,7 @@ oxidemerge-0.9.6-windows-x64.zip
 
 ### 發行失敗或已發布版本的修補流程
 
-例如 `v0.9.6` 建置失敗，或發布後需要修正，請改以 `v0.9.7` 發布修補內容。
+例如 `v0.9.5` 建置失敗，或發布後需要修正，請改以 `v0.9.6` 發布修補內容。
 請使用尚未使用過的新修補版本號，保留原標籤與已發布的檔案。
 
 1. 確認工作目錄沒有未提交的變更，再更新 `main`。若有本機修改，請先提交，
@@ -426,16 +426,16 @@ oxidemerge-0.9.6-windows-x64.zip
    git pull --ff-only origin main
    ```
 
-2. 在 `main` 修正原始碼、套件建置或工作流程。將 `Cargo.toml` 的 `version` 更新為 `0.9.7`。
-   在 `CHANGELOG.md` 新增或更新 `0.9.7` 段落，說明修正內容，並將 `Unreleased` 改為發行日期。
-   保留 `0.9.6` 的歷史紀錄。
+2. 在 `main` 修正原始碼、套件建置或工作流程。將 `Cargo.toml` 的 `version` 更新為 `0.9.6`。
+   在 `CHANGELOG.md` 新增或更新 `0.9.6` 段落，說明修正內容，並將 `Unreleased` 改為發行日期。
+   保留 `0.9.5` 的歷史紀錄。
 
 3. 更新鎖定檔、執行檢查，並確認新版本的發行說明：
 
    ```sh
    cargo build
    make fmt-check ci
-   scripts/release-notes.sh 0.9.7
+   scripts/release-notes.sh 0.9.6
    git diff --check
    git diff
    ```
@@ -447,7 +447,7 @@ oxidemerge-0.9.6-windows-x64.zip
    git add -p
    git add Cargo.toml Cargo.lock CHANGELOG.md
    git diff --cached
-   git commit -m "Fix release issues and prepare 0.9.7"
+   git commit -m "Fix release issues and prepare 0.9.6"
    git push origin main
    git rev-parse HEAD
    ```
@@ -457,8 +457,8 @@ oxidemerge-0.9.6-windows-x64.zip
 
    ```sh
    git log -1 --oneline
-   git tag -a v0.9.7 -m "OxideMerge 0.9.7"
-   git push origin v0.9.7
+   git tag -a v0.9.6 -m "OxideMerge 0.9.6"
+   git push origin v0.9.6
    ```
 
 6. 檢查新標籤的工作流程與 GitHub 發行頁面，確認預期的套件與 PDF 指南均已提供，
