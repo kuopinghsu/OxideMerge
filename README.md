@@ -379,21 +379,21 @@ baseline results.
 ### Continuous integration
 
 The [CI workflow](.github/workflows/ci.yml) runs on pushes to `main` and on pull requests.
-Routine runs check code with Clippy, run the complete test suite, build release executables,
+Pull requests check code with Clippy, run the complete test suite, build release executables,
 and verify command-line and window behavior on Windows x64, Linux x64 and macOS Apple silicon.
 Windows and Linux window checks use Mesa's software renderer; Linux also uses Xvfb. Failed test output is retained as `test-output-*`
 artifacts. A separate `cargo deny` job checks dependencies; see [Security](SECURITY.md).
 
-Release tags automatically enable the full packaging workflow, including native Windows/Linux
-Arm64 checks and the Intel macOS build. To validate all packages without publishing a release,
-start the workflow manually and enable **packages**. Ordinary pushes and pull requests skip
-AppImage builds, PDF generation and distribution packaging, so slow package mirrors do not
-hold up routine code checks. Full test coverage remains enabled on the three default platforms.
+Every push to `main` and every release-tag push runs full package validation, including native
+Windows/Linux Arm64 checks, the Intel macOS build, AppImages and PDF guides. Pushes to `main`
+produce validated build artifacts without publishing a release; only release-tag pushes publish.
+Pull requests skip this packaging work while retaining the complete tests on the three default
+platforms. Manual runs can also validate all packages by enabling **packages**.
 
 Manual runs can also enable randomized test cases and benchmarks. Release publishing does not
 depend on these optional runs.
 
-Release tags and manual packaging runs produce and validate these distribution files:
+Pushes to `main`, release tags and manual packaging runs produce and validate these distribution files:
 
 - **Windows x64 and Arm64:** ZIP packages holding only `oxidemerge.exe`, which is checked to be
   for the right processor and to run.
