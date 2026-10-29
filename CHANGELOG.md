@@ -54,6 +54,10 @@ section of this file as the release notes.
 
 ### Fixed
 
+- **UTF-8 patches:** inserting or deleting lines at the start of a file with a byte order
+  mark now keeps exactly one mark at the file's start, including when ignore rules match
+  the line that moves across that boundary.
+
 - **Windows CI:** the Git revision CLI test explicitly checks LF and CRLF checkout modes
   instead of assuming LF output, and isolates the subprocess Git configuration from the runner.
 

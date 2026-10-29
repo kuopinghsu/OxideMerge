@@ -451,7 +451,7 @@ fn messages_follow_the_language_chosen() {
 }
 
 #[test]
-fn files_compare_with_their_git_revision() {
+fn format_regression_git_revision_checkout_modes() {
     let d = tmp();
     let d = d.path();
     let git = |args: &[&str]| {
@@ -687,4 +687,71 @@ fn bom_files_keep_anchored_ignore_rules_during_patch_export() {
     let patch = read(d.join("fix.patch"));
     assert_eq!(patch.matches("@@ -").count(), 1, "{patch}");
     assert!(!patch.contains("ignored"), "{patch}");
+}
+
+#[test]
+fn format_regression_cli_patches_apply_with_git() {
+    let dir = tmp();
+    let d = dir.path();
+    std::fs::create_dir(d.join(".config")).unwrap();
+    std::fs::write(
+        d.join(".config/config.json"),
+        r#"{"diff":{"ignore_eol":false,"ignore_codepage":false}}"#,
+    )
+    .unwrap();
+    for (old, new) in [
+        ("\u{feff}a\nb\n", "\u{feff}x\na\nb\n"),
+        ("\u{feff}x\na\nb\n", "\u{feff}a\nb\n"),
+        ("\u{feff}a\r\nb", "\u{feff}x\r\na\r\nb"),
+        ("", "\u{feff}"),
+        ("\u{feff}", ""),
+        ("foo\nbar\n", "foo"),
+        ("one\r\ntwo\n", "ONE\ntwo\r\n"),
+    ] {
+        files(d, &[("a.txt", old), ("b.txt", new), ("target.txt", old)]);
+        let run = oxidemerge(
+            d,
+            &[
+                "--cli",
+                "--dl",
+                "a/target.txt",
+                "--dr",
+                "b/target.txt",
+                "--patch",
+                "fix.patch",
+                "a.txt",
+                "b.txt",
+            ],
+        );
+        assert_eq!(
+            run.code, 1,
+            "old={old:?}, target={new:?}, stderr={:?}",
+            run.stderr
+        );
+        let applied = Command::new("git")
+            .current_dir(d)
+            .args([
+                "-c",
+                "core.autocrlf=false",
+                "apply",
+                "--whitespace=nowarn",
+                "fix.patch",
+            ])
+            .env("GIT_CONFIG_GLOBAL", d.join(".gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git is required for format regressions");
+        assert!(
+            applied.status.success(),
+            "old={old:?}, target={new:?}, patch={:?}, stderr={:?}",
+            read(d.join("fix.patch")),
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        assert_eq!(
+            read(d.join("target.txt")),
+            new,
+            "old={old:?}, target={new:?}, patch={:?}",
+            read(d.join("fix.patch"))
+        );
+    }
 }

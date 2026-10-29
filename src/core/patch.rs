@@ -84,14 +84,14 @@ pub fn make_patch(
 /// Unified patches are line oriented; other encodings and lone-CR terminators cannot
 /// safely be written as UTF-8 patch text.
 pub fn document_lines(doc: &super::text::TextDoc) -> Result<(Vec<String>, bool), String> {
-    raw_lines(doc, None, doc.bom)
+    raw_lines(doc, None, doc.bom).map(|text| (text.lines, text.final_newline))
 }
 
 fn raw_lines(
     doc: &super::text::TextDoc,
     eols: Option<&super::text::TextDoc>,
     bom: bool,
-) -> Result<(Vec<String>, bool), String> {
+) -> Result<PhysicalText, String> {
     if doc.encoding != super::text::TextEncoding::Utf8 {
         return Err(format!(
             "Cannot export/apply a text patch for {}: {} encoding is not supported; use UTF-8.",
@@ -114,15 +114,151 @@ fn raw_lines(
         }
     }
     let final_newline = text.is_empty() || text.ends_with('\n');
-    Ok((
-        text.split_terminator('\n').map(str::to_string).collect(),
+    Ok(PhysicalText {
+        lines: text.split_terminator('\n').map(str::to_string).collect(),
         final_newline,
-    ))
+        bom,
+    })
 }
 
-/// Produces a patch of the document bytes, subject to the selected ignore options.
-/// Errors are returned before any patch file is created instead of exporting a no-op
-/// patch for a format the text patch format cannot represent.
+/// Bytes used only for emission/application, never for normalization or ignore rules.
+struct PhysicalText {
+    lines: Vec<String>,
+    final_newline: bool,
+    bom: bool,
+}
+
+struct PatchDocument {
+    decoded: super::text::TextDoc,
+    physical: PhysicalText,
+}
+
+impl PatchDocument {
+    fn new(
+        doc: &super::text::TextDoc,
+        eols: Option<&super::text::TextDoc>,
+        bom: bool,
+    ) -> Result<Self, String> {
+        let physical = raw_lines(doc, eols, bom)?;
+        let mut decoded = doc.clone();
+        // A BOM-only file occupies a physical line without any decoded characters.
+        // Give that line an empty comparison key; filters never see BOM/CRLF bytes.
+        decoded.lines.resize(physical.lines.len(), String::new());
+        decoded.final_newline = physical.final_newline;
+        decoded.bom = bom;
+        Ok(Self { decoded, physical })
+    }
+}
+
+/// A decoded comparison plus independent byte data for the patch writers.
+struct PatchPlan {
+    old: PatchDocument,
+    new: PatchDocument,
+    result: DiffResult,
+}
+
+impl PatchPlan {
+    fn new(
+        old: PatchDocument,
+        new: PatchDocument,
+        opts: &super::diff::DiffOptions,
+        syntax: Option<&super::comments::CommentSyntax>,
+    ) -> Self {
+        let mut result =
+            super::diff::compute_with(&[&old.decoded.lines, &new.decoded.lines], opts, syntax);
+        super::diff::include_doc_formats(&mut result, &[&old.decoded, &new.decoded], opts);
+        let mut plan = Self { old, new, result };
+        plan.include_bom_boundary();
+        plan
+    }
+
+    fn include_bom_boundary(&mut self) {
+        let mut forced = vec![false; self.result.rows.len()];
+        for (index, row) in self.result.rows.iter().enumerate() {
+            let (Some(a), Some(b)) = (row.line[0], row.line[1]) else {
+                continue;
+            };
+            let old_prefix = a == 0 && self.old.physical.bom;
+            let new_prefix = b == 0 && self.new.physical.bom;
+            if old_prefix == new_prefix {
+                continue;
+            }
+            // A decoded context line moved across the physical BOM boundary. It must
+            // be replaced, but ignored text changes on that line must remain ignored.
+            if row.block.is_none_or(|i| self.result.blocks[i].ignored) {
+                let old = &self.old.physical.lines[a];
+                let body = if old_prefix {
+                    old.strip_prefix('\u{feff}').unwrap()
+                } else {
+                    old.as_str()
+                };
+                self.new.physical.lines[b] =
+                    format!("{}{body}", if new_prefix { "\u{feff}" } else { "" });
+            }
+            forced[index] = true;
+        }
+        if !forced.contains(&true) {
+            return;
+        }
+        let labels: Vec<_> = self
+            .result
+            .rows
+            .iter()
+            .zip(forced)
+            .map(|(row, force)| {
+                if force {
+                    Some((None, false))
+                } else {
+                    row.block.map(|i| (Some(i), self.result.blocks[i].ignored))
+                }
+            })
+            .collect();
+        self.result.blocks.clear();
+        let mut positions = [0usize; 3];
+        let mut previous = None;
+        for (index, (row, label)) in self.result.rows.iter_mut().zip(labels).enumerate() {
+            let start = positions;
+            for (p, line) in row.line.iter().enumerate() {
+                if line.is_some() {
+                    positions[p] += 1;
+                }
+            }
+            row.block = label.map(|(_, ignored)| {
+                if previous != Some(label) {
+                    self.result.blocks.push(Block {
+                        ranges: std::array::from_fn(|p| start[p]..positions[p]),
+                        kind: super::diff::BlockKind::Diff,
+                        ignored,
+                        first_row: index,
+                        rows: 1,
+                    });
+                } else {
+                    let last = self.result.blocks.last_mut().unwrap();
+                    last.rows += 1;
+                    for (p, range) in last.ranges.iter_mut().enumerate() {
+                        range.end = positions[p];
+                    }
+                }
+                self.result.blocks.len() - 1
+            });
+            previous = Some(label);
+        }
+    }
+
+    fn emit(&self, names: &PatchInput, style: PatchStyle, context: usize) -> String {
+        let input = PatchInput {
+            a: &self.old.physical.lines,
+            b: &self.new.physical.lines,
+            final_newline_a: self.old.physical.final_newline,
+            final_newline_b: self.new.physical.final_newline,
+            ..*names
+        };
+        make_patch(&input, &self.result, style, context)
+    }
+}
+
+/// Produces a byte-faithful patch subject to decoded-text comparison options.
+/// Unsupported byte formats return an error before an output file is created.
 pub fn make_doc_patch(
     input: &PatchInput,
     docs: &[&super::text::TextDoc],
@@ -139,9 +275,8 @@ pub fn make_doc_patch(
     if visible.is_identical() {
         return Ok(String::new());
     }
-    let (a, na) = document_lines(docs[0])?;
-    // Ignored document-wide style changes stay out of the patch, like ignored text changes.
-    let (b, nb) = raw_lines(
+    let old = PatchDocument::new(docs[0], None, docs[0].bom)?;
+    let new = PatchDocument::new(
         docs[1],
         opts.ignore_eol.then_some(docs[0]),
         if opts.ignore_codepage {
@@ -150,29 +285,7 @@ pub fn make_doc_patch(
             docs[1].bom
         },
     )?;
-    // Keep ignore rules and alignment on decoded content. Re-diffing raw byte lines
-    // would put a BOM before anchored patterns and a CR after end-anchored patterns.
-    let mut result = visible;
-    if a.len() != docs[0].lines.len() || b.len() != docs[1].lines.len() {
-        // A BOM-only file occupies one physical patch line but has no decoded text lines.
-        // Supply an empty comparison key for it; never expose the BOM to the normalizer.
-        let mut da = docs[0].clone();
-        let mut db = docs[1].clone();
-        da.lines.resize(a.len(), String::new());
-        db.lines.resize(b.len(), String::new());
-        da.final_newline = na;
-        db.final_newline = nb;
-        result = super::diff::compute_with(&[&da.lines, &db.lines], opts, syntax);
-        super::diff::include_doc_formats(&mut result, &[&da, &db], opts);
-    }
-    let input = PatchInput {
-        a: &a,
-        b: &b,
-        final_newline_a: na,
-        final_newline_b: nb,
-        ..*input
-    };
-    Ok(make_patch(&input, &result, style, context))
+    Ok(PatchPlan::new(old, new, opts, syntax).emit(input, style, context))
 }
 
 /// Patch of all differing or unique text files of a 2-way folder compare.
@@ -698,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_patch_emission_keeps_anchored_rules_on_decoded_text() {
+    fn format_regression_anchored_rules_use_decoded_text() {
         use crate::core::text::{self, TextEncoding};
         let filter = DiffOptions {
             line_filters_enabled: true,
@@ -1030,5 +1143,147 @@ mod tests {
         assert!(p.contains(&format!("@@ -1,{old} +1,{new} @@")), "{p}");
         let n = make_patch(&input, &r, PatchStyle::Normal, 3);
         assert_eq!(n, "4c3\n< 1\n---\n> 2\n");
+    }
+}
+
+#[cfg(test)]
+mod format_regression {
+    use super::*;
+    use crate::core::diff::DiffOptions;
+    use crate::core::text::{self, TextEncoding};
+
+    fn patch(old: &str, new: &str, opts: &DiffOptions, context: usize) -> String {
+        let a = text::doc_from_bytes(None, old.as_bytes(), Some(TextEncoding::Utf8));
+        let b = text::doc_from_bytes(None, new.as_bytes(), Some(TextEncoding::Utf8));
+        let input = PatchInput {
+            name_a: "a/target.txt",
+            name_b: "b/target.txt",
+            date_a: "",
+            date_b: "",
+            a: &a.lines,
+            b: &b.lines,
+            final_newline_a: a.final_newline,
+            final_newline_b: b.final_newline,
+        };
+        make_doc_patch(&input, &[&a, &b], opts, PatchStyle::Unified, context).unwrap()
+    }
+
+    fn apply_bytes(old: &str, patch: &str) -> String {
+        if patch.is_empty() {
+            return old.to_string();
+        }
+        let a = text::doc_from_bytes(None, old.as_bytes(), Some(TextEncoding::Utf8));
+        let (lines, nl) = document_lines(&a).unwrap();
+        let parsed = parse_unified(patch).unwrap();
+        let result = apply(&lines, &parsed[0]);
+        assert!(result.failed.is_empty(), "old={old:?}, patch={patch:?}");
+        text::join_lines(
+            &result.lines,
+            text::Eol::Lf,
+            result.final_newline.unwrap_or(nl),
+        )
+    }
+
+    #[test]
+    fn byte_round_trip_matrix() {
+        let shapes: &[&[&str]] = &[&[], &["a"], &["a", "b"], &["x", "a", "b"], &["a", "x", "b"]];
+        let mut cases = Vec::new();
+        for lines in shapes {
+            for bom in [false, true] {
+                for mode in 0..3 {
+                    for newline in [false, true] {
+                        let mut text = if bom {
+                            "\u{feff}".to_string()
+                        } else {
+                            String::new()
+                        };
+                        for (i, line) in lines.iter().enumerate() {
+                            text.push_str(line);
+                            if i + 1 < lines.len() || newline {
+                                text.push_str(match mode {
+                                    0 => "\n",
+                                    1 => "\r\n",
+                                    _ if i % 2 == 0 => "\r\n",
+                                    _ => "\n",
+                                });
+                            }
+                        }
+                        cases.push(text);
+                    }
+                }
+            }
+        }
+        cases.sort();
+        cases.dedup();
+        let opts = DiffOptions {
+            ignore_eol: false,
+            ignore_codepage: false,
+            ..Default::default()
+        };
+        for old in &cases {
+            for new in &cases {
+                for context in [0, 1, 3] {
+                    let p = patch(old, new, &opts, context);
+                    assert_eq!(
+                        apply_bytes(old, &p),
+                        *new,
+                        "old={old:?}, target={new:?}, context={context}, patch={p:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moving_bom_boundary_preserves_ignored_text() {
+        let opts = DiffOptions {
+            substitutions_enabled: true,
+            substitutions: vec![("^version=.*$".into(), "version".into())],
+            ..Default::default()
+        };
+        for (old, new, expected) in [
+            (
+                "\u{feff}version=old\na\nold\n",
+                "\u{feff}x\nversion=new\na\nnew\n",
+                "\u{feff}x\nversion=old\na\nnew\n",
+            ),
+            (
+                "\u{feff}x\nversion=old\na\nold\n",
+                "\u{feff}version=new\na\nnew\n",
+                "\u{feff}version=old\na\nnew\n",
+            ),
+        ] {
+            for context in [0, 3] {
+                let p = patch(old, new, &opts, context);
+                assert_eq!(apply_bytes(old, &p), expected, "patch={p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ignored_differences_outside_context_do_not_leak() {
+        let gap = (0..20).map(|i| format!("same {i}\n")).collect::<String>();
+        for opts in [
+            DiffOptions {
+                ignore_case: true,
+                ..Default::default()
+            },
+            DiffOptions {
+                line_filters_enabled: true,
+                line_filters: vec!["^keep".into()],
+                ..Default::default()
+            },
+            DiffOptions {
+                substitutions_enabled: true,
+                substitutions: vec![("^keep .*".into(), "keep".into())],
+                ..Default::default()
+            },
+        ] {
+            let old = format!("\u{feff}keep OLD\n{gap}old\n");
+            let new = format!("\u{feff}keep old\n{gap}changed\n");
+            let expected = format!("\u{feff}keep OLD\n{gap}changed\n");
+            let p = patch(&old, &new, &opts, 3);
+            assert_eq!(apply_bytes(&old, &p), expected, "patch={p:?}");
+        }
     }
 }

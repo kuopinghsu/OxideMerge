@@ -353,6 +353,11 @@ For other isolated runs, set `OXIDEMERGE_CONFIG_DIR` to a dedicated configuratio
 Some web tests start a local HTTP server, so the test environment must allow local listening
 sockets.
 
+Run `cargo test --release --locked format_regression -- --nocapture` for the focused
+format checks. They cover BOM and line-ending patch round trips, ignored text changes,
+mixed-ending merge/save/undo, and Git checkout and patch compatibility. Git must be installed.
+CI runs this group separately on Windows, Linux and macOS before the full suite.
+
 Randomized test failures print a seed that can be used to reproduce the case:
 
 ```sh

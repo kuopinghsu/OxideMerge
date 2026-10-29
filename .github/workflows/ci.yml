@@ -88,6 +88,12 @@ jobs:
         if: matrix.arch == 'x64'
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: Format regression tests
+        timeout-minutes: 20
+        run: cargo test --release --locked --target ${{ matrix.target }} format_regression -- --nocapture
+        env:
+          RUST_BACKTRACE: "1"
+
       # A test that hangs fails here instead of holding the runner until the job's timeout.
       - name: Test
         timeout-minutes: 20
@@ -234,6 +240,12 @@ jobs:
       - name: Clippy
         if: matrix.arch == 'x64'
         run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Format regression tests
+        timeout-minutes: 20
+        run: cargo test --release --locked format_regression -- --nocapture
+        env:
+          RUST_BACKTRACE: "1"
 
       - name: Test
         timeout-minutes: 20
@@ -528,6 +540,12 @@ jobs:
 
       # The runner's own target named, so the Apple silicon build below reuses what the tests
       # built instead of building it again in another folder.
+      - name: Format regression tests
+        timeout-minutes: 20
+        run: cargo test --release --locked --target aarch64-apple-darwin format_regression -- --nocapture
+        env:
+          RUST_BACKTRACE: "1"
+
       - name: Test
         timeout-minutes: 20
         run: cargo test --release --locked --target aarch64-apple-darwin

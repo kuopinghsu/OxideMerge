@@ -251,25 +251,46 @@ struct Snapshot {
     modified: Vec<bool>,
     saves: Vec<u64>,
     /// The format of each pane before this step, where the step changed it.
-    formats: Vec<Option<Format>>,
+    formats: Vec<Option<DocumentFormat>>,
     /// The synchronization points before this step, so that undo brings back the ones whose
     /// lines the step deleted.
     sync_points: Vec<SyncPoint>,
 }
 
-/// How a file is written: encoding, byte order mark, line ending, final newline, mixed endings.
-type Format = (TextEncoding, bool, Eol, bool, bool, Vec<Option<Eol>>, bool);
+/// Save-format state shared by merge operations and their undo snapshots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DocumentFormat {
+    encoding: TextEncoding,
+    bom: bool,
+    eol: Eol,
+    final_newline: bool,
+    mixed_eol: bool,
+    original_eols: Vec<Option<Eol>>,
+    preserve_eols: bool,
+}
 
-fn format_of(d: &TextDoc) -> Format {
-    (
-        d.encoding,
-        d.bom,
-        d.eol,
-        d.final_newline,
-        d.mixed_eol,
-        d.original_eols.clone(),
-        d.preserve_eols,
-    )
+impl DocumentFormat {
+    fn restore(self, doc: &mut TextDoc) {
+        doc.encoding = self.encoding;
+        doc.bom = self.bom;
+        doc.eol = self.eol;
+        doc.final_newline = self.final_newline;
+        doc.mixed_eol = self.mixed_eol;
+        doc.original_eols = self.original_eols;
+        doc.preserve_eols = self.preserve_eols;
+    }
+}
+
+fn format_of(doc: &TextDoc) -> DocumentFormat {
+    DocumentFormat {
+        encoding: doc.encoding,
+        bom: doc.bom,
+        eol: doc.eol,
+        final_newline: doc.final_newline,
+        mixed_eol: doc.mixed_eol,
+        original_eols: doc.original_eols.clone(),
+        preserve_eols: doc.preserve_eols,
+    }
 }
 
 /// Makes the merge result pane (the middle of three, else the right one) save to `out`.
@@ -1098,16 +1119,7 @@ impl TextView {
     fn restore(&mut self, s: Snapshot) {
         for (i, f) in s.formats.into_iter().enumerate() {
             if let Some(f) = f {
-                let d = &mut self.panes[i].doc;
-                (
-                    d.encoding,
-                    d.bom,
-                    d.eol,
-                    d.final_newline,
-                    d.mixed_eol,
-                    d.original_eols,
-                    d.preserve_eols,
-                ) = f;
+                f.restore(&mut self.panes[i].doc);
             }
         }
         for (i, lines) in s.lines.into_iter().enumerate() {
@@ -1176,15 +1188,15 @@ impl TextView {
         let d = &mut self.panes[to].doc;
         d.lines.splice(blk.ranges[to].clone(), src);
         if eof {
-            d.final_newline = source.3;
+            d.final_newline = source.final_newline;
         }
         if whole && !self.opts.ignore_eol {
-            d.eol = source.2;
+            d.eol = source.eol;
             d.mixed_eol = false;
         }
         if whole && !self.opts.ignore_codepage {
-            d.encoding = source.0;
-            d.bom = source.1;
+            d.encoding = source.encoding;
+            d.bom = source.bom;
         }
         if format_of(d) != old {
             if let Some(s) = self.undo.last_mut() {
@@ -1204,7 +1216,7 @@ impl TextView {
             format_of(&self.panes[to].doc),
         );
         let d = &mut self.panes[to].doc;
-        (d.encoding, d.bom, d.eol, d.final_newline) = (f.0, f.1, f.2, f.3);
+        (d.encoding, d.bom, d.eol, d.final_newline) = (f.encoding, f.bom, f.eol, f.final_newline);
         d.mixed_eol = false;
         if let Some(s) = self.undo.last_mut() {
             s.formats[to].get_or_insert(old);
@@ -1380,10 +1392,11 @@ impl TextView {
         let source = format_of(&self.panes[from].doc);
         let d = &mut self.panes[to].doc;
         if !self.opts.ignore_eol {
-            (d.eol, d.mixed_eol, d.original_eols) = (source.2, source.4, source.5);
+            (d.eol, d.mixed_eol, d.original_eols) =
+                (source.eol, source.mixed_eol, source.original_eols);
         }
         if !self.opts.ignore_codepage {
-            (d.encoding, d.bom) = (source.0, source.1);
+            (d.encoding, d.bom) = (source.encoding, source.bom);
         }
         if format_of(d) != old {
             self.undo.last_mut().unwrap().formats[to].get_or_insert(old);
@@ -1517,10 +1530,10 @@ impl TextView {
         let d = &mut self.panes[1].doc;
         // These are independent properties: a text edit need not conflict with a BOM edit.
         if !self.opts.ignore_codepage {
-            d.encoding = merge(&l.0, &b.0, &r.0);
-            d.bom = merge(&l.1, &b.1, &r.1);
+            d.encoding = merge(&l.encoding, &b.encoding, &r.encoding);
+            d.bom = merge(&l.bom, &b.bom, &r.bom);
         }
-        d.final_newline = merge(&l.3, &b.3, &r.3);
+        d.final_newline = merge(&l.final_newline, &b.final_newline, &r.final_newline);
         if !self.opts.ignore_eol {
             let last = output_endings.len().saturating_sub(1);
             let terminators: Vec<_> = output_endings
@@ -1538,7 +1551,7 @@ impl TextView {
             for &eol in &terminators {
                 counts.add(eol);
             }
-            d.eol = counts.dominant().unwrap_or(b.2);
+            d.eol = counts.dominant().unwrap_or(b.eol);
             d.mixed_eol = counts.mixed();
             d.original_eols = if d.mixed_eol { terminators } else { Vec::new() };
             // A successful mixed-EOL merge must retain those edits when it is saved.
@@ -4303,7 +4316,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_eol_edits_merge_per_aligned_line_and_survive_save_undo_redo() {
+    fn format_regression_mixed_eol_merge_save_undo_redo() {
         for (base, left, right, expected) in [
             ("a\nb\nc\n", "a\r\nb\nc\n", "a\nb\nc\r\n", "a\r\nb\nc\r\n"),
             (
