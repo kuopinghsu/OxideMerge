@@ -3,6 +3,34 @@
 All notable changes to OxideMerge are listed here, newest first. Each release on GitHub uses its
 section of this file as the release notes.
 
+## [0.9.6] - Unreleased
+
+### Added
+
+- **Document conversion throughout comparisons:** full-content folder scans, individual files,
+  command-line comparisons, docked previews and folder reports share the same external converters.
+  Options include presets for PDF text (pdftotext), Office/OpenDocument (Pandoc), and Apache Tika,
+  with dependency hints. Converters are limited to 30 seconds and 16 MiB per output stream;
+  stopping a folder scan cancels its running conversions. Failed conversions report errors even
+  when they produced partial text. Extracted documents remain read-only.
+- **CSV/TSV record editing:** table view handles quoted multiline records and escaped quotes,
+  offers resizable columns, and lets you edit or copy individual cells through the context menu.
+  Cell changes preserve untouched field quoting, encoding and line endings, with undo/redo.
+- **Portable folder reviews:** save a folder comparison as `.oxmreview`, or right-click to save
+  only selected files/folders. Bundles include captured contents, effective comparison settings,
+  and folder bookmarks/comments, and reopen as read-only snapshots without the original files.
+  Converted documents are captured as text; converter commands are not included or run on reopen.
+  Folder comments are included in HTML, XML and text reports.
+
+### Fixed
+
+- Merging a CSV/TSV difference preserves other changes in the same multiline record; partial
+  merges that would break quoting are rejected without modifying the document.
+- Table view supports record and column keyboard navigation, F2/Enter cell editing, clipboard
+  copy/paste and Go to Line. Clicking a multiline record selects a difference within that record.
+- Portable folder reviews retain captured line filters, substitutions and ignored blocks from
+  the initial scan onward, including after refreshing on another machine.
+
 ## [0.9.5] - 2026-10-29
 
 ### Added
@@ -498,6 +526,7 @@ First release.
   on Windows.
 - Chinese, Japanese and Korean fonts on Linux and WSL, and GPU acceleration under WSL2.
 
+[0.9.6]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.2...v0.9.3

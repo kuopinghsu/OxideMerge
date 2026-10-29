@@ -33,6 +33,9 @@ pub enum InlineMode {
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct DiffOptions {
+    /// Runtime-only converters from trusted application settings; never loaded from reviews.
+    #[serde(skip)]
+    pub unpackers: Vec<super::unpacker::Unpacker>,
     pub whitespace: WhitespaceMode,
     pub ignore_case: bool,
     pub ignore_blank_lines: bool,
@@ -62,6 +65,7 @@ pub struct DiffOptions {
 impl Default for DiffOptions {
     fn default() -> Self {
         DiffOptions {
+            unpackers: Vec::new(),
             whitespace: WhitespaceMode::Compare,
             ignore_case: false,
             ignore_blank_lines: false,

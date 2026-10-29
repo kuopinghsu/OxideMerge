@@ -19,6 +19,7 @@ pub mod project;
 #[cfg(test)]
 mod regress;
 pub mod report;
+pub mod review;
 pub mod rules;
 pub mod saved;
 pub mod slideshow;

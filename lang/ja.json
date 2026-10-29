@@ -660,5 +660,19 @@
   "slides.end": "相違の終わり",
   "slides.no_diffs": "相違はありません",
   "slides.other_files": "その他の理由で異なるファイル",
-  "slides.more_files": "ほかに {n} 個のファイルは表示されていません。"
+  "slides.more_files": "ほかに {n} 個のファイルは表示されていません。",
+  "plugins.available": "変換プログラムを利用できます",
+  "table.edit_cell": "セルを編集",
+  "table.record": "レコード",
+  "table.column": "列",
+  "table.copy_cell": "セルをコピー",
+  "table.stale": "セルの編集中に文書が変更されました。セルを開き直してください。",
+  "table.invalid": "表データが無効です。テキスト表示で修正してください。",
+  "review.save_selected": "選択したフォルダレビューを保存…",
+  "review.save": "フォルダレビューを保存",
+  "review.label": "ポータブルフォルダレビュー",
+  "review.finish_first": "比較とファイル操作が完了してから保存してください。",
+  "review.select_first": "レビューに含めるファイルやフォルダを選択してください。",
+  "review.snapshot": "保存済みフォルダレビュー — 読み取り専用",
+  "review.notes": "フォルダのブックマークとコメント"
 }

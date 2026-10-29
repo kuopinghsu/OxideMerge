@@ -324,7 +324,14 @@ impl<'a> Scanner<'a> {
                 break;
             }
             let paths: Vec<PathBuf> = self.roots.iter().map(|r| it.path(r)).collect();
-            let o = match compare_files(&paths, &it, self.fopts, self.dopts, norm) {
+            let o = match compare_files_with_cancel(
+                &paths,
+                &it,
+                self.fopts,
+                self.dopts,
+                norm,
+                Some(&self.progress.abort),
+            ) {
                 Ok((status, diff_side, binary)) => Outcome {
                     index,
                     status,
@@ -337,7 +344,7 @@ impl<'a> Scanner<'a> {
                     status: CmpStatus::Error,
                     diff_side: None,
                     binary: false,
-                    error: Some(e.to_string()),
+                    error: Some(format!("{e:#}")),
                 },
             };
             if self.progress.live {
@@ -784,7 +791,34 @@ pub fn compare_files(
     dopts: &DiffOptions,
     norm: &Normalizer,
 ) -> Result<(CmpStatus, Option<usize>, bool)> {
+    compare_files_with_cancel(paths, item, fopts, dopts, norm, None)
+}
+
+fn compare_files_with_cancel(
+    paths: &[PathBuf],
+    item: &DirItem,
+    fopts: &FolderOptions,
+    dopts: &DiffOptions,
+    norm: &Normalizer,
+    cancel: Option<&AtomicBool>,
+) -> Result<(CmpStatus, Option<usize>, bool)> {
     let n = paths.len();
+    if fopts.method == CompareMethod::FullContents
+        && paths
+            .iter()
+            .any(|p| super::unpacker::find(&dopts.unpackers, p).is_some())
+    {
+        let docs = paths
+            .iter()
+            .map(|p| super::unpacker::load_compare_doc(p, dopts, cancel))
+            .collect::<Result<Vec<_>>>()?;
+        return pairwise(n, false, |a, b| {
+            let refs = [docs[a].lines.as_slice(), docs[b].lines.as_slice()];
+            let mut result = super::diff::compute_with(&refs, dopts, comments::for_path(&paths[a]));
+            super::diff::include_doc_formats(&mut result, &[&docs[a], &docs[b]], dopts);
+            Ok(result.is_identical())
+        });
+    }
     let tol = fopts.time_tolerance_secs;
     let (size, mtime) = (&item.size, &item.mtime);
     match fopts.method {

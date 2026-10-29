@@ -660,5 +660,19 @@
   "slides.end": "Ende der Unterschiede",
   "slides.no_diffs": "Keine Unterschiede",
   "slides.other_files": "Auf andere Weise unterschiedliche Dateien",
-  "slides.more_files": "{n} weitere Dateien werden nicht angezeigt."
+  "slides.more_files": "{n} weitere Dateien werden nicht angezeigt.",
+  "plugins.available": "Konverter ist verfügbar",
+  "table.edit_cell": "Zelle bearbeiten",
+  "table.record": "Datensatz",
+  "table.column": "Spalte",
+  "table.copy_cell": "Zelle kopieren",
+  "table.stale": "Das Dokument wurde während der Bearbeitung geändert. Öffnen Sie die Zelle erneut.",
+  "table.invalid": "Ungültige Tabellendaten. Korrigieren Sie diese in der Textansicht.",
+  "review.save_selected": "Ausgewählte Ordnerprüfung speichern…",
+  "review.save": "Ordnerprüfung speichern",
+  "review.label": "Portable Ordnerprüfung",
+  "review.finish_first": "Beenden Sie zuerst den Vergleich und die Dateioperationen.",
+  "review.select_first": "Wählen Sie Dateien oder Ordner für die Prüfung aus.",
+  "review.snapshot": "Gespeicherte Ordnerprüfung — schreibgeschützt",
+  "review.notes": "Ordnerlesezeichen und Kommentare"
 }

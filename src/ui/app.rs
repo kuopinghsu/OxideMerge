@@ -3,7 +3,7 @@
 use crate::config::{Config, SessionTab, ThemeMode};
 use crate::core::archive;
 use crate::core::conflict;
-use crate::core::diff::{DiffAlgorithm, InlineMode, WhitespaceMode};
+use crate::core::diff::{DiffAlgorithm, DiffOptions, InlineMode, WhitespaceMode};
 use crate::core::filter::{self, FltFilter, FLT_PREFIX};
 use crate::core::folder::CompareMethod;
 use crate::core::git;
@@ -46,6 +46,7 @@ pub struct OpenRequest {
     pub git_rev: Option<String>,
     /// Compare rules file to use instead of the one of the options ("" = none).
     pub rules: Option<String>,
+    pub snapshot_options: Option<Box<DiffOptions>>,
 }
 
 pub enum Content {
@@ -251,9 +252,10 @@ fn content_ui(
 ) -> Option<FolderAction> {
     match content {
         Content::Text(v) => {
-            match v.options_for(&cfg.diff) {
+            let options = cfg.comparison_options();
+            match v.options_for(&options) {
                 Some(o) => v.set_options(&o),
-                None => v.set_options(&cfg.diff),
+                None => v.set_options(&options),
             }
             v.ui(ui, cfg, colors);
             None
@@ -1388,6 +1390,7 @@ impl Menus {
                 | BookmarkComment | Indent(_) | SaveComparison | SyncPoint,
                 Text,
             ) => true,
+            (SaveComparison, Folder) => !self.folder_busy,
             (ClearSyncPoints, Text) => self.has_sync_points,
             (Find | CopyRight | CopyLeft | SelectPattern | Statistics, Folder) => true,
             // A report or patch of a folder compare still running would miss files.
@@ -2011,17 +2014,11 @@ impl OxideMergeApp {
     fn load_text(&self, p: &Path, missing: bool) -> anyhow::Result<TextDoc> {
         if missing {
             let mut d = TextDoc::empty(Some(p.to_path_buf()));
+            d.read_only = unpacker::find(&self.cfg.unpackers, p).is_some();
             d.description = Some(format!("{} ({})", p.display(), tr("label.missing")));
             return Ok(d);
         }
-        if let Some(u) = unpacker::find(&self.cfg.unpackers, p) {
-            let bytes = u.run(p)?;
-            let mut d = text::doc_from_bytes(Some(p.to_path_buf()), &bytes, None);
-            d.read_only = true;
-            d.description = Some(format!("{} [{}]", p.display(), tr("label.unpacked")));
-            return Ok(d);
-        }
-        text::load_doc(p, None)
+        unpacker::load_doc(p, &self.cfg.unpackers, None)
     }
 
     pub fn open(&mut self, req: OpenRequest) {
@@ -2033,7 +2030,7 @@ impl OxideMergeApp {
                     self.cfg.add_recent_compare(&r);
                 }
             }
-            Err(e) => self.error(e.to_string()),
+            Err(e) => self.error(format!("{e:#}")),
         }
     }
 
@@ -2071,6 +2068,13 @@ impl OxideMergeApp {
         }
         if let (Some(rev), [path]) = (&req.git_rev, &paths[..]) {
             return self.open_git_revision(path, rev);
+        }
+        if paths.len() == 1 && text::extension(&paths[0]) == crate::core::review::EXT {
+            let review = crate::core::review::load(&paths[0])?;
+            let view = FolderView::from_review(review, &self.cfg);
+            self.cfg.add_recent_path(&paths[0].display().to_string());
+            self.push_tab(Content::Folder(view), Vec::new());
+            return Ok(());
         }
         if paths.len() == 1 && saved::is_saved_compare(&paths[0]) {
             let s = SavedCompare::load(&paths[0])?;
@@ -2179,7 +2183,12 @@ impl OxideMergeApp {
             make_folder(self, paths, display, Vec::new());
             return Ok(());
         }
-        if req.kind.is_none() && paths.iter().all(|p| archive::is_archive(p)) {
+        if req.kind.is_none()
+            && req.snapshot_options.is_none()
+            && paths
+                .iter()
+                .all(|p| archive::is_archive(p) && unpacker::find(&self.cfg.unpackers, p).is_none())
+        {
             let mut temps = Vec::new();
             for p in &paths {
                 temps.push(archive::extract_to_temp(p)?);
@@ -2199,7 +2208,7 @@ impl OxideMergeApp {
             if existing.iter().all(|p| text::is_image_path(p)) {
                 FileKind::Image
             } else if existing.iter().any(|p| {
-                unpacker::find(&self.cfg.unpackers, p).is_none()
+                (req.snapshot_options.is_some() || unpacker::find(&self.cfg.unpackers, p).is_none())
                     && text::detect_kind(p) == FileKind::Binary
             }) {
                 FileKind::Binary
@@ -2211,7 +2220,11 @@ impl OxideMergeApp {
             FileKind::Text => {
                 let mut docs = Vec::new();
                 for (i, p) in paths.iter().enumerate() {
-                    let mut d = self.load_text(p, missing[i])?;
+                    let mut d = if req.snapshot_options.is_some() && !missing[i] {
+                        text::load_doc(p, None)?
+                    } else {
+                        self.load_text(p, missing[i])?
+                    };
                     if let Some(Some(desc)) = req.descriptions.get(i) {
                         d.description = Some(desc.clone());
                     }
@@ -2229,6 +2242,9 @@ impl OxideMergeApp {
                     if let Some(o) = v.options_for(&self.cfg.diff) {
                         v.set_options(&o);
                     }
+                }
+                if let Some(options) = &req.snapshot_options {
+                    v.freeze_options((**options).clone());
                 }
                 Content::Text(v)
             }
@@ -2430,6 +2446,7 @@ impl OxideMergeApp {
             kind,
             rel,
             rules,
+            snapshot_options,
         }) = f
             .adjacent_different_file(cfg, &rel, forward)
             .and_then(|i| f.reveal_and_open(i, cfg))
@@ -2445,6 +2462,7 @@ impl OxideMergeApp {
             kind,
             skip_recent: true,
             rules: Some(rules),
+            snapshot_options,
             ..Default::default()
         });
         if self.tabs.len() == count {
@@ -3035,7 +3053,10 @@ impl OxideMergeApp {
                         tr("label.project"),
                         &[project::EXT, "WinMerge", project::WINMERGE_EXT],
                     )
-                    .add_filter(tr("label.saved_compare"), &[saved::EXT])
+                    .add_filter(
+                        tr("label.saved_compare"),
+                        &[saved::EXT, crate::core::review::EXT],
+                    )
                     .pick_file()
                 {
                     self.open(OpenRequest {
@@ -3567,6 +3588,13 @@ impl OxideMergeApp {
 
     /// Saves the active text compare with its bookmarks and their comments as one file.
     fn save_comparison(&mut self) {
+        if matches!(
+            self.tabs.get(self.active).map(|t| &t.content),
+            Some(Content::Folder(_))
+        ) {
+            self.save_folder_review(false);
+            return;
+        }
         let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
             self.error(tr("msg.text_compare_only"));
             return;
@@ -3585,6 +3613,25 @@ impl OxideMergeApp {
         match v.saved_compare().save(&path) {
             Ok(()) => self.notify(trf("msg.saved", &[("file", path.display().to_string())])),
             Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    fn save_folder_review(&mut self, selected_only: bool) {
+        let Some(Content::Folder(view)) = self.tabs.get(self.active).map(|t| &t.content) else {
+            return;
+        };
+        let Some(mut path) = rfd::FileDialog::new()
+            .set_title(tr("review.save"))
+            .add_filter(tr("review.label"), &[crate::core::review::EXT])
+            .set_file_name(format!("review.{}", crate::core::review::EXT))
+            .save_file()
+        else {
+            return;
+        };
+        path.set_extension(crate::core::review::EXT);
+        match view.save_review(&path, selected_only) {
+            Ok(()) => self.notify(trf("msg.saved", &[("file", path.display().to_string())])),
+            Err(e) => self.error(format!("{e:#}")),
         }
     }
 
@@ -5311,6 +5358,13 @@ impl OxideMergeApp {
                                 }
                                 OptTab::Plugins => {
                                     ui.label(tr("opt.unpackers_hint"));
+                                    ui.horizontal_wrapped(|ui| {
+                                        for (name, preset) in Unpacker::presets() {
+                                            if ui.button(name).clicked() {
+                                                d.cfg.unpackers.push(preset);
+                                            }
+                                        }
+                                    });
                                     let mut remove = None;
                                     let pattern_w = 180.0;
                                     let command_w = (ui.available_width()
@@ -5330,7 +5384,13 @@ impl OxideMergeApp {
                                             ui.label("");
                                             ui.end_row();
                                             for (i, u) in d.cfg.unpackers.iter_mut().enumerate() {
-                                                ui.checkbox(&mut u.enabled, "");
+                                                ui.checkbox(&mut u.enabled, "").on_hover_text(
+                                                    u.check_dependency()
+                                                        .map(|_| {
+                                                            tr("plugins.available").to_string()
+                                                        })
+                                                        .unwrap_or_else(|e| e.to_string()),
+                                                );
                                                 let h = ui.spacing().interact_size.y;
                                                 ui.add_sized(
                                                     [pattern_w, h],
@@ -5409,7 +5469,9 @@ impl OxideMergeApp {
         }
         if apply {
             rules::apply_selected(&mut d.cfg);
-            let folder_changed = d.cfg.folder != self.cfg.folder || d.cfg.diff != self.cfg.diff;
+            let folder_changed = d.cfg.folder != self.cfg.folder
+                || d.cfg.diff != self.cfg.diff
+                || d.cfg.unpackers != self.cfg.unpackers;
             self.cfg = d.cfg;
             if folder_changed {
                 let named = self.named_filters.clone();
@@ -6088,6 +6150,7 @@ impl eframe::App for OxideMergeApp {
                     kind,
                     rel,
                     rules,
+                    snapshot_options,
                 } => {
                     let folder = self.tabs.get(self.active).map(|t| match &t.content {
                         Content::Diffs(v) => v.folder,
@@ -6103,6 +6166,7 @@ impl eframe::App for OxideMergeApp {
                         kind,
                         skip_recent: true,
                         rules: Some(rules),
+                        snapshot_options,
                         ..Default::default()
                     });
                     if let (Some(folder), true) = (folder, self.tabs.len() > count) {
@@ -6136,6 +6200,7 @@ impl eframe::App for OxideMergeApp {
                 FolderAction::EditRules => self.open_options(OptTab::Rules),
                 FolderAction::ExportHtml => self.export_html(),
                 FolderAction::AllDiffs => self.show_all_diffs(),
+                FolderAction::SaveReview(selected_only) => self.save_folder_review(selected_only),
                 FolderAction::ExportFileReport { name, job } => {
                     self.write_html_report(tr("menu.export_html"), &name, job);
                 }

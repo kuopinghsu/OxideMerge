@@ -1079,3 +1079,236 @@ fn applying_byte_patches_preserves_boms_and_crlf() {
         assert_eq!(std::fs::read(d.join("target.txt")).unwrap(), new.as_bytes());
     }
 }
+
+#[test]
+fn csv_multiline_cells_open_edit_and_save_in_the_real_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("a.csv", "id,note\r\n1,\"old\r\nworld\"\r\n"),
+            ("b.csv", "id,note\r\n1,\"new\r\nworld\"\r\n"),
+        ],
+    );
+    let mut gui = Gui::start(
+        "table_cell_edit",
+        compare(&[d.join("a.csv"), d.join("b.csv")]),
+    );
+    assert!(gui.shows("Record"));
+    assert!(gui.shows_text("old"));
+    gui.click("old\r\nworld");
+    gui.click("old\r\nworld");
+    assert!(gui.shows("Edit cell"));
+    gui.key(CMD, Key::A);
+    gui.type_text("edited, value\nnext");
+    gui.click("OK");
+    gui.key(CMD, Key::S);
+    assert_eq!(
+        read(&d.join("a.csv")),
+        "id,note\r\n1,\"edited, value\nnext\"\r\n"
+    );
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn folder_review_reopens_without_sources_and_keeps_annotations_and_options() {
+    let source = tempfile::tempdir().unwrap();
+    let d = source.path();
+    write(
+        d,
+        &[
+            ("left/a.txt", "Hello\n"),
+            ("right/a.txt", "hello\n"),
+            ("left/skip.tmp", "skip"),
+        ],
+    );
+    let mut cfg = config();
+    cfg.diff.ignore_case = true;
+    cfg.filter = "*.txt".into();
+    let mut original = Gui::with_config(
+        "review_capture",
+        cfg,
+        compare(&[d.join("left"), d.join("right")]),
+    );
+    let out = tempfile::tempdir().unwrap();
+    let bundle = out.path().join("review.oxmreview");
+    if let Content::Folder(view) = &mut original.app.tabs[0].content {
+        view.notes
+            .insert("a.txt".into(), "Check <this> & that".into());
+        view.save_review(&bundle, false).unwrap();
+    } else {
+        panic!("Expected a folder comparison");
+    }
+    drop(original);
+    drop(source);
+    let mut gui = Gui::start("review_reopen", compare(&[bundle]));
+    let Content::Folder(view) = &gui.app.tabs[0].content else {
+        panic!("Expected a folder review");
+    };
+    assert_eq!(view.notes["a.txt"], "Check <this> & that");
+    assert!(view.read_only.iter().all(|&value| value));
+    assert!(view.items.iter().all(|i| i.name != "skip.tmp"));
+    assert_eq!(view.outcome(), Outcome::Identical);
+    let html = view.report(ReportFormat::Html, &gui.app.cfg);
+    assert!(html.contains("Check &lt;this&gt; &amp; that"));
+    gui.app.cfg.diff.ignore_case = false;
+    gui.app.run(Cmd::Refresh, &gui.ctx);
+    gui.settle();
+    let Content::Folder(view) = &gui.app.tabs[0].content else {
+        panic!("Expected a folder review");
+    };
+    assert_eq!(view.outcome(), Outcome::Identical);
+    assert!(gui.shows_text("read-only snapshot"));
+}
+
+#[cfg(unix)]
+#[test]
+fn converted_documents_stay_read_only_in_file_and_all_differences_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("left/a.docx", "\0container\nOLD\n"),
+            ("right/a.docx", "\0container\nNEW\n"),
+        ],
+    );
+    let mut cfg = config();
+    cfg.unpackers = vec![Unpacker {
+        enabled: true,
+        pattern: "*.docx".into(),
+        command: "tail -n +2 ${file}".into(),
+    }];
+    let mut gui = Gui::with_config(
+        "converter_readonly",
+        cfg.clone(),
+        compare(&[d.join("left/a.docx"), d.join("right/a.docx")]),
+    );
+    assert!(gui.text_view().panes.iter().all(|p| p.doc.read_only));
+    gui.app.run(Cmd::CopyRight, &gui.ctx);
+    gui.app.run(Cmd::Save, &gui.ctx);
+    assert_eq!(read(&d.join("right/a.docx")), "\0container\nNEW\n");
+    let mut folder = Gui::with_config(
+        "converter_folder",
+        cfg,
+        compare(&[d.join("left"), d.join("right")]),
+    );
+    folder.app.run(Cmd::AllDiffs, &folder.ctx);
+    folder.settle();
+    folder.app.run(Cmd::CopyRight, &folder.ctx);
+    folder.app.run(Cmd::Save, &folder.ctx);
+    folder.settle();
+    assert_eq!(read(&d.join("right/a.docx")), "\0container\nNEW\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn converted_review_opens_documents_without_running_local_converters() {
+    let source = tempfile::tempdir().unwrap();
+    let d = source.path();
+    write(
+        d,
+        &[
+            ("left/a.docx", "\0container-one\nold text\n"),
+            ("right/a.docx", "\0container-two\nnew text\n"),
+        ],
+    );
+    let mut cfg = config();
+    cfg.unpackers = vec![Unpacker {
+        enabled: true,
+        pattern: "*.docx".into(),
+        command: "tail -n +2 ${file}".into(),
+    }];
+    let original = Gui::with_config(
+        "converted_review_capture",
+        cfg,
+        compare(&[d.join("left"), d.join("right")]),
+    );
+    let out = tempfile::tempdir().unwrap();
+    let path = out.path().join("review.oxmreview");
+    let Content::Folder(view) = &original.app.tabs[0].content else {
+        panic!("folder expected");
+    };
+    view.save_review(&path, false).unwrap();
+    drop(original);
+    drop(source);
+    let mut cfg = config();
+    cfg.unpackers = vec![Unpacker {
+        enabled: true,
+        pattern: "*.docx".into(),
+        command: "exit 99 # ${file}".into(),
+    }];
+    let mut gui = Gui::with_config("converted_review_reopen", cfg, compare(&[path]));
+    gui.click("a.docx");
+    gui.click("a.docx");
+    assert_eq!(gui.text_view().panes[0].doc.lines, ["old text"]);
+    assert!(gui.text_view().panes.iter().all(|p| p.doc.read_only));
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn table_keyboard_navigation_cell_editing_and_go_to_line_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let left = format!(
+        "id,note\n{}",
+        (0..24)
+            .map(|i| format!("{i},left-{i}\n"))
+            .collect::<String>()
+    );
+    let right = left.replace("left-", "right-");
+    write(dir.path(), &[("left.csv", &left), ("right.csv", &right)]);
+    let mut gui = Gui::start(
+        "table_keyboard",
+        compare(&[dir.path().join("left.csv"), dir.path().join("right.csv")]),
+    );
+    gui.click("left-0");
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    let line = |gui: &Gui| {
+        let v = gui.text_view();
+        v.diff.rows[v.cursor_row.unwrap()].line[v.active_pane].unwrap()
+    };
+    assert_eq!(line(&gui), 2);
+    gui.key(Modifiers::NONE, Key::ArrowUp);
+    assert_eq!(line(&gui), 1);
+    gui.key(Modifiers::NONE, Key::PageDown);
+    assert!(line(&gui) > 1);
+    gui.key(CMD, Key::Home);
+    assert_eq!(line(&gui), 0);
+    gui.key(CMD, Key::End);
+    assert_eq!(line(&gui), 24);
+    gui.key(Modifiers::NONE, Key::F2);
+    assert!(gui.shows("Edit cell"));
+    gui.key(CMD, Key::A);
+    gui.type_text("edited-last");
+    gui.click("OK");
+    assert_eq!(gui.text_view().panes[0].doc.lines[24], "23,edited-last");
+    gui.key(Modifiers::NONE, Key::Enter);
+    assert!(gui.shows("Edit cell"));
+    gui.click("Cancel");
+    gui.key(CMD, Key::G);
+    assert!(gui.text_view().goto.is_some());
+    gui.type_text("3");
+    gui.click("OK");
+    assert!(gui.text_view().goto.is_none());
+    assert_eq!(line(&gui), 2);
+    gui.key(Modifiers::NONE, Key::PageUp);
+    assert_eq!(line(&gui), 0);
+}
+
+#[test]
+fn clicking_multiline_cell_selects_and_merges_a_later_line_difference() {
+    let dir = tempfile::tempdir().unwrap();
+    let left = "id,note\n1,\"same\nold\"\n";
+    let right = "id,note\n1,\"same\nnew\"\n";
+    write(dir.path(), &[("left.csv", left), ("right.csv", right)]);
+    let mut gui = Gui::start(
+        "table_record_selection",
+        compare(&[dir.path().join("left.csv"), dir.path().join("right.csv")]),
+    );
+    gui.click("same\nold");
+    assert!(gui.text_view().cur_block.is_some());
+    gui.app.run(Cmd::CopyRight, &gui.ctx);
+    gui.settle();
+    assert_eq!(gui.text_view().panes[1].doc.text(), left);
+}

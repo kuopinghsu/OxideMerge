@@ -723,27 +723,22 @@ pub(crate) fn file_docs(it: &DirItem, roots: &[PathBuf], opts: &DiffOptions) -> 
             docs.push(super::text::TextDoc::empty(Some(p.clone())));
             continue;
         }
-        let bytes = match std::fs::read(p) {
-            Ok(b) => b,
-            Err(e) => return FileDiffs::Note(format!("{}: {e}", tr("status.error"))),
+        let doc = match super::unpacker::load_compare_doc(p, opts, None) {
+            Ok(doc) => doc,
+            Err(e) => return FileDiffs::Note(format!("{}: {e:#}", tr("status.error"))),
         };
-        if bytes.len() as u64 > MAX_BYTES {
-            return FileDiffs::Note(trf(
-                "report.too_big",
-                &[("size", fmt_size(Some(bytes.len() as u64)))],
-            ));
-        }
-        if super::text::looks_binary(&bytes) {
+        if !doc.read_only && doc.lines.iter().any(|l| l.contains('\0')) {
             return FileDiffs::Note(tr("report.binary").into());
         }
-        docs.push(super::text::doc_from_bytes(Some(p.clone()), &bytes, None));
+        docs.push(doc);
     }
     let longest = docs.iter().map(|d| d.lines.len()).max().unwrap_or(0);
     if longest > MAX_LINES {
         return FileDiffs::Note(trf("report.too_long", &[("n", longest.to_string())]));
     }
     let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
-    let result = super::diff::compute_with(&refs, opts, super::comments::for_path(&paths[0]));
+    let mut result = super::diff::compute_with(&refs, opts, super::comments::for_path(&paths[0]));
+    super::diff::include_doc_formats(&mut result, &docs.iter().collect::<Vec<_>>(), opts);
     FileDiffs::Diffs(docs, result)
 }
 
