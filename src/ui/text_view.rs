@@ -422,10 +422,28 @@ enum MenuAction {
 /// A bookmark comment being edited: pane, line, text, and whether the field needs focus.
 type NoteEdit = (usize, usize, String, bool);
 
+struct CellEdit {
+    pane: usize,
+    record: usize,
+    column: usize,
+    value: String,
+    source: String,
+    focus: bool,
+}
+
+#[derive(Default)]
+struct TableState {
+    docs: Vec<Result<table::Table, String>>,
+    diff: DiffResult,
+    edit: Option<CellEdit>,
+    column: usize,
+}
+
 pub struct TextView {
     pub panes: Vec<Pane>,
     pub diff: DiffResult,
     opts: DiffOptions,
+    frozen_options: Option<Box<DiffOptions>>,
     pub cur_block: Option<usize>,
     scroll: f32,
     hscroll: f32,
@@ -444,6 +462,7 @@ pub struct TextView {
     pub table_mode: bool,
     pub table_delim: Option<char>,
     col_widths: Vec<usize>,
+    table: Box<TableState>,
     pub status: String,
     /// Message about an edit that changed many differences at once, for an undo toast.
     pub bulk_edit: Option<String>,
@@ -498,7 +517,8 @@ impl TextView {
         let mut v = TextView {
             panes: docs.into_iter().map(Pane::new).collect(),
             diff: DiffResult::default(),
-            opts: cfg.diff.clone(),
+            opts: cfg.comparison_options(),
+            frozen_options: None,
             cur_block: None,
             scroll: 0.0,
             hscroll: 0.0,
@@ -515,6 +535,7 @@ impl TextView {
             table_mode: table_delim.is_some(),
             table_delim,
             col_widths: Vec::new(),
+            table: Box::default(),
             status: String::new(),
             bulk_edit: None,
             scroll_to: None,
@@ -578,6 +599,15 @@ impl TextView {
     /// Whether there are unsaved changes, counting a line still being typed.
     pub fn is_modified(&self) -> bool {
         self.panes.iter().any(|p| p.doc.modified)
+            || self.table.edit.as_ref().is_some_and(|e| {
+                self.table
+                    .docs
+                    .get(e.pane)
+                    .and_then(|t| t.as_ref().ok())
+                    .and_then(|t| t.records.get(e.record))
+                    .and_then(|r| r.cells.get(e.column))
+                    != Some(&e.value)
+            })
             || self.edit.as_ref().is_some_and(|e| {
                 let line = self.diff.rows.get(e.row).and_then(|r| r.line[e.pane]);
                 match line {
@@ -589,6 +619,11 @@ impl TextView {
 
     /// Takes in a line still being typed, as if it had been left.
     pub fn commit_pending_edit(&mut self) {
+        if let Some(edit) = self.table.edit.take() {
+            if let Err(error) = self.apply_cell_edit(&edit) {
+                self.status = error;
+            }
+        }
         if let Some(e) = self.edit.take() {
             self.commit_edit(e);
         }
@@ -607,6 +642,9 @@ impl TextView {
 
     /// The options to compare with: `base` with this compare's rules, when it has its own.
     pub fn options_for(&self, base: &DiffOptions) -> Option<DiffOptions> {
+        if let Some(options) = &self.frozen_options {
+            return Some((**options).clone());
+        }
         self.rules
             .as_ref()
             .map(|_| rules::options_with(base, self.rule_set.as_ref()))
@@ -659,6 +697,12 @@ impl TextView {
             }
         };
         RuleDraft { kind, a, b }
+    }
+
+    pub fn freeze_options(&mut self, mut opts: DiffOptions) {
+        opts.unpackers.clear();
+        self.set_options(&opts);
+        self.frozen_options = Some(Box::new(opts));
     }
 
     pub fn set_options(&mut self, opts: &DiffOptions) {
@@ -739,6 +783,26 @@ impl TextView {
             .max()
             .unwrap_or(0);
         if let Some(d) = self.table_delim {
+            self.table.docs = self
+                .panes
+                .iter()
+                .map(|p| table::Table::parse(table::source(&p.doc), d))
+                .collect();
+            if self.table.docs.iter().all(Result::is_ok) {
+                let keys: Vec<Vec<String>> = self
+                    .table
+                    .docs
+                    .iter()
+                    .map(|t| t.as_ref().unwrap().keys(self.opts.ignore_eol))
+                    .collect();
+                self.table.diff = diff::compute_with(
+                    &keys.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                    &self.opts,
+                    None,
+                );
+            } else {
+                self.table.diff = DiffResult::default();
+            }
             let mut w: Vec<usize> = Vec::new();
             for p in &self.panes {
                 for l in p.doc.lines.iter().take(20000) {
@@ -1257,6 +1321,23 @@ impl TextView {
         {
             return;
         }
+        if self.table_mode {
+            if let (Some(Ok(a)), Some(Ok(btable))) =
+                (self.table.docs.get(from), self.table.docs.get(to))
+            {
+                let block = &self.diff.blocks[b];
+                let source = btable.copy_lines(
+                    block.ranges[to].clone(),
+                    a,
+                    block.ranges[from].clone(),
+                    self.panes[to].doc.eol.as_str(),
+                );
+                if let Err(error) = self.replace_table_source(to, source) {
+                    self.status = error;
+                }
+            }
+            return;
+        }
         self.push_undo();
         let was_empty = self.panes[to].doc.lines.is_empty();
         let row = self.diff.blocks[b].first_row;
@@ -1592,6 +1673,20 @@ impl TextView {
     }
 
     fn begin_edit(&mut self, row: usize, pane: usize) {
+        if self.table_mode {
+            if let Some(line) = self.diff.rows.get(row).and_then(|r| r.line[pane]) {
+                if let Some(record) = self
+                    .table
+                    .docs
+                    .get(pane)
+                    .and_then(|t| t.as_ref().ok())
+                    .and_then(|t| t.records.iter().position(|r| r.lines.contains(&line)))
+                {
+                    self.begin_cell_edit(pane, record, self.table.column);
+                }
+            }
+            return;
+        }
         if self.panes[pane].doc.read_only {
             self.status = tr("msg.readonly").to_string();
             return;
@@ -3336,6 +3431,535 @@ impl TextView {
         }
     }
 
+    fn table_cursor(&self) -> Option<usize> {
+        let raw = self.diff.rows.get(self.cursor_row?)?;
+        let contains = |row: &diff::Row, pane: usize| match (row.line[pane], raw.line[pane]) {
+            (Some(record), Some(line)) => self.table.docs[pane]
+                .as_ref()
+                .is_ok_and(|table| table.records[record].lines.contains(&line)),
+            _ => false,
+        };
+        self.table
+            .diff
+            .rows
+            .iter()
+            .position(|row| contains(row, self.active_pane))
+            .or_else(|| {
+                self.table
+                    .diff
+                    .rows
+                    .iter()
+                    .position(|row| (0..self.n()).any(|pane| contains(row, pane)))
+            })
+    }
+
+    /// Pick an actual changed physical line within the record, even when its opening
+    /// line is unchanged. Prefer the current pane, then use another side for gaps.
+    fn select_table_row(&mut self, row: usize, pane: usize, column: usize) {
+        let Some(aligned) = self.table.diff.rows.get(row) else {
+            return;
+        };
+        let contains = |raw: &diff::Row, side: usize| match (aligned.line[side], raw.line[side]) {
+            (Some(record), Some(line)) => self.table.docs[side]
+                .as_ref()
+                .is_ok_and(|table| table.records[record].lines.contains(&line)),
+            _ => false,
+        };
+        let significant = |raw: &diff::Row| raw.block.is_some_and(|b| !self.diff.blocks[b].ignored);
+        let rows = &self.diff.rows;
+        let found = rows
+            .iter()
+            .position(|r| contains(r, pane) && significant(r))
+            .or_else(|| {
+                rows.iter()
+                    .position(|r| significant(r) && (0..self.n()).any(|p| contains(r, p)))
+            })
+            .or_else(|| rows.iter().position(|r| contains(r, pane)))
+            .or_else(|| {
+                rows.iter()
+                    .position(|r| (0..self.n()).any(|p| contains(r, p)))
+            });
+        if let Some(raw) = found {
+            self.active_pane = pane;
+            self.table.column = column;
+            self.cursor_row = Some(raw);
+            self.scroll_to = Some(raw);
+            self.cur_block = rows[raw].block.filter(|&b| !self.diff.blocks[b].ignored);
+            self.sel_anchor = None;
+        }
+    }
+
+    fn handle_table_keys(&mut self, ui: &Ui) {
+        if !self.keys_enabled
+            || widgets::typing(ui.ctx())
+            || self.table.edit.is_some()
+            || self.goto.is_some()
+            || widgets::modal_open(ui.ctx())
+            || self.table.diff.rows.is_empty()
+        {
+            return;
+        }
+        let current = self.table_cursor().unwrap_or(0);
+        let (mut target, mut pane, mut column) = (current, self.active_pane, self.table.column);
+        let last = self.table.diff.rows.len() - 1;
+        let mut navigate = false;
+        let mut edit = false;
+        ui.input_mut(|input| {
+            for (key, next) in [
+                (Key::ArrowDown, current.saturating_add(1).min(last)),
+                (Key::ArrowUp, current.saturating_sub(1)),
+                (
+                    Key::PageDown,
+                    current.saturating_add(self.page_rows).min(last),
+                ),
+                (Key::PageUp, current.saturating_sub(self.page_rows)),
+            ] {
+                if input.consume_key(Modifiers::NONE, key) {
+                    target = next;
+                    navigate = true;
+                }
+            }
+            if input.consume_key(Modifiers::COMMAND, Key::Home) {
+                target = 0;
+                navigate = true;
+            }
+            if input.consume_key(Modifiers::COMMAND, Key::End) {
+                target = last;
+                navigate = true;
+            }
+            let columns = self
+                .table
+                .docs
+                .iter()
+                .filter_map(|t| t.as_ref().ok())
+                .flat_map(|t| &t.records)
+                .map(|r| r.cells.len())
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            if input.consume_key(Modifiers::NONE, Key::ArrowRight) {
+                if column + 1 < columns {
+                    column += 1;
+                } else if pane + 1 < self.n() {
+                    pane += 1;
+                    column = 0;
+                }
+                navigate = true;
+            }
+            if input.consume_key(Modifiers::NONE, Key::ArrowLeft) {
+                if column > 0 {
+                    column -= 1;
+                } else if pane > 0 {
+                    pane -= 1;
+                    column = columns - 1;
+                }
+                navigate = true;
+            }
+            edit = input.consume_key(Modifiers::NONE, Key::F2)
+                || input.consume_key(Modifiers::NONE, Key::Enter);
+        });
+        if navigate {
+            self.select_table_row(target, pane, column);
+        }
+        let Some(record) = self.table.diff.rows[target].line[pane] else {
+            return;
+        };
+        if edit {
+            self.begin_cell_edit(pane, record, column);
+        }
+        if let Some(value) = self.table.docs[pane]
+            .as_ref()
+            .ok()
+            .and_then(|t| t.records[record].cells.get(column))
+        {
+            if ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
+                ui.ctx().copy_text(value.clone());
+            }
+        }
+        let pasted = ui.input(|i| {
+            i.events.iter().find_map(|e| {
+                if let egui::Event::Paste(value) = e {
+                    Some(value.clone())
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(value) = pasted {
+            self.begin_cell_edit(pane, record, column);
+            if let Some(mut edit) = self.table.edit.take() {
+                edit.value = value;
+                if let Err(error) = self.apply_cell_edit(&edit) {
+                    self.status = error;
+                }
+            }
+        }
+    }
+
+    fn begin_cell_edit(&mut self, pane: usize, record: usize, column: usize) {
+        if !self.writable(pane) {
+            return;
+        }
+        let Some(table) = self.table.docs.get(pane).and_then(|t| t.as_ref().ok()) else {
+            return;
+        };
+        let Some(value) = table.records.get(record).and_then(|r| r.cells.get(column)) else {
+            return;
+        };
+        self.table.edit = Some(CellEdit {
+            pane,
+            record,
+            column,
+            value: value.clone(),
+            source: table.source.clone(),
+            focus: true,
+        });
+    }
+
+    fn apply_cell_edit(&mut self, edit: &CellEdit) -> Result<(), String> {
+        if !self.writable(edit.pane) {
+            return Err(tr("msg.readonly").into());
+        }
+        if table::source(&self.panes[edit.pane].doc) != edit.source {
+            return Err(tr("table.stale").into());
+        }
+        let delim = self.table_delim.ok_or("No table delimiter")?;
+        let table = table::Table::parse(edit.source.clone(), delim)?;
+        let source = table.replace_cell(edit.record, edit.column, &edit.value, delim)?;
+        if source == edit.source {
+            return Ok(());
+        }
+        self.replace_table_source(edit.pane, source)
+    }
+
+    fn replace_table_source(&mut self, pane: usize, source: String) -> Result<(), String> {
+        table::Table::parse(
+            source.clone(),
+            self.table_delim.ok_or("No table delimiter")?,
+        )?;
+        if source == table::source(&self.panes[pane].doc) {
+            return Ok(());
+        }
+        self.push_undo();
+        self.undo.last_mut().unwrap().formats[pane] = Some(format_of(&self.panes[pane].doc));
+        let parsed = TextDoc::from_text(None, &source);
+        let doc = &mut self.panes[pane].doc;
+        doc.lines = parsed.lines;
+        doc.eol = parsed.eol;
+        doc.final_newline = parsed.final_newline;
+        doc.mixed_eol = parsed.mixed_eol;
+        doc.original_eols = parsed.original_eols;
+        doc.preserve_eols = true;
+        self.mark_changed(&[pane]);
+        Ok(())
+    }
+
+    fn copy_cell(&mut self, row: usize, column: usize, from: usize, to: usize) {
+        let Some(aligned) = self.table.diff.rows.get(row) else {
+            return;
+        };
+        let (Some(src), Some(dst)) = (aligned.line[from], aligned.line[to]) else {
+            return;
+        };
+        let (Ok(a), Ok(b)) = (&self.table.docs[from], &self.table.docs[to]) else {
+            return;
+        };
+        let Some(value) = a.records[src].cells.get(column) else {
+            return;
+        };
+        let edit = CellEdit {
+            pane: to,
+            record: dst,
+            column,
+            value: value.clone(),
+            source: b.source.clone(),
+            focus: false,
+        };
+        if let Err(error) = self.apply_cell_edit(&edit) {
+            self.status = error;
+        }
+    }
+
+    fn cell_window(&mut self, ui: &Ui) {
+        let Some(mut edit) = self.table.edit.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new(tr("table.edit_cell"))
+            .id(self.id.with("cell_edit"))
+            .collapsible(false)
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "{} · {} {} · {} {}",
+                    self.panes[edit.pane].doc.title(),
+                    tr("table.record"),
+                    edit.record + 1,
+                    tr("table.column"),
+                    edit.column + 1
+                ));
+                let response = ui.add(
+                    egui::TextEdit::multiline(&mut edit.value)
+                        .desired_rows(5)
+                        .desired_width(420.0),
+                );
+                if edit.focus {
+                    response.request_focus();
+                    edit.focus = false;
+                }
+                ui.horizontal(|ui| {
+                    apply = ui.button(tr("btn.ok")).clicked();
+                    cancel = ui.button(tr("btn.cancel")).clicked();
+                });
+            });
+        if apply {
+            if let Err(error) = self.apply_cell_edit(&edit) {
+                self.status = error;
+            }
+        } else if open && !cancel {
+            self.table.edit = Some(edit);
+        }
+    }
+
+    /// Record-aware rendering leaves the raw text diff intact for reports and ordinary merges.
+    fn table_ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
+        if let Some(error) = self.table.docs.iter().find_map(|t| t.as_ref().err()) {
+            ui.colored_label(c.ui.warning, error);
+            ui.label(tr("table.invalid"));
+            if ui.button(tr("cmd.table_mode")).clicked() {
+                self.table_mode = false;
+            }
+            return;
+        }
+        let n = self.n();
+        let columns = self
+            .table
+            .docs
+            .iter()
+            .filter_map(|t| t.as_ref().ok())
+            .flat_map(|t| &t.records)
+            .map(|r| r.cells.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let line_height = cfg.font_size + 6.0;
+        let heights: Vec<f32> = self
+            .table
+            .diff
+            .rows
+            .iter()
+            .map(|row| {
+                (0..n)
+                    .filter_map(|p| {
+                        row.line[p].map(|r| &self.table.docs[p].as_ref().unwrap().records[r])
+                    })
+                    .flat_map(|r| &r.cells)
+                    .map(|s| s.lines().count().clamp(1, 8))
+                    .max()
+                    .unwrap_or(1) as f32
+                    * line_height
+                    + 8.0
+            })
+            .collect();
+        let target = self
+            .scroll_to
+            .take()
+            .and_then(|raw_row| self.diff.rows.get(raw_row))
+            .and_then(|raw| {
+                self.table.diff.rows.iter().position(|row| {
+                    (0..n).any(|p| match (row.line[p], raw.line[p]) {
+                        (Some(r), Some(l)) => self.table.docs[p].as_ref().unwrap().records[r]
+                            .lines
+                            .contains(&l),
+                        _ => false,
+                    })
+                })
+            });
+        let normalizer = diff::Normalizer::new(&self.opts);
+        let mut clicked = None;
+        let mut edit_cell = None;
+        let mut copy = None;
+        egui::ScrollArea::horizontal()
+            .id_salt(self.id.with("table_horizontal"))
+            .show(ui, |ui| {
+                ui.set_min_width((columns * n) as f32 * 140.0 + 60.0);
+                let mut builder = egui_extras::TableBuilder::new(ui)
+                    .id_salt(self.id.with("records"))
+                    .resizable(true)
+                    .striped(true)
+                    .sense(Sense::click())
+                    .column(egui_extras::Column::initial(55.0).at_least(40.0))
+                    .columns(
+                        egui_extras::Column::initial(140.0)
+                            .at_least(60.0)
+                            .clip(true),
+                        columns * n,
+                    );
+                if let Some(row) = target {
+                    builder = builder.scroll_to_row(row, Some(egui::Align::Center));
+                }
+                builder
+                    .header(34.0, |mut header| {
+                        header.col(|ui| {
+                            ui.label(tr("table.record"));
+                        });
+                        for p in 0..n {
+                            for column in 0..columns {
+                                header.col(|ui| {
+                                    ui.label(format!("{} · {}", side_name(p, n), column + 1))
+                                        .on_hover_text(self.panes[p].doc.title());
+                                });
+                            }
+                        }
+                    })
+                    .body(|body| {
+                        body.heterogeneous_rows(heights.into_iter(), |mut row| {
+                            let index = row.index();
+                            let aligned = self.table.diff.rows[index];
+                            row.col(|ui| {
+                                ui.label((index + 1).to_string());
+                            });
+                            for p in 0..n {
+                                for column in 0..columns {
+                                    row.col(|ui| {
+                                        let record = aligned.line[p].map(|r| {
+                                            &self.table.docs[p].as_ref().unwrap().records[r]
+                                        });
+                                        let value = record.and_then(|r| r.cells.get(column));
+                                        let changed = value.is_some()
+                                            && aligned.block.is_some_and(|b| {
+                                                !self.table.diff.blocks[b].ignored
+                                            })
+                                            && (0..n).filter(|&q| q != p).any(|q| {
+                                                let other = aligned.line[q].and_then(|r| {
+                                                    self.table.docs[q].as_ref().unwrap().records[r]
+                                                        .cells
+                                                        .get(column)
+                                                });
+                                                match (value, other) {
+                                                    (Some(a), Some(b)) => {
+                                                        let clean = |s: &str| {
+                                                            if self.opts.ignore_eol {
+                                                                s.replace("\r\n", "\n")
+                                                                    .replace('\r', "\n")
+                                                            } else {
+                                                                s.to_string()
+                                                            }
+                                                        };
+                                                        !normalizer.close(&clean(a), &clean(b))
+                                                    }
+                                                    _ => value != other,
+                                                }
+                                            });
+                                        if changed {
+                                            ui.painter().rect_filled(ui.max_rect(), 0.0, c.inline);
+                                        }
+                                        let response = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    value.map(String::as_str).unwrap_or("—"),
+                                                )
+                                                .sense(Sense::click()),
+                                            )
+                                            .on_hover_text(value.map(String::as_str).unwrap_or(""));
+                                        if response.clicked() {
+                                            clicked = Some((index, p, column));
+                                        }
+                                        if response.double_clicked() {
+                                            if let Some(r) = aligned.line[p] {
+                                                edit_cell = Some((p, r, column));
+                                            }
+                                        }
+                                        response.context_menu(|ui| {
+                                            if let Some(r) = aligned.line[p] {
+                                                if ui
+                                                    .add_enabled(
+                                                        !self.panes[p].doc.read_only
+                                                            && value.is_some(),
+                                                        egui::Button::new(tr("table.edit_cell")),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    edit_cell = Some((p, r, column));
+                                                    ui.close_menu();
+                                                }
+                                                for to in 0..n {
+                                                    if to != p
+                                                        && aligned.line[to].is_some()
+                                                        && ui
+                                                            .add_enabled(
+                                                                !self.panes[to].doc.read_only
+                                                                    && value.is_some(),
+                                                                egui::Button::new(format!(
+                                                                    "{} → {}",
+                                                                    tr("table.copy_cell"),
+                                                                    side_name(to, n)
+                                                                )),
+                                                            )
+                                                            .clicked()
+                                                    {
+                                                        copy = Some((index, column, p, to));
+                                                        ui.close_menu();
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    });
+                                }
+                            }
+                        });
+                    });
+            });
+        if let Some((row, pane, column)) = clicked {
+            self.select_table_row(row, pane, column);
+        }
+        if let Some((p, r, col)) = edit_cell {
+            self.begin_cell_edit(p, r, col);
+        }
+        if let Some((r, col, from, to)) = copy {
+            self.copy_cell(r, col, from, to);
+        }
+        self.cell_window(ui);
+    }
+
+    fn goto_window(&mut self, ui: &Ui) {
+        // go to line dialog
+        if let Some(mut g) = self.goto.take() {
+            let mut open = !ui.input(|i| i.key_pressed(Key::Escape));
+            let mut go = false;
+            let max = self.panes[self.active_pane].doc.lines.len().max(1);
+            egui::Window::new(tr("dlg.goto"))
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                .show(ui.ctx(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(tr("label.line"));
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut g).hint_text(format!("1 – {max}")),
+                        );
+                        r.request_focus();
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            go = true;
+                        }
+                        if ui.button(tr("btn.ok")).clicked() {
+                            go = true;
+                        }
+                    });
+                });
+            if go {
+                if let Ok(line) = g.trim().parse::<usize>() {
+                    self.goto_line(line);
+                }
+            } else if open {
+                self.goto = Some(g);
+            }
+        }
+    }
+
     /// Works out the edited lines of every pane, when they are marked.
     fn update_edited(&mut self) {
         for pane in &mut self.panes {
@@ -3369,6 +3993,14 @@ impl TextView {
             self.find_bar(ui);
         }
 
+        if self.table_mode && self.table_delim.is_some() {
+            self.page_rows = (ui.available_height() / (cfg.font_size + 14.0)).max(1.0) as usize;
+            self.handle_table_keys(ui);
+            self.table_ui(ui, cfg, c);
+            self.note_window(ui);
+            self.goto_window(ui);
+            return;
+        }
         let n = self.n();
         self.tab_size = cfg.tab_size;
         let full = ui.available_rect_before_wrap();
@@ -4216,45 +4848,153 @@ impl TextView {
         }
         self.note_window(ui);
 
-        // go to line dialog
-        if let Some(mut g) = self.goto.take() {
-            let mut open = !ui.input(|i| i.key_pressed(Key::Escape));
-            let mut go = false;
-            let max = self.panes[self.active_pane].doc.lines.len().max(1);
-            egui::Window::new(tr("dlg.goto"))
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                .show(ui.ctx(), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(tr("label.line"));
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut g).hint_text(format!("1 – {max}")),
-                        );
-                        r.request_focus();
-                        if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                            go = true;
-                        }
-                        if ui.button(tr("btn.ok")).clicked() {
-                            go = true;
-                        }
-                    });
-                });
-            if go {
-                if let Ok(line) = g.trim().parse::<usize>() {
-                    self.goto_line(line);
-                }
-            } else if open {
-                self.goto = Some(g);
-            }
-        }
+        self.goto_window(ui);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_block_merge_preserves_unselected_field_changes_and_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = "\"SOURCE\nsame\nsame2\nend\",keep\n";
+        let right = "\"TARGET\nsame\nsame2\nend\",custom\n";
+        let path = dir.path().join("right.csv");
+        std::fs::write(&path, right).unwrap();
+        let mut v = TextView::new(
+            vec![
+                TextDoc::from_text(Some("left.csv".into()), left),
+                text::load_doc(&path, None).unwrap(),
+            ],
+            &Config::default(),
+        );
+        assert_eq!(v.diff.blocks.len(), 2);
+        v.copy_block(0, 0, 1);
+        let expected = right.replacen("TARGET", "SOURCE", 1);
+        assert_eq!(v.panes[1].doc.text(), expected);
+        assert_eq!(
+            v.table.docs[1].as_ref().unwrap().records[0].cells[1],
+            "custom"
+        );
+        assert_eq!(v.diff.blocks.len(), 1);
+        v.undo();
+        assert_eq!(v.panes[1].doc.text(), right);
+        v.redo();
+        assert_eq!(v.panes[1].doc.text(), expected);
+        v.save_pane(1).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+    }
+
+    #[test]
+    fn table_block_merge_rejects_partial_quotes_without_changing_the_document() {
+        let right = "a\nsame\nsame2\nb,x\n";
+        let mut v = TextView::new(
+            vec![
+                TextDoc::from_text(Some("left.csv".into()), "\"a\nsame\nsame2\nb\",x\n"),
+                TextDoc::from_text(Some("right.csv".into()), right),
+            ],
+            &Config::default(),
+        );
+        assert_eq!(v.diff.blocks.len(), 2);
+        v.copy_block(0, 0, 1);
+        assert_eq!(v.panes[1].doc.text(), right);
+        assert!(!v.panes[1].doc.modified);
+        assert!(!v.can_undo());
+        assert!(!v.status.is_empty());
+    }
+
+    #[test]
+    fn selecting_a_multiline_table_record_finds_its_later_difference() {
+        let left = "id,note\n1,\"same\nold\"\n";
+        let right = "id,note\n1,\"same\nnew\"\n";
+        let mut v = TextView::new(
+            vec![
+                TextDoc::from_text(Some("left.csv".into()), left),
+                TextDoc::from_text(Some("right.csv".into()), right),
+            ],
+            &Config::default(),
+        );
+        let row = v
+            .table
+            .diff
+            .rows
+            .iter()
+            .position(|r| r.line[1] == Some(1))
+            .unwrap();
+        assert!(v.diff.rows[v.diff.row_of_line(1, 1)].block.is_none());
+        v.select_table_row(row, 1, 1);
+        assert!(v.cur_block.is_some());
+        assert_eq!(v.diff.rows[v.cursor_row.unwrap()].line[1], Some(2));
+        assert_eq!(v.table.column, 1);
+        v.copy_current(true);
+        assert_eq!(v.panes[1].doc.text(), left);
+    }
+
+    #[test]
+    fn table_cell_merge_edit_save_and_undo_preserve_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.csv");
+        let b = dir.path().join("b.csv");
+        let original = "id,note,other\r\n1,\"old\r\n世界\",\"untouched\"\n2,last,\r\n";
+        std::fs::write(&a, original.replace("old", "new")).unwrap();
+        std::fs::write(&b, original).unwrap();
+        let mut v = TextView::new(
+            vec![
+                text::load_doc(&a, None).unwrap(),
+                text::load_doc(&b, None).unwrap(),
+            ],
+            &Config::default(),
+        );
+        assert_eq!(v.table.docs[1].as_ref().unwrap().records.len(), 3);
+        let row = v
+            .table
+            .diff
+            .rows
+            .iter()
+            .position(|r| r.line[0] == Some(1))
+            .unwrap();
+        v.copy_cell(row, 1, 0, 1);
+        assert_eq!(v.panes[1].doc.text(), original.replace("old", "new"));
+        v.save_pane(1).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            original.replace("old", "new")
+        );
+        v.undo();
+        assert_eq!(table::source(&v.panes[1].doc), original);
+        v.redo();
+        assert_eq!(v.panes[1].doc.text(), original.replace("old", "new"));
+        v.begin_cell_edit(1, 1, 1);
+        v.table.edit.as_mut().unwrap().value = "quoted, \"value\"\nnext".into();
+        assert!(v.is_modified());
+        v.commit_pending_edit();
+        let output = table::source(&v.panes[1].doc);
+        assert!(output.contains("\"quoted, \"\"value\"\"\nnext\",\"untouched\"\n"));
+        assert_eq!(v.table.docs[1].as_ref().unwrap().records.len(), 3);
+        v.panes[1].doc.read_only = true;
+        let before = output;
+        v.copy_cell(row, 1, 0, 1);
+        assert_eq!(table::source(&v.panes[1].doc), before);
+    }
+
+    #[test]
+    fn table_rejects_edits_after_underlying_document_changes() {
+        let mut v = TextView::new(
+            vec![
+                TextDoc::from_text(Some("a.csv".into()), "a,b\n"),
+                TextDoc::from_text(Some("b.csv".into()), "a,c\n"),
+            ],
+            &Config::default(),
+        );
+        v.begin_cell_edit(1, 0, 1);
+        let mut edit = v.table.edit.take().unwrap();
+        edit.value = "edited".into();
+        v.panes[1].doc.lines[0] = "external,change".into();
+        assert!(v.apply_cell_edit(&edit).is_err());
+        assert_eq!(v.panes[1].doc.lines[0], "external,change");
+    }
 
     fn strict_config() -> Config {
         Config {

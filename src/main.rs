@@ -467,10 +467,10 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             FileKind::Web
         }
         None => {
-            if paths
-                .iter()
-                .any(|p| core::text::detect_kind(p) == FileKind::Binary)
-            {
+            if paths.iter().any(|p| {
+                core::unpacker::find(&cfg.unpackers, p).is_none()
+                    && core::text::detect_kind(p) == FileKind::Binary
+            }) {
                 FileKind::Binary
             } else {
                 FileKind::Text
@@ -524,7 +524,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     } else {
         paths
             .iter()
-            .map(|p| core::text::load_doc(p, None))
+            .map(|p| core::unpacker::load_doc(p, &cfg.unpackers, None))
             .collect::<Result<_, _>>()?
     };
     if cfg.diff.prettify {
@@ -683,6 +683,7 @@ fn main() -> ExitCode {
     attach_console();
     let cli = Cli::parse_from(winmerge_args());
     let mut cfg = Config::load();
+    cfg.diff = cfg.comparison_options();
     if core::rules::load_selected(&mut cfg) {
         if let Err(e) = cfg.save() {
             eprintln!("note: {e:#}");

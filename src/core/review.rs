@@ -98,16 +98,29 @@ impl Manifest {
 
 /// Only the supplied items are included. Their effective filter/rules have already been
 /// applied; capture the resulting data, not dependencies on another machine's settings.
-pub fn save(
-    path: &Path,
-    roots: &[PathBuf],
-    labels: &[String],
-    items: &[&DirItem],
-    options: &DiffOptions,
-    folder: &FolderOptions,
-    filter: &str,
-    notes: &BTreeMap<String, String>,
-) -> Result<()> {
+pub struct Capture<'a> {
+    pub roots: &'a [PathBuf],
+    pub labels: &'a [String],
+    pub items: &'a [&'a DirItem],
+    pub options: &'a DiffOptions,
+    pub folder: &'a FolderOptions,
+    pub filter: &'a str,
+    pub notes: &'a BTreeMap<String, String>,
+}
+
+pub fn save(path: &Path, capture: Capture<'_>) -> Result<()> {
+    let Capture {
+        roots,
+        labels,
+        items,
+        options,
+        folder,
+        filter,
+        notes,
+    } = capture;
+    if roots.len() != labels.len() || !(2..=3).contains(&roots.len()) {
+        bail!("A folder review needs 2 or 3 sides");
+    }
     let mut manifest = Manifest {
         version: 1,
         saved: chrono::Local::now().to_rfc3339(),
@@ -166,7 +179,9 @@ pub fn save(
             {
                 bail!("File changed since comparison; refresh before saving: {rel}");
             }
-            let converted = !item.is_dir && unpacker::find(&options.unpackers, &input).is_some();
+            let converted = folder.method == super::folder::CompareMethod::FullContents
+                && !item.is_dir
+                && unpacker::find(&options.unpackers, &input).is_some();
             let entry = Entry {
                 side,
                 path: rel.clone(),
@@ -282,7 +297,10 @@ pub fn load(path: &Path) -> Result<Review> {
                 bail!("Folder review exceeds 256 MiB");
             }
             std::fs::create_dir_all(dest.parent().unwrap())?;
-            let mut output = std::fs::File::create(&dest)?;
+            let mut output = std::fs::File::options()
+                .write(true)
+                .create_new(true)
+                .open(&dest)?;
             output.write_all(&bytes)?;
             if let Some(time) = entry.modified {
                 output.set_times(std::fs::FileTimes::new().set_modified(time))?;
@@ -294,6 +312,55 @@ pub fn load(path: &Path) -> Result<Review> {
         roots,
         temp,
     })
+}
+
+/// Include folder annotations in exported reviews without treating note text as markup.
+pub fn annotate_report(
+    mut content: String,
+    format: super::report::ReportFormat,
+    notes: &BTreeMap<String, String>,
+) -> String {
+    if notes.is_empty() {
+        return content;
+    }
+    use super::report::{esc, ReportFormat};
+    match format {
+        ReportFormat::Html | ReportFormat::Slideshow => {
+            let mut section = format!(
+                "<aside><h2>{}</h2><dl>",
+                esc(crate::i18n::tr("review.notes"))
+            );
+            for (path, note) in notes {
+                section.push_str(&format!("<dt>{}</dt><dd>{}</dd>", esc(path), esc(note)));
+            }
+            section.push_str("</dl></aside>");
+            let at = content.rfind("</body>").unwrap_or(content.len());
+            content.insert_str(at, &section);
+        }
+        ReportFormat::Xml => {
+            let mut section = String::from("<annotations>");
+            for (path, note) in notes {
+                section.push_str(&format!(
+                    "<annotation path=\"{}\">{}</annotation>",
+                    esc(path),
+                    esc(note)
+                ));
+            }
+            section.push_str("</annotations>");
+            let at = content.rfind("</comparison>").unwrap_or(content.len());
+            content.insert_str(at, &section);
+        }
+        _ => {
+            // Folder CSV stays rectangular; comments are carried by HTML/XML and bundles.
+            if format == ReportFormat::Text {
+                content.push_str(&format!("\n{}\n", crate::i18n::tr("review.notes")));
+                for (path, note) in notes {
+                    content.push_str(&format!("{path}: {note}\n"));
+                }
+            }
+        }
+    }
+    content
 }
 
 #[cfg(test)]
@@ -333,13 +400,15 @@ mod tests {
         let path = out.path().join("review.oxmreview");
         save(
             &path,
-            &roots,
-            &["Left".into(), "Right".into()],
-            &items.iter().collect::<Vec<_>>(),
-            &opts,
-            &folder,
-            "*",
-            &BTreeMap::from([("a.txt".into(), "Check this change".into())]),
+            Capture {
+                roots: &roots,
+                labels: &["Left".into(), "Right".into()],
+                items: &items.iter().collect::<Vec<_>>(),
+                options: &opts,
+                folder: &folder,
+                filter: "*",
+                notes: &BTreeMap::from([("a.txt".into(), "Check this change".into())]),
+            },
         )
         .unwrap();
         drop(original);
@@ -400,53 +469,4 @@ mod tests {
         manifest.version = 2;
         assert!(manifest.validate().is_err());
     }
-}
-
-/// Include folder annotations in exported reviews without treating note text as markup.
-pub fn annotate_report(
-    mut content: String,
-    format: super::report::ReportFormat,
-    notes: &BTreeMap<String, String>,
-) -> String {
-    if notes.is_empty() {
-        return content;
-    }
-    use super::report::{esc, ReportFormat};
-    match format {
-        ReportFormat::Html | ReportFormat::Slideshow => {
-            let mut section = format!(
-                "<aside><h2>{}</h2><dl>",
-                esc(crate::i18n::tr("review.notes"))
-            );
-            for (path, note) in notes {
-                section.push_str(&format!("<dt>{}</dt><dd>{}</dd>", esc(path), esc(note)));
-            }
-            section.push_str("</dl></aside>");
-            let at = content.rfind("</body>").unwrap_or(content.len());
-            content.insert_str(at, &section);
-        }
-        ReportFormat::Xml => {
-            let mut section = String::from("<annotations>");
-            for (path, note) in notes {
-                section.push_str(&format!(
-                    "<annotation path=\"{}\">{}</annotation>",
-                    esc(path),
-                    esc(note)
-                ));
-            }
-            section.push_str("</annotations>");
-            let at = content.rfind("</comparison>").unwrap_or(content.len());
-            content.insert_str(at, &section);
-        }
-        _ => {
-            // Folder CSV stays rectangular; comments are carried by HTML/XML and bundles.
-            if format == ReportFormat::Text {
-                content.push_str(&format!("\n{}\n", crate::i18n::tr("review.notes")));
-                for (path, note) in notes {
-                    content.push_str(&format!("{path}: {note}\n"));
-                }
-            }
-        }
-    }
-    content
 }

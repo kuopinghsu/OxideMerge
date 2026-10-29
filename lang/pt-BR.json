@@ -660,5 +660,19 @@
   "slides.end": "Fim das diferenças",
   "slides.no_diffs": "Nenhuma diferença",
   "slides.other_files": "Arquivos que diferem de outra forma",
-  "slides.more_files": "Mais {n} arquivos não são mostrados."
+  "slides.more_files": "Mais {n} arquivos não são mostrados.",
+  "plugins.available": "O conversor está disponível",
+  "table.edit_cell": "Editar célula",
+  "table.record": "Registro",
+  "table.column": "Coluna",
+  "table.copy_cell": "Copiar célula",
+  "table.stale": "O documento mudou durante a edição. Abra a célula novamente.",
+  "table.invalid": "Dados de tabela inválidos. Corrija-os na visualização de texto.",
+  "review.save_selected": "Salvar revisão das pastas selecionadas…",
+  "review.save": "Salvar revisão de pastas",
+  "review.label": "Revisão de pastas portátil",
+  "review.finish_first": "Conclua a comparação e as operações de arquivos antes de salvar.",
+  "review.select_first": "Selecione os arquivos ou pastas a incluir.",
+  "review.snapshot": "Revisão de pastas salva — somente leitura",
+  "review.notes": "Marcadores e comentários de pastas"
 }

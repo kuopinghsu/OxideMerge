@@ -374,6 +374,7 @@ pub struct DiffsView {
     stopped: bool,
     /// An error to show, until the app takes it.
     pub error: Option<String>,
+    snapshot_options: Option<DiffOptions>,
     temps: Vec<std::sync::Arc<tempfile::TempDir>>,
     id: egui::Id,
 }
@@ -383,6 +384,7 @@ pub struct Source {
     pub display_roots: Vec<String>,
     pub read_only: Vec<bool>,
     pub dopts: DiffOptions,
+    pub snapshot_options: Option<DiffOptions>,
     pub rules: String,
     pub title: String,
     /// The files with differences, in the order to list them.
@@ -419,6 +421,7 @@ impl DiffsView {
             display_roots: src.display_roots,
             read_only: src.read_only,
             dopts: src.dopts,
+            snapshot_options: src.snapshot_options,
             rules: src.rules,
             names: src.title,
             cards,
@@ -491,6 +494,7 @@ impl DiffsView {
         (self.roots, self.display_roots, self.read_only) =
             (src.roots, src.display_roots, src.read_only);
         (self.dopts, self.rules, self.names) = (src.dopts, src.rules, src.title);
+        self.snapshot_options = src.snapshot_options;
         self.stopped = src.stopped;
         self.temps = src.temps;
         self.cells.clear();
@@ -810,7 +814,9 @@ impl DiffsView {
 
     /// Reads the compare rules and options again, then the files without changes here.
     pub fn refresh(&mut self, cfg: &Config) {
-        self.dopts = rules::options_with(&cfg.diff, rules::find(&self.rules).as_ref());
+        self.dopts = self.snapshot_options.clone().unwrap_or_else(|| {
+            rules::options_with(&cfg.comparison_options(), rules::find(&self.rules).as_ref())
+        });
         self.cells.clear();
         let (kept, reread): (Vec<usize>, Vec<usize>) =
             (0..self.cards.len()).partition(|&f| self.cards[f].modified());
@@ -851,7 +857,7 @@ impl DiffsView {
                 continue;
             };
             for side in 0..d.docs.len() {
-                if !d.docs[side].modified {
+                if !d.docs[side].modified || d.docs[side].read_only {
                     continue;
                 }
                 let Some(path) = d.docs[side].path.clone() else {
@@ -1148,6 +1154,18 @@ impl DiffsView {
         new: Vec<String>,
         whole: bool,
     ) {
+        if !self.writable(to)
+            || crate::core::unpacker::find(
+                &self.dopts.unpackers,
+                &self.cards[f].item.path(&self.roots[to]),
+            )
+            .is_some()
+            || self.cards[f].diffs().is_some_and(|d| d.docs[to].read_only)
+        {
+            self.status = tr("msg.readonly").into();
+            return;
+        }
+
         let Body::Diffs(d) = &mut self.cards[f].body else {
             return;
         };
@@ -1227,6 +1245,7 @@ impl DiffsView {
             kind: None,
             rel,
             rules: self.rules.clone(),
+            snapshot_options: self.snapshot_options.clone().map(Box::new),
         });
     }
 
@@ -1958,6 +1977,9 @@ enum Act {
 /// Copying block `b` from side `from` to side `to` changes something: with three sides, a side
 /// may already hold the lines of the other. Unknown while the text is dropped to save memory.
 fn copy_changes(d: &Diffs, b: usize, from: usize, to: usize) -> bool {
+    if d.docs.get(to).is_some_and(|doc| doc.read_only) {
+        return false;
+    }
     let Some(blk) = d.result.blocks.get(b) else {
         return false;
     };
@@ -2110,6 +2132,7 @@ mod tests {
             display_roots: roots.iter().map(|r| r.display().to_string()).collect(),
             read_only,
             dopts: DiffOptions::default(),
+            snapshot_options: None,
             rules: String::new(),
             title: "test".into(),
             items,
@@ -2295,6 +2318,7 @@ mod tests {
             display_roots: roots.iter().map(|r| r.display().to_string()).collect(),
             read_only: vec![false, true],
             dopts: DiffOptions::default(),
+            snapshot_options: None,
             rules: String::new(),
             title: "test".into(),
             items,

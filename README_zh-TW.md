@@ -63,7 +63,7 @@ OxideMerge 以 [WinMerge](https://github.com/WinMerge/winmerge) 為設計參考�
 
 - 匯出 HTML 報告供瀏覽器檢閱、一次顯示一個差異的 HTML 投影片、供其他程式讀取的 XML 報告，或將資料夾比較摘要匯出為 CSV 與純文字。
 - 產生修補檔，或套用統一格式的修補檔，檢查結果後再儲存。
-- 將比較設定儲存為專案檔，或將文字比較連同書籤與註記一起儲存。
+- 將比較設定儲存為專案檔，將文字比較連同書籤與註記一起儲存，或建立包含檔案內容、比較設定與註解的可攜式資料夾審閱。
 - 搭配 Git 使用，或透過指令列與系統的檔案管理員啟動比較。
 
 介面提供淺色與深色主題，並內建 10 種語言：英文、繁體中文、簡體中文、日文、韓文、德文、法文、
@@ -78,6 +78,8 @@ OxideMerge 以 [WinMerge](https://github.com/WinMerge/winmerge) 為設計參考�
 **文字比較**
 
 ![文字比較](images/text.png)
+
+可攜式資料夾審閱（`.oxmreview`）可保存完整內容、比較設定、書籤與註解；CSV/TSV 表格支援多行記錄、儲存格編輯與合併。文件轉換預設需另行安裝 PDF 或 Office 轉換工具。
 
 ## 安裝
 
@@ -371,39 +373,39 @@ Windows 與 Linux 的 Arm64 套件會在原生 Arm 執行環境中建置與測�
 
 ### 發布條件
 
-推送 `v0.9.5` 這類標籤時，會觸發 GitHub Releases 套件發布。
+推送 `v0.9.6` 這類標籤時，會觸發 GitHub Releases 套件發布。
 標籤必須與 `Cargo.toml` 的版本一致，且 `CHANGELOG.md` 必須包含對應版本的段落。
 含有 `-` 的標籤，例如 `v1.0.0-rc1`，會發布為預先發行版本。
 
 發行說明取自對應的變更紀錄段落，後面再附上下載說明。工作流程只會讀取變更紀錄，不會修改內容。
 發布前會確認預期的套件均已產生、沒有其他多餘檔案，且該版本尚未發布。每個版本都會附上 PDF 指南，
-並註明建置時使用的原始碼提交版本；GitHub 會列出每個檔案的 SHA-256 摘要。發行版本只包含以下檔案（以 0.9.5 為例）：
+並註明建置時使用的原始碼提交版本；GitHub 會列出每個檔案的 SHA-256 摘要。發行版本只包含以下檔案（以 0.9.6 為例）：
 
 ```text
-oxidemerge-0.9.5-linux-arm64.AppImage
-oxidemerge-0.9.5-linux-arm64.tar.gz
-oxidemerge-0.9.5-linux-x64.AppImage
-oxidemerge-0.9.5-linux-x64.tar.gz
-oxidemerge-0.9.5-macos-universal.dmg
-oxidemerge-0.9.5-user-guide.pdf
-oxidemerge-0.9.5-user-guide.zh-TW.pdf
-oxidemerge-0.9.5-windows-arm64.zip
-oxidemerge-0.9.5-windows-x64.zip
+oxidemerge-0.9.6-linux-arm64.AppImage
+oxidemerge-0.9.6-linux-arm64.tar.gz
+oxidemerge-0.9.6-linux-x64.AppImage
+oxidemerge-0.9.6-linux-x64.tar.gz
+oxidemerge-0.9.6-macos-universal.dmg
+oxidemerge-0.9.6-user-guide.pdf
+oxidemerge-0.9.6-user-guide.zh-TW.pdf
+oxidemerge-0.9.6-windows-arm64.zip
+oxidemerge-0.9.6-windows-x64.zip
 ```
 
 ### 發布步驟
 
-以下以 `0.9.5` 為例，請替換為預計發布的版本號。
+以下以 `0.9.6` 為例，請替換為預計發布的版本號。
 
 1. 更新 `Cargo.toml` 中的 `version`，執行 `cargo build` 以更新 `Cargo.lock`。
 2. 檢查 `CHANGELOG.md` 中對應版本的段落，將標題中的 `Unreleased` 改為 `YYYY-MM-DD` 格式的發行日期。
-3. 執行 `make fmt-check ci`，並以 `scripts/release-notes.sh 0.9.5` 預覽發行說明。
+3. 執行 `make fmt-check ci`，並以 `scripts/release-notes.sh 0.9.6` 預覽發行說明。
 4. 提交並推送至 `main`，等待所有平台的必要 CI 檢查通過。
 5. 為已驗證的提交加上標籤並推送：
 
    ```sh
-   git tag -a v0.9.5 -m "OxideMerge 0.9.5"
-   git push origin v0.9.5
+   git tag -a v0.9.6 -m "OxideMerge 0.9.6"
+   git push origin v0.9.6
    ```
 
 6. 在 `CHANGELOG.md` 加入下一個版本的 `Unreleased` 段落，記錄後續變更。

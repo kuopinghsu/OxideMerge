@@ -660,5 +660,19 @@
   "slides.end": "End of differences",
   "slides.no_diffs": "No differences",
   "slides.other_files": "Files that differ in other ways",
-  "slides.more_files": "{n} more files are not shown."
+  "slides.more_files": "{n} more files are not shown.",
+  "plugins.available": "Converter executable is available",
+  "table.edit_cell": "Edit cell",
+  "table.record": "Record",
+  "table.column": "Column",
+  "table.copy_cell": "Copy cell",
+  "table.stale": "The document changed while this cell was being edited. Reopen the cell and try again.",
+  "table.invalid": "Invalid table data. Switch to text view to correct it.",
+  "review.save_selected": "Save selected folder review…",
+  "review.save": "Save folder review",
+  "review.label": "Portable folder review",
+  "review.finish_first": "Finish the comparison and file operations before saving a review.",
+  "review.select_first": "Select files or folders to include in the review.",
+  "review.snapshot": "Saved folder review — read-only snapshot",
+  "review.notes": "Folder bookmarks and comments"
 }

@@ -210,6 +210,13 @@ pub fn unreadable() -> Option<&'static Unreadable> {
 }
 
 impl Config {
+    /// Comparison settings with the trusted local converter configuration attached.
+    pub fn comparison_options(&self) -> crate::core::diff::DiffOptions {
+        let mut options = self.diff.clone();
+        options.unpackers = self.unpackers.clone();
+        options
+    }
+
     pub fn load() -> Config {
         let Some(p) = config_path() else {
             return Config::default();

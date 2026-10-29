@@ -660,5 +660,19 @@
   "slides.end": "差异结束",
   "slides.no_diffs": "没有差异",
   "slides.other_files": "以其他方式不同的文件",
-  "slides.more_files": "另有 {n} 个文件未显示。"
+  "slides.more_files": "另有 {n} 个文件未显示。",
+  "plugins.available": "转换程序可用",
+  "table.edit_cell": "编辑单元格",
+  "table.record": "记录",
+  "table.column": "列",
+  "table.copy_cell": "复制单元格",
+  "table.stale": "编辑单元格期间文档已更改。请重新打开单元格后重试。",
+  "table.invalid": "表格数据无效。请切换至文本视图修正。",
+  "review.save_selected": "保存所选文件夹审阅…",
+  "review.save": "保存文件夹审阅",
+  "review.label": "可移植文件夹审阅",
+  "review.finish_first": "请先完成比较与文件操作，再保存审阅。",
+  "review.select_first": "请选择要包含在审阅中的文件或文件夹。",
+  "review.snapshot": "已保存的文件夹审阅 — 只读快照",
+  "review.notes": "文件夹书签与注释"
 }

@@ -660,5 +660,19 @@
   "slides.end": "差異結束",
   "slides.no_diffs": "沒有差異",
   "slides.other_files": "以其他方式不同的檔案",
-  "slides.more_files": "另有 {n} 個檔案未顯示。"
+  "slides.more_files": "另有 {n} 個檔案未顯示。",
+  "plugins.available": "轉換程式可使用",
+  "table.edit_cell": "編輯儲存格",
+  "table.record": "記錄",
+  "table.column": "欄",
+  "table.copy_cell": "複製儲存格",
+  "table.stale": "編輯儲存格期間文件已變更。請重新開啟儲存格再試一次。",
+  "table.invalid": "表格資料無效。請切換至文字檢視修正。",
+  "review.save_selected": "儲存所選資料夾審閱…",
+  "review.save": "儲存資料夾審閱",
+  "review.label": "可攜式資料夾審閱",
+  "review.finish_first": "請先完成比較與檔案操作，再儲存審閱。",
+  "review.select_first": "請選取要包含在審閱中的檔案或資料夾。",
+  "review.snapshot": "已儲存的資料夾審閱 — 唯讀快照",
+  "review.notes": "資料夾書籤與註解"
 }

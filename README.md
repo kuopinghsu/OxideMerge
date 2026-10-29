@@ -51,7 +51,8 @@ It supports text and folder merging, as well as binary, image and web page compa
 - Open files that contain version-control conflict markers and resolve them visually.
 - Focus on relevant changes with options to ignore whitespace, comments or selected patterns.
   Reusable comparison rules and numeric tolerance help with generated files and measurement data.
-- Use syntax highlighting, search and replace, bookmarks, and CSV/TSV table views.
+- Use syntax highlighting, search and replace, bookmarks, and CSV/TSV table views with
+  multiline records, cell editing and cell merging.
 - Set synchronization points to line up lines the compare pairs wrongly.
 
 ### Compare other content
@@ -66,7 +67,8 @@ It supports text and folder merging, as well as binary, image and web page compa
 - Export HTML reports for review in a browser, HTML slideshows that show one difference at a
   time, XML reports for other programs, or folder summaries in CSV and plain text.
 - Create patches and apply unified patches for review before saving.
-- Save comparison settings as project files, or save text comparisons with bookmarks and comments.
+- Save comparison settings as project files, save annotated text comparisons, or capture portable
+  folder reviews with file contents, comparison settings, bookmarks and comments.
 - Use OxideMerge with Git, from the command line, or from your system's file manager.
 
 The interface includes light and dark themes and 10 built-in languages: English, Traditional
@@ -278,7 +280,8 @@ use Command where Windows and Linux use Ctrl; the interface displays the platfor
   not supported; pages that require a login may show the login page instead.
 - Text editing is line-based and is intended for reviewing and merging changes.
 - WinMerge project files and filter files are supported, but WinMerge plugin DLLs and scripts
-  are not. Unpacker plugins use external commands.
+  are not. Unpacker plugins use external commands consistently in file, full-content folder, CLI
+  and report comparisons; PDF and Office presets require separately installed conversion tools.
 - Machine-assisted translations have not been reviewed by native speakers.
 
 ## Development
@@ -405,7 +408,7 @@ Windows and Linux Arm64 packages are built and tested on native Arm runners.
 
 ### Release requirements
 
-A tag such as `v0.9.5` triggers package publication on GitHub Releases. The tag must match the
+A tag such as `v0.9.6` triggers package publication on GitHub Releases. The tag must match the
 version in `Cargo.toml`, and `CHANGELOG.md` must contain a section for that version. Tags with
 `-`, such as `v1.0.0-rc1`, are published as pre-releases.
 
@@ -413,35 +416,35 @@ Release notes come from the matching changelog section, followed by download ins
 The workflow reads the changelog without changing it. Before publishing, it checks that all
 expected packages, and nothing else, exist and that the release has not already been published.
 Each release includes PDF guides and the source commit used for the build, and GitHub lists the
-SHA-256 digest of every file. A release holds exactly these files (for version 0.9.5):
+SHA-256 digest of every file. A release holds exactly these files (for version 0.9.6):
 
 ```text
-oxidemerge-0.9.5-linux-arm64.AppImage
-oxidemerge-0.9.5-linux-arm64.tar.gz
-oxidemerge-0.9.5-linux-x64.AppImage
-oxidemerge-0.9.5-linux-x64.tar.gz
-oxidemerge-0.9.5-macos-universal.dmg
-oxidemerge-0.9.5-user-guide.pdf
-oxidemerge-0.9.5-user-guide.zh-TW.pdf
-oxidemerge-0.9.5-windows-arm64.zip
-oxidemerge-0.9.5-windows-x64.zip
+oxidemerge-0.9.6-linux-arm64.AppImage
+oxidemerge-0.9.6-linux-arm64.tar.gz
+oxidemerge-0.9.6-linux-x64.AppImage
+oxidemerge-0.9.6-linux-x64.tar.gz
+oxidemerge-0.9.6-macos-universal.dmg
+oxidemerge-0.9.6-user-guide.pdf
+oxidemerge-0.9.6-user-guide.zh-TW.pdf
+oxidemerge-0.9.6-windows-arm64.zip
+oxidemerge-0.9.6-windows-x64.zip
 ```
 
 ### Release procedure
 
-The following example uses `0.9.5`; replace it with the version you intend to release.
+The following example uses `0.9.6`; replace it with the version you intend to release.
 
 1. Update `version` in `Cargo.toml` and run `cargo build` to update `Cargo.lock`.
 2. Review the matching section in `CHANGELOG.md`. Replace `Unreleased` in its heading with the
    release date, using `YYYY-MM-DD`.
 3. Run `make fmt-check ci`. Preview the release notes with
-   `scripts/release-notes.sh 0.9.5`.
+   `scripts/release-notes.sh 0.9.6`.
 4. Commit and push to `main`. Wait for the required CI checks to pass on every platform.
 5. Tag the verified commit and push the tag:
 
    ```sh
-   git tag -a v0.9.5 -m "OxideMerge 0.9.5"
-   git push origin v0.9.5
+   git tag -a v0.9.6 -m "OxideMerge 0.9.6"
+   git push origin v0.9.6
    ```
 
 6. Add an `Unreleased` section for the next version to `CHANGELOG.md` and record subsequent

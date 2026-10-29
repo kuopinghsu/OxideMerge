@@ -755,3 +755,53 @@ fn format_regression_cli_patches_apply_with_git() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn converters_agree_for_files_folder_reports_and_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    files(
+        d,
+        &[
+            ("left/a.docx", "\0metadata-one\nvisible text\n"),
+            ("right/a.docx", "\0metadata-two\nvisible text\n"),
+        ],
+    );
+    std::fs::create_dir_all(d.join(".config")).unwrap();
+    let config = |command: &str| {
+        serde_json::json!({"unpackers":[{"enabled":true,"pattern":"*.docx","command":command}]})
+            .to_string()
+    };
+    std::fs::write(d.join(".config/config.json"), config("tail -n +2 ${file}")).unwrap();
+    let file = oxidemerge(d, &["--cli", "left/a.docx", "right/a.docx"]);
+    assert_eq!(file.code, 0, "{}", file.stderr);
+    let folder = oxidemerge(d, &["--cli", "-r", "left", "right"]);
+    assert_eq!(folder.code, 0, "{}", folder.stderr);
+    std::fs::write(d.join("right/a.docx"), "\0metadata-three\nchanged text\n").unwrap();
+    let report = oxidemerge(
+        d,
+        &[
+            "-r",
+            "left",
+            "right",
+            "--report",
+            "review.html",
+            "--report-diffs",
+        ],
+    );
+    assert_eq!(report.code, 1, "{}", report.stderr);
+    let html = read(d.join("review.html"));
+    assert!(html.contains("visible") && html.contains("changed"));
+    assert!(!html.contains("metadata-three"));
+    std::fs::write(
+        d.join(".config/config.json"),
+        config("printf partial; exit 9 # ${file}"),
+    )
+    .unwrap();
+    assert_eq!(
+        oxidemerge(d, &["--cli", "left/a.docx", "right/a.docx"]).code,
+        2
+    );
+    assert_eq!(oxidemerge(d, &["--cli", "-r", "left", "right"]).code, 2);
+}
