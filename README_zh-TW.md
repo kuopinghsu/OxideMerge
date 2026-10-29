@@ -349,19 +349,19 @@ Linux 沒有可用顯示環境時，會啟動 Xvfb。設定 `OXIDEMERGE_SMOKE_RE
 ### 持續整合
 
 推送至 `main` 或提出 Pull Request 時，會執行 [CI 工作流程](.github/workflows/ci.yml)。
-一般執行會在 Windows x64、Linux x64 與 macOS Apple 晶片上執行 Clippy 檢查、完整測試、建置發行版本，
+Pull Request 會在 Windows x64、Linux x64 與 macOS Apple 晶片上執行 Clippy 檢查、完整測試、建置發行版本，
 並驗證指令列與視窗行為。Windows 與 Linux 的視窗檢查使用 Mesa 軟體渲染，Linux 另使用 Xvfb。
 失敗的測試輸出會保留為 `test-output-*` 成品。獨立的 `cargo deny` 工作會檢查相依套件，
 詳見[安全性說明](SECURITY.md)。
 
-發行標籤會自動啟用完整套件流程，包括 Windows/Linux Arm64 原生測試與 Intel macOS 建置。
-若只想驗證套件而不發布版本，請手動執行工作流程並勾選 **packages**。
-一般推送與 Pull Request 會略過 AppImage、PDF 與套件製作，避免緩慢的套件鏡像站拖延程式碼檢查；
-三個預設平台仍會執行完整測試。
+每次推送至 `main` 或推送發行標籤，都會驗證完整套件，包括 Windows/Linux Arm64 原生測試、
+Intel macOS 建置、AppImage 與 PDF 指南。推送至 `main` 只產生經驗證的建置成品，不發布版本；
+只有推送發行標籤才會發布 GitHub Release。Pull Request 會略過套件製作，三個預設平台仍執行完整測試。
+手動執行時也可勾選 **packages**，驗證完整套件。
 
 手動執行時也可啟用額外的隨機測試與效能測試，版本發布不依賴這些選用測試的結果。
 
-發行標籤與手動套件流程會產生並驗證以下發布檔案：
+推送至 `main`、發行標籤與手動套件流程會產生並驗證以下發布檔案：
 
 - **Windows x64 與 Arm64：** 只包含 `oxidemerge.exe` 的 ZIP 套件，並檢查執行檔的處理器架構與能否執行。
 - **Linux x64 與 Arm64：** 在 Ubuntu 22.04 建置的 TAR.GZ 套件，會實際執行其中的程式，並確認不變更應用程式設定。
