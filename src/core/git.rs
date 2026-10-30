@@ -198,6 +198,26 @@ pub fn recent_commits(path: &Path, n: usize) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Resolve a user revision once; callers retain this immutable commit in baseline reports.
+pub fn resolve_commit(path: &Path, revision: &str) -> Result<String> {
+    let revision = check_rev(revision)?;
+    let (root, _) = locate(path)?;
+    let bytes = git(
+        &root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{revision}^{{commit}}"),
+        ],
+    )?;
+    let id = String::from_utf8(bytes)?.trim().to_owned();
+    if ![40, 64].contains(&id.len()) || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
+        bail!("Invalid resolved Git commit");
+    }
+    Ok(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

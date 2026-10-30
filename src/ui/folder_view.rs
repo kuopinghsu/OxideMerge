@@ -24,6 +24,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 pub enum FolderAction {
+    OpenCaptured {
+        docs: Vec<crate::core::text::TextDoc>,
+    },
     OpenFiles {
         paths: Vec<PathBuf>,
         missing: Vec<bool>,
@@ -114,6 +117,14 @@ struct Running {
 }
 
 pub struct FolderView {
+    pub workspace: crate::core::review_state::Workspace,
+    pub baseline_panel: Box<super::baseline_panel::BaselinePanel>,
+    review_filter: Option<crate::core::review_state::State>,
+    review_stale_only: bool,
+    review_fingerprints: Option<super::analysis::Task<BTreeMap<String, String>>>,
+    review_checked: bool,
+    review_resume: Option<String>,
+
     pub roots: Vec<PathBuf>,
     pub notes: BTreeMap<String, String>,
     note_edit: Option<(String, String)>,
@@ -392,6 +403,14 @@ impl FolderView {
             .map(|r| temps.iter().any(|t| r.starts_with(t.path())))
             .collect();
         let mut v = FolderView {
+            workspace: Default::default(),
+            baseline_panel: Default::default(),
+            review_filter: None,
+            review_stale_only: false,
+            review_fingerprints: None,
+            review_checked: false,
+            review_resume: None,
+
             roots,
             notes: BTreeMap::new(),
             note_edit: None,
@@ -463,12 +482,40 @@ impl FolderView {
         );
         view.filter_spec = manifest.filter;
         view.notes = manifest.notes;
+        view.review_resume = manifest.workspace.current.clone();
+        view.workspace = manifest.workspace;
+        view.peek = false;
         view.read_only = vec![true; view.n()];
         view
     }
 
+    pub fn accept_review_update(
+        &mut self,
+        path: String,
+        mut decision: crate::core::review_state::Decision,
+    ) {
+        match crate::core::review_state::fingerprint(&path, &self.roots, &self.dopts) {
+            Ok(f) => {
+                if decision.fingerprint.is_empty() {
+                    decision.fingerprint = f;
+                } else if decision.fingerprint != f {
+                    decision.stale = true;
+                }
+            }
+            Err(_) => decision.stale = true,
+        }
+        self.workspace.current = Some(path.clone());
+        self.workspace.entries.insert(path, decision);
+        self.view_key = None;
+    }
+
     pub fn save_review(&self, path: &Path, selected_only: bool) -> anyhow::Result<()> {
-        if self.running.is_some() || self.file_job.is_some() || self.stopped || self.failed {
+        if self.running.is_some()
+            || self.file_job.is_some()
+            || self.review_fingerprints.is_some()
+            || self.stopped
+            || self.failed
+        {
             anyhow::bail!(tr("review.finish_first"));
         }
         let selected_paths: Vec<String> = self
@@ -492,7 +539,7 @@ impl FolderView {
                     .any(|p| path == *p || path.starts_with(&format!("{p}/")))
             })
             .collect();
-        crate::core::review::save(
+        crate::core::review::save_with_workspace(
             path,
             crate::core::review::Capture {
                 roots: &self.roots,
@@ -503,6 +550,7 @@ impl FolderView {
                 filter: &self.filter_spec,
                 notes: &self.notes,
             },
+            &self.workspace,
         )
     }
 
@@ -537,7 +585,21 @@ impl FolderView {
     }
 
     fn report_notes(&self, content: String, format: ReportFormat) -> String {
-        crate::core::review::annotate_report(content, format, &self.notes)
+        let content = crate::core::review::annotate_report(content, format, &self.notes);
+        if self.workspace.entries.is_empty() {
+            content
+        } else {
+            crate::core::review_state::annotate_report(
+                content,
+                format,
+                &self.workspace.summary(
+                    self.items
+                        .iter()
+                        .filter(|i| !i.is_dir)
+                        .map(|i| i.rel_path()),
+                ),
+            )
+        }
     }
 
     pub fn set_recursive(&mut self, recursive: bool) {
@@ -593,6 +655,8 @@ impl FolderView {
     }
 
     pub fn start_compare(&mut self) {
+        self.review_checked = false;
+        self.review_fingerprints = None;
         if let Some(r) = &self.running {
             r.progress.abort.store(true, Ordering::Relaxed);
         }
@@ -821,6 +885,29 @@ impl FolderView {
 
     fn rebuild_visible(&mut self, cfg: &Config) {
         self.visible = self.display_order(cfg, false);
+        if self.review_filter.is_some() || self.review_stale_only {
+            self.visible = self
+                .flat_list(cfg)
+                .into_iter()
+                .filter(|&i| {
+                    let decision = self
+                        .workspace
+                        .entries
+                        .get(&self.items[i].rel_path())
+                        .cloned()
+                        .unwrap_or_default();
+                    !self.items[i].is_dir
+                        && self.review_filter.is_none_or(|s| {
+                            if decision.stale {
+                                s == crate::core::review_state::State::NeedsAction
+                            } else {
+                                decision.state == s
+                            }
+                        })
+                        && (!self.review_stale_only || decision.stale)
+                })
+                .collect();
+        }
     }
 
     /// Listed items in display order; with `expand_all`, as if every folder were expanded.
@@ -1662,15 +1749,27 @@ impl FolderView {
         let (roots, dopts) = (self.roots.clone(), self.dopts.clone());
         let rules = self.used_rules().to_string();
         let notes = self.notes.clone();
+        let review_summary = (!self.workspace.entries.is_empty()).then(|| {
+            self.workspace
+                .summary(items.iter().filter(|i| !i.is_dir).map(|i| i.rel_path()))
+        });
         let temps = self.temps.clone();
         move || {
             let _keep_alive = temps;
             let refs: Vec<&DirItem> = items.iter().collect();
-            crate::core::review::annotate_report(
+            let content = crate::core::review::annotate_report(
                 report::folder_html_with_diffs(&refs, &roots, &display, &dopts, &rules),
                 ReportFormat::Html,
                 &notes,
-            )
+            );
+            match review_summary {
+                Some(summary) => crate::core::review_state::annotate_report(
+                    content,
+                    ReportFormat::Html,
+                    &summary,
+                ),
+                None => content,
+            }
         }
     }
 
@@ -1686,15 +1785,27 @@ impl FolderView {
         let (roots, dopts) = (self.roots.clone(), self.dopts.clone());
         let rules = self.used_rules().to_string();
         let notes = self.notes.clone();
+        let review_summary = (!self.workspace.entries.is_empty()).then(|| {
+            self.workspace
+                .summary(items.iter().filter(|i| !i.is_dir).map(|i| i.rel_path()))
+        });
         let temps = self.temps.clone();
         move || {
             let _keep_alive = temps;
             let refs: Vec<&DirItem> = items.iter().collect();
-            crate::core::review::annotate_report(
+            let content = crate::core::review::annotate_report(
                 report::folder_slideshow(&refs, &roots, &display, &dopts, &rules),
                 ReportFormat::Html,
                 &notes,
-            )
+            );
+            match review_summary {
+                Some(summary) => crate::core::review_state::annotate_report(
+                    content,
+                    ReportFormat::Html,
+                    &summary,
+                ),
+                None => content,
+            }
         }
     }
 
@@ -2190,6 +2301,239 @@ impl FolderView {
         action
     }
 
+    fn review_ui(&mut self, ui: &mut Ui, cfg: &Config) {
+        use crate::core::{
+            analysis,
+            review_state::{Decision, State},
+        };
+        if self.running.is_none() {
+            if let Some(path) = self.review_resume.take() {
+                if let Some(i) = self.items.iter().position(|item| item.rel_path() == path) {
+                    self.rebuild_visible(cfg);
+                    if let Some(v) = self.visible.iter().position(|&x| x == i) {
+                        self.cursor = Some(v);
+                        self.selected.clear();
+                        self.selected.insert(i);
+                        self.scroll_to = Some(v);
+                    }
+                }
+            }
+        }
+        if self.running.is_none()
+            && !self.review_checked
+            && !self.workspace.entries.is_empty()
+            && self.review_fingerprints.is_none()
+        {
+            let paths: Vec<_> = self
+                .items
+                .iter()
+                .filter(|i| !i.is_dir)
+                .map(|i| i.rel_path())
+                .collect();
+            let roots = self.roots.clone();
+            let opts = self.dopts.clone();
+            self.review_fingerprints =
+                Some(super::analysis::Task::start(move |cancel, progress| {
+                    let mut fingerprints = BTreeMap::new();
+                    for path in paths {
+                        analysis::check_cancel(cancel)?;
+                        if let Ok(f) = crate::core::review_state::fingerprint(&path, &roots, &opts)
+                        {
+                            fingerprints.insert(path, f);
+                        }
+                        progress.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(fingerprints)
+                }));
+        }
+        if let Some(task) = &mut self.review_fingerprints {
+            if let Some(result) = task.poll() {
+                match result {
+                    Ok(f) => self.workspace.reconcile(&f),
+                    Err(e) => {
+                        for d in self.workspace.entries.values_mut() {
+                            d.stale = true;
+                        }
+                        self.status = e.to_string();
+                    }
+                };
+                self.review_fingerprints = None;
+                self.review_checked = true;
+                self.view_key = None;
+            }
+        }
+        egui::CollapsingHeader::new(tr("workspace.title"))
+            .id_salt(self.id.with("review_workspace"))
+            .show(ui, |ui| {
+                if let Some(task) = &self.review_fingerprints {
+                    task.status(ui);
+                }
+                let summary = self.workspace.summary(
+                    self.items
+                        .iter()
+                        .filter(|i| !i.is_dir)
+                        .map(|i| i.rel_path()),
+                );
+                ui.label(format!(
+                    "{}: {} · {}: {} · {}: {} · {}: {}",
+                    tr("workspace.unreviewed"),
+                    summary.unreviewed,
+                    tr("workspace.accepted"),
+                    summary.accepted + summary.resolved,
+                    tr("workspace.needs_action"),
+                    summary.needs_action,
+                    tr("workspace.stale"),
+                    summary.stale
+                ));
+                ui.horizontal_wrapped(|ui| {
+                    let mut changed = ui
+                        .selectable_value(&mut self.review_filter, None, tr("analysis.all"))
+                        .changed();
+                    for state in State::ALL {
+                        changed |= ui
+                            .selectable_value(&mut self.review_filter, Some(state), tr(state.key()))
+                            .changed();
+                    }
+                    changed |= ui
+                        .checkbox(&mut self.review_stale_only, tr("workspace.stale"))
+                        .changed();
+                    if changed {
+                        self.view_key = None;
+                    }
+                    if ui.button(tr("workspace.next")).clicked() {
+                        let current = self.workspace.current.as_deref();
+                        let mut candidates: Vec<_> = self
+                            .items
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, i)| !i.is_dir)
+                            .filter(|(_, i)| {
+                                self.workspace
+                                    .entries
+                                    .get(&i.rel_path())
+                                    .is_none_or(|d| d.state == State::Unreviewed || d.stale)
+                            })
+                            .map(|(i, item)| (item.rel_path(), i))
+                            .collect();
+                        candidates.sort();
+                        if let Some((path, i)) = candidates
+                            .iter()
+                            .find(|(p, _)| current.is_none_or(|c| p.as_str() > c))
+                            .or(candidates.first())
+                            .cloned()
+                        {
+                            self.review_filter = None;
+                            self.review_stale_only = false;
+                            self.view_key = None;
+                            self.workspace.current = Some(path);
+                            self.rebuild_visible(cfg);
+                            if let Some(v) = self.visible.iter().position(|&x| x == i) {
+                                self.cursor = Some(v);
+                                self.selected.clear();
+                                self.selected.insert(i);
+                                self.scroll_to = Some(v);
+                            }
+                        }
+                    }
+                    if ui.button(tr("workspace.export")).clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_file_name("review-summary.json")
+                            .save_file()
+                        {
+                            if let Err(e) = analysis::report(&summary, &path, &self.roots) {
+                                self.status = e.to_string();
+                            }
+                        }
+                    }
+                    if ui.button(tr("workspace.update_inputs")).clicked() {
+                        let mut roots = Vec::new();
+                        for _ in 0..self.n() {
+                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                roots.push(path);
+                            } else {
+                                break;
+                            }
+                        }
+                        if roots.len() == self.n() {
+                            self.display_roots =
+                                roots.iter().map(|p| p.display().to_string()).collect();
+                            self.roots = roots;
+                            self.read_only = vec![true; self.n()];
+                            self.start_compare();
+                        }
+                    }
+                });
+                let selected = self
+                    .cursor
+                    .and_then(|v| self.visible.get(v))
+                    .copied()
+                    .or_else(|| self.selected.iter().next().copied());
+                if let Some(i) = selected.filter(|&i| !self.items[i].is_dir) {
+                    let path = self.items[i].rel_path();
+                    self.workspace.current = Some(path.clone());
+                    ui.label(&path);
+                    let mut decision = self
+                        .workspace
+                        .entries
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut changed = false;
+                    ui.horizontal(|ui| {
+                        for state in State::ALL {
+                            if ui
+                                .selectable_label(decision.state == state, tr(state.key()))
+                                .clicked()
+                            {
+                                match crate::core::review_state::fingerprint(
+                                    &path,
+                                    &self.roots,
+                                    &self.dopts,
+                                ) {
+                                    Ok(fingerprint) => {
+                                        decision.id = analysis::identity(&(&path, &fingerprint));
+                                        decision.fingerprint = fingerprint;
+                                        decision.state = state;
+                                        decision.stale = false;
+                                        changed = true;
+                                    }
+                                    Err(e) => self.status = e.to_string(),
+                                }
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(tr("workspace.reviewer"));
+                        changed |= ui
+                            .add(egui::TextEdit::singleline(&mut decision.reviewer).char_limit(64))
+                            .changed();
+                    });
+                    changed |= ui
+                        .add(
+                            egui::TextEdit::multiline(&mut decision.comment)
+                                .hint_text(tr("workspace.comment"))
+                                .char_limit(4096)
+                                .desired_rows(2),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut decision.rationale)
+                                .hint_text(tr("workspace.rationale"))
+                                .char_limit(4096),
+                        )
+                        .changed();
+                    if decision.stale {
+                        ui.colored_label(ui.visuals().warn_fg_color, tr("workspace.stale"));
+                    }
+                    if changed {
+                        self.workspace.entries.insert(path, Decision { ..decision });
+                        self.view_key = None;
+                    }
+                }
+            });
+    }
+
     pub fn ui(
         &mut self,
         ui: &mut Ui,
@@ -2200,6 +2544,11 @@ impl FolderView {
         self.note_window(ui);
         let was_running = self.running.is_some();
         self.poll();
+        self.review_ui(ui, cfg);
+        let captured_action = self
+            .baseline_panel
+            .ui(ui, &self.roots, &self.dopts, &self.filter_spec)
+            .map(|docs| FolderAction::OpenCaptured { docs });
         if was_running {
             // Also repaints once after finishing, as the status bar was drawn before this poll.
             ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -2221,7 +2570,9 @@ impl FolderView {
             self.view_cost += t.elapsed();
         }
         if self.running.is_none() && self.visible.is_empty() {
-            return header_action.or_else(|| self.empty_state(ui, cfg, named));
+            return captured_action
+                .or(header_action)
+                .or_else(|| self.empty_state(ui, cfg, named));
         }
         if cfg.folder_file_pane {
             self.dock_ui(ui, cfg, c);
@@ -2229,7 +2580,8 @@ impl FolderView {
             self.dock = None;
         }
 
-        let mut result: Option<FolderAction> = header_action
+        let mut result: Option<FolderAction> = captured_action
+            .or(header_action)
             .or_else(|| self.rule_request.take().map(FolderAction::AddRule))
             .or_else(|| {
                 self.file_report

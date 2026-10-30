@@ -29,3 +29,10 @@ pub mod unpacker;
 pub mod web;
 pub mod web_render;
 pub mod xml_report;
+
+pub mod analysis;
+pub mod baseline;
+pub mod impact;
+pub mod merge_validation;
+pub mod review_state;
+pub mod semantic;

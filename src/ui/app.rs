@@ -2496,6 +2496,7 @@ impl OxideMergeApp {
             self.prompt = Some(Prompt::CloseTab(self.tabs[i].id));
             return;
         }
+        self.take_review_updates();
         self.refresh_saved_folders();
         self.tabs.remove(i);
         self.shown_active = None;
@@ -3438,6 +3439,26 @@ impl OxideMergeApp {
 
     /// Shows the errors of tabs of all differences, and after they saved files, compares their
     /// folder compares again and has text compares notice the files that changed.
+    fn take_review_updates(&mut self) {
+        let mut updates = Vec::new();
+        for tab in &mut self.tabs {
+            if let (Some(origin), Content::Text(view)) = (&tab.origin, tab.content.view_mut()) {
+                if std::mem::take(&mut view.review_dirty) {
+                    if let Some(review) = &view.review_decision {
+                        updates.push((origin.clone(), (**review).clone()));
+                    }
+                }
+            }
+        }
+        for (origin, review) in updates {
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == origin.folder) {
+                if let Content::Folder(view) = &mut tab.content {
+                    view.accept_review_update(origin.rel, review);
+                }
+            }
+        }
+    }
+
     fn refresh_saved_folders(&mut self) {
         let mut folders = Vec::new();
         let mut errors = Vec::new();
@@ -4769,6 +4790,24 @@ impl OxideMergeApp {
                         }
                     });
                     ui.add_space(8.0);
+                    if ui.button(tr("baseline.compare")).clicked() {
+                        if let Some(paths) = rfd::FileDialog::new()
+                            .pick_folders()
+                            .filter(|p| p.len() == 2)
+                        {
+                            self.open(OpenRequest {
+                                paths,
+                                ..Default::default()
+                            });
+                            if let Some(Tab {
+                                content: Content::Folder(view),
+                                ..
+                            }) = self.tabs.get_mut(self.active)
+                            {
+                                view.baseline_panel.open = true;
+                            }
+                        }
+                    }
 
                     let (rect, _) = ui.allocate_exact_size(vec2(w, 64.0), Sense::hover());
                     dashed_rect(ui, rect, p.border_strong);
@@ -6142,6 +6181,10 @@ impl eframe::App for OxideMergeApp {
         self.refresh_saved_folders();
         if let Some(a) = folder_action {
             match a {
+                FolderAction::OpenCaptured { docs } => {
+                    let view = TextView::new(docs, &self.cfg);
+                    self.push_tab(Content::Text(view), Vec::new());
+                }
                 FolderAction::OpenFiles {
                     paths,
                     missing,
@@ -6170,7 +6213,19 @@ impl eframe::App for OxideMergeApp {
                         ..Default::default()
                     });
                     if let (Some(folder), true) = (folder, self.tabs.len() > count) {
+                        let review = self
+                            .tabs
+                            .iter()
+                            .find(|t| t.id == folder)
+                            .and_then(|t| match &t.content {
+                                Content::Folder(v) => v.workspace.entries.get(&rel).cloned(),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
                         if let Some(t) = self.tabs.last_mut() {
+                            if let Content::Text(view) = t.content.view_mut() {
+                                view.review_decision = Some(Box::new(review));
+                            }
                             t.origin = Some(Origin { folder, rel });
                             t.temps = temps.unwrap_or_default();
                         }

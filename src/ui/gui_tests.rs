@@ -1312,3 +1312,157 @@ fn clicking_multiline_cell_selects_and_merges_a_later_line_difference() {
     gui.settle();
     assert_eq!(gui.text_view().panes[1].doc.text(), left);
 }
+
+#[test]
+fn meld_link_arrows_and_compact_pane_clicks_target_the_correct_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let left = "start\ncommon\nend\nleft value\n";
+    let right = "start\ninserted\nextra\ncommon\nend\nright value\n";
+    write(dir.path(), &[("left.txt", left), ("right.txt", right)]);
+    let mut gui = Gui::start(
+        "meld_link_map",
+        compare(&[dir.path().join("left.txt"), dir.path().join("right.txt")]),
+    );
+    // The last button belongs to the later block, below the unequal-length insertion.
+    gui.click(tr("cmd.copy_right"));
+    assert_eq!(
+        gui.text_view().panes[1].doc.text(),
+        right.replace("right value", "left value")
+    );
+    gui.key(CMD, Key::Z);
+    assert_eq!(gui.text_view().panes[1].doc.text(), right);
+
+    let header = gui
+        .widgets
+        .iter()
+        .find(|w| w.label.starts_with("left.txt   "))
+        .unwrap()
+        .rect;
+    let row_h = gui
+        .ctx
+        .fonts(|f| f.row_height(&egui::FontId::monospace(config().font_size)))
+        + 2.0;
+    // Left line 4 is directly below line 3, with no two-row insertion spacer.
+    gui.click_at(Pos2::new(
+        header.left() + 100.0,
+        header.center().y + 18.0 + 3.5 * row_h,
+    ));
+    let v = gui.text_view();
+    let r = v.cursor_row.expect("clicked a real line");
+    assert_eq!(v.active_pane, 0);
+    assert_eq!(v.diff.rows[r].line[0], Some(3));
+    assert!(
+        v.cur_block.is_some(),
+        "row: {:?}, blocks: {:?}",
+        v.diff.rows[r],
+        v.diff.blocks
+    );
+    gui.app.run(Cmd::CopyRight, &gui.ctx);
+    gui.settle();
+    assert_eq!(
+        gui.text_view().panes[1].doc.text(),
+        right.replace("right value", "left value")
+    );
+}
+
+#[test]
+fn compact_pane_keyboard_skips_the_other_sides_insertions() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[
+            ("left.txt", "start\ncommon\nend\n"),
+            ("right.txt", "start\ninserted\nextra\ncommon\nend\n"),
+        ],
+    );
+    let mut gui = Gui::start(
+        "meld_keyboard",
+        compare(&[dir.path().join("left.txt"), dir.path().join("right.txt")]),
+    );
+    gui.key(CMD, Key::Home);
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    let v = gui.text_view();
+    assert_eq!(v.diff.rows[v.cursor_row.unwrap()].line[0], Some(1));
+    gui.key(Modifiers::NONE, Key::F2);
+    gui.key(CMD, Key::A);
+    gui.type_text("edited common");
+    gui.key(Modifiers::NONE, Key::Enter);
+    assert_eq!(gui.text_view().panes[0].doc.lines[1], "edited common");
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    let v = gui.text_view();
+    assert_eq!(v.diff.rows[v.cursor_row.unwrap()].line[0], Some(2));
+}
+
+#[test]
+fn semantic_view_is_read_only_and_can_jump_back_to_source() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[
+            ("a.json", "{\n  \"timeout\": 30\n}\n"),
+            ("b.json", "{\n  \"timeout\": 60\n}\n"),
+        ],
+    );
+    let mut gui = Gui::start(
+        "semantic_view",
+        compare(&[dir.path().join("a.json"), dir.path().join("b.json")]),
+    );
+    gui.click(tr("analysis.semantic"));
+    let start = Instant::now();
+    while !gui.shows_text("timeout") || !gui.shows_text("30 → 60") {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "semantic worker did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        gui.frame();
+    }
+    assert!(gui.shows(tr("analysis.semantic_read_only")));
+    gui.click(&format!("{} 2:2", tr("analysis.source")));
+    assert_eq!(gui.text_view().active_pane, 1);
+    assert_eq!(gui.text_view().panes[1].doc.lines[1], "  \"timeout\": 60");
+    assert_eq!(
+        read(&dir.path().join("b.json")),
+        "{\n  \"timeout\": 60\n}\n"
+    );
+}
+
+#[test]
+fn merge_verification_preview_never_edits_the_middle_pane() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[
+            ("left.txt", "a\nLEFT\nc\nd\n"),
+            ("base.txt", "a\nb\nc\nd\n"),
+            ("right.txt", "a\nb\nc\nRIGHT\n"),
+        ],
+    );
+    let mut gui = Gui::start(
+        "merge_verification",
+        compare(&[
+            dir.path().join("left.txt"),
+            dir.path().join("base.txt"),
+            dir.path().join("right.txt"),
+        ]),
+    );
+    gui.click(tr("analysis.merge_verification"));
+    gui.click(tr("analysis.preview_merge"));
+    let start = Instant::now();
+    while !gui.shows_text(tr("analysis.planned_changes")) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "merge preview did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        gui.frame();
+    }
+    assert!(gui.shows(tr("analysis.not_run")));
+    assert_eq!(gui.text_view().panes[1].doc.text(), "a\nb\nc\nd\n");
+    assert_eq!(read(&dir.path().join("base.txt")), "a\nb\nc\nd\n");
+    gui.click(tr("analysis.validate_result"));
+    assert!(
+        gui.shows(tr("analysis.failed")),
+        "unmerged base cannot validate as merged output"
+    );
+}

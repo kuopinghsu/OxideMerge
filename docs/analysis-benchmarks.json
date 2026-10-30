@@ -1,0 +1,196 @@
+{
+  "date": "2026-10-30",
+  "host": "macOS aarch64 / Apple M2 Max / 12 threads / 32 GB",
+  "base_commit": "c65dfe791a54de6cc9afeba517df169b3d59aa29",
+  "current": "main working tree, version 0.9.6",
+  "method": "Existing release benchmark fixtures; 3 independent child runs per workload, median time and maximum reported peak RSS. Focused diagnostic: 7 runs. Rounded values from native benchmark reports.",
+  "gate": "Fail above 1.5x baseline time for baseline workloads >= 50 ms.",
+  "full_run_passed": false,
+  "failed_workloads": [
+    "merge3-10mb"
+  ],
+  "workloads": [
+    {
+      "id": "text-10mb",
+      "before": {
+        "fixture": "2 text files of 10 MB, 1 line in 20 changed",
+        "median_seconds": 0.189,
+        "peak_rss_mb": 157.0,
+        "result": "14305 differences"
+      },
+      "after": {
+        "fixture": "2 text files of 10 MB, 1 line in 20 changed",
+        "median_seconds": 0.204,
+        "peak_rss_mb": 157.0,
+        "result": "14305 differences"
+      }
+    },
+    {
+      "id": "text-repeated",
+      "before": {
+        "fixture": "2 text files of 300,000 equal lines with 300 inserted",
+        "median_seconds": 0.033,
+        "peak_rss_mb": 52.0,
+        "result": "300 differences"
+      },
+      "after": {
+        "fixture": "2 text files of 300,000 equal lines with 300 inserted",
+        "median_seconds": 0.033,
+        "peak_rss_mb": 53.0,
+        "result": "300 differences"
+      }
+    },
+    {
+      "id": "text-100mb",
+      "before": {
+        "fixture": "2 text files of 100 MB, 1 line in 200 changed",
+        "median_seconds": 2.089,
+        "peak_rss_mb": 1492.0,
+        "result": "15086 differences"
+      },
+      "after": {
+        "fixture": "2 text files of 100 MB, 1 line in 200 changed",
+        "median_seconds": 2.887,
+        "peak_rss_mb": 1494.0,
+        "result": "15086 differences"
+      }
+    },
+    {
+      "id": "merge3-10mb",
+      "before": {
+        "fixture": "3 text files of 10 MB, compared and merged",
+        "median_seconds": 0.592,
+        "peak_rss_mb": 224.0,
+        "result": "14107 differences, conflicts left"
+      },
+      "after": {
+        "fixture": "3 text files of 10 MB, compared and merged",
+        "median_seconds": 1.071,
+        "peak_rss_mb": 226.0,
+        "result": "14107 differences, conflicts left"
+      }
+    },
+    {
+      "id": "binary-10mb",
+      "before": {
+        "fixture": "2 binary files of 10 MB, 100 bytes changed",
+        "median_seconds": 0.003,
+        "peak_rss_mb": 28.0,
+        "result": "100 ranges"
+      },
+      "after": {
+        "fixture": "2 binary files of 10 MB, 100 bytes changed",
+        "median_seconds": 0.005,
+        "peak_rss_mb": 28.0,
+        "result": "100 ranges"
+      }
+    },
+    {
+      "id": "binary-100mb",
+      "before": {
+        "fixture": "2 binary files of 100 MB, 100 bytes changed",
+        "median_seconds": 0.032,
+        "peak_rss_mb": 208.0,
+        "result": "100 ranges"
+      },
+      "after": {
+        "fixture": "2 binary files of 100 MB, 100 bytes changed",
+        "median_seconds": 0.044,
+        "peak_rss_mb": 208.0,
+        "result": "100 ranges"
+      }
+    },
+    {
+      "id": "binary-1gb",
+      "before": {
+        "fixture": "2 binary files of 1 GB, 100 bytes changed",
+        "median_seconds": 0.406,
+        "peak_rss_mb": 2056.0,
+        "result": "100 ranges"
+      },
+      "after": {
+        "fixture": "2 binary files of 1 GB, 100 bytes changed",
+        "median_seconds": 0.401,
+        "peak_rss_mb": 2056.0,
+        "result": "100 ranges"
+      }
+    },
+    {
+      "id": "image-4k",
+      "before": {
+        "fixture": "2 PNG images of 3840 x 2160, 1% of the pixels changed",
+        "median_seconds": 0.109,
+        "peak_rss_mb": 104.0,
+        "result": "82116 pixels differ"
+      },
+      "after": {
+        "fixture": "2 PNG images of 3840 x 2160, 1% of the pixels changed",
+        "median_seconds": 0.109,
+        "peak_rss_mb": 105.0,
+        "result": "82116 pixels differ"
+      }
+    },
+    {
+      "id": "folder-small-files",
+      "before": {
+        "fixture": "2 folders of 20,000 files of 1 KB, 8 levels deep, 1% changed",
+        "median_seconds": 0.563,
+        "peak_rss_mb": 32.0,
+        "result": "220 differ, 198 unique, 0 errors; first result after 2 ms"
+      },
+      "after": {
+        "fixture": "2 folders of 20,000 files of 1 KB, 8 levels deep, 1% changed",
+        "median_seconds": 0.59,
+        "peak_rss_mb": 34.0,
+        "result": "220 differ, 198 unique, 0 errors; first result after 2 ms"
+      }
+    },
+    {
+      "id": "folder-large-files",
+      "before": {
+        "fixture": "2 folders of 20 files of 8 MB, 2 changed at the end",
+        "median_seconds": 0.014,
+        "peak_rss_mb": 138.0,
+        "result": "2 differ, 0 unique, 0 errors; first result after 2 ms"
+      },
+      "after": {
+        "fixture": "2 folders of 20 files of 8 MB, 2 changed at the end",
+        "median_seconds": 0.015,
+        "peak_rss_mb": 139.0,
+        "result": "2 differ, 0 unique, 0 errors; first result after 2 ms"
+      }
+    },
+    {
+      "id": "folder-mixed",
+      "before": {
+        "fixture": "2 folders of 2,000 files of 100 bytes to 2 MB, 60 levels deep in places",
+        "median_seconds": 0.055,
+        "peak_rss_mb": 40.0,
+        "result": "80 differ, 0 unique, 0 errors; first result after 2 ms"
+      },
+      "after": {
+        "fixture": "2 folders of 2,000 files of 100 bytes to 2 MB, 60 levels deep in places",
+        "median_seconds": 0.059,
+        "peak_rss_mb": 38.0,
+        "result": "80 differ, 0 unique, 0 errors; first result after 2 ms"
+      }
+    }
+  ],
+  "focused_diagnostic": {
+    "runs": 7,
+    "passed": true,
+    "workloads": {
+      "merge3-10mb": {
+        "fixture": "3 text files of 10 MB, compared and merged",
+        "median_seconds": 0.623,
+        "peak_rss_mb": 226.0,
+        "result": "14107 differences, conflicts left"
+      }
+    }
+  },
+  "limitations": [
+    "Shared desktop host; timing varies with load/cache/thermal state.",
+    "The failed full-run result is retained; diagnostic success does not erase it.",
+    "Existing comparison-engine benchmarks do not measure semantic/impact analysis, new GUI panels or merge confirmation hashing."
+  ]
+}
