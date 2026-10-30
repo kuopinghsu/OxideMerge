@@ -6257,7 +6257,16 @@ mod tests {
         let mut actual = TextView::new(docs, &cfg);
         actual.sync_points = vec![[1, 0, 1]];
         let plan = actual.preview_merge(&cfg).unwrap();
-        assert_ne!(plan.expected_digest, unsynced.expected_digest);
+        // Conflicts retain the base, so different alignments can produce the same bytes.
+        // Check that the synchronization point changes the planned ranges instead.
+        assert_ne!(
+            plan.actions.iter().map(|a| &a.ranges).collect::<Vec<_>>(),
+            unsynced
+                .actions
+                .iter()
+                .map(|a| &a.ranges)
+                .collect::<Vec<_>>()
+        );
         actual.auto_merge();
         let output = &actual.panes[1].doc;
         assert_eq!(plan.preview.as_deref(), Some(output.text().as_str()));
