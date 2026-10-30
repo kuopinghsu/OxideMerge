@@ -8,7 +8,7 @@
 //! memory can be measured (with `/usr/bin/time` where there is one). Inputs are generated once
 //! into `target/bench-data`; results are printed and written to `target/bench/results.md`.
 //!
-//! - `OXIDEMERGE_BENCH_LARGE=1` adds 100 MB inputs, `=2` also a 1 GB binary compare.
+//! - `OXIDEMERGE_BENCH_LARGE=1` adds 100 MB inputs, `=2` also a 1 GB binary compare, `=3` a 1 GB text compare.
 //! - `OXIDEMERGE_BENCH_ONLY=text,folder` runs the workloads whose names contain one of these.
 //! - `OXIDEMERGE_BENCH_RUNS=<n>` sets the number of runs (the median time is reported).
 //! - `OXIDEMERGE_BENCH_SAVE=<file>` saves the results as a baseline (after the comparison
@@ -56,6 +56,13 @@ const WORKLOADS: &[Workload] = &[
         what: "2 text files of 100 MB, 1 line in 200 changed",
         level: 1,
         make: |d| text_pair(d, 100 * MB, 200),
+        run: |d| diff_files(d, &["a.txt", "b.txt"]),
+    },
+    Workload {
+        name: "text-1gb",
+        what: "2 text files of 1 GB, 1 line in 200 changed",
+        level: 3,
+        make: |d| text_pair(d, 1024 * MB, 200),
         run: |d| diff_files(d, &["a.txt", "b.txt"]),
     },
     Workload {
@@ -156,22 +163,26 @@ fn write(path: &Path, bytes: &[u8]) {
 /// Two files of about `size` bytes; one line in `every` is changed, inserted or deleted.
 fn text_pair(dir: &Path, size: usize, every: usize) {
     let mut rng = Rng(7);
-    let (mut a, mut b) = (String::with_capacity(size), String::with_capacity(size));
-    while a.len() < size {
+    use std::io::Write;
+    let mut a = std::io::BufWriter::new(std::fs::File::create(dir.join("a.txt")).unwrap());
+    let mut b = std::io::BufWriter::new(std::fs::File::create(dir.join("b.txt")).unwrap());
+    let mut written = 0;
+    while written < size {
         let line = source_line(&mut rng);
-        a.push_str(&line);
+        a.write_all(line.as_bytes()).unwrap();
+        written += line.len();
         match (rng.below(every), rng.below(3)) {
-            (0, 0) => b.push_str(&source_line(&mut rng)),
+            (0, 0) => b.write_all(source_line(&mut rng).as_bytes()).unwrap(),
             (0, 1) => {
-                b.push_str(&line);
-                b.push_str(&source_line(&mut rng));
+                b.write_all(line.as_bytes()).unwrap();
+                b.write_all(source_line(&mut rng).as_bytes()).unwrap();
             }
             (0, _) => {}
-            _ => b.push_str(&line),
+            _ => b.write_all(line.as_bytes()).unwrap(),
         }
     }
-    write(&dir.join("a.txt"), a.as_bytes());
-    write(&dir.join("b.txt"), b.as_bytes());
+    a.flush().unwrap();
+    b.flush().unwrap();
 }
 
 fn repeated_pair(dir: &Path) {
@@ -305,13 +316,59 @@ fn mixed_files(dir: &Path) {
 
 // ---------- measured work ----------
 
+/// Optional local profiling, kept off during ordinary benchmarks.
+pub fn profile(phase: &str, detail: impl FnOnce() -> String) {
+    let Ok(path) = std::env::var("OXIDEMERGE_BENCH_PROFILE") else {
+        return;
+    };
+    use std::io::Write;
+    let rss = Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .map(|v| String::from_utf8_lossy(&v.stdout).trim().to_string())
+        .unwrap_or_default();
+    if let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(log, "{phase}: rss_kib={rss}; {}", detail());
+    }
+}
+
 fn diff_files(dir: &Path, names: &[&str]) -> String {
     let docs: Vec<_> = names
         .iter()
         .map(|n| super::text::load_doc(&dir.join(n), None).unwrap())
         .collect();
+    profile("loaded", || {
+        format!(
+            "{} lines; {} line bytes; {} line capacity; {} vector bytes",
+            docs.iter().map(|d| d.lines.len()).sum::<usize>(),
+            docs.iter()
+                .flat_map(|d| &d.lines)
+                .map(String::len)
+                .sum::<usize>(),
+            docs.iter()
+                .flat_map(|d| &d.lines)
+                .map(String::capacity)
+                .sum::<usize>(),
+            docs.iter()
+                .map(|d| d.lines.capacity() * std::mem::size_of::<String>())
+                .sum::<usize>()
+        )
+    });
     let panes: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
     let r = diff::compute(&panes, &DiffOptions::default());
+    profile("aligned", || {
+        format!(
+            "rows={} capacity={} size={}",
+            r.rows.len(),
+            r.rows.capacity(),
+            std::mem::size_of::<diff::Row>()
+        )
+    });
     format!("{} differences", r.blocks.len())
 }
 

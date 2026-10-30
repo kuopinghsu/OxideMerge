@@ -175,7 +175,7 @@ impl PatchPlan {
     fn include_bom_boundary(&mut self) {
         let mut forced = vec![false; self.result.rows.len()];
         for (index, row) in self.result.rows.iter().enumerate() {
-            let (Some(a), Some(b)) = (row.line[0], row.line[1]) else {
+            let (Some(a), Some(b)) = (row.line(0), row.line(1)) else {
                 continue;
             };
             let old_prefix = a == 0 && self.old.physical.bom;
@@ -185,7 +185,7 @@ impl PatchPlan {
             }
             // A decoded context line moved across the physical BOM boundary. It must
             // be replaced, but ignored text changes on that line must remain ignored.
-            if row.block.is_none_or(|i| self.result.blocks[i].ignored) {
+            if row.block().is_none_or(|i| self.result.blocks[i].ignored) {
                 let old = &self.old.physical.lines[a];
                 let body = if old_prefix {
                     old.strip_prefix('\u{feff}').unwrap()
@@ -209,7 +209,8 @@ impl PatchPlan {
                 if force {
                     Some((None, false))
                 } else {
-                    row.block.map(|i| (Some(i), self.result.blocks[i].ignored))
+                    row.block()
+                        .map(|i| (Some(i), self.result.blocks[i].ignored))
                 }
             })
             .collect();
@@ -218,12 +219,12 @@ impl PatchPlan {
         let mut previous = None;
         for (index, (row, label)) in self.result.rows.iter_mut().zip(labels).enumerate() {
             let start = positions;
-            for (p, line) in row.line.iter().enumerate() {
+            for (p, line) in row.lines().iter().enumerate() {
                 if line.is_some() {
                     positions[p] += 1;
                 }
             }
-            row.block = label.map(|(_, ignored)| {
+            row.set_block(label.map(|(_, ignored)| {
                 if previous != Some(label) {
                     self.result.blocks.push(Block {
                         ranges: std::array::from_fn(|p| start[p]..positions[p]),
@@ -240,7 +241,7 @@ impl PatchPlan {
                     }
                 }
                 self.result.blocks.len() - 1
-            });
+            }));
             previous = Some(label);
         }
     }

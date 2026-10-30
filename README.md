@@ -534,3 +534,40 @@ and dependency checks.
 ## License
 
 OxideMerge is licensed under the [MIT License](LICENSE).
+
+## Optional review and analysis
+
+These actions are read-only and opt-in. In a three-way text or folder view, expand **Merge Verification**
+for an in-memory merge preview or to check the saved result's bytes. **Text / Semantic** compares
+JSON and XML paths without editing or reserializing the originals. JSON duplicate keys and XML
+DTDs/entities are rejected; YAML/TOML use the existing text view.
+
+Folder comparisons include a **Review workspace** for file/hunk decisions, comments, rationale,
+tags and next-unreviewed navigation. Save `.oxmreview` to resume elsewhere. Version 1 bundles
+still open; new version 2 bundles add bounded annotations and captured-content SHA-256 digests.
+Updating review inputs flags stale decisions; it never automatically accepts a changed hunk.
+
+**Compare baselines** / **Release summary** accepts folders, immutable Git revisions and sides of
+review snapshots. Exact unique-content moves are distinguished from added/deleted files. Optional
+**Potential impact** shows delimited path/config-key occurrences with concrete source evidence;
+all such references are heuristic, and do not establish runtime behavior or build/test success.
+Git sources honor trusted Git configuration, as existing revision comparisons do.
+
+```sh
+oxidemerge --merge-plan left.txt base.txt right.txt --report merge-plan.json
+oxidemerge --validate-merge merged.txt left.txt base.txt right.txt --report validation.json
+oxidemerge --semantic --format json old.json new.json --report semantic.html
+oxidemerge --review-summary review.oxmreview --report review-summary.json
+oxidemerge --baseline-left git:v1.0:/path/to/repo --baseline-right git:v1.1:/path/to/repo --release-report release.html
+oxidemerge --impact old-folder new-folder --report impact.json
+```
+
+Analysis reports use a separate versioned envelope (JSON, HTML or XML); old report formats are
+unchanged. Analysis never overwrites an input or exports a report inside a selected input folder.
+Exit codes remain 0/1/2 (equal-or-success / different-or-warning / error), with **3** reserved for a
+failed `--validate-merge`. Unreadable or unsupported baseline paths produce exit 2. Intentional filter exclusions are listed as outside scope.
+See the [analysis guide](docs/analysis-guide.md) for policies, bounds and limitations.
+
+Text comparisons offer **Compact rows** (default, no insertion/deletion padding) and **Aligned
+rows** (blank space keeps corresponding lines aligned). Change **Text layout** in Options → General
+or View → Text compare. Location panes appear on the right in text and binary comparisons.

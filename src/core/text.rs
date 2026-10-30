@@ -426,8 +426,99 @@ pub fn split_lines(s: &str) -> (Vec<String>, Option<Eol>, bool, bool) {
 }
 
 pub fn load_doc(path: &Path, forced: Option<TextEncoding>) -> Result<TextDoc> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    use std::io::{Read, Seek};
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let large = file.metadata()?.len() >= 16 * 1024 * 1024;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    if large && forced.is_none_or(|enc| enc == TextEncoding::Utf8) {
+        if let Some(doc) = read_utf8_lines(&mut reader, Some(path.to_path_buf()))
+            .with_context(|| format!("reading {}", path.display()))?
+        {
+            return Ok(doc);
+        }
+        // Invalid UTF-8 or another BOM must retain the existing detection/replacement rules.
+        reader.rewind()?;
+    }
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
     Ok(doc_from_bytes(Some(path.to_path_buf()), &bytes, forced))
+}
+
+/// Read valid UTF-8 incrementally without retaining a second whole-file byte buffer.
+/// None asks the caller to rewind and use the full encoding detector instead.
+fn read_utf8_lines(
+    reader: &mut impl std::io::BufRead,
+    path: Option<PathBuf>,
+) -> std::io::Result<Option<TextDoc>> {
+    let prefix = reader.fill_buf()?;
+    if prefix.starts_with(&[0xff, 0xfe]) || prefix.starts_with(&[0xfe, 0xff]) {
+        return Ok(None);
+    }
+    let bom = prefix.starts_with(&[0xef, 0xbb, 0xbf]);
+    if bom {
+        reader.consume(3);
+    }
+    let mut doc = TextDoc::empty(path);
+    doc.bom = bom;
+    let mut counts = EolCounts::default();
+    let mut pending = Vec::new();
+    let mut after_cr = false;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        // A CR at the preceding buffer boundary may be followed by LF.
+        if after_cr {
+            after_cr = false;
+            if chunk[0] == b'\n' {
+                *doc.original_eols.last_mut().unwrap() = Some(Eol::CrLf);
+                counts.cr -= 1;
+                counts.crlf += 1;
+                reader.consume(1);
+                continue;
+            }
+        }
+        let end = memchr::memchr2(b'\r', b'\n', chunk);
+        let len = end.unwrap_or(chunk.len());
+        pending.extend_from_slice(&chunk[..len]);
+        let consumed = if let Some(end) = end {
+            let Ok(line) = String::from_utf8(std::mem::take(&mut pending)) else {
+                return Ok(None);
+            };
+            let eol = if chunk[end] == b'\r' {
+                Eol::Cr
+            } else {
+                Eol::Lf
+            };
+            after_cr = eol == Eol::Cr;
+            counts.add(Some(eol));
+            doc.lines.push(line);
+            doc.original_eols.push(Some(eol));
+            end + 1
+        } else {
+            len
+        };
+        reader.consume(consumed);
+    }
+    if !pending.is_empty() {
+        let Ok(line) = String::from_utf8(pending) else {
+            return Ok(None);
+        };
+        doc.lines.push(line);
+        doc.original_eols.push(None);
+    }
+    doc.final_newline = doc.original_eols.last().is_none_or(Option::is_some);
+    doc.mixed_eol = counts.mixed();
+    if let Some(eol) = counts.dominant() {
+        doc.eol = eol;
+    }
+    if !doc.mixed_eol {
+        doc.original_eols = Vec::new();
+    }
+    Ok(Some(doc))
 }
 
 pub fn doc_from_bytes(
@@ -486,6 +577,53 @@ pub fn detect_kind(path: &Path) -> FileKind {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn buffered_utf8_matches_the_existing_decoder_at_buffer_boundaries() {
+        use std::io::{BufReader, Cursor};
+        for bytes in [
+            &b""[..],
+            &b"\n"[..],
+            &b"\r\n"[..],
+            &b"a\rb\rc"[..],
+            &b"a\r\nb\nc\rd\r\n"[..],
+            "繁體中文\r\nemoji 🦀\nend".as_bytes(),
+            "\u{feff}繁體\r\n中文\r\n".as_bytes(),
+        ] {
+            for capacity in [4, 7, 64] {
+                let mut reader = BufReader::with_capacity(capacity, Cursor::new(bytes));
+                let doc = super::read_utf8_lines(&mut reader, None).unwrap().unwrap();
+                let expected = super::doc_from_bytes(None, bytes, None);
+                assert_eq!(doc.lines, expected.lines);
+                assert_eq!(doc.encoding, expected.encoding);
+                assert_eq!(doc.bom, expected.bom);
+                assert_eq!(doc.eol, expected.eol);
+                assert_eq!(doc.mixed_eol, expected.mixed_eol);
+                assert_eq!(doc.final_newline, expected.final_newline);
+                assert_eq!(doc.original_eols, expected.original_eols);
+            }
+        }
+        for bytes in [&b"valid\ninvalid \xff"[..], &b"\xff\xfea\0"[..]] {
+            let mut reader = BufReader::new(Cursor::new(bytes));
+            assert!(super::read_utf8_lines(&mut reader, None).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn large_file_encoding_fallback_rewinds_after_late_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let mut bytes = b"plain ascii line\r\n".repeat(1_000_000);
+        bytes.extend_from_slice(b"legacy \xe9\r\n");
+        std::fs::write(&path, &bytes).unwrap();
+        for forced in [None, Some(super::TextEncoding::Utf8)] {
+            let actual = super::load_doc(&path, forced).unwrap();
+            let expected = super::doc_from_bytes(None, &bytes, forced);
+            assert_eq!(actual.lines, expected.lines);
+            assert_eq!(actual.encoding, expected.encoding);
+            assert_eq!(actual.final_newline, expected.final_newline);
+        }
+    }
+
     use super::*;
 
     #[test]

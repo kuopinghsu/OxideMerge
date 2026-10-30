@@ -9,6 +9,11 @@ use crate::{
     i18n::tr,
 };
 use std::collections::BTreeSet;
+pub enum CapturedComparison {
+    Text(Vec<TextDoc>),
+    Source { docs: Vec<TextDoc>, line: usize },
+    Bytes(Vec<(String, Vec<u8>)>),
+}
 pub struct ResultSet {
     pub left: Capture,
     pub right: Capture,
@@ -22,33 +27,80 @@ pub struct BaselinePanel {
     important: String,
     impact_enabled: bool,
     job: Option<Task<ResultSet>>,
-    result: Option<ResultSet>,
+    result: Option<std::sync::Arc<ResultSet>>,
+    export_job: Option<Task<()>>,
     error: String,
     dismissed: BTreeSet<String>,
     changes_only: bool,
+    policy_id: String,
+    index: std::sync::Arc<std::sync::Mutex<impact::Index>>,
+    initialized: bool,
+    scope: String,
+    id: Option<egui::Id>,
 }
 impl BaselinePanel {
+    pub fn invalidate(&mut self) {
+        self.job = None;
+        self.result = None;
+        self.error.clear();
+    }
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         roots: &[std::path::PathBuf],
         options: &crate::core::diff::DiffOptions,
         filter: &str,
-    ) -> Option<Vec<TextDoc>> {
+    ) -> Option<CapturedComparison> {
+        if !self.initialized {
+            for (i, root) in roots.iter().take(2).enumerate() {
+                self.specs[i] = format!("folder:{}", root.display());
+            }
+            self.scope = filter.into();
+            self.initialized = true;
+        }
+        let policy = analysis::identity(&(options, &self.scope, &options.unpackers));
+        if self.policy_id != policy {
+            self.invalidate();
+            self.policy_id = policy;
+        }
+        if let Some(task) = &mut self.export_job {
+            if let Some(result) = task.poll() {
+                if let Err(e) = result {
+                    self.error = e.to_string();
+                }
+                self.export_job = None;
+            }
+        }
+        if let Some(task) = &self.export_job {
+            task.status(ui);
+        }
         let mut open_files = None;
+        let id = *self
+            .id
+            .get_or_insert_with(|| egui::Id::new(("baseline", std::time::Instant::now())));
         let response = egui::CollapsingHeader::new(tr("baseline.title"))
+            .id_salt(id)
             .default_open(self.open)
             .show(ui, |ui| {
-                if self.specs[0].is_empty() {
-                    for (i, root) in roots.iter().take(2).enumerate() {
-                        self.specs[i] = format!("folder:{}", root.display());
-                    }
-                }
                 let mut changed = false;
+                ui.horizontal(|ui| { ui.label(tr("baseline.filter")); changed |= ui.add(egui::TextEdit::singleline(&mut self.scope).char_limit(1024)).changed(); });
                 ui.small(tr("baseline.syntax"));
-                for spec in &mut self.specs {
+                for (side, spec) in self.specs.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
-                        changed |= ui.text_edit_singleline(spec).changed();
+                        super::widgets::side_chip(ui, side, 2);
+                        let label = tr(if side == 0 {
+                            "baseline.left"
+                        } else {
+                            "baseline.right"
+                        });
+                        let response = ui.add(egui::TextEdit::singleline(spec).hint_text(label));
+                        changed |= response.changed();
+                        response.widget_info(|| {
+                            let mut info =
+                                egui::WidgetInfo::text_edit(true, spec.as_str(), spec.as_str());
+                            info.label = Some(label.into());
+                            info
+                        });
                         if ui.button(tr("baseline.folder")).clicked() {
                             if let Some(p) = rfd::FileDialog::new().pick_folder() {
                                 *spec = format!("folder:{}", p.display());
@@ -88,7 +140,7 @@ impl BaselinePanel {
                     match specs {
                         [Ok(a), Ok(b)] => {
                             let options = options.clone();
-                            let filter = filter.to_owned();
+                            let filter = self.scope.clone();
                             let important: Vec<_> = self
                                 .important
                                 .split(';')
@@ -96,6 +148,7 @@ impl BaselinePanel {
                                 .map(str::to_owned)
                                 .collect();
                             let impact_enabled = self.impact_enabled;
+                            let index = self.index.clone();
                             self.job = Some(Task::start(move |cancel, progress| {
                                 let left =
                                     baseline::capture(&a, &options, &filter, cancel, progress)?;
@@ -104,8 +157,7 @@ impl BaselinePanel {
                                 let summary = baseline::compare(&left, &right, &important, cancel)?;
                                 let impact = if impact_enabled {
                                     Some(
-                                        impact::Index::default()
-                                            .analyze(&summary, &right, cancel)?,
+                                        index.lock().map_err(|_| anyhow::anyhow!("Impact index worker failed; reopen the comparison"))?.analyze(&summary, &right, cancel)?,
                                     )
                                 } else {
                                     None
@@ -125,7 +177,7 @@ impl BaselinePanel {
                     if let Some(result) = job.poll() {
                         match result {
                             Ok(r) => {
-                                self.result = Some(r);
+                                self.result = Some(std::sync::Arc::new(r));
                                 self.dismissed.clear();
                             }
                             Err(e) => self.error = e.to_string(),
@@ -156,19 +208,40 @@ impl BaselinePanel {
                                 .set_file_name("release.json")
                                 .save_file()
                             {
-                                let inputs: Vec<_> = roots.to_vec();
-                                let report = result
-                                    .impact
-                                    .as_ref()
-                                    .map(serde_json::to_value)
-                                    .unwrap_or_else(|| serde_json::to_value(&result.summary));
-                                match report.and_then(|v| {
-                                    analysis::report(&v, &path, &inputs)
-                                        .map_err(serde::ser::Error::custom)
-                                }) {
-                                    Ok(_) => (),
-                                    Err(e) => self.error = e.to_string(),
-                                }
+                                let inputs: Vec<_> = roots
+                                    .iter()
+                                    .cloned()
+                                    .chain([
+                                        result.summary.left.spec.path().to_owned(),
+                                        result.summary.right.spec.path().to_owned(),
+                                    ])
+                                    .collect();
+                                let result = result.clone();
+                                let dismissed: Vec<_> = self.dismissed.iter().cloned().collect();
+                                self.export_job = Some(Task::start(move |cancel, _| {
+                                    analysis::check_cancel(cancel)?;
+                                    if let Some(impact) = &result.impact {
+                                        let mut report = serde_json::to_value(impact)?;
+                                        report.as_object_mut().unwrap().insert(
+                                            "dismissed_findings".into(),
+                                            serde_json::to_value(dismissed)?,
+                                        );
+                                        analysis::check_cancel(cancel)?;
+                                        analysis::report(&report, &path, &inputs)
+                                    } else if ["html", "htm"]
+                                        .contains(&text::extension(&path).as_str())
+                                    {
+                                        let html = baseline::html_report(
+                                            &result.summary,
+                                            &result.left,
+                                            &result.right,
+                                        )?;
+                                        analysis::check_cancel(cancel)?;
+                                        analysis::write_report_text(&path, &html, &inputs)
+                                    } else {
+                                        analysis::report(&result.summary, &path, &inputs)
+                                    }
+                                }));
                             }
                         }
                     });
@@ -186,9 +259,14 @@ impl BaselinePanel {
                                     .selectable_label(
                                         false,
                                         format!(
-                                            "{:?} {}{}",
+                                            "{:?} {}{}{}",
                                             change.category,
                                             change.path,
+                                            if change.ignored_by_text_rules {
+                                                tr("baseline.ignored")
+                                            } else {
+                                                ""
+                                            },
                                             if change.risk_flags.is_empty() {
                                                 ""
                                             } else {
@@ -222,7 +300,31 @@ impl BaselinePanel {
                                             Some(text::extension(std::path::Path::new(key)));
                                         docs.push(doc);
                                     }
-                                    open_files = Some(docs);
+                                    let bytes: Vec<_> = [&result.left, &result.right]
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(side, capture)| {
+                                            let key = if side == 0 {
+                                                change.old_path.as_deref().unwrap_or(&change.path)
+                                            } else {
+                                                &change.path
+                                            };
+                                            (
+                                                key.to_string(),
+                                                capture
+                                                    .files
+                                                    .get(key)
+                                                    .map(|f| f.bytes.clone())
+                                                    .unwrap_or_default(),
+                                            )
+                                        })
+                                        .collect();
+                                    open_files =
+                                        Some(if bytes.iter().any(|(_, b)| text::looks_binary(b)) {
+                                            CapturedComparison::Bytes(bytes)
+                                        } else {
+                                            CapturedComparison::Text(docs)
+                                        });
                                 }
                             }
                             for (side, path, error) in &result.summary.excluded {
@@ -267,7 +369,10 @@ impl BaselinePanel {
                                                     "{}:{}",
                                                     finding.evidence.path, finding.evidence.line
                                                 ));
-                                                open_files = Some(vec![d.clone(), d]);
+                                                open_files = Some(CapturedComparison::Source {
+                                                    docs: vec![d.clone(), d],
+                                                    line: finding.evidence.line,
+                                                });
                                             }
                                         }
                                         if ui.small_button(tr("impact.dismiss")).clicked() {

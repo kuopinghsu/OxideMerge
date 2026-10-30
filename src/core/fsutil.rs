@@ -100,6 +100,27 @@ pub fn write_atomic_with(path: &Path, bytes: &[u8], backup: bool) -> Result<()> 
     written.with_context(|| writing(path))
 }
 
+/// Analysis reports replace only the named directory entry; a symlink planted at the final
+/// destination after validation must never redirect a report into an unrelated input file.
+pub fn write_atomic_report(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()?;
+    let target = dir.join(
+        path.file_name()
+            .ok_or_else(|| anyhow::anyhow!("Invalid report name"))?,
+    );
+    let old = match std::fs::symlink_metadata(&target) {
+        Ok(m) if m.is_file() && !m.file_type().is_symlink() => Some(m),
+        Ok(_) => anyhow::bail!("Report target is a link or special file"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    write_staged(&target, &dir, bytes, old.as_ref()).with_context(|| writing(path))
+}
+
 /// Writes `bytes` to a temporary file in `dir`, then renames it over `target`.
 /// If staging or replacement fails, return the error without writing into the original.
 fn write_staged(

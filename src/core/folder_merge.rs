@@ -52,15 +52,59 @@ fn kind(p: &Path) -> Kind {
     }
 }
 
-/// Size and modification time of a file on each side, or `None` where it is missing. A
-/// symbolic link put in a file's place since has other ones.
-type Stamp = [Option<(u64, Option<SystemTime>)>; 3];
+/// Metadata plus a streaming SHA-256 fingerprint of every regular input. Same-size edits
+/// with restored timestamps must not bypass the confirmation's stale-input guard.
+type Stamp = [Option<(u64, Option<SystemTime>, [u8; 32])>; 3];
 
-fn stamp(it: &DirItem, roots: &[PathBuf]) -> Stamp {
-    std::array::from_fn(|s| {
-        let md = std::fs::symlink_metadata(it.path(&roots[s])).ok()?;
-        Some((md.len(), md.modified().ok()))
-    })
+fn stamp(it: &DirItem, roots: &[PathBuf]) -> Option<Stamp> {
+    use sha2::{Digest, Sha256};
+    let mut stamps = [None; 3];
+    for side in 0..3 {
+        let path = it.path(&roots[side]);
+        let md = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        let mut digest = [0; 32];
+        if md.is_file() {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                options.custom_flags(0x00200000);
+            }
+            let mut file = options.open(&path).ok()?;
+            if !file.metadata().ok()?.is_file() {
+                return None;
+            }
+            let mut hash = Sha256::new();
+            let mut buffer = [0; 64 * 1024];
+            loop {
+                let count = file.read(&mut buffer).ok()?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&buffer[..count]);
+            }
+            digest = hash.finalize().into();
+            let after = std::fs::symlink_metadata(&path).ok()?;
+            if !after.is_file()
+                || after.len() != md.len()
+                || after.modified().ok() != md.modified().ok()
+            {
+                return None;
+            }
+        }
+        stamps[side] = Some((md.len(), md.modified().ok(), digest));
+    }
+    Some(stamps)
 }
 
 #[derive(Default)]
@@ -246,7 +290,11 @@ pub fn plan(items: &[DirItem], roots: &[PathBuf]) -> Plan {
         }
         // Taken before the files are read, so a change while they are is seen as one.
         if !it.is_dir {
-            stamps.insert(i, stamp(it, roots));
+            let Some(signature) = stamp(it, roots) else {
+                stale.push(i);
+                continue;
+            };
+            stamps.insert(i, signature);
         }
         let path = |s: usize| it.path(&roots[s]);
         let kinds: [Kind; 3] = std::array::from_fn(|s| kind(&path(s)));
@@ -388,7 +436,11 @@ pub fn apply_with(
             errors.push(format!("{}: {}", it.rel_path(), tr("msg.backup_listed")));
             continue;
         }
-        if plan.stamps.get(&i).is_some_and(|s| *s != stamp(it, roots)) {
+        if plan
+            .stamps
+            .get(&i)
+            .is_some_and(|s| Some(*s) != stamp(it, roots))
+        {
             errors.push(format!(
                 "{}: {}",
                 it.rel_path(),
@@ -470,6 +522,29 @@ mod tests {
 
     fn read(root: &Path, rel: &str) -> String {
         std::fs::read_to_string(root.join(rel)).unwrap()
+    }
+
+    #[test]
+    fn confirmation_rejects_same_size_destination_edits_even_when_mtime_is_restored() {
+        let (_dirs, roots) = folders();
+        write(&roots[0], "a.txt", "LEFT\n");
+        write(&roots[1], "a.txt", "base\n");
+        write(&roots[2], "a.txt", "base\n");
+        let items = scan(&roots);
+        let plan = plan(&items, &roots);
+        let path = roots[1].join("a.txt");
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        write(&roots[1], "a.txt", "user\n");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let (changed, errors) = apply_with(plan, &items, &roots, false, false);
+        assert_eq!(changed, 0);
+        assert!(!errors.is_empty());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "user\n");
     }
 
     #[test]

@@ -226,13 +226,13 @@ pub(crate) fn row_cells(
 ) -> Vec<(&'static str, Vec<Range<usize>>)> {
     let n = panes.len();
     let row = &result.rows[r];
-    let block = row.block.map(|b| &result.blocks[b]);
+    let block = row.block().map(|b| &result.blocks[b]);
     let mut cells: Vec<(&'static str, Vec<Range<usize>>)> = (0..n)
         .map(|p| {
             let class = match block {
                 None => "ctx",
                 Some(b) if b.ignored => "ign",
-                Some(_) if row.line[p].is_none() => "gap",
+                Some(_) if row.line(p).is_none() => "gap",
                 Some(_) if n == 2 => ["del", "add"][p],
                 Some(b) if b.kind == BlockKind::Conflict => "conf",
                 Some(_) => "chg",
@@ -240,7 +240,7 @@ pub(crate) fn row_cells(
             (class, Vec::new())
         })
         .collect();
-    let text = |p: usize| row.line[p].map(|l| panes[p][l].as_str());
+    let text = |p: usize| row.line(p).map(|l| panes[p][l].as_str());
     let changed = |c: &str| matches!(c, "del" | "add" | "chg" | "conf");
     // Three sides: a side still as the middle one is unchanged; the middle is changed only when
     // both sides moved away from it.
@@ -340,7 +340,7 @@ fn hunk_html(
         out.push_str("<tr>");
         let cells = row_cells(result, panes, opts, r);
         for (p, (lines, (class, marks))) in panes.iter().zip(&cells).enumerate() {
-            match result.rows[r].line[p] {
+            match result.rows[r].line(p) {
                 Some(l) => {
                     let line = &lines[l];
                     let cut = line.char_indices().nth(LINE_CHARS).map(|(i, _)| i);
@@ -363,7 +363,9 @@ fn hunk_html(
         }
         out.push_str("</tr>");
         for (p, marks) in notes.iter().enumerate().take(n) {
-            let note = result.rows[r].line[p].and_then(|l| marks.get(&l).map(|t| (l, t)));
+            let note = result.rows[r]
+                .line(p)
+                .and_then(|l| marks.get(&l).map(|t| (l, t)));
             if let Some((l, text)) = note.filter(|(_, t)| !t.trim().is_empty()) {
                 let _ = write!(
                     out,
@@ -1078,7 +1080,7 @@ mod tests {
         let (l, m, r) = (v(&["a", "L"]), v(&["a", "b"]), v(&["a", "b"]));
         let opts = DiffOptions::default();
         let res = compute(&[&l, &m, &r], &opts);
-        let row = res.rows.iter().position(|x| x.block.is_some()).unwrap();
+        let row = res.rows.iter().position(|x| x.block().is_some()).unwrap();
         let classes: Vec<&str> = row_cells(&res, &[&l, &m, &r], &opts, row)
             .iter()
             .map(|c| c.0)
@@ -1087,7 +1089,7 @@ mod tests {
 
         let both = v(&["a", "B"]);
         let res = compute(&[&both, &m, &both], &opts);
-        let row = res.rows.iter().position(|x| x.block.is_some()).unwrap();
+        let row = res.rows.iter().position(|x| x.block().is_some()).unwrap();
         let classes: Vec<&str> = row_cells(&res, &[&both, &m, &both], &opts, row)
             .iter()
             .map(|c| c.0)

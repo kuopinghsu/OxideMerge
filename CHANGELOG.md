@@ -7,6 +7,23 @@ section of this file as the release notes.
 
 ### Added
 
+- Escape closes the active comparison tab after open dialogs, search, previews and editors
+  have handled it, retaining the existing unsaved-changes confirmation.
+
+- Configurable compact/aligned text rows, including blank insertion/deletion spacing in aligned
+  mode; text and binary location panes consistently appear on the right.
+
+- Opt-in merge plans and saved-result byte verification using the existing merge engines, with
+  explicit conflict, mechanical-check and heuristic-warning states; `--merge-plan` and
+  `--validate-merge` provide versioned analysis reports without writing comparison inputs.
+- Read-only JSON/XML semantic views and `--semantic`, with changed paths, decoded source spans,
+  duplicate-key/entity/depth guards and textual fallback.
+- Persistent file/hunk review decisions, comments, rationale, tags, stale-source detection and
+  summaries in additive `.oxmreview` version 2 manifests; version 1 remains readable.
+- Frozen folder/Git/snapshot baseline summaries, unique exact-content move detection, optional
+  important-path flags and evidence-only potential-impact reports. All reference findings are
+  heuristic and do not certify builds, tests or compatibility.
+
 - **Document conversion throughout comparisons:** full-content folder scans, individual files,
   command-line comparisons, docked previews and folder reports share the same external converters.
   Options include presets for PDF text (pdftotext), Office/OpenDocument (Pandoc), and Apache Tika,
@@ -23,6 +40,14 @@ section of this file as the release notes.
   Folder comments are included in HTML, XML and text reports.
 
 ### Fixed
+
+- Large UTF-8 text comparisons load incrementally, borrow unmodified comparison keys and use
+  compact unique-line anchors with coalesced equal runs and in-place reconstruction. Alignment
+  rows shrink from 64 to 16 bytes; pane display maps share rows. Release comparison dictionaries
+  before alignment and avoid whole-document syntax-worker copies beyond 50,000 lines or 16 MiB.
+
+- Folder merge confirmation rechecks SHA-256 content hashes so same-size edits with restored
+  modification times are detected before overwriting a changed file.
 
 - Merging a CSV/TSV difference preserves other changes in the same multiline record; partial
   merges that would break quoting are rejected without modifying the document.

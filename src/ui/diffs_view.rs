@@ -1884,7 +1884,7 @@ impl DiffsView {
             if s > 0 {
                 painter.vline(col.left(), col.y_range(), Stroke::new(1.0_f32, p.border));
             }
-            let Some(line) = row.line[s].and_then(|l| Some((l, d.docs[s].lines.get(l)?))) else {
+            let Some(line) = row.line(s).and_then(|l| Some((l, d.docs[s].lines.get(l)?))) else {
                 continue;
             };
             painter.text(
@@ -1919,7 +1919,7 @@ impl DiffsView {
         if !d.hunks.get(h)?.1.contains(&r) {
             return None;
         }
-        if self.current == Some((f, h)) && row.block == Some(d.hunks[h].0) {
+        if self.current == Some((f, h)) && row.block() == Some(d.hunks[h].0) {
             painter.rect_filled(
                 Rect::from_min_size(rect.min, vec2(3.0, rect.height())),
                 0.0,

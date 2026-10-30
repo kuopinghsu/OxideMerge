@@ -1,6 +1,6 @@
 //! File compare / merge view for text files (2-way and 3-way).
 
-use crate::config::Config;
+use crate::config::{Config, TextLayout};
 use crate::core::comments;
 use crate::core::diff::{self, BlockKind, DiffOptions, DiffResult, InlineMode, SyncPoint};
 use crate::core::patch::{self, PatchStyle};
@@ -327,18 +327,17 @@ type MergeArrow = (usize, usize, Icon, &'static str);
 
 #[derive(Default)]
 struct Layout {
-    /// (wrap columns or 0, tab size, folding, layout generation) the lines were built for.
-    key: Option<(usize, usize, bool, u64)>,
+    /// (wrap columns or 0, tab size, folding, layout generation, spacing) of these lines.
+    key: Option<(usize, usize, bool, u64, TextLayout)>,
     lines: Vec<VLine>,
     /// First display line of every diff row (the fold line for hidden rows).
     row_line: Vec<usize>,
     panes: Vec<PaneLayout>,
 }
 
-/// Compact pane lines keep insertions from creating empty alignment rows.
+/// Per-pane display lines and their mapping to shared comparison rows.
 #[derive(Default)]
 struct PaneLayout {
-    lines: Vec<VLine>,
     /// Shared display boundary -> compact pane boundary, including the end sentinel.
     boundaries: Vec<usize>,
     /// Compact line -> shared display line, for pointer and keyboard navigation.
@@ -499,6 +498,7 @@ pub struct TextView {
     pub review_decision: Option<Box<crate::core::review_state::Decision>>,
     pub review_dirty: bool,
     semantic_mode: bool,
+    semantic_page: usize,
     semantic_cache: Option<(u64, crate::core::semantic::SemanticReport)>,
     semantic_job: Option<(
         u64,
@@ -506,6 +506,7 @@ pub struct TextView {
     )>,
     semantic_filter: Option<crate::core::semantic::ChangeKind>,
     merge_validation_generation: Option<u64>,
+    merge_freshness: Option<(u64, bool)>,
     merge_preview_job: Option<(
         u64,
         super::analysis::Task<crate::core::merge_validation::MergePlan>,
@@ -548,6 +549,7 @@ pub struct TextView {
     layout: Layout,
     /// Bumped whenever rows or folds change so the layout is rebuilt.
     layout_gen: u64,
+    text_layout: TextLayout,
     /// Folds (by first hidden row) the user opened.
     expanded: HashSet<usize>,
     pub collapse: bool,
@@ -591,10 +593,12 @@ impl TextView {
             review_decision: None,
             review_dirty: false,
             semantic_mode: false,
+            semantic_page: 0,
             semantic_cache: None,
             semantic_job: None,
             semantic_filter: None,
             merge_validation_generation: None,
+            merge_freshness: None,
             merge_preview_job: None,
             merge_preview: None,
             merge_validation: None,
@@ -629,6 +633,7 @@ impl TextView {
             disk_changed: Vec::new(),
             layout: Layout::default(),
             layout_gen: 0,
+            text_layout: cfg.text_layout,
             expanded: HashSet::new(),
             collapse: cfg.collapse_unchanged,
             wrap: cfg.word_wrap,
@@ -693,12 +698,21 @@ impl TextView {
                     != Some(&e.value)
             })
             || self.edit.as_ref().is_some_and(|e| {
-                let line = self.diff.rows.get(e.row).and_then(|r| r.line[e.pane]);
+                let line = self.diff.rows.get(e.row).and_then(|r| r.line(e.pane));
                 match line {
                     Some(l) => self.panes[e.pane].doc.lines[l] != e.text,
                     None => !e.text.is_empty(),
                 }
             })
+    }
+
+    /// Local overlays/editors get Escape before the tab-level close shortcut.
+    pub fn handles_escape(&self) -> bool {
+        self.find.open
+            || self.goto.is_some()
+            || self.edit.is_some()
+            || self.note_edit.is_some()
+            || self.table.edit.is_some()
     }
 
     /// Takes in a line still being typed, as if it had been left.
@@ -737,7 +751,7 @@ impl TextView {
     /// A rule of `kind` taken from the line at row `r` of pane `p`, or from the selected lines.
     fn rule_draft(&self, kind: RuleKind, r: usize, p: usize) -> RuleDraft {
         let line = |row: usize, pane: usize| {
-            let l = self.diff.rows.get(row)?.line[pane]?;
+            let l = self.diff.rows.get(row)?.line(pane)?;
             self.panes[pane].doc.lines.get(l).map(String::as_str)
         };
         let text = line(r, p)
@@ -791,6 +805,7 @@ impl TextView {
 
     pub fn set_options(&mut self, opts: &DiffOptions) {
         if self.opts != *opts {
+            self.invalidate_review();
             self.opts = opts.clone();
             self.apply_prettify();
             self.rediff();
@@ -840,6 +855,8 @@ impl TextView {
         let refs: Vec<&[String]> = self.panes.iter().map(|p| p.doc.lines.as_slice()).collect();
         let lens: Vec<usize> = refs.iter().map(|l| l.len()).collect();
         self.sync_points = diff::valid_sync_points(&self.sync_points, &lens);
+        // Do not hold the previous large alignment while allocating its replacement.
+        self.diff = DiffResult::default();
         self.diff = diff::compute_synced(&refs, &self.opts, syntax, &self.sync_points);
         diff::include_doc_formats(
             &mut self.diff,
@@ -902,7 +919,7 @@ impl TextView {
         }
     }
 
-    fn mark_changed(&mut self, panes: &[usize]) {
+    fn invalidate_review(&mut self) {
         if let Some(review) = &mut self.review_decision {
             review.stale = true;
             for h in review.hunks.values_mut() {
@@ -910,6 +927,9 @@ impl TextView {
             }
             self.review_dirty = true;
         }
+    }
+    fn mark_changed(&mut self, panes: &[usize]) {
+        self.invalidate_review();
         for &p in panes {
             self.panes[p].doc.modified = true;
             self.panes[p].hl_dirty = true;
@@ -994,7 +1014,7 @@ impl TextView {
     /// every pane, they are put on one row and the compare is worked out again. Picking a line
     /// that is part of a synchronization point removes that point.
     pub fn set_sync_point_at(&mut self, row: usize, pane: usize) {
-        let Some(line) = self.diff.rows.get(row).and_then(|r| r.line[pane]) else {
+        let Some(line) = self.diff.rows.get(row).and_then(|r| r.line(pane)) else {
             self.status = tr("sync.no_line").to_string();
             return;
         };
@@ -1038,7 +1058,7 @@ impl TextView {
                     .diff
                     .rows
                     .iter()
-                    .position(|r| r.line[0] == Some(point[0]))
+                    .position(|r| r.line(0) == Some(point[0]))
                 {
                     self.cursor_row = Some(r);
                     self.scroll_to = Some(r);
@@ -1083,9 +1103,9 @@ impl TextView {
     /// first line on that row.
     fn bookmark_target(&self, row: usize, pane: usize) -> Option<(usize, usize)> {
         let r = self.diff.rows.get(row)?;
-        r.line[pane]
+        r.line(pane)
             .map(|l| (pane, l))
-            .or_else(|| (0..self.n()).find_map(|p| r.line[p].map(|l| (p, l))))
+            .or_else(|| (0..self.n()).find_map(|p| r.line(p).map(|l| (p, l))))
     }
 
     pub fn toggle_bookmark(&mut self) {
@@ -1125,14 +1145,16 @@ impl TextView {
     }
 
     fn row_bookmarked(&self, r: usize, p: usize) -> bool {
-        self.diff.rows[r].line[p].is_some_and(|l| self.bookmarks[p].contains_key(&l))
+        self.diff.rows[r]
+            .line(p)
+            .is_some_and(|l| self.bookmarks[p].contains_key(&l))
     }
 
     /// The comment of a bookmark on row `r`, in the pane that has one.
     fn row_note(&self, r: usize) -> Option<&str> {
         let row = self.diff.rows.get(r)?;
         (0..self.n()).find_map(|p| {
-            let note = self.bookmarks[p].get(&row.line[p]?)?;
+            let note = self.bookmarks[p].get(&row.line(p)?)?;
             (!note.is_empty()).then_some(note.as_str())
         })
     }
@@ -1171,7 +1193,7 @@ impl TextView {
                 self.cursor_row = Some(row);
                 self.scroll_to = Some(row);
                 self.cur_block = self.diff.rows[row]
-                    .block
+                    .block()
                     .filter(|&b| !self.diff.blocks[b].ignored);
                 self.status = self.row_note(row).unwrap_or_default().to_string();
             }
@@ -1191,6 +1213,20 @@ impl TextView {
     }
 
     pub fn select_block(&mut self, b: usize) {
+        if self
+            .review_decision
+            .as_ref()
+            .is_some_and(|review| review.current_hunk.is_some())
+            && self.review_within_budget()
+        {
+            let id = self.review_hunk_id(&self.diff.blocks[b]);
+            if let Some(review) = &mut self.review_decision {
+                if review.current_hunk.as_deref() != Some(&id) {
+                    review.current_hunk = Some(id);
+                    self.review_dirty = true;
+                }
+            }
+        }
         self.cur_block = Some(b);
         let row = self.diff.blocks[b].first_row;
         self.cursor_row = Some(row);
@@ -1227,7 +1263,7 @@ impl TextView {
     /// Selects the previous difference; false when there is none before the cursor.
     pub fn prev_diff(&mut self, conflicts_only: bool) -> bool {
         let row = self.cursor_row.unwrap_or(self.diff.rows.len());
-        let containing = self.diff.rows.get(row).and_then(|r| r.block);
+        let containing = self.diff.rows.get(row).and_then(|r| r.block());
         let found = self
             .significant()
             .filter(|&b| !conflicts_only || self.diff.blocks[b].kind == BlockKind::Conflict)
@@ -1462,7 +1498,7 @@ impl TextView {
         let doc = &self.panes[pane].doc;
         let lines: Vec<&str> = rows
             .iter()
-            .filter_map(|r| r.line[pane])
+            .filter_map(|r| r.line(pane))
             .map(|l| doc.lines[l].as_str())
             .collect();
         (!lines.is_empty()).then(|| {
@@ -1482,10 +1518,10 @@ impl TextView {
         let rows = &self.diff.rows[r0..=r1];
         let src: Vec<String> = rows
             .iter()
-            .filter_map(|r| r.line[from])
+            .filter_map(|r| r.line(from))
             .map(|l| self.panes[from].doc.lines[l].clone())
             .collect();
-        let dst: Vec<usize> = rows.iter().filter_map(|r| r.line[to]).collect();
+        let dst: Vec<usize> = rows.iter().filter_map(|r| r.line(to)).collect();
         let range = match (dst.first(), dst.last()) {
             (Some(&a), Some(&b)) => a..b + 1,
             _ => {
@@ -1505,7 +1541,7 @@ impl TextView {
         self.mark_changed(&[to]);
         let row = self.diff.row_of_line(to, start);
         self.cursor_row = Some(row);
-        self.cur_block = self.diff.rows.get(row).and_then(|r| r.block);
+        self.cur_block = self.diff.rows.get(row).and_then(|r| r.block());
         self.status = trf("msg.copied_lines", &[("n", n.to_string())]);
     }
 
@@ -1612,7 +1648,7 @@ impl TextView {
         self.mark_changed(&[1]);
         let row = self.diff.row_of_line(1, start);
         self.cursor_row = Some(row);
-        self.cur_block = self.diff.rows.get(row).and_then(|r| r.block);
+        self.cur_block = self.diff.rows.get(row).and_then(|r| r.block());
     }
 
     /// Whether "take both" applies to the current difference.
@@ -1632,7 +1668,9 @@ impl TextView {
     ) -> anyhow::Result<crate::core::merge_validation::MergePlan> {
         anyhow::ensure!(self.n() == 3, "Merge preview requires three panes");
         let docs: Vec<_> = self.panes.iter().map(|p| p.doc.clone()).collect();
-        let mut preview = Self::new(docs.clone(), cfg);
+        let mut local = cfg.clone();
+        local.diff = self.opts.clone();
+        let mut preview = Self::new(docs.clone(), &local);
         preview.opts = self.opts.clone();
         preview.sync_points = self.sync_points.clone();
         preview.panes[1].doc.read_only = false;
@@ -1678,16 +1716,18 @@ impl TextView {
         // insertions/deletions. Missing sides do not invent a terminator change.
         if !self.opts.ignore_eol {
             for row in &self.diff.rows {
-                if let Some(base) = row.line[1] {
+                if let Some(base) = row.line(1) {
                     let b = endings[1][base];
-                    let l = row.line[0]
+                    let l = row
+                        .line(0)
                         .and_then(|i| self.panes[0].doc.line_eol(i))
                         .unwrap_or(b);
-                    let r = row.line[2]
+                    let r = row
+                        .line(2)
                         .and_then(|i| self.panes[2].doc.line_eol(i))
                         .unwrap_or(b);
                     let merged = merge(&l, &b, &r);
-                    for (p, line) in row.line.iter().enumerate() {
+                    for (p, line) in row.lines().iter().enumerate() {
                         if let Some(i) = line {
                             endings[p][*i] = merged;
                         }
@@ -1779,7 +1819,7 @@ impl TextView {
 
     fn insert_index(&self, pane: usize, row: usize) -> usize {
         for r in (0..row.min(self.diff.rows.len())).rev() {
-            if let Some(l) = self.diff.rows[r].line[pane] {
+            if let Some(l) = self.diff.rows[r].line(pane) {
                 return l + 1;
             }
         }
@@ -1788,7 +1828,7 @@ impl TextView {
 
     fn begin_edit(&mut self, row: usize, pane: usize) {
         if self.table_mode {
-            if let Some(line) = self.diff.rows.get(row).and_then(|r| r.line[pane]) {
+            if let Some(line) = self.diff.rows.get(row).and_then(|r| r.line(pane)) {
                 if let Some(record) = self
                     .table
                     .docs
@@ -1809,7 +1849,7 @@ impl TextView {
             .diff
             .rows
             .get(row)
-            .and_then(|r| r.line[pane])
+            .and_then(|r| r.line(pane))
             .map(|l| self.panes[pane].doc.lines[l].clone())
             .unwrap_or_default();
         self.edit = Some(EditState {
@@ -1826,7 +1866,7 @@ impl TextView {
             .split('\n')
             .map(|s| s.trim_end_matches('\r').to_string())
             .collect();
-        let existing = self.diff.rows.get(e.row).and_then(|r| r.line[e.pane]);
+        let existing = self.diff.rows.get(e.row).and_then(|r| r.line(e.pane));
         if let Some(l) = existing {
             if new_lines.len() == 1 && self.panes[e.pane].doc.lines[l] == new_lines[0] {
                 return;
@@ -1850,7 +1890,7 @@ impl TextView {
         if !self.writable(pane) {
             return;
         }
-        let at = match self.diff.rows.get(row).and_then(|r| r.line[pane]) {
+        let at = match self.diff.rows.get(row).and_then(|r| r.line(pane)) {
             Some(l) => l + 1,
             None => self.insert_index(pane, row),
         };
@@ -1880,7 +1920,7 @@ impl TextView {
         } else if let Some((r0, r1)) = self.selection() {
             let lines: Vec<usize> = self.diff.rows[r0..=r1]
                 .iter()
-                .filter_map(|r| r.line[p])
+                .filter_map(|r| r.line(p))
                 .collect();
             match (lines.first(), lines.last()) {
                 (Some(&a), Some(&b)) => a..b + 1,
@@ -1908,7 +1948,7 @@ impl TextView {
         let row = self.diff.row_of_line(p, last);
         self.cursor_row = Some(row);
         self.scroll_to = Some(row);
-        self.cur_block = self.diff.rows.get(row).and_then(|r| r.block);
+        self.cur_block = self.diff.rows.get(row).and_then(|r| r.block());
         self.status = trf("msg.pasted_lines", &[("n", n.to_string())]);
     }
 
@@ -1916,7 +1956,7 @@ impl TextView {
         if !self.writable(pane) {
             return;
         }
-        if let Some(l) = self.diff.rows.get(row).and_then(|r| r.line[pane]) {
+        if let Some(l) = self.diff.rows.get(row).and_then(|r| r.line(pane)) {
             self.push_undo();
             self.panes[pane].doc.lines.remove(l);
             self.mark_changed(&[pane]);
@@ -1958,10 +1998,21 @@ impl TextView {
     /// unsaved edits are listed in a warning bar.
     pub fn check_disk(&mut self) {
         let times: Vec<_> = self.panes.iter().map(|p| disk_time(&p.doc)).collect();
+        if self
+            .panes
+            .iter()
+            .zip(&times)
+            .any(|(p, now)| p.disk_time.is_some() && now.is_none())
+        {
+            self.invalidate_review();
+            self.merge_validation = None;
+        }
         let changed = |(p, now): (&Pane, &Option<SystemTime>)| now.is_some() && *now != p.disk_time;
         if !self.panes.iter().zip(&times).any(changed) {
             return;
         }
+        self.invalidate_review();
+        self.merge_validation = None;
         // A line still being typed is an edit of its file, which is then not reloaded.
         self.commit_pending_edit();
         let mut reloaded = Vec::new();
@@ -2076,6 +2127,15 @@ impl TextView {
     /// Reloads unmodified files and the compare rules file from disk and recomputes the
     /// differences.
     pub fn refresh(&mut self) {
+        let before = self.review_decision.as_ref().map(|_| {
+            (
+                self.opts.clone(),
+                self.panes
+                    .iter()
+                    .map(|p| crate::core::merge_validation::doc_fingerprint(&p.doc))
+                    .collect::<Vec<_>>(),
+            )
+        });
         self.commit_pending_edit();
         self.reload_rules();
         if let Some(o) = self.options_for(&self.opts) {
@@ -2086,6 +2146,17 @@ impl TextView {
                 continue;
             }
             let _ = p.reload();
+        }
+        if before.is_some_and(|(options, digests)| {
+            options != self.opts
+                || digests
+                    != self
+                        .panes
+                        .iter()
+                        .map(|p| crate::core::merge_validation::doc_fingerprint(&p.doc))
+                        .collect::<Vec<_>>()
+        }) {
+            self.invalidate_review();
         }
         self.rediff();
     }
@@ -2259,7 +2330,7 @@ impl TextView {
         };
         let lines: Vec<usize> = self.diff.rows[r0..=r1]
             .iter()
-            .filter_map(|r| r.line[p])
+            .filter_map(|r| r.line(p))
             .collect();
         let (Some(&first), Some(&last)) = (lines.first(), lines.last()) else {
             return;
@@ -2370,11 +2441,11 @@ impl TextView {
             } else {
                 (start + total * 2 - k) % total
             };
-            if let Some(l) = self.diff.rows[r].line[pane] {
+            if let Some(l) = self.diff.rows[r].line(pane) {
                 if re.is_match(&self.panes[pane].doc.lines[l]) {
                     self.cursor_row = Some(r);
                     self.scroll_to = Some(r);
-                    self.cur_block = self.diff.rows[r].block;
+                    self.cur_block = self.diff.rows[r].block();
                     self.status.clear();
                     return;
                 }
@@ -2392,7 +2463,7 @@ impl TextView {
         let line = self
             .cursor_row
             .and_then(|r| self.diff.rows.get(r))
-            .and_then(|r| r.line[pane]);
+            .and_then(|r| r.line(pane));
         if let Some(l) = line.filter(|&l| re.is_match(&self.panes[pane].doc.lines[l])) {
             if !self.writable(pane) {
                 return;
@@ -2488,7 +2559,7 @@ impl TextView {
                 .diff
                 .rows
                 .get(r)
-                .and_then(|row| row.line[self.active_pane])
+                .and_then(|row| row.line(self.active_pane))
             {
                 s.push_str(&format!("  |  {} {}", tr("label.line"), l + 1));
             }
@@ -2538,7 +2609,12 @@ impl TextView {
                     .map(text::extension)
                     .or_else(|| p.doc.syntax.clone())
                     .unwrap_or_default();
-                p.hl_rx = Some(syntax::spawn(p.doc.lines.clone(), ext, cfg.dark_mode));
+                // Check the highlighter's limit before cloning a potentially gigabyte document.
+                if syntax::within_limits(&p.doc.lines) {
+                    p.hl_rx = Some(syntax::spawn(p.doc.lines.clone(), ext, cfg.dark_mode));
+                } else {
+                    p.hl = None;
+                }
             }
         }
     }
@@ -2549,9 +2625,9 @@ impl TextView {
         }
         let row = self.diff.rows[r];
         let mut out: [Vec<Range<usize>>; 3] = Default::default();
-        if let Some(b) = row.block {
+        if let Some(b) = row.block() {
             if !self.diff.blocks[b].ignored {
-                let line = |p: usize| row.line[p].map(|l| self.panes[p].doc.lines[l].as_str());
+                let line = |p: usize| row.line(p).map(|l| self.panes[p].doc.lines[l].as_str());
                 if self.n() == 2 {
                     if let (Some(a), Some(bb)) = (line(0), line(1)) {
                         let (x, y) = diff::inline_diff(a, bb, &self.opts);
@@ -2578,13 +2654,13 @@ impl TextView {
 
     fn row_bg(&self, r: usize, p: usize, c: &Colors) -> Option<Color32> {
         let row = &self.diff.rows[r];
-        let b = row.block?;
+        let b = row.block()?;
         let blk = &self.diff.blocks[b];
         let sel = self.cur_block == Some(b);
         if blk.ignored {
             return Some(c.ignored);
         }
-        let Some(l) = row.line[p] else {
+        let Some(l) = row.line(p) else {
             return Some(if sel { c.missing_sel } else { c.missing });
         };
         if !sel && self.diff.moved[p].contains(&l) {
@@ -2613,8 +2689,8 @@ impl TextView {
 
     fn row_bar(&self, r: usize, p: usize, c: &Colors) -> Option<Color32> {
         let row = &self.diff.rows[r];
-        let blk = &self.diff.blocks[row.block?];
-        if blk.ignored || row.line[p].is_none() {
+        let blk = &self.diff.blocks[row.block()?];
+        if blk.ignored || row.line(p).is_none() {
             return None;
         }
         Some(if blk.kind == BlockKind::Conflict {
@@ -3200,7 +3276,7 @@ impl TextView {
             let line = self
                 .cursor_row
                 .and_then(|r| self.diff.rows.get(r))
-                .and_then(|r| r.line[p])
+                .and_then(|r| r.line(p))
                 .map_or(0, |l| l + 1);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add(
@@ -3223,7 +3299,13 @@ impl TextView {
 
     /// Rebuilds the display lines when folding, wrapping or the diff changed.
     fn ensure_layout(&mut self, wrap_cols: usize, tab: usize) {
-        let key = (wrap_cols, tab, self.collapse, self.layout_gen);
+        let key = (
+            wrap_cols,
+            tab,
+            self.collapse,
+            self.layout_gen,
+            self.text_layout,
+        );
         let rows = self.diff.rows.len();
         if self.layout.key == Some(key) && self.layout.row_line.len() == rows {
             return;
@@ -3238,7 +3320,7 @@ impl TextView {
             });
         let unchanged = |r: usize| {
             self.diff.rows[r]
-                .block
+                .block()
                 .is_none_or(|b| self.diff.blocks[b].ignored)
         };
         let mut lines = Vec::with_capacity(rows);
@@ -3287,29 +3369,30 @@ impl TextView {
                 let mut pane = PaneLayout::default();
                 let mut segments = 0;
                 for (v, &line) in lines.iter().enumerate() {
-                    pane.boundaries.push(pane.lines.len());
-                    let include = match line {
-                        VLine::Fold(..) => true,
-                        VLine::Row(r, seg) => {
-                            if seg == 0 {
-                                segments = self.diff.rows[r].line[p].map_or(0, |l| {
-                                    if wrap_cols == 0 {
-                                        1
-                                    } else {
-                                        wrap_starts(&self.panes[p].doc.lines[l], tab, wrap_cols)
-                                            .len() as u32
-                                    }
-                                });
+                    pane.boundaries.push(pane.shared.len());
+                    let include = self.text_layout == TextLayout::Aligned
+                        || match line {
+                            VLine::Fold(..) => true,
+                            VLine::Row(r, seg) => {
+                                if seg == 0 {
+                                    segments = self.diff.rows[r].line(p).map_or(0, |l| {
+                                        if wrap_cols == 0 {
+                                            1
+                                        } else {
+                                            wrap_starts(&self.panes[p].doc.lines[l], tab, wrap_cols)
+                                                .len()
+                                                as u32
+                                        }
+                                    });
+                                }
+                                seg < segments
                             }
-                            seg < segments
-                        }
-                    };
+                        };
                     if include {
-                        pane.lines.push(line);
                         pane.shared.push(v);
                     }
                 }
-                pane.boundaries.push(pane.lines.len());
+                pane.boundaries.push(pane.shared.len());
                 pane
             })
             .collect();
@@ -3327,7 +3410,7 @@ impl TextView {
     fn row_segments(&self, r: usize, cols: usize, tab: usize) -> u32 {
         let row = &self.diff.rows[r];
         (0..self.n())
-            .filter_map(|p| row.line[p].map(|l| &self.panes[p].doc.lines[l]))
+            .filter_map(|p| row.line(p).map(|l| &self.panes[p].doc.lines[l]))
             .map(|line| wrap_starts(line, tab, cols).len() as u32)
             .max()
             .unwrap_or(1)
@@ -3373,9 +3456,9 @@ impl TextView {
 
     /// The row shown nearest to display line `v`, looking in the given direction first.
     fn row_near(&self, v: usize, forward: bool) -> Option<usize> {
-        let lines = &self.layout.panes[self.active_pane].lines;
+        let lines = &self.layout.panes[self.active_pane].shared;
         let v = v.min(lines.len().checked_sub(1)?);
-        let row = |l: &VLine| match *l {
+        let row = |&index: &usize| match self.layout.lines[index] {
             VLine::Row(r, _) => Some(r),
             VLine::Fold(..) => None,
         };
@@ -3415,7 +3498,7 @@ impl TextView {
             self.paste(&text);
         }
         let pane_layout = &self.layout.panes[self.active_pane];
-        let total = pane_layout.lines.len();
+        let total = pane_layout.shared.len();
         if total == 0 {
             return;
         }
@@ -3490,7 +3573,7 @@ impl TextView {
             self.cursor_row = Some(row);
             self.scroll_to = Some(row);
             self.cur_block = self.diff.rows[row]
-                .block
+                .block()
                 .filter(|&b| !self.diff.blocks[b].ignored);
         }
         if ui.input(|i| {
@@ -3519,7 +3602,7 @@ impl TextView {
         let label_w = 70.0;
         let slot_h = (rect.height() - 6.0) / n as f32;
         let row = self.diff.rows[r];
-        let sel = row.block.is_some() && row.block == self.cur_block;
+        let sel = row.block().is_some() && row.block() == self.cur_block;
         let inline_bg = if sel { c.inline_sel } else { c.inline };
         for p in 0..n {
             let slot = Rect::from_min_size(
@@ -3530,7 +3613,7 @@ impl TextView {
             if let Some(bg) = self.row_bg(r, p, c) {
                 painter.rect_filled(slot, 3.0, bg);
             }
-            let label = match row.line[p] {
+            let label = match row.line(p) {
                 Some(l) => format!("{} {}", side_name(p, n), l + 1),
                 None => side_name(p, n).to_string(),
             };
@@ -3541,7 +3624,7 @@ impl TextView {
                 FontId::proportional(cfg.font_size - 1.0),
                 c.gutter_text,
             );
-            let Some(l) = row.line[p] else { continue };
+            let Some(l) = row.line(p) else { continue };
             let line = &self.panes[p].doc.lines[l];
             let inline = self
                 .inline_cache
@@ -3618,7 +3701,7 @@ impl TextView {
 
     fn table_cursor(&self) -> Option<usize> {
         let raw = self.diff.rows.get(self.cursor_row?)?;
-        let contains = |row: &diff::Row, pane: usize| match (row.line[pane], raw.line[pane]) {
+        let contains = |row: &diff::Row, pane: usize| match (row.line(pane), raw.line(pane)) {
             (Some(record), Some(line)) => self.table.docs[pane]
                 .as_ref()
                 .is_ok_and(|table| table.records[record].lines.contains(&line)),
@@ -3644,13 +3727,14 @@ impl TextView {
         let Some(aligned) = self.table.diff.rows.get(row) else {
             return;
         };
-        let contains = |raw: &diff::Row, side: usize| match (aligned.line[side], raw.line[side]) {
+        let contains = |raw: &diff::Row, side: usize| match (aligned.line(side), raw.line(side)) {
             (Some(record), Some(line)) => self.table.docs[side]
                 .as_ref()
                 .is_ok_and(|table| table.records[record].lines.contains(&line)),
             _ => false,
         };
-        let significant = |raw: &diff::Row| raw.block.is_some_and(|b| !self.diff.blocks[b].ignored);
+        let significant =
+            |raw: &diff::Row| raw.block().is_some_and(|b| !self.diff.blocks[b].ignored);
         let rows = &self.diff.rows;
         let found = rows
             .iter()
@@ -3669,7 +3753,7 @@ impl TextView {
             self.table.column = column;
             self.cursor_row = Some(raw);
             self.scroll_to = Some(raw);
-            self.cur_block = rows[raw].block.filter(|&b| !self.diff.blocks[b].ignored);
+            self.cur_block = rows[raw].block().filter(|&b| !self.diff.blocks[b].ignored);
             self.sel_anchor = None;
         }
     }
@@ -3746,7 +3830,7 @@ impl TextView {
         if navigate {
             self.select_table_row(target, pane, column);
         }
-        let Some(record) = self.table.diff.rows[target].line[pane] else {
+        let Some(record) = self.table.diff.rows[target].line(pane) else {
             return;
         };
         if edit {
@@ -3843,7 +3927,7 @@ impl TextView {
         let Some(aligned) = self.table.diff.rows.get(row) else {
             return;
         };
-        let (Some(src), Some(dst)) = (aligned.line[from], aligned.line[to]) else {
+        let (Some(src), Some(dst)) = (aligned.line(from), aligned.line(to)) else {
             return;
         };
         let (Ok(a), Ok(b)) = (&self.table.docs[from], &self.table.docs[to]) else {
@@ -3938,7 +4022,8 @@ impl TextView {
             .map(|row| {
                 (0..n)
                     .filter_map(|p| {
-                        row.line[p].map(|r| &self.table.docs[p].as_ref().unwrap().records[r])
+                        row.line(p)
+                            .map(|r| &self.table.docs[p].as_ref().unwrap().records[r])
                     })
                     .flat_map(|r| &r.cells)
                     .map(|s| s.lines().count().clamp(1, 8))
@@ -3954,7 +4039,7 @@ impl TextView {
             .and_then(|raw_row| self.diff.rows.get(raw_row))
             .and_then(|raw| {
                 self.table.diff.rows.iter().position(|row| {
-                    (0..n).any(|p| match (row.line[p], raw.line[p]) {
+                    (0..n).any(|p| match (row.line(p), raw.line(p)) {
                         (Some(r), Some(l)) => self.table.docs[p].as_ref().unwrap().records[r]
                             .lines
                             .contains(&l),
@@ -4009,16 +4094,16 @@ impl TextView {
                             for p in 0..n {
                                 for column in 0..columns {
                                     row.col(|ui| {
-                                        let record = aligned.line[p].map(|r| {
+                                        let record = aligned.line(p).map(|r| {
                                             &self.table.docs[p].as_ref().unwrap().records[r]
                                         });
                                         let value = record.and_then(|r| r.cells.get(column));
                                         let changed = value.is_some()
-                                            && aligned.block.is_some_and(|b| {
+                                            && aligned.block().is_some_and(|b| {
                                                 !self.table.diff.blocks[b].ignored
                                             })
                                             && (0..n).filter(|&q| q != p).any(|q| {
-                                                let other = aligned.line[q].and_then(|r| {
+                                                let other = aligned.line(q).and_then(|r| {
                                                     self.table.docs[q].as_ref().unwrap().records[r]
                                                         .cells
                                                         .get(column)
@@ -4053,12 +4138,12 @@ impl TextView {
                                             clicked = Some((index, p, column));
                                         }
                                         if response.double_clicked() {
-                                            if let Some(r) = aligned.line[p] {
+                                            if let Some(r) = aligned.line(p) {
                                                 edit_cell = Some((p, r, column));
                                             }
                                         }
                                         response.context_menu(|ui| {
-                                            if let Some(r) = aligned.line[p] {
+                                            if let Some(r) = aligned.line(p) {
                                                 if ui
                                                     .add_enabled(
                                                         !self.panes[p].doc.read_only
@@ -4072,7 +4157,7 @@ impl TextView {
                                                 }
                                                 for to in 0..n {
                                                     if to != p
-                                                        && aligned.line[to].is_some()
+                                                        && aligned.line(to).is_some()
                                                         && ui
                                                             .add_enabled(
                                                                 !self.panes[to].doc.read_only
@@ -4156,6 +4241,54 @@ impl TextView {
         }
     }
 
+    fn review_within_budget(&self) -> bool {
+        self.panes.iter().all(|pane| {
+            let mut bytes = 0usize;
+            pane.doc.lines.iter().enumerate().all(|(i, line)| {
+                let ending = if i + 1 < pane.doc.lines.len() || pane.doc.final_newline {
+                    if pane.doc.preserve_eols {
+                        pane.doc.line_eol(i).map_or(0, |e| e.as_str().len())
+                    } else {
+                        pane.doc.eol.as_str().len()
+                    }
+                } else {
+                    0
+                };
+                bytes = bytes.saturating_add(line.len()).saturating_add(ending);
+                bytes as u64 <= crate::core::analysis::MAX_FILE
+            })
+        })
+    }
+    pub fn restore_review_cursor(&mut self) {
+        let Some(id) = self
+            .review_decision
+            .as_ref()
+            .and_then(|review| review.current_hunk.clone())
+        else {
+            return;
+        };
+        if !self.review_within_budget() {
+            if let Some(review) = &mut self.review_decision {
+                review.stale = true;
+                self.review_dirty = true;
+            }
+            return;
+        }
+        let matches: Vec<_> = self
+            .diff
+            .blocks
+            .iter()
+            .enumerate()
+            .take(1000)
+            .filter_map(|(i, block)| (self.review_hunk_id(block) == id).then_some(i))
+            .collect();
+        if matches.len() == 1 && self.diff.blocks.len() <= 1000 {
+            self.select_block(matches[0]);
+        } else if let Some(review) = &mut self.review_decision {
+            review.stale = true;
+            self.review_dirty = true;
+        }
+    }
     fn review_hunk_id(&self, block: &crate::core::diff::Block) -> String {
         let context: Vec<_> = self
             .panes
@@ -4177,11 +4310,21 @@ impl TextView {
         egui::CollapsingHeader::new(tr("workspace.hunk_title"))
             .id_salt(self.id.with("hunk_review"))
             .show(ui, |ui| {
+                if !self.review_within_budget() {
+                    ui.label(tr("analysis.too_large"));
+                    return;
+                }
                 let Some(block) = self.cur_block.and_then(|i| self.diff.blocks.get(i)) else {
                     ui.label(tr("workspace.select_hunk"));
                     return;
                 };
                 let id = self.review_hunk_id(block);
+                if let Some(review) = &mut self.review_decision {
+                    if review.current_hunk.as_deref() != Some(&id) {
+                        review.current_hunk = Some(id.clone());
+                        self.review_dirty = true;
+                    }
+                }
                 let ambiguous = self.diff.blocks.len() > 1000
                     || self
                         .diff
@@ -4260,6 +4403,7 @@ impl TextView {
                 match result {
                     Ok(plan) => {
                         self.merge_preview = Some(Box::new(plan));
+                        self.merge_freshness = None;
                         self.merge_validation = None;
                     }
                     Err(e) => self.status = e.to_string(),
@@ -4269,6 +4413,22 @@ impl TextView {
         }
 
         if self.n() == 3 {
+            if self
+                .merge_freshness
+                .is_none_or(|(generation, _)| generation != self.layout_gen)
+            {
+                let current = self.merge_preview.as_ref().is_some_and(|plan| {
+                    plan.rules == self.opts
+                        && [0, 2].into_iter().all(|side| {
+                            plan.inputs.get(side).is_some_and(|(_, digest)| {
+                                *digest == mv::doc_fingerprint(&self.panes[side].doc)
+                            })
+                        })
+                });
+                self.merge_freshness = Some((self.layout_gen, current));
+            }
+            let plan_current = self.merge_preview.is_some()
+                && self.merge_freshness.is_some_and(|(_, current)| current);
             egui::CollapsingHeader::new(tr("analysis.merge_verification"))
                 .id_salt(self.id.with("verify"))
                 .show(ui, |ui| {
@@ -4300,7 +4460,7 @@ impl TextView {
                         }
                         if ui
                             .add_enabled(
-                                self.merge_preview.is_some(),
+                                plan_current,
                                 egui::Button::new(tr("analysis.validate_result")),
                             )
                             .clicked()
@@ -4350,6 +4510,9 @@ impl TextView {
                         task.status(ui);
                     }
                     ui.small(tr("analysis.mechanical_only"));
+                    if self.merge_preview.is_some() && !plan_current {
+                        ui.colored_label(ui.visuals().warn_fg_color, tr("analysis.repreview"));
+                    }
                     if let Some(plan) = &self.merge_preview {
                         ui.label(format!(
                             "{}: {}",
@@ -4361,7 +4524,14 @@ impl TextView {
                                 egui::ScrollArea::vertical()
                                     .max_height(160.0)
                                     .show(ui, |ui| {
-                                        ui.monospace(preview);
+                                        let excerpt = preview
+                                            .lines()
+                                            .take(200)
+                                            .map(|line| line.chars().take(500).collect::<String>())
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        ui.monospace(excerpt);
+                                        ui.small(tr("analysis.preview_limit"));
                                     });
                             });
                         }
@@ -4407,7 +4577,7 @@ impl TextView {
                         if let Some(row) = navigate {
                             self.cursor_row = Some(row);
                             self.scroll_to = Some(row);
-                            self.cur_block = self.diff.rows.get(row).and_then(|r| r.block);
+                            self.cur_block = self.diff.rows.get(row).and_then(|r| r.block());
                         }
                     }
                 });
@@ -4415,19 +4585,23 @@ impl TextView {
         if self.n() != 2 {
             return false;
         }
-        let format = self
-            .panes
-            .first()
-            .and_then(|p| {
-                crate::core::prettify::detect(
-                    p.doc.path.as_deref(),
-                    &p.doc.lines.first().cloned().unwrap_or_default(),
-                )
-            })
-            .map(|f| match f {
-                crate::core::prettify::Format::Json => semantic::Format::Json,
-                crate::core::prettify::Format::Xml => semantic::Format::Xml,
-            });
+        let format =
+            self.panes
+                .first()
+                .and_then(|p| {
+                    let hint =
+                        p.doc.syntax.as_ref().map(|extension| {
+                            std::path::PathBuf::from(format!("source.{extension}"))
+                        });
+                    crate::core::prettify::detect(
+                        p.doc.path.as_deref().or(hint.as_deref()),
+                        &p.doc.lines.first().cloned().unwrap_or_default(),
+                    )
+                })
+                .map(|f| match f {
+                    crate::core::prettify::Format::Json => semantic::Format::Json,
+                    crate::core::prettify::Format::Xml => semantic::Format::Xml,
+                });
         let Some(format) = format else {
             return false;
         };
@@ -4461,7 +4635,10 @@ impl TextView {
         if let Some((generation, task)) = &mut self.semantic_job {
             if let Some(result) = task.poll() {
                 match result {
-                    Ok(report) => self.semantic_cache = Some((*generation, report)),
+                    Ok(report) => {
+                        self.semantic_page = 0;
+                        self.semantic_cache = Some((*generation, report));
+                    }
                     Err(e) => {
                         self.status = e.to_string();
                         self.semantic_cache = Some((
@@ -4525,9 +4702,52 @@ impl TextView {
             if report.identical() {
                 ui.label(tr("analysis.semantic_identical"));
             }
+            let count = report
+                .changes
+                .iter()
+                .filter(|change| {
+                    self.semantic_filter
+                        .as_ref()
+                        .is_none_or(|f| f == &change.kind)
+                })
+                .count();
+            let pages = count.div_ceil(100).max(1);
+            self.semantic_page = self.semantic_page.min(pages - 1);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(self.semantic_page > 0, egui::Button::new("←"))
+                    .clicked()
+                {
+                    self.semantic_page -= 1;
+                }
+                ui.label(format!(
+                    "{} {}/{} · {}",
+                    tr("analysis.page"),
+                    self.semantic_page + 1,
+                    pages,
+                    count
+                ));
+                if ui
+                    .add_enabled(self.semantic_page + 1 < pages, egui::Button::new("→"))
+                    .clicked()
+                {
+                    self.semantic_page += 1;
+                }
+                ui.small(tr("analysis.value_limit"));
+            });
             let mut jump = None;
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for change in &report.changes {
+                for change in report
+                    .changes
+                    .iter()
+                    .filter(|change| {
+                        self.semantic_filter
+                            .as_ref()
+                            .is_none_or(|f| f == &change.kind)
+                    })
+                    .skip(self.semantic_page * 100)
+                    .take(100)
+                {
                     if self
                         .semantic_filter
                         .as_ref()
@@ -4535,31 +4755,52 @@ impl TextView {
                     {
                         continue;
                     }
-                    egui::CollapsingHeader::new(format!("{:?} {}", change.kind, change.path))
-                        .id_salt(&change.id)
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui.monospace(format!(
-                                "{} → {}",
-                                change.before.as_deref().unwrap_or("∅"),
-                                change.after.as_deref().unwrap_or("∅")
-                            ));
-                            for (side, span) in change.spans.iter().enumerate() {
-                                if let Some(span) = span {
-                                    if ui
-                                        .button(format!(
-                                            "{} {}:{}",
-                                            tr("analysis.source"),
-                                            side + 1,
-                                            span.line
-                                        ))
-                                        .clicked()
-                                    {
-                                        jump = Some((side, span.line - 1));
-                                    }
+                    egui::CollapsingHeader::new(format!(
+                        "{:?} {}{}",
+                        change.kind,
+                        change.path.chars().take(240).collect::<String>(),
+                        if change.path.chars().count() > 240 {
+                            "…"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .id_salt(&change.id)
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.monospace(format!(
+                            "{} → {}",
+                            change
+                                .before
+                                .as_deref()
+                                .unwrap_or("∅")
+                                .chars()
+                                .take(512)
+                                .collect::<String>(),
+                            change
+                                .after
+                                .as_deref()
+                                .unwrap_or("∅")
+                                .chars()
+                                .take(512)
+                                .collect::<String>()
+                        ));
+                        for (side, span) in change.spans.iter().enumerate() {
+                            if let Some(span) = span {
+                                if ui
+                                    .button(format!(
+                                        "{} {}:{}",
+                                        tr("analysis.source"),
+                                        side + 1,
+                                        span.line
+                                    ))
+                                    .clicked()
+                                {
+                                    jump = Some((side, span.line - 1));
                                 }
                             }
-                        });
+                        }
+                    });
                 }
             });
             if let Some((side, line)) = jump {
@@ -4568,8 +4809,13 @@ impl TextView {
                     .diff
                     .rows
                     .iter()
-                    .position(|r| r.line[side] == Some(line));
+                    .position(|r| r.line(side) == Some(line));
                 self.scroll_to = self.cursor_row;
+                self.sel_anchor = None;
+                self.cur_block = self
+                    .cursor_row
+                    .and_then(|row| self.diff.rows[row].block())
+                    .filter(|&b| !self.diff.blocks[b].ignored);
                 self.semantic_mode = false;
             }
         }
@@ -4577,6 +4823,10 @@ impl TextView {
     }
 
     pub fn ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
+        if self.text_layout != cfg.text_layout {
+            self.text_layout = cfg.text_layout;
+            self.scroll_anim = None;
+        }
         self.poll_highlight(cfg);
         if self.edit_markers != cfg.show_edit_markers {
             self.edit_markers = cfg.show_edit_markers;
@@ -4759,9 +5009,15 @@ impl TextView {
             .iter()
             .zip(&pane_scroll)
             .map(|(p, &scroll)| {
-                let start = (scroll.floor() as usize).min(p.lines.len());
-                let end = (start + visible.ceil() as usize + 1).min(p.lines.len());
-                (start, p.lines[start..end].to_vec())
+                let start = (scroll.floor() as usize).min(p.shared.len());
+                let end = (start + visible.ceil() as usize + 1).min(p.shared.len());
+                (
+                    start,
+                    p.shared[start..end]
+                        .iter()
+                        .map(|&v| self.layout.lines[v])
+                        .collect(),
+                )
             })
             .collect();
         for l in pane_shown.iter().flat_map(|(_, lines)| lines) {
@@ -4795,7 +5051,7 @@ impl TextView {
             .and_then(|p| line_at(pane_at(p.x), p.y));
         let hover_block = hover_v
             .and_then(|v| match self.layout.lines[v] {
-                VLine::Row(r, _) => self.diff.rows[r].block,
+                VLine::Row(r, _) => self.diff.rows[r].block(),
                 VLine::Fold(..) => None,
             })
             .filter(|&b| !self.diff.blocks[b].ignored);
@@ -4811,7 +5067,8 @@ impl TextView {
             let p = pane_at(pos.x);
             let in_gutter = pos.x - (content_left + p as f32 * pane_step) < gutter_w;
             let note = match hover_v.map(|v| self.layout.lines[v]) {
-                Some(VLine::Row(r, _)) if in_gutter => self.diff.rows[r].line[p]
+                Some(VLine::Row(r, _)) if in_gutter => self.diff.rows[r]
+                    .line(p)
                     .and_then(|l| self.bookmarks[p].get(&l))
                     .filter(|n| !n.is_empty())
                     .cloned(),
@@ -4841,7 +5098,7 @@ impl TextView {
                             };
                             self.active_pane = p;
                             self.cursor_row = Some(r);
-                            if let Some(b) = self.diff.rows[r].block {
+                            if let Some(b) = self.diff.rows[r].block() {
                                 if !self.diff.blocks[b].ignored {
                                     self.cur_block = Some(b);
                                 }
@@ -4896,7 +5153,7 @@ impl TextView {
                     }
                     self.cursor_row = Some(r);
                     self.cur_block = self.diff.rows[r]
-                        .block
+                        .block()
                         .filter(|&b| !self.diff.blocks[b].ignored);
                 }
             }
@@ -4948,7 +5205,7 @@ impl TextView {
                     );
                 }
                 let row = self.diff.rows[r];
-                let Some(l) = row.line[p] else { continue };
+                let Some(l) = row.line(p) else { continue };
                 if seg == 0 {
                     if self.sync_points.iter().any(|s| s[p] == l) {
                         // A synchronization point: a line across the top of the row.
@@ -4994,18 +5251,18 @@ impl TextView {
                 }
                 let line = &pane.doc.lines[l];
                 let ignored = row
-                    .block
+                    .block()
                     .map(|b| self.diff.blocks[b].ignored)
                     .unwrap_or(false);
                 let fg = if ignored { c.gutter_text } else { c.text };
-                let sel = row.block.is_some() && row.block == self.cur_block;
+                let sel = row.block().is_some() && row.block() == self.cur_block;
                 let inline_bg = if sel { c.inline_sel } else { c.inline };
                 if let (true, Some(delim)) = (self.table_mode, self.table_delim) {
                     let cells = table::split_row(line, delim);
                     let others: Vec<Vec<String>> = (0..n)
                         .filter(|&q| q != p)
                         .filter_map(|q| {
-                            row.line[q]
+                            row.line(q)
                                 .map(|ol| table::split_row(&self.panes[q].doc.lines[ol], delim))
                         })
                         .collect();
@@ -5015,7 +5272,7 @@ impl TextView {
                             * char_w
                             + 8.0;
                         let cell_rect = Rect::from_min_size(pos2(x, y), vec2(w, row_h));
-                        let differs = row.block.is_some()
+                        let differs = row.block().is_some()
                             && !ignored
                             && others.iter().any(|o| o.get(ci) != Some(cell));
                         if differs {
@@ -5154,13 +5411,13 @@ impl TextView {
             }
         }
 
-        // Meld-style link maps: each side has its own compact line coordinates.
+        // Link maps use each pane’s display coordinates in either spacing mode.
         // Only visit blocks intersecting a visible pane, even for very large files.
         let blocks: std::collections::BTreeSet<usize> = pane_shown
             .iter()
             .flat_map(|(_, lines)| lines)
             .filter_map(|line| match *line {
-                VLine::Row(r, _) => self.diff.rows[r].block,
+                VLine::Row(r, _) => self.diff.rows[r].block(),
                 VLine::Fold(..) => None,
             })
             .collect();
@@ -5320,7 +5577,7 @@ impl TextView {
         // context menu
         let mut action: Option<MenuAction> = None;
         if let Some((r, p)) = self.ctx_target {
-            let block = self.diff.rows.get(r).and_then(|row| row.block);
+            let block = self.diff.rows.get(r).and_then(|row| row.block());
             let lines = selection.filter(|&(a, b)| (a..=b).contains(&r));
             resp.context_menu(|ui| {
                 widgets::menu_setup(ui);
@@ -5378,10 +5635,11 @@ impl TextView {
                     action = Some(MenuAction::EditNote(r, p));
                 }
                 ui.separator();
-                let synced = self.diff.rows[r].line[p]
+                let synced = self.diff.rows[r]
+                    .line(p)
                     .is_some_and(|l| self.sync_points.iter().any(|s| s[p] == l));
-                let picked = self.diff.rows[r].line[p].is_some()
-                    && self.sync_pending.get(p).copied().flatten() == self.diff.rows[r].line[p];
+                let picked = self.diff.rows[r].line(p).is_some()
+                    && self.sync_pending.get(p).copied().flatten() == self.diff.rows[r].line(p);
                 let sync_label = if synced {
                     "cmd.remove_sync_point"
                 } else if picked {
@@ -5392,7 +5650,7 @@ impl TextView {
                 let sync = egui::Button::new(tr(sync_label))
                     .shortcut_text(widgets::menu_shortcut(ui, &Cmd::SyncPoint.shown_key()));
                 if ui
-                    .add_enabled(self.diff.rows[r].line[p].is_some(), sync)
+                    .add_enabled(self.diff.rows[r].line(p).is_some(), sync)
                     .clicked()
                 {
                     action = Some(MenuAction::SyncPoint(r, p));
@@ -5438,7 +5696,7 @@ impl TextView {
                             .diff
                             .rows
                             .get(r)
-                            .and_then(|row| row.line[p])
+                            .and_then(|row| row.line(p))
                             .map(|l| self.panes[p].doc.lines[l].clone()),
                     };
                     if let Some(t) = text {
@@ -5565,6 +5823,101 @@ mod tests {
     use super::*;
 
     #[test]
+    fn review_cursor_restores_unique_hunks_and_flags_ambiguous_contexts() {
+        let cfg = Config::default();
+        let docs = [
+            "one\nold a\nthree\nfour\nfive\nold b\nend\n",
+            "one\nnew a\nthree\nfour\nfive\nnew b\nend\n",
+        ]
+        .map(|text| TextDoc::from_text(None, text))
+        .to_vec();
+        let original = TextView::new(docs.clone(), &cfg);
+        let last = original.diff.blocks.len() - 1;
+        let id = original.review_hunk_id(&original.diff.blocks[last]);
+        let mut reopened = TextView::new(docs, &cfg);
+        reopened.review_decision = Some(Box::new(crate::core::review_state::Decision {
+            current_hunk: Some(id),
+            ..Default::default()
+        }));
+        reopened.restore_review_cursor();
+        assert_eq!(reopened.cur_block, Some(last));
+        let docs = [
+            "same\nsame\nold\nsame\nsame\nseparator\nsame\nsame\nold\nsame\nsame\n",
+            "same\nsame\nnew\nsame\nsame\nseparator\nsame\nsame\nnew\nsame\nsame\n",
+        ]
+        .map(|text| TextDoc::from_text(None, text))
+        .to_vec();
+        let mut ambiguous = TextView::new(docs, &cfg);
+        let id = ambiguous.review_hunk_id(&ambiguous.diff.blocks[0]);
+        ambiguous.review_decision = Some(Box::new(crate::core::review_state::Decision {
+            current_hunk: Some(id),
+            state: crate::core::review_state::State::Accepted,
+            ..Default::default()
+        }));
+        ambiguous.restore_review_cursor();
+        assert!(ambiguous.review_decision.as_ref().unwrap().stale);
+    }
+
+    #[test]
+    fn spacing_modes_rebuild_cached_rows_without_changing_documents_or_differences() {
+        for texts in [
+            vec![
+                "start\nend\n",
+                "start\ninserted long line that wraps\nextra\nend\n",
+            ],
+            vec![
+                "start\nleft\nend\n",
+                "start\nend\n",
+                "start\ninserted long line that wraps\nextra\nend\n",
+            ],
+        ] {
+            let docs = texts.iter().map(|t| TextDoc::from_text(None, t)).collect();
+            let mut view = TextView::new(docs, &Config::default());
+            let rows = format!("{:?}", view.diff.rows);
+            for cols in [0, 8] {
+                view.text_layout = TextLayout::Aligned;
+                view.ensure_layout(cols, 4);
+                for pane in &view.layout.panes {
+                    assert_eq!(
+                        pane.shared
+                            .iter()
+                            .map(|&v| view.layout.lines[v])
+                            .collect::<Vec<_>>(),
+                        view.layout.lines
+                    );
+                    assert!(pane
+                        .boundaries
+                        .iter()
+                        .copied()
+                        .eq(0..=view.layout.lines.len()));
+                }
+                assert!(view.layout.lines.iter().any(
+                    |line| matches!(line, VLine::Row(r, _) if view.diff.rows[*r].line(0).is_none())
+                ));
+                view.text_layout = TextLayout::Compact;
+                view.ensure_layout(cols, 4);
+                assert!(view.layout.panes[0].shared.len() < view.layout.lines.len());
+                for (p, expected) in texts.iter().enumerate() {
+                    assert_eq!(view.panes[p].doc.text(), *expected);
+                }
+                assert_eq!(format!("{:?}", view.diff.rows), rows);
+            }
+            view.set_collapse(true);
+            view.text_layout = TextLayout::Aligned;
+            view.ensure_layout(8, 4);
+            for pane in &view.layout.panes {
+                assert_eq!(
+                    pane.shared
+                        .iter()
+                        .map(|&v| view.layout.lines[v])
+                        .collect::<Vec<_>>(),
+                    view.layout.lines
+                );
+            }
+        }
+    }
+
+    #[test]
     fn compact_panes_preserve_real_lines_and_wrapped_segments_in_two_and_three_way_views() {
         for texts in [
             vec![
@@ -5598,13 +5951,14 @@ mod tests {
                         .collect();
                     let pane = &v.layout.panes[p];
                     let actual: Vec<_> = pane
-                        .lines
+                        .shared
                         .iter()
-                        .map(|line| {
+                        .map(|&index| {
+                            let line = &v.layout.lines[index];
                             let VLine::Row(r, seg) = *line else {
                                 panic!("unexpected fold")
                             };
-                            (v.diff.rows[r].line[p].expect("no alignment filler"), seg)
+                            (v.diff.rows[r].line(p).expect("no alignment filler"), seg)
                         })
                         .collect();
                     assert_eq!(actual, expected);
@@ -5686,12 +6040,12 @@ mod tests {
             .diff
             .rows
             .iter()
-            .position(|r| r.line[1] == Some(1))
+            .position(|r| r.line(1) == Some(1))
             .unwrap();
-        assert!(v.diff.rows[v.diff.row_of_line(1, 1)].block.is_none());
+        assert!(v.diff.rows[v.diff.row_of_line(1, 1)].block().is_none());
         v.select_table_row(row, 1, 1);
         assert!(v.cur_block.is_some());
-        assert_eq!(v.diff.rows[v.cursor_row.unwrap()].line[1], Some(2));
+        assert_eq!(v.diff.rows[v.cursor_row.unwrap()].line(1), Some(2));
         assert_eq!(v.table.column, 1);
         v.copy_current(true);
         assert_eq!(v.panes[1].doc.text(), left);
@@ -5718,7 +6072,7 @@ mod tests {
             .diff
             .rows
             .iter()
-            .position(|r| r.line[0] == Some(1))
+            .position(|r| r.line(0) == Some(1))
             .unwrap();
         v.copy_cell(row, 1, 0, 1);
         assert_eq!(v.panes[1].doc.text(), original.replace("old", "new"));
@@ -5987,7 +6341,7 @@ mod tests {
         v.set_sync_point_at(v.diff.row_of_line(0, 0), 0);
         assert_eq!(v.sync_points, [[0, 0, 0]]);
         let row = v.diff.row_of_line(0, 0);
-        assert_eq!(v.diff.rows[row].line[..2], [Some(0), Some(0)]);
+        assert_eq!(v.diff.rows[row].lines()[..2], [Some(0), Some(0)]);
         // An edit above the point on the left moves it along with its line.
         v.push_undo();
         v.panes[0].doc.lines.insert(0, "zero".into());

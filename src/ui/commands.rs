@@ -318,6 +318,7 @@ pub const BINDINGS: &[Binding] = {
         bind(A, CTRL, Key::S, "Ctrl+S", Save),
         bind(A, CTRL, Key::W, "Ctrl+W", CloseTab),
         bind(A, CTRL, Key::F4, "Ctrl+F4", CloseTab),
+        bind(V, NONE, Key::Escape, "Esc", CloseTab),
         REPLACE,
         bind(A, CTRL, Key::F, "Ctrl+F", Find),
         bind(A, CTRL, Key::G, "Ctrl+G", GotoLine),

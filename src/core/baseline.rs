@@ -1,10 +1,5 @@
 //! Bounded immutable baseline captures and reproducible release summaries.
-use super::{
-    analysis,
-    diff::{self, DiffOptions},
-    filter::FileFilter,
-    semantic, text,
-};
+use super::{analysis, diff::DiffOptions, filter::FileFilter, semantic, text};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,6 +15,13 @@ pub enum BaselineSpec {
     ReviewSnapshot { path: PathBuf, side: usize },
 }
 impl BaselineSpec {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Folder { path }
+            | Self::GitRef { path, .. }
+            | Self::ReviewSnapshot { path, .. } => path,
+        }
+    }
     pub fn parse(value: &str) -> Result<Self> {
         if let Some(value) = value.strip_prefix("git:") {
             let (rev, path) = value.split_once(':').context("Use git:REV:PATH")?;
@@ -82,6 +84,7 @@ pub struct ReleaseChange {
     pub before_digest: Option<String>,
     pub after_digest: Option<String>,
     pub ignored_by_text_rules: bool,
+    pub conflict_marker_candidates: bool,
     pub semantic: Option<semantic::SemanticReport>,
     pub risk_flags: Vec<String>,
 }
@@ -134,12 +137,30 @@ pub fn capture(
     let mut directories = BTreeSet::new();
     let mut excluded = BTreeMap::new();
     let mut total = 0;
-    let mask = FileFilter::resolve(filter, &super::filter::load_all_filters());
+    anyhow::ensure!(
+        filter.len() <= 4096 && !filter.contains('\0'),
+        "Baseline scope expression exceeds 4 KiB or contains NUL"
+    );
+    let named = super::filter::load_all_filters();
+    if let Some(name) = filter.strip_prefix(super::filter::FLT_PREFIX) {
+        anyhow::ensure!(
+            named.iter().any(|f| f.name == name.trim()),
+            "Unknown named scope filter: {name}"
+        );
+    }
+    let mask = FileFilter::resolve(filter, &named);
     let mut walk = walkdir::WalkDir::new(&root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter();
+    let mut observed = 0usize;
     while let Some(entry) = walk.next() {
+        observed += 1;
+        if observed > analysis::MAX_FILES + 1 {
+            bail!(
+                "Baseline exceeds 10,000 observed entries; narrow the root or exclude directories"
+            );
+        }
         analysis::check_cancel(cancel)?;
         let entry = match entry {
             Ok(e) => e,
@@ -182,7 +203,7 @@ pub fn capture(
             excluded.insert(rel, "Link or special file; not assessed".into());
             continue;
         }
-        let bytes = match analysis::read(entry.path()) {
+        let bytes = match analysis::read_in_root(entry.path(), &root) {
             Ok(b) => b,
             Err(e) => {
                 excluded.insert(rel, e.to_string());
@@ -202,12 +223,16 @@ pub fn capture(
             },
         );
     }
-    let fingerprint = analysis::identity(
-        &files
+    let fingerprint = analysis::identity(&(
+        files
             .iter()
-            .map(|(p, f)| (p, &f.digest))
+            .map(|(path, file)| (path, &file.digest))
             .collect::<Vec<_>>(),
-    );
+        &directories,
+        &excluded,
+        options,
+        filter,
+    ));
     let _keep_alive = (git_temp, review_temp);
     Ok(Capture {
         metadata: BaselineMetadata {
@@ -227,6 +252,12 @@ pub fn capture(
         directories,
         excluded,
     })
+}
+pub fn is_scope_exclusion(reason: &str) -> bool {
+    matches!(
+        reason,
+        "File excluded by scope" | "Directory excluded by scope"
+    )
 }
 fn excluded(exclusions: &BTreeMap<String, String>, mut path: &str) -> bool {
     if exclusions.contains_key("") {
@@ -291,6 +322,13 @@ pub fn compare(
         let old_path = moved.get(path).cloned();
         let a = left.files.get(old_path.as_ref().unwrap_or(path));
         let b = right.files.get(path);
+        let conflict_marker_candidates = b.is_some_and(|file| {
+            !text::looks_binary(&file.bytes)
+                && text::decode(&file.bytes, None)
+                    .0
+                    .lines()
+                    .any(|line| line.starts_with("<<<<<<<") || line.starts_with(">>>>>>>"))
+        });
         let mut semantic = None;
         let mut ignored = false;
         let category = match (a, b) {
@@ -315,9 +353,12 @@ pub fn compare(
                 } else {
                     let da = text::doc_from_bytes(Some(PathBuf::from(path)), &a.bytes, None);
                     let db = text::doc_from_bytes(Some(PathBuf::from(path)), &b.bytes, None);
-                    let mut d = diff::compute(&[&da.lines, &db.lines], &left.metadata.rules);
-                    diff::include_doc_formats(&mut d, &[&da, &db], &left.metadata.rules);
-                    ignored = d.blocks.iter().all(|b| b.ignored);
+                    ignored = super::folder::captured_bytes_equal(
+                        &a.bytes,
+                        &b.bytes,
+                        &left.metadata.rules,
+                        Path::new(path),
+                    );
                     let format = match text::extension(Path::new(path)).as_str() {
                         "json" => Some(semantic::Format::Json),
                         "xml" => Some(semantic::Format::Xml),
@@ -331,13 +372,18 @@ pub fn compare(
             }
             _ => continue,
         };
-        let risk_flags = if !matches!(category, Category::Unchanged)
+        let mut risk_flags = if !matches!(category, Category::Unchanged)
             && important.iter().any(|p| path.contains(p))
         {
             vec!["User important-path rule matched; compatibility has not been validated".into()]
         } else {
             Vec::new()
         };
+        if conflict_marker_candidates {
+            risk_flags.push(
+                "Conflict marker candidates remain; inspect the captured source manually".into(),
+            );
+        }
         let before_digest = a.map(|f| f.digest.clone());
         let after_digest = b.map(|f| f.digest.clone());
         changes.push(ReleaseChange {
@@ -348,6 +394,7 @@ pub fn compare(
             before_digest,
             after_digest,
             ignored_by_text_rules: ignored,
+            conflict_marker_candidates,
             semantic,
             risk_flags,
         });
@@ -363,6 +410,13 @@ pub fn compare(
             )
             .or_default() += 1;
     }
+    counts.insert(
+        "conflict_marker_candidates".into(),
+        changes
+            .iter()
+            .filter(|c| c.conflict_marker_candidates)
+            .count(),
+    );
     let excluded = [("left", &left.excluded), ("right", &right.excluded)]
         .into_iter()
         .flat_map(|(side, e)| {
@@ -373,9 +427,148 @@ pub fn compare(
     Ok(ReleaseSummary { version: 1, left: left.metadata.clone(), right: right.metadata.clone(), changes, counts, excluded, limitations: vec!["Exact unique-content moves only; edited/ambiguous renames stay added/deleted.".into(), "Heuristic priority flags do not validate release compatibility; source references are relative to captured baseline paths.".into(), "Files vs directories and excluded ancestors require manual review; unreadable paths are never counted identical.".into()] })
 }
 
+/// A self-contained, linked release report. Detail comparisons reuse the existing report
+/// renderer in script-disabled frames and are bounded independently of captured input size.
+pub fn html_report(summary: &ReleaseSummary, left: &Capture, right: &Capture) -> Result<String> {
+    use super::xml_report::esc;
+    use std::fmt::Write;
+    let json = serde_json::to_string_pretty(summary)?;
+    let mut out = format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>OxideMerge release summary</title><style>body{{font:15px system-ui;margin:2rem}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}iframe{{width:100%;height:32rem;border:1px solid #aaa}}section{{margin-block:2rem}}</style><h1>Release summary</h1><p>Frozen captured baselines. Priority and conflict-marker flags require review; compatibility has not been validated.</p><details><summary>Baseline metadata and versioned JSON</summary><pre>{}</pre></details><nav><ul>", esc(&json));
+    for change in &summary.changes {
+        write!(
+            out,
+            "<li><a href=\"#change-{}\">{:?}: {}</a></li>",
+            change.id,
+            change.category,
+            esc(&change.path)
+        )?;
+    }
+    out.push_str("</ul></nav>");
+    let mut detailed = 0;
+    for change in &summary.changes {
+        write!(
+            out,
+            "<section id=\"change-{}\"><h2>{:?}: {}</h2>",
+            change.id,
+            change.category,
+            esc(&change.path)
+        )?;
+        if let Some(old) = &change.old_path {
+            write!(out, "<p>Exact content move from {}</p>", esc(old))?;
+        }
+        for warning in &change.risk_flags {
+            write!(out, "<p>{}</p>", esc(warning))?;
+        }
+        let a = left
+            .files
+            .get(change.old_path.as_deref().unwrap_or(&change.path));
+        let b = right.files.get(&change.path);
+        let bytes = [
+            a.map_or(&[][..], |f| f.bytes.as_slice()),
+            b.map_or(&[][..], |f| f.bytes.as_slice()),
+        ];
+        if !matches!(change.category, Category::Unchanged)
+            && detailed < 100
+            && out.len() < 12 << 20
+            && bytes
+                .iter()
+                .all(|b| b.len() <= 128 << 10 && !text::looks_binary(b))
+        {
+            let docs: Vec<_> = bytes
+                .iter()
+                .map(|b| text::doc_from_bytes(None, b, None))
+                .collect();
+            let refs: Vec<_> = docs.iter().map(|d| d.lines.as_slice()).collect();
+            let mut diff = super::diff::compute_with(
+                &refs,
+                &summary.left.rules,
+                super::comments::for_path(Path::new(&change.path)),
+            );
+            super::diff::include_doc_formats(
+                &mut diff,
+                &docs.iter().collect::<Vec<_>>(),
+                &summary.left.rules,
+            );
+            let html = super::report::text_html(
+                &[
+                    format!(
+                        "Left: {}",
+                        change.old_path.as_deref().unwrap_or(&change.path)
+                    ),
+                    format!("Right: {}", change.path),
+                ],
+                &refs,
+                &diff,
+                &summary.left.rules,
+                &[],
+                "Captured baseline comparison options",
+            );
+            let escaped = esc(&html);
+            if out.len() + escaped.len() <= 16 << 20 {
+                write!(
+                    out,
+                    "<iframe sandbox loading=\"lazy\" title=\"{}\" srcdoc=\"{}\"></iframe>",
+                    esc(&change.path),
+                    escaped
+                )?;
+                detailed += 1;
+            } else {
+                out.push_str("<p>Detail omitted: HTML preview budget exceeded. Use the captured comparison in the app.</p>");
+            }
+        } else {
+            out.push_str("<p>Detail omitted: unchanged, binary or beyond the bounded HTML preview budget. Full classifications and digests are in the JSON above.</p>");
+        }
+        out.push_str("</section>");
+    }
+    out.push_str("</html>");
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ignored_text_changes_use_the_same_full_content_policy_as_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let left = root.path().join("left");
+        let right = root.path().join("right");
+        for p in [&left, &right] {
+            std::fs::create_dir(p).unwrap();
+        }
+        std::fs::write(left.join("a.rs"), "let x = 1; // old\n").unwrap();
+        std::fs::write(right.join("a.rs"), "let x = 1; // new\n").unwrap();
+        let options = DiffOptions {
+            ignore_comments: true,
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let progress = AtomicUsize::new(0);
+        let a = capture(
+            &BaselineSpec::Folder { path: left },
+            &options,
+            "*",
+            &cancel,
+            &progress,
+        )
+        .unwrap();
+        let b = capture(
+            &BaselineSpec::Folder { path: right },
+            &options,
+            "*",
+            &cancel,
+            &progress,
+        )
+        .unwrap();
+        let report = compare(&a, &b, &[], &cancel).unwrap();
+        assert_eq!(report.changes.len(), 1);
+        assert!(report.changes[0].ignored_by_text_rules);
+        assert!(crate::core::impact::Index::default()
+            .analyze(&report, &b, &cancel)
+            .unwrap()
+            .findings
+            .is_empty());
+    }
+
     #[test]
     fn captures_exact_moves_exclusions_and_incremental_impact_evidence() {
         let dir = tempfile::tempdir().unwrap();
@@ -410,6 +603,11 @@ mod tests {
         .unwrap();
         let summary = compare(&left, &right, &["config".into()], &cancel).unwrap();
         assert_eq!(summary.counts.get("moved"), Some(&1));
+        let html = html_report(&summary, &left, &right).unwrap();
+        assert!(html.contains("href=\"#change-"));
+        assert!(html.contains("<iframe sandbox"));
+        assert!(html.contains("srcdoc=\"&lt;!DOCTYPE") || html.contains("srcdoc=\"&lt;!doctype"));
+
         assert_eq!(
             summary
                 .changes
@@ -435,9 +633,11 @@ mod tests {
             &progress,
         )
         .unwrap();
-        let incremental = index.analyze(&summary, &updated, &cancel).unwrap();
+        assert!(index.analyze(&summary, &updated, &cancel).is_err());
+        let updated_summary = compare(&left, &updated, &["config".into()], &cancel).unwrap();
+        let incremental = index.analyze(&updated_summary, &updated, &cancel).unwrap();
         let fresh = crate::core::impact::Index::default()
-            .analyze(&summary, &updated, &cancel)
+            .analyze(&updated_summary, &updated, &cancel)
             .unwrap();
         assert_eq!(
             serde_json::to_value(incremental).unwrap(),

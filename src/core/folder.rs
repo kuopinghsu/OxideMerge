@@ -660,6 +660,20 @@ impl Loaded {
     }
 }
 
+/// Compare frozen in-memory bytes under exactly the folder full-content text policy.
+/// Analysis callers never run converters; converter identities remain provenance metadata.
+pub fn captured_bytes_equal(a: &[u8], b: &[u8], options: &DiffOptions, path: &Path) -> bool {
+    let a = Loaded {
+        bytes: a.to_vec(),
+        binary: text::looks_binary(a),
+    };
+    let b = Loaded {
+        bytes: b.to_vec(),
+        binary: text::looks_binary(b),
+    };
+    text_equal(&a, &b, &Normalizer::new(options), options, path)
+}
+
 /// Text aware equality honoring the ignore options. `path` (of either side) tells the
 /// language for ignoring comments and the format for reformatting JSON and XML.
 fn text_equal(a: &Loaded, b: &Loaded, norm: &Normalizer, dopts: &DiffOptions, path: &Path) -> bool {

@@ -236,6 +236,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn analysis_strings_have_explicit_english_fallback_outside_traditional_chinese() {
+        let en = english();
+        for (code, text) in EMBEDDED {
+            if *code == "en" || *code == "zh-TW" {
+                continue;
+            }
+            let table = parse(text);
+            for (key, value) in en.iter().filter(|(k, _)| {
+                ["analysis.", "workspace.", "baseline.", "impact."]
+                    .iter()
+                    .any(|p| k.starts_with(p))
+            }) {
+                assert_eq!(
+                    table.get(key),
+                    Some(value),
+                    "Intentional English fallback for {code}: {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn all_languages_have_all_keys() {
         let en = english();
         for (code, text) in EMBEDDED {

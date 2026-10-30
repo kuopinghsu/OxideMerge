@@ -406,8 +406,8 @@ impl BinaryView {
             0.0
         };
         let vbar_w = 12.0;
-        let left = avail.left() + loc_w;
-        let right = avail.right() - vbar_w;
+        let left = avail.left();
+        let right = avail.right() - vbar_w - loc_w;
         let pane_w = (right - left) / n as f32;
         let top = avail.top() + header_h;
         let bottom = avail.bottom();
@@ -576,10 +576,7 @@ impl BinaryView {
         }
 
         if cfg.show_location_pane {
-            let loc = Rect::from_min_max(
-                pos2(avail.left(), top),
-                pos2(avail.left() + loc_w - 2.0, bottom),
-            );
+            let loc = Rect::from_min_max(pos2(right, top), pos2(right + loc_w - 2.0, bottom));
             let marks: Vec<Mark> = self
                 .diffs
                 .iter()
@@ -614,7 +611,7 @@ impl BinaryView {
                 self.scroll = (t - visible / 2.0).clamp(0.0, max_scroll);
             }
         }
-        let vbar = Rect::from_min_max(pos2(right, top), pos2(avail.right(), bottom));
+        let vbar = Rect::from_min_max(pos2(right + loc_w, top), pos2(avail.right(), bottom));
         widgets::vscrollbar(
             ui,
             self.id.with("vbar"),

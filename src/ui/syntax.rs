@@ -28,9 +28,22 @@ fn highlighter() -> &'static Highlighter {
 }
 
 const MAX_LINES: usize = 50_000;
+const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Check before cloning input for the worker, not only after allocating its copy.
+pub fn within_limits(lines: &[String]) -> bool {
+    lines.len() <= MAX_LINES
+        && lines
+            .iter()
+            .try_fold(0usize, |total, line| {
+                let next = total.checked_add(line.len())?;
+                (next <= MAX_BYTES).then_some(next)
+            })
+            .is_some()
+}
 
 pub fn highlight(lines: &[String], ext: &str, dark: bool) -> Option<Vec<LineSpans>> {
-    if lines.len() > MAX_LINES {
+    if !within_limits(lines) {
         return None;
     }
     let h = highlighter();
@@ -68,4 +81,18 @@ pub fn spawn(lines: Vec<String>, ext: String, dark: bool) -> Receiver<Option<Vec
         let _ = tx.send(highlight(&lines, &ext, dark));
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limits_reject_large_line_counts_and_single_giant_lines_before_worker_copy() {
+        assert!(within_limits(&["let n = 1;".into()]));
+        assert!(!within_limits(&vec![String::new(); MAX_LINES + 1]));
+        let lines = vec!["x".repeat(MAX_BYTES + 1)];
+        assert!(!within_limits(&lines));
+        assert!(highlight(&lines, "rs", false).is_none());
+    }
 }
