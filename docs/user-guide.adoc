@@ -160,6 +160,10 @@ Status bar:: The number of differences, the current line or offset, and at the r
 interface language.
 Change the language under *Options → General*, or start OxideMerge with `--lang`.
 
+Click the app logo or choose *Help → About* for the version and build identifier. Development
+builds show a short Git hash, with `-dirty` for tracked source/index changes. Clean optimized
+builds at the matching version tag show the UTC build date. `--version` shows the same identifier.
+
 Starting OxideMerge without a comparison shows the start page.
 It has *Compare files or folders*, *Open conflict file*, and the list of recent comparisons.
 Right-click a recent comparison to change its paths or remove it from the list.

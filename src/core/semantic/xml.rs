@@ -45,6 +45,21 @@ fn scalar(kind: &str, value: String, source: &str, start: usize, end: usize) -> 
         span: span(source, start, end),
     }
 }
+// Attributes live in the same map but do not consume a child-node position.
+// Track that position while parsing instead of rescanning every preceding sibling.
+struct Frame {
+    node: Node,
+    next_child: usize,
+}
+impl Frame {
+    fn push(&mut self, node: Node) {
+        self.node
+            .children
+            .insert(format!("/node()[{}]", self.next_child), node);
+        self.next_child += 1;
+    }
+}
+
 pub fn parse(source: &str) -> Result<Node> {
     if !source.chars().all(xml_char) {
         bail!("Invalid XML 1.0 character");
@@ -52,7 +67,7 @@ pub fn parse(source: &str) -> Result<Node> {
     let mut reader = NsReader::from_str(source);
     reader.config_mut().check_end_names = true;
     reader.config_mut().check_comments = true;
-    let mut stack: Vec<Node> = Vec::new();
+    let mut stack: Vec<Frame> = Vec::new();
     let mut root = None;
     let mut document = Node {
         kind: "document".into(),
@@ -128,11 +143,14 @@ pub fn parse(source: &str) -> Result<Node> {
                 if matches!(event, Event::Empty(_)) {
                     attach(node, &mut stack, &mut root)?;
                 } else {
-                    stack.push(node);
+                    stack.push(Frame {
+                        node,
+                        next_child: 0,
+                    });
                 }
             }
             Event::End(_) => {
-                let mut node = stack.pop().context("Unbalanced XML")?;
+                let mut node = stack.pop().context("Unbalanced XML")?.node;
                 node.span.bytes.end = end;
                 attach(node, &mut stack, &mut root)?;
             }
@@ -186,14 +204,9 @@ pub fn parse(source: &str) -> Result<Node> {
         .insert("/root".into(), root.context("XML has no root element")?);
     Ok(document)
 }
-fn misc(node: Node, stack: &mut [Node], document: &mut Node, after: bool) {
+fn misc(node: Node, stack: &mut [Frame], document: &mut Node, after: bool) {
     if let Some(parent) = stack.last_mut() {
-        let i = parent
-            .children
-            .keys()
-            .filter(|k| !k.starts_with("/@"))
-            .count();
-        parent.children.insert(format!("/node()[{i}]"), node);
+        parent.push(node);
     } else {
         let i = document.children.len();
         document.children.insert(
@@ -202,20 +215,15 @@ fn misc(node: Node, stack: &mut [Node], document: &mut Node, after: bool) {
         );
     }
 }
-fn attach(node: Node, stack: &mut [Node], root: &mut Option<Node>) -> Result<()> {
+fn attach(node: Node, stack: &mut [Frame], root: &mut Option<Node>) -> Result<()> {
     if let Some(parent) = stack.last_mut() {
-        let i = parent
-            .children
-            .keys()
-            .filter(|k| !k.starts_with("/@"))
-            .count();
-        parent.children.insert(format!("/node()[{i}]"), node);
+        parent.push(node);
     } else if root.replace(node).is_some() {
         bail!("XML has multiple roots");
     }
     Ok(())
 }
-fn text(stack: &mut [Node], value: &str, source: &str, start: usize, end: usize) -> Result<()> {
+fn text(stack: &mut [Frame], value: &str, source: &str, start: usize, end: usize) -> Result<()> {
     if !value.chars().all(xml_char) {
         bail!("Invalid XML text character");
     }
@@ -228,13 +236,10 @@ fn text(stack: &mut [Node], value: &str, source: &str, start: usize, end: usize)
         }
         return Ok(());
     };
-    let count = parent
-        .children
-        .keys()
-        .filter(|k| !k.starts_with("/@"))
-        .count();
+    let count = parent.next_child;
     let previous = format!("/node()[{}]", count.saturating_sub(1));
     if let Some(last) = parent
+        .node
         .children
         .get_mut(&previous)
         .filter(|n| n.kind == "text")
@@ -242,10 +247,38 @@ fn text(stack: &mut [Node], value: &str, source: &str, start: usize, end: usize)
         last.value.as_mut().unwrap().push_str(value);
         last.span.bytes.end = end;
     } else {
-        parent.children.insert(
-            format!("/node()[{count}]"),
-            scalar("text", value.into(), source, start, end),
-        );
+        parent.push(scalar("text", value.into(), source, start, end));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_positions_exclude_attributes_and_coalesce_text_events() {
+        let doc = parse("<r a='1'>a&amp;b<![CDATA[c]]><!--note--><?pi d?><item/>d</r>").unwrap();
+        let root = &doc.children["/root"];
+        assert_eq!(root.children.len(), 6);
+        assert_eq!(root.children["/node()[0]"].value.as_deref(), Some("a&bc"));
+        assert_eq!(root.children["/node()[1]"].kind, "comment");
+        assert_eq!(root.children["/node()[2]"].kind, "pi");
+        assert_eq!(root.children["/node()[3]"].kind, "element");
+        assert_eq!(root.children["/node()[4]"].value.as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn wide_documents_within_the_node_limit_do_not_scan_all_previous_siblings() {
+        let source = format!("<r a='1'>{}</r>", "<item/>".repeat(40_000));
+        let start = std::time::Instant::now();
+        let doc = parse(&source).unwrap();
+        assert_eq!(doc.children["/root"].children.len(), 40_001);
+        assert_eq!(
+            doc.children["/root"].children["/node()[39999]"].kind,
+            "element"
+        );
+        // Generous margin for CI load; the previous quadratic implementation takes minutes.
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
 }

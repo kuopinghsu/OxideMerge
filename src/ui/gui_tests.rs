@@ -1677,3 +1677,18 @@ fn escape_closes_binary_and_folder_comparisons() {
         assert!(!gui.closed);
     }
 }
+
+#[test]
+fn about_displays_the_build_identifier_and_keeps_the_calendar_copyright_year() {
+    let mut gui = Gui::start("about_build", None);
+    gui.menu(&[tr("menu.help"), tr("menu.about")]);
+    assert!(gui.shows_text(env!("OXIDEMERGE_BUILD_ID")));
+    let copyright = trf(
+        "about.copyright",
+        &[
+            ("year", env!("OXIDEMERGE_BUILD_DATE")[..4].to_owned()),
+            ("license", env!("CARGO_PKG_LICENSE").to_owned()),
+        ],
+    );
+    assert!(gui.shows_text(&copyright));
+}

@@ -106,7 +106,7 @@ pub fn text_plan(
         let origin = match block.kind {
             BlockKind::LeftOnly => "left",
             BlockKind::RightOnly => "right",
-            BlockKind::BothSame => "both",
+            BlockKind::BothSame | BlockKind::Compatible => "both",
             _ => "manual_review",
         };
         let chunks: Vec<_> = docs
@@ -157,7 +157,9 @@ pub fn text_plan(
             f.hunk_id = Some(id.clone());
             f.row = Some(block.first_row);
             findings.push(f);
-        } else if block.ranges[0].is_empty() || block.ranges[2].is_empty() {
+        } else if (block.ranges[0].is_empty() || block.ranges[2].is_empty())
+            && block.ranges.iter().any(|range| !range.is_empty())
+        {
             let mut f = finding("deletion_review", ValidationSeverity::Warning, false, "Deletion is mechanically mergeable; check whether removing this content is intended.");
             f.hunk_id = Some(id.clone());
             f.row = Some(block.first_row);
