@@ -16,3 +16,7 @@ pub mod text_view;
 pub mod theme;
 pub mod web_view;
 pub mod widgets;
+
+pub mod analysis;
+
+pub mod baseline_panel;

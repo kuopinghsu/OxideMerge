@@ -25,6 +25,8 @@ pub struct Entry {
     pub modified: Option<SystemTime>,
     /// Text extracted at capture time instead of the original document container.
     pub converted: bool,
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37,6 +39,8 @@ pub struct Manifest {
     pub filter: String,
     pub notes: BTreeMap<String, String>,
     pub entries: Vec<Entry>,
+    #[serde(default)]
+    pub workspace: super::review_state::Workspace,
 }
 
 pub struct Review {
@@ -45,7 +49,7 @@ pub struct Review {
     pub temp: tempfile::TempDir,
 }
 
-fn safe_path(path: &str) -> bool {
+pub(crate) fn safe_path(path: &str) -> bool {
     !path.is_empty()
         && !path.contains(['\\', ':', '\0'])
         && path.split('/').all(|p| {
@@ -71,7 +75,7 @@ fn safe_path(path: &str) -> bool {
 
 impl Manifest {
     fn validate(&self) -> Result<()> {
-        if self.version != 1 {
+        if !(1..=2).contains(&self.version) {
             bail!("Unsupported folder review version {}", self.version);
         }
         if !(2..=3).contains(&self.labels.len()) {
@@ -88,6 +92,10 @@ impl Manifest {
             {
                 bail!("Invalid or duplicate folder review path: {}", entry.path);
             }
+        }
+        self.workspace.validate()?;
+        if self.notes.values().any(|n| n.len() > 16_384) {
+            bail!("Review comment is too long");
         }
         if self.notes.keys().any(|p| !safe_path(p)) {
             bail!("Invalid annotation path");
@@ -108,7 +116,15 @@ pub struct Capture<'a> {
     pub notes: &'a BTreeMap<String, String>,
 }
 
+#[cfg(test)]
 pub fn save(path: &Path, capture: Capture<'_>) -> Result<()> {
+    save_with_workspace(path, capture, &super::review_state::Workspace::default())
+}
+pub fn save_with_workspace(
+    path: &Path,
+    capture: Capture<'_>,
+    workspace: &super::review_state::Workspace,
+) -> Result<()> {
     let Capture {
         roots,
         labels,
@@ -122,7 +138,7 @@ pub fn save(path: &Path, capture: Capture<'_>) -> Result<()> {
         bail!("A folder review needs 2 or 3 sides");
     }
     let mut manifest = Manifest {
-        version: 1,
+        version: 2,
         saved: chrono::Local::now().to_rfc3339(),
         labels: labels.to_vec(),
         options: options.clone(),
@@ -130,6 +146,7 @@ pub fn save(path: &Path, capture: Capture<'_>) -> Result<()> {
         filter: filter.into(),
         notes: BTreeMap::new(),
         entries: Vec::new(),
+        workspace: workspace.clone(),
     };
     manifest.options.unpackers.clear();
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -182,12 +199,13 @@ pub fn save(path: &Path, capture: Capture<'_>) -> Result<()> {
             let converted = folder.method == super::folder::CompareMethod::FullContents
                 && !item.is_dir
                 && unpacker::find(&options.unpackers, &input).is_some();
-            let entry = Entry {
+            let mut entry = Entry {
                 side,
                 path: rel.clone(),
                 directory: item.is_dir,
                 modified: md.modified().ok(),
                 converted,
+                digest: None,
             };
             let name = format!("data/{side}/{rel}");
             if item.is_dir {
@@ -215,11 +233,30 @@ pub fn save(path: &Path, capture: Capture<'_>) -> Result<()> {
                 if after.len() != md.len() || after.modified().ok() != md.modified().ok() {
                     bail!("File changed while capturing: {rel}");
                 }
+                entry.digest = Some(super::analysis::digest(&bytes));
                 writer.start_file(name, zip_options)?;
                 writer.write_all(&bytes)?;
             }
             manifest.entries.push(entry);
         }
+    }
+    let captured: HashSet<_> = manifest
+        .entries
+        .iter()
+        .filter(|e| !e.directory)
+        .map(|e| e.path.clone())
+        .collect();
+    manifest
+        .workspace
+        .entries
+        .retain(|path, _| captured.contains(path));
+    if manifest
+        .workspace
+        .current
+        .as_ref()
+        .is_some_and(|p| !captured.contains(p))
+    {
+        manifest.workspace.current = None;
     }
     manifest.validate()?;
     let data = serde_json::to_vec_pretty(&manifest)?;
@@ -295,6 +332,13 @@ pub fn load(path: &Path) -> Result<Review> {
             total += bytes.len() as u64;
             if total > MAX_BYTES {
                 bail!("Folder review exceeds 256 MiB");
+            }
+            if entry
+                .digest
+                .as_ref()
+                .is_some_and(|digest| *digest != super::analysis::digest(&bytes))
+            {
+                bail!("Review content fingerprint mismatch: {}", entry.path);
             }
             std::fs::create_dir_all(dest.parent().unwrap())?;
             let mut output = std::fs::File::options()
@@ -450,6 +494,7 @@ mod tests {
             filter: "*".into(),
             notes: BTreeMap::new(),
             entries: vec![],
+            workspace: Default::default(),
         };
         manifest.entries.push(Entry {
             side: 0,
@@ -457,6 +502,7 @@ mod tests {
             directory: false,
             modified: None,
             converted: false,
+            digest: None,
         });
         assert!(manifest.validate().is_err());
         manifest.entries[0].path = "A.txt".into();
@@ -466,7 +512,7 @@ mod tests {
         });
         assert!(manifest.validate().is_err());
         manifest.entries.clear();
-        manifest.version = 2;
+        manifest.version = 3;
         assert!(manifest.validate().is_err());
     }
 }
