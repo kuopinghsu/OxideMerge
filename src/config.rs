@@ -296,6 +296,10 @@ impl Config {
             std::fs::create_dir_all(d).map_err(|e| anyhow::anyhow!("{}: {e}", d.display()))?;
         }
         let s = serde_json::to_string_pretty(self)?;
+        // One save at a time: on Windows, a file replaced while another save replaces it too
+        // can be refused ("Access is denied"), as unit tests running side by side found.
+        static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
         crate::core::fsutil::write_atomic_with(&p, s.as_bytes(), false)
     }
 
