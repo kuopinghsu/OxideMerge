@@ -17,8 +17,10 @@ use std::fmt::Write;
 use std::ops::Range;
 use std::path::PathBuf;
 
-/// Most difference slides in one report; the rest are counted on the closing slide.
-const MAX_SLIDES: usize = 2_000;
+/// Most difference slides in one report; the rest are counted on the closing slide. Fewer in
+/// tests: a file with more differences than that takes the compare of an unoptimized build past
+/// its deadline, after which it reports the file as one difference.
+const MAX_SLIDES: usize = if cfg!(test) { 50 } else { 2_000 };
 /// Most files the closing slide of a folder slideshow lists.
 const MAX_LISTED: usize = 500;
 
