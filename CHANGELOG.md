@@ -7,6 +7,10 @@ section of this file as the release notes.
 
 ### Added
 
+- About and `--version` show a short Git revision for development builds, with `-dirty` for
+  tracked source/index changes; clean optimized builds at the matching version tag retain the
+  UTC build date. The copyright year always uses the calendar date.
+
 - Escape closes the active comparison tab after open dialogs, search, previews and editors
   have handled it, retaining the existing unsaved-changes confirmation.
 
@@ -40,6 +44,11 @@ section of this file as the release notes.
   Folder comments are included in HTML, XML and text reports.
 
 ### Fixed
+
+- Merge verification includes encoding/BOM/EOL conflicts and rejects matching base bytes while
+  a format conflict remains unresolved; independent text/format changes remain mergeable.
+- XML semantic parsing tracks child positions per parent, avoiding quadratic sibling scans on
+  wide documents while preserving attribute, comment, mixed-content and reference semantics.
 
 - Large UTF-8 text comparisons load incrementally, borrow unmodified comparison keys and use
   compact unique-line anchors with coalesced equal runs and in-place reconstruction. Alignment

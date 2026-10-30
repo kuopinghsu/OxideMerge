@@ -1675,8 +1675,9 @@ impl TextView {
         preview.sync_points = self.sync_points.clone();
         preview.panes[1].doc.read_only = false;
         let refs: Vec<_> = docs.iter().map(|d| d.lines.as_slice()).collect();
-        let alignment =
+        let mut alignment =
             diff::compute_synced(&refs, &self.opts, self.comment_syntax(), &self.sync_points);
+        diff::include_doc_formats(&mut alignment, &docs.iter().collect::<Vec<_>>(), &self.opts);
         preview.auto_merge();
         Ok(crate::core::merge_validation::text_plan(
             &docs,
@@ -6215,6 +6216,107 @@ mod tests {
             assert_eq!(v.panes[1].doc.text(), expected);
             assert!(v.panes[1].doc.preserve_eols);
         }
+    }
+
+    #[test]
+    fn merge_preview_cannot_validate_unresolved_eol_or_encoding_conflicts() {
+        use crate::core::merge_validation::{validate, ValidationStatus};
+        let cfg = strict_config();
+        let eols = ["one\r\n", "one\n", "one\r"]
+            .map(|s| TextDoc::from_text(None, s))
+            .to_vec();
+        let mut encodings = vec![TextDoc::from_text(None, "one\n"); 3];
+        encodings[0].encoding = TextEncoding::Utf16Le;
+        encodings[2].encoding = TextEncoding::Utf16Be;
+        for docs in [eols, encodings] {
+            let output = docs[1].clone();
+            let view = TextView::new(docs, &cfg);
+            let plan = view.preview_merge(&cfg).unwrap();
+            assert!(plan.actions.iter().any(|a| a.operation == "conflict"));
+            let bytes = text::encode(&output.text(), output.encoding, output.bom);
+            assert_eq!(
+                validate(&plan, &output, &bytes).status,
+                ValidationStatus::Failed
+            );
+        }
+    }
+
+    #[test]
+    fn preview_and_auto_merge_use_the_same_nontrivial_synchronization_points() {
+        let cfg = Config::default();
+        let docs = [
+            "left\nsame\nend\n",
+            "base\nsame\nend\n",
+            "right\nsame\nend\n",
+        ]
+        .map(|s| TextDoc::from_text(None, s))
+        .to_vec();
+        let unsynced = TextView::new(docs.clone(), &cfg)
+            .preview_merge(&cfg)
+            .unwrap();
+        let mut actual = TextView::new(docs, &cfg);
+        actual.sync_points = vec![[1, 0, 1]];
+        let plan = actual.preview_merge(&cfg).unwrap();
+        assert_ne!(plan.expected_digest, unsynced.expected_digest);
+        actual.auto_merge();
+        let output = &actual.panes[1].doc;
+        assert_eq!(plan.preview.as_deref(), Some(output.text().as_str()));
+        assert_eq!(
+            plan.expected_digest,
+            Some(crate::core::analysis::digest(&text::encode(
+                &output.text(),
+                output.encoding,
+                output.bom
+            )))
+        );
+    }
+
+    #[test]
+    fn empty_document_bom_edits_are_not_reported_as_deletions() {
+        use crate::core::merge_validation::{validate, ValidationStatus};
+        let cfg = strict_config();
+        let mut left = TextDoc::empty(None);
+        left.bom = true;
+        let mut actual =
+            TextView::new(vec![left, TextDoc::empty(None), TextDoc::empty(None)], &cfg);
+        let plan = actual.preview_merge(&cfg).unwrap();
+        assert_eq!(plan.actions.len(), 1);
+        actual.auto_merge();
+        let output = &actual.panes[1].doc;
+        let bytes = text::encode(&output.text(), output.encoding, output.bom);
+        assert_eq!(bytes, b"\xef\xbb\xbf");
+        assert_eq!(
+            validate(&plan, output, &bytes).status,
+            ValidationStatus::Passed
+        );
+    }
+
+    #[test]
+    fn merge_preview_accepts_independent_text_and_format_changes_with_sync_points() {
+        use crate::core::merge_validation::{validate, ValidationStatus};
+        let cfg = strict_config();
+        let left = TextDoc::from_text(None, "start\nLEFT\nanchor\nend\n");
+        let base = TextDoc::from_text(None, "start\nbase\nanchor\nend\n");
+        let mut right = base.clone();
+        right.encoding = TextEncoding::Utf16Le;
+        right.bom = true;
+        let mut actual = TextView::new(vec![left, base, right], &cfg);
+        actual.sync_points = vec![[2, 2, 2]];
+        let plan = actual.preview_merge(&cfg).unwrap();
+        assert!(plan
+            .findings
+            .iter()
+            .all(|f| f.severity != crate::core::merge_validation::ValidationSeverity::Error));
+        actual.auto_merge();
+        let output = &actual.panes[1].doc;
+        assert_eq!(output.text(), "start\nLEFT\nanchor\nend\n");
+        assert_eq!(output.encoding, TextEncoding::Utf16Le);
+        assert!(output.bom);
+        let bytes = text::encode(&output.text(), output.encoding, output.bom);
+        assert_eq!(
+            validate(&plan, output, &bytes).status,
+            ValidationStatus::Passed
+        );
     }
 
     #[test]

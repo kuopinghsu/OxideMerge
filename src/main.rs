@@ -58,7 +58,7 @@ enum PatchArg {
 #[derive(Parser)]
 #[command(
     name = "oxidemerge",
-    version = concat!(env!("CARGO_PKG_VERSION"), " (build ", env!("OXIDEMERGE_BUILD_DATE"), ")"),
+    version = concat!(env!("CARGO_PKG_VERSION"), " (build ", env!("OXIDEMERGE_BUILD_ID"), ")"),
     about,
     long_about = None
 )]

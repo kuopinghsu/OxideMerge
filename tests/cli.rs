@@ -1038,3 +1038,31 @@ fn folder_merge_validation_checks_written_results_without_merging_inputs() {
     let bad = oxidemerge(d, &["--validate-merge", "merged", "left", "base", "right"]);
     assert_eq!(bad.code, 3, "{}", bad.stderr);
 }
+
+#[test]
+fn merge_validation_rejects_eol_conflicts_even_when_output_matches_the_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    files(d, &[("left", "a\r\n"), ("base", "a\n"), ("right", "a\r")]);
+    std::fs::create_dir(d.join(".config")).unwrap();
+    std::fs::write(
+        d.join(".config/config.json"),
+        r#"{"diff":{"ignore_eol":false,"ignore_codepage":false}}"#,
+    )
+    .unwrap();
+    let run = oxidemerge(d, &["--validate-merge", "base", "left", "base", "right"]);
+    assert_eq!(run.code, 3, "{} {}", run.stdout, run.stderr);
+    assert!(run.stdout.contains("unresolved_conflict"));
+    assert_eq!(read(d.join("base")), "a\n");
+}
+
+#[test]
+fn command_line_version_displays_the_same_build_identifier_as_about() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = oxidemerge(dir.path(), &["--version"]);
+    assert_eq!(run.code, 0);
+    assert!(run.stdout.contains(env!("CARGO_PKG_VERSION")));
+    assert!(run
+        .stdout
+        .contains(&format!("(build {})", env!("OXIDEMERGE_BUILD_ID"))));
+}

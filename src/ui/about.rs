@@ -108,7 +108,7 @@ fn close_button(ui: &mut egui::Ui) -> egui::Response {
 
 fn body(ui: &mut egui::Ui) {
     let p = widgets::pal(ui);
-    let build = env!("OXIDEMERGE_BUILD_DATE");
+    let build = env!("OXIDEMERGE_BUILD_ID");
     let mut title = egui::text::LayoutJob::default();
     let parts = [
         RichText::new(format!("OxideMerge {}  ", env!("CARGO_PKG_VERSION")))
@@ -147,7 +147,8 @@ fn body(ui: &mut egui::Ui) {
     heading(ui, tr("about.license"));
     let repository = env!("CARGO_PKG_REPOSITORY");
     link(ui, repository.trim_start_matches("https://"), repository);
-    let year = build.get(..4).unwrap_or(build);
+    let date = env!("OXIDEMERGE_BUILD_DATE");
+    let year = date.get(..4).unwrap_or(date);
     text(
         ui,
         &trf(

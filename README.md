@@ -571,3 +571,8 @@ See the [analysis guide](docs/analysis-guide.md) for policies, bounds and limita
 Text comparisons offer **Compact rows** (default, no insertion/deletion padding) and **Aligned
 rows** (blank space keeps corresponding lines aligned). Change **Text layout** in Options → General
 or View → Text compare. Location panes appear on the right in text and binary comparisons.
+
+About and `--version` identify development builds with the short Git revision and append `-dirty`
+for tracked working-tree or index changes. Clean optimized builds of the matching `vVERSION` tag
+show the UTC build date instead; `SOURCE_DATE_EPOCH` still controls that date for reproducibility.
+Without Git metadata, builds use a valid `GITHUB_SHA` when available, otherwise `unknown`.

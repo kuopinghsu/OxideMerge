@@ -518,3 +518,7 @@ oxidemerge --impact old-folder new-folder --report impact.json
 
 文字比較提供「緊密排列」（預設，不保留新增／刪除的空白）與「對齊差異」（留白以對齊相應行）。
 可在「選項 → 一般」或「檢視 → 文字比較」變更「文字排列」。文字與二進位比較的位置窗格都在右側。
+
+「關於」與 `--version` 會以 Git 短雜湊識別開發版本；已追蹤檔案或暫存區有變更時加上 `-dirty`。
+對應 `v版本號` 標籤的乾淨最佳化建置則顯示 UTC 建置日期；仍可透過 `SOURCE_DATE_EPOCH` 固定日期以重現建置。
+若無 Git 資訊，會使用有效的 `GITHUB_SHA`；兩者皆無時顯示 `unknown`。
