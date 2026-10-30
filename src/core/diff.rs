@@ -244,13 +244,15 @@ impl Normalizer {
         }
     }
 
+    fn borrows_keys(&self) -> bool {
+        self.subs.is_empty()
+            && !self.opts.ignore_numbers
+            && self.opts.whitespace == WhitespaceMode::Compare
+            && !self.opts.ignore_case
+    }
+
     pub fn key<'a>(&self, line: &'a str) -> Cow<'a, str> {
-        let o = &self.opts;
-        if self.subs.is_empty()
-            && !o.ignore_numbers
-            && o.whitespace == WhitespaceMode::Compare
-            && !o.ignore_case
-        {
+        if self.borrows_keys() {
             return Cow::Borrowed(line);
         }
         let mut s: String = line.to_string();
@@ -322,8 +324,47 @@ pub struct Block {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Row {
-    pub line: [Option<usize>; 3],
-    pub block: Option<usize>,
+    // A missing index is u32::MAX. Avoid four 16-byte Option<usize> values
+    // per display row: a 30-million-line file otherwise needs nearly 2 GB here.
+    packed: [u32; 4],
+}
+
+impl Row {
+    const NONE: u32 = u32::MAX;
+    fn pack(value: Option<usize>) -> u32 {
+        value.map_or(Self::NONE, |value| {
+            assert!(
+                value < Self::NONE as usize,
+                "text comparison exceeds 4 billion lines or blocks"
+            );
+            value as u32
+        })
+    }
+    fn unpack(value: u32) -> Option<usize> {
+        (value != Self::NONE).then_some(value as usize)
+    }
+    pub fn new(lines: [Option<usize>; 3], block: Option<usize>) -> Self {
+        Self {
+            packed: [
+                Self::pack(lines[0]),
+                Self::pack(lines[1]),
+                Self::pack(lines[2]),
+                Self::pack(block),
+            ],
+        }
+    }
+    pub fn line(&self, pane: usize) -> Option<usize> {
+        Self::unpack(self.packed[pane])
+    }
+    pub fn lines(&self) -> [Option<usize>; 3] {
+        std::array::from_fn(|p| self.line(p))
+    }
+    pub fn block(&self) -> Option<usize> {
+        Self::unpack(self.packed[3])
+    }
+    pub fn set_block(&mut self, block: Option<usize>) {
+        self.packed[3] = Self::pack(block);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -368,8 +409,8 @@ impl DiffResult {
             ..Default::default()
         };
         for row in &self.rows {
-            let (a, b) = (row.line[0].is_some(), row.line[1].is_some());
-            match row.block.map(|b| self.blocks[b].ignored) {
+            let (a, b) = (row.line(0).is_some(), row.line(1).is_some());
+            match row.block().map(|b| self.blocks[b].ignored) {
                 None => s.identical += 1,
                 Some(true) => s.ignored += 1,
                 Some(false) if a && b => s.changed += 1,
@@ -384,7 +425,7 @@ impl DiffResult {
     pub fn row_of_line(&self, pane: usize, line: usize) -> usize {
         let mut best = 0;
         for (i, r) in self.rows.iter().enumerate() {
-            if let Some(l) = r.line[pane] {
+            if let Some(l) = r.line(pane) {
                 if l >= line {
                     return i;
                 }
@@ -428,33 +469,43 @@ pub fn include_doc_formats(
             _ => Some(BlockKind::Compatible),
         }
     }
+    let codepage = if opts.ignore_codepage {
+        None
+    } else {
+        combine(
+            kind(&docs.iter().map(|d| d.encoding).collect::<Vec<_>>()),
+            kind(&docs.iter().map(|d| d.bom).collect::<Vec<_>>()),
+        )
+    };
+    // The common case has no format differences anywhere. Avoid a per-row label buffer
+    // and millions of tiny allocations when opening very large, terminated UTF-8 files.
+    if codepage.is_none()
+        && docs.iter().all(|d| d.final_newline)
+        && (opts.ignore_eol
+            || opts.prettify
+            || docs.iter().all(|d| !d.mixed_eol && d.eol == docs[0].eol))
+    {
+        return;
+    }
     let metadata = |row: &Row| {
-        let mut changed = None;
-        if !opts.ignore_codepage {
-            changed = combine(
-                changed,
-                kind(&docs.iter().map(|d| d.encoding).collect::<Vec<_>>()),
-            );
-            changed = combine(
-                changed,
-                kind(&docs.iter().map(|d| d.bom).collect::<Vec<_>>()),
-            );
-        }
-        if row.line[..docs.len()].iter().all(Option::is_some) {
-            let ends: Vec<_> = docs
-                .iter()
-                .enumerate()
-                .map(|(p, d)| d.line_eol(row.line[p].unwrap()))
-                .collect();
+        let mut changed = codepage;
+        if row.lines()[..docs.len()].iter().all(Option::is_some) {
+            let mut ends = [None; 3];
+            for (p, doc) in docs.iter().enumerate() {
+                ends[p] = doc.line_eol(row.line(p).unwrap());
+            }
+            let ends = &ends[..docs.len()];
             // A retained line can become the unterminated final line after a later deletion.
-            changed = combine(
-                changed,
-                kind(&ends.iter().map(Option::is_some).collect::<Vec<_>>()),
-            );
+            let present = [
+                ends[0].is_some(),
+                ends[1].is_some(),
+                ends.get(2).is_some_and(Option::is_some),
+            ];
+            changed = combine(changed, kind(&present[..docs.len()]));
             if !opts.ignore_eol && !opts.prettify {
                 // Missing terminators are handled above independently of their style.
                 if ends.iter().all(Option::is_some) {
-                    changed = combine(changed, kind(&ends));
+                    changed = combine(changed, kind(ends));
                 }
             }
         }
@@ -467,17 +518,14 @@ pub fn include_doc_formats(
                 && (docs[0].encoding != docs[p].encoding || docs[0].bom != docs[p].bom)
         })
     {
-        result.rows.push(Row {
-            line: [None; 3],
-            block: None,
-        });
+        result.rows.push(Row::new([None; 3], None));
     }
     let mut labels = Vec::with_capacity(result.rows.len());
     let mut changed = false;
     for row in &result.rows {
         let meta = metadata(row);
         let old = row
-            .block
+            .block()
             .map(|b| (result.blocks[b].kind, result.blocks[b].ignored, Some(b)));
         let label = match (old, meta) {
             (old, None) => old,
@@ -497,12 +545,12 @@ pub fn include_doc_formats(
     let mut previous = None;
     for (i, (row, label)) in result.rows.iter_mut().zip(labels).enumerate() {
         let start = positions;
-        for (p, line) in row.line.iter().enumerate() {
+        for (p, line) in row.lines().iter().enumerate() {
             if line.is_some() {
                 positions[p] += 1;
             }
         }
-        row.block = label.map(|(kind, ignored, _)| {
+        row.set_block(label.map(|(kind, ignored, _)| {
             if previous != Some(label) || result.blocks.is_empty() {
                 result.blocks.push(Block {
                     ranges: std::array::from_fn(|p| start[p]..positions[p]),
@@ -519,7 +567,7 @@ pub fn include_doc_formats(
                 }
             }
             result.blocks.len() - 1
-        });
+        }));
         previous = Some(label);
     }
 }
@@ -532,22 +580,18 @@ fn algorithm(a: DiffAlgorithm) -> Algorithm {
     }
 }
 
-struct Interner {
-    map: HashMap<String, u32>,
+struct Interner<'a> {
+    map: HashMap<Cow<'a, str>, u32>,
 }
 
-impl Interner {
-    fn ids(&mut self, norm: &Normalizer, lines: &[String]) -> Vec<u32> {
+impl<'a> Interner<'a> {
+    fn ids(&mut self, norm: &Normalizer, lines: &'a [String]) -> Vec<u32> {
         lines
             .iter()
             .map(|l| {
                 let k = norm.key(l);
-                if let Some(&id) = self.map.get(k.as_ref()) {
-                    return id;
-                }
-                let id = self.map.len() as u32;
-                self.map.insert(k.into_owned(), id);
-                id
+                let next = self.map.len() as u32;
+                *self.map.entry(k).or_insert(next)
             })
             .collect()
     }
@@ -576,6 +620,7 @@ fn line_ops(
     let mut out = Vec::new();
     let (mut pa, mut pb) = (0, 0);
     for (ia, ib) in unique_anchors(a, b) {
+        let (ia, ib) = (ia as usize, ib as usize);
         out.extend(ops_between(
             &a[pa..ia],
             &b[pb..ib],
@@ -583,7 +628,16 @@ fn line_ops(
             DiffAlgorithm::Myers,
             deadline,
         ));
-        out.push((DiffTag::Equal, ia..ia + 1, ib..ib + 1));
+        // Adjacent anchors are a single equal run, not millions of tiny operations.
+        if let Some((DiffTag::Equal, a, b)) = out
+            .last_mut()
+            .filter(|(_, a, b)| a.end == ia && b.end == ib)
+        {
+            a.end += 1;
+            b.end += 1;
+        } else {
+            out.push((DiffTag::Equal, ia..ia + 1, ib..ib + 1));
+        }
         (pa, pb) = (ia + 1, ib + 1);
     }
     out.extend(ops_between(
@@ -600,45 +654,84 @@ const ANCHOR_MIN_LINES: usize = 10_000;
 
 /// Lines that occur exactly once in `a` and once in `b`, paired, keeping the longest run of
 /// pairs that is in order on both sides.
-fn unique_anchors(a: &[u32], b: &[u32]) -> Vec<(usize, usize)> {
-    // id -> (count in a, count in b, index in a, index in b)
-    let mut seen: HashMap<u32, (u32, u32, usize, usize)> = HashMap::new();
-    for (i, &id) in a.iter().enumerate() {
-        let e = seen.entry(id).or_default();
-        e.0 += 1;
-        e.2 = i;
+fn unique_anchors(a: &[u32], b: &[u32]) -> Vec<(u32, u32)> {
+    // Interned IDs are dense. Store only unique positions in a compact array instead
+    // of a second per-line hash table. Sparse external/segmented IDs use the fallback.
+    const MISSING: u32 = u32::MAX;
+    const REPEATED: u32 = u32::MAX - 1;
+    let max_id = a.iter().chain(b).copied().max().map_or(0, |id| id as usize);
+    let mut pairs: Vec<(u32, u32)> = if max_id <= a.len().saturating_add(b.len()).saturating_mul(2)
+        && a.len().max(b.len()) < REPEATED as usize
+    {
+        let mut positions = vec![(MISSING, MISSING); max_id + 1];
+        for (side, ids) in [a, b].into_iter().enumerate() {
+            for (i, &id) in ids.iter().enumerate() {
+                let entry = &mut positions[id as usize];
+                let pos = if side == 0 {
+                    &mut entry.0
+                } else {
+                    &mut entry.1
+                };
+                *pos = if *pos == MISSING { i as u32 } else { REPEATED };
+            }
+        }
+        a.iter()
+            .enumerate()
+            .filter_map(|(i, &id)| {
+                let (left, right) = positions[id as usize];
+                (left == i as u32 && right < REPEATED).then_some((i as u32, right))
+            })
+            .collect()
+    } else {
+        let mut seen: HashMap<u32, (usize, usize, usize, usize)> = HashMap::new();
+        for (i, &id) in a.iter().enumerate() {
+            let e = seen.entry(id).or_default();
+            e.0 += 1;
+            e.2 = i;
+        }
+        for (i, &id) in b.iter().enumerate() {
+            let e = seen.entry(id).or_default();
+            e.1 += 1;
+            e.3 = i;
+        }
+        a.iter()
+            .enumerate()
+            .filter_map(|(i, id)| {
+                let &(ca, cb, ia, ib) = &seen[id];
+                (ca == 1 && cb == 1 && ia == i).then_some((ia as u32, ib as u32))
+            })
+            .collect()
+    };
+    // Source-like large files usually keep all unique anchors in order already.
+    if pairs.windows(2).all(|p| p[0].1 < p[1].1) {
+        return pairs;
     }
-    for (j, &id) in b.iter().enumerate() {
-        let e = seen.entry(id).or_default();
-        e.1 += 1;
-        e.3 = j;
-    }
-    let mut pairs: Vec<(usize, usize)> = seen
-        .values()
-        .filter(|e| e.0 == 1 && e.1 == 1)
-        .map(|e| (e.2, e.3))
-        .collect();
-    pairs.sort_unstable();
     // longest increasing subsequence of the b indexes, by patience sorting
-    let mut tails: Vec<usize> = Vec::new();
-    let mut prev: Vec<Option<usize>> = vec![None; pairs.len()];
+    let mut tails: Vec<u32> = Vec::new();
+    let mut prev = vec![u32::MAX; pairs.len()];
     for (k, &(_, y)) in pairs.iter().enumerate() {
-        let pos = tails.partition_point(|&t| pairs[t].1 < y);
-        prev[k] = pos.checked_sub(1).map(|p| tails[p]);
+        let pos = tails.partition_point(|&t| pairs[t as usize].1 < y);
+        prev[k] = pos.checked_sub(1).map_or(u32::MAX, |p| tails[p]);
         if pos == tails.len() {
-            tails.push(k);
+            tails.push(k as u32);
         } else {
-            tails[pos] = k;
+            tails[pos] = k as u32;
         }
     }
-    let mut out = Vec::with_capacity(tails.len());
-    let mut k = tails.last().copied();
-    while let Some(i) = k {
-        out.push(pairs[i]);
-        k = prev[i];
+    // Reconstruct into the unused suffix of the existing pair buffer. Walking
+    // backwards only writes at/after the current index, so predecessor pairs survive.
+    let count = tails.len();
+    let mut write = pairs.len();
+    let mut at = tails.last().copied();
+    while let Some(index) = at {
+        let index = index as usize;
+        write -= 1;
+        pairs[write] = pairs[index];
+        at = (prev[index] != u32::MAX).then_some(prev[index]);
     }
-    out.reverse();
-    out
+    pairs.copy_within(write.., 0);
+    pairs.truncate(count);
+    pairs
 }
 
 /// The diff of `a` and `b`, with indexes shifted by `offset`.
@@ -795,10 +888,41 @@ pub fn compute_synced(
         panes: &keyed,
         skip,
     };
-    let mut interner = Interner {
-        map: HashMap::new(),
+    // The ordinary case needs only borrowed str keys, without Cow's discriminant
+    // in every hash bucket. Normalizing rules retain their owned-key behavior.
+    let ids: Vec<Vec<u32>> = if norm.borrows_keys() {
+        // Estimate an initial dictionary from a small sample. Starting at zero
+        // repeatedly allocates/frees huge tables whose pages can stay resident.
+        // Discount the estimate so repeated/generated files do not reserve by line count.
+        let first = keyed.first().copied().unwrap_or(&[]);
+        let sample = first.len().min(4096);
+        let distinct: HashSet<&str> = first.iter().take(sample).map(String::as_str).collect();
+        let initial = first.len().saturating_mul(distinct.len()) / sample.max(1) / 2;
+        let mut dictionary = HashMap::<&str, u32>::with_capacity(initial);
+        keyed
+            .iter()
+            .map(|lines| {
+                lines
+                    .iter()
+                    .map(|line| {
+                        let next = dictionary.len() as u32;
+                        *dictionary.entry(line.as_str()).or_insert(next)
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        let mut interner = Interner {
+            map: HashMap::new(),
+        };
+        keyed.iter().map(|p| interner.ids(&norm, p)).collect()
     };
-    let ids: Vec<Vec<u32>> = keyed.iter().map(|p| interner.ids(&norm, p)).collect();
+    // Both dictionaries leave scope before allocating anchors or display rows.
+    #[cfg(test)]
+    super::bench::profile("interned", || {
+        format!("unique_max={}", ids.iter().flatten().max().unwrap_or(&0))
+    });
+
     let lens: Vec<usize> = panes.iter().map(|p| p.len()).collect();
     let sync = valid_sync_points(sync, &lens);
     let mut result = if sync.is_empty() {
@@ -825,10 +949,10 @@ pub fn compute_synced(
                 let ranges: Vec<Range<usize>> = (0..n).map(|p| s[p]..s[p] + 1).collect();
                 let same = (1..n).all(|p| ids[p][s[p]] == ids[0][s[0]]);
                 if same {
-                    result.rows.push(Row {
-                        line: [Some(s[0]), Some(s[1]), (n == 3).then_some(s[2])],
-                        block: None,
-                    });
+                    result.rows.push(Row::new(
+                        [Some(s[0]), Some(s[1]), (n == 3).then_some(s[2])],
+                        None,
+                    ));
                 } else {
                     let kind = if n == 3 {
                         let r = [ranges[0].clone(), ranges[1].clone(), ranges[2].clone()];
@@ -896,10 +1020,10 @@ fn segment(
 fn append(result: &mut DiffResult, part: DiffResult, start: &[usize; 3]) {
     let (rows, blocks) = (result.rows.len(), result.blocks.len());
     for mut row in part.rows {
-        for (line, s) in row.line.iter_mut().zip(start) {
-            *line = line.map(|l| l + s);
-        }
-        row.block = row.block.map(|b| b + blocks);
+        row = Row::new(
+            std::array::from_fn(|p| row.line(p).map(|l| l + start[p])),
+            row.block().map(|b| b + blocks),
+        );
         result.rows.push(row);
     }
     for mut b in part.blocks {
@@ -919,7 +1043,7 @@ fn join_at_seams(result: &mut DiffResult, seams: &[usize], ids: &[Vec<u32>]) {
         if r == 0 || r >= result.rows.len() {
             continue;
         }
-        if let (Some(a), Some(b)) = (result.rows[r - 1].block, result.rows[r].block) {
+        if let (Some(a), Some(b)) = (result.rows[r - 1].block(), result.rows[r].block()) {
             if a != b && result.blocks[a].ignored == result.blocks[b].ignored {
                 join[b] = true;
             }
@@ -947,7 +1071,7 @@ fn join_at_seams(result: &mut DiffResult, seams: &[usize], ids: &[Vec<u32>]) {
     }
     result.blocks = blocks;
     for row in &mut result.rows {
-        row.block = row.block.map(|b| to[b]);
+        row.set_block(row.block().map(|b| to[b]));
     }
 }
 
@@ -1024,10 +1148,7 @@ fn push_block(result: &mut DiffResult, ranges: [Range<usize>; 3], kind: BlockKin
                 line[p] = Some(ranges[p].start + i);
             }
         }
-        result.rows.push(Row {
-            line,
-            block: Some(idx),
-        });
+        result.rows.push(Row::new(line, Some(idx)));
     }
     result.blocks.push(Block {
         ranges,
@@ -1043,6 +1164,11 @@ fn diff2(a: &[u32], b: &[u32], ignorable: &Ignorable, opts: &DiffOptions) -> Dif
         panes: 2,
         ..Default::default()
     };
+    let ops = line_ops(a, b, opts.algorithm);
+    // Insertions can make the alignment longer than either input. Reserve from
+    // the operations, avoiding a nearly 2x row-buffer growth just above that boundary.
+    let row_bound: usize = ops.iter().map(|(_, a, b)| a.len().max(b.len())).sum();
+    result.rows.reserve(row_bound);
     let mut pending: Option<(Range<usize>, Range<usize>)> = None;
     let flush = |result: &mut DiffResult, pending: &mut Option<(Range<usize>, Range<usize>)>| {
         if let Some((ra, rb)) = pending.take() {
@@ -1053,14 +1179,13 @@ fn diff2(a: &[u32], b: &[u32], ignorable: &Ignorable, opts: &DiffOptions) -> Dif
             }
         }
     };
-    for (tag, o, n) in line_ops(a, b, opts.algorithm) {
+    for (tag, o, n) in ops {
         if tag == DiffTag::Equal {
             flush(&mut result, &mut pending);
             for k in 0..o.len() {
-                result.rows.push(Row {
-                    line: [Some(o.start + k), Some(n.start + k), None],
-                    block: None,
-                });
+                result
+                    .rows
+                    .push(Row::new([Some(o.start + k), Some(n.start + k), None], None));
             }
         } else {
             pending = Some(match pending {
@@ -1097,10 +1222,9 @@ fn diff3<T: AsRef<[u32]>>(ids: &[T], ignorable: &Ignorable, opts: &DiffOptions) 
     let (nb, nl, nr) = (base.len(), left.len(), right.len());
     while i < nb || l < nl || r < nr {
         if i < nb && ml[i] == Some(l) && mr[i] == Some(r) {
-            result.rows.push(Row {
-                line: [Some(l), Some(i), Some(r)],
-                block: None,
-            });
+            result
+                .rows
+                .push(Row::new([Some(l), Some(i), Some(r)], None));
             i += 1;
             l += 1;
             r += 1;
@@ -1150,8 +1274,8 @@ pub fn merge3(left: &[String], base: &[String], right: &[String]) -> Option<Vec<
     let mut row = 0;
     while row < d.rows.len() {
         let r = d.rows[row];
-        let Some(b) = r.block else {
-            out.extend(r.line[1].map(|l| base[l].clone()));
+        let Some(b) = r.block() else {
+            out.extend(r.line(1).map(|l| base[l].clone()));
             row += 1;
             continue;
         };
@@ -1186,10 +1310,10 @@ fn kind3<T: AsRef<[u32]>>(ids: &[T], [rl, rb, rr]: &[Range<usize>; 3]) -> Option
 
 fn push_equal3(result: &mut DiffResult, [rl, rb, rr]: &[Range<usize>; 3]) {
     for k in 0..rb.len() {
-        result.rows.push(Row {
-            line: [Some(rl.start + k), Some(rb.start + k), Some(rr.start + k)],
-            block: None,
-        });
+        result.rows.push(Row::new(
+            [Some(rl.start + k), Some(rb.start + k), Some(rr.start + k)],
+            None,
+        ));
     }
 }
 
@@ -1337,6 +1461,114 @@ mod tests {
     }
 
     #[test]
+    fn packed_rows_keep_indices_and_missing_sides_in_sixteen_bytes() {
+        assert_eq!(std::mem::size_of::<Row>(), 16);
+        let mut row = Row::new([Some(0), None, Some(u32::MAX as usize - 1)], Some(42));
+        assert_eq!(row.lines(), [Some(0), None, Some(u32::MAX as usize - 1)]);
+        assert_eq!(row.block(), Some(42));
+        row.set_block(None);
+        assert_eq!(row.block(), None);
+    }
+
+    #[test]
+    fn interning_borrows_unchanged_keys_and_owns_transformed_keys() {
+        let lines = vec!["UPPER".to_string(), "second".into(), "UPPER".into()];
+        let mut interner = Interner {
+            map: HashMap::new(),
+        };
+        assert_eq!(
+            interner.ids(&Normalizer::new(&DiffOptions::default()), &lines),
+            [0, 1, 0]
+        );
+        assert!(interner
+            .map
+            .keys()
+            .all(|key| matches!(key, Cow::Borrowed(_))));
+        let mut interner = Interner {
+            map: HashMap::new(),
+        };
+        let options = DiffOptions {
+            ignore_case: true,
+            ..Default::default()
+        };
+        assert_eq!(interner.ids(&Normalizer::new(&options), &lines), [0, 1, 0]);
+        assert!(interner.map.keys().all(|key| matches!(key, Cow::Owned(_))));
+    }
+
+    #[test]
+    fn dense_and_sparse_unique_anchors_match_the_reference_selection() {
+        let reference = |a: &[u32], b: &[u32]| {
+            let mut entries: HashMap<u32, (usize, usize, usize, usize)> = HashMap::new();
+            for (i, &id) in a.iter().enumerate() {
+                let e = entries.entry(id).or_default();
+                e.0 += 1;
+                e.2 = i;
+            }
+            for (i, &id) in b.iter().enumerate() {
+                let e = entries.entry(id).or_default();
+                e.1 += 1;
+                e.3 = i;
+            }
+            let mut pairs: Vec<_> = entries
+                .values()
+                .filter(|e| e.0 == 1 && e.1 == 1)
+                .map(|e| (e.2, e.3))
+                .collect();
+            pairs.sort_unstable();
+            let mut tails = Vec::<usize>::new();
+            let mut prev = vec![None; pairs.len()];
+            for (k, &(_, y)) in pairs.iter().enumerate() {
+                let pos = tails.partition_point(|&t| pairs[t].1 < y);
+                prev[k] = pos.checked_sub(1).map(|p| tails[p]);
+                if pos == tails.len() {
+                    tails.push(k);
+                } else {
+                    tails[pos] = k;
+                }
+            }
+            let mut out = Vec::new();
+            let mut at = tails.last().copied();
+            while let Some(i) = at {
+                out.push(pairs[i]);
+                at = prev[i];
+            }
+            out.reverse();
+            out
+        };
+        let mut seed = 7u32;
+        for _ in 0..200 {
+            let mut make = || {
+                (0..60)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        (seed >> 16) % 100
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let (a, b) = (make(), make());
+            for scale in [1, 10_000_000] {
+                let a: Vec<_> = a.iter().map(|&n| n * scale).collect();
+                let b: Vec<_> = b.iter().map(|&n| n * scale).collect();
+                assert_eq!(
+                    unique_anchors(&a, &b),
+                    reference(&a, &b)
+                        .into_iter()
+                        .map(|(a, b)| (a as u32, b as u32))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        let equal: Vec<_> = (0..50_000).collect();
+        let ops = line_ops(&equal, &equal, DiffAlgorithm::Myers);
+        assert_valid(&ops, &equal, &equal);
+        assert_eq!(
+            ops.len(),
+            1,
+            "adjacent equal anchors should be one operation"
+        );
+    }
+
+    #[test]
     fn document_format_differences_respect_options_and_three_way_kinds() {
         use crate::core::text::{TextDoc, TextEncoding};
         let a = TextDoc::from_text(None, "one\r\ntwo\r\n");
@@ -1424,12 +1656,12 @@ mod tests {
     /// Every line of every pane appears once, in order, and blocks match their rows.
     fn assert_consistent(d: &DiffResult, lens: &[usize]) {
         for (p, &n) in lens.iter().enumerate() {
-            let seen: Vec<usize> = d.rows.iter().filter_map(|r| r.line[p]).collect();
+            let seen: Vec<usize> = d.rows.iter().filter_map(|r| r.line(p)).collect();
             assert_eq!(seen, (0..n).collect::<Vec<_>>(), "pane {p}");
         }
         for (i, b) in d.blocks.iter().enumerate() {
             for r in &d.rows[b.first_row..b.first_row + b.rows] {
-                assert_eq!(r.block, Some(i));
+                assert_eq!(r.block(), Some(i));
             }
         }
     }
@@ -1437,7 +1669,7 @@ mod tests {
     fn row_with<'a>(d: &'a DiffResult, lines: &[usize]) -> Option<&'a Row> {
         d.rows
             .iter()
-            .find(|r| lines.iter().enumerate().all(|(p, &l)| r.line[p] == Some(l)))
+            .find(|r| lines.iter().enumerate().all(|(p, &l)| r.line(p) == Some(l)))
     }
 
     #[test]
@@ -1468,13 +1700,13 @@ mod tests {
         let d = compute_synced(&[&a, &b], &opts, None, &[[4, 0, 0]]);
         assert_consistent(&d, &[7, 3 + 4]);
         let anchor = row_with(&d, &[4, 0]).expect("the sync point is one row");
-        assert_eq!(anchor.block, None, "equal lines");
+        assert_eq!(anchor.block(), None, "equal lines");
         assert!(row_with(&d, &[5, 1]).is_some() && row_with(&d, &[6, 2]).is_some());
         // Lines that differ still share the row, as a change.
         let d = compute_synced(&[&a, &b], &opts, None, &[[0, 1, 0]]);
         assert_consistent(&d, &[7, 7]);
         let r = row_with(&d, &[0, 1]).unwrap();
-        assert!(r.block.is_some_and(|b| !d.blocks[b].ignored));
+        assert!(r.block().is_some_and(|b| !d.blocks[b].ignored));
     }
 
     #[test]
@@ -1528,14 +1760,14 @@ mod tests {
         let d = compute_synced(&[&left, &base, &right], &opts, None, &[[0, 1, 2]]);
         assert_consistent(&d, &[3, 3, 3]);
         let r = row_with(&d, &[0, 1, 2]).expect("one row");
-        assert_eq!(r.block, None);
+        assert_eq!(r.block(), None);
         // A sync point whose lines differ is classified like any 3-way change, together with
         // the change before it: "x" left out on the left, "y" and "other" added on the right.
         let right2 = v(&["x", "y", "other"]);
         let d = compute_synced(&[&left, &base, &right2], &opts, None, &[[0, 1, 2]]);
         assert_consistent(&d, &[3, 3, 3]);
         let r = row_with(&d, &[0, 1, 2]).unwrap();
-        assert_eq!(d.blocks[r.block.unwrap()].kind, BlockKind::Conflict);
+        assert_eq!(d.blocks[r.block().unwrap()].kind, BlockKind::Conflict);
     }
 
     #[test]

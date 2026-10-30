@@ -1,6 +1,6 @@
 //! Main application window: menus, tabs, dialogs and command dispatch.
 
-use crate::config::{Config, SessionTab, ThemeMode};
+use crate::config::{Config, SessionTab, TextLayout, ThemeMode};
 use crate::core::archive;
 use crate::core::conflict;
 use crate::core::diff::{DiffAlgorithm, DiffOptions, InlineMode, WhitespaceMode};
@@ -361,6 +361,9 @@ const OPT_INDEX: &[(OptTab, &str)] = &[
     (OptTab::General, "view.theme"),
     (OptTab::General, "opt.font_size"),
     (OptTab::General, "opt.tab_size"),
+    (OptTab::General, "view.text_layout"),
+    (OptTab::General, "view.layout_compact"),
+    (OptTab::General, "view.layout_aligned"),
     (OptTab::General, "view.line_numbers"),
     (OptTab::General, "view.location_pane"),
     (OptTab::General, "view.whitespace"),
@@ -1180,6 +1183,7 @@ struct Toast {
 }
 
 pub struct OxideMergeApp {
+    baseline_start: Box<super::baseline_panel::BaselinePanel>,
     cfg: Config,
     saved_cfg: Config,
     /// The config with the options of the command line, and as loaded without them.
@@ -1196,6 +1200,7 @@ pub struct OxideMergeApp {
     report_job: Option<(PathBuf, std::sync::mpsc::Receiver<Result<(), String>>)>,
     /// Ctrl+Tab presses taken from the input before egui saw them.
     tab_keys: Vec<Cmd>,
+    menu_bar_id: Option<egui::Id>,
     filters_dlg: bool,
     about: bool,
     help: bool,
@@ -1842,6 +1847,7 @@ impl OxideMergeApp {
         crate::ui::macos::ask_before_quitting();
         let applied_lang = cfg.language.clone();
         let mut app = OxideMergeApp {
+            baseline_start: Default::default(),
             saved_cfg: cfg.clone(),
             cli_options: (cfg != stored).then(|| (cfg.clone(), stored)),
             cfg,
@@ -1854,6 +1860,7 @@ impl OxideMergeApp {
             git_dlg: None,
             report_job: None,
             tab_keys: Vec::new(),
+            menu_bar_id: None,
             filters_dlg: false,
             rule_dlg: None,
             about: false,
@@ -2379,6 +2386,68 @@ impl OxideMergeApp {
         v.status = trf("msg.conflicts_found", &[("n", parts.conflicts.to_string())]);
         self.push_tab(Content::Text(v), vec![path.to_path_buf()]);
         Ok(())
+    }
+
+    fn open_captured(&mut self, comparison: super::baseline_panel::CapturedComparison) {
+        use super::baseline_panel::CapturedComparison;
+        match comparison {
+            CapturedComparison::Text(docs) => {
+                let view = TextView::new(docs, &self.cfg);
+                self.push_tab(Content::Text(view), Vec::new());
+            }
+            CapturedComparison::Source { docs, line } => {
+                let mut view = TextView::new(docs, &self.cfg);
+                view.goto_line(line);
+                self.push_tab(Content::Text(view), Vec::new());
+            }
+            CapturedComparison::Bytes(files) => {
+                let result = (|| -> anyhow::Result<_> {
+                    let temp = tempfile::Builder::new()
+                        .prefix("oxidemerge-baseline-view-")
+                        .tempdir()?;
+                    let mut paths = Vec::new();
+                    for (side, (label, bytes)) in files.iter().enumerate() {
+                        let dir = temp.path().join(side.to_string());
+                        std::fs::create_dir(&dir)?;
+                        let name = Path::new(label)
+                            .file_name()
+                            .unwrap_or_else(|| std::ffi::OsStr::new("captured.bin"));
+                        let path = dir.join(name);
+                        std::fs::write(&path, bytes)?;
+                        paths.push(path);
+                    }
+                    let content = if paths.iter().all(|p| text::is_image_path(p)) {
+                        match ImageView::load(paths.clone(), &self.cfg) {
+                            Ok(mut view) => {
+                                view.read_only.fill(true);
+                                view.descriptions =
+                                    files.iter().map(|(label, _)| Some(label.clone())).collect();
+                                Content::Image(view)
+                            }
+                            Err(_) => {
+                                let mut view = BinaryView::load(paths.clone())?;
+                                view.read_only.fill(true);
+                                Content::Binary(view)
+                            }
+                        }
+                    } else {
+                        let mut view = BinaryView::load(paths.clone())?;
+                        view.read_only.fill(true);
+                        Content::Binary(view)
+                    };
+                    Ok((content, temp))
+                })();
+                match result {
+                    Ok((content, temp)) => {
+                        self.push_tab(content, Vec::new());
+                        if let Some(tab) = self.tabs.last_mut() {
+                            tab.temps.push(std::sync::Arc::new(temp));
+                        }
+                    }
+                    Err(e) => self.error(e.to_string()),
+                }
+            }
+        }
     }
 
     fn push_tab(&mut self, content: Content, source: Vec<PathBuf>) {
@@ -4021,10 +4090,24 @@ impl OxideMergeApp {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let typing = widgets::typing(ctx);
+        let escape_reserved = self
+            .menu_bar_id
+            .is_some_and(|id| egui::menu::BarState::load(ctx, id).is_some())
+            || ctx.is_context_menu_open()
+            || ctx.memory(|m| m.any_popup_open())
+            || match self.tabs.get(self.active).map(|t| t.content.view()) {
+                Some(Content::Text(v)) => v.handles_escape(),
+                Some(Content::Binary(v)) => v.find.open || v.goto.is_some(),
+                Some(Content::Folder(v)) => v.handles_escape(),
+                _ => false,
+            };
         let menus = self.menus();
         let mut cmds = std::mem::take(&mut self.tab_keys);
         ctx.input_mut(|i| {
             for b in BINDINGS {
+                if b.key.logical_key == Key::Escape && escape_reserved {
+                    continue;
+                }
                 let active = match b.scope {
                     Scope::Always => true,
                     Scope::View => !typing,
@@ -4116,6 +4199,7 @@ impl OxideMergeApp {
             }
             ui.label(egui::RichText::new("OxideMerge").font(theme::semibold(14.5)));
             ui.add_space(12.0);
+            self.menu_bar_id = Some(ui.id());
             for (i, key) in MENUS.into_iter().enumerate() {
                 ui.menu_button(tr(key), |ui| {
                     widgets::menu_setup(ui);
@@ -4298,6 +4382,11 @@ impl OxideMergeApp {
             check(ui, &mut cfg.show_unique[2], tr("view.right_only"), "");
         });
         submenu(ui, tr("view.text_menu"), |ui| {
+            submenu(ui, tr("view.text_layout"), |ui| {
+                for layout in TextLayout::ALL {
+                    ui.radio_value(&mut cfg.text_layout, layout, tr(layout.key()));
+                }
+            });
             check(
                 ui,
                 &mut cfg.show_location_pane,
@@ -4790,23 +4879,13 @@ impl OxideMergeApp {
                         }
                     });
                     ui.add_space(8.0);
-                    if ui.button(tr("baseline.compare")).clicked() {
-                        if let Some(paths) = rfd::FileDialog::new()
-                            .pick_folders()
-                            .filter(|p| p.len() == 2)
-                        {
-                            self.open(OpenRequest {
-                                paths,
-                                ..Default::default()
-                            });
-                            if let Some(Tab {
-                                content: Content::Folder(view),
-                                ..
-                            }) = self.tabs.get_mut(self.active)
-                            {
-                                view.baseline_panel.open = true;
-                            }
-                        }
+                    if let Some(comparison) = self.baseline_start.ui(
+                        ui,
+                        &[],
+                        &self.cfg.comparison_options(),
+                        &self.cfg.filter,
+                    ) {
+                        self.open_captured(comparison);
                     }
 
                     let (rect, _) = ui.allocate_exact_size(vec2(w, 64.0), Sense::hover());
@@ -5217,6 +5296,15 @@ impl OxideMergeApp {
                                         egui::Slider::new(&mut c.tab_size, 1..=16)
                                             .text(tr("opt.tab_size")),
                                     );
+                                    ui.label(egui::RichText::new(tr("view.text_layout")).strong());
+                                    for layout in TextLayout::ALL {
+                                        ui.radio_value(
+                                            &mut c.text_layout,
+                                            layout,
+                                            tr(layout.key()),
+                                        );
+                                    }
+                                    ui.small(tr("view.layout_help"));
                                     ui.checkbox(&mut c.show_line_numbers, tr("view.line_numbers"));
                                     ui.checkbox(
                                         &mut c.show_location_pane,
@@ -6181,10 +6269,7 @@ impl eframe::App for OxideMergeApp {
         self.refresh_saved_folders();
         if let Some(a) = folder_action {
             match a {
-                FolderAction::OpenCaptured { docs } => {
-                    let view = TextView::new(docs, &self.cfg);
-                    self.push_tab(Content::Text(view), Vec::new());
-                }
+                FolderAction::OpenCaptured { comparison } => self.open_captured(comparison),
                 FolderAction::OpenFiles {
                     paths,
                     missing,
@@ -6225,6 +6310,7 @@ impl eframe::App for OxideMergeApp {
                         if let Some(t) = self.tabs.last_mut() {
                             if let Content::Text(view) = t.content.view_mut() {
                                 view.review_decision = Some(Box::new(review));
+                                view.restore_review_cursor();
                             }
                             t.origin = Some(Origin { folder, rel });
                             t.temps = temps.unwrap_or_default();

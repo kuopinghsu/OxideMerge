@@ -147,6 +147,35 @@ struct Cli {
     /// Compare in the console only: print differences, exit code 0 = identical, 1 = different, 2 = error
     #[arg(long)]
     cli: bool,
+    /// Read-only three-way merge plan (JSON on stdout, or --report)
+    #[arg(long)]
+    merge_plan: bool,
+    /// Validate this existing result against the three input files (left, base, right)
+    #[arg(long, value_name = "RESULT")]
+    validate_merge: Option<PathBuf>,
+    /// Read-only JSON/XML semantic comparison (two files)
+    #[arg(long)]
+    semantic: bool,
+    /// Semantic format: json or xml; YAML/TOML are not supported yet
+    #[arg(long, value_name = "FORMAT", requires = "semantic")]
+    format: Option<String>,
+    /// Summarize annotations from this portable .oxmreview
+    #[arg(long, value_name = "SNAPSHOT")]
+    review_summary: Option<PathBuf>,
+    /// Evidence-only potential references for the two selected folder baselines
+    #[arg(long)]
+    impact: bool,
+    /// folder:PATH, git:REV:PATH or review:SIDE:PATH (zero-based snapshot side)
+    #[arg(long, requires = "baseline_right")]
+    baseline_left: Option<String>,
+    #[arg(long, requires = "baseline_left")]
+    baseline_right: Option<String>,
+    /// Write an opt-in release baseline report (.json/.html/.xml)
+    #[arg(long)]
+    release_report: Option<PathBuf>,
+    /// Flag changed baseline paths containing this literal substring; repeatable
+    #[arg(long)]
+    important_path: Vec<String>,
     /// User interface language code (en, zh-TW, zh-CN, ja, ko, de, fr, es, ru, pt-BR, ...)
     #[arg(long)]
     lang: Option<String>,
@@ -334,6 +363,9 @@ fn export(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
 
 /// Non-interactive operations (console compare, report, patch). Returns the process exit code.
 fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
+    if analysis_mode(cli) {
+        return run_analysis(cli, cfg);
+    }
     let mut cli_paths = cli.paths.clone();
     let mut _git_temp = None;
     let mut git_desc = None;
@@ -628,6 +660,221 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     Ok(u8::from(!result.is_identical()))
 }
 
+fn analysis_mode(cli: &Cli) -> bool {
+    cli.merge_plan
+        || cli.validate_merge.is_some()
+        || cli.semantic
+        || cli.review_summary.is_some()
+        || cli.impact
+        || cli.baseline_left.is_some()
+        || cli.release_report.is_some()
+}
+fn analysis_output<T: serde::Serialize>(
+    cli: &Cli,
+    value: &T,
+    mut inputs: Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    inputs.extend(cli.paths.clone());
+    if let Some(path) = cli.release_report.as_ref().or(cli.report.as_ref()) {
+        core::analysis::report(value, path, &inputs)
+    } else {
+        println!("{}", core::analysis::json(value)?);
+        Ok(())
+    }
+}
+fn run_analysis(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
+    use core::{analysis, baseline, merge_validation, review, semantic};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    anyhow::ensure!(
+        cli.patch.is_none()
+            && cli.output.is_none()
+            && cli.git_rev.is_none()
+            && !cli.slideshow
+            && !cli.report_diffs,
+        "Analysis is read-only; do not combine it with output/patch/git-rev/slideshow/report-diffs"
+    );
+    let modes = usize::from(cli.merge_plan || cli.validate_merge.is_some())
+        + usize::from(cli.semantic)
+        + usize::from(cli.review_summary.is_some())
+        + usize::from(cli.impact || cli.baseline_left.is_some() || cli.release_report.is_some());
+    anyhow::ensure!(modes == 1, "Choose one analysis mode per invocation");
+    if let Some(path) = &cli.review_summary {
+        anyhow::ensure!(
+            cli.paths.is_empty(),
+            "--review-summary takes its snapshot as its flag argument"
+        );
+        let r = review::load(path)?;
+        let paths = r
+            .manifest
+            .entries
+            .iter()
+            .filter(|e| !e.directory)
+            .map(|e| e.path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let summary = r.manifest.workspace.summary(paths);
+        analysis_output(cli, &summary, vec![path.clone()])?;
+        return Ok(u8::from(summary.stale > 0));
+    }
+    if cli.semantic {
+        anyhow::ensure!(
+            cli.paths.len() == 2,
+            "Semantic comparison requires two files"
+        );
+        let format = match cli.format.as_deref().unwrap_or_else(|| if core::text::extension(&cli.paths[0]) == "xml" { "xml" } else { "json" }) { "json" => semantic::Format::Json, "xml" => semantic::Format::Xml, _ => anyhow::bail!("Supported semantic formats: json, xml. YAML/TOML require fidelity adapters; use textual compare.") };
+        let docs: Vec<_> = cli
+            .paths
+            .iter()
+            .map(|p| analysis::read(p).map(|b| core::text::decode(&b, None).0))
+            .collect::<anyhow::Result<_>>()?;
+        let report = semantic::compare(&docs[0], &docs[1], format);
+        let code = if !report.errors.is_empty() {
+            2
+        } else {
+            u8::from(!report.identical())
+        };
+        analysis_output(cli, &report, Vec::new())?;
+        return Ok(code);
+    }
+    if cli.merge_plan || cli.validate_merge.is_some() {
+        anyhow::ensure!(
+            cli.paths.len() == 3,
+            "Merge analysis requires left, base, right paths"
+        );
+        if cli.paths.iter().all(|p| p.is_dir()) {
+            let progress = Progress::default();
+            let mut folder = cfg.folder.clone();
+            folder.recursive = true;
+            let mask = FileFilter::resolve(
+                cli.filter.as_deref().unwrap_or(&cfg.filter),
+                &core::filter::load_all_filters(),
+            );
+            let items = Scanner {
+                roots: &cli.paths,
+                filter: &mask,
+                fopts: &folder,
+                dopts: &cfg.diff,
+                progress: &progress,
+            }
+            .run();
+            let report = merge_validation::folder_plan(&items, &cli.paths, &cfg.diff);
+            if let Some(destination) = &cli.validate_merge {
+                let validated = merge_validation::validate_folder(&report, destination)?;
+                let code = match validated.status {
+                    merge_validation::ValidationStatus::Failed => 3,
+                    merge_validation::ValidationStatus::Warning => 1,
+                    _ => 0,
+                };
+                analysis_output(cli, &validated, vec![destination.clone()])?;
+                return Ok(code);
+            }
+            let code = u8::from(
+                report.actions.iter().any(|a| a.operation == "conflict")
+                    || !report.findings.is_empty(),
+            );
+            analysis_output(cli, &report, Vec::new())?;
+            return Ok(code);
+        }
+        let docs: Vec<_> = cli
+            .paths
+            .iter()
+            .map(|p| {
+                analysis::read(p).map(|b| core::text::doc_from_bytes(Some(p.clone()), &b, None))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let view = ui::text_view::TextView::new(docs, cfg);
+        let plan = view.preview_merge(cfg)?;
+        if let Some(path) = &cli.validate_merge {
+            let report = merge_validation::validate_file(&plan, path)?;
+            let code = match report.status {
+                merge_validation::ValidationStatus::Failed => 3,
+                merge_validation::ValidationStatus::Warning => 1,
+                _ => 0,
+            };
+            analysis_output(cli, &report, vec![path.clone()])?;
+            return Ok(code);
+        }
+        let code = u8::from(
+            plan.actions.iter().any(|a| a.operation == "conflict")
+                || plan
+                    .findings
+                    .iter()
+                    .any(|f| f.severity != merge_validation::ValidationSeverity::Info),
+        );
+        analysis_output(cli, &plan, Vec::new())?;
+        return Ok(code);
+    }
+    let specs = match (&cli.baseline_left, &cli.baseline_right) {
+        (Some(a), Some(b)) => {
+            anyhow::ensure!(
+                cli.paths.is_empty(),
+                "Do not combine positional paths with baseline specifications"
+            );
+            [
+                baseline::BaselineSpec::parse(a)?,
+                baseline::BaselineSpec::parse(b)?,
+            ]
+        }
+        _ => {
+            anyhow::ensure!(
+                cli.paths.len() == 2,
+                "Baseline/impact analysis requires two folders or --baseline-left/--baseline-right"
+            );
+            [
+                baseline::BaselineSpec::Folder {
+                    path: cli.paths[0].clone(),
+                },
+                baseline::BaselineSpec::Folder {
+                    path: cli.paths[1].clone(),
+                },
+            ]
+        }
+    };
+    let cancel = AtomicBool::new(false);
+    let progress = AtomicUsize::new(0);
+    let filter = cli.filter.as_deref().unwrap_or(&cfg.filter);
+    let left = baseline::capture(&specs[0], &cfg.diff, filter, &cancel, &progress)?;
+    let right = baseline::capture(&specs[1], &cfg.diff, filter, &cancel, &progress)?;
+    let summary = baseline::compare(&left, &right, &cli.important_path, &cancel)?;
+    let inputs: Vec<PathBuf> = specs
+        .iter()
+        .map(|s| match s {
+            baseline::BaselineSpec::Folder { path }
+            | baseline::BaselineSpec::GitRef { path, .. }
+            | baseline::BaselineSpec::ReviewSnapshot { path, .. } => path.clone(),
+        })
+        .collect();
+    if cli.impact {
+        let report = core::impact::Index::default().analyze(&summary, &right, &cancel)?;
+        analysis_output(cli, &report, inputs)?;
+    } else if let Some(path) = cli
+        .release_report
+        .as_ref()
+        .or(cli.report.as_ref())
+        .filter(|p| ["html", "htm"].contains(&core::text::extension(p).as_str()))
+    {
+        let html = baseline::html_report(&summary, &left, &right)?;
+        analysis::write_report_text(path, &html, &inputs)?;
+    } else {
+        analysis_output(cli, &summary, inputs)?;
+    }
+    Ok(
+        if summary
+            .excluded
+            .iter()
+            .any(|(_, _, reason)| !baseline::is_scope_exclusion(reason))
+        {
+            2
+        } else {
+            u8::from(
+                summary
+                    .changes
+                    .iter()
+                    .any(|c| !matches!(c.category, baseline::Category::Unchanged)),
+            )
+        },
+    )
+}
+
 fn cli_desc(cli: &Cli, i: usize) -> Option<String> {
     match (cli.paths.len(), i) {
         (_, 0) => cli.dl.clone(),
@@ -761,7 +1008,7 @@ fn main() -> ExitCode {
         },
     };
 
-    if cli.cli || cli.report.is_some() || cli.patch.is_some() {
+    if cli.cli || cli.report.is_some() || cli.patch.is_some() || analysis_mode(&cli) {
         if let (Some(set), Some(name)) = (&rules, &cli_rules) {
             cfg.diff = core::rules::options_with(&cfg.diff, set.as_ref());
             cfg.rules = name.clone();

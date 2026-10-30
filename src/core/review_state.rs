@@ -35,6 +35,7 @@ impl State {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Decision {
+    pub current_hunk: Option<String>,
     pub id: String,
     pub fingerprint: String,
     pub state: State,
@@ -48,11 +49,13 @@ pub struct Decision {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Workspace {
+    pub policy: String,
     pub entries: BTreeMap<String, Decision>,
     pub current: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Summary {
+    pub policy: String,
     pub version: u32,
     pub total: usize,
     pub unreviewed: usize,
@@ -65,8 +68,28 @@ pub struct Summary {
     pub provenance: String,
 }
 impl Workspace {
+    pub fn bind_policy(
+        &mut self,
+        options: &DiffOptions,
+        folder: &super::folder::FolderOptions,
+        filter: &str,
+    ) -> bool {
+        let expected = policy_digest(options, folder, filter);
+        if self.policy == expected {
+            return false;
+        }
+        let stale = !self.entries.is_empty();
+        for decision in self.entries.values_mut() {
+            decision.stale = true;
+            for hunk in decision.hunks.values_mut() {
+                hunk.stale = true;
+            }
+        }
+        self.policy = expected;
+        stale
+    }
     pub fn validate(&self) -> Result<()> {
-        if self.entries.len() > analysis::MAX_FILES {
+        if self.policy.len() > 128 || self.entries.len() > analysis::MAX_FILES {
             bail!("Too many review decisions");
         }
         for (path, d) in &self.entries {
@@ -92,7 +115,7 @@ impl Workspace {
                 (p, d)
             })
             .collect();
-        let mut s = Summary { version: 1, total: entries.len(), unreviewed: 0, in_review: 0, accepted: 0, needs_action: 0, resolved: 0, stale: 0, entries, provenance: "Captured review annotations; reviewer names are free-form, not authenticated. Stale decisions require renewed review.".into() };
+        let mut s = Summary { policy: self.policy.clone(), version: 1, total: entries.len(), unreviewed: 0, in_review: 0, accepted: 0, needs_action: 0, resolved: 0, stale: 0, entries, provenance: "Captured review annotations; reviewer names are free-form, not authenticated. Stale decisions require renewed review.".into() };
         for d in s.entries.values() {
             if d.stale {
                 s.stale += 1;
@@ -131,6 +154,7 @@ fn validate_decision(d: &Decision, depth: usize) -> Result<()> {
         || d.tags.iter().any(|t| t.len() > 256)
         || d.id.len() > 128
         || d.fingerprint.len() > 128
+        || d.current_hunk.as_ref().is_some_and(|id| id.len() > 128)
     {
         bail!("Review annotation limits exceeded");
     }
@@ -139,24 +163,30 @@ fn validate_decision(d: &Decision, depth: usize) -> Result<()> {
     }
     Ok(())
 }
+pub fn policy_digest(
+    options: &DiffOptions,
+    folder: &super::folder::FolderOptions,
+    filter: &str,
+) -> String {
+    analysis::identity(&(options, folder, filter))
+}
 pub fn fingerprint(path: &str, roots: &[PathBuf], options: &DiffOptions) -> Result<String> {
     let mut sides = Vec::new();
     for root in roots {
         let file = root.join(path);
         match std::fs::symlink_metadata(&file) {
-            Ok(m) if m.is_file() && !m.file_type().is_symlink() => {
-                sides.push(Some(analysis::digest(&analysis::read(&file)?)))
-            }
+            Ok(m) if m.is_file() && !m.file_type().is_symlink() => sides.push(Some(
+                analysis::digest(&analysis::read_in_root(&file, &root.canonicalize()?)?),
+            )),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => sides.push(None),
             _ => bail!("Review state supports regular files only: {path}"),
         }
     }
-    Ok(analysis::identity(&(
-        path,
-        sides,
-        options,
-        &options.unpackers,
-    )))
+    Ok(fingerprint_digests(path, &sides, options))
+}
+pub fn fingerprint_digests(path: &str, sides: &[Option<String>], options: &DiffOptions) -> String {
+    let converter = super::unpacker::find(&options.unpackers, std::path::Path::new(path));
+    analysis::identity(&(path, sides, options, converter))
 }
 /// Opt-in additive annotation: comparison tables and CSV columns retain their old shape.
 pub fn annotate_report(
@@ -192,6 +222,39 @@ pub fn annotate_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn comparison_policy_changes_invalidate_decisions_and_converter_identity_is_scoped() {
+        let mut options = DiffOptions::default();
+        let folder = super::super::folder::FolderOptions::default();
+        let mut workspace = Workspace::default();
+        workspace.bind_policy(&options, &folder, "*");
+        workspace.entries.insert(
+            "a.rs".into(),
+            Decision {
+                state: State::Accepted,
+                ..Default::default()
+            },
+        );
+        assert!(!workspace.bind_policy(&options, &folder, "*"));
+        let changed = super::super::folder::FolderOptions {
+            method: super::super::folder::CompareMethod::Size,
+            ..folder
+        };
+        assert!(workspace.bind_policy(&options, &changed, "*"));
+        assert_eq!(workspace.summary(["a.rs".into()]).accepted, 0);
+        let sides = [Some("content".into()), Some("other".into())];
+        let plain = fingerprint_digests("a.rs", &sides, &options);
+        options.unpackers.push(super::super::unpacker::Unpacker {
+            enabled: true,
+            pattern: "*.pdf".into(),
+            command: "never executed ${file}".into(),
+        });
+        assert_eq!(plain, fingerprint_digests("a.rs", &sides, &options));
+        let converted = fingerprint_digests("a.pdf", &sides, &options);
+        options.unpackers.clear();
+        assert_ne!(converted, fingerprint_digests("a.pdf", &sides, &options));
+    }
+
     #[test]
     fn stale_decisions_are_never_silently_reaccepted() {
         let mut w = Workspace::default();

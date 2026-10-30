@@ -149,6 +149,9 @@ pub fn save_with_workspace(
         workspace: workspace.clone(),
     };
     manifest.options.unpackers.clear();
+    manifest
+        .workspace
+        .bind_policy(&manifest.options, &manifest.folder, &manifest.filter);
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let zip_options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
@@ -303,6 +306,7 @@ pub fn load(path: &Path) -> Result<Review> {
             bail!("Duplicate ZIP entry");
         }
     }
+    let mut captured_digests = BTreeMap::new();
     for entry in &manifest.entries {
         let name = format!(
             "data/{}/{}{}",
@@ -333,13 +337,15 @@ pub fn load(path: &Path) -> Result<Review> {
             if total > MAX_BYTES {
                 bail!("Folder review exceeds 256 MiB");
             }
+            let digest = super::analysis::digest(&bytes);
             if entry
                 .digest
                 .as_ref()
-                .is_some_and(|digest| *digest != super::analysis::digest(&bytes))
+                .is_some_and(|expected| *expected != digest)
             {
                 bail!("Review content fingerprint mismatch: {}", entry.path);
             }
+            captured_digests.insert((entry.side, entry.path.clone()), digest);
             std::fs::create_dir_all(dest.parent().unwrap())?;
             let mut output = std::fs::File::options()
                 .write(true)
@@ -351,6 +357,24 @@ pub fn load(path: &Path) -> Result<Review> {
             }
         }
     }
+    let fingerprints = manifest
+        .entries
+        .iter()
+        .filter(|e| !e.directory)
+        .map(|entry| {
+            let sides: Vec<_> = (0..manifest.labels.len())
+                .map(|side| captured_digests.get(&(side, entry.path.clone())).cloned())
+                .collect();
+            (
+                entry.path.clone(),
+                super::review_state::fingerprint_digests(&entry.path, &sides, &manifest.options),
+            )
+        })
+        .collect();
+    manifest
+        .workspace
+        .bind_policy(&manifest.options, &manifest.folder, &manifest.filter);
+    manifest.workspace.reconcile(&fingerprints);
     Ok(Review {
         manifest,
         roots,
@@ -471,6 +495,113 @@ mod tests {
         assert_eq!(review.manifest.notes["a.txt"], "Check this change");
         assert!(review.manifest.options.unpackers.is_empty());
     }
+    #[test]
+    fn persistent_review_states_round_trip_and_corrupt_content_is_rejected() {
+        use crate::core::review_state::{Decision, State, Workspace};
+        let original = tempfile::tempdir().unwrap();
+        let roots: Vec<_> = ["left", "right"]
+            .into_iter()
+            .map(|p| original.path().join(p))
+            .collect();
+        for (side, root) in roots.iter().enumerate() {
+            std::fs::create_dir(root).unwrap();
+            std::fs::write(root.join("a.txt"), format!("side {side}\n")).unwrap();
+        }
+        let opts = DiffOptions::default();
+        let folder = FolderOptions::default();
+        let items = Scanner {
+            roots: &roots,
+            filter: &FileFilter::default(),
+            fopts: &folder,
+            dopts: &opts,
+            progress: &Progress::default(),
+        }
+        .run();
+        let fingerprint = crate::core::review_state::fingerprint("a.txt", &roots, &opts).unwrap();
+        let mut workspace = Workspace {
+            current: Some("a.txt".into()),
+            ..Default::default()
+        };
+        workspace.policy = crate::core::review_state::policy_digest(&opts, &folder, "*");
+        workspace.entries.insert(
+            "a.txt".into(),
+            Decision {
+                id: fingerprint.clone(),
+                fingerprint,
+                state: State::Accepted,
+                comment: "Review <safe> & complete".into(),
+                tags: vec!["release".into()],
+                hunks: BTreeMap::from([(
+                    "hunk-id".into(),
+                    Box::new(Decision {
+                        state: State::NeedsAction,
+                        comment: "Check this hunk".into(),
+                        ..Default::default()
+                    }),
+                )]),
+                ..Default::default()
+            },
+        );
+        let out = tempfile::tempdir().unwrap();
+        let path = out.path().join("review.oxmreview");
+        save_with_workspace(
+            &path,
+            Capture {
+                roots: &roots,
+                labels: &["Left".into(), "Right".into()],
+                items: &items.iter().collect::<Vec<_>>(),
+                options: &opts,
+                folder: &folder,
+                filter: "*",
+                notes: &BTreeMap::new(),
+            },
+            &workspace,
+        )
+        .unwrap();
+        drop(original);
+        let review = load(&path).unwrap();
+        assert_eq!(review.manifest.version, 2);
+        assert_eq!(review.manifest.workspace.current.as_deref(), Some("a.txt"));
+        assert_eq!(
+            review.manifest.workspace.entries["a.txt"].state,
+            State::Accepted
+        );
+        assert!(!review.manifest.workspace.entries["a.txt"].stale);
+        assert_eq!(
+            review.manifest.workspace.summary(["a.txt".into()]).accepted,
+            1
+        );
+
+        assert_eq!(
+            review.manifest.workspace.entries["a.txt"].hunks["hunk-id"].state,
+            State::NeedsAction
+        );
+        assert!(review.manifest.entries.iter().all(|e| e.digest.is_some()));
+        // Repack a well-formed ZIP with one changed payload; CRCs are valid, captured SHA-256 is not.
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).unwrap();
+            let name = entry.name().to_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if name == "data/0/a.txt" {
+                bytes = b"tampered\n".to_vec();
+            }
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        let corrupted = out.path().join("corrupt.oxmreview");
+        std::fs::write(&corrupted, writer.finish().unwrap().into_inner()).unwrap();
+        assert!(load(&corrupted)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("fingerprint mismatch"));
+    }
+
     #[test]
     fn rejects_unsafe_and_duplicate_paths_and_future_versions() {
         for path in [

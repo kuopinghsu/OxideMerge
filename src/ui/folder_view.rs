@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub enum FolderAction {
     OpenCaptured {
-        docs: Vec<crate::core::text::TextDoc>,
+        comparison: super::baseline_panel::CapturedComparison,
     },
     OpenFiles {
         paths: Vec<PathBuf>,
@@ -117,6 +117,7 @@ struct Running {
 }
 
 pub struct FolderView {
+    merge_verification: Box<super::merge_verification::FolderVerification>,
     pub workspace: crate::core::review_state::Workspace,
     pub baseline_panel: Box<super::baseline_panel::BaselinePanel>,
     review_filter: Option<crate::core::review_state::State>,
@@ -403,6 +404,7 @@ impl FolderView {
             .map(|r| temps.iter().any(|t| r.starts_with(t.path())))
             .collect();
         let mut v = FolderView {
+            merge_verification: Default::default(),
             workspace: Default::default(),
             baseline_panel: Default::default(),
             review_filter: None,
@@ -558,7 +560,7 @@ impl FolderView {
         let Some((path, mut note)) = self.note_edit.take() else {
             return;
         };
-        let mut open = true;
+        let mut open = !ui.input(|i| i.key_pressed(Key::Escape));
         let mut done = false;
         let mut cancel = false;
         egui::Window::new(tr("dlg.bookmark_comment"))
@@ -655,6 +657,8 @@ impl FolderView {
     }
 
     pub fn start_compare(&mut self) {
+        self.baseline_panel.invalidate();
+        self.merge_verification.clear_validation();
         self.review_checked = false;
         self.review_fingerprints = None;
         if let Some(r) = &self.running {
@@ -1485,6 +1489,10 @@ impl FolderView {
         }
     }
 
+    pub fn handles_escape(&self) -> bool {
+        self.has_dialog() || self.peek || self.note_edit.is_some()
+    }
+
     /// Whether one of the view's dialogs is open, so the app leaves the keyboard to it.
     pub fn has_dialog(&self) -> bool {
         self.confirm.is_some() || self.merge_plan.is_some() || self.select_pattern.is_some()
@@ -2306,6 +2314,12 @@ impl FolderView {
             analysis,
             review_state::{Decision, State},
         };
+        if self
+            .workspace
+            .bind_policy(&self.dopts, &self.fopts, &self.filter_spec)
+        {
+            self.view_key = None;
+        }
         if self.running.is_none() {
             if let Some(path) = self.review_resume.take() {
                 if let Some(i) = self.items.iter().position(|item| item.rel_path() == path) {
@@ -2545,10 +2559,29 @@ impl FolderView {
         let was_running = self.running.is_some();
         self.poll();
         self.review_ui(ui, cfg);
+        if let Some(path) = self.merge_verification.ui(
+            ui,
+            &self.items,
+            &self.roots,
+            &self.dopts,
+            self.running.is_some() || self.file_job.is_some(),
+            &self.filter_spec,
+        ) {
+            if let Some(i) = self.items.iter().position(|item| item.rel_path() == path) {
+                self.rebuild_visible(cfg);
+                if let Some(v) = self.visible.iter().position(|&x| x == i) {
+                    self.cursor = Some(v);
+                    self.selected.clear();
+                    self.selected.insert(i);
+                    self.scroll_to = Some(v);
+                }
+            }
+        }
+
         let captured_action = self
             .baseline_panel
             .ui(ui, &self.roots, &self.dopts, &self.filter_spec)
-            .map(|docs| FolderAction::OpenCaptured { docs });
+            .map(|comparison| FolderAction::OpenCaptured { comparison });
         if was_running {
             // Also repaints once after finishing, as the status bar was drawn before this poll.
             ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -3169,6 +3202,11 @@ impl FolderView {
         }
         self.merge_dialog(ui, cfg);
         self.select_pattern_dialog(ui, cfg);
+        if let Some(i) = self.cursor.and_then(|v| self.visible.get(v)).copied() {
+            if !self.items[i].is_dir {
+                self.workspace.current = Some(self.items[i].rel_path());
+            }
+        }
         result
     }
 }

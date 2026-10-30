@@ -22,7 +22,7 @@ const KEYBOARD: &[Section] = &[
             (&["Ctrl+S"], "menu.save"),
             (&["Ctrl+Shift+S"], "btn.save_all"),
             (&["Ctrl+Shift+E"], "menu.export_html"),
-            (&["Ctrl+W", "Ctrl+F4"], "help.close_tab"),
+            (&["Ctrl+W", "Ctrl+F4", "Esc"], "help.close_tab"),
             (&["Control+Tab", "Control+Shift+Tab"], "help.next_prev_tab"),
             (&["F5"], "cmd.refresh"),
             (&["Ctrl++", "Ctrl+−"], "help.zoom"),

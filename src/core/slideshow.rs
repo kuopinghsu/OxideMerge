@@ -222,7 +222,7 @@ fn diff_slide(
         let row = &doc.result.rows[r];
         out.push_str("<tr>");
         for (p, (class, marks)) in cells.iter().enumerate() {
-            match row.line[p] {
+            match row.line(p) {
                 Some(l) => {
                     let _ = write!(
                         out,

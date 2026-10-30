@@ -71,10 +71,9 @@ pub fn parse(source: &str, format: Format) -> Result<Node> {
     };
     let lines: Vec<_> = std::iter::once(0)
         .chain(
-            source
-                .bytes()
-                .enumerate()
-                .filter_map(|(i, b)| (b == b'\n').then_some(i + 1)),
+            super::text::lines(source)
+                .skip(1)
+                .map(|(line, _)| line.as_ptr() as usize - source.as_ptr() as usize),
         )
         .collect();
     fn locate(node: &mut Node, lines: &[usize]) {
@@ -91,7 +90,24 @@ fn describe(node: &Node) -> String {
         .clone()
         .unwrap_or_else(|| format!("{} ({} children)", node.kind, node.children.len()))
 }
-fn compare_node(path: &str, a: Option<&Node>, b: Option<&Node>, out: &mut Vec<Change>) {
+fn node_fingerprint(node: &Node) -> String {
+    let children: Vec<_> = node
+        .children
+        .iter()
+        .map(|(key, value)| (key, node_fingerprint(value)))
+        .collect();
+    analysis::identity(&(&node.kind, &node.value, children))
+}
+fn compare_node(
+    path: &str,
+    a: Option<&Node>,
+    b: Option<&Node>,
+    out: &mut Vec<Change>,
+    budget: &mut usize,
+) -> Result<()> {
+    if path.len() > 4096 {
+        bail!("Semantic path exceeds 4 KiB; use Text view");
+    }
     let kind = match (a, b) {
         (Some(a), Some(b)) if a.kind != b.kind => Some(ChangeKind::TypeChanged),
         (Some(a), Some(b)) if a.value != b.value => Some(ChangeKind::Modified),
@@ -100,10 +116,18 @@ fn compare_node(path: &str, a: Option<&Node>, b: Option<&Node>, out: &mut Vec<Ch
         _ => None,
     };
     if let Some(kind) = kind {
+        let cost = path.len()
+            + a.map_or(0, |node| node.span.bytes.len())
+            + b.map_or(0, |node| node.span.bytes.len())
+            + 256;
+        if cost > *budget {
+            bail!("Semantic changes exceed the 32 MiB comparison budget; use Text view");
+        }
+        *budget -= cost;
         let before = a.map(describe);
         let after = b.map(describe);
         out.push(Change {
-            id: analysis::identity(&(path, &before, &after)),
+            id: analysis::identity(&(path, a.map(node_fingerprint), b.map(node_fingerprint))),
             path: path.into(),
             kind,
             before,
@@ -111,7 +135,7 @@ fn compare_node(path: &str, a: Option<&Node>, b: Option<&Node>, out: &mut Vec<Ch
             spans: [a.map(|n| n.span.clone()), b.map(|n| n.span.clone())],
             confidence: "parser_exact".into(),
         });
-        return;
+        return Ok(());
     }
     if let (Some(a), Some(b)) = (a, b) {
         for key in a
@@ -125,11 +149,14 @@ fn compare_node(path: &str, a: Option<&Node>, b: Option<&Node>, out: &mut Vec<Ch
                 a.children.get(key),
                 b.children.get(key),
                 out,
-            );
+                budget,
+            )?;
         }
     }
+    Ok(())
 }
 pub fn compare(a: &str, b: &str, format: Format) -> SemanticReport {
+    let (a_source, b_source) = (a, b);
     let mut report = SemanticReport { version: 1, format, changes: Vec::new(), errors: Vec::new(), policies: vec!["Read-only; text comparison rules are not semantic path rules and are not applied.".into(), "JSON objects unordered; arrays ordered; duplicate keys rejected. XML attributes unordered; child/mixed-content order and text whitespace significant; expanded namespace names; comments included. No external entities/DTDs.".into()] };
     let parsed = [parse(a, format), parse(b, format)];
     for (side, p) in parsed.iter().enumerate() {
@@ -140,7 +167,24 @@ pub fn compare(a: &str, b: &str, format: Format) -> SemanticReport {
         }
     }
     if let [Ok(a), Ok(b)] = &parsed {
-        compare_node("$", Some(a), Some(b), &mut report.changes);
+        let mut budget = analysis::MAX_REPORT;
+        if let Err(error) = compare_node("$", Some(a), Some(b), &mut report.changes, &mut budget) {
+            report.changes.clear();
+            report.errors.push(error.to_string());
+            return report;
+        }
+        for change in &mut report.changes {
+            if let Some(span) = &change.spans[0] {
+                if let Some(value) = a_source.get(span.bytes.clone()) {
+                    change.before = Some(value.to_owned());
+                }
+            }
+            if let Some(span) = &change.spans[1] {
+                if let Some(value) = b_source.get(span.bytes.clone()) {
+                    change.after = Some(value.to_owned());
+                }
+            }
+        }
     }
     report
 }
@@ -148,12 +192,52 @@ pub fn compare(a: &str, b: &str, format: Format) -> SemanticReport {
 mod tests {
     use super::*;
     #[test]
+    fn added_containers_keep_values_and_structural_ids_ignore_object_order() {
+        let a = compare("{}", r#"{"added":{"a":1,"b":2}}"#, Format::Json);
+        let b = compare("{}", r#"{"added":{"b":2,"a":1}}"#, Format::Json);
+        assert_eq!(a.changes[0].after.as_deref(), Some(r#"{"a":1,"b":2}"#));
+        assert_eq!(a.changes[0].id, b.changes[0].id);
+        let path = format!("{{\"{}\":1}}", "x".repeat(4097));
+        assert!(!compare("{}", &path, Format::Json).errors.is_empty());
+        let xml = format!("<x:r xmlns:x='{}'/>", "u".repeat(1025));
+        assert!(parse(&xml, Format::Xml).is_err());
+        let deep = format!("{}0{}", "[".repeat(70), "]".repeat(70));
+        assert!(parse(&deep, Format::Json).is_err());
+    }
+
+    #[test]
+    fn xml_rejects_invalid_names_characters_and_preserves_document_comments() {
+        assert!(!compare("<!--old--><r/>", "<!--new--><r/>", Format::Xml).identical());
+        assert!(compare(
+            "<a:r xmlns:a='urn:a&amp;b'/>",
+            "<b:r xmlns:b='urn:a&#38;b'/>",
+            Format::Xml
+        )
+        .identical());
+        assert!(!compare("<r/><!--old-->", "<r/><!--new-->", Format::Xml).identical());
+        for source in [
+            "<1bad/>",
+            "<r>&#0;</r>",
+            "<r a='&#0;'/>",
+            "<r><?xml version='1.0'?></r>",
+            "<r/><?XML data?>",
+            "<![CDATA[ ]]><r/>",
+            "<r><!--bad--comment--></r>",
+        ] {
+            assert!(parse(source, Format::Xml).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn json_reordering_types_duplicates_and_ordered_arrays() {
         assert!(compare(r#"{"b":2,"a":1}"#, r#"{"a":1,"b":2}"#, Format::Json).identical());
         let r = compare(r#"{"timeout":30}"#, r#"{"timeout":60}"#, Format::Json);
         assert_eq!(r.changes.len(), 1);
         assert_eq!(r.changes[0].path, "$[\"timeout\"]");
         assert_eq!(r.changes[0].spans[0].as_ref().unwrap().bytes, 11..13);
+        let cr = compare("{\r\"timeout\":30\r}", "{\r\"timeout\":60\r}", Format::Json);
+        assert_eq!(cr.changes[0].spans[0].as_ref().unwrap().line, 2);
+
         assert!(!compare("[1,2]", "[2,1]", Format::Json).identical());
         assert_eq!(
             compare("null", "\"null\"", Format::Json).changes[0].kind,

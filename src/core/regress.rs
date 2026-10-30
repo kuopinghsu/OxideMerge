@@ -100,20 +100,23 @@ fn mutate(rng: &mut Rng, lines: &[String]) -> Vec<String> {
 /// rows outside blocks pair equal lines, and blocks hold exactly the lines of their rows.
 fn check_rows(r: &DiffResult, panes: &[&[String]], seed: u64) {
     for (p, lines) in panes.iter().enumerate() {
-        let shown: Vec<usize> = r.rows.iter().filter_map(|row| row.line[p]).collect();
+        let shown: Vec<usize> = r.rows.iter().filter_map(|row| row.line(p)).collect();
         assert_eq!(shown, (0..lines.len()).collect::<Vec<_>>(), "seed {seed}");
     }
-    for row in r.rows.iter().filter(|row| row.block.is_none()) {
-        let first = &panes[0][row.line[0].unwrap()];
+    for row in r.rows.iter().filter(|row| row.block().is_none()) {
+        let first = &panes[0][row.line(0).unwrap()];
         for (p, lines) in panes.iter().enumerate() {
-            assert_eq!(&lines[row.line[p].unwrap()], first, "seed {seed}");
+            assert_eq!(&lines[row.line(p).unwrap()], first, "seed {seed}");
         }
     }
     for (bi, b) in r.blocks.iter().enumerate() {
         let rows = &r.rows[b.first_row..b.first_row + b.rows];
-        assert!(rows.iter().all(|row| row.block == Some(bi)), "seed {seed}");
+        assert!(
+            rows.iter().all(|row| row.block() == Some(bi)),
+            "seed {seed}"
+        );
         for p in 0..panes.len() {
-            let lines: Vec<usize> = rows.iter().filter_map(|row| row.line[p]).collect();
+            let lines: Vec<usize> = rows.iter().filter_map(|row| row.line(p)).collect();
             assert_eq!(
                 lines,
                 b.ranges[p].clone().collect::<Vec<_>>(),
@@ -122,7 +125,7 @@ fn check_rows(r: &DiffResult, panes: &[&[String]], seed: u64) {
             // Also for empty ranges, which mark where the other side's lines go.
             let before = r.rows[..b.first_row]
                 .iter()
-                .filter(|row| row.line[p].is_some())
+                .filter(|row| row.line(p).is_some())
                 .count();
             assert_eq!(
                 b.ranges[p].start, before,
@@ -168,7 +171,7 @@ fn random_two_way_diffs_are_whole_and_their_patches_rebuild_the_right_side() {
         let stats = r.stats();
         assert_eq!(
             stats.identical + stats.changed + stats.removed,
-            r.rows.iter().filter(|row| row.line[0].is_some()).count(),
+            r.rows.iter().filter(|row| row.line(0).is_some()).count(),
             "seed {seed}"
         );
         if a == b {

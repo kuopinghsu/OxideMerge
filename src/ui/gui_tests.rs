@@ -615,7 +615,7 @@ fn lines_are_found_copied_and_pasted_with_the_keyboard() {
     gui.key(Modifiers::NONE, Key::Enter);
     assert_eq!(gui.text_view().find.query, "gam");
     let row = gui.text_view().cursor_row.expect("the match is selected");
-    assert_eq!(gui.text_view().diff.rows[row].line[0], Some(2));
+    assert_eq!(gui.text_view().diff.rows[row].line(0), Some(2));
     gui.key(Modifiers::NONE, Key::Escape);
     assert!(!gui.text_view().find.open);
 
@@ -1266,7 +1266,9 @@ fn table_keyboard_navigation_cell_editing_and_go_to_line_work() {
     gui.key(Modifiers::NONE, Key::ArrowDown);
     let line = |gui: &Gui| {
         let v = gui.text_view();
-        v.diff.rows[v.cursor_row.unwrap()].line[v.active_pane].unwrap()
+        v.diff.rows[v.cursor_row.unwrap()]
+            .line(v.active_pane)
+            .unwrap()
     };
     assert_eq!(line(&gui), 2);
     gui.key(Modifiers::NONE, Key::ArrowUp);
@@ -1350,7 +1352,7 @@ fn meld_link_arrows_and_compact_pane_clicks_target_the_correct_change() {
     let v = gui.text_view();
     let r = v.cursor_row.expect("clicked a real line");
     assert_eq!(v.active_pane, 0);
-    assert_eq!(v.diff.rows[r].line[0], Some(3));
+    assert_eq!(v.diff.rows[r].line(0), Some(3));
     assert!(
         v.cur_block.is_some(),
         "row: {:?}, blocks: {:?}",
@@ -1382,7 +1384,7 @@ fn compact_pane_keyboard_skips_the_other_sides_insertions() {
     gui.key(CMD, Key::Home);
     gui.key(Modifiers::NONE, Key::ArrowDown);
     let v = gui.text_view();
-    assert_eq!(v.diff.rows[v.cursor_row.unwrap()].line[0], Some(1));
+    assert_eq!(v.diff.rows[v.cursor_row.unwrap()].line(0), Some(1));
     gui.key(Modifiers::NONE, Key::F2);
     gui.key(CMD, Key::A);
     gui.type_text("edited common");
@@ -1390,7 +1392,7 @@ fn compact_pane_keyboard_skips_the_other_sides_insertions() {
     assert_eq!(gui.text_view().panes[0].doc.lines[1], "edited common");
     gui.key(Modifiers::NONE, Key::ArrowDown);
     let v = gui.text_view();
-    assert_eq!(v.diff.rows[v.cursor_row.unwrap()].line[0], Some(2));
+    assert_eq!(v.diff.rows[v.cursor_row.unwrap()].line(0), Some(2));
 }
 
 #[test]
@@ -1465,4 +1467,213 @@ fn merge_verification_preview_never_edits_the_middle_pane() {
         gui.shows(tr("analysis.failed")),
         "unmerged base cannot validate as merged output"
     );
+}
+
+#[test]
+fn start_page_baselines_open_frozen_binary_bytes_without_original_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("left");
+    let b = dir.path().join("right");
+    for path in [&a, &b] {
+        std::fs::create_dir(path).unwrap();
+    }
+    std::fs::write(a.join("a.bin"), b"\0A").unwrap();
+    std::fs::write(b.join("a.bin"), b"\0B").unwrap();
+    let mut gui = Gui::start("baseline_binary", None);
+    gui.click(tr("baseline.title"));
+    gui.click(tr("baseline.left"));
+    gui.type_text(&format!("folder:{}", a.display()));
+    gui.click(tr("baseline.right"));
+    gui.type_text(&format!("folder:{}", b.display()));
+    gui.click(tr("baseline.compare"));
+    let start = Instant::now();
+    while !gui.shows(tr("baseline.captured")) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "baseline worker did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        gui.frame();
+    }
+    std::fs::remove_file(a.join("a.bin")).unwrap();
+    std::fs::remove_file(b.join("a.bin")).unwrap();
+    gui.click("BinaryChanged a.bin");
+    let Content::Binary(view) = gui.app.tabs[gui.app.active].content.view() else {
+        panic!("captured binary compare expected")
+    };
+    assert_eq!(view.data, [b"\0A".to_vec(), b"\0B".to_vec()]);
+    assert!(view.read_only.iter().all(|r| *r));
+}
+
+#[test]
+fn semantic_source_navigation_merges_the_selected_later_block_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let left = "{\n  \"a\": 1,\n  \"same1\": true,\n  \"same2\": true,\n  \"same3\": true,\n  \"b\": 2\n}\n";
+    let right = left
+        .replace("\"a\": 1", "\"a\": 10")
+        .replace("\"b\": 2", "\"b\": 20");
+    write(dir.path(), &[("a.json", left), ("b.json", &right)]);
+    let mut gui = Gui::start(
+        "semantic_source_merge",
+        compare(&[dir.path().join("a.json"), dir.path().join("b.json")]),
+    );
+    gui.click(tr("analysis.semantic"));
+    let start = Instant::now();
+    let source = format!("{} 2:6", tr("analysis.source"));
+    while !gui.shows(&source) {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(1));
+        gui.frame();
+    }
+    gui.click(&source);
+    gui.app.run(Cmd::CopyRight, &gui.ctx);
+    gui.settle();
+    assert_eq!(
+        gui.text_view().panes[1].doc.text(),
+        right.replace("\"b\": 20", "\"b\": 2")
+    );
+}
+
+#[test]
+fn captured_impact_source_opens_at_its_evidence_line() {
+    let mut gui = Gui::start("impact_source", None);
+    let mut doc = text::doc_from_bytes(None, b"first\nreference here\nlast\n", None);
+    doc.read_only = true;
+    gui.app
+        .open_captured(super::super::baseline_panel::CapturedComparison::Source {
+            docs: vec![doc.clone(), doc],
+            line: 2,
+        });
+    gui.settle();
+    let view = gui.text_view();
+    assert_eq!(view.cursor_row, Some(1));
+    assert!(view.panes.iter().all(|pane| pane.doc.read_only));
+}
+
+#[test]
+fn text_layout_settings_apply_immediately_and_keep_merge_content_correct() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[
+            ("a.txt", "start\nend\n"),
+            ("b.txt", "start\ninserted\nend\n"),
+        ],
+    );
+    let mut gui = Gui::start(
+        "text_layout",
+        compare(&[dir.path().join("a.txt"), dir.path().join("b.txt")]),
+    );
+    gui.click(tr("menu.options").trim_end_matches(['.', '…']));
+    gui.click(tr("view.layout_aligned"));
+    gui.click(tr("btn.cancel"));
+    assert_eq!(gui.app.cfg.text_layout, TextLayout::Compact);
+    gui.click(tr("menu.options").trim_end_matches(['.', '…']));
+    gui.click(tr("view.layout_aligned"));
+    gui.click(tr("btn.ok"));
+    assert_eq!(gui.app.cfg.text_layout, TextLayout::Aligned);
+    gui.app.run(Cmd::FirstDiff, &gui.ctx);
+    gui.app.run(Cmd::CopyLeft, &gui.ctx);
+    gui.settle();
+    assert_eq!(
+        gui.text_view().panes[0].doc.text(),
+        "start\ninserted\nend\n"
+    );
+    gui.app.cfg.text_layout = TextLayout::Compact;
+    gui.settle();
+    assert_eq!(
+        gui.text_view().panes[0].doc.text(),
+        "start\ninserted\nend\n"
+    );
+}
+
+#[test]
+fn escape_closes_only_the_active_compare_and_leaves_the_start_page_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("a.txt", "a\n"),
+            ("b.txt", "b\n"),
+            ("c.txt", "c\n"),
+            ("d.txt", "d\n"),
+        ],
+    );
+    let mut gui = Gui::start("escape_tabs", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    let first = gui.app.tabs[0].id;
+    gui.drop_files(&[d.join("c.txt"), d.join("d.txt")]);
+    assert_eq!(gui.app.tabs.len(), 2);
+    gui.click(tr("menu.file"));
+    assert!(
+        egui::menu::BarState::load(&gui.ctx, gui.app.menu_bar_id.unwrap()).is_some(),
+        "clicked menu should be tracked as open"
+    );
+    gui.key(Modifiers::NONE, Key::Escape);
+    assert_eq!(
+        gui.app.tabs.len(),
+        2,
+        "menu dismissal must not also close a tab"
+    );
+    gui.key(CMD, Key::O);
+    assert!(gui.app.open_dlg.is_some());
+    gui.key(Modifiers::NONE, Key::Escape);
+    assert!(gui.app.open_dlg.is_none());
+    assert_eq!(
+        gui.app.tabs.len(),
+        2,
+        "dialog dismissal must not also close a tab"
+    );
+    gui.key(Modifiers::NONE, Key::Escape);
+    assert_eq!(gui.app.tabs.len(), 1);
+    assert_eq!(gui.app.tabs[0].id, first);
+    gui.key(Modifiers::NONE, Key::Escape);
+    assert!(gui.app.tabs.is_empty());
+    gui.key(Modifiers::NONE, Key::Escape);
+    assert!(!gui.closed);
+}
+
+#[test]
+fn escape_search_and_unsaved_confirmation_take_priority_over_closing() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "one\nleft\n"), ("b.txt", "one\nright\n")]);
+    let mut gui = Gui::start(
+        "escape_priority",
+        compare(&[d.join("a.txt"), d.join("b.txt")]),
+    );
+    gui.key(CMD, Key::F);
+    gui.type_text("one");
+    gui.key(Modifiers::NONE, Key::Escape);
+    assert!(!gui.text_view().find.open);
+    assert_eq!(gui.app.tabs.len(), 1);
+    gui.key(ALT, Key::ArrowRight);
+    assert!(gui.text_view().panes[1].doc.modified);
+    gui.key(Modifiers::NONE, Key::Escape);
+    assert!(gui.shows(tr("dlg.unsaved")));
+    assert_eq!(gui.app.tabs.len(), 1);
+    gui.key(Modifiers::NONE, Key::Escape);
+    assert!(gui.app.prompt.is_none());
+    assert_eq!(gui.app.tabs.len(), 1);
+    gui.key(Modifiers::NONE, Key::Escape);
+    gui.click(tr("btn.discard"));
+    assert!(gui.app.tabs.is_empty());
+    assert_eq!(read(&d.join("b.txt")), "one\nright\n");
+}
+
+#[test]
+fn escape_closes_binary_and_folder_comparisons() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("left/a.bin", "\0left"), ("right/a.bin", "\0right")]);
+    for paths in [
+        [d.join("left/a.bin"), d.join("right/a.bin")],
+        [d.join("left"), d.join("right")],
+    ] {
+        let mut gui = Gui::start("escape_other_views", compare(&paths));
+        assert_eq!(gui.app.tabs.len(), 1);
+        gui.key(Modifiers::NONE, Key::Escape);
+        assert!(gui.app.tabs.is_empty());
+        assert!(!gui.closed);
+    }
 }

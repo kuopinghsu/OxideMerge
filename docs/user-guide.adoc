@@ -154,7 +154,8 @@ Buttons at the top right:: *Open*, theme selection, *Options*, *Command palette*
 *Help & Shortcuts*.
 Tabs:: Each comparison opens in a separate tab.
 Right-click a tab to close it, the others, the tabs to its right, or all of them.
-kbd:[Ctrl+Tab] and kbd:[Ctrl+Shift+Tab] switch tabs, and kbd:[Ctrl+W] closes the current one.
+kbd:[Ctrl+Tab] and kbd:[Ctrl+Shift+Tab] switch tabs, and kbd:[Ctrl+W] or kbd:[Esc] closes the current one.
+Esc first dismisses an open dialog, search bar, preview or editor; unsaved changes still prompt before closing.
 Status bar:: The number of differences, the current line or offset, and at the right end the
 interface language.
 Change the language under *Options → General*, or start OxideMerge with `--lang`.
@@ -431,7 +432,13 @@ used when saving, and a lock button that makes the side read-only.
 Choosing another encoding reloads the file using that encoding.
 Check the text after changing the encoding, especially before editing or saving.
 
-The *location pane* on the left is an overview of the whole file.
+The *location pane* on the right is an overview of the whole file, in both text and binary comparisons.
+
+Choose *Text layout* in Options → General or View → Text compare. *Compact rows* (the default)
+shows each side without insertion/deletion padding. *Aligned rows* leaves blank space opposite
+inserted or deleted lines so subsequent content stays horizontally aligned. The preference applies
+to open two-way and three-way text views, including wrapped lines, and is saved for future sessions.
+Switching the layout does not change file contents or comparison rules.
 Click it to jump to that place.
 Differences are colored: changed lines in amber, and lines only on one side in blue.
 Within changed lines, the changed words or characters are highlighted.
@@ -1078,7 +1085,7 @@ The unpacker plugins (see <<unpackers>>).
 |kbd:[Ctrl+S] |Save
 |kbd:[Ctrl+Shift+S] |Save all
 |kbd:[Ctrl+Shift+E] |Export HTML report
-|kbd:[Ctrl+W], kbd:[Ctrl+F4] |Close tab
+|kbd:[Ctrl+W], kbd:[Ctrl+F4], kbd:[Esc] |Close tab (Esc first dismisses active dialogs/search/editors)
 |kbd:[Ctrl+Tab], kbd:[Ctrl+Shift+Tab] |Next or previous tab
 |kbd:[Alt+F4] (kbd:[Cmd+Q] on macOS) |Exit, asking about unsaved changes first
 |kbd:[Ctrl+F], kbd:[F3], kbd:[Shift+F3], kbd:[Esc] |Find, find next, find previous, close the find bar
@@ -1395,8 +1402,89 @@ network, are counted in the status bar.
 Large files are slow or use a lot of memory::
 Text comparisons keep decoded text, comparison data and editing history in memory.
 Memory use depends on the content and operations; binary and image views also load complete files.
-Compare files of several hundred MB as binary, or compare folders by size and date instead of
-contents (see <<compare-methods>>).
+Valid UTF-8 files of at least 16 MiB load incrementally; UTF-16 and legacy encodings retain the
+existing complete-buffer decoder. Text remains editable and comparison rules are unchanged.
+Syntax highlighting is skipped above 50,000 lines or 16 MiB of decoded line content, avoiding
+whole-document worker copies. Editing/undo, wrapping and unusual comparison rules can still
+increase memory use. For a lower-memory alternative, use binary comparison or compare folders
+by size and date instead of contents (see <<compare-methods>>).
+
+== Optional merge verification, semantic compare and review workspace
+
+All analysis is opt-in and read-only. Expand *Merge Verification* in a three-way text view to
+preview the existing merge engine without changing the middle pane. *Validate saved result*
+re-reads the result and compares its bytes, encoding, BOM, line endings and final newline with
+that preview. Conflicts retain the base in previews and require explicit manual resolution;
+mechanical checks never certify semantic correctness. Editing the view invalidates its displayed
+validation status. Folder `--merge-plan` lists the existing folder merge operations and conflicts;
+it does not execute them or provide a transaction across multiple files. Folder validation checks
+planned copies/merges/deletions and retained files, and rechecks scoped source fingerprints.
+Preview before using the existing merge command; validate afterwards against the retained plan.
+`--validate-merge result-folder left-folder base-folder right-folder` supports separate result folders.
+
+For supported JSON/XML files choose *Semantic*. JSON object key order and XML attribute order
+are ignored. JSON arrays remain ordered; missing and null are distinct; duplicate keys are errors.
+XML uses expanded namespace names and preserves child order, text whitespace, mixed content and
+comments. XML DTDs, declared/unknown entities and XML 1.1 are unsupported; built-in character
+references are supported. Text ignore rules are deliberately not semantic path filters.
+Errors provide a one-click return to Text; semantic mode never writes structured documents.
+Choose a changed path's source button to return to the original physical line.
+
+Folder *Review workspace* stores file and hunk states, comments, rationale, optional tags and a
+free-form reviewer name (not an authenticated identity). *Next unreviewed* navigates remaining
+files. Hunk review is available when a file is opened from its folder view. Save the folder review
+to persist decisions and cursor. New `.oxmreview` version 2 bundles are additive; version 1 loads
+with unreviewed defaults and unknown versions are rejected. Captured file digests are checked
+on reopen. *Update review inputs* selects new folders, keeps the selected comparison rules,
+opens them read-only and flags mismatched decisions. Converted content or converter/rule changes
+may invalidate previous decisions and require renewed review. Stale decisions count as needing
+action, never as accepted. Repeated/ambiguous hunk contexts require manual review.
+
+== Optional release baseline and impact analysis
+
+The start page and folder comparisons share the *Release summary / Compare baselines* panel.
+Choose each source directly; selecting two live folders first is not required. Use `folder:PATH`, `git:REV:PATH`, or `review:SIDE:PATH`. Snapshot sides
+start at zero. Git refs are resolved once to recorded immutable commit IDs; uncommitted working
+changes are excluded from Git baselines. Folder captures include the selected current bytes.
+Git configuration and filters must be trusted, as for existing Git revision comparison.
+
+The summary reports additions, deletions, modifications, unchanged files, unique exact-content
+moves, binary changes, file-type changes, semantic JSON/XML changes and exclusions. Ambiguous or
+edited renames stay additions/deletions; no similarity-based rename claim is made. Selecting a
+summary row opens captured bytes read-only, preserving the saved baseline even if sources change.
+Important path substrings are user-defined heuristic review priorities, not compatibility guarantees.
+
+Enable *Potential impact* to list delimited filename/path or top-level JSON-key occurrences with
+file, line, content digest and source excerpts. All these findings are labeled heuristic; no parser
+proves language-level dependencies and no builds, tests or repository scripts are executed.
+Findings may be dismissed without changing source files. Empty output says impact is not assessed.
+Changing source specifications clears old findings; cancellation never publishes a partial result.
+
+Analysis limits are 16 MiB per regular file, 10,000 entries and 256 MiB of captured bytes per baseline;
+structured parsing is limited to 64 nested nodes and 100,000 nodes. Impact reports stop at 2,000
+findings. Files exceeding these limits are rejected or explicitly excluded, never called identical.
+Background jobs offer cancellation/progress. A bounded parser/merge currently checks cancellation
+before and after its parse/merge, so cancellation may wait for that bounded operation to finish.
+The existing normal comparison limits and behavior are unchanged.
+
+[source,shell]
+----
+oxidemerge --merge-plan left.txt base.txt right.txt --report merge-plan.json
+oxidemerge --validate-merge merged.txt left.txt base.txt right.txt --report validation.json
+oxidemerge --semantic --format json old.json new.json --report semantic.html
+oxidemerge --review-summary review.oxmreview --report review-summary.json
+oxidemerge --baseline-left git:v1.0:/repo --baseline-right git:v1.1:/repo --release-report release.html
+oxidemerge --impact old-folder new-folder --report impact.json
+----
+
+Without a report path, analyses emit versioned JSON on stdout. `.html` and `.xml` reports wrap
+that versioned JSON separately from the existing comparison report schema. Report output cannot
+replace an input or live under a selected input root. Standard analysis exits are 0 = identical or
+successful plan/summary, 1 = different, warning or unresolved plan conflicts, 2 = error or incomplete
+baseline scope (intentional filter exclusions are outside scope, not errors); `--validate-merge` uses 3 for a failed check. A validation warning uses 1.
+A review summary with stale decisions uses 1. YAML/TOML adapters and structured write-back are not
+implemented; use text compare. Semantic source spans are decoded UTF-8 byte ranges and physical
+lines, not offsets in an original UTF-16/legacy-encoded byte stream.
 
 == Known limitations
 

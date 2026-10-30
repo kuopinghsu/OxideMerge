@@ -20,3 +20,5 @@ pub mod widgets;
 pub mod analysis;
 
 pub mod baseline_panel;
+
+pub mod merge_verification;

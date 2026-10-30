@@ -18,6 +18,11 @@ impl<'de> Deserialize<'de> for Members<'de> {
                 let mut members = Vec::new();
                 let mut keys = std::collections::HashSet::new();
                 while let Some((key, value)) = map.next_entry::<String, &'de RawValue>()? {
+                    if members.len() >= 100_000 {
+                        return Err(serde::de::Error::custom(
+                            "JSON object member limit exceeded",
+                        ));
+                    }
                     if !keys.insert(key.clone()) {
                         return Err(serde::de::Error::custom(format!("Duplicate key: {key}")));
                     }

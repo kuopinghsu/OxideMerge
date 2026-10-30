@@ -487,3 +487,34 @@ oxidemerge-0.9.6-windows-x64.zip
 ## 授權條款
 
 OxideMerge 採用 [MIT 授權條款](LICENSE)。
+
+## 選擇性審閱與分析
+
+這些操作均為唯讀，需自行啟用。在三向文字或資料夾比較中展開「合併驗證」，可在記憶體中預覽合併，
+或檢查已儲存結果的實際位元組。「文字／語意」檢視會比較 JSON 與 XML 路徑，不會編輯或重新
+序列化原檔。重複的 JSON 鍵與 XML DTD／實體會被拒絕；YAML／TOML 請使用原有文字檢視。
+
+資料夾比較新增「審閱工作區」，支援檔案／差異區塊狀態、註解、理由、標籤及下一個未審閱項目。
+儲存為 `.oxmreview` 後可在其他電腦繼續。第 1 版套件仍可開啟；新第 2 版套件加入有大小限制的
+審閱資訊及擷取內容的 SHA-256 摘要。更新來源會標記過期決定，不會自動接受已變更的區塊。
+
+「比較基準／版本摘要」接受資料夾、固定 Git 提交及審閱快照的側別。內容完全相同且唯一對應的
+移動會與新增／刪除分開列出。選擇性的「潛在影響」會以具體原始碼證據列出路徑／設定鍵名稱的
+文字出現位置；這些參照均為啟發式判斷，不代表已驗證執行行為或建置／測試結果。
+Git 來源與原有版本比較相同，會使用受信任的 Git 設定。
+
+```sh
+oxidemerge --merge-plan left.txt base.txt right.txt --report merge-plan.json
+oxidemerge --validate-merge merged.txt left.txt base.txt right.txt --report validation.json
+oxidemerge --semantic --format json old.json new.json --report semantic.html
+oxidemerge --review-summary review.oxmreview --report review-summary.json
+oxidemerge --baseline-left git:v1.0:/path/to/repo --baseline-right git:v1.1:/path/to/repo --release-report release.html
+oxidemerge --impact old-folder new-folder --report impact.json
+```
+
+分析報告使用獨立、有版本編號的格式（JSON、HTML 或 XML），不變更原有報告格式。分析不會覆寫
+輸入，也不允許將報告匯出至選取的輸入資料夾內。結束代碼維持 0／1／2（相同或成功／不同或警告／
+錯誤）；`--validate-merge` 另以 **3** 表示驗證失敗。無法讀取或不支援的基準路徑會明確列出並傳回 2；依篩選規則排除的項目則列為範圍外。規則、限制與尚未支援的行為請參閱[分析指南](docs/analysis-guide.md)。
+
+文字比較提供「緊密排列」（預設，不保留新增／刪除的空白）與「對齊差異」（留白以對齊相應行）。
+可在「選項 → 一般」或「檢視 → 文字比較」變更「文字排列」。文字與二進位比較的位置窗格都在右側。

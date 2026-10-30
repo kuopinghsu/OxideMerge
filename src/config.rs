@@ -28,6 +28,24 @@ impl ThemeMode {
     }
 }
 
+/// Visual row spacing; comparison and merge rules are independent of this preference.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+pub enum TextLayout {
+    #[default]
+    Compact,
+    Aligned,
+}
+
+impl TextLayout {
+    pub const ALL: [Self; 2] = [Self::Compact, Self::Aligned];
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Compact => "view.layout_compact",
+            Self::Aligned => "view.layout_aligned",
+        }
+    }
+}
+
 /// A tab of the previous session: what was compared, and how.
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 pub struct SessionTab {
@@ -64,6 +82,7 @@ pub struct Config {
     pub recent_filters: Vec<String>,
     pub syntax_highlight: bool,
     pub show_location_pane: bool,
+    pub text_layout: TextLayout,
     pub show_line_numbers: bool,
     pub show_whitespace: bool,
     pub show_identical: bool,
@@ -129,6 +148,7 @@ impl Default for Config {
             ],
             syntax_highlight: true,
             show_location_pane: true,
+            text_layout: TextLayout::default(),
             show_line_numbers: true,
             show_whitespace: false,
             show_identical: true,
@@ -358,6 +378,21 @@ mod tests {
             Config::load_from(&unreadable),
             (Config::default(), Some(Err(unreadable.clone())))
         );
+    }
+
+    #[test]
+    fn text_layout_defaults_and_roundtrips_without_changing_comparison_rules() {
+        let old = Config::parse("{}").unwrap();
+        assert_eq!(old.text_layout, TextLayout::Compact);
+        for text_layout in TextLayout::ALL {
+            let cfg = Config {
+                text_layout,
+                ..old.clone()
+            };
+            let reopened = Config::parse(&serde_json::to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(reopened, cfg);
+            assert_eq!(reopened.diff, old.diff);
+        }
     }
 
     #[test]

@@ -805,3 +805,236 @@ fn converters_agree_for_files_folder_reports_and_failures() {
     );
     assert_eq!(oxidemerge(d, &["--cli", "-r", "left", "right"]).code, 2);
 }
+
+#[test]
+fn semantic_merge_validation_and_release_analysis_are_opt_in_and_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    files(
+        d,
+        &[
+            ("a.json", r#"{"b":2,"a":1}"#),
+            ("b.json", r#"{"a":1,"b":2}"#),
+            ("left", "a\nLEFT\nc\nd\n"),
+            ("base", "a\nb\nc\nd\n"),
+            ("right", "a\nb\nc\nRIGHT\n"),
+            ("result", "a\nLEFT\nc\nRIGHT\n"),
+            ("old/old.txt", "same\n"),
+            ("new/new.txt", "same\n"),
+        ],
+    );
+    let r = oxidemerge(d, &["--semantic", "a.json", "b.json"]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains("policies"));
+    assert_eq!(oxidemerge(d, &["--cli", "a.json", "b.json"]).code, 1);
+    assert_eq!(
+        oxidemerge(d, &["--semantic", "--format", "yaml", "a.json", "b.json"]).code,
+        2
+    );
+    let plan = oxidemerge(d, &["--merge-plan", "left", "base", "right"]);
+    assert_eq!(plan.code, 0, "{}", plan.stderr);
+    assert!(plan.stdout.contains("LEFT"));
+    assert_eq!(read(d.join("base")), "a\nb\nc\nd\n");
+    let validated = oxidemerge(d, &["--validate-merge", "result", "left", "base", "right"]);
+    assert_eq!(validated.code, 0, "{}", validated.stderr);
+    std::fs::write(d.join("result"), "CORRUPT\n").unwrap();
+    assert_eq!(
+        oxidemerge(d, &["--validate-merge", "result", "left", "base", "right"]).code,
+        3
+    );
+    let release = oxidemerge(
+        d,
+        &[
+            "--baseline-left",
+            "folder:old",
+            "--baseline-right",
+            "folder:new",
+            "--release-report",
+            "release.json",
+        ],
+    );
+    assert_eq!(release.code, 1, "{}", release.stderr);
+    assert!(read(d.join("release.json")).contains("moved"));
+    let scoped = oxidemerge(d, &["--impact", "--filter", "*.rs", "old", "new"]);
+    assert_eq!(scoped.code, 0, "{}", scoped.stderr);
+    assert!(scoped.stdout.contains("File excluded by scope"));
+    assert_eq!(
+        oxidemerge(
+            d,
+            &[
+                "--impact",
+                "--filter",
+                "[F] missing-analysis-filter",
+                "old",
+                "new"
+            ]
+        )
+        .code,
+        2
+    );
+    let bad = oxidemerge(d, &["--semantic", "--report", "a.json", "a.json", "b.json"]);
+    assert_eq!(bad.code, 2);
+    assert_eq!(read(d.join("a.json")), r#"{"b":2,"a":1}"#);
+}
+
+#[test]
+fn semantic_ambiguities_report_errors_instead_of_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    files(
+        d,
+        &[
+            ("a.json", r#"{"x":1,"x":2}"#),
+            ("b.json", r#"{"x":2}"#),
+            (
+                "a.xml",
+                "<!DOCTYPE a [<!ENTITY x SYSTEM 'file:///etc/passwd'>]><a>&x;</a>",
+            ),
+            ("b.xml", "<a/>"),
+        ],
+    );
+    for (a, b) in [("a.json", "b.json"), ("a.xml", "b.xml")] {
+        let r = oxidemerge(d, &["--semantic", a, b]);
+        assert_eq!(r.code, 2);
+        assert!(r.stdout.contains("Text view"));
+    }
+}
+
+#[test]
+fn review_summary_accepts_version_one_archives_without_original_sources() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let f = std::fs::File::create(d.join("legacy.oxmreview")).unwrap();
+    let mut writer = zip::ZipWriter::new(f);
+    let options = zip::write::SimpleFileOptions::default();
+    writer.start_file("manifest.json", options).unwrap();
+    writer.write_all(br#"{"version":1,"saved":"baseline","labels":["left","right"],"options":{},"folder":{},"filter":"*","notes":{},"entries":[{"side":0,"path":"a.txt","directory":false,"modified":null,"converted":false},{"side":1,"path":"a.txt","directory":false,"modified":null,"converted":false}]}"#).unwrap();
+    for (path, content) in [("data/0/a.txt", b"old"), ("data/1/a.txt", b"new")] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(content).unwrap();
+    }
+    writer.finish().unwrap();
+    let r = oxidemerge(d, &["--review-summary", "legacy.oxmreview"]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let summary: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(summary["total"], 1);
+    assert_eq!(summary["unreviewed"], 1);
+    assert_eq!(
+        oxidemerge(
+            d,
+            &[
+                "--review-summary",
+                "legacy.oxmreview",
+                "--report",
+                "legacy.oxmreview"
+            ]
+        )
+        .code,
+        2
+    );
+}
+
+#[test]
+fn release_git_sources_record_immutable_commits_and_leave_the_working_tree_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(d)
+            .env("GIT_CONFIG_GLOBAL", d.join(".gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+    };
+    assert!(git(&["init", "-q"]).status.success());
+    files(d, &[("file.txt", "first\n")]);
+    assert!(git(&["add", "file.txt"]).status.success());
+    assert!(git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "first"
+    ])
+    .status
+    .success());
+    let first = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    files(d, &[("file.txt", "second\n")]);
+    assert!(git(&["add", "file.txt"]).status.success());
+    assert!(git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "second"
+    ])
+    .status
+    .success());
+    let second = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    files(d, &[("file.txt", "uncommitted\n")]);
+    let report_dir = tempfile::tempdir().unwrap();
+    let report_path = report_dir.path().join("release.json");
+    let r = oxidemerge(
+        d,
+        &[
+            "--baseline-left",
+            "git:HEAD~1:.",
+            "--baseline-right",
+            "git:HEAD:.",
+            "--release-report",
+            report_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(r.code, 1, "{}", r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&read(&report_path)).unwrap();
+    assert_eq!(report["left"]["resolved_commit"], first);
+    assert_eq!(report["right"]["resolved_commit"], second);
+    assert_eq!(read(d.join("file.txt")), "uncommitted\n");
+    assert!(git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "advance"
+    ])
+    .status
+    .success());
+    let saved: serde_json::Value = serde_json::from_str(&read(&report_path)).unwrap();
+    assert_eq!(saved, report);
+}
+
+#[test]
+fn folder_merge_validation_checks_written_results_without_merging_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    files(
+        d,
+        &[
+            ("left/a.txt", "a\nLEFT\nc\nd\n"),
+            ("base/a.txt", "a\nb\nc\nd\n"),
+            ("right/a.txt", "a\nb\nc\nRIGHT\n"),
+            ("merged/a.txt", "a\nLEFT\nc\nRIGHT\n"),
+        ],
+    );
+    let good = oxidemerge(d, &["--validate-merge", "merged", "left", "base", "right"]);
+    assert_eq!(good.code, 0, "{}", good.stderr);
+    assert_eq!(read(d.join("base/a.txt")), "a\nb\nc\nd\n");
+    files(d, &[("merged/a.txt", "incorrect\n")]);
+    let bad = oxidemerge(d, &["--validate-merge", "merged", "left", "base", "right"]);
+    assert_eq!(bad.code, 3, "{}", bad.stderr);
+}

@@ -46,8 +46,7 @@ limits are checked after export. External Git filters may execute/download as ex
 SECURITY.md. No native-language dependency graph or API compatibility rules are implemented.
 New controls have Traditional Chinese translations and explicit tested English text in the other
 bundled language packs until native translations are supplied.
-Cross-platform CI and large-workload performance results must be recorded separately; local tests
-are not evidence that a Windows/Linux release has been built.
+See [benchmarks](benchmarks.md) for comparison-engine measurement methods and recorded results.
 
 ## Export and captured comparisons
 
@@ -58,3 +57,22 @@ report output is capped at 32 MiB. Captured binary/image comparisons use the exi
 private temporary copies; unlocking one changes only that private copy, not the source baseline.
 The start page accepts both baseline source specifications directly, including two Git refs of the
 same repository, without requiring two distinct live folders first.
+
+## Resource and scope details
+
+The baseline panel exposes the existing folder filter syntax. For example,
+`*;!target/;!node_modules/` excludes generated directories. Unknown named filters fail explicitly.
+Intentional filter exclusions remain visible as outside scope; unreadable or unsupported captured
+paths make the CLI return 2. A clean result only covers the selected scope.
+
+Semantic source navigation supports LF, CRLF and CR physical lines. Changes are paginated in the
+GUI and displayed values are abbreviated; exports retain bounded full values. XML expanded names
+are capped at 1 KiB and semantic paths at 4 KiB, with a 32 MiB change budget. The impact cache
+bounds indexed lines to 100,000 per file and 1,000,000 total, with a 256 MiB estimated footprint;
+lines longer than 4 KiB are explicitly omitted. Multi-pattern matching has a 1 MiB pattern budget,
+32 MiB matcher budget and 10 million match-step limit. Cancellation/error clears partial caches.
+
+Actual folder merge confirmation now hashes regular files with SHA-256, in addition to checking
+metadata, so same-size edits with restored timestamps cannot silently pass the stale-input check.
+This adds file-reading cost to explicit plan/confirmation operations; existing engine benchmarks
+do not measure that cost or the new semantic/impact analyses.
