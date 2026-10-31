@@ -170,7 +170,10 @@ pub fn show(ctx: &egui::Context, settings: Option<&Path>) -> bool {
     let response = egui::Modal::new(egui::Id::new("help_dialog"))
         .frame(about::dialog_frame(ctx))
         .show(ctx, |ui| {
-            ui.set_width(content + 2.0 * MARGIN as f32 + 4.0);
+            // The scroll bar takes room of its own beside the panels; the title bar, laid out
+            // first, is only as wide as this, so the panels must not be any wider.
+            let bar = ui.spacing().scroll.allocated_width();
+            ui.set_width(content + 2.0 * MARGIN as f32 + bar);
             about::title_bar(ui, tr("help.title"), &mut close);
             egui::Frame::new()
                 .inner_margin(Margin::same(MARGIN))
@@ -192,8 +195,6 @@ pub fn show(ctx: &egui::Context, settings: Option<&Path>) -> bool {
                                         panel(ui, tr("help.mouse"), MOUSE, true);
                                     });
                                 }
-                                // Room for the scroll bar.
-                                ui.add_space(4.0);
                             });
                         });
                     if let Some(path) = settings {

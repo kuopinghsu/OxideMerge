@@ -1,6 +1,6 @@
 = OxideMerge User Guide
 :description: How to compare, review and merge files and folders with OxideMerge.
-:revnumber: 0.9.6
+:revnumber: 0.9.7
 :doctype: book
 :toc: left
 :toclevels: 3
@@ -1009,7 +1009,7 @@ A folder report lists every file and folder with its status, and its date and si
 
 [source,xml]
 ----
-<comparison format="1" tool="OxideMerge" version="0.9.6" type="text" created="…">
+<comparison format="1" tool="OxideMerge" version="0.9.7" type="text" created="…">
   <side index="0" role="left" name="a.txt"/>
   <side index="1" role="right" name="b.txt"/>
   <statistics differences="1" ignored="0" identical-lines="1" changed-lines="1" added-lines="0" removed-lines="0"/>

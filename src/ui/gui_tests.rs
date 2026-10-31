@@ -1692,3 +1692,34 @@ fn about_displays_the_build_identifier_and_keeps_the_calendar_copyright_year() {
     );
     assert!(gui.shows_text(&copyright));
 }
+
+#[test]
+fn dialogs_put_their_close_button_at_the_right_edge() {
+    let mut gui = Gui::start("dialog_close_buttons", None);
+    // How far the close button is from the right edge of the dialog, as each lays it out.
+    let gap = |gui: &mut Gui, open: &[&str], id: &str| {
+        gui.menu(open);
+        gui.frames(3);
+        let dialog = gui
+            .ctx
+            .memory(|m| m.area_rect(egui::Id::new(id)))
+            .expect(id);
+        let close = gui.widget(tr("btn.close")).rect;
+        let gap = dialog.right() - close.right();
+        gui.click(tr("btn.close"));
+        gui.frames(3);
+        gap
+    };
+    let about = gap(
+        &mut gui,
+        &[tr("menu.help"), tr("menu.about")],
+        "about_dialog",
+    );
+    let help = gap(
+        &mut gui,
+        &[tr("menu.help"), tr("help.title")],
+        "help_dialog",
+    );
+    assert!((0.0..20.0).contains(&about), "about: {about}");
+    assert!((help - about).abs() < 0.5, "help {help}, about {about}");
+}
