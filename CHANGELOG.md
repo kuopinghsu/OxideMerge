@@ -9,7 +9,8 @@ section of this file as the release notes.
 
 - The close button of the Help & Shortcuts dialog sits at the right edge of its title bar, as in
   the About dialog, instead of short of it: the dialog is now exactly as wide as its panels and
-  scroll bar.
+  scroll bar, and shortcuts too long for their column, such as `Shift+↑ ↓ / Shift+PgUp PgDn` on
+  Windows and Linux, wrap instead of widening a panel.
 - The close button of the About and Help & Shortcuts dialogs is announced as "Close" to screen
   readers.
 
