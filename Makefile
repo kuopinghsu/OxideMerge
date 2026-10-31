@@ -32,7 +32,7 @@ DIST_DIR    := dist/$(DIST_NAME)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all help build release run run-release demo demo-text demo-3way demo-conflict \
+.PHONY: all help build release run run-release demo demo-text demo-3way demo-3way-merge demo-3way-folder demo-conflict \
         test gui-smoke check check-platforms lint fmt fmt-check ci install uninstall shell-register shell-unregister \
         languages dist appimage user-guide clean
 
@@ -46,6 +46,8 @@ help:
 	@echo '  demo              Folder compare of samples/left and samples/right'
 	@echo '  demo-text         2-way text compare of the sample main.rs files'
 	@echo '  demo-3way         3-way text compare of samples/three'
+	@echo '  demo-3way-merge   3-way merge of the sample settings files, with conflicts'
+	@echo '  demo-3way-folder  3-way folder compare of samples/three/folders'
 	@echo '  demo-conflict     Resolve the sample Git conflict file'
 	@echo '  test              Run the unit, window and command line tests'
 	@echo '  gui-smoke         Open real windows with the release build and check what they show'
@@ -87,6 +89,12 @@ demo-text:
 
 demo-3way:
 	$(CARGO) run -- samples/three/left.txt samples/three/base.txt samples/three/right.txt
+
+demo-3way-merge:
+	$(CARGO) run -- samples/three/settings/left.ini samples/three/settings/base.ini samples/three/settings/right.ini
+
+demo-3way-folder:
+	$(CARGO) run -- -r samples/three/folders/left samples/three/folders/base samples/three/folders/right
 
 demo-conflict:
 	$(CARGO) run -- samples/three/conflict.txt

@@ -292,7 +292,7 @@ macOS 與 Linux 的執行檔位於 `target/release/oxidemerge`，Windows 則為
 - `make` 或 `make release`：建置最佳化的執行檔。
 - `make build`：建置偵錯版本。
 - `make run ARGS="a.txt b.txt"`：以指定的比較路徑執行偵錯版本。
-- `make demo`、`make demo-text`、`make demo-3way`、`make demo-conflict`：開啟各類範例比較。網頁比較請參閱 `samples/web/README.md`。
+- `make demo`、`make demo-text`、`make demo-3way`、`make demo-3way-merge`、`make demo-3way-folder`、`make demo-conflict`：開啟各類範例比較。`samples/README.md` 列出每個範例及其示範的功能；網頁比較請參閱 `samples/web/README.md`。
 - `make install` 或 `make uninstall`：將程式安裝至 Cargo 的執行檔目錄，或從該目錄移除；
   預設目錄為 `~/.cargo/bin`。
 - `make shell-register`：安裝執行檔，並註冊檔案管理員整合。
