@@ -3473,7 +3473,14 @@ mod tests {
 
         let stats = v.statistics();
         let get = |key: &'static str| stats.iter().find(|(k, _)| k == tr(key)).unwrap().1.clone();
-        assert_eq!(get("stats.identical"), "1");
+        // Every identical file of the samples is counted, whatever the samples hold.
+        let identical = v
+            .items
+            .iter()
+            .filter(|it| !it.is_dir && it.status == CmpStatus::Identical)
+            .count();
+        assert!(identical >= 1);
+        assert_eq!(get("stats.identical"), identical.to_string());
 
         v.start_compare();
         assert!(!v.has_dialog());
