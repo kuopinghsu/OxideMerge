@@ -286,7 +286,8 @@ fn input_text(inputs: &[&'static str], mouse: bool) -> String {
 }
 
 /// Key cap in the accent color. Latin text uses the monospace font, which has no CJK glyphs,
-/// so translated gestures in those scripts stay proportional.
+/// so translated gestures in those scripts stay proportional. Text too long for the key column
+/// wraps, between inputs where it can, instead of widening the panel.
 fn keycap(ui: &mut egui::Ui, text: &str) {
     let latin = text.chars().all(|c| (c as u32) < 0x2E80);
     let font = if latin {
@@ -300,13 +301,56 @@ fn keycap(ui: &mut egui::Ui, text: &str) {
         .corner_radius(4)
         .inner_margin(Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).font(font).color(p.accent))
+            ui.add(egui::Label::new(RichText::new(text).font(font).color(p.accent)).wrap())
         });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No row is wider than its panel, with the shortcuts as every platform writes them: a
+    /// wider one would widen the dialog past its title bar.
+    #[test]
+    fn rows_fit_their_panel_on_every_platform() {
+        let ctx = egui::Context::default();
+        crate::ui::fonts::setup(&ctx, "en");
+        crate::ui::theme::apply(&ctx, false);
+        let windows = |inputs: &[&str]| -> String {
+            inputs
+                .iter()
+                .map(|k| k.replace("Control+", "Ctrl+"))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        };
+        let mut texts: Vec<(String, &str)> = Vec::new();
+        for (_, rows) in KEYBOARD {
+            for (inputs, action) in *rows {
+                texts.push((windows(inputs), tr(action)));
+                texts.push((input_text(inputs, false), tr(action)));
+            }
+        }
+        for (_, rows) in MOUSE {
+            for (inputs, action) in *rows {
+                texts.push((input_text(inputs, true), tr(action)));
+            }
+        }
+        let mut wide = Vec::new();
+        for _ in 0..2 {
+            wide.clear();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for (inputs, action) in &texts {
+                        let r = ui.scope(|ui| row(ui, inputs, action)).response;
+                        if r.rect.width() > KEYS + GAP + ACTION + 0.5 {
+                            wide.push((inputs.clone(), r.rect.width()));
+                        }
+                    }
+                });
+            });
+        }
+        assert!(wide.is_empty(), "{wide:?}");
+    }
 
     #[test]
     fn every_entry_is_translated() {
