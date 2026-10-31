@@ -3,6 +3,16 @@
 All notable changes to OxideMerge are listed here, newest first. Each release on GitHub uses its
 section of this file as the release notes.
 
+## [0.9.7] - Unreleased
+
+### Fixed
+
+- The close button of the Help & Shortcuts dialog sits at the right edge of its title bar, as in
+  the About dialog, instead of short of it: the dialog is now exactly as wide as its panels and
+  scroll bar.
+- The close button of the About and Help & Shortcuts dialogs is announced as "Close" to screen
+  readers.
+
 ## [0.9.6] - 2026-10-30
 
 ### Added
@@ -560,6 +570,7 @@ First release.
   on Windows.
 - Chinese, Japanese and Korean fonts on Linux and WSL, and GPU acceleration under WSL2.
 
+[0.9.7]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.3...v0.9.4

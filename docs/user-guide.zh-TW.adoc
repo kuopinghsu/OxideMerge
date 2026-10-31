@@ -1,6 +1,6 @@
 = OxideMerge 使用者指南
 :description: 使用 OxideMerge 比較、檢查與合併檔案及資料夾的操作指南。
-:revnumber: 0.9.6
+:revnumber: 0.9.7
 :lang: zh-TW
 :scripts: cjk
 :chapter-signifier!:

@@ -89,6 +89,9 @@ fn close_button(ui: &mut egui::Ui) -> egui::Response {
     let p = widgets::pal(ui);
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tr("btn.close"))
+    });
     let painter = ui.painter();
     if response.hovered() {
         painter.rect_filled(rect, CornerRadius::same(6), p.control_hover);

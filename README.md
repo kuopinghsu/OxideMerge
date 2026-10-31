@@ -414,7 +414,7 @@ Windows and Linux Arm64 packages are built and tested on native Arm runners.
 
 ### Release requirements
 
-A tag such as `v0.9.6` triggers package publication on GitHub Releases. The tag must match the
+A tag such as `v0.9.7` triggers package publication on GitHub Releases. The tag must match the
 version in `Cargo.toml`, and `CHANGELOG.md` must contain a section for that version. Tags with
 `-`, such as `v1.0.0-rc1`, are published as pre-releases.
 
@@ -422,35 +422,35 @@ Release notes come from the matching changelog section, followed by download ins
 The workflow reads the changelog without changing it. Before publishing, it checks that all
 expected packages, and nothing else, exist and that the release has not already been published.
 Each release includes PDF guides and the source commit used for the build, and GitHub lists the
-SHA-256 digest of every file. A release holds exactly these files (for version 0.9.6):
+SHA-256 digest of every file. A release holds exactly these files (for version 0.9.7):
 
 ```text
-oxidemerge-0.9.6-linux-arm64.AppImage
-oxidemerge-0.9.6-linux-arm64.tar.gz
-oxidemerge-0.9.6-linux-x64.AppImage
-oxidemerge-0.9.6-linux-x64.tar.gz
-oxidemerge-0.9.6-macos-universal.dmg
-oxidemerge-0.9.6-user-guide.pdf
-oxidemerge-0.9.6-user-guide.zh-TW.pdf
-oxidemerge-0.9.6-windows-arm64.zip
-oxidemerge-0.9.6-windows-x64.zip
+oxidemerge-0.9.7-linux-arm64.AppImage
+oxidemerge-0.9.7-linux-arm64.tar.gz
+oxidemerge-0.9.7-linux-x64.AppImage
+oxidemerge-0.9.7-linux-x64.tar.gz
+oxidemerge-0.9.7-macos-universal.dmg
+oxidemerge-0.9.7-user-guide.pdf
+oxidemerge-0.9.7-user-guide.zh-TW.pdf
+oxidemerge-0.9.7-windows-arm64.zip
+oxidemerge-0.9.7-windows-x64.zip
 ```
 
 ### Release procedure
 
-The following example uses `0.9.6`; replace it with the version you intend to release.
+The following example uses `0.9.7`; replace it with the version you intend to release.
 
 1. Update `version` in `Cargo.toml` and run `cargo build` to update `Cargo.lock`.
 2. Review the matching section in `CHANGELOG.md`. Replace `Unreleased` in its heading with the
    release date, using `YYYY-MM-DD`.
 3. Run `make fmt-check ci`. Preview the release notes with
-   `scripts/release-notes.sh 0.9.6`.
+   `scripts/release-notes.sh 0.9.7`.
 4. Commit and push to `main`. Wait for the required CI checks to pass on every platform.
 5. Tag the verified commit and push the tag:
 
    ```sh
-   git tag -a v0.9.6 -m "OxideMerge 0.9.6"
-   git push origin v0.9.6
+   git tag -a v0.9.7 -m "OxideMerge 0.9.7"
+   git push origin v0.9.7
    ```
 
 6. Add an `Unreleased` section for the next version to `CHANGELOG.md` and record subsequent
@@ -463,8 +463,8 @@ publish a partial release because publication waits for all required package job
 
 ### Recover from a failed or incorrect release
 
-For example, if `v0.9.5` fails to build or needs a correction after publication, release the
-fix as `v0.9.6`. Choose a new, unused patch version; keep the original tag and published assets.
+For example, if `v0.9.6` fails to build or needs a correction after publication, release the
+fix as `v0.9.7`. Choose a new, unused patch version; keep the original tag and published assets.
 
 1. Start with a clean working tree and update `main`. If local changes are present, commit
    them or save them with `git stash` before switching branches.
@@ -476,15 +476,15 @@ fix as `v0.9.6`. Choose a new, unused patch version; keep the original tag and p
    ```
 
 2. Fix the source code, packaging or workflow on `main`. Update `version` in `Cargo.toml`
-   to `0.9.6`. Add or update the `0.9.6` section in `CHANGELOG.md`, describe the correction,
-   and replace `Unreleased` with the release date. Keep the `0.9.5` history unchanged.
+   to `0.9.7`. Add or update the `0.9.7` section in `CHANGELOG.md`, describe the correction,
+   and replace `Unreleased` with the release date. Keep the `0.9.6` history unchanged.
 
 3. Update the lockfile, run the checks and review the new release notes:
 
    ```sh
    cargo build
    make fmt-check ci
-   scripts/release-notes.sh 0.9.6
+   scripts/release-notes.sh 0.9.7
    git diff --check
    git diff
    ```
@@ -497,7 +497,7 @@ fix as `v0.9.6`. Choose a new, unused patch version; keep the original tag and p
    git add -p
    git add Cargo.toml Cargo.lock CHANGELOG.md
    git diff --cached
-   git commit -m "Fix release issues and prepare 0.9.6"
+   git commit -m "Fix release issues and prepare 0.9.7"
    git push origin main
    git rev-parse HEAD
    ```
@@ -508,8 +508,8 @@ fix as `v0.9.6`. Choose a new, unused patch version; keep the original tag and p
 
    ```sh
    git log -1 --oneline
-   git tag -a v0.9.6 -m "OxideMerge 0.9.6"
-   git push origin v0.9.6
+   git tag -a v0.9.7 -m "OxideMerge 0.9.7"
+   git push origin v0.9.7
    ```
 
 6. Check the tag's workflow and the new GitHub release. Confirm that all expected packages and
