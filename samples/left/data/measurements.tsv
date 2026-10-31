@@ -1,0 +1,8 @@
+sensor	time	temperature	humidity	note
+A1	08:00	21.4031	40.12	ok
+A1	09:00	21.9874	41.03	ok
+A2	08:00	19.5520	55.90	"door opened,
+reading after 5 minutes"
+A2	09:00	19.8015	56.42	ok
+B1	08:00	23.1200	38.70	ok
+B1	09:00	23.4500	38.10	calibrated

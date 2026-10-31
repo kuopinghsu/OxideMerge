@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<layout name="main">
+  <panel id="list" width="320">
+    <column key="sku"/>
+    <column key="name"/>
+    <column key="location"/>
+  </panel>
+  <panel id="detail" width="640">
+    <field key="price" format="0.00"/>
+  </panel>
+</layout>
