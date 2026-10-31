@@ -1,0 +1,5 @@
+SELECT name, total FROM orders WHERE id = 1001;
+Release 2.3 shipped on 2026-09-14 with 118 fixes.
+Contact: Support@Example.com
+
+Totals are rounded to 2 decimals.

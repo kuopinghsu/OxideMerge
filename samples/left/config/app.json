@@ -1,0 +1,1 @@
+{"name":"warehouse","version":"1.4.0","server":{"port":8080,"host":"0.0.0.0","timeout_s":30},"features":{"reports":true,"export":false},"locales":["en","de","ja"]}
