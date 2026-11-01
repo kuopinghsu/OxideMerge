@@ -155,7 +155,7 @@ fn write_staged(
 }
 
 /// Clears the read-only flag of the file `path`; whether it was set and is now cleared.
-fn make_writable(path: &Path) -> bool {
+pub(crate) fn make_writable(path: &Path) -> bool {
     let Ok(md) = std::fs::symlink_metadata(path) else {
         return false;
     };

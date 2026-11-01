@@ -10,24 +10,93 @@ an envelope separate from existing comparison reports. Standard comparisons rema
   and source fingerprint; planning fingerprints sources before and after the existing planner.
   Folder plans do not execute operations and are not transactions. Manually resolved conflicts
   are never auto-certified: output differing from the automatic preview fails the equality check.
+  Merge plans also warn, without failing mechanically, when the two sides edit lines at most two
+  lines apart (`nearby_edits`) or both change the same `name = value`, `name: value` or
+  `"name": value` setting in different places (`shared_setting`); a deletion review is raised only
+  where base lines are deleted.
 - JSON objects are unordered; arrays are ordered. Duplicate keys fail. Numeric spellings are
   retained exactly (for example `1` and `1.0` can differ). Missing is distinct from null. XML uses
   expanded namespaces; attributes are unordered; child order, whitespace, comments and mixed
-  content matter. DTDs/external entities/XML 1.1 are unsupported. YAML/TOML and structured
-  write-back are intentionally deferred. Source spans refer to decoded UTF-8, not encoded bytes.
+  content matter. DTDs/external entities/XML 1.1 are unsupported. Source spans refer to decoded
+  UTF-8, not encoded bytes. Structured write-back is intentionally deferred.
+- Array elements are compared by position. When two arrays hold exactly the same elements in a
+  different order, the elements out of order are reported as `moved` (with `from`, the old path);
+  the longest run kept in order stays unmoved. With an array matching key (`--array-key id`, or
+  *Array matching key* in the semantic view), object elements are paired by that member's value
+  when every element of both arrays has a unique scalar value for it; otherwise position is used,
+  and for an array of objects a report `notes` entry says so (at most 20 notes).
+  The GUI groups changes into a tree of their paths.
+- Each change has a `confidence`: `parser_exact` when its path alone pairs it, `array_key`,
+  `reordered` (an exact reordering) or `position` (arrays of different lengths compared by
+  position) for changes inside paired arrays. `ambiguous: true` marks a change another reading
+  explains as well: a moved element that is in some longest run kept in order (so it may as well
+  have stayed, as in a swap of two), a moved element with duplicates in its array, and every
+  change found by position across a length change. Ambiguous changes need manual review.
+  Fixed-seed fuzzing checks that reformatting and reordering object members compare identical,
+  that a one-value edit reports exactly that path, that results are symmetric, and that text
+  `serde_json` rejects is never reported identical.
+- TOML (`toml` crate) and YAML (`yaml-rust`, one document) compare as JSON-shaped values: tables
+  and mappings are unordered, numbers compare by value (`1_000` = `1000`, `0x10` = `16`), and
+  comments and layout are ignored. YAML plain scalars follow the YAML 1.2 core schema, so
+  `yes`/`no`/`on`/`off` are strings. YAML input is limited to 4 MiB, 64 levels and 100,000 nodes;
+  the parser is driven event by event so nesting never recurses. Aliases, several documents,
+  complex keys and tags other than `!!str`, `!!int`, `!!float`, `!!bool`, `!!null` and `!` are
+  refused with an error, so the CLI returns 2.
 - Review version 2 extends the existing ZIP manifest; version 1 defaults to unreviewed, and future
   versions fail. SHA-256 entry digests detect accidental/corrupt captured-content changes, not
   authenticity. Reviewer names are free-form. State edits do not mutate captured source content.
   Stale decisions count as needing action. Fingerprints include paths, content, comparison options
   and trusted converter identities; converted content may require renewed review on reopen.
+  A decision also records a path-free content print. When reviewed content reappears under one new
+  path with no decision of its own, the decision moves there and notes where it came from; when
+  several new paths hold that content, or several old decisions claim it, each copy is marked
+  stale for review again. Opening an archive refuses paths that leave it, unlisted, missing or
+  link entries, oversized manifests, notes or entry counts, and versions from a newer OxideMerge.
 - Baselines capture at most 256 MiB / 10,000 entries, with 16 MiB per file. Filters use existing
   folder filter semantics. Git refs resolve to immutable commits and exclude working-tree changes;
   Git filters remain trusted as documented in SECURITY.md. Exclusions are listed, not identical.
-  Moves require a unique exact digest match; ambiguous/edited renames remain additions/deletions.
+  Each capture records when it was read (UTC); the time is not part of its fingerprint. Moves
+  require a unique exact digest match. A rename with edits is suspected when a deleted and an
+  added text file with the same extension (each at most 256 KiB) share at least 50% of their
+  non-blank lines and are each other's clear best match; ties stay added/deleted, and more than
+  250,000 candidate pairs skips the search (listed under limitations). *Not a rename* in the
+  panel, or `--split-rename PATH`, keeps an added file added; the summary lists `split_renames`.
+  The panel shows counts per category as filters, a *High priority* list of changes with risk
+  flags, and each suspected rename with its share of matching lines.
 - Impact indexes are keyed by SHA-256. They index only the selected captured root/filter and do
   not follow file links or execute source code. Every finding includes line, digest and evidence.
   Delimited occurrences are heuristic; matching a name proves neither dependency nor runtime
-  behavior. Unsupported syntax/symbols are unassessed. Findings can be dismissed without writes.
+  behavior. Changed keys of JSON, TOML and YAML files are searched for as the leaf key and, for
+  nested keys, as the dotted path (`db.timeout`). Findings labelled exact come from an import
+  statement that resolves to exactly a changed, deleted or renamed path: relative JavaScript and
+  TypeScript `import`/`export … from`/`require`, Python `import` and `from … import` (from the
+  root, `src/` or relative), C/C++ `#include "…"`, CSS `@import`, Rust `mod name;` and
+  `use crate|super|self::…` (resolved from the nearest folder with `lib.rs` or `main.rs`), plus
+  JSON `$ref` file references (rule `import-reference-v3`). JavaScript/TypeScript, Python, C/C++
+  and Rust statements are read from Tree-sitter syntax trees (`use` trees up to 64 levels deep);
+  a file with error or missing nodes, including valid code the grammar does not cover (such as
+  Rust `dyn 'a + Fn(…)`), is listed as partly unassessed. Vue/Svelte script, Objective-C, CSS and
+  JSON statements are read from tokens that skip comments and keep strings whole (up to 512
+  tokens per statement, 2,000,000 per file, beyond which the file is listed as partly
+  unassessed). Either way a statement may span lines and comments and strings are not code.
+  Conditional, generated or macro-built imports can be missed; an exact finding replaces
+  heuristic ones on its line.
+- For changed or deleted JavaScript/TypeScript, Python, C/C++ and Rust files, top-level
+  definitions (functions, classes/structs/enums/traits/interfaces/typedefs, and constants or
+  module-level assignments) of the old and new bytes are compared by the leaves of their syntax
+  trees, so comments and layout do not count. A file importing a changed or removed definition by name from the changed
+  file gets an exact `function_reference`, `type_reference` or `value_reference` finding (rule
+  `symbol-reference-v2`) at the first use of the name it is imported as, or at the import when it
+  is not used. Names of at least four characters are also searched for in other files of the same
+  language as heuristic `symbol_name_reference` findings, at their first use as a name (not in a
+  comment, string or import) and not in files with the exact finding. Methods, names reached
+  through a namespace import and C/C++ headers (which include all names) give heuristic findings
+  only. A Rust `use` tree gives one import finding per changed file it imports from.
+- Name and leaf configuration key occurrences together are listed up to 500; the rest are counted
+  in a report `notes` entry instead of failing the analysis, so common keys such as `version` in a
+  broad change leave room for the other findings, which still fail beyond 2,000.
+  Unsupported syntax/symbols are unassessed. Findings can be dismissed without writes, and in a
+  folder compare *Review* opens the evidence file in the review workspace.
 - Parser limits are 64 levels / 100,000 nodes; impact stops at 2,000 findings. UI jobs can be
   cancelled, but a bounded parse or merge is interrupted only before/after the operation. Both
   baselines and an impact text index occupy memory; the limits apply per capture, not total RSS.
@@ -37,10 +106,12 @@ an envelope separate from existing comparison reports. Standard comparisons rema
 
 ## Still outside this implementation
 
-Similarity-based rename matching, language parser/symbol dependency adapters, semantic path ignore
-rules, array matching keys, YAML/TOML adapters, automatic structured editing, transactional folder
-commit/rollback, and cryptographic reviewer identity are not provided. Existing folder merge
-confirmation, stale-file checks and per-file atomic save/backup behavior remain the write path.
+Type-aware dependency analysis (a name is matched to what a file imports by name, not resolved
+through types, methods or re-exports), semantic path ignore rules, automatic structured editing
+and cryptographic reviewer identity are not provided. Folder auto merge checks every item before
+writing, keeps a copy of everything it replaces or deletes in a temporary folder, and undoes its
+changes when one fails or it is stopped; a crash or power loss during the merge can still leave
+it partly applied, with per-file atomic saves and backups as before.
 Git checkout/export cancellation waits for the existing trusted Git provider to return; capture
 limits are checked after export. External Git filters may execute/download as explained in
 SECURITY.md. No native-language dependency graph or API compatibility rules are implemented.

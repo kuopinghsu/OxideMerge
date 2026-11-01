@@ -29,6 +29,8 @@ pub fn modal_open(ctx: &egui::Context) -> bool {
 enum Look {
     Ghost,
     Primary,
+    /// Bordered, for secondary dialog actions.
+    Secondary,
     Toggle(bool),
     Segment(bool),
 }
@@ -84,11 +86,11 @@ pub fn typing(ctx: &egui::Context) -> bool {
 }
 
 /// Accent outline around a widget that has keyboard focus (focus only moves with Tab).
-pub fn focus_ring(ui: &Ui, resp: &Response, rect: Rect, radius: f32) {
+pub fn focus_ring(ui: &Ui, resp: &Response, rect: Rect, radius: u8) {
     if resp.has_focus() {
         ui.painter().rect_stroke(
             rect.expand(1.5),
-            radius + 1.5,
+            radius as f32 + 1.5,
             Stroke::new(2.0_f32, pal(ui).accent),
             StrokeKind::Outside,
         );
@@ -108,7 +110,7 @@ fn paint_button(
 ) -> Response {
     let p = pal(ui);
     let fg = match look {
-        _ if !enabled => p.text_dim.gamma_multiply(0.55),
+        _ if !enabled => p.text_disabled,
         Look::Primary => p.on_accent,
         Look::Toggle(true) => p.accent,
         _ => p.text,
@@ -148,6 +150,8 @@ fn paint_button(
             Look::Primary => (
                 if !enabled {
                     p.accent.gamma_multiply(0.45)
+                } else if pressed {
+                    p.accent_pressed
                 } else if hovered {
                     p.accent_hover
                 } else {
@@ -155,7 +159,27 @@ fn paint_button(
                 },
                 Stroke::NONE,
             ),
-            Look::Toggle(true) => (p.accent_soft, Stroke::NONE),
+            Look::Secondary => (
+                if pressed {
+                    p.control_active
+                } else if hovered {
+                    p.control_hover
+                } else {
+                    p.surface
+                },
+                Stroke::new(1.0_f32, p.border_strong),
+            ),
+            Look::Toggle(true) => (
+                p.accent_soft.lerp_to_gamma(
+                    p.accent,
+                    match (pressed, hovered) {
+                        (true, _) => 0.3,
+                        (_, true) => 0.15,
+                        _ => 0.0,
+                    },
+                ),
+                Stroke::NONE,
+            ),
             Look::Segment(true) => (
                 if ui.visuals().dark_mode {
                     p.control_active
@@ -170,7 +194,7 @@ fn paint_button(
         };
         ui.painter().rect(
             rect,
-            CornerRadius::same(7),
+            CornerRadius::same(theme::radius::MD),
             fill,
             stroke,
             StrokeKind::Inside,
@@ -187,7 +211,7 @@ fn paint_button(
             let pos = egui::pos2(left + icon_w, rect.center().y - galley.size().y / 2.0);
             ui.painter().galley(pos, galley, fg);
         }
-        focus_ring(ui, &resp, rect, 7.0);
+        focus_ring(ui, &resp, rect, theme::radius::MD);
     }
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -203,6 +227,32 @@ pub fn inline_icon(ui: &mut Ui, icon: Icon, color: Color32) -> Response {
     resp
 }
 
+/// Icon at caption size in the flow of a layout, such as a sort or priority mark.
+pub fn small_icon(ui: &mut Ui, icon: Icon, color: Color32) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+    icons::paint(ui.painter(), rect, icon, color);
+    resp
+}
+
+/// Frameless icon button the size of a row's text, such as a tree disclosure; `label` names it
+/// for assistive technologies.
+pub fn mini_icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
+    let p = pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
+    if ui.is_rect_visible(rect) {
+        let hovered = resp.hovered();
+        if hovered {
+            ui.painter()
+                .rect_filled(rect, theme::radius::XS, p.control_hover);
+        }
+        let fg = if hovered { p.text } else { p.text_dim };
+        icons::paint(ui.painter(), rect.shrink(2.5), icon, fg);
+        focus_ring(ui, &resp, rect, theme::radius::XS);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// Square toolbar button showing an icon; highlights on hover.
 pub fn icon_button(ui: &mut Ui, icon: Icon, tip: &str) -> Response {
     icon_button_enabled(ui, true, icon, tip)
@@ -214,7 +264,7 @@ pub fn icon_button_enabled(ui: &mut Ui, enabled: bool, icon: Icon, tip: &str) ->
         Some(icon),
         "",
         tip,
-        FontId::proportional(13.5),
+        FontId::proportional(theme::size::CONTROL),
         Vec2::new(30.0, 28.0),
         Look::Ghost,
         enabled,
@@ -229,7 +279,7 @@ pub fn ghost_button(ui: &mut Ui, label: &str) -> Response {
         None,
         label,
         label,
-        FontId::proportional(13.5),
+        FontId::proportional(theme::size::CONTROL),
         Vec2::new(0.0, 28.0),
         Look::Ghost,
         true,
@@ -243,7 +293,7 @@ pub fn ghost_icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
         Some(icon),
         label,
         label,
-        FontId::proportional(13.5),
+        FontId::proportional(theme::size::CONTROL),
         Vec2::new(0.0, 28.0),
         Look::Ghost,
         true,
@@ -265,7 +315,7 @@ pub fn bar_button(
         icon,
         label,
         label,
-        FontId::proportional(13.0),
+        FontId::proportional(theme::size::DENSE),
         size,
         look,
         enabled,
@@ -279,7 +329,7 @@ pub fn primary_button(ui: &mut Ui, label: &str) -> Response {
         None,
         label,
         label,
-        theme::semibold(14.0),
+        theme::semibold(theme::size::BODY),
         Vec2::new(96.0, 32.0),
         Look::Primary,
         true,
@@ -288,12 +338,15 @@ pub fn primary_button(ui: &mut Ui, label: &str) -> Response {
 
 /// Neutral bordered button for secondary dialog actions.
 pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
-    let p = pal(ui);
-    ui.add(
-        egui::Button::new(label)
-            .min_size(Vec2::new(88.0, 32.0))
-            .stroke(Stroke::new(1.0_f32, p.border_strong))
-            .fill(p.surface),
+    paint_button(
+        ui,
+        None,
+        label,
+        label,
+        FontId::proportional(theme::size::BODY),
+        Vec2::new(88.0, 32.0),
+        Look::Secondary,
+        true,
     )
 }
 
@@ -315,7 +368,7 @@ pub fn toggle_icon_button(
         icon,
         label,
         if label.is_empty() { tip } else { label },
-        FontId::proportional(13.5),
+        FontId::proportional(theme::size::CONTROL),
         Vec2::new(30.0, 28.0),
         Look::Toggle(*on),
         true,
@@ -333,8 +386,8 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T,
     let mut changed = false;
     egui::Frame::new()
         .fill(p.control)
-        .corner_radius(9)
-        .inner_margin(Margin::same(2))
+        .corner_radius(theme::radius::LG)
+        .inner_margin(Margin::same(theme::space::XXS))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
@@ -345,7 +398,7 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T,
                         None,
                         label,
                         label,
-                        FontId::proportional(13.0),
+                        FontId::proportional(theme::size::DENSE),
                         Vec2::new(0.0, 24.0),
                         Look::Segment(sel),
                         true,
@@ -371,8 +424,14 @@ pub fn search_button(ui: &mut Ui, width: f32, hint: &str, keys: &str, label: &st
     let painter = ui.painter();
     painter.rect(
         rect,
-        7.0,
-        if hovered { p.control_hover } else { p.control },
+        theme::radius::MD,
+        if resp.is_pointer_button_down_on() {
+            p.control_active
+        } else if hovered {
+            p.control_hover
+        } else {
+            p.control
+        },
         Stroke::new(1.0_f32, if hovered { p.border_strong } else { p.border }),
         egui::StrokeKind::Inside,
     );
@@ -385,18 +444,22 @@ pub fn search_button(ui: &mut Ui, width: f32, hint: &str, keys: &str, label: &st
         egui::pos2(rect.left() + 30.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         hint,
-        FontId::proportional(12.5),
+        FontId::proportional(theme::size::SMALL),
         p.text_dim,
     );
     if !keys.is_empty() {
-        let galley = painter.layout_no_wrap(key_text(keys), FontId::proportional(11.5), p.text_dim);
+        let galley = painter.layout_no_wrap(
+            key_text(keys),
+            FontId::proportional(theme::size::CAPTION),
+            p.text_dim,
+        );
         let key = Rect::from_min_size(
             egui::pos2(rect.right() - galley.size().x - 16.0, rect.center().y - 9.0),
             Vec2::new(galley.size().x + 10.0, 18.0),
         );
         painter.rect_stroke(
             key,
-            4.0,
+            theme::radius::XS,
             Stroke::new(1.0_f32, p.border),
             egui::StrokeKind::Inside,
         );
@@ -406,20 +469,23 @@ pub fn search_button(ui: &mut Ui, width: f32, hint: &str, keys: &str, label: &st
             p.text_dim,
         );
     }
-    focus_ring(ui, &resp, rect, 7.0);
+    focus_ring(ui, &resp, rect, theme::radius::MD);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// Full-width toolbar strip with a bottom border.
+/// Full-width toolbar strip with a bottom border. Controls that do not fit continue on another
+/// row, whole.
 pub fn toolbar<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     let p = pal(ui);
     let r = egui::Frame::new()
         .fill(p.surface_alt)
-        .inner_margin(Margin::symmetric(8, 4))
+        .inner_margin(Margin::symmetric(theme::space::MD, theme::space::XS))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.data_mut(|d| d.insert_temp(ui.scope_id().with("tool_groups"), 0usize));
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 ui.spacing_mut().item_spacing.x = 2.0;
                 add(ui)
             })
@@ -434,23 +500,61 @@ pub fn toolbar<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     r.inner
 }
 
-/// Related toolbar buttons in a rounded outline, after an optional caption.
+/// Lays out `add` from the right end of a toolbar row; on a row of its own when less than
+/// `width` is left on this one.
+pub fn toolbar_end<R>(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    if ui.max_rect().right() - ui.cursor().min.x < width {
+        ui.end_row();
+    }
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add)
+        .inner
+}
+
+/// Related toolbar buttons in a rounded outline, after an optional caption; only inside
+/// [`toolbar`].
 pub fn tool_group<R>(ui: &mut Ui, caption: Option<&str>, add: impl FnOnce(&mut Ui) -> R) -> R {
     let p = pal(ui);
+    // A group starts a new toolbar row when it did not fit on this one last time. Groups are
+    // told apart by their order in the toolbar, which counts them afresh each frame.
+    let order = ui.data_mut(|d| {
+        let n = d.get_temp_mut_or_default::<usize>(ui.scope_id().with("tool_groups"));
+        *n += 1;
+        *n
+    });
+    let width_id = ui.scope_id().with(("tool_group", order));
+    let width: f32 = ui.data(|d| d.get_temp(width_id)).unwrap_or(0.0);
+    if ui.max_rect().right() - ui.cursor().min.x < width
+        && ui.cursor().min.x > ui.max_rect().min.x + 1.0
+    {
+        ui.end_row();
+    }
+    let start = ui.cursor().min.x;
     ui.add_space(4.0);
     if let Some(caption) = caption {
-        ui.label(egui::RichText::new(caption).size(11.5).color(p.text_dim));
+        ui.label(
+            egui::RichText::new(caption)
+                .size(theme::size::CAPTION)
+                .color(p.text_dim),
+        );
     }
     let r = egui::Frame::new()
         .fill(p.surface)
         .stroke(Stroke::new(1.0_f32, p.border))
-        .corner_radius(8)
-        .inner_margin(Margin::symmetric(2, 0))
+        .corner_radius(theme::radius::MD)
+        .inner_margin(Margin::symmetric(theme::space::XXS, 0))
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            add(ui)
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                add(ui)
+            })
+            .inner
         });
     ui.add_space(4.0);
+    let used = r.response.rect.right() + 4.0 - start;
+    if (used - width).abs() > 0.5 {
+        ui.data_mut(|d| d.insert_temp(width_id, used));
+        ui.ctx().request_repaint();
+    }
     r.inner
 }
 
@@ -468,14 +572,14 @@ pub fn toolbar_sep(ui: &mut Ui) {
 pub fn chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) -> Response {
     egui::Frame::new()
         .fill(bg)
-        .corner_radius(10)
-        .inner_margin(Margin::symmetric(8, 1))
+        .corner_radius(theme::radius::LG)
+        .inner_margin(Margin::symmetric(theme::space::MD, 1))
         .show(ui, |ui| {
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(text)
                         .color(fg)
-                        .font(theme::semibold(12.0)),
+                        .font(theme::semibold(theme::size::SMALL)),
                 )
                 .selectable(false),
             );
@@ -498,23 +602,29 @@ pub fn chip_button(
     } else {
         String::new()
     };
-    let label_g = ui
-        .painter()
-        .layout_no_wrap(caption, FontId::proportional(12.0), p.text_dim);
-    let value_g = ui
-        .painter()
-        .layout_no_wrap(value.to_string(), theme::semibold(12.0), p.text);
+    let label_g = ui.painter().layout_no_wrap(
+        caption,
+        FontId::proportional(theme::size::SMALL),
+        p.text_dim,
+    );
+    let value_g = ui.painter().layout_no_wrap(
+        value.to_string(),
+        theme::semibold(theme::size::SMALL),
+        p.text,
+    );
     let w = 8.0 + 14.0 + 5.0 + label_g.size().x + value_g.size().x.min(260.0) + 4.0 + 10.0 + 8.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::click());
     resp.widget_info(|| WidgetInfo::labeled(Role::ComboBox, true, format!("{label} {value}")));
     if ui.is_rect_visible(rect) {
-        let fill = if resp.hovered() || resp.has_focus() {
+        let fill = if resp.is_pointer_button_down_on() {
+            p.control_active
+        } else if resp.hovered() || resp.has_focus() {
             p.control_hover
         } else {
             p.control
         };
         let painter = ui.painter();
-        painter.rect_filled(rect, 12.0, fill);
+        painter.rect_filled(rect, theme::radius::XL, fill);
         let mut x = rect.left() + 8.0;
         let icon_rect =
             Rect::from_min_size(egui::pos2(x, rect.center().y - 7.0), Vec2::splat(14.0));
@@ -539,7 +649,7 @@ pub fn chip_button(
         );
         let chevron = Rect::from_center_size(egui::pos2(rect.right() - 14.0, y), Vec2::splat(12.0));
         icons::paint(painter, chevron, Icon::Next, p.text_dim);
-        focus_ring(ui, &resp, rect, 12.0);
+        focus_ring(ui, &resp, rect, theme::radius::XL);
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -591,7 +701,7 @@ pub fn info_bar(ui: &mut Ui, icon: Icon, text: &str, color: Color32) {
     let p = pal(ui);
     let r = egui::Frame::new()
         .fill(color.gamma_multiply(if ui.visuals().dark_mode { 0.16 } else { 0.10 }))
-        .inner_margin(Margin::symmetric(12, 6))
+        .inner_margin(Margin::symmetric(theme::space::LG, theme::space::SM))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -629,16 +739,8 @@ impl Outcome {
 
 /// Identity color of a compare side (left / middle / right).
 pub fn side_color(ui: &Ui, side: usize, panes: usize) -> Color32 {
-    let dark = ui.visuals().dark_mode;
     let idx = if panes == 2 && side == 1 { 2 } else { side };
-    match (idx, dark) {
-        (0, false) => Color32::from_rgb(0x4E, 0x62, 0xE0),
-        (0, true) => Color32::from_rgb(0x8C, 0x9E, 0xFF),
-        (1, false) => Color32::from_rgb(0x8E, 0x4E, 0xC6),
-        (1, true) => Color32::from_rgb(0xC0, 0x8C, 0xF0),
-        (_, false) => Color32::from_rgb(0x0E, 0x8F, 0x7E),
-        (_, true) => Color32::from_rgb(0x4F, 0xD1, 0xBC),
-    }
+    pal(ui).sides[idx.min(2)]
 }
 
 /// Chip naming a compare side in its identity color.
@@ -654,8 +756,8 @@ pub fn card(ui: &Ui) -> egui::Frame {
     egui::Frame::new()
         .fill(p.surface)
         .stroke(Stroke::new(1.0_f32, p.border))
-        .corner_radius(12)
-        .inner_margin(Margin::same(16))
+        .corner_radius(theme::radius::XL)
+        .inner_margin(Margin::same(theme::space::XL))
 }
 
 /// Side drawer on the right of `ui`, for panels that work beside the main view (review,
@@ -682,13 +784,13 @@ pub fn drawer<T: PartialEq + Copy>(
             egui::Frame::new()
                 .fill(p.surface)
                 .stroke(Stroke::new(1.0_f32, p.border))
-                .inner_margin(Margin::symmetric(12, 10)),
+                .inner_margin(Margin::symmetric(theme::space::LG, theme::space::CONTROL)),
         )
         .show(ui, |ui| {
             match tabs {
                 [] => return,
                 [(_, title)] => {
-                    ui.label(egui::RichText::new(*title).font(theme::semibold(14.0)));
+                    ui.label(egui::RichText::new(*title).font(theme::semibold(theme::size::BODY)));
                 }
                 _ => {
                     segmented(ui, tab, tabs);
@@ -727,7 +829,7 @@ pub fn vscrollbar(
     let total_f = total.max(1) as f32;
     let max_scroll = (total_f - visible).max(0.0);
     let h = rect.height() - 4.0;
-    let thumb_h = (visible / total_f * h).clamp(24.0, h);
+    let thumb_h = (visible / total_f * h).max(24.0).min(h.max(0.0));
     let frac = if max_scroll > 0.0 {
         *scroll / max_scroll
     } else {
@@ -735,6 +837,7 @@ pub fn vscrollbar(
     };
     let thumb_top = rect.top() + 2.0 + frac * (h - thumb_h);
     let resp = ui.interact(rect, id, Sense::click_and_drag());
+    resp.widget_info(|| WidgetInfo::labeled(Role::ScrollBar, true, crate::i18n::tr("help.scroll")));
     let active = resp.dragged() || resp.hovered();
     let w = if active { 8.0 } else { 5.0 };
     let thumb = Rect::from_min_size(
@@ -774,9 +877,10 @@ pub fn hscrollbar(
         return;
     }
     let w = rect.width() - 4.0;
-    let thumb_w = (visible / content * w).clamp(24.0, w);
+    let thumb_w = (visible / content * w).max(24.0).min(w.max(0.0));
     let thumb_left = rect.left() + 2.0 + (*scroll / max_scroll) * (w - thumb_w);
     let resp = ui.interact(rect, id, Sense::click_and_drag());
+    resp.widget_info(|| WidgetInfo::labeled(Role::ScrollBar, true, crate::i18n::tr("help.scroll")));
     let active = resp.dragged() || resp.hovered();
     let hgt = if active { 8.0 } else { 5.0 };
     let thumb = Rect::from_min_size(
@@ -865,12 +969,15 @@ pub fn location_pane(
     );
     painter.rect(
         vr,
-        3.0,
+        theme::radius::XS,
         viewport.gamma_multiply(0.12),
         Stroke::new(1.0_f32, viewport.gamma_multiply(0.7)),
         StrokeKind::Inside,
     );
     let resp = ui.interact(rect, id, Sense::click_and_drag());
+    resp.widget_info(|| {
+        WidgetInfo::labeled(Role::ScrollBar, true, crate::i18n::tr("view.location_pane"))
+    });
     if resp.dragged() || resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
             return Some(((p.y - inner.top()) / scale).max(0.0));
@@ -936,12 +1043,14 @@ pub fn nav_item(ui: &mut Ui, selected: bool, icon: Icon, label: &str) -> Respons
     resp.widget_info(|| WidgetInfo::selected(Role::Button, true, selected, label));
     let fill = if selected {
         p.accent_soft
+    } else if resp.is_pointer_button_down_on() {
+        p.control_active
     } else if resp.hovered() {
         p.control_hover
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, 8.0, fill);
+    ui.painter().rect_filled(rect, theme::radius::MD, fill);
     let fg = if selected { p.accent } else { p.text };
     icons::paint(
         ui.painter(),
@@ -953,9 +1062,9 @@ pub fn nav_item(ui: &mut Ui, selected: bool, icon: Icon, label: &str) -> Respons
         fg,
     );
     let font = if selected {
-        theme::semibold(13.5)
+        theme::semibold(theme::size::CONTROL)
     } else {
-        FontId::proportional(13.5)
+        FontId::proportional(theme::size::CONTROL)
     };
     ui.painter().text(
         egui::pos2(rect.left() + 38.0, rect.center().y),
@@ -964,7 +1073,7 @@ pub fn nav_item(ui: &mut Ui, selected: bool, icon: Icon, label: &str) -> Respons
         font,
         fg,
     );
-    focus_ring(ui, &resp, rect, 8.0);
+    focus_ring(ui, &resp, rect, theme::radius::MD);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -972,7 +1081,7 @@ pub fn nav_item(ui: &mut Ui, selected: bool, icon: Icon, label: &str) -> Respons
 pub fn dialog_title(ui: &mut Ui, title: &str) -> bool {
     let mut close = false;
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(title).font(theme::semibold(17.0)));
+        ui.label(egui::RichText::new(title).font(theme::semibold(theme::size::TITLE)));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             close = icon_button(
                 ui,
@@ -1002,7 +1111,7 @@ pub fn caption(ui: &mut Ui, text: &str) {
     let p = pal(ui);
     ui.label(
         egui::RichText::new(text)
-            .font(theme::semibold(12.5))
+            .font(theme::semibold(theme::size::SMALL))
             .color(p.text_dim),
     );
 }

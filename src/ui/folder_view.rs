@@ -18,7 +18,7 @@ use egui::{vec2, Align, Color32, FontId, Key, Layout, Margin, Modifiers, Sense, 
 use egui_extras::{Column, TableBuilder};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
@@ -303,7 +303,8 @@ pub struct FolderView {
     pub baseline_panel: Box<super::baseline_panel::BaselinePanel>,
     review_filter: Option<crate::core::review_state::State>,
     review_stale_only: bool,
-    review_fingerprints: Option<super::analysis::Task<BTreeMap<String, String>>>,
+    review_fingerprints:
+        Option<super::analysis::Task<BTreeMap<String, crate::core::review_state::Prints>>>,
     review_checked: bool,
     review_resume: Option<String>,
 
@@ -359,6 +360,8 @@ pub struct FolderView {
     /// Copying or merging files on another thread: how many items it changed and the errors,
     /// and whether to compare again afterwards.
     file_job: Option<(JoinHandle<OpResult>, bool)>,
+    /// Set to stop the auto merge running as `file_job`, which then undoes what it changed.
+    merge_stop: Option<Arc<AtomicBool>>,
     /// Sides nothing may be copied to or deleted from, such as an extracted Git revision.
     pub read_only: Vec<bool>,
     /// Compare rules file used (a name or path, "" = none); read again on every refresh.
@@ -619,7 +622,7 @@ impl FolderView {
             drawer_tab: FolderPanel::Review,
             merge_verification: Default::default(),
             workspace: Default::default(),
-            baseline_panel: Default::default(),
+            baseline_panel: Box::new(super::baseline_panel::BaselinePanel::with_review_links()),
             review_filter: None,
             review_stale_only: false,
             review_fingerprints: None,
@@ -663,6 +666,7 @@ impl FolderView {
             merge_job: None,
             merge_plan: None,
             file_job: None,
+            merge_stop: None,
             read_only: Vec::new(),
             rules: cfg.rules.clone(),
             rules_found: false,
@@ -711,12 +715,15 @@ impl FolderView {
         path: String,
         mut decision: crate::core::review_state::Decision,
     ) {
-        match crate::core::review_state::fingerprint(&path, &self.roots, &self.dopts) {
-            Ok(f) => {
+        match crate::core::review_state::prints(&path, &self.roots, &self.dopts) {
+            Ok(p) => {
                 if decision.fingerprint.is_empty() {
-                    decision.fingerprint = f;
-                } else if decision.fingerprint != f {
+                    decision.fingerprint = p.fingerprint;
+                    decision.content = p.content;
+                } else if decision.fingerprint != p.fingerprint {
                     decision.stale = true;
+                } else if decision.content.is_empty() {
+                    decision.content = p.content;
                 }
             }
             Err(_) => decision.stale = true,
@@ -943,10 +950,15 @@ impl FolderView {
         self.running.is_some()
     }
 
-    /// Whether a compare, a merge plan or file operations are still under way.
+    /// Whether a compare, a merge plan, file operations or the check of review decisions are
+    /// still under way.
     #[cfg(test)]
     pub fn busy(&self) -> bool {
-        self.running.is_some() || self.merge_job.is_some() || self.file_job.is_some()
+        self.running.is_some()
+            || self.merge_job.is_some()
+            || self.file_job.is_some()
+            || self.review_fingerprints.is_some()
+            || (!self.review_checked && !self.workspace.entries.is_empty())
     }
 
     /// How long the comparison took, once, right after it finished without being stopped.
@@ -968,6 +980,9 @@ impl FolderView {
     pub fn stop(&mut self) {
         if let Some(r) = &self.running {
             r.progress.abort.store(true, Ordering::Relaxed);
+        }
+        if let Some(stop) = &self.merge_stop {
+            stop.store(true, Ordering::Relaxed);
         }
     }
 
@@ -1210,6 +1225,12 @@ impl FolderView {
     /// Selects item `i`, expanding its folders and scrolling to it, and returns the action that
     /// opens it.
     pub fn reveal_and_open(&mut self, i: usize, cfg: &Config) -> Option<FolderAction> {
+        self.reveal(i, cfg);
+        self.open_action(i, None)
+    }
+
+    /// Selects item `i`, expanding its folders and scrolling to it.
+    fn reveal(&mut self, i: usize, cfg: &Config) {
         let mut p = self.items[i].parent;
         while let Some(pi) = p {
             self.expanded.insert(self.items[pi].rel_path());
@@ -1222,7 +1243,6 @@ impl FolderView {
             self.cursor = Some(v);
             self.scroll_to = Some(v);
         }
-        self.open_action(i, None)
     }
 
     // ---------- operations ----------
@@ -1509,11 +1529,11 @@ impl FolderView {
                 let pal = widgets::pal(ui);
                 ui.label(
                     egui::RichText::new(tr("peek.hint"))
-                        .size(12.0)
+                        .size(theme::size::SMALL)
                         .color(pal.text_dim),
                 );
                 ui.separator();
-                let font = FontId::monospace(12.5);
+                let font = FontId::monospace(theme::size::SMALL);
                 let row_h = ui.fonts_mut(|f| f.row_height(&font));
                 ui.spacing_mut().item_spacing.y = 0.0;
                 egui::ScrollArea::both()
@@ -1584,6 +1604,7 @@ impl FolderView {
         let Some((job, rescan)) = self.file_job.take() else {
             return false;
         };
+        self.merge_stop = None;
         let (done, errors) = job
             .join()
             .unwrap_or_else(|_| (0, vec![tr("status.error").to_string()]));
@@ -1776,8 +1797,8 @@ impl FolderView {
             let list = |ui: &mut Ui, items: Vec<usize>| {
                 egui::Frame::new()
                     .fill(pal.surface_alt)
-                    .corner_radius(8)
-                    .inner_margin(Margin::same(10))
+                    .corner_radius(theme::radius::MD)
+                    .inner_margin(Margin::same(theme::space::CONTROL))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         for &i in items.iter().take(10) {
@@ -1829,9 +1850,15 @@ impl FolderView {
         if run {
             let (items, roots) = (self.items.clone(), self.roots.clone());
             let recycle = cfg.use_recycle_bin;
+            let backup = crate::core::fsutil::backup_on();
+            let stop = Arc::new(AtomicBool::new(false));
+            self.merge_stop = Some(stop.clone());
             self.status = tr("msg.folder_merge_applying").to_string();
             self.file_job = Some((
-                std::thread::spawn(move || folder_merge::apply(plan, &items, &roots, recycle)),
+                std::thread::spawn(move || {
+                    let stop = || stop.load(Ordering::Relaxed);
+                    folder_merge::apply_until(plan, &items, &roots, recycle, backup, &stop)
+                }),
                 true,
             ));
         } else if keep {
@@ -2228,11 +2255,16 @@ impl FolderView {
                 cfg.tree_mode,
                 theme::look().compact,
             ));
-            let need = ui
-                .data(|d| d.get_temp::<(egui::Id, f32)>(need_id))
-                .filter(|&(l, _)| l == labels)
-                .map_or(0.0, |(_, w)| w);
+            let measured = |ui: &Ui, id: egui::Id| {
+                ui.data(|d| d.get_temp::<(egui::Id, f32)>(id))
+                    .filter(|&(l, _)| l == labels)
+                    .map_or(0.0, |(_, w)| w)
+            };
+            let need = measured(ui, need_id);
             let compact = ui.available_width() < need.max(1180.0);
+            // Where even icons and short chips do not fit, the chips take a row of their own.
+            let compact_id = self.id.with("toolbar_compact_width");
+            let wrap = compact && ui.available_width() < measured(ui, compact_id);
             let labelled = |ui: &mut Ui, icon: Icon, label: &str| {
                 if compact {
                     widgets::icon_button(ui, icon, label)
@@ -2323,11 +2355,16 @@ impl FolderView {
                 action = Some(FolderAction::ExportHtml);
             }
             let left_end = ui.cursor().min.x + 4.0;
+            if wrap {
+                ui.end_row();
+            }
             let right = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                let mut clip = ui.clip_rect();
-                clip.min.x = clip.min.x.max(left_end);
-                ui.set_clip_rect(clip);
+                if !wrap {
+                    let mut clip = ui.clip_rect();
+                    clip.min.x = clip.min.x.max(left_end);
+                    ui.set_clip_rect(clip);
+                }
                 let close = egui::PopupCloseBehavior::CloseOnClickOutside;
                 widgets::drawer_toggle(ui, &mut self.drawer_open);
 
@@ -2448,10 +2485,11 @@ impl FolderView {
                     }
                 });
             });
-            if !compact {
+            if !wrap {
                 let width = left_end - start_x + right.response.rect.width() + 16.0;
-                if (need - width).abs() > 0.5 {
-                    ui.data_mut(|d| d.insert_temp(need_id, (labels, width)));
+                let id = if compact { compact_id } else { need_id };
+                if (measured(ui, id) - width).abs() > 0.5 {
+                    ui.data_mut(|d| d.insert_temp(id, (labels, width)));
                     ui.ctx().request_repaint();
                 }
             }
@@ -2480,7 +2518,7 @@ impl FolderView {
         let pal = widgets::pal(ui);
         let paths = egui::Frame::new()
             .fill(pal.surface)
-            .inner_margin(Margin::symmetric(10, 6))
+            .inner_margin(Margin::symmetric(theme::space::CONTROL, theme::space::SM))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.columns(n, |cols| {
@@ -2489,7 +2527,8 @@ impl FolderView {
                             widgets::side_chip(ui, s, n);
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(&self.display_roots[s]).size(13.0),
+                                    egui::RichText::new(&self.display_roots[s])
+                                        .size(theme::size::DENSE),
                                 )
                                 .truncate(),
                             )
@@ -2511,7 +2550,7 @@ impl FolderView {
             let total = r.progress.total.load(Ordering::Relaxed);
             let mut stop = false;
             egui::Frame::new()
-                .inner_margin(Margin::symmetric(10, 6))
+                .inner_margin(Margin::symmetric(theme::space::CONTROL, theme::space::SM))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let frac = if total > 0 {
@@ -2532,18 +2571,52 @@ impl FolderView {
                                     .unwrap_or_default()
                             )
                         };
-                        ui.label(egui::RichText::new(text).size(12.5).color(pal.text_dim));
+                        ui.label(
+                            egui::RichText::new(text)
+                                .size(theme::size::SMALL)
+                                .color(pal.text_dim),
+                        );
                         ui.add(
                             egui::ProgressBar::new(frac)
                                 .fill(pal.accent)
                                 .desired_height(6.0)
-                                .corner_radius(3)
+                                .corner_radius(theme::radius::XS)
                                 .desired_width(ui.available_width() - 90.0)
                                 .animate(total == 0 && !theme::look().reduce_motion),
                         );
                         if widgets::secondary_button(ui, tr("btn.stop")).clicked() {
                             stop = true;
                         }
+                    });
+                });
+            if stop {
+                self.stop();
+            }
+        }
+        if let Some(flag) = &self.merge_stop {
+            let stopping = flag.load(Ordering::Relaxed);
+            let mut stop = false;
+            egui::Frame::new()
+                .inner_margin(Margin::symmetric(theme::space::CONTROL, theme::space::SM))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(tr("msg.folder_merge_applying"))
+                                .size(theme::size::SMALL)
+                                .color(pal.text_dim),
+                        );
+                        ui.add(
+                            egui::ProgressBar::new(0.0)
+                                .fill(pal.accent)
+                                .desired_height(6.0)
+                                .corner_radius(theme::radius::XS)
+                                .desired_width(ui.available_width() - 90.0)
+                                .animate(!theme::look().reduce_motion),
+                        );
+                        let button = ui.add_enabled_ui(!stopping, |ui| {
+                            widgets::secondary_button(ui, tr("btn.stop"))
+                        });
+                        stop = button.inner.clicked();
                     });
                 });
             if stop {
@@ -2565,7 +2638,7 @@ impl FolderView {
         let mut all = all_on;
         let mut changed = false;
         egui::Frame::new()
-            .inner_margin(Margin::symmetric(8, 4))
+            .inner_margin(Margin::symmetric(theme::space::MD, theme::space::XS))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
@@ -2622,7 +2695,8 @@ impl FolderView {
             ui.vertical_centered(|ui| {
                 ui.add_space((ui.available_height() * 0.3).max(24.0));
                 let (rect, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
-                ui.painter().rect_filled(rect, 12.0, pal.control);
+                ui.painter()
+                    .rect_filled(rect, theme::radius::XL, pal.control);
                 crate::ui::icons::paint(
                     ui.painter(),
                     rect.shrink(10.0),
@@ -2633,7 +2707,7 @@ impl FolderView {
                 let query = self.search.trim().to_string();
                 ui.label(
                     egui::RichText::new(trf("folder.no_match", &[("text", query)]))
-                        .font(theme::semibold(15.0)),
+                        .font(theme::semibold(theme::size::SUBTITLE)),
                 );
                 ui.add_space(12.0);
                 if widgets::secondary_button(ui, tr("btn.clear_search")).clicked() {
@@ -2646,7 +2720,8 @@ impl FolderView {
         ui.vertical_centered(|ui| {
             ui.add_space((ui.available_height() * 0.3).max(24.0));
             let (rect, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
-            ui.painter().rect_filled(rect, 12.0, pal.control);
+            ui.painter()
+                .rect_filled(rect, theme::radius::XL, pal.control);
             crate::ui::icons::paint(
                 ui.painter(),
                 rect.shrink(10.0),
@@ -2660,7 +2735,7 @@ impl FolderView {
                 } else {
                     tr("folder.empty_none")
                 })
-                .font(theme::semibold(15.0)),
+                .font(theme::semibold(theme::size::SUBTITLE)),
             );
             if !hidden && !default_filter {
                 ui.add_space(2.0);
@@ -2699,13 +2774,7 @@ impl FolderView {
         if self.running.is_none() {
             if let Some(path) = self.review_resume.take() {
                 if let Some(i) = self.items.iter().position(|item| item.rel_path() == path) {
-                    self.rebuild_visible(cfg);
-                    if let Some(v) = self.visible.iter().position(|&x| x == i) {
-                        self.cursor = Some(v);
-                        self.selected.clear();
-                        self.selected.insert(i);
-                        self.scroll_to = Some(v);
-                    }
+                    self.reveal(i, cfg);
                 }
             }
         }
@@ -2727,9 +2796,8 @@ impl FolderView {
                     let mut fingerprints = BTreeMap::new();
                     for path in paths {
                         analysis::check_cancel(cancel)?;
-                        if let Ok(f) = crate::core::review_state::fingerprint(&path, &roots, &opts)
-                        {
-                            fingerprints.insert(path, f);
+                        if let Ok(p) = crate::core::review_state::prints(&path, &roots, &opts) {
+                            fingerprints.insert(path, p);
                         }
                         progress.fetch_add(1, Ordering::Relaxed);
                     }
@@ -2815,13 +2883,7 @@ impl FolderView {
                         self.review_stale_only = false;
                         self.view_key = None;
                         self.workspace.current = Some(path);
-                        self.rebuild_visible(cfg);
-                        if let Some(v) = self.visible.iter().position(|&x| x == i) {
-                            self.cursor = Some(v);
-                            self.selected.clear();
-                            self.selected.insert(i);
-                            self.scroll_to = Some(v);
-                        }
+                        self.reveal(i, cfg);
                     }
                 }
                 if ui.button(tr("workspace.export")).clicked() {
@@ -2874,16 +2936,15 @@ impl FolderView {
                             .selectable_label(decision.state == state, tr(state.key()))
                             .clicked()
                         {
-                            match crate::core::review_state::fingerprint(
-                                &path,
-                                &self.roots,
-                                &self.dopts,
-                            ) {
-                                Ok(fingerprint) => {
-                                    decision.id = analysis::identity(&(&path, &fingerprint));
-                                    decision.fingerprint = fingerprint;
+                            match crate::core::review_state::prints(&path, &self.roots, &self.dopts)
+                            {
+                                Ok(prints) => {
+                                    decision.id = analysis::identity(&(&path, &prints.fingerprint));
+                                    decision.fingerprint = prints.fingerprint;
+                                    decision.content = prints.content;
                                     decision.state = state;
                                     decision.stale = false;
+                                    decision.ambiguous_rename = false;
                                     changed = true;
                                 }
                                 Err(e) => self.status = e.to_string(),
@@ -2914,6 +2975,14 @@ impl FolderView {
                     .changed();
                 if decision.stale {
                     ui.colored_label(ui.visuals().warn_fg_color, tr("workspace.stale"));
+                }
+                if let Some(old) = &decision.renamed_from {
+                    let key = if decision.ambiguous_rename {
+                        "workspace.ambiguous_rename"
+                    } else {
+                        "workspace.renamed_from"
+                    };
+                    ui.label(trf(key, &[("path", old.clone())]));
                 }
                 if changed {
                     self.workspace.entries.insert(path, Decision { ..decision });
@@ -2986,7 +3055,7 @@ impl FolderView {
         if refresh {
             self.refresh(cfg, named);
         }
-        let (navigate, captured) = if self.drawer_open {
+        let (mut navigate, captured) = if self.drawer_open {
             let tabs = self.panel_tabs();
             let mut tab = self.drawer_tab;
             let mut out = (None, None);
@@ -2998,15 +3067,14 @@ impl FolderView {
         } else {
             self.panels(None, None, cfg)
         };
+        if let Some(path) = self.baseline_panel.review_request.take() {
+            self.drawer_tab = FolderPanel::Review;
+            self.workspace.current = Some(path.clone());
+            navigate = Some(path);
+        }
         if let Some(path) = navigate {
             if let Some(i) = self.items.iter().position(|item| item.rel_path() == path) {
-                self.rebuild_visible(cfg);
-                if let Some(v) = self.visible.iter().position(|&x| x == i) {
-                    self.cursor = Some(v);
-                    self.selected.clear();
-                    self.selected.insert(i);
-                    self.scroll_to = Some(v);
-                }
+                self.reveal(i, cfg);
             }
         }
 
@@ -3152,23 +3220,30 @@ impl FolderView {
         let ui = &mut list_ui;
         // The tree already shows where each item is.
         let folder_col = !cfg.tree_mode;
+        // Starting widths and minimums of the columns before the last, which takes the rest.
+        let mut widths: Vec<(f32, f32)> = vec![(280.0, 80.0)];
+        if folder_col {
+            widths.push((160.0, 40.0));
+        }
+        widths.extend([(230.0, 60.0), (210.0, 60.0)]);
+        widths.extend((0..n).map(|_| (90.0, 30.0)));
+        // A list too narrow for them starts them narrower, in steps of an eighth, each step
+        // keeping its own column state, so every column stays in view.
+        let need = widths.iter().map(|w| w.0).sum::<f32>();
+        let fixed = 40.0 + ui.spacing().item_spacing.x * (widths.len() + 2) as f32;
+        let eighths = (((list_rect.width() - fixed) / need * 8.0).floor() as u8).clamp(3, 8);
+        let scale = eighths as f32 / 8.0;
         let mut table = TableBuilder::new(ui)
-            .id_salt(self.id.with(folder_col))
+            .id_salt(self.id.with((folder_col, eighths)))
             .striped(false)
             .resizable(true)
             .sense(Sense::click())
-            .cell_layout(Layout::left_to_right(Align::Center))
-            .column(Column::initial(280.0).at_least(80.0).clip(true));
-        if folder_col {
-            table = table.column(Column::initial(160.0).at_least(40.0).clip(true));
+            .cell_layout(Layout::left_to_right(Align::Center));
+        for (width, least) in widths {
+            let width = width * scale;
+            table = table.column(Column::initial(width).at_least(least.min(width)).clip(true));
         }
-        table = table
-            .column(Column::initial(230.0).at_least(60.0).clip(true))
-            .column(Column::initial(210.0).at_least(60.0).clip(true));
-        for _ in 0..n {
-            table = table.column(Column::initial(90.0).at_least(30.0).clip(true));
-        }
-        table = table.column(Column::remainder().at_least(40.0));
+        table = table.column(Column::remainder().at_least(40.0).clip(true));
         if let Some(r) = self.scroll_to.take() {
             table = table.scroll_to_row(r, None);
         }
@@ -3211,21 +3286,16 @@ impl FolderView {
                             Stroke::new(1.0_f32, pal.border),
                         );
                         let sorted = sort.0 == *col;
-                        let arrow = if sorted {
-                            if sort.1 {
-                                "  ▲"
-                            } else {
-                                "  ▼"
-                            }
-                        } else {
-                            ""
-                        };
                         let color = if sorted { pal.text } else { pal.text_dim };
-                        let text = egui::RichText::new(format!("{label}{arrow}"))
-                            .font(theme::semibold(12.5))
+                        let text = egui::RichText::new(label.as_str())
+                            .font(theme::semibold(theme::size::SMALL))
                             .color(color);
                         if ui.add(egui::Button::new(text).frame(false)).clicked() {
                             new_sort = Some(*col);
+                        }
+                        if sorted {
+                            let mark = if sort.1 { Icon::Prev } else { Icon::Next };
+                            widgets::small_icon(ui, mark, color);
                         }
                     });
                 }
@@ -3263,12 +3333,13 @@ impl FolderView {
                             ui.add_space(it.depth as f32 * 16.0);
                             if it.is_dir && !it.children.is_empty() {
                                 let open = searching || expanded.contains(&it.rel_path());
-                                let arrow = egui::RichText::new(if open { "⏷" } else { "⏵" })
-                                    .color(pal.text_dim);
-                                if ui
-                                    .add(egui::Button::new(arrow).frame(false).small())
-                                    .clicked()
-                                {
+                                let (icon, key) = if open {
+                                    (Icon::Next, "folder.collapse")
+                                } else {
+                                    (Icon::ChevronRight, "folder.expand")
+                                };
+                                let name = trf(key, &[("name", it.name.clone())]);
+                                if widgets::mini_icon_button(ui, icon, &name).clicked() {
                                     toggle = Some(idx);
                                 }
                             } else {
@@ -3276,7 +3347,7 @@ impl FolderView {
                             }
                         }
                         let (icon, icon_color) = if it.is_dir {
-                            (Icon::Folder, Color32::from_rgb(0xE0, 0xA4, 0x2E))
+                            (Icon::Folder, pal.folder)
                         } else {
                             (Icon::File, pal.text_dim)
                         };
@@ -3309,12 +3380,18 @@ impl FolderView {
                         let detail = (!it.is_dir && it.binary && it.status != CmpStatus::Unique)
                             .then(|| tr("kind.binary"));
                         let r = ui.add(
-                            egui::Label::new(txt(label).font(FontId::proportional(13.5)))
-                                .selectable(false)
-                                .truncate(),
+                            egui::Label::new(
+                                txt(label).font(FontId::proportional(theme::size::CONTROL)),
+                            )
+                            .selectable(false)
+                            .truncate(),
                         );
                         if let Some(d) = detail {
-                            ui.label(txt(format!("· {d}")).size(12.0).color(pal.text_dim));
+                            ui.label(
+                                txt(format!("· {d}"))
+                                    .size(theme::size::SMALL)
+                                    .color(pal.text_dim),
+                            );
                         }
                         r.on_hover_ui(|ui| {
                             ui.label(status_text(it, n));
@@ -3327,7 +3404,7 @@ impl FolderView {
                         if let Some(s) = newer_side(it, n, tolerance) {
                             ui.label(
                                 txt(trf("folder.newer", &[("side", side_name(s, n).into())]))
-                                    .size(12.0)
+                                    .size(theme::size::SMALL)
                                     .color(side_cols[s]),
                             );
                         }
@@ -3609,8 +3686,8 @@ impl FolderView {
                 ui.add_space(4.0);
                 egui::Frame::new()
                     .fill(pal.surface_alt)
-                    .corner_radius(8)
-                    .inner_margin(Margin::same(10))
+                    .corner_radius(theme::radius::MD)
+                    .inner_margin(Margin::same(theme::space::CONTROL))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         for &i in op.targets.iter().take(10) {

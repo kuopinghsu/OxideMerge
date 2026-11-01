@@ -3,7 +3,7 @@
 All notable changes to OxideMerge are listed here, newest first. Each release on GitHub uses its
 section of this file as the release notes.
 
-## [0.9.7] - Unreleased
+## [0.9.7] - 2026-11-01
 
 ### Added
 
@@ -45,8 +45,53 @@ section of this file as the release notes.
 - **HTML files open in the web page compare** (`.html` and `.htm` on every side), so they show
   formatted by default; `-t text` or *Compare as → Text* compares their source, and a merge
   with an output file (`-o`) or a console `--patch` still uses the text compare.
+- **TOML and YAML semantic compare:** the *Semantic* view and `--semantic` also read TOML and
+  YAML (`--format toml` or `yaml`, or from the extension), comparing tables and mappings without
+  regard to order and numbers by value. YAML is read by the YAML 1.2 core schema, one document of
+  at most 4 MiB without aliases, complex keys or custom tags, within the existing nesting and
+  node limits.
+- **Semantic changes as a path tree,** with a count on each branch, and a **Moved** kind for array
+  elements that only changed place. *Array matching key* (`--array-key MEMBER`) pairs the object
+  elements of arrays by a member such as `id` instead of by position.
+- **Release summary:** the time each side was captured, category counts that filter the list,
+  and a *High priority* list of changes with risk flags. A deleted and an added text file that
+  share at least half of their lines are shown as a **suspected rename** with the share of
+  matching lines; *Not a rename* (`--split-rename PATH`) keeps them apart.
+- **Exact impact findings:** *Potential impact* recognizes JavaScript/TypeScript, Python, C/C++,
+  CSS, Rust and JSON `$ref` imports of a changed file and labels them exact; changed nested JSON,
+  TOML and YAML keys are also searched for as dotted paths. In a folder comparison, *Review* opens
+  the file of a finding in the review workspace.
+- **Merge plans warn** when both sides edit lines close together or change the same setting in
+  different places.
+- Review decisions follow files renamed without changes, and ambiguous renames are marked for
+  review again; review bundles with unsafe or missing entries are refused.
+- **Function and type impact:** for changed JavaScript/TypeScript, Python, C/C++ and Rust files,
+  *Potential impact* compares the top-level functions, types and constants, and a file importing a
+  changed or removed one by name (also under another name) gets an exact finding at its first use;
+  the name's first use in other files of the same language is a heuristic finding. Matches of
+  names and configuration keys stop at 500 with a note counting the rest, instead of failing the
+  analysis when a broad change hits common words.
+- **How sure a semantic change is:** each change says whether its array elements were paired by
+  the array matching key, as a reordering or by position, and changes another reading explains as
+  well, such as either element of a swap, are marked *ambiguous*. A note says when the array
+  matching key cannot pair an array. Reports add `confidence`, `ambiguous` and `notes`.
+- TOML and YAML samples: `config/service.toml` and `config/deploy.yaml` in `samples/left` and
+  `samples/right` differ in layout almost everywhere but in only a few settings, and
+  `samples/three/settings` holds the 3-way merge settings as TOML and YAML as well as INI.
+- Saved JSON and XML semantic, release summary and impact reports in `tests/fixtures/reports`;
+  the tests fail when a report of the same inputs differs from them.
 
 ### Changed
+
+- **Folder auto merge is all or nothing:** every item is checked before anything is written, and
+  if one changed since the plan nothing is merged. A *Stop* button ends a running merge, and
+  stopping it or a failed change (a read-only folder, a full disk) undoes the changes made so far.
+- *Potential impact* reads imports and definitions of JavaScript/TypeScript, Python, C/C++ and Rust
+  files from their syntax trees, parsed with Tree-sitter, and imports of other files from the
+  code's tokens, so imports spanning lines are found and imports inside comments and strings are
+  not; Rust `use crate::…`, `super::…` and `self::…` paths and JavaScript re-exports count as
+  imports. A file with code the parser could not read is listed as partly assessed. The
+  application is about 10 MB larger for the grammars.
 
 - Review, verification and baseline panels open in a side drawer, toggled by the button at the
   right end of the toolbar, instead of taking space below the comparison.
@@ -68,9 +113,30 @@ section of this file as the release notes.
 - The user interface is built on egui and eframe 0.37 (from 0.31), which the formatted web page
   view needs. Menu items sit slightly inside their menu, and screen readers name menu items by
   their label alone, without the shortcut, and drop-downs by the caption beside them.
+- Icons are drawn instead of taken from font symbols (sort arrows, tree arrows, warnings and the
+  Help icon), so they look the same with every font, and colors, sizes, corners and spacing come
+  from one set of theme values. The common icons (compare, folder, file, search, settings, theme,
+  arrows, history, filter, export, image, binary, web page, add, check and side drawer) follow one
+  outline set on a 24-unit grid, and all icons use its lighter line; *Options* now shows two
+  sliders instead of a gear. Buttons, chips and toggles show distinct hover, pressed, selected,
+  disabled and focus states in every theme and high contrast mode, and dialog buttons react to
+  hover.
+- Toolbars start a new row for a group that no longer fits instead of running past the window
+  edge, and folder columns start narrower in narrow windows so every column stays in view.
+  Narrow windows leave out the name next to the logo in the title bar.
+- Screen readers name the tree arrows ("Expand …" / "Collapse …"), the Git revision picker, the
+  scroll bars, the location pane and the comparison areas.
 
 ### Fixed
 
+- The Formatted web page compare stops at every changed block when stepping through the
+  differences. Changed blocks next to each other counted as one difference, so *Next difference*
+  skipped all but the first, such as an item added after a changed one at the end of a list.
+- Decisions on documents compared through a converter stay current when a review is reopened,
+  instead of always being marked for review again.
+- Merge plans no longer warn that an insertion on one side is a deletion.
+- *Next unreviewed* and the links to a file in the review workspace open folders collapsed in the
+  tree to show the file.
 - The close button of the Help & Shortcuts dialog sits at the right edge of its title bar, as in
   the About dialog, instead of short of it: the dialog is now exactly as wide as its panels and
   scroll bar, and shortcuts too long for their column, such as `Shift+↑ ↓ / Shift+PgUp PgDn` on
@@ -106,6 +172,10 @@ section of this file as the release notes.
   runs past the window edge in windows narrower than about 1200 points: both switch to icons and
   shorter chips. Title bar icons that no longer fit are left out rather than overlapping the
   menus.
+- In 3-way text comparisons, windows narrower than about 780 points no longer push the panes, the
+  pane footers and the scroll bar past the right edge.
+- Very short panes no longer crash the custom scroll bars.
+- In dark high contrast mode, hovered accent buttons are told apart from resting ones.
 
 ## [0.9.6] - 2026-10-30
 

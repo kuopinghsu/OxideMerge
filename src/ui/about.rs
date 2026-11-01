@@ -70,12 +70,12 @@ pub fn title_bar(ui: &mut egui::Ui, title: &str, close: &mut bool) {
     egui::Frame::new()
         .fill(p.chrome)
         .corner_radius(corners)
-        .inner_margin(Margin::symmetric(12, 7))
+        .inner_margin(Margin::symmetric(theme::space::LG, theme::space::SM))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 widgets::logo(ui, 18.0);
-                ui.label(RichText::new(title).size(13.0).color(p.text));
+                ui.label(RichText::new(title).size(theme::size::DENSE).color(p.text));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if close_button(ui).on_hover_text(tr("btn.close")).clicked() {
                         *close = true;
@@ -94,7 +94,7 @@ fn close_button(ui: &mut egui::Ui) -> egui::Response {
     });
     let painter = ui.painter();
     if response.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(6), p.control_hover);
+        painter.rect_filled(rect, CornerRadius::same(theme::radius::SM), p.control_hover);
     }
     let arm = 5.0;
     let color = if response.hovered() {
@@ -115,13 +115,13 @@ fn body(ui: &mut egui::Ui) {
     let mut title = egui::text::LayoutJob::default();
     let parts = [
         RichText::new(format!("OxideMerge {}  ", env!("CARGO_PKG_VERSION")))
-            .font(theme::semibold(26.0))
+            .font(theme::semibold(theme::size::DISPLAY))
             .color(p.text),
         RichText::new(format!(
             "({})",
             trf("about.build", &[("date", build.to_string())])
         ))
-        .size(16.0)
+        .size(theme::size::SUBTITLE)
         .color(p.text_dim),
     ];
     for part in parts {
@@ -169,7 +169,7 @@ fn heading(ui: &mut egui::Ui, title: &str) {
     ui.add_space(12.0);
     ui.label(
         RichText::new(title)
-            .font(theme::semibold(17.0))
+            .font(theme::semibold(theme::size::TITLE))
             .color(color),
     );
     ui.add_space(1.0);
@@ -177,10 +177,13 @@ fn heading(ui: &mut egui::Ui, title: &str) {
 
 fn text(ui: &mut egui::Ui, line: &str) {
     let color = widgets::pal(ui).text;
-    ui.add(egui::Label::new(RichText::new(line).size(13.5).color(color)).wrap());
+    ui.add(egui::Label::new(RichText::new(line).size(theme::size::CONTROL).color(color)).wrap());
 }
 
 fn link(ui: &mut egui::Ui, label: &str, url: &str) {
     let color = ui.visuals().hyperlink_color;
-    ui.hyperlink_to(RichText::new(label).size(13.5).color(color), url);
+    ui.hyperlink_to(
+        RichText::new(label).size(theme::size::CONTROL).color(color),
+        url,
+    );
 }

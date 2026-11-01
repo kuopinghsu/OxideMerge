@@ -460,10 +460,9 @@ impl BinaryView {
                         widgets::chip(ui, &size, pal.text_dim, pal.control);
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(title)
-                                        .font(crate::ui::theme::semibold(13.5)),
-                                )
+                                egui::Label::new(egui::RichText::new(title).font(
+                                    crate::ui::theme::semibold(crate::ui::theme::size::CONTROL),
+                                ))
                                 .truncate(),
                             )
                             .on_hover_text(path);
@@ -475,6 +474,9 @@ impl BinaryView {
 
         let body = Rect::from_min_max(pos2(left, top), pos2(right, bottom));
         let resp = ui.interact(body, self.id.with("body"), Sense::click());
+        resp.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::Role::Document, true, tr("help.binary_compare"))
+        });
         if ui.rect_contains_pointer(body) {
             self.scroll -= ui.input(|i| i.smooth_scroll_delta.y) / row_h;
         }

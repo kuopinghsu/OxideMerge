@@ -32,6 +32,8 @@ impl egui::DroppedFile for Dropped {
 
 struct Gui {
     name: &'static str,
+    /// The window's size in points.
+    screen: egui::Vec2,
     ctx: egui::Context,
     app: OxideMergeApp,
     frame: eframe::Frame,
@@ -42,6 +44,8 @@ struct Gui {
     focused: bool,
     /// In drawing order, so later widgets are on top.
     widgets: Vec<Widget>,
+    /// Every control that can be clicked or set, named or not.
+    controls: Vec<Widget>,
     copied: Vec<String>,
     closed: bool,
 }
@@ -71,6 +75,7 @@ impl Gui {
         let app = OxideMergeApp::new(&cc, cfg.clone(), cfg, initial);
         let mut gui = Gui {
             name,
+            screen: SCREEN,
             ctx,
             app,
             frame: eframe::Frame::_new_kittest(),
@@ -80,6 +85,7 @@ impl Gui {
             dropped: Vec::new(),
             focused: true,
             widgets: Vec::new(),
+            controls: Vec::new(),
             copied: Vec::new(),
             closed: false,
         };
@@ -91,7 +97,7 @@ impl Gui {
         let mut events = vec![Event::ModifiersChanged(self.modifiers)];
         events.append(&mut self.events);
         let mut raw = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.screen)),
             time: Some(self.time),
             events,
             dropped_files: self
@@ -114,6 +120,7 @@ impl Gui {
         }
         if let Some(tree) = &out.platform_output.accesskit_update {
             self.widgets = widgets_of(tree);
+            self.controls = controls_of(tree);
         }
         self.closed |= out
             .viewport_output
@@ -435,6 +442,46 @@ fn widgets_of(tree: &accesskit::TreeUpdate) -> Vec<Widget> {
     out
 }
 
+/// The controls of an accessibility tree, with the name a screen reader gives each ("" for none).
+fn controls_of(tree: &accesskit::TreeUpdate) -> Vec<Widget> {
+    use accesskit::Role;
+    let nodes: std::collections::HashMap<accesskit::NodeId, &accesskit::Node> =
+        tree.nodes.iter().map(|(id, n)| (*id, n)).collect();
+    tree.nodes
+        .iter()
+        .map(|(_, n)| n)
+        .filter(|n| {
+            n.supports_action(accesskit::Action::Click)
+                || matches!(
+                    n.role(),
+                    Role::CheckBox | Role::RadioButton | Role::ComboBox | Role::Slider
+                )
+        })
+        .filter_map(|n| {
+            let caption = n
+                .labelled_by()
+                .iter()
+                .find_map(|id| nodes.get(id).and_then(|c| c.label().or(c.value())));
+            let b = n.bounds()?;
+            Some(Widget {
+                role: n.role(),
+                label: n
+                    .label()
+                    .or(caption)
+                    .or(n.value().filter(|v| !v.is_empty()))
+                    .or(n.placeholder())
+                    .unwrap_or("")
+                    .to_string(),
+                rect: Rect::from_min_max(
+                    Pos2::new(b.x0 as f32, b.y0 as f32),
+                    Pos2::new(b.x1 as f32, b.y1 as f32),
+                ),
+                enabled: !n.is_disabled(),
+            })
+        })
+        .collect()
+}
+
 fn write(dir: &Path, files: &[(&str, &str)]) {
     for (name, text) in files {
         let p = dir.join(name);
@@ -663,6 +710,127 @@ fn the_merge_bar_counts_conflicts_down_to_a_saved_result() {
     assert!(!gui.app.tabs[0].is_modified());
 }
 
+/// `git mergetool` runs the configured tool and waits for it; the tool here notes the files Git
+/// passes and waits for the test, which opens them as `-o "$MERGED" --wl --wr` would.
+#[test]
+fn git_mergetool_conflicts_are_resolved_into_the_merged_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", dir.path().join(".gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let commit = |file: &str, text: &str, message: &str| {
+        std::fs::write(repo.join(file), text).unwrap();
+        assert!(git(&["add", file]).status.success());
+        assert!(git(&["commit", "-qm", message]).status.success());
+    };
+    assert!(git(&["init", "-q"]).status.success());
+    for (key, value) in [
+        ("user.name", "Test"),
+        ("user.email", "test@example.invalid"),
+        ("core.autocrlf", "false"),
+        ("mergetool.keepBackup", "false"),
+        ("mergetool.oxm.trustExitCode", "false"),
+        (
+            "mergetool.oxm.cmd",
+            "printf '%s\\n' \"$LOCAL\" \"$BASE\" \"$REMOTE\" \"$MERGED\" > ../paths.tmp && \
+             mv ../paths.tmp ../paths && while [ ! -f ../done ]; do sleep 0.05; done",
+        ),
+    ] {
+        assert!(git(&["config", key, value]).status.success());
+    }
+    let base = "a\nb\nc\nd\ne\nf\ng\nh\n";
+    commit("file.txt", base, "base");
+    assert!(git(&["checkout", "-qb", "theirs"]).status.success());
+    commit("file.txt", "a\nTHEIRS\nc\nd\nTHEIRS-E\nf\ng\nh\n", "theirs");
+    assert!(git(&["checkout", "-q", "-"]).status.success());
+    commit("file.txt", "a\nOURS\nc\nd\ne\nf\nOURS-G\nh\n", "ours");
+    assert!(!git(&["merge", "-q", "theirs"]).status.success());
+    assert!(read(&repo.join("file.txt")).contains("<<<<<<<"));
+
+    let mut tool = std::process::Command::new("git")
+        .args(["mergetool", "--tool=oxm", "--no-prompt", "file.txt"])
+        .current_dir(&repo)
+        .env("GIT_CONFIG_GLOBAL", dir.path().join(".gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    struct Release<'a>(&'a Path, &'a mut std::process::Child);
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("done"), "");
+            let start = Instant::now();
+            while self.1.try_wait().ok().flatten().is_none() {
+                if start.elapsed() > Duration::from_secs(30) {
+                    let _ = self.1.kill();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    let release = Release(dir.path(), &mut tool);
+    let start = Instant::now();
+    let listed = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.path().join("paths")) {
+            break s;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "git mergetool never ran the tool"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let backup = Instant::now();
+    let paths: Vec<PathBuf> = listed.lines().map(|p| repo.join(p)).collect();
+    assert_eq!(paths.len(), 4, "{listed}");
+    let (base_file, merged) = (paths[1].clone(), paths[3].clone());
+    assert_eq!(read(&base_file), base);
+
+    let mut gui = Gui::start(
+        "git_mergetool",
+        Some(OpenRequest {
+            paths: paths[..3].to_vec(),
+            descriptions: vec![Some("Local".into()), None, Some("Remote".into())],
+            read_only: vec![true, false, true],
+            output: Some(merged.clone()),
+            ..Default::default()
+        }),
+    );
+    gui.menu(&[tr("menu.merge"), tr("cmd.auto_merge")]);
+    gui.click(tr("merge.next_conflict"));
+    gui.click(tr("merge.take_both"));
+    assert_eq!(gui.text_view().conflicts_left(), 0);
+    // Git takes the merge as done when the result is newer than its backup, which some shells
+    // compare in whole seconds.
+    while backup.elapsed() < Duration::from_millis(1100) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    gui.click(tr("merge.save_result"));
+    let expected = "a\nOURS\nTHEIRS\nc\nd\nTHEIRS-E\nf\nOURS-G\nh\n";
+    assert_eq!(read(&merged), expected);
+    assert_eq!(read(&base_file), base, "the common base was changed");
+    drop(gui);
+    drop(release);
+
+    let unmerged = git(&["diff", "--name-only", "--diff-filter=U"]);
+    assert!(unmerged.stdout.is_empty(), "Git still sees a conflict");
+    let staged = git(&["show", ":file.txt"]);
+    assert_eq!(String::from_utf8_lossy(&staged.stdout), expected);
+    assert_eq!(read(&repo.join("file.txt")), expected);
+}
+
 fn merge_folders(d: &Path) -> [PathBuf; 3] {
     write(
         d,
@@ -747,7 +915,7 @@ fn folder_merges_leave_alone_what_changed_meanwhile() {
     assert!(status.contains(&stale), "{status}");
     assert!(!gui.shows(tr("btn.ok")), "a merge was offered");
 
-    // A file changed between the preview and OK is kept as it is, and named.
+    // A file changed between the preview and OK is named, and nothing is merged.
     gui.key(Modifiers::NONE, Key::F5);
     gui.click(tr("cmd.folder_merge"));
     let target = roots[1].join("changed.txt");
@@ -755,11 +923,13 @@ fn folder_merges_leave_alone_what_changed_meanwhile() {
     touch_later(&target, 5);
     gui.click(tr("btn.ok"));
     assert_eq!(read(&target), "mine\n");
-    assert_eq!(read(&roots[1].join("sub/added.txt")), "added\n");
-    assert!(!roots[1].join("gone.txt").exists());
+    assert!(!roots[1].join("sub/added.txt").exists());
+    assert!(roots[1].join("gone.txt").exists());
     let status = gui.app.tabs[0].status_line();
     assert!(
-        status.contains(tr("status.error")) && status.contains("changed.txt"),
+        status.contains(tr("status.error"))
+            && status.contains("changed.txt")
+            && status.contains(tr("msg.folder_merge_not_applied")),
         "{status}"
     );
 }
@@ -1421,6 +1591,123 @@ fn folder_review_reopens_without_sources_and_keeps_annotations_and_options() {
     assert!(gui.shows_text("read-only snapshot"));
 }
 
+#[test]
+fn review_pane_decisions_survive_a_saved_review_and_follow_renamed_files() {
+    use crate::core::review_state::State;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("left/a.txt", "a old\n"),
+            ("right/a.txt", "a new\n"),
+            ("left/b.txt", "b old\n"),
+            ("right/b.txt", "b new\n"),
+            ("left/c.txt", "c old\n"),
+            ("right/c.txt", "c new\n"),
+        ],
+    );
+    let mut gui = Gui::with_config(
+        "review_pane",
+        Config {
+            web_render: false,
+            ..config()
+        },
+        compare(&[d.join("left"), d.join("right")]),
+    );
+    let counts = |unreviewed: usize, accepted: usize, needs: usize| {
+        format!(
+            "{}: {unreviewed} · {}: {accepted} · {}: {needs} ·",
+            tr("workspace.unreviewed"),
+            tr("workspace.accepted"),
+            tr("workspace.needs_action")
+        )
+    };
+    gui.click(tr("drawer.toggle"));
+    assert!(gui.shows(tr("workspace.title")));
+    assert!(gui.shows_text(&counts(3, 0, 0)));
+    gui.click(tr("workspace.next"));
+    gui.click(tr("workspace.accepted"));
+    assert!(gui.shows_text(&counts(2, 1, 0)));
+    gui.click(tr("workspace.next"));
+    gui.click(tr("workspace.needs_action"));
+    let comment = gui
+        .widgets
+        .iter()
+        .find(|w| w.role == accesskit::Role::MultilineTextInput)
+        .expect("a review comment box")
+        .rect;
+    gui.click_at(comment.center());
+    gui.type_text("Check the wording");
+    gui.settle();
+    assert!(gui.shows_text(&counts(1, 1, 1)));
+    let Content::Folder(view) = &gui.app.tabs[0].content else {
+        panic!("Expected a folder comparison");
+    };
+    assert_eq!(view.workspace.entries["a.txt"].state, State::Accepted);
+    assert_eq!(view.workspace.entries["b.txt"].state, State::NeedsAction);
+    assert_eq!(view.workspace.entries["b.txt"].comment, "Check the wording");
+    let filter = gui
+        .widgets
+        .iter()
+        .find(|w| named(w, tr("workspace.accepted")))
+        .unwrap()
+        .rect;
+    gui.click_at(filter.center());
+    assert!(gui.shows("a.txt") && !gui.shows("c.txt"));
+    gui.click(tr("analysis.all"));
+    assert!(gui.shows("c.txt"));
+    gui.click(tr("workspace.next"));
+    let Content::Folder(view) = &gui.app.tabs[0].content else {
+        panic!("Expected a folder comparison");
+    };
+    assert_eq!(view.workspace.current.as_deref(), Some("c.txt"));
+    let out = tempfile::tempdir().unwrap();
+    let bundle = out.path().join("review.oxmreview");
+    view.save_review(&bundle, false).unwrap();
+    drop(gui);
+
+    write(
+        d,
+        &[
+            ("next-left/renamed.txt", "a old\n"),
+            ("next-right/renamed.txt", "a new\n"),
+            ("next-left/b.txt", "b old\n"),
+            ("next-right/b.txt", "b newer\n"),
+            ("next-left/c.txt", "c old\n"),
+            ("next-right/c.txt", "c new\n"),
+        ],
+    );
+    let mut gui = Gui::start("review_pane_reopen", compare(&[bundle]));
+    let Content::Folder(view) = &mut gui.app.tabs[0].content else {
+        panic!("Expected a folder review");
+    };
+    assert_eq!(view.workspace.entries["a.txt"].state, State::Accepted);
+    assert_eq!(view.workspace.entries["b.txt"].comment, "Check the wording");
+    assert!(view.workspace.entries.values().all(|e| !e.stale));
+    view.roots = vec![d.join("next-left"), d.join("next-right")];
+    view.display_roots = view.roots.iter().map(|p| p.display().to_string()).collect();
+    view.read_only = vec![true; 2];
+    view.start_compare();
+    gui.settle();
+    let Content::Folder(view) = &gui.app.tabs[0].content else {
+        panic!("Expected a folder review");
+    };
+    let renamed = &view.workspace.entries["renamed.txt"];
+    assert_eq!(renamed.state, State::Accepted);
+    assert_eq!(renamed.renamed_from.as_deref(), Some("a.txt"));
+    assert!(!renamed.stale && !renamed.ambiguous_rename);
+    assert!(!view.workspace.entries.contains_key("a.txt"));
+    assert!(view.workspace.entries["b.txt"].stale);
+    assert!(!view.workspace.entries.contains_key("c.txt"));
+    gui.click("renamed.txt");
+    gui.click(tr("drawer.toggle"));
+    assert!(gui.shows(&trf("workspace.renamed_from", &[("path", "a.txt".into())])));
+    gui.click("b.txt");
+    assert!(gui.shows(tr("workspace.stale")));
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
 #[cfg(unix)]
 #[test]
 fn converted_documents_stay_read_only_in_file_and_all_differences_views() {
@@ -1479,16 +1766,24 @@ fn converted_review_opens_documents_without_running_local_converters() {
         pattern: "*.docx".into(),
         command: "tail -n +2 ${file}".into(),
     }];
-    let original = Gui::with_config(
+    let mut original = Gui::with_config(
         "converted_review_capture",
         cfg,
         compare(&[d.join("left"), d.join("right")]),
     );
+    original.click(tr("drawer.toggle"));
+    original.click(tr("workspace.next"));
+    original.click(tr("workspace.accepted"));
+    original.settle();
     let out = tempfile::tempdir().unwrap();
     let path = out.path().join("review.oxmreview");
     let Content::Folder(view) = &original.app.tabs[0].content else {
         panic!("folder expected");
     };
+    assert_eq!(
+        view.workspace.entries["a.docx"].state,
+        crate::core::review_state::State::Accepted
+    );
     view.save_review(&path, false).unwrap();
     drop(original);
     drop(source);
@@ -1499,6 +1794,16 @@ fn converted_review_opens_documents_without_running_local_converters() {
         command: "exit 99 # ${file}".into(),
     }];
     let mut gui = Gui::with_config("converted_review_reopen", cfg, compare(&[path]));
+    gui.settle();
+    let Content::Folder(view) = &gui.app.tabs[0].content else {
+        panic!("folder review expected");
+    };
+    let decision = &view.workspace.entries["a.docx"];
+    assert_eq!(decision.state, crate::core::review_state::State::Accepted);
+    assert!(
+        !decision.stale,
+        "a decision on a converted document survives the reopen"
+    );
     gui.click("a.docx");
     gui.click("a.docx");
     assert_eq!(gui.text_view().panes[0].doc.lines, ["old text"]);
@@ -1689,6 +1994,99 @@ fn semantic_view_is_read_only_and_can_jump_back_to_source() {
 }
 
 #[test]
+fn semantic_tree_groups_paths_and_an_array_key_pairs_moved_elements() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[
+            (
+                "a.json",
+                r#"{"items":[{"id":"a","v":1},{"id":"b","v":2}],"name":"x"}"#,
+            ),
+            (
+                "b.json",
+                r#"{"items":[{"id":"b","v":2},{"id":"a","v":10}],"name":"y"}"#,
+            ),
+        ],
+    );
+    let mut gui = Gui::start(
+        "semantic_tree",
+        compare(&[dir.path().join("a.json"), dir.path().join("b.json")]),
+    );
+    gui.click(tr("analysis.semantic"));
+    let wait_for = |gui: &mut Gui, label: &str| {
+        let start = Instant::now();
+        while !gui.shows(label) {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "semantic view did not show {label:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+            gui.frame();
+        }
+    };
+    wait_for(&mut gui, "[\"items\"] (4)");
+    assert!(gui.shows("[\"name\"] (1)"));
+    assert!(gui.shows("[0] (2)"));
+    gui.click(tr("analysis.array_key"));
+    gui.type_text("id");
+    // In a swap of two, either element may be the one that moved.
+    let moved = format!(
+        "{} · {} · {}",
+        tr("analysis.moved"),
+        trf("analysis.moved_from", &[("path", "$[\"items\"][0]".into())]),
+        tr("analysis.ambiguous")
+    );
+    wait_for(&mut gui, &moved);
+    assert!(gui.shows(tr("analysis.ambiguous_hint")));
+    assert!(gui.shows(tr("analysis.paired_by_key")));
+    assert!(gui.shows("[\"items\"][1] (2)"));
+    assert!(gui.shows("[\"v\"] (1)"));
+    assert!(gui.shows("1 → 10"));
+    gui.click(tr("analysis.moved"));
+    assert!(gui.shows(&moved));
+    assert!(!gui.shows("[\"name\"] (1)"));
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn yaml_and_toml_compares_offer_the_semantic_view() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[
+            ("a.yaml", "db:\n  port: 5432\n"),
+            ("b.yaml", "db:\n  port: 6543\n"),
+            ("a.toml", "[db]\nport = 5432\n"),
+            ("b.toml", "[db]\nport = 6543\n"),
+        ],
+    );
+    for (name, ext, before) in [
+        ("semantic_yaml", "yaml", "5432 → 6543"),
+        ("semantic_toml", "toml", "5432 → 6543"),
+    ] {
+        let mut gui = Gui::start(
+            name,
+            compare(&[
+                dir.path().join(format!("a.{ext}")),
+                dir.path().join(format!("b.{ext}")),
+            ]),
+        );
+        gui.click(tr("analysis.semantic"));
+        let start = Instant::now();
+        while !gui.shows(before) {
+            assert!(start.elapsed() < Duration::from_secs(5), "{name}");
+            std::thread::sleep(Duration::from_millis(1));
+            gui.frame();
+        }
+        assert!(gui.shows("[\"db\"][\"port\"] (1)"));
+        assert!(gui.shows(tr("analysis.array_key")));
+        gui.click(&format!("{} 2:2", tr("analysis.source")));
+        assert_eq!(gui.text_view().active_pane, 1);
+    }
+}
+
+#[test]
 fn merge_verification_preview_never_edits_the_middle_pane() {
     let dir = tempfile::tempdir().unwrap();
     write(
@@ -1739,6 +2137,11 @@ fn start_page_baselines_open_frozen_binary_bytes_without_original_inputs() {
     }
     std::fs::write(a.join("a.bin"), b"\0A").unwrap();
     std::fs::write(b.join("a.bin"), b"\0B").unwrap();
+    let config: String = (0..10).map(|i| format!("key{i} = {i}\n")).collect();
+    std::fs::write(a.join("old.cfg"), &config).unwrap();
+    std::fs::write(b.join("new.cfg"), config.replace("key3 = 3", "key3 = 30")).unwrap();
+    std::fs::write(a.join("merge.txt"), "one\n").unwrap();
+    std::fs::write(b.join("merge.txt"), "<<<<<<< ours\none\n").unwrap();
     let mut gui = Gui::start("baseline_binary", None);
     gui.click(tr("baseline.title"));
     gui.click(tr("baseline.left"));
@@ -1746,19 +2149,53 @@ fn start_page_baselines_open_frozen_binary_bytes_without_original_inputs() {
     gui.click(tr("baseline.right"));
     gui.type_text(&format!("folder:{}", b.display()));
     gui.click(tr("baseline.compare"));
-    let start = Instant::now();
-    while !gui.shows(tr("baseline.captured")) {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "baseline worker did not finish"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-        gui.frame();
-    }
+    let wait_for = |gui: &mut Gui, label: &str| {
+        let start = Instant::now();
+        while !gui.shows(label) {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "baseline worker did not show {label:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+            gui.frame();
+        }
+    };
+    wait_for(&mut gui, tr("baseline.captured"));
+    let category = |key: &'static str, rest: &str| format!("{} {rest}", tr(key));
+    let renamed = category("baseline.cat.renamed_modified", "new.cfg");
+    let priority = format!("{} 1", tr("baseline.high_priority"));
+    assert!(gui.shows(&category("baseline.cat.binary_changed", "1")));
+    assert!(gui.shows(&priority));
+    assert!(gui.shows(&renamed));
+    assert!(gui.shows(&trf(
+        "baseline.renamed_from",
+        &[("path", "old.cfg".into()), ("n", "90".into())]
+    )));
+    assert!(gui.shows_text(&trf("baseline.captured_at", &[("time", String::new())])));
+    let click = |gui: &mut Gui, label: &str| {
+        gui.scroll_to(label);
+        gui.click(label);
+    };
+    click(&mut gui, &category("baseline.cat.renamed_modified", "1"));
+    assert!(gui.shows(&renamed));
+    assert!(!gui.shows(&category("baseline.cat.binary_changed", "a.bin")));
+    click(&mut gui, tr("baseline.not_rename"));
+    wait_for(&mut gui, &category("baseline.cat.added", "new.cfg"));
+    assert!(gui.shows(&category("baseline.cat.deleted", "old.cfg")));
+    let restore = trf("baseline.restore_renames", &[("n", "1".into())]);
+    click(&mut gui, &restore);
+    wait_for(&mut gui, &renamed);
+    assert!(!gui.shows(&restore));
+    click(&mut gui, &priority);
+    assert!(gui.shows(&category("baseline.cat.modified", "merge.txt")));
+    assert!(gui.shows(tr("baseline.high_priority")));
+    assert!(!gui.shows(&renamed));
+    click(&mut gui, tr("analysis.all"));
     std::fs::remove_file(a.join("a.bin")).unwrap();
     std::fs::remove_file(b.join("a.bin")).unwrap();
-    gui.scroll_to("BinaryChanged a.bin");
-    gui.click("BinaryChanged a.bin");
+    let binary = category("baseline.cat.binary_changed", "a.bin");
+    gui.scroll_to(&binary);
+    gui.click(&binary);
     let Content::Binary(view) = gui.app.tabs[gui.app.active].content.view() else {
         panic!("captured binary compare expected")
     };
@@ -1809,6 +2246,56 @@ fn captured_impact_source_opens_at_its_evidence_line() {
     let view = gui.text_view();
     assert_eq!(view.cursor_row, Some(1));
     assert!(view.panes.iter().all(|pane| pane.doc.read_only));
+}
+
+#[test]
+fn exact_impact_findings_link_to_the_folder_review_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("left/src/util.ts", "export const x = 1;\n"),
+            ("right/src/util.ts", "export const x = 2;\n"),
+            ("left/src/app.ts", "import { x } from \"./util\";\n"),
+            ("right/src/app.ts", "import { x } from \"./util\";\n"),
+        ],
+    );
+    let mut gui = Gui::with_config(
+        "impact_review_link",
+        Config {
+            web_render: false,
+            ..config()
+        },
+        compare(&[d.join("left"), d.join("right")]),
+    );
+    gui.click(tr("drawer.toggle"));
+    gui.click(tr("baseline.title"));
+    gui.click(tr("impact.title"));
+    gui.click(tr("baseline.compare"));
+    let finding = format!("{} · src/app.ts:1", tr("impact.exact"));
+    let start = Instant::now();
+    while !gui.shows(&finding) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "impact worker did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        gui.frame();
+    }
+    gui.scroll_to(tr("impact.review"));
+    gui.click(tr("impact.review"));
+    let Content::Folder(view) = &gui.app.tabs[0].content else {
+        panic!("Expected a folder comparison");
+    };
+    assert_eq!(
+        view.drawer_tab,
+        super::super::folder_view::FolderPanel::Review
+    );
+    assert_eq!(view.workspace.current.as_deref(), Some("src/app.ts"));
+    assert!(gui.shows(tr("workspace.next")));
+    assert!(gui.shows("src/app.ts"));
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
 }
 
 #[test]
@@ -2041,4 +2528,209 @@ fn dialogs_put_their_close_button_at_the_right_edge() {
     );
     assert!((0.0..20.0).contains(&about), "about: {about}");
     assert!((help - about).abs() < 0.5, "help {help}, about {about}");
+}
+
+/// Notes the controls of `view` that a screen reader would announce without a word. Text,
+/// scroll bars, rows (named by their cells), the window itself and the column splitters of
+/// tables, which egui_extras leaves unnamed, are not controls here.
+fn unnamed_controls(gui: &Gui, view: &str, found: &mut Vec<String>) {
+    use accesskit::Role;
+    for w in &gui.controls {
+        let window = w.rect.width() >= SCREEN.x && w.rect.height() >= SCREEN.y;
+        let splitter = w.role == Role::Unknown && w.rect.width() <= 8.0;
+        if matches!(
+            w.role,
+            Role::Label | Role::ScrollBar | Role::GenericContainer
+        ) || window
+            || splitter
+            || !w.rect.is_finite()
+        {
+            continue;
+        }
+        if !w.label.chars().any(char::is_alphanumeric) {
+            found.push(format!(
+                "{view}: {:?} {:?} at {:?} size {:?}",
+                w.role,
+                w.label,
+                w.rect.min,
+                w.rect.size()
+            ));
+        }
+    }
+}
+
+#[test]
+fn every_control_is_named_for_screen_readers() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("left/a.txt", "one\ntwo\nthree\n"),
+            ("base.txt", "one\n2\nthree\n"),
+            ("right/a.txt", "one\n2\n3\n"),
+            ("left/sub/b.txt", "x\n"),
+            ("right/sub/b.txt", "y\n"),
+        ],
+    );
+    for (name, shade) in [("a.png", 10u8), ("b.png", 200)] {
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([shade, 0, 0, 255]))
+            .save(d.join(name))
+            .unwrap();
+    }
+    std::fs::write(d.join("a.bin"), [0u8, 1, 2, 255]).unwrap();
+    std::fs::write(d.join("b.bin"), [0u8, 9, 2, 255]).unwrap();
+    let mut found = Vec::new();
+
+    let mut gui = Gui::start("named_controls_start", None);
+    unnamed_controls(&gui, "start page", &mut found);
+    for (open, id) in [
+        (&[tr("menu.help"), tr("menu.about")], "about"),
+        (&[tr("menu.help"), tr("help.title")], "help"),
+    ] {
+        gui.menu(open);
+        gui.frames(3);
+        unnamed_controls(&gui, id, &mut found);
+        gui.click(tr("btn.close"));
+        gui.frames(3);
+    }
+    gui.click(tr("menu.options").trim_end_matches(['.', '…']));
+    gui.frames(3);
+    unnamed_controls(&gui, "options", &mut found);
+
+    let views: [(&'static str, Vec<PathBuf>); 5] = [
+        (
+            "named_controls_text",
+            vec![d.join("left/a.txt"), d.join("right/a.txt")],
+        ),
+        (
+            "named_controls_merge",
+            vec![
+                d.join("left/a.txt"),
+                d.join("base.txt"),
+                d.join("right/a.txt"),
+            ],
+        ),
+        (
+            "named_controls_folders",
+            vec![d.join("left"), d.join("right")],
+        ),
+        (
+            "named_controls_images",
+            vec![d.join("a.png"), d.join("b.png")],
+        ),
+        (
+            "named_controls_binary",
+            vec![d.join("a.bin"), d.join("b.bin")],
+        ),
+    ];
+    for (name, paths) in views {
+        let mut gui = Gui::start(name, compare(&paths));
+        gui.settle();
+        unnamed_controls(&gui, name, &mut found);
+        if gui.shows(tr("drawer.toggle")) {
+            gui.click(tr("drawer.toggle"));
+            gui.frames(3);
+            unnamed_controls(&gui, &format!("{name} with the side panel"), &mut found);
+        }
+    }
+    assert!(found.is_empty(), "controls without a name: {found:#?}");
+}
+
+/// Notes controls of `view` that reach past the window's edges or lie over one another.
+fn crowded_controls(gui: &Gui, view: &str, found: &mut Vec<String>) {
+    use accesskit::Role;
+    let controls: Vec<&Widget> = gui
+        .controls
+        .iter()
+        .filter(|w| {
+            w.rect.is_finite()
+                && w.rect.area() > 0.0
+                && !matches!(
+                    w.role,
+                    Role::Label
+                        | Role::ScrollBar
+                        | Role::GenericContainer
+                        | Role::Document
+                        | Role::Image
+                        | Role::TitleBar
+                        | Role::Unknown
+                )
+        })
+        .collect();
+    for w in &controls {
+        if w.rect.left() < -1.0 || w.rect.right() > gui.screen.x + 1.0 {
+            found.push(format!(
+                "{view}: {:?} {:?} is cut off at {:?}",
+                w.role, w.label, w.rect
+            ));
+        }
+    }
+    for (i, a) in controls.iter().enumerate() {
+        for b in &controls[i + 1..] {
+            let both = a.rect.intersect(b.rect);
+            if both.width() > 2.0 && both.height() > 2.0 {
+                found.push(format!(
+                    "{view}: {:?} at {:?} lies over {:?} at {:?}",
+                    a.label, a.rect, b.label, b.rect
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn controls_fit_scaled_and_narrow_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("left/a.txt", "one\ntwo\nthree\n"),
+            ("base.txt", "one\n2\nthree\n"),
+            ("right/a.txt", "one\n2\n3\n"),
+            ("left/sub/b.txt", "x\n"),
+            ("right/sub/b.txt", "y\n"),
+        ],
+    );
+    let views: [(&'static str, Option<OpenRequest>); 4] = [
+        ("fit_start", None),
+        (
+            "fit_text",
+            compare(&[d.join("left/a.txt"), d.join("right/a.txt")]),
+        ),
+        (
+            "fit_merge",
+            compare(&[
+                d.join("left/a.txt"),
+                d.join("base.txt"),
+                d.join("right/a.txt"),
+            ]),
+        ),
+        ("fit_folders", compare(&[d.join("left"), d.join("right")])),
+    ];
+    // Window sizes in points with their scale: the default window at 100%, 150% and 200%,
+    // a smaller one at 150%, and the smallest window the app allows.
+    let sizes = [
+        (egui::vec2(1280.0, 820.0), 1.0),
+        (egui::vec2(1280.0, 820.0), 1.5),
+        (egui::vec2(1280.0, 820.0), 2.0),
+        (egui::vec2(960.0, 640.0), 1.5),
+        (egui::vec2(640.0, 400.0), 2.0),
+    ];
+    let mut found = Vec::new();
+    for (name, open) in views {
+        let mut gui = Gui::start(name, open);
+        for (size, scale) in sizes {
+            gui.screen = size;
+            gui.ctx.set_pixels_per_point(scale);
+            gui.frames(4);
+            crowded_controls(
+                &gui,
+                &format!("{name} {}x{} at {}%", size.x, size.y, scale * 100.0),
+                &mut found,
+            );
+        }
+    }
+    assert!(found.is_empty(), "crowded controls: {found:#?}");
 }

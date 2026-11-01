@@ -1669,7 +1669,7 @@ fn recent_card(ui: &mut egui::Ui, w: f32, paths: &[String]) -> egui::Response {
     let hovered = resp.hovered();
     ui.painter().rect(
         rect,
-        10.0,
+        theme::radius::LG,
         if hovered { p.surface_alt } else { p.surface },
         Stroke::new(1.0_f32, if hovered { p.accent } else { p.border }),
         egui::StrokeKind::Inside,
@@ -1711,17 +1711,17 @@ fn recent_card(ui: &mut egui::Ui, w: f32, paths: &[String]) -> egui::Response {
         egui::pos2(x, rect.center().y - if has_dirs { 8.0 } else { 0.0 }),
         Align2::LEFT_CENTER,
         names.join("  ↔  "),
-        theme::semibold(13.5),
+        theme::semibold(theme::size::CONTROL),
         p.text,
     );
     clip.text(
         egui::pos2(x, rect.center().y + 9.0),
         Align2::LEFT_CENTER,
         dirs.join("  ↔  "),
-        FontId::proportional(12.0),
+        FontId::proportional(theme::size::SMALL),
         p.text_dim,
     );
-    widgets::focus_ring(ui, &resp, rect, 10.0);
+    widgets::focus_ring(ui, &resp, rect, theme::radius::LG);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, names.join(" ↔ ")));
     resp.on_hover_text(paths.join("\n"))
         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1801,7 +1801,7 @@ fn path_status(ui: &egui::Ui, field: &egui::Response, text: &str) {
     if missing {
         ui.painter().rect_stroke(
             r,
-            7.0,
+            theme::radius::MD,
             Stroke::new(1.5_f32, p.danger),
             egui::StrokeKind::Inside,
         );
@@ -1821,7 +1821,8 @@ fn option_result_row(ui: &mut egui::Ui, icon: Icon, label: &str, tab: &str) -> e
         return resp;
     }
     if resp.hovered() {
-        ui.painter().rect_filled(rect, 7.0, p.control_hover);
+        ui.painter()
+            .rect_filled(rect, theme::radius::MD, p.control_hover);
     }
     crate::ui::icons::paint(
         ui.painter(),
@@ -1838,17 +1839,17 @@ fn option_result_row(ui: &mut egui::Ui, icon: Icon, label: &str, tab: &str) -> e
         egui::pos2(x, rect.center().y - 8.0),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(13.5),
+        FontId::proportional(theme::size::CONTROL),
         p.text,
     );
     clip.text(
         egui::pos2(x, rect.center().y + 9.0),
         Align2::LEFT_CENTER,
         tab,
-        FontId::proportional(12.0),
+        FontId::proportional(theme::size::SMALL),
         p.text_dim,
     );
-    widgets::focus_ring(ui, &resp, rect, 7.0);
+    widgets::focus_ring(ui, &resp, rect, theme::radius::MD);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -1892,7 +1893,7 @@ fn drop_overlay(ctx: &egui::Context, filling_dialog: bool) {
         c + vec2(0.0, 14.0),
         Align2::CENTER_CENTER,
         title,
-        theme::semibold(20.0),
+        theme::semibold(theme::size::HEADING),
         p.text,
     );
     if !filling_dialog {
@@ -1900,7 +1901,7 @@ fn drop_overlay(ctx: &egui::Context, filling_dialog: bool) {
             c + vec2(0.0, 42.0),
             Align2::CENTER_CENTER,
             tr("app.drop_overlay_desc"),
-            FontId::proportional(14.0),
+            FontId::proportional(theme::size::BODY),
             p.text_dim,
         );
     }
@@ -4000,19 +4001,21 @@ impl OxideMergeApp {
                         if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                             go = true;
                         }
-                        ui.add_enabled_ui(!d.commits.is_empty(), |ui| {
-                            ui.menu_button("⏷", |ui| {
-                                ui.set_min_width(420.0);
-                                for (hash, subject) in &d.commits {
-                                    let text = egui::RichText::new(format!("{hash}  {subject}"));
-                                    if ui.button(text).clicked() {
-                                        d.rev = hash.clone();
-                                        ui.close();
-                                    }
+                        let commits = widgets::icon_button_enabled(
+                            ui,
+                            !d.commits.is_empty(),
+                            Icon::Next,
+                            tr("label.recent_commits"),
+                        );
+                        egui::Popup::menu(&commits).show(|ui| {
+                            ui.set_min_width(420.0);
+                            for (hash, subject) in &d.commits {
+                                let text = egui::RichText::new(format!("{hash}  {subject}"));
+                                if ui.button(text).clicked() {
+                                    d.rev = hash.clone();
+                                    ui.close();
                                 }
-                            })
-                            .response
-                            .on_hover_text(tr("label.recent_commits"));
+                            }
                         });
                     });
                     ui.end_row();
@@ -4277,6 +4280,7 @@ impl OxideMergeApp {
                 ui.scope_id().with("title_bar"),
                 Sense::click_and_drag(),
             );
+            bar.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TitleBar, true, "OxideMerge"));
             if bar.drag_started_by(egui::PointerButton::Primary) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
@@ -4303,7 +4307,12 @@ impl OxideMergeApp {
             {
                 self.about = true;
             }
-            ui.label(egui::RichText::new("OxideMerge").font(theme::semibold(14.5)));
+            // Narrow windows give the name's room to the menus and icons.
+            if ui.available_width() > 640.0 {
+                ui.label(
+                    egui::RichText::new("OxideMerge").font(theme::semibold(theme::size::SUBTITLE)),
+                );
+            }
             ui.add_space(12.0);
             for (i, key) in MENUS.into_iter().enumerate() {
                 ui.menu_button(tr(key), |ui| {
@@ -4320,7 +4329,8 @@ impl OxideMergeApp {
                 let wide = ui.available_width() > 420.0;
                 // Icons that no longer fit are left out; the menus offer the same commands.
                 let fits = |ui: &egui::Ui| ui.available_width() >= 36.0;
-                if !wide && widgets::icon_button(ui, Icon::Palette, &palette).clicked() {
+                if !wide && fits(ui) && widgets::icon_button(ui, Icon::Palette, &palette).clicked()
+                {
                     m.picked = Some(Cmd::Palette);
                 }
                 let options = tr("menu.options").trim_end_matches(['.', '…']);
@@ -4700,9 +4710,9 @@ impl OxideMergeApp {
                         let full = t.title();
                         let (title, folders) = tab_label(&full, &t.paths());
                         let font = if active {
-                            theme::semibold(13.0)
+                            theme::semibold(theme::size::DENSE)
                         } else {
-                            FontId::proportional(13.0)
+                            FontId::proportional(theme::size::DENSE)
                         };
                         let galley = ui.painter().layout_no_wrap(
                             shorten(&title, 40),
@@ -4712,7 +4722,7 @@ impl OxideMergeApp {
                         let sub = folders.map(|f| {
                             ui.painter().layout_no_wrap(
                                 shorten(&f, 36),
-                                FontId::proportional(11.5),
+                                FontId::proportional(theme::size::CAPTION),
                                 p.text_dim,
                             )
                         });
@@ -4795,7 +4805,7 @@ impl OxideMergeApp {
                         let show_close =
                             (active && !modified) || resp.hovered() || close_resp.hovered();
                         if close_resp.hovered() {
-                            painter.rect_filled(close_rect, 5.0, p.control_active);
+                            painter.rect_filled(close_rect, theme::radius::SM, p.control_active);
                         }
                         if show_close {
                             crate::ui::icons::paint(
@@ -4807,7 +4817,12 @@ impl OxideMergeApp {
                         } else if modified {
                             painter.circle_filled(close_rect.center(), 4.0, p.text);
                         }
-                        widgets::focus_ring(ui, &resp, rect.shrink2(vec2(0.0, 3.0)), 8.0);
+                        widgets::focus_ring(
+                            ui,
+                            &resp,
+                            rect.shrink2(vec2(0.0, 3.0)),
+                            theme::radius::MD,
+                        );
                         let close_resp = close_resp.on_hover_text(Cmd::CloseTab.tip());
                         if close_resp.clicked() || resp.middle_clicked() {
                             close = Some(i);
@@ -4941,9 +4956,13 @@ impl OxideMergeApp {
             }
             for (k, part) in s.split("  |  ").enumerate() {
                 if k > 0 {
-                    ui.label(egui::RichText::new("•").color(p.border_strong).size(11.0));
+                    ui.label(
+                        egui::RichText::new("•")
+                            .color(p.border_strong)
+                            .size(theme::size::CAPTION),
+                    );
                 }
-                let text = egui::RichText::new(part).size(12.5);
+                let text = egui::RichText::new(part).size(theme::size::SMALL);
                 ui.label(if k == 0 {
                     text.color(p.text)
                 } else {
@@ -4956,7 +4975,11 @@ impl OxideMergeApp {
                     .find(|l| l.code == i18n::current_language())
                     .map(|l| l.name.as_str())
                     .unwrap_or_default();
-                ui.label(egui::RichText::new(lang).size(12.5).color(p.text_dim));
+                ui.label(
+                    egui::RichText::new(lang)
+                        .size(theme::size::SMALL)
+                        .color(p.text_dim),
+                );
                 let (r, _) = ui.allocate_exact_size(vec2(13.0, 13.0), Sense::hover());
                 crate::ui::icons::paint(ui.painter(), r, Icon::Globe, p.text_dim);
             });
@@ -4985,10 +5008,13 @@ impl OxideMergeApp {
                         ui.add_space(8.0);
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.label(egui::RichText::new("OxideMerge").font(theme::semibold(30.0)));
+                            ui.label(
+                                egui::RichText::new("OxideMerge")
+                                    .font(theme::semibold(theme::size::DISPLAY)),
+                            );
                             ui.label(
                                 egui::RichText::new(tr("app.tagline"))
-                                    .size(15.0)
+                                    .size(theme::size::SUBTITLE)
                                     .color(p.text_dim),
                             );
                         });
@@ -5004,7 +5030,7 @@ impl OxideMergeApp {
                     }
                     ui.add_space(4.0);
                     widgets::card(ui)
-                        .inner_margin(Margin::symmetric(10, 6))
+                        .inner_margin(Margin::symmetric(theme::space::CONTROL, theme::space::SM))
                         .show(ui, |ui| {
                             ui.set_width(w - 22.0);
                             ui.horizontal(|ui| {
@@ -5014,14 +5040,14 @@ impl OxideMergeApp {
                                 }
                                 ui.label(
                                     egui::RichText::new(tr("start.conflict_desc"))
-                                        .size(12.5)
+                                        .size(theme::size::SMALL)
                                         .color(p.text_dim),
                                 );
                             });
                         });
                     let mut captured = None;
                     widgets::card(ui)
-                        .inner_margin(Margin::symmetric(10, 6))
+                        .inner_margin(Margin::symmetric(theme::space::CONTROL, theme::space::SM))
                         .show(ui, |ui| {
                             ui.set_width(w - 22.0);
                             let open = self.baseline_start.open;
@@ -5033,7 +5059,7 @@ impl OxideMergeApp {
                                 }
                                 ui.label(
                                     egui::RichText::new(tr("start.baselines_desc"))
-                                        .size(12.5)
+                                        .size(theme::size::SMALL)
                                         .color(p.text_dim),
                                 );
                             });
@@ -5052,7 +5078,7 @@ impl OxideMergeApp {
                     if self.cfg.recent_compares.is_empty() {
                         ui.add_space(16.0);
                         widgets::card(ui)
-                            .inner_margin(Margin::same(16))
+                            .inner_margin(Margin::same(theme::space::XL))
                             .show(ui, |ui| {
                                 ui.set_width(w - 34.0);
                                 ui.horizontal(|ui| {
@@ -5061,11 +5087,11 @@ impl OxideMergeApp {
                                         ui.spacing_mut().item_spacing.y = 2.0;
                                         ui.label(
                                             egui::RichText::new(tr("start.try_title"))
-                                                .font(theme::semibold(14.5)),
+                                                .font(theme::semibold(theme::size::SUBTITLE)),
                                         );
                                         ui.label(
                                             egui::RichText::new(tr("start.try_desc"))
-                                                .size(12.5)
+                                                .size(theme::size::SMALL)
                                                 .color(p.text_dim),
                                         );
                                     });
@@ -5211,13 +5237,16 @@ impl OxideMergeApp {
         let mut go = false;
         let mut more = false;
         widgets::card(ui)
-            .inner_margin(Margin::same(16))
+            .inner_margin(Margin::same(theme::space::XL))
             .show(ui, |ui| {
                 ui.set_width(w - 34.0);
                 ui.spacing_mut().item_spacing.y = 8.0;
                 ui.horizontal(|ui| {
                     widgets::inline_icon(ui, Icon::Compare, p.accent);
-                    ui.label(egui::RichText::new(tr("start.compare")).font(theme::semibold(15.5)));
+                    ui.label(
+                        egui::RichText::new(tr("start.compare"))
+                            .font(theme::semibold(theme::size::SUBTITLE)),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         widgets::toggle_button(
                             ui,
@@ -5285,7 +5314,7 @@ impl OxideMergeApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(tr("start.drop_hint"))
-                                .size(12.0)
+                                .size(theme::size::SMALL)
                                 .color(p.text_dim),
                         );
                         widgets::inline_icon(ui, Icon::Drop, p.text_dim);
@@ -5397,8 +5426,8 @@ impl OxideMergeApp {
             egui::Frame::new()
                 .fill(p.surface_alt)
                 .stroke(Stroke::new(1.0_f32, p.border))
-                .corner_radius(10)
-                .inner_margin(Margin::same(12))
+                .corner_radius(theme::radius::LG)
+                .inner_margin(Margin::same(theme::space::LG))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     egui::Grid::new("open_opts")
@@ -6292,7 +6321,7 @@ impl OxideMergeApp {
                     egui::Frame::new()
                         .fill(p.surface)
                         .stroke(Stroke::new(1.0_f32, p.border_strong))
-                        .corner_radius(10)
+                        .corner_radius(theme::radius::LG)
                         .shadow(ctx.global_style().visuals.popup_shadow)
                         .inner_margin(Margin {
                             left: 12,
@@ -6311,8 +6340,10 @@ impl OxideMergeApp {
                                     ui.painter().circle_filled(r.center(), 4.0, accent);
                                 }
                                 ui.add(
-                                    egui::Label::new(egui::RichText::new(&t.text).size(13.5))
-                                        .wrap(),
+                                    egui::Label::new(
+                                        egui::RichText::new(&t.text).size(theme::size::CONTROL),
+                                    )
+                                    .wrap(),
                                 );
                                 if let Some(tab) = t.undo_tab {
                                     if widgets::ghost_icon_button(ui, Icon::Undo, tr("cmd.undo"))
@@ -6564,7 +6595,7 @@ impl eframe::App for OxideMergeApp {
                 .show(root, |ui| self.tab_bar(ui));
         }
         egui::Panel::bottom("status")
-            .frame(chrome.inner_margin(Margin::symmetric(12, 3)))
+            .frame(chrome.inner_margin(Margin::symmetric(theme::space::LG, theme::space::XXS)))
             .show(root, |ui| self.status_bar(ui));
 
         let colors = theme::colors(self.cfg.dark_mode);

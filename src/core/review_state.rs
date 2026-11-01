@@ -45,6 +45,19 @@ pub struct Decision {
     pub tags: Vec<String>,
     pub stale: bool,
     pub hunks: BTreeMap<String, Box<Decision>>,
+    /// What the compared files held, wherever they are: finds the decision again after a rename.
+    pub content: String,
+    /// The path the decision was made on, when it followed the content to another path.
+    pub renamed_from: Option<String>,
+    /// Several paths hold that content: the decision was copied to each, to be reviewed again.
+    pub ambiguous_rename: bool,
+}
+
+/// Fingerprints of one compared path: with the path (`fingerprint`) and without (`content`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Prints {
+    pub fingerprint: String,
+    pub content: String,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -132,10 +145,52 @@ impl Workspace {
         }
         s
     }
-    /// Rebase never transfers an accepted state to a different fingerprint automatically.
-    pub fn reconcile(&mut self, fingerprints: &BTreeMap<String, String>) {
+    /// Rebase never transfers an accepted state to a different fingerprint automatically. A
+    /// decision whose path is gone follows its content to the one new path holding exactly it;
+    /// when several do, each gets a stale copy flagged for review instead. When several gone paths
+    /// held that content, the first one's decision moves, flagged, and the others stay put.
+    pub fn reconcile(&mut self, prints: &BTreeMap<String, Prints>) {
+        let mut undecided: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+        for (path, p) in prints {
+            if !self.entries.contains_key(path) {
+                undecided.entry(p.content.as_str()).or_default().push(path);
+            }
+        }
+        let mut orphans: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (path, d) in &self.entries {
+            if !prints.contains_key(path) && undecided.contains_key(d.content.as_str()) {
+                orphans
+                    .entry(d.content.clone())
+                    .or_default()
+                    .push(path.clone());
+            }
+        }
+        for (content, olds) in orphans {
+            let targets = &undecided[content.as_str()];
+            let ambiguous = olds.len() > 1 || targets.len() > 1;
+            let old = &olds[0];
+            let Some(decision) = self.entries.remove(old) else {
+                continue;
+            };
+            for &new in targets {
+                let mut d = decision.clone();
+                d.fingerprint = prints[new].fingerprint.clone();
+                d.renamed_from = Some(old.clone());
+                d.ambiguous_rename = ambiguous;
+                if ambiguous {
+                    d.stale = true;
+                    for h in d.hunks.values_mut() {
+                        h.stale = true;
+                    }
+                }
+                if self.current.as_deref() == Some(old.as_str()) {
+                    self.current = Some(new.clone());
+                }
+                self.entries.insert(new.clone(), d);
+            }
+        }
         for (path, d) in &mut self.entries {
-            if fingerprints.get(path) != Some(&d.fingerprint) {
+            if prints.get(path).map(|p| &p.fingerprint) != Some(&d.fingerprint) {
                 d.stale = true;
                 for h in d.hunks.values_mut() {
                     h.stale = true;
@@ -155,8 +210,15 @@ fn validate_decision(d: &Decision, depth: usize) -> Result<()> {
         || d.id.len() > 128
         || d.fingerprint.len() > 128
         || d.current_hunk.as_ref().is_some_and(|id| id.len() > 128)
+        || d.content.len() > 128
     {
         bail!("Review annotation limits exceeded");
+    }
+    if d.renamed_from
+        .as_deref()
+        .is_some_and(|p| !super::review::safe_path(p))
+    {
+        bail!("Invalid review decision path");
     }
     for h in d.hunks.values() {
         validate_decision(h, depth + 1)?;
@@ -170,7 +232,7 @@ pub fn policy_digest(
 ) -> String {
     analysis::identity(&(options, folder, filter))
 }
-pub fn fingerprint(path: &str, roots: &[PathBuf], options: &DiffOptions) -> Result<String> {
+pub fn prints(path: &str, roots: &[PathBuf], options: &DiffOptions) -> Result<Prints> {
     let mut sides = Vec::new();
     for root in roots {
         let file = root.join(path);
@@ -182,11 +244,18 @@ pub fn fingerprint(path: &str, roots: &[PathBuf], options: &DiffOptions) -> Resu
             _ => bail!("Review state supports regular files only: {path}"),
         }
     }
-    Ok(fingerprint_digests(path, &sides, options))
+    Ok(prints_of_digests(path, &sides, options))
 }
 pub fn fingerprint_digests(path: &str, sides: &[Option<String>], options: &DiffOptions) -> String {
     let converter = super::unpacker::find(&options.unpackers, std::path::Path::new(path));
     analysis::identity(&(path, sides, options, converter))
+}
+pub fn prints_of_digests(path: &str, sides: &[Option<String>], options: &DiffOptions) -> Prints {
+    let converter = super::unpacker::find(&options.unpackers, std::path::Path::new(path));
+    Prints {
+        fingerprint: fingerprint_digests(path, sides, options),
+        content: analysis::identity(&(sides, options, converter.map(|c| &c.command))),
+    }
 }
 /// Opt-in additive annotation: comparison tables and CSV columns retain their old shape.
 pub fn annotate_report(
@@ -256,6 +325,127 @@ mod tests {
     }
 
     #[test]
+    fn decisions_follow_renamed_content_and_ambiguous_renames_are_flagged() {
+        let accepted = |content: &str| Decision {
+            fingerprint: format!("old-{content}"),
+            content: content.into(),
+            state: State::Accepted,
+            comment: "looked fine".into(),
+            ..Default::default()
+        };
+        let prints = |entries: &[(&str, &str)]| -> BTreeMap<String, Prints> {
+            entries
+                .iter()
+                .map(|(path, content)| {
+                    let p = Prints {
+                        fingerprint: format!("{path}-{content}"),
+                        content: (*content).into(),
+                    };
+                    ((*path).into(), p)
+                })
+                .collect()
+        };
+
+        // One new path holds exactly the content: the decision moves there, still accepted.
+        let mut w = Workspace {
+            current: Some("old.txt".into()),
+            ..Default::default()
+        };
+        w.entries.insert("old.txt".into(), accepted("C"));
+        w.reconcile(&prints(&[("new.txt", "C"), ("other.txt", "D")]));
+        let d = &w.entries["new.txt"];
+        assert!(!w.entries.contains_key("old.txt"));
+        assert_eq!(
+            (d.state, d.stale, d.ambiguous_rename),
+            (State::Accepted, false, false)
+        );
+        assert_eq!(d.renamed_from.as_deref(), Some("old.txt"));
+        assert_eq!(d.fingerprint, "new.txt-C");
+        assert_eq!(d.comment, "looked fine");
+        assert_eq!(w.current.as_deref(), Some("new.txt"));
+        assert_eq!(w.summary(["new.txt".into()]).accepted, 1);
+        w.validate().unwrap();
+
+        // Two paths hold it: each gets a stale copy to review again.
+        let mut w = Workspace::default();
+        w.entries.insert("old.txt".into(), accepted("C"));
+        w.reconcile(&prints(&[("a/x.txt", "C"), ("b/x.txt", "C")]));
+        for path in ["a/x.txt", "b/x.txt"] {
+            let d = &w.entries[path];
+            assert!(d.stale && d.ambiguous_rename, "{path}");
+            assert_eq!(d.renamed_from.as_deref(), Some("old.txt"));
+        }
+        assert_eq!(w.summary(["a/x.txt".into(), "b/x.txt".into()]).accepted, 0);
+
+        // Two gone paths held the same content: neither claim is trusted.
+        let mut w = Workspace::default();
+        w.entries.insert("one.txt".into(), accepted("C"));
+        w.entries.insert("two.txt".into(), accepted("C"));
+        w.entries.get_mut("two.txt").unwrap().comment = "second opinion".into();
+        w.reconcile(&prints(&[("moved.txt", "C")]));
+        assert!(w.entries["moved.txt"].stale && w.entries["moved.txt"].ambiguous_rename);
+        assert_eq!(
+            w.entries["moved.txt"].renamed_from.as_deref(),
+            Some("one.txt")
+        );
+        assert!(!w.entries.contains_key("one.txt"));
+        let kept = &w.entries["two.txt"];
+        assert!(kept.stale && kept.comment == "second opinion");
+
+        // Renamed and edited, decided without content, or onto a path already decided: no move.
+        let mut w = Workspace::default();
+        w.entries.insert("edited.txt".into(), accepted("C"));
+        w.entries.insert(
+            "legacy.txt".into(),
+            Decision {
+                content: String::new(),
+                ..accepted("L")
+            },
+        );
+        w.entries.insert("gone.txt".into(), accepted("K"));
+        w.entries.insert(
+            "kept.txt".into(),
+            Decision {
+                fingerprint: "kept.txt-K".into(),
+                ..accepted("K")
+            },
+        );
+        w.reconcile(&prints(&[
+            ("renamed.txt", "C2"),
+            ("legacy2.txt", "L"),
+            ("kept.txt", "K"),
+        ]));
+        assert!(w.entries["edited.txt"].stale && w.entries["legacy.txt"].stale);
+        assert!(!w.entries.contains_key("renamed.txt") && !w.entries.contains_key("legacy2.txt"));
+        assert!(w.entries["gone.txt"].stale);
+        assert_eq!(w.entries["kept.txt"].renamed_from, None);
+        assert!(!w.entries["kept.txt"].stale);
+
+        w.entries.get_mut("kept.txt").unwrap().renamed_from = Some("../escape".into());
+        assert!(w.validate().is_err());
+    }
+
+    #[test]
+    fn content_prints_ignore_the_path_but_not_the_bytes_or_rules() {
+        let sides = [Some("a".into()), Some("b".into())];
+        let options = DiffOptions::default();
+        let here = prints_of_digests("x/a.txt", &sides, &options);
+        let there = prints_of_digests("y/b.txt", &sides, &options);
+        assert_eq!(here.content, there.content);
+        assert_ne!(here.fingerprint, there.fingerprint);
+        let edited = prints_of_digests("x/a.txt", &[Some("a".into()), Some("c".into())], &options);
+        assert_ne!(here.content, edited.content);
+        let strict = DiffOptions {
+            ignore_case: !options.ignore_case,
+            ..options
+        };
+        assert_ne!(
+            here.content,
+            prints_of_digests("x/a.txt", &sides, &strict).content
+        );
+    }
+
+    #[test]
     fn stale_decisions_are_never_silently_reaccepted() {
         let mut w = Workspace::default();
         w.entries.insert(
@@ -266,7 +456,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        w.reconcile(&BTreeMap::from([("a.txt".into(), "new".into())]));
+        w.reconcile(&BTreeMap::from([(
+            "a.txt".into(),
+            Prints {
+                fingerprint: "new".into(),
+                content: "new".into(),
+            },
+        )]));
         let s = w.summary(["a.txt".into(), "b.txt".into()]);
         assert_eq!((s.total, s.accepted, s.unreviewed, s.stale), (2, 0, 1, 1));
         w.entries.get_mut("a.txt").unwrap().comment = "x".repeat(16_385);

@@ -447,6 +447,9 @@ impl ImageView {
 
         let all_rect = Rect::from_min_max(pos2(avail.left(), avail.top() + header_h), avail.max);
         let resp = ui.interact(all_rect, self.id.with("drag"), Sense::click_and_drag());
+        resp.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::Role::Image, true, tr("help.image_compare"))
+        });
         if resp.dragged() {
             self.offset += resp.drag_delta();
         }
@@ -506,17 +509,7 @@ impl ImageView {
             header_rect.bottom() - 0.5,
             Stroke::new(1.0_f32, pal.border),
         );
-        let checker = if ui.visuals().dark_mode {
-            [
-                Color32::from_rgb(0x26, 0x27, 0x2C),
-                Color32::from_rgb(0x2E, 0x30, 0x35),
-            ]
-        } else {
-            [
-                Color32::from_rgb(0xF4, 0xF5, 0xF7),
-                Color32::from_rgb(0xE8, 0xEA, 0xEE),
-            ]
-        };
+        let checker = pal.checker;
         for p in 0..panes {
             let x0 = avail.left() + p as f32 * pane_w;
             let header =
@@ -546,10 +539,11 @@ impl ImageView {
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(name)
-                                                .font(crate::ui::theme::semibold(13.5)),
-                                        )
+                                        egui::Label::new(egui::RichText::new(name).font(
+                                            crate::ui::theme::semibold(
+                                                crate::ui::theme::size::CONTROL,
+                                            ),
+                                        ))
                                         .truncate(),
                                     )
                                     .on_hover_text(path);
@@ -564,7 +558,10 @@ impl ImageView {
                             ImgMode::Blink => tr("img.blink"),
                             _ => tr("img.difference"),
                         };
-                        ui.label(egui::RichText::new(title).font(crate::ui::theme::semibold(13.5)));
+                        ui.label(
+                            egui::RichText::new(title)
+                                .font(crate::ui::theme::semibold(crate::ui::theme::size::CONTROL)),
+                        );
                         widgets::chip(ui, &dims.join(" / "), pal.text_dim, pal.control);
                         if mode == ImgMode::Blink {
                             widgets::side_chip(ui, self.blink_side(ui), n);

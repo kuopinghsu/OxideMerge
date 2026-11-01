@@ -38,7 +38,8 @@ pub struct MarkdownView {
     rows: Vec<Row>,
     /// What differs within each block of each row, page by page.
     marks: Vec<Vec<Option<Marks>>>,
-    /// Runs of rows that differ.
+    /// The rows that differ, each a difference of its own even next to another: a block is a
+    /// whole paragraph, list item or table.
     diffs: Vec<Range<usize>>,
     cur: Option<usize>,
     /// The row compared side by side: outlined, and where stepping through differences starts.
@@ -69,19 +70,10 @@ impl MarkdownView {
                 }
             }
         }
-        let mut diffs = Vec::new();
-        let mut i = 0;
-        while i < rows.len() {
-            if rows[i].changed {
-                let start = i;
-                while i < rows.len() && rows[i].changed {
-                    i += 1;
-                }
-                diffs.push(start..i);
-            } else {
-                i += 1;
-            }
-        }
+        let diffs = (0..rows.len())
+            .filter(|&i| rows[i].changed)
+            .map(|i| i..i + 1)
+            .collect();
         MarkdownView {
             heights: vec![ESTIMATE; rows.len()],
             pages,
@@ -401,7 +393,7 @@ impl MarkdownView {
                             };
                             ui.painter().rect_stroke(
                                 rect,
-                                3.0,
+                                crate::ui::theme::radius::XS,
                                 Stroke::new(1.5_f32, color),
                                 StrokeKind::Inside,
                             );
@@ -789,19 +781,21 @@ mod tests {
     }
 
     #[test]
-    fn differences_are_runs_of_changed_rows_and_can_be_stepped_through() {
+    fn each_changed_row_is_a_difference_and_can_be_stepped_through() {
         let left = vec![block("a"), block("b"), block("c"), block("d")];
         let right = vec![block("a"), block("B"), block("c"), block("D"), block("e")];
         let opts = DiffOptions::default();
         let mut v = MarkdownView::new(vec![left, right], vec!["l".into(), "r".into()], &opts);
-        assert_eq!(v.diffs, [1..2, 3..5]);
+        assert_eq!(v.diffs, [1..2, 3..4, 4..5]);
         assert_eq!(v.outcome(), Outcome::Different);
         assert!(!v.prev_diff());
         assert!(v.next_diff());
         assert_eq!((v.cur, v.cursor, v.scroll_to), (Some(0), Some(1), Some(1)));
         assert!(v.next_diff());
-        assert!(!v.next_diff());
         assert_eq!((v.cur, v.cursor), (Some(1), Some(3)));
+        assert!(v.next_diff());
+        assert!(!v.next_diff());
+        assert_eq!((v.cur, v.cursor), (Some(2), Some(4)));
         v.first_diff();
         assert_eq!((v.cur, v.cursor), (Some(0), Some(1)));
         // A clicked row becomes the compared one; stepping goes on from there.
@@ -810,12 +804,59 @@ mod tests {
         assert!(v.prev_diff());
         assert_eq!((v.cur, v.cursor), (Some(0), Some(1)));
         v.click(4, 0);
-        assert_eq!((v.cur, v.cursor), (Some(1), Some(4)));
+        assert_eq!((v.cur, v.cursor), (Some(2), Some(4)));
         assert!(!v.next_diff());
         assert!(v.prev_diff());
         assert_eq!(v.cur, Some(1));
         let same = MarkdownView::new(vec![vec![block("a")], vec![block("a")]], Vec::new(), &opts);
         assert_eq!(same.outcome(), Outcome::Identical);
+    }
+
+    /// A page of `samples/web` with its known issues filled in, as its script does in a browser.
+    fn release_notes(html: &str) -> Vec<Block> {
+        let list = html.find("const issues = [").unwrap();
+        let end = list + html[list..].find("];").unwrap();
+        let items: String = html[list..end]
+            .lines()
+            .skip(1)
+            .map(|l| l.trim().trim_end_matches(',').trim_matches('"'))
+            .filter(|l| !l.is_empty())
+            .map(|l| format!("<li>{l}</li>"))
+            .collect();
+        let html = html.replace(
+            r#"<ul id="issues"></ul>"#,
+            &format!(r#"<ul id="issues">{items}</ul>"#),
+        );
+        web_markdown::html_to_blocks(&html, None)
+    }
+
+    #[test]
+    fn stepping_stops_at_every_changed_block_of_the_three_release_notes() {
+        let pages = vec![
+            release_notes(include_str!("../../samples/web/left.html")),
+            release_notes(include_str!("../../samples/web/base.html")),
+            release_notes(include_str!("../../samples/web/right.html")),
+        ];
+        let labels = vec!["left".into(), "base".into(), "right".into()];
+        let mut v = MarkdownView::new(pages, labels, &DiffOptions::default());
+        let mut stops = Vec::new();
+        while v.next_diff() {
+            let row = &v.rows[v.cursor.unwrap()];
+            stops.push(row.cells[2].map_or(String::new(), |b| v.pages[2][b].text.clone()));
+        }
+        assert_eq!(stops.len(), v.rows.iter().filter(|r| r.changed).count());
+        assert!(
+            stops.iter().any(|s| s == "- Tags can have colors"),
+            "{stops:#?}"
+        );
+        assert!(
+            stops[stops.len() - 2].starts_with("- Sync can pause"),
+            "{stops:#?}"
+        );
+        assert_eq!(
+            stops.last().map(String::as_str),
+            Some("- Colored tags are not shown in exported PDF files")
+        );
     }
 
     #[test]

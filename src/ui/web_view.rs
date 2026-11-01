@@ -532,7 +532,11 @@ impl WebView {
         ui.vertical_centered(|ui| {
             ui.add_space((ui.available_height() * 0.35).max(24.0));
             if let Some(e) = &self.error {
-                ui.label(egui::RichText::new(e).color(pal.danger).size(14.0));
+                ui.label(
+                    egui::RichText::new(e)
+                        .color(pal.danger)
+                        .size(crate::ui::theme::size::BODY),
+                );
             } else {
                 ui.spinner();
                 ui.add_space(8.0);
