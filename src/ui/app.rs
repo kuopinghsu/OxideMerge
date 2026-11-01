@@ -206,6 +206,17 @@ impl Tab {
         temps
     }
 
+    /// The files the tab compares: where its text files are now (after Save As), otherwise
+    /// what it was opened with.
+    fn paths(&self) -> Vec<PathBuf> {
+        if let Content::Text(v) = self.content.view() {
+            if let Some(paths) = v.panes.iter().map(|p| p.doc.path.clone()).collect() {
+                return paths;
+            }
+        }
+        self.source.clone()
+    }
+
     fn title(&self) -> String {
         match &self.content {
             Content::Folder(v) => v.title(),
@@ -1599,15 +1610,11 @@ fn tab_label(full: &str, source: &[PathBuf]) -> (String, Option<String>) {
     if parts.len() < 2 || parts.iter().any(|p| *p != parts[0]) || source.len() != parts.len() {
         return (full.to_string(), None);
     }
-    let dirs: Vec<Vec<String>> = source
+    let dirs: Vec<Vec<std::path::Component>> = source
         .iter()
         .map(|p| {
             p.parent()
-                .map(|d| {
-                    d.components()
-                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                        .collect()
-                })
+                .map(|d| d.components().collect())
                 .unwrap_or_default()
         })
         .collect();
@@ -1617,14 +1624,27 @@ fn tab_label(full: &str, source: &[PathBuf]) -> (String, Option<String>) {
                 .all(|d| d.get(i).is_some() && d[i] == dirs[0][i])
         })
         .count();
-    let rest: Vec<String> = dirs.iter().map(|d| d[common..].join("/")).collect();
-    let folders = rest.iter().any(|r| !r.is_empty()).then(|| {
-        rest.iter()
-            .map(|r| if r.is_empty() { "." } else { r.as_str() })
-            .collect::<Vec<_>>()
-            .join(" ↔ ")
-    });
-    (parts[0].to_string(), folders)
+    // Rebuilt as paths, so a drive or root left over keeps its own separator.
+    let rest: Vec<String> = dirs
+        .iter()
+        .map(|d| {
+            d[common..]
+                .iter()
+                .collect::<PathBuf>()
+                .display()
+                .to_string()
+        })
+        .collect();
+    if rest.iter().all(|r| r.is_empty()) {
+        // The same file on every side.
+        return (full.to_string(), None);
+    }
+    let folders = rest
+        .iter()
+        .map(|r| if r.is_empty() { "." } else { r.as_str() })
+        .collect::<Vec<_>>()
+        .join(" ↔ ");
+    (parts[0].to_string(), Some(folders))
 }
 
 /// `s`, cut to `max` characters with an ellipsis.
@@ -1652,12 +1672,10 @@ fn recent_card(ui: &mut egui::Ui, w: f32, paths: &[String]) -> egui::Response {
         egui::StrokeKind::Inside,
     );
     let first = paths.first().map(String::as_str).unwrap_or_default();
-    let icon = if web::is_url(first) {
-        Icon::Globe
-    } else if Path::new(first).is_dir() {
-        Icon::Folder
-    } else {
-        Icon::File
+    let icon = match path_kind(first) {
+        PathKind::Url => Icon::Globe,
+        PathKind::Dir => Icon::Folder,
+        PathKind::File | PathKind::Missing => Icon::File,
     };
     crate::ui::icons::paint(
         ui.painter(),
@@ -1717,21 +1735,62 @@ const PATH_FIELD_MARGIN: Margin = Margin {
     bottom: 5,
 };
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PathKind {
+    Url,
+    Dir,
+    File,
+    Missing,
+}
+
+/// How long [`path_kind`] trusts what it found.
+const PATH_KIND_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What `raw` points to, looked up at most every [`PATH_KIND_TTL`] per path: the start page
+/// and the Open dialog are drawn continuously, and a network path can be slow to answer.
+fn path_kind(raw: &str) -> PathKind {
+    use std::collections::HashMap;
+    use std::time::Instant;
+    type Cache = HashMap<String, (PathKind, Instant)>;
+    static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
+    if web::is_url(raw) {
+        return PathKind::Url;
+    }
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if let Some(&(kind, at)) = cache.get(raw) {
+        if at.elapsed() < PATH_KIND_TTL {
+            return kind;
+        }
+    }
+    let path = Path::new(raw);
+    let kind = if path.is_dir() {
+        PathKind::Dir
+    } else if path.exists() {
+        PathKind::File
+    } else {
+        PathKind::Missing
+    };
+    if cache.len() > 256 {
+        cache.clear();
+    }
+    cache.insert(raw.to_string(), (kind, Instant::now()));
+    kind
+}
+
 fn path_status(ui: &egui::Ui, field: &egui::Response, text: &str) {
     let raw = text.trim().trim_matches('"');
     if raw.is_empty() {
         return;
     }
     let p = pal(ui);
-    let path = Path::new(raw);
-    let (icon, color, missing) = if web::is_url(raw) {
-        (Icon::Globe, p.accent, false)
-    } else if path.is_dir() {
-        (Icon::Folder, p.success, false)
-    } else if path.exists() {
-        (Icon::File, p.success, false)
-    } else {
-        (Icon::Warning, p.danger, true)
+    // Looks again once the status may be out of date, even with nothing else happening.
+    ui.ctx().request_repaint_after(PATH_KIND_TTL);
+    let (icon, color, missing) = match path_kind(raw) {
+        PathKind::Url => (Icon::Globe, p.accent, false),
+        PathKind::Dir => (Icon::Folder, p.success, false),
+        PathKind::File => (Icon::File, p.success, false),
+        PathKind::Missing => (Icon::Warning, p.danger, true),
     };
     // The response covers only the text, inside the margin.
     let r = field.rect + PATH_FIELD_MARGIN;
@@ -4626,7 +4685,7 @@ impl OxideMergeApp {
                     for (i, t) in self.tabs.iter().enumerate() {
                         let active = i == self.active;
                         let full = t.title();
-                        let (title, folders) = tab_label(&full, &t.source);
+                        let (title, folders) = tab_label(&full, &t.paths());
                         let font = if active {
                             theme::semibold(13.0)
                         } else {
@@ -6744,12 +6803,33 @@ mod tests {
     #[test]
     fn tabs_name_a_shared_file_once_with_the_folders_that_differ() {
         let src = |a: &str, b: &str| vec![PathBuf::from(a), PathBuf::from(b)];
+        let native = |p: &str| {
+            Path::new(p)
+                .components()
+                .collect::<PathBuf>()
+                .display()
+                .to_string()
+        };
+        let sub = |a: &str, b: &str| native(&format!("{a}/{b}"));
         assert_eq!(
             tab_label(
                 "main.rs* ↔ main.rs",
                 &src("/w/left/src/main.rs", "/w/right/src/main.rs")
             ),
-            ("main.rs".into(), Some("left/src ↔ right/src".into()))
+            (
+                "main.rs".into(),
+                Some(format!("{} ↔ {}", sub("left", "src"), sub("right", "src")))
+            )
+        );
+        // A file compared with itself, and a relative path next to an absolute one.
+        assert_eq!(
+            tab_label("a.txt ↔ a.txt", &src("/w/a.txt", "/w/a.txt")),
+            ("a.txt ↔ a.txt".into(), None)
+        );
+        let root = native("/w");
+        assert_eq!(
+            tab_label("a.txt ↔ a.txt", &src("a.txt", "/w/a.txt")),
+            ("a.txt".into(), Some(format!(". ↔ {root}")))
         );
         assert_eq!(
             tab_label("a.txt ↔ a.txt", &src("/w/a.txt", "/w/old/a.txt")),

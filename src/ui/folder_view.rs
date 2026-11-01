@@ -94,6 +94,9 @@ struct Tally {
     /// Files on one side only, by side.
     only: [usize; 3],
     errors: usize,
+    /// Folders left uncompared (not compared recursively): listed, but saying nothing about
+    /// whether their files differ, as in the console compare.
+    unknown: usize,
 }
 
 impl Tally {
@@ -104,6 +107,15 @@ impl Tally {
             self.only[s] += o.only[s];
         }
         self.errors += o.errors;
+        self.unknown += o.unknown;
+    }
+
+    fn all(&self) -> usize {
+        self.identical
+            + self.different
+            + self.errors
+            + self.unknown
+            + self.only.iter().sum::<usize>()
     }
 
     /// Each folder's files and, last, every file. Parents come before their children in
@@ -113,20 +125,20 @@ impl Tally {
         let mut total = Tally::default();
         for i in (0..items.len()).rev() {
             let it = &items[i];
-            if !it.is_dir {
+            // Counted as listed: files, and folders with nothing listed below them (empty,
+            // not scanned, or not compared recursively). See `FolderView::shown`.
+            if !it.is_dir || it.children.is_empty() {
                 let own = &mut tallies[i];
                 match it.status {
                     CmpStatus::Identical => own.identical = 1,
-                    CmpStatus::Different => own.different = 1,
+                    CmpStatus::NotCompared if it.is_dir => own.unknown = 1,
+                    CmpStatus::Different | CmpStatus::NotCompared => own.different = 1,
                     CmpStatus::Error => own.errors = 1,
-                    CmpStatus::Unique => {
-                        let present: Vec<usize> = (0..n).filter(|&s| it.exists[s]).collect();
-                        match present[..] {
-                            [s] => own.only[s] = 1,
-                            _ => own.different = 1,
-                        }
-                    }
-                    CmpStatus::NotCompared | CmpStatus::Pending => {}
+                    CmpStatus::Unique => match only_side(it, n) {
+                        Some(s) => own.only[s] = 1,
+                        None => own.different = 1,
+                    },
+                    CmpStatus::Pending => {}
                 }
                 total.add(&tallies[i]);
             }
@@ -170,6 +182,16 @@ impl Tally {
     }
 }
 
+/// The side an item is on, when it is on one side only. In a 3-way compare an item missing
+/// from one side only differs, for the counts and the filters alike.
+fn only_side(it: &DirItem, n: usize) -> Option<usize> {
+    let mut sides = (0..n).filter(|&s| it.exists[s]);
+    match (sides.next(), sides.next()) {
+        (Some(s), None) => Some(s),
+        _ => None,
+    }
+}
+
 /// Short status of a file for the list (the full sentence is its tooltip).
 fn short_status(it: &DirItem, n: usize) -> String {
     match it.status {
@@ -186,23 +208,33 @@ fn newest(it: &DirItem) -> Option<SystemTime> {
 }
 
 /// The side alone in having the newest modification time, when the sides differ by more than
-/// two seconds (the precision of some file systems).
-fn newer_side(it: &DirItem, n: usize) -> Option<usize> {
-    let times: Vec<(usize, SystemTime)> =
-        (0..n).filter_map(|s| it.mtime[s].map(|t| (s, t))).collect();
-    if times.len() < 2 {
+/// `tolerance` seconds (the time tolerance of the compare options).
+fn newer_side(it: &DirItem, n: usize, tolerance: u64) -> Option<usize> {
+    let times = || (0..n).filter_map(|s| it.mtime[s].map(|t| (s, t)));
+    if times().count() < 2 {
         return None;
     }
-    let max = times.iter().map(|&(_, t)| t).max()?;
-    let close = |t: SystemTime| max.duration_since(t).unwrap_or_default() <= Duration::from_secs(2);
-    let newest: Vec<usize> = times
-        .iter()
-        .filter(|&&(_, t)| close(t))
-        .map(|&(s, _)| s)
-        .collect();
-    match newest[..] {
-        [s] => Some(s),
+    let max = times().map(|(_, t)| t).max()?;
+    let tolerance = Duration::from_secs(tolerance);
+    let mut newest = times()
+        .filter(|&(_, t)| max.duration_since(t).unwrap_or_default() <= tolerance)
+        .map(|(s, _)| s);
+    match (newest.next(), newest.next()) {
+        (Some(s), None) => Some(s),
         _ => None,
+    }
+}
+
+/// The result shown for an item in the list: a folder's summary of what differs below it, or
+/// the short status (`tally` is the folder's, see [`Tally::of`]).
+fn shown_status(it: &DirItem, n: usize, tally: Option<&Tally>) -> String {
+    let summary = (it.is_dir && it.status == CmpStatus::Different)
+        .then(|| tally.and_then(|t| t.summary(n)))
+        .flatten();
+    match summary {
+        Some(summary) => summary,
+        None if it.is_dir => status_text(it, n),
+        None => short_status(it, n),
     }
 }
 
@@ -424,6 +456,33 @@ fn load_dock_view(
 }
 
 /// Case-insensitive ordering without allocating lowercase copies.
+/// Compares `a` and `b` with runs of digits as numbers: "2 different" before "10 different".
+fn cmp_numeric(mut a: &str, mut b: &str) -> std::cmp::Ordering {
+    let digits = |s: &str| s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    loop {
+        let (da, db) = (digits(a), digits(b));
+        if da > 0 && db > 0 {
+            let (na, nb) = (
+                a[..da].trim_start_matches('0'),
+                b[..db].trim_start_matches('0'),
+            );
+            let o = na.len().cmp(&nb.len()).then_with(|| na.cmp(nb));
+            if o.is_ne() {
+                return o;
+            }
+            (a, b) = (&a[da..], &b[db..]);
+            continue;
+        }
+        let (Some(ca), Some(cb)) = (a.chars().next(), b.chars().next()) else {
+            return a.len().cmp(&b.len());
+        };
+        if ca != cb {
+            return ca.cmp(&cb);
+        }
+        (a, b) = (&a[ca.len_utf8()..], &b[cb.len_utf8()..]);
+    }
+}
+
 fn cmp_ci(a: &str, b: &str) -> std::cmp::Ordering {
     if a.is_ascii() && b.is_ascii() {
         let (a, b) = (a.bytes(), b.bytes());
@@ -959,32 +1018,45 @@ impl FolderView {
             return false;
         }
         match it.status {
+            // Counted in no chip but All, so no chip hides them either (see `Tally::of`).
+            CmpStatus::NotCompared if it.is_dir => true,
             CmpStatus::Identical => cfg.show_identical,
             CmpStatus::Different | CmpStatus::Error | CmpStatus::NotCompared => cfg.show_different,
             CmpStatus::Pending => false,
-            CmpStatus::Unique => {
-                let unique_flag = |s: usize| {
-                    if n == 2 && s == 1 {
-                        cfg.show_unique[2]
-                    } else {
-                        cfg.show_unique[s]
-                    }
-                };
-                (0..n).any(|s| it.exists[s] && unique_flag(s))
-            }
+            CmpStatus::Unique => match only_side(it, n) {
+                Some(s) if n == 2 && s == 1 => cfg.show_unique[2],
+                Some(s) => cfg.show_unique[s],
+                None => cfg.show_different,
+            },
         }
     }
 
-    fn cmp_items(&self, a: usize, b: usize) -> std::cmp::Ordering {
+    /// Sorts `v` into list order after `first`, working out the result shown for each item once
+    /// rather than for every comparison.
+    fn sort_items(&self, v: &mut [usize], first: impl Fn(usize, usize) -> std::cmp::Ordering) {
+        let n = self.n();
+        let shown: BTreeMap<usize, String> = if self.sort.0 == Col::Result {
+            v.iter()
+                .map(|&i| (i, shown_status(&self.items[i], n, self.tallies.get(i))))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        v.sort_by(|&a, &b| first(a, b).then_with(|| self.cmp_items(a, b, &shown)));
+    }
+
+    /// `shown`: the result shown for each item, when sorting by it.
+    fn cmp_items(&self, a: usize, b: usize, shown: &BTreeMap<usize, String>) -> std::cmp::Ordering {
         let (ia, ib) = (&self.items[a], &self.items[b]);
         let (col, asc) = self.sort;
         let name = || cmp_ci(&ia.name, &ib.name);
         let o = match col {
             Col::Name => ib.is_dir.cmp(&ia.is_dir).then_with(name),
             Col::Folder => cmp_ci(&ia.rel_dir, &ib.rel_dir).then_with(name),
-            Col::Result => status_text(ia, self.n())
-                .cmp(&status_text(ib, self.n()))
-                .then_with(name),
+            Col::Result => {
+                let shown = |i: usize| shown.get(&i).map_or("", String::as_str);
+                cmp_numeric(shown(a), shown(b)).then_with(name)
+            }
             Col::Modified => newest(ia).cmp(&newest(ib)).then_with(name),
             Col::Size(s) => ia.size[s].cmp(&ib.size[s]).then_with(name),
             Col::Ext => cmp_ci(sort_ext(ia), sort_ext(ib)).then_with(name),
@@ -1021,15 +1093,37 @@ impl FolderView {
         let mut v: Vec<usize> = (0..self.items.len())
             .filter(|&i| vis[i] && (!self.items[i].is_dir || self.items[i].children.is_empty()))
             .collect();
-        v.sort_by(|&a, &b| {
+        self.sort_items(&mut v, |a, b| {
             if self.sort.0 == Col::Name {
                 cmp_ci(&self.items[a].rel_dir, &self.items[b].rel_dir)
-                    .then_with(|| self.cmp_items(a, b))
             } else {
-                self.cmp_items(a, b)
+                std::cmp::Ordering::Equal
             }
         });
         v
+    }
+
+    /// Works out the list and its counts again when they may have changed. Then draws once
+    /// more, as the chips above the list may have shown the old counts this frame.
+    fn update_visible(&mut self, ctx: &egui::Context, cfg: &Config) {
+        // The tree has no Folder column to show the sort on.
+        if cfg.tree_mode && self.sort.0 == Col::Folder {
+            self.sort = (Col::Name, true);
+            self.view_key = None;
+        }
+        let key = (
+            cfg.tree_mode,
+            cfg.show_identical,
+            cfg.show_different,
+            cfg.show_unique,
+        );
+        if self.view_key != Some(key) {
+            self.view_key = Some(key);
+            let t = Instant::now();
+            self.rebuild_visible(cfg);
+            self.view_cost += t.elapsed();
+            ctx.request_repaint();
+        }
     }
 
     fn rebuild_visible(&mut self, cfg: &Config) {
@@ -1071,14 +1165,14 @@ impl FolderView {
         let mut roots: Vec<usize> = (0..self.items.len())
             .filter(|&i| self.items[i].parent.is_none() && vis[i])
             .collect();
-        roots.sort_by(|&a, &b| self.cmp_items(a, b));
+        self.sort_items(&mut roots, |_, _| std::cmp::Ordering::Equal);
         let mut stack: Vec<usize> = roots.into_iter().rev().collect();
         while let Some(i) = stack.pop() {
             out.push(i);
             let it = &self.items[i];
             if it.is_dir && (searching || self.expanded.contains(&it.rel_path())) {
                 let mut ch: Vec<usize> = it.children.iter().copied().filter(|&c| vis[c]).collect();
-                ch.sort_by(|&a, &b| self.cmp_items(a, b));
+                self.sort_items(&mut ch, |_, _| std::cmp::Ordering::Equal);
                 stack.extend(ch.into_iter().rev());
             }
         }
@@ -1535,7 +1629,12 @@ impl FolderView {
         self.anchor = first;
         self.cursor = first;
         self.scroll_to = first;
-        self.status = format!("{} {}", self.selected.len(), tr("label.selected"));
+        // The status line counts a selection of more than one item by itself.
+        self.status = if self.selected.len() > 1 {
+            String::new()
+        } else {
+            format!("{} {}", self.selected.len(), tr("label.selected"))
+        };
     }
 
     pub fn open_select_pattern(&mut self) {
@@ -2105,7 +2204,24 @@ impl FolderView {
         let sel = !self.selected.is_empty();
         widgets::toolbar(ui, |ui| {
             let key = widgets::with_key;
-            let compact = ui.available_width() < 1180.0;
+            // Icons and shorter chips once the full toolbar, as last measured, does not fit:
+            // long filter or rule names and longer translations need more room.
+            // Measured again whenever the labels change, shorter or longer.
+            let start_x = ui.cursor().min.x;
+            let need_id = self.id.with("toolbar_width");
+            let labels = egui::Id::new((
+                &self.filter_spec,
+                &self.rules,
+                self.fopts.method.key(),
+                crate::i18n::current_language(),
+                cfg.tree_mode,
+                theme::look().compact,
+            ));
+            let need = ui
+                .data(|d| d.get_temp::<(egui::Id, f32)>(need_id))
+                .filter(|&(l, _)| l == labels)
+                .map_or(0.0, |(_, w)| w);
+            let compact = ui.available_width() < need.max(1180.0);
             let labelled = |ui: &mut Ui, icon: Icon, label: &str| {
                 if compact {
                     widgets::icon_button(ui, icon, label)
@@ -2196,7 +2312,7 @@ impl FolderView {
                 action = Some(FolderAction::ExportHtml);
             }
             let left_end = ui.cursor().min.x + 4.0;
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let right = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 let mut clip = ui.clip_rect();
                 clip.min.x = clip.min.x.max(left_end);
@@ -2326,6 +2442,13 @@ impl FolderView {
                     }
                 });
             });
+            if !compact {
+                let width = left_end - start_x + right.response.rect.width() + 16.0;
+                if (need - width).abs() > 0.5 {
+                    ui.data_mut(|d| d.insert_temp(need_id, (labels, width)));
+                    ui.ctx().request_repaint();
+                }
+            }
         });
         if let Some((method, recursive)) = new_options {
             if method != self.fopts.method {
@@ -2375,9 +2498,8 @@ impl FolderView {
             rect.bottom() - 0.5,
             Stroke::new(1.0_f32, pal.border),
         );
-        if action.is_none() {
-            action = self.status_chips(ui, cfg);
-        }
+        let chip_action = self.status_chips(ui, cfg);
+        action = action.or(chip_action);
         if let Some(r) = &self.running {
             let done = r.progress.done.load(Ordering::Relaxed);
             let total = r.progress.total.load(Ordering::Relaxed);
@@ -2411,7 +2533,7 @@ impl FolderView {
                                 .desired_height(6.0)
                                 .corner_radius(3)
                                 .desired_width(ui.available_width() - 90.0)
-                                .animate(total == 0),
+                                .animate(total == 0 && !theme::look().reduce_motion),
                         );
                         if widgets::secondary_button(ui, tr("btn.stop")).clicked() {
                             stop = true;
@@ -2442,7 +2564,7 @@ impl FolderView {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     let count = |label: &str, k: usize| format!("{label}  {k}");
-                    let files = t.identical + t.different + t.errors + t.only.iter().sum::<usize>();
+                    let files = t.all();
                     let mut chip = |ui: &mut Ui, on: &mut bool, label: String| {
                         let r = widgets::toggle_button(ui, on, &label, &label);
                         changed |= r.clicked();
@@ -2852,6 +2974,8 @@ impl FolderView {
         self.note_window(ui);
         let was_running = self.running.is_some();
         self.poll();
+        // Before the header, whose chips show the counts worked out with the list.
+        self.update_visible(ui.ctx(), cfg);
         let (refresh, header_action) = self.header_bar(ui, cfg, named);
         if refresh {
             self.refresh(cfg, named);
@@ -2885,18 +3009,7 @@ impl FolderView {
             // Also repaints once after finishing, as the status bar was drawn before this poll.
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
-        let key = (
-            cfg.tree_mode,
-            cfg.show_identical,
-            cfg.show_different,
-            cfg.show_unique,
-        );
-        if self.view_key != Some(key) {
-            self.view_key = Some(key);
-            let t = Instant::now();
-            self.rebuild_visible(cfg);
-            self.view_cost += t.elapsed();
-        }
+        self.update_visible(ui.ctx(), cfg);
         if self.running.is_none() && self.visible.is_empty() {
             return captured_action
                 .or(header_action)
@@ -3068,6 +3181,7 @@ impl FolderView {
         cols.push((Col::Ext, tr("col.ext").into()));
 
         let sort = self.sort;
+        let tolerance = self.fopts.time_tolerance_secs;
         let tallies = &self.tallies;
         let items = &self.items;
         let visible = &self.visible;
@@ -3185,18 +3299,9 @@ impl FolderView {
                         paint_bg(ui);
                         let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
                         ui.painter().circle_filled(dot.center(), 4.0, sc);
-                        let summary = (it.is_dir && it.status == CmpStatus::Different)
-                            .then(|| tallies.get(idx).and_then(|t| t.summary(n)))
-                            .flatten();
-                        let (label, detail) = match summary {
-                            Some(summary) => (summary, None),
-                            None if it.is_dir => (status_text(it, n), None),
-                            None => (
-                                short_status(it, n),
-                                (it.binary && it.status != CmpStatus::Unique)
-                                    .then(|| tr("kind.binary")),
-                            ),
-                        };
+                        let label = shown_status(it, n, tallies.get(idx));
+                        let detail = (!it.is_dir && it.binary && it.status != CmpStatus::Unique)
+                            .then(|| tr("kind.binary"));
                         let r = ui.add(
                             egui::Label::new(txt(label).font(FontId::proportional(13.5)))
                                 .selectable(false)
@@ -3205,13 +3310,15 @@ impl FolderView {
                         if let Some(d) = detail {
                             ui.label(txt(format!("· {d}")).size(12.0).color(pal.text_dim));
                         }
-                        r.on_hover_text(status_text(it, n));
+                        r.on_hover_ui(|ui| {
+                            ui.label(status_text(it, n));
+                        });
                     });
                     row.col(|ui| {
                         paint_bg(ui);
                         let r =
                             ui.add(egui::Label::new(txt(fmt_time(newest(it)))).selectable(false));
-                        if let Some(s) = newer_side(it, n) {
+                        if let Some(s) = newer_side(it, n, tolerance) {
                             ui.label(
                                 txt(trf("folder.newer", &[("side", side_name(s, n).into())]))
                                     .size(12.0)
@@ -3219,15 +3326,15 @@ impl FolderView {
                             );
                         }
                         if it.mtime[..n].iter().flatten().count() > 1 {
-                            r.on_hover_text(
-                                (0..n)
-                                    .filter(|&s| it.exists[s])
-                                    .map(|s| {
-                                        format!("{}  {}", side_name(s, n), fmt_time(it.mtime[s]))
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                            );
+                            r.on_hover_ui(|ui| {
+                                for s in (0..n).filter(|&s| it.exists[s]) {
+                                    ui.label(format!(
+                                        "{}  {}",
+                                        side_name(s, n),
+                                        fmt_time(it.mtime[s])
+                                    ));
+                                }
+                            });
                         }
                     });
                     for s in 0..n {
@@ -3547,6 +3654,69 @@ impl FolderView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn item(name: &str, is_dir: bool, exists: [bool; 3], status: CmpStatus) -> DirItem {
+        DirItem {
+            rel_dir: String::new(),
+            name: name.into(),
+            is_dir,
+            exists,
+            size: [None; 3],
+            mtime: [None; 3],
+            status,
+            diff_side: None,
+            binary: false,
+            error: None,
+            depth: 0,
+            parent: None,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn counts_follow_what_is_listed() {
+        let items = [
+            // 3-way: on Left and Right, missing from Middle: differs, as the filters treat it.
+            item("two.txt", false, [true, false, true], CmpStatus::Unique),
+            item("left.txt", false, [true, false, false], CmpStatus::Unique),
+            // Left over after Stop.
+            item(
+                "later.txt",
+                false,
+                [true, true, true],
+                CmpStatus::NotCompared,
+            ),
+            // A folder on Left only that was not scanned.
+            item("old", true, [true, false, false], CmpStatus::Unique),
+            // A folder of a compare that is not recursive: listed, but not different.
+            item("sub", true, [true, true, true], CmpStatus::NotCompared),
+        ];
+        let (_, total) = Tally::of(&items, 3);
+        assert_eq!(total.different, 2);
+        assert_eq!(total.only, [2, 0, 0]);
+        assert_eq!((total.unknown, total.all()), (1, 5));
+        assert_eq!(only_side(&items[0], 3), None);
+        assert_eq!(only_side(&items[1], 3), Some(0));
+    }
+
+    #[test]
+    fn results_sort_their_numbers_by_value() {
+        use std::cmp::Ordering::*;
+        assert_eq!(cmp_numeric("2 different", "10 different"), Less);
+        assert_eq!(cmp_numeric("3 different · 1", "3 different · 01"), Equal);
+        assert_eq!(cmp_numeric("Different", "Identical"), Less);
+        assert_eq!(cmp_numeric("9", "9 · 2"), Less);
+        assert_eq!(cmp_numeric("12 個不同", "3 個不同"), Greater);
+    }
+
+    #[test]
+    fn the_newer_side_allows_for_the_time_tolerance() {
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut it = item("a.txt", false, [true, true, false], CmpStatus::Different);
+        it.mtime = [Some(t), Some(t + Duration::from_secs(3600)), None];
+        assert_eq!(newer_side(&it, 2, 2), Some(1));
+        assert_eq!(newer_side(&it, 2, 3600), None);
+    }
 
     #[test]
     fn saved_folder_rules_apply_to_initial_scan_refresh_and_reports() {

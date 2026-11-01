@@ -288,6 +288,9 @@ Hover over a result for the full description, such as *Text files are different*
 
 Chips under the paths count *All* items and the *Different*, *Only in Left*, *Only in Right*
 (and *Only in Middle*) and *Identical* ones. Click a chip to hide or show that kind of item.
+In a 3-way comparison, an item missing from one side only counts as different. Empty folders and
+folders that were not scanned are counted by the result shown for them. Folders left uncompared
+by a comparison that is not recursive count only in *All*, and no chip hides them.
 The status bar shows how long the comparison took.
 
 In *View → Folder list*:
@@ -485,8 +488,9 @@ the difference number are the added and removed lines.
 In a 2-way compare, the *Inline view* toggle next to *Word wrap*, or *Inline view* in the command
 palette, shows the differences in one column: removed lines first, then the lines that replace
 them, each with its old and new line number. Unchanged runs are folded as with *Collapse unchanged
-lines*; click a fold to show it. Moving between differences and copying them work as usual. To edit
-a line, switch back to the side-by-side view.
+lines*; click a fold to show it. Moving between differences and copying them work as usual; the
+arrow keys move along the lines, and kbd:[Ctrl+C] copies the current line. To edit or select
+lines, switch back to the side-by-side view.
 
 === Moving between differences
 

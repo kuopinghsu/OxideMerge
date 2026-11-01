@@ -228,22 +228,55 @@ impl Gui {
         self.settle();
     }
 
-    /// Scrolls the view under the middle of the window until the widget `label` is in it.
+    /// Scrolls the view under the middle of the window until the widget `label` is in it: above
+    /// the bottom edge and below the toolbars and headers over the list, unless the list goes no
+    /// further. A list only draws the rows in view, so one not drawn yet is further down.
     fn scroll_to(&mut self, label: &str) {
         let middle = Pos2::new(SCREEN.x / 2.0, SCREEN.y / 2.0);
+        let (top, bottom) = (SCREEN.y / 4.0, SCREEN.y - 40.0);
         for _ in 0..50 {
-            if self.widget(label).rect.bottom() < SCREEN.y - 40.0 {
+            let rect = self.resting_rect(label);
+            let dy = if rect.is_none_or(|r| r.bottom() > bottom) {
+                -120.0
+            } else if rect.is_some_and(|r| r.top() < top) {
+                120.0
+            } else {
                 return;
-            }
+            };
             self.events.push(Event::PointerMoved(middle));
             self.events.push(Event::MouseWheel {
                 unit: egui::MouseWheelUnit::Point,
-                delta: egui::vec2(0.0, -120.0),
+                delta: egui::vec2(0.0, dy),
                 modifiers: Modifiers::NONE,
             });
             self.frames(3);
+            if rect.is_some() && self.resting_rect(label) == rect {
+                return;
+            }
         }
         panic!("{}: could not scroll to {label:?}", self.name);
+    }
+
+    /// Where the widget `label` is once a scroll has ended, if it is drawn: egui spreads a wheel
+    /// scroll over the next frames, and a click before it ends would miss the widget as it moves.
+    fn resting_rect(&mut self, label: &str) -> Option<Rect> {
+        let find = |gui: &Self| {
+            gui.widgets
+                .iter()
+                .rev()
+                .find(|w| named(w, label))
+                .map(|w| w.rect)
+        };
+        let mut rect = find(self);
+        for _ in 0..120 {
+            self.frame();
+            let now = find(self);
+            if now == rect {
+                break;
+            }
+            rect = now;
+        }
+        rect
     }
 
     fn key(&mut self, modifiers: Modifiers, key: Key) {
@@ -544,6 +577,36 @@ fn the_inline_view_keeps_navigation_and_copying() {
     gui.type_text(tr("cmd.inline_view"));
     gui.key(Modifiers::NONE, Key::Enter);
     assert!(gui.text_view().unified);
+}
+
+#[test]
+fn the_inline_view_moves_the_cursor_but_does_not_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let left: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+    let right = left
+        .replace("line 2\n", "two\n")
+        .replace("line 39\n", "thirty-nine\n");
+    write(d, &[("a.txt", &left), ("b.txt", &right)]);
+    let mut gui = Gui::start(
+        "inline_view_keys",
+        compare(&[d.join("a.txt"), d.join("b.txt")]),
+    );
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    gui.key(Modifiers::SHIFT, Key::ArrowDown);
+    gui.click(tr("cmd.inline_view"));
+    let before = gui.text_view().panes[1].doc.text();
+    // Neither pasting over the selection nor Enter edits; the arrow keys still move.
+    gui.events.push(Event::Paste("x\n".into()));
+    gui.frames(2);
+    assert_eq!(gui.text_view().panes[1].doc.text(), before);
+    gui.key(Modifiers::NONE, Key::Enter);
+    let row = gui.text_view().cursor_row.unwrap();
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    assert!(gui.text_view().cursor_row.unwrap() > row);
+    gui.key(CMD, Key::End);
+    assert_eq!(gui.text_view().cursor_row, Some(39));
+    assert_eq!(gui.text_view().panes[1].doc.text(), before);
 }
 
 #[test]
@@ -1847,6 +1910,23 @@ fn folder_chips_count_each_kind_and_hide_it() {
     gui.click(&format!("{}  3", tr("analysis.all")));
     gui.frames(3);
     assert!(gui.shows("same.txt") && gui.shows("gone.txt"));
+}
+
+#[test]
+fn scrolling_reaches_a_row_the_list_has_not_drawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    for side in ["left", "right"] {
+        std::fs::create_dir(d.join(side)).unwrap();
+        for i in 0..120 {
+            std::fs::write(d.join(side).join(format!("f{i:03}.txt")), "x\n").unwrap();
+        }
+    }
+    let mut gui = Gui::start("folder_scroll", compare(&[d.join("left"), d.join("right")]));
+    gui.settle();
+    assert!(gui.shows("f000.txt") && !gui.shows("f119.txt"));
+    gui.scroll_to("f119.txt");
+    assert!(gui.widget("f119.txt").rect.bottom() < SCREEN.y);
 }
 
 #[test]
