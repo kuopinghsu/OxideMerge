@@ -1,0 +1,28 @@
+title = "inventory"
+version = "1.4.0"
+
+# Workers run in this order
+[[workers]]
+id = "report"
+threads = 4
+
+[[workers]]
+id = "import"
+threads = 2
+
+[[workers]]
+id = "cleanup"
+threads = 1
+
+[database]
+pool = 10
+url = "postgres://db.internal/inventory"
+
+[server]
+port = 8080        # the same port, written without the separator
+host = "0.0.0.0"
+timeout_s = 45
+
+[features]
+audit = false
+cache = true

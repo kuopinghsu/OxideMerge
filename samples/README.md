@@ -22,6 +22,8 @@ Each pair below can also be opened on its own, for example
 | `src/queue.c` | Only comments and indentation changed (spaces against tabs). With **Ignore comment changes** and **Whitespace: Ignore all** the files compare equal. |
 | `config/app.json` | Left is one line, right is formatted with its keys in another order. With **Format JSON and XML before comparing** (`--prettify`) only the two changed values remain. |
 | `config/layout.xml` | The same for XML: formatted, only the added `<column>` remains. |
+| `config/service.toml` | Tables and keys in another order, other comments and `8_080` written as `8080`, so the text differs almost everywhere. Choose **Semantic** (`--semantic`) and only the changed timeout, the new `audit` flag and the `[[workers]]` array remain. The workers are listed in a new order, so they differ at every position until you type `id` in **Array matching key** (`--array-key id`): then one is moved, one has more threads and one is added. |
+| `config/deploy.yaml` | Flow style (`{name: http}`), keys in another order, `no` quoted as `"no"` and the port written as `0x1F90`. **Semantic** shows only the changed replica count and log level, and the two ports in a new order as a move: YAML 1.2 reads `no` as text and compares numbers by value. |
 | `data/measurements.tsv` | Table view of tab-separated data, with a quoted note that spans two lines. With **Treat numbers as equal within** `0.001` (`--numeric-tolerance 0.001`), the readings that moved by less than that are ignored; the temperature that changed by 1, the edited note and the new sensor remain. |
 | `logs/build.log` | Timestamps, a load address, a generated header and a license block that differ on every build. Compare with the rules file `samples/rules/Build logs.oxrules` (`--rules "samples/rules/Build logs.oxrules"`, or import it under **Options → Compare rules**) and only the changed test result remains. |
 | `logs/large.log` | 2,000 lines with a few scattered changes: use the location pane and Next/Previous difference to move between them. |
@@ -39,13 +41,16 @@ Each pair below can also be opened on its own, for example
 
     cargo run -- samples/three/left.txt samples/three/base.txt samples/three/right.txt   # make demo-3way
     cargo run -- samples/three/settings/left.ini samples/three/settings/base.ini samples/three/settings/right.ini   # make demo-3way-merge
+    cargo run -- samples/three/settings/left.toml samples/three/settings/base.toml samples/three/settings/right.toml
+    cargo run -- samples/three/settings/left.yaml samples/three/settings/base.yaml samples/three/settings/right.yaml
     cargo run -- -r samples/three/folders/left samples/three/folders/base samples/three/folders/right   # make demo-3way-folder
     cargo run -- samples/three/conflict.txt                                              # make demo-conflict
     cargo run -- samples/three/diff3-conflict.py
 
-- `settings/*.ini`: changes made on the left only, on the right only, the same change on both
-  sides, and conflicting changes. **Auto merge** takes the first three kinds and leaves the
-  conflicts for you to resolve.
+- `settings/*.ini`, `settings/*.toml`, `settings/*.yaml`: the same settings in three formats, with
+  changes made on the left only, on the right only, the same change on both sides, and
+  conflicting changes. **Auto merge** takes the first three kinds and leaves the conflicts for
+  you to resolve. `--merge-plan` lists the same actions and warnings for each format.
 - `folders/`: a 3-way folder compare with a file changed on one side, on the other, the same on
   both, in conflict, added on the left, and removed on the right. Use **Auto merge** on the folder
   compare too.
