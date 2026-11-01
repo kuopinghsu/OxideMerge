@@ -57,6 +57,107 @@ fn is_hidden(attrs: &str) -> bool {
     })
 }
 
+/// Elements whose end tag a page may leave out.
+const OPTIONAL_END: &[&str] = &[
+    "p", "li", "dt", "dd", "option", "optgroup", "rt", "rp", "td", "th", "tr", "thead", "tbody",
+    "tfoot",
+];
+
+/// Start tags that end an open `p`.
+const ENDS_P: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "details",
+    "dialog",
+    "div",
+    "dl",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hgroup",
+    "hr",
+    "main",
+    "menu",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "search",
+    "section",
+    "table",
+    "ul",
+];
+
+/// Whether a start tag `tag` ends the open element `open`, whose end tag was left out.
+fn ended_by(open: &str, tag: &str) -> bool {
+    match open {
+        "p" => ENDS_P.contains(&tag),
+        "li" => tag == "li",
+        "dt" | "dd" => matches!(tag, "dt" | "dd"),
+        "option" => matches!(tag, "option" | "optgroup"),
+        "optgroup" => tag == "optgroup",
+        "rt" | "rp" => matches!(tag, "rt" | "rp"),
+        "td" | "th" => matches!(tag, "td" | "th" | "tr" | "thead" | "tbody" | "tfoot"),
+        "tr" => matches!(tag, "tr" | "thead" | "tbody" | "tfoot"),
+        "thead" | "tbody" | "tfoot" => matches!(tag, "thead" | "tbody" | "tfoot"),
+        _ => false,
+    }
+}
+
+/// Follows `tok` through `open`, the elements open in an element being left out, outermost
+/// first: whether it is part of them. As in a browser, an element whose end tag was left out
+/// ends at a tag that cannot be inside it, such as the next `<li>` after `<li hidden>`, or at
+/// the end tag of the element around it; that tag is then not part of them.
+fn skipped(open: &mut Vec<String>, tok: &Token) -> bool {
+    let Token::Tag(name, attrs, closing) = tok else {
+        return true;
+    };
+    let name = name.as_str();
+    if *closing {
+        if let Some(i) = open.iter().rposition(|o| o == name) {
+            open.truncate(i);
+            return true;
+        }
+        let around = matches!(name, "td" | "th")
+            || (BLOCK.contains(&name)
+                && !matches!(name, "p" | "br" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"));
+        if around && OPTIONAL_END.contains(&open[0].as_str()) {
+            open.clear();
+            return false;
+        }
+        return true;
+    }
+    let mut cut = None;
+    for (i, o) in open.iter().enumerate().rev() {
+        if ended_by(o, name) {
+            cut = Some(i);
+        } else if BLOCK.contains(&o.as_str()) || OPTIONAL_END.contains(&o.as_str()) {
+            break;
+        }
+    }
+    if let Some(i) = cut {
+        open.truncate(i);
+        if open.is_empty() {
+            return false;
+        }
+    }
+    if !VOID.contains(&name) && !attrs.trim_end().ends_with('/') {
+        open.push(name.to_string());
+    }
+    true
+}
+
 /// Decodes character references, keeping the white space.
 fn decode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -166,8 +267,8 @@ struct Converter {
     /// Text of a `pre` element being read, with the language of its code.
     pre: Option<(String, String)>,
     table: Option<Table>,
-    /// An element being left out: its name and how many of them are open.
-    skip: Option<(String, usize)>,
+    /// The elements open in an element being left out, outermost first; empty when none is.
+    skip: Vec<String>,
 }
 
 impl Converter {
@@ -651,22 +752,10 @@ pub fn html_to_blocks(html: &str, base: Option<&Url>) -> Vec<Block> {
         heading: None,
         pre: None,
         table: None,
-        skip: None,
+        skip: Vec::new(),
     };
     for tok in tokens(html) {
-        if let Some((name, depth)) = &mut c.skip {
-            if let Token::Tag(n, attrs, closing) = &tok {
-                if n == name {
-                    if *closing {
-                        *depth -= 1;
-                    } else if !attrs.trim_end().ends_with('/') {
-                        *depth += 1;
-                    }
-                }
-            }
-            if *depth == 0 {
-                c.skip = None;
-            }
+        if !c.skip.is_empty() && skipped(&mut c.skip, &tok) {
             continue;
         }
         match tok {
@@ -674,7 +763,7 @@ pub fn html_to_blocks(html: &str, base: Option<&Url>) -> Vec<Block> {
             Token::Tag(name, attrs, false) => {
                 if SKIP.contains(&name.as_str()) || is_hidden(attrs) {
                     if !VOID.contains(&name.as_str()) && !attrs.trim_end().ends_with('/') {
-                        c.skip = Some((name, 1));
+                        c.skip.push(name);
                     }
                     continue;
                 }
@@ -1165,6 +1254,27 @@ mod tests {
             <p aria-hidden="true">Icon</p><select><option>Pick</option></select>
             <p>After <img hidden src="x.png" alt="x"></p>"#;
         assert_eq!(md(html), "Shown\n\nAfter");
+    }
+
+    #[test]
+    fn hidden_elements_end_where_a_browser_ends_them() {
+        assert_eq!(md("<p hidden>Gone<p>Shown"), "Shown");
+        assert_eq!(md("<p hidden>Gone <b>bold<div>Shown</div>"), "Shown");
+        assert_eq!(md("<div><p hidden>Gone</div><p>After"), "After");
+        assert_eq!(md("<ul><li hidden>Gone<li>b</ul><p>c"), "- b\n\nc");
+        assert_eq!(md("<ul><li>a<li hidden>Gone</ul><p>After"), "- a\n\nAfter");
+        assert_eq!(
+            md("<ul><li hidden>Gone<ul><li>Gone too</ul></p><li>b</ul>"),
+            "- b"
+        );
+        assert_eq!(
+            md("<table><tr><td hidden>Gone<td>b<tr><td>c</table>"),
+            md("<table><tr><td>b</td></tr><tr><td>c</td></tr></table>")
+        );
+        assert_eq!(
+            md("<div hidden><p>Gone<li>Gone too</ul></div><p>After"),
+            "After"
+        );
     }
 
     #[test]
