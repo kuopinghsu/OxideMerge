@@ -390,8 +390,153 @@ fn escapes(root: &Path, it: &DirItem, target: &Path) -> bool {
     true
 }
 
+/// What a path held before the merge changed it, to put back if the merge does not finish.
+enum Before {
+    Missing,
+    Dir,
+    File {
+        copy: PathBuf,
+        permissions: std::fs::Permissions,
+        modified: Option<SystemTime>,
+    },
+}
+
+/// The paths a merge changes, each with what it held before, in the order they changed.
+#[derive(Default)]
+struct Journal {
+    /// Copies of the files changed, made on first use.
+    dir: Option<tempfile::TempDir>,
+    entries: Vec<(PathBuf, Before)>,
+    seen: HashSet<PathBuf>,
+}
+
+impl Journal {
+    /// Keeps what `path` holds now, unless it was kept already.
+    fn remember(&mut self, path: &Path) -> std::io::Result<()> {
+        if self.seen.contains(path) {
+            return Ok(());
+        }
+        let before = match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Before::Missing,
+            Err(e) => return Err(e),
+            Ok(m) if m.is_dir() => Before::Dir,
+            Ok(m) if m.is_file() => {
+                let dir = match &mut self.dir {
+                    Some(d) => d,
+                    none => none.insert(
+                        tempfile::Builder::new()
+                            .prefix("oxidemerge-undo")
+                            .tempdir()?,
+                    ),
+                };
+                let copy = dir.path().join(self.entries.len().to_string());
+                std::fs::copy(path, &copy)?;
+                fsutil::make_writable(&copy);
+                Before::File {
+                    copy,
+                    permissions: m.permissions(),
+                    modified: m.modified().ok(),
+                }
+            }
+            Ok(_) => return Err(std::io::Error::other(tr("msg.outside_folder"))),
+        };
+        self.seen.insert(path.to_path_buf());
+        self.entries.push((path.to_path_buf(), before));
+        Ok(())
+    }
+
+    /// Keeps `path` and its `<name>.bak` when one is made.
+    fn remember_with_backup(&mut self, path: &Path, backup: bool) -> std::io::Result<()> {
+        self.remember(path)?;
+        if backup {
+            self.remember(&fsutil::backup_path(path))?;
+        }
+        Ok(())
+    }
+
+    /// Keeps the folders missing on the way to `dir`, outermost first.
+    fn remember_new_dirs(&mut self, dir: &Path) -> std::io::Result<()> {
+        let missing: Vec<&Path> = dir
+            .ancestors()
+            .take_while(|d| std::fs::symlink_metadata(d).is_err())
+            .collect();
+        missing.into_iter().rev().try_for_each(|d| self.remember(d))
+    }
+
+    /// Puts back every path kept, the last changed first. Returns the paths it could not.
+    fn roll_back(self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (path, before) in self.entries.into_iter().rev() {
+            if let Err(e) = restore(&path, before) {
+                errors.push(crate::i18n::trf(
+                    "msg.folder_merge_undo_failed",
+                    &[
+                        ("file", path.display().to_string()),
+                        ("error", e.to_string()),
+                    ],
+                ));
+            }
+        }
+        errors
+    }
+}
+
+fn restore(path: &Path, before: Before) -> std::io::Result<()> {
+    let now = std::fs::symlink_metadata(path);
+    if let Err(e) = &now {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(std::io::Error::new(e.kind(), e.to_string()));
+        }
+    }
+    let now = now.ok();
+    match before {
+        Before::Missing => match now {
+            None => Ok(()),
+            Some(m) if m.is_dir() => std::fs::remove_dir(path),
+            Some(_) => {
+                // Only Windows keeps a read-only file from being deleted.
+                if cfg!(windows) {
+                    fsutil::make_writable(path);
+                }
+                std::fs::remove_file(path)
+            }
+        },
+        Before::Dir => match now {
+            None => std::fs::create_dir(path),
+            Some(m) if m.is_dir() => Ok(()),
+            Some(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
+        },
+        Before::File {
+            copy,
+            permissions,
+            modified,
+        } => {
+            match now {
+                Some(m) if m.is_dir() => return Err(std::io::ErrorKind::AlreadyExists.into()),
+                Some(_) => {
+                    if cfg!(windows) {
+                        fsutil::make_writable(path);
+                    }
+                    std::fs::remove_file(path)?;
+                }
+                None => {}
+            }
+            std::fs::copy(&copy, path)?;
+            fsutil::make_writable(path);
+            if let Some(t) = modified {
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)?
+                    .set_modified(t)?;
+            }
+            std::fs::set_permissions(path, permissions)
+        }
+    }
+}
+
 /// Carries out the plan, with the setting for backups. Returns how many items changed and
 /// the errors, each naming its item.
+#[cfg(test)]
 pub fn apply(
     plan: Plan,
     items: &[DirItem],
@@ -401,8 +546,8 @@ pub fn apply(
     apply_with(plan, items, roots, use_recycle_bin, fsutil::backup_on())
 }
 
-/// [`apply`], keeping the middle files it replaces as `<name>.bak` with `backup`. A file whose
-/// `<name>.bak` is itself listed is then left alone.
+/// [`apply`], keeping the middle files it replaces as `<name>.bak` with `backup`.
+#[cfg(test)]
 pub fn apply_with(
     plan: Plan,
     items: &[DirItem],
@@ -410,76 +555,141 @@ pub fn apply_with(
     use_recycle_bin: bool,
     backup: bool,
 ) -> (usize, Vec<String>) {
-    let mut done = 0;
-    let mut errors = Vec::new();
+    apply_until(plan, items, roots, use_recycle_bin, backup, &|| false)
+}
+
+/// Carries out the plan all or nothing, keeping the middle files it replaces as `<name>.bak`
+/// with `backup`. Every item is checked before anything is written, and when a change fails
+/// or `stop` returns true, the changes made so far are undone. A file whose `<name>.bak` is
+/// itself listed is not merged with `backup`. A file sent to the trash is put back from a
+/// copy, so the trash keeps one too. Returns how many items changed and the errors.
+pub fn apply_until(
+    plan: Plan,
+    items: &[DirItem],
+    roots: &[PathBuf],
+    use_recycle_bin: bool,
+    backup: bool,
+    stop: &dyn Fn() -> bool,
+) -> (usize, Vec<String>) {
     if !plan.stale.is_empty() {
-        errors.extend(plan.stale.iter().map(|&i| {
+        let errors = plan.stale.iter().map(|&i| {
             format!(
                 "{}: {}",
                 items[i].rel_path(),
                 tr("msg.changed_since_compare")
             )
-        }));
-        return (done, errors);
+        });
+        return (0, errors.collect());
     }
     let listed: HashSet<(Option<usize>, String)> = items
         .iter()
         .map(|it| (it.parent, name_key(&it.name, false).1))
         .collect();
-    let mut prune = Vec::new();
-    for (i, step) in plan.steps {
-        let it = &items[i];
+    let mut errors = Vec::new();
+    for (i, step) in &plan.steps {
+        let it = &items[*i];
         let target = it.path(&roots[BASE]);
         let bak = (it.parent, name_key(&format!("{}.bak", it.name), false).1);
         let replaces = matches!(step, Step::Copy(_) | Step::Merge(_)) && target.is_file();
-        if backup && replaces && listed.contains(&bak) {
-            errors.push(format!("{}: {}", it.rel_path(), tr("msg.backup_listed")));
-            continue;
-        }
-        if plan
+        let problem = if backup && replaces && listed.contains(&bak) {
+            Some("msg.backup_listed")
+        } else if plan
             .stamps
-            .get(&i)
+            .get(i)
             .is_some_and(|s| Some(*s) != stamp(it, roots))
         {
-            errors.push(format!(
-                "{}: {}",
-                it.rel_path(),
-                tr("msg.changed_since_plan")
-            ));
-            continue;
-        }
-        if !matches!(step, Step::Conflict) && escapes(&roots[BASE], it, &target) {
-            errors.push(format!("{}: {}", it.rel_path(), tr("msg.outside_folder")));
-            continue;
-        }
-        let r = match step {
-            Step::Copy(_) if it.is_dir => std::fs::create_dir_all(&target).map_err(Into::into),
+            Some("msg.changed_since_plan")
+        } else if !matches!(step, Step::Conflict) && escapes(&roots[BASE], it, &target) {
+            Some("msg.outside_folder")
+        } else if matches!(step, Step::Copy(_)) && !it.is_dir && target.is_dir() {
             // A folder there now is not replaced: it may hold files the merge does not list.
-            Step::Copy(_) if target.is_dir() => Err(anyhow::anyhow!(tr("msg.changed_since_plan"))),
-            Step::Copy(from) => fsutil::copy_atomic(&it.path(&roots[from]), &target, backup),
-            Step::Delete => delete_path(&target, use_recycle_bin),
+            Some("msg.changed_since_plan")
+        } else {
+            None
+        };
+        if let Some(key) = problem {
+            errors.push(format!("{}: {}", it.rel_path(), tr(key)));
+        }
+    }
+    if !errors.is_empty() {
+        errors.push(tr("msg.folder_merge_not_applied").to_string());
+        return (0, errors);
+    }
+
+    let mut journal = Journal::default();
+    let mut done = 0;
+    let mut prune = Vec::new();
+    let mut failure = None;
+    for (i, step) in plan.steps {
+        if stop() {
+            failure = Some(tr("msg.folder_merge_stopped").to_string());
+            break;
+        }
+        let it = &items[i];
+        let target = it.path(&roots[BASE]);
+        let r = match step {
+            Step::Copy(_) if it.is_dir => journal
+                .remember_new_dirs(&target)
+                .and_then(|()| std::fs::create_dir_all(&target))
+                .map_err(Into::into),
+            Step::Copy(from) => target
+                .parent()
+                .map_or(Ok(()), |p| journal.remember_new_dirs(p))
+                .and_then(|()| journal.remember_with_backup(&target, backup))
+                .map_err(Into::into)
+                .and_then(|()| fsutil::copy_atomic(&it.path(&roots[from]), &target, backup)),
+            Step::Delete => journal
+                .remember(&target)
+                .map_err(Into::into)
+                .and_then(|()| delete_path(&target, use_recycle_bin)),
             Step::Prune => {
                 prune.push(i);
                 continue;
             }
-            Step::Merge(mut doc) => doc.save_with(backup),
+            Step::Merge(mut doc) => journal
+                .remember_with_backup(&target, backup)
+                .map_err(Into::into)
+                .and_then(|()| doc.save_with(backup)),
             Step::Conflict => continue,
         };
         match r {
             Ok(()) => done += 1,
-            Err(e) => errors.push(format!("{}: {e:#}", it.rel_path())),
+            Err(e) => {
+                failure = Some(format!("{}: {e:#}", it.rel_path()));
+                break;
+            }
         }
     }
     // innermost folders first; a folder still holding files the filter hides stays
     for i in prune.into_iter().rev() {
-        match std::fs::remove_dir(items[i].path(&roots[BASE])) {
+        if failure.is_some() {
+            break;
+        }
+        if stop() {
+            failure = Some(tr("msg.folder_merge_stopped").to_string());
+            break;
+        }
+        let dir = items[i].path(&roots[BASE]);
+        match journal
+            .remember(&dir)
+            .and_then(|()| std::fs::remove_dir(&dir))
+        {
             Ok(()) => done += 1,
             Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => errors.push(format!("{}: {e}", items[i].rel_path())),
+            Err(e) => failure = Some(format!("{}: {e}", items[i].rel_path())),
         }
     }
-    (done, errors)
+    let Some(failure) = failure else {
+        return (done, Vec::new());
+    };
+    let mut errors = vec![failure];
+    let undo = journal.roll_back();
+    if undo.is_empty() {
+        errors.push(tr("msg.folder_merge_undone").to_string());
+    }
+    errors.extend(undo);
+    (0, errors)
 }
 
 #[cfg(test)]
@@ -670,7 +880,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         write(b, "late.txt", "edited meanwhile\n");
         let (_, errors) = apply(p, &items, &roots, false);
-        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("late.txt"), "{errors:?}");
         assert_eq!(read(b, "late.txt"), "edited meanwhile\n");
     }
 
@@ -757,7 +967,7 @@ mod tests {
         write(l, "a.txt", "new\n");
         let items = scan(&roots);
         let (done, errors) = apply_with(plan(&items, &roots), &items, &roots, false, true);
-        assert_eq!((done, errors.len()), (0, 1), "{errors:?}");
+        assert_eq!((done, errors.len()), (0, 2), "{errors:?}");
         assert_eq!(read(b, "a.txt"), "old\n");
         assert_eq!(read(b, "a.txt.bak"), "precious\n");
         let (done, errors) = apply_with(plan(&items, &roots), &items, &roots, false, false);
@@ -1005,7 +1215,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_failed_step_is_reported_and_the_others_go_on() {
+    fn a_failed_step_undoes_the_whole_merge() {
         use std::os::unix::fs::PermissionsExt;
         let (_dirs, roots) = folders();
         let [l, b, r] = [&roots[0], &roots[1], &roots[2]];
@@ -1027,10 +1237,92 @@ mod tests {
         if writable {
             return;
         }
-        assert_eq!(done, 1);
-        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(done, 0);
+        assert_eq!(errors.len(), 2, "{errors:?}");
         assert!(errors[0].starts_with("locked/new.txt"), "{errors:?}");
+        assert_eq!(errors[1], tr("msg.folder_merge_undone").to_string());
         assert!(!b.join("locked/new.txt").exists());
-        assert_eq!(read(b, "b.txt"), "new\n");
+        assert_eq!(read(b, "b.txt"), "old\n");
+    }
+
+    #[test]
+    fn a_stopped_merge_puts_everything_back() {
+        let (_dirs, roots) = folders();
+        let [l, b, r] = [&roots[0], &roots[1], &roots[2]];
+        for root in [b, r] {
+            write(root, "a.txt", "old\n");
+            write(root, "removed.txt", "rm\n");
+            write(root, "gone/old.txt", "g\n");
+        }
+        write(l, "a.txt", "new\n");
+        write(l, "new/deep/added.txt", "added\n");
+        let a = b.join("a.txt");
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&a)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let mut perm = std::fs::metadata(&a).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&a, perm).unwrap();
+        let items = scan(&roots);
+        let plan = plan(&items, &roots);
+        assert!(matches!(step_of(&plan, &items, "gone"), Some(Step::Prune)));
+
+        // stopped at the first folder to remove, once every file has changed
+        let steps = plan.steps.len();
+        let asked = std::cell::Cell::new(0);
+        let stop = || {
+            asked.set(asked.get() + 1);
+            asked.get() > steps
+        };
+        let (done, errors) = apply_until(plan, &items, &roots, false, true, &stop);
+        assert_eq!(done, 0);
+        assert_eq!(
+            errors,
+            [
+                tr("msg.folder_merge_stopped"),
+                tr("msg.folder_merge_undone")
+            ]
+        );
+        assert_eq!(read(b, "a.txt"), "old\n");
+        let md = std::fs::metadata(&a).unwrap();
+        assert!(md.permissions().readonly());
+        assert_eq!(md.modified().unwrap(), mtime);
+        assert!(!b.join("a.txt.bak").exists());
+        assert_eq!(read(b, "removed.txt"), "rm\n");
+        assert_eq!(read(b, "gone/old.txt"), "g\n");
+        assert!(!b.join("new").exists());
+
+        // stopped before it starts
+        let items = scan(&roots);
+        let plan = super::plan(&items, &roots);
+        let (done, errors) = apply_until(plan, &items, &roots, false, true, &|| true);
+        assert_eq!(done, 0);
+        assert_eq!(errors[0], tr("msg.folder_merge_stopped").to_string());
+        assert_eq!(read(b, "a.txt"), "old\n");
+    }
+
+    #[test]
+    fn nothing_is_written_when_an_item_fails_its_checks() {
+        let (_dirs, roots) = folders();
+        let [l, b, r] = [&roots[0], &roots[1], &roots[2]];
+        for root in [b, r] {
+            write(root, "a.txt", "old\n");
+        }
+        write(l, "a.txt", "new\n");
+        write(l, "late.txt", "left\n");
+        let items = scan(&roots);
+        let plan = plan(&items, &roots);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(b, "late.txt", "edited meanwhile\n");
+        let (done, errors) = apply(plan, &items, &roots, false);
+        assert_eq!(done, 0);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].starts_with("late.txt"), "{errors:?}");
+        assert_eq!(errors[1], tr("msg.folder_merge_not_applied").to_string());
+        assert_eq!(read(b, "a.txt"), "old\n");
     }
 }

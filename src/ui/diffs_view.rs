@@ -1272,7 +1272,7 @@ impl DiffsView {
             .frame(
                 egui::Frame::new()
                     .fill(pal(ui).surface_alt)
-                    .inner_margin(egui::Margin::same(8)),
+                    .inner_margin(egui::Margin::same(theme::space::MD)),
             )
             .show(ui, |ui| self.file_list(ui));
         if self.cards.is_empty() {
@@ -1370,7 +1370,7 @@ impl DiffsView {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(tr("report.files"))
-                    .font(theme::semibold(13.0))
+                    .font(theme::semibold(theme::size::DENSE))
                     .color(p.text),
             );
             ui.label(egui::RichText::new(self.cards.len().to_string()).color(p.text_dim));
@@ -1379,7 +1379,7 @@ impl DiffsView {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(tr("diffs.stopped"))
-                    .size(12.0)
+                    .size(theme::size::SMALL)
                     .color(p.warning),
             );
         }
@@ -1409,9 +1409,9 @@ impl DiffsView {
                     );
                     let painter = ui.painter_at(rect);
                     if current_file == Some(f) {
-                        painter.rect_filled(rect, 6.0, p.accent_soft);
+                        painter.rect_filled(rect, theme::radius::SM, p.accent_soft);
                     } else if resp.hovered() {
-                        painter.rect_filled(rect, 6.0, p.control_hover);
+                        painter.rect_filled(rect, theme::radius::SM, p.control_hover);
                     }
                     let dot = card_color(&p, card, n);
                     painter.circle_filled(pos2(rect.left() + 10.0, rect.center().y), 3.5, dot);
@@ -1420,8 +1420,11 @@ impl DiffsView {
                         Body::Note(..) => "–".to_string(),
                         Body::Diffs(d) => d.hunks.len().to_string(),
                     };
-                    let count_g =
-                        painter.layout_no_wrap(count, FontId::proportional(12.0), p.text_dim);
+                    let count_g = painter.layout_no_wrap(
+                        count,
+                        FontId::proportional(theme::size::SMALL),
+                        p.text_dim,
+                    );
                     let right = rect.right() - 8.0 - count_g.size().x;
                     painter.galley(
                         pos2(right, rect.center().y - count_g.size().y / 2.0),
@@ -1440,13 +1443,16 @@ impl DiffsView {
                     job.append(
                         &name,
                         0.0,
-                        TextFormat::simple(FontId::proportional(13.0), p.text),
+                        TextFormat::simple(FontId::proportional(theme::size::DENSE), p.text),
                     );
                     if !card.item.rel_dir.is_empty() {
                         job.append(
                             &card.item.rel_dir,
                             8.0,
-                            TextFormat::simple(FontId::proportional(11.5), p.text_dim),
+                            TextFormat::simple(
+                                FontId::proportional(theme::size::CAPTION),
+                                p.text_dim,
+                            ),
                         );
                     }
                     job.wrap = one_line(name_rect.width());
@@ -1503,13 +1509,16 @@ impl DiffsView {
             job.append(
                 side_name(s, n),
                 0.0,
-                TextFormat::simple(theme::semibold(12.0), widgets::side_color(ui, s, n)),
+                TextFormat::simple(
+                    theme::semibold(theme::size::SMALL),
+                    widgets::side_color(ui, s, n),
+                ),
             );
             let root = self.display_roots.get(s).cloned().unwrap_or_default();
             job.append(
                 &root,
                 8.0,
-                TextFormat::simple(FontId::proportional(12.0), p.text_dim),
+                TextFormat::simple(FontId::proportional(theme::size::SMALL), p.text_dim),
             );
             job.wrap = one_line(col.width() - 8.0);
             let g = ui.fonts_mut(|f| f.layout_job(job));
@@ -1692,7 +1701,7 @@ impl DiffsView {
         let text_right = bui.min_rect().left() - 8.0;
 
         let mut summary = LayoutJob::default();
-        let small = FontId::proportional(12.0);
+        let small = FontId::proportional(theme::size::SMALL);
         match &card.body {
             Body::Loading => summary.append(
                 tr("msg.comparing"),
@@ -1714,7 +1723,7 @@ impl DiffsView {
                             summary.append(
                                 &format!("{sign}{v}"),
                                 8.0,
-                                TextFormat::simple(theme::semibold(12.0), color),
+                                TextFormat::simple(theme::semibold(theme::size::SMALL), color),
                             );
                         }
                     }
@@ -1731,20 +1740,20 @@ impl DiffsView {
             name.append(
                 "● ",
                 0.0,
-                TextFormat::simple(theme::semibold(13.5), p.accent),
+                TextFormat::simple(theme::semibold(theme::size::CONTROL), p.accent),
             );
         }
         if !card.item.rel_dir.is_empty() {
             name.append(
                 &format!("{}/", card.item.rel_dir),
                 0.0,
-                TextFormat::simple(FontId::proportional(13.5), p.text_dim),
+                TextFormat::simple(FontId::proportional(theme::size::CONTROL), p.text_dim),
             );
         }
         name.append(
             &card.item.name,
             0.0,
-            TextFormat::simple(theme::semibold(13.5), p.text),
+            TextFormat::simple(theme::semibold(theme::size::CONTROL), p.text),
         );
         let left = rect.left() + 50.0;
         name.wrap = one_line((sx - 12.0 - left).max(20.0));
@@ -1796,17 +1805,17 @@ impl DiffsView {
                 &[("i", (h + 1).to_string()), ("n", d.hunks.len().to_string())],
             ),
             0.0,
-            TextFormat::simple(theme::semibold(12.5), p.text),
+            TextFormat::simple(theme::semibold(theme::size::SMALL), p.text),
         );
         job.append(
             kind,
             10.0,
-            TextFormat::simple(FontId::proportional(12.5), p.accent),
+            TextFormat::simple(FontId::proportional(theme::size::SMALL), p.accent),
         );
         job.append(
             &ranges,
             10.0,
-            TextFormat::simple(FontId::proportional(12.0), p.text_dim),
+            TextFormat::simple(FontId::proportional(theme::size::SMALL), p.text_dim),
         );
         job.wrap = one_line((rect.width() - 110.0).max(20.0));
         let g = ui.fonts_mut(|fonts| fonts.layout_job(job));
@@ -1957,7 +1966,7 @@ impl DiffsView {
             pos2(rect.left() + 16.0, rect.center().y),
             Align2::LEFT_CENTER,
             text,
-            FontId::proportional(13.0),
+            FontId::proportional(theme::size::DENSE),
             p.text_dim,
         );
     }
@@ -2579,7 +2588,7 @@ mod tests {
 
     #[test]
     fn marks_cut_with_the_line_and_tabs_expand() {
-        let font = FontId::monospace(12.0);
+        let font = FontId::monospace(theme::size::SMALL);
         let colors = (Color32::WHITE, Color32::RED);
         let line = "é".repeat(SHOWN_CHARS * 3);
         let job = line_job(&line, &[0..2, 10..line.len()], &font, colors, 100.0, 4);

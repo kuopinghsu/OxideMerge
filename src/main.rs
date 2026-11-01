@@ -157,9 +157,12 @@ struct Cli {
     /// Read-only JSON/XML semantic comparison (two files)
     #[arg(long)]
     semantic: bool,
-    /// Semantic format: json or xml; YAML/TOML are not supported yet
+    /// Semantic format: json, xml, toml or yaml (default: from the first file's extension)
     #[arg(long, value_name = "FORMAT", requires = "semantic")]
     format: Option<String>,
+    /// Pair object elements of arrays by this member's value instead of by position
+    #[arg(long, value_name = "MEMBER", requires = "semantic")]
+    array_key: Option<String>,
     /// Summarize annotations from this portable .oxmreview
     #[arg(long, value_name = "SNAPSHOT")]
     review_summary: Option<PathBuf>,
@@ -177,6 +180,9 @@ struct Cli {
     /// Flag changed baseline paths containing this literal substring; repeatable
     #[arg(long)]
     important_path: Vec<String>,
+    /// Keep this added baseline path added rather than a suspected rename with edits; repeatable
+    #[arg(long, value_name = "PATH")]
+    split_rename: Vec<String>,
     /// User interface language code (en, zh-TW, zh-CN, ja, ko, de, fr, es, ru, pt-BR, ...)
     #[arg(long)]
     lang: Option<String>,
@@ -724,13 +730,22 @@ fn run_analysis(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             cli.paths.len() == 2,
             "Semantic comparison requires two files"
         );
-        let format = match cli.format.as_deref().unwrap_or_else(|| if core::text::extension(&cli.paths[0]) == "xml" { "xml" } else { "json" }) { "json" => semantic::Format::Json, "xml" => semantic::Format::Xml, _ => anyhow::bail!("Supported semantic formats: json, xml. YAML/TOML require fidelity adapters; use textual compare.") };
+        let format = match cli.format.as_deref() {
+            Some(name) => semantic::Format::of_extension(name).ok_or_else(|| {
+                anyhow::anyhow!("Unsupported semantic format {name}; use json, xml, toml or yaml")
+            })?,
+            None => semantic::Format::of_extension(&core::text::extension(&cli.paths[0]))
+                .unwrap_or(semantic::Format::Json),
+        };
         let docs: Vec<_> = cli
             .paths
             .iter()
             .map(|p| analysis::read(p).map(|b| core::text::decode(&b, None).0))
             .collect::<anyhow::Result<_>>()?;
-        let report = semantic::compare(&docs[0], &docs[1], format);
+        let options = semantic::Options {
+            array_key: cli.array_key.clone().filter(|k| !k.is_empty()),
+        };
+        let report = semantic::compare_with(&docs[0], &docs[1], format, &options);
         let code = if !report.errors.is_empty() {
             2
         } else {
@@ -838,7 +853,13 @@ fn run_analysis(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     let filter = cli.filter.as_deref().unwrap_or(&cfg.filter);
     let left = baseline::capture(&specs[0], &cfg.diff, filter, &cancel, &progress)?;
     let right = baseline::capture(&specs[1], &cfg.diff, filter, &cancel, &progress)?;
-    let summary = baseline::compare(&left, &right, &cli.important_path, &cancel)?;
+    let summary = baseline::compare_with(
+        &left,
+        &right,
+        &cli.important_path,
+        &cli.split_rename.iter().cloned().collect(),
+        &cancel,
+    )?;
     let inputs: Vec<PathBuf> = specs
         .iter()
         .map(|s| match s {
@@ -848,7 +869,7 @@ fn run_analysis(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         })
         .collect();
     if cli.impact {
-        let report = core::impact::Index::default().analyze(&summary, &right, &cancel)?;
+        let report = core::impact::Index::default().analyze(&summary, &left, &right, &cancel)?;
         analysis_output(cli, &report, inputs)?;
     } else if let Some(path) = cli
         .release_report

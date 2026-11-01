@@ -415,6 +415,82 @@ fn clip_line(text: &str) -> &str {
     &text[..end]
 }
 
+/// The first `max` characters of `text`, with an ellipsis when it is longer.
+fn shorten(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_owned(),
+    }
+}
+
+/// The changes of a semantic report under `node`, each a section with its values and links to
+/// where it is in each file. `jump` is set to the side and line of a clicked link.
+fn semantic_tree_ui(
+    ui: &mut Ui,
+    node: &crate::core::semantic::PathTree,
+    depth: usize,
+    jump: &mut Option<(usize, usize)>,
+) {
+    use crate::core::semantic::ChangeKind;
+    for change in &node.changes {
+        let kind = tr(match change.kind {
+            ChangeKind::Added => "analysis.added",
+            ChangeKind::Removed => "analysis.removed",
+            ChangeKind::Modified => "analysis.modified",
+            ChangeKind::TypeChanged => "analysis.type_changed",
+            ChangeKind::Moved => "analysis.moved",
+        });
+        let label = match &change.from {
+            Some(from) => format!(
+                "{kind} · {}",
+                trf("analysis.moved_from", &[("path", shorten(from, 240))])
+            ),
+            None => kind.to_owned(),
+        };
+        let label = if change.ambiguous {
+            format!("{label} · {}", tr("analysis.ambiguous"))
+        } else {
+            label
+        };
+        egui::CollapsingHeader::new(label)
+            .id_salt(&change.id)
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.monospace(format!(
+                    "{} → {}",
+                    shorten(change.before.as_deref().unwrap_or("∅"), 512),
+                    shorten(change.after.as_deref().unwrap_or("∅"), 512),
+                ));
+                let paired = match change.confidence.as_str() {
+                    "array_key" => Some("analysis.paired_by_key"),
+                    "reordered" => Some("analysis.paired_by_reordering"),
+                    "position" => Some("analysis.paired_by_position"),
+                    _ => None,
+                };
+                if let Some(key) = paired {
+                    ui.small(tr(key));
+                }
+                if change.ambiguous {
+                    ui.colored_label(widgets::pal(ui).warning, tr("analysis.ambiguous_hint"));
+                }
+                for (side, span) in change.spans.iter().enumerate() {
+                    if let Some(span) = span {
+                        let link = format!("{} {}:{}", tr("analysis.source"), side + 1, span.line);
+                        if ui.button(link).clicked() {
+                            *jump = Some((side, span.line - 1));
+                        }
+                    }
+                }
+            });
+    }
+    for child in &node.children {
+        egui::CollapsingHeader::new(format!("{} ({})", shorten(&child.label, 240), child.count))
+            .id_salt(&child.label)
+            .default_open(depth < 4 || child.count <= 20)
+            .show(ui, |ui| semantic_tree_ui(ui, child, depth + 1, jump));
+    }
+}
+
 /// Display columns where each wrapped segment of `text` starts, breaking after
 /// whitespace when possible. Wide characters take two columns.
 fn wrap_starts(text: &str, tab: usize, cols: usize) -> Vec<usize> {
@@ -528,6 +604,8 @@ pub struct TextView {
         super::analysis::Task<crate::core::semantic::SemanticReport>,
     )>,
     semantic_filter: Option<crate::core::semantic::ChangeKind>,
+    /// The array matching key of the semantic view; empty compares arrays by position.
+    semantic_array_key: String,
     merge_validation_generation: Option<u64>,
     merge_freshness: Option<(u64, bool)>,
     merge_preview_job: Option<(
@@ -636,6 +714,7 @@ impl TextView {
             semantic_cache: None,
             semantic_job: None,
             semantic_filter: None,
+            semantic_array_key: String::new(),
             merge_validation_generation: None,
             merge_freshness: None,
             merge_preview_job: None,
@@ -3142,7 +3221,7 @@ impl TextView {
                 self.export_request = true;
             }
             if !self.panel_tabs().is_empty() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                widgets::toolbar_end(ui, 34.0, |ui| {
                     widgets::drawer_toggle(ui, &mut self.drawer_open);
                 });
             }
@@ -3224,9 +3303,19 @@ impl TextView {
                     self.mark_resolved(b);
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let label = tr("merge.save_result");
+            let width = ui
+                .painter()
+                .layout_no_wrap(
+                    label.to_owned(),
+                    FontId::proportional(theme::size::DENSE),
+                    Color32::PLACEHOLDER,
+                )
+                .size()
+                .x
+                + 32.0;
+            widgets::toolbar_end(ui, width, |ui| {
                 ui.add_space(4.0);
-                let label = tr("merge.save_result");
                 let r = widgets::bar_button(ui, modified, None, label, left == 0)
                     .on_hover_text(Cmd::Save.tip_if(keys));
                 if r.clicked() {
@@ -3779,9 +3868,9 @@ impl TextView {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             let mut job = LayoutJob::default();
                             let name_font = if active {
-                                theme::semibold(13.5)
+                                theme::semibold(theme::size::CONTROL)
                             } else {
-                                FontId::proportional(13.5)
+                                FontId::proportional(theme::size::CONTROL)
                             };
                             job.append(
                                 &name,
@@ -3797,7 +3886,7 @@ impl TextView {
                                     "  ●",
                                     0.0,
                                     TextFormat {
-                                        font_id: FontId::proportional(11.0),
+                                        font_id: FontId::proportional(theme::size::CAPTION),
                                         color: pal.warning,
                                         ..Default::default()
                                     },
@@ -3808,7 +3897,7 @@ impl TextView {
                                     &format!("   {dir}"),
                                     0.0,
                                     TextFormat {
-                                        font_id: FontId::proportional(12.5),
+                                        font_id: FontId::proportional(theme::size::SMALL),
                                         color: pal.text_dim,
                                         ..Default::default()
                                     },
@@ -4214,7 +4303,7 @@ impl TextView {
             )
             .shrink2(vec2(6.0, 2.0));
             if let Some(bg) = self.row_bg(r, p, c) {
-                painter.rect_filled(slot, 3.0, bg);
+                painter.rect_filled(slot, theme::radius::XS, bg);
             }
             let label = match row.line(p) {
                 Some(l) => format!("{} {}", side_name(p, n), l + 1),
@@ -5199,30 +5288,35 @@ impl TextView {
         tabs
     }
 
-    /// The Text / Semantic switch of JSON and XML compares, and the semantic view itself.
+    /// The Text / Semantic switch of JSON, XML, TOML and YAML compares, and the semantic view.
     /// Returns true when the semantic view took the place of the text panes.
     fn analysis_ui(&mut self, ui: &mut Ui) -> bool {
         use crate::core::{analysis, semantic};
         if self.n() != 2 {
             return false;
         }
-        let format =
-            self.panes
-                .first()
-                .and_then(|p| {
-                    let hint =
-                        p.doc.syntax.as_ref().map(|extension| {
-                            std::path::PathBuf::from(format!("source.{extension}"))
-                        });
-                    crate::core::prettify::detect(
-                        p.doc.path.as_deref().or(hint.as_deref()),
-                        &p.doc.lines.first().cloned().unwrap_or_default(),
-                    )
-                })
+        let format = self.panes.first().and_then(|p| {
+            let hint = p
+                .doc
+                .syntax
+                .as_ref()
+                .map(|extension| std::path::PathBuf::from(format!("source.{extension}")));
+            let path = p.doc.path.as_deref().or(hint.as_deref());
+            path.and_then(|path| {
+                semantic::Format::of_extension(&text::extension(path))
+                    .filter(|f| matches!(f, semantic::Format::Toml | semantic::Format::Yaml))
+            })
+            .or_else(|| {
+                crate::core::prettify::detect(
+                    path,
+                    &p.doc.lines.first().cloned().unwrap_or_default(),
+                )
                 .map(|f| match f {
                     crate::core::prettify::Format::Json => semantic::Format::Json,
                     crate::core::prettify::Format::Xml => semantic::Format::Xml,
-                });
+                })
+            })
+        });
         let Some(format) = format else {
             return false;
         };
@@ -5233,21 +5327,36 @@ impl TextView {
         if !self.semantic_mode {
             return false;
         }
+        // While the array key is being typed, the report keeps the key it was made with.
+        let typed_id = self.id.with("array_key_typed");
+        let typing = ui
+            .data(|d| d.get_temp::<std::time::Instant>(typed_id))
+            .is_some();
+        let options = match self.semantic_cache.as_ref().filter(|_| typing) {
+            Some((_, report)) => report.options.clone(),
+            None => semantic::Options {
+                array_key: Some(self.semantic_array_key.trim().to_owned())
+                    .filter(|k| !k.is_empty()),
+            },
+        };
         if self
             .semantic_cache
             .as_ref()
-            .is_none_or(|(generation, _)| *generation != self.layout_gen)
+            .is_none_or(|(generation, report)| {
+                *generation != self.layout_gen || report.options != options
+            })
             && self
                 .semantic_job
                 .as_ref()
                 .is_none_or(|(generation, _)| *generation != self.layout_gen)
         {
             let docs: Vec<_> = self.panes.iter().map(|p| p.doc.text()).collect();
+            let job_options = options.clone();
             self.semantic_job = Some((
                 self.layout_gen,
                 super::analysis::Task::start(move |cancel, _| {
                     analysis::check_cancel(cancel)?;
-                    let report = semantic::compare(&docs[0], &docs[1], format);
+                    let report = semantic::compare_with(&docs[0], &docs[1], format, &job_options);
                     analysis::check_cancel(cancel)?;
                     Ok(report)
                 }),
@@ -5270,6 +5379,8 @@ impl TextView {
                                 changes: Vec::new(),
                                 errors: vec![e.to_string()],
                                 policies: Vec::new(),
+                                options,
+                                notes: Vec::new(),
                             },
                         ));
                     }
@@ -5301,6 +5412,7 @@ impl TextView {
                     (semantic::ChangeKind::Removed, "analysis.removed"),
                     (semantic::ChangeKind::Modified, "analysis.modified"),
                     (semantic::ChangeKind::TypeChanged, "analysis.type_changed"),
+                    (semantic::ChangeKind::Moved, "analysis.moved"),
                 ] {
                     ui.selectable_value(&mut self.semantic_filter, Some(kind), tr(key));
                 }
@@ -5320,6 +5432,40 @@ impl TextView {
                     }
                 }
             });
+            if format.keyed() {
+                ui.horizontal(|ui| {
+                    let label = tr("analysis.array_key");
+                    ui.label(label);
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.semantic_array_key)
+                            .hint_text(tr("analysis.array_key_hint"))
+                            .char_limit(256)
+                            .desired_width(160.0),
+                    );
+                    let key = self.semantic_array_key.as_str();
+                    response.widget_info(|| {
+                        let mut info = egui::WidgetInfo::text_edit(true, key, key, "");
+                        info.label = Some(label.into());
+                        info
+                    });
+                    if response.changed() {
+                        ui.data_mut(|d| d.insert_temp(typed_id, std::time::Instant::now()));
+                    }
+                    if let Some(typed) = ui.data(|d| d.get_temp::<std::time::Instant>(typed_id)) {
+                        let pause = std::time::Duration::from_millis(300);
+                        let waited = typed.elapsed();
+                        if waited >= pause || response.lost_focus() {
+                            ui.data_mut(|d| d.remove::<std::time::Instant>(typed_id));
+                            ui.ctx().request_repaint();
+                        } else {
+                            ui.ctx().request_repaint_after(pause - waited);
+                        }
+                    }
+                });
+            }
+            for note in &report.notes {
+                ui.colored_label(widgets::pal(ui).warning, note);
+            }
             if report.identical() {
                 ui.label(tr("analysis.semantic_identical"));
             }
@@ -5357,72 +5503,17 @@ impl TextView {
                 ui.small(tr("analysis.value_limit"));
             });
             let mut jump = None;
+            let filter = self.semantic_filter.clone();
+            let page: Vec<_> = report
+                .changes
+                .iter()
+                .filter(|change| filter.as_ref().is_none_or(|f| f == &change.kind))
+                .skip(self.semantic_page * 100)
+                .take(100)
+                .collect();
+            let tree = semantic::PathTree::of(page);
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for change in report
-                    .changes
-                    .iter()
-                    .filter(|change| {
-                        self.semantic_filter
-                            .as_ref()
-                            .is_none_or(|f| f == &change.kind)
-                    })
-                    .skip(self.semantic_page * 100)
-                    .take(100)
-                {
-                    if self
-                        .semantic_filter
-                        .as_ref()
-                        .is_some_and(|f| f != &change.kind)
-                    {
-                        continue;
-                    }
-                    egui::CollapsingHeader::new(format!(
-                        "{:?} {}{}",
-                        change.kind,
-                        change.path.chars().take(240).collect::<String>(),
-                        if change.path.chars().count() > 240 {
-                            "…"
-                        } else {
-                            ""
-                        }
-                    ))
-                    .id_salt(&change.id)
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        ui.monospace(format!(
-                            "{} → {}",
-                            change
-                                .before
-                                .as_deref()
-                                .unwrap_or("∅")
-                                .chars()
-                                .take(512)
-                                .collect::<String>(),
-                            change
-                                .after
-                                .as_deref()
-                                .unwrap_or("∅")
-                                .chars()
-                                .take(512)
-                                .collect::<String>()
-                        ));
-                        for (side, span) in change.spans.iter().enumerate() {
-                            if let Some(span) = span {
-                                if ui
-                                    .button(format!(
-                                        "{} {}:{}",
-                                        tr("analysis.source"),
-                                        side + 1,
-                                        span.line
-                                    ))
-                                    .clicked()
-                                {
-                                    jump = Some((side, span.line - 1));
-                                }
-                            }
-                        }
-                    });
-                }
+                semantic_tree_ui(ui, &tree, 0, &mut jump);
             });
             if let Some((side, line)) = jump {
                 self.active_pane = side;
@@ -5569,6 +5660,9 @@ impl TextView {
             pos2(content_right, body_bottom),
         );
         let resp = ui.interact(body_rect, self.id.with("body"), Sense::click_and_drag());
+        resp.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::Role::Document, true, tr("help.text_compare"))
+        });
 
         let digits = self
             .panes
@@ -6007,7 +6101,12 @@ impl TextView {
                     } else {
                         c.cursor_row.gamma_multiply(0.35)
                     };
-                    tp.rect_stroke(rr, 3.0, Stroke::new(1.5_f32, color), StrokeKind::Inside);
+                    tp.rect_stroke(
+                        rr,
+                        theme::radius::XS,
+                        Stroke::new(1.5_f32, color),
+                        StrokeKind::Inside,
+                    );
                 }
             }
             painter.line_segment(
@@ -6171,7 +6270,7 @@ impl TextView {
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
                     r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tr(key)));
                     if r.hovered() {
-                        painter.rect_filled(rect, 3.0, c.ui.accent);
+                        painter.rect_filled(rect, theme::radius::XS, c.ui.accent);
                     }
                     if selected || r.hovered() {
                         icons::paint(

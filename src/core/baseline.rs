@@ -52,6 +52,9 @@ pub struct BaselineMetadata {
     pub filter: String,
     pub rules: DiffOptions,
     pub working_tree: String,
+    /// When the bytes were read (UTC, RFC 3339); not part of the fingerprint.
+    #[serde(default)]
+    pub captured_at: String,
 }
 #[derive(Clone)]
 pub struct CapturedFile {
@@ -72,14 +75,55 @@ pub enum Category {
     Modified,
     Unchanged,
     Moved,
+    RenamedModified,
     BinaryChanged,
     FileTypeChanged,
+}
+impl Category {
+    pub const ALL: [Category; 8] = [
+        Category::Added,
+        Category::Deleted,
+        Category::Modified,
+        Category::RenamedModified,
+        Category::Moved,
+        Category::BinaryChanged,
+        Category::FileTypeChanged,
+        Category::Unchanged,
+    ];
+    /// The JSON name, also used as the count key.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Category::Added => "added",
+            Category::Deleted => "deleted",
+            Category::Modified => "modified",
+            Category::Unchanged => "unchanged",
+            Category::Moved => "moved",
+            Category::RenamedModified => "renamed_modified",
+            Category::BinaryChanged => "binary_changed",
+            Category::FileTypeChanged => "file_type_changed",
+        }
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            Category::Added => "Added",
+            Category::Deleted => "Deleted",
+            Category::Modified => "Modified",
+            Category::Unchanged => "Unchanged",
+            Category::Moved => "Moved",
+            Category::RenamedModified => "Renamed with edits",
+            Category::BinaryChanged => "Binary changed",
+            Category::FileTypeChanged => "File type changed",
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReleaseChange {
     pub id: String,
     pub path: String,
     pub old_path: Option<String>,
+    /// Percent of matching lines, for a suspected rename with edits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<u8>,
     pub category: Category,
     pub before_digest: Option<String>,
     pub after_digest: Option<String>,
@@ -97,6 +141,14 @@ pub struct ReleaseSummary {
     pub counts: BTreeMap<String, usize>,
     pub excluded: Vec<(String, String, String)>,
     pub limitations: Vec<String>,
+    /// Added paths the user said are not renames: they stay added, their sources deleted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub split_renames: Vec<String>,
+}
+impl ReleaseChange {
+    pub fn high_priority(&self) -> bool {
+        !self.risk_flags.is_empty()
+    }
 }
 pub fn capture(
     spec: &BaselineSpec,
@@ -247,6 +299,7 @@ pub fn capture(
                 "Captured file bytes; unreadable/excluded paths listed separately"
             }
             .into(),
+            captured_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         },
         files,
         directories,
@@ -273,10 +326,109 @@ fn excluded(exclusions: &BTreeMap<String, String>, mut path: &str) -> bool {
         }
     }
 }
+/// Smallest share of matching lines for a suspected rename with edits, in percent.
+const RENAME_SIMILARITY: usize = 50;
+/// Files larger than this are never rename candidates.
+const RENAME_MAX_BYTES: usize = 256 << 10;
+/// More candidate pairs than this skips the similarity search.
+const RENAME_MAX_PAIRS: usize = 250_000;
+
+/// The lines of a text file, counted.
+fn line_counts(bytes: &[u8]) -> Option<(std::collections::HashMap<&str, usize>, usize)> {
+    if bytes.len() > RENAME_MAX_BYTES || text::looks_binary(bytes) {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut counts = std::collections::HashMap::new();
+    let mut total = 0;
+    for line in text.lines().map(str::trim_end).filter(|l| !l.is_empty()) {
+        *counts.entry(line).or_insert(0) += 1;
+        total += 1;
+    }
+    (total > 0).then_some((counts, total))
+}
+
+/// Added path → (deleted path, percentage of matching lines).
+type Renames = BTreeMap<String, (String, u8)>;
+
+/// Pairs deleted and added text files that share most of their lines, by extension. A pair is
+/// kept only when it is the clear best for both files; ties leave both files unpaired.
+fn similar_renames(
+    removed: &[(&String, &CapturedFile)],
+    added: &[(&String, &CapturedFile)],
+    cancel: &AtomicBool,
+) -> Result<(Renames, bool)> {
+    let mut found = BTreeMap::new();
+    if removed.is_empty() || added.is_empty() {
+        return Ok((found, false));
+    }
+    if removed.len().saturating_mul(added.len()) > RENAME_MAX_PAIRS {
+        return Ok((found, true));
+    }
+    let ext = |p: &str| text::extension(Path::new(p));
+    let old: Vec<_> = removed
+        .iter()
+        .filter_map(|(p, f)| line_counts(&f.bytes).map(|c| (p.as_str(), ext(p), c)))
+        .collect();
+    let new: Vec<_> = added
+        .iter()
+        .filter_map(|(p, f)| line_counts(&f.bytes).map(|c| (p.as_str(), ext(p), c)))
+        .collect();
+    let mut pairs = Vec::new();
+    for (o, oext, (ocounts, ototal)) in &old {
+        analysis::check_cancel(cancel)?;
+        for (n, next, (ncounts, ntotal)) in &new {
+            if oext != next || ototal.min(ntotal) * 200 < RENAME_SIMILARITY * (ototal + ntotal) {
+                continue;
+            }
+            let common: usize = ocounts
+                .iter()
+                .map(|(line, c)| (*c).min(ncounts.get(line).copied().unwrap_or(0)))
+                .sum();
+            let score = common * 200 / (ototal + ntotal);
+            if score >= RENAME_SIMILARITY {
+                pairs.push((score, *o, *n));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)).then(a.2.cmp(b.2)));
+    let mut used = BTreeSet::new();
+    for (i, &(score, o, n)) in pairs.iter().enumerate() {
+        if used.contains(&("old", o)) || used.contains(&("new", n)) {
+            continue;
+        }
+        let tied = pairs.iter().enumerate().any(|(j, &(s, oo, nn))| {
+            j != i
+                && s == score
+                && (oo == o || nn == n)
+                && !used.contains(&("old", oo))
+                && !used.contains(&("new", nn))
+        });
+        used.insert(("old", o));
+        used.insert(("new", n));
+        if !tied {
+            found.insert(n.to_owned(), (o.to_owned(), score as u8));
+        }
+    }
+    Ok((found, false))
+}
+
+#[cfg(test)]
 pub fn compare(
     left: &Capture,
     right: &Capture,
     important: &[String],
+    cancel: &AtomicBool,
+) -> Result<ReleaseSummary> {
+    compare_with(left, right, important, &BTreeSet::new(), cancel)
+}
+
+/// Compares two captures; `split` lists added paths never to be paired as renames with edits.
+pub fn compare_with(
+    left: &Capture,
+    right: &Capture,
+    important: &[String],
+    split: &BTreeSet<String>,
     cancel: &AtomicBool,
 ) -> Result<ReleaseSummary> {
     let mut changes = Vec::new();
@@ -305,6 +457,30 @@ pub fn compare(
             moved.insert(new[0].clone(), old[0].clone());
             consumed.insert(old[0].clone());
         }
+    }
+    fn unpaired<'a>(
+        side: &BTreeMap<String, Vec<String>>,
+        capture: &'a Capture,
+        skip: &dyn Fn(&str) -> bool,
+    ) -> Vec<(&'a String, &'a CapturedFile)> {
+        side.values()
+            .flatten()
+            .filter(|p| !skip(p))
+            .filter_map(|p| capture.files.get_key_value(p))
+            .collect()
+    }
+    let (similar, skipped) = similar_renames(
+        &unpaired(&removed, left, &|p| consumed.contains(p)),
+        &unpaired(&added, right, &|p| {
+            moved.contains_key(p) || split.contains(p)
+        }),
+        cancel,
+    )?;
+    let mut similarity = BTreeMap::new();
+    for (new, (old, score)) in similar {
+        consumed.insert(old.clone());
+        moved.insert(new.clone(), old);
+        similarity.insert(new, score);
     }
     for path in left
         .files
@@ -359,15 +535,15 @@ pub fn compare(
                         &left.metadata.rules,
                         Path::new(path),
                     );
-                    let format = match text::extension(Path::new(path)).as_str() {
-                        "json" => Some(semantic::Format::Json),
-                        "xml" => Some(semantic::Format::Xml),
-                        _ => None,
-                    };
+                    let format = semantic::Format::of_extension(&text::extension(Path::new(path)));
                     if let Some(f) = format {
                         semantic = Some(semantic::compare(&da.text(), &db.text(), f));
                     }
-                    Category::Modified
+                    if old_path.is_some() {
+                        Category::RenamedModified
+                    } else {
+                        Category::Modified
+                    }
                 }
             }
             _ => continue,
@@ -388,6 +564,7 @@ pub fn compare(
         let after_digest = b.map(|f| f.digest.clone());
         changes.push(ReleaseChange {
             id: analysis::identity(&(path, &before_digest, &after_digest)),
+            similarity: similarity.get(path).copied(),
             path: path.clone(),
             old_path,
             category,
@@ -401,14 +578,7 @@ pub fn compare(
     }
     let mut counts = BTreeMap::new();
     for c in &changes {
-        *counts
-            .entry(
-                serde_json::to_value(&c.category)?
-                    .as_str()
-                    .unwrap()
-                    .to_owned(),
-            )
-            .or_default() += 1;
+        *counts.entry(c.category.name().to_owned()).or_default() += 1;
     }
     counts.insert(
         "conflict_marker_candidates".into(),
@@ -417,6 +587,21 @@ pub fn compare(
             .filter(|c| c.conflict_marker_candidates)
             .count(),
     );
+    counts.insert(
+        "high_priority".into(),
+        changes.iter().filter(|c| c.high_priority()).count(),
+    );
+    let mut limitations = vec![
+        "Exact unique-content moves are moves. Renames with edits are suspected from shared lines (at least 50%, same extension, text up to 256 KiB, a clear best match only) and can be split back into added and deleted files.".to_owned(),
+        "Heuristic priority flags do not validate release compatibility; source references are relative to captured baseline paths.".into(),
+        "Files vs directories and excluded ancestors require manual review; unreadable paths are never counted identical.".into(),
+    ];
+    if skipped {
+        limitations.push(
+            "Too many added and deleted files to look for renames with edits; they stay added/deleted."
+                .into(),
+        );
+    }
     let excluded = [("left", &left.excluded), ("right", &right.excluded)]
         .into_iter()
         .flat_map(|(side, e)| {
@@ -424,7 +609,16 @@ pub fn compare(
                 .map(move |(p, reason)| (side.into(), p.clone(), reason.clone()))
         })
         .collect();
-    Ok(ReleaseSummary { version: 1, left: left.metadata.clone(), right: right.metadata.clone(), changes, counts, excluded, limitations: vec!["Exact unique-content moves only; edited/ambiguous renames stay added/deleted.".into(), "Heuristic priority flags do not validate release compatibility; source references are relative to captured baseline paths.".into(), "Files vs directories and excluded ancestors require manual review; unreadable paths are never counted identical.".into()] })
+    Ok(ReleaseSummary {
+        version: 1,
+        left: left.metadata.clone(),
+        right: right.metadata.clone(),
+        changes,
+        counts,
+        excluded,
+        limitations,
+        split_renames: split.iter().cloned().collect(),
+    })
 }
 
 /// A self-contained, linked release report. Detail comparisons reuse the existing report
@@ -433,13 +627,52 @@ pub fn html_report(summary: &ReleaseSummary, left: &Capture, right: &Capture) ->
     use super::xml_report::esc;
     use std::fmt::Write;
     let json = serde_json::to_string_pretty(summary)?;
-    let mut out = format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>OxideMerge release summary</title><style>body{{font:15px system-ui;margin:2rem}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}iframe{{width:100%;height:32rem;border:1px solid #aaa}}section{{margin-block:2rem}}</style><h1>Release summary</h1><p>Frozen captured baselines. Priority and conflict-marker flags require review; compatibility has not been validated.</p><details><summary>Baseline metadata and versioned JSON</summary><pre>{}</pre></details><nav><ul>", esc(&json));
+    let mut out = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>OxideMerge release summary</title><style>body{font:15px system-ui;margin:2rem}pre{white-space:pre-wrap;overflow-wrap:anywhere}iframe{width:100%;height:32rem;border:1px solid #aaa}section{margin-block:2rem}</style><h1>Release summary</h1><p>Frozen captured baselines. Priority and conflict-marker flags require review; compatibility has not been validated.</p>".to_string();
+    for (side, meta) in [("Left", &summary.left), ("Right", &summary.right)] {
+        write!(
+            out,
+            "<p>{side}: {} · captured {} · {}</p>",
+            esc(&meta.spec.path().display().to_string()),
+            esc(&meta.captured_at),
+            esc(meta.resolved_commit.as_deref().unwrap_or(&meta.fingerprint))
+        )?;
+    }
+    out.push_str("<ul class=\"counts\">");
+    for category in Category::ALL {
+        if let Some(n) = summary.counts.get(category.name()).filter(|&&n| n > 0) {
+            write!(out, "<li>{}: {n}</li>", category.label())?;
+        }
+    }
+    out.push_str("</ul>");
+    let priority: Vec<_> = summary
+        .changes
+        .iter()
+        .filter(|c| c.high_priority())
+        .collect();
+    if !priority.is_empty() {
+        write!(out, "<h2>High priority ({})</h2><ul>", priority.len())?;
+        for change in priority {
+            write!(
+                out,
+                "<li><a href=\"#change-{}\">{}</a>: {}</li>",
+                change.id,
+                esc(&change.path),
+                esc(&change.risk_flags.join(" "))
+            )?;
+        }
+        out.push_str("</ul>");
+    }
+    write!(
+        out,
+        "<details><summary>Baseline metadata and versioned JSON</summary><pre>{}</pre></details><nav><ul>",
+        esc(&json)
+    )?;
     for change in &summary.changes {
         write!(
             out,
-            "<li><a href=\"#change-{}\">{:?}: {}</a></li>",
+            "<li><a href=\"#change-{}\">{}: {}</a></li>",
             change.id,
-            change.category,
+            change.category.label(),
             esc(&change.path)
         )?;
     }
@@ -448,13 +681,19 @@ pub fn html_report(summary: &ReleaseSummary, left: &Capture, right: &Capture) ->
     for change in &summary.changes {
         write!(
             out,
-            "<section id=\"change-{}\"><h2>{:?}: {}</h2>",
+            "<section id=\"change-{}\"><h2>{}: {}</h2>",
             change.id,
-            change.category,
+            change.category.label(),
             esc(&change.path)
         )?;
-        if let Some(old) = &change.old_path {
-            write!(out, "<p>Exact content move from {}</p>", esc(old))?;
+        match (&change.old_path, change.similarity) {
+            (Some(old), Some(score)) => write!(
+                out,
+                "<p>Suspected rename from {} ({score}% of lines match)</p>",
+                esc(old)
+            )?,
+            (Some(old), None) => write!(out, "<p>Exact content move from {}</p>", esc(old))?,
+            _ => {}
         }
         for warning in &change.risk_flags {
             write!(out, "<p>{}</p>", esc(warning))?;
@@ -563,7 +802,7 @@ mod tests {
         assert_eq!(report.changes.len(), 1);
         assert!(report.changes[0].ignored_by_text_rules);
         assert!(crate::core::impact::Index::default()
-            .analyze(&report, &b, &cancel)
+            .analyze(&report, &a, &b, &cancel)
             .unwrap()
             .findings
             .is_empty());
@@ -619,7 +858,7 @@ mod tests {
             Some("old.txt")
         );
         let mut index = crate::core::impact::Index::default();
-        let report = index.analyze(&summary, &right, &cancel).unwrap();
+        let report = index.analyze(&summary, &left, &right, &cancel).unwrap();
         assert!(report
             .findings
             .iter()
@@ -633,11 +872,13 @@ mod tests {
             &progress,
         )
         .unwrap();
-        assert!(index.analyze(&summary, &updated, &cancel).is_err());
+        assert!(index.analyze(&summary, &left, &updated, &cancel).is_err());
         let updated_summary = compare(&left, &updated, &["config".into()], &cancel).unwrap();
-        let incremental = index.analyze(&updated_summary, &updated, &cancel).unwrap();
+        let incremental = index
+            .analyze(&updated_summary, &left, &updated, &cancel)
+            .unwrap();
         let fresh = crate::core::impact::Index::default()
-            .analyze(&updated_summary, &updated, &cancel)
+            .analyze(&updated_summary, &left, &updated, &cancel)
             .unwrap();
         assert_eq!(
             serde_json::to_value(incremental).unwrap(),
@@ -646,6 +887,203 @@ mod tests {
         cancel.store(true, Ordering::Relaxed);
         assert!(compare(&left, &right, &[], &cancel).is_err());
     }
+    #[test]
+    fn renames_with_edits_are_suspected_only_on_a_clear_match_and_can_be_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        for root in [&a, &b] {
+            std::fs::create_dir(root).unwrap();
+        }
+        let lines = |tag: &str, n: usize| {
+            (0..n)
+                .map(|i| format!("{tag} line {i}\n"))
+                .collect::<String>()
+        };
+        let body = lines("main", 10);
+        std::fs::write(a.join("old.rs"), &body).unwrap();
+        std::fs::write(b.join("new.rs"), body.replace("main line 3", "edited")).unwrap();
+        let shared = lines("dup", 10);
+        std::fs::write(a.join("dup.txt"), &shared).unwrap();
+        std::fs::write(b.join("copy1.txt"), shared.replace("dup line 1", "x")).unwrap();
+        std::fs::write(b.join("copy2.txt"), shared.replace("dup line 2", "y")).unwrap();
+        std::fs::write(a.join("notes.md"), lines("notes", 6)).unwrap();
+        std::fs::write(b.join("notes.txt"), lines("notes", 6) + "more\n").unwrap();
+        std::fs::write(a.join("gone.cfg"), lines("gone", 8)).unwrap();
+        std::fs::write(b.join("fresh.cfg"), lines("fresh", 8)).unwrap();
+        let cancel = AtomicBool::new(false);
+        let take = |root: &PathBuf| {
+            capture(
+                &BaselineSpec::Folder { path: root.clone() },
+                &DiffOptions::default(),
+                "*",
+                &cancel,
+                &AtomicUsize::new(0),
+            )
+            .unwrap()
+        };
+        let (left, right) = (take(&a), take(&b));
+        assert!(chrono::DateTime::parse_from_rfc3339(&left.metadata.captured_at).is_ok());
+        assert_eq!(take(&a).metadata.fingerprint, left.metadata.fingerprint);
+        let summary = compare(&left, &right, &["new".into()], &cancel).unwrap();
+        let find = |s: &ReleaseSummary, p: &str| {
+            s.changes
+                .iter()
+                .find(|c| c.path == p)
+                .map(|c| (c.category.name(), c.old_path.clone(), c.similarity))
+        };
+        assert_eq!(
+            find(&summary, "new.rs"),
+            Some(("renamed_modified", Some("old.rs".into()), Some(90)))
+        );
+        assert_eq!(find(&summary, "old.rs"), None);
+        for (path, category) in [
+            ("dup.txt", "deleted"),
+            ("copy1.txt", "added"),
+            ("copy2.txt", "added"),
+            ("notes.md", "deleted"),
+            ("notes.txt", "added"),
+            ("gone.cfg", "deleted"),
+            ("fresh.cfg", "added"),
+        ] {
+            assert_eq!(find(&summary, path), Some((category, None, None)), "{path}");
+        }
+        assert_eq!(summary.counts["renamed_modified"], 1);
+        assert_eq!(summary.counts["high_priority"], 1);
+        let html = html_report(&summary, &left, &right).unwrap();
+        assert!(html.contains("Renamed with edits: new.rs"));
+        assert!(html.contains("Suspected rename from old.rs (90% of lines match)"));
+        assert!(html.contains("High priority (1)"));
+        assert!(html.contains("<style>body{font:") && !html.contains("{{"));
+        assert!(html.contains(&left.metadata.captured_at));
+
+        let split = BTreeSet::from(["new.rs".to_owned()]);
+        let summary = compare_with(&left, &right, &[], &split, &cancel).unwrap();
+        assert_eq!(find(&summary, "new.rs"), Some(("added", None, None)));
+        assert_eq!(find(&summary, "old.rs"), Some(("deleted", None, None)));
+        assert_eq!(summary.split_renames, ["new.rs"]);
+        assert!(!summary.counts.contains_key("renamed_modified"));
+    }
+
+    fn take(spec: BaselineSpec) -> Result<Capture> {
+        capture(
+            &spec,
+            &DiffOptions::default(),
+            "*",
+            &AtomicBool::new(false),
+            &AtomicUsize::new(0),
+        )
+    }
+
+    fn category_of(s: &ReleaseSummary, path: &str) -> Option<(&'static str, Option<String>)> {
+        s.changes
+            .iter()
+            .find(|c| c.path == path)
+            .map(|c| (c.category.name(), c.old_path.clone()))
+    }
+
+    #[test]
+    fn unicode_and_case_only_renames_are_moves_or_renames_with_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        for root in [&a, &b] {
+            std::fs::create_dir_all(root.join("docs")).unwrap();
+        }
+        let body = (0..10).map(|i| format!("line {i}\n")).collect::<String>();
+        std::fs::write(a.join("résumé.txt"), "cv\n").unwrap();
+        std::fs::write(b.join("docs/履歷.txt"), "cv\n").unwrap();
+        std::fs::write(a.join("Readme.md"), "read me\n").unwrap();
+        std::fs::write(b.join("README.md"), "read me\n").unwrap();
+        std::fs::write(a.join("データ.rs"), &body).unwrap();
+        std::fs::write(b.join("資料.rs"), body.replace("line 4", "edited")).unwrap();
+        std::fs::write(a.join("Lib.rs"), body.replace("line", "lib")).unwrap();
+        std::fs::write(b.join("lib.rs"), body.replace("line", "lib") + "more\n").unwrap();
+        // the same name composed and decomposed
+        std::fs::write(a.join("caf\u{e9}.txt"), "coffee\n").unwrap();
+        std::fs::write(b.join("cafe\u{301}.txt"), "coffee\n").unwrap();
+
+        let left = take(BaselineSpec::Folder { path: a }).unwrap();
+        let right = take(BaselineSpec::Folder { path: b }).unwrap();
+        let summary = compare(&left, &right, &[], &AtomicBool::new(false)).unwrap();
+        for (path, expected) in [
+            ("docs/履歷.txt", ("moved", Some("résumé.txt"))),
+            ("README.md", ("moved", Some("Readme.md"))),
+            ("資料.rs", ("renamed_modified", Some("データ.rs"))),
+            ("lib.rs", ("renamed_modified", Some("Lib.rs"))),
+        ] {
+            let expected = (expected.0, expected.1.map(str::to_owned));
+            assert_eq!(category_of(&summary, path), Some(expected), "{path}");
+        }
+        for old in ["résumé.txt", "Readme.md", "データ.rs", "Lib.rs"] {
+            assert_eq!(category_of(&summary, old), None, "{old}");
+        }
+        // A file system may store either form; the file is never added and deleted.
+        let composed = "caf\u{e9}.txt";
+        let decomposed = "cafe\u{301}.txt";
+        let renamed = category_of(&summary, decomposed)
+            .or_else(|| category_of(&summary, composed))
+            .unwrap();
+        assert!(
+            renamed == ("moved", Some(composed.into())) || renamed == ("unchanged", None),
+            "{renamed:?}"
+        );
+        assert_eq!(summary.counts.get("added"), None);
+        assert_eq!(summary.counts.get("deleted"), None);
+    }
+
+    #[test]
+    fn a_review_snapshot_compares_with_a_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let review = dir.path().join("release.oxmreview");
+        std::fs::write(
+            &review,
+            include_bytes!("../../tests/fixtures/review-0.9.6.oxmreview"),
+        )
+        .unwrap();
+        let spec = BaselineSpec::parse(&format!("review:1:{}", review.display())).unwrap();
+        assert!(matches!(spec, BaselineSpec::ReviewSnapshot { side: 1, .. }));
+        let folder = dir.path().join("work");
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::create_dir_all(folder.join("empty")).unwrap();
+        std::fs::write(folder.join("same.txt"), "same\n").unwrap();
+        std::fs::write(folder.join("a.txt"), "ONE\nfour\n").unwrap();
+        std::fs::write(folder.join("sub/C.txt"), "cafe\n").unwrap();
+        std::fs::write(folder.join("new.txt"), "new\n").unwrap();
+
+        let snapshot = take(spec.clone()).unwrap();
+        assert_eq!(
+            snapshot.files.keys().collect::<Vec<_>>(),
+            ["a.txt", "same.txt", "sub/c.txt"]
+        );
+        assert!(snapshot.directories.contains("empty"));
+        // the review is opened in a new temporary folder each time
+        assert_eq!(
+            take(spec).unwrap().metadata.fingerprint,
+            snapshot.metadata.fingerprint
+        );
+        let work = take(BaselineSpec::Folder { path: folder }).unwrap();
+        let summary = compare(&snapshot, &work, &[], &AtomicBool::new(false)).unwrap();
+        assert_eq!(category_of(&summary, "same.txt"), Some(("unchanged", None)));
+        assert_eq!(category_of(&summary, "a.txt"), Some(("modified", None)));
+        assert_eq!(
+            category_of(&summary, "sub/C.txt"),
+            Some(("moved", Some("sub/c.txt".into())))
+        );
+        assert_eq!(category_of(&summary, "new.txt"), Some(("added", None)));
+        assert_eq!(summary.changes.len(), 4);
+        assert!(matches!(
+            summary.left.spec,
+            BaselineSpec::ReviewSnapshot { side: 1, .. }
+        ));
+
+        let error = take(BaselineSpec::ReviewSnapshot {
+            path: review,
+            side: 2,
+        })
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("out of range"), "{error:#}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_inputs_are_excluded_and_never_counted_identical() {

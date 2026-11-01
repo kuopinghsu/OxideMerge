@@ -76,7 +76,11 @@ pub(crate) fn safe_path(path: &str) -> bool {
 impl Manifest {
     fn validate(&self) -> Result<()> {
         if !(1..=2).contains(&self.version) {
-            bail!("Unsupported folder review version {}", self.version);
+            bail!(
+                "Unsupported folder review version {}: it was saved by a newer OxideMerge; \
+                 update OxideMerge to open it",
+                self.version
+            );
         }
         if !(2..=3).contains(&self.labels.len()) {
             bail!("A folder review needs 2 or 3 sides");
@@ -261,6 +265,24 @@ pub fn save_with_workspace(
     {
         manifest.workspace.current = None;
     }
+    // A decision still current for the compared files holds for what the review stores, which
+    // for a converted document is its text, compared without converters.
+    let digests: BTreeMap<(usize, &str), &str> = manifest
+        .entries
+        .iter()
+        .filter_map(|e| Some(((e.side, e.path.as_str()), e.digest.as_deref()?)))
+        .collect();
+    for (path, decision) in &mut manifest.workspace.entries {
+        if decision.stale {
+            continue;
+        }
+        let sides: Vec<_> = (0..manifest.labels.len())
+            .map(|side| digests.get(&(side, path.as_str())).map(|d| d.to_string()))
+            .collect();
+        let prints = super::review_state::prints_of_digests(path, &sides, &manifest.options);
+        decision.fingerprint = prints.fingerprint;
+        decision.content = prints.content;
+    }
     manifest.validate()?;
     let data = serde_json::to_vec_pretty(&manifest)?;
     if data.len() as u64 > MAX_MANIFEST {
@@ -367,7 +389,7 @@ pub fn load(path: &Path) -> Result<Review> {
                 .collect();
             (
                 entry.path.clone(),
-                super::review_state::fingerprint_digests(&entry.path, &sides, &manifest.options),
+                super::review_state::prints_of_digests(&entry.path, &sides, &manifest.options),
             )
         })
         .collect();
@@ -517,7 +539,9 @@ mod tests {
             progress: &Progress::default(),
         }
         .run();
-        let fingerprint = crate::core::review_state::fingerprint("a.txt", &roots, &opts).unwrap();
+        let fingerprint = crate::core::review_state::prints("a.txt", &roots, &opts)
+            .unwrap()
+            .fingerprint;
         let mut workspace = Workspace {
             current: Some("a.txt".into()),
             ..Default::default()
@@ -645,5 +669,171 @@ mod tests {
         manifest.entries.clear();
         manifest.version = 3;
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn hostile_review_archives_are_rejected_without_writing_outside_the_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = |path: &str| {
+            serde_json::json!({
+                "side": 0, "path": path, "directory": false, "modified": null, "converted": false
+            })
+        };
+        let manifest = |entries: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "version": 2,
+                "saved": "",
+                "labels": ["Left", "Right"],
+                "options": DiffOptions::default(),
+                "folder": FolderOptions::default(),
+                "filter": "*",
+                "notes": {},
+                "entries": entries,
+            })
+        };
+        enum Item<'a> {
+            File(&'a str, &'a [u8]),
+            Link(&'a str, &'a str),
+        }
+        let archive = |name: &str, manifest: &[u8], items: &[Item]| {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("manifest.json", options).unwrap();
+            writer.write_all(manifest).unwrap();
+            for item in items {
+                match item {
+                    Item::File(path, bytes) => {
+                        writer.start_file(*path, options).unwrap();
+                        writer.write_all(bytes).unwrap();
+                    }
+                    Item::Link(path, target) => {
+                        writer.add_symlink(*path, *target, options).unwrap()
+                    }
+                }
+            }
+            let path = dir.path().join(name);
+            std::fs::write(&path, writer.finish().unwrap().into_inner()).unwrap();
+            path
+        };
+        let rejected = |path: &Path, expected: &str| {
+            let error = load(path).err().map(|e| format!("{e:#}"));
+            assert!(
+                error.as_deref().is_some_and(|e| e.contains(expected)),
+                "{}: {error:?}, expected {expected:?}",
+                path.display()
+            );
+        };
+        let json = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+
+        let fine = archive(
+            "fine.oxmreview",
+            &json(manifest(vec![entry("a.txt")])),
+            &[Item::File("data/0/a.txt", b"a\n")],
+        );
+        assert!(load(&fine).is_ok());
+
+        let slip = archive(
+            "slip.oxmreview",
+            &json(manifest(vec![entry("../../evil.txt")])),
+            &[Item::File("data/0/../../evil.txt", b"evil\n")],
+        );
+        rejected(&slip, "Invalid or duplicate folder review path");
+        let hidden = archive(
+            "hidden.oxmreview",
+            &json(manifest(vec![entry("a.txt")])),
+            &[
+                Item::File("data/0/a.txt", b"a\n"),
+                Item::File("data/0/../../evil.txt", b"evil\n"),
+            ],
+        );
+        rejected(&hidden, "unlisted or missing entries");
+        let link = archive(
+            "link.oxmreview",
+            &json(manifest(vec![entry("a.txt")])),
+            &[Item::Link("data/0/a.txt", "/etc/passwd")],
+        );
+        rejected(&link, "Invalid review entry type");
+        let missing = archive(
+            "missing.oxmreview",
+            &json(manifest(vec![entry("a.txt"), entry("b.txt")])),
+            &[
+                Item::File("data/0/a.txt", b"a\n"),
+                Item::File("data/0/c.txt", b"c\n"),
+            ],
+        );
+        rejected(&missing, "Missing review content: b.txt");
+        let mut typed = manifest(vec![entry("a.txt")]);
+        typed["entries"][0]["side"] = "zero".into();
+        let typed = archive(
+            "typed.oxmreview",
+            &json(typed),
+            &[Item::File("data/0/a.txt", b"a\n")],
+        );
+        rejected(&typed, "Invalid folder review manifest");
+        let mut newer = manifest(vec![]);
+        newer["version"] = 3.into();
+        let newer = archive("newer.oxmreview", &json(newer), &[]);
+        rejected(&newer, "update OxideMerge to open it");
+        let mut huge = json(manifest(vec![]));
+        huge.splice(1..1, std::iter::repeat_n(b' ', MAX_MANIFEST as usize));
+        let huge = archive("huge.oxmreview", &huge, &[]);
+        rejected(&huge, "Review manifest is too large");
+        let mut long = manifest(vec![]);
+        long["notes"] = serde_json::json!({ "a.txt": "x".repeat(16_385) });
+        let long = archive("long.oxmreview", &json(long), &[]);
+        rejected(&long, "Review comment is too long");
+        let names: Vec<String> = (0..=MAX_ENTRIES).map(|i| format!("data/0/{i}")).collect();
+        let many: Vec<Item> = names.iter().map(|n| Item::File(n, b"")).collect();
+        let many = archive("many.oxmreview", &json(manifest(vec![])), &many);
+        rejected(&many, "too many entries");
+
+        assert!(!dir.path().join("evil.txt").exists());
+        assert!(!dir.path().parent().unwrap().join("evil.txt").exists());
+    }
+
+    /// Saved by OxideMerge 0.9.6 itself: two sides compared ignoring case, with notes and
+    /// decisions on a file and on one in a subfolder.
+    const REVIEW_0_9_6: &[u8] = include_bytes!("../../tests/fixtures/review-0.9.6.oxmreview");
+
+    #[test]
+    fn reviews_saved_by_0_9_6_open_with_their_decisions_current() {
+        use crate::core::review_state::State;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.oxmreview");
+        std::fs::write(&path, REVIEW_0_9_6).unwrap();
+        let review = load(&path).unwrap();
+        let manifest = &review.manifest;
+        assert_eq!(manifest.version, 2);
+        assert_eq!(manifest.labels, ["Release", "Main"]);
+        assert!(manifest.options.ignore_case);
+        assert_eq!(manifest.filter, "*");
+        assert_eq!(manifest.notes["a.txt"], "Note from 0.9.6");
+        let read = |side: usize, rel: &str| std::fs::read(review.roots[side].join(rel)).unwrap();
+        assert_eq!(read(0, "a.txt"), b"one\r\ntwo\r\n");
+        assert_eq!(read(1, "a.txt"), b"ONE\nthree\n");
+        assert_eq!(read(0, "sub/c.txt"), "caf\u{e9}\n".as_bytes());
+        assert_eq!(read(0, "only_left.bin"), [0, 255, 1]);
+        assert!(!review.roots[1].join("only_left.bin").exists());
+        assert!(review.roots[1].join("empty").is_dir());
+
+        let workspace = &manifest.workspace;
+        assert_eq!(workspace.current.as_deref(), Some("sub/c.txt"));
+        let a = &workspace.entries["a.txt"];
+        assert_eq!(a.state, State::Accepted);
+        assert_eq!(a.reviewer, "Kim");
+        assert_eq!(a.comment, "Line endings only <ok> & fine");
+        assert_eq!(a.rationale, "Checked by hand");
+        assert_eq!(a.tags, ["release"]);
+        assert_eq!(a.hunks["hunk-1"].state, State::NeedsAction);
+        assert_eq!(a.hunks["hunk-1"].comment, "Check this hunk");
+        let c = &workspace.entries["sub/c.txt"];
+        assert_eq!(c.state, State::InReview);
+        assert_eq!(c.comment, "Accent dropped");
+        // what the folder view computes again from the files it opens
+        for (rel, decision) in [("a.txt", a), ("sub/c.txt", c)] {
+            assert!(!decision.stale, "{rel}");
+            let now = crate::core::review_state::prints(rel, &review.roots, &manifest.options);
+            assert_eq!(now.unwrap().fingerprint, decision.fingerprint, "{rel}");
+        }
     }
 }

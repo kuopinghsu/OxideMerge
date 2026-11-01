@@ -815,26 +815,71 @@ fn semantic_merge_validation_and_release_analysis_are_opt_in_and_read_only() {
         &[
             ("a.json", r#"{"b":2,"a":1}"#),
             ("b.json", r#"{"a":1,"b":2}"#),
-            ("left", "a\nLEFT\nc\nd\n"),
-            ("base", "a\nb\nc\nd\n"),
-            ("right", "a\nb\nc\nRIGHT\n"),
-            ("result", "a\nLEFT\nc\nRIGHT\n"),
+            ("a.yaml", "db:\n  port: 5432\n  host: x\n"),
+            ("b.yml", "db:\n  host: x\n  port: 6543\n"),
+            ("alias.yaml", "base: &b {port: 1}\ndb: *b\n"),
+            ("a.toml", "[db]\nport = 5_432\n"),
+            ("b.toml", "# same value\n[db]\nport = 5432\n"),
+            ("list1.json", r#"[{"id":1,"v":1},{"id":2,"v":2}]"#),
+            (
+                "list2.json",
+                r#"[{"id":3,"v":3},{"id":2,"v":2},{"id":1,"v":1}]"#,
+            ),
+            ("left", "a\nLEFT\nc\nd\ne\nf\n"),
+            ("base", "a\nb\nc\nd\ne\nf\n"),
+            ("right", "a\nb\nc\nd\ne\nRIGHT\n"),
+            ("result", "a\nLEFT\nc\nd\ne\nRIGHT\n"),
+            ("close", "a\nb\nc\nd\nCLOSE\nf\n"),
             ("old/old.txt", "same\n"),
             ("new/new.txt", "same\n"),
+            ("old/app.ini", "k1=1\nk2=2\nk3=3\nk4=4\n"),
+            ("new/main.ini", "k1=1\nk2=2\nk3=3\nk4=40\n"),
         ],
     );
     let r = oxidemerge(d, &["--semantic", "a.json", "b.json"]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(r.stdout.contains("policies"));
     assert_eq!(oxidemerge(d, &["--cli", "a.json", "b.json"]).code, 1);
+    let keyed = oxidemerge(
+        d,
+        &[
+            "--semantic",
+            "--array-key",
+            "id",
+            "list1.json",
+            "list2.json",
+        ],
+    );
+    assert_eq!(keyed.code, 1, "{}", keyed.stderr);
+    assert!(keyed.stdout.contains("\"kind\": \"moved\""));
+    assert!(keyed.stdout.contains("\"from\": \"$[0]\""));
+    assert!(keyed.stdout.contains("\"array_key\": \"id\""));
+    assert_eq!(
+        oxidemerge(d, &["--semantic", "--format", "ini", "a.json", "b.json"]).code,
+        2
+    );
     assert_eq!(
         oxidemerge(d, &["--semantic", "--format", "yaml", "a.json", "b.json"]).code,
+        0
+    );
+    let yaml = oxidemerge(d, &["--semantic", "a.yaml", "b.yml"]);
+    assert_eq!(yaml.code, 1, "{}", yaml.stderr);
+    assert!(yaml.stdout.contains("\"format\": \"yaml\""));
+    assert!(yaml.stdout.contains(r#"$[\"db\"][\"port\"]"#));
+    let toml = oxidemerge(d, &["--semantic", "a.toml", "b.toml"]);
+    assert_eq!(toml.code, 0, "{}", toml.stderr);
+    assert_eq!(
+        oxidemerge(d, &["--semantic", "a.yaml", "alias.yaml"]).code,
         2
     );
     let plan = oxidemerge(d, &["--merge-plan", "left", "base", "right"]);
     assert_eq!(plan.code, 0, "{}", plan.stderr);
     assert!(plan.stdout.contains("LEFT"));
-    assert_eq!(read(d.join("base")), "a\nb\nc\nd\n");
+    assert_eq!(read(d.join("base")), "a\nb\nc\nd\ne\nf\n");
+    let close = oxidemerge(d, &["--merge-plan", "left", "base", "close"]);
+    assert_eq!(close.code, 1, "{}", close.stderr);
+    assert!(close.stdout.contains("\"nearby_edits\""));
+    assert!(close.stdout.contains("\"mechanical\": false"));
     let validated = oxidemerge(d, &["--validate-merge", "result", "left", "base", "right"]);
     assert_eq!(validated.code, 0, "{}", validated.stderr);
     std::fs::write(d.join("result"), "CORRUPT\n").unwrap();
@@ -854,7 +899,25 @@ fn semantic_merge_validation_and_release_analysis_are_opt_in_and_read_only() {
         ],
     );
     assert_eq!(release.code, 1, "{}", release.stderr);
-    assert!(read(d.join("release.json")).contains("moved"));
+    let json = read(d.join("release.json"));
+    assert!(json.contains("\"moved\""));
+    assert!(json.contains("\"renamed_modified\""));
+    assert!(json.contains("\"similarity\": 75"));
+    assert!(json.contains("\"captured_at\""));
+    let split = oxidemerge(
+        d,
+        &[
+            "--baseline-left",
+            "folder:old",
+            "--baseline-right",
+            "folder:new",
+            "--split-rename",
+            "main.ini",
+        ],
+    );
+    assert_eq!(split.code, 1, "{}", split.stderr);
+    assert!(!split.stdout.contains("\"renamed_modified\""));
+    assert!(split.stdout.contains("\"split_renames\""));
     let scoped = oxidemerge(d, &["--impact", "--filter", "*.rs", "old", "new"]);
     assert_eq!(scoped.code, 0, "{}", scoped.stderr);
     assert!(scoped.stdout.contains("File excluded by scope"));
@@ -1054,6 +1117,150 @@ fn merge_validation_rejects_eol_conflicts_even_when_output_matches_the_base() {
     assert_eq!(run.code, 3, "{} {}", run.stdout, run.stderr);
     assert!(run.stdout.contains("unresolved_conflict"));
     assert_eq!(read(d.join("base")), "a\n");
+}
+
+/// The capture times of `report`, the only part of a report that differs between runs, blanked.
+fn without_capture_times(report: &str) -> String {
+    let mut out = String::new();
+    let mut rest = report;
+    while let Some(at) = rest.find("captured_at") {
+        let (head, tail) = rest.split_at(at);
+        out.push_str(head);
+        // "captured_at": "2026-11-01T13:38:33Z", quoted with `"` or `&quot;`
+        let time = tail
+            .char_indices()
+            .find(|(_, c)| c.is_ascii_digit())
+            .map(|(i, _)| i)
+            .filter(|&i| i < 40 && tail.get(i..i + 20).is_some_and(|t| t.ends_with('Z')))
+            .unwrap_or_else(|| panic!("a capture time after {}", &tail[..40.min(tail.len())]));
+        out.push_str(&tail[..time]);
+        out.push_str("CAPTURE-TIME");
+        rest = &tail[time + 20..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Semantic, release summary and impact reports of fixed inputs match the reports saved under
+/// `tests/fixtures/reports`, so any change to their content or layout is a reviewed change.
+/// After an intended change, `OXIDEMERGE_UPDATE_REPORTS=1 cargo test --test cli reports_match`
+/// saves the new reports to review in the diff.
+#[test]
+fn reports_match_the_saved_reference_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut inputs = vec![
+        (
+            "a.json",
+            r#"{"name":"svc","db":{"host":"x","port":5432},"items":[{"id":1,"v":1},{"id":2,"v":2}]}"#,
+        ),
+        (
+            "b.json",
+            r#"{"name":"svc","db":{"host":"x","port":6543},"items":[{"id":2,"v":2},{"id":1,"v":10}]}"#,
+        ),
+    ];
+    let project = [
+        ("src/lib.rs", "mod parser;\npub use parser::parse;\n"),
+        ("src/main.rs", "use crate::parser::{parse, Token};\n\nfn main() {\n    let _t = Token;\n    println!(\"{}\", parse(\"x\"));\n}\n"),
+        ("web/app.js", "import { format as fmt } from \"./util.js\";\n\nconsole.log(fmt(1));\n"),
+        ("py/main.py", "from .helpers import normalize\n\nprint(normalize(\" a \"))\n"),
+        ("c/main.c", "#include \"limits.h\"\n\nint main(void) { return LIMIT; }\n"),
+        ("README.md", "Set db.timeout in config.json.\n"),
+        ("notes.txt", "unchanged\n"),
+    ];
+    for side in ["old", "new"] {
+        for (name, text) in project {
+            inputs.push((Box::leak(format!("{side}/{name}").into_boxed_str()), text));
+        }
+    }
+    inputs.extend([
+        (
+            "old/src/parser.rs",
+            "pub fn parse(s: &str) -> usize {\n    s.len()\n}\n\npub struct Token;\n",
+        ),
+        (
+            "new/src/parser.rs",
+            "pub fn parse(s: &str) -> usize {\n    s.trim().len()\n}\n\npub struct Token;\n",
+        ),
+        (
+            "old/web/util.js",
+            "export function format(x) {\n  return String(x);\n}\n",
+        ),
+        (
+            "new/web/util.js",
+            "export function format(x, digits) {\n  return Number(x).toFixed(digits);\n}\n",
+        ),
+        (
+            "old/py/helpers.py",
+            "def normalize(text):\n    return text.strip()\n",
+        ),
+        (
+            "new/py/helpers.py",
+            "def normalize(text):\n    return text.strip().lower()\n",
+        ),
+        ("old/c/limits.h", "#define LIMIT 3\n"),
+        ("new/c/limits.h", "#define LIMIT 4\n"),
+        (
+            "old/config.json",
+            "{\"db\": {\"timeout\": 30, \"host\": \"x\"}}\n",
+        ),
+        (
+            "new/config.json",
+            "{\"db\": {\"timeout\": 60, \"host\": \"x\"}}\n",
+        ),
+        ("old/docs/guide.txt", "moved file\n"),
+        ("new/guide.txt", "moved file\n"),
+        ("old/app.ini", "k1=1\nk2=2\nk3=3\nk4=4\n"),
+        ("new/main.ini", "k1=1\nk2=2\nk3=3\nk4=40\n"),
+    ]);
+    files(d, &inputs);
+    let saved = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reports");
+    let update = std::env::var_os("OXIDEMERGE_UPDATE_REPORTS").is_some();
+    let mut differing = Vec::new();
+    for ext in ["json", "xml"] {
+        let runs: [(&str, Vec<&str>); 3] = [
+            (
+                "semantic",
+                vec![
+                    "--semantic",
+                    "--array-key",
+                    "id",
+                    "a.json",
+                    "b.json",
+                    "--report",
+                ],
+            ),
+            (
+                "release-summary",
+                vec![
+                    "--baseline-left",
+                    "folder:old",
+                    "--baseline-right",
+                    "folder:new",
+                    "--release-report",
+                ],
+            ),
+            ("impact", vec!["--impact", "old", "new", "--report"]),
+        ];
+        for (name, mut args) in runs {
+            let file = format!("{name}.{ext}");
+            args.push(&file);
+            let run = oxidemerge(d, &args);
+            assert_eq!(run.code, 1, "{file}: {}", run.stderr);
+            let report = without_capture_times(&read(d.join(&file)));
+            if update {
+                std::fs::create_dir_all(&saved).unwrap();
+                std::fs::write(saved.join(&file), &report).unwrap();
+            } else if report != read(saved.join(&file)) {
+                differing.push(file);
+            }
+        }
+    }
+    assert!(
+        differing.is_empty(),
+        "{differing:?} differ from tests/fixtures/reports; after an intended change, rerun with \
+         OXIDEMERGE_UPDATE_REPORTS=1 and review the diff"
+    );
 }
 
 #[test]

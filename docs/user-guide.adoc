@@ -413,6 +413,13 @@ Review this plan before confirming. Files with incompatible edits, unsupported c
 symbolic links or read errors are left unchanged. If a file has changed since the comparison,
 refresh the comparison before trying again.
 
+The merge is all or nothing. Every item is checked before anything is written: if one changed
+after the plan was made, would be written outside the middle folder, or would have its backup
+replace a compared file, nothing is merged and the items are listed. While the merge runs, *Stop*
+ends it. When you stop it, or a change fails (a read-only folder, a full disk), the changes made
+so far are undone and the middle folder is as it was. A file the merge sent to the trash is put
+back from a copy, so the trash keeps one too.
+
 IMPORTANT: Folder operations write to disk after confirmation; they do not wait for *Save*.
 The middle folder receives the merged result. Use a separate working copy as the middle folder
 if you need to keep the original base folder unchanged.
@@ -808,7 +815,8 @@ and a block found on one page only faces a gap. As in the text compare, the chan
 characters within a changed block are highlighted more strongly, as *Inline differences* in the
 comparison options asks. Tables are drawn with lines around their cells: their rows are lined up
 too, and within rows that differ the changed words are highlighted, and so are whole cells of a
-row or column that the other page does not have. Step through the differences with the buttons
+row or column that the other page does not have. Each changed block is a difference of its own,
+also when it follows another changed block. Step through the differences with the buttons
 above the pages or the same keys as in the text compare: as there, the current difference is
 highlighted more strongly and the blocks being compared are outlined on every page, most
 strongly on the page last clicked. Clicking a block makes it the one compared, and the next and
@@ -1135,7 +1143,7 @@ If a project is moved to another computer, copy its input files and any external
 
 == Application options
 
-*Edit → Options...*, or the gear button at the top right, opens the options.
+*Edit → Options...*, or the settings button (two sliders) at the top right, opens the options.
 *Search settings* finds an option by name, and *Reset to defaults* restores the defaults.
 
 General::
@@ -1476,9 +1484,10 @@ OxideMerge reports the reason when it cannot save settings.
 Check that the configuration folder (see <<configuration>>) can be written and that the disk
 is not full.
 
-Automatic folder merging does not start, or skips files::
+Automatic folder merging does not start, or merges nothing::
 Let the comparison finish with both *Include subfolders* and *Include unique subfolders contents*
-enabled. Files that changed after comparison are skipped and listed. Refresh the comparison
+enabled. When a file changed after the comparison, nothing is merged and the file is listed;
+when a change fails during the merge, the changes made so far are undone. Refresh the comparison
 and review the merge plan again.
 
 A web comparison is missing content shown in the browser::
@@ -1511,14 +1520,37 @@ it does not execute them or provide a transaction across multiple files. Folder 
 planned copies/merges/deletions and retained files, and rechecks scoped source fingerprints.
 Preview before using the existing merge command; validate afterwards against the retained plan.
 `--validate-merge result-folder left-folder base-folder right-folder` supports separate result folders.
+A text merge plan also warns, without failing, when the two sides edit lines at most two lines
+apart, or both change the same setting (`name = value`, `name: value` or `"name": value`) in
+different places: such merges are worth reading even when they apply cleanly.
 
-For supported JSON/XML files choose *Semantic*. JSON object key order and XML attribute order
-are ignored. JSON arrays remain ordered; missing and null are distinct; duplicate keys are errors.
-XML uses expanded namespace names and preserves child order, text whitespace, mixed content and
-comments. XML DTDs, declared/unknown entities and XML 1.1 are unsupported; built-in character
-references are supported. Text ignore rules are deliberately not semantic path filters.
+For supported JSON, XML, TOML and YAML files choose *Semantic*. JSON object key order and XML
+attribute order are ignored. JSON arrays remain ordered; missing and null are distinct; duplicate
+keys are errors. XML uses expanded namespace names and preserves child order, text whitespace,
+mixed content and comments. XML DTDs, declared/unknown entities and XML 1.1 are unsupported;
+built-in character references are supported. TOML and YAML compare like JSON: tables and mappings
+are unordered, numbers compare by value (`8_080` equals `8080`), and comments and layout are
+ignored. YAML follows the YAML 1.2 core schema, so `yes` and `on` are text. A YAML file must hold
+one document of at most 4 MiB without aliases, complex keys or custom tags; otherwise the view
+shows why and offers Text. Text ignore rules are deliberately not semantic path filters.
 Errors provide a one-click return to Text; semantic mode never writes structured documents.
+
+Changes are shown as a tree of their paths; a branch shows how many changes it holds. When an
+array holds the same elements in a new order, the elements out of order are listed as *Moved*,
+with the place they came from. Type a member name such as `id` in *Array matching key* (JSON, TOML
+and YAML) to pair object elements of arrays by that member instead of by position, so an insertion
+or a reordering shows as added and moved elements instead of a change at every later position.
 Choose a changed path's source button to return to the original physical line.
+
+Each change notes how array elements were paired when that was not by path alone: by the array
+matching key, as an exact reordering, or by position in arrays of different lengths. A change
+that another reading explains as well is marked *ambiguous*: a moved element that may as well have
+stayed while the others moved (as in a swap of two), a moved element that has duplicates, or a
+change found by position after an insertion shifted the elements. Check those by hand. When the
+array matching key cannot pair an array of objects, because an element has no unique scalar value
+for it, a note above the changes says so and that array is compared by position. Reports record
+each change's `confidence` (`parser_exact`, `array_key`, `reordered` or `position`), `ambiguous`
+when set, and the `notes`.
 
 Folder *Review workspace* stores file and hunk states, comments, rationale, optional tags and a
 free-form reviewer name (not an authenticated identity). *Next unreviewed* navigates remaining
@@ -1526,9 +1558,12 @@ files. Hunk review is available when a file is opened from its folder view. Save
 to persist decisions and cursor. New `.oxmreview` version 2 bundles are additive; version 1 loads
 with unreviewed defaults and unknown versions are rejected. Captured file digests are checked
 on reopen. *Update review inputs* selects new folders, keeps the selected comparison rules,
-opens them read-only and flags mismatched decisions. Converted content or converter/rule changes
-may invalidate previous decisions and require renewed review. Stale decisions count as needing
-action, never as accepted. Repeated/ambiguous hunk contexts require manual review.
+opens them read-only and flags mismatched decisions. A decision follows a file that was renamed
+without changes, and notes where it came from; when several new files hold the same content, each
+is marked for review again. Converted content or converter/rule changes may invalidate previous
+decisions and require renewed review. Stale decisions count as needing action, never as accepted.
+Repeated/ambiguous hunk contexts require manual review. A bundle whose paths leave it, whose
+entries are missing, unlisted or links, or that a newer OxideMerge saved is refused on opening.
 
 == Optional release baseline and impact analysis
 
@@ -1540,15 +1575,40 @@ changes are excluded from Git baselines. Folder captures include the selected cu
 Git configuration and filters must be trusted, as for existing Git revision comparison.
 
 The summary reports additions, deletions, modifications, unchanged files, unique exact-content
-moves, binary changes, file-type changes, semantic JSON/XML changes and exclusions. Ambiguous or
-edited renames stay additions/deletions; no similarity-based rename claim is made. Selecting a
-summary row opens captured bytes read-only, preserving the saved baseline even if sources change.
-Important path substrings are user-defined heuristic review priorities, not compatibility guarantees.
+moves, suspected renames with edits, binary changes, file-type changes, semantic JSON/XML/TOML/YAML
+changes and exclusions, with the time each side was captured. The counts above the list are
+filters: click one or more categories, or *High priority* for the changes with risk flags (an
+important path, or conflict markers left in a file), which are also listed first. A rename with
+edits is suspected when a deleted and an added text file of the same type share at least half of
+their lines and are clearly each other's best match; the row shows the old name and the share of
+matching lines. Click *Not a rename* to keep the files as added and deleted (`--split-rename PATH`
+on the command line), and *Detect renames again* to undo. Selecting a summary row opens captured
+bytes read-only, preserving the saved baseline even if sources change. Important path substrings
+are user-defined heuristic review priorities, not compatibility guarantees.
 
-Enable *Potential impact* to list delimited filename/path or top-level JSON-key occurrences with
-file, line, content digest and source excerpts. All these findings are labeled heuristic; no parser
-proves language-level dependencies and no builds, tests or repository scripts are executed.
-Findings may be dismissed without changing source files. Empty output says impact is not assessed.
+Enable *Potential impact* to list where changed files may be used. Findings labelled *Exact* come
+from an import statement that names exactly a changed, deleted or renamed file: relative
+JavaScript/TypeScript imports, re-exports and `require`, Python imports, C/C++ `#include "…"`, CSS
+`@import`, Rust `mod name;` and `use crate::…`, `super::…` or `self::…` paths, and JSON `$ref`
+file references. Imports of JavaScript/TypeScript, Python, C/C++ and Rust files are read from
+their syntax trees (parsed with Tree-sitter), and those of other files from the code's tokens, so
+they may span lines, and an import in a comment or a string is not one. A file with code the
+parser could not read is listed as partly assessed, since imports and definitions there may be
+missed.
+
+For changed JavaScript/TypeScript, Python, C/C++ and Rust files, the top-level functions, types
+and constants are compared too. A file that imports a changed or removed one by name from the
+changed file (`import { parse } from "./parser"`, `from .parser import parse`,
+`use crate::parser::parse`), also under another name, gets an *Exact* finding at its first use,
+saying whether the definition changed or was removed. The first use of the name in other files of
+the same language is a heuristic finding. Other heuristic findings are delimited filename/path occurrences
+and changed JSON, TOML and YAML keys, also as dotted paths such as `db.timeout`. Each finding shows
+the file, line, content digest and an excerpt. Conditional, generated or macro-built imports can be
+missed, and methods and names reached through a namespace (`ns.parse`) are not followed; no
+builds, tests or repository scripts are executed. When a broad change matches more than 500 names
+and configuration keys, the first 500 are listed and a note above the findings counts the rest. Findings may be dismissed without changing source files. In a folder
+comparison, *Review* opens the file of a finding in the review workspace. Empty output says impact
+is not assessed.
 Changing source specifications clears old findings; cancellation never publishes a partial result.
 
 Analysis limits are 16 MiB per regular file, 10,000 entries and 256 MiB of captured bytes per baseline;
@@ -1563,6 +1623,7 @@ The existing normal comparison limits and behavior are unchanged.
 oxidemerge --merge-plan left.txt base.txt right.txt --report merge-plan.json
 oxidemerge --validate-merge merged.txt left.txt base.txt right.txt --report validation.json
 oxidemerge --semantic --format json old.json new.json --report semantic.html
+oxidemerge --semantic --array-key id old.yaml new.yaml
 oxidemerge --review-summary review.oxmreview --report review-summary.json
 oxidemerge --baseline-left git:v1.0:/repo --baseline-right git:v1.1:/repo --release-report release.html
 oxidemerge --impact old-folder new-folder --report impact.json
@@ -1573,8 +1634,9 @@ that versioned JSON separately from the existing comparison report schema. Repor
 replace an input or live under a selected input root. Standard analysis exits are 0 = identical or
 successful plan/summary, 1 = different, warning or unresolved plan conflicts, 2 = error or incomplete
 baseline scope (intentional filter exclusions are outside scope, not errors); `--validate-merge` uses 3 for a failed check. A validation warning uses 1.
-A review summary with stale decisions uses 1. YAML/TOML adapters and structured write-back are not
-implemented; use text compare. Semantic source spans are decoded UTF-8 byte ranges and physical
+A review summary with stale decisions uses 1. `--format` accepts `json`, `xml`, `toml` and `yaml`
+and defaults to the first file's extension. Structured write-back is not implemented; edit in the
+text compare. Semantic source spans are decoded UTF-8 byte ranges and physical
 lines, not offsets in an original UTF-16/legacy-encoded byte stream.
 
 == Known limitations

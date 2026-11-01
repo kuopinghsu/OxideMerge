@@ -81,6 +81,68 @@ fn finding(
         message: message.into(),
     }
 }
+/// Unchanged base lines between edits of the two sides below which they count as close.
+const NEARBY: usize = 2;
+
+/// The name a line sets, as in `name = value`, `name: value` or `"name": value`; a line with
+/// nothing after the separator, such as `else:` or `server:`, sets nothing.
+fn setting_key(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    let at = t.find(['=', ':'])?;
+    if t[at..].starts_with("://") || t[at..].starts_with("==") || t[at + 1..].trim().is_empty() {
+        return None;
+    }
+    let key = t[..at].trim().trim_matches(['"', '\'']);
+    (key.len() >= 2
+        && key.len() <= 64
+        && key
+            .chars()
+            .all(|c| c.is_alphanumeric() || "_-.".contains(c)))
+    .then_some(key)
+}
+
+/// A one-sided edit: origin, base range, hunk, row and the settings it touches.
+type Edit<'a> = (&'a str, std::ops::Range<usize>, String, usize, Vec<String>);
+
+/// Heuristic warnings over the one-sided edits, in base order: edits of the two sides close
+/// together, and a setting each side changes in a different place.
+fn nearby_and_shared_settings(edits: &[Edit], findings: &mut Vec<ValidationFinding>) {
+    let mut warn = |id: &str, message: String, hunk: &str, row: usize| {
+        let mut f = finding(id, ValidationSeverity::Warning, false, &message);
+        f.hunk_id = Some(hunk.to_owned());
+        f.row = Some(row);
+        findings.push(f);
+    };
+    for pair in edits.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        if a.0 != b.0 && b.1.start.saturating_sub(a.1.end) <= NEARBY {
+            warn(
+                "nearby_edits",
+                "Both sides edit lines close together; check that the merged lines still fit."
+                    .into(),
+                &b.2,
+                b.3,
+            );
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for right in edits.iter().filter(|e| e.0 == "right") {
+        for key in &right.4 {
+            let shared = edits
+                .iter()
+                .any(|left| left.0 == "left" && left.4.contains(key));
+            if shared && seen.insert(key) {
+                warn(
+                    "shared_setting",
+                    format!("Both sides change the setting `{key}` in different places."),
+                    &right.2,
+                    right.3,
+                );
+            }
+        }
+    }
+}
+
 pub fn doc_fingerprint(doc: &TextDoc) -> String {
     let mut exact = doc.clone();
     exact.preserve_eols = true;
@@ -99,6 +161,7 @@ pub fn text_plan(
     let mut actions = Vec::new();
     let mut findings = Vec::new();
     let mut occurrences = std::collections::BTreeMap::new();
+    let mut edits: Vec<Edit> = Vec::new();
     for block in &diff.blocks {
         if block.ignored {
             continue;
@@ -157,16 +220,36 @@ pub fn text_plan(
             f.hunk_id = Some(id.clone());
             f.row = Some(block.first_row);
             findings.push(f);
-        } else if (block.ranges[0].is_empty() || block.ranges[2].is_empty())
-            && block.ranges.iter().any(|range| !range.is_empty())
+        } else if !block.ranges[1].is_empty()
+            && match origin {
+                "left" => block.ranges[0].is_empty(),
+                "right" => block.ranges[2].is_empty(),
+                _ => block.ranges[0].is_empty() && block.ranges[2].is_empty(),
+            }
         {
             let mut f = finding("deletion_review", ValidationSeverity::Warning, false, "Deletion is mechanically mergeable; check whether removing this content is intended.");
             f.hunk_id = Some(id.clone());
             f.row = Some(block.first_row);
             findings.push(f);
         }
+        if let Some(side) = match origin {
+            "left" => Some(0),
+            "right" => Some(2),
+            _ => None,
+        } {
+            let mut keys: Vec<String> = [side, 1]
+                .iter()
+                .flat_map(|&s| chunks[s].iter())
+                .filter_map(|line| setting_key(line))
+                .map(str::to_owned)
+                .collect();
+            keys.sort();
+            keys.dedup();
+            edits.push((origin, block.ranges[1].clone(), id, block.first_row, keys));
+        }
         actions.push(action);
     }
+    nearby_and_shared_settings(&edits, &mut findings);
     let bytes = text::encode(&preview.text(), preview.encoding, preview.bom);
     if text::decode(&bytes, Some(preview.encoding)).0 != preview.text() {
         findings.push(finding(
@@ -692,9 +775,9 @@ mod tests {
         ] {
             let bom = encoding == text::TextEncoding::Utf8;
             let strings = [
-                "café LEFT\r\ncommon\r\nlast",
-                "café base\r\ncommon\r\nlast",
-                "café base\r\ncommon\r\nRIGHT",
+                "café LEFT\r\ncommon\r\none\r\ntwo\r\nlast",
+                "café base\r\ncommon\r\none\r\ntwo\r\nlast",
+                "café base\r\ncommon\r\none\r\ntwo\r\nRIGHT",
             ];
             let docs: Vec<_> = strings
                 .into_iter()
@@ -706,7 +789,7 @@ mod tests {
             let cfg = crate::config::Config::default();
             let view = crate::ui::text_view::TextView::new(docs, &cfg);
             let plan = view.preview_merge(&cfg).unwrap();
-            let expected = "café LEFT\r\ncommon\r\nRIGHT";
+            let expected = "café LEFT\r\ncommon\r\none\r\ntwo\r\nRIGHT";
             let bytes = text::encode(expected, encoding, bom);
             assert_eq!(plan.expected_digest, Some(analysis::digest(&bytes)));
             let output = text::doc_from_bytes(None, &bytes, Some(encoding));
@@ -747,8 +830,12 @@ mod tests {
     #[test]
     fn plans_are_deterministic_and_validate_saved_bytes_not_only_lines() {
         let cfg = crate::config::Config::default();
-        let docs = ["a\nLEFT\nc\nd\n", "a\nb\nc\nd\n", "a\nb\nc\nRIGHT\n"]
-            .map(|t| TextDoc::from_text(None, t));
+        let docs = [
+            "a\nLEFT\nc\nd\ne\nf\n",
+            "a\nb\nc\nd\ne\nf\n",
+            "a\nb\nc\nd\ne\nRIGHT\n",
+        ]
+        .map(|t| TextDoc::from_text(None, t));
         let view = crate::ui::text_view::TextView::new(docs.to_vec(), &cfg);
         let a = view.preview_merge(&cfg).unwrap();
         let b = view.preview_merge(&cfg).unwrap();
@@ -756,7 +843,7 @@ mod tests {
             serde_json::to_value(&a).unwrap(),
             serde_json::to_value(&b).unwrap()
         );
-        assert_eq!(a.preview.as_deref(), Some("a\nLEFT\nc\nRIGHT\n"));
+        assert_eq!(a.preview.as_deref(), Some("a\nLEFT\nc\nd\ne\nRIGHT\n"));
         let output = TextDoc::from_text(None, a.preview.as_ref().unwrap());
         assert_eq!(
             validate(&a, &output, output.text().as_bytes()).status,
@@ -768,6 +855,163 @@ mod tests {
             ValidationStatus::Failed
         );
     }
+    #[test]
+    fn setting_keys_need_a_name_and_a_value() {
+        assert_eq!(setting_key("timeout = 30"), Some("timeout"));
+        assert_eq!(setting_key("  \"db.port\": 5432,"), Some("db.port"));
+        assert_eq!(setting_key("name: x"), Some("name"));
+        for line in [
+            "else:",
+            "try:",
+            "server:",
+            "default: ",
+            "x = 1",
+            "a == b",
+            "https://example.com",
+        ] {
+            assert_eq!(setting_key(line), None, "{line}");
+        }
+    }
+    #[test]
+    fn merge_fixtures_plan_exact_actions_findings_and_hunks() {
+        let cfg = crate::config::Config::default();
+        // (case, left, base, right, preview, (operation, origin) per action, finding ids)
+        type Case<'a> = (
+            &'a str,
+            &'a str,
+            &'a str,
+            &'a str,
+            &'a str,
+            &'a [(&'a str, &'a str)],
+            &'a [&'a str],
+        );
+        let cases: &[Case] = &[
+            (
+                "both sides delete",
+                "a\nc\n",
+                "a\nb\nc\n",
+                "a\nc\n",
+                "a\nc\n",
+                &[("merge", "both")],
+                &["deletion_review"],
+            ),
+            (
+                "insert at end of file",
+                "a\nb\nc\n",
+                "a\nb\n",
+                "a\nb\n",
+                "a\nb\nc\n",
+                &[("merge", "left")],
+                &[],
+            ),
+            (
+                "one side deletes",
+                "a\nb\nc\n",
+                "a\nb\nc\n",
+                "a\nc\n",
+                "a\nc\n",
+                &[("merge", "right")],
+                &["deletion_review"],
+            ),
+            (
+                "duplicate lines",
+                "L\ndup\ndup\ndup\n",
+                "dup\ndup\ndup\ndup\n",
+                "dup\ndup\ndup\nR\n",
+                "L\ndup\ndup\nR\n",
+                &[("merge", "left"), ("merge", "right")],
+                &["nearby_edits"],
+            ),
+            (
+                "CSV record with a quoted line break",
+                "id,note\n1,\"first\nLEFT\"\n2,two\n3,three\n",
+                "id,note\n1,\"first\nline\"\n2,two\n3,three\n",
+                "id,note\n1,\"first\nline\"\n2,two\n3,RIGHT\n",
+                "id,note\n1,\"first\nLEFT\"\n2,two\n3,RIGHT\n",
+                &[("merge", "left"), ("merge", "right")],
+                &["nearby_edits"],
+            ),
+            (
+                "edits far apart",
+                "a\nLEFT\nc\nd\ne\nf\ng\n",
+                "a\nb\nc\nd\ne\nf\ng\n",
+                "a\nb\nc\nd\ne\nRIGHT\ng\n",
+                "a\nLEFT\nc\nd\ne\nRIGHT\ng\n",
+                &[("merge", "left"), ("merge", "right")],
+                &[],
+            ),
+            (
+                "a setting changed by both sides",
+                "timeout = 60\nretries = 3\nname: x\n\n[other]\nport: 1\ntimeout = 5\n",
+                "timeout = 30\nretries = 3\nname: x\n\n[other]\nport: 1\ntimeout = 5\n",
+                "timeout = 30\nretries = 3\nname: x\n\n[other]\nport: 1\ntimeout = 10\n",
+                "timeout = 60\nretries = 3\nname: x\n\n[other]\nport: 1\ntimeout = 10\n",
+                &[("merge", "left"), ("merge", "right")],
+                &["shared_setting"],
+            ),
+            (
+                "same line",
+                "a\nLEFT\nc\n",
+                "a\nb\nc\n",
+                "a\nRIGHT\nc\n",
+                "a\nb\nc\n",
+                &[("conflict", "manual_review")],
+                &["unresolved_conflict"],
+            ),
+        ];
+        for (case, left, base, right, preview, actions, findings) in cases {
+            let docs = [left, base, right].map(|t| TextDoc::from_text(None, t));
+            let view = crate::ui::text_view::TextView::new(docs.to_vec(), &cfg);
+            let plan = view.preview_merge(&cfg).unwrap();
+            assert_eq!(plan.preview.as_deref(), Some(*preview), "{case}");
+            let got: Vec<_> = plan
+                .actions
+                .iter()
+                .map(|a| (a.operation.as_str(), a.origin.as_str()))
+                .collect();
+            assert_eq!(got, *actions, "{case}");
+            let ids: Vec<_> = plan.findings.iter().map(|f| f.id.as_str()).collect();
+            assert_eq!(ids, *findings, "{case}");
+            for f in &plan.findings {
+                assert!(
+                    plan.actions
+                        .iter()
+                        .any(|a| Some(&a.id) == f.hunk_id.as_ref()),
+                    "{case}: finding {} names no planned hunk",
+                    f.id
+                );
+                assert!(f.row.is_some(), "{case}");
+            }
+            let mut unique: Vec<_> = plan.actions.iter().map(|a| &a.id).collect();
+            unique.dedup();
+            assert_eq!(unique.len(), plan.actions.len(), "{case}: hunk ids repeat");
+
+            let json = serde_json::to_value(&plan).unwrap();
+            let back: MergePlan = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&back).unwrap(), json, "{case}");
+
+            let output = TextDoc::from_text(None, preview);
+            let first = validate(&plan, &output, preview.as_bytes());
+            let again = validate(&plan, &output, preview.as_bytes());
+            assert_eq!(
+                serde_json::to_value(&first).unwrap(),
+                serde_json::to_value(&again).unwrap(),
+                "{case}: validation is not repeatable"
+            );
+            assert!(first.findings.iter().any(|f| f.id == "output_matches"));
+            let corrupted = format!("{preview}extra\n");
+            let report = validate(&plan, &output, corrupted.as_bytes());
+            assert_eq!(report.status, ValidationStatus::Failed, "{case}");
+            let mismatches: Vec<_> = report
+                .findings
+                .iter()
+                .filter(|f| f.id == "output_mismatch")
+                .collect();
+            assert_eq!(mismatches.len(), 1, "{case}");
+            assert!(mismatches[0].mechanical);
+        }
+    }
+
     #[test]
     fn conflicts_and_marker_candidates_can_never_pass_verification() {
         let cfg = crate::config::Config::default();
@@ -781,5 +1025,48 @@ mod tests {
             ValidationStatus::Failed
         );
         assert!(plan.findings.iter().any(|f| f.hunk_id.is_some()));
+    }
+
+    #[test]
+    fn settings_samples_merge_alike_in_ini_toml_and_yaml() {
+        let cfg = crate::config::Config::default();
+        let samples = [
+            [
+                include_str!("../../samples/three/settings/left.ini"),
+                include_str!("../../samples/three/settings/base.ini"),
+                include_str!("../../samples/three/settings/right.ini"),
+            ],
+            [
+                include_str!("../../samples/three/settings/left.toml"),
+                include_str!("../../samples/three/settings/base.toml"),
+                include_str!("../../samples/three/settings/right.toml"),
+            ],
+            [
+                include_str!("../../samples/three/settings/left.yaml"),
+                include_str!("../../samples/three/settings/base.yaml"),
+                include_str!("../../samples/three/settings/right.yaml"),
+            ],
+        ];
+        let plans: Vec<_> = samples
+            .iter()
+            .map(|texts| {
+                let docs = texts.map(|t| TextDoc::from_text(None, t));
+                let view = crate::ui::text_view::TextView::new(docs.to_vec(), &cfg);
+                let plan = view.preview_merge(&cfg).unwrap();
+                let actions: Vec<_> = plan
+                    .actions
+                    .iter()
+                    .map(|a| (a.operation.clone(), a.origin.clone()))
+                    .collect();
+                let findings: Vec<_> = plan.findings.iter().map(|f| f.id.clone()).collect();
+                (actions, findings)
+            })
+            .collect();
+        assert_eq!(
+            plans[0].1,
+            ["unresolved_conflict", "unresolved_conflict", "nearby_edits"]
+        );
+        assert_eq!(plans[1], plans[0], "TOML");
+        assert_eq!(plans[2], plans[0], "YAML");
     }
 }

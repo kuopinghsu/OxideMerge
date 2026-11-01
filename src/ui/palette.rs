@@ -164,9 +164,9 @@ fn entry_row<A>(
     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, &e.label));
     let painter = ui.painter_at(rect);
     if selected {
-        painter.rect_filled(rect, 6.0, p.accent_soft);
+        painter.rect_filled(rect, crate::ui::theme::radius::SM, p.accent_soft);
     } else if resp.hovered() {
-        painter.rect_filled(rect, 6.0, p.control_hover);
+        painter.rect_filled(rect, crate::ui::theme::radius::SM, p.control_hover);
     }
     let cy = rect.center().y;
     icons::paint(
@@ -175,8 +175,13 @@ fn entry_row<A>(
         e.icon,
         if selected { p.accent } else { p.text_dim },
     );
-    let detail = ui
-        .fonts_mut(|f| f.layout_no_wrap(e.detail.clone(), FontId::proportional(12.5), p.text_dim));
+    let detail = ui.fonts_mut(|f| {
+        f.layout_no_wrap(
+            e.detail.clone(),
+            FontId::proportional(crate::ui::theme::size::SMALL),
+            p.text_dim,
+        )
+    });
     let detail_x = rect.right() - 10.0 - detail.size().x;
     painter.galley(
         pos2(detail_x, cy - detail.size().y / 2.0),
@@ -184,7 +189,7 @@ fn entry_row<A>(
         p.text_dim,
     );
 
-    let font = FontId::proportional(14.0);
+    let font = FontId::proportional(crate::ui::theme::size::BODY);
     let mut job = LayoutJob::default();
     let mut run = String::new();
     let mut run_hit = false;

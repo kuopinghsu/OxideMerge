@@ -152,7 +152,9 @@ the remaining conflicts; take the left, right or both changes, or edit and mark 
 then save the result. You can also open a single file that contains conflict markers.
 
 Three-way folder merging writes into the middle folder. **Merge → Auto merge folders...**
-shows the planned copies, deletions and merges for confirmation before applying them.
+shows the planned copies, deletions and merges for confirmation before applying them. The merge
+is all or nothing: if an item changed since the plan, nothing is merged, and stopping it or a
+failed change undoes what it already changed.
 
 ## Command-line usage
 
@@ -359,7 +361,11 @@ Run `make help` to list all targets.
   editing, file drops and saved results. Failed window tests write diagnostic output to
   `target/gui-tests/<test>.txt`.
 - **Command-line behavior:** tests in `tests/cli.rs` run the executable and verify exit codes,
-  reports, patches and error messages.
+  reports, patches and error messages. Semantic, release summary and impact reports of fixed
+  inputs must match the JSON and XML reports saved in `tests/fixtures/reports`, apart from capture
+  times. After an intended report change, run
+  `OXIDEMERGE_UPDATE_REPORTS=1 cargo test --test cli reports_match` and review the diff of the
+  saved reports.
 
 Tests use a separate configuration folder and do not change your application settings.
 For other isolated runs, set `OXIDEMERGE_CONFIG_DIR` to a dedicated configuration folder.
@@ -549,8 +555,9 @@ OxideMerge is licensed under the [MIT License](LICENSE).
 
 These actions are read-only and opt-in. In a three-way text or folder view, expand **Merge Verification**
 for an in-memory merge preview or to check the saved result's bytes. **Text / Semantic** compares
-JSON and XML paths without editing or reserializing the originals. JSON duplicate keys and XML
-DTDs/entities are rejected; YAML/TOML use the existing text view.
+JSON, XML, TOML and YAML paths without editing or reserializing the originals, as a tree of
+changed paths with moved array elements and an optional array matching key. Duplicate keys, XML
+DTDs/entities and YAML aliases are rejected.
 
 Folder comparisons include a **Review workspace** for file/hunk decisions, comments, rationale,
 tags and next-unreviewed navigation. Save `.oxmreview` to resume elsewhere. Version 1 bundles
@@ -558,9 +565,11 @@ still open; new version 2 bundles add bounded annotations and captured-content S
 Updating review inputs flags stale decisions; it never automatically accepts a changed hunk.
 
 **Compare baselines** / **Release summary** accepts folders, immutable Git revisions and sides of
-review snapshots. Exact unique-content moves are distinguished from added/deleted files. Optional
-**Potential impact** shows delimited path/config-key occurrences with concrete source evidence;
-all such references are heuristic, and do not establish runtime behavior or build/test success.
+review snapshots. Exact unique-content moves and suspected renames with edits are distinguished
+from added/deleted files, and category counts filter the list. Optional **Potential impact** shows
+imports of changed files and uses of the changed functions and types they import by name, labelled
+exact, and delimited path, name and config-key occurrences, labelled heuristic, with concrete
+source evidence; neither establishes runtime behavior or build/test success.
 Git sources honor trusted Git configuration, as existing revision comparisons do.
 
 ```sh

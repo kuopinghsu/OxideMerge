@@ -115,6 +115,32 @@ These are comparison-engine measurements. They do not measure semantic/impact an
 GUI rendering or the extra SHA-256 reads used by folder merge confirmation. They are not
 cross-platform release validation.
 
+## Recorded comparison: 0.9.7 impact and merge changes (2026-11-01)
+
+Commit `291d184` (extracted with `git archive`) and the 0.9.7 working tree with all-or-nothing
+folder merges, semantic pairing confidence and Tree-sitter impact analysis were measured on the
+macOS aarch64 host above, with the default workloads, three runs each and the same generated
+inputs. The working tree passed the 1.5x gate against the saved commit baseline with identical
+results; for example text 10 MB 0.112 → 0.111 s (99 → 100 MB), 3-way merge 0.340 → 0.345 s
+(150 MB), 20,000-file folders 0.602 → 0.570 s (36 → 32 MB).
+
+The large workloads (`OXIDEMERGE_BENCH_LARGE=2 OXIDEMERGE_BENCH_ONLY=text-100mb,binary-1gb`)
+were then run with frozen commit and working-tree test executables, alternating them twice with
+five runs each on the idle host. Text 100 MB measured 1.054 and 1.073 s at the commit against
+1.076 and 1.067 s in the working tree (619–620 MB each), and binary 1 GB 0.340 and 0.341 s
+against 0.347 and 0.336 s (2,057 MB each), with the same 15,086 differences and 100 ranges. The
+differences are within the variation between runs.
+
+The engine workloads do not run impact analysis, so `--impact` was also timed on the egui 0.31.1
+and 0.37.0 sources (88 and 132 Rust files, 106 files differing under `src`), three runs each after
+a warm-up run: the median time was 0.08 → 0.18 s and the peak memory 28 → 47 MB. Files are parsed
+with Tree-sitter on up to eight threads; on one thread the working tree took 0.50 s. The commit
+reported 17 heuristic findings; the working tree reports 601 exact import, function, type and
+value findings and 517 heuristic ones, with 1,724 more name and configuration key matches counted
+in a note. Five files are listed as partly assessed because the Rust grammar does not read
+`dyn 'a + Fn(…)` trait objects and some attribute positions. The release executable grew from
+27.6 to 37.5 MB with the grammars.
+
 ## Large UTF-8 text comparison
 
 On 2026-10-30, two 1 GiB UTF-8 inputs (`text-1gb`, deterministic generator seed 7,

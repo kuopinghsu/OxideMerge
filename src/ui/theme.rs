@@ -10,6 +10,54 @@ pub fn semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(SEMIBOLD.into()))
 }
 
+/// Type scale, in points.
+pub mod size {
+    /// Shortcut hints, counts and secondary lines.
+    pub const CAPTION: f32 = 11.5;
+    /// Column headers, chips, badges and details.
+    pub const SMALL: f32 = 12.0;
+    /// Dense rows and compact action bars.
+    pub const DENSE: f32 = 13.0;
+    /// Buttons and other controls.
+    pub const CONTROL: f32 = 13.5;
+    pub const BODY: f32 = 14.0;
+    /// Section and card titles.
+    pub const SUBTITLE: f32 = 15.0;
+    /// Dialog titles.
+    pub const TITLE: f32 = 17.0;
+    pub const HEADING: f32 = 20.0;
+    /// The application name on the start page and in About.
+    pub const DISPLAY: f32 = 28.0;
+}
+
+/// Corner radii, for `CornerRadius::same` and the painter.
+pub mod radius {
+    /// Marks inside text and small badges.
+    pub const XS: u8 = 3;
+    /// Controls inside rows.
+    pub const SM: u8 = 5;
+    /// Buttons, inputs and menu items.
+    pub const MD: u8 = 7;
+    /// Cards, menus and panels.
+    pub const LG: u8 = 10;
+    /// Dialogs, windows and pills.
+    pub const XL: u8 = 12;
+}
+
+/// Spacing steps, for margins and the gaps between controls.
+pub mod space {
+    pub const XXS: i8 = 2;
+    pub const XS: i8 = 4;
+    pub const SM: i8 = 6;
+    pub const MD: i8 = 8;
+    /// Horizontal padding inside controls.
+    pub const CONTROL: i8 = 10;
+    pub const LG: i8 = 12;
+    pub const XL: i8 = 16;
+    /// Dialog margins.
+    pub const XXL: i8 = 18;
+}
+
 const fn rgb(hex: u32) -> Color32 {
     Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
@@ -31,13 +79,22 @@ pub struct Palette {
     pub input: Color32,
     pub text: Color32,
     pub text_dim: Color32,
+    /// Labels of controls that cannot be used.
+    pub text_disabled: Color32,
     pub accent: Color32,
     pub accent_hover: Color32,
+    pub accent_pressed: Color32,
     pub accent_soft: Color32,
     pub on_accent: Color32,
     pub success: Color32,
     pub warning: Color32,
     pub danger: Color32,
+    /// Identity colors of the left, middle and right sides.
+    pub sides: [Color32; 3],
+    /// Folder icons in lists.
+    pub folder: Color32,
+    /// Checkerboard behind transparent images.
+    pub checker: [Color32; 2],
 }
 
 /// Accessibility choices that change the palette, the diff colors and the style.
@@ -107,7 +164,10 @@ pub fn palette_for(dark: bool, look: Look) -> Palette {
             p.border_strong = rgb(0x9AA0AB);
             p.text = rgb(0xFFFFFF);
             p.text_dim = rgb(0xD0D4DB);
+            p.text_disabled = rgb(0x8A909C);
             p.accent = rgb(0x9DB0FF);
+            p.accent_hover = rgb(0xB8C6FF);
+            p.accent_pressed = rgb(0xD2DBFF);
         } else {
             p.chrome = rgb(0xFFFFFF);
             p.surface_alt = rgb(0xFFFFFF);
@@ -115,7 +175,10 @@ pub fn palette_for(dark: bool, look: Look) -> Palette {
             p.border_strong = rgb(0x505662);
             p.text = rgb(0x000000);
             p.text_dim = rgb(0x30353F);
+            p.text_disabled = rgb(0x6A707C);
             p.accent = rgb(0x2B3AB8);
+            p.accent_hover = rgb(0x212D93);
+            p.accent_pressed = rgb(0x18216E);
         }
     }
     if look.color_blind {
@@ -143,13 +206,18 @@ fn base_palette(dark: bool) -> Palette {
             input: rgb(0x16171A),
             text: rgb(0xE4E6EA),
             text_dim: rgb(0x949AA4),
+            text_disabled: rgb(0x5C616B),
             accent: rgb(0x7B93FF),
             accent_hover: rgb(0x93A6FF),
+            accent_pressed: rgb(0xAEBCFF),
             accent_soft: rgb(0x2C3558),
             on_accent: rgb(0x10131F),
             success: rgb(0x4CC38A),
             warning: rgb(0xE8B04B),
             danger: rgb(0xF2706A),
+            sides: [rgb(0x8C9EFF), rgb(0xC08CF0), rgb(0x4FD1BC)],
+            folder: rgb(0xE0A42E),
+            checker: [rgb(0x26272C), rgb(0x2E3035)],
         }
     } else {
         Palette {
@@ -164,13 +232,18 @@ fn base_palette(dark: bool) -> Palette {
             input: rgb(0xFFFFFF),
             text: rgb(0x1D2128),
             text_dim: rgb(0x687080),
+            text_disabled: rgb(0xAEB3BC),
             accent: rgb(0x4E62E0),
             accent_hover: rgb(0x3F52CC),
+            accent_pressed: rgb(0x3343AE),
             accent_soft: rgb(0xE5E9FD),
             on_accent: rgb(0xFFFFFF),
             success: rgb(0x1F9254),
             warning: rgb(0xB7791F),
             danger: rgb(0xD63B3B),
+            sides: [rgb(0x4E62E0), rgb(0x8E4EC6), rgb(0x0E8F7E)],
+            folder: rgb(0xE0A42E),
+            checker: [rgb(0xF4F5F7), rgb(0xE8EAEE)],
         }
     }
 }
@@ -370,21 +443,22 @@ pub fn apply(ctx: &egui::Context, dark: bool, look: Look) {
     let mut style = (*ctx.global_style()).clone();
 
     style.text_styles = [
-        (TextStyle::Small, FontId::proportional(11.5)),
-        (TextStyle::Body, FontId::proportional(14.0)),
-        (TextStyle::Button, FontId::proportional(14.0)),
-        (TextStyle::Heading, semibold(20.0)),
+        (TextStyle::Small, FontId::proportional(size::CAPTION)),
+        (TextStyle::Body, FontId::proportional(size::BODY)),
+        (TextStyle::Button, FontId::proportional(size::BODY)),
+        (TextStyle::Heading, semibold(size::HEADING)),
         (TextStyle::Monospace, FontId::monospace(13.5)),
     ]
     .into();
 
     let s = &mut style.spacing;
-    s.item_spacing = egui::vec2(8.0, 6.0);
-    s.button_padding = egui::vec2(10.0, 4.0);
+    let step = |n: i8| n as f32;
+    s.item_spacing = egui::vec2(step(space::MD), step(space::SM));
+    s.button_padding = egui::vec2(step(space::CONTROL), step(space::XS));
     s.interact_size = egui::vec2(28.0, 26.0);
-    s.window_margin = Margin::same(18);
-    s.menu_margin = Margin::same(6);
-    s.menu_spacing = 4.0;
+    s.window_margin = Margin::same(space::XXL);
+    s.menu_margin = Margin::same(space::SM);
+    s.menu_spacing = step(space::XS);
     s.combo_height = 320.0;
     s.icon_width = 16.0;
     s.icon_width_inner = 9.0;
@@ -393,8 +467,8 @@ pub fn apply(ctx: &egui::Context, dark: bool, look: Look) {
     s.scroll = egui::style::ScrollStyle::thin();
 
     if look.compact {
-        s.item_spacing = egui::vec2(6.0, 3.0);
-        s.button_padding = egui::vec2(8.0, 2.0);
+        s.item_spacing = egui::vec2(step(space::SM), 3.0);
+        s.button_padding = egui::vec2(step(space::MD), step(space::XXS));
         s.interact_size = egui::vec2(24.0, 22.0);
         s.window_margin = Margin::same(14);
     }
@@ -417,8 +491,8 @@ pub fn apply(ctx: &egui::Context, dark: bool, look: Look) {
     v.panel_fill = p.surface;
     v.window_fill = p.surface;
     v.window_stroke = Stroke::new(1.0_f32, p.border);
-    v.window_corner_radius = CornerRadius::same(12);
-    v.menu_corner_radius = CornerRadius::same(10);
+    v.window_corner_radius = CornerRadius::same(radius::XL);
+    v.menu_corner_radius = CornerRadius::same(radius::LG);
     v.window_shadow = Shadow {
         offset: [0, 10],
         blur: 32,
@@ -444,40 +518,40 @@ pub fn apply(ctx: &egui::Context, dark: bool, look: Look) {
     v.striped = false;
     v.text_cursor.stroke = Stroke::new(2.0_f32, p.accent);
 
-    let radius = CornerRadius::same(7);
+    let control = CornerRadius::same(radius::MD);
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = p.surface;
     w.noninteractive.weak_bg_fill = p.surface;
     w.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border);
     w.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text);
-    w.noninteractive.corner_radius = radius;
+    w.noninteractive.corner_radius = control;
 
     w.inactive.bg_fill = p.control;
     w.inactive.weak_bg_fill = p.control;
     w.inactive.bg_stroke = Stroke::new(1.0_f32, p.border);
     w.inactive.fg_stroke = Stroke::new(1.0_f32, p.text);
-    w.inactive.corner_radius = radius;
+    w.inactive.corner_radius = control;
     w.inactive.expansion = 0.0;
 
     w.hovered.bg_fill = p.control_hover;
     w.hovered.weak_bg_fill = p.control_hover;
     w.hovered.bg_stroke = Stroke::new(1.0_f32, p.border_strong);
     w.hovered.fg_stroke = Stroke::new(1.5_f32, p.text);
-    w.hovered.corner_radius = radius;
+    w.hovered.corner_radius = control;
     w.hovered.expansion = 0.0;
 
     w.active.bg_fill = p.control_active;
     w.active.weak_bg_fill = p.control_active;
     w.active.bg_stroke = Stroke::new(1.0_f32, p.accent);
     w.active.fg_stroke = Stroke::new(1.5_f32, p.text);
-    w.active.corner_radius = radius;
+    w.active.corner_radius = control;
     w.active.expansion = 0.0;
 
     w.open.bg_fill = p.control_hover;
     w.open.weak_bg_fill = p.control_hover;
     w.open.bg_stroke = Stroke::new(1.0_f32, p.border_strong);
     w.open.fg_stroke = Stroke::new(1.0_f32, p.text);
-    w.open.corner_radius = radius;
+    w.open.corner_radius = control;
     w.open.expansion = 0.0;
 
     ctx.set_global_style(style);
@@ -567,5 +641,28 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(Look::from_bits(compact.bits()), compact);
+    }
+
+    #[test]
+    fn control_states_are_told_apart_in_every_look() {
+        let dist = |a: Color32, b: Color32| {
+            let d = |x: u8, y: u8| (x as i32 - y as i32).abs();
+            d(a.r(), b.r()) + d(a.g(), b.g()) + d(a.b(), b.b())
+        };
+        for bits in 0..16 {
+            for dark in [false, true] {
+                let p = palette_for(dark, Look::from_bits(bits));
+                // Rest, hover and pressed differ, for neutral and accent controls.
+                assert!(dist(p.control, p.control_hover) > 10);
+                assert!(dist(p.control_hover, p.control_active) > 10);
+                assert!(dist(p.accent, p.accent_hover) > 20);
+                assert!(dist(p.accent_hover, p.accent_pressed) > 20);
+                // Disabled labels are dimmer than secondary text but still readable.
+                assert!(dist(p.text_disabled, p.surface) < dist(p.text_dim, p.surface));
+                assert!(dist(p.text_disabled, p.surface) > 120);
+                // Sides keep distinct identity colors.
+                assert!(dist(p.sides[0], p.sides[1]) > 60 && dist(p.sides[1], p.sides[2]) > 60);
+            }
+        }
     }
 }

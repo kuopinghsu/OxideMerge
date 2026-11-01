@@ -204,7 +204,7 @@ pub fn show(ctx: &egui::Context, settings: Option<&Path>) -> bool {
                                 "help.settings_file",
                                 &[("path", path.display().to_string())],
                             ))
-                            .size(11.5)
+                            .size(theme::size::CAPTION)
                             .color(widgets::pal(ui).text_dim),
                         );
                     }
@@ -219,7 +219,7 @@ fn panel(ui: &mut egui::Ui, title: &str, sections: &[Section], mouse: bool) {
     egui::Frame::new()
         .fill(p.surface_alt)
         .stroke(Stroke::new(1.0_f32, p.border))
-        .corner_radius(8)
+        .corner_radius(theme::radius::MD)
         .inner_margin(Margin::same(PANEL_MARGIN))
         .show(ui, |ui| {
             ui.vertical(|ui| {
@@ -228,14 +228,14 @@ fn panel(ui: &mut egui::Ui, title: &str, sections: &[Section], mouse: bool) {
                 ui.spacing_mut().interact_size.y = 18.0;
                 ui.label(
                     RichText::new(title.to_uppercase())
-                        .font(theme::semibold(12.0))
+                        .font(theme::semibold(theme::size::SMALL))
                         .color(p.text_dim),
                 );
                 for (heading, rows) in sections {
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(tr(heading))
-                            .font(theme::semibold(13.0))
+                            .font(theme::semibold(theme::size::DENSE))
                             .color(p.text),
                     );
                     for (inputs, action) in *rows {
@@ -263,7 +263,10 @@ fn row(ui: &mut egui::Ui, inputs: &str, action: &str) {
             |ui| {
                 ui.set_width(ACTION);
                 ui.add_space(1.0);
-                ui.add(egui::Label::new(RichText::new(action).size(13.0).color(text)).wrap());
+                ui.add(
+                    egui::Label::new(RichText::new(action).size(theme::size::DENSE).color(text))
+                        .wrap(),
+                );
             },
         );
     });
@@ -291,15 +294,15 @@ fn input_text(inputs: &[&'static str], mouse: bool) -> String {
 fn keycap(ui: &mut egui::Ui, text: &str) {
     let latin = text.chars().all(|c| (c as u32) < 0x2E80);
     let font = if latin {
-        FontId::monospace(11.5)
+        FontId::monospace(theme::size::CAPTION)
     } else {
-        FontId::proportional(12.0)
+        FontId::proportional(theme::size::SMALL)
     };
     let p = widgets::pal(ui);
     egui::Frame::new()
         .fill(p.control)
-        .corner_radius(4)
-        .inner_margin(Margin::symmetric(6, 2))
+        .corner_radius(theme::radius::XS)
+        .inner_margin(Margin::symmetric(theme::space::SM, theme::space::XXS))
         .show(ui, |ui| {
             ui.add(egui::Label::new(RichText::new(text).font(font).color(p.accent)).wrap())
         });
