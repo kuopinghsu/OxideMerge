@@ -45,8 +45,9 @@ pub struct WebView {
     pub mode: WebMode,
     /// Pages fetched for the HTML, text and resource modes, reused when switching between them.
     pages: Option<Arc<Vec<Page>>>,
-    /// Pages rendered by the browser, reused by the text and HTML modes.
-    rendered: Option<Arc<Vec<Rendered>>>,
+    /// Pages rendered by the browser, reused by the text and HTML modes while rendered the
+    /// same way (see [`RenderKey`]).
+    rendered: Option<(RenderKey, Arc<Vec<Rendered>>)>,
     /// Set when the text and HTML modes show `pages` as downloaded, with why the browser was not
     /// used when it failed; switching between the two modes then keeps to them.
     downloaded_text: Option<Option<String>>,
@@ -57,6 +58,21 @@ pub struct WebView {
     error: Option<String>,
     shots: Option<tempfile::TempDir>,
     note: String,
+}
+
+/// The settings pages are rendered with: browser, width and height.
+type RenderKey = (String, u32, u32);
+
+fn render_key(cfg: &Config) -> RenderKey {
+    (cfg.web_browser.clone(), cfg.web_width, cfg.web_height)
+}
+
+impl Drop for WebView {
+    fn drop(&mut self) {
+        if let Some(j) = &self.job {
+            j.progress.abort.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 fn short(u: &Url) -> String {
@@ -85,7 +101,9 @@ fn url_label(u: &Url) -> String {
 
 fn rendered_label(r: &Rendered, asked: &Url) -> String {
     let url = url_label(r.url.as_ref().unwrap_or(asked));
-    if (200..300).contains(&r.status) {
+    if let Some(e) = &r.error {
+        format!("{url}  ({}: {e})", tr("status.error"))
+    } else if (200..300).contains(&r.status) {
         url
     } else {
         format!("{url}  (HTTP {})", r.status)
@@ -161,17 +179,26 @@ impl WebView {
         let render_urls = self.urls.clone();
         match self.mode {
             WebMode::Html | WebMode::Text => {
-                if let Some(r) = self.rendered.clone() {
+                let key = render_key(cfg);
+                let rendered = self
+                    .rendered
+                    .clone()
+                    .filter(|(k, _)| cfg.web_render && *k == key);
+                let browser = cfg
+                    .web_render
+                    .then(|| web::find_browser(&cfg.web_browser))
+                    .flatten();
+                // Pages downloaded because rendering failed stay so; those downloaded without
+                // a browser are rendered once there is one.
+                let downloaded = self
+                    .downloaded_text
+                    .clone()
+                    .filter(|failed| failed.is_some() || browser.is_none());
+                if let Some((_, r)) = rendered {
                     let _ = tx.send(Ok(Loaded::Rendered(r, None)));
-                } else if let (Some(p), Some(failed)) =
-                    (self.pages.clone(), self.downloaded_text.clone())
-                {
+                } else if let (Some(p), Some(failed)) = (self.pages.clone(), downloaded) {
                     let _ = tx.send(Ok(Loaded::Pages(p, failed)));
                 } else {
-                    let browser = cfg
-                        .web_render
-                        .then(|| web::find_browser(&cfg.web_browser))
-                        .flatten();
                     let pr = progress.clone();
                     std::thread::spawn(move || {
                         let r = web_render::load_text(browser.as_deref(), &render_urls, w, h, &pr)
@@ -305,7 +332,7 @@ impl WebView {
                 self.note = notes.join(" · ");
                 self.shots = Some(dir);
                 // The text and HTML modes can show these pages without loading them again.
-                self.rendered = Some(rendered);
+                self.rendered = Some((render_key(cfg), rendered));
                 Content::Image(v)
             }
             Loaded::Rendered(rendered, None) => {
@@ -326,7 +353,7 @@ impl WebView {
                         d
                     })
                     .collect();
-                self.rendered = Some(rendered);
+                self.rendered = Some((render_key(cfg), rendered));
                 Content::Text(TextView::new(docs, cfg))
             }
             Loaded::Tree(pages, temps, outcome) => {

@@ -178,11 +178,22 @@ impl Gui {
         self.click_at(w.rect.center());
     }
 
+    /// Opens or closes the menu of the menu bar named `label`, not a button of that name below.
+    fn click_menu(&mut self, label: &str) -> Rect {
+        let rect = self
+            .widgets
+            .iter()
+            .find(|w| named(w, label) && w.rect.top() < 40.0)
+            .unwrap_or_else(|| panic!("{}: no menu {label:?}", self.name))
+            .rect;
+        self.click_at(rect.center());
+        rect
+    }
+
     /// Picks an item of the menu bar: `["File", "Export", "Generate patch..."]`. Items are told
     /// from buttons of the same name by where they are: under their menu, or beside it.
     fn menu(&mut self, path: &[&str]) {
-        let mut anchor = self.widget(path[0]).rect;
-        self.click(path[0]);
+        let mut anchor = self.click_menu(path[0]);
         for (depth, item) in path.iter().enumerate().skip(1) {
             let found = self.widgets.iter().rev().find(|w| {
                 let r = w.rect;
@@ -215,6 +226,24 @@ impl Gui {
             self.frame();
         }
         self.settle();
+    }
+
+    /// Scrolls the view under the middle of the window until the widget `label` is in it.
+    fn scroll_to(&mut self, label: &str) {
+        let middle = Pos2::new(SCREEN.x / 2.0, SCREEN.y / 2.0);
+        for _ in 0..50 {
+            if self.widget(label).rect.bottom() < SCREEN.y - 40.0 {
+                return;
+            }
+            self.events.push(Event::PointerMoved(middle));
+            self.events.push(Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                modifiers: Modifiers::NONE,
+            });
+            self.frames(3);
+        }
+        panic!("{}: could not scroll to {label:?}", self.name);
     }
 
     fn key(&mut self, modifiers: Modifiers, key: Key) {
@@ -452,6 +481,105 @@ fn three_way_conflicts_are_resolved_and_the_middle_saved() {
     assert_eq!(read(&paths[1]), "a\nleft\nc\nd\nE\n");
     assert_eq!(read(&paths[0]), "a\nleft\nc\nd\ne\n");
     assert_eq!(read(&paths[2]), "a\nright\nc\nd\nE\n");
+}
+
+#[test]
+fn the_first_start_offers_a_sample_that_leaves_no_trace() {
+    let mut gui = Gui::start("start_sample", None);
+    assert!(gui.app.cfg.recent_compares.is_empty());
+    gui.click(tr("start.try_button"));
+    assert_eq!(gui.app.tabs.len(), 1);
+    assert!(gui.shows("README.md") && gui.shows("src"));
+    assert!(gui.app.cfg.recent_compares.is_empty());
+    let root = gui.app.tabs[0].source[0].parent().unwrap().to_path_buf();
+    assert!(root.exists());
+    gui.key(CMD, Key::W);
+    assert!(gui.app.tabs.is_empty());
+    assert!(!root.exists(), "the sample is removed with its tab");
+}
+
+#[test]
+fn the_start_page_compares_the_typed_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "one\n"), ("b.txt", "two\n")]);
+    let mut gui = Gui::start("start_launcher", None);
+    assert!(!gui.widget(tr("btn.compare")).enabled);
+    let fields: Vec<_> = gui
+        .widgets
+        .iter()
+        .filter(|w| w.role == accesskit::Role::TextInput)
+        .map(|w| w.rect.center())
+        .collect();
+    assert_eq!(fields.len(), 2);
+    for (at, file) in fields.into_iter().zip(["a.txt", "b.txt"]) {
+        gui.click_at(at);
+        gui.type_text(&d.join(file).display().to_string());
+        gui.frames(2);
+    }
+    gui.click(tr("btn.compare"));
+    assert_eq!(gui.app.tabs.len(), 1);
+    assert_eq!(gui.text_view().panes[1].doc.lines, ["two"]);
+}
+
+#[test]
+fn the_inline_view_keeps_navigation_and_copying() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[("a.txt", "one\ntwo\nthree\n"), ("b.txt", "one\n2\nthree\n")],
+    );
+    let mut gui = Gui::start("inline_view", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    gui.click(tr("cmd.inline_view"));
+    assert!(gui.text_view().unified);
+    gui.key(ALT, Key::ArrowDown);
+    assert_eq!(gui.text_view().cur_block, Some(0));
+    gui.key(ALT, Key::ArrowRight);
+    assert_eq!(gui.text_view().panes[1].doc.lines[1], "two");
+    gui.click(tr("cmd.inline_view"));
+    assert!(!gui.text_view().unified);
+
+    gui.key(CMD, Key::K);
+    gui.type_text(tr("cmd.inline_view"));
+    gui.key(Modifiers::NONE, Key::Enter);
+    assert!(gui.text_view().unified);
+}
+
+#[test]
+fn the_merge_bar_counts_conflicts_down_to_a_saved_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("left.txt", "a\nleft\nc\nd\ne\nL2\n"),
+            ("base.txt", "a\nb\nc\nd\ne\nb2\n"),
+            ("right.txt", "a\nright\nc\nd\ne\nR2\n"),
+        ],
+    );
+    let paths = ["left.txt", "base.txt", "right.txt"].map(|f| d.join(f));
+    let mut gui = Gui::start("merge_bar", compare(&paths));
+    let left = |n: usize| trf("merge.conflicts_left", &[("n", n.to_string())]);
+    assert!(gui.shows_text(&left(2)));
+    assert!(!gui.widget(tr("merge.save_result")).enabled);
+
+    gui.click(tr("merge.next_conflict"));
+    gui.click(tr("merge.take_both"));
+    assert_eq!(gui.text_view().panes[1].doc.lines[5..7], ["L2", "R2"]);
+    let one = trf("merge.conflicts_left_one", &[("n", "1".into())]);
+    assert!(gui.shows_text(&one));
+
+    gui.click(tr("merge.next_conflict"));
+    let b = gui.text_view().cur_block.unwrap();
+    assert!(gui.text_view().is_open_conflict(b));
+    gui.click(tr("merge.mark_resolved"));
+    assert!(gui.shows_text(tr("merge.no_conflicts")));
+    assert_eq!(gui.text_view().conflicts_left(), 0);
+
+    gui.click(tr("merge.save_result"));
+    assert_eq!(read(&paths[1]), "a\nb\nc\nd\ne\nL2\nR2\n");
+    assert!(!gui.app.tabs[0].is_modified());
 }
 
 fn merge_folders(d: &Path) -> [PathBuf; 3] {
@@ -831,7 +959,7 @@ fn files_that_cannot_be_read_are_reported() {
 fn menu_widths(gui: &mut Gui) -> Vec<(&'static str, f32)> {
     let mut widths = Vec::new();
     for key in MENUS {
-        gui.click(tr(key));
+        gui.click_menu(tr(key));
         gui.frames(3);
         let open: Vec<f32> = gui.ctx.memory(|m| {
             m.layer_ids()
@@ -842,7 +970,7 @@ fn menu_widths(gui: &mut Gui) -> Vec<(&'static str, f32)> {
         });
         assert_eq!(open.len(), 1, "{key}: {open:?}");
         widths.push((key, open[0]));
-        gui.click(tr(key));
+        gui.click_menu(tr(key));
         gui.frames(3);
     }
     widths
@@ -1448,7 +1576,8 @@ fn merge_verification_preview_never_edits_the_middle_pane() {
             dir.path().join("right.txt"),
         ]),
     );
-    gui.click(tr("analysis.merge_verification"));
+    gui.click(tr("drawer.toggle"));
+    assert!(gui.shows(tr("analysis.merge_verification")));
     gui.click(tr("analysis.preview_merge"));
     let start = Instant::now();
     while !gui.shows_text(tr("analysis.planned_changes")) {
@@ -1497,6 +1626,7 @@ fn start_page_baselines_open_frozen_binary_bytes_without_original_inputs() {
     }
     std::fs::remove_file(a.join("a.bin")).unwrap();
     std::fs::remove_file(b.join("a.bin")).unwrap();
+    gui.scroll_to("BinaryChanged a.bin");
     gui.click("BinaryChanged a.bin");
     let Content::Binary(view) = gui.app.tabs[gui.app.active].content.view() else {
         panic!("captured binary compare expected")
@@ -1676,6 +1806,47 @@ fn escape_closes_binary_and_folder_comparisons() {
         assert!(gui.app.tabs.is_empty());
         assert!(!gui.closed);
     }
+}
+
+#[test]
+fn folder_chips_count_each_kind_and_hide_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("left/same.txt", "x\n"),
+            ("right/same.txt", "x\n"),
+            ("left/changed.txt", "a\n"),
+            ("right/changed.txt", "b\n"),
+            ("left/gone.txt", "old\n"),
+        ],
+    );
+    let mut gui = Gui::start("folder_chips", compare(&[d.join("left"), d.join("right")]));
+    gui.settle();
+    let identical = format!("{}  1", tr("view.identical"));
+    let only_left = format!(
+        "{}  1",
+        trf("stats.only_in", &[("side", tr("side.left").into())])
+    );
+    assert!(gui.shows(&format!("{}  3", tr("analysis.all"))));
+    assert!(gui.shows(&format!("{}  1", tr("view.different"))));
+    assert!(gui.shows(&only_left));
+    assert!(gui.shows("same.txt"));
+
+    gui.click(&identical);
+    gui.frames(3);
+    assert!(!gui.app.cfg.show_identical);
+    assert!(!gui.shows("same.txt"));
+    assert!(gui.shows("changed.txt"));
+
+    gui.click(&only_left);
+    gui.frames(3);
+    assert!(!gui.shows("gone.txt"));
+
+    gui.click(&format!("{}  3", tr("analysis.all")));
+    gui.frames(3);
+    assert!(gui.shows("same.txt") && gui.shows("gone.txt"));
 }
 
 #[test]

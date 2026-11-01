@@ -15,6 +15,8 @@ use url::Url;
 
 /// Time allowed for all pages to load before they are used as they are.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(45);
+/// Time allowed for a page that navigated on by itself (a redirect after loading) to load.
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(15);
 /// Tallest full size screenshot; taller pages are cut (larger images exceed GPU texture limits).
 pub const MAX_SHOT_HEIGHT: u32 = 16384;
 
@@ -51,6 +53,8 @@ pub struct Rendered {
     pub cut: bool,
     /// Text blocks highlighted as different on the screenshot.
     pub marked: usize,
+    /// Why the page could not be shown (fully); the others are shown all the same.
+    pub error: Option<String>,
 }
 
 impl Rendered {
@@ -67,6 +71,10 @@ impl Rendered {
 const EXTRACT_JS: &str = r#"(() => {
   const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE','HEAD','IFRAME','FRAME',
     'OBJECT','EMBED','CANVAS','VIDEO','AUDIO','SELECT','TEXTAREA','OPTION']);
+  // Tag names are lower case in XHTML and other XML documents.
+  const tag = el => el.nodeName.toUpperCase();
+  // A lone UTF-16 surrogate can't be sent as JSON; U+FFFD keeps the offsets.
+  const wf = s => s.toWellFormed ? s.toWellFormed() : s;
   const styles = new Map();
   const style = el => {
     let s = styles.get(el);
@@ -77,8 +85,9 @@ const EXTRACT_JS: &str = r#"(() => {
     const d = style(el).d;
     return !(d.startsWith('inline') || d === 'contents' || d.startsWith('ruby'));
   };
+  const parentOf = n => n.assignedSlot || n.parentElement || (n.parentNode && n.parentNode.host) || null;
   const blockOf = el => {
-    while (el.parentElement && el !== document.body && !isBlock(el)) el = el.parentElement;
+    while (parentOf(el) && el !== document.body && !isBlock(el)) el = parentOf(el);
     return el;
   };
   const blocks = [];
@@ -90,8 +99,8 @@ const EXTRACT_JS: &str = r#"(() => {
   const start = el => { flush(); cur = { text: '', pieces: [] }; curEl = el; brk = false; };
   const space = () => { if (cur && cur.text && !cur.text.endsWith(' ')) cur.text += ' '; };
   const control = el => {
-    if (el.tagName === 'SELECT') { const o = el.selectedOptions && el.selectedOptions[0]; return o ? o.text : ''; }
-    if (el.tagName === 'TEXTAREA') return el.value;
+    if (tag(el) === 'SELECT') { const o = el.selectedOptions && el.selectedOptions[0]; return o ? o.text : ''; }
+    if (tag(el) === 'TEXTAREA') return el.value;
     const t = (el.type || 'text').toLowerCase();
     if (['hidden','checkbox','radio','file','image','range','color'].includes(t)) return '';
     if (t === 'password') return el.value ? '••••' : '';
@@ -99,29 +108,47 @@ const EXTRACT_JS: &str = r#"(() => {
   };
   const root = document.body || document.documentElement;
   if (!root) return { url: location.href, html: '', blocks: [] };
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
-    acceptNode(n) {
-      if (n.nodeType !== 1) return NodeFilter.FILTER_ACCEPT;
-      if (n.tagName === 'SELECT' || n.tagName === 'TEXTAREA') return NodeFilter.FILTER_ACCEPT;
-      if (SKIP.has(n.tagName)) return NodeFilter.FILTER_REJECT;
-      if (n.checkVisibility && !n.checkVisibility()) return NodeFilter.FILTER_REJECT;
-      return NodeFilter.FILTER_ACCEPT;
+  // The tree as rendered: open shadow roots instead of their hosts' children, and the nodes
+  // assigned to a slot instead of its fallback content.
+  const children = n => {
+    if (n.shadowRoot) return n.shadowRoot.childNodes;
+    if (tag(n) === 'SLOT') { const a = n.assignedNodes(); if (a.length) return a; }
+    return n.childNodes;
+  };
+  // An element without a box of its own (display: contents) still shows its children.
+  const shown = el => style(el).d === 'contents' || !el.checkVisibility || el.checkVisibility();
+  const hiddenAbove = el => {
+    for (let a = el; a && a.nodeType === 1; a = parentOf(a)) {
+      if (getComputedStyle(a).contentVisibility === 'hidden') return true;
+      const up = parentOf(a);
+      if (up && tag(up) === 'DETAILS' && !up.open && tag(a) !== 'SUMMARY') return true;
     }
-  });
-  for (let n = walker.currentNode; n; n = walker.nextNode()) {
+    return false;
+  };
+  const stack = [root];
+  while (stack.length) {
+    const n = stack.pop();
     if (n.nodeType === 1) {
-      if (n.tagName === 'BR') brk = true;
-      else if (n.tagName === 'INPUT' || n.tagName === 'SELECT' || n.tagName === 'TEXTAREA') {
-        if (n.checkVisibility && !n.checkVisibility()) continue;
+      const t = tag(n);
+      if (t === 'BR') brk = true;
+      else if (t === 'INPUT' || t === 'SELECT' || t === 'TEXTAREA') {
+        if (!shown(n)) continue;
         const v = control(n).replace(/\s+/g, ' ').trim();
         if (v) { start(null); cur.text = v; flush(); }
+      } else if (!SKIP.has(t) && shown(n)) {
+        const c = children(n);
+        for (let i = c.length - 1; i >= 0; i--) stack.push(c[i]);
       }
       continue;
     }
-    const p = n.parentElement;
-    if (!p || SKIP.has(p.tagName)) continue;
+    if (n.nodeType !== 3) continue;
+    const p = parentOf(n);
+    if (!p || SKIP.has(tag(p))) continue;
     const st = style(p);
     if (st.v === 'hidden' || st.v === 'collapse') continue;
+    // Text right inside a display: contents element was not checked with its element (it has
+    // no box to check): look for what hides content above it.
+    if (st.d === 'contents' && hiddenAbove(p)) continue;
     const data = n.data;
     if (!/\S/.test(data)) { space(); continue; }
     const b = blockOf(p);
@@ -146,8 +173,8 @@ const EXTRACT_JS: &str = r#"(() => {
     (dt.systemId ? (dt.publicId ? ' ' : ' SYSTEM ') + '"' + dt.systemId + '"' : '') + '>\n' : '';
   return {
     url: location.href,
-    html: doctype + document.documentElement.outerHTML,
-    blocks: blocks.map(b => b.text),
+    html: wf(doctype + document.documentElement.outerHTML),
+    blocks: blocks.map(b => wf(b.text)),
   };
 })()"#;
 
@@ -156,16 +183,22 @@ const EXTRACT_JS: &str = r#"(() => {
 const MARK_JS: &str = r#"((marks) => {
   const blocks = window.__oxidemergeBlocks || [];
   if (!window.Highlight || !window.CSS || !CSS.highlights) return 0;
-  const rangeOf = (b, s, e) => {
-    const ps = b.pieces.filter(p => p[3] + (p[2] - p[1]) > s && p[3] < e);
-    if (!ps.length) return null;
-    const f = ps[0], l = ps[ps.length - 1];
-    const r = document.createRange();
-    try {
-      r.setStart(f[0], f[1] + Math.max(0, s - f[3]));
-      r.setEnd(l[0], l[1] + Math.min(l[2] - l[1], e - l[3]));
-    } catch (_) { return null; }
-    return r;
+  const roots = new Set([document]);
+  // One range per text node: a block may run into a shadow tree, which a range can't span.
+  const addRanges = (hl, b, s, e) => {
+    const spans = [];
+    for (const p of b.pieces) {
+      if (p[3] + (p[2] - p[1]) <= s || p[3] >= e) continue;
+      const from = p[1] + Math.max(0, s - p[3]), to = p[1] + Math.min(p[2] - p[1], e - p[3]);
+      const last = spans[spans.length - 1];
+      if (last && last[0] === p[0]) last[2] = to; else spans.push([p[0], from, to]);
+    }
+    for (const [node, from, to] of spans) {
+      const r = document.createRange();
+      try { r.setStart(node, from); r.setEnd(node, to); } catch (_) { continue; }
+      hl.add(r);
+      roots.add(node.getRootNode());
+    }
   };
   const whole = new Highlight(), words = new Highlight();
   words.priority = 1;
@@ -175,19 +208,26 @@ const MARK_JS: &str = r#"((marks) => {
     if (!b) continue;
     if (!seen.has(i)) {
       seen.add(i);
-      const r = rangeOf(b, 0, b.text.length);
-      if (r) whole.add(r);
+      addRanges(whole, b, 0, b.text.length);
     }
-    if (s !== null && e !== null) { const r = rangeOf(b, s, e); if (r) words.add(r); }
+    if (s !== null && e !== null) addRanges(words, b, s, e);
   }
   CSS.highlights.set('oxidemerge-block', whole);
   CSS.highlights.set('oxidemerge-word', words);
-  const st = document.createElement('style');
-  st.textContent = '::highlight(oxidemerge-block){background-color:rgba(255,232,96,.8);color:#000}' +
-    '::highlight(oxidemerge-word){background-color:rgba(255,140,30,.95);color:#000}';
-  (document.head || document.documentElement).appendChild(st);
+  // Adopted rather than added as a <style>, so the page's own elements stay as they were.
+  const sheet = new CSSStyleSheet();
+  sheet.replaceSync('::highlight(oxidemerge-block){background-color:rgba(255,232,96,.8);color:#000}' +
+    '::highlight(oxidemerge-word){background-color:rgba(255,140,30,.95);color:#000}');
+  for (const r of roots) {
+    if (r === document || r instanceof ShadowRoot) r.adoptedStyleSheets = [...r.adoptedStyleSheets, sheet];
+  }
   return seen.size;
 })"#;
+
+/// Run in every page before its own scripts: dialogs would stop the page until answered, and
+/// nobody is there to answer them.
+const NO_DIALOGS_JS: &str = "window.alert = () => {}; window.confirm = () => false; \
+    window.prompt = () => null; window.print = () => {};";
 
 /// Waits for fonts and, for full size screenshots, scrolls through the page so content loaded
 /// on scrolling (lazy images, infinite lists) is there, then back to the top.
@@ -332,7 +372,9 @@ pub fn diff_marks(pages: &[Vec<String>]) -> Vec<Vec<Mark>> {
 
 fn keep_event(v: &Value) -> bool {
     match v.get("method").and_then(Value::as_str) {
-        Some("Page.loadEventFired") | Some("Inspector.targetCrashed") => true,
+        Some("Page.loadEventFired")
+        | Some("Inspector.targetCrashed")
+        | Some("Target.detachedFromTarget") => true,
         Some("Network.responseReceived") => {
             v.pointer("/params/type").and_then(Value::as_str) == Some("Document")
         }
@@ -400,7 +442,10 @@ pub fn load_text(
                 highlight: false,
             };
             match render(exe, urls, &opts, progress) {
-                Ok(r) => return Ok(TextSource::Rendered(r)),
+                Ok(r) => match r.iter().find_map(|r| r.error.clone()) {
+                    None => return Ok(TextSource::Rendered(r)),
+                    Some(e) => Some(e),
+                },
                 Err(_) if progress.abort.load(Ordering::Relaxed) => {
                     bail!("{}", crate::i18n::tr("msg.aborted"))
                 }
@@ -412,7 +457,8 @@ pub fn load_text(
 }
 
 /// Loads every page in its own tab of one headless browser and extracts, marks and captures
-/// them. `progress.done` counts finished pages.
+/// them. `progress.done` counts finished pages. A page that fails keeps its error in
+/// [`Rendered::error`] (with a blank screenshot); the others are shown all the same.
 pub fn render(
     browser_exe: &Path,
     urls: &[Url],
@@ -426,11 +472,17 @@ pub fn render(
         }
         Ok(())
     };
-    let mut b = Browser::launch(browser_exe, keep_event)?;
+    // Stopping is never one page's error.
+    let page_error = |e: anyhow::Error| -> Result<String> {
+        check()?;
+        Ok(format!("{e:#}"))
+    };
+    let mut b = Browser::launch(browser_exe, keep_event, Some(&progress.abort))?;
     let (w, h) = (opts.width.clamp(320, 7680), opts.height.clamp(240, 16384));
     let mut tabs = Vec::new();
+    let mut out: Vec<Rendered> = Vec::new();
     for url in urls {
-        let s = b.new_tab()?;
+        let (s, target) = b.new_tab()?;
         b.call(Some(&s), "Page.enable", json!({}))?;
         b.call(Some(&s), "Network.enable", json!({}))?;
         b.call(
@@ -438,48 +490,80 @@ pub fn render(
             "Emulation.setDeviceMetricsOverride",
             json!({ "width": w, "height": h, "deviceScaleFactor": 1, "mobile": false }),
         )?;
+        b.call(
+            Some(&s),
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": NO_DIALOGS_JS }),
+        )?;
         b.clear_events(&s);
-        let nav = b
-            .call(Some(&s), "Page.navigate", json!({ "url": url.as_str() }))
-            .with_context(|| url.to_string())?;
-        if let Some(e) = nav.get("errorText").and_then(Value::as_str) {
-            if !e.is_empty() {
-                bail!("{url}: {e}");
-            }
-        }
-        let frame = nav["frameId"].as_str().unwrap_or_default().to_string();
-        tabs.push((s, frame));
+        // Answered once the response headers arrive: all the pages are asked for first, so
+        // they load at the same time.
+        let id = b.send(Some(&s), "Page.navigate", json!({ "url": url.as_str() }))?;
+        tabs.push((s, target, id));
+        out.push(Rendered::default());
     }
-    // The pages load at the same time; wait for each (or give up waiting and take them as is).
     let deadline = Instant::now() + LOAD_TIMEOUT;
-    for (s, _) in &tabs {
-        let s = s.clone();
-        let ev = b.wait_event(deadline, &aborted, &|v| {
-            session_of(v) == Some(&s)
+    for (i, (s, frame, id)) in tabs.iter_mut().enumerate() {
+        match b.reply(*id, Some(s), "Page.navigate", deadline) {
+            Ok(Some(nav)) => {
+                if let Some(f) = nav["frameId"].as_str() {
+                    *frame = f.to_string();
+                }
+                match nav.get("errorText").and_then(Value::as_str) {
+                    // An error status with an empty body: the status tells what happened.
+                    None | Some("") | Some("net::ERR_HTTP_RESPONSE_CODE_FAILURE") => {}
+                    Some(e) => out[i].error = Some(format!("{}: {e}", urls[i])),
+                }
+            }
+            Ok(None) => {
+                out[i].error = Some(format!("{}: {}", urls[i], crate::i18n::tr("web.timeout")))
+            }
+            Err(e) => out[i].error = Some(page_error(e)?),
+        }
+    }
+    // Wait for each page to load (or give up waiting and take them as they are). A crashed tab
+    // would not answer again.
+    let mut crashed = vec![false; tabs.len()];
+    for (i, (s, _, _)) in tabs.iter().enumerate() {
+        let ev = b.wait_event(deadline, &|v| {
+            session_of(v) == Some(s.as_str())
                 && matches!(
                     v.get("method").and_then(Value::as_str),
                     Some("Page.loadEventFired") | Some("Inspector.targetCrashed")
                 )
         })?;
-        check()?;
         if ev
             .as_ref()
             .and_then(|v| v.get("method"))
             .and_then(Value::as_str)
             == Some("Inspector.targetCrashed")
         {
-            bail!("the browser tab crashed");
+            out[i].error = Some(format!("{}: the browser tab crashed", urls[i]));
+            crashed[i] = true;
         }
     }
     let full = opts.capture == Capture::FullPage;
-    let mut out = Vec::new();
-    for (s, frame) in &tabs {
+    let mut worlds = vec![None; tabs.len()];
+    for (i, (s, frame, _)) in tabs.iter().enumerate() {
         check()?;
+        if crashed[i] {
+            continue;
+        }
         // Only the last tab created is active. Activate each page before scrolling it so
         // Chromium also produces frames for pages that were loaded in the background.
-        b.call(Some(s), "Page.bringToFront", json!({}))?;
-        b.eval(s, &format!("{SETTLE_JS}({full})"))?;
-        let v = b.eval(s, EXTRACT_JS)?;
+        let read = (|| -> Result<(i64, Value)> {
+            b.call(Some(s), "Page.bringToFront", json!({}))?;
+            settle_and_extract(&mut b, s, frame, full)
+        })();
+        let (world, v) = match read {
+            Ok(r) => r,
+            Err(e) => {
+                let e = page_error(e)?;
+                out[i].error.get_or_insert(e);
+                continue;
+            }
+        };
+        worlds[i] = Some(world);
         let status = b
             .events()
             .filter(|e| {
@@ -489,20 +573,18 @@ pub fn render(
             .filter_map(|e| e.pointer("/params/response/status").and_then(Value::as_f64))
             .last()
             .map_or(200, |n| n as u16);
-        out.push(Rendered {
-            url: v["url"].as_str().and_then(|u| Url::parse(u).ok()),
-            status: if status == 0 { 200 } else { status },
-            blocks: v["blocks"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            html: v["html"].as_str().unwrap_or_default().to_string(),
-            ..Default::default()
-        });
+        let r = &mut out[i];
+        r.url = v["url"].as_str().and_then(|u| Url::parse(u).ok());
+        r.status = if status == 0 { 200 } else { status };
+        r.blocks = v["blocks"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        r.html = v["html"].as_str().unwrap_or_default().to_string();
     }
     if opts.capture == Capture::None {
         progress.done.store(urls.len(), Ordering::Relaxed);
@@ -511,6 +593,7 @@ pub fn render(
     if opts.highlight && out.len() > 1 {
         let blocks: Vec<Vec<String>> = out.iter().map(|r| r.blocks.clone()).collect();
         for (i, marks) in diff_marks(&blocks).into_iter().enumerate() {
+            let Some(world) = worlds[i] else { continue };
             if marks.is_empty() {
                 continue;
             }
@@ -521,38 +604,105 @@ pub fn render(
                     None => json!([m.block, null, null]),
                 })
                 .collect();
-            let n = b.eval(&tabs[i].0, &format!("{MARK_JS}({})", Value::Array(list)))?;
-            out[i].marked = n.as_u64().unwrap_or(0) as usize;
+            let js = format!("{MARK_JS}({})", Value::Array(list));
+            // Without highlights the screenshot still shows the page.
+            match b.eval(&tabs[i].0, Some(world), &js) {
+                Ok(n) => out[i].marked = n.as_u64().unwrap_or(0) as usize,
+                Err(e) => {
+                    page_error(e)?;
+                }
+            }
         }
     }
-    for (i, (s, _)) in tabs.iter().enumerate() {
+    for (i, (s, _, _)) in tabs.iter().enumerate() {
         check()?;
-        // captureScreenshot can wait indefinitely for a compositor frame on an inactive
-        // tab (notably Edge on Windows), even with background throttling disabled.
-        b.call(Some(s), "Page.bringToFront", json!({}))?;
-        let mut params = json!({ "format": "png" });
-        if full {
-            let m = b.call(Some(s), "Page.getLayoutMetrics", json!({}))?;
-            let size = m.get("cssContentSize").or_else(|| m.get("contentSize"));
-            let page_h = size
-                .and_then(|c| c["height"].as_f64())
-                .unwrap_or(h as f64)
-                .ceil()
-                .max(1.0) as u32;
-            let shot_h = page_h.min(MAX_SHOT_HEIGHT);
-            out[i].cut = page_h > MAX_SHOT_HEIGHT;
-            params = json!({
-                "format": "png",
-                "captureBeyondViewport": true,
-                "clip": { "x": 0, "y": 0, "width": w, "height": shot_h, "scale": 1 },
-            });
+        if crashed[i] {
+            out[i].shot = Some(blank_png(w, h)?);
+            progress.done.fetch_add(1, Ordering::Relaxed);
+            continue;
         }
-        let shot = b.call(Some(s), "Page.captureScreenshot", params)?;
-        let data = shot["data"].as_str().context("Page.captureScreenshot")?;
-        out[i].shot = Some(cdp::base64_decode(data)?);
+        let shot = (|| -> Result<(Vec<u8>, bool)> {
+            // captureScreenshot can wait indefinitely for a compositor frame on an inactive
+            // tab (notably Edge on Windows), even with background throttling disabled.
+            b.call(Some(s), "Page.bringToFront", json!({}))?;
+            let mut params = json!({ "format": "png" });
+            let mut cut = false;
+            if full {
+                let m = b.call(Some(s), "Page.getLayoutMetrics", json!({}))?;
+                let size = m.get("cssContentSize").or_else(|| m.get("contentSize"));
+                let page_h = size
+                    .and_then(|c| c["height"].as_f64())
+                    .unwrap_or(h as f64)
+                    .ceil()
+                    .max(1.0) as u32;
+                let shot_h = page_h.min(MAX_SHOT_HEIGHT);
+                cut = page_h > MAX_SHOT_HEIGHT;
+                params = json!({
+                    "format": "png",
+                    "captureBeyondViewport": true,
+                    "clip": { "x": 0, "y": 0, "width": w, "height": shot_h, "scale": 1 },
+                });
+            }
+            let shot = b.call(Some(s), "Page.captureScreenshot", params)?;
+            let data = shot["data"].as_str().context("Page.captureScreenshot")?;
+            Ok((cdp::base64_decode(data)?, cut))
+        })();
+        match shot {
+            Ok((png, cut)) => {
+                out[i].shot = Some(png);
+                out[i].cut = cut;
+            }
+            Err(e) => {
+                let e = page_error(e)?;
+                out[i].error.get_or_insert(e);
+                out[i].shot = Some(blank_png(w, h)?);
+            }
+        }
         progress.done.fetch_add(1, Ordering::Relaxed);
     }
     Ok(out)
+}
+
+/// Lets the page settle, then reads its text in a JavaScript context of its own (returned for
+/// marking it later). A page that navigates on by itself meanwhile (a redirect after loading)
+/// is read once the next page has loaded, a few times at most.
+fn settle_and_extract(b: &mut Browser, s: &str, frame: &str, full: bool) -> Result<(i64, Value)> {
+    let mut tries = 0;
+    loop {
+        let read = (|| -> Result<(i64, Value)> {
+            let world = b.isolated_world(s, frame)?;
+            b.eval(s, Some(world), &format!("{SETTLE_JS}({full})"))?;
+            Ok((world, b.eval(s, Some(world), EXTRACT_JS)?))
+        })();
+        let e = match read {
+            Ok(r) => return Ok(r),
+            Err(e) => e,
+        };
+        let msg = format!("{e:#}");
+        let navigated = [
+            "navigated or closed",
+            "context was destroyed",
+            "Cannot find context",
+        ]
+        .iter()
+        .any(|m| msg.contains(m));
+        tries += 1;
+        if !navigated || tries == 3 {
+            return Err(e);
+        }
+        b.wait_event(Instant::now() + RELOAD_TIMEOUT, &|v| {
+            session_of(v) == Some(s)
+                && v.get("method").and_then(Value::as_str) == Some("Page.loadEventFired")
+        })?;
+    }
+}
+
+/// A white PNG in place of a screenshot that could not be taken.
+fn blank_png(w: u32, h: u32) -> Result<Vec<u8>> {
+    let img = image::RgbaImage::from_pixel(w, h, image::Rgba([255, 255, 255, 255]));
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+    Ok(png)
 }
 
 #[cfg(test)]
@@ -661,8 +811,12 @@ mod tests {
                 &p,
                 format!(
                     "<!doctype html><html><head><title>T</title></head><body>{body}\
-                     <script>document.body.insertAdjacentHTML('beforeend','<p>From script</p>')</script>\
-                     </body></html>"
+                     <div style='display:contents'><p>In contents</p></div>\
+                     <x-card><b>slotted</b></x-card>\
+                     <script>document.body.insertAdjacentHTML('beforeend','<p>From script</p>');\
+                     customElements.define('x-card', class extends HTMLElement {{ constructor() {{ super();\
+                     this.attachShadow({{mode:'open'}}).innerHTML='<p>Shadow <slot>fallback</slot></p>'; }} }});\
+                     </script></body></html>"
                 ),
             )
             .unwrap();
@@ -692,7 +846,15 @@ mod tests {
         .unwrap();
         assert_eq!(
             text[0].blocks,
-            v(&["Hello", "The quick brown fox", "tall", "end", "From script"])
+            v(&[
+                "Hello",
+                "The quick brown fox",
+                "tall",
+                "end",
+                "In contents",
+                "Shadow slotted",
+                "From script"
+            ])
         );
         assert!(text[1].html.contains("<p>From script</p>"));
         for capture in [Capture::Viewport, Capture::FullPage] {
@@ -720,9 +882,149 @@ mod tests {
                     );
                 } else {
                     assert_eq!(image.height(), 600);
+                    // The changed paragraph, near the top, is painted with the highlight.
+                    let painted = image
+                        .to_rgb8()
+                        .pixels()
+                        .filter(|p| p[0] >= 245 && (120..=245).contains(&p[1]) && p[2] <= 150)
+                        .count();
+                    assert!(painted > 50, "{painted} highlighted pixels");
                 }
                 assert_eq!(shot.marked, 1);
             }
         }
+    }
+
+    /// Pages that redirect, open dialogs, hold odd text or fail don't fail the others.
+    #[test]
+    fn pages_that_misbehave_are_shown_on_their_own() {
+        let Some(exe) = test_browser() else {
+            eprintln!("OXIDEMERGE_TEST_BROWSER not set; skipped");
+            return;
+        };
+        let d = tempfile::tempdir().unwrap();
+        let page = |name: &str, body: &str| {
+            let p = d.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            Url::from_file_path(&p).unwrap()
+        };
+        page("target.html", "<p>Target</p>");
+        let urls = [
+            page(
+                "redirect.html",
+                "<meta http-equiv=refresh content='0;url=target.html'><p>Before</p>",
+            ),
+            page("alert.html", "<script>alert('hi')</script><p>After alert</p>"),
+            page(
+                "surrogate.html",
+                "<p id=x></p><script>x.textContent = 'Hi \u{1F600}'.slice(0, 4)</script>",
+            ),
+            page(
+                "page.xhtml",
+                "<html xmlns='http://www.w3.org/1999/xhtml'><body><p>line one<br/>line two</p>\
+                 <input value='typed'/></body></html>",
+            ),
+            page(
+                "details.html",
+                "<details><summary>Summary</summary><div style='display:contents'>secret</div></details>",
+            ),
+            Url::parse("http://127.0.0.1:9/").unwrap(),
+        ];
+        let opts = RenderOptions {
+            width: 800,
+            height: 600,
+            capture: Capture::None,
+            highlight: false,
+        };
+        let r = render(&exe, &urls, &opts, &Progress::default()).unwrap();
+        let blocks: Vec<&[String]> = r.iter().map(|r| r.blocks.as_slice()).collect();
+        assert_eq!(blocks[0], v(&["Target"]));
+        assert_eq!(blocks[1], v(&["After alert"]));
+        assert_eq!(blocks[2], v(&["Hi \u{FFFD}"]));
+        assert_eq!(blocks[3], v(&["line one", "line two", "typed"]));
+        assert_eq!(blocks[4], v(&["Summary"]));
+        assert!(r[..5].iter().all(|r| r.error.is_none()), "{r:?}");
+        assert!(r[5].error.is_some());
+
+        // Replaced globals don't reach the scripts, and a failed page still gets a screenshot.
+        let globals = |name: &str, word: &str| {
+            page(
+                name,
+                &format!(
+                    "<script>var Highlight = function () {{}}; window.Set = function () {{}};</script>\
+                     <p>The {word} fox</p>"
+                ),
+            )
+        };
+        let urls = [
+            globals("g1.html", "brown"),
+            globals("g2.html", "red"),
+            Url::parse("http://127.0.0.1:9/").unwrap(),
+        ];
+        let opts = RenderOptions {
+            capture: Capture::Viewport,
+            highlight: true,
+            ..opts
+        };
+        let r = render(&exe, &urls, &opts, &Progress::default()).unwrap();
+        assert_eq!(
+            (r[0].marked, r[1].marked),
+            (1, 1),
+            "{:?}",
+            (&r[0].error, &r[1].error)
+        );
+        assert!(r[2].error.is_some() && r[2].shot.is_some());
+    }
+
+    /// An error status without a body is shown as that status, and Stop ends a page that never
+    /// answers.
+    #[test]
+    fn empty_error_pages_show_their_status_and_stop_ends_waiting() {
+        let Some(exe) = test_browser() else {
+            eprintln!("OXIDEMERGE_TEST_BROWSER not set; skipped");
+            return;
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 2048];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                if String::from_utf8_lossy(&buf[..n]).starts_with("GET /gone") {
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                } else {
+                    held.push(stream);
+                }
+            }
+        });
+        let opts = RenderOptions {
+            width: 800,
+            height: 600,
+            capture: Capture::None,
+            highlight: false,
+        };
+        let gone = Url::parse(&format!("http://127.0.0.1:{port}/gone")).unwrap();
+        let r = render(&exe, &[gone.clone(), gone], &opts, &Progress::default()).unwrap();
+        assert_eq!(r[0].status, 404, "{:?}", r[0].error);
+        assert!(r[0].error.is_none());
+
+        let progress = std::sync::Arc::new(Progress::default());
+        let stop = progress.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            stop.abort.store(true, Ordering::Relaxed);
+        });
+        let hang = Url::parse(&format!("http://127.0.0.1:{port}/hang")).unwrap();
+        let started = Instant::now();
+        assert!(render(&exe, &[hang.clone(), hang], &opts, &progress).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

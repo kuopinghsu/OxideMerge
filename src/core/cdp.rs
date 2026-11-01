@@ -4,17 +4,20 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Largest WebSocket message accepted (a full size screenshot is a large base64 string).
+/// Largest DevTools message accepted (a full size screenshot is a large base64 string).
 const MAX_MESSAGE: usize = 512 << 20;
+/// Longest wait for the answer to one command.
+const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// What the reader thread of a [`Socket`] passes on.
 enum Incoming {
@@ -206,10 +209,11 @@ impl Pipe {
         let (reader, browser_writes) = std::io::pipe()?;
         let (r, w) = (browser_reads.as_raw_fd(), browser_writes.as_raw_fd());
         // SAFETY: between fork and exec only async-signal-safe calls (fcntl, dup2) are made.
-        // The pipe ends are first copied above 4, so placing one on 3 can't overwrite the other.
+        // The pipe ends are first copied above 4, so placing one on 3 can't overwrite the other;
+        // the copies close on exec.
         unsafe {
             cmd.pre_exec(move || {
-                let high = |fd| match libc::fcntl(fd, libc::F_DUPFD, 10) {
+                let high = |fd| match libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) {
                     -1 => Err(std::io::Error::last_os_error()),
                     fd => Ok(fd),
                 };
@@ -233,8 +237,12 @@ impl Pipe {
                 let mut reader = BufReader::new(reader);
                 let reason = loop {
                     let mut message = Vec::new();
-                    match reader.read_until(0, &mut message) {
+                    let limit = MAX_MESSAGE as u64 + 1;
+                    match (&mut reader).take(limit).read_until(0, &mut message) {
                         Ok(0) => break "the browser closed the DevTools connection".to_string(),
+                        Ok(_) if message.len() > MAX_MESSAGE && message.last() != Some(&0) => {
+                            break "DevTools message too large".to_string()
+                        }
                         Ok(_) => {
                             if message.last() == Some(&0) {
                                 message.pop();
@@ -292,18 +300,22 @@ impl Conn {
 }
 
 /// A headless browser process and the DevTools connection to it. The process is ended on drop.
-pub struct Browser {
+pub struct Browser<'a> {
     child: Child,
     conn: Conn,
     next_id: u64,
     /// Events received while waiting for a reply, kept for `wait_event`.
     events: VecDeque<Value>,
+    /// Replies to commands other than the one being waited for, by command id.
+    replies: HashMap<u64, Value>,
     /// Which events are worth keeping; the rest (there can be very many) are dropped.
     keep: fn(&Value) -> bool,
+    /// Set to stop: every wait then ends with an error.
+    abort: Option<&'a AtomicBool>,
     _profile: tempfile::TempDir,
 }
 
-impl Drop for Browser {
+impl Drop for Browser<'_> {
     fn drop(&mut self) {
         let _ = self.send(None, "Browser.close", json!({}));
         let started = Instant::now();
@@ -318,9 +330,14 @@ impl Drop for Browser {
     }
 }
 
-impl Browser {
-    /// Starts `exe` headless, with a throwaway profile, and connects to it.
-    pub fn launch(exe: &Path, keep: fn(&Value) -> bool) -> Result<Browser> {
+impl<'a> Browser<'a> {
+    /// Starts `exe` headless, with a throwaway profile, and connects to it. Setting `abort`
+    /// ends any wait for the browser with an error.
+    pub fn launch(
+        exe: &Path,
+        keep: fn(&Value) -> bool,
+        abort: Option<&'a AtomicBool>,
+    ) -> Result<Browser<'a>> {
         let profile = tempfile::tempdir()?;
         let mut cmd = Command::new(exe);
         if running_as_root() {
@@ -341,19 +358,27 @@ impl Browser {
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
             "--disable-features=Translate,MediaRouter",
-        ])
-        .arg(format!("--user-data-dir={}", profile.path().display()))
-        .arg("about:blank")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        ]);
+        // No keychain or wallet prompts when pages store cookies or passwords.
+        if cfg!(target_os = "macos") {
+            cmd.arg("--use-mock-keychain");
+        } else if cfg!(target_os = "linux") {
+            cmd.arg("--password-store=basic");
+        }
+        cmd.arg(format!("--user-data-dir={}", profile.path().display()))
+            .arg("about:blank")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         let (child, conn) = Browser::connect(exe, &mut cmd, profile.path())?;
         Ok(Browser {
             child,
             conn,
             next_id: 0,
             events: VecDeque::new(),
+            replies: HashMap::new(),
             keep,
+            abort,
             _profile: profile,
         })
     }
@@ -388,6 +413,7 @@ impl Browser {
             }
             if started.elapsed() > Duration::from_secs(30) {
                 let _ = child.kill();
+                let _ = child.wait();
                 bail!("{}: the browser did not start", exe.display());
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -396,12 +422,14 @@ impl Browser {
             Ok(s) => Ok((child, Conn::Socket(s))),
             Err(e) => {
                 let _ = child.kill();
+                let _ = child.wait();
                 Err(e)
             }
         }
     }
 
-    fn send(&mut self, session: Option<&str>, method: &str, params: Value) -> Result<u64> {
+    /// Sends a command without waiting for its result; see [`Browser::reply`].
+    pub fn send(&mut self, session: Option<&str>, method: &str, params: Value) -> Result<u64> {
         self.next_id += 1;
         let mut msg = json!({ "id": self.next_id, "method": method, "params": params });
         if let Some(s) = session {
@@ -411,52 +439,122 @@ impl Browser {
         Ok(self.next_id)
     }
 
+    fn aborted(&self) -> bool {
+        self.abort.is_some_and(|a| a.load(Ordering::Relaxed))
+    }
+
+    /// Takes in a message that is not the reply being waited for.
     fn stash(&mut self, v: Value) {
+        if let Some(id) = v.get("id").and_then(Value::as_u64) {
+            self.replies.insert(id, v);
+            return;
+        }
+        if v.get("method").and_then(Value::as_str) == Some("Page.javascriptDialogOpening") {
+            // Nobody is there to answer a dialog, and the page stops until it is answered.
+            if let Some(s) = v
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            {
+                let _ = self.send(
+                    Some(&s),
+                    "Page.handleJavaScriptDialog",
+                    json!({ "accept": false }),
+                );
+            }
+            return;
+        }
         if v.get("method").is_some() && (self.keep)(&v) {
             self.events.push_back(v);
         }
     }
 
-    /// Sends a command and waits for its result.
-    pub fn call(&mut self, session: Option<&str>, method: &str, params: Value) -> Result<Value> {
-        let id = self.send(session, method, params)?;
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                bail!("{method}: the browser did not answer");
+    /// Why the tab of `session` can no longer answer, when it crashed or was closed.
+    fn gone(v: &Value, session: &str) -> Option<&'static str> {
+        match v.get("method").and_then(Value::as_str) {
+            Some("Inspector.targetCrashed")
+                if v.get("sessionId").and_then(Value::as_str) == Some(session) =>
+            {
+                Some("the browser tab crashed")
             }
-            let Some(text) = self.conn.recv_text(left)? else {
-                continue;
-            };
-            let v: Value = serde_json::from_str(&text).context("DevTools message")?;
-            if v.get("id").and_then(Value::as_u64) == Some(id) {
+            Some("Target.detachedFromTarget")
+                if v.pointer("/params/sessionId").and_then(Value::as_str) == Some(session) =>
+            {
+                Some("the browser tab was closed")
+            }
+            _ => None,
+        }
+    }
+
+    /// Waits until `deadline` for the reply to command `id` sent as `method` to `session`.
+    /// `Ok(None)` when it did not come in time; an error when it reports one, the tab went
+    /// away or `abort` was set.
+    pub fn reply(
+        &mut self,
+        id: u64,
+        session: Option<&str>,
+        method: &str,
+        deadline: Instant,
+    ) -> Result<Option<Value>> {
+        if let Some(s) = session {
+            if let Some(why) = self.events.iter().find_map(|e| Self::gone(e, s)) {
+                bail!("{method}: {why}");
+            }
+        }
+        loop {
+            if let Some(v) = self.replies.remove(&id) {
                 if let Some(e) = v.get("error") {
                     bail!(
                         "{method}: {}",
                         e.get("message").and_then(Value::as_str).unwrap_or("error")
                     );
                 }
-                return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+                return Ok(Some(v.get("result").cloned().unwrap_or(Value::Null)));
+            }
+            if self.aborted() {
+                bail!("{}", crate::i18n::tr("msg.aborted"));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            let Some(text) = self.conn.recv_text(left.min(Duration::from_millis(200)))? else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(&text).context("DevTools message")?;
+            if let Some(why) = session.and_then(|s| Self::gone(&v, s)) {
+                self.stash(v);
+                bail!("{method}: {why}");
             }
             self.stash(v);
         }
     }
 
+    /// Sends a command and waits for its result.
+    pub fn call(&mut self, session: Option<&str>, method: &str, params: Value) -> Result<Value> {
+        let id = self.send(session, method, params)?;
+        match self.reply(id, session, method, Instant::now() + CALL_TIMEOUT)? {
+            Some(v) => Ok(v),
+            None => bail!("{method}: the browser did not answer"),
+        }
+    }
+
     /// Removes and returns the first kept event matching `pred`, waiting until `deadline`.
-    /// `Ok(None)` on timeout or when `abort` returns true.
+    /// `Ok(None)` on timeout; an error when `abort` was set.
     pub fn wait_event(
         &mut self,
         deadline: Instant,
-        abort: &dyn Fn() -> bool,
         pred: &dyn Fn(&Value) -> bool,
     ) -> Result<Option<Value>> {
         loop {
             if let Some(i) = self.events.iter().position(pred) {
                 return Ok(self.events.remove(i));
             }
+            if self.aborted() {
+                bail!("{}", crate::i18n::tr("msg.aborted"));
+            }
             let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() || abort() {
+            if left.is_zero() {
                 return Ok(None);
             }
             if let Some(text) = self.conn.recv_text(left.min(Duration::from_millis(200)))? {
@@ -477,8 +575,8 @@ impl Browser {
         self.events.iter()
     }
 
-    /// Opens a new tab and returns its session id.
-    pub fn new_tab(&mut self) -> Result<String> {
+    /// Opens a new tab and returns its session id and target id (also its main frame's id).
+    pub fn new_tab(&mut self) -> Result<(String, String)> {
         let target = self.call(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
         let target_id = target["targetId"]
             .as_str()
@@ -489,23 +587,38 @@ impl Browser {
             "Target.attachToTarget",
             json!({ "targetId": target_id, "flatten": true }),
         )?;
-        Ok(attached["sessionId"]
+        let session = attached["sessionId"]
             .as_str()
             .context("Target.attachToTarget")?
-            .to_string())
+            .to_string();
+        Ok((session, target_id))
     }
 
-    /// Evaluates `expression` in the tab, awaiting a returned promise, and returns its value.
-    pub fn eval(&mut self, session: &str, expression: &str) -> Result<Value> {
+    /// Creates a JavaScript context of its own in `frame` of the tab and returns its id: it
+    /// shares the page's DOM but not the globals the page's scripts may have replaced.
+    pub fn isolated_world(&mut self, session: &str, frame: &str) -> Result<i64> {
         let r = self.call(
             Some(session),
-            "Runtime.evaluate",
-            json!({
-                "expression": expression,
-                "returnByValue": true,
-                "awaitPromise": true,
-            }),
+            "Page.createIsolatedWorld",
+            json!({ "frameId": frame, "worldName": "oxidemerge" }),
         )?;
+        r["executionContextId"]
+            .as_i64()
+            .context("Page.createIsolatedWorld")
+    }
+
+    /// Evaluates `expression` in the tab, in context `context` or else the page's own, awaiting
+    /// a returned promise, and returns its value.
+    pub fn eval(&mut self, session: &str, context: Option<i64>, expression: &str) -> Result<Value> {
+        let mut params = json!({
+            "expression": expression,
+            "returnByValue": true,
+            "awaitPromise": true,
+        });
+        if let Some(c) = context {
+            params["contextId"] = json!(c);
+        }
+        let r = self.call(Some(session), "Runtime.evaluate", params)?;
         if let Some(ex) = r.get("exceptionDetails") {
             let msg = ex
                 .pointer("/exception/description")

@@ -89,6 +89,16 @@ impl Content {
         }
     }
 
+    /// The status line without what the view's own toolbar already shows.
+    fn status_bar_line(&self) -> String {
+        match self {
+            Content::Folder(v) => v.status_detail(),
+            Content::Text(v) => v.status_detail(),
+            Content::Web(v) => v.status_line(v.inner.as_deref().map(Content::status_bar_line)),
+            other => other.status_line(),
+        }
+    }
+
     fn outcome(&self) -> Option<Outcome> {
         match self {
             Content::Folder(v) => Some(v.outcome()),
@@ -290,6 +300,7 @@ enum PaletteAction {
     Settings(OptTab),
     Theme(ThemeMode),
     Toggle(ConfigFlag),
+    Inline,
 }
 
 /// Selects one on/off setting.
@@ -368,6 +379,10 @@ const OPT_INDEX: &[(OptTab, &str)] = &[
     (OptTab::General, "view.location_pane"),
     (OptTab::General, "view.whitespace"),
     (OptTab::General, "view.syntax"),
+    (OptTab::General, "opt.color_blind"),
+    (OptTab::General, "opt.high_contrast"),
+    (OptTab::General, "opt.reduce_motion"),
+    (OptTab::General, "opt.compact"),
     (OptTab::General, "cmd.collapse_unchanged"),
     (OptTab::General, "cmd.word_wrap"),
     (OptTab::General, "opt.backup_on_save"),
@@ -1191,6 +1206,9 @@ pub struct OxideMergeApp {
     tabs: Vec<Tab>,
     active: usize,
     open_dlg: Option<OpenDialog>,
+    /// The paths typed on the start page, and whether it asks for a base (3-way).
+    start_paths: [String; 3],
+    start_three_way: bool,
     options_dlg: Option<OptionsDialog>,
     rule_dlg: Option<RuleDialog>,
     patch_dlg: Option<PatchDialog>,
@@ -1211,7 +1229,8 @@ pub struct OxideMergeApp {
     toasts: Vec<Toast>,
     font_lang: String,
     applied_lang: String,
-    visuals_dark: Option<bool>,
+    /// The dark mode and look the style was last built for.
+    visuals_dark: Option<(bool, theme::Look)>,
     allow_close: bool,
     /// When to try saving the settings again after saving them failed.
     settings_retry: Option<f64>,
@@ -1573,56 +1592,65 @@ fn recent_label(paths: &[String]) -> String {
         .join(" ↔ ")
 }
 
-/// Large clickable card on the start page.
-fn action_card(ui: &mut egui::Ui, w: f32, icon: Icon, title: &str, desc: &str) -> bool {
+/// What a tab shows for title `full` of a compare of `source`: a name all sides share once,
+/// followed by the folders that tell them apart; otherwise `full` alone.
+fn tab_label(full: &str, source: &[PathBuf]) -> (String, Option<String>) {
+    let parts: Vec<&str> = full.split(" ↔ ").map(|p| p.trim_end_matches('*')).collect();
+    if parts.len() < 2 || parts.iter().any(|p| *p != parts[0]) || source.len() != parts.len() {
+        return (full.to_string(), None);
+    }
+    let dirs: Vec<Vec<String>> = source
+        .iter()
+        .map(|p| {
+            p.parent()
+                .map(|d| {
+                    d.components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+    let common = (0..)
+        .take_while(|&i| {
+            dirs.iter()
+                .all(|d| d.get(i).is_some() && d[i] == dirs[0][i])
+        })
+        .count();
+    let rest: Vec<String> = dirs.iter().map(|d| d[common..].join("/")).collect();
+    let folders = rest.iter().any(|r| !r.is_empty()).then(|| {
+        rest.iter()
+            .map(|r| if r.is_empty() { "." } else { r.as_str() })
+            .collect::<Vec<_>>()
+            .join(" ↔ ")
+    });
+    (parts[0].to_string(), folders)
+}
+
+/// `s`, cut to `max` characters with an ellipsis.
+fn shorten(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        s.chars().take(max - 2).collect::<String>() + "…"
+    } else {
+        s.to_string()
+    }
+}
+
+/// Card of the start page's recent list: the compared names, with where they are below.
+fn recent_card(ui: &mut egui::Ui, w: f32, paths: &[String]) -> egui::Response {
     let p = pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, 120.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, 56.0), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
     let hovered = resp.hovered();
-    let painter = ui.painter();
-    painter.rect(
+    ui.painter().rect(
         rect,
-        12.0,
+        10.0,
         if hovered { p.surface_alt } else { p.surface },
         Stroke::new(1.0_f32, if hovered { p.accent } else { p.border }),
         egui::StrokeKind::Inside,
     );
-    widgets::focus_ring(ui, &resp, rect, 12.0);
-    let painter = ui.painter();
-    let icon_rect = egui::Rect::from_min_size(rect.min + vec2(18.0, 18.0), vec2(36.0, 36.0));
-    painter.rect_filled(icon_rect, 10.0, p.accent_soft);
-    crate::ui::icons::paint(painter, icon_rect.shrink(9.0), icon, p.accent);
-    painter.text(
-        egui::pos2(icon_rect.right() + 12.0, icon_rect.center().y),
-        Align2::LEFT_CENTER,
-        title,
-        theme::semibold(15.5),
-        p.text,
-    );
-    let galley = painter.layout(
-        desc.to_string(),
-        FontId::proportional(13.0),
-        p.text_dim,
-        w - 36.0,
-    );
-    painter.galley(
-        egui::pos2(rect.left() + 18.0, icon_rect.bottom() + 12.0),
-        galley,
-        p.text_dim,
-    );
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-        .clicked()
-}
-
-/// Row of the start page's recent list: the compared names, with where they are below.
-fn recent_row(ui: &mut egui::Ui, paths: &[String]) -> egui::Response {
-    let p = pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::click());
-    if !ui.is_rect_visible(rect) {
-        return resp;
-    }
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, 7.0, p.control_hover);
-    }
     let first = paths.first().map(String::as_str).unwrap_or_default();
     let icon = if web::is_url(first) {
         Icon::Globe
@@ -1657,8 +1685,9 @@ fn recent_row(ui: &mut egui::Ui, paths: &[String]) -> egui::Response {
         egui::pos2(rect.right() - 10.0, rect.bottom()),
     ));
     let x = rect.left() + 36.0;
+    let has_dirs = dirs.iter().any(|d| !d.is_empty());
     clip.text(
-        egui::pos2(x, rect.center().y - 8.0),
+        egui::pos2(x, rect.center().y - if has_dirs { 8.0 } else { 0.0 }),
         Align2::LEFT_CENTER,
         names.join("  ↔  "),
         theme::semibold(13.5),
@@ -1671,7 +1700,7 @@ fn recent_row(ui: &mut egui::Ui, paths: &[String]) -> egui::Response {
         FontId::proportional(12.0),
         p.text_dim,
     );
-    widgets::focus_ring(ui, &resp, rect, 7.0);
+    widgets::focus_ring(ui, &resp, rect, 10.0);
     resp.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, names.join(" ↔ "))
     });
@@ -1817,22 +1846,6 @@ fn drop_overlay(ctx: &egui::Context, filling_dialog: bool) {
     }
 }
 
-fn dashed_rect(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
-    let pts = [
-        rect.left_top(),
-        rect.right_top(),
-        rect.right_bottom(),
-        rect.left_bottom(),
-        rect.left_top(),
-    ];
-    ui.painter().extend(egui::Shape::dashed_line(
-        &pts,
-        Stroke::new(1.2_f32, color),
-        6.0,
-        4.0,
-    ));
-}
-
 impl OxideMergeApp {
     /// `stored` is the config as loaded, before the options of the command line went into `cfg`.
     pub fn new(
@@ -1854,6 +1867,8 @@ impl OxideMergeApp {
             tabs: Vec::new(),
             active: 0,
             open_dlg: None,
+            start_paths: Default::default(),
+            start_three_way: false,
             options_dlg: None,
             patch_dlg: None,
             stats_dlg: None,
@@ -2941,7 +2956,14 @@ impl OxideMergeApp {
             out.push(entry(c.icon(), label, String::new(), PaletteAction::Cmd(c)));
         }
         let on = tr("palette.on").to_string();
-        let toggles: [(&str, ConfigFlag); 9] = [
+        if let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) {
+            if v.n() == 2 && !v.table_mode {
+                let detail = if v.unified { on.clone() } else { String::new() };
+                let label = plain(tr("cmd.inline_view"));
+                out.push(entry(Icon::Inline, label, detail, PaletteAction::Inline));
+            }
+        }
+        let toggles: [(&str, ConfigFlag); 13] = [
             ("view.line_numbers", |c| &mut c.show_line_numbers),
             ("view.location_pane", |c| &mut c.show_location_pane),
             ("view.line_detail", |c| &mut c.show_line_detail),
@@ -2951,6 +2973,10 @@ impl OxideMergeApp {
             ("view.syntax", |c| &mut c.syntax_highlight),
             ("view.tree_mode", |c| &mut c.tree_mode),
             ("menu.open_reports", |c| &mut c.open_reports),
+            ("opt.color_blind", |c| &mut c.color_blind_colors),
+            ("opt.high_contrast", |c| &mut c.high_contrast),
+            ("opt.reduce_motion", |c| &mut c.reduce_motion),
+            ("opt.compact", |c| &mut c.compact_density),
         ];
         let mut cfg = self.cfg.clone();
         for (key, f) in toggles {
@@ -3033,6 +3059,13 @@ impl OxideMergeApp {
                     PaletteAction::Toggle(f) => {
                         let v = f(&mut self.cfg);
                         *v = !*v;
+                    }
+                    PaletteAction::Inline => {
+                        if let Some(Content::Text(v)) =
+                            self.tabs.get_mut(self.active).map(|t| t.content.view_mut())
+                        {
+                            v.unified = !v.unified;
+                        }
                     }
                 }
             }
@@ -4210,11 +4243,16 @@ impl OxideMergeApp {
                 if widgets::icon_button(ui, Icon::Help, &Cmd::Help.tip()).clicked() {
                     m.picked = Some(Cmd::Help);
                 }
-                if widgets::icon_button(ui, Icon::Palette, &Cmd::Palette.tip()).clicked() {
+                let palette = Cmd::Palette.tip();
+                // Narrow windows keep the icon; wide ones show a search field for commands.
+                let wide = ui.available_width() > 420.0;
+                // Icons that no longer fit are left out; the menus offer the same commands.
+                let fits = |ui: &egui::Ui| ui.available_width() >= 36.0;
+                if !wide && widgets::icon_button(ui, Icon::Palette, &palette).clicked() {
                     m.picked = Some(Cmd::Palette);
                 }
                 let options = tr("menu.options").trim_end_matches(['.', '…']);
-                if widgets::icon_button(ui, Icon::Settings, options).clicked() {
+                if fits(ui) && widgets::icon_button(ui, Icon::Settings, options).clicked() {
                     m.picked = Some(Cmd::Options);
                 }
                 let theme_icon = if self.cfg.dark_mode {
@@ -4222,7 +4260,8 @@ impl OxideMergeApp {
                 } else {
                     Icon::Moon
                 };
-                if widgets::icon_button(ui, theme_icon, tr("view.dark_mode")).clicked() {
+                if fits(ui) && widgets::icon_button(ui, theme_icon, tr("view.dark_mode")).clicked()
+                {
                     self.cfg.theme = if self.cfg.dark_mode {
                         ThemeMode::Light
                     } else {
@@ -4230,10 +4269,24 @@ impl OxideMergeApp {
                     };
                 }
                 let open = tr("menu.open").trim_end_matches(['.', '…']);
-                if widgets::icon_button(ui, Icon::Folder, &widgets::with_key(open, Cmd::Open.key()))
+                if fits(ui)
+                    && widgets::icon_button(
+                        ui,
+                        Icon::Folder,
+                        &widgets::with_key(open, Cmd::Open.key()),
+                    )
                     .clicked()
                 {
                     m.picked = Some(Cmd::Open);
+                }
+                if wide {
+                    ui.add_space(8.0);
+                    let hint = tr("palette.search");
+                    if widgets::search_button(ui, 230.0, hint, Cmd::Palette.key(), &palette)
+                        .clicked()
+                    {
+                        m.picked = Some(Cmd::Palette);
+                    }
                 }
             });
         });
@@ -4573,21 +4626,26 @@ impl OxideMergeApp {
                     for (i, t) in self.tabs.iter().enumerate() {
                         let active = i == self.active;
                         let full = t.title();
-                        let mut title = full.clone();
-                        if title.chars().count() > 40 {
-                            title = title.chars().take(38).collect::<String>() + "…";
-                        }
+                        let (title, folders) = tab_label(&full, &t.source);
                         let font = if active {
                             theme::semibold(13.0)
                         } else {
                             FontId::proportional(13.0)
                         };
                         let galley = ui.painter().layout_no_wrap(
-                            title,
+                            shorten(&title, 40),
                             font,
                             if active { p.text } else { p.text_dim },
                         );
-                        let w = 40.0 + galley.size().x + 30.0;
+                        let sub = folders.map(|f| {
+                            ui.painter().layout_no_wrap(
+                                shorten(&f, 36),
+                                FontId::proportional(11.5),
+                                p.text_dim,
+                            )
+                        });
+                        let sub_w = sub.as_ref().map_or(0.0, |g| g.size().x + 8.0);
+                        let w = 40.0 + galley.size().x + sub_w + 30.0;
                         let (rect, _) = ui.allocate_exact_size(vec2(w, 34.0), Sense::hover());
                         let resp = ui.interact(
                             rect,
@@ -4646,6 +4704,7 @@ impl OxideMergeApp {
                             t.icon(),
                             if active { p.accent } else { p.text_dim },
                         );
+                        let title_w = galley.size().x;
                         painter.galley(
                             egui::pos2(
                                 rect.left() + 36.0,
@@ -4654,7 +4713,20 @@ impl OxideMergeApp {
                             galley,
                             p.text,
                         );
-                        let show_close = active || resp.hovered() || close_resp.hovered();
+                        if let Some(sub) = sub {
+                            painter.galley(
+                                egui::pos2(
+                                    rect.left() + 36.0 + title_w + 8.0,
+                                    rect.center().y + 1.5 - sub.size().y / 2.0,
+                                ),
+                                sub,
+                                p.text_dim,
+                            );
+                        }
+                        // An unsaved tab shows a dot where its close button is, until pointed at.
+                        let modified = t.is_modified();
+                        let show_close =
+                            (active && !modified) || resp.hovered() || close_resp.hovered();
                         if close_resp.hovered() {
                             painter.rect_filled(close_rect, 5.0, p.control_active);
                         }
@@ -4665,8 +4737,8 @@ impl OxideMergeApp {
                                 Icon::Close,
                                 p.text_dim,
                             );
-                        } else if t.is_modified() {
-                            painter.circle_filled(close_rect.center(), 3.5, p.warning);
+                        } else if modified {
+                            painter.circle_filled(close_rect.center(), 4.0, p.text);
                         }
                         widgets::focus_ring(ui, &resp, rect.shrink2(vec2(0.0, 3.0)), 8.0);
                         let close_resp = close_resp.on_hover_text(Cmd::CloseTab.tip());
@@ -4786,13 +4858,13 @@ impl OxideMergeApp {
             let s = self
                 .tabs
                 .get(self.active)
-                .map(|t| t.status_line())
+                .map(|t| t.content.status_bar_line())
                 .unwrap_or_else(|| tr("app.ready").to_string());
             let outcome = self.tabs.get(self.active).and_then(|t| t.content.outcome());
             let color = outcome.map_or(p.border_strong, |o| o.color(&p));
             let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
             ui.painter().circle_filled(dot.center(), 3.5, color);
-            if outcome == Some(Outcome::Busy) {
+            if outcome == Some(Outcome::Busy) && ui.style().animation_time > 0.0 {
                 // Pulsing ring while a comparison or page load is running.
                 let t = (ui.input(|i| i.time) % 1.2) as f32 / 1.2;
                 ui.painter().circle_stroke(
@@ -4829,6 +4901,8 @@ impl OxideMergeApp {
     fn start_page(&mut self, ui: &mut egui::Ui) {
         let p = pal(ui);
         let mut open: Option<Option<String>> = None;
+        let mut submit = false;
+        let mut sample = false;
         let mut conflict = false;
         let mut compare: Option<Vec<String>> = None;
         let mut edit: Option<Vec<String>> = None;
@@ -4856,99 +4930,144 @@ impl OxideMergeApp {
                     });
                     ui.add_space(24.0);
 
-                    let card_w = (w - 16.0) / 2.0;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 16.0;
-                        if action_card(
-                            ui,
-                            card_w,
-                            Icon::Compare,
-                            tr("start.compare"),
-                            tr("start.compare_desc"),
-                        ) {
-                            open = Some(None);
-                        }
-                        if action_card(
-                            ui,
-                            card_w,
-                            Icon::Warning,
-                            tr("menu.open_conflict").trim_end_matches(['.', '…']),
-                            tr("start.conflict_desc"),
-                        ) {
-                            conflict = true;
-                        }
-                    });
-                    ui.add_space(8.0);
-                    if let Some(comparison) = self.baseline_start.ui(
-                        ui,
-                        &[],
-                        &self.cfg.comparison_options(),
-                        &self.cfg.filter,
-                    ) {
+                    let (launch, more) = self.start_launcher(ui, w);
+                    if launch {
+                        submit = true;
+                    }
+                    if more {
+                        open = Some(None);
+                    }
+                    ui.add_space(4.0);
+                    widgets::card(ui)
+                        .inner_margin(Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.set_width(w - 22.0);
+                            ui.horizontal(|ui| {
+                                let title = tr("menu.open_conflict").trim_end_matches(['.', '…']);
+                                if widgets::ghost_icon_button(ui, Icon::Warning, title).clicked() {
+                                    conflict = true;
+                                }
+                                ui.label(
+                                    egui::RichText::new(tr("start.conflict_desc"))
+                                        .size(12.5)
+                                        .color(p.text_dim),
+                                );
+                            });
+                        });
+                    let mut captured = None;
+                    widgets::card(ui)
+                        .inner_margin(Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.set_width(w - 22.0);
+                            let open = self.baseline_start.open;
+                            ui.horizontal(|ui| {
+                                if widgets::ghost_icon_button(ui, Icon::Clock, tr("baseline.title"))
+                                    .clicked()
+                                {
+                                    self.baseline_start.open = !open;
+                                }
+                                ui.label(
+                                    egui::RichText::new(tr("start.baselines_desc"))
+                                        .size(12.5)
+                                        .color(p.text_dim),
+                                );
+                            });
+                            let panel_ui = if open { Some(&mut *ui) } else { None };
+                            captured = self.baseline_start.ui(
+                                panel_ui,
+                                &[],
+                                &self.cfg.comparison_options(),
+                                &self.cfg.filter,
+                            );
+                        });
+                    if let Some(comparison) = captured {
                         self.open_captured(comparison);
                     }
 
-                    let (rect, _) = ui.allocate_exact_size(vec2(w, 64.0), Sense::hover());
-                    dashed_rect(ui, rect, p.border_strong);
-                    let hint = ui.painter().layout_no_wrap(
-                        tr("app.drop_hint").to_string(),
-                        FontId::proportional(13.5),
-                        p.text_dim,
-                    );
-                    let left = rect.center().x - (hint.size().x + 22.0) / 2.0;
-                    crate::ui::icons::paint(
-                        ui.painter(),
-                        egui::Rect::from_min_size(
-                            egui::pos2(left, rect.center().y - 8.0),
-                            vec2(16.0, 16.0),
-                        ),
-                        Icon::Drop,
-                        p.text_dim,
-                    );
-                    ui.painter().galley(
-                        egui::pos2(left + 22.0, rect.center().y - hint.size().y / 2.0),
-                        hint,
-                        p.text_dim,
-                    );
-
+                    if self.cfg.recent_compares.is_empty() {
+                        ui.add_space(16.0);
+                        widgets::card(ui)
+                            .inner_margin(Margin::same(16))
+                            .show(ui, |ui| {
+                                ui.set_width(w - 34.0);
+                                ui.horizontal(|ui| {
+                                    widgets::inline_icon(ui, Icon::Bolt, p.accent);
+                                    ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        ui.label(
+                                            egui::RichText::new(tr("start.try_title"))
+                                                .font(theme::semibold(14.5)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(tr("start.try_desc"))
+                                                .size(12.5)
+                                                .color(p.text_dim),
+                                        );
+                                    });
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if widgets::bar_button(
+                                            ui,
+                                            true,
+                                            None,
+                                            tr("start.try_button"),
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            sample = true;
+                                        }
+                                    });
+                                });
+                            });
+                    }
                     if !self.cfg.recent_compares.is_empty() {
                         ui.add_space(16.0);
                         widgets::caption(ui, tr("label.recent"));
-                        widgets::card(ui)
-                            .inner_margin(Margin::same(6))
-                            .show(ui, |ui| {
-                                ui.set_width(w - 14.0);
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                for paths in self.cfg.recent_compares.iter().take(8) {
-                                    let resp = recent_row(ui, paths);
-                                    if resp.clicked() {
-                                        compare = Some(paths.clone());
-                                    }
-                                    resp.context_menu(|ui| {
-                                        widgets::menu_setup(ui);
-                                        if ui.button(tr("btn.compare")).clicked() {
-                                            compare = Some(paths.clone());
-                                            ui.close_menu();
-                                        }
-                                        if ui.button(tr("start.recent_edit")).clicked() {
-                                            edit = Some(paths.clone());
-                                            ui.close_menu();
-                                        }
-                                        ui.separator();
-                                        if ui.button(tr("start.recent_remove")).clicked() {
-                                            remove = Some(paths.clone());
-                                            ui.close_menu();
-                                        }
-                                    });
+                        let card_w = (w - 12.0) / 2.0;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(12.0, 12.0);
+                            for paths in self.cfg.recent_compares.iter().take(8) {
+                                let resp = recent_card(ui, card_w, paths);
+                                if resp.clicked() {
+                                    compare = Some(paths.clone());
                                 }
-                            });
+                                resp.context_menu(|ui| {
+                                    widgets::menu_setup(ui);
+                                    if ui.button(tr("btn.compare")).clicked() {
+                                        compare = Some(paths.clone());
+                                        ui.close_menu();
+                                    }
+                                    if ui.button(tr("start.recent_edit")).clicked() {
+                                        edit = Some(paths.clone());
+                                        ui.close_menu();
+                                    }
+                                    ui.separator();
+                                    if ui.button(tr("start.recent_remove")).clicked() {
+                                        remove = Some(paths.clone());
+                                        ui.close_menu();
+                                    }
+                                });
+                            }
+                        });
                     }
                     ui.add_space(32.0);
                 });
             });
         });
         if let Some(left) = open {
-            self.open_dlg = Some(self.new_open_dialog(left));
+            let mut d = self.new_open_dialog(left);
+            d.paths = self.start_paths.clone();
+            d.three_way = self.start_three_way;
+            self.open_dlg = Some(d);
+        }
+        if sample {
+            self.open_sample();
+        }
+        if submit {
+            let mut d = self.new_open_dialog(None);
+            d.paths = self.start_paths.clone();
+            d.three_way = self.start_three_way;
+            self.submit_open(d);
         }
         if conflict {
             self.run(Cmd::OpenConflict, &ui.ctx().clone());
@@ -4971,6 +5090,144 @@ impl OxideMergeApp {
         if let Some(paths) = remove {
             self.cfg.remove_recent_compare(&paths);
         }
+    }
+
+    /// Writes two small folders to a temporary place and compares them, for trying the app
+    /// out. The copy lives as long as the tabs showing it.
+    fn open_sample(&mut self) {
+        let made = (|| -> std::io::Result<tempfile::TempDir> {
+            let dir = tempfile::Builder::new()
+                .prefix("oxidemerge-sample")
+                .tempdir()?;
+            let files: &[(&str, &str)] = &[
+                ("left/README.md", "# Sample\n\nTwo folders to compare.\n"),
+                ("right/README.md", "# Sample\n\nTwo folders to compare and merge.\n"),
+                (
+                    "left/src/main.rs",
+                    "fn main() {\n    let name = \"world\";\n    println!(\"Hello, {}!\", name);\n}\n",
+                ),
+                (
+                    "right/src/main.rs",
+                    "fn main() {\n    let name = \"OxideMerge\";\n    println!(\"Hello, {name}!\");\n    println!(\"done\");\n}\n",
+                ),
+                ("left/same.txt", "Identical on both sides.\n"),
+                ("right/same.txt", "Identical on both sides.\n"),
+                ("left/notes/old.txt", "Only on the left.\n"),
+                ("right/notes/new.txt", "Only on the right.\n"),
+            ];
+            for (name, text) in files {
+                let path = dir.path().join(name);
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                std::fs::write(path, text)?;
+            }
+            Ok(dir)
+        })();
+        let dir = match made {
+            Ok(dir) => std::sync::Arc::new(dir),
+            Err(e) => return self.error(e.to_string()),
+        };
+        let tabs = self.tabs.len();
+        self.open(OpenRequest {
+            paths: vec![dir.path().join("left"), dir.path().join("right")],
+            skip_recent: true,
+            ..Default::default()
+        });
+        if self.tabs.len() > tabs {
+            if let Some(tab) = self.tabs.last_mut() {
+                tab.temps.push(dir);
+            }
+        }
+    }
+
+    /// The start page's compare form: a path field per side, then Compare, or More options
+    /// for the Open dialog. Returns whether either button was used.
+    fn start_launcher(&mut self, ui: &mut egui::Ui, w: f32) -> (bool, bool) {
+        let p = pal(ui);
+        let mut go = false;
+        let mut more = false;
+        widgets::card(ui)
+            .inner_margin(Margin::same(16))
+            .show(ui, |ui| {
+                ui.set_width(w - 34.0);
+                ui.spacing_mut().item_spacing.y = 8.0;
+                ui.horizontal(|ui| {
+                    widgets::inline_icon(ui, Icon::Compare, p.accent);
+                    ui.label(egui::RichText::new(tr("start.compare")).font(theme::semibold(15.5)));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        widgets::toggle_button(
+                            ui,
+                            &mut self.start_three_way,
+                            tr("start.three_way"),
+                            tr("start.three_way_tip"),
+                        );
+                    });
+                });
+                let three = self.start_three_way;
+                let slots: &[usize] = if three { &[0, 1, 2] } else { &[0, 2] };
+                let sides = slots.len();
+                // Side chip, gaps and the two browse buttons around the path field.
+                let field_w = ui.available_width() - 60.0 - 4.0 - 8.0 - 2.0 * 30.0 - 16.0 - 40.0;
+                for (k, &s) in slots.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let chip = ui.allocate_ui_with_layout(
+                            vec2(60.0, 28.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| widgets::side_chip(ui, k, sides),
+                        );
+                        ui.add_space((60.0 - chip.response.rect.width()).max(0.0));
+                        let field = ui.add(
+                            egui::TextEdit::singleline(&mut self.start_paths[s])
+                                .hint_text(
+                                    egui::RichText::new(tr("dlg.path_hint")).color(p.text_dim),
+                                )
+                                .margin(PATH_FIELD_MARGIN)
+                                .desired_width(field_w),
+                        );
+                        path_status(ui, &field, &self.start_paths[s]);
+                        if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            go = true;
+                        }
+                        ui.add_space(4.0);
+                        if widgets::icon_button(ui, Icon::File, tr("btn.browse_file")).clicked() {
+                            if let Some(f) = rfd::FileDialog::new().pick_file() {
+                                self.start_paths[s] = f.display().to_string();
+                            }
+                        }
+                        if widgets::icon_button(ui, Icon::Folder, tr("btn.browse_folder")).clicked()
+                        {
+                            if let Some(f) = rfd::FileDialog::new().pick_folder() {
+                                self.start_paths[s] = f.display().to_string();
+                            }
+                        }
+                    });
+                }
+                let ready = slots
+                    .iter()
+                    .all(|&s| !self.start_paths[s].trim().is_empty());
+                go &= ready;
+                ui.horizontal(|ui| {
+                    ui.add_space(64.0);
+                    go |= widgets::bar_button(
+                        ui,
+                        ready,
+                        Some(Icon::Compare),
+                        tr("btn.compare"),
+                        true,
+                    )
+                    .clicked();
+                    more = widgets::ghost_button(ui, tr("start.more_options")).clicked();
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(tr("start.drop_hint"))
+                                .size(12.0)
+                                .color(p.text_dim),
+                        );
+                        widgets::inline_icon(ui, Icon::Drop, p.text_dim);
+                    });
+                });
+            });
+        (go, more)
     }
 
     // ---------- dialogs ----------
@@ -5163,37 +5420,43 @@ impl OxideMergeApp {
             keep = false;
         }
         if go {
-            let idx: Vec<usize> = if d.three_way {
-                vec![0, 1, 2]
-            } else {
-                vec![0, 2]
-            };
-            let raw: Vec<String> = idx
-                .iter()
-                .map(|&i| d.paths[i].trim().trim_matches('"').to_string())
-                .collect();
-            if raw.iter().any(|p| p.is_empty()) {
-                self.open_dlg = Some(d);
-                self.error(tr("msg.need_paths"));
-                return;
-            }
-            self.cfg.filter = d.filter.clone();
-            self.cfg.folder.method = d.method;
-            self.cfg.folder.recursive = d.recursive;
-            self.cfg.add_recent_filter(&d.filter);
-            let req = OpenRequest {
-                paths: raw.iter().map(PathBuf::from).collect(),
-                read_only: idx.iter().map(|&i| d.read_only[i]).collect(),
-                kind: d.kind,
-                recursive: Some(d.recursive),
-                filter: Some(d.filter.clone()),
-                method: Some(d.method),
-                ..Default::default()
-            };
-            self.open(req);
+            self.submit_open(d);
         } else if keep {
             self.open_dlg = Some(d);
         }
+    }
+
+    /// Opens what the Open dialog (or the start page) holds; reopens the dialog when a path
+    /// is missing.
+    fn submit_open(&mut self, d: OpenDialog) {
+        let idx: Vec<usize> = if d.three_way {
+            vec![0, 1, 2]
+        } else {
+            vec![0, 2]
+        };
+        let raw: Vec<String> = idx
+            .iter()
+            .map(|&i| d.paths[i].trim().trim_matches('"').to_string())
+            .collect();
+        if raw.iter().any(|p| p.is_empty()) {
+            self.open_dlg = Some(d);
+            self.error(tr("msg.need_paths"));
+            return;
+        }
+        self.cfg.filter = d.filter.clone();
+        self.cfg.folder.method = d.method;
+        self.cfg.folder.recursive = d.recursive;
+        self.cfg.add_recent_filter(&d.filter);
+        let req = OpenRequest {
+            paths: raw.iter().map(PathBuf::from).collect(),
+            read_only: idx.iter().map(|&i| d.read_only[i]).collect(),
+            kind: d.kind,
+            recursive: Some(d.recursive),
+            filter: Some(d.filter.clone()),
+            method: Some(d.method),
+            ..Default::default()
+        };
+        self.open(req);
     }
 
     fn options_dialog(&mut self, ctx: &egui::Context) {
@@ -5312,6 +5575,11 @@ impl OxideMergeApp {
                                     );
                                     ui.checkbox(&mut c.show_whitespace, tr("view.whitespace"));
                                     ui.checkbox(&mut c.syntax_highlight, tr("view.syntax"));
+                                    ui.label(egui::RichText::new(tr("opt.accessibility")).strong());
+                                    ui.checkbox(&mut c.color_blind_colors, tr("opt.color_blind"));
+                                    ui.checkbox(&mut c.high_contrast, tr("opt.high_contrast"));
+                                    ui.checkbox(&mut c.reduce_motion, tr("opt.reduce_motion"));
+                                    ui.checkbox(&mut c.compact_density, tr("opt.compact"));
                                     ui.checkbox(
                                         &mut c.collapse_unchanged,
                                         tr("cmd.collapse_unchanged"),
@@ -6154,9 +6422,10 @@ impl eframe::App for OxideMergeApp {
                 .system_theme()
                 .map_or(self.cfg.dark_mode, |t| t == egui::Theme::Dark),
         };
-        if self.visuals_dark != Some(self.cfg.dark_mode) {
-            self.visuals_dark = Some(self.cfg.dark_mode);
-            theme::apply(ctx, self.cfg.dark_mode);
+        let look = (self.cfg.dark_mode, theme::Look::of(&self.cfg));
+        if self.visuals_dark != Some(look) {
+            self.visuals_dark = Some(look);
+            theme::apply(ctx, look.0, look.1);
         }
         if self.applied_lang != self.cfg.language {
             i18n::set_language(&self.cfg.language);
@@ -6337,6 +6606,15 @@ impl eframe::App for OxideMergeApp {
                     self.cfg.show_different = true;
                     self.cfg.show_unique = [true; 3];
                 }
+                FolderAction::Show {
+                    identical,
+                    different,
+                    unique,
+                } => {
+                    self.cfg.show_identical = identical;
+                    self.cfg.show_different = different;
+                    self.cfg.show_unique = unique;
+                }
                 FolderAction::AddRule(draft) => self.open_rule_dialog(self.active, draft),
                 FolderAction::EditRules => self.open_options(OptTab::Rules),
                 FolderAction::ExportHtml => self.export_html(),
@@ -6462,6 +6740,26 @@ mod gui_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tabs_name_a_shared_file_once_with_the_folders_that_differ() {
+        let src = |a: &str, b: &str| vec![PathBuf::from(a), PathBuf::from(b)];
+        assert_eq!(
+            tab_label(
+                "main.rs* ↔ main.rs",
+                &src("/w/left/src/main.rs", "/w/right/src/main.rs")
+            ),
+            ("main.rs".into(), Some("left/src ↔ right/src".into()))
+        );
+        assert_eq!(
+            tab_label("a.txt ↔ a.txt", &src("/w/a.txt", "/w/old/a.txt")),
+            ("a.txt".into(), Some(". ↔ old".into()))
+        );
+        assert_eq!(
+            tab_label("a.txt ↔ b.txt", &src("/w/a.txt", "/w/b.txt")),
+            ("a.txt ↔ b.txt".into(), None)
+        );
+    }
 
     #[test]
     fn options_of_the_command_line_are_not_kept_unless_changed() {

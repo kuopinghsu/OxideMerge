@@ -40,7 +40,88 @@ pub struct Palette {
     pub danger: Color32,
 }
 
+/// Accessibility choices that change the palette, the diff colors and the style.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct Look {
+    pub color_blind: bool,
+    pub high_contrast: bool,
+    pub reduce_motion: bool,
+    pub compact: bool,
+}
+
+impl Look {
+    pub fn of(cfg: &crate::config::Config) -> Self {
+        Self {
+            color_blind: cfg.color_blind_colors,
+            high_contrast: cfg.high_contrast,
+            reduce_motion: cfg.reduce_motion,
+            compact: cfg.compact_density,
+        }
+    }
+
+    fn bits(self) -> u8 {
+        self.color_blind as u8
+            | (self.high_contrast as u8) << 1
+            | (self.reduce_motion as u8) << 2
+            | (self.compact as u8) << 3
+    }
+
+    fn from_bits(b: u8) -> Self {
+        Self {
+            color_blind: b & 1 != 0,
+            high_contrast: b & 2 != 0,
+            reduce_motion: b & 4 != 0,
+            compact: b & 8 != 0,
+        }
+    }
+}
+
+static LOOK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The look in use, set by [`apply`].
+pub fn look() -> Look {
+    Look::from_bits(LOOK.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Extra height of a text row beyond its font, by density.
+pub fn row_padding() -> f32 {
+    if look().compact {
+        0.0
+    } else {
+        2.0
+    }
+}
+
 pub fn palette(dark: bool) -> Palette {
+    palette_for(dark, look())
+}
+
+pub fn palette_for(dark: bool, look: Look) -> Palette {
+    let mut p = base_palette(dark);
+    if look.high_contrast {
+        if dark {
+            p.chrome = rgb(0x000000);
+            p.surface = rgb(0x0B0B0D);
+            p.surface_alt = rgb(0x111215);
+            p.border = rgb(0x6A6F7A);
+            p.border_strong = rgb(0x9AA0AB);
+            p.text = rgb(0xFFFFFF);
+            p.text_dim = rgb(0xD0D4DB);
+            p.accent = rgb(0x9DB0FF);
+        } else {
+            p.chrome = rgb(0xFFFFFF);
+            p.surface_alt = rgb(0xFFFFFF);
+            p.border = rgb(0x8A909C);
+            p.border_strong = rgb(0x505662);
+            p.text = rgb(0x000000);
+            p.text_dim = rgb(0x30353F);
+            p.accent = rgb(0x2B3AB8);
+        }
+    }
+    p
+}
+
+fn base_palette(dark: bool) -> Palette {
     if dark {
         Palette {
             chrome: rgb(0x17181B),
@@ -101,6 +182,11 @@ pub struct Colors {
     pub ignored: Color32,
     pub conflict: Color32,
     pub conflict_sel: Color32,
+    /// Removed and added lines of the inline view, and the changed text within them.
+    pub removed: Color32,
+    pub removed_sel: Color32,
+    pub inline_removed: Color32,
+    pub inline_added: Color32,
     /// Change markers in the gutter and the location pane.
     pub change_bar: Color32,
     pub conflict_bar: Color32,
@@ -110,8 +196,6 @@ pub struct Colors {
     pub text_bg: Color32,
     pub cursor_row: Color32,
     pub find_hit: Color32,
-    pub folder_diff: Color32,
-    pub folder_unique: Color32,
     pub folder_error: Color32,
     pub location_bg: Color32,
     pub viewport: Color32,
@@ -120,7 +204,56 @@ pub struct Colors {
 }
 
 pub fn colors(dark: bool) -> Colors {
-    let ui = palette(dark);
+    colors_for(dark, look())
+}
+
+pub fn colors_for(dark: bool, look: Look) -> Colors {
+    let mut c = base_colors(dark, palette_for(dark, look));
+    if look.color_blind {
+        // Blue and orange (Okabe-Ito) instead of green and red; changes in purple, conflicts
+        // in yellow.
+        if dark {
+            (c.diff, c.diff_sel, c.inline, c.inline_sel) =
+                (rgb(0x33294A), rgb(0x45375F), rgb(0x5A4785), rgb(0x6E58A0));
+            (c.added, c.added_sel, c.inline_added) = (rgb(0x1B3553), rgb(0x23466D), rgb(0x2D5F95));
+            (c.removed, c.removed_sel, c.inline_removed) =
+                (rgb(0x44301A), rgb(0x5A3F20), rgb(0x86592A));
+            (c.conflict, c.conflict_sel, c.conflict_bar) =
+                (rgb(0x403C17), rgb(0x55501D), rgb(0xF0E442));
+            c.change_bar = rgb(0xB79CF0);
+            c.ui.success = rgb(0x56B4E9);
+            c.ui.danger = rgb(0xE69F00);
+        } else {
+            (c.diff, c.diff_sel, c.inline, c.inline_sel) =
+                (rgb(0xF1EAFA), rgb(0xE3D6F5), rgb(0xD3C0F0), rgb(0xC2A8EA));
+            (c.added, c.added_sel, c.inline_added) = (rgb(0xE3EFFB), rgb(0xCFE3F7), rgb(0xA8CBF0));
+            (c.removed, c.removed_sel, c.inline_removed) =
+                (rgb(0xFCEEDC), rgb(0xF9E0C0), rgb(0xF2C48A));
+            (c.conflict, c.conflict_sel, c.conflict_bar) =
+                (rgb(0xFBF6D2), rgb(0xF5EDB0), rgb(0xA89200));
+            c.change_bar = rgb(0x7B5BC4);
+            c.ui.success = rgb(0x0072B2);
+            c.ui.danger = rgb(0xD55E00);
+        }
+    }
+    if look.high_contrast {
+        let more = |a: Color32, b: Color32| a.lerp_to_gamma(b, 0.35);
+        let toward = if dark { rgb(0xFFFFFF) } else { rgb(0x000000) };
+        for col in [
+            &mut c.inline,
+            &mut c.inline_sel,
+            &mut c.inline_added,
+            &mut c.inline_removed,
+        ] {
+            *col = more(*col, toward);
+        }
+        c.text = c.ui.text;
+        c.gutter_text = c.ui.text_dim;
+    }
+    c
+}
+
+fn base_colors(dark: bool, ui: Palette) -> Colors {
     if dark {
         Colors {
             diff: rgb(0x223449),
@@ -135,6 +268,10 @@ pub fn colors(dark: bool) -> Colors {
             ignored: rgb(0x232428),
             conflict: rgb(0x47272A),
             conflict_sel: rgb(0x5C2C30),
+            removed: rgb(0x40262A),
+            removed_sel: rgb(0x542D32),
+            inline_removed: rgb(0x7C3A40),
+            inline_added: rgb(0x2F6E40),
             change_bar: rgb(0x6AA8E8),
             conflict_bar: rgb(0xF2706A),
             gutter_bg: rgb(0x1B1C20),
@@ -143,8 +280,6 @@ pub fn colors(dark: bool) -> Colors {
             text_bg: ui.surface,
             cursor_row: ui.accent,
             find_hit: rgb(0x2E5F96),
-            folder_diff: rgb(0x2E2A21),
-            folder_unique: rgb(0x24262B),
             folder_error: rgb(0x3D2427),
             location_bg: rgb(0x1B1C20),
             viewport: rgb(0xA9B6FF),
@@ -165,6 +300,10 @@ pub fn colors(dark: bool) -> Colors {
             ignored: rgb(0xF7F8FA),
             conflict: rgb(0xFFE4E4),
             conflict_sel: rgb(0xFFCACA),
+            removed: rgb(0xFDECEC),
+            removed_sel: rgb(0xFBD9D9),
+            inline_removed: rgb(0xF5B8B8),
+            inline_added: rgb(0xB5E3A0),
             change_bar: rgb(0x619BE0),
             conflict_bar: rgb(0xE05252),
             gutter_bg: rgb(0xF8F9FB),
@@ -173,8 +312,6 @@ pub fn colors(dark: bool) -> Colors {
             text_bg: ui.surface,
             cursor_row: ui.accent,
             find_hit: rgb(0xBBD6FF),
-            folder_diff: rgb(0xFFF8EA),
-            folder_unique: rgb(0xF4F5F8),
             folder_error: rgb(0xFFEDED),
             location_bg: rgb(0xF4F5F7),
             viewport: rgb(0x4E62E0),
@@ -184,8 +321,10 @@ pub fn colors(dark: bool) -> Colors {
     }
 }
 
-/// Installs the visual style (colors, spacing, rounding, typography) for the given mode.
-pub fn apply(ctx: &egui::Context, dark: bool) {
+/// Installs the visual style (colors, spacing, rounding, typography) for the given mode and
+/// look; the look also applies to [`palette`] and [`colors`] from now on.
+pub fn apply(ctx: &egui::Context, dark: bool, look: Look) {
+    LOOK.store(look.bits(), std::sync::atomic::Ordering::Relaxed);
     // Pin egui's own theme so it never swaps in its stock style behind ours.
     ctx.set_theme(if dark {
         egui::Theme::Dark
@@ -218,7 +357,15 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     s.slider_rail_height = 4.0;
     s.scroll = egui::style::ScrollStyle::thin();
 
+    if look.compact {
+        s.item_spacing = egui::vec2(6.0, 3.0);
+        s.button_padding = egui::vec2(8.0, 2.0);
+        s.interact_size = egui::vec2(24.0, 22.0);
+        s.window_margin = Margin::same(14);
+    }
+
     style.interaction.tooltip_delay = 0.35;
+    style.animation_time = if look.reduce_motion { 0.0 } else { 1.0 / 12.0 };
 
     let v = &mut style.visuals;
     *v = if dark {
@@ -294,4 +441,43 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     w.open.expansion = 0.0;
 
     ctx.set_style(style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_blind_and_high_contrast_looks_change_the_diff_colors() {
+        for dark in [false, true] {
+            let cb = colors_for(
+                dark,
+                Look {
+                    color_blind: true,
+                    ..Default::default()
+                },
+            );
+            // Added lines lean blue and removed lines orange, rather than green and red.
+            assert!(cb.added.b() > cb.added.g() && cb.added.b() > cb.added.r());
+            assert!(cb.removed.r() > cb.removed.b() && cb.removed.g() > cb.removed.b());
+            let plain = colors_for(dark, Look::default());
+            assert!(plain.added.g() > plain.added.b());
+
+            let hc = palette_for(
+                dark,
+                Look {
+                    high_contrast: true,
+                    ..Default::default()
+                },
+            );
+            let base = palette_for(dark, Look::default());
+            let contrast = |p: &Palette| (p.text.r() as i32 - p.surface.r() as i32).abs();
+            assert!(contrast(&hc) > contrast(&base));
+        }
+        let compact = Look {
+            compact: true,
+            ..Default::default()
+        };
+        assert_eq!(Look::from_bits(compact.bits()), compact);
+    }
 }

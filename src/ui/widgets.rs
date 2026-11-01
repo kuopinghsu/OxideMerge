@@ -250,6 +250,28 @@ pub fn ghost_icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
     )
 }
 
+/// Compact button for a bar of actions; accent-filled when `primary`.
+pub fn bar_button(
+    ui: &mut Ui,
+    enabled: bool,
+    icon: Option<Icon>,
+    label: &str,
+    primary: bool,
+) -> Response {
+    let look = if primary { Look::Primary } else { Look::Ghost };
+    let size = Vec2::new(0.0, 26.0);
+    paint_button(
+        ui,
+        icon,
+        label,
+        label,
+        FontId::proportional(13.0),
+        size,
+        look,
+        enabled,
+    )
+}
+
 /// Accent-filled call-to-action button.
 pub fn primary_button(ui: &mut Ui, label: &str) -> Response {
     paint_button(
@@ -340,6 +362,55 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T,
     changed
 }
 
+/// A button drawn like a search field, for opening a search such as the command palette:
+/// an icon, `hint`, and the shortcut `keys` at the right end. Named `label` for accessibility.
+pub fn search_button(ui: &mut Ui, width: f32, hint: &str, keys: &str, label: &str) -> Response {
+    let p = pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 26.0), Sense::click());
+    let hovered = resp.hovered();
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        7.0,
+        if hovered { p.control_hover } else { p.control },
+        Stroke::new(1.0_f32, if hovered { p.border_strong } else { p.border }),
+        egui::StrokeKind::Inside,
+    );
+    let icon = Rect::from_center_size(
+        egui::pos2(rect.left() + 16.0, rect.center().y),
+        Vec2::splat(13.0),
+    );
+    icons::paint(painter, icon, Icon::Search, p.text_dim);
+    painter.text(
+        egui::pos2(rect.left() + 30.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        hint,
+        FontId::proportional(12.5),
+        p.text_dim,
+    );
+    if !keys.is_empty() {
+        let galley = painter.layout_no_wrap(key_text(keys), FontId::proportional(11.5), p.text_dim);
+        let key = Rect::from_min_size(
+            egui::pos2(rect.right() - galley.size().x - 16.0, rect.center().y - 9.0),
+            Vec2::new(galley.size().x + 10.0, 18.0),
+        );
+        painter.rect_stroke(
+            key,
+            4.0,
+            Stroke::new(1.0_f32, p.border),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(
+            egui::pos2(key.left() + 5.0, key.center().y - galley.size().y / 2.0),
+            galley,
+            p.text_dim,
+        );
+    }
+    focus_ring(ui, &resp, rect, 7.0);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// Full-width toolbar strip with a bottom border.
 pub fn toolbar<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     let p = pal(ui);
@@ -360,6 +431,26 @@ pub fn toolbar<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
         rect.bottom() - 0.5,
         Stroke::new(1.0_f32, p.border),
     );
+    r.inner
+}
+
+/// Related toolbar buttons in a rounded outline, after an optional caption.
+pub fn tool_group<R>(ui: &mut Ui, caption: Option<&str>, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let p = pal(ui);
+    ui.add_space(4.0);
+    if let Some(caption) = caption {
+        ui.label(egui::RichText::new(caption).size(11.5).color(p.text_dim));
+    }
+    let r = egui::Frame::new()
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0_f32, p.border))
+        .corner_radius(8)
+        .inner_margin(Margin::symmetric(2, 0))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            add(ui)
+        });
+    ui.add_space(4.0);
     r.inner
 }
 
@@ -393,11 +484,23 @@ pub fn chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) -> Response {
 }
 
 /// Chip showing a setting and its value, with a chevron; clicking it opens an editor.
-pub fn chip_button(ui: &mut Ui, icon: Icon, label: &str, value: &str) -> Response {
+/// `show_label` leaves out the caption where space is short.
+pub fn chip_button(
+    ui: &mut Ui,
+    icon: Icon,
+    label: &str,
+    value: &str,
+    show_label: bool,
+) -> Response {
     let p = pal(ui);
-    let label_g =
-        ui.painter()
-            .layout_no_wrap(format!("{label}  "), FontId::proportional(12.0), p.text_dim);
+    let caption = if show_label {
+        format!("{label}  ")
+    } else {
+        String::new()
+    };
+    let label_g = ui
+        .painter()
+        .layout_no_wrap(caption, FontId::proportional(12.0), p.text_dim);
     let value_g = ui
         .painter()
         .layout_no_wrap(value.to_string(), theme::semibold(12.0), p.text);
@@ -559,6 +662,61 @@ pub fn card(ui: &Ui) -> egui::Frame {
         .stroke(Stroke::new(1.0_f32, p.border))
         .corner_radius(12)
         .inner_margin(Margin::same(16))
+}
+
+/// Side drawer on the right of `ui`, for panels that work beside the main view (review,
+/// verification, baselines). With more than one tab a segmented control picks one; `add`
+/// draws the picked tab. The rest of `ui` stays for the main view.
+pub fn drawer<T: PartialEq + Copy>(
+    ui: &mut Ui,
+    id: egui::Id,
+    tab: &mut T,
+    tabs: &[(T, &str)],
+    add: impl FnOnce(&mut Ui, T),
+) {
+    let p = pal(ui);
+    if !tabs.iter().any(|(t, _)| t == tab) {
+        if let Some((t, _)) = tabs.first() {
+            *tab = *t;
+        }
+    }
+    egui::SidePanel::right(id)
+        .resizable(true)
+        .default_width(360.0)
+        .width_range(280.0..=720.0)
+        .frame(
+            egui::Frame::new()
+                .fill(p.surface)
+                .stroke(Stroke::new(1.0_f32, p.border))
+                .inner_margin(Margin::symmetric(12, 10)),
+        )
+        .show_inside(ui, |ui| {
+            match tabs {
+                [] => return,
+                [(_, title)] => {
+                    ui.label(egui::RichText::new(*title).font(theme::semibold(14.0)));
+                }
+                _ => {
+                    segmented(ui, tab, tabs);
+                }
+            }
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .id_salt(id.with("scroll"))
+                .auto_shrink([false, false])
+                .show(ui, |ui| add(ui, *tab));
+        });
+}
+
+/// Toolbar toggle that opens and closes the side drawer.
+pub fn drawer_toggle(ui: &mut Ui, open: &mut bool) -> Response {
+    toggle_icon_button(
+        ui,
+        open,
+        Some(Icon::Sidebar),
+        "",
+        crate::i18n::tr("drawer.toggle"),
+    )
 }
 
 /// Draws a vertical scrollbar in `rect`. `scroll` is the first visible row.

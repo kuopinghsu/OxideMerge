@@ -120,9 +120,9 @@ See xref:../README.md#development[Development in the README] for prerequisites a
 [[first-comparison]]
 === Your first comparison
 
-. Choose *Compare files or folders* on the start page.
-. Select an older file as *Left* and a newer file as *Right*.
-. Enable *Read-only* for either side that you want to protect, then click *Compare*.
+. On the start page, type, paste or browse an older file as *Left* and a newer file as *Right*.
+. Click *Compare*. To protect a side from changes, choose *More options...* instead and enable
+  *Read-only* for it.
 . Press kbd:[Alt+↓] to move to the next difference.
 . To merge a difference, check the destination and use the arrow pointing toward that pane.
 . Review the result. Use *File → Save as* for a separate output file, or *Save* to update
@@ -150,29 +150,45 @@ The window has these parts:
 
 Menu bar:: *File*, *Edit*, *View*, *Compare*, *Merge*, *Tools* and *Help*.
 Commands that are unavailable for the current tab are disabled.
-Buttons at the top right:: *Open*, theme selection, *Options*, *Command palette* and
-*Help & Shortcuts*.
+Title bar, at the right:: *Search commands*, which opens the command palette, then *Open*,
+theme selection, *Options* and *Help & Shortcuts*.
+In a narrow window the search field becomes an icon, and buttons that do not fit are left out;
+the menus have the same commands.
 Tabs:: Each comparison opens in a separate tab.
+When both sides have the same file name, the tab shows it once, with the folders that differ
+underneath. A dot in place of the close button marks unsaved changes; hover over it to close.
 Right-click a tab to close it, the others, the tabs to its right, or all of them.
 kbd:[Ctrl+Tab] and kbd:[Ctrl+Shift+Tab] switch tabs, and kbd:[Ctrl+W] or kbd:[Esc] closes the current one.
 Esc first dismisses an open dialog, search bar, preview or editor; unsaved changes still prompt before closing.
-Status bar:: The number of differences, the current line or offset, and at the right end the
-interface language.
+Status bar:: Whether the sides differ, the current line or offset, and at the right end the
+interface language. Difference and item counts are in the toolbar and the folder chips instead.
 Change the language under *Options → General*, or start OxideMerge with `--lang`.
 
 Click the app logo or choose *Help → About* for the version and build identifier. Development
 builds show a short Git hash, with `-dirty` for tracked source/index changes. Clean optimized
 builds at the matching version tag show the UTC build date. `--version` shows the same identifier.
 
-Starting OxideMerge without a comparison shows the start page.
-It has *Compare files or folders*, *Open conflict file*, and the list of recent comparisons.
-Right-click a recent comparison to change its paths or remove it from the list.
+Starting OxideMerge without a comparison shows the start page:
+
+* *Compare files or folders* takes a *Left* and *Right* path, typed, pasted or picked with the
+  file and folder buttons next to each field. *3-way* adds a *Middle* path, and *More options...*
+  opens the *Select files or folders* dialog with the paths filled in.
+* *Open conflict file* resolves a file with conflict markers (see <<conflict-files>>).
+* *Release summary / Compare baselines* compares two folders or saved reviews as releases.
+* *Recent* lists the last comparisons as cards. Click one to compare again, or right-click it to
+  change its paths or remove it from the list.
+
+On the first start, before there are recent comparisons, *Open a sample* opens two small sample
+folders. They are created in a temporary folder that is removed when the tab closes, and
+the sample is not added to the recent list.
 
 === Opening a comparison
 
 There are several ways to start a comparison:
 
-* *File → Open...* (kbd:[Ctrl+O]) or *Compare files or folders* on the start page opens the
+* Type or browse the paths under *Compare files or folders* on the start page and click
+  *Compare*.
+* *File → Open...* (kbd:[Ctrl+O]), or *More options...* on the start page, opens the
   *Select files or folders* dialog.
 * Drop two or three files or folders onto the window.
   Dropping a single item opens the dialog with that item filled in.
@@ -235,8 +251,8 @@ Each type is described in its own chapter below.
 
 * *Help → Help & Shortcuts* (kbd:[F1] or kbd:[?]) lists every keyboard shortcut and mouse
   action by view, and shows where the settings file is stored.
-* *Help → Command palette* (kbd:[Ctrl+K] or kbd:[Ctrl+Shift+P]) searches commands, recent
-  comparisons and settings.
+* *Search commands* in the title bar, or *Help → Command palette* (kbd:[Ctrl+K] or
+  kbd:[Ctrl+Shift+P]), searches commands, recent comparisons and settings.
   Type part of a name, then press kbd:[Enter].
   Settings that can be switched on and off show whether they are on.
 
@@ -253,20 +269,26 @@ attention.
 
 === The folder list
 
-Each row shows the *Name*, the *Folder* it is in, the *Comparison result*, the dates and sizes on
-each side, and the *Extension*.
+Each row shows the *Name*, the *Folder* it is in (in a flat list only), the *Comparison result*,
+the *Modified* date, the size on each side, and the *Extension*.
+*Modified* is the newest date of the sides, followed by the side that is newer when the dates
+differ; hover over it for the date of every side.
 Click a column header to sort by it.
+A colored bar at the left edge of a row marks a difference or an item found on one side only.
 
 The comparison result can be:
 
-* *Text files are identical* or *Text files are different*;
-* *Binary files are identical* or *Binary files are different*;
-* *Folders are identical* or *Folders are different*;
+* *Identical* or *Different* for files; binary files are marked *Binary*;
+* for a folder that differs, what differs inside it, such as *3 different · 1 only in Left*;
 * *Left only*, *Right only* or *Middle only*, for items found on one side;
 * *Left is different*, *Middle is different* or *Right is different*, in a 3-way compare;
 * *Error*, when an item could not be read.
 
-The status bar counts the identical, different and unique items and the errors.
+Hover over a result for the full description, such as *Text files are different*.
+
+Chips under the paths count *All* items and the *Different*, *Only in Left*, *Only in Right*
+(and *Only in Middle*) and *Identical* ones. Click a chip to hide or show that kind of item.
+The status bar shows how long the comparison took.
 
 In *View → Folder list*:
 
@@ -293,6 +315,10 @@ From left to right:
 * *Rules* chooses the compare rules file for this compare (see <<compare-rules>>).
 * *Compare method* chooses how files are compared.
 * *Find by name* (kbd:[Ctrl+F]) shows only the items whose names contain the text.
+* *Side panel*, at the right end, opens the review, verification and baseline panels in a drawer.
+
+In a narrow window, *All differences* and *Export HTML* become icons and the chips drop their
+captions.
 
 [[compare-methods]]
 === Comparison methods
@@ -446,6 +472,21 @@ Switching the layout does not change file contents or comparison rules.
 Click it to jump to that place.
 Differences are colored: changed lines in amber, and lines only on one side in blue.
 Within changed lines, the changed words or characters are highlighted.
+Between the panes, a connector links each difference on both sides; the current one stands out,
+and its copy arrows appear when it is current or under the mouse.
+
+The toolbar groups its buttons into *Differences* (navigation), *Copy* (*Merge* in a 3-way compare),
+*Edit* (undo and redo) and *View* (find, collapse, wrap). Wide windows show these captions. The +/− counts next to
+the difference number are the added and removed lines.
+
+[[inline-view]]
+=== Inline view
+
+In a 2-way compare, the *Inline view* toggle next to *Word wrap*, or *Inline view* in the command
+palette, shows the differences in one column: removed lines first, then the lines that replace
+them, each with its old and new line number. Unchanged runs are folded as with *Collapse unchanged
+lines*; click a fold to show it. Moving between differences and copying them work as usual. To edit
+a line, switch back to the side-by-side view.
 
 === Moving between differences
 
@@ -599,6 +640,11 @@ You can also use *File → Save as* to choose another path. Mark the left and ri
 read-only if they are only sources for the merge.
 
 ==== Merge and review conflicts
+
+Above the panes, the merge bar shows how many conflicts are left and has *Next conflict*,
+*Take left*, *Take both* and *Take right* for the current conflict. After editing a conflict by
+hand, *Mark resolved* keeps the middle as it is and counts it as resolved. *Save result* at the
+right end saves the middle pane, and becomes the main button once no conflicts are left.
 
 . Choose *Merge → Auto merge*. This copies changes made on only one side, and identical
   changes made on both sides, into the middle pane.
@@ -767,6 +813,11 @@ tab, and are taken as they are after 45 seconds. Without a browser, or with *Ren
 browser for text and HTML* turned off, Text and HTML source use the HTML as downloaded instead:
 scripts do not run, and content they add is missing. If the browser fails, they fall back to the
 HTML as downloaded too, and the status bar says why.
+A page that the browser cannot load (it cannot be reached, does not load in time or its tab
+crashes) is blank in the screenshot modes, with the error in its pane header, and the other pages
+are compared all the same; Text and HTML source then use the pages as downloaded.
+Dialogs that a page opens, such as `alert`, are dismissed, and a page that redirects after loading
+is taken as the page it redirects to.
 The console compare (`--cli -t web`) compares the same text, or HTML with the HTML source mode.
 On macOS and Linux OxideMerge talks to the browser over a private pipe; on Windows, over a port
 that only this computer can reach, open while the pages load.
@@ -1062,6 +1113,10 @@ General::
 numbers*, *Location pane*, *View whitespace* and *Syntax highlighting*; *Keep a .bak copy when
 saving over a file*; *Use the recycle bin when deleting*; *Confirm copy operations*; and
 *Reopen previous comparisons at startup*.
+Under *Accessibility*: *Color-blind friendly diff colors* (blue for added, orange for removed,
+purple for changed lines and yellow for conflicts), *High contrast*, *Reduce motion* (no
+animations) and *Compact density* (shorter rows and tighter spacing). These four can also be
+switched from the command palette.
 Compare::
 The compare options (see <<compare-options>>).
 Compare rules::
@@ -1415,8 +1470,9 @@ by size and date instead of contents (see <<compare-methods>>).
 
 == Optional merge verification, semantic compare and review workspace
 
-All analysis is opt-in and read-only. Expand *Merge Verification* in a three-way text view to
-preview the existing merge engine without changing the middle pane. *Validate saved result*
+All analysis is opt-in and read-only. The panels below open in the side drawer: click *Side
+panel* at the right end of the toolbar and pick a tab. Open *Merge Verification* in a three-way
+text view to preview the existing merge engine without changing the middle pane. *Validate saved result*
 re-reads the result and compares its bytes, encoding, BOM, line endings and final newline with
 that preview. Conflicts retain the base in previews and require explicit manual resolution;
 mechanical checks never certify semantic correctness. Editing the view invalidates its displayed
@@ -1446,7 +1502,8 @@ action, never as accepted. Repeated/ambiguous hunk contexts require manual revie
 
 == Optional release baseline and impact analysis
 
-The start page and folder comparisons share the *Release summary / Compare baselines* panel.
+The start page and folder comparisons share the *Release summary / Compare baselines* panel; in a
+folder comparison it is a tab of the side drawer.
 Choose each source directly; selecting two live folders first is not required. Use `folder:PATH`, `git:REV:PATH`, or `review:SIDE:PATH`. Snapshot sides
 start at zero. Git refs are resolved once to recorded immutable commit IDs; uncommitted working
 changes are excluded from Git baselines. Folder captures include the selected current bytes.

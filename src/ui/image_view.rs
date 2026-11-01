@@ -324,6 +324,7 @@ impl ImageView {
         let mut recompute = false;
         widgets::toolbar(ui, |ui| {
             let pal = widgets::pal(ui);
+            let compact = ui.available_width() < 1180.0;
             widgets::segmented(
                 ui,
                 &mut self.mode,
@@ -348,7 +349,12 @@ impl ImageView {
             if widgets::icon_button(ui, Icon::ZoomIn, tr("cmd.zoom_in")).clicked() {
                 self.zoom = (self.zoom * 1.25).min(64.0);
             }
-            if widgets::ghost_icon_button(ui, Icon::Fit, tr("img.fit")).clicked() {
+            let fit = if compact {
+                widgets::icon_button(ui, Icon::Fit, tr("img.fit"))
+            } else {
+                widgets::ghost_icon_button(ui, Icon::Fit, tr("img.fit"))
+            };
+            if fit.clicked() {
                 self.fit = true;
             }
             if widgets::ghost_button(ui, "1:1").clicked() {
@@ -360,17 +366,23 @@ impl ImageView {
                 ui,
                 &mut self.show_blocks,
                 Some(Icon::Table),
-                tr("img.show_blocks"),
+                if compact { "" } else { tr("img.show_blocks") },
                 tr("img.show_blocks"),
             );
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new(tr("img.threshold")).color(pal.text_dim));
             // Comparing every pixel is too slow to repeat on each frame of a drag.
             let settled = |r: egui::Response| (r.changed() && !r.dragged()) || r.drag_stopped();
-            recompute |= settled(ui.add(egui::DragValue::new(&mut self.threshold).range(0..=255)));
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new(tr("img.block_size")).color(pal.text_dim));
-            recompute |= settled(ui.add(egui::DragValue::new(&mut self.block).range(1..=256)));
+            let caption = |ui: &mut Ui, label: &str| {
+                ui.add_space(6.0);
+                if !compact {
+                    ui.label(egui::RichText::new(label).color(pal.text_dim));
+                }
+            };
+            caption(ui, tr("img.threshold"));
+            let r = ui.add(egui::DragValue::new(&mut self.threshold).range(0..=255));
+            recompute |= settled(r.on_hover_text(tr("img.threshold")));
+            caption(ui, tr("img.block_size"));
+            let r = ui.add(egui::DragValue::new(&mut self.block).range(1..=256));
+            recompute |= settled(r.on_hover_text(tr("img.block_size")));
             if self.mode == ImgMode::Overlay {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(tr("img.alpha")).color(pal.text_dim));

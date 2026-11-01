@@ -54,6 +54,8 @@ pub enum Icon {
     Wrap,
     Palette,
     Export,
+    Sidebar,
+    Inline,
 }
 
 /// Maps 16×16 design-grid coordinates into `rect`.
@@ -388,6 +390,22 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.closed(&[(2.0, 3.0), (14.0, 3.0), (14.0, 13.0), (2.0, 13.0)]);
             pen.line(&[(4.5, 6.0), (7.0, 8.0), (4.5, 10.0)]);
             pen.line(&[(8.5, 10.5), (11.5, 10.5)]);
+        }
+        Icon::Sidebar => {
+            pen.closed(&[(2.0, 3.0), (14.0, 3.0), (14.0, 13.0), (2.0, 13.0)]);
+            pen.line(&[(10.0, 3.0), (10.0, 13.0)]);
+            pen.line(&[(11.5, 6.0), (12.5, 6.0)]);
+            pen.line(&[(11.5, 8.5), (12.5, 8.5)]);
+        }
+        Icon::Inline => {
+            // One column: a removed line over an added one.
+            pen.line(&[(2.5, 4.0), (13.5, 4.0)]);
+            pen.line(&[(2.5, 7.0), (4.5, 7.0)]);
+            pen.line(&[(6.5, 7.0), (13.5, 7.0)]);
+            pen.line(&[(2.5, 10.0), (4.5, 10.0)]);
+            pen.line(&[(3.5, 9.0), (3.5, 11.0)]);
+            pen.line(&[(6.5, 10.0), (13.5, 10.0)]);
+            pen.line(&[(2.5, 13.0), (9.0, 13.0)]);
         }
     }
 }
