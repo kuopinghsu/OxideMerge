@@ -95,6 +95,9 @@ section of this file as the release notes.
 
 - The footer of HTML reports of folder and file comparisons links *OxideMerge* to the project
   page, https://github.com/kuopinghsu/OxideMerge.
+- CI builds, tests and packages the macOS app, and runs the macOS benchmarks, on the macOS 15
+  runner image, since the macOS 14 image is retired on November 2, 2026. The app still runs on
+  macOS 11 and later.
 - Review, verification and baseline panels open in a side drawer, toggled by the button at the
   right end of the toolbar, instead of taking space below the comparison.
 - **Folder comparison:** chips under the paths count *All*, *Different*, *Only in Left/Right* and
