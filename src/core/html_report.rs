@@ -108,7 +108,7 @@ tr.cm td{background:var(--chg);font-family:system-ui,sans-serif;font-style:itali
 tr.more td{text-align:center;color:var(--dim);font-family:system-ui,sans-serif;padding:4px;background:var(--surface2)}
 table.u{display:none}body.unified table.u{display:table}body.unified table.s2.two{display:none}
 .empty{text-align:center;color:var(--dim);padding:40px}
-.foot{color:var(--dim);font-size:12px;text-align:center;margin-top:24px}
+.foot{color:var(--dim);font-size:12px;text-align:center;margin-top:24px}.foot a{color:inherit}
 kbd{font-family:var(--mono);font-size:11px;padding:0 5px;border:1px solid var(--border);border-bottom-width:2px;border-radius:4px;background:var(--surface)}
 @media (max-width:900px){.layout{grid-template-columns:minmax(0,1fr)}.toc{display:none}input.q{width:150px}}
 [hidden]{display:none!important}
@@ -518,13 +518,18 @@ fn page_end(out: &mut String, hunks: bool) {
     if hunks {
         let _ = write!(out, "{} · ", tr("report.keys"));
     }
+    let made_by = esc(&trf(
+        "report.made_by",
+        &[("version", env!("CARGO_PKG_VERSION").to_string())],
+    ));
+    let link = format!(
+        "<a href=\"{}\">OxideMerge</a>",
+        env!("CARGO_PKG_REPOSITORY")
+    );
     let _ = writeln!(
         out,
         "{}</p></main></div><script>{JS}</script></body></html>",
-        esc(&trf(
-            "report.made_by",
-            &[("version", env!("CARGO_PKG_VERSION").to_string())]
-        ))
+        made_by.replacen("OxideMerge", &link, 1)
     );
 }
 
@@ -1175,6 +1180,9 @@ mod tests {
         assert!(html.contains("<span class=\"m\">…</span></td>"));
         assert!(!html.contains(&"w ".repeat(LINE_CHARS / 2 + 1)));
         assert!(html.contains("class=\"toc\""));
+        assert!(
+            html.contains("<a href=\"https://github.com/kuopinghsu/OxideMerge\">OxideMerge</a>")
+        );
 
         let plain = folder_report(&refs, &roots, &roots, None, "");
         assert!(!plain.contains("class=\"hunk\"") && !plain.contains("class=\"toc\""));

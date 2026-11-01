@@ -93,6 +93,8 @@ section of this file as the release notes.
   imports. A file with code the parser could not read is listed as partly assessed. The
   application is about 10 MB larger for the grammars.
 
+- The footer of HTML reports of folder and file comparisons links *OxideMerge* to the project
+  page, https://github.com/kuopinghsu/OxideMerge.
 - Review, verification and baseline panels open in a side drawer, toggled by the button at the
   right end of the toolbar, instead of taking space below the comparison.
 - **Folder comparison:** chips under the paths count *All*, *Different*, *Only in Left/Right* and
