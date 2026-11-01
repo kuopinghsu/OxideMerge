@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Writing release notes - Aurora Handbook</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0 auto; max-width: 760px; padding: 24px 40px; color: #222; line-height: 1.5; }
+  blockquote { border-left: 4px solid #2b4c7e; margin-left: 0; padding: 4px 16px; background: #eef4ff; }
+  pre { background: #f3f4f6; padding: 12px; overflow-x: auto; }
+  kbd { border: 1px solid #bbb; border-radius: 3px; padding: 0 4px; font-size: 90%; }
+  dt { font-weight: 600; }
+  .draft { display: none; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<h1>Writing release notes</h1>
+
+<p>Release notes tell users <strong>what changed</strong> and <em>why it matters</em>. Keep each
+entry to one or two sentences&mdash;readers skim them.</p>
+
+<!-- Hidden by the style sheet: only the browser knows, so it is left out when rendered. -->
+<p class="draft">Draft: check the wording with the documentation team before publishing.</p>
+
+<p>Mark <strong>breaking changes <em>clearly</em></strong>, link to the
+<a href="https://example.com/migrate/v3">migration guide</a>, and name settings exactly, such as
+<code>sync.interval_minutes</code>.<span class="sr-only"> (Screen reader hint: settings are case sensitive.)</span></p>
+
+<p>Plain text keeps characters that Markdown would read: use * or _ for emphasis, a # for a
+heading, a | between table cells, and [brackets] for links.</p>
+
+<p>1. A line that starts like a numbered step is still a paragraph.</p>
+
+<p>Press <kbd>Ctrl</kbd>+<kbd>S</kbd> (<kbd>⌘</kbd>+<kbd>S</kbd> on macOS) to save; <kbd>Esc</kbd>
+closes the dialog. Write a setting with backticks in it as <code>`name`</code>.</p>
+
+<p>The <del>beta</del> channel is now called Preview &copy; 2026 &lt;Aurora&gt;.</p>
+
+<p lang="zh-Hant">中文說明：筆記現在每 10 分鐘同步一次，附件會在文字之後上傳。</p>
+
+<address>Aurora Software<br>40 Quay Street<br>Wellington 6011</address>
+
+<blockquote>
+  <p>Good release notes answer three questions:</p>
+  <ul>
+    <li>What can I do now that I could not before?</li>
+    <li>What works differently?</li>
+    <li>What do I need to do?</li>
+  </ul>
+</blockquote>
+
+<h2>Steps</h2>
+<ol>
+  <li>Collect the merged changes.
+    <ul>
+      <li>Leave out internal refactoring.</li>
+      <li>Group fixes by area:
+        <ul>
+          <li>Sync</li>
+          <li>Search and filters</li>
+          <li>Accessibility</li>
+        </ul>
+      </li>
+    </ul>
+  </li>
+  <li>Write one entry per change, starting with a verb.</li>
+  <li>Ask a second person to read them.</li>
+  <li>Publish them with the release.</li>
+</ol>
+
+<h2>Terms</h2>
+<dl>
+  <dt>Breaking change</dt>
+  <dd>A change that makes existing notes, settings or scripts stop working.</dd>
+  <dt>Deprecation</dt>
+  <dd>A feature that still works but will be removed after two releases.</dd>
+</dl>
+
+<h2>Example settings</h2>
+<pre class="language-toml">[sync]
+interval_minutes = 10
+retry = true
+
+[search]
+instant = true</pre>
+
+<p>Long entries are hard to scan: when a paragraph runs past three lines, readers miss the one
+sentence they came for, so put the most important change first and leave the background for the
+linked article.</p>
+
+<p>Notes sync in the background.</p>
+
+<p>Large attachments upload after the text, one at a time.</p>
+
+<details>
+  <summary>Template</summary>
+  <p>Added: … Changed: … Deprecated: … Fixed: …</p>
+</details>
+
+<p id="reviewed"></p>
+<script>
+  document.getElementById("reviewed").textContent = "Last reviewed by Lee.";
+</script>
+</body>
+</html>
