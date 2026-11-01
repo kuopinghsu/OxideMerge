@@ -550,7 +550,7 @@ jobs:
 
   macos:
     name: macOS universal
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
@@ -772,7 +772,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-latest, macos-14]
+        os: [ubuntu-24.04, windows-latest, macos-15]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
