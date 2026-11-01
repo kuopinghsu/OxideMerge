@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "format": "json",
+  "changes": [
+    {
+      "id": "2bfb07fba1150e639fc5f10032fe8713762fa75ca5b1a6abc01b01e21e03c1c4",
+      "path": "$[\"db\"][\"port\"]",
+      "kind": "modified",
+      "before": "5432",
+      "after": "6543",
+      "spans": [
+        {
+          "bytes": {
+            "start": 38,
+            "end": 42
+          },
+          "line": 1
+        },
+        {
+          "bytes": {
+            "start": 38,
+            "end": 42
+          },
+          "line": 1
+        }
+      ],
+      "confidence": "parser_exact"
+    },
+    {
+      "id": "505d1b9aaa72b2bab4960ca0af88ea5f1041d30c407fcc9693cf450d3d7cd57e",
+      "path": "$[\"items\"][1]",
+      "from": "$[\"items\"][0]",
+      "kind": "moved",
+      "before": "{\"id\":1,\"v\":1}",
+      "after": "{\"id\":1,\"v\":10}",
+      "spans": [
+        {
+          "bytes": {
+            "start": 53,
+            "end": 67
+          },
+          "line": 1
+        },
+        {
+          "bytes": {
+            "start": 68,
+            "end": 83
+          },
+          "line": 1
+        }
+      ],
+      "confidence": "array_key",
+      "ambiguous": true
+    },
+    {
+      "id": "731c6e17375829341bbdd43693f277f83dbc84c8acbcc96901c72804d166530b",
+      "path": "$[\"items\"][1][\"v\"]",
+      "kind": "modified",
+      "before": "1",
+      "after": "10",
+      "spans": [
+        {
+          "bytes": {
+            "start": 65,
+            "end": 66
+          },
+          "line": 1
+        },
+        {
+          "bytes": {
+            "start": 80,
+            "end": 82
+          },
+          "line": 1
+        }
+      ],
+      "confidence": "array_key"
+    }
+  ],
+  "errors": [],
+  "policies": [
+    "Read-only; text comparison rules are not semantic path rules and are not applied.",
+    "JSON objects unordered; duplicate keys rejected. Arrays ordered: elements are compared by position, an exact reordering is reported as moves, and with an array matching key, object elements are paired by that member's unique scalar value. XML attributes unordered; child/mixed-content order and text whitespace significant; expanded namespace names; comments included. No external entities/DTDs.",
+    "TOML and YAML compare as JSON-shaped values: tables and mappings are unordered objects, numbers compare by value, and comments and formatting are ignored. YAML follows the YAML 1.2 core schema (yes/no/on/off are strings); aliases, several documents, complex keys and custom tags are refused, and input is limited to 4 MiB, 64 levels and 100,000 nodes."
+  ],
+  "options": {
+    "array_key": "id"
+  }
+}

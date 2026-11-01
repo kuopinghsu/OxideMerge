@@ -1,0 +1,7 @@
+service: inventory
+debug: "no"   # quoted, still the same text
+replicas: 3
+env: {REGION: eu-west-1, LOG_LEVEL: debug}
+ports:
+  - {name: metrics, port: 9090}
+  - {name: http, port: 0x1F90}

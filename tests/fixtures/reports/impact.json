@@ -1,0 +1,196 @@
+{
+  "version": 1,
+  "baseline_fingerprint": "40a608221266730395dba8ddbbe8b6fc5bb351ca00040b7070d20cdb7d0a1a39",
+  "findings": [
+    {
+      "id": "cdb6bf6ca3cd229246da83817eb6b99878785d1533e3ecb80a403ae0727c9833",
+      "origin_change_id": "0be5aaed359652c105ac4dd87698454d8c5d93b28ac073ba14ca7f03728956be",
+      "related_paths": [
+        "src/lib.rs",
+        "src/parser.rs"
+      ],
+      "relation_type": "import",
+      "evidence": {
+        "path": "src/lib.rs",
+        "line": 1,
+        "excerpt": "mod parser;",
+        "digest": "7f5dad3e98eac4ac9ac1ae4ca84f78aa346ca05cc9eab935df74fcbbca5b67c6"
+      },
+      "severity": "review",
+      "confidence": "exact",
+      "rule_id": "import-reference-v3:rust",
+      "limitations": "This import/include/$ref statement resolves to exactly the changed path. Statements are read from the syntax tree (Tree-sitter) of JavaScript/TypeScript, Python, C/C++ and Rust files and from the tokens of others, so comments and strings are not imports; conditional, generated or macro-built imports can be missed. It is not proof of a build or runtime failure."
+    },
+    {
+      "id": "ba6f8b292299fcabf2fa972f1dd1df5f04d45dc7bd037b7c62ff884ee2776035",
+      "origin_change_id": "0be5aaed359652c105ac4dd87698454d8c5d93b28ac073ba14ca7f03728956be",
+      "related_paths": [
+        "src/main.rs",
+        "src/parser.rs"
+      ],
+      "relation_type": "import",
+      "evidence": {
+        "path": "src/main.rs",
+        "line": 1,
+        "excerpt": "use crate::parser::{parse, Token};",
+        "digest": "f6d6c799b83dcd33883e60016ff8b03011fef98a7e08d6729e9ff4164ddba113"
+      },
+      "severity": "review",
+      "confidence": "exact",
+      "rule_id": "import-reference-v3:rust",
+      "limitations": "This import/include/$ref statement resolves to exactly the changed path. Statements are read from the syntax tree (Tree-sitter) of JavaScript/TypeScript, Python, C/C++ and Rust files and from the tokens of others, so comments and strings are not imports; conditional, generated or macro-built imports can be missed. It is not proof of a build or runtime failure."
+    },
+    {
+      "id": "0e6b99b1d641e64055da6fda51c42feae83b7023bd66c91d2a17b3015fb8d1a0",
+      "origin_change_id": "0be5aaed359652c105ac4dd87698454d8c5d93b28ac073ba14ca7f03728956be",
+      "related_paths": [
+        "src/main.rs",
+        "src/parser.rs"
+      ],
+      "relation_type": "function_reference",
+      "evidence": {
+        "path": "src/main.rs",
+        "line": 5,
+        "excerpt": "    println!(\"{}\", parse(\"x\"));",
+        "digest": "f6d6c799b83dcd33883e60016ff8b03011fef98a7e08d6729e9ff4164ddba113"
+      },
+      "severity": "review",
+      "confidence": "exact",
+      "rule_id": "symbol-reference-v2:rust",
+      "limitations": "Uses parse, a function changed in src/parser.rs, imported from it by name. Whether this use still builds and behaves the same is not checked."
+    },
+    {
+      "id": "900d6211d40e32823c0514f66a274aa7153e98a233d9be830680e8b2e276f871",
+      "origin_change_id": "42ffe08436d8d49046023a3ada7b9accb29168be15dc911bd4849280eb797b9e",
+      "related_paths": [
+        "py/main.py",
+        "py/helpers.py"
+      ],
+      "relation_type": "import",
+      "evidence": {
+        "path": "py/main.py",
+        "line": 1,
+        "excerpt": "from .helpers import normalize",
+        "digest": "402b6686b89ae125a57b79cfd503e78c3c28fbbcc1946eeac048fdf198c6f78e"
+      },
+      "severity": "review",
+      "confidence": "exact",
+      "rule_id": "import-reference-v3:python",
+      "limitations": "This import/include/$ref statement resolves to exactly the changed path. Statements are read from the syntax tree (Tree-sitter) of JavaScript/TypeScript, Python, C/C++ and Rust files and from the tokens of others, so comments and strings are not imports; conditional, generated or macro-built imports can be missed. It is not proof of a build or runtime failure."
+    },
+    {
+      "id": "847140fe792acc86566dc5d72651a35d258c0d5065165d42aecf52e0a8c99336",
+      "origin_change_id": "42ffe08436d8d49046023a3ada7b9accb29168be15dc911bd4849280eb797b9e",
+      "related_paths": [
+        "py/main.py",
+        "py/helpers.py"
+      ],
+      "relation_type": "function_reference",
+      "evidence": {
+        "path": "py/main.py",
+        "line": 3,
+        "excerpt": "print(normalize(\" a \"))",
+        "digest": "402b6686b89ae125a57b79cfd503e78c3c28fbbcc1946eeac048fdf198c6f78e"
+      },
+      "severity": "review",
+      "confidence": "exact",
+      "rule_id": "symbol-reference-v2:python",
+      "limitations": "Uses normalize, a function changed in py/helpers.py, imported from it by name. Whether this use still builds and behaves the same is not checked."
+    },
+    {
+      "id": "4ea4cd172fa455ea20bc27d4f3270bc5804b9418e0e4b48e96523e1e3e092fe5",
+      "origin_change_id": "68c1dfd5e50cfc9089da0f22260d1aeddc160adf1d35bba00d82f340bb8a3f53",
+      "related_paths": [
+        "c/main.c",
+        "c/limits.h"
+      ],
+      "relation_type": "import",
+      "evidence": {
+        "path": "c/main.c",
+        "line": 1,
+        "excerpt": "#include \"limits.h\"",
+        "digest": "347ff8824d595466a3bd3d3a5b04d16460ea5484169e23621dcf9f9c88dce08f"
+      },
+      "severity": "review",
+      "confidence": "exact",
+      "rule_id": "import-reference-v3:c",
+      "limitations": "This import/include/$ref statement resolves to exactly the changed path. Statements are read from the syntax tree (Tree-sitter) of JavaScript/TypeScript, Python, C/C++ and Rust files and from the tokens of others, so comments and strings are not imports; conditional, generated or macro-built imports can be missed. It is not proof of a build or runtime failure."
+    },
+    {
+      "id": "387ead252bad345c6df2b08fe260700dede7863f2ea7e9220791baa1f41f87eb",
+      "origin_change_id": "68c1dfd5e50cfc9089da0f22260d1aeddc160adf1d35bba00d82f340bb8a3f53",
+      "related_paths": [
+        "c/main.c"
+      ],
+      "relation_type": "symbol_name_reference",
+      "evidence": {
+        "path": "c/main.c",
+        "line": 3,
+        "excerpt": "int main(void) { return LIMIT; }",
+        "digest": "347ff8824d595466a3bd3d3a5b04d16460ea5484169e23621dcf9f9c88dce08f"
+      },
+      "severity": "review",
+      "confidence": "heuristic",
+      "rule_id": "literal-reference-v1:symbol_name_reference",
+      "limitations": "LIMIT names a definition changed or removed in c/limits.h; this file does not import it by name from there, so the word may name something else. Inspect or dismiss it manually."
+    },
+    {
+      "id": "039c97a15dfde4b53898dd8d50856307bd555791f95f8b8ab220fbdad5bee072",
+      "origin_change_id": "b8226198f63ac3d9de23ea1b3b84c8e8c703d0a8fe85c595cfc4f227af215d23",
+      "related_paths": [
+        "README.md"
+      ],
+      "relation_type": "config_key_path",
+      "evidence": {
+        "path": "README.md",
+        "line": 1,
+        "excerpt": "Set db.timeout in config.json.",
+        "digest": "a4b3b6aa02ad086a5440690e645206647a49cf6c5f5f41ec10b6841693bc94cb"
+      },
+      "severity": "review",
+      "confidence": "heuristic",
+      "rule_id": "literal-reference-v1:config_key_path",
+      "limitations": "A delimited name/path occurrence is evidence of text only; it does not prove a dependency or runtime/build/test failure. Inspect or dismiss it manually."
+    },
+    {
+      "id": "be9d5f94004012cbea6048b292d9c803dee78719a42ad7136204d44c98587ecc",
+      "origin_change_id": "d682a3cc274a94fb5a95c28e08918f209b44df7cfda8577d71acdfd1914ca3fb",
+      "related_paths": [
+        "web/app.js",
+        "web/util.js"
+      ],
+      "relation_type": "import",
+      "evidence": {
+        "path": "web/app.js",
+        "line": 1,
+        "excerpt": "import { format as fmt } from \"./util.js\";",
+        "digest": "73869c3d4fc6f72dda2657b4af72a69beff70cf5e550c99aac9012e25d35f332"
+      },
+      "severity": "review",
+      "confidence": "exact",
+      "rule_id": "import-reference-v3:script",
+      "limitations": "This import/include/$ref statement resolves to exactly the changed path. Statements are read from the syntax tree (Tree-sitter) of JavaScript/TypeScript, Python, C/C++ and Rust files and from the tokens of others, so comments and strings are not imports; conditional, generated or macro-built imports can be missed. It is not proof of a build or runtime failure."
+    },
+    {
+      "id": "9851fd09072c6f4a5470d6df3444c6e2b6c6c878e6e89d91baaa6ec7474a93e1",
+      "origin_change_id": "d682a3cc274a94fb5a95c28e08918f209b44df7cfda8577d71acdfd1914ca3fb",
+      "related_paths": [
+        "web/app.js",
+        "web/util.js"
+      ],
+      "relation_type": "function_reference",
+      "evidence": {
+        "path": "web/app.js",
+        "line": 3,
+        "excerpt": "console.log(fmt(1));",
+        "digest": "73869c3d4fc6f72dda2657b4af72a69beff70cf5e550c99aac9012e25d35f332"
+      },
+      "severity": "review",
+      "confidence": "exact",
+      "rule_id": "symbol-reference-v2:script",
+      "limitations": "Uses format, a function changed in web/util.js, imported from it by name. Whether this use still builds and behaves the same is not checked."
+    }
+  ],
+  "assessment": "Potential references found; all findings require review",
+  "excluded": {}
+}

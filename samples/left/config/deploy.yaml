@@ -1,0 +1,12 @@
+# Deployment of the inventory service
+service: inventory
+replicas: 2
+debug: no
+ports:
+  - name: http
+    port: 8080
+  - name: metrics
+    port: 9090
+env:
+  LOG_LEVEL: info
+  REGION: eu-west-1

@@ -1,0 +1,23 @@
+# Inventory service settings
+title = "inventory"
+version = "1.4.0"
+
+[server]
+host = "0.0.0.0"
+port = 8_080
+timeout_s = 30
+
+[database]
+url = "postgres://db.internal/inventory"
+pool = 10
+
+[features]
+cache = true
+
+[[workers]]
+id = "import"
+threads = 2
+
+[[workers]]
+id = "report"
+threads = 1

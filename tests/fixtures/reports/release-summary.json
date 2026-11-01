@@ -1,0 +1,288 @@
+{
+  "version": 1,
+  "left": {
+    "spec": {
+      "kind": "folder",
+      "path": "old"
+    },
+    "resolved_commit": null,
+    "fingerprint": "19422a1fa3b6ab885e86c3fda34a62d741261d83dbff0575992afeff60ad58e7",
+    "filter": "*.*",
+    "rules": {
+      "whitespace": "Compare",
+      "ignore_case": false,
+      "ignore_blank_lines": false,
+      "ignore_eol": true,
+      "ignore_numbers": false,
+      "ignore_codepage": true,
+      "algorithm": "Myers",
+      "detect_moved": true,
+      "inline": "Word",
+      "line_filters_enabled": false,
+      "line_filters": [],
+      "substitutions_enabled": false,
+      "substitutions": [],
+      "ignore_comments": false,
+      "prettify": false,
+      "numeric_tolerance_enabled": false,
+      "numeric_tolerance": 0.001,
+      "block_filters_enabled": false,
+      "block_filters": []
+    },
+    "working_tree": "Captured file bytes; unreadable/excluded paths listed separately",
+    "captured_at": "CAPTURE-TIME"
+  },
+  "right": {
+    "spec": {
+      "kind": "folder",
+      "path": "new"
+    },
+    "resolved_commit": null,
+    "fingerprint": "40a608221266730395dba8ddbbe8b6fc5bb351ca00040b7070d20cdb7d0a1a39",
+    "filter": "*.*",
+    "rules": {
+      "whitespace": "Compare",
+      "ignore_case": false,
+      "ignore_blank_lines": false,
+      "ignore_eol": true,
+      "ignore_numbers": false,
+      "ignore_codepage": true,
+      "algorithm": "Myers",
+      "detect_moved": true,
+      "inline": "Word",
+      "line_filters_enabled": false,
+      "line_filters": [],
+      "substitutions_enabled": false,
+      "substitutions": [],
+      "ignore_comments": false,
+      "prettify": false,
+      "numeric_tolerance_enabled": false,
+      "numeric_tolerance": 0.001,
+      "block_filters_enabled": false,
+      "block_filters": []
+    },
+    "working_tree": "Captured file bytes; unreadable/excluded paths listed separately",
+    "captured_at": "CAPTURE-TIME"
+  },
+  "changes": [
+    {
+      "id": "aeff972f2bd31b0b371009e5cb0a4292e661115f4a44499c58625609257b3f55",
+      "path": "README.md",
+      "old_path": null,
+      "category": "unchanged",
+      "before_digest": "a4b3b6aa02ad086a5440690e645206647a49cf6c5f5f41ec10b6841693bc94cb",
+      "after_digest": "a4b3b6aa02ad086a5440690e645206647a49cf6c5f5f41ec10b6841693bc94cb",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": null,
+      "risk_flags": []
+    },
+    {
+      "id": "68c1dfd5e50cfc9089da0f22260d1aeddc160adf1d35bba00d82f340bb8a3f53",
+      "path": "c/limits.h",
+      "old_path": null,
+      "category": "modified",
+      "before_digest": "38352b080a97afbdaa86fcb4b7857cc510d5591f1b410d8fe2c6f3db2d0818ac",
+      "after_digest": "598ac5ac904ab82f4e97d2e91a308f3d69568b5563647a3f7a544da7de9988e1",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": null,
+      "risk_flags": []
+    },
+    {
+      "id": "122ea1ee689160037db1baf21634f69868c44c8e9d1b86ceaabf921fe21e7615",
+      "path": "c/main.c",
+      "old_path": null,
+      "category": "unchanged",
+      "before_digest": "347ff8824d595466a3bd3d3a5b04d16460ea5484169e23621dcf9f9c88dce08f",
+      "after_digest": "347ff8824d595466a3bd3d3a5b04d16460ea5484169e23621dcf9f9c88dce08f",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": null,
+      "risk_flags": []
+    },
+    {
+      "id": "b8226198f63ac3d9de23ea1b3b84c8e8c703d0a8fe85c595cfc4f227af215d23",
+      "path": "config.json",
+      "old_path": null,
+      "category": "modified",
+      "before_digest": "da14c7d5dd4e397313ac6dfd2a3ec9d6690af648a639a8be734ec1f91571ecbb",
+      "after_digest": "22655477f576eec2a15526c9bdaeef59ff90bf590251970434b63c2b99788430",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": {
+        "version": 1,
+        "format": "json",
+        "changes": [
+          {
+            "id": "636689b777c084c2889cbabb46a47e3d848ae3d97ea174f26d6607356cfc86fd",
+            "path": "$[\"db\"][\"timeout\"]",
+            "kind": "modified",
+            "before": "30",
+            "after": "60",
+            "spans": [
+              {
+                "bytes": {
+                  "start": 19,
+                  "end": 21
+                },
+                "line": 1
+              },
+              {
+                "bytes": {
+                  "start": 19,
+                  "end": 21
+                },
+                "line": 1
+              }
+            ],
+            "confidence": "parser_exact"
+          }
+        ],
+        "errors": [],
+        "policies": [
+          "Read-only; text comparison rules are not semantic path rules and are not applied.",
+          "JSON objects unordered; duplicate keys rejected. Arrays ordered: elements are compared by position, an exact reordering is reported as moves, and with an array matching key, object elements are paired by that member's unique scalar value. XML attributes unordered; child/mixed-content order and text whitespace significant; expanded namespace names; comments included. No external entities/DTDs.",
+          "TOML and YAML compare as JSON-shaped values: tables and mappings are unordered objects, numbers compare by value, and comments and formatting are ignored. YAML follows the YAML 1.2 core schema (yes/no/on/off are strings); aliases, several documents, complex keys and custom tags are refused, and input is limited to 4 MiB, 64 levels and 100,000 nodes."
+        ],
+        "options": {}
+      },
+      "risk_flags": []
+    },
+    {
+      "id": "00c1dcdc110cc60defe04a057d119d77934203cd2ec251d8ea299484d0f10d38",
+      "path": "guide.txt",
+      "old_path": "docs/guide.txt",
+      "category": "moved",
+      "before_digest": "c37e3726db202c844c5cffcaab912ceca2f8723a04d8c70abaae3ac9cbfb59c1",
+      "after_digest": "c37e3726db202c844c5cffcaab912ceca2f8723a04d8c70abaae3ac9cbfb59c1",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": null,
+      "risk_flags": []
+    },
+    {
+      "id": "b9ef4d9f896b0b79cab866055c68e59a6128dd631cfba878ee57b7534da2d2a8",
+      "path": "main.ini",
+      "old_path": "app.ini",
+      "similarity": 75,
+      "category": "renamed_modified",
+      "before_digest": "618f5d8a142e5726e90f9f08308a5f2c6f1a1a20135a697d01691c27aa91a62c",
+      "after_digest": "db24e76c549b6767e629a5eb7bb921d5b84198098e05562ea373844b12fd744b",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": null,
+      "risk_flags": []
+    },
+    {
+      "id": "f7440df45ac875b2359c81ca3ff2f29575cde12824744514896b8435117af032",
+      "path": "notes.txt",
+      "old_path": null,
+      "category": "unchanged",
+      "before_digest": "1cd263f1102656dd6b6cf1d626d1a96f9eba0406af3cb2a52560d473d4801052",
+      "after_digest": "1cd263f1102656dd6b6cf1d626d1a96f9eba0406af3cb2a52560d473d4801052",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": null,
+      "risk_flags": []
+    },
+    {
+      "id": "42ffe08436d8d49046023a3ada7b9accb29168be15dc911bd4849280eb797b9e",
+      "path": "py/helpers.py",
+      "old_path": null,
+      "category": "modified",
+      "before_digest": "763993317290e8f86683b5aa9c86f9e3255115075e6399c036fc53b11eb3414c",
+      "after_digest": "f33bd97ccd53d4c258072a44fc4c19686d5bf7a8bd70df32a3ffbcac1c58b916",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": null,
+      "risk_flags": []
+    },
+    {
+      "id": "e68634d3ce5c84c14e77b6d3150b00d9c35982142f52949d00cf15332355d75b",
+      "path": "py/main.py",
+      "old_path": null,
+      "category": "unchanged",
+      "before_digest": "402b6686b89ae125a57b79cfd503e78c3c28fbbcc1946eeac048fdf198c6f78e",
+      "after_digest": "402b6686b89ae125a57b79cfd503e78c3c28fbbcc1946eeac048fdf198c6f78e",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": null,
+      "risk_flags": []
+    },
+    {
+      "id": "73805a20bb608d58e8dc0b18b8c94fa0bf85d5aa1407b9a28c1663fb26fcfed9",
+      "path": "src/lib.rs",
+      "old_path": null,
+      "category": "unchanged",
+      "before_digest": "7f5dad3e98eac4ac9ac1ae4ca84f78aa346ca05cc9eab935df74fcbbca5b67c6",
+      "after_digest": "7f5dad3e98eac4ac9ac1ae4ca84f78aa346ca05cc9eab935df74fcbbca5b67c6",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": null,
+      "risk_flags": []
+    },
+    {
+      "id": "f6829e1991a98093f60c150f200bec804833e397ddf8c6ce8a79ba4ecd815b18",
+      "path": "src/main.rs",
+      "old_path": null,
+      "category": "unchanged",
+      "before_digest": "f6d6c799b83dcd33883e60016ff8b03011fef98a7e08d6729e9ff4164ddba113",
+      "after_digest": "f6d6c799b83dcd33883e60016ff8b03011fef98a7e08d6729e9ff4164ddba113",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": null,
+      "risk_flags": []
+    },
+    {
+      "id": "0be5aaed359652c105ac4dd87698454d8c5d93b28ac073ba14ca7f03728956be",
+      "path": "src/parser.rs",
+      "old_path": null,
+      "category": "modified",
+      "before_digest": "56f478cd29bb7393e1b1275e14d0e8d3312376b8d940e52fabca02b0b1d571cb",
+      "after_digest": "e0237eef6558b06d37d131d964561e8ed8bf4f7200f13dac3ae6291e5f6727c5",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": null,
+      "risk_flags": []
+    },
+    {
+      "id": "6ed7a58c29460cb1ea3bad488824ad2bc0fbcd2a7b616584984bfe52b9982b5e",
+      "path": "web/app.js",
+      "old_path": null,
+      "category": "unchanged",
+      "before_digest": "73869c3d4fc6f72dda2657b4af72a69beff70cf5e550c99aac9012e25d35f332",
+      "after_digest": "73869c3d4fc6f72dda2657b4af72a69beff70cf5e550c99aac9012e25d35f332",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": null,
+      "risk_flags": []
+    },
+    {
+      "id": "d682a3cc274a94fb5a95c28e08918f209b44df7cfda8577d71acdfd1914ca3fb",
+      "path": "web/util.js",
+      "old_path": null,
+      "category": "modified",
+      "before_digest": "e6935d5c3d7da8dc2b844ebd60eea0751480c1fe5e76cde83b577dd08c9df658",
+      "after_digest": "53b95622119f63d4c7fdc311fdee7f5adbf1e02050dca2a0c90bf23099d588d9",
+      "ignored_by_text_rules": false,
+      "conflict_marker_candidates": false,
+      "semantic": null,
+      "risk_flags": []
+    }
+  ],
+  "counts": {
+    "conflict_marker_candidates": 0,
+    "high_priority": 0,
+    "modified": 5,
+    "moved": 1,
+    "renamed_modified": 1,
+    "unchanged": 7
+  },
+  "excluded": [],
+  "limitations": [
+    "Exact unique-content moves are moves. Renames with edits are suspected from shared lines (at least 50%, same extension, text up to 256 KiB, a clear best match only) and can be split back into added and deleted files.",
+    "Heuristic priority flags do not validate release compatibility; source references are relative to captured baseline paths.",
+    "Files vs directories and excluded ancestors require manual review; unreadable paths are never counted identical."
+  ]
+}
