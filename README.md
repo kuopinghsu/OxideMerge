@@ -61,8 +61,10 @@ It supports text and folder merging, as well as binary, image and web page compa
 
 - **Binary files:** inspect byte differences in a side-by-side hexadecimal view.
 - **Images:** compare images side by side or use overlay, swipe, blink and difference views.
-- **Web pages:** compare the text a page shows after its scripts run, full page screenshots with
-  the text differences highlighted on the page, HTML source or downloaded resources.
+- **Web pages:** compare pages as formatted Markdown side by side (the default), with the
+  changed blocks and words highlighted, the text a page shows after its scripts run, full page
+  screenshots with the text differences highlighted on the page, HTML source or downloaded
+  resources. Local `.html` files open this way too.
 
 ### Save and share your work
 
@@ -320,6 +322,8 @@ Run `make help` to list all targets.
 - `make demo`, `make demo-text`, `make demo-3way`, `make demo-3way-merge`, `make demo-3way-folder`,
   `make demo-conflict`: open sample comparisons. `samples/README.md` lists every sample and the
   feature it shows; for web page compare, see `samples/web/README.md`.
+- `make demo-web`, `make demo-web-text`, `make demo-web-headings`, `make demo-web-tables`: open
+  the sample web page comparisons; the last three are for the *Formatted* mode.
 - `make install` or `make uninstall`: install to, or remove from, Cargo's binary directory
   (`~/.cargo/bin` by default).
 - `make shell-register`: install the executable and register file manager integration.

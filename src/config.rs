@@ -181,7 +181,7 @@ impl Default for Config {
             web_browser: String::new(),
             web_width: 1280,
             web_height: 1600,
-            web_mode: WebMode::Text,
+            web_mode: WebMode::Markdown,
             web_highlight: true,
             web_render: true,
             restore_session: true,

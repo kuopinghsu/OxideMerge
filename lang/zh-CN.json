@@ -634,6 +634,8 @@
   "web.resources": "资源树",
   "web.screenshot": "截图（可见区域）",
   "web.text": "文本",
+  "web.markdown": "格式化",
+  "web.md_identical": "页面的格式化内容相同",
   "web.full_screenshot": "整页",
   "web.highlight": "突出显示差异",
   "web.highlight_tip": "在截图上突出显示页面之间不同的文本",

@@ -96,7 +96,7 @@ impl BaselinePanel {
                     changed |= response.changed();
                     response.widget_info(|| {
                         let mut info =
-                            egui::WidgetInfo::text_edit(true, spec.as_str(), spec.as_str());
+                            egui::WidgetInfo::text_edit(true, spec.as_str(), spec.as_str(), "");
                         info.label = Some(label.into());
                         info
                     });

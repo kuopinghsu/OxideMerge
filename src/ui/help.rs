@@ -159,7 +159,7 @@ pub fn show(ctx: &egui::Context, settings: Option<&Path>) -> bool {
             i.consume_key(Modifiers::NONE, Key::F1)
                 || i.consume_key(Modifiers::NONE, Key::Questionmark)
         });
-    let screen = ctx.screen_rect();
+    let screen = ctx.content_rect();
     let side_by_side = screen.width() >= 2.0 * PANEL + GAP + 120.0;
     let content = if side_by_side {
         2.0 * PANEL + GAP
@@ -167,7 +167,7 @@ pub fn show(ctx: &egui::Context, settings: Option<&Path>) -> bool {
         PANEL
     };
     let max_height = (screen.height() - 160.0).max(200.0);
-    let response = egui::Modal::new(egui::Id::new("help_dialog"))
+    let response = egui::Modal::new(egui::Id::unique("help_dialog"))
         .frame(about::dialog_frame(ctx))
         .show(ctx, |ui| {
             // The scroll bar takes room of its own beside the panels; the title bar, laid out
@@ -338,8 +338,8 @@ mod tests {
         let mut wide = Vec::new();
         for _ in 0..2 {
             wide.clear();
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     for (inputs, action) in &texts {
                         let r = ui.scope(|ui| row(ui, inputs, action)).response;
                         if r.rect.width() > KEYS + GAP + ACTION + 0.5 {
@@ -347,7 +347,9 @@ mod tests {
                         }
                     }
                 });
-            });
+            })
+            .textures_delta
+            .clear();
         }
         assert!(wide.is_empty(), "{wide:?}");
     }

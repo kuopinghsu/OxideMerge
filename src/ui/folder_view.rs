@@ -192,6 +192,17 @@ fn only_side(it: &DirItem, n: usize) -> Option<usize> {
     }
 }
 
+/// A popup under the button `r` with the id `id`, opened and closed by clicking the button.
+fn popup_below<'a>(
+    r: &egui::Response,
+    id: egui::Id,
+    close: egui::PopupCloseBehavior,
+) -> egui::Popup<'a> {
+    egui::Popup::from_toggle_button_response(r)
+        .id(id)
+        .close_behavior(close)
+}
+
 /// Short status of a file for the list (the full sentence is its tooltip).
 fn short_status(it: &DirItem, n: usize) -> String {
     match it.status {
@@ -661,7 +672,7 @@ impl FolderView {
             stopped: false,
             failed: false,
             whole_tree: false,
-            id: egui::Id::new(("folderview", std::time::Instant::now())),
+            id: egui::Id::unique(("folderview", std::time::Instant::now())),
         };
         v.read_only = read_only;
         v.set_rules(cfg, cfg.rules.clone());
@@ -1486,7 +1497,7 @@ impl FolderView {
             return;
         };
         let mut open = true;
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         egui::Window::new(self.items[i].rel_path())
             .id(self.id.with("peek"))
             .open(&mut open)
@@ -1503,7 +1514,7 @@ impl FolderView {
                 );
                 ui.separator();
                 let font = FontId::monospace(12.5);
-                let row_h = ui.fonts(|f| f.row_height(&font));
+                let row_h = ui.fonts_mut(|f| f.row_height(&font));
                 ui.spacing_mut().item_spacing.y = 0.0;
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
@@ -1928,12 +1939,12 @@ impl FolderView {
         self.update_dock(ui.ctx(), cfg);
         let avail = ui.available_height();
         let rules = self.used_rules().to_string();
-        egui::TopBottomPanel::bottom(self.id.with("dock"))
+        egui::Panel::bottom(self.id.with("dock"))
             .resizable(true)
-            .default_height(avail * 0.45)
-            .height_range(100.0..=(avail - 120.0).max(100.0))
+            .default_size(avail * 0.45)
+            .size_range(100.0..=(avail - 120.0).max(100.0))
             .frame(egui::Frame::new())
-            .show_inside(ui, |ui| match &mut self.dock {
+            .show(ui, |ui| match &mut self.dock {
                 Some((_, Dock::Ready(Some(v), ..))) => {
                     v.set_options(&self.dopts);
                     v.ui(ui, cfg, c);
@@ -2209,7 +2220,7 @@ impl FolderView {
             // Measured again whenever the labels change, shorter or longer.
             let start_x = ui.cursor().min.x;
             let need_id = self.id.with("toolbar_width");
-            let labels = egui::Id::new((
+            let labels = egui::Id::unique((
                 &self.filter_spec,
                 &self.rules,
                 self.fopts.method.key(),
@@ -2346,10 +2357,7 @@ impl FolderView {
                     !compact,
                 )
                 .on_hover_text(tr("tip.click_change"));
-                if r.clicked() {
-                    ui.memory_mut(|m| m.toggle_popup(method_id));
-                }
-                egui::popup::popup_below_widget(ui, method_id, &r, close, |ui| {
+                popup_below(&r, method_id, close).show(|ui| {
                     widgets::menu_setup(ui);
                     for m in folder::CompareMethod::ALL {
                         let on = self.fopts.method == m;
@@ -2375,9 +2383,8 @@ impl FolderView {
                         .on_hover_text(tr("tip.rules"));
                 if r.clicked() {
                     self.rule_names = rules::list().into_iter().map(|s| s.name).collect();
-                    ui.memory_mut(|m| m.toggle_popup(rules_id));
                 }
-                egui::popup::popup_below_widget(ui, rules_id, &r, close, |ui| {
+                popup_below(&r, rules_id, close).show(|ui| {
                     widgets::menu_setup(ui);
                     if widgets::menu_check(ui, self.rules.is_empty(), tr("rules.none"), "")
                         .clicked()
@@ -2394,7 +2401,7 @@ impl FolderView {
                     }
                     ui.separator();
                     if ui.button(tr("cmd.edit_rules")).clicked() {
-                        ui.memory_mut(|m| m.close_popup());
+                        ui.close();
                         action = Some(FolderAction::EditRules);
                     }
                 });
@@ -2411,9 +2418,8 @@ impl FolderView {
                 let opened = r.clicked();
                 if opened {
                     self.filter_edit = Some(self.filter_spec.clone());
-                    ui.memory_mut(|m| m.toggle_popup(filter_id));
                 }
-                egui::popup::popup_below_widget(ui, filter_id, &r, close, |ui| {
+                popup_below(&r, filter_id, close).show(|ui| {
                     ui.set_min_width(widgets::menu_width(ui.ctx()).max(300.0));
                     let edit = self
                         .filter_edit
@@ -2452,7 +2458,7 @@ impl FolderView {
         });
         if let Some((method, recursive)) = new_options {
             if method != self.fopts.method {
-                ui.memory_mut(|m| m.close_popup());
+                egui::Popup::close_all(ui.ctx());
             }
             self.set_method(method);
             self.set_recursive(recursive);
@@ -2460,12 +2466,12 @@ impl FolderView {
             action = Some(FolderAction::OptionsChanged { method, recursive });
         }
         if let Some(name) = new_rules {
-            ui.memory_mut(|m| m.close_popup());
+            egui::Popup::close_all(ui.ctx());
             self.rules = name;
             refresh = true;
         }
         if let Some(spec) = new_filter.filter(|s| !s.trim().is_empty()) {
-            ui.memory_mut(|m| m.close_popup());
+            egui::Popup::close_all(ui.ctx());
             self.filter_edit = None;
             self.filter_spec = spec.clone();
             refresh = true;
@@ -3479,7 +3485,7 @@ impl FolderView {
                             menu = Some(MenuCmd::SelectPattern);
                         }
                         if menu.is_some() {
-                            ui.close_menu();
+                            ui.close();
                         }
                     });
                 });

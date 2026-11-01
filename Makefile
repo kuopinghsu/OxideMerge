@@ -33,6 +33,7 @@ DIST_DIR    := dist/$(DIST_NAME)
 .DEFAULT_GOAL := all
 
 .PHONY: all help build release run run-release demo demo-text demo-3way demo-3way-merge demo-3way-folder demo-conflict \
+        demo-web demo-web-text demo-web-headings demo-web-tables \
         test gui-smoke check check-platforms lint fmt fmt-check ci install uninstall shell-register shell-unregister \
         languages dist appimage user-guide clean
 
@@ -49,6 +50,10 @@ help:
 	@echo '  demo-3way-merge   3-way merge of the sample settings files, with conflicts'
 	@echo '  demo-3way-folder  3-way folder compare of samples/three/folders'
 	@echo '  demo-conflict     Resolve the sample Git conflict file'
+	@echo '  demo-web          Web page compare of the sample release notes pages'
+	@echo '  demo-web-text     Web page compare of complex text (try the Formatted mode)'
+	@echo '  demo-web-headings Web page compare of renamed, moved and re-levelled headings'
+	@echo '  demo-web-tables   Web page compare of tables: changed cells, rows and columns'
 	@echo '  test              Run the unit, window and command line tests'
 	@echo '  gui-smoke         Open real windows with the release build and check what they show'
 	@echo '  check             Type-check all targets'
@@ -98,6 +103,12 @@ demo-3way-folder:
 
 demo-conflict:
 	$(CARGO) run -- samples/three/conflict.txt
+
+demo-web:
+	$(CARGO) run -- samples/web/left.html samples/web/right.html
+
+demo-web-text demo-web-headings demo-web-tables: demo-web-%:
+	$(CARGO) run -- samples/web/formatted/$*/left.html samples/web/formatted/$*/right.html
 
 test:
 	$(CARGO) test

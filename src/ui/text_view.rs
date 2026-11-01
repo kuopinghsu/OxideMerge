@@ -695,7 +695,7 @@ impl TextView {
             unified_lines: None,
             unified_shown: (0.0, 0.0),
             shown_unified: false,
-            id: egui::Id::new(("textview", std::time::Instant::now())),
+            id: egui::Id::unique(("textview", std::time::Instant::now())),
         };
         v.apply_prettify();
         v.rediff();
@@ -3314,8 +3314,8 @@ impl TextView {
         self.tab_size = cfg.tab_size;
         self.ensure_layout(0, cfg.tab_size);
         let font = FontId::monospace(cfg.font_size);
-        let row_h = ui.fonts(|f| f.row_height(&font)) + theme::row_padding();
-        let char_w = ui.fonts(|f| f.glyph_width(&font, 'M'));
+        let row_h = ui.fonts_mut(|f| f.row_height(&font)) + theme::row_padding();
+        let char_w = ui.fonts_mut(|f| f.glyph_width(&font, 'M'));
         self.page_rows = ((ui.available_height() / row_h) as usize)
             .saturating_sub(1)
             .max(1);
@@ -3454,7 +3454,7 @@ impl TextView {
                         tab,
                         cfg.show_whitespace,
                     );
-                    let galley = ui.fonts(|f| f.layout_job(job));
+                    let galley = ui.fonts_mut(|f| f.layout_job(job));
                     let w = (gutter_w + 12.0 + galley.size().x).max(width);
                     let (rect, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
                     let painter = ui.painter();
@@ -3505,7 +3505,7 @@ impl TextView {
             })
         });
         let area = shown.inner;
-        self.unified_shown = (area.state.offset.y, area.inner_rect.height());
+        self.unified_shown = (area.state.clamped_offset().y, area.inner_rect.height());
         if let Some((row, pane)) = clicked {
             self.sel_anchor = None;
             self.cursor_row = Some(row);
@@ -4247,7 +4247,7 @@ impl TextView {
                 cfg.show_whitespace,
             );
             job.wrap.max_width = slot.width() - label_w - 4.0;
-            let galley = ui.fonts(|f| f.layout_job(job));
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
             painter.with_clip_rect(slot).galley(
                 slot.left_top() + vec2(label_w, 1.0),
                 galley,
@@ -4756,7 +4756,7 @@ impl TextView {
                                                     .clicked()
                                                 {
                                                     edit_cell = Some((p, r, column));
-                                                    ui.close_menu();
+                                                    ui.close();
                                                 }
                                                 for to in 0..n {
                                                     if to != p
@@ -4774,7 +4774,7 @@ impl TextView {
                                                             .clicked()
                                                     {
                                                         copy = Some((index, column, p, to));
-                                                        ui.close_menu();
+                                                        ui.close();
                                                     }
                                                 }
                                             }
@@ -5515,7 +5515,7 @@ impl TextView {
         self.tab_size = cfg.tab_size;
         let full = ui.available_rect_before_wrap();
         let detail_h = if cfg.show_line_detail {
-            let row = ui.fonts(|f| f.row_height(&FontId::monospace(cfg.font_size)));
+            let row = ui.fonts_mut(|f| f.row_height(&FontId::monospace(cfg.font_size)));
             (n as f32 * (2.0 * row + 6.0) + 6.0).min(full.height() / 2.0)
         } else {
             0.0
@@ -5541,8 +5541,8 @@ impl TextView {
         let body_top = avail.top() + header_h;
         let body_bottom = (avail.bottom() - footer_h - hbar_h).max(body_top + 20.0);
         let font = FontId::monospace(cfg.font_size);
-        let row_h = ui.fonts(|f| f.row_height(&font)) + theme::row_padding();
-        let char_w = ui.fonts(|f| f.glyph_width(&font, 'M'));
+        let row_h = ui.fonts_mut(|f| f.row_height(&font)) + theme::row_padding();
+        let char_w = ui.fonts_mut(|f| f.glyph_width(&font, 'M'));
         let body_h = body_bottom - body_top;
         let visible = body_h / row_h;
         self.page_rows = (visible as usize).saturating_sub(1).max(1);
@@ -5969,7 +5969,7 @@ impl TextView {
                         tab,
                         cfg.show_whitespace,
                     );
-                    let galley = ui.fonts(|f| f.layout_job(job));
+                    let galley = ui.fonts_mut(|f| f.layout_job(job));
                     let xs = if wrap {
                         segment_x(&galley, &wrap_starts(line, tab, wrap_cols))
                     } else {
@@ -6044,7 +6044,7 @@ impl TextView {
                 let fg = if hovered { c.ui.accent } else { c.ui.text_dim };
                 let label = trf("text.folded", &[("n", (e - s).to_string())]);
                 let small = FontId::proportional((cfg.font_size - 1.0).max(10.0));
-                let galley = ui.fonts(|f| f.layout_no_wrap(label, small, fg));
+                let galley = ui.fonts_mut(|f| f.layout_no_wrap(label, small, fg));
                 let icon = row_h - 6.0;
                 let w = icon + 6.0 + galley.size().x;
                 let x = (rect.center().x - w / 2.0).max(rect.left() + 8.0);
@@ -6169,9 +6169,7 @@ impl TextView {
                         .interact(rect, self.id.with(("merge", b, from, to)), Sense::click())
                         .on_hover_text(tr(key))
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    r.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tr(key))
-                    });
+                    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tr(key)));
                     if r.hovered() {
                         painter.rect_filled(rect, 3.0, c.ui.accent);
                     }
@@ -6310,10 +6308,8 @@ impl TextView {
                 } else {
                     "cmd.sync_point"
                 };
-                let sync = egui::Button::new(tr(sync_label))
-                    .shortcut_text(widgets::menu_shortcut(ui, &Cmd::SyncPoint.shown_key()));
-                if ui
-                    .add_enabled(self.diff.rows[r].line(p).is_some(), sync)
+                let enabled = self.diff.rows[r].line(p).is_some();
+                if widgets::menu_item(ui, enabled, tr(sync_label), &Cmd::SyncPoint.shown_key())
                     .clicked()
                 {
                     action = Some(MenuAction::SyncPoint(r, p));
@@ -6340,7 +6336,7 @@ impl TextView {
                     }
                 }
                 if action.is_some() {
-                    ui.close_menu();
+                    ui.close();
                 }
             });
         }
@@ -7144,9 +7140,11 @@ mod tests {
             theme::colors(false),
         );
         for _ in 0..2 {
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| v.unified_ui(ui, &cfg, &colors));
-            });
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| v.unified_ui(ui, &cfg, &colors));
+            })
+            .textures_delta
+            .clear();
         }
         assert!(text(&v).contains(&" same 13".to_string()));
     }
@@ -7167,9 +7165,11 @@ mod tests {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 400.0))),
                 ..Default::default()
             };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| v.ui(ui, &cfg, &colors));
-            });
+            ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| v.ui(ui, &cfg, &colors));
+            })
+            .textures_delta
+            .clear();
         };
         // The inline view takes the scroll to the first difference.
         for _ in 0..3 {
@@ -7201,9 +7201,11 @@ mod tests {
                 events,
                 ..Default::default()
             };
-            ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| v.unified_ui(ui, &cfg, &colors));
-            })
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| v.unified_ui(ui, &cfg, &colors));
+            });
+            out.textures_delta.clear();
+            out
         };
         frame(&mut v, vec![]);
         let copied = frame(&mut v, vec![egui::Event::Copy])

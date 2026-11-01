@@ -28,14 +28,17 @@ pub enum WebMode {
     /// Each whole page, top to bottom.
     FullScreenshot,
     Html,
-    #[default]
     Text,
+    /// The pages as Markdown, shown formatted.
+    #[default]
+    Markdown,
     Resources,
 }
 
 impl WebMode {
-    pub const ALL: [WebMode; 5] = [
+    pub const ALL: [WebMode; 6] = [
         WebMode::Text,
+        WebMode::Markdown,
         WebMode::FullScreenshot,
         WebMode::Screenshot,
         WebMode::Html,
@@ -52,6 +55,7 @@ impl WebMode {
             WebMode::FullScreenshot => "web.full_screenshot",
             WebMode::Html => "web.html",
             WebMode::Text => "web.text",
+            WebMode::Markdown => "web.markdown",
             WebMode::Resources => "web.resources",
         }
     }
@@ -76,6 +80,14 @@ pub fn is_url(s: &str) -> bool {
     let s = s.trim_start();
     let head = s.get(..8).unwrap_or(s).to_ascii_lowercase();
     head.starts_with("http://") || head.starts_with("https://")
+}
+
+/// Whether `paths` are all HTML files, which are compared as web pages unless asked otherwise.
+pub fn are_html_files(paths: &[PathBuf]) -> bool {
+    !paths.is_empty()
+        && paths
+            .iter()
+            .all(|p| matches!(text::extension(p).as_str(), "html" | "htm") && p.is_file())
 }
 
 /// The address to load for a path typed by the user: web addresses as they are, local files as `file:` URLs.
@@ -354,10 +366,10 @@ pub fn fetch_pages(urls: &[Url]) -> Result<Vec<Page>> {
 
 // ---------- HTML scanning ----------
 
-const SKIP_CONTENT: &[&str] = &[
+pub(super) const SKIP_CONTENT: &[&str] = &[
     "script", "style", "noscript", "template", "svg", "math", "head",
 ];
-const BLOCK: &[&str] = &[
+pub(super) const BLOCK: &[&str] = &[
     "address",
     "article",
     "aside",
@@ -404,7 +416,7 @@ const BLOCK: &[&str] = &[
     "ul",
 ];
 
-enum Token<'a> {
+pub(super) enum Token<'a> {
     Text(&'a str),
     /// Name (lower case), raw attribute text, closing tag.
     Tag(String, &'a str, bool),
@@ -412,7 +424,7 @@ enum Token<'a> {
 
 /// Minimal HTML tokenizer: text runs and tags. Comments, doctypes and the contents of raw-text
 /// elements (`script`, `style`, ...) and `head`/`svg` are skipped, apart from `<title>`.
-fn tokens(html: &str) -> Vec<Token<'_>> {
+pub(super) fn tokens(html: &str) -> Vec<Token<'_>> {
     tokens_in(html, false)
 }
 
@@ -517,7 +529,17 @@ fn tag_end(b: &[u8], from: usize) -> usize {
     b.len()
 }
 
-fn attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
+pub(super) fn attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
+    attr_entry(attrs, name).flatten()
+}
+
+/// Whether the attribute `name` is there, with or without a value.
+pub(super) fn has_attr(attrs: &str, name: &str) -> bool {
+    attr_entry(attrs, name).is_some()
+}
+
+/// The attribute `name`: `Some(None)` when it is there without a value.
+fn attr_entry<'a>(attrs: &'a str, name: &str) -> Option<Option<&'a str>> {
     let b = attrs.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -535,6 +557,8 @@ fn attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
         if i >= b.len() || b[i] != b'=' {
             if key.is_empty() {
                 i += 1;
+            } else if key.eq_ignore_ascii_case(name) {
+                return Some(None);
             }
             continue;
         }
@@ -556,13 +580,13 @@ fn attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
             &attrs[s..i]
         };
         if key.eq_ignore_ascii_case(name) {
-            return Some(value);
+            return Some(Some(value));
         }
     }
     None
 }
 
-fn entity(name: &str) -> Option<char> {
+pub(super) fn entity(name: &str) -> Option<char> {
     if let Some(num) = name.strip_prefix('#') {
         let code = match num.strip_prefix(['x', 'X']) {
             Some(hex) => u32::from_str_radix(hex, 16).ok()?,
@@ -1056,6 +1080,21 @@ mod tests {
         assert!(is_url("  HTTP://example.com/a"));
         assert!(!is_url("C:\\pages\\a.html"));
         assert!(!is_url("httpfoo"));
+    }
+
+    #[test]
+    fn html_files_are_web_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, "<p>x</p>").unwrap();
+            p
+        };
+        let (a, b, c) = (file("a.html"), file("B.HTM"), file("c.txt"));
+        assert!(are_html_files(&[a.clone(), b.clone()]));
+        assert!(!are_html_files(&[a.clone(), c]));
+        assert!(!are_html_files(&[a, dir.path().join("missing.html")]));
+        assert!(!are_html_files(&[]));
     }
 
     #[test]

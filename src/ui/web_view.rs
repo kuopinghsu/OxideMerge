@@ -1,17 +1,20 @@
 //! Web page compare: loads pages in the background, then shows them as screenshots of the visible
 //! area or the whole page with text differences highlighted (image view), rendered text or HTML
-//! (text view), or a downloaded resource tree (folder view). Text and HTML are taken from the
-//! page as the browser renders it when a browser is available, else from the page as downloaded.
+//! (text view), Markdown shown formatted, or a downloaded resource tree (folder view). Text, HTML
+//! and Markdown are taken from the page as the browser renders it when a browser is available,
+//! else from the page as downloaded.
 
 use crate::config::Config;
 use crate::core::filter::FltFilter;
 use crate::core::text::TextDoc;
 use crate::core::web::{self, Page, Progress, WebMode};
+use crate::core::web_markdown;
 use crate::core::web_render::{self, Capture, RenderOptions, Rendered, TextSource};
 use crate::i18n::{tr, trf};
 use crate::ui::app::Content;
 use crate::ui::folder_view::FolderView;
 use crate::ui::image_view::ImageView;
+use crate::ui::markdown_view::MarkdownView;
 use crate::ui::text_view::TextView;
 use crate::ui::widgets::{self, Icon, Outcome};
 use egui::Ui;
@@ -54,6 +57,8 @@ pub struct WebView {
     /// Whether screenshots show text differences highlighted.
     pub highlight: bool,
     pub inner: Option<Box<Content>>,
+    /// The pages as Markdown, shown formatted instead of an inner view.
+    pub formatted: Option<MarkdownView>,
     job: Option<Job>,
     error: Option<String>,
     shots: Option<tempfile::TempDir>,
@@ -129,6 +134,7 @@ impl WebView {
             downloaded_text: None,
             highlight: cfg.web_highlight,
             inner: None,
+            formatted: None,
             job: None,
             error: None,
             shots: None,
@@ -162,6 +168,7 @@ impl WebView {
             j.progress.abort.store(true, Ordering::Relaxed);
         }
         self.inner = None;
+        self.formatted = None;
         self.shots = None;
         self.error = None;
         self.note.clear();
@@ -178,7 +185,7 @@ impl WebView {
         let (w, h) = (cfg.web_width, cfg.web_height);
         let render_urls = self.urls.clone();
         match self.mode {
-            WebMode::Html | WebMode::Text => {
+            WebMode::Html | WebMode::Text | WebMode::Markdown => {
                 let key = render_key(cfg);
                 let rendered = self
                     .rendered
@@ -283,6 +290,38 @@ impl WebView {
 
     fn show(&mut self, loaded: Loaded, cfg: &Config, named: &[FltFilter]) -> anyhow::Result<()> {
         let content = match loaded {
+            Loaded::Pages(pages, failed) if self.mode == WebMode::Markdown => {
+                let blocks = pages
+                    .iter()
+                    .map(|p| web_markdown::html_to_blocks(&p.html, Some(&p.url)))
+                    .collect();
+                self.formatted = Some(MarkdownView::new(
+                    blocks,
+                    pages.iter().map(label).collect(),
+                    &cfg.comparison_options(),
+                ));
+                self.pages = Some(pages);
+                if let Some(e) = &failed {
+                    self.note = trf("web.fallback", &[("error", e.clone())]);
+                }
+                self.downloaded_text = Some(failed);
+                return Ok(());
+            }
+            Loaded::Rendered(rendered, None) if self.mode == WebMode::Markdown => {
+                let blocks = rendered
+                    .iter()
+                    .zip(&self.urls)
+                    .map(|(r, u)| r.markdown(Some(u)))
+                    .collect();
+                let labels = rendered
+                    .iter()
+                    .zip(&self.urls)
+                    .map(|(r, u)| rendered_label(r, u))
+                    .collect();
+                self.formatted = Some(MarkdownView::new(blocks, labels, &cfg.comparison_options()));
+                self.rendered = Some((render_key(cfg), rendered));
+                return Ok(());
+            }
             Loaded::Pages(pages, failed) => {
                 let html = self.mode == WebMode::Html;
                 let docs = pages
@@ -412,7 +451,7 @@ impl WebView {
         } else if self.error.is_some() {
             Some(Outcome::Error)
         } else {
-            inner
+            inner.or_else(|| self.formatted.as_ref().map(MarkdownView::outcome))
         }
     }
 
@@ -423,6 +462,7 @@ impl WebView {
         if let Some(e) = &self.error {
             return format!("{}: {e}", tr("status.error"));
         }
+        let inner = inner.or_else(|| self.formatted.as_ref().map(MarkdownView::status_line));
         match (inner, self.note.is_empty()) {
             (Some(s), true) => s,
             (Some(s), false) => format!("{s}  |  {}", self.note),
@@ -485,7 +525,7 @@ impl WebView {
             // Also repaints once after finishing, as the status bar was drawn before this poll.
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
-        if self.inner.is_some() {
+        if self.inner.is_some() || self.formatted.is_some() {
             return;
         }
         let pal = widgets::pal(ui);

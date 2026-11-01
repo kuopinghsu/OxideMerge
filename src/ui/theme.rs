@@ -367,7 +367,7 @@ pub fn apply(ctx: &egui::Context, dark: bool, look: Look) {
         egui::Theme::Light
     });
     let p = palette(dark);
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
 
     style.text_styles = [
         (TextStyle::Small, FontId::proportional(11.5)),
@@ -480,7 +480,7 @@ pub fn apply(ctx: &egui::Context, dark: bool, look: Look) {
     w.open.corner_radius = radius;
     w.open.expansion = 0.0;
 
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 #[cfg(test)]

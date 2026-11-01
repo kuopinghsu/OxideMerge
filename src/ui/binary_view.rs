@@ -63,7 +63,7 @@ impl BinaryView {
             redo: Vec::new(),
             status: String::new(),
             bulk_edit: None,
-            id: egui::Id::new(("binview", std::time::Instant::now())),
+            id: egui::Id::unique(("binview", std::time::Instant::now())),
             step_file: None,
             find: Default::default(),
             hit: None,
@@ -412,8 +412,8 @@ impl BinaryView {
         let top = avail.top() + header_h;
         let bottom = avail.bottom();
         let font = FontId::monospace(cfg.font_size);
-        let row_h = ui.fonts(|f| f.row_height(&font)) + 2.0;
-        let char_w = ui.fonts(|f| f.glyph_width(&font, '0'));
+        let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 2.0;
+        let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
         let visible = (bottom - top) / row_h;
         let max_len = self.data.iter().map(|d| d.len()).max().unwrap_or(0);
         let total = max_len.div_ceil(bpl).max(1);
@@ -560,10 +560,10 @@ impl BinaryView {
                 }
                 job.append(" ", 0.0, fmt(c.text, Color32::TRANSPARENT));
                 for s in ascii.sections.iter() {
-                    let t = &ascii.text[s.byte_range.clone()];
+                    let t = &ascii.text[s.byte_range.start.0..s.byte_range.end.0];
                     job.append(t, 0.0, s.format.clone());
                 }
-                let galley = ui.fonts(|f| f.layout_job(job));
+                let galley = ui.fonts_mut(|f| f.layout_job(job));
                 painter.galley(pos2(x0 + 4.0, y + 1.0), galley, c.text);
             }
             ui.painter().line_segment(
