@@ -118,6 +118,14 @@ pub fn palette_for(dark: bool, look: Look) -> Palette {
             p.accent = rgb(0x2B3AB8);
         }
     }
+    if look.color_blind {
+        // Blue and orange (Okabe-Ito) instead of green and red.
+        (p.success, p.danger) = if dark {
+            (rgb(0x56B4E9), rgb(0xE69F00))
+        } else {
+            (rgb(0x0072B2), rgb(0xD55E00))
+        };
+    }
     p
 }
 
@@ -211,7 +219,8 @@ pub fn colors_for(dark: bool, look: Look) -> Colors {
     let mut c = base_colors(dark, palette_for(dark, look));
     if look.color_blind {
         // Blue and orange (Okabe-Ito) instead of green and red; changes in purple, conflicts
-        // in yellow.
+        // in yellow, moved lines in bluish green and search hits in strong yellow, so none of
+        // them looks like another.
         if dark {
             (c.diff, c.diff_sel, c.inline, c.inline_sel) =
                 (rgb(0x33294A), rgb(0x45375F), rgb(0x5A4785), rgb(0x6E58A0));
@@ -219,21 +228,19 @@ pub fn colors_for(dark: bool, look: Look) -> Colors {
             (c.removed, c.removed_sel, c.inline_removed) =
                 (rgb(0x44301A), rgb(0x5A3F20), rgb(0x86592A));
             (c.conflict, c.conflict_sel, c.conflict_bar) =
-                (rgb(0x403C17), rgb(0x55501D), rgb(0xF0E442));
+                (rgb(0x3D4214), rgb(0x525919), rgb(0xF0E442));
             c.change_bar = rgb(0xB79CF0);
-            c.ui.success = rgb(0x56B4E9);
-            c.ui.danger = rgb(0xE69F00);
+            (c.moved, c.find_hit) = (rgb(0x173D35), rgb(0x8A7413));
         } else {
             (c.diff, c.diff_sel, c.inline, c.inline_sel) =
-                (rgb(0xF1EAFA), rgb(0xE3D6F5), rgb(0xD3C0F0), rgb(0xC2A8EA));
-            (c.added, c.added_sel, c.inline_added) = (rgb(0xE3EFFB), rgb(0xCFE3F7), rgb(0xA8CBF0));
+                (rgb(0xEBDDF9), rgb(0xDECBF4), rgb(0xD3C0F0), rgb(0xC2A8EA));
+            (c.added, c.added_sel, c.inline_added) = (rgb(0xDCEBFA), rgb(0xC6DDF5), rgb(0xA8CBF0));
             (c.removed, c.removed_sel, c.inline_removed) =
                 (rgb(0xFCEEDC), rgb(0xF9E0C0), rgb(0xF2C48A));
             (c.conflict, c.conflict_sel, c.conflict_bar) =
-                (rgb(0xFBF6D2), rgb(0xF5EDB0), rgb(0xA89200));
+                (rgb(0xFAF5C4), rgb(0xF5EDB0), rgb(0xA89200));
             c.change_bar = rgb(0x7B5BC4);
-            c.ui.success = rgb(0x0072B2);
-            c.ui.danger = rgb(0xD55E00);
+            (c.moved, c.find_hit) = (rgb(0xD8F0E6), rgb(0xFFD84A));
         }
     }
     if look.high_contrast {
@@ -244,8 +251,36 @@ pub fn colors_for(dark: bool, look: Look) -> Colors {
             &mut c.inline_sel,
             &mut c.inline_added,
             &mut c.inline_removed,
+            &mut c.change_bar,
+            &mut c.conflict_bar,
         ] {
             *col = more(*col, toward);
+        }
+        // Row colors further from the background they are drawn on.
+        let bg = c.text_bg;
+        let away = |col: Color32| {
+            let ch =
+                |a: u8, b: u8| (b as f32 + (a as f32 - b as f32) * 1.7).clamp(0.0, 255.0) as u8;
+            Color32::from_rgb(
+                ch(col.r(), bg.r()),
+                ch(col.g(), bg.g()),
+                ch(col.b(), bg.b()),
+            )
+        };
+        for col in [
+            &mut c.diff,
+            &mut c.diff_sel,
+            &mut c.added,
+            &mut c.added_sel,
+            &mut c.removed,
+            &mut c.removed_sel,
+            &mut c.missing,
+            &mut c.missing_sel,
+            &mut c.moved,
+            &mut c.conflict,
+            &mut c.conflict_sel,
+        ] {
+            *col = away(*col);
         }
         c.text = c.ui.text;
         c.gutter_text = c.ui.text_dim;
@@ -366,6 +401,11 @@ pub fn apply(ctx: &egui::Context, dark: bool, look: Look) {
 
     style.interaction.tooltip_delay = 0.35;
     style.animation_time = if look.reduce_motion { 0.0 } else { 1.0 / 12.0 };
+    style.scroll_animation = if look.reduce_motion {
+        egui::style::ScrollAnimation::none()
+    } else {
+        egui::style::ScrollAnimation::default()
+    };
 
     let v = &mut style.visuals;
     *v = if dark {
@@ -462,6 +502,40 @@ mod tests {
             assert!(cb.removed.r() > cb.removed.b() && cb.removed.g() > cb.removed.b());
             let plain = colors_for(dark, Look::default());
             assert!(plain.added.g() > plain.added.b());
+            // The status colors drawn from the palette change too.
+            let cb_palette = palette_for(
+                dark,
+                Look {
+                    color_blind: true,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                (cb_palette.success, cb_palette.danger),
+                (cb.ui.success, cb.ui.danger)
+            );
+            assert_ne!(cb_palette.success, plain.ui.success);
+            // No two of the colors that mark lines look alike.
+            let far = |a: Color32, b: Color32| {
+                let d = |x: u8, y: u8| (x as i32 - y as i32).abs();
+                d(a.r(), b.r()) + d(a.g(), b.g()) + d(a.b(), b.b()) > 24
+            };
+            let rows = [
+                cb.diff,
+                cb.added,
+                cb.removed,
+                cb.conflict,
+                cb.moved,
+                cb.missing,
+            ];
+            for (i, &a) in rows.iter().enumerate() {
+                for &b in &rows[i + 1..] {
+                    assert!(far(a, b), "{a:?} and {b:?} look alike");
+                }
+            }
+            for hl in [cb.inline, cb.inline_added, cb.inline_removed] {
+                assert!(far(cb.find_hit, hl), "search hits vanish on {hl:?}");
+            }
 
             let hc = palette_for(
                 dark,
@@ -473,6 +547,20 @@ mod tests {
             let base = palette_for(dark, Look::default());
             let contrast = |p: &Palette| (p.text.r() as i32 - p.surface.r() as i32).abs();
             assert!(contrast(&hc) > contrast(&base));
+            let hc_colors = colors_for(
+                dark,
+                Look {
+                    high_contrast: true,
+                    ..Default::default()
+                },
+            );
+            let off_bg = |c: &Colors, col: Color32| {
+                let d = |x: u8, y: u8| (x as i32 - y as i32).abs();
+                d(col.r(), c.text_bg.r()) + d(col.g(), c.text_bg.g()) + d(col.b(), c.text_bg.b())
+            };
+            for (a, b) in [(hc_colors.diff, plain.diff), (hc_colors.added, plain.added)] {
+                assert!(off_bg(&hc_colors, a) > off_bg(&plain, b));
+            }
         }
         let compact = Look {
             compact: true,

@@ -604,11 +604,18 @@ pub struct TextView {
     pub export_request: bool,
     /// Conflicts accepted as they are, by their content (see [`Self::block_key`]).
     resolved: HashSet<u64>,
+    /// See [`Self::open_conflicts`]: the layout generation, number of resolved conflicts and
+    /// of blocks it was worked out for, and whether each block is an open conflict.
+    open_cache: std::cell::RefCell<((u64, usize, usize), Vec<bool>)>,
     /// 2-way: both files in one column instead of side by side.
     pub unified: bool,
     /// The lines of the inline view, with the layout generation, folding and row count they
     /// were worked out for.
     unified_lines: Option<((u64, bool, usize), Vec<ULine>)>,
+    /// How far the inline view is scrolled and how tall it is, as last drawn.
+    unified_shown: (f32, f32),
+    /// Whether the inline view was the one last drawn.
+    shown_unified: bool,
     id: egui::Id,
 }
 
@@ -683,8 +690,11 @@ impl TextView {
             rule_request: None,
             export_request: false,
             resolved: HashSet::new(),
+            open_cache: Default::default(),
             unified: false,
             unified_lines: None,
+            unified_shown: (0.0, 0.0),
+            shown_unified: false,
             id: egui::Id::new(("textview", std::time::Instant::now())),
         };
         v.apply_prettify();
@@ -1294,18 +1304,31 @@ impl TextView {
         h.finish()
     }
 
+    /// Which blocks are open conflicts, worked out again once the differences or the resolved
+    /// conflicts change: hashing a large conflict for every row drawn is slow.
+    fn open_conflicts(&self) -> std::cell::Ref<'_, Vec<bool>> {
+        let key = (self.layout_gen, self.resolved.len(), self.diff.blocks.len());
+        if self.open_cache.borrow().0 != key {
+            let open = (0..self.diff.blocks.len())
+                .map(|b| {
+                    let blk = &self.diff.blocks[b];
+                    blk.kind == BlockKind::Conflict
+                        && !blk.ignored
+                        && (self.resolved.is_empty() || !self.resolved.contains(&self.block_key(b)))
+                })
+                .collect();
+            *self.open_cache.borrow_mut() = (key, open);
+        }
+        std::cell::Ref::map(self.open_cache.borrow(), |c| &c.1)
+    }
+
     /// A conflict that still needs a decision: not ignored and not marked resolved.
     pub fn is_open_conflict(&self, b: usize) -> bool {
-        let blk = &self.diff.blocks[b];
-        blk.kind == BlockKind::Conflict
-            && !blk.ignored
-            && !self.resolved.contains(&self.block_key(b))
+        self.open_conflicts().get(b).copied().unwrap_or(false)
     }
 
     pub fn conflicts_left(&self) -> usize {
-        (0..self.diff.blocks.len())
-            .filter(|&b| self.is_open_conflict(b))
-            .count()
+        self.open_conflicts().iter().filter(|&&o| o).count()
     }
 
     /// Accepts the middle of conflict `b` as it is, typically after editing it by hand.
@@ -2637,7 +2660,8 @@ impl TextView {
         if let Some((del, add)) = self.change_counts().filter(|&(d, a)| counts && d + a > 0) {
             s.push_str(&format!("  (+{add} −{del})"));
         }
-        if counts && self.n() == 3 {
+        // The merge bar shows the conflicts left, but not in table mode.
+        if (counts || self.table_mode) && self.n() == 3 {
             s.push_str(&format!(
                 "  |  {}: {}",
                 tr("label.conflicts"),
@@ -2915,8 +2939,9 @@ impl TextView {
                     Some(p) => format!("{} / {total}", p + 1),
                     None => format!("– / {total}"),
                 };
-                widgets::chip(ui, &counter, pal.text, pal.control)
-                    .on_hover_text(self.status_line());
+                widgets::chip(ui, &counter, pal.text, pal.control).on_hover_ui(|ui| {
+                    ui.label(self.status_line());
+                });
                 if let Some((del, add)) = self.change_counts().filter(|&(d, a)| d + a > 0) {
                     let (added, removed) = (format!("+{add}"), format!("−{del}"));
                     let diff = theme::colors(ui.visuals().dark_mode).ui;
@@ -3278,6 +3303,9 @@ impl TextView {
     /// 2-way: both files in one column, the removed lines of each difference above the added
     /// ones.
     fn unified_ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
+        // The inline view does not edit or select: finish what the side-by-side view started.
+        self.commit_pending_edit();
+        self.sel_anchor = None;
         let key = (self.layout_gen, self.collapse, self.diff.rows.len());
         let lines = match self.unified_lines.take() {
             Some((k, lines)) if k == key => lines,
@@ -3291,7 +3319,9 @@ impl TextView {
         self.page_rows = ((ui.available_height() / row_h) as usize)
             .saturating_sub(1)
             .max(1);
-        self.handle_keys(ui);
+        // `show_rows` adds the spacing between items to each row.
+        let step = row_h + ui.spacing().item_spacing.y;
+        let moved_to = self.unified_keys(ui, &lines, step);
         let digits = self
             .panes
             .iter()
@@ -3310,24 +3340,43 @@ impl TextView {
         let mut area = egui::ScrollArea::both()
             .id_salt(self.id.with("unified"))
             .auto_shrink(false);
-        if let Some(row) = self.scroll_to.take() {
-            let at = lines.iter().position(|l| match *l {
+        if let Some(i) = moved_to {
+            // Scroll only as far as needed to show the whole cursor line.
+            let (offset, height) = self.unified_shown;
+            let (top, bottom) = (i as f32 * step, (i + 1) as f32 * step);
+            if top < offset {
+                area = area.vertical_scroll_offset(top);
+            } else if bottom > offset + height {
+                area = area.vertical_scroll_offset((bottom - height).max(0.0));
+            }
+        } else if let Some(row) = self.scroll_to.take() {
+            let folded = lines.iter().find_map(|l| match *l {
+                ULine::Fold(lo, hi) if (lo..hi).contains(&row) => Some(lo),
+                _ => None,
+            });
+            if let Some(lo) = folded {
+                // Unfold first; the next frame scrolls to the row.
+                self.expanded.insert(lo);
+                self.layout_gen += 1;
+                self.scroll_to = Some(row);
+                ui.ctx().request_repaint();
+            } else if let Some(i) = lines.iter().position(|l| match *l {
                 ULine::Line { row: r, .. } => r >= row,
                 ULine::Fold(_, hi) => hi > row,
-            });
-            if let Some(i) = at {
-                let top = i as f32 * row_h - ui.available_height() / 3.0;
+            }) {
+                let top = i as f32 * step - ui.available_height() / 3.0;
                 area = area.vertical_scroll_offset(top.max(0.0));
             }
         }
         let mut clicked = None;
         let mut open = None;
         let tab = cfg.tab_size;
-        egui::Frame::new().fill(c.text_bg).show(ui, |ui| {
+        let cursor_at = self.unified_cursor(&lines);
+        let shown = egui::Frame::new().fill(c.text_bg).show(ui, |ui| {
             area.show_rows(ui, row_h, lines.len(), |ui, range| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let width = ui.available_width();
-                for line in &lines[range] {
+                for (i, line) in lines.iter().enumerate().take(range.end).skip(range.start) {
                     let (row, pane, change) = match *line {
                         ULine::Fold(lo, hi) => {
                             let size = vec2(width, row_h);
@@ -3360,8 +3409,10 @@ impl TextView {
                         }
                         ULine::Line { row, pane, change } => (row, pane, change),
                     };
+                    let Some(&r) = self.diff.rows.get(row) else {
+                        continue;
+                    };
                     self.ensure_inline(row);
-                    let r = self.diff.rows[row];
                     let Some(l) = r.line(pane) else { continue };
                     let text = &self.panes[pane].doc.lines[l];
                     let block = r.block().filter(|&b| !self.diff.blocks[b].ignored);
@@ -3439,7 +3490,7 @@ impl TextView {
                         if pane == 0 { c.ui.danger } else { c.ui.success },
                     );
                     painter.galley(pos2(gutter.right() + 6.0, rect.top() + 1.0), galley, fg);
-                    if self.cursor_row == Some(row) && (self.active_pane == pane || !change) {
+                    if cursor_at == Some(i) {
                         painter.rect_stroke(
                             rect.with_min_x(gutter.right()).shrink(0.5),
                             3.0,
@@ -3451,8 +3502,10 @@ impl TextView {
                         clicked = Some((row, pane));
                     }
                 }
-            });
+            })
         });
+        let area = shown.inner;
+        self.unified_shown = (area.state.offset.y, area.inner_rect.height());
         if let Some((row, pane)) = clicked {
             self.sel_anchor = None;
             self.cursor_row = Some(row);
@@ -3466,6 +3519,90 @@ impl TextView {
             self.layout_gen += 1;
         }
         self.unified_lines = Some((key, lines));
+    }
+
+    /// The index in `lines` of the cursor line: the one on the active side, or on the other
+    /// side when the cursor row has no line on the active one (going to an added line).
+    fn unified_cursor(&self, lines: &[ULine]) -> Option<usize> {
+        let at = self.cursor_row?;
+        let find = |any_side: bool| {
+            lines.iter().position(|l| {
+                matches!(*l, ULine::Line { row, pane, change }
+                    if row == at && (any_side || pane == self.active_pane || !change))
+            })
+        };
+        find(false).or_else(|| find(true))
+    }
+
+    /// The keys of the inline view, which only shows the files: the arrow keys, Page Up/Down
+    /// and Cmd+Home/End move the cursor along its lines, and Copy copies the cursor line.
+    /// Returns the index in `lines` the cursor moved to; `line_h` is the height of a line.
+    fn unified_keys(&mut self, ui: &Ui, lines: &[ULine], line_h: f32) -> Option<usize> {
+        if !self.keys_enabled
+            || widgets::typing(ui.ctx())
+            || self.goto.is_some()
+            || widgets::modal_open(ui.ctx())
+            || lines.is_empty()
+        {
+            return None;
+        }
+        if ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
+            if let Some(ULine::Line { row, pane, .. }) =
+                self.unified_cursor(lines).map(|i| lines[i])
+            {
+                if let Some(l) = self.diff.rows.get(row).and_then(|r| r.line(pane)) {
+                    ui.ctx().copy_text(self.panes[pane].doc.lines[l].clone());
+                }
+            }
+        }
+        let page = self.page_rows.max(1) as isize;
+        let step = ui.input_mut(|i| {
+            let mut step = None;
+            for (mods, key, d) in [
+                (Modifiers::NONE, Key::ArrowDown, 1),
+                (Modifiers::NONE, Key::ArrowUp, -1),
+                (Modifiers::NONE, Key::PageDown, page),
+                (Modifiers::NONE, Key::PageUp, -page),
+                (Modifiers::COMMAND, Key::Home, isize::MIN),
+                (Modifiers::COMMAND, Key::End, isize::MAX),
+            ] {
+                if i.consume_key(mods, key) {
+                    step = Some(d);
+                }
+            }
+            step
+        })?;
+        let last = lines.len() - 1;
+        let cur = self.unified_cursor(lines);
+        let target = match step {
+            isize::MIN => 0,
+            isize::MAX => last,
+            // Without a cursor, start on the first line shown.
+            d => match cur {
+                Some(i) => (i as isize + d).clamp(0, last as isize) as usize,
+                None => ((self.unified_shown.0 / line_h).ceil() as usize).min(last),
+            },
+        };
+        let is_line = |i: &usize| matches!(lines[*i], ULine::Line { .. });
+        let found = if step > 0 {
+            (target..=last)
+                .find(is_line)
+                .or_else(|| (0..target).rev().find(is_line))
+        } else {
+            (0..=target)
+                .rev()
+                .find(is_line)
+                .or_else(|| (target..=last).find(is_line))
+        }?;
+        let ULine::Line { row, pane, .. } = lines[found] else {
+            return None;
+        };
+        self.cursor_row = Some(row);
+        self.active_pane = pane;
+        self.cur_block = self.diff.rows[row]
+            .block()
+            .filter(|&b| !self.diff.blocks[b].ignored);
+        Some(found)
     }
 
     fn disk_changed_bar(&mut self, ui: &mut Ui) {
@@ -5363,7 +5500,13 @@ impl TextView {
             self.goto_window(ui);
             return;
         }
-        if self.unified && self.n() == 2 {
+        let unified = self.unified && self.n() == 2;
+        if unified != self.shown_unified {
+            // Each view keeps its own scroll position: show the cursor in the one switched to.
+            self.shown_unified = unified;
+            self.scroll_to = self.scroll_to.or(self.cursor_row);
+        }
+        if unified {
             self.unified_ui(ui, cfg, c);
             self.goto_window(ui);
             return;
@@ -6991,6 +7134,91 @@ mod tests {
         let fold = folded.iter().position(|l| l.starts_with('~')).unwrap();
         assert_eq!(folded[fold - 1], " same 3");
         assert_eq!(folded[fold..], ["~18"]);
+
+        // Going to a line folded away unfolds it.
+        v.unified = true;
+        v.goto_line(15);
+        let (ctx, cfg, colors) = (
+            egui::Context::default(),
+            Config::default(),
+            theme::colors(false),
+        );
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| v.unified_ui(ui, &cfg, &colors));
+            });
+        }
+        assert!(text(&v).contains(&" same 13".to_string()));
+    }
+
+    #[test]
+    fn switching_to_the_side_by_side_view_shows_the_cursor() {
+        let left: String = (1..=200).map(|i| format!("l{i}\n")).collect();
+        let mut v = two_way(&left, &left.replace("l150\n", "changed\n"));
+        v.unified = true;
+        let (ctx, cfg, colors) = (
+            egui::Context::default(),
+            Config::default(),
+            theme::colors(false),
+        );
+        crate::ui::fonts::setup(&ctx, "en");
+        let frame = |v: &mut TextView| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 400.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| v.ui(ui, &cfg, &colors));
+            });
+        };
+        // The inline view takes the scroll to the first difference.
+        for _ in 0..3 {
+            frame(&mut v);
+        }
+        assert_eq!((v.cursor_row, v.scroll_to), (Some(149), None));
+        v.unified = false;
+        for _ in 0..3 {
+            frame(&mut v);
+        }
+        assert!(v.scroll > 0.0);
+    }
+
+    #[test]
+    fn the_inline_cursor_moves_on_from_an_added_line() {
+        let left: String = (1..=60).map(|i| format!("l{i}\n")).collect();
+        let right = left.replace("l30\n", "l30\nadded\n");
+        let mut v = two_way(&left, &right);
+        v.unified = true;
+        // The first difference is on the right only, while the left side is active.
+        assert_eq!((v.cursor_row, v.active_pane), (Some(30), 0));
+        let (ctx, cfg, colors) = (
+            egui::Context::default(),
+            Config::default(),
+            theme::colors(false),
+        );
+        let frame = |v: &mut TextView, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| v.unified_ui(ui, &cfg, &colors));
+            })
+        };
+        frame(&mut v, vec![]);
+        let copied = frame(&mut v, vec![egui::Event::Copy])
+            .platform_output
+            .commands;
+        assert!(copied.contains(&egui::OutputCommand::CopyText("added".into())));
+        let down = egui::Event::Key {
+            key: Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        frame(&mut v, vec![down]);
+        assert_eq!(v.cursor_row, Some(31));
     }
 
     #[test]

@@ -9,8 +9,9 @@ section of this file as the release notes.
 
 - **Inline view** for 2-way text comparisons (the toolbar toggle next to word wrap, or *Inline
   view* in the command palette): one column with removed lines above the added lines that replace
-  them, old and new line numbers, and unchanged runs folded. Difference navigation and copying work
-  as in the side-by-side view; editing stays in the side-by-side view.
+  them, old and new line numbers, and unchanged runs folded. Moving between differences and copying
+  them to the other side work as in the side-by-side view; the arrow keys move along the lines and
+  Copy copies the current line. Editing and selecting lines stay in the side-by-side view.
 - **Merge bar** for 3-way comparisons: how many conflicts are left, *Next conflict* (wrapping
   around), *Take left*, *Take both*, *Take right*, *Mark resolved* for a conflict edited by hand,
   and *Save result*, which turns into the main button once no conflicts are left.
@@ -32,7 +33,11 @@ section of this file as the release notes.
   *Identical* items and show or hide each kind with a click, replacing the counts in the status
   bar. Folder rows say how many items differ inside them; a colored bar at the left edge marks
   differences instead of tinting whole rows; one *Modified* column shows the newest date and which
-  side is newer; the *Folder* column is left out in tree mode.
+  side is newer; the *Folder* column is left out in tree mode. In a 3-way comparison, an item
+  missing from one side only is counted, shown and hidden with *Different* rather than with
+  *Only in*, which now covers items on one side alone. Folders left uncompared by a comparison
+  that is not recursive count only in *All*, as in the console comparison, and stay listed
+  whichever kinds are hidden.
 - The text comparison toolbar is grouped into Differences, Merge, Edit and View, with captions in
   wide windows. The status bar no longer repeats the difference count shown in the toolbar.
 - The gutter between panes is calmer: the connector of the current difference stands out, the
@@ -72,10 +77,11 @@ section of this file as the release notes.
     closed `<details>` or `content-visibility: hidden` element is left out.
   - On macOS and Linux the browser no longer asks for keychain or password store access, its
     messages are limited in size, and its pipes are not passed on to other programs.
-- In windows narrower than about 1200 points, the folder comparison toolbar no longer draws its
-  filter, rules and method chips over *All differences* and *Export HTML*, and the image
-  comparison toolbar no longer runs past the window edge: both switch to icons and shorter chips.
-  Title bar icons that no longer fit are left out rather than overlapping the menus.
+- The folder comparison toolbar no longer draws its filter, rules and method chips over *All
+  differences* and *Export HTML* when they do not fit, and the image comparison toolbar no longer
+  runs past the window edge in windows narrower than about 1200 points: both switch to icons and
+  shorter chips. Title bar icons that no longer fit are left out rather than overlapping the
+  menus.
 
 ## [0.9.6] - 2026-10-30
 
