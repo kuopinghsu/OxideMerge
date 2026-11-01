@@ -45,9 +45,11 @@ It supports text and folder merging, as well as binary, image and web page compa
 
 ### Review and merge text
 
-- See changes side by side, including changes within a line and moved blocks of text.
+- See changes side by side or in a single inline column, including changes within a line and
+  moved blocks of text.
 - Copy individual changes between versions, edit text, and undo or redo edits.
-- Automatically merge compatible changes in a three-way comparison, then review conflicts.
+- Automatically merge compatible changes in a three-way comparison, then work through the
+  remaining conflicts with a merge bar that counts them down to a saved result.
 - Open files that contain version-control conflict markers and resolve them visually.
 - Focus on relevant changes with options to ignore whitespace, comments or selected patterns.
   Reusable comparison rules and numeric tolerance help with generated files and measurement data.
@@ -71,7 +73,8 @@ It supports text and folder merging, as well as binary, image and web page compa
   folder reviews with file contents, comparison settings, bookmarks and comments.
 - Use OxideMerge with Git, from the command line, or from your system's file manager.
 
-The interface includes light and dark themes and 10 built-in languages: English, Traditional
+The interface includes light and dark themes, a command search (⌘K / Ctrl+K), color-blind
+friendly, high-contrast, reduced-motion and compact options, and 10 built-in languages: English, Traditional
 Chinese, Simplified Chinese, Japanese, Korean, German, French, Spanish, Russian and Brazilian
 Portuguese. Additional translations can be loaded from language files.
 
@@ -124,8 +127,9 @@ For Chinese, Japanese and Korean text, install a suitable font such as Noto Sans
 
 ## Getting started
 
-Launch OxideMerge to open the start page. Select the files or folders to compare, drag them
-onto the window, or reopen a recent comparison.
+Launch OxideMerge to open the start page. Type or browse the files or folders to compare and
+click **Compare**, drag them onto the window, or reopen a recent comparison. On the first start,
+**Open a sample** shows a small sample comparison.
 
 ### Compare two files or folders
 
@@ -141,7 +145,8 @@ Open the files in this order: **your version, the common ancestor, the other ver
 The common ancestor is the original version that both versions were based on; it appears in
 the middle pane.
 
-Choose **Merge → Auto merge** to combine compatible changes. Review the remaining conflicts,
+Choose **Merge → Auto merge** to combine compatible changes. The merge bar above the panes counts
+the remaining conflicts; take the left, right or both changes, or edit and mark them resolved,
 then save the result. You can also open a single file that contains conflict markers.
 
 Three-way folder merging writes into the middle folder. **Merge → Auto merge folders...**

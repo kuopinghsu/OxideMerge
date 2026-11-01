@@ -82,6 +82,13 @@ pub struct Config {
     pub recent_filters: Vec<String>,
     pub syntax_highlight: bool,
     pub show_location_pane: bool,
+    /// Diff colors told apart without red and green: blue for added, orange for removed.
+    pub color_blind_colors: bool,
+    pub high_contrast: bool,
+    /// No animated scrolling or pulsing indicators.
+    pub reduce_motion: bool,
+    /// Tighter spacing and shorter rows.
+    pub compact_density: bool,
     pub text_layout: TextLayout,
     pub show_line_numbers: bool,
     pub show_whitespace: bool,
@@ -148,6 +155,10 @@ impl Default for Config {
             ],
             syntax_highlight: true,
             show_location_pane: true,
+            color_blind_colors: false,
+            high_contrast: false,
+            reduce_motion: false,
+            compact_density: false,
             text_layout: TextLayout::default(),
             show_line_numbers: true,
             show_whitespace: false,

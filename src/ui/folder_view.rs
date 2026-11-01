@@ -58,6 +58,12 @@ pub enum FolderAction {
     EditRules,
     /// Save the HTML report of the folder compare with the differences of every changed file.
     ExportHtml,
+    /// Show or hide each kind of item.
+    Show {
+        identical: bool,
+        different: bool,
+        unique: [bool; 3],
+    },
     /// Show the differences of every changed file in one tab.
     AllDiffs,
     SaveReview(bool),
@@ -74,9 +80,130 @@ enum Col {
     Name,
     Folder,
     Result,
-    Date(usize),
+    /// The newest modification time of the sides.
+    Modified,
     Size(usize),
     Ext,
+}
+
+/// Files counted by how they compare: below a folder, or in the whole comparison.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Tally {
+    identical: usize,
+    different: usize,
+    /// Files on one side only, by side.
+    only: [usize; 3],
+    errors: usize,
+}
+
+impl Tally {
+    fn add(&mut self, o: &Tally) {
+        self.identical += o.identical;
+        self.different += o.different;
+        for s in 0..3 {
+            self.only[s] += o.only[s];
+        }
+        self.errors += o.errors;
+    }
+
+    /// Each folder's files and, last, every file. Parents come before their children in
+    /// `items`, so one pass from the end adds each item into its parent after its own children.
+    fn of(items: &[DirItem], n: usize) -> (Vec<Tally>, Tally) {
+        let mut tallies = vec![Tally::default(); items.len()];
+        let mut total = Tally::default();
+        for i in (0..items.len()).rev() {
+            let it = &items[i];
+            if !it.is_dir {
+                let own = &mut tallies[i];
+                match it.status {
+                    CmpStatus::Identical => own.identical = 1,
+                    CmpStatus::Different => own.different = 1,
+                    CmpStatus::Error => own.errors = 1,
+                    CmpStatus::Unique => {
+                        let present: Vec<usize> = (0..n).filter(|&s| it.exists[s]).collect();
+                        match present[..] {
+                            [s] => own.only[s] = 1,
+                            _ => own.different = 1,
+                        }
+                    }
+                    CmpStatus::NotCompared | CmpStatus::Pending => {}
+                }
+                total.add(&tallies[i]);
+            }
+            if let Some(p) = it.parent.filter(|&p| p < i) {
+                let own = tallies[i];
+                tallies[p].add(&own);
+            }
+        }
+        (tallies, total)
+    }
+
+    /// "3 different · 1 only in Left", or `None` when nothing below differs.
+    fn summary(&self, n: usize) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.different > 0 {
+            parts.push(trf(
+                "folder.n_different",
+                &[("n", self.different.to_string())],
+            ));
+        }
+        for s in 0..n {
+            if self.only[s] > 0 {
+                parts.push(trf(
+                    "folder.n_only",
+                    &[
+                        ("n", self.only[s].to_string()),
+                        ("side", side_name(s, n).to_string()),
+                    ],
+                ));
+            }
+        }
+        if self.errors > 0 {
+            let key = if self.errors == 1 {
+                "folder.n_errors_one"
+            } else {
+                "folder.n_errors"
+            };
+            parts.push(trf(key, &[("n", self.errors.to_string())]));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
+/// Short status of a file for the list (the full sentence is its tooltip).
+fn short_status(it: &DirItem, n: usize) -> String {
+    match it.status {
+        CmpStatus::Identical => tr("view.identical").into(),
+        CmpStatus::Different if n == 2 || it.diff_side.is_none() => tr("view.different").into(),
+        CmpStatus::Error => tr("status.error").into(),
+        _ => status_text(it, n),
+    }
+}
+
+/// The newest modification time of the sides an item is on.
+fn newest(it: &DirItem) -> Option<SystemTime> {
+    it.mtime.iter().flatten().max().copied()
+}
+
+/// The side alone in having the newest modification time, when the sides differ by more than
+/// two seconds (the precision of some file systems).
+fn newer_side(it: &DirItem, n: usize) -> Option<usize> {
+    let times: Vec<(usize, SystemTime)> =
+        (0..n).filter_map(|s| it.mtime[s].map(|t| (s, t))).collect();
+    if times.len() < 2 {
+        return None;
+    }
+    let max = times.iter().map(|&(_, t)| t).max()?;
+    let close = |t: SystemTime| max.duration_since(t).unwrap_or_default() <= Duration::from_secs(2);
+    let newest: Vec<usize> = times
+        .iter()
+        .filter(|&&(_, t)| close(t))
+        .map(|&(s, _)| s)
+        .collect();
+    match newest[..] {
+        [s] => Some(s),
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
@@ -116,7 +243,18 @@ struct Running {
     updated: Instant,
 }
 
+/// The panels of the side drawer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FolderPanel {
+    Review,
+    Verification,
+    Baselines,
+}
+
 pub struct FolderView {
+    /// Whether the side drawer is open, and the panel it shows.
+    pub drawer_open: bool,
+    pub drawer_tab: FolderPanel,
     merge_verification: Box<super::merge_verification::FolderVerification>,
     pub workspace: crate::core::review_state::Workspace,
     pub baseline_panel: Box<super::baseline_panel::BaselinePanel>,
@@ -148,6 +286,9 @@ pub struct FolderView {
     cursor: Option<usize>,
     sort: (Col, bool),
     visible: Vec<usize>,
+    /// Each item's files by how they compare, and every file's, as of the last rebuild.
+    tallies: Vec<Tally>,
+    total: Tally,
     view_key: Option<(bool, bool, bool, [bool; 3])>,
     /// Time spent on the last list refresh; a running comparison refreshes less often when the
     /// list is expensive to rebuild.
@@ -404,6 +545,8 @@ impl FolderView {
             .map(|r| temps.iter().any(|t| r.starts_with(t.path())))
             .collect();
         let mut v = FolderView {
+            drawer_open: false,
+            drawer_tab: FolderPanel::Review,
             merge_verification: Default::default(),
             workspace: Default::default(),
             baseline_panel: Default::default(),
@@ -432,6 +575,8 @@ impl FolderView {
             cursor: None,
             sort: (Col::Name, true),
             visible: Vec::new(),
+            tallies: Vec::new(),
+            total: Tally::default(),
             view_key: None,
             view_cost: Duration::ZERO,
             status: String::new(),
@@ -840,7 +985,7 @@ impl FolderView {
             Col::Result => status_text(ia, self.n())
                 .cmp(&status_text(ib, self.n()))
                 .then_with(name),
-            Col::Date(s) => ia.mtime[s].cmp(&ib.mtime[s]).then_with(name),
+            Col::Modified => newest(ia).cmp(&newest(ib)).then_with(name),
             Col::Size(s) => ia.size[s].cmp(&ib.size[s]).then_with(name),
             Col::Ext => cmp_ci(sort_ext(ia), sort_ext(ib)).then_with(name),
         };
@@ -888,6 +1033,7 @@ impl FolderView {
     }
 
     fn rebuild_visible(&mut self, cfg: &Config) {
+        (self.tallies, self.total) = Tally::of(&self.items, self.n());
         self.visible = self.display_order(cfg, false);
         if self.review_filter.is_some() || self.review_stale_only {
             self.visible = self
@@ -1887,6 +2033,28 @@ impl FolderView {
         s
     }
 
+    /// The status line for the status bar: the chips above the list show the counts.
+    pub fn status_detail(&self) -> String {
+        if self.running.is_some() {
+            return self.status_line();
+        }
+        let mut parts = Vec::new();
+        if let Some(e) = self.elapsed {
+            let secs = format!("{:.2}", e.as_secs_f32());
+            parts.push(trf("folder.compared_in", &[("s", secs)]));
+        }
+        if self.selected.len() > 1 {
+            parts.push(format!("{} {}", self.selected.len(), tr("label.selected")));
+        }
+        if !self.status.is_empty() {
+            parts.push(self.status.clone());
+        }
+        if parts.is_empty() {
+            return self.status_line();
+        }
+        parts.join("  |  ")
+    }
+
     pub fn expand_all(&mut self, expand: bool) {
         if expand {
             self.expanded = self
@@ -1917,6 +2085,9 @@ impl FolderView {
             widgets::toolbar(ui, |ui| {
                 ui.label(tr("review.snapshot"));
                 ui.label(format!("{}: {}", tr("label.filter"), self.filter_spec));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    widgets::drawer_toggle(ui, &mut self.drawer_open);
+                });
             });
             ui.horizontal_wrapped(|ui| {
                 for label in &self.display_roots {
@@ -1934,6 +2105,14 @@ impl FolderView {
         let sel = !self.selected.is_empty();
         widgets::toolbar(ui, |ui| {
             let key = widgets::with_key;
+            let compact = ui.available_width() < 1180.0;
+            let labelled = |ui: &mut Ui, icon: Icon, label: &str| {
+                if compact {
+                    widgets::icon_button(ui, icon, label)
+                } else {
+                    widgets::ghost_icon_button(ui, icon, label)
+                }
+            };
             if widgets::ghost_icon_button(ui, Icon::Refresh, tr("cmd.refresh"))
                 .on_hover_text("F5")
                 .clicked()
@@ -2001,7 +2180,7 @@ impl FolderView {
             let ready = self.running.is_none();
             if ui
                 .add_enabled_ui(ready, |ui| {
-                    widgets::ghost_icon_button(ui, Icon::Compare, tr("cmd.all_diffs"))
+                    labelled(ui, Icon::Compare, tr("cmd.all_diffs"))
                         .on_hover_text(tr("diffs.tip"))
                         .on_disabled_hover_text(tr("msg.comparing"))
                 })
@@ -2010,21 +2189,26 @@ impl FolderView {
             {
                 action = Some(FolderAction::AllDiffs);
             }
-            if widgets::ghost_icon_button(ui, Icon::Export, tr("btn.export_html"))
+            if labelled(ui, Icon::Export, tr("btn.export_html"))
                 .on_hover_text(Cmd::ExportHtml.tip())
                 .clicked()
             {
                 action = Some(FolderAction::ExportHtml);
             }
+            let left_end = ui.cursor().min.x + 4.0;
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
+                let mut clip = ui.clip_rect();
+                clip.min.x = clip.min.x.max(left_end);
+                ui.set_clip_rect(clip);
                 let close = egui::PopupCloseBehavior::CloseOnClickOutside;
+                widgets::drawer_toggle(ui, &mut self.drawer_open);
 
                 let search = widgets::search_edit(
                     ui,
                     &mut self.search,
                     &key(tr("folder.search_hint"), Cmd::Find.key()),
-                    170.0,
+                    if compact { 120.0 } else { 170.0 },
                 );
                 if std::mem::take(&mut self.focus_search) {
                     search.request_focus();
@@ -2043,6 +2227,7 @@ impl FolderView {
                     Icon::Method,
                     tr("label.method"),
                     tr(self.fopts.method.key()),
+                    !compact,
                 )
                 .on_hover_text(tr("tip.click_change"));
                 if r.clicked() {
@@ -2069,8 +2254,9 @@ impl FolderView {
                 } else {
                     rules::display_name(&self.rules)
                 };
-                let r = widgets::chip_button(ui, Icon::Settings, tr("label.rules"), shown)
-                    .on_hover_text(tr("tip.rules"));
+                let r =
+                    widgets::chip_button(ui, Icon::Settings, tr("label.rules"), shown, !compact)
+                        .on_hover_text(tr("tip.rules"));
                 if r.clicked() {
                     self.rule_names = rules::list().into_iter().map(|s| s.name).collect();
                     ui.memory_mut(|m| m.toggle_popup(rules_id));
@@ -2098,9 +2284,14 @@ impl FolderView {
                 });
 
                 let filter_id = self.id.with("filter_popup");
-                let r =
-                    widgets::chip_button(ui, Icon::Filter, tr("label.filter"), &self.filter_spec)
-                        .on_hover_text(tr("tip.click_change"));
+                let r = widgets::chip_button(
+                    ui,
+                    Icon::Filter,
+                    tr("label.filter"),
+                    &self.filter_spec,
+                    !compact,
+                )
+                .on_hover_text(tr("tip.click_change"));
                 let opened = r.clicked();
                 if opened {
                     self.filter_edit = Some(self.filter_spec.clone());
@@ -2184,6 +2375,9 @@ impl FolderView {
             rect.bottom() - 0.5,
             Stroke::new(1.0_f32, pal.border),
         );
+        if action.is_none() {
+            action = self.status_chips(ui, cfg);
+        }
         if let Some(r) = &self.running {
             let done = r.progress.done.load(Ordering::Relaxed);
             let total = r.progress.total.load(Ordering::Relaxed);
@@ -2229,6 +2423,60 @@ impl FolderView {
             }
         }
         (refresh, action)
+    }
+
+    /// Chips that show or hide each kind of item, with how many files are of that kind.
+    fn status_chips(&self, ui: &mut Ui, cfg: &Config) -> Option<FolderAction> {
+        let n = self.n();
+        let t = &self.total;
+        let unique_slot = |s: usize| if n == 2 && s == 1 { 2 } else { s };
+        let mut identical = cfg.show_identical;
+        let mut different = cfg.show_different;
+        let mut unique = cfg.show_unique;
+        let all_on = identical && different && (0..n).all(|s| unique[unique_slot(s)]);
+        let mut all = all_on;
+        let mut changed = false;
+        egui::Frame::new()
+            .inner_margin(Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let count = |label: &str, k: usize| format!("{label}  {k}");
+                    let files = t.identical + t.different + t.errors + t.only.iter().sum::<usize>();
+                    let mut chip = |ui: &mut Ui, on: &mut bool, label: String| {
+                        let r = widgets::toggle_button(ui, on, &label, &label);
+                        changed |= r.clicked();
+                        r
+                    };
+                    chip(ui, &mut all, count(tr("analysis.all"), files));
+                    widgets::toolbar_sep(ui);
+                    chip(
+                        ui,
+                        &mut different,
+                        count(tr("view.different"), t.different + t.errors),
+                    );
+                    for s in 0..n {
+                        let label = trf("stats.only_in", &[("side", side_name(s, n).into())]);
+                        chip(ui, &mut unique[unique_slot(s)], count(&label, t.only[s]));
+                    }
+                    chip(ui, &mut identical, count(tr("view.identical"), t.identical));
+                });
+            });
+        if !changed {
+            return None;
+        }
+        if all != all_on {
+            // "All" turns everything on; clicked while everything is on, it keeps only the
+            // differences.
+            identical = !all_on;
+            different = true;
+            unique = [true; 3];
+        }
+        Some(FolderAction::Show {
+            identical,
+            different,
+            unique,
+        })
     }
 
     /// Shown instead of the list when a finished comparison has nothing to list.
@@ -2309,7 +2557,7 @@ impl FolderView {
         action
     }
 
-    fn review_ui(&mut self, ui: &mut Ui, cfg: &Config) {
+    fn review_ui(&mut self, ui: Option<&mut Ui>, cfg: &Config) {
         use crate::core::{
             analysis,
             review_state::{Decision, State},
@@ -2376,176 +2624,222 @@ impl FolderView {
                 self.view_key = None;
             }
         }
-        egui::CollapsingHeader::new(tr("workspace.title"))
-            .id_salt(self.id.with("review_workspace"))
-            .show(ui, |ui| {
-                if let Some(task) = &self.review_fingerprints {
-                    task.status(ui);
+        let Some(ui) = ui else { return };
+        {
+            if let Some(task) = &self.review_fingerprints {
+                task.status(ui);
+            }
+            let summary = self.workspace.summary(
+                self.items
+                    .iter()
+                    .filter(|i| !i.is_dir)
+                    .map(|i| i.rel_path()),
+            );
+            ui.label(format!(
+                "{}: {} · {}: {} · {}: {} · {}: {}",
+                tr("workspace.unreviewed"),
+                summary.unreviewed,
+                tr("workspace.accepted"),
+                summary.accepted + summary.resolved,
+                tr("workspace.needs_action"),
+                summary.needs_action,
+                tr("workspace.stale"),
+                summary.stale
+            ));
+            ui.horizontal_wrapped(|ui| {
+                let mut changed = ui
+                    .selectable_value(&mut self.review_filter, None, tr("analysis.all"))
+                    .changed();
+                for state in State::ALL {
+                    changed |= ui
+                        .selectable_value(&mut self.review_filter, Some(state), tr(state.key()))
+                        .changed();
                 }
-                let summary = self.workspace.summary(
-                    self.items
+                changed |= ui
+                    .checkbox(&mut self.review_stale_only, tr("workspace.stale"))
+                    .changed();
+                if changed {
+                    self.view_key = None;
+                }
+                if ui.button(tr("workspace.next")).clicked() {
+                    let current = self.workspace.current.as_deref();
+                    let mut candidates: Vec<_> = self
+                        .items
                         .iter()
-                        .filter(|i| !i.is_dir)
-                        .map(|i| i.rel_path()),
-                );
-                ui.label(format!(
-                    "{}: {} · {}: {} · {}: {} · {}: {}",
-                    tr("workspace.unreviewed"),
-                    summary.unreviewed,
-                    tr("workspace.accepted"),
-                    summary.accepted + summary.resolved,
-                    tr("workspace.needs_action"),
-                    summary.needs_action,
-                    tr("workspace.stale"),
-                    summary.stale
-                ));
-                ui.horizontal_wrapped(|ui| {
-                    let mut changed = ui
-                        .selectable_value(&mut self.review_filter, None, tr("analysis.all"))
-                        .changed();
-                    for state in State::ALL {
-                        changed |= ui
-                            .selectable_value(&mut self.review_filter, Some(state), tr(state.key()))
-                            .changed();
-                    }
-                    changed |= ui
-                        .checkbox(&mut self.review_stale_only, tr("workspace.stale"))
-                        .changed();
-                    if changed {
-                        self.view_key = None;
-                    }
-                    if ui.button(tr("workspace.next")).clicked() {
-                        let current = self.workspace.current.as_deref();
-                        let mut candidates: Vec<_> = self
-                            .items
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, i)| !i.is_dir)
-                            .filter(|(_, i)| {
-                                self.workspace
-                                    .entries
-                                    .get(&i.rel_path())
-                                    .is_none_or(|d| d.state == State::Unreviewed || d.stale)
-                            })
-                            .map(|(i, item)| (item.rel_path(), i))
-                            .collect();
-                        candidates.sort();
-                        if let Some((path, i)) = candidates
-                            .iter()
-                            .find(|(p, _)| current.is_none_or(|c| p.as_str() > c))
-                            .or(candidates.first())
-                            .cloned()
-                        {
-                            self.review_filter = None;
-                            self.review_stale_only = false;
-                            self.view_key = None;
-                            self.workspace.current = Some(path);
-                            self.rebuild_visible(cfg);
-                            if let Some(v) = self.visible.iter().position(|&x| x == i) {
-                                self.cursor = Some(v);
-                                self.selected.clear();
-                                self.selected.insert(i);
-                                self.scroll_to = Some(v);
-                            }
-                        }
-                    }
-                    if ui.button(tr("workspace.export")).clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name("review-summary.json")
-                            .save_file()
-                        {
-                            if let Err(e) = analysis::report(&summary, &path, &self.roots) {
-                                self.status = e.to_string();
-                            }
-                        }
-                    }
-                    if ui.button(tr("workspace.update_inputs")).clicked() {
-                        let mut roots = Vec::new();
-                        for _ in 0..self.n() {
-                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                roots.push(path);
-                            } else {
-                                break;
-                            }
-                        }
-                        if roots.len() == self.n() {
-                            self.display_roots =
-                                roots.iter().map(|p| p.display().to_string()).collect();
-                            self.roots = roots;
-                            self.read_only = vec![true; self.n()];
-                            self.start_compare();
-                        }
-                    }
-                });
-                let selected = self
-                    .cursor
-                    .and_then(|v| self.visible.get(v))
-                    .copied()
-                    .or_else(|| self.selected.iter().next().copied());
-                if let Some(i) = selected.filter(|&i| !self.items[i].is_dir) {
-                    let path = self.items[i].rel_path();
-                    self.workspace.current = Some(path.clone());
-                    ui.label(&path);
-                    let mut decision = self
-                        .workspace
-                        .entries
-                        .get(&path)
+                        .enumerate()
+                        .filter(|(_, i)| !i.is_dir)
+                        .filter(|(_, i)| {
+                            self.workspace
+                                .entries
+                                .get(&i.rel_path())
+                                .is_none_or(|d| d.state == State::Unreviewed || d.stale)
+                        })
+                        .map(|(i, item)| (item.rel_path(), i))
+                        .collect();
+                    candidates.sort();
+                    if let Some((path, i)) = candidates
+                        .iter()
+                        .find(|(p, _)| current.is_none_or(|c| p.as_str() > c))
+                        .or(candidates.first())
                         .cloned()
-                        .unwrap_or_default();
-                    let mut changed = false;
-                    ui.horizontal(|ui| {
-                        for state in State::ALL {
-                            if ui
-                                .selectable_label(decision.state == state, tr(state.key()))
-                                .clicked()
-                            {
-                                match crate::core::review_state::fingerprint(
-                                    &path,
-                                    &self.roots,
-                                    &self.dopts,
-                                ) {
-                                    Ok(fingerprint) => {
-                                        decision.id = analysis::identity(&(&path, &fingerprint));
-                                        decision.fingerprint = fingerprint;
-                                        decision.state = state;
-                                        decision.stale = false;
-                                        changed = true;
-                                    }
-                                    Err(e) => self.status = e.to_string(),
-                                }
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(tr("workspace.reviewer"));
-                        changed |= ui
-                            .add(egui::TextEdit::singleline(&mut decision.reviewer).char_limit(64))
-                            .changed();
-                    });
-                    changed |= ui
-                        .add(
-                            egui::TextEdit::multiline(&mut decision.comment)
-                                .hint_text(tr("workspace.comment"))
-                                .char_limit(4096)
-                                .desired_rows(2),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::TextEdit::singleline(&mut decision.rationale)
-                                .hint_text(tr("workspace.rationale"))
-                                .char_limit(4096),
-                        )
-                        .changed();
-                    if decision.stale {
-                        ui.colored_label(ui.visuals().warn_fg_color, tr("workspace.stale"));
-                    }
-                    if changed {
-                        self.workspace.entries.insert(path, Decision { ..decision });
+                    {
+                        self.review_filter = None;
+                        self.review_stale_only = false;
                         self.view_key = None;
+                        self.workspace.current = Some(path);
+                        self.rebuild_visible(cfg);
+                        if let Some(v) = self.visible.iter().position(|&x| x == i) {
+                            self.cursor = Some(v);
+                            self.selected.clear();
+                            self.selected.insert(i);
+                            self.scroll_to = Some(v);
+                        }
+                    }
+                }
+                if ui.button(tr("workspace.export")).clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name("review-summary.json")
+                        .save_file()
+                    {
+                        if let Err(e) = analysis::report(&summary, &path, &self.roots) {
+                            self.status = e.to_string();
+                        }
+                    }
+                }
+                if ui.button(tr("workspace.update_inputs")).clicked() {
+                    let mut roots = Vec::new();
+                    for _ in 0..self.n() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            roots.push(path);
+                        } else {
+                            break;
+                        }
+                    }
+                    if roots.len() == self.n() {
+                        self.display_roots =
+                            roots.iter().map(|p| p.display().to_string()).collect();
+                        self.roots = roots;
+                        self.read_only = vec![true; self.n()];
+                        self.start_compare();
                     }
                 }
             });
+            let selected = self
+                .cursor
+                .and_then(|v| self.visible.get(v))
+                .copied()
+                .or_else(|| self.selected.iter().next().copied());
+            if let Some(i) = selected.filter(|&i| !self.items[i].is_dir) {
+                let path = self.items[i].rel_path();
+                self.workspace.current = Some(path.clone());
+                ui.label(&path);
+                let mut decision = self
+                    .workspace
+                    .entries
+                    .get(&path)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    for state in State::ALL {
+                        if ui
+                            .selectable_label(decision.state == state, tr(state.key()))
+                            .clicked()
+                        {
+                            match crate::core::review_state::fingerprint(
+                                &path,
+                                &self.roots,
+                                &self.dopts,
+                            ) {
+                                Ok(fingerprint) => {
+                                    decision.id = analysis::identity(&(&path, &fingerprint));
+                                    decision.fingerprint = fingerprint;
+                                    decision.state = state;
+                                    decision.stale = false;
+                                    changed = true;
+                                }
+                                Err(e) => self.status = e.to_string(),
+                            }
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(tr("workspace.reviewer"));
+                    changed |= ui
+                        .add(egui::TextEdit::singleline(&mut decision.reviewer).char_limit(64))
+                        .changed();
+                });
+                changed |= ui
+                    .add(
+                        egui::TextEdit::multiline(&mut decision.comment)
+                            .hint_text(tr("workspace.comment"))
+                            .char_limit(4096)
+                            .desired_rows(2),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut decision.rationale)
+                            .hint_text(tr("workspace.rationale"))
+                            .char_limit(4096),
+                    )
+                    .changed();
+                if decision.stale {
+                    ui.colored_label(ui.visuals().warn_fg_color, tr("workspace.stale"));
+                }
+                if changed {
+                    self.workspace.entries.insert(path, Decision { ..decision });
+                    self.view_key = None;
+                }
+            }
+        }
+    }
+
+    /// The side panels: each keeps its background work going; the one shown in the drawer,
+    /// if any, is drawn there.
+    fn panels(
+        &mut self,
+        mut ui: Option<&mut Ui>,
+        shown: Option<FolderPanel>,
+        cfg: &Config,
+    ) -> (
+        Option<String>,
+        Option<super::baseline_panel::CapturedComparison>,
+    ) {
+        let mut ui_for = |panel| {
+            if shown == Some(panel) {
+                ui.take()
+            } else {
+                None
+            }
+        };
+        self.review_ui(ui_for(FolderPanel::Review), cfg);
+        let navigate = self.merge_verification.ui(
+            ui_for(FolderPanel::Verification),
+            &self.items,
+            &self.roots,
+            &self.dopts,
+            self.running.is_some() || self.file_job.is_some(),
+            &self.filter_spec,
+        );
+        let captured = self.baseline_panel.ui(
+            ui_for(FolderPanel::Baselines),
+            &self.roots,
+            &self.dopts,
+            &self.filter_spec,
+        );
+        (navigate, captured)
+    }
+
+    fn panel_tabs(&self) -> Vec<(FolderPanel, &'static str)> {
+        let mut tabs = vec![(FolderPanel::Review, tr("workspace.title"))];
+        if self.n() == 3 && self.snapshot_options.is_none() {
+            tabs.push((FolderPanel::Verification, tr("analysis.merge_verification")));
+        }
+        if self.snapshot_options.is_none() {
+            tabs.push((FolderPanel::Baselines, tr("baseline.title")));
+        }
+        tabs
     }
 
     pub fn ui(
@@ -2558,15 +2852,23 @@ impl FolderView {
         self.note_window(ui);
         let was_running = self.running.is_some();
         self.poll();
-        self.review_ui(ui, cfg);
-        if let Some(path) = self.merge_verification.ui(
-            ui,
-            &self.items,
-            &self.roots,
-            &self.dopts,
-            self.running.is_some() || self.file_job.is_some(),
-            &self.filter_spec,
-        ) {
+        let (refresh, header_action) = self.header_bar(ui, cfg, named);
+        if refresh {
+            self.refresh(cfg, named);
+        }
+        let (navigate, captured) = if self.drawer_open {
+            let tabs = self.panel_tabs();
+            let mut tab = self.drawer_tab;
+            let mut out = (None, None);
+            widgets::drawer(ui, self.id.with("drawer"), &mut tab, &tabs, |ui, tab| {
+                out = self.panels(Some(ui), Some(tab), cfg);
+            });
+            self.drawer_tab = tab;
+            out
+        } else {
+            self.panels(None, None, cfg)
+        };
+        if let Some(path) = navigate {
             if let Some(i) = self.items.iter().position(|item| item.rel_path() == path) {
                 self.rebuild_visible(cfg);
                 if let Some(v) = self.visible.iter().position(|&x| x == i) {
@@ -2578,17 +2880,10 @@ impl FolderView {
             }
         }
 
-        let captured_action = self
-            .baseline_panel
-            .ui(ui, &self.roots, &self.dopts, &self.filter_spec)
-            .map(|comparison| FolderAction::OpenCaptured { comparison });
+        let captured_action = captured.map(|comparison| FolderAction::OpenCaptured { comparison });
         if was_running {
             // Also repaints once after finishing, as the status bar was drawn before this poll.
             ui.ctx().request_repaint_after(Duration::from_millis(100));
-        }
-        let (refresh, header_action) = self.header_bar(ui, cfg, named);
-        if refresh {
-            self.refresh(cfg, named);
         }
         let key = (
             cfg.tree_mode,
@@ -2628,7 +2923,8 @@ impl FolderView {
         let mut new_sort: Option<Col> = None;
 
         // keyboard navigation
-        let row_h = ui.text_style_height(&egui::TextStyle::Body) + 12.0;
+        let row_h = ui.text_style_height(&egui::TextStyle::Body)
+            + if theme::look().compact { 6.0 } else { 12.0 };
         if !widgets::typing(ui.ctx())
             && !widgets::modal_open(ui.ctx())
             && self.confirm.is_none()
@@ -2735,18 +3031,21 @@ impl FolderView {
         let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list_rect));
         list_ui.set_clip_rect(list_rect.intersect(ui.clip_rect()));
         let ui = &mut list_ui;
+        // The tree already shows where each item is.
+        let folder_col = !cfg.tree_mode;
         let mut table = TableBuilder::new(ui)
-            .id_salt(self.id)
+            .id_salt(self.id.with(folder_col))
             .striped(false)
             .resizable(true)
             .sense(Sense::click())
             .cell_layout(Layout::left_to_right(Align::Center))
-            .column(Column::initial(280.0).at_least(80.0).clip(true))
-            .column(Column::initial(160.0).at_least(40.0).clip(true))
-            .column(Column::initial(190.0).at_least(60.0).clip(true));
-        for _ in 0..n {
-            table = table.column(Column::initial(140.0).at_least(40.0).clip(true));
+            .column(Column::initial(280.0).at_least(80.0).clip(true));
+        if folder_col {
+            table = table.column(Column::initial(160.0).at_least(40.0).clip(true));
         }
+        table = table
+            .column(Column::initial(230.0).at_least(60.0).clip(true))
+            .column(Column::initial(210.0).at_least(60.0).clip(true));
         for _ in 0..n {
             table = table.column(Column::initial(90.0).at_least(30.0).clip(true));
         }
@@ -2754,17 +3053,12 @@ impl FolderView {
         if let Some(r) = self.scroll_to.take() {
             table = table.scroll_to_row(r, None);
         }
-        let mut cols = vec![
-            (Col::Name, tr("col.name").to_string()),
-            (Col::Folder, tr("col.folder").into()),
-            (Col::Result, tr("col.result").into()),
-        ];
-        for s in 0..n {
-            cols.push((
-                Col::Date(s),
-                format!("{} {}", side_name(s, n), tr("col.date")),
-            ));
+        let mut cols = vec![(Col::Name, tr("col.name").to_string())];
+        if folder_col {
+            cols.push((Col::Folder, tr("col.folder").into()));
         }
+        cols.push((Col::Result, tr("col.result").into()));
+        cols.push((Col::Modified, tr("col.modified").into()));
         for s in 0..n {
             cols.push((
                 Col::Size(s),
@@ -2774,6 +3068,7 @@ impl FolderView {
         cols.push((Col::Ext, tr("col.ext").into()));
 
         let sort = self.sort;
+        let tallies = &self.tallies;
         let items = &self.items;
         let visible = &self.visible;
         let selected = &self.selected;
@@ -2821,12 +3116,9 @@ impl FolderView {
                     let idx = visible[vi];
                     let it = &items[idx];
                     row.set_selected(selected.contains(&idx));
-                    let bg = match it.status {
-                        CmpStatus::Different => Some(c.folder_diff),
-                        CmpStatus::Unique => Some(c.folder_unique),
-                        CmpStatus::Error => Some(c.folder_error),
-                        _ => None,
-                    };
+                    // Only errors tint the whole row; other differences mark its edge, so a
+                    // list where most rows differ stays readable.
+                    let bg = (it.status == CmpStatus::Error).then_some(c.folder_error);
                     let paint_bg = |ui: &mut Ui| {
                         if let Some(bg) = bg {
                             if !selected.contains(&idx) {
@@ -2836,8 +3128,17 @@ impl FolderView {
                         }
                     };
                     let txt = egui::RichText::new;
+                    let sc = status_color(it);
                     row.col(|ui| {
                         paint_bg(ui);
+                        if matches!(
+                            it.status,
+                            CmpStatus::Different | CmpStatus::Unique | CmpStatus::Error
+                        ) {
+                            let r = ui.max_rect().expand2(vec2(0.0, 2.0));
+                            let edge = egui::Rect::from_min_size(r.min, vec2(3.0, r.height()));
+                            ui.painter().rect_filled(edge, 0.0, sc);
+                        }
                         if tree {
                             ui.add_space(it.depth as f32 * 16.0);
                             if it.is_dir && !it.children.is_empty() {
@@ -2870,33 +3171,65 @@ impl FolderView {
                             .truncate(),
                         );
                     });
+                    if folder_col {
+                        row.col(|ui| {
+                            paint_bg(ui);
+                            ui.add(
+                                egui::Label::new(txt(it.rel_dir.clone()).color(pal.text_dim))
+                                    .selectable(false)
+                                    .truncate(),
+                            );
+                        });
+                    }
                     row.col(|ui| {
                         paint_bg(ui);
-                        ui.add(
-                            egui::Label::new(txt(it.rel_dir.clone()).color(pal.text_dim))
+                        let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 4.0, sc);
+                        let summary = (it.is_dir && it.status == CmpStatus::Different)
+                            .then(|| tallies.get(idx).and_then(|t| t.summary(n)))
+                            .flatten();
+                        let (label, detail) = match summary {
+                            Some(summary) => (summary, None),
+                            None if it.is_dir => (status_text(it, n), None),
+                            None => (
+                                short_status(it, n),
+                                (it.binary && it.status != CmpStatus::Unique)
+                                    .then(|| tr("kind.binary")),
+                            ),
+                        };
+                        let r = ui.add(
+                            egui::Label::new(txt(label).font(FontId::proportional(13.5)))
                                 .selectable(false)
                                 .truncate(),
                         );
+                        if let Some(d) = detail {
+                            ui.label(txt(format!("· {d}")).size(12.0).color(pal.text_dim));
+                        }
+                        r.on_hover_text(status_text(it, n));
                     });
                     row.col(|ui| {
                         paint_bg(ui);
-                        let sc = status_color(it);
-                        let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-                        ui.painter().circle_filled(dot.center(), 4.0, sc);
-                        ui.add(
-                            egui::Label::new(
-                                txt(status_text(it, n)).font(FontId::proportional(13.5)),
-                            )
-                            .selectable(false)
-                            .truncate(),
-                        );
+                        let r =
+                            ui.add(egui::Label::new(txt(fmt_time(newest(it)))).selectable(false));
+                        if let Some(s) = newer_side(it, n) {
+                            ui.label(
+                                txt(trf("folder.newer", &[("side", side_name(s, n).into())]))
+                                    .size(12.0)
+                                    .color(side_cols[s]),
+                            );
+                        }
+                        if it.mtime[..n].iter().flatten().count() > 1 {
+                            r.on_hover_text(
+                                (0..n)
+                                    .filter(|&s| it.exists[s])
+                                    .map(|s| {
+                                        format!("{}  {}", side_name(s, n), fmt_time(it.mtime[s]))
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            );
+                        }
                     });
-                    for s in 0..n {
-                        row.col(|ui| {
-                            paint_bg(ui);
-                            ui.add(egui::Label::new(txt(fmt_time(it.mtime[s]))).selectable(false));
-                        });
-                    }
                     for s in 0..n {
                         row.col(|ui| {
                             paint_bg(ui);

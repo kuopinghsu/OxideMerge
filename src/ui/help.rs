@@ -315,7 +315,7 @@ mod tests {
     fn rows_fit_their_panel_on_every_platform() {
         let ctx = egui::Context::default();
         crate::ui::fonts::setup(&ctx, "en");
-        crate::ui::theme::apply(&ctx, false);
+        crate::ui::theme::apply(&ctx, false, Default::default());
         let windows = |inputs: &[&str]| -> String {
             inputs
                 .iter()

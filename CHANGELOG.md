@@ -5,6 +5,41 @@ section of this file as the release notes.
 
 ## [0.9.7] - Unreleased
 
+### Added
+
+- **Inline view** for 2-way text comparisons (the toolbar toggle next to word wrap, or *Inline
+  view* in the command palette): one column with removed lines above the added lines that replace
+  them, old and new line numbers, and unchanged runs folded. Difference navigation and copying work
+  as in the side-by-side view; editing stays in the side-by-side view.
+- **Merge bar** for 3-way comparisons: how many conflicts are left, *Next conflict* (wrapping
+  around), *Take left*, *Take both*, *Take right*, *Mark resolved* for a conflict edited by hand,
+  and *Save result*, which turns into the main button once no conflicts are left.
+- **Start page launcher:** type, paste or browse two (or, with *3-way*, three) paths and compare
+  them without opening a dialog; *More options…* opens the full Open dialog. Recent comparisons
+  are cards. The first start offers a sample comparison in a temporary folder, which is removed
+  when its tab closes and is not added to the recent list.
+- **Accessibility options** in *Options → General* and the command palette: color-blind friendly
+  diff colors (blue, orange, purple and yellow instead of green and red), high contrast, reduce
+  motion and compact density.
+- **Search commands** field (⌘K / Ctrl+K) in the title bar, which opens the command palette;
+  narrow windows keep the icon.
+
+### Changed
+
+- Review, verification and baseline panels open in a side drawer, toggled by the button at the
+  right end of the toolbar, instead of taking space below the comparison.
+- **Folder comparison:** chips under the paths count *All*, *Different*, *Only in Left/Right* and
+  *Identical* items and show or hide each kind with a click, replacing the counts in the status
+  bar. Folder rows say how many items differ inside them; a colored bar at the left edge marks
+  differences instead of tinting whole rows; one *Modified* column shows the newest date and which
+  side is newer; the *Folder* column is left out in tree mode.
+- The text comparison toolbar is grouped into Differences, Merge, Edit and View, with captions in
+  wide windows. The status bar no longer repeats the difference count shown in the toolbar.
+- The gutter between panes is calmer: the connector of the current difference stands out, the
+  others are faded, and the copy arrows appear on the current or hovered difference.
+- Tab titles name a file shared by both sides once, with the folders that differ as a subtitle.
+  Tabs with unsaved changes show a dot in place of the close button until hovered.
+
 ### Fixed
 
 - The close button of the Help & Shortcuts dialog sits at the right edge of its title bar, as in
@@ -13,6 +48,34 @@ section of this file as the release notes.
   Windows and Linux, wrap instead of widening a panel.
 - The close button of the About and Help & Shortcuts dialogs is announced as "Close" to screen
   readers.
+- **Web page compare** no longer leaves out text inside `display: contents` elements, which
+  hid it from the Text mode and the highlights altogether, nor the text of web components
+  (open shadow roots, with their slotted content in place). Highlights are painted in shadow
+  roots too.
+- With *Render pages in the browser for text and HTML* off, the Text and HTML source modes show
+  the pages as downloaded even after a screenshot mode has rendered them. Rendered pages are
+  rendered again after the browser or the screenshot size changes in Options.
+- **Web page compare** is sturdier with pages that misbehave:
+  - A page that redirects after it loads, or opens an `alert`, `confirm`, `prompt` or print
+    dialog, no longer fails the comparison or waits until the time limit: dialogs are dismissed
+    and the page the redirect leads to is read.
+  - A page that cannot be reached, does not load in time or crashes its tab is reported in its
+    own pane header with a blank screenshot, and the other pages are still shown. Error pages
+    with an empty body (such as an empty 404) show their status instead of failing.
+  - The pages are asked for at the same time instead of one after the other, so slow pages no
+    longer add up, and Stop or closing the tab ends the wait at once instead of after the time
+    limit.
+  - Text and highlights are read in a separate script context, so pages that redefine
+    `Array`, `JSON` or other globals cannot break them, and a page whose highlights cannot be
+    painted is still compared.
+  - XHTML pages and text with unpaired surrogates are read correctly, and text hidden inside a
+    closed `<details>` or `content-visibility: hidden` element is left out.
+  - On macOS and Linux the browser no longer asks for keychain or password store access, its
+    messages are limited in size, and its pipes are not passed on to other programs.
+- In windows narrower than about 1200 points, the folder comparison toolbar no longer draws its
+  filter, rules and method chips over *All differences* and *Export HTML*, and the image
+  comparison toolbar no longer runs past the window edge: both switch to icons and shorter chips.
+  Title bar icons that no longer fit are left out rather than overlapping the menus.
 
 ## [0.9.6] - 2026-10-30
 
