@@ -448,7 +448,7 @@ impl DiffsView {
             stopped: src.stopped,
             error: None,
             temps: src.temps,
-            id: egui::Id::new(("diffs_view", folder, SystemTime::now())),
+            id: egui::Id::unique(("diffs_view", folder, SystemTime::now())),
         };
         v.load((0..v.cards.len()).collect());
         v
@@ -1265,16 +1265,16 @@ impl DiffsView {
             ui.ctx().request_repaint_after(DISK_CHECK);
         }
         self.toolbar(ui, cfg);
-        egui::SidePanel::left(self.id.with("files"))
+        egui::Panel::left(self.id.with("files"))
             .resizable(true)
-            .default_width(260.0)
-            .width_range(160.0..=520.0)
+            .default_size(260.0)
+            .size_range(160.0..=520.0)
             .frame(
                 egui::Frame::new()
                     .fill(pal(ui).surface_alt)
                     .inner_margin(egui::Margin::same(8)),
             )
-            .show_inside(ui, |ui| self.file_list(ui));
+            .show(ui, |ui| self.file_list(ui));
         if self.cards.is_empty() {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
@@ -1450,7 +1450,7 @@ impl DiffsView {
                         );
                     }
                     job.wrap = one_line(name_rect.width());
-                    let g = ui.fonts(|fonts| fonts.layout_job(job));
+                    let g = ui.fonts_mut(|fonts| fonts.layout_job(job));
                     painter.galley(
                         pos2(name_rect.left(), rect.center().y - g.size().y / 2.0),
                         g,
@@ -1473,10 +1473,10 @@ impl DiffsView {
     fn cards_ui(&mut self, ui: &mut Ui, cfg: &Config, colors: &Colors) {
         let p = pal(ui);
         let mono = FontId::monospace(cfg.font_size);
-        let row_h = (ui.fonts(|f| f.row_height(&mono)) + 3.0).round();
+        let row_h = (ui.fonts_mut(|f| f.row_height(&mono)) + 3.0).round();
         let look = Look {
             mono: &mono,
-            char_w: ui.fonts(|f| f.glyph_width(&mono, '0')),
+            char_w: ui.fonts_mut(|f| f.glyph_width(&mono, '0')),
             colors,
             tab: cfg.tab_size.max(1),
         };
@@ -1512,7 +1512,7 @@ impl DiffsView {
                 TextFormat::simple(FontId::proportional(12.0), p.text_dim),
             );
             job.wrap = one_line(col.width() - 8.0);
-            let g = ui.fonts(|f| f.layout_job(job));
+            let g = ui.fonts_mut(|f| f.layout_job(job));
             painter.galley(
                 pos2(col.left() + 4.0, col.center().y - g.size().y / 2.0),
                 g,
@@ -1721,7 +1721,7 @@ impl DiffsView {
                 }
             }
         }
-        let sg = ui.fonts(|fonts| fonts.layout_job(summary));
+        let sg = ui.fonts_mut(|fonts| fonts.layout_job(summary));
         let sx = text_right - sg.size().x;
         let painter = ui.painter();
         painter.galley(pos2(sx, c.y - sg.size().y / 2.0), sg, p.text);
@@ -1748,7 +1748,7 @@ impl DiffsView {
         );
         let left = rect.left() + 50.0;
         name.wrap = one_line((sx - 12.0 - left).max(20.0));
-        let g = ui.fonts(|fonts| fonts.layout_job(name));
+        let g = ui.fonts_mut(|fonts| fonts.layout_job(name));
         painter.galley(pos2(left, c.y - g.size().y / 2.0), g, p.text);
 
         if resp
@@ -1809,7 +1809,7 @@ impl DiffsView {
             TextFormat::simple(FontId::proportional(12.0), p.text_dim),
         );
         job.wrap = one_line((rect.width() - 110.0).max(20.0));
-        let g = ui.fonts(|fonts| fonts.layout_job(job));
+        let g = ui.fonts_mut(|fonts| fonts.layout_job(job));
         painter.galley(
             pos2(rect.left() + 12.0, rect.center().y - g.size().y / 2.0),
             g,
@@ -1902,7 +1902,7 @@ impl DiffsView {
                 text.width() - 10.0,
                 look.tab,
             );
-            let g = ui.fonts(|fonts| fonts.layout_job(job));
+            let g = ui.fonts_mut(|fonts| fonts.layout_job(job));
             if g.elided && hover.is_some_and(|h| text.contains(h)) {
                 tip = Some(line.1);
             }
@@ -2596,7 +2596,8 @@ mod tests {
             4,
         );
         assert_eq!(job.text, "a   b   c");
-        assert_eq!(&job.text[job.sections[1].byte_range.clone()], "b");
+        let b = &job.sections[1].byte_range;
+        assert_eq!(&job.text[b.start.0..b.end.0], "b");
         assert!(tooltip(&"x".repeat(TIP_CHARS * 2)).chars().count() == TIP_CHARS + 1);
     }
 }

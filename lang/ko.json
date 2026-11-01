@@ -634,6 +634,8 @@
   "web.resources": "리소스 트리",
   "web.screenshot": "스크린샷 (보이는 영역)",
   "web.text": "텍스트",
+  "web.markdown": "서식 있음",
+  "web.md_identical": "페이지의 서식 있는 내용이 같습니다",
   "web.full_screenshot": "전체 페이지",
   "web.highlight": "차이점 강조",
   "web.highlight_tip": "페이지 간에 다른 텍스트를 스크린샷에 강조 표시합니다",

@@ -4,8 +4,8 @@ use crate::ui::icons;
 pub use crate::ui::icons::Icon;
 use crate::ui::theme::{self, Palette};
 use egui::{
-    Align2, Color32, CornerRadius, FontId, Margin, Rect, Response, Sense, Stroke, StrokeKind, Ui,
-    Vec2, WidgetInfo, WidgetType,
+    Align2, Color32, CornerRadius, FontId, Margin, Rect, Response, Role, Sense, Stroke, StrokeKind,
+    Ui, Vec2, WidgetInfo,
 };
 
 pub fn pal(ui: &Ui) -> Palette {
@@ -13,7 +13,7 @@ pub fn pal(ui: &Ui) -> Palette {
 }
 
 fn modal_id() -> egui::Id {
-    egui::Id::new("oxidemerge_modal_open")
+    egui::Id::unique("oxidemerge_modal_open")
 }
 
 /// Marks whether an application dialog is open, so views ignore keys meant for the dialog.
@@ -137,9 +137,9 @@ fn paint_button(
         },
     );
     resp.widget_info(|| match look {
-        Look::Toggle(on) => WidgetInfo::selected(WidgetType::Checkbox, enabled, on, a11y_label),
-        Look::Segment(on) => WidgetInfo::selected(WidgetType::RadioButton, enabled, on, a11y_label),
-        _ => WidgetInfo::labeled(WidgetType::Button, enabled, a11y_label),
+        Look::Toggle(on) => WidgetInfo::selected(Role::CheckBox, enabled, on, a11y_label),
+        Look::Segment(on) => WidgetInfo::selected(Role::RadioButton, enabled, on, a11y_label),
+        _ => WidgetInfo::labeled(Role::Button, enabled, a11y_label),
     });
     if ui.is_rect_visible(rect) {
         let hovered = enabled && resp.hovered();
@@ -407,7 +407,7 @@ pub fn search_button(ui: &mut Ui, width: f32, hint: &str, keys: &str, label: &st
         );
     }
     focus_ring(ui, &resp, rect, 7.0);
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -506,9 +506,7 @@ pub fn chip_button(
         .layout_no_wrap(value.to_string(), theme::semibold(12.0), p.text);
     let w = 8.0 + 14.0 + 5.0 + label_g.size().x + value_g.size().x.min(260.0) + 4.0 + 10.0 + 8.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::click());
-    resp.widget_info(|| {
-        WidgetInfo::labeled(WidgetType::ComboBox, true, format!("{label} {value}"))
-    });
+    resp.widget_info(|| WidgetInfo::labeled(Role::ComboBox, true, format!("{label} {value}")));
     if ui.is_rect_visible(rect) {
         let fill = if resp.hovered() || resp.has_focus() {
             p.control_hover
@@ -575,11 +573,7 @@ pub fn search_edit(ui: &mut Ui, text: &mut String, hint: &str, width: f32) -> Re
             .interact(clear_rect, resp.id.with("clear"), Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         clear.widget_info(|| {
-            WidgetInfo::labeled(
-                WidgetType::Button,
-                true,
-                crate::i18n::tr("btn.clear_search"),
-            )
+            WidgetInfo::labeled(Role::Button, true, crate::i18n::tr("btn.clear_search"))
         });
         let color = if clear.hovered() { p.text } else { p.text_dim };
         icons::paint(ui.painter(), clear_rect.shrink(3.0), Icon::Close, color);
@@ -680,17 +674,17 @@ pub fn drawer<T: PartialEq + Copy>(
             *tab = *t;
         }
     }
-    egui::SidePanel::right(id)
+    egui::Panel::right(id)
         .resizable(true)
-        .default_width(360.0)
-        .width_range(280.0..=720.0)
+        .default_size(360.0)
+        .size_range(280.0..=720.0)
         .frame(
             egui::Frame::new()
                 .fill(p.surface)
                 .stroke(Stroke::new(1.0_f32, p.border))
                 .inner_margin(Margin::symmetric(12, 10)),
         )
-        .show_inside(ui, |ui| {
+        .show(ui, |ui| {
             match tabs {
                 [] => return,
                 [(_, title)] => {
@@ -897,7 +891,7 @@ pub fn logo_image() -> Option<image::RgbaImage> {
 
 pub fn logo(ui: &mut Ui, size: f32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    let id = egui::Id::new("oxidemerge-logo");
+    let id = egui::Id::unique("oxidemerge-logo");
     let tex = match ui
         .ctx()
         .data(|d| d.get_temp::<Option<egui::TextureHandle>>(id))
@@ -939,7 +933,7 @@ pub fn nav_item(ui: &mut Ui, selected: bool, icon: Icon, label: &str) -> Respons
     let p = pal(ui);
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
-    resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, label));
+    resp.widget_info(|| WidgetInfo::selected(Role::Button, true, selected, label));
     let fill = if selected {
         p.accent_soft
     } else if resp.hovered() {
@@ -1025,7 +1019,7 @@ pub const MENU_MIN_WIDTH: f32 = 220.0;
 pub const MENU_ITEM_PADDING: Vec2 = Vec2::new(8.0, 4.0);
 
 fn menu_width_id() -> egui::Id {
-    egui::Id::new("oxidemerge_menu_width")
+    egui::Id::unique("oxidemerge_menu_width")
 }
 
 /// Sets the width all menus open with: that of the widest menu of the menu bar, measured with
@@ -1053,7 +1047,7 @@ const MENU_SHORTCUT_GAP: f32 = 24.0;
 const MENU_CHECK_GUTTER: f32 = 20.0;
 
 /// Shortcut text of a menu item, kept clear of its label.
-pub fn menu_shortcut(ui: &Ui, keys: &str) -> egui::WidgetText {
+fn menu_shortcut(ui: &Ui, keys: &str) -> egui::WidgetText {
     if keys.is_empty() {
         return egui::WidgetText::default();
     }
@@ -1069,6 +1063,14 @@ pub fn menu_shortcut(ui: &Ui, keys: &str) -> egui::WidgetText {
         },
     );
     job.into()
+}
+
+/// A menu item with the shortcut `keys` at its right end, named `label` alone for accessibility.
+pub fn menu_item(ui: &mut Ui, enabled: bool, label: &str, keys: &str) -> Response {
+    let button = egui::Button::new(label).shortcut_text(menu_shortcut(ui, keys));
+    let r = ui.add_enabled(enabled, button);
+    r.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, label));
+    r
 }
 
 /// A submenu of a context menu or drop-down, styled like the menu it opens from.
@@ -1117,7 +1119,7 @@ pub fn menu_check(ui: &mut Ui, on: bool, label: &str, keys: &str) -> Response {
             Stroke::new(1.6_f32, color),
         ));
     }
-    r.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, ui.is_enabled(), on, label));
+    r.widget_info(|| WidgetInfo::selected(Role::CheckBox, ui.is_enabled(), on, label));
     r
 }
 

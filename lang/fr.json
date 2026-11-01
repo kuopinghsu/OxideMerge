@@ -634,6 +634,8 @@
   "web.resources": "Arborescence des ressources",
   "web.screenshot": "Capture (zone visible)",
   "web.text": "Texte",
+  "web.markdown": "Mis en forme",
+  "web.md_identical": "Les pages affichent le même contenu mis en forme",
   "web.full_screenshot": "Page entière",
   "web.highlight": "Surligner les différences",
   "web.highlight_tip": "Surligner sur les captures le texte qui diffère entre les pages",

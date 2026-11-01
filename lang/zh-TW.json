@@ -634,6 +634,8 @@
   "web.resources": "資源樹",
   "web.screenshot": "螢幕截圖（可見區域）",
   "web.text": "文字",
+  "web.markdown": "格式化",
+  "web.md_identical": "頁面的格式化內容相同",
   "web.full_screenshot": "整頁",
   "web.highlight": "醒目提示差異",
   "web.highlight_tip": "在螢幕截圖上醒目提示頁面之間不同的文字",

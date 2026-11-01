@@ -33,8 +33,9 @@ enum KindArg {
     Text,
     Binary,
     Image,
-    /// Web pages (URLs or HTML files); the console compare uses the visible text, after the
-    /// pages' scripts have run when a browser is found
+    /// Web pages (URLs or HTML files, which are compared so by default); the console compare
+    /// uses the pages as Markdown, or the web mode last chosen, after the pages' scripts have
+    /// run when a browser is found
     Web,
 }
 
@@ -494,7 +495,10 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         Some(k) => file_kind(k),
         None if paths
             .iter()
-            .any(|p| core::web::is_url(&p.to_string_lossy())) =>
+            .any(|p| core::web::is_url(&p.to_string_lossy()))
+            || (cli.output.is_none()
+                && cli.patch.is_none()
+                && core::web::are_html_files(paths)) =>
         {
             FileKind::Web
         }
@@ -533,7 +537,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             .iter()
             .map(|p| core::web::location(p))
             .collect::<Result<Vec<_>, _>>()?;
-        // As the text and HTML modes show them: rendered by the browser when there is one.
+        // As the text, HTML and Markdown modes show them: rendered by the browser when there is one.
         let browser = cfg
             .web_render
             .then(|| core::web::find_browser(&cfg.web_browser))
@@ -549,7 +553,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             eprintln!("{}", i18n::trf("web.fallback", &[("error", e.clone())]));
         }
         source
-            .texts(cfg.web_mode == core::web::WebMode::Html)
+            .texts(cfg.web_mode)
             .iter()
             .map(|text| core::text::TextDoc::from_text(None, text))
             .collect()

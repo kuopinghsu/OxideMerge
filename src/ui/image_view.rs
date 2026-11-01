@@ -92,7 +92,7 @@ impl ImageView {
             read_only: vec![false; n],
             undo: Vec::new(),
             status: String::new(),
-            id: egui::Id::new(("imgview", std::time::Instant::now())),
+            id: egui::Id::unique(("imgview", std::time::Instant::now())),
             step_file: None,
         })
     }
@@ -461,6 +461,7 @@ impl ImageView {
                         unit,
                         delta,
                         modifiers,
+                        ..
                     } = e
                     else {
                         continue;

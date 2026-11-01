@@ -57,7 +57,7 @@ OxideMerge 以 [WinMerge](https://github.com/WinMerge/winmerge) 為設計參考�
 
 - **二進位檔：** 以並排的十六進位檢視檢查位元組差異。
 - **影像：** 並排比較，或使用疊合、滑動分隔線、閃爍與差異檢視。
-- **網頁：** 比較網頁執行指令碼後顯示的文字、在網頁上醒目提示文字差異的整頁截圖、HTML 原始碼或下載的資源。
+- **網頁：** 比較並排顯示並醒目提示變更區塊與字詞的格式化 Markdown（預設）、網頁執行指令碼後顯示的文字、在網頁上醒目提示文字差異的整頁截圖、HTML 原始碼或下載的資源。本機 `.html` 檔案也會以網頁比較開啟。
 
 ### 儲存與分享成果
 
@@ -295,6 +295,7 @@ macOS 與 Linux 的執行檔位於 `target/release/oxidemerge`，Windows 則為
 - `make build`：建置偵錯版本。
 - `make run ARGS="a.txt b.txt"`：以指定的比較路徑執行偵錯版本。
 - `make demo`、`make demo-text`、`make demo-3way`、`make demo-3way-merge`、`make demo-3way-folder`、`make demo-conflict`：開啟各類範例比較。`samples/README.md` 列出每個範例及其示範的功能；網頁比較請參閱 `samples/web/README.md`。
+- `make demo-web`、`make demo-web-text`、`make demo-web-headings`、`make demo-web-tables`：開啟網頁比較範例；後三者用於「格式化」模式。
 - `make install` 或 `make uninstall`：將程式安裝至 Cargo 的執行檔目錄，或從該目錄移除；
   預設目錄為 `~/.cargo/bin`。
 - `make shell-register`：安裝執行檔，並註冊檔案管理員整合。

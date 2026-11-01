@@ -634,6 +634,8 @@
   "web.resources": "リソースツリー",
   "web.screenshot": "スクリーンショット (表示領域)",
   "web.text": "テキスト",
+  "web.markdown": "書式付き",
+  "web.md_identical": "ページの書式付き内容は同じです",
   "web.full_screenshot": "ページ全体",
   "web.highlight": "差異を強調表示",
   "web.highlight_tip": "ページ間で異なるテキストをスクリーンショット上で強調表示します",

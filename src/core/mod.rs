@@ -27,6 +27,7 @@ pub mod table;
 pub mod text;
 pub mod unpacker;
 pub mod web;
+pub mod web_markdown;
 pub mod web_render;
 pub mod xml_report;
 

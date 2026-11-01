@@ -634,6 +634,8 @@
   "web.resources": "Resource tree",
   "web.screenshot": "Screenshot (visible area)",
   "web.text": "Text",
+  "web.markdown": "Formatted",
+  "web.md_identical": "The pages show the same formatted content",
   "web.full_screenshot": "Full page",
   "web.highlight": "Highlight differences",
   "web.highlight_tip": "Highlight the text that differs between the pages on the screenshots",

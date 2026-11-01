@@ -17,7 +17,7 @@ const FEATURES: [&str; 4] = [
 /// Draws the dialog. Returns true once it should close.
 pub fn show(ctx: &egui::Context) -> bool {
     let mut close = false;
-    let response = egui::Modal::new(egui::Id::new("about_dialog"))
+    let response = egui::Modal::new(egui::Id::unique("about_dialog"))
         .frame(dialog_frame(ctx))
         .show(ctx, |ui| {
             ui.set_width(600.0);
@@ -43,7 +43,7 @@ pub fn show(ctx: &egui::Context) -> bool {
 
 /// Card behind the About and Help & Shortcuts dialogs.
 pub fn dialog_frame(ctx: &egui::Context) -> egui::Frame {
-    let dark = ctx.style().visuals.dark_mode;
+    let dark = ctx.global_style().visuals.dark_mode;
     let p = theme::palette(dark);
     egui::Frame::new()
         .fill(p.surface)
@@ -90,7 +90,7 @@ fn close_button(ui: &mut egui::Ui) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
     response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tr("btn.close"))
+        egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), tr("btn.close"))
     });
     let painter = ui.painter();
     if response.hovered() {

@@ -217,6 +217,9 @@ Paste text into them with kbd:[Ctrl+V], or double-click a line to type.
 With *Compare as* set to *Automatic*, OxideMerge selects the comparison type in this order:
 
 . An `http://` or `https://` address on any side opens a web page compare.
+. HTML files (`.html` or `.htm`) on every side open a web page compare too, in the Formatted mode
+  unless another mode was chosen before; a merge with an output file (`-o`) or a console
+  `--patch` compares them as text.
 . Folders on every side open a folder compare.
 . Archives on every side are extracted and compared as folders.
 . Files that all have image extensions (`.png`, `.jpg`, `.gif`, `.bmp`, `.tif`, `.webp` and more)
@@ -241,8 +244,8 @@ Image:: Pixels, side by side, overlaid, swiped, blinking or as a difference imag
 Differing regions can be copied between images.
 Folder:: The items of two or three folders, compared by the chosen compare method.
 Items are copied, deleted and merged here, and each file opens in its own compare.
-Web page:: Two or three pages, as visible text, full page or visible area screenshots with the
-text differences highlighted, HTML source or downloaded resources.
+Web page:: Two or three pages, as visible text, formatted Markdown, full page or visible area
+screenshots with the text differences highlighted, HTML source or downloaded resources.
 Web pages are read-only: nothing is saved back to a server.
 
 Each type is described in its own chapter below.
@@ -465,7 +468,7 @@ used when saving, and a lock button that makes the side read-only.
 Choosing another encoding reloads the file using that encoding.
 Check the text after changing the encoding, especially before editing or saving.
 
-The *location pane* on the right is an overview of the whole file, in both text and binary comparisons.
+The *location pane* on the right is an overview of the whole file, in both text and binary comparisons, and of the pages in the Formatted web page compare.
 
 Choose *Text layout* in Options → General or View → Text compare. *Compact rows* (the default)
 shows each side without insertion/deletion padding. *Aligned rows* leaves blank space opposite
@@ -789,14 +792,34 @@ The status bar shows how many pixels differ and in how many regions.
 
 == Web page comparison
 
-Compare two or three `http://` or `https://` addresses, or local HTML files compared with
-*Compare as → Web page* (`-t web` on the command line).
+Compare two or three `http://` or `https://` addresses, or local HTML files, which open here
+by default (*Compare as → Web page*, or `-t web` on the command line, for other files).
 Use the mode selector at the top of the tab. OxideMerge remembers the last selected mode:
 
 Text:: The text you see on each page, one block per line: each heading, paragraph, list item,
 table cell, form field value and line of preformatted text is one line, and hidden elements are
 left out. It opens in the text compare, so changed words are highlighted within each line, and
-the comparison options, filters and reports all apply. This is the default mode.
+the comparison options, filters and reports all apply.
+Formatted:: The default mode. Each page turned into Markdown and shown formatted, side by side: headings,
+paragraphs, emphasis, links, lists, quotes, code blocks and tables keep their look. The pages are
+compared block by block (a heading, paragraph, list item, table, quote or code block); blocks that
+differ are highlighted and lined up with the changed block of the same kind on the other pages,
+and a block found on one page only faces a gap. As in the text compare, the changed words or
+characters within a changed block are highlighted more strongly, as *Inline differences* in the
+comparison options asks. Tables are drawn with lines around their cells: their rows are lined up
+too, and within rows that differ the changed words are highlighted, and so are whole cells of a
+row or column that the other page does not have. Step through the differences with the buttons
+above the pages or the same keys as in the text compare: as there, the current difference is
+highlighted more strongly and the blocks being compared are outlined on every page, most
+strongly on the page last clicked. Clicking a block makes it the one compared, and the next and
+previous difference are then found from there. The pages scroll only when the difference is out
+of view, and then show it a third of the way down. The location pane right of the pages gives an
+overview of all the differences, with the current one in the accent colour and the visible part
+outlined; click or drag in it to go there (*View → Text compare → Location pane* shows or hides
+it). Images are shown as links to them, and
+content the page hides is left out: with the browser, whatever it does not show, also when a
+style sheet hides it; from the HTML as downloaded, elements marked `hidden`, `aria-hidden` or
+hidden with an inline `display: none` style.
 Full page:: A screenshot of each whole page, from top to bottom, in the image view. With
 *Highlight differences* on, the text that differs between the pages is highlighted on the page
 itself before the screenshot: changed blocks in yellow and the changed words in them in orange,
@@ -810,19 +833,22 @@ tags, in the text compare.
 Resource tree:: Downloads each page with its stylesheets, scripts, images, frames and media, and
 compares the downloaded files in the folder compare.
 
-Text, HTML source and the screenshots come from a Chromium-based browser that runs without a
+Text, Formatted, HTML source and the screenshots come from a Chromium-based browser that runs without a
 window (Edge, Chrome, Chromium and Brave are detected automatically), so they show each page
 after its scripts have run, as you would see it. The pages load at the same time, each in its own
 tab, and are taken as they are after 45 seconds. Without a browser, or with *Render pages in the
-browser for text and HTML* turned off, Text and HTML source use the HTML as downloaded instead:
+browser for text and HTML* turned off, Text, Formatted and HTML source use the HTML as downloaded
+instead:
 scripts do not run, and content they add is missing. If the browser fails, they fall back to the
 HTML as downloaded too, and the status bar says why.
 A page that the browser cannot load (it cannot be reached, does not load in time or its tab
 crashes) is blank in the screenshot modes, with the error in its pane header, and the other pages
-are compared all the same; Text and HTML source then use the pages as downloaded.
+are compared all the same; Text, Formatted and HTML source then use the pages as downloaded.
 Dialogs that a page opens, such as `alert`, are dismissed, and a page that redirects after loading
 is taken as the page it redirects to.
-The console compare (`--cli -t web`) compares the same text, or HTML with the HTML source mode.
+The console compare (`--cli`, of HTML files or with `-t web`) follows the last selected mode: the Markdown, one line per
+line of it, with the Formatted mode (the default), the HTML with the HTML source mode, and the
+visible text with the others.
 On macOS and Linux OxideMerge talks to the browser over a private pipe; on Windows, over a port
 that only this computer can reach, open while the pages load.
 
@@ -843,8 +869,8 @@ The addresses you enter are always loaded.
 The screenshot size and the browser are set under *Options → Image / Binary / Web*.
 Leave the browser path empty to detect a supported browser automatically.
 Switching modes loads the pages again; use *Reload* (kbd:[F5]) after a page changes.
-Local HTML files require `-t web` or an explicit *Compare as → Web page* selection; otherwise,
-they normally open as text.
+Local `.html` and `.htm` files open as web pages; to compare their source line by line instead,
+use *Compare as → Text* (`-t text`), or the HTML source mode.
 
 NOTE: The resource tree compares the HTML as delivered by the server; the other modes run page
 scripts when a browser is used. Authenticated sessions are not supported; a page that requires a

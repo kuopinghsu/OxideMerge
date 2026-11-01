@@ -24,6 +24,27 @@ section of this file as the release notes.
   motion and compact density.
 - **Search commands** field (⌘K / Ctrl+K) in the title bar, which opens the command palette;
   narrow windows keep the icon.
+- **Formatted web page compare:** the new *Formatted* mode, the default for web pages and HTML
+  files (a mode chosen before is still remembered), turns each page into Markdown and shows it
+  formatted, side by side, with headings, emphasis, links, lists, quotes, code blocks and
+  tables. Pages are compared block by block; changed blocks are highlighted and lined up with
+  the changed block of the same kind on the other pages (a heading with one of the same level
+  first), with the changed words highlighted within them as in the text compare (following
+  *Inline differences*). Tables are drawn with lines around their cells; their rows are lined
+  up, with the changed words in each cell highlighted, and cells of rows or columns only one page
+  has highlighted whole. The difference buttons and keys step through them, and as in the text
+  compare the current difference is highlighted more strongly and the blocks being compared are
+  outlined on every page; clicking a block makes it the compared one, and stepping goes on from
+  there. The pages scroll only when the difference is out of view, and a location pane gives an
+  overview of the differences, as in the text compare. Content the browser
+  does not show, also when a style sheet hides it, is left out, and images appear as links.
+  Text that reads like a character reference, such as `&copy;` on a page about HTML, is shown
+  as written. The
+  console compare (`--cli -t web`) compares the Markdown when this mode is selected. Sample pages
+  with complex text, headings and tables are in `samples/web/formatted`.
+- **HTML files open in the web page compare** (`.html` and `.htm` on every side), so they show
+  formatted by default; `-t text` or *Compare as → Text* compares their source, and a merge
+  with an output file (`-o`) or a console `--patch` still uses the text compare.
 
 ### Changed
 
@@ -44,6 +65,9 @@ section of this file as the release notes.
   others are faded, and the copy arrows appear on the current or hovered difference.
 - Tab titles name a file shared by both sides once, with the folders that differ as a subtitle.
   Tabs with unsaved changes show a dot in place of the close button until hovered.
+- The user interface is built on egui and eframe 0.37 (from 0.31), which the formatted web page
+  view needs. Menu items sit slightly inside their menu, and screen readers name menu items by
+  their label alone, without the shortcut, and drop-downs by the caption beside them.
 
 ### Fixed
 

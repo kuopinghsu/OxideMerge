@@ -55,4 +55,5 @@ Each pair below can also be opened on its own, for example
 
 ## Web page compare: `web`
 
-See [web/README.md](web/README.md).
+See [web/README.md](web/README.md): a release notes page in three versions, and pairs of pages
+in `web/formatted` with complex text, headings and tables for the *Formatted* mode.

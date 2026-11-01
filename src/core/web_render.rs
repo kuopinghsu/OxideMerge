@@ -4,7 +4,8 @@
 //! highlighted on the page itself (like WinMerge's "View Differences").
 
 use crate::core::cdp::{self, Browser};
-use crate::core::web::{self, Page, Progress};
+use crate::core::web::{self, Page, Progress, WebMode};
+use crate::core::web_markdown;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use similar::{Algorithm, DiffTag, TextDiff};
@@ -47,6 +48,9 @@ pub struct Rendered {
     pub blocks: Vec<String>,
     /// The DOM after scripts have run.
     pub html: String,
+    /// The body as shown, without the elements the page hides and with absolute links and
+    /// image addresses: what its Markdown is made from.
+    pub visible_html: String,
     /// PNG screenshot.
     pub shot: Option<Vec<u8>>,
     /// Whether the page was taller than the full size screenshot.
@@ -58,6 +62,16 @@ pub struct Rendered {
 }
 
 impl Rendered {
+    /// The page as Markdown blocks; links are made absolute against its address, else `asked`.
+    pub fn markdown(&self, asked: Option<&Url>) -> Vec<web_markdown::Block> {
+        let html = if self.visible_html.is_empty() {
+            &self.html
+        } else {
+            &self.visible_html
+        };
+        web_markdown::html_to_blocks(html, self.url.as_ref().or(asked))
+    }
+
     /// The visible text, one block per line.
     pub fn text(&self) -> String {
         let mut s = self.blocks.join("\n");
@@ -107,7 +121,7 @@ const EXTRACT_JS: &str = r#"(() => {
     return el.value || '';
   };
   const root = document.body || document.documentElement;
-  if (!root) return { url: location.href, html: '', blocks: [] };
+  if (!root) return { url: location.href, html: '', visible: '', blocks: [] };
   // The tree as rendered: open shadow roots instead of their hosts' children, and the nodes
   // assigned to a slot instead of its fallback content.
   const children = n => {
@@ -168,12 +182,31 @@ const EXTRACT_JS: &str = r#"(() => {
   }
   flush();
   window.__oxidemergeBlocks = blocks;
+  // The body as shown: a copy without what is hidden, its links and images made absolute.
+  const copy = root.cloneNode(true);
+  const absolute = (sel, prop, attr) => {
+    const o = root.querySelectorAll(sel), c = copy.querySelectorAll(sel);
+    for (let i = 0; i < o.length && i < c.length; i++) if (o[i][prop]) c[i].setAttribute(attr, o[i][prop]);
+  };
+  absolute('a[href]', 'href', 'href');
+  absolute('img', 'currentSrc', 'src');
+  const prune = (o, c) => {
+    const oc = o.childNodes, cc = c.childNodes;
+    for (let i = Math.min(oc.length, cc.length) - 1; i >= 0; i--) {
+      const n = oc[i];
+      if (n.nodeType !== 1) continue;
+      if (SKIP.has(tag(n)) || !shown(n) || style(n).v === 'hidden') c.removeChild(cc[i]);
+      else prune(n, cc[i]);
+    }
+  };
+  prune(root, copy);
   const dt = document.doctype;
   const doctype = dt ? '<!DOCTYPE ' + dt.name + (dt.publicId ? ' PUBLIC "' + dt.publicId + '"' : '') +
     (dt.systemId ? (dt.publicId ? ' ' : ' SYSTEM ') + '"' + dt.systemId + '"' : '') + '>\n' : '';
   return {
     url: location.href,
     html: wf(doctype + document.documentElement.outerHTML),
+    visible: wf(copy.outerHTML),
     blocks: blocks.map(b => wf(b.text)),
   };
 })()"#;
@@ -396,27 +429,25 @@ pub enum TextSource {
 }
 
 impl TextSource {
-    /// The visible text, or the HTML, of each page.
-    pub fn texts(&self, html: bool) -> Vec<String> {
+    /// The visible text, the HTML or the Markdown of each page, as `mode` shows them.
+    pub fn texts(&self, mode: WebMode) -> Vec<String> {
         match self {
             TextSource::Rendered(r) => r
                 .iter()
-                .map(|r| {
-                    if html {
-                        web::format_html(&r.html)
-                    } else {
-                        r.text()
-                    }
+                .map(|r| match mode {
+                    WebMode::Html => web::format_html(&r.html),
+                    WebMode::Markdown => web_markdown::to_text(&r.markdown(None)),
+                    _ => r.text(),
                 })
                 .collect(),
             TextSource::Downloaded(pages, _) => pages
                 .iter()
-                .map(|p| {
-                    if html {
-                        web::format_html(&p.html)
-                    } else {
-                        web::html_to_text(&p.html)
+                .map(|p| match mode {
+                    WebMode::Html => web::format_html(&p.html),
+                    WebMode::Markdown => {
+                        web_markdown::to_text(&web_markdown::html_to_blocks(&p.html, Some(&p.url)))
                     }
+                    _ => web::html_to_text(&p.html),
                 })
                 .collect(),
         }
@@ -585,6 +616,7 @@ pub fn render(
             })
             .unwrap_or_default();
         r.html = v["html"].as_str().unwrap_or_default().to_string();
+        r.visible_html = v["visible"].as_str().unwrap_or_default().to_string();
     }
     if opts.capture == Capture::None {
         progress.done.store(urls.len(), Ordering::Relaxed);
@@ -825,11 +857,13 @@ mod tests {
         let a = page(
             "a.html",
             "<h1>Hello</h1><p>The <b>quick</b> brown fox</p><p style='display:none'>hidden</p>\
-             <div style='height:3000px'>tall</div><p>end</p>",
+             <style>.gone {display: none}</style><p class='gone'>styled away</p>\
+             <div style='height:3000px'>tall</div><p>end <a href='b.html'>next</a></p>",
         );
         let b = page(
             "b.html",
-            "<h1>Hello</h1><p>The <b>quick</b> red fox</p><div style='height:3000px'>tall</div><p>end</p>",
+            "<h1>Hello</h1><p>The <b>quick</b> red fox</p><div style='height:3000px'>tall</div>\
+             <p>end <a href='b.html'>next</a></p>",
         );
         let progress = Progress::default();
         let text = render(
@@ -850,13 +884,26 @@ mod tests {
                 "Hello",
                 "The quick brown fox",
                 "tall",
-                "end",
+                "end next",
                 "In contents",
                 "Shadow slotted",
                 "From script"
             ])
         );
         assert!(text[1].html.contains("<p>From script</p>"));
+        // Markdown leaves out what the page hides, also by its style sheets, and makes links
+        // absolute.
+        let md = web_markdown::to_text(&text[0].markdown(None));
+        assert!(
+            md.contains("# Hello\nThe **quick** brown fox\ntall\n"),
+            "{md}"
+        );
+        assert!(md.contains(&format!("end [next]({b})")), "{md}");
+        assert!(md.contains("From script"), "{md}");
+        assert!(
+            !md.contains("hidden") && !md.contains("styled away"),
+            "{md}"
+        );
         for capture in [Capture::Viewport, Capture::FullPage] {
             let shots = render(
                 &exe,

@@ -96,12 +96,12 @@ impl Palette {
             }
             enter = i.consume_key(Modifiers::NONE, Key::Enter);
         });
-        let id = egui::Id::new("command_palette");
+        let id = egui::Id::unique("command_palette");
         let mut picked: Option<usize> = None;
         let modal = egui::Modal::new(id)
             .area(egui::Modal::default_area(id).anchor(Align2::CENTER_TOP, vec2(0.0, 90.0)))
             .show(ctx, |ui| {
-                let width = 600.0_f32.min(ctx.screen_rect().width() - 60.0);
+                let width = 600.0_f32.min(ctx.content_rect().width() - 60.0);
                 ui.set_width(width);
                 let p = widgets::pal(ui);
                 let field = widgets::search_edit(ui, &mut self.query, tr("palette.hint"), width);
@@ -161,9 +161,7 @@ fn entry_row<A>(
     p: &crate::ui::theme::Palette,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
-    resp.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, &e.label)
-    });
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, &e.label));
     let painter = ui.painter_at(rect);
     if selected {
         painter.rect_filled(rect, 6.0, p.accent_soft);
@@ -177,8 +175,8 @@ fn entry_row<A>(
         e.icon,
         if selected { p.accent } else { p.text_dim },
     );
-    let detail =
-        ui.fonts(|f| f.layout_no_wrap(e.detail.clone(), FontId::proportional(12.5), p.text_dim));
+    let detail = ui
+        .fonts_mut(|f| f.layout_no_wrap(e.detail.clone(), FontId::proportional(12.5), p.text_dim));
     let detail_x = rect.right() - 10.0 - detail.size().x;
     painter.galley(
         pos2(detail_x, cy - detail.size().y / 2.0),
@@ -213,7 +211,7 @@ fn entry_row<A>(
         run.push(ch);
     }
     flush(&mut job, &mut run, run_hit);
-    let label = ui.fonts(|f| f.layout_job(job));
+    let label = ui.fonts_mut(|f| f.layout_job(job));
     let clip = Rect::from_min_max(rect.min, pos2(detail_x - 12.0, rect.max.y));
     painter.with_clip_rect(clip).galley(
         pos2(rect.left() + 36.0, cy - label.size().y / 2.0),

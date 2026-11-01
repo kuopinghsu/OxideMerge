@@ -634,6 +634,8 @@
   "web.resources": "Árbol de recursos",
   "web.screenshot": "Captura (área visible)",
   "web.text": "Texto",
+  "web.markdown": "Con formato",
+  "web.md_identical": "Las páginas muestran el mismo contenido con formato",
   "web.full_screenshot": "Página completa",
   "web.highlight": "Resaltar diferencias",
   "web.highlight_tip": "Resaltar en las capturas el texto que difiere entre las páginas",

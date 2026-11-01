@@ -17,6 +17,19 @@ struct Widget {
     enabled: bool,
 }
 
+#[derive(Debug)]
+struct Dropped(PathBuf);
+
+impl egui::DroppedFile for Dropped {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
+}
+
 struct Gui {
     name: &'static str,
     ctx: egui::Context,
@@ -75,18 +88,16 @@ impl Gui {
     }
 
     fn frame(&mut self) {
+        let mut events = vec![Event::ModifiersChanged(self.modifiers)];
+        events.append(&mut self.events);
         let mut raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SCREEN)),
             time: Some(self.time),
-            modifiers: self.modifiers,
-            events: std::mem::take(&mut self.events),
+            events,
             dropped_files: self
                 .dropped
                 .drain(..)
-                .map(|p| egui::DroppedFile {
-                    path: Some(p),
-                    ..Default::default()
-                })
+                .map(|p| std::sync::Arc::new(Dropped(p)) as egui::DroppedFileHandle)
                 .collect(),
             focused: self.focused,
             ..Default::default()
@@ -94,9 +105,8 @@ impl Gui {
         self.time += 1.0 / 60.0;
         eframe::App::raw_input_hook(&mut self.app, &self.ctx, &mut raw);
         let (app, frame) = (&mut self.app, &mut self.frame);
-        let out = self
-            .ctx
-            .run(raw, |ctx| eframe::App::update(app, ctx, frame));
+        let mut out = self.ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, frame));
+        out.textures_delta.clear();
         for c in &out.platform_output.commands {
             if let egui::OutputCommand::CopyText(t) = c {
                 self.copied.push(t.clone());
@@ -199,7 +209,8 @@ impl Gui {
                 let r = w.rect;
                 named(w, item)
                     && if depth == 1 {
-                        (r.left() - anchor.left()).abs() < 2.0 && r.top() >= anchor.bottom()
+                        (anchor.left() - 2.0..=anchor.left() + 12.0).contains(&r.left())
+                            && r.top() >= anchor.bottom()
                     } else {
                         r.left() >= anchor.right() - 4.0 && r.left() <= anchor.right() + 24.0
                     }
@@ -247,6 +258,8 @@ impl Gui {
             self.events.push(Event::MouseWheel {
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0.0, dy),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
                 modifiers: Modifiers::NONE,
             });
             self.frames(3);
@@ -400,8 +413,13 @@ fn widgets_of(tree: &accesskit::TreeUpdate) -> Vec<Widget> {
         stack.extend(n.children().iter().rev());
     }
     for n in order {
-        // Plain text has its words as the value.
-        let (Some(label), Some(b)) = (n.label().or(n.value()), n.bounds()) else {
+        // A combo box is named by the caption it is labelled by; plain text has its words as
+        // the value.
+        let caption = n
+            .labelled_by()
+            .iter()
+            .find_map(|id| nodes.get(id).and_then(|c| c.label().or(c.value())));
+        let (Some(label), Some(b)) = (n.label().or(caption).or(n.value()), n.bounds()) else {
             continue;
         };
         out.push(Widget {
@@ -747,6 +765,50 @@ fn folder_merges_leave_alone_what_changed_meanwhile() {
 }
 
 #[test]
+fn formatted_web_pages_step_on_to_the_next_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("left/one.html", "<p>one</p><p>left</p>"),
+            ("right/one.html", "<p>one</p><p>right</p>"),
+            ("left/two.html", "<p>two</p><p>left</p>"),
+            ("right/two.html", "<p>two</p><p>right</p>"),
+        ],
+    );
+    let cfg = Config {
+        web_render: false,
+        ..config()
+    };
+    let roots = [d.join("left"), d.join("right")];
+    let mut gui = Gui::with_config("web_step_file", cfg, compare_folders(&roots));
+    let shown = |gui: &mut Gui| {
+        let start = Instant::now();
+        loop {
+            gui.frame();
+            if let Content::Web(w) = &gui.app.tabs[gui.app.active].content {
+                if w.formatted.is_some() {
+                    return w.urls[0].path().to_string();
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "the pages never loaded"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    gui.click("one.html");
+    gui.key(Modifiers::NONE, Key::Enter);
+    assert!(shown(&mut gui).ends_with("/one.html"));
+    gui.key(ALT, Key::ArrowDown);
+    gui.key(ALT, Key::ArrowDown);
+    assert!(shown(&mut gui).ends_with("/two.html"));
+}
+
+#[test]
 fn tabs_switch_and_ask_before_closing_with_unsaved_changes() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
@@ -830,9 +892,9 @@ fn lines_are_found_copied_and_pasted_with_the_keyboard() {
 #[test]
 fn theme_and_language_follow_the_settings() {
     let mut gui = Gui::start("theme_language", None);
-    assert!(!gui.ctx.style().visuals.dark_mode);
+    assert!(!gui.ctx.global_style().visuals.dark_mode);
     gui.click(tr("view.dark_mode"));
-    assert!(gui.ctx.style().visuals.dark_mode);
+    assert!(gui.ctx.global_style().visuals.dark_mode);
 
     gui.click(tr("menu.options").trim_end_matches(['.', '…']));
     gui.click_a(accesskit::Role::ComboBox, tr("menu.language"));
@@ -1046,12 +1108,12 @@ fn menus_are_measured_with_their_submenus_contents() {
     let mut widths = Vec::new();
     for _ in 0..2 {
         widths.clear();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             for (layer, list) in [(MENU_MEASURE, false), (MENU_MEASURE, true)] {
-                let shown = egui::Area::new(egui::Id::new(layer).with(list)).show(ctx, |ui| {
+                let shown = egui::Area::new(egui::Id::unique(layer).with(list)).show(ctx, |ui| {
                     let mut ui = ui.new_child(egui::UiBuilder::new().layer_id(egui::LayerId::new(
                         egui::Order::Middle,
-                        egui::Id::new(layer),
+                        egui::Id::unique(layer),
                     )));
                     // As the menus are measured (see `OxideMergeApp::menu_width`).
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
@@ -1067,11 +1129,13 @@ fn menus_are_measured_with_their_submenus_contents() {
                 });
                 widths.push(shown.inner);
             }
-        });
+        })
+        .textures_delta
+        .clear();
     }
     // The style first: `fonts` holds the context's lock, which `style` also needs.
-    let font = egui::TextStyle::Button.resolve(&ctx.style());
-    let text = ctx.fonts(|f| {
+    let font = egui::TextStyle::Button.resolve(&ctx.global_style());
+    let text = ctx.fonts_mut(|f| {
         f.layout_no_wrap(long.into(), font, egui::Color32::WHITE)
             .size()
             .x
@@ -1088,13 +1152,15 @@ fn menus_are_measured_with_their_submenus_contents() {
 fn menu_checks_line_up_whether_on_or_off() {
     let ctx = egui::Context::default();
     let mut rects = Vec::new();
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
-        egui::Area::new(egui::Id::new("checks")).show(ctx, |ui| {
+    ctx.run_pass(egui::RawInput::default(), |ctx| {
+        egui::Area::new(egui::Id::unique("checks")).show(ctx, |ui| {
             for on in [true, false] {
                 rects.push(widgets::menu_check(ui, on, "Tree mode", "").rect);
             }
         });
-    });
+    })
+    .textures_delta
+    .clear();
     assert_eq!(rects[0].width(), rects[1].width(), "{rects:?}");
 }
 
@@ -1104,17 +1170,19 @@ fn submenus_are_measured_with_their_arrow() {
     let mut widths = Vec::new();
     for _ in 0..2 {
         widths.clear();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
             for layer in [MENU_MEASURE, "elsewhere"] {
-                let shown = egui::Area::new(egui::Id::new(layer)).show(ctx, |ui| {
+                let shown = egui::Area::new(egui::Id::unique(layer)).show(ctx, |ui| {
                     submenu(ui, "Export", |_| ());
                 });
                 widths.push(shown.response.rect.width());
             }
-        });
+        })
+        .textures_delta
+        .clear();
     }
     // Only where the menus are measured, as menus draw the arrow themselves.
-    let spacing = ctx.style().spacing.item_spacing.x;
+    let spacing = ctx.global_style().spacing.item_spacing.x;
     assert!(widths[0] > widths[1] + spacing, "{widths:?}");
 }
 
@@ -1533,7 +1601,7 @@ fn meld_link_arrows_and_compact_pane_clicks_target_the_correct_change() {
         .rect;
     let row_h = gui
         .ctx
-        .fonts(|f| f.row_height(&egui::FontId::monospace(config().font_size)))
+        .fonts_mut(|f| f.row_height(&egui::FontId::monospace(config().font_size)))
         + 2.0;
     // Left line 4 is directly below line 3, with no two-row insertion spacer.
     gui.click_at(Pos2::new(
@@ -1799,7 +1867,7 @@ fn escape_closes_only_the_active_compare_and_leaves_the_start_page_open() {
     assert_eq!(gui.app.tabs.len(), 2);
     gui.click(tr("menu.file"));
     assert!(
-        egui::menu::BarState::load(&gui.ctx, gui.app.menu_bar_id.unwrap()).is_some(),
+        egui::Popup::is_any_open(&gui.ctx),
         "clicked menu should be tracked as open"
     );
     gui.key(Modifiers::NONE, Key::Escape);
@@ -1953,7 +2021,7 @@ fn dialogs_put_their_close_button_at_the_right_edge() {
         gui.frames(3);
         let dialog = gui
             .ctx
-            .memory(|m| m.area_rect(egui::Id::new(id)))
+            .memory(|m| m.area_rect(egui::Id::unique(id)))
             .expect(id);
         let close = gui.widget(tr("btn.close")).rect;
         let gap = dialog.right() - close.right();

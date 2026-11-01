@@ -124,7 +124,7 @@ fn vertical_metrics(bytes: &[u8], index: u32) -> Option<VMetrics> {
     })
 }
 
-/// `FontTweak::baseline_offset_factor` that puts `fallback` on `primary`'s baseline.
+/// `FontTweak::y_offset_factor` that puts `fallback` on `primary`'s baseline.
 ///
 /// egui centers a fallback font's em box on the primary font
 /// (`ascent + 0.5 * (primary_row - fallback_row)`). San Francisco and the macOS CJK fonts
@@ -275,7 +275,7 @@ fn fallback_tweak(primary: Option<VMetrics>, bytes: &[u8], index: u32) -> FontTw
         return FontTweak::default();
     };
     FontTweak {
-        baseline_offset_factor: baseline_offset_factor(primary, fallback),
+        y_offset_factor: baseline_offset_factor(primary, fallback),
         ..Default::default()
     }
 }

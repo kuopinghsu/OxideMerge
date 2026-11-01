@@ -296,6 +296,9 @@ fn content_ui(
         }
         Content::Web(v) => {
             v.header(ui, cfg, named);
+            if let Some(f) = &mut v.formatted {
+                f.ui(ui, colors, cfg.show_location_pane);
+            }
             v.inner
                 .as_deref_mut()
                 .and_then(|c| content_ui(c, ui, cfg, colors, named))
@@ -751,13 +754,13 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
                 for set in &d.rule_sets {
                     if ui.button(&set.name).clicked() {
                         export = Some(Some(set.clone()));
-                        ui.close_menu();
+                        ui.close();
                     }
                 }
                 ui.separator();
                 if ui.button(tr("rules.export_all")).clicked() {
                     export = Some(None);
-                    ui.close_menu();
+                    ui.close();
                 }
             });
         });
@@ -1229,7 +1232,6 @@ pub struct OxideMergeApp {
     report_job: Option<(PathBuf, std::sync::mpsc::Receiver<Result<(), String>>)>,
     /// Ctrl+Tab presses taken from the input before egui saw them.
     tab_keys: Vec<Cmd>,
-    menu_bar_id: Option<egui::Id>,
     filters_dlg: bool,
     about: bool,
     help: bool,
@@ -1391,6 +1393,8 @@ struct Menus {
     folder_busy: bool,
     /// The tab compares web pages, whichever way it shows them.
     web: bool,
+    /// The web page tab shows the pages formatted, with its own differences to step through.
+    formatted: bool,
     tabs: usize,
     picked: Option<Cmd>,
     /// Compare rules file picked for the active tab ("" = none).
@@ -1434,6 +1438,7 @@ impl Menus {
             (Patch, Text) => self.sides == 2,
             (ExportHtml | Report | Slideshow | Statistics, Text) => true,
             (Refresh, Text | Folder | Web) => true,
+            (NextDiff | PrevDiff | FirstDiff | LastDiff, Web) => self.formatted,
             (AllDiffs, Folder) => !self.folder_busy,
             (
                 Save | Undo | NextDiff | PrevDiff | FirstDiff | LastDiff | CopyRight | CopyLeft
@@ -1457,11 +1462,9 @@ impl Menus {
     }
 
     fn item_as(&mut self, ui: &mut egui::Ui, label: &str, c: Cmd) {
-        let button =
-            egui::Button::new(label).shortcut_text(widgets::menu_shortcut(ui, &c.shown_key()));
-        if ui.add_enabled(self.enabled(c), button).clicked() {
+        if widgets::menu_item(ui, self.enabled(c), label, &c.shown_key()).clicked() {
             self.picked = Some(c);
-            ui.close_menu();
+            ui.close();
         }
     }
 }
@@ -1497,7 +1500,7 @@ fn submenu_measured<R>(
     contents: bool,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
-    if ui.layer_id().id != egui::Id::new(MENU_MEASURE) {
+    if ui.layer_id().id != egui::Id::unique(MENU_MEASURE) {
         return widgets::submenu(ui, title, add);
     }
     let shown = ui.menu_button(title, |_| ());
@@ -1719,9 +1722,7 @@ fn recent_card(ui: &mut egui::Ui, w: f32, paths: &[String]) -> egui::Response {
         p.text_dim,
     );
     widgets::focus_ring(ui, &resp, rect, 10.0);
-    resp.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, names.join(" ↔ "))
-    });
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, names.join(" ↔ ")));
     resp.on_hover_text(paths.join("\n"))
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -1814,7 +1815,7 @@ fn option_result_row(ui: &mut egui::Ui, icon: Icon, label: &str, tab: &str) -> e
     let p = pal(ui);
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
     resp.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{label} — {tab}"))
+        egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{label} — {tab}"))
     });
     if !ui.is_rect_visible(rect) {
         return resp;
@@ -1857,11 +1858,11 @@ fn drop_overlay(ctx: &egui::Context, filling_dialog: bool) {
     if count == 0 {
         return;
     }
-    let p = theme::palette(ctx.style().visuals.dark_mode);
-    let screen = ctx.screen_rect();
+    let p = theme::palette(ctx.global_style().visuals.dark_mode);
+    let screen = ctx.content_rect();
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Tooltip,
-        egui::Id::new("drop_overlay"),
+        egui::Id::unique("drop_overlay"),
     ));
     painter.rect_filled(screen, 0.0, p.surface.gamma_multiply(0.82));
     let frame = screen.shrink(14.0);
@@ -1934,7 +1935,6 @@ impl OxideMergeApp {
             git_dlg: None,
             report_job: None,
             tab_keys: Vec::new(),
-            menu_bar_id: None,
             filters_dlg: false,
             rule_dlg: None,
             about: false,
@@ -2180,7 +2180,12 @@ impl OxideMergeApp {
         for p in &paths {
             self.cfg.add_recent_path(&p.display().to_string());
         }
-        if req.kind == Some(FileKind::Web)
+        let html = req.kind.is_none()
+            && req.output.is_none()
+            && req.snapshot_options.is_none()
+            && web::are_html_files(&paths);
+        if html
+            || req.kind == Some(FileKind::Web)
             || paths.iter().any(|p| web::is_url(&p.to_string_lossy()))
         {
             let urls = paths
@@ -2869,7 +2874,7 @@ impl OxideMergeApp {
         let mut keep = true;
         let mut save = false;
         let problem = d.draft.problem();
-        let modal = egui::Modal::new(egui::Id::new("rule_dialog")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("rule_dialog")).show(ctx, |ui| {
             ui.set_width(600.0);
             if widgets::dialog_title(ui, tr("cmd.add_rule")) {
                 keep = false;
@@ -3458,7 +3463,17 @@ impl OxideMergeApp {
                         Cmd::CopyLeft => v.copy_current(false),
                         _ => {}
                     },
-                    Content::Web(_) => {}
+                    Content::Web(v) => {
+                        if let Some(f) = &mut v.formatted {
+                            match cmd {
+                                Cmd::NextDiff if !f.next_diff() => f.step_file = Some(true),
+                                Cmd::PrevDiff if !f.prev_diff() => f.step_file = Some(false),
+                                Cmd::FirstDiff => f.first_diff(),
+                                Cmd::LastDiff => f.last_diff(),
+                                _ => {}
+                            }
+                        }
+                    }
                 }
                 if let Some(e) = err {
                     self.error(e);
@@ -3477,6 +3492,7 @@ impl OxideMergeApp {
                 Content::Text(v) => v.step_file.take(),
                 Content::Binary(v) => v.step_file.take(),
                 Content::Image(v) => v.step_file.take(),
+                Content::Web(v) => v.formatted.as_mut().and_then(|f| f.step_file.take()),
                 _ => None,
             });
         if let Some(forward) = step {
@@ -3859,7 +3875,7 @@ impl OxideMergeApp {
             return;
         };
         let mut keep = true;
-        let modal = egui::Modal::new(egui::Id::new("stats_dialog")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("stats_dialog")).show(ctx, |ui| {
             ui.set_min_width(360.0);
             if widgets::dialog_title(ui, &plain(tr("menu.statistics"))) {
                 keep = false;
@@ -3942,7 +3958,7 @@ impl OxideMergeApp {
             d.commits.clear();
         }
         let (mut keep, mut go) = (true, false);
-        let modal = egui::Modal::new(egui::Id::new("git_dialog")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("git_dialog")).show(ctx, |ui| {
             ui.set_width(560.0);
             if widgets::dialog_title(ui, &plain(tr("menu.git_compare"))) {
                 keep = false;
@@ -3991,7 +4007,7 @@ impl OxideMergeApp {
                                     let text = egui::RichText::new(format!("{hash}  {subject}"));
                                     if ui.button(text).clicked() {
                                         d.rev = hash.clone();
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                 }
                             })
@@ -4182,11 +4198,8 @@ impl OxideMergeApp {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let typing = widgets::typing(ctx);
-        let escape_reserved = self
-            .menu_bar_id
-            .is_some_and(|id| egui::menu::BarState::load(ctx, id).is_some())
-            || ctx.is_context_menu_open()
-            || ctx.memory(|m| m.any_popup_open())
+        // Open menus, context menus and popups take Escape to close.
+        let escape_reserved = egui::Popup::is_any_open(ctx)
             || match self.tabs.get(self.active).map(|t| t.content.view()) {
                 Some(Content::Text(v)) => v.handles_escape(),
                 Some(Content::Binary(v)) => v.find.open || v.goto.is_some(),
@@ -4247,6 +4260,7 @@ impl OxideMergeApp {
             has_source: tab.is_some_and(|t| t.source.len() >= 2),
             folder_busy: matches!(view, Some(Content::Folder(v)) if v.is_running()),
             web: matches!(tab.map(|t| &t.content), Some(Content::Web(_))),
+            formatted: matches!(view, Some(Content::Web(w)) if w.formatted.is_some()),
             tabs: self.tabs.len(),
             picked: None,
             rules: None,
@@ -4260,7 +4274,7 @@ impl OxideMergeApp {
             // The menu bar is the title bar: its empty parts move and zoom the window.
             let bar = ui.interact(
                 ui.max_rect().expand2(vec2(10.0, 5.0)),
-                ui.id().with("title_bar"),
+                ui.scope_id().with("title_bar"),
                 Sense::click_and_drag(),
             );
             if bar.drag_started_by(egui::PointerButton::Primary) {
@@ -4273,7 +4287,7 @@ impl OxideMergeApp {
         }
         let width = self.menu_width(ctx, &mut m);
         widgets::set_menu_width(ctx, width);
-        egui::menu::bar(ui, |ui| {
+        egui::MenuBar::new().ui(ui, |ui| {
             ui.spacing_mut().button_padding = vec2(9.0, 4.0);
             let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             if cfg!(target_os = "macos") && !fullscreen {
@@ -4291,7 +4305,6 @@ impl OxideMergeApp {
             }
             ui.label(egui::RichText::new("OxideMerge").font(theme::semibold(14.5)));
             ui.add_space(12.0);
-            self.menu_bar_id = Some(ui.id());
             for (i, key) in MENUS.into_iter().enumerate() {
                 ui.menu_button(tr(key), |ui| {
                     widgets::menu_setup(ui);
@@ -4378,7 +4391,7 @@ impl OxideMergeApp {
                 ui.separator();
                 if ui.button(tr("menu.about")).clicked() {
                     self.about = true;
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         }
@@ -4388,11 +4401,11 @@ impl OxideMergeApp {
     /// bar or of its submenus, measured once per language, fonts, text size, display scale and
     /// kind of view by laying the menus out unseen.
     fn menu_width(&mut self, ctx: &egui::Context, m: &mut Menus) -> f32 {
-        let size = ctx.style().text_styles[&egui::TextStyle::Button].size;
+        let size = ctx.global_style().text_styles[&egui::TextStyle::Button].size;
         // The fonts in use: after a change of language they follow a frame later.
-        let fonts = ctx.fonts(|f| egui::Id::new(&f.lock().fonts.definitions().families));
+        let fonts = ctx.fonts(|f| egui::Id::unique(&f.definitions().families));
         // The Merge menu names its first item after the view.
-        let id = egui::Id::new("menu_width")
+        let id = egui::Id::unique("menu_width")
             .with(i18n::current_language())
             .with(fonts)
             .with(size.to_bits())
@@ -4401,7 +4414,7 @@ impl OxideMergeApp {
         if let Some(width) = ctx.data(|d| d.get_temp::<f32>(id)) {
             return width;
         }
-        let width = egui::Area::new(egui::Id::new(MENU_MEASURE))
+        let width = egui::Area::new(egui::Id::unique(MENU_MEASURE))
             .order(egui::Order::Background)
             .fixed_pos(egui::pos2(-10_000.0, -10_000.0))
             .constrain(false)
@@ -4431,7 +4444,7 @@ impl OxideMergeApp {
                 for paths in recent.iter().take(10) {
                     if ui.button(recent_label(paths)).clicked() {
                         m.recent = Some(paths.clone());
-                        ui.close_menu();
+                        ui.close();
                     }
                 }
             });
@@ -4531,7 +4544,7 @@ impl OxideMergeApp {
             for mode in ThemeMode::ALL {
                 if widgets::menu_check(ui, cfg.theme == mode, tr(mode.key()), "").clicked() {
                     cfg.theme = mode;
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -4562,7 +4575,7 @@ impl OxideMergeApp {
         m.item(ui, Cmd::AllDiffs);
         let tab_rules = self.tab_rules(self.active);
         // Listed when the menu opens, not every frame it stays open.
-        let names_id = egui::Id::new("menu_rule_names");
+        let names_id = egui::Id::unique("menu_rule_names");
         ui.add_enabled_ui(tab_rules.is_some(), |ui| {
             // Rule names are the user's, like recent paths: not measured, so a long one widens
             // this submenu only, and new ones need no measuring again.
@@ -4592,7 +4605,7 @@ impl OxideMergeApp {
                 ui.separator();
                 m.item(ui, Cmd::EditRules);
                 if m.rules.is_some() {
-                    ui.close_menu();
+                    ui.close();
                 }
             });
             if shown.inner.is_none() {
@@ -4654,7 +4667,7 @@ impl OxideMergeApp {
                 Ok(()) => self.notify(tr(added)),
                 Err(e) => self.error(e.to_string()),
             }
-            ui.close_menu();
+            ui.close();
         }
         if ui
             .add_enabled(registered, egui::Button::new(tr(remove)))
@@ -4662,7 +4675,7 @@ impl OxideMergeApp {
         {
             let _ = crate::shell::unregister();
             self.notify(tr(removed));
-            ui.close_menu();
+            ui.close();
         }
     }
 
@@ -4708,16 +4721,11 @@ impl OxideMergeApp {
                         let (rect, _) = ui.allocate_exact_size(vec2(w, 34.0), Sense::hover());
                         let resp = ui.interact(
                             rect,
-                            egui::Id::new(("tab", t.id)),
+                            egui::Id::unique(("tab", t.id)),
                             Sense::click_and_drag(),
                         );
                         resp.widget_info(|| {
-                            egui::WidgetInfo::selected(
-                                egui::WidgetType::SelectableLabel,
-                                true,
-                                active,
-                                &full,
-                            )
+                            egui::WidgetInfo::selected(egui::Role::Button, true, active, &full)
                         });
                         rects.push(rect);
                         if resp.dragged() {
@@ -4730,7 +4738,7 @@ impl OxideMergeApp {
                         );
                         let close_resp = ui.interact(
                             close_rect,
-                            egui::Id::new(("tab_close", t.id)),
+                            egui::Id::unique(("tab_close", t.id)),
                             Sense::click(),
                         );
                         let painter = ui.painter();
@@ -4827,11 +4835,9 @@ impl OxideMergeApp {
                                         Cmd::CloseTabAt(_) => Cmd::CloseTab.shown_key(),
                                         c => c.shown_key(),
                                     };
-                                    let button = egui::Button::new(label)
-                                        .shortcut_text(widgets::menu_shortcut(ui, &keys));
-                                    if ui.add_enabled(enabled, button).clicked() {
+                                    if widgets::menu_item(ui, enabled, label, &keys).clicked() {
                                         tab_cmd = Some(c);
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                 };
                             item(ui, tr("menu.close_tab"), true, Cmd::CloseTabAt(i));
@@ -4847,7 +4853,7 @@ impl OxideMergeApp {
                                 ui.separator();
                                 if ui.button(tr("cmd.copy_path")).clicked() {
                                     ui.ctx().copy_text(paths.join("\n"));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             }
                         });
@@ -5094,16 +5100,16 @@ impl OxideMergeApp {
                                     widgets::menu_setup(ui);
                                     if ui.button(tr("btn.compare")).clicked() {
                                         compare = Some(paths.clone());
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                     if ui.button(tr("start.recent_edit")).clicked() {
                                         edit = Some(paths.clone());
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                     ui.separator();
                                     if ui.button(tr("start.recent_remove")).clicked() {
                                         remove = Some(paths.clone());
-                                        ui.close_menu();
+                                        ui.close();
                                     }
                                 });
                             }
@@ -5302,7 +5308,7 @@ impl OxideMergeApp {
         for f in &self.named_filters {
             filters.push(format!("{FLT_PREFIX}{}", f.name));
         }
-        let modal = egui::Modal::new(egui::Id::new("open_dialog")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("open_dialog")).show(ctx, |ui| {
             ui.set_width(660.0);
             let p = pal(ui);
             if widgets::dialog_title(ui, tr("dlg.open")) {
@@ -5316,7 +5322,7 @@ impl OxideMergeApp {
                     // Overflowing rows widen the grid for later rows, so every row shares the first row's width.
                     let mut field_w: Option<f32> = None;
                     // Width of the buttons after the path field, measured on the previous frame.
-                    let trailing_id = egui::Id::new("open_dlg_trailing_w");
+                    let trailing_id = egui::Id::unique("open_dlg_trailing_w");
                     for s in 0..3 {
                         if !d.three_way && s == 1 {
                             continue;
@@ -5338,30 +5344,24 @@ impl OxideMergeApp {
                             );
                             path_status(ui, &field, &d.paths[s]);
                             ui.add_space(4.0);
-                            let recent_id = egui::Id::new(("open_recent", s));
+                            let recent_id = egui::Id::unique(("open_recent", s));
                             let r = widgets::icon_button_enabled(
                                 ui,
                                 !recent.is_empty(),
                                 Icon::Clock,
                                 tr("label.recent"),
                             );
-                            if r.clicked() {
-                                ui.memory_mut(|m| m.toggle_popup(recent_id));
-                            }
-                            egui::popup::popup_below_widget(
-                                ui,
-                                recent_id,
-                                &r,
-                                egui::PopupCloseBehavior::CloseOnClick,
-                                |ui| {
+                            egui::Popup::from_toggle_button_response(&r)
+                                .id(recent_id)
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                                .show(|ui| {
                                     ui.set_min_width(320.0);
                                     for r in &recent {
                                         if ui.selectable_label(false, r).clicked() {
                                             d.paths[s] = r.clone();
                                         }
                                     }
-                                },
-                            );
+                                });
                             if widgets::icon_button(ui, Icon::File, tr("btn.browse_file")).clicked()
                             {
                                 if let Some(p) = rfd::FileDialog::new().pick_file() {
@@ -5526,7 +5526,7 @@ impl OxideMergeApp {
         let mut apply = false;
         let mut leave = false;
         let results = search_options(&d.search);
-        let modal = egui::Modal::new(egui::Id::new("options_dialog")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("options_dialog")).show(ctx, |ui| {
             ui.set_width(780.0);
             if widgets::dialog_title(ui, tr("menu.options")) {
                 leave = true;
@@ -6053,7 +6053,7 @@ impl OxideMergeApp {
         };
         let mut keep = true;
         let mut go = false;
-        let modal = egui::Modal::new(egui::Id::new("patch_dialog")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("patch_dialog")).show(ctx, |ui| {
             ui.set_width(520.0);
             if widgets::dialog_title(ui, tr("menu.patch").trim_end_matches(['.', '…'])) {
                 keep = false;
@@ -6151,7 +6151,7 @@ impl OxideMergeApp {
                 };
                 let title = self.tabs.get(i).map(|t| t.title()).unwrap_or_default();
                 let mut action = 0;
-                let modal = egui::Modal::new(egui::Id::new("close_tab")).show(ctx, |ui| {
+                let modal = egui::Modal::new(egui::Id::unique("close_tab")).show(ctx, |ui| {
                     ui.set_min_width(420.0);
                     ui.heading(tr("dlg.unsaved"));
                     ui.label(trf("msg.save_changes", &[("name", title)]));
@@ -6204,7 +6204,7 @@ impl OxideMergeApp {
             }
             Prompt::Exit => {
                 let mut action = 0;
-                let modal = egui::Modal::new(egui::Id::new("exit")).show(ctx, |ui| {
+                let modal = egui::Modal::new(egui::Id::unique("exit")).show(ctx, |ui| {
                     ui.set_min_width(420.0);
                     ui.heading(tr("dlg.unsaved"));
                     ui.label(tr("msg.exit_unsaved"));
@@ -6266,7 +6266,7 @@ impl OxideMergeApp {
         let now = ctx.input(|i| i.time);
         let mut close: Option<usize> = None;
         let mut undo: Option<u64> = None;
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         let mut bottom = screen.bottom() - 40.0;
         for i in (0..self.toasts.len()).rev() {
             let t = &mut self.toasts[i];
@@ -6283,7 +6283,7 @@ impl OxideMergeApp {
                 ((life - age) / 0.3).clamp(0.0, 1.0) as f32
             };
             let accent = if t.error { p.danger } else { p.success };
-            let area = egui::Area::new(egui::Id::new(("toast", i)))
+            let area = egui::Area::new(egui::Id::unique(("toast", i)))
                 .order(egui::Order::Tooltip)
                 .pivot(Align2::RIGHT_BOTTOM)
                 .fixed_pos(egui::pos2(screen.right() - 16.0, bottom))
@@ -6293,7 +6293,7 @@ impl OxideMergeApp {
                         .fill(p.surface)
                         .stroke(Stroke::new(1.0_f32, p.border_strong))
                         .corner_radius(10)
-                        .shadow(ctx.style().visuals.popup_shadow)
+                        .shadow(ctx.global_style().visuals.popup_shadow)
                         .inner_margin(Margin {
                             left: 12,
                             right: 6,
@@ -6368,7 +6368,7 @@ impl OxideMergeApp {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .map(|f| f.path().to_path_buf())
                 .collect()
         });
         let busy = self.prompt.is_some()
@@ -6473,7 +6473,8 @@ impl eframe::App for OxideMergeApp {
         });
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &root.ctx().clone();
         self.cfg.dark_mode = match self.cfg.theme {
             ThemeMode::Light => false,
             ThemeMode::Dark => true,
@@ -6542,7 +6543,7 @@ impl eframe::App for OxideMergeApp {
 
         let p = theme::palette(self.cfg.dark_mode);
         let chrome = egui::Frame::new().fill(p.chrome);
-        egui::TopBottomPanel::top("menu")
+        egui::Panel::top("menu")
             .frame(chrome.inner_margin(Margin {
                 left: 10,
                 right: 8,
@@ -6550,9 +6551,9 @@ impl eframe::App for OxideMergeApp {
                 bottom: 3,
             }))
             .show_separator_line(false)
-            .show(ctx, |ui| self.menu_bar(ui, ctx));
+            .show(root, |ui| self.menu_bar(ui, ctx));
         if !self.tabs.is_empty() {
-            egui::TopBottomPanel::top("tabs")
+            egui::Panel::top("tabs")
                 .frame(chrome.inner_margin(Margin {
                     left: 8,
                     right: 8,
@@ -6560,11 +6561,11 @@ impl eframe::App for OxideMergeApp {
                     bottom: 0,
                 }))
                 .show_separator_line(false)
-                .show(ctx, |ui| self.tab_bar(ui));
+                .show(root, |ui| self.tab_bar(ui));
         }
-        egui::TopBottomPanel::bottom("status")
+        egui::Panel::bottom("status")
             .frame(chrome.inner_margin(Margin::symmetric(12, 3)))
-            .show(ctx, |ui| self.status_bar(ui));
+            .show(root, |ui| self.status_bar(ui));
 
         let colors = theme::colors(self.cfg.dark_mode);
         let mut folder_action: Option<FolderAction> = None;
@@ -6575,7 +6576,7 @@ impl eframe::App for OxideMergeApp {
         };
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(content_fill))
-            .show(ctx, |ui| {
+            .show(root, |ui| {
                 let cfg = self.cfg.clone();
                 let named = self.named_filters.clone();
                 if !self.tabs.is_empty() {

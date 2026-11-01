@@ -10,6 +10,7 @@ pub mod icons;
 pub mod image_view;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod markdown_view;
 pub mod palette;
 pub mod syntax;
 pub mod text_view;

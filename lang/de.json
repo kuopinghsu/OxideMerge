@@ -634,6 +634,8 @@
   "web.resources": "Ressourcenbaum",
   "web.screenshot": "Bildschirmfoto (sichtbarer Bereich)",
   "web.text": "Text",
+  "web.markdown": "Formatiert",
+  "web.md_identical": "Die Seiten zeigen denselben formatierten Inhalt",
   "web.full_screenshot": "Ganze Seite",
   "web.highlight": "Unterschiede hervorheben",
   "web.highlight_tip": "Text, der sich zwischen den Seiten unterscheidet, in den Bildschirmfotos hervorheben",
