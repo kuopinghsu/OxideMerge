@@ -370,8 +370,8 @@ pub fn plan(items: &[DirItem], roots: &[PathBuf]) -> Plan {
 
 /// Whether `target`, the path of an item under `root`, would be written outside it: through
 /// a name that is not a plain one, or a folder on the way replaced by a symbolic link.
-fn escapes(root: &Path, it: &DirItem, target: &Path) -> bool {
-    let plain = Path::new(&it.rel_path())
+pub(crate) fn escapes(root: &Path, rel: &str, target: &Path) -> bool {
+    let plain = Path::new(rel)
         .components()
         .all(|c| matches!(c, Component::Normal(_)));
     if !plain {
@@ -708,7 +708,8 @@ pub fn apply_until(
         {
             // a conflict is left as it is, so a change to it does no harm
             Some("msg.changed_since_plan")
-        } else if !matches!(step, Step::Conflict) && escapes(&roots[BASE], it, &target) {
+        } else if !matches!(step, Step::Conflict) && escapes(&roots[BASE], &it.rel_path(), &target)
+        {
             Some("msg.outside_folder")
         } else if matches!(step, Step::Copy(_)) && !it.is_dir && target.is_dir() {
             // A folder there now is not replaced: it may hold files the merge does not list.
@@ -1277,10 +1278,10 @@ mod tests {
         write(&roots[0], "x.txt", "x\n");
         let mut items = scan(&roots);
         let target = items[0].path(&roots[BASE]);
-        assert!(!escapes(&roots[BASE], &items[0], &target));
+        assert!(!escapes(&roots[BASE], &items[0].rel_path(), &target));
         items[0].rel_dir = "..".into();
         let target = items[0].path(&roots[BASE]);
-        assert!(escapes(&roots[BASE], &items[0], &target));
+        assert!(escapes(&roots[BASE], &items[0].rel_path(), &target));
     }
 
     #[test]

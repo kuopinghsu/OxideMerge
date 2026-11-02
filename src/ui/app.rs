@@ -47,6 +47,8 @@ pub struct OpenRequest {
     /// Compare rules file to use instead of the one of the options ("" = none).
     pub rules: Option<String>,
     pub snapshot_options: Option<Box<DiffOptions>>,
+    /// How a table compare matches records.
+    pub table: Option<crate::core::table_match::TableMatch>,
 }
 
 pub enum Content {
@@ -175,6 +177,7 @@ impl Tab {
                 proj.read_only = v.panes.iter().map(|p| p.doc.read_only).collect();
                 proj.kind = Some(kind_name(FileKind::Text).into());
                 proj.rules = v.rules.clone();
+                proj.table = Some(v.table_match.clone()).filter(|m| m.by_key());
             }
             Content::Binary(v) => {
                 proj.kind = Some(kind_name(FileKind::Binary).into());
@@ -426,6 +429,7 @@ const OPT_INDEX: &[(OptTab, &str)] = &[
     (OptTab::Folder, "label.recursive"),
     (OptTab::Folder, "opt.unique_subfolders"),
     (OptTab::Folder, "opt.skip_hidden"),
+    (OptTab::Folder, "opt.structured_equal"),
     (OptTab::Folder, "opt.time_tolerance"),
     (OptTab::Folder, "opt.threads"),
     (OptTab::Media, "img.threshold"),
@@ -1191,7 +1195,7 @@ struct PatchDialog {
 enum Prompt {
     CloseTab(u64),
     /// Replace the tab with the next (true) or previous (false) file of its folder compare.
-    SwitchFile(u64, bool),
+    SwitchFile(u64, bool, bool),
     Exit,
 }
 
@@ -1221,6 +1225,8 @@ enum ToastUndo {
 
 pub struct OxideMergeApp {
     baseline_start: Box<super::baseline_panel::BaselinePanel>,
+    /// Folder synchronizations that did not finish, found at startup.
+    sync_recovery: Option<super::sync_dialog::Recovery>,
     cfg: Config,
     saved_cfg: Config,
     /// The config with the options of the command line, and as loaded without them.
@@ -1257,6 +1263,9 @@ pub struct OxideMergeApp {
     settings_retry: Option<f64>,
     /// Tab last scrolled into view in the tab strip.
     shown_active: Option<usize>,
+    /// A tab that opened a file without open conflicts, to move on from to the next (`true`) or
+    /// previous file with conflicts on the next frame, one file a frame.
+    pass_on: Option<(u64, bool)>,
     /// Whether the window had focus on the previous frame; files are checked for outside changes
     /// when it comes back.
     was_focused: bool,
@@ -1292,6 +1301,22 @@ fn kind_from_name(s: &str) -> Option<FileKind> {
     .find(|&k| kind_name(k) == s)
 }
 
+/// The file after (or before) `rel` in folder compare `f` with differences, or with
+/// `conflicts`, that both sides changed.
+fn adjacent_file(
+    f: &FolderView,
+    cfg: &Config,
+    rel: &str,
+    forward: bool,
+    conflicts: bool,
+) -> Option<usize> {
+    if conflicts {
+        f.adjacent_conflict_file(cfg, rel, forward)
+    } else {
+        f.adjacent_different_file(cfg, rel, forward)
+    }
+}
+
 /// What opening the project file `path` compares.
 fn project_request(path: &Path) -> anyhow::Result<OpenRequest> {
     let p = Project::load(path)?;
@@ -1306,6 +1331,7 @@ fn project_request(path: &Path) -> anyhow::Result<OpenRequest> {
         filter: p.filter.clone(),
         method: p.method,
         rules: p.rules.as_deref().map(|r| rules::absolute_spec(r, base)),
+        table: p.table.clone(),
         ..Default::default()
     })
 }
@@ -1399,6 +1425,8 @@ struct Menus {
     has_source: bool,
     /// The folder compare of the tab is still running.
     folder_busy: bool,
+    /// Files of the folder compare are still being copied or deleted.
+    folder_job: bool,
     /// The tab compares web pages, whichever way it shows them.
     web: bool,
     /// The web page tab shows the pages formatted, with its own differences to step through.
@@ -1432,7 +1460,7 @@ impl Menus {
                 Redo | Find | FindNext | FindPrev | GotoLine | CopyAllRight | CopyAllLeft,
                 Text | Binary,
             ) => true,
-            (NextConflict | PrevConflict, Text) | (AutoMerge, Text | Folder) => self.sides == 3,
+            (NextConflict | PrevConflict | AutoMerge, Text | Folder) => self.sides == 3,
             (
                 Replace | ToggleBookmark | NextBookmark | PrevBookmark | ClearBookmarks
                 | BookmarkComment | Indent(_) | SaveComparison | SyncPoint,
@@ -1448,6 +1476,7 @@ impl Menus {
             // A report or patch of a folder compare still running would miss files.
             (ReportWithDiffs | ExportHtml | Report | Slideshow, Folder) => !self.folder_busy,
             (Patch, Folder) => self.sides == 2 && !self.folder_busy,
+            (SyncFolders, Folder) => self.sides == 2 && !self.folder_busy && !self.folder_job,
             (Patch, Text) => self.sides == 2,
             (ExportHtml | Report | Slideshow | Statistics, Text) => true,
             (Refresh, Text | Folder | Web) => true,
@@ -1592,6 +1621,9 @@ fn merge_menu(ui: &mut egui::Ui, m: &mut Menus) {
         tr("cmd.auto_merge")
     };
     m.item_as(ui, merge, Cmd::AutoMerge);
+    if m.view == ViewKind::Folder {
+        m.item(ui, Cmd::SyncFolders);
+    }
     m.item(ui, Cmd::TakeBoth(true));
     m.item(ui, Cmd::TakeBoth(false));
     ui.separator();
@@ -1935,6 +1967,7 @@ impl OxideMergeApp {
         let applied_lang = cfg.language.clone();
         let mut app = OxideMergeApp {
             baseline_start: Default::default(),
+            sync_recovery: Some(super::sync_dialog::Recovery::all()).filter(|r| !r.is_empty()),
             saved_cfg: cfg.clone(),
             cli_options: (cfg != stored).then(|| (cfg.clone(), stored)),
             cfg,
@@ -1963,6 +1996,7 @@ impl OxideMergeApp {
             allow_close: false,
             settings_retry: None,
             shown_active: None,
+            pass_on: None,
             was_focused: true,
             next_tab_id: 0,
             track_session: initial.is_none(),
@@ -2337,6 +2371,9 @@ impl OxideMergeApp {
                     crate::ui::text_view::redirect_output(&mut docs, out);
                 }
                 let mut v = TextView::new(docs, &self.cfg);
+                if let Some(m) = &req.table {
+                    v.set_table_match(m.clone());
+                }
                 if req.rules.is_some() {
                     v.set_rules(req.rules.clone());
                     if let Some(o) = v.options_for(&self.cfg.diff) {
@@ -2557,8 +2594,8 @@ impl OxideMergeApp {
     }
 
     /// Moves on from the active tab to the next or previous file with differences in the folder
-    /// compare it was opened from.
-    fn step_file(&mut self, forward: bool) {
+    /// compare it was opened from, or with `conflicts`, that both sides changed.
+    fn step_file(&mut self, forward: bool, conflicts: bool) {
         let ti = self.active;
         let Some(Origin { folder, rel }) = self.tabs.get(ti).and_then(|t| t.origin.clone()) else {
             return;
@@ -2571,22 +2608,17 @@ impl OxideMergeApp {
         else {
             return;
         };
-        if f.adjacent_different_file(&self.cfg, &rel, forward)
-            .is_none()
-        {
-            self.notify(tr(if forward {
-                "msg.no_next_file"
-            } else {
-                "msg.no_prev_file"
-            }));
+        if adjacent_file(f, &self.cfg, &rel, forward, conflicts).is_none() {
+            let message = f.no_more_files(forward, conflicts);
+            self.notify(tr(message));
         } else if self.tabs[ti].is_modified() {
-            self.prompt = Some(Prompt::SwitchFile(self.tabs[ti].id, forward));
+            self.prompt = Some(Prompt::SwitchFile(self.tabs[ti].id, forward, conflicts));
         } else {
-            self.switch_file(ti, forward);
+            self.switch_file(ti, forward, conflicts);
         }
     }
 
-    fn switch_file(&mut self, ti: usize, forward: bool) {
+    fn switch_file(&mut self, ti: usize, forward: bool, conflicts: bool) {
         let Some(Origin { folder, rel }) = self.tabs.get(ti).and_then(|t| t.origin.clone()) else {
             return;
         };
@@ -2609,10 +2641,12 @@ impl OxideMergeApp {
             rel,
             rules,
             snapshot_options,
-        }) = f
-            .adjacent_different_file(cfg, &rel, forward)
-            .and_then(|i| f.reveal_and_open(i, cfg))
+        }) =
+            adjacent_file(f, cfg, &rel, forward, conflicts).and_then(|i| f.reveal_and_open(i, cfg))
         else {
+            // The folders were compared again while the tab waited for an answer.
+            let message = f.no_more_files(forward, conflicts);
+            self.notify(tr(message));
             return;
         };
         let count = self.tabs.len();
@@ -2633,20 +2667,67 @@ impl OxideMergeApp {
         let Some(mut tab) = self.tabs.pop() else {
             return;
         };
+        let mut pass = false;
         match tab.content.view_mut() {
+            Content::Text(v) if conflicts => {
+                if !v.edge_conflict(forward) {
+                    pass = true;
+                    if forward {
+                        v.first_diff();
+                    } else {
+                        v.last_diff();
+                    }
+                }
+            }
             Content::Text(v) if forward => v.first_diff(),
             Content::Text(v) => v.last_diff(),
             Content::Binary(v) if forward => v.first_diff(),
             Content::Binary(v) => v.last_diff(),
             Content::Image(v) if forward => v.first_diff(),
             Content::Image(v) => v.last_diff(),
+            // Pages are loaded in the background; they open there once loaded.
+            Content::Web(v) => v.land = Some(forward),
             _ => {}
         }
-        self.notify(trf("msg.file_switched", &[("file", rel.clone())]));
+        // A file without open conflicts is passed over on the next frame, unless it is the last.
+        let next = pass
+            .then(|| {
+                self.tabs
+                    .iter()
+                    .find(|t| t.id == folder)
+                    .and_then(|t| match t.content.view() {
+                        Content::Folder(f) => Some((
+                            f.adjacent_conflict_file(&self.cfg, &rel, forward).is_some(),
+                            f.no_more_files(forward, true),
+                        )),
+                        _ => None,
+                    })
+            })
+            .flatten();
+        match next {
+            Some((true, _)) => self.pass_on = Some((tab.id, forward)),
+            Some((false, message)) => {
+                self.notify(trf("msg.file_switched", &[("file", rel.clone())]));
+                self.notify(tr(message));
+            }
+            None => self.notify(trf("msg.file_switched", &[("file", rel.clone())])),
+        }
         tab.origin = Some(Origin { folder, rel });
         tab.temps = temps;
         self.tabs[ti] = tab;
         self.active = ti;
+    }
+
+    /// Moves on from a file passed over without open conflicts, as [`Self::pass_on`] asks.
+    fn pass_on(&mut self) {
+        let Some((id, forward)) = self.pass_on.take() else {
+            return;
+        };
+        if let Some(ti) = self.tabs.iter().position(|t| t.id == id) {
+            if !self.tabs[ti].is_modified() {
+                self.switch_file(ti, forward, true);
+            }
+        }
     }
 
     fn close_tab(&mut self, i: usize, force: bool) {
@@ -3389,12 +3470,8 @@ impl OxideMergeApp {
                         Cmd::PrevDiff if !v.prev_diff(false) => v.step_file = Some(false),
                         Cmd::FirstDiff => v.first_diff(),
                         Cmd::LastDiff => v.last_diff(),
-                        Cmd::NextConflict => {
-                            v.next_diff(true);
-                        }
-                        Cmd::PrevConflict => {
-                            v.prev_diff(true);
-                        }
+                        Cmd::NextConflict if !v.next_diff(true) => v.step_conflict = Some(true),
+                        Cmd::PrevConflict if !v.prev_diff(true) => v.step_conflict = Some(false),
                         Cmd::CopyRight => v.copy_current(true),
                         Cmd::CopyLeft => v.copy_current(false),
                         Cmd::CopyAllRight => v.copy_all(0, 1),
@@ -3458,9 +3535,12 @@ impl OxideMergeApp {
                         Cmd::CopyRight => v.copy_selected(true, &cfg),
                         Cmd::CopyLeft => v.copy_selected(false, &cfg),
                         Cmd::AutoMerge => v.request_merge(),
+                        Cmd::SyncFolders => v.request_sync(),
                         Cmd::SelectPattern => v.open_select_pattern(),
                         Cmd::NextDiff => v.step_diff(true, &cfg),
                         Cmd::PrevDiff => v.step_diff(false, &cfg),
+                        Cmd::NextConflict => v.step_conflict(true, &cfg),
+                        Cmd::PrevConflict => v.step_conflict(false, &cfg),
                         Cmd::FirstDiff => v.edge_diff(true, &cfg),
                         Cmd::LastDiff => v.edge_diff(false, &cfg),
                         _ => {}
@@ -3509,10 +3589,17 @@ impl OxideMergeApp {
             .tabs
             .get_mut(self.active)
             .and_then(|t| match t.content.view_mut() {
-                Content::Text(v) => v.step_file.take(),
-                Content::Binary(v) => v.step_file.take(),
-                Content::Image(v) => v.step_file.take(),
-                Content::Web(v) => v.formatted.as_mut().and_then(|f| f.step_file.take()),
+                Content::Text(v) => match v.step_conflict.take() {
+                    Some(forward) => Some((forward, true)),
+                    None => v.step_file.take().map(|f| (f, false)),
+                },
+                Content::Binary(v) => v.step_file.take().map(|f| (f, false)),
+                Content::Image(v) => v.step_file.take().map(|f| (f, false)),
+                Content::Web(v) => v
+                    .formatted
+                    .as_mut()
+                    .and_then(|f| f.step_file.take())
+                    .map(|f| (f, false)),
                 Content::Folder(v) => {
                     notice = v.take_notice();
                     None
@@ -3522,8 +3609,8 @@ impl OxideMergeApp {
         if let Some(msg) = notice {
             self.notify(tr(msg));
         }
-        if let Some(forward) = step {
-            self.step_file(forward);
+        if let Some((forward, conflicts)) = step {
+            self.step_file(forward, conflicts);
         }
     }
 
@@ -3597,6 +3684,26 @@ impl OxideMergeApp {
         self.write_html_report(tr("menu.slideshow"), &name, job);
     }
 
+    /// Selects in the folder compare the file its tab of all differences moved to, so both
+    /// show the same file.
+    fn sync_diffs_selection(&mut self) {
+        let Some(Content::Diffs(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.content) else {
+            return;
+        };
+        let (Some(rel), folder) = (v.take_moved_to(), v.folder) else {
+            return;
+        };
+        let cfg = &self.cfg;
+        if let Some(Content::Folder(f)) = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.id == folder)
+            .map(|t| t.content.view_mut())
+        {
+            f.select_rel(&rel, cfg);
+        }
+    }
+
     /// Opens the differences of every changed file of the active folder compare in one tab.
     fn show_all_diffs(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else {
@@ -3611,6 +3718,7 @@ impl OxideMergeApp {
         }
         let folder = tab.id;
         let src = f.diffs_source(&self.cfg);
+        let at = f.cursor_position();
         if let Some(i) = self
             .tabs
             .iter()
@@ -3620,19 +3728,29 @@ impl OxideMergeApp {
             let Content::Diffs(v) = &mut self.tabs[i].content else {
                 return;
             };
+            let mut outdated = false;
             if v.lists_all(&src) {
                 v.set_stopped(src.stopped);
             } else if v.is_modified() || v.can_undo() {
-                self.notify(tr("diffs.outdated"));
+                outdated = true;
             } else {
                 v.update_from(src);
             }
+            if let Some((rel, at)) = at {
+                v.show_file(&rel, at);
+            }
+            if outdated {
+                self.notify(tr("diffs.outdated"));
+            }
             return;
         }
-        let view = DiffsView::new(src, folder);
+        let mut view = DiffsView::new(src, folder);
         if view.is_empty() {
             self.notify(tr("diffs.empty"));
             return;
+        }
+        if let Some((rel, at)) = at {
+            view.show_file(&rel, at);
         }
         let temps = tab.temps.clone();
         self.push_tab(Content::Diffs(view), Vec::new());
@@ -4235,11 +4353,17 @@ impl OxideMergeApp {
                 Some(Content::Folder(v)) => v.handles_escape(),
                 _ => false,
             };
+        let text_typed = matches!(
+            self.tabs.get(self.active).map(|t| t.content.view()),
+            Some(Content::Binary(v)) if v.takes_text()
+        );
         let menus = self.menus();
         let mut cmds = std::mem::take(&mut self.tab_keys);
         ctx.input_mut(|i| {
             for b in BINDINGS {
-                if b.key.logical_key == Key::Escape && escape_reserved {
+                if b.key.logical_key == Key::Escape && escape_reserved
+                    || b.key.logical_key == Key::Questionmark && text_typed
+                {
                     continue;
                 }
                 let active = match b.scope {
@@ -4288,6 +4412,7 @@ impl OxideMergeApp {
             has_sync_points: matches!(view, Some(Content::Text(v)) if v.has_sync_points()),
             has_source: tab.is_some_and(|t| t.source.len() >= 2),
             folder_busy: matches!(view, Some(Content::Folder(v)) if v.is_running()),
+            folder_job: matches!(view, Some(Content::Folder(v)) if v.has_file_job()),
             web: matches!(tab.map(|t| &t.content), Some(Content::Web(_))),
             formatted: matches!(view, Some(Content::Web(w)) if w.formatted.is_some()),
             tabs: self.tabs.len(),
@@ -4966,6 +5091,34 @@ impl OxideMergeApp {
         }
     }
 
+    /// "File 8 / 42 · Difference 3 / 12" for a tab opened from a folder compare.
+    fn file_nav_label(&self, tab: &Tab) -> Option<String> {
+        let origin = tab.origin.as_ref()?;
+        let Content::Folder(f) = self
+            .tabs
+            .iter()
+            .find(|t| t.id == origin.folder)?
+            .content
+            .view()
+        else {
+            return None;
+        };
+        let mut label = f.file_label(&self.cfg, &origin.rel);
+        let position = match tab.content.view() {
+            Content::Text(v) => Some(v.diff_position()),
+            _ => None,
+        };
+        if let Some((pos, total)) = position {
+            let n = pos.map_or("–".to_string(), |p| (p + 1).to_string());
+            label.push_str(" · ");
+            label.push_str(&trf(
+                "nav.diff_of",
+                &[("n", n), ("total", total.to_string())],
+            ));
+        }
+        Some(label)
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         let p = pal(ui);
         ui.horizontal(|ui| {
@@ -4973,7 +5126,10 @@ impl OxideMergeApp {
             let s = self
                 .tabs
                 .get(self.active)
-                .map(|t| t.content.status_bar_line())
+                .map(|t| match self.file_nav_label(t) {
+                    Some(nav) => format!("{nav}  |  {}", t.content.status_bar_line()),
+                    None => t.content.status_bar_line(),
+                })
                 .unwrap_or_else(|| tr("app.ready").to_string());
             let outcome = self.tabs.get(self.active).and_then(|t| t.content.outcome());
             let color = outcome.map_or(p.border_strong, |o| o.color(&p));
@@ -5854,6 +6010,15 @@ impl OxideMergeApp {
                                         tr("opt.unique_subfolders"),
                                     );
                                     ui.checkbox(&mut f.skip_hidden, tr("opt.skip_hidden"));
+                                    ui.add_enabled(
+                                        f.method == CompareMethod::FullContents,
+                                        egui::Checkbox::new(
+                                            &mut f.structured,
+                                            tr("opt.structured_equal"),
+                                        ),
+                                    )
+                                    .on_hover_text(tr("opt.structured_equal_hint"))
+                                    .on_disabled_hover_text(tr("opt.structured_equal_hint"));
                                     ui.add(
                                         egui::Slider::new(&mut f.time_tolerance_secs, 0..=10)
                                             .text(tr("opt.time_tolerance")),
@@ -6244,7 +6409,7 @@ impl OxideMergeApp {
         let Some(p) = self.prompt.take() else { return };
         let mut keep = true;
         match &p {
-            Prompt::CloseTab(id) | Prompt::SwitchFile(id, _) => {
+            Prompt::CloseTab(id) | Prompt::SwitchFile(id, ..) => {
                 let Some(i) = self.tabs.iter().position(|t| t.id == *id) else {
                     if matches!(p, Prompt::CloseTab(_)) {
                         self.ask_next_close();
@@ -6252,7 +6417,9 @@ impl OxideMergeApp {
                     return;
                 };
                 let finish = |app: &mut Self| match p {
-                    Prompt::SwitchFile(_, forward) => app.switch_file(i, forward),
+                    Prompt::SwitchFile(_, forward, conflicts) => {
+                        app.switch_file(i, forward, conflicts)
+                    }
                     _ => app.close_tab(i, true),
                 };
                 let title = self.tabs.get(i).map(|t| t.title()).unwrap_or_default();
@@ -6483,6 +6650,7 @@ impl OxideMergeApp {
                 .collect()
         });
         let busy = self.prompt.is_some()
+            || self.sync_recovery.is_some()
             || self.patch_dlg.is_some()
             || self.stats_dlg.is_some()
             || self.git_dlg.is_some()
@@ -6607,10 +6775,22 @@ impl eframe::App for OxideMergeApp {
             fonts::setup(ctx, &self.font_lang);
         }
 
+        self.pass_on();
         let unsaved = self.tabs.iter().any(|t| t.is_modified());
         #[cfg(target_os = "macos")]
         crate::ui::macos::set_unsaved(unsaved && !self.allow_close);
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && unsaved {
+        // Ending the program part way would leave a synchronization to recover next time.
+        let syncing = self.sync_recovery.as_ref().is_some_and(|r| r.busy())
+            || self
+                .tabs
+                .iter()
+                .any(|t| matches!(t.content.view(), Content::Folder(f) if f.syncing()));
+        if ctx.input(|i| i.viewport().close_requested()) && syncing {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_queue.clear();
+            self.allow_close = false;
+            self.notify(tr("folder_sync.wait_to_close"));
+        } else if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && unsaved {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_queue.clear();
             self.prompt = Some(Prompt::Exit);
@@ -6632,6 +6812,7 @@ impl eframe::App for OxideMergeApp {
 
         self.handle_drops(ctx);
         let modal = self.prompt.is_some()
+            || self.sync_recovery.is_some()
             || self.open_dlg.is_some()
             || self.options_dlg.is_some()
             || self.patch_dlg.is_some()
@@ -6706,6 +6887,7 @@ impl eframe::App for OxideMergeApp {
         crate::core::fsutil::set_backup(self.cfg.backup_on_save);
         self.announce_finished(ctx);
         self.take_step_file();
+        self.sync_diffs_selection();
         self.refresh_saved_folders();
         if let Some(a) = folder_action {
             match a {
@@ -6818,6 +7000,20 @@ impl eframe::App for OxideMergeApp {
         self.rule_dialog(ctx);
         self.stats_dialog(ctx);
         self.git_dialog(ctx);
+        if let Some(r) = &mut self.sync_recovery {
+            if !r.show(ctx) {
+                let changed = r.changed;
+                self.sync_recovery = None;
+                if changed {
+                    let (cfg, named) = (self.cfg.clone(), self.named_filters.clone());
+                    for t in &mut self.tabs {
+                        if let Content::Folder(f) = t.content.view_mut() {
+                            f.refresh(&cfg, &named);
+                        }
+                    }
+                }
+            }
+        }
         self.poll_report(ctx);
         self.about_window(ctx);
         self.prompts(ctx);
@@ -6838,6 +7034,9 @@ impl eframe::App for OxideMergeApp {
         self.toasts_ui(ctx);
         drop_overlay(ctx, self.open_dlg.is_some());
         self.save_session();
+        if self.pass_on.is_some() {
+            ctx.request_repaint();
+        }
 
         // Settings that could not be read are left alone, as the message at startup said.
         let refused = matches!(crate::config::unreadable(), Some(Err(_)));

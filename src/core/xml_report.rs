@@ -11,6 +11,13 @@
 //!   text:   <difference index="1" kind="changed|added|removed|left-only|right-only|both-same|conflict"
 //!                       ignored="false"><lines side="0" start="12" count="2"><line number="12">…</line>…</lines>…</difference>
 //!           <bookmark side="0" line="5">comment</bookmark>
+//!           <table-match version="1" header="true" columns="position|name" order="left|right|key"
+//!                        ignore-order="false" abs-tolerance="0" rel-tolerance="0.01">
+//!             <key name="id"/> or <key column="3"/> …
+//!             <counts identical="…" added="…" removed="…" modified="…" moved="…" ambiguous="…"/>
+//!             <warning kind="duplicate_header|unpaired_columns|duplicate_keys|empty_keys"
+//!                      side="0" …/> …
+//!           </table-match>                            (a table whose rows were matched by key)
 //!   folder: <item path="…" name="…" folder="…" type="file|folder" status="identical|different|unique|error|other"
 //!                 description="…"><on side="0" date="…" size="…"/>…</item>
 //! </comparison>
@@ -18,6 +25,8 @@
 //!
 //! Line numbers start at 1. Each side's `<lines>` are its lines in the difference; a side with
 //! none (added or removed text) has `count="0"`, and `start` the line it would go before.
+//! `<table-match>` describes how the rows were matched; the differences stay those of the text.
+//! Its `column` numbers start at 1, and `side` is 0 for the left and 1 for the right side.
 
 use super::diff::{BlockKind, DiffResult};
 use super::folder::{CmpStatus, DirItem};

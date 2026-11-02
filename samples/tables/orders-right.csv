@@ -1,0 +1,8 @@
+order_id,customer,status,amount
+1003,Linus,returned,300.00
+1001,Ada,shipped,120.00
+1006,Barbara,shipped,99.99
+1005,Ken,pending,18.00
+1002,Grace,pending,75.505
+1007,Alan,pending,64.00
+1006,Barbara,shipped,99.99

@@ -172,6 +172,44 @@ fn folders(d: &Path) {
 }
 
 #[test]
+fn structured_files_compare_by_structure_in_folders_and_three_ways() {
+    let d = tmp();
+    let d = d.path();
+    files(
+        d,
+        &[
+            ("left/conf.json", "{\"a\": 1, \"b\": 2}"),
+            ("right/conf.json", "{\n  \"b\": 2,\n  \"a\": 1\n}\n"),
+            ("l.yaml", "port: 8080\nmode: fast\n"),
+            ("base.yaml", "port: 80\nmode: slow\n"),
+            ("r.yaml", "port: 80\nmode: safe\n"),
+            ("broken.yaml", "port: [80\n"),
+        ],
+    );
+    assert_eq!(oxidemerge(d, &["--cli", "-r", "left", "right"]).code, 1);
+    let run = oxidemerge(d, &["--cli", "-r", "--structured", "left", "right"]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+
+    let run = oxidemerge(d, &["--semantic", "l.yaml", "base.yaml", "r.yaml"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let report: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+    let states: Vec<_> = report["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["path"].as_str().unwrap(), e["state"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        states,
+        [("$[\"mode\"]", "conflict"), ("$[\"port\"]", "left")]
+    );
+    let same = oxidemerge(d, &["--semantic", "base.yaml", "base.yaml", "base.yaml"]);
+    assert_eq!(same.code, 0, "{}", same.stderr);
+    let bad = oxidemerge(d, &["--semantic", "l.yaml", "base.yaml", "broken.yaml"]);
+    assert_eq!(bad.code, 2, "{}", bad.stdout);
+}
+
+#[test]
 fn folder_compares_list_and_report_the_differences() {
     let d = tmp();
     let d = d.path();
@@ -1285,4 +1323,106 @@ fn command_line_version_displays_the_same_build_identifier_as_about() {
     assert!(run
         .stdout
         .contains(&format!("(build {})", env!("OXIDEMERGE_BUILD_ID"))));
+}
+
+#[test]
+fn folders_are_synchronized_from_a_plan_checked_again_before_applying() {
+    let d = tmp();
+    let d = d.path();
+    files(
+        d,
+        &[
+            ("src/a.txt", "new\n"),
+            ("src/sub/b.txt", "b\n"),
+            ("dst/a.txt", "old\n"),
+            ("dst/extra.txt", "extra\n"),
+        ],
+    );
+    let plan = oxidemerge(
+        d,
+        &[
+            "--sync-plan",
+            "mirror",
+            "src",
+            "dst",
+            "--report",
+            "plan.json",
+        ],
+    );
+    assert_eq!(plan.code, 1, "{}", plan.stderr);
+    let json = read(d.join("plan.json"));
+    assert!(json.contains("\"replace\"") && json.contains("\"delete\""));
+    assert!(!json.contains(d.to_str().unwrap()), "no absolute paths");
+    assert_eq!(
+        read(d.join("dst/a.txt")),
+        "old\n",
+        "planning changes nothing"
+    );
+
+    let unconfirmed = oxidemerge(d, &["--sync-apply", "plan.json", "src", "dst"]);
+    assert_eq!(unconfirmed.code, 2);
+    assert_eq!(read(d.join("dst/extra.txt")), "extra\n");
+    let filtered = oxidemerge(
+        d,
+        &[
+            "--sync-apply",
+            "plan.json",
+            "--yes",
+            "--filter",
+            "*.md",
+            "src",
+            "dst",
+        ],
+    );
+    assert_eq!(filtered.code, 2);
+    assert!(filtered.stderr.contains("filter"), "{}", filtered.stderr);
+    assert_eq!(read(d.join("dst/extra.txt")), "extra\n");
+
+    files(d, &[("dst/a.txt", "OLD\n")]);
+    let stale = oxidemerge(d, &["--sync-apply", "plan.json", "--yes", "src", "dst"]);
+    assert_eq!(stale.code, 2, "{}", stale.stdout);
+    assert_eq!(read(d.join("dst/a.txt")), "OLD\n");
+
+    let plan = oxidemerge(
+        d,
+        &[
+            "--sync-plan",
+            "mirror",
+            "src",
+            "dst",
+            "--report",
+            "plan.json",
+        ],
+    );
+    assert_eq!(plan.code, 1);
+    // A file touched without changing its contents still fits the plan.
+    std::fs::File::options()
+        .write(true)
+        .open(d.join("src/a.txt"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        .unwrap();
+    let applied = oxidemerge(d, &["--sync-apply", "plan.json", "--yes", "src", "dst"]);
+    assert_eq!(applied.code, 0, "{}{}", applied.stdout, applied.stderr);
+    assert!(applied.stdout.contains("\"applied\""));
+    assert_eq!(read(d.join("dst/a.txt")), "new\n");
+    assert_eq!(read(d.join("dst/sub/b.txt")), "b\n");
+    assert!(!d.join("dst/extra.txt").exists());
+    let again = oxidemerge(d, &["--sync-plan", "update", "src", "dst"]);
+    assert_eq!(again.code, 0, "{}", again.stdout);
+
+    std::fs::write(
+        d.join("future.json"),
+        json.replacen("\"version\": 1", "\"version\": 99", 1),
+    )
+    .unwrap();
+    let future = oxidemerge(d, &["--sync-apply", "future.json", "--yes", "src", "dst"]);
+    assert_eq!(future.code, 2);
+    assert!(future.stderr.contains("99"), "{}", future.stderr);
+    let nested = oxidemerge(d, &["--sync-plan", "mirror", "src", "src/sub"]);
+    assert_eq!(nested.code, 2);
+    let recover = oxidemerge(d, &["--sync-recover"]);
+    assert_eq!(recover.code, 0, "{}", recover.stdout);
+    let yes_alone = oxidemerge(d, &["--yes", "src", "dst"]);
+    assert_eq!(yes_alone.code, 2, "{}", yes_alone.stdout);
 }

@@ -42,6 +42,14 @@ It compares text, folders, binary files, images and web pages.
 - Compare folders with their subfolders, filter items by name, and copy items from one folder
   to the other.
 - See all changed text files of a folder comparison in one list with **All differences**.
+- **Next difference** and **Previous difference** go through the file shown below the folder list
+  and then on to the next changed file. The status bar shows where you are, for example
+  *File 2 / 5 · Difference 3 / 7*. In a three-way folder comparison, **Next conflict** and
+  **Previous conflict** go on to the next file that both sides changed and that still has an open
+  conflict.
+- **Synchronize two folders:** preview how one folder would be made to match the other, or only
+  brought up to date from it, then apply the changes after you confirm. If applying fails or you
+  stop it, the changes made so far are undone.
 - Open ZIP, TAR, 7z and other supported archives as folders.
 - Compare a file or folder with a Git branch, tag or commit.
 
@@ -56,7 +64,11 @@ It compares text, folders, binary files, images and web pages.
 - Ignore white space, comments or lines that match a pattern. Saved comparison rules and number
   tolerances help with generated files and measurement data.
 - Use syntax highlighting, search and replace, and bookmarks. CSV and TSV files open in a table
-  view that supports records with line breaks, cell editing and cell merging.
+  view that supports records with line breaks, cell editing and cell merging. Rows can be
+  matched by key columns instead of by position, columns by their header names, and numbers
+  within a tolerance count as equal. Matched rows are listed in left, right or key order. Large
+  tables are matched in the background, with progress and **Cancel**, and reports record how
+  the rows were matched.
 - Add synchronization points to match lines that the comparison paired wrongly.
 - Choose one of two row layouts in **View → Text compare** or **Options → General**:
   - **Compact rows** (the default) shows the text without gaps.
@@ -65,7 +77,8 @@ It compares text, folders, binary files, images and web pages.
 
 ### Other file types
 
-- **Binary files:** see the changed bytes in a side-by-side hexadecimal view.
+- **Binary files:** see the changed bytes in a side-by-side hexadecimal view. Click a byte to
+  change it: type hexadecimal digits or text, insert or delete bytes, and save.
 - **Images:** compare images side by side, or with the overlay, swipe, blink and difference
   views.
 - **Web pages:** by default, both pages are converted to Markdown and shown formatted side by
@@ -88,8 +101,10 @@ These tools only read files. They run only when you open them.
 - **Merge verification:** in a three-way text or folder comparison, expand **Merge
   Verification**. Preview the merge in memory, or check the bytes of the saved result.
 - **Semantic comparison:** **Text / Semantic** compares JSON, XML, TOML and YAML files by their
-  structure. It does not edit or reformat the files. Changes appear in a tree of paths. Moved
-  array items are marked, and you can choose a key that matches array items.
+  structure. Changes appear in a tree of paths. Moved array items are marked, and you can choose
+  a key that matches array items. Copy a single value to the other side without touching the rest
+  of the file, or compare three files and take the left or right value for each conflict. A
+  folder option counts files with the same structure as identical.
 - **Review workspace:** in a folder comparison, record a decision for each file and each change.
   Add comments, reasons and tags, and go to the next item that is not reviewed yet. Save the
   review as an `.oxmreview` file to continue on another computer. When the files change, earlier
@@ -216,6 +231,24 @@ The merge either completes fully or changes nothing:
 - If an item changed after the plan was made, nothing is merged.
 - If you stop the merge, or a change fails, all changes made so far are undone.
 
+### Synchronize two folders
+
+In a two-way folder comparison, choose **Synchronize folders...** in the toolbar or the **Merge**
+menu. The comparison must include subfolders and must be finished.
+
+1. Choose a mode: **Mirror** makes the destination match the source and deletes what only the
+   destination has. **Update** copies new and changed files and deletes nothing.
+2. Review the preview. Nothing has changed yet. Each item shows what would happen and why. A
+   file that was renamed or moved in the source is also listed under **Rename**. You can export
+   the plan as JSON.
+3. Choose **Apply changes...** and confirm. Large deletions ask a second time. While the changes
+   are applied, the dialog shows the file that is being changed.
+
+Before each change, OxideMerge checks that the file is still the one in the preview. A file
+edited after the preview is not overwritten. The files that are replaced or deleted are kept in
+a recovery journal in the settings folder until the synchronization finishes. If OxideMerge
+ends before that, it offers to undo the changes the next time it starts.
+
 ## Command line
 
 The examples below assume that `oxidemerge` is in your `PATH`. If it is not, use the full path
@@ -248,6 +281,7 @@ oxidemerge -r old-folder new-folder --report report.html --report-diffs
 | `-t text`, `-t binary`, `-t image`, `-t web` | Choose the comparison type. |
 | `-o <file>` | Save the merge result to another file. |
 | `--ignore-case`, `--ignore-eol`, `--ignore-comments` | Ignore letter case, line endings or comments. |
+| `--structured` | In folder comparisons, count JSON, XML, TOML and YAML files with the same structure as identical. |
 | `--rules <name-or-path>` | Use a comparison rules file. |
 | `--git-rev <revision>` | Compare one file or folder with a Git revision. |
 | `--report <file>` | Export a report as `.html` or `.xml`. Folder comparisons can also use `.csv` or `.txt`. |
@@ -275,6 +309,7 @@ for all options. For the full reference and script examples, see the
 oxidemerge --merge-plan left.txt base.txt right.txt --report merge-plan.json
 oxidemerge --validate-merge merged.txt left.txt base.txt right.txt --report validation.json
 oxidemerge --semantic --format json old.json new.json --report semantic.html
+oxidemerge --semantic left.yaml base.yaml right.yaml --report conflicts.json
 oxidemerge --review-summary review.oxmreview --report review-summary.json
 oxidemerge --baseline-left git:v1.0:/path/to/repo --baseline-right git:v1.1:/path/to/repo --release-report release.html
 oxidemerge --impact old-folder new-folder --report impact.json
@@ -290,6 +325,31 @@ overwrite an input file, and never write a report inside an input folder.
 | `1` | Differences or warnings were found. |
 | `2` | An error happened, for example a baseline path cannot be read. |
 | `3` | `--validate-merge` found a problem. |
+
+### Folder synchronization commands
+
+```sh
+# Plan a mirror of source into destination; nothing is changed
+oxidemerge --sync-plan mirror source destination --report plan.json
+# Apply the plan after checking every file again
+oxidemerge --sync-apply plan.json --yes source destination
+# Undo synchronizations that did not finish
+oxidemerge --sync-recover
+```
+
+`--sync-plan` takes `mirror` or `update`. The plan file holds relative paths only, with the filter
+and a fingerprint of the two folder paths, not the paths themselves. `--sync-apply` compares the
+folders again and refuses the plan when anything in it has changed, when the filter differs, or
+when it was made for other folders. A file touched without changing its contents still fits the
+plan.
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Nothing to do (`--sync-plan`), every change was applied (`--sync-apply`), or everything was undone (`--sync-recover`). |
+| `1` | `--sync-plan` found changes or conflicts. |
+| `2` | An error happened, or the plan was refused and nothing was changed. |
+| `4` | Applying failed or was stopped, and every change was undone. |
+| `5` | Partly applied: some changes could not be undone, also by `--sync-recover`. The recovery journals named in the output are kept. |
 
 ## Git and file manager integration
 
@@ -405,6 +465,10 @@ use Command instead of Ctrl. The app shows the right keys for your system.
 - Unpacker plugins run external commands. They work the same way in file comparisons, folder
   comparisons of full contents, the command line and reports. The PDF and Office presets need
   conversion tools that you install separately.
+- Folder synchronization changes files one at a time, so it is not one atomic step. A renamed
+  or moved file is listed as a rename, but it is applied as a copy and a deletion. Symbolic
+  links, and names that differ only in letter case or in how accents on Latin letters are
+  written (composed or not), are left alone.
 - The translations were made with machine help. Native speakers have not reviewed them yet.
 
 ## Development

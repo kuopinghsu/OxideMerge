@@ -130,11 +130,13 @@ pub fn parse(source: &str) -> Result<Node> {
                         }
                         continue;
                     }
+                    let (from, to) =
+                        attribute_span(source, &attr, (start, end)).unwrap_or((start, end));
                     let (ns, local) = reader.resolver().resolve_attribute(attr.key);
                     let key = format!("/@{}", name(ns, local.as_ref())?);
                     if node
                         .children
-                        .insert(key, scalar("attribute", val, source, start, end))
+                        .insert(key, scalar("attribute", val, source, from, to))
                         .is_some()
                     {
                         bail!("Duplicate expanded XML attribute");
@@ -203,6 +205,23 @@ pub fn parse(source: &str) -> Result<Node> {
         .children
         .insert("/root".into(), root.context("XML has no root element")?);
     Ok(document)
+}
+/// Where attribute `attr` is written in `source`, from its name to its closing quote. Read from
+/// a string, the name and value are slices of the source.
+fn attribute_span(
+    source: &str,
+    attr: &quick_xml::events::attributes::Attribute,
+    tag: (usize, usize),
+) -> Option<(usize, usize)> {
+    let base = source.as_ptr() as usize;
+    let key = attr.key.as_ref();
+    let std::borrow::Cow::Borrowed(value) = &attr.value else {
+        return None;
+    };
+    let from = (key.as_ptr() as usize).checked_sub(base)?;
+    let to = (value.as_ptr() as usize + value.len()).checked_sub(base)? + 1;
+    let quote = *source.as_bytes().get(to - 1)?;
+    (tag.0 < from && from < to && to < tag.1 && matches!(quote, b'"' | b'\'')).then_some((from, to))
 }
 fn misc(node: Node, stack: &mut [Frame], document: &mut Node, after: bool) {
     if let Some(parent) = stack.last_mut() {

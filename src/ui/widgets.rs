@@ -272,6 +272,25 @@ pub fn icon_button_enabled(ui: &mut Ui, enabled: bool, icon: Icon, tip: &str) ->
     .on_hover_text(tip)
 }
 
+/// [`icon_button`] whose tooltip adds `hint`, dimmed, below `tip`; it is named by `tip` alone.
+pub fn icon_button_hint(ui: &mut Ui, icon: Icon, tip: &str, hint: &str) -> Response {
+    paint_button(
+        ui,
+        Some(icon),
+        "",
+        tip,
+        FontId::proportional(theme::size::CONTROL),
+        Vec2::new(30.0, 28.0),
+        Look::Ghost,
+        true,
+    )
+    .on_hover_ui(|ui| {
+        ui.set_max_width(340.0);
+        ui.label(tip);
+        ui.weak(hint);
+    })
+}
+
 /// Frameless text button that highlights on hover.
 pub fn ghost_button(ui: &mut Ui, label: &str) -> Response {
     ghost_button_named(ui, label, label)

@@ -359,6 +359,10 @@ pub struct DiffsView {
     focus_search: bool,
     /// The selected difference: a file and the index of one of its differences.
     current: Option<(usize, usize)>,
+    /// A file stepped to while it was still being read, which opens once read.
+    pending: Option<Pending>,
+    /// The file last selected, as the folder compare was told.
+    synced: Option<String>,
     scroll_to: Option<Line>,
     /// First line in view, where moving to the next difference starts without a selection.
     top_line: usize,
@@ -393,6 +397,24 @@ pub struct Source {
     pub stopped: bool,
     /// Folders holding extracted archives, kept while their files are shown.
     pub temps: Vec<std::sync::Arc<tempfile::TempDir>>,
+}
+
+/// A file to show once read: at its first, last or `Nth` difference, then moved on by the next
+/// (+1) and previous (-1) steps asked for meanwhile; `forward` is the way to move on when it has
+/// no differences to show.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pending {
+    file: usize,
+    at: At,
+    forward: bool,
+    steps: isize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum At {
+    First,
+    Last,
+    Nth(usize),
 }
 
 /// Whether `it` is a file whose differences are shown.
@@ -438,6 +460,8 @@ impl DiffsView {
             search: String::new(),
             focus_search: false,
             current: None,
+            pending: None,
+            synced: None,
             scroll_to: None,
             top_line: 0,
             undo: Vec::new(),
@@ -500,6 +524,8 @@ impl DiffsView {
         self.cells.clear();
         self.undo.clear();
         self.current = None;
+        self.pending = None;
+        self.synced = None;
         self.scroll_to = None;
         self.top_line = 0;
         self.status.clear();
@@ -536,6 +562,7 @@ impl DiffsView {
     }
 
     fn poll(&mut self) {
+        let mut land = false;
         if let Some(rx) = &self.loading {
             loop {
                 match rx.try_recv() {
@@ -544,6 +571,7 @@ impl DiffsView {
                         self.cards[f].body = body;
                         self.cards[f].item = item;
                         self.stale = true;
+                        land |= self.pending.is_some_and(|p| p.file == f);
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
@@ -554,10 +582,14 @@ impl DiffsView {
                                 self.stale = true;
                             }
                         }
+                        land = true;
                         break;
                     }
                 }
             }
+        }
+        if land {
+            self.land_pending();
         }
         let mut got = Vec::new();
         self.refills.retain(|(_, rx, _)| match rx.try_recv() {
@@ -818,6 +850,9 @@ impl DiffsView {
                 self.cards.len()
             );
         }
+        if let Some(position) = self.position_label() {
+            s = format!("{position}  |  {s}");
+        }
         if !self.status.is_empty() {
             s.push_str("  |  ");
             s.push_str(&self.status);
@@ -1012,16 +1047,23 @@ impl DiffsView {
 
     // ---------- moving between differences ----------
 
-    /// Every difference of the files listed, in order.
-    fn all_hunks(&self) -> Vec<(usize, usize)> {
+    /// Where next and previous stop, in order: every difference of the files listed, and the
+    /// files still being read (`None`), which they wait for rather than pass over.
+    fn stops(&self) -> Vec<(usize, Option<usize>)> {
         (0..self.cards.len())
             .filter(|&f| self.shown(f))
-            .flat_map(|f| (0..self.cards[f].hunk_count()).map(move |h| (f, h)))
+            .flat_map(|f| {
+                let card = &self.cards[f];
+                let loading = matches!(card.body, Body::Loading);
+                let hunks = (0..card.hunk_count()).map(move |h| (f, Some(h)));
+                loading.then_some((f, None)).into_iter().chain(hunks)
+            })
             .collect()
     }
 
     fn select(&mut self, target: (usize, usize)) {
         self.current = Some(target);
+        self.pending = None;
         self.status.clear();
     }
 
@@ -1034,9 +1076,76 @@ impl DiffsView {
         self.scroll_to = Some(Line::Hunk(target.0, target.1));
     }
 
+    /// Goes to a stop: a difference, or a file still being read, which opens once read.
+    fn go_stop(&mut self, stop: (usize, Option<usize>), forward: bool) {
+        match stop {
+            (f, Some(h)) => self.go((f, h)),
+            (f, None) => self.wait_for(f, if forward { At::First } else { At::Last }, forward),
+        }
+    }
+
+    fn wait_for(&mut self, file: usize, at: At, forward: bool) {
+        self.current = None;
+        self.pending = Some(Pending {
+            file,
+            at,
+            forward,
+            steps: 0,
+        });
+        self.scroll_to = Some(Line::File(file));
+        let name = self.cards[file].item.rel_path();
+        self.status = trf("diffs.waiting", &[("file", name)]);
+    }
+
+    /// Shows the file waited for once it is read: at its first (or last) difference, then the
+    /// steps asked for meanwhile; or moves on past it when it has none to show.
+    fn land_pending(&mut self) {
+        let Some(p) = self.pending else {
+            return;
+        };
+        if matches!(self.cards[p.file].body, Body::Loading) && self.loading.is_some() {
+            return;
+        }
+        self.pending = None;
+        self.status.clear();
+        let n = self.cards[p.file].hunk_count();
+        if n == 0 {
+            self.step_past(p.file, p.forward);
+            return;
+        }
+        let h = match p.at {
+            At::First => 0,
+            At::Last => n - 1,
+            At::Nth(h) => h.min(n - 1),
+        };
+        self.go((p.file, h));
+        for _ in 0..p.steps.unsigned_abs() {
+            self.step(p.steps > 0);
+        }
+    }
+
+    /// Goes to the stop after (or before) every stop of file `f`.
+    fn step_past(&mut self, f: usize, forward: bool) {
+        let all = self.stops();
+        let stop = if forward {
+            all.iter().find(|s| s.0 > f)
+        } else {
+            all.iter().rev().find(|s| s.0 < f)
+        };
+        match stop {
+            Some(&stop) => self.go_stop(stop, forward),
+            None => self.status = self.none_left("diffs.no_more"),
+        }
+    }
+
     pub fn step(&mut self, forward: bool) {
-        let all = self.all_hunks();
-        let k = match self.current.and_then(|c| all.iter().position(|&x| x == c)) {
+        if let Some(p) = &mut self.pending {
+            p.steps += if forward { 1 } else { -1 };
+            return;
+        }
+        let all = self.stops();
+        let current = self.current.map(|(f, h)| (f, Some(h)));
+        let k = match current.and_then(|c| all.iter().position(|&x| x == c)) {
             Some(k) if forward => k + 1,
             Some(k) => k.wrapping_sub(1),
             None => {
@@ -1054,8 +1163,8 @@ impl DiffsView {
                         _ => {}
                     }
                 }
-                let at = |&(f, h): &(usize, usize)| {
-                    pos.get(&(f, h))
+                let at = |&(f, h): &(usize, Option<usize>)| {
+                    h.and_then(|h| pos.get(&(f, h)))
                         .or_else(|| pos.get(&(f, usize::MAX)))
                         .copied()
                         .unwrap_or(0)
@@ -1069,22 +1178,77 @@ impl DiffsView {
             }
         };
         match all.get(k) {
-            Some(&t) => self.go(t),
+            Some(&t) => self.go_stop(t, forward),
             None => self.status = self.none_left("diffs.no_more"),
         }
     }
 
     pub fn first(&mut self) {
-        match self.all_hunks().first() {
-            Some(&t) => self.go(t),
+        self.pending = None;
+        match self.stops().first() {
+            Some(&t) => self.go_stop(t, true),
             None => self.status = self.none_left("report.no_diffs"),
         }
     }
 
     pub fn last(&mut self) {
-        match self.all_hunks().last() {
-            Some(&t) => self.go(t),
+        self.pending = None;
+        match self.stops().last() {
+            Some(&t) => self.go_stop(t, false),
             None => self.status = self.none_left("report.no_diffs"),
+        }
+    }
+
+    /// "File 3 / 12 · Difference 2 / 5" for the selected difference, or the file waited for.
+    fn position_label(&self) -> Option<String> {
+        let f = self.current.map(|c| c.0).or(self.pending.map(|p| p.file))?;
+        let shown: Vec<usize> = (0..self.cards.len()).filter(|&f| self.shown(f)).collect();
+        let n = shown
+            .iter()
+            .position(|&x| x == f)
+            .map_or("–".to_string(), |p| (p + 1).to_string());
+        let mut label = trf(
+            "nav.file_of",
+            &[("n", n), ("total", shown.len().to_string())],
+        );
+        if let (Some((_, h)), Some(card)) = (self.current, self.cards.get(f)) {
+            let total = card.hunk_count().to_string();
+            label.push_str(" · ");
+            label.push_str(&trf(
+                "nav.diff_of",
+                &[("n", (h + 1).to_string()), ("total", total)],
+            ));
+        }
+        Some(label)
+    }
+
+    /// The file now selected, once each time it changes, for the folder compare to select.
+    pub fn take_moved_to(&mut self) -> Option<String> {
+        let f = self.current.map(|c| c.0).or(self.pending.map(|p| p.file))?;
+        let rel = self.cards.get(f)?.item.rel_path();
+        (self.synced.as_ref() != Some(&rel)).then(|| {
+            self.synced = Some(rel.clone());
+            rel
+        })
+    }
+
+    /// Selects file `rel` at its difference `at` (or the first), when it is listed; it waits
+    /// for the file while it is still being read.
+    pub fn show_file(&mut self, rel: &str, at: Option<usize>) {
+        let Some(f) = self.cards.iter().position(|c| c.item.rel_path() == rel) else {
+            return;
+        };
+        self.synced = Some(rel.to_string());
+        if !self.shown(f) {
+            return;
+        }
+        let n = self.cards[f].hunk_count();
+        if matches!(self.cards[f].body, Body::Loading) {
+            self.wait_for(f, at.map_or(At::First, At::Nth), true);
+        } else if n > 0 {
+            self.go((f, at.unwrap_or(0).min(n - 1)));
+        } else {
+            self.reveal(f);
         }
     }
 
@@ -1104,6 +1268,7 @@ impl DiffsView {
             self.stale = true;
         }
         self.current = (self.cards[f].hunk_count() > 0).then_some((f, 0));
+        self.pending = None;
         self.status.clear();
         self.scroll_to = Some(Line::File(f));
     }
@@ -1329,10 +1494,24 @@ impl DiffsView {
             if widgets::icon_button(ui, Icon::First, &Cmd::FirstDiff.tip()).clicked() {
                 self.first();
             }
-            if widgets::icon_button(ui, Icon::Prev, &Cmd::PrevDiff.tip()).clicked() {
+            if widgets::icon_button_hint(
+                ui,
+                Icon::Prev,
+                &Cmd::PrevDiff.tip(),
+                tr("tip.nav_all_diffs"),
+            )
+            .clicked()
+            {
                 self.step(false);
             }
-            if widgets::icon_button(ui, Icon::Next, &Cmd::NextDiff.tip()).clicked() {
+            if widgets::icon_button_hint(
+                ui,
+                Icon::Next,
+                &Cmd::NextDiff.tip(),
+                tr("tip.nav_all_diffs"),
+            )
+            .clicked()
+            {
                 self.step(true);
             }
             if widgets::icon_button(ui, Icon::Last, &Cmd::LastDiff.tip()).clicked() {
@@ -2207,7 +2386,7 @@ mod tests {
             ],
             vec![false, false],
         );
-        assert_eq!(v.all_hunks(), vec![(0, 0), (1, 0)]);
+        assert_eq!(v.stops(), vec![(0, Some(0)), (1, Some(0))]);
         assert!(v.lines.contains(&Line::Hunk(1, 0)));
 
         v.step(true);
@@ -2316,6 +2495,56 @@ mod tests {
     }
 
     #[test]
+    fn steps_wait_for_files_still_being_read_and_pass_over_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let far = |a: &str, b: &str| format!("{a}\n{}{b}\n", "same\n".repeat(12));
+        let (left, right) = (far("x", "y"), far("X", "Y"));
+        let (mut v, _) = view(
+            dir.path(),
+            &[
+                ("a.txt", &[Some(&left), Some(&right)]),
+                ("same.txt", &[Some("s\n"), Some("s\n")]),
+                ("b.txt", &[Some("p\n"), Some("q\n")]),
+            ],
+            vec![false, false],
+        );
+        assert_eq!(v.cards[0].hunk_count(), 2);
+        assert_eq!(v.cards[1].hunk_count(), 0);
+
+        // Steps asked for while the first file is read are all taken once it is.
+        v.load((0..3).collect());
+        v.step(true);
+        assert!(v.current.is_none());
+        assert_eq!(v.status, trf("diffs.waiting", &[("file", "a.txt".into())]));
+        v.step(true);
+        wait(&mut v);
+        assert_eq!(v.current, Some((0, 1)));
+        assert_eq!(
+            v.position_label().as_deref(),
+            Some("File 1 / 3 · Difference 2 / 2")
+        );
+        assert_eq!(v.take_moved_to().as_deref(), Some("a.txt"));
+        assert_eq!(v.take_moved_to(), None);
+        // A file without differences to show is passed over.
+        v.step(true);
+        assert_eq!(v.current, Some((2, 0)));
+        v.step(true);
+        assert_eq!(v.current, Some((2, 0)));
+        assert_eq!(v.status, tr("diffs.no_more"));
+        // Back to a file being read again: it opens at its last difference.
+        v.load(vec![0]);
+        v.step(false);
+        assert!(v.current.is_none());
+        wait(&mut v);
+        assert_eq!(v.current, Some((0, 1)));
+        // From the folder compare: the file and difference it showed.
+        v.show_file("a.txt", Some(0));
+        assert_eq!(v.current, Some((0, 0)));
+        v.show_file("b.txt", Some(5));
+        assert_eq!(v.current, Some((2, 0)));
+    }
+
+    #[test]
     fn files_left_unread_by_a_stopped_reader_tell_so() {
         let dir = tempfile::tempdir().unwrap();
         let (mut v, _) = view(
@@ -2372,7 +2601,15 @@ mod tests {
         assert_eq!(names, ["b.txt", "c.txt"]);
         assert!(!v.cards[0].open && v.cards[1].open);
         assert!(v.stopped && v.read_only == [false, true]);
-        assert_eq!(v.all_hunks(), vec![(0, 0), (1, 0)]);
+        assert_eq!(v.stops(), vec![(0, Some(0)), (1, Some(0))]);
+
+        // A file waited for is forgotten with the list it was in.
+        v.wait_for(1, At::First, true);
+        v.update_from(src(vec![v.cards[0].item.clone()]));
+        assert!(v.pending.is_none());
+        wait(&mut v);
+        assert_eq!(v.take_moved_to(), None);
+        assert_eq!(v.position_label(), None);
     }
 
     #[test]

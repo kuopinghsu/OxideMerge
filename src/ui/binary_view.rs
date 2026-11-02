@@ -7,9 +7,22 @@ use crate::ui::commands::Cmd;
 use crate::ui::theme::Colors;
 use crate::ui::widgets::{self, Icon, Mark, Outcome};
 use egui::text::LayoutJob;
-use egui::{pos2, vec2, Align2, Color32, FontId, Key, Rect, Sense, Stroke, TextFormat, Ui};
+use egui::{
+    pos2, vec2, Align2, Color32, FontId, Key, Modifiers, Rect, Sense, Stroke, StrokeKind,
+    TextFormat, Ui,
+};
 use std::ops::Range;
 use std::path::PathBuf;
+
+/// One undo or redo step: the bytes it puts back in place of the `len` bytes at `at` of side
+/// `side`, and the contents that leaves, to tell them from those saved.
+struct Step {
+    side: usize,
+    at: usize,
+    len: usize,
+    bytes: Vec<u8>,
+    state: u64,
+}
 
 pub struct BinaryView {
     pub paths: Vec<PathBuf>,
@@ -21,8 +34,12 @@ pub struct BinaryView {
     pub cursor: Option<usize>,
     scroll: f32,
     scroll_to: Option<usize>,
-    undo: Vec<(Vec<Vec<u8>>, Vec<bool>)>,
-    redo: Vec<(Vec<Vec<u8>>, Vec<bool>)>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
+    /// A number for the contents of each side, new for each change, and the one saved.
+    state: Vec<u64>,
+    saved: Vec<u64>,
+    last_state: u64,
     pub status: String,
     /// Message about an edit that changed many differences at once, for an undo toast.
     pub bulk_edit: Option<String>,
@@ -34,6 +51,17 @@ pub struct BinaryView {
     hit: Option<Range<usize>>,
     /// Text of the open "Go to offset" dialog.
     pub goto: Option<String>,
+    /// The side that typing edits, chosen by clicking one of its bytes.
+    pub pane: Option<usize>,
+    /// The cursor is in the text column rather than the hexadecimal one.
+    pub ascii: bool,
+    /// Typing inserts bytes instead of replacing the bytes at the cursor.
+    pub insert: bool,
+    /// Side and offset of a byte whose first hexadecimal digit was typed.
+    nibble: Option<(usize, usize)>,
+    /// Side and cursor offset where an edit continues the undo step of the previous one.
+    run: Option<(usize, usize)>,
+    page_rows: usize,
     id: egui::Id,
     bpl: usize,
 }
@@ -61,6 +89,9 @@ impl BinaryView {
             scroll_to: None,
             undo: Vec::new(),
             redo: Vec::new(),
+            state: vec![0; n],
+            saved: vec![0; n],
+            last_state: 0,
             status: String::new(),
             bulk_edit: None,
             id: egui::Id::unique(("binview", std::time::Instant::now())),
@@ -68,6 +99,12 @@ impl BinaryView {
             find: Default::default(),
             hit: None,
             goto: None,
+            pane: None,
+            ascii: false,
+            insert: false,
+            nibble: None,
+            run: None,
+            page_rows: 1,
             bpl: 16,
         };
         v.recompute();
@@ -114,10 +151,64 @@ impl BinaryView {
         }
     }
 
+    /// The differences again after bytes `lo..hi` of a side changed and its length did not:
+    /// only there and in the differences touching them.
+    fn recompute_bytes(&mut self, lo: usize, hi: usize) {
+        let first = self.diffs.partition_point(|r| r.end < lo);
+        let last = self.diffs.partition_point(|r| r.start <= hi);
+        let touching = &self.diffs[first..last];
+        let (lo, hi) = match (touching.first(), touching.last()) {
+            (Some(a), Some(b)) => (a.start.min(lo), b.end.max(hi)),
+            _ => (lo, hi),
+        };
+        let refs: Vec<&[u8]> = self
+            .data
+            .iter()
+            .map(|d| &d[lo.min(d.len())..hi.min(d.len())])
+            .collect();
+        let fresh = binary::diff_ranges(&refs)
+            .into_iter()
+            .map(|r| r.start + lo..r.end + lo);
+        self.diffs.splice(first..last, fresh);
+        if let Some(c) = self.cur {
+            if c >= self.diffs.len() {
+                self.cur = None;
+            }
+        }
+    }
+
+    /// Replaces bytes `range` of side `p` with `bytes`, as part of the last undo step.
+    fn splice(&mut self, p: usize, range: Range<usize>, bytes: &[u8]) {
+        let data = &mut self.data[p];
+        if let Some(step) = self.undo.last_mut().filter(|s| s.side == p) {
+            if step.len == 0 && step.bytes.is_empty() {
+                step.at = range.start;
+            }
+            // what the step covers grows to cover the range too
+            let lo = step.at.min(range.start);
+            let hi = (step.at + step.len).max(range.end);
+            let mut old = Vec::with_capacity(hi - lo - step.len + step.bytes.len());
+            old.extend_from_slice(&data[lo..step.at]);
+            old.extend_from_slice(&step.bytes);
+            old.extend_from_slice(&data[step.at + step.len..hi]);
+            (step.at, step.len, step.bytes) = (lo, hi - lo - range.len() + bytes.len(), old);
+        }
+        let same = range.len() == bytes.len();
+        data.splice(range.clone(), bytes.iter().copied());
+        self.modified[p] = self.state[p] != self.saved[p];
+        if same {
+            self.recompute_bytes(range.start, range.end);
+        } else {
+            self.recompute();
+        }
+    }
+
     fn select(&mut self, i: usize) {
         self.cur = Some(i);
         self.cursor = Some(self.diffs[i].start);
         self.scroll_to = Some(self.diffs[i].start / self.bpl);
+        self.nibble = None;
+        self.run = None;
     }
 
     /// Selects the next difference; false when there is none after the cursor.
@@ -191,33 +282,199 @@ impl BinaryView {
         self.cur = self.diffs.iter().position(|r| r.contains(&off));
         self.scroll_to = Some(off / self.bpl);
         self.hit = None;
+        self.nibble = None;
+        self.run = None;
     }
 
-    fn push_undo(&mut self) {
-        self.undo.push((self.data.clone(), self.modified.clone()));
+    /// Moves the cursor to `off`, at most just past the last byte of the side being edited (or
+    /// of the longest side), where typing adds bytes.
+    pub fn move_cursor(&mut self, off: usize) {
+        let end = match self.pane {
+            Some(p) => self.data[p].len(),
+            None => self.data.iter().map(|d| d.len()).max().unwrap_or(0),
+        };
+        let off = off.min(end);
+        self.cursor = Some(off);
+        self.cur = self.diffs.iter().position(|r| r.contains(&off));
+        self.scroll_to = Some(off / self.bpl);
+        self.hit = None;
+        self.nibble = None;
+        self.run = None;
+    }
+
+    /// Typing in the text column, where keys such as "?" are characters rather than commands.
+    pub fn takes_text(&self) -> bool {
+        self.ascii && self.pane.is_some()
+    }
+
+    /// The side and offset an edit changes, after starting a new undo step unless the edit
+    /// continues the previous one; `None` when no side is chosen or it is read-only.
+    fn edit_at(&mut self) -> Option<(usize, usize)> {
+        let p = self.pane?;
+        if self.read_only[p] {
+            self.status = tr("msg.readonly").into();
+            return None;
+        }
+        let off = self.cursor.unwrap_or(0).min(self.data[p].len());
+        if self.run != Some((p, off)) {
+            self.push_undo(p);
+        }
+        Some((p, off))
+    }
+
+    /// After an edit of side `p` that leaves the cursor at `off`.
+    fn edited(&mut self, p: usize, off: usize) {
+        self.cursor = Some(off);
+        self.cur = self.diffs.iter().position(|r| r.contains(&off));
+        self.scroll_to = Some(off / self.bpl);
+        self.hit = None;
+        self.run = Some((p, off));
+    }
+
+    /// Types `ch` at the cursor: in the hexadecimal column a digit, which sets the first and
+    /// then the second half of a byte; in the text column a printable ASCII character.
+    pub fn type_char(&mut self, ch: char) {
+        if self.ascii {
+            if ch.is_ascii_graphic() || ch == ' ' {
+                self.write_bytes(&[ch as u8]);
+            }
+            return;
+        }
+        let Some(digit) = ch.to_digit(16).map(|d| d as u8) else {
+            return;
+        };
+        let Some((p, off)) = self.edit_at() else {
+            return;
+        };
+        let data = &self.data[p];
+        if self.nibble == Some((p, off)) && off < data.len() {
+            let byte = data[off] & 0xF0 | digit;
+            self.splice(p, off..off + 1, &[byte]);
+            self.nibble = None;
+            self.edited(p, off + 1);
+        } else {
+            if self.insert || off == data.len() {
+                self.splice(p, off..off, &[digit << 4]);
+            } else {
+                let byte = data[off] & 0x0F | digit << 4;
+                self.splice(p, off..off + 1, &[byte]);
+            }
+            self.edited(p, off);
+            self.nibble = Some((p, off));
+        }
+    }
+
+    /// Writes `bytes` at the cursor, over the bytes there or, in insert mode, before them, and
+    /// moves the cursor past them.
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Some((p, off)) = self.edit_at() else {
+            return;
+        };
+        let end = if self.insert {
+            off
+        } else {
+            (off + bytes.len()).min(self.data[p].len())
+        };
+        self.splice(p, off..end, bytes);
+        self.nibble = None;
+        self.edited(p, off + bytes.len());
+    }
+
+    /// Pastes text as its bytes in the text column, or in the hexadecimal column the bytes it
+    /// writes in hexadecimal (`DE AD BE EF`). A paste is one undo step.
+    pub fn paste(&mut self, text: &str) {
+        let bytes = if self.ascii {
+            Some(text.as_bytes().to_vec())
+        } else {
+            binary::parse_hex(text)
+        };
+        match bytes {
+            Some(bytes) => {
+                self.run = None;
+                self.write_bytes(&bytes);
+                self.run = None;
+            }
+            None if !text.trim().is_empty() => self.status = tr("msg.paste_not_hex").into(),
+            None => {}
+        }
+    }
+
+    /// Deletes the byte at the cursor or, with `back`, the one before it.
+    pub fn delete(&mut self, back: bool) {
+        let Some(p) = self.pane else { return };
+        let at = self.cursor.unwrap_or(0).min(self.data[p].len());
+        let off = if back {
+            match at.checked_sub(1) {
+                Some(o) => o,
+                None => return,
+            }
+        } else {
+            at
+        };
+        if off >= self.data[p].len() || self.edit_at().is_none() {
+            return;
+        }
+        self.splice(p, off..off + 1, &[]);
+        self.nibble = None;
+        self.edited(p, off);
+    }
+
+    /// Starts an undo step for a change of side `side`.
+    fn push_undo(&mut self, side: usize) {
+        self.undo.push(Step {
+            side,
+            at: 0,
+            len: 0,
+            bytes: Vec::new(),
+            state: self.state[side],
+        });
+        self.last_state += 1;
+        self.state[side] = self.last_state;
         self.redo.clear();
+        self.run = None;
+        self.nibble = None;
         if self.undo.len() > 20 {
             self.undo.remove(0);
         }
     }
 
-    pub fn undo(&mut self) {
-        if let Some((d, m)) = self.undo.pop() {
-            self.redo.push((
-                std::mem::replace(&mut self.data, d),
-                std::mem::replace(&mut self.modified, m),
-            ));
+    /// Puts back the side of `step`, returning the step that brings the current bytes back.
+    fn swap_step(&mut self, step: Step) -> Step {
+        let (s, at, len) = (step.side, step.at, step.bytes.len());
+        let same = len == step.len;
+        let removed = self.data[s].splice(at..at + step.len, step.bytes).collect();
+        let back = Step {
+            side: s,
+            at,
+            len,
+            bytes: removed,
+            state: std::mem::replace(&mut self.state[s], step.state),
+        };
+        self.modified[s] = self.state[s] != self.saved[s];
+        self.run = None;
+        self.nibble = None;
+        if same {
+            self.recompute_bytes(at, at + len);
+        } else {
             self.recompute();
+        }
+        back
+    }
+
+    pub fn undo(&mut self) {
+        if let Some(step) = self.undo.pop() {
+            let back = self.swap_step(step);
+            self.redo.push(back);
         }
     }
 
     pub fn redo(&mut self) {
-        if let Some((d, m)) = self.redo.pop() {
-            self.undo.push((
-                std::mem::replace(&mut self.data, d),
-                std::mem::replace(&mut self.modified, m),
-            ));
-            self.recompute();
+        if let Some(step) = self.redo.pop() {
+            let back = self.swap_step(step);
+            self.undo.push(back);
         }
     }
 
@@ -227,14 +484,12 @@ impl BinaryView {
             return;
         }
         let r = self.diffs[i].clone();
-        self.push_undo();
+        self.push_undo(to);
         let src_end = r.end.min(self.data[from].len());
         let src = self.data[from][r.start.min(src_end)..src_end].to_vec();
         let dst_end = r.end.min(self.data[to].len());
         let dst_start = r.start.min(dst_end);
-        self.data[to].splice(dst_start..dst_end, src);
-        self.modified[to] = true;
-        self.recompute();
+        self.splice(to, dst_start..dst_end, &src);
         let pos = r.start;
         if let Some(ni) = self.diffs.iter().position(|d| d.start >= pos) {
             self.select(ni);
@@ -265,21 +520,20 @@ impl BinaryView {
             return;
         }
         let n = self.diffs.len();
-        self.push_undo();
-        self.data[to] = self.data[from].clone();
-        self.modified[to] = true;
-        self.recompute();
+        self.push_undo(to);
+        let src = self.data[from].clone();
+        self.splice(to, 0..self.data[to].len(), &src);
         self.bulk_edit = Some(trf("msg.copied_blocks", &[("n", n.to_string())]));
     }
 
     pub fn save(&mut self) -> anyhow::Result<()> {
+        self.run = None;
+        self.nibble = None;
         for i in 0..self.n() {
             if self.modified[i] {
                 anyhow::ensure!(!self.read_only[i], "{}", tr("msg.readonly"));
                 crate::core::fsutil::write_atomic(&self.paths[i], &self.data[i])?;
-                for (data, modified) in self.undo.iter_mut().chain(self.redo.iter_mut()) {
-                    modified[i] = data[i] != self.data[i];
-                }
+                self.saved[i] = self.state[i];
                 self.modified[i] = false;
                 self.status = trf(
                     "msg.saved",
@@ -334,13 +588,15 @@ impl BinaryView {
             self.bpl = cfg.binary_bytes_per_line.clamp(4, 64);
         }
         let bpl = self.bpl;
+        self.handle_keys(ui);
         widgets::toolbar(ui, |ui| {
             let pal = widgets::pal(ui);
             let key = widgets::with_key;
             if widgets::icon_button(ui, Icon::First, &Cmd::FirstDiff.tip()).clicked() {
                 self.first_diff();
             }
-            if widgets::icon_button(ui, Icon::Prev, &Cmd::PrevDiff.tip()).clicked()
+            if widgets::icon_button_hint(ui, Icon::Prev, &Cmd::PrevDiff.tip(), tr("tip.nav_diff"))
+                .clicked()
                 && !self.prev_diff()
             {
                 self.step_file = Some(false);
@@ -350,7 +606,8 @@ impl BinaryView {
                 None => format!("– / {}", self.diffs.len()),
             };
             widgets::chip(ui, &counter, pal.text, pal.control);
-            if widgets::icon_button(ui, Icon::Next, &Cmd::NextDiff.tip()).clicked()
+            if widgets::icon_button_hint(ui, Icon::Next, &Cmd::NextDiff.tip(), tr("tip.nav_diff"))
+                .clicked()
                 && !self.next_diff()
             {
                 self.step_file = Some(true);
@@ -375,6 +632,16 @@ impl BinaryView {
                 .clicked()
             {
                 self.redo();
+            }
+            if widgets::toggle_button(
+                ui,
+                &mut self.insert,
+                tr("label.insert_mode"),
+                &key(tr("tip.insert_mode"), "Insert"),
+            )
+            .clicked()
+            {
+                self.nibble = None;
             }
             widgets::toolbar_sep(ui);
             if widgets::icon_button(ui, Icon::Search, &Cmd::Find.tip()).clicked() {
@@ -415,8 +682,11 @@ impl BinaryView {
         let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 2.0;
         let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
         let visible = (bottom - top) / row_h;
+        self.page_rows = (visible.floor() as usize).saturating_sub(1).max(1);
         let max_len = self.data.iter().map(|d| d.len()).max().unwrap_or(0);
-        let total = max_len.div_ceil(bpl).max(1);
+        // The cursor can stand just past the last byte, where typing adds one.
+        let end = max_len.max(self.cursor.map_or(0, |c| c + 1));
+        let total = end.div_ceil(bpl).max(1);
 
         let pal = widgets::pal(ui);
         let header_rect =
@@ -490,21 +760,26 @@ impl BinaryView {
         self.scroll = self.scroll.clamp(0.0, max_scroll);
         let first = self.scroll.floor() as usize;
         let last = (first + visible.ceil() as usize + 1).min(total);
-        let hex_x = 10.0 * char_w + 4.0;
+        // Character columns of a line: the offset, then each byte as "HH ", a space and the text.
+        let hex_col = 10.0;
+        let text_col = hex_col + 3.0 * bpl as f32 + 1.0;
 
         if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let line = (self.scroll + (pos.y - top) / row_h).floor() as usize;
                 let p = (((pos.x - left) / pane_w).floor() as usize).min(n - 1);
-                let x = pos.x - (left + p as f32 * pane_w) - hex_x;
-                if x >= 0.0 {
-                    let col = (x / (3.0 * char_w)).floor() as usize;
-                    if col < bpl {
-                        let off = line * bpl + col;
-                        self.cursor = Some(off);
-                        self.cur = self.diffs.iter().position(|r| r.contains(&off));
-                        self.hit = None;
-                    }
+                let col = (pos.x - (left + p as f32 * pane_w) - 4.0) / char_w;
+                let hit = if (hex_col..text_col - 1.0).contains(&col) {
+                    Some((((col - hex_col) / 3.0) as usize, false))
+                } else if (text_col..text_col + bpl as f32).contains(&col) {
+                    Some(((col - text_col) as usize, true))
+                } else {
+                    None
+                };
+                if let Some((k, ascii)) = hit {
+                    self.pane = Some(p);
+                    self.ascii = ascii;
+                    self.move_cursor(line * bpl + k);
                 }
             }
         }
@@ -568,6 +843,30 @@ impl BinaryView {
                 let galley = ui.fonts_mut(|f| f.layout_job(job));
                 painter.galley(pos2(x0 + 4.0, y + 1.0), galley, c.text);
             }
+            if let (Some(off), true) = (self.cursor, self.pane == Some(p)) {
+                let line = off / bpl;
+                if (first..last).contains(&line) {
+                    let k = (off % bpl) as f32;
+                    let (col, width) = if self.ascii {
+                        (text_col + k, 1.0)
+                    } else if self.nibble == Some((p, off)) {
+                        (hex_col + 3.0 * k + 1.0, 1.0)
+                    } else {
+                        (hex_col + 3.0 * k, 2.0)
+                    };
+                    let y = top + (line as f32 - self.scroll) * row_h;
+                    let r = Rect::from_min_size(
+                        pos2(x0 + 4.0 + col * char_w, y + 1.0),
+                        vec2(width * char_w, row_h - 2.0),
+                    );
+                    painter.rect_stroke(
+                        r.expand(1.0),
+                        2.0,
+                        Stroke::new(1.5_f32, c.ui.accent),
+                        StrokeKind::Inside,
+                    );
+                }
+            }
             ui.painter().line_segment(
                 [
                     pos2(x0 + pane_w - 1.0, avail.top()),
@@ -624,6 +923,88 @@ impl BinaryView {
         );
         ui.allocate_rect(avail, Sense::hover());
         self.goto_dialog(ui, max_len);
+    }
+
+    /// Cursor keys, and typing, deleting and pasting bytes on the side being edited.
+    fn handle_keys(&mut self, ui: &Ui) {
+        let ctx = ui.ctx();
+        if widgets::typing(ctx)
+            || self.goto.is_some()
+            || widgets::modal_open(ctx)
+            || egui::Popup::is_any_open(ctx)
+        {
+            return;
+        }
+        let bpl = self.bpl;
+        let page = bpl * self.page_rows;
+        let end = match self.pane {
+            Some(p) => self.data[p].len(),
+            None => self.data.iter().map(|d| d.len()).max().unwrap_or(0),
+        };
+        let at = self.cursor.unwrap_or(0).min(end);
+        let line_start = at - at % bpl;
+        let mut target = None;
+        let (mut insert, mut delete) = (false, None);
+        let mut typed = String::new();
+        let mut pasted = None;
+        ui.input_mut(|i| {
+            for (modifiers, key, to) in [
+                (Modifiers::COMMAND, Key::Home, 0),
+                (Modifiers::COMMAND, Key::End, end),
+                (Modifiers::NONE, Key::ArrowLeft, at.saturating_sub(1)),
+                (Modifiers::NONE, Key::ArrowRight, at + 1),
+                (
+                    Modifiers::NONE,
+                    Key::ArrowUp,
+                    at.checked_sub(bpl).unwrap_or(at),
+                ),
+                (
+                    Modifiers::NONE,
+                    Key::ArrowDown,
+                    if at + bpl <= end { at + bpl } else { at },
+                ),
+                (Modifiers::NONE, Key::PageUp, at.saturating_sub(page)),
+                (Modifiers::NONE, Key::PageDown, at + page),
+                (Modifiers::NONE, Key::Home, line_start),
+                (Modifiers::NONE, Key::End, line_start + bpl - 1),
+            ] {
+                if i.consume_key(modifiers, key) {
+                    target = Some(to);
+                }
+            }
+            insert = i.consume_key(Modifiers::NONE, Key::Insert);
+            if i.consume_key(Modifiers::NONE, Key::Delete) {
+                delete = Some(false);
+            }
+            if i.consume_key(Modifiers::NONE, Key::Backspace) {
+                delete = Some(true);
+            }
+            for e in &i.events {
+                match e {
+                    egui::Event::Text(t) => typed.push_str(t),
+                    egui::Event::Paste(t) => pasted = Some(t.clone()),
+                    _ => {}
+                }
+            }
+        });
+        if let Some(to) = target {
+            self.move_cursor(to);
+        }
+        if insert {
+            self.insert = !self.insert;
+            self.nibble = None;
+        }
+        if let Some(back) = delete {
+            self.delete(back);
+        }
+        if self.pane.is_some() {
+            for ch in typed.chars() {
+                self.type_char(ch);
+            }
+            if let Some(text) = pasted {
+                self.paste(&text);
+            }
+        }
     }
 
     fn find_bar(&mut self, ui: &mut Ui) {
@@ -697,6 +1078,8 @@ impl BinaryView {
             });
         if go {
             match binary::parse_offset(&g) {
+                // within the side being edited, or just past its end where typing adds bytes
+                Some(off) if self.pane.is_some() => self.move_cursor(off),
                 Some(off) => self.go_to(off),
                 None => self.status = trf("msg.not_found", &[("text", g)]),
             }
@@ -709,6 +1092,68 @@ impl BinaryView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edits_keep_the_differences_of_a_full_compare_and_undo_to_the_same_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = ["a.bin", "b.bin"]
+            .iter()
+            .map(|n| dir.path().join(n))
+            .collect();
+        let base: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
+        std::fs::write(&paths[0], &base).unwrap();
+        std::fs::write(&paths[1], &base[..4000]).unwrap();
+        let mut v = BinaryView::load(paths).unwrap();
+        v.pane = Some(1);
+        let mut seed = 12345u64;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        let full = |v: &BinaryView| {
+            let refs: Vec<&[u8]> = v.data.iter().map(|d| d.as_slice()).collect();
+            binary::diff_ranges(&refs)
+        };
+        let mut history = Vec::new();
+        for round in 0..400 {
+            let (before, state) = (v.data[1].clone(), v.last_state);
+            v.move_cursor(next(v.data[1].len() + 1));
+            v.insert = next(4) == 0;
+            v.ascii = false;
+            let digit = |n: usize| char::from_digit(n as u32, 16).unwrap();
+            match next(4) {
+                0 => v.type_char(digit(next(16))),
+                // a byte typed digit by digit, and bytes written on, are one step each
+                1 => {
+                    v.type_char(digit(next(16)));
+                    v.type_char(digit(next(16)));
+                }
+                2 => {
+                    v.write_bytes(&[next(256) as u8; 3]);
+                    v.write_bytes(&[next(256) as u8; 2]);
+                }
+                _ => v.delete(next(2) == 0),
+            }
+            assert_eq!(v.diffs, full(&v), "round {round}");
+            if v.last_state != state {
+                history.push(before);
+            }
+        }
+        let last = v.data[1].clone();
+        let steps = v.undo.len();
+        for k in 0..steps {
+            v.undo();
+            assert_eq!(v.data[1], history[history.len() - 1 - k], "undo {k}");
+            assert_eq!(v.diffs, full(&v), "undo {k}");
+        }
+        for _ in 0..steps {
+            v.redo();
+        }
+        assert_eq!(v.data[1], last);
+        assert_eq!(v.diffs, full(&v));
+    }
 
     #[test]
     fn undo_and_redo_remain_relative_to_the_latest_save() {
@@ -735,5 +1180,115 @@ mod tests {
         v.read_only[1] = true;
         assert!(v.save().is_err());
         assert_eq!(std::fs::read(&paths[1]).unwrap(), b"bbb");
+    }
+
+    #[test]
+    fn typing_digits_and_text_edits_the_chosen_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = ["a.bin", "b.bin"]
+            .iter()
+            .map(|n| dir.path().join(n))
+            .collect();
+        std::fs::write(&paths[0], [0x00, 0x11, 0x22]).unwrap();
+        std::fs::write(&paths[1], [0x00, 0x11, 0x22]).unwrap();
+        let mut v = BinaryView::load(paths.clone()).unwrap();
+        v.type_char('a');
+        assert!(!v.is_modified(), "no side is chosen before a click");
+
+        v.pane = Some(1);
+        v.move_cursor(1);
+        for ch in "abc".chars() {
+            v.type_char(ch);
+        }
+        assert_eq!(v.data[1], [0x00, 0xAB, 0xC2]);
+        assert_eq!(v.cursor, Some(2), "half a byte typed keeps the cursor");
+        for ch in "dxef".chars() {
+            v.type_char(ch);
+        }
+        assert_eq!(
+            v.data[1],
+            [0x00, 0xAB, 0xCD, 0xEF],
+            "typed past the end adds bytes"
+        );
+        assert_eq!(v.diffs, [Range { start: 1, end: 4 }]);
+        v.undo();
+        assert_eq!(
+            v.data[1],
+            [0x00, 0x11, 0x22],
+            "one typing run is one undo step"
+        );
+        assert!(!v.is_modified());
+        v.redo();
+
+        v.insert = true;
+        v.ascii = true;
+        v.move_cursor(0);
+        for ch in "OKé".chars() {
+            v.type_char(ch);
+        }
+        assert_eq!(v.data[1], [b'O', b'K', 0x00, 0xAB, 0xCD, 0xEF]);
+        v.delete(true);
+        v.delete(false);
+        assert_eq!(v.data[1], [b'O', 0xAB, 0xCD, 0xEF]);
+
+        v.insert = false;
+        v.ascii = false;
+        v.move_cursor(1);
+        v.paste("DE AD BE EF");
+        assert_eq!(v.data[1], [b'O', 0xDE, 0xAD, 0xBE, 0xEF]);
+        v.undo();
+        assert_eq!(
+            v.data[1],
+            [b'O', 0xAB, 0xCD, 0xEF],
+            "a paste is its own undo step"
+        );
+
+        v.paste("123");
+        v.paste("hello");
+        assert_eq!(v.data[1], [b'O', 0xAB, 0xCD, 0xEF]);
+        assert_eq!(v.status, tr("msg.paste_not_hex"));
+
+        v.move_cursor(1);
+        v.type_char('1');
+        v.type_char('2');
+        v.move_cursor(3);
+        v.move_cursor(2);
+        v.type_char('3');
+        v.type_char('4');
+        assert_eq!(v.data[1], [b'O', 0x12, 0x34, 0xEF]);
+        v.undo();
+        assert_eq!(
+            v.data[1],
+            [b'O', 0x12, 0xCD, 0xEF],
+            "typing after moving the cursor is a new undo step"
+        );
+
+        v.move_cursor(1);
+        v.type_char('9');
+        v.copy_all(false);
+        assert_eq!(v.data[0], v.data[1]);
+        v.type_char('8');
+        assert_eq!(v.data[1][1], 0x82, "a copy ends a half-typed byte");
+        v.undo();
+        v.undo();
+        assert_eq!(
+            v.data[1],
+            [b'O', 0x92, 0xCD, 0xEF],
+            "undoing a change of one side leaves the other"
+        );
+        assert_eq!(v.data[0], [0x00, 0x11, 0x22]);
+        assert!(!v.modified[0]);
+        v.undo();
+        assert_eq!(v.data[1], [b'O', 0x12, 0xCD, 0xEF]);
+
+        v.read_only[0] = true;
+        v.pane = Some(0);
+        v.move_cursor(0);
+        v.type_char('f');
+        assert_eq!(v.data[0], [0x00, 0x11, 0x22]);
+        assert_eq!(v.status, tr("msg.readonly"));
+        v.save().unwrap();
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), [b'O', 0x12, 0xCD, 0xEF]);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), [0x00, 0x11, 0x22]);
     }
 }

@@ -9,6 +9,7 @@ use crate::core::report::side_name;
 use crate::core::rules::{self, RuleDraft, RuleKind, RuleSet};
 use crate::core::saved::{SavedCompare, SavedPane};
 use crate::core::table;
+use crate::core::table_match::{self, KeyColumn, RowState, TableDiff, TableMatch};
 use crate::core::text::{self, Eol, TextDoc, TextEncoding, COMMON_ENCODINGS};
 use crate::i18n::{tr, trf};
 use crate::ui::commands::Cmd;
@@ -293,6 +294,196 @@ fn format_of(doc: &TextDoc) -> DocumentFormat {
     }
 }
 
+/// Key column `column`: by its header name when there is a header row and the name is
+/// usable, else by position.
+fn key_column(names: &[String], column: usize, header: bool) -> KeyColumn {
+    match names.get(column) {
+        Some(name) if header && !name.is_empty() => KeyColumn::Name(name.clone()),
+        _ => KeyColumn::Index(column),
+    }
+}
+
+fn key_label(key: &KeyColumn, names: &[String]) -> String {
+    match key {
+        KeyColumn::Name(name) => name.clone(),
+        KeyColumn::Index(i) => match names.get(*i) {
+            Some(name) if !name.is_empty() => format!("{} ({name})", i + 1),
+            _ => format!("{} {}", tr("table.column"), i + 1),
+        },
+    }
+}
+
+/// A numeric tolerance as typed: "0.01" is absolute, "1%" relative, empty is none.
+fn parse_tolerance(text: &str) -> Option<(f64, f64)> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Some((0.0, 0.0));
+    }
+    let (number, relative) = match text.strip_suffix('%') {
+        Some(n) => (n.trim(), true),
+        None => (text, false),
+    };
+    let value = number
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)?;
+    Some(if relative {
+        (0.0, value / 100.0)
+    } else {
+        (value, 0.0)
+    })
+}
+
+fn tolerance_text(m: &TableMatch) -> String {
+    // Rounded to 12 digits, so 7% is not shown as 7.000000000000001%.
+    let short = |x: f64| format!("{x:.11e}").parse::<f64>().unwrap_or(x).to_string();
+    if m.rel_tolerance > 0.0 {
+        format!("{}%", short(m.rel_tolerance * 100.0))
+    } else if m.abs_tolerance > 0.0 {
+        short(m.abs_tolerance)
+    } else {
+        String::new()
+    }
+}
+
+fn problem_text(problem: &table_match::Problem) -> String {
+    use table_match::Problem;
+    match problem {
+        Problem::MissingKey { side, column } => trf(
+            "table.err_missing_key",
+            &[
+                ("column", column.clone()),
+                ("side", side_name(*side, 2).to_string()),
+            ],
+        ),
+        Problem::DuplicateKeyColumn { side, column } => trf(
+            "table.err_duplicate_key_column",
+            &[
+                ("column", column.clone()),
+                ("side", side_name(*side, 2).to_string()),
+            ],
+        ),
+        Problem::NoHeader => tr("table.err_no_header").to_string(),
+        Problem::TooLarge => trf(
+            "table.err_too_large",
+            &[("count", table_match::MAX_RECORDS.to_string())],
+        ),
+        Problem::Cancelled => tr("table.err_cancelled").to_string(),
+        Problem::Failed => tr("table.err_failed").to_string(),
+    }
+}
+
+/// Records, both sides together, above which matching by key runs in the background.
+const BACKGROUND_RECORDS: usize = 100_000;
+
+/// Matches the records of `a` and `b` by the key columns of `m`, comparing cells with the
+/// compare options; `stop` as in [`table_match::compare_with_stop`].
+fn match_records(
+    a: &table::Table,
+    b: &table::Table,
+    m: &TableMatch,
+    opts: &DiffOptions,
+    stop: &dyn Fn(usize) -> bool,
+) -> Result<TableDiff, table_match::Problem> {
+    let normalizer = diff::Normalizer::new(opts);
+    let clean = |s: &str| {
+        if opts.ignore_eol {
+            s.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            s.to_string()
+        }
+    };
+    let key = |s: &str| normalizer.key(&clean(s)).into_owned();
+    let eq = |x: &str, y: &str| normalizer.close(&clean(x), &clean(y));
+    let compare = table_match::Compare { key: &key, eq: &eq };
+    table_match::compare_with_stop(a, b, m, &compare, stop)
+}
+
+fn warning_text(warning: &table_match::Warning) -> String {
+    use table_match::Warning;
+    match warning {
+        Warning::DuplicateHeader { side, column } => trf(
+            "table.warn_duplicate_header",
+            &[
+                ("column", column.clone()),
+                ("side", side_name(*side, 2).to_string()),
+            ],
+        ),
+        Warning::UnpairedColumns { side, columns } => trf(
+            "table.warn_unpaired",
+            &[
+                ("columns", columns.join(", ")),
+                ("side", side_name(*side, 2).to_string()),
+            ],
+        ),
+        Warning::DuplicateKeys { side, records } => trf(
+            "table.warn_duplicate_keys",
+            &[
+                ("count", records.to_string()),
+                ("side", side_name(*side, 2).to_string()),
+            ],
+        ),
+        Warning::EmptyKeys { side, records } => trf(
+            "table.warn_empty_keys",
+            &[
+                ("count", records.to_string()),
+                ("side", side_name(*side, 2).to_string()),
+            ],
+        ),
+    }
+}
+
+/// The marker, description and edge colour of a row matched by key.
+fn row_marker(m: &table_match::MatchedRow, c: &Colors) -> (String, String, Option<Color32>) {
+    let (mark, key, fill) = match m.state {
+        RowState::Identical => ("", None, None),
+        RowState::Added => ("+", Some("table.state_added"), Some(c.change_bar)),
+        RowState::Removed => ("−", Some("table.state_removed"), Some(c.change_bar)),
+        RowState::Modified => ("~", Some("table.state_modified"), Some(c.change_bar)),
+        RowState::Ambiguous => ("?", Some("table.state_ambiguous"), Some(c.conflict_bar)),
+    };
+    let mut tips: Vec<&str> = Vec::new();
+    if m.header {
+        tips.push(tr("table.state_header"));
+    }
+    tips.extend(key.map(tr));
+    let mut mark = mark.to_string();
+    if m.moved {
+        mark.push('↕');
+        tips.push(tr("table.state_moved"));
+    }
+    (mark, tips.join(" · "), fill.or(m.moved.then_some(c.moved)))
+}
+
+/// The source of `dst` with the changed cells of record `s` of `src` copied into record `t`,
+/// or `None` when a changed cell has no counterpart on the other side.
+fn copy_record_cells(
+    d: &TableDiff,
+    r: &table_match::MatchedRow,
+    (src, s, from): (&table::Table, usize, usize),
+    (dst, t, to): (&table::Table, usize, usize),
+    delim: char,
+) -> Option<String> {
+    let (a, b) = (&src.records[s], &dst.records[t]);
+    if r.changed[to].iter().any(|&c| {
+        d.paired_column(to, c, from)
+            .is_none_or(|f| f >= a.cells.len())
+    }) {
+        return None;
+    }
+    let cells = r.changed[from]
+        .iter()
+        .map(|&c| {
+            Some((
+                d.paired_column(from, c, to)
+                    .filter(|&t| t < b.cells.len())?,
+                a.cells[c].as_str(),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    dst.replace_cells(t, &cells, delim).ok()
+}
+
 /// Makes the merge result pane (the middle of three, else the right one) save to `out`.
 /// It counts as modified when `out` is another file, so saving always writes the result.
 pub fn redirect_output(docs: &mut [TextDoc], out: &std::path::Path) {
@@ -423,71 +614,195 @@ fn shorten(text: &str, max: usize) -> String {
     }
 }
 
-/// The changes of a semantic report under `node`, each a section with its values and links to
-/// where it is in each file. `jump` is set to the side and line of a clicked link.
+/// A semantic report of two files, or of three with the middle one as the base.
+enum Structured {
+    Two(crate::core::semantic::SemanticReport),
+    Three(crate::core::semantic::three_way::ThreeWayReport),
+}
+
+impl Structured {
+    fn options(&self) -> &crate::core::semantic::Options {
+        match self {
+            Structured::Two(r) => &r.options,
+            Structured::Three(r) => &r.options,
+        }
+    }
+}
+
+/// What a click in the semantic view asks for.
+enum SemanticAction {
+    /// Show this line of this pane in the text view.
+    Jump(usize, usize),
+    /// Copy the value of a change from this side to the other.
+    Copy(Box<crate::core::semantic::Change>, usize),
+    /// Take the value of an entry of a three-way report from the left (0) or right (1) pane
+    /// into the middle one.
+    Take(Box<crate::core::semantic::three_way::MergeEntry>, usize),
+}
+
+/// What a change does, and where it was moved from.
+fn change_label(change: &crate::core::semantic::Change) -> String {
+    use crate::core::semantic::ChangeKind;
+    let kind = tr(match change.kind {
+        ChangeKind::Added => "analysis.added",
+        ChangeKind::Removed => "analysis.removed",
+        ChangeKind::Modified => "analysis.modified",
+        ChangeKind::TypeChanged => "analysis.type_changed",
+        ChangeKind::Moved => "analysis.moved",
+    });
+    let label = match &change.from {
+        Some(from) => format!(
+            "{kind} · {}",
+            trf("analysis.moved_from", &[("path", shorten(from, 240))])
+        ),
+        None => kind.to_owned(),
+    };
+    if change.ambiguous {
+        format!("{label} · {}", tr("analysis.ambiguous"))
+    } else {
+        label
+    }
+}
+
+/// The values of a change, how sure its pairing is, and links to where it is in panes `panes`
+/// (of its first and second side).
+fn change_details(
+    ui: &mut Ui,
+    change: &crate::core::semantic::Change,
+    panes: [usize; 2],
+    out: &mut Option<SemanticAction>,
+) {
+    ui.monospace(format!(
+        "{} → {}",
+        shorten(change.before.as_deref().unwrap_or("∅"), 512),
+        shorten(change.after.as_deref().unwrap_or("∅"), 512),
+    ));
+    let paired = match change.confidence.as_str() {
+        "array_key" => Some("analysis.paired_by_key"),
+        "reordered" => Some("analysis.paired_by_reordering"),
+        "position" => Some("analysis.paired_by_position"),
+        _ => None,
+    };
+    if let Some(key) = paired {
+        ui.small(tr(key));
+    }
+    if change.ambiguous {
+        ui.colored_label(widgets::pal(ui).warning, tr("analysis.ambiguous_hint"));
+    }
+    ui.horizontal_wrapped(|ui| {
+        for (side, span) in change.spans.iter().enumerate() {
+            if let Some(span) = span {
+                let pane = panes[side];
+                let link = format!("{} {}:{}", tr("analysis.source"), pane + 1, span.line);
+                if ui.button(link).clicked() {
+                    *out = Some(SemanticAction::Jump(pane, span.line - 1));
+                }
+            }
+        }
+    });
+}
+
+/// The changes of a two-way semantic report under `node`, each a section with its values,
+/// links to where it is in each file and, to a pane in `writable`, a button copying it there.
 fn semantic_tree_ui(
     ui: &mut Ui,
     node: &crate::core::semantic::PathTree,
     depth: usize,
-    jump: &mut Option<(usize, usize)>,
+    writable: [bool; 2],
+    out: &mut Option<SemanticAction>,
 ) {
     use crate::core::semantic::ChangeKind;
     for change in &node.changes {
-        let kind = tr(match change.kind {
-            ChangeKind::Added => "analysis.added",
-            ChangeKind::Removed => "analysis.removed",
-            ChangeKind::Modified => "analysis.modified",
-            ChangeKind::TypeChanged => "analysis.type_changed",
-            ChangeKind::Moved => "analysis.moved",
-        });
-        let label = match &change.from {
-            Some(from) => format!(
-                "{kind} · {}",
-                trf("analysis.moved_from", &[("path", shorten(from, 240))])
-            ),
-            None => kind.to_owned(),
-        };
-        let label = if change.ambiguous {
-            format!("{label} · {}", tr("analysis.ambiguous"))
-        } else {
-            label
-        };
-        egui::CollapsingHeader::new(label)
+        egui::CollapsingHeader::new(change_label(change))
             .id_salt(&change.id)
             .default_open(true)
             .show(ui, |ui| {
-                ui.monospace(format!(
-                    "{} → {}",
-                    shorten(change.before.as_deref().unwrap_or("∅"), 512),
-                    shorten(change.after.as_deref().unwrap_or("∅"), 512),
-                ));
-                let paired = match change.confidence.as_str() {
-                    "array_key" => Some("analysis.paired_by_key"),
-                    "reordered" => Some("analysis.paired_by_reordering"),
-                    "position" => Some("analysis.paired_by_position"),
-                    _ => None,
-                };
-                if let Some(key) = paired {
-                    ui.small(tr(key));
+                change_details(ui, change, [0, 1], out);
+                if change.kind == ChangeKind::Moved {
+                    return;
                 }
-                if change.ambiguous {
-                    ui.colored_label(widgets::pal(ui).warning, tr("analysis.ambiguous_hint"));
-                }
-                for (side, span) in change.spans.iter().enumerate() {
-                    if let Some(span) = span {
-                        let link = format!("{} {}:{}", tr("analysis.source"), side + 1, span.line);
-                        if ui.button(link).clicked() {
-                            *jump = Some((side, span.line - 1));
+                ui.horizontal(|ui| {
+                    for (to, key) in [(0, "analysis.copy_to_left"), (1, "analysis.copy_to_right")] {
+                        if writable[to] && ui.button(tr(key)).clicked() {
+                            *out = Some(SemanticAction::Copy(Box::new((*change).clone()), 1 - to));
                         }
                     }
-                }
+                });
             });
     }
     for child in &node.children {
         egui::CollapsingHeader::new(format!("{} ({})", shorten(&child.label, 240), child.count))
             .id_salt(&child.label)
             .default_open(depth < 4 || child.count <= 20)
-            .show(ui, |ui| semantic_tree_ui(ui, child, depth + 1, jump));
+            .show(ui, |ui| {
+                semantic_tree_ui(ui, child, depth + 1, writable, out)
+            });
+    }
+}
+
+/// The entries of a three-way semantic report: what each side changed at a path of the middle
+/// one and, when it can be written, buttons taking a side's value into it.
+fn three_way_ui(
+    ui: &mut Ui,
+    entries: &[&crate::core::semantic::three_way::MergeEntry],
+    writable: bool,
+    out: &mut Option<SemanticAction>,
+) {
+    use crate::core::semantic::three_way::MergeState;
+    for entry in entries {
+        let state = tr(match entry.state {
+            MergeState::Left => "analysis.state_left",
+            MergeState::Right => "analysis.state_right",
+            MergeState::Both => "analysis.state_both",
+            MergeState::Conflict => "analysis.state_conflict",
+        });
+        let header = egui::RichText::new(format!("{state} · {}", shorten(&entry.path, 240)));
+        let header = if entry.state == MergeState::Conflict {
+            header.color(widgets::pal(ui).danger)
+        } else {
+            header
+        };
+        egui::CollapsingHeader::new(header)
+            .id_salt(("three_way", &entry.path))
+            .default_open(true)
+            .show(ui, |ui| {
+                for (side, changes, pane, name) in [
+                    (0, &entry.left, 0, "side.left"),
+                    (1, &entry.right, 2, "side.right"),
+                ] {
+                    if changes.is_empty() {
+                        continue;
+                    }
+                    ui.label(egui::RichText::new(tr(name)).strong());
+                    for change in changes {
+                        ui.indent(("change", side, &change.id), |ui| {
+                            ui.label(format!(
+                                "{} · {}",
+                                change_label(change),
+                                shorten(&change.path, 240)
+                            ));
+                            change_details(ui, change, [1, pane], out);
+                        });
+                    }
+                }
+                if !writable {
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    for (side, changes, key) in [
+                        (0, &entry.left, "analysis.use_left"),
+                        (1, &entry.right, "analysis.use_right"),
+                    ] {
+                        let both = entry.state == MergeState::Both;
+                        if !changes.is_empty()
+                            && !(both && side == 1)
+                            && ui.button(tr(key)).clicked()
+                        {
+                            *out = Some(SemanticAction::Take(Box::new((*entry).clone()), side));
+                        }
+                    }
+                });
+            });
     }
 }
 
@@ -564,10 +879,23 @@ struct CellEdit {
 
 #[derive(Default)]
 struct TableState {
-    docs: Vec<Result<table::Table, String>>,
+    docs: Vec<Result<Arc<table::Table>, String>>,
     diff: DiffResult,
     edit: Option<CellEdit>,
     column: usize,
+    /// Rows matched by key (2-way, with key columns chosen), or why they could not be;
+    /// `diff` then holds the same rows.
+    keyed: Option<Box<Result<TableDiff, table_match::Problem>>>,
+    /// Matching by key of large tables; `diff` is empty until it ends.
+    job: Option<super::analysis::Task<Result<TableDiff, table_match::Problem>>>,
+    /// The lines of the row selected when `job` started, to select it again.
+    restore: Option<[Option<usize>; 3]>,
+    /// Overrides [`BACKGROUND_RECORDS`].
+    background_at: Option<usize>,
+    /// The selected row of `diff`.
+    selected: Option<usize>,
+    /// Text of the numeric tolerance field.
+    tolerance: String,
 }
 
 /// A line of the inline view.
@@ -598,12 +926,12 @@ pub struct TextView {
     pub review_dirty: bool,
     semantic_mode: bool,
     semantic_page: usize,
-    semantic_cache: Option<(u64, crate::core::semantic::SemanticReport)>,
-    semantic_job: Option<(
-        u64,
-        super::analysis::Task<crate::core::semantic::SemanticReport>,
-    )>,
+    semantic_cache: Option<(u64, Structured)>,
+    semantic_job: Option<(u64, super::analysis::Task<Structured>)>,
     semantic_filter: Option<crate::core::semantic::ChangeKind>,
+    semantic_state_filter: Option<crate::core::semantic::three_way::MergeState>,
+    /// Why the last value was not copied.
+    semantic_message: Option<String>,
     /// The array matching key of the semantic view; empty compares arrays by position.
     semantic_array_key: String,
     merge_validation_generation: Option<u64>,
@@ -636,6 +964,8 @@ pub struct TextView {
     pub goto: Option<String>,
     pub table_mode: bool,
     pub table_delim: Option<char>,
+    /// How the table view matches records: by position, or by key columns (2-way).
+    pub table_match: TableMatch,
     col_widths: Vec<usize>,
     table: Box<TableState>,
     pub status: String,
@@ -660,6 +990,8 @@ pub struct TextView {
     /// Set when difference navigation ran past the last (true) or first (false) difference,
     /// so the app can move on to the next or previous file of the folder compare.
     pub step_file: Option<bool>,
+    /// Set when next (true) or previous conflict ran past the last or first open conflict.
+    pub step_conflict: Option<bool>,
     /// Bookmarked lines of each pane, with their comments (empty when there is none).
     pub bookmarks: Vec<BTreeMap<usize, String>>,
     /// Lines the compare puts on one row (see [`SyncPoint`]), in order.
@@ -714,6 +1046,8 @@ impl TextView {
             semantic_cache: None,
             semantic_job: None,
             semantic_filter: None,
+            semantic_state_filter: None,
+            semantic_message: None,
             semantic_array_key: String::new(),
             merge_validation_generation: None,
             merge_freshness: None,
@@ -740,6 +1074,7 @@ impl TextView {
             goto: None,
             table_mode: table_delim.is_some(),
             table_delim,
+            table_match: TableMatch::default(),
             col_widths: Vec::new(),
             table: Box::default(),
             status: String::new(),
@@ -757,6 +1092,7 @@ impl TextView {
             wrap: cfg.word_wrap,
             scroll_anim: None,
             step_file: None,
+            step_conflict: None,
             sync_pending: vec![None; bookmarks.len()],
             bookmarks,
             sync_points: Vec::new(),
@@ -1011,23 +1347,31 @@ impl TextView {
             self.table.docs = self
                 .panes
                 .iter()
-                .map(|p| table::Table::parse(table::source(&p.doc), d))
+                .map(|p| table::Table::parse(table::source(&p.doc), d).map(Arc::new))
                 .collect();
-            if self.table.docs.iter().all(Result::is_ok) {
-                let keys: Vec<Vec<String>> = self
+            // The records of the selected row, to select them again in the new rows; while a
+            // match runs there are no rows, only the selection to make when it ends.
+            let selected = match self.table.job {
+                Some(_) => self.table.restore.take(),
+                None => self
                     .table
-                    .docs
-                    .iter()
-                    .map(|t| t.as_ref().unwrap().keys(self.opts.ignore_eol))
-                    .collect();
-                self.table.diff = diff::compute_with(
-                    &keys.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-                    &self.opts,
-                    None,
-                );
+                    .selected
+                    .and_then(|r| self.table.diff.rows.get(r))
+                    .map(|r| r.lines()),
+            };
+            self.table.keyed = None;
+            self.table.job = None;
+            if self.table.docs.iter().all(Result::is_ok) {
+                if self.table_mode && self.table_match.by_key() && self.n() == 2 {
+                    self.match_table_by_key(selected);
+                }
+                if self.table.job.is_none() && !matches!(self.table.keyed.as_deref(), Some(Ok(_))) {
+                    self.table_by_position();
+                }
             } else {
                 self.table.diff = DiffResult::default();
             }
+            self.select_table_lines(selected);
             let mut w: Vec<usize> = Vec::new();
             for p in &self.panes {
                 for l in p.doc.lines.iter().take(20000) {
@@ -1358,13 +1702,39 @@ impl TextView {
     }
 
     pub fn first_diff(&mut self) {
+        if let Some(rows) = self.keyed_differences() {
+            if let Some(&r) = rows.first() {
+                self.select_keyed_row(r);
+            }
+            return;
+        }
         let first = self.significant().next();
         if let Some(b) = first {
             self.select_block(b);
         }
     }
 
+    /// Selects difference `n` (0-based), or the last one when there are fewer.
+    pub fn go_to_diff(&mut self, n: usize) {
+        if let Some(rows) = self.keyed_differences() {
+            if let Some(&r) = rows.get(n).or(rows.last()) {
+                self.select_keyed_row(r);
+            }
+            return;
+        }
+        let sig: Vec<usize> = self.significant().collect();
+        if let Some(&b) = sig.get(n).or(sig.last()) {
+            self.select_block(b);
+        }
+    }
+
     pub fn last_diff(&mut self) {
+        if let Some(rows) = self.keyed_differences() {
+            if let Some(&r) = rows.last() {
+                self.select_keyed_row(r);
+            }
+            return;
+        }
         let last = self.significant().last();
         if let Some(b) = last {
             self.select_block(b);
@@ -1422,8 +1792,33 @@ impl TextView {
         }
     }
 
+    /// Selects the first (or last) open conflict; false when there is none.
+    pub fn edge_conflict(&mut self, first: bool) -> bool {
+        if self.keyed().is_some() {
+            return false;
+        }
+        let found = {
+            let mut open = self.significant().filter(|&b| self.is_open_conflict(b));
+            if first {
+                open.next()
+            } else {
+                open.last()
+            }
+        };
+        if let Some(b) = found {
+            self.select_block(b);
+        }
+        found.is_some()
+    }
+
     /// Selects the next difference; false when there is none after the cursor.
     pub fn next_diff(&mut self, conflicts_only: bool) -> bool {
+        if self.matching() {
+            return false;
+        }
+        if self.keyed().is_some() {
+            return !conflicts_only && self.step_keyed(true) == Some(true);
+        }
         let row = self.cursor_row;
         let found = self
             .significant()
@@ -1437,6 +1832,12 @@ impl TextView {
 
     /// Selects the previous difference; false when there is none before the cursor.
     pub fn prev_diff(&mut self, conflicts_only: bool) -> bool {
+        if self.matching() {
+            return false;
+        }
+        if self.keyed().is_some() {
+            return !conflicts_only && self.step_keyed(false) == Some(true);
+        }
         let row = self.cursor_row.unwrap_or(self.diff.rows.len());
         let containing = self.diff.rows.get(row).and_then(|r| r.block());
         let found = self
@@ -1451,11 +1852,22 @@ impl TextView {
     }
 
     pub fn diff_position(&self) -> (Option<usize>, usize) {
-        let sig: Vec<usize> = self.significant().collect();
-        let pos = self
-            .cur_block
-            .and_then(|c| sig.iter().position(|&b| b == c));
-        (pos, sig.len())
+        // Asked for several times a frame, so counted without collecting.
+        let place = |stops: &mut dyn Iterator<Item = usize>, at: Option<usize>| {
+            let (mut pos, mut total) = (None, 0);
+            for s in stops {
+                if Some(s) == at {
+                    pos = Some(total);
+                }
+                total += 1;
+            }
+            (pos, total)
+        };
+        if let Some(d) = self.keyed() {
+            let mut rows = (0..d.rows.len()).filter(|&i| d.rows[i].differs(d.ignore_order));
+            return place(&mut rows, self.table.selected);
+        }
+        place(&mut self.significant(), self.cur_block)
     }
 
     // ---------- merging ----------
@@ -1624,6 +2036,10 @@ impl TextView {
             return;
         }
         if self.table_mode {
+            // Line blocks pair records by position, which rows matched by key do not.
+            if self.keyed().is_some() || self.table.job.is_some() {
+                return;
+            }
             if let (Some(Ok(a)), Some(Ok(btable))) =
                 (self.table.docs.get(from), self.table.docs.get(to))
             {
@@ -1687,7 +2103,12 @@ impl TextView {
 
     /// Replaces the lines of `to` in rows `r0..=r1` with the lines of `from` in those rows.
     pub fn copy_rows(&mut self, r0: usize, r1: usize, from: usize, to: usize) {
-        if from == to || to >= self.n() || r1 >= self.diff.rows.len() || !self.writable(to) {
+        if from == to
+            || to >= self.n()
+            || r1 >= self.diff.rows.len()
+            || !self.writable(to)
+            || self.matching()
+        {
             return;
         }
         let rows = &self.diff.rows[r0..=r1];
@@ -1738,6 +2159,16 @@ impl TextView {
     }
 
     pub fn copy_current(&mut self, to_right: bool) {
+        if self.matching() {
+            return;
+        }
+        if self.keyed().is_some() {
+            if let Some(row) = self.table_cursor() {
+                let (from, to) = if to_right { (0, 1) } else { (1, 0) };
+                self.copy_keyed_row(row, from, to);
+            }
+            return;
+        }
         if let Some((r0, r1)) = self.selection() {
             let (from, to) = self.copy_direction(to_right);
             self.copy_rows(r0, r1, from, to);
@@ -2399,10 +2830,88 @@ impl TextView {
             _ => String::new(),
         };
         let (diff, opts, notes) = (self.diff.clone(), self.opts.clone(), self.bookmarks.clone());
+        let table = self.keyed().map(|d| {
+            let summary = self.table_report_lines(d);
+            (
+                self.table_match.clone(),
+                d.counts,
+                d.warnings.clone(),
+                summary,
+            )
+        });
         Box::new(move || {
             let refs: Vec<&[String]> = lines.iter().map(Vec::as_slice).collect();
-            crate::core::report::text_report(format, &titles, &refs, &diff, &opts, &notes, &rules)
+            let report = crate::core::report::text_report(
+                format, &titles, &refs, &diff, &opts, &notes, &rules,
+            );
+            match &table {
+                Some((m, counts, warnings, summary)) => {
+                    table_match::annotate_report(report, format, m, (counts, warnings), summary)
+                }
+                None => report,
+            }
         })
+    }
+
+    /// What matching by key used and found, in words: a heading, the settings, the counts and
+    /// the warnings.
+    fn table_report_lines(&self, d: &TableDiff) -> Vec<String> {
+        let m = &self.table_match;
+        let names: Vec<String> = self
+            .table
+            .docs
+            .first()
+            .and_then(|t| t.as_ref().ok())
+            .filter(|_| m.header)
+            .and_then(|t| t.records.first())
+            .map(|r| r.cells.iter().map(|c| c.trim().to_string()).collect())
+            .unwrap_or_default();
+        let keys: Vec<String> = m.keys.iter().map(|k| key_label(k, &names)).collect();
+        let mut settings = vec![format!("{}: {}", tr("table.choose_keys"), keys.join(" + "))];
+        if m.header {
+            settings.push(tr("table.header_row").to_string());
+        }
+        settings.push(format!(
+            "{}: {}",
+            tr("table.columns_by"),
+            tr(match m.columns {
+                table_match::ColumnPolicy::Position => "table.columns_position",
+                table_match::ColumnPolicy::Name => "table.columns_name",
+            })
+        ));
+        settings.push(format!(
+            "{}: {}",
+            tr("table.order"),
+            tr(match m.order {
+                table_match::RowOrder::Left => "table.order_left",
+                table_match::RowOrder::Right => "table.order_right",
+                table_match::RowOrder::Key => "table.order_key",
+            })
+        ));
+        if m.ignore_order {
+            settings.push(tr("table.ignore_order").to_string());
+        }
+        let tolerance = tolerance_text(m);
+        if !tolerance.is_empty() {
+            settings.push(format!("{}: {tolerance}", tr("table.tolerance")));
+        }
+        let n = d.counts;
+        let mut lines = vec![
+            tr("table.report_title").to_string(),
+            settings.join(" · "),
+            trf(
+                "table.summary",
+                &[
+                    ("added", n.added.to_string()),
+                    ("removed", n.removed.to_string()),
+                    ("modified", n.modified.to_string()),
+                    ("moved", n.moved.to_string()),
+                    ("ambiguous", n.ambiguous.to_string()),
+                ],
+            ),
+        ];
+        lines.extend(d.warnings.iter().map(warning_text));
+        lines
     }
 
     /// The compare with its bookmarks, to save as one file.
@@ -3005,7 +3514,13 @@ impl TextView {
                 if widgets::icon_button(ui, Icon::First, &Cmd::FirstDiff.tip()).clicked() {
                     self.first_diff();
                 }
-                if widgets::icon_button(ui, Icon::Prev, &Cmd::PrevDiff.tip()).clicked()
+                if widgets::icon_button_hint(
+                    ui,
+                    Icon::Prev,
+                    &Cmd::PrevDiff.tip(),
+                    tr("tip.nav_diff"),
+                )
+                .clicked()
                     && !self.prev_diff(false)
                 {
                     self.step_file = Some(false);
@@ -3028,7 +3543,13 @@ impl TextView {
                             &[("add", add.to_string()), ("del", del.to_string())],
                         ));
                 }
-                if widgets::icon_button(ui, Icon::Next, &Cmd::NextDiff.tip()).clicked()
+                if widgets::icon_button_hint(
+                    ui,
+                    Icon::Next,
+                    &Cmd::NextDiff.tip(),
+                    tr("tip.nav_diff"),
+                )
+                .clicked()
                     && !self.next_diff(false)
                 {
                     self.step_file = Some(true);
@@ -3081,23 +3602,27 @@ impl TextView {
                         self.copy_all(1, 0);
                     }
                 } else {
-                    if widgets::icon_button(
+                    if widgets::icon_button_hint(
                         ui,
                         Icon::PrevConflict,
                         &Cmd::PrevConflict.tip_if(self.keys_enabled),
+                        tr("tip.nav_conflict"),
                     )
                     .clicked()
+                        && !self.prev_diff(true)
                     {
-                        self.prev_diff(true);
+                        self.step_conflict = Some(false);
                     }
-                    if widgets::icon_button(
+                    if widgets::icon_button_hint(
                         ui,
                         Icon::NextConflict,
                         &Cmd::NextConflict.tip_if(self.keys_enabled),
+                        tr("tip.nav_conflict"),
                     )
                     .clicked()
+                        && !self.next_diff(true)
                     {
-                        self.next_diff(true);
+                        self.step_conflict = Some(true);
                     }
                     widgets::toolbar_sep(ui);
                     if widgets::icon_button(ui, Icon::CopyRight, tr("cmd.copy_from_left")).clicked()
@@ -4385,26 +4910,272 @@ impl TextView {
         }
     }
 
-    fn table_cursor(&self) -> Option<usize> {
-        let raw = self.diff.rows.get(self.cursor_row?)?;
-        let contains = |row: &diff::Row, pane: usize| match (row.line(pane), raw.line(pane)) {
+    /// The rows matched by key, when the table view shows them.
+    fn keyed(&self) -> Option<&TableDiff> {
+        match self.table.keyed.as_deref() {
+            Some(Ok(d)) if self.table_mode => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Whether the table rows wait for a background match by key, so no rows can be copied or
+    /// stepped through yet.
+    fn matching(&self) -> bool {
+        self.table_mode && self.table.job.is_some()
+    }
+
+    /// Matches the records of the two sides by the key columns of [`Self::table_match`]: at
+    /// once, or for large tables in the background, selecting `selected` again when it ends.
+    fn match_table_by_key(&mut self, selected: Option<[Option<usize>; 3]>) {
+        let (Some(Ok(a)), Some(Ok(b))) = (self.table.docs.first(), self.table.docs.get(1)) else {
+            return;
+        };
+        let (a, b) = (a.clone(), b.clone());
+        let limit = self.table.background_at.unwrap_or(BACKGROUND_RECORDS);
+        if a.records.len() + b.records.len() <= limit {
+            let result = match_records(&a, &b, &self.table_match, &self.opts, &|_| false);
+            self.show_keyed(result);
+            return;
+        }
+        let (m, opts) = (self.table_match.clone(), self.opts.clone());
+        self.table.job = Some(super::analysis::Task::start(move |cancel, progress| {
+            let stop = |done: usize| {
+                progress.store(done, std::sync::atomic::Ordering::Relaxed);
+                cancel.load(std::sync::atomic::Ordering::Relaxed)
+            };
+            Ok(match_records(&a, &b, &m, &opts, &stop))
+        }));
+        self.table.restore = selected;
+        self.table.diff = DiffResult::default();
+    }
+
+    /// Ends a background match by key that has finished.
+    fn poll_table_job(&mut self) {
+        let Some(job) = self.table.job.as_mut() else {
+            return;
+        };
+        let cancelled = job.cancel.clone();
+        let Some(result) = job.poll() else {
+            return;
+        };
+        self.table.job = None;
+        let problem = if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            table_match::Problem::Cancelled
+        } else {
+            table_match::Problem::Failed
+        };
+        self.show_keyed(result.unwrap_or(Err(problem)));
+        if !matches!(self.table.keyed.as_deref(), Some(Ok(_))) {
+            self.table_by_position();
+        }
+        let restore = self.table.restore.take();
+        self.select_table_lines(restore);
+    }
+
+    /// Shows the rows matched by key, or keeps why they could not be.
+    fn show_keyed(&mut self, result: Result<TableDiff, table_match::Problem>) {
+        if let Ok(d) = &result {
+            let mut blocks = Vec::new();
+            let rows = d
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let block = r.differs(d.ignore_order).then(|| {
+                        let range = |x: Option<usize>| x.map_or(0..0, |x| x..x + 1);
+                        blocks.push(diff::Block {
+                            ranges: [range(r.records[0]), range(r.records[1]), 0..0],
+                            kind: BlockKind::Diff,
+                            ignored: false,
+                            first_row: i,
+                            rows: 1,
+                        });
+                        blocks.len() - 1
+                    });
+                    diff::Row::new([r.records[0], r.records[1], None], block)
+                })
+                .collect();
+            self.table.diff = DiffResult {
+                panes: 2,
+                rows,
+                blocks,
+                moved: Default::default(),
+            };
+        }
+        self.table.keyed = Some(Box::new(result));
+    }
+
+    /// Aligns the records of the sides by position, as text lines are.
+    fn table_by_position(&mut self) {
+        let keys: Vec<Vec<String>> = self
+            .table
+            .docs
+            .iter()
+            .filter_map(|t| t.as_ref().ok())
+            .map(|t| t.keys(self.opts.ignore_eol))
+            .collect();
+        self.table.diff = diff::compute_with(
+            &keys.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            &self.opts,
+            None,
+        );
+    }
+
+    /// Selects the row holding one of the record `lines`, or none.
+    fn select_table_lines(&mut self, lines: Option<[Option<usize>; 3]>) {
+        self.table.selected =
+            lines.and_then(|lines| {
+                self.table.diff.rows.iter().position(|r| {
+                    (0..self.n()).any(|p| lines[p].is_some() && r.line(p) == lines[p])
+                })
+            });
+    }
+
+    /// The rows matched by key that are differences.
+    fn keyed_differences(&self) -> Option<Vec<usize>> {
+        let d = self.keyed()?;
+        Some(
+            (0..d.rows.len())
+                .filter(|&i| d.rows[i].differs(d.ignore_order))
+                .collect(),
+        )
+    }
+
+    /// Selects row `row` of the rows matched by key, on a side that has its record, at its
+    /// first changed column.
+    fn select_keyed_row(&mut self, row: usize) {
+        let Some(r) = self.keyed().and_then(|d| d.rows.get(row)) else {
+            return;
+        };
+        let active = self.active_pane.min(1);
+        let pane = if r.records[active].is_some() {
+            active
+        } else {
+            usize::from(r.records[0].is_none())
+        };
+        let column = r.changed[pane]
+            .first()
+            .copied()
+            .unwrap_or(self.table.column);
+        self.select_table_row(row, pane, column);
+    }
+
+    /// Next or previous difference of the rows matched by key; `None` when rows are not
+    /// matched by key.
+    fn step_keyed(&mut self, forward: bool) -> Option<bool> {
+        let rows = self.keyed_differences()?;
+        let cur = self.table.selected;
+        let found = if forward {
+            rows.into_iter().find(|&r| cur.is_none_or(|c| r > c))
+        } else {
+            rows.into_iter().rev().find(|&r| cur.is_none_or(|c| r < c))
+        };
+        if let Some(r) = found {
+            self.select_keyed_row(r);
+        }
+        Some(found.is_some())
+    }
+
+    /// Copies row `row` of the rows matched by key from side `from` to side `to`: the changed
+    /// cells of a record both sides have, the record only `from` has, or removes the record
+    /// only `to` has. Records with an ambiguous key are not copied.
+    fn copy_keyed_row(&mut self, row: usize, from: usize, to: usize) {
+        let Some(d) = self.keyed() else { return };
+        let Some(r) = d.rows.get(row).cloned() else {
+            return;
+        };
+        if r.state == RowState::Ambiguous {
+            self.status = tr("table.ambiguous_copy").into();
+            return;
+        }
+        if !r.differs(true) || from == to || !self.writable(to) {
+            return;
+        }
+        let Some(delim) = self.table_delim else {
+            return;
+        };
+        let d = self.keyed().unwrap();
+        let (Some(Ok(src)), Some(Ok(dst))) = (self.table.docs.get(from), self.table.docs.get(to))
+        else {
+            return;
+        };
+        // Whole records keep their cells in place only when columns pair by position.
+        let in_place = d
+            .columns
+            .iter()
+            .all(|c| c[0].is_none() || c[1].is_none() || c[0] == c[1]);
+        let eol = self.panes[to].doc.eol.as_str();
+        let result = match (r.records[from], r.records[to]) {
+            (Some(s), Some(t)) => {
+                match copy_record_cells(d, &r, (src, s, from), (dst, t, to), delim) {
+                    Some(source) => Ok(source),
+                    None if in_place => Ok(dst.copy_lines(
+                        dst.records[t].lines.clone(),
+                        src,
+                        src.records[s].lines.clone(),
+                        eol,
+                    )),
+                    None => Err(tr("table.copy_columns_differ").to_string()),
+                }
+            }
+            (Some(s), None) if in_place => {
+                let at = d.rows[..row]
+                    .iter()
+                    .rev()
+                    .find_map(|x| x.records[to])
+                    .map_or(0, |t| dst.records[t].lines.end);
+                Ok(dst.copy_lines(at..at, src, src.records[s].lines.clone(), eol))
+            }
+            (Some(_), None) => Err(tr("table.copy_columns_differ").to_string()),
+            (None, Some(t)) => Ok(dst.copy_lines(dst.records[t].lines.clone(), src, 0..0, eol)),
+            (None, None) => return,
+        };
+        let removed = r.records[from].is_none();
+        match result.and_then(|source| self.replace_table_source(to, source)) {
+            Ok(()) => {
+                // The rows after a removed record move up into its place.
+                if removed {
+                    self.table.selected = row.checked_sub(1);
+                }
+                self.step_keyed(true);
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    /// Whether table row `row` holds raw row `raw` on side `pane`.
+    fn holds(&self, row: &diff::Row, raw: &diff::Row, pane: usize) -> bool {
+        match (row.line(pane), raw.line(pane)) {
             (Some(record), Some(line)) => self.table.docs[pane]
                 .as_ref()
                 .is_ok_and(|table| table.records[record].lines.contains(&line)),
             _ => false,
-        };
-        self.table
-            .diff
-            .rows
-            .iter()
-            .position(|row| contains(row, self.active_pane))
+        }
+    }
+
+    /// The table row holding raw row `raw_row`, preferring the record of side `pane`.
+    fn table_row_at(&self, raw_row: usize, pane: usize) -> Option<usize> {
+        let raw = self.diff.rows.get(raw_row)?;
+        let rows = &self.table.diff.rows;
+        rows.iter()
+            .position(|row| self.holds(row, raw, pane))
             .or_else(|| {
-                self.table
-                    .diff
-                    .rows
-                    .iter()
-                    .position(|row| (0..self.n()).any(|pane| contains(row, pane)))
+                rows.iter()
+                    .position(|row| (0..self.n()).any(|p| self.holds(row, raw, p)))
             })
+    }
+
+    fn table_cursor(&self) -> Option<usize> {
+        if self.keyed().is_some() {
+            if let Some(row) = self
+                .table
+                .selected
+                .filter(|&r| r < self.table.diff.rows.len())
+            {
+                return Some(row);
+            }
+        }
+        self.table_row_at(self.cursor_row?, self.active_pane)
     }
 
     /// Pick an actual changed physical line within the record, even when its opening
@@ -4413,6 +5184,7 @@ impl TextView {
         let Some(aligned) = self.table.diff.rows.get(row) else {
             return;
         };
+        self.table.selected = Some(row);
         let contains = |raw: &diff::Row, side: usize| match (aligned.line(side), raw.line(side)) {
             (Some(record), Some(line)) => self.table.docs[side]
                 .as_ref()
@@ -4592,8 +5364,15 @@ impl TextView {
             source.clone(),
             self.table_delim.ok_or("No table delimiter")?,
         )?;
+        self.replace_source(pane, source);
+        Ok(())
+    }
+
+    /// Replaces the text of pane `pane` as one undoable edit, keeping its line breaks where its
+    /// lines stay.
+    fn replace_source(&mut self, pane: usize, source: String) {
         if source == table::source(&self.panes[pane].doc) {
-            return Ok(());
+            return;
         }
         self.push_undo();
         self.undo.last_mut().unwrap().formats[pane] = Some(format_of(&self.panes[pane].doc));
@@ -4606,7 +5385,6 @@ impl TextView {
         doc.original_eols = parsed.original_eols;
         doc.preserve_eols = true;
         self.mark_changed(&[pane]);
-        Ok(())
     }
 
     fn copy_cell(&mut self, row: usize, column: usize, from: usize, to: usize) {
@@ -4614,6 +5392,18 @@ impl TextView {
             return;
         };
         let (Some(src), Some(dst)) = (aligned.line(from), aligned.line(to)) else {
+            return;
+        };
+        let target = match self.keyed().and_then(|d| Some((d, d.rows.get(row)?))) {
+            Some((_, m)) if m.state == RowState::Ambiguous => {
+                self.status = tr("table.ambiguous_copy").into();
+                return;
+            }
+            Some((d, _)) => d.paired_column(from, column, to),
+            None => Some(column),
+        };
+        let Some(target) = target else {
+            self.status = tr("table.copy_columns_differ").into();
             return;
         };
         let (Ok(a), Ok(b)) = (&self.table.docs[from], &self.table.docs[to]) else {
@@ -4625,7 +5415,7 @@ impl TextView {
         let edit = CellEdit {
             pane: to,
             record: dst,
-            column,
+            column: target,
             value: value.clone(),
             source: b.source.clone(),
             focus: false,
@@ -4679,13 +5469,281 @@ impl TextView {
     }
 
     /// Record-aware rendering leaves the raw text diff intact for reports and ordinary merges.
+    /// Matches records as `m` says, keeping the tolerance field in step.
+    pub fn set_table_match(&mut self, m: TableMatch) {
+        self.table.tolerance = tolerance_text(&m);
+        if m != self.table_match {
+            self.table_match = m;
+            self.rediff();
+        }
+    }
+
+    /// Choosing how the table view matches records, and what matching found.
+    fn table_match_bar(&mut self, ui: &mut Ui, c: &Colors) {
+        let before = self.table_match.clone();
+        let names: Vec<String> = self
+            .table
+            .docs
+            .first()
+            .and_then(|t| t.as_ref().ok())
+            .and_then(|t| t.records.first())
+            .map(|r| r.cells.iter().map(|c| c.trim().to_string()).collect())
+            .unwrap_or_default();
+        let width = self
+            .table
+            .docs
+            .iter()
+            .filter_map(|t| t.as_ref().ok())
+            .flat_map(|t| t.records.first())
+            .map(|r| r.cells.len())
+            .max()
+            .unwrap_or(1)
+            .max(names.len());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(tr("table.match_by"));
+            let mut by_key = self.table_match.by_key();
+            egui::ComboBox::from_id_salt(self.id.with("match_by"))
+                .selected_text(tr(if by_key {
+                    "table.match_keys"
+                } else {
+                    "table.match_position"
+                }))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut by_key, false, tr("table.match_position"));
+                    ui.selectable_value(&mut by_key, true, tr("table.match_keys"));
+                });
+            if by_key != self.table_match.by_key() {
+                if by_key {
+                    self.table_match.header = true;
+                    self.table_match.keys = vec![key_column(&names, 0, true)];
+                } else {
+                    self.table_match.keys.clear();
+                }
+            }
+            if !self.table_match.by_key() {
+                return;
+            }
+            let mut header = self.table_match.header;
+            if ui.checkbox(&mut header, tr("table.header_row")).changed() {
+                self.table_match.header = header;
+                self.table_match.keys = self
+                    .table_match
+                    .keys
+                    .iter()
+                    .map(|k| {
+                        let column = match k {
+                            KeyColumn::Index(i) => Some(*i),
+                            KeyColumn::Name(n) => names.iter().position(|x| x == n),
+                        };
+                        // A name no column has stays, to be shown as missing and removed.
+                        column.map_or_else(|| k.clone(), |c| key_column(&names, c, header))
+                    })
+                    .collect();
+                if !header {
+                    self.table_match.columns = table_match::ColumnPolicy::Position;
+                }
+            }
+            let chosen: Vec<String> = self
+                .table_match
+                .keys
+                .iter()
+                .map(|k| key_label(k, &names))
+                .collect();
+            ui.menu_button(
+                format!("{}: {}", tr("table.choose_keys"), chosen.join(" + ")),
+                |ui| {
+                    let listed: Vec<KeyColumn> = (0..width)
+                        .map(|column| key_column(&names, column, self.table_match.header))
+                        .collect();
+                    // Saved keys no column has, such as from a project, can be unticked too.
+                    let missing: Vec<KeyColumn> = self
+                        .table_match
+                        .keys
+                        .iter()
+                        .filter(|k| !listed.contains(k))
+                        .cloned()
+                        .collect();
+                    for key in listed.into_iter().chain(missing) {
+                        let mut on = self.table_match.keys.contains(&key);
+                        if ui.checkbox(&mut on, key_label(&key, &names)).changed() {
+                            if on {
+                                self.table_match.keys.push(key);
+                            } else if self.table_match.keys.len() > 1 {
+                                self.table_match.keys.retain(|k| *k != key);
+                            }
+                        }
+                    }
+                },
+            );
+            ui.label(tr("table.columns_by"));
+            let columns = &mut self.table_match.columns;
+            egui::ComboBox::from_id_salt(self.id.with("columns_by"))
+                .selected_text(tr(match columns {
+                    table_match::ColumnPolicy::Position => "table.columns_position",
+                    table_match::ColumnPolicy::Name => "table.columns_name",
+                }))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        columns,
+                        table_match::ColumnPolicy::Position,
+                        tr("table.columns_position"),
+                    );
+                    ui.add_enabled_ui(header, |ui| {
+                        ui.selectable_value(
+                            columns,
+                            table_match::ColumnPolicy::Name,
+                            tr("table.columns_name"),
+                        );
+                    });
+                });
+            ui.checkbox(&mut self.table_match.ignore_order, tr("table.ignore_order"));
+            ui.label(tr("table.order"));
+            let order = &mut self.table_match.order;
+            let order_key = |o: table_match::RowOrder| match o {
+                table_match::RowOrder::Left => "table.order_left",
+                table_match::RowOrder::Right => "table.order_right",
+                table_match::RowOrder::Key => "table.order_key",
+            };
+            egui::ComboBox::from_id_salt(self.id.with("row_order"))
+                .selected_text(tr(order_key(*order)))
+                .show_ui(ui, |ui| {
+                    for o in [
+                        table_match::RowOrder::Left,
+                        table_match::RowOrder::Right,
+                        table_match::RowOrder::Key,
+                    ] {
+                        ui.selectable_value(order, o, tr(order_key(o)));
+                    }
+                })
+                .response
+                .on_hover_text(tr("tip.table_order"));
+            ui.label(tr("table.tolerance"));
+            let response = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.table.tolerance)
+                        .desired_width(64.0)
+                        .hint_text("0"),
+                )
+                .on_hover_text(tr("tip.table_tolerance"));
+            if response.changed() {
+                if let Some((abs, rel)) = parse_tolerance(&self.table.tolerance) {
+                    self.table_match.abs_tolerance = abs;
+                    self.table_match.rel_tolerance = rel;
+                }
+            }
+        });
+        if self.table_match != before {
+            self.rediff();
+        }
+        let mut show = None;
+        let mut again = false;
+        if let Some(job) = &self.table.job {
+            let total: usize = self
+                .table
+                .docs
+                .iter()
+                .filter_map(|t| t.as_ref().ok())
+                .map(|t| t.records.len())
+                .sum();
+            // the records are handled twice: their keys first, then the records themselves
+            let done = job.progress.load(std::sync::atomic::Ordering::Relaxed) / 2;
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(trf(
+                    "table.matching",
+                    &[
+                        ("done", done.min(total).to_string()),
+                        ("total", total.to_string()),
+                    ],
+                ));
+                if ui.button(tr("btn.cancel")).clicked() {
+                    job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(60));
+        }
+        match self.table.keyed.as_deref() {
+            Some(Ok(d)) => {
+                ui.horizontal_wrapped(|ui| {
+                    let n = d.counts;
+                    ui.label(trf(
+                        "table.summary",
+                        &[
+                            ("added", n.added.to_string()),
+                            ("removed", n.removed.to_string()),
+                            ("modified", n.modified.to_string()),
+                            ("moved", n.moved.to_string()),
+                            ("ambiguous", n.ambiguous.to_string()),
+                        ],
+                    ));
+                    if d.ignore_order && n.moved > 0 {
+                        ui.weak(tr("table.order_ignored"));
+                    }
+                    if n.ambiguous > 0 && ui.button(tr("table.show_ambiguous")).clicked() {
+                        let ambiguous = || {
+                            (0..d.rows.len()).filter(|&i| d.rows[i].state == RowState::Ambiguous)
+                        };
+                        let after = self.table.selected;
+                        show = ambiguous()
+                            .find(|&i| after.is_none_or(|s| i > s))
+                            .or_else(|| ambiguous().next());
+                    }
+                });
+                for warning in &d.warnings {
+                    ui.colored_label(c.ui.warning, warning_text(warning));
+                }
+            }
+            Some(Err(problem)) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(c.ui.warning, problem_text(problem));
+                    if *problem == table_match::Problem::Cancelled {
+                        again = ui.button(tr("table.match_again")).clicked();
+                    }
+                });
+            }
+            None => {}
+        }
+        if let Some(row) = show {
+            self.select_keyed_row(row);
+        }
+        if again {
+            self.rediff();
+        }
+        ui.separator();
+    }
+
     fn table_ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
+        self.poll_table_job();
+        // matched when table mode is turned on, not while it is off
+        if self.table_match.by_key()
+            && self.n() == 2
+            && self.table.keyed.is_none()
+            && self.table.job.is_none()
+            && self.table.docs.iter().all(Result::is_ok)
+        {
+            let selected = self
+                .table
+                .selected
+                .and_then(|r| self.table.diff.rows.get(r))
+                .map(|r| r.lines());
+            self.match_table_by_key(selected);
+            if self.table.job.is_none() {
+                self.select_table_lines(selected);
+            }
+        }
         if let Some(error) = self.table.docs.iter().find_map(|t| t.as_ref().err()) {
             ui.colored_label(c.ui.warning, error);
             ui.label(tr("table.invalid"));
             if ui.button(tr("cmd.table_mode")).clicked() {
                 self.table_mode = false;
             }
+            return;
+        }
+        if self.n() == 2 {
+            self.table_match_bar(ui, c);
+        }
+        if self.table.job.is_some() {
             return;
         }
         let n = self.n();
@@ -4719,20 +5777,26 @@ impl TextView {
                     + 8.0
             })
             .collect();
-        let target = self
-            .scroll_to
-            .take()
-            .and_then(|raw_row| self.diff.rows.get(raw_row))
-            .and_then(|raw| {
-                self.table.diff.rows.iter().position(|row| {
-                    (0..n).any(|p| match (row.line(p), raw.line(p)) {
-                        (Some(r), Some(l)) => self.table.docs[p].as_ref().unwrap().records[r]
-                            .lines
-                            .contains(&l),
-                        _ => false,
-                    })
+        let keyed = self.keyed().is_some();
+        let target = self.scroll_to.take().and_then(|raw_row| {
+            let raw = self.diff.rows.get(raw_row)?;
+            self.table
+                .selected
+                .filter(|&s| {
+                    keyed
+                        && self
+                            .table
+                            .diff
+                            .rows
+                            .get(s)
+                            .is_some_and(|row| (0..n).any(|p| self.holds(row, raw, p)))
                 })
-            });
+                .or_else(|| self.table_row_at(raw_row, self.active_pane))
+        });
+        if keyed && target.is_some() {
+            self.table.selected = target;
+        }
+        let cursor = self.table_cursor();
         let normalizer = diff::Normalizer::new(&self.opts);
         let mut clicked = None;
         let mut edit_cell = None;
@@ -4774,8 +5838,26 @@ impl TextView {
                         body.heterogeneous_rows(heights.into_iter(), |mut row| {
                             let index = row.index();
                             let aligned = self.table.diff.rows[index];
+                            let matched = self.keyed().and_then(|d| d.rows.get(index));
                             row.col(|ui| {
-                                ui.label((index + 1).to_string());
+                                if cursor == Some(index) {
+                                    ui.painter().rect_filled(ui.max_rect(), 0.0, c.cursor_row);
+                                }
+                                match matched {
+                                    Some(m) => {
+                                        let (mark, tip, fill) = row_marker(m, c);
+                                        if let Some(fill) = fill {
+                                            let mut rect = ui.max_rect();
+                                            rect.set_width(4.0);
+                                            ui.painter().rect_filled(rect, 0.0, fill);
+                                        }
+                                        ui.label(format!("{} {mark}", index + 1))
+                                            .on_hover_text(tip);
+                                    }
+                                    None => {
+                                        ui.label((index + 1).to_string());
+                                    }
+                                }
                             });
                             for p in 0..n {
                                 for column in 0..columns {
@@ -4784,31 +5866,40 @@ impl TextView {
                                             &self.table.docs[p].as_ref().unwrap().records[r]
                                         });
                                         let value = record.and_then(|r| r.cells.get(column));
-                                        let changed = value.is_some()
-                                            && aligned.block().is_some_and(|b| {
-                                                !self.table.diff.blocks[b].ignored
-                                            })
-                                            && (0..n).filter(|&q| q != p).any(|q| {
-                                                let other = aligned.line(q).and_then(|r| {
-                                                    self.table.docs[q].as_ref().unwrap().records[r]
-                                                        .cells
-                                                        .get(column)
-                                                });
-                                                match (value, other) {
-                                                    (Some(a), Some(b)) => {
-                                                        let clean = |s: &str| {
-                                                            if self.opts.ignore_eol {
-                                                                s.replace("\r\n", "\n")
-                                                                    .replace('\r', "\n")
-                                                            } else {
-                                                                s.to_string()
+                                        let changed = match matched {
+                                            Some(m) => m.changed[p].contains(&column),
+                                            None => {
+                                                value.is_some()
+                                                    && aligned.block().is_some_and(|b| {
+                                                        !self.table.diff.blocks[b].ignored
+                                                    })
+                                                    && (0..n).filter(|&q| q != p).any(|q| {
+                                                        let other = aligned.line(q).and_then(|r| {
+                                                            self.table.docs[q]
+                                                                .as_ref()
+                                                                .unwrap()
+                                                                .records[r]
+                                                                .cells
+                                                                .get(column)
+                                                        });
+                                                        match (value, other) {
+                                                            (Some(a), Some(b)) => {
+                                                                let clean = |s: &str| {
+                                                                    if self.opts.ignore_eol {
+                                                                        s.replace("\r\n", "\n")
+                                                                            .replace('\r', "\n")
+                                                                    } else {
+                                                                        s.to_string()
+                                                                    }
+                                                                };
+                                                                !normalizer
+                                                                    .close(&clean(a), &clean(b))
                                                             }
-                                                        };
-                                                        !normalizer.close(&clean(a), &clean(b))
-                                                    }
-                                                    _ => value != other,
-                                                }
-                                            });
+                                                            _ => value != other,
+                                                        }
+                                                    })
+                                            }
+                                        };
                                         if changed {
                                             ui.painter().rect_filled(ui.max_rect(), 0.0, c.inline);
                                         }
@@ -4841,13 +5932,16 @@ impl TextView {
                                                     edit_cell = Some((p, r, column));
                                                     ui.close();
                                                 }
+                                                let safe = matched
+                                                    .is_none_or(|m| m.state != RowState::Ambiguous);
                                                 for to in 0..n {
                                                     if to != p
                                                         && aligned.line(to).is_some()
                                                         && ui
                                                             .add_enabled(
                                                                 !self.panes[to].doc.read_only
-                                                                    && value.is_some(),
+                                                                    && value.is_some()
+                                                                    && safe,
                                                                 egui::Button::new(format!(
                                                                     "{} → {}",
                                                                     tr("table.copy_cell"),
@@ -5286,7 +6380,7 @@ impl TextView {
     /// Returns true when the semantic view took the place of the text panes.
     fn analysis_ui(&mut self, ui: &mut Ui) -> bool {
         use crate::core::{analysis, semantic};
-        if self.n() != 2 {
+        if !matches!(self.n(), 2 | 3) {
             return false;
         }
         let format = self.panes.first().and_then(|p| {
@@ -5361,7 +6455,7 @@ impl TextView {
         }
         let typing = ui.data(|d| d.get_temp::<f64>(typed_id)).is_some();
         let options = match self.semantic_cache.as_ref().filter(|_| typing) {
-            Some((_, report)) => report.options.clone(),
+            Some((_, report)) => report.options().clone(),
             None => semantic::Options {
                 array_key: Some(self.semantic_array_key.trim().to_owned())
                     .filter(|k| !k.is_empty()),
@@ -5371,7 +6465,7 @@ impl TextView {
             .semantic_cache
             .as_ref()
             .is_none_or(|(generation, report)| {
-                *generation != self.layout_gen || report.options != options
+                *generation != self.layout_gen || report.options() != &options
             })
             && self
                 .semantic_job
@@ -5384,7 +6478,21 @@ impl TextView {
                 self.layout_gen,
                 super::analysis::Task::start(move |cancel, _| {
                     analysis::check_cancel(cancel)?;
-                    let report = semantic::compare_with(&docs[0], &docs[1], format, &job_options);
+                    let report = match &docs[..] {
+                        [a, b] => {
+                            Structured::Two(semantic::compare_with(a, b, format, &job_options))
+                        }
+                        [left, base, right] => {
+                            Structured::Three(semantic::three_way::compare_three(
+                                left,
+                                base,
+                                right,
+                                format,
+                                &job_options,
+                            ))
+                        }
+                        _ => anyhow::bail!("Semantic comparison takes two or three files"),
+                    };
                     analysis::check_cancel(cancel)?;
                     Ok(report)
                 }),
@@ -5392,27 +6500,27 @@ impl TextView {
         }
         if let Some((generation, task)) = &mut self.semantic_job {
             if let Some(result) = task.poll() {
-                match result {
-                    Ok(report) => {
-                        self.semantic_page = 0;
-                        self.semantic_cache = Some((*generation, report));
-                    }
-                    Err(e) => {
-                        self.status = e.to_string();
-                        self.semantic_cache = Some((
-                            *generation,
-                            semantic::SemanticReport {
-                                version: 1,
-                                format,
-                                changes: Vec::new(),
-                                errors: vec![e.to_string()],
-                                policies: Vec::new(),
-                                options,
-                                notes: Vec::new(),
-                            },
-                        ));
-                    }
-                };
+                let report = result.unwrap_or_else(|e| {
+                    self.status = e.to_string();
+                    Structured::Two(semantic::SemanticReport {
+                        version: 1,
+                        format,
+                        changes: Vec::new(),
+                        errors: vec![e.to_string()],
+                        policies: Vec::new(),
+                        options: options.clone(),
+                        notes: Vec::new(),
+                    })
+                });
+                // a page of the same report stays shown after a value is copied
+                if self
+                    .semantic_cache
+                    .as_ref()
+                    .is_none_or(|(_, old)| old.options() != report.options())
+                {
+                    self.semantic_page = 0;
+                }
+                self.semantic_cache = Some((*generation, report));
                 self.semantic_job = None;
             }
         }
@@ -5420,99 +6528,22 @@ impl TextView {
             task.status(ui);
             return true;
         }
-        let Some((_, report)) = &self.semantic_cache else {
+        let Some((generation, report)) = self.semantic_cache.take() else {
             ui.label(&self.status);
             return true;
         };
-        ui.small(tr("analysis.semantic_read_only"));
-        if !report.errors.is_empty() {
-            for error in &report.errors {
-                ui.colored_label(widgets::pal(ui).danger, error);
-            }
-            if ui.button(tr("analysis.text_fallback")).clicked() {
-                self.semantic_mode = false;
-            }
-        } else {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.semantic_filter, None, tr("analysis.all"));
-                for (kind, key) in [
-                    (semantic::ChangeKind::Added, "analysis.added"),
-                    (semantic::ChangeKind::Removed, "analysis.removed"),
-                    (semantic::ChangeKind::Modified, "analysis.modified"),
-                    (semantic::ChangeKind::TypeChanged, "analysis.type_changed"),
-                    (semantic::ChangeKind::Moved, "analysis.moved"),
-                ] {
-                    ui.selectable_value(&mut self.semantic_filter, Some(kind), tr(key));
-                }
-                if ui.button(tr("analysis.export")).clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_file_name("semantic.json")
-                        .save_file()
-                    {
-                        let inputs = self
-                            .panes
-                            .iter()
-                            .filter_map(|p| p.doc.path.clone())
-                            .collect::<Vec<_>>();
-                        if let Err(e) = analysis::report(report, &path, &inputs) {
-                            self.status = e.to_string();
-                        }
-                    }
-                }
-            });
-            for note in &report.notes {
-                ui.colored_label(widgets::pal(ui).warning, note);
-            }
-            if report.identical() {
-                ui.label(tr("analysis.semantic_identical"));
-            }
-            let count = report
-                .changes
-                .iter()
-                .filter(|change| {
-                    self.semantic_filter
-                        .as_ref()
-                        .is_none_or(|f| f == &change.kind)
-                })
-                .count();
-            let pages = count.div_ceil(100).max(1);
-            self.semantic_page = self.semantic_page.min(pages - 1);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(self.semantic_page > 0, egui::Button::new("←"))
-                    .clicked()
-                {
-                    self.semantic_page -= 1;
-                }
-                ui.label(format!(
-                    "{} {}/{} · {}",
-                    tr("analysis.page"),
-                    self.semantic_page + 1,
-                    pages,
-                    count
-                ));
-                if ui
-                    .add_enabled(self.semantic_page + 1 < pages, egui::Button::new("→"))
-                    .clicked()
-                {
-                    self.semantic_page += 1;
-                }
-                ui.small(tr("analysis.value_limit"));
-            });
-            let mut jump = None;
-            let filter = self.semantic_filter.clone();
-            let page: Vec<_> = report
-                .changes
-                .iter()
-                .filter(|change| filter.as_ref().is_none_or(|f| f == &change.kind))
-                .skip(self.semantic_page * 100)
-                .take(100)
-                .collect();
-            let tree = semantic::PathTree::of(page);
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                semantic_tree_ui(ui, &tree, 0, &mut jump);
-            });
-            if let Some((side, line)) = jump {
+        ui.small(tr("analysis.semantic_policy"));
+        if let Some(message) = &self.semantic_message {
+            ui.colored_label(widgets::pal(ui).warning, message);
+        }
+        let mut action = None;
+        match &report {
+            Structured::Two(r) => self.semantic_two_ui(ui, r, &mut action),
+            Structured::Three(r) => self.semantic_three_ui(ui, r, &mut action),
+        }
+        self.semantic_cache = Some((generation, report));
+        match action {
+            Some(SemanticAction::Jump(side, line)) => {
                 self.active_pane = side;
                 self.cursor_row = self
                     .diff
@@ -5527,8 +6558,207 @@ impl TextView {
                     .filter(|&b| !self.diff.blocks[b].ignored);
                 self.semantic_mode = false;
             }
+            Some(SemanticAction::Copy(change, from)) => {
+                let to = 1 - from;
+                if self.writable(to) {
+                    let docs = [self.panes[0].doc.text(), self.panes[1].doc.text()];
+                    let copied =
+                        semantic::write::copy_change(&change, [&docs[0], &docs[1]], format, from);
+                    self.semantic_copied(to, copied);
+                }
+            }
+            Some(SemanticAction::Take(entry, side)) if self.writable(1) => {
+                let docs: Vec<_> = self.panes.iter().map(|p| p.doc.text()).collect();
+                let taken =
+                    semantic::three_way::take(&entry, side, [&docs[0], &docs[1], &docs[2]], format);
+                self.semantic_copied(1, taken);
+            }
+            Some(SemanticAction::Take(..)) | None => {}
         }
         true
+    }
+
+    /// Puts the text a semantic copy made into pane `to`, or says why there is none.
+    fn semantic_copied(
+        &mut self,
+        to: usize,
+        result: Result<String, crate::core::semantic::write::Refusal>,
+    ) {
+        use crate::core::semantic::write::Refusal;
+        match result {
+            Ok(text) => {
+                self.semantic_message = None;
+                self.replace_source(to, text);
+            }
+            Err(refusal) => {
+                self.semantic_message = Some(
+                    tr(match refusal {
+                        Refusal::Moved => "analysis.copy_moved",
+                        Refusal::Stale => "analysis.copy_stale",
+                        Refusal::NoEdit => "analysis.copy_no_edit",
+                    })
+                    .to_owned(),
+                )
+            }
+        }
+    }
+
+    /// Errors, notes, filters and the paged tree of a semantic report of two files.
+    fn semantic_two_ui(
+        &mut self,
+        ui: &mut Ui,
+        report: &crate::core::semantic::SemanticReport,
+        action: &mut Option<SemanticAction>,
+    ) {
+        use crate::core::semantic;
+        if !report.errors.is_empty() {
+            for error in &report.errors {
+                ui.colored_label(widgets::pal(ui).danger, error);
+            }
+            if ui.button(tr("analysis.text_fallback")).clicked() {
+                self.semantic_mode = false;
+            }
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.semantic_filter, None, tr("analysis.all"));
+            for (kind, key) in [
+                (semantic::ChangeKind::Added, "analysis.added"),
+                (semantic::ChangeKind::Removed, "analysis.removed"),
+                (semantic::ChangeKind::Modified, "analysis.modified"),
+                (semantic::ChangeKind::TypeChanged, "analysis.type_changed"),
+                (semantic::ChangeKind::Moved, "analysis.moved"),
+            ] {
+                ui.selectable_value(&mut self.semantic_filter, Some(kind), tr(key));
+            }
+            if ui.button(tr("analysis.export")).clicked() {
+                self.export_semantic(report);
+            }
+        });
+        for note in &report.notes {
+            ui.colored_label(widgets::pal(ui).warning, note);
+        }
+        if report.identical() {
+            ui.label(tr("analysis.semantic_identical"));
+        }
+        let filter = self.semantic_filter.clone();
+        let shown: Vec<_> = report
+            .changes
+            .iter()
+            .filter(|change| filter.as_ref().is_none_or(|f| f == &change.kind))
+            .collect();
+        let page = self.semantic_pager(ui, shown.len());
+        let tree = semantic::PathTree::of(page.map(|i| shown[i]));
+        let writable = [0, 1].map(|p| !self.panes[p].doc.read_only);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            semantic_tree_ui(ui, &tree, 0, writable, action);
+        });
+    }
+
+    /// Errors, notes, filters and the paged entries of a semantic report of three files.
+    fn semantic_three_ui(
+        &mut self,
+        ui: &mut Ui,
+        report: &crate::core::semantic::three_way::ThreeWayReport,
+        action: &mut Option<SemanticAction>,
+    ) {
+        use crate::core::semantic::three_way::MergeState;
+        if !report.errors.is_empty() {
+            for error in &report.errors {
+                ui.colored_label(widgets::pal(ui).danger, error);
+            }
+            if ui.button(tr("analysis.text_fallback")).clicked() {
+                self.semantic_mode = false;
+            }
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.semantic_state_filter, None, tr("analysis.all"));
+            for (state, key) in [
+                (MergeState::Conflict, "analysis.state_conflict"),
+                (MergeState::Left, "analysis.state_left"),
+                (MergeState::Right, "analysis.state_right"),
+                (MergeState::Both, "analysis.state_both"),
+            ] {
+                ui.selectable_value(&mut self.semantic_state_filter, Some(state), tr(key));
+            }
+            if ui.button(tr("analysis.export")).clicked() {
+                self.export_semantic(report);
+            }
+        });
+        for note in &report.notes {
+            ui.colored_label(widgets::pal(ui).warning, note);
+        }
+        if report.identical() {
+            ui.label(tr("analysis.semantic_identical"));
+        } else {
+            ui.label(trf(
+                "analysis.three_way_summary",
+                &[
+                    ("n", report.entries.len().to_string()),
+                    ("conflicts", report.conflicts().to_string()),
+                ],
+            ));
+        }
+        let filter = self.semantic_state_filter;
+        let shown: Vec<_> = report
+            .entries
+            .iter()
+            .filter(|e| filter.is_none_or(|f| f == e.state))
+            .collect();
+        let page = self.semantic_pager(ui, shown.len());
+        let entries = &shown[page];
+        let writable = !self.panes[1].doc.read_only;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            three_way_ui(ui, entries, writable, action);
+        });
+    }
+
+    /// Page buttons for `count` items, 100 a page; the range of the page shown.
+    fn semantic_pager(&mut self, ui: &mut Ui, count: usize) -> std::ops::Range<usize> {
+        const PAGE: usize = 100;
+        let pages = count.div_ceil(PAGE).max(1);
+        self.semantic_page = self.semantic_page.min(pages - 1);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.semantic_page > 0, egui::Button::new("←"))
+                .clicked()
+            {
+                self.semantic_page -= 1;
+            }
+            ui.label(format!(
+                "{} {}/{} · {}",
+                tr("analysis.page"),
+                self.semantic_page + 1,
+                pages,
+                count
+            ));
+            if ui
+                .add_enabled(self.semantic_page + 1 < pages, egui::Button::new("→"))
+                .clicked()
+            {
+                self.semantic_page += 1;
+            }
+            ui.small(tr("analysis.value_limit"));
+        });
+        let start = self.semantic_page * PAGE;
+        start..(start + PAGE).min(count)
+    }
+
+    fn export_semantic(&mut self, report: &impl serde::Serialize) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name("semantic.json")
+            .save_file()
+        {
+            let inputs = self
+                .panes
+                .iter()
+                .filter_map(|p| p.doc.path.clone())
+                .collect::<Vec<_>>();
+            if let Err(e) = crate::core::analysis::report(report, &path, &inputs) {
+                self.status = e.to_string();
+            }
+        }
     }
 
     pub fn ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
@@ -6851,6 +8081,262 @@ mod tests {
         let before = output;
         v.copy_cell(row, 1, 0, 1);
         assert_eq!(table::source(&v.panes[1].doc), before);
+    }
+
+    fn keyed_view(left: &str, right: &str, m: TableMatch) -> TextView {
+        let mut v = TextView::new(
+            vec![
+                TextDoc::from_text(Some("left.csv".into()), left),
+                TextDoc::from_text(Some("right.csv".into()), right),
+            ],
+            &Config::default(),
+        );
+        v.set_table_match(m);
+        v
+    }
+
+    fn by_id() -> TableMatch {
+        TableMatch {
+            header: true,
+            keys: vec![KeyColumn::Name("id".into())],
+            ..Default::default()
+        }
+    }
+
+    /// The row of the rows matched by key whose record on `side` has `id` in its first cell.
+    fn keyed_row(v: &TextView, side: usize, id: &str) -> usize {
+        let d = v.keyed().unwrap();
+        let table = v.table.docs[side].as_ref().unwrap();
+        (0..d.rows.len())
+            .find(|&i| d.rows[i].records[side].is_some_and(|r| table.records[r].cells[0] == id))
+            .unwrap()
+    }
+
+    #[test]
+    fn large_tables_match_by_key_in_the_background_and_can_be_stopped() {
+        let left: String = std::iter::once("id,v\n".to_string())
+            .chain((0..300).map(|i| format!("{i},{i}\n")))
+            .collect();
+        let right: String = std::iter::once("id,v\n".to_string())
+            .chain(
+                (0..300)
+                    .rev()
+                    .map(|i| format!("{i},{}\n", i + usize::from(i == 7))),
+            )
+            .collect();
+        let mut v = keyed_view(&left, &right, by_id());
+        let at_once = v.keyed().unwrap().clone();
+        v.select_keyed_row(keyed_row(&v, 0, "7"));
+        let finish = |v: &mut TextView| {
+            let start = std::time::Instant::now();
+            while v.table.job.is_some() {
+                assert!(start.elapsed() < std::time::Duration::from_secs(20));
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                v.poll_table_job();
+            }
+        };
+
+        v.table.background_at = Some(100);
+        v.set_table_match(TableMatch {
+            order: table_match::RowOrder::Key,
+            ..by_id()
+        });
+        assert!(v.table.job.is_some());
+        assert!(v.keyed().is_none() && v.table.diff.rows.is_empty());
+        assert_eq!(v.table.selected, None);
+        // nothing pairs records by position while the match runs
+        let lines = v.panes[1].doc.lines.clone();
+        v.copy_current(true);
+        let first = v.significant().next().unwrap();
+        v.copy_block(first, 0, 1);
+        v.copy_rows(0, v.diff.rows.len() - 1, 0, 1);
+        assert_eq!(v.panes[1].doc.lines, lines);
+        assert!(!v.next_diff(false) && !v.prev_diff(false));
+        // compared again before it ends, the selection to make is kept
+        v.rediff();
+        assert!(v.table.job.is_some());
+        finish(&mut v);
+        let d = v.keyed().unwrap();
+        assert_eq!(d.counts, at_once.counts);
+        assert_eq!(d.rows.len(), at_once.rows.len());
+        assert_eq!(v.table_cursor(), Some(keyed_row(&v, 0, "7")));
+
+        // Stopped: by position, and saying so, until matched again.
+        v.set_table_match(by_id());
+        v.table
+            .job
+            .as_ref()
+            .unwrap()
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        finish(&mut v);
+        assert_eq!(
+            v.table.keyed.as_deref(),
+            Some(&Err(table_match::Problem::Cancelled))
+        );
+        assert!(!v.table.diff.rows.is_empty());
+        v.rediff();
+        finish(&mut v);
+        assert_eq!(v.keyed().unwrap().counts, at_once.counts);
+    }
+
+    #[test]
+    fn reports_of_tables_matched_by_key_record_how_and_what_was_found() {
+        use crate::core::report::ReportFormat;
+        let left = "id,v\n1,a\n2,b\n2,c\n";
+        let right = "id,v\n2,b\n1,z\n3,d\n";
+        let m = TableMatch {
+            order: table_match::RowOrder::Key,
+            rel_tolerance: 0.01,
+            ..by_id()
+        };
+        let v = keyed_view(left, right, m);
+        let xml = (v.report_job(ReportFormat::Xml, ""))();
+        let at = xml
+            .find("<table-match version=\"1\"")
+            .expect("table-match element");
+        assert!(at < xml.find("</comparison>").unwrap());
+        assert!(xml.contains(
+            "header=\"true\" columns=\"position\" order=\"key\" ignore-order=\"false\" abs-tolerance=\"0\" rel-tolerance=\"0.01\""
+        ));
+        assert!(xml.contains("<key name=\"id\"/>"));
+        assert!(xml.contains("modified=\"1\""), "{xml}");
+        assert!(xml.contains("<warning kind=\"duplicate_keys\" side=\"0\" records=\"2\"/>"));
+        // The differences are still those of the text.
+        assert!(xml.contains("<difference index=\"1\""));
+
+        let html = (v.report_job(ReportFormat::Html, ""))();
+        let section = html.find("<section class=\"table-match\">").unwrap();
+        assert!(section < html.find("<p class=\"foot\">").unwrap());
+        assert!(html.contains("Rows in: Key order"), "{html}");
+        assert!(html.contains("Numeric tolerance: 1%"));
+
+        let plain = keyed_view(left, right, TableMatch::default());
+        assert!(!(plain.report_job(ReportFormat::Xml, ""))().contains("table-match"));
+        assert!(!(plain.report_job(ReportFormat::Html, ""))().contains("table-match"));
+    }
+
+    #[test]
+    fn rows_matched_by_key_navigate_and_copy_cells_records_and_removals() {
+        let left = "id,name,price\n1,Ann,10\n2,Bob,20\n3,Cy,30\n4,Dee,40\n";
+        let right = "id,name,price\n3,Cy,30\n1,Ann,11\n2,Bob,20\n5,Eve,50\n";
+        let mut v = keyed_view(left, right, by_id());
+        let d = v.keyed().unwrap();
+        assert_eq!(
+            (
+                d.counts.modified,
+                d.counts.added,
+                d.counts.removed,
+                d.counts.ambiguous
+            ),
+            (1, 1, 1, 0)
+        );
+        assert!(d.counts.moved > 0);
+        let mut m = by_id();
+        m.ignore_order = true;
+        v.set_table_match(m);
+        assert_eq!(v.diff_position(), (None, 3));
+
+        v.first_diff();
+        assert_eq!(v.table_cursor(), Some(keyed_row(&v, 0, "1")));
+        assert_eq!(v.table.column, 2);
+        assert_eq!(v.diff_position(), (Some(0), 3));
+        v.copy_current(false);
+        let left1 = left.replace("1,Ann,10", "1,Ann,11");
+        assert_eq!(v.panes[0].doc.text(), left1);
+        assert_eq!(v.diff_position().1, 2);
+
+        let added = keyed_row(&v, 1, "5");
+        v.select_keyed_row(added);
+        v.copy_current(false);
+        let left2 = left1.replace("2,Bob,20\n", "2,Bob,20\n5,Eve,50\n");
+        assert_eq!(v.panes[0].doc.text(), left2);
+
+        let removed = keyed_row(&v, 0, "4");
+        v.select_keyed_row(removed);
+        v.copy_current(false);
+        assert_eq!(v.panes[0].doc.text(), left2.replace("4,Dee,40\n", ""));
+        assert_eq!(v.diff_position(), (None, 0));
+        assert!(!v.next_diff(false));
+
+        v.undo();
+        v.undo();
+        v.undo();
+        assert_eq!(v.panes[0].doc.text(), left);
+        assert_eq!(v.panes[1].doc.text(), right);
+    }
+
+    #[test]
+    fn removing_a_record_moves_on_to_the_next_difference_without_passing_it() {
+        let mut v = keyed_view("id,v\n2,b\n3,c\n", "id,v\n", by_id());
+        v.select_keyed_row(keyed_row(&v, 0, "2"));
+        v.copy_current(false);
+        assert_eq!(v.panes[0].doc.text(), "id,v\n3,c\n");
+        assert_eq!(v.table_cursor(), Some(keyed_row(&v, 0, "3")));
+        assert_eq!(v.diff_position(), (Some(0), 1));
+    }
+
+    #[test]
+    fn rows_with_ambiguous_keys_are_never_copied() {
+        let left = "id,v\n1,a\n2,b\n";
+        let right = "id,v\n1,x\n1,y\n2,b\n";
+        let mut v = keyed_view(left, right, by_id());
+        assert_eq!(v.keyed().unwrap().counts.ambiguous, 2);
+        v.first_diff();
+        let row = v.table_cursor().unwrap();
+        assert_eq!(v.keyed().unwrap().rows[row].state, RowState::Ambiguous);
+        v.copy_current(true);
+        v.copy_current(false);
+        v.copy_cell(row, 1, 0, 1);
+        assert_eq!(v.panes[0].doc.text(), left);
+        assert_eq!(v.panes[1].doc.text(), right);
+        assert!(!v.can_undo());
+        assert_eq!(v.status, tr("table.ambiguous_copy"));
+    }
+
+    #[test]
+    fn columns_paired_by_name_copy_into_the_paired_column() {
+        let left = "id,a,b\n1,x,y\n2,p,q\n";
+        let right = "id,b,a\n1,y,z\n2,q,p\n";
+        let mut m = by_id();
+        m.columns = table_match::ColumnPolicy::Name;
+        let mut v = keyed_view(left, right, m);
+        assert_eq!(v.diff_position(), (None, 1));
+        v.first_diff();
+        v.copy_current(true);
+        assert_eq!(v.panes[1].doc.text(), "id,b,a\n1,y,x\n2,q,p\n");
+        v.undo();
+        let row = keyed_row(&v, 0, "1");
+        v.copy_cell(row, 1, 0, 1);
+        assert_eq!(v.panes[1].doc.text(), "id,b,a\n1,y,x\n2,q,p\n");
+    }
+
+    #[test]
+    fn a_missing_key_column_falls_back_to_position_and_says_why() {
+        let left = "id,v\n1,a\n";
+        let right = "code,v\n1,a\n";
+        let v = keyed_view(left, right, by_id());
+        assert!(v.keyed().is_none());
+        assert!(matches!(
+            v.table.keyed.as_deref(),
+            Some(Err(table_match::Problem::MissingKey { side: 1, .. }))
+        ));
+        assert_eq!(v.table.diff.rows.len(), 2);
+    }
+
+    #[test]
+    fn tolerances_parse_as_absolute_or_percent() {
+        assert_eq!(parse_tolerance(""), Some((0.0, 0.0)));
+        assert_eq!(parse_tolerance(" 0.5 "), Some((0.5, 0.0)));
+        assert_eq!(parse_tolerance("1%"), Some((0.0, 0.01)));
+        assert_eq!(parse_tolerance("-1"), None);
+        assert_eq!(parse_tolerance("abc"), None);
+        assert_eq!(parse_tolerance("inf"), None);
+        let m = TableMatch {
+            rel_tolerance: 0.01,
+            ..Default::default()
+        };
+        assert_eq!(tolerance_text(&m), "1%");
     }
 
     #[test]
