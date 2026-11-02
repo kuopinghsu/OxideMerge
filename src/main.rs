@@ -154,7 +154,7 @@ struct Cli {
     /// Validate this existing result against the three input files (left, base, right)
     #[arg(long, value_name = "RESULT")]
     validate_merge: Option<PathBuf>,
-    /// Read-only JSON/XML semantic comparison (two files)
+    /// Read-only JSON/XML/TOML/YAML semantic comparison (two files)
     #[arg(long)]
     semantic: bool,
     /// Semantic format: json, xml, toml or yaml (default: from the first file's extension)
@@ -183,7 +183,7 @@ struct Cli {
     /// Keep this added baseline path added rather than a suspected rename with edits; repeatable
     #[arg(long, value_name = "PATH")]
     split_rename: Vec<String>,
-    /// User interface language code (en, zh-TW, zh-CN, ja, ko, de, fr, es, ru, pt-BR, ...)
+    /// User interface language code (en, zh-TW, zh-CN, ja, ko, de, fr, es, ru, pt-BR, it, ...)
     #[arg(long)]
     lang: Option<String>,
     /// List available languages
@@ -678,6 +678,8 @@ fn analysis_mode(cli: &Cli) -> bool {
         || cli.impact
         || cli.baseline_left.is_some()
         || cli.release_report.is_some()
+        || !cli.important_path.is_empty()
+        || !cli.split_rename.is_empty()
 }
 fn analysis_output<T: serde::Serialize>(
     cli: &Cli,
@@ -707,6 +709,13 @@ fn run_analysis(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         + usize::from(cli.semantic)
         + usize::from(cli.review_summary.is_some())
         + usize::from(cli.impact || cli.baseline_left.is_some() || cli.release_report.is_some());
+    anyhow::ensure!(
+        cli.impact
+            || cli.baseline_left.is_some()
+            || cli.release_report.is_some()
+            || (cli.important_path.is_empty() && cli.split_rename.is_empty()),
+        "--important-path and --split-rename need --impact, --release-report or --baseline-left/--baseline-right"
+    );
     anyhow::ensure!(modes == 1, "Choose one analysis mode per invocation");
     if let Some(path) = &cli.review_summary {
         anyhow::ensure!(
@@ -853,13 +862,27 @@ fn run_analysis(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     let filter = cli.filter.as_deref().unwrap_or(&cfg.filter);
     let left = baseline::capture(&specs[0], &cfg.diff, filter, &cancel, &progress)?;
     let right = baseline::capture(&specs[1], &cfg.diff, filter, &cancel, &progress)?;
-    let summary = baseline::compare_with(
-        &left,
-        &right,
-        &cli.important_path,
-        &cli.split_rename.iter().cloned().collect(),
-        &cancel,
-    )?;
+    // written as baseline paths are: with `/` between folders, from the top of the folder
+    let baseline_path = |p: &String| {
+        let p = p.replace('\\', "/");
+        let mut rest = p.as_str();
+        while let Some(r) = rest.strip_prefix("./") {
+            rest = r;
+        }
+        rest.to_owned()
+    };
+    let split = cli.split_rename.iter().map(baseline_path).collect();
+    let important: Vec<String> = cli.important_path.iter().map(baseline_path).collect();
+    let summary = baseline::compare_with(&left, &right, &important, &split, &cancel)?;
+    for path in &split {
+        if !summary
+            .changes
+            .iter()
+            .any(|c| &c.path == path && matches!(c.category, baseline::Category::Added))
+        {
+            eprintln!("--split-rename {path}: not an added path of this comparison");
+        }
+    }
     let inputs: Vec<PathBuf> = specs
         .iter()
         .map(|s| match s {

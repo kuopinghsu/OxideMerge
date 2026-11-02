@@ -54,10 +54,17 @@ pub struct Decision {
 }
 
 /// Fingerprints of one compared path: with the path (`fingerprint`) and without (`content`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Prints {
     pub fingerprint: String,
     pub content: String,
+}
+impl Prints {
+    /// A path that exists but could not be read: its decision stays where it is, stale, and no
+    /// decision moves to it.
+    pub fn unreadable() -> Prints {
+        Prints::default()
+    }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -152,7 +159,7 @@ impl Workspace {
     pub fn reconcile(&mut self, prints: &BTreeMap<String, Prints>) {
         let mut undecided: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
         for (path, p) in prints {
-            if !self.entries.contains_key(path) {
+            if !self.entries.contains_key(path) && !p.content.is_empty() {
                 undecided.entry(p.content.as_str()).or_default().push(path);
             }
         }
@@ -376,6 +383,18 @@ mod tests {
             assert_eq!(d.renamed_from.as_deref(), Some("old.txt"));
         }
         assert_eq!(w.summary(["a/x.txt".into(), "b/x.txt".into()]).accepted, 0);
+
+        // A path that could not be read keeps its decision, stale; nothing moves to or from it.
+        let mut w = Workspace::default();
+        w.entries.insert("old.txt".into(), accepted("C"));
+        let mut read = prints(&[("copy.txt", "C")]);
+        read.insert("old.txt".into(), Prints::unreadable());
+        read.insert("locked.txt".into(), Prints::unreadable());
+        w.entries.insert("gone.txt".into(), Decision::default());
+        w.reconcile(&read);
+        assert!(w.entries["old.txt"].stale);
+        assert!(!w.entries.contains_key("copy.txt"));
+        assert!(!w.entries.contains_key("locked.txt"));
 
         // Two gone paths held the same content: neither claim is trusted.
         let mut w = Workspace::default();

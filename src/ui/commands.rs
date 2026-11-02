@@ -81,6 +81,8 @@ pub enum Cmd {
     ClearSyncPoints,
     /// Save an HTML slideshow report: one difference per slide.
     Slideshow,
+    /// Show or hide the file compare below the folder list.
+    ToggleFilePane,
 }
 
 impl Cmd {
@@ -156,6 +158,7 @@ impl Cmd {
             SyncPoint => "cmd.sync_point",
             ClearSyncPoints => "cmd.clear_sync_points",
             Slideshow => "menu.slideshow",
+            ToggleFilePane => "view.folder_file_pane",
         }
     }
 
@@ -191,6 +194,7 @@ impl Cmd {
             AutoMerge => Icon::Bolt,
             ToggleCollapse => Icon::Fold,
             ToggleWrap => Icon::Wrap,
+            ToggleFilePane => Icon::BottomPane,
             Refresh => Icon::Refresh,
             ZoomIn => Icon::ZoomIn,
             ZoomOut => Icon::ZoomOut,
@@ -350,6 +354,7 @@ pub const BINDINGS: &[Binding] = {
         bind(V, ALT, Key::ArrowLeft, "Alt+←", CopyLeft),
         bind(V, ALT, Key::C, "Alt+C", ToggleCollapse),
         bind(V, ALT, Key::Z, "Alt+Z", ToggleWrap),
+        bind(V, ALT, Key::P, "Alt+P", ToggleFilePane),
         bind(V, ALT, Key::S, "Alt+S", SyncPoint),
         bind(V, CTRL, Key::F2, "Ctrl+F2", ToggleBookmark),
         bind(V, CTRL, Key::CloseBracket, "Ctrl+]", Indent(false)),

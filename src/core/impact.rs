@@ -47,8 +47,8 @@ struct CacheEntry {
     lines: Vec<(usize, String)>,
     footprint: usize,
     long_lines: bool,
-    /// Imports and identifiers, in each language a file holding these bytes is named in.
-    code: BTreeMap<Lang, Code>,
+    /// Imports and identifiers, read the way of each name a file holding these bytes has.
+    code: BTreeMap<Reader, Code>,
 }
 struct Code {
     imports: Vec<code::Import>,
@@ -58,26 +58,69 @@ struct Code {
     unassessed: Option<&'static str>,
 }
 
-/// The imports, identifiers and top-level definitions of `source`, a file in `lang` named
-/// `path`: from its syntax tree when there is a grammar for it, otherwise from its tokens.
+/// How the code of a file is read, from its name.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Reader {
+    Syntax(syntax::Grammar),
+    Tokens(code::Lang),
+    /// The `<script>` blocks of a Vue or Svelte file, from their tokens.
+    Component,
+}
+impl Reader {
+    fn of(path: &str) -> Option<Reader> {
+        if let Some(grammar) = syntax::Grammar::of(path) {
+            return Some(Reader::Syntax(grammar));
+        }
+        Some(
+            match super::text::extension(std::path::Path::new(path)).as_str() {
+                "vue" | "svelte" => Reader::Component,
+                "m" | "mm" => Reader::Tokens(code::Lang::C),
+                "css" | "scss" | "less" => Reader::Tokens(code::Lang::Css),
+                "json" => Reader::Tokens(code::Lang::Json),
+                _ => return None,
+            },
+        )
+    }
+}
+
+/// `source` with each line break on its own (old Mac files) made a line feed, so that the
+/// parsers count lines as the index does. Offsets in it are those of `source`.
+fn lone_cr_as_lf(source: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = source.as_bytes();
+    let lone = |i: usize| bytes[i] == b'\r' && bytes.get(i + 1) != Some(&b'\n');
+    if !(0..bytes.len()).any(lone) {
+        return source.into();
+    }
+    let fixed: Vec<u8> = (0..bytes.len())
+        .map(|i| if lone(i) { b'\n' } else { bytes[i] })
+        .collect();
+    String::from_utf8(fixed).map_or_else(|_| source.into(), Into::into)
+}
+
+/// The imports, identifiers and top-level definitions of `source`, read the way of `reader`:
+/// from its syntax tree when there is a grammar for it, otherwise from its tokens.
 fn read_code(
-    lang: Lang,
-    path: &str,
+    reader: Reader,
     source: &str,
     cancel: &AtomicBool,
 ) -> Result<(Code, BTreeMap<String, code::Definition>)> {
-    if let Some(grammar) = syntax::Grammar::of(path) {
-        let read = syntax::read(grammar, source, cancel)?;
-        let code = Code {
-            imports: read.imports,
-            uses: read.uses,
-            unassessed: read.errors.then_some(
-                "Code the parser could not read; imports and definitions there may be missed",
-            ),
-        };
-        return Ok((code, read.definitions));
-    }
-    let (tokens, truncated) = code::tokens(lang, source);
+    let source = lone_cr_as_lf(source);
+    let (lang, source) = match reader {
+        Reader::Syntax(grammar) => {
+            let read = syntax::read(grammar, &source, cancel)?;
+            let code = Code {
+                imports: read.imports,
+                uses: read.uses,
+                unassessed: read.errors.then_some(
+                    "Code the parser could not read; imports and definitions there may be missed",
+                ),
+            };
+            return Ok((code, read.definitions));
+        }
+        Reader::Tokens(lang) => (lang, source),
+        Reader::Component => (code::Lang::Script, code::script_blocks(&source).into()),
+    };
+    let (tokens, truncated) = code::tokens(lang, &source);
     let imports = code::imports(lang, &tokens);
     let uses = code::uses(&tokens, &imports);
     let definitions = code::definitions(lang, &tokens);
@@ -90,10 +133,10 @@ fn read_code(
     Ok((code, definitions))
 }
 /// The lines and code of `file` for its index entry, or why it cannot be indexed, reading its
-/// code in each of `langs` as the file named for that language.
+/// code each way of `readers`.
 fn index(
     file: &super::baseline::CapturedFile,
-    langs: &BTreeMap<Lang, &str>,
+    readers: &BTreeSet<Reader>,
     cancel: &AtomicBool,
 ) -> Result<std::result::Result<CacheEntry, String>> {
     if super::text::looks_binary(&file.bytes) {
@@ -117,16 +160,16 @@ fn index(
         .map(|(_, line)| line.len() + std::mem::size_of::<(usize, String)>())
         .sum();
     let mut code = BTreeMap::new();
-    for (&lang, path) in langs {
+    for &reader in readers {
         analysis::check_cancel(cancel)?;
-        let (read, _) = read_code(lang, path, &source, cancel)?;
+        let (read, _) = read_code(reader, &source, cancel)?;
         footprint += read
             .imports
             .iter()
             .map(|i| std::mem::size_of::<code::Import>() + i.spec.len())
             .sum::<usize>()
             + read.uses.keys().map(|k| k.len() + 48).sum::<usize>();
-        code.insert(lang, read);
+        code.insert(reader, read);
     }
     Ok(Ok(CacheEntry {
         lines,
@@ -136,8 +179,17 @@ fn index(
     }))
 }
 
-/// `f` of each of `items`, in order, computed on up to eight threads.
-fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+/// Files larger than this are read one at a time, so that at most one large syntax tree is
+/// built at once.
+const PARALLEL_BYTES: usize = 1 << 20;
+
+/// `f` of each of `items`, in order, computed on up to eight threads; the items of more than
+/// [`PARALLEL_BYTES`] by `bytes` one at a time afterwards.
+fn parallel<T: Sync, R: Send>(
+    items: &[T],
+    bytes: impl Fn(&T) -> usize + Sync,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
     let threads = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .min(8)
@@ -153,7 +205,9 @@ fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>
                         let Some(item) = items.get(at) else {
                             break;
                         };
-                        out.push((at, f(item)));
+                        if bytes(item) <= PARALLEL_BYTES {
+                            out.push((at, f(item)));
+                        }
                     }
                     out
                 })
@@ -164,6 +218,11 @@ fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>
             .flat_map(|w| w.join().unwrap())
             .collect()
     });
+    for (at, item) in items.iter().enumerate() {
+        if bytes(item) > PARALLEL_BYTES {
+            out.push((at, f(item)));
+        }
+    }
     out.sort_by_key(|(at, _)| *at);
     out.into_iter().map(|(_, r)| r).collect()
 }
@@ -339,6 +398,17 @@ fn candidates(lang: Lang, from: &str, spec: &str) -> Vec<String> {
         Lang::Script => {
             if let Some(p) = join(dir, spec) {
                 out.push(p.clone());
+                // TypeScript sources imported by the name of the file they compile to
+                for (js, ts) in [
+                    ("js", &["ts", "tsx"][..]),
+                    ("jsx", &["tsx"]),
+                    ("mjs", &["mts"]),
+                    ("cjs", &["cts"]),
+                ] {
+                    if let Some(stem) = p.strip_suffix(js).and_then(|s| s.strip_suffix('.')) {
+                        out.extend(ts.iter().map(|ext| format!("{stem}.{ext}")));
+                    }
+                }
                 for ext in [
                     "ts", "tsx", "js", "jsx", "mjs", "cjs", "json", "vue", "svelte",
                 ] {
@@ -416,7 +486,7 @@ impl Index {
                 && summary.left.fingerprint == left.metadata.fingerprint,
             "Impact baseline changed; regenerate the release summary first"
         );
-        const VERSION: &str = "syntax-v1";
+        const VERSION: &str = "syntax-v2";
         if self.version != VERSION {
             self.cache.clear();
             self.version = VERSION;
@@ -427,27 +497,43 @@ impl Index {
             BTreeMap::new();
         // the top-level functions, types and values each changed file changed or removed
         let mut symbols: BTreeMap<&str, BTreeMap<String, (code::Kind, bool)>> = BTreeMap::new();
-        let read = parallel(&summary.changes, |change| -> Result<_> {
-            let Some(lang) = Lang::of(&change.path).filter(|_| {
-                !change.ignored_by_text_rules
-                    && matches!(
-                        change.category,
-                        Category::Modified | Category::RenamedModified | Category::Deleted
-                    )
-            }) else {
-                return Ok(None);
-            };
-            let definitions = |path: &str, file: Option<&super::baseline::CapturedFile>| match file
-                .filter(|f| !super::text::looks_binary(&f.bytes))
+        let old_path = |change: &super::baseline::ReleaseChange| {
+            change
+                .old_path
+                .clone()
+                .unwrap_or_else(|| change.path.clone())
+        };
+        let size = |change: &super::baseline::ReleaseChange| {
+            let before = left
+                .files
+                .get(&old_path(change))
+                .map_or(0, |f| f.bytes.len());
+            let after = target.files.get(&change.path).map_or(0, |f| f.bytes.len());
+            before.max(after)
+        };
+        let read = parallel(&summary.changes, size, |change| -> Result<_> {
+            analysis::check_cancel(cancel)?;
+            if Lang::of(&change.path).is_none()
+                || change.ignored_by_text_rules
+                || !matches!(
+                    change.category,
+                    Category::Modified | Category::RenamedModified | Category::Deleted
+                )
             {
-                Some(f) => {
+                return Ok(None);
+            }
+            let definitions = |path: &str, file: Option<&super::baseline::CapturedFile>| match (
+                Reader::of(path),
+                file,
+            ) {
+                (Some(reader), Some(f)) if !super::text::looks_binary(&f.bytes) => {
                     let source = super::text::decode(&f.bytes, None).0;
-                    read_code(lang, path, &source, cancel).map(|(_, d)| d)
+                    read_code(reader, &source, cancel).map(|(_, d)| d)
                 }
-                None => Ok(BTreeMap::new()),
+                _ => Ok(BTreeMap::new()),
             };
-            let old_path = change.old_path.as_deref().unwrap_or(&change.path);
-            let before = definitions(old_path, left.files.get(old_path))?;
+            let old_path = old_path(change);
+            let before = definitions(&old_path, left.files.get(&old_path))?;
             let after = definitions(&change.path, target.files.get(&change.path))?;
             Ok(Some(code::changed(&before, &after)))
         });
@@ -522,19 +608,14 @@ impl Index {
             if matcher.memory_usage() > 32 << 20 {
                 bail!("Impact matcher exceeds 32 MiB; narrow the scope");
             }
-            // the languages each content is read in, from the names of the files holding it,
-            // with the first such name
-            let mut by_digest: BTreeMap<
-                &str,
-                (&super::baseline::CapturedFile, BTreeMap<Lang, &str>),
-            > = BTreeMap::new();
+            // the ways each content is read, from the names of the files holding it
+            let mut by_digest: BTreeMap<&str, (&super::baseline::CapturedFile, BTreeSet<Reader>)> =
+                BTreeMap::new();
             for (path, file) in &target.files {
                 let entry = by_digest
                     .entry(file.digest.as_str())
-                    .or_insert_with(|| (file, BTreeMap::new()));
-                if let Some(lang) = Lang::of(path) {
-                    entry.1.entry(lang).or_insert(path);
-                }
+                    .or_insert_with(|| (file, BTreeSet::new()));
+                entry.1.extend(Reader::of(path));
             }
             let mut selected = BTreeSet::new();
             let mut unsupported = BTreeMap::new();
@@ -546,16 +627,18 @@ impl Index {
                 analysis::check_cancel(cancel)?;
                 let todo: Vec<_> = batch
                     .iter()
-                    .filter(|(digest, (_, langs))| {
+                    .filter(|(digest, (_, readers))| {
                         !self
                             .cache
                             .get(*digest)
-                            .is_some_and(|e| langs.keys().all(|l| e.code.contains_key(l)))
+                            .is_some_and(|e| readers.iter().all(|r| e.code.contains_key(r)))
                     })
                     .collect();
-                let read = parallel(&todo, |(digest, (file, langs))| {
-                    (*digest, index(file, langs, cancel))
-                });
+                let read = parallel(
+                    &todo,
+                    |(_, (file, _))| file.bytes.len(),
+                    |(digest, (file, readers))| (*digest, index(file, readers, cancel)),
+                );
                 let mut read = read
                     .into_iter()
                     .map(|(digest, entry)| Ok((digest, entry?)))
@@ -582,14 +665,15 @@ impl Index {
                     }
                     line_count += entry.lines.len();
                     footprint += entry.footprint;
-                    if entry.long_lines {
-                        unsupported.insert(
-                            digest.to_owned(),
-                            "Lines longer than 4 KiB were not assessed".into(),
-                        );
-                    }
-                    if let Some(reason) = entry.code.values().find_map(|c| c.unassessed) {
-                        unsupported.insert(digest.to_owned(), reason.into());
+                    let reasons: BTreeSet<&str> = entry
+                        .long_lines
+                        .then_some("Lines longer than 4 KiB were not assessed")
+                        .into_iter()
+                        .chain(entry.code.values().filter_map(|c| c.unassessed))
+                        .collect();
+                    if !reasons.is_empty() {
+                        let reasons: Vec<_> = reasons.into_iter().collect();
+                        unsupported.insert(digest.to_owned(), reasons.join("; "));
                     }
                     selected.insert(digest.to_owned());
                     if let Some(entry) = candidate {
@@ -602,6 +686,8 @@ impl Index {
             // (change, file, name) of each changed name a file imports by name
             let mut imported = BTreeSet::new();
             let mut statements = BTreeSet::new();
+            // (change, file, line) of each exact finding, which text matches there repeat
+            let mut exact_lines = BTreeSet::new();
             let mut match_steps = 0usize;
             for (path, file) in &target.files {
                 analysis::check_cancel(cancel)?;
@@ -612,7 +698,7 @@ impl Index {
                     continue;
                 };
                 let lang = Lang::of(path);
-                let code = lang.and_then(|lang| Some((lang, entry.code.get(&lang)?)));
+                let code = lang.zip(Reader::of(path).and_then(|r| entry.code.get(&r)));
                 for (lang, import) in code
                     .iter()
                     .flat_map(|(l, c)| c.imports.iter().map(move |i| (*l, i)))
@@ -632,6 +718,7 @@ impl Index {
                         if findings.len() >= 2000 {
                             bail!("Impact exceeds 2,000 findings; narrow the scope");
                         }
+                        exact_lines.insert((change.id.as_str(), path.as_str(), line));
                         let spec = &import.spec;
                         let rule_id = format!("import-reference-v3:{}", lang.name());
                         findings.push(ImpactFinding {
@@ -666,6 +753,7 @@ impl Index {
                         }
                         let (_, code) = code.expect("a file with imports");
                         let line = code.uses.get(local).copied().unwrap_or(line);
+                        exact_lines.insert((change.id.as_str(), path.as_str(), line));
                         let rule_id = format!("symbol-reference-v2:{}", lang.name());
                         findings.push(ImpactFinding {
                             id: analysis::identity(&(&change.id, path, line, &file.digest, name, &rule_id)),
@@ -692,7 +780,9 @@ impl Index {
                 }
                 for (line, source) in &entry.lines {
                     analysis::check_cancel(cancel)?;
-                    let mut seen = BTreeSet::new();
+                    // the reasons on this line of each change, in the order they are found
+                    let mut on_line: BTreeMap<&str, Vec<(_, &str, &String, usize)>> =
+                        BTreeMap::new();
                     for matched in matcher.find_overlapping_iter(source) {
                         match_steps += 1;
                         if match_steps.is_multiple_of(1024) {
@@ -728,60 +818,98 @@ impl Index {
                             let name = relation == "symbol_name_reference";
                             // the first use as a name, outside comments, strings and imports
                             if path == &change.path
-                                || !seen.insert((change.id.as_str(), relation, needle.as_str()))
+                                || exact_lines.contains(&(change.id.as_str(), path.as_str(), *line))
                                 || name && code.and_then(|(_, c)| c.uses.get(needle)) != Some(line)
                             {
                                 continue;
                             }
-                            let word = name || relation == "config_key_occurrence";
-                            if word && word_findings.len() >= MAX_WORD_FINDINGS {
-                                words_left_out += 1;
-                                continue;
+                            let reasons = on_line.entry(change.id.as_str()).or_default();
+                            if !reasons
+                                .iter()
+                                .any(|&(_, r, n, _)| r == relation && n == needle)
+                            {
+                                reasons.push((change, relation, needle, matched.start()));
                             }
-                            if !word && findings.len() >= 2000 {
-                                bail!("Impact exceeds 2,000 findings; narrow the scope");
-                            }
-                            let rule_id = format!("literal-reference-v1:{relation}");
-                            let limitations = if name {
-                                format!("{needle} names a definition changed or removed in {}; this file does not import it by name from there, so the word may name something else. Inspect or dismiss it manually.", change.path)
-                            } else {
-                                "A delimited name/path occurrence is evidence of text only; it does not prove a dependency or runtime/build/test failure. Inspect or dismiss it manually.".into()
-                            };
-                            let finding = ImpactFinding {
-                                id: analysis::identity(&(
-                                    &change.id,
-                                    path,
-                                    line,
-                                    &file.digest,
-                                    needle,
-                                    &rule_id,
-                                )),
-                                origin_change_id: change.id.clone(),
-                                related_paths: vec![path.clone()],
-                                relation_type: relation.into(),
-                                evidence: Evidence {
-                                    path: path.clone(),
-                                    line: *line,
-                                    excerpt: source[source[..matched.start()]
-                                        .char_indices()
-                                        .rev()
-                                        .nth(80)
-                                        .map_or(0, |(at, _)| at)..]
-                                        .chars()
-                                        .take(240)
-                                        .collect(),
-                                    digest: file.digest.clone(),
-                                },
-                                severity: "review".into(),
-                                confidence: "heuristic".into(),
-                                rule_id,
-                                limitations,
-                            };
-                            if word {
-                                word_findings.push(finding);
-                            } else {
-                                findings.push(finding);
-                            }
+                        }
+                    }
+                    for mut reasons in on_line.into_values() {
+                        let word = |relation: &str| {
+                            relation == "symbol_name_reference"
+                                || relation == "config_key_occurrence"
+                        };
+                        // the most telling reason first, the same however the text is matched:
+                        // a path before a key path, a file name, and words that may name
+                        // something else; then the longer needle
+                        reasons.sort_by_key(|&(_, relation, needle, _)| {
+                            let rank = [
+                                "literal_path_reference",
+                                "config_key_path",
+                                "filename_reference",
+                                "config_key_occurrence",
+                                "symbol_name_reference",
+                            ]
+                            .iter()
+                            .position(|r| *r == relation);
+                            (rank, std::cmp::Reverse(needle.len()), needle.as_str())
+                        });
+                        let (change, relation, needle, start) = reasons[0];
+                        let name = relation == "symbol_name_reference";
+                        let word = word(relation);
+                        if word && word_findings.len() >= MAX_WORD_FINDINGS {
+                            words_left_out += 1;
+                            continue;
+                        }
+                        if !word && findings.len() >= 2000 {
+                            bail!("Impact exceeds 2,000 findings; narrow the scope");
+                        }
+                        let rule_id = format!("literal-reference-v2:{relation}");
+                        let mut limitations = if name {
+                            format!("{needle} names a definition changed or removed in {}; this file does not import it by name from there, so the word may name something else. Inspect or dismiss it manually.", change.path)
+                        } else {
+                            "A delimited name/path occurrence is evidence of text only; it does not prove a dependency or runtime/build/test failure. Inspect or dismiss it manually.".into()
+                        };
+                        if reasons.len() > 1 {
+                            let also: Vec<String> = reasons[1..]
+                                .iter()
+                                .map(|&(_, relation, needle, _)| format!("{needle} ({relation})"))
+                                .collect();
+                            limitations
+                                .push_str(&format!(" The line also has {}.", also.join(", ")));
+                        }
+                        let finding = ImpactFinding {
+                            id: analysis::identity(&(
+                                &change.id,
+                                path,
+                                line,
+                                &file.digest,
+                                needle,
+                                &rule_id,
+                            )),
+                            origin_change_id: change.id.clone(),
+                            related_paths: vec![path.clone()],
+                            relation_type: relation.into(),
+                            evidence: Evidence {
+                                path: path.clone(),
+                                line: *line,
+                                excerpt: source[source[..start]
+                                    .char_indices()
+                                    .rev()
+                                    .nth(80)
+                                    .map_or(0, |(at, _)| at)..]
+                                    .chars()
+                                    .take(240)
+                                    .collect(),
+                                digest: file.digest.clone(),
+                            },
+                            severity: "review".into(),
+                            confidence: "heuristic".into(),
+                            rule_id,
+                            limitations,
+                        };
+                        if word {
+                            word_findings.push(finding);
+                        } else {
+                            findings.push(finding);
                         }
                     }
                 }
@@ -800,25 +928,6 @@ impl Index {
             ));
         }
         findings.append(&mut word_findings);
-        let exact: BTreeSet<_> = findings
-            .iter()
-            .filter(|f| f.confidence == "exact")
-            .map(|f| {
-                (
-                    f.origin_change_id.clone(),
-                    f.evidence.path.clone(),
-                    f.evidence.line,
-                )
-            })
-            .collect();
-        findings.retain(|f| {
-            f.confidence == "exact"
-                || !exact.contains(&(
-                    f.origin_change_id.clone(),
-                    f.evidence.path.clone(),
-                    f.evidence.line,
-                ))
-        });
         findings.sort_by(|a, b| {
             (
                 &a.origin_change_id,
@@ -857,6 +966,74 @@ mod tests {
         baseline::{capture, compare, BaselineSpec},
         diff::DiffOptions,
     };
+    #[test]
+    fn several_reasons_on_one_line_are_one_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        for (root, timeout, user) in [
+            (&a, 30, ""),
+            (&b, 60, "x = get(\"db.timeout\") or timeout\ny = timeout\n"),
+        ] {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(
+                root.join("config.json"),
+                format!(r#"{{"db":{{"timeout":{timeout}}}}}"#),
+            )
+            .unwrap();
+            std::fs::write(root.join("settings.py"), user).unwrap();
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            let util = format!("export const x = {timeout};\n");
+            std::fs::write(root.join("src/util.ts"), util).unwrap();
+            std::fs::write(root.join("notes.txt"), "See src/util.ts for x\n").unwrap();
+        }
+        let cancel = AtomicBool::new(false);
+        let take = |root: &std::path::Path| {
+            capture(
+                &BaselineSpec::Folder {
+                    path: root.to_owned(),
+                },
+                &DiffOptions::default(),
+                "*",
+                &cancel,
+                &AtomicUsize::new(0),
+            )
+            .unwrap()
+        };
+        let (left, right) = (take(&a), take(&b));
+        let summary = compare(&left, &right, &[], &cancel).unwrap();
+        let report = Index::default()
+            .analyze(&summary, &left, &right, &cancel)
+            .unwrap();
+        let found: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.evidence.path == "settings.py")
+            .map(|f| (f.evidence.line, f.relation_type.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [(1, "config_key_path"), (2, "config_key_occurrence")]
+        );
+        let on = |path: &str, line: usize| {
+            let at: Vec<_> = report
+                .findings
+                .iter()
+                .filter(|f| f.evidence.path == path && f.evidence.line == line)
+                .collect();
+            assert_eq!(at.len(), 1, "{path}:{line} {at:?}");
+            at[0]
+        };
+        assert!(on("settings.py", 1)
+            .limitations
+            .ends_with(" The line also has timeout (config_key_occurrence)."));
+        let path = on("notes.txt", 1);
+        assert_eq!(path.relation_type, "literal_path_reference");
+        assert_eq!(path.rule_id, "literal-reference-v2:literal_path_reference");
+        assert!(path
+            .limitations
+            .ends_with(" The line also has util.ts (filename_reference)."));
+    }
+
     #[test]
     fn imports_resolving_to_changed_files_are_exact_and_text_matches_heuristic() {
         let dir = tempfile::tempdir().unwrap();
@@ -1181,9 +1358,97 @@ mod tests {
         );
     }
 
+    /// The impact report of the change from `before` to `after`, two lists of files.
+    fn report_of(before: &[(&str, &str)], after: &[(&str, &str)]) -> ImpactReport {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(false);
+        let take = |name: &str, files: &[(&str, &str)]| {
+            let root = dir.path().join(name);
+            for (path, text) in files {
+                let path = root.join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text).unwrap();
+            }
+            capture(
+                &BaselineSpec::Folder { path: root },
+                &DiffOptions::default(),
+                "*",
+                &cancel,
+                &AtomicUsize::new(0),
+            )
+            .unwrap()
+        };
+        let (left, right) = (take("a", before), take("b", after));
+        let summary = compare(&left, &right, &[], &cancel).unwrap();
+        Index::default()
+            .analyze(&summary, &left, &right, &cancel)
+            .unwrap()
+    }
+
+    #[test]
+    fn odd_files_are_read_without_failing_or_shifting_lines() {
+        let long = format!("// {}\n", "x".repeat(5000));
+        let bad = format!("{long}fn main( {{\n");
+        let shared = [
+            ("src/app.js", "// one\r// two\rimport { val } from './x';\rval();\r"),
+            ("src/main.ts", "import { val } from './x.js';\n"),
+            (
+                "src/c.vue",
+                "<template><p>It`s</p></template>\n<script>\nimport { val } from './x';\n</script>\n",
+            ),
+            ("style/z.css", "@import url(\"b.css\""),
+            ("bad.rs", bad.as_str()),
+        ];
+        let mut before = vec![("src/x.ts", "export const val = 1;\n")];
+        let mut after = vec![("src/x.ts", "export const val = 2;\n")];
+        before.extend(shared);
+        after.extend(shared);
+        let report = report_of(&before, &after);
+        let found: BTreeSet<_> = report
+            .findings
+            .iter()
+            .map(|f| {
+                (
+                    f.evidence.path.as_str(),
+                    f.evidence.line,
+                    f.evidence.excerpt.as_str(),
+                    f.relation_type.as_str(),
+                )
+            })
+            .collect();
+        for expected in [
+            ("src/app.js", 3, "import { val } from './x';", "import"),
+            ("src/app.js", 4, "val();", "value_reference"),
+            ("src/main.ts", 1, "import { val } from './x.js';", "import"),
+            ("src/c.vue", 3, "import { val } from './x';", "import"),
+        ] {
+            assert!(found.contains(&expected), "{expected:?} not in {found:#?}");
+        }
+        let reason = &report.excluded["bad.rs"];
+        assert!(
+            reason.contains("4 KiB") && reason.contains("parser could not read"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn large_items_are_computed_in_order_after_the_others() {
+        let items: Vec<usize> = (0..20).collect();
+        let size = |&n: &usize| if n % 3 == 0 { PARALLEL_BYTES + 1 } else { n };
+        assert_eq!(
+            parallel(&items, size, |&n| n * 10),
+            items.iter().map(|n| n * 10).collect::<Vec<_>>()
+        );
+        assert!(parallel(&[] as &[usize], size, |&n| n).is_empty());
+    }
+
     #[test]
     fn import_specifiers_resolve_inside_the_root_only() {
         assert!(candidates(Lang::C, "a.c", "../../etc/passwd").is_empty());
+        assert_eq!(
+            candidates(Lang::Script, "src/a.ts", "./b.js")[..3],
+            ["src/b.js", "src/b.ts", "src/b.tsx"]
+        );
         assert_eq!(
             candidates(Lang::Rust, "src/a.rs", "b"),
             ["src/a/b.rs", "src/a/b/mod.rs"]

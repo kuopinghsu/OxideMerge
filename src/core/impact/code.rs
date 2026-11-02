@@ -1,10 +1,19 @@
 //! A small tokenizer for the source files there is no syntax tree for (script in Vue and Svelte
 //! files, Objective-C, style sheets and JSON), and the imports and top-level definitions read
 //! from its tokens. Comments are skipped and strings kept whole, so neither is mistaken for code.
-use super::Lang;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
+
+/// The languages read from tokens.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Lang {
+    Script,
+    /// C and Objective-C.
+    C,
+    Css,
+    Json,
+}
 
 /// Tokens read at most from one file.
 const MAX_TOKENS: usize = 2_000_000;
@@ -193,7 +202,8 @@ pub struct Import {
 pub fn uses(tokens: &[Token], imports: &[Import]) -> HashMap<String, usize> {
     let mut skip = vec![false; tokens.len()];
     for import in imports {
-        for flag in &mut skip[import.tokens.clone()] {
+        let end = import.tokens.end.min(tokens.len());
+        for flag in &mut skip[import.tokens.start.min(end)..end] {
             *flag = true;
         }
     }
@@ -377,15 +387,17 @@ pub fn imports(lang: Lang, tokens: &[Token]) -> Vec<Import> {
         spec,
         line: tokens[i].line,
         names: Vec::new(),
-        tokens: i..i + len,
+        tokens: i..(i + len).min(tokens.len()),
     };
     match lang {
         Lang::Script => script_imports(tokens),
-        // read from their syntax trees
-        Lang::Python | Lang::Rust => Vec::new(),
         Lang::C => (0..tokens.len())
             .filter(|&i| tokens[i].first && tokens[i].is('#'))
-            .filter(|&i| tokens.get(i + 1).is_some_and(|t| t.is_word("include")))
+            .filter(|&i| {
+                tokens
+                    .get(i + 1)
+                    .is_some_and(|t| t.is_word("include") || t.is_word("import"))
+            })
             .filter_map(|i| Some(simple(i, str_at(i + 2)?, 3)))
             .collect(),
         Lang::Css => (0..tokens.len())
@@ -442,6 +454,52 @@ fn print(tokens: &[Token]) -> u64 {
         t.tok.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// One hash of the hashes `a` then `b`.
+pub fn mix(a: u64, b: u64) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (a, b).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `source`, a Vue or Svelte file, with everything outside its `<script>` blocks blanked and
+/// its line breaks kept.
+pub fn script_blocks(source: &str) -> String {
+    let lower = source.to_ascii_lowercase();
+    let mut out = String::with_capacity(source.len());
+    let blank = |out: &mut String, text: &str| {
+        out.extend(text.chars().map(|c| if c == '\n' { '\n' } else { ' ' }));
+    };
+    let mut at = 0;
+    while let Some(open) = lower[at..].find("<script").map(|i| at + i) {
+        // the `>` ending the start tag, not one in a quoted value such as `generic="Array<T>"`
+        let mut quote = None;
+        let tag_end = lower[open..].char_indices().find(|&(_, c)| match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+                false
+            }
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                false
+            }
+            None => c == '>',
+        });
+        let Some(body) = tag_end.map(|(i, _)| open + i + 1) else {
+            break;
+        };
+        let end = lower[body..]
+            .find("</script")
+            .map_or(source.len(), |i| body + i);
+        blank(&mut out, &source[at..body]);
+        out.push_str(&source[body..end]);
+        at = end;
+    }
+    blank(&mut out, &source[at..]);
+    out
 }
 
 /// Where a definition starting at `tokens[start]` ends: at a top-level `;`, at the `}` closing a
@@ -502,11 +560,14 @@ const C_KEYWORDS: [&str; 16] = [
 pub fn definitions(lang: Lang, tokens: &[Token]) -> BTreeMap<String, Definition> {
     let mut out = BTreeMap::new();
     let mut add = |name: &str, kind: Kind, range: Range<usize>| {
-        out.entry(name.to_owned()).or_insert(Definition {
-            kind,
-            print: print(&tokens[range.clone()]),
-            line: tokens[range.start].line,
-        });
+        let hash = print(&tokens[range.clone()]);
+        out.entry(name.to_owned())
+            .and_modify(|d: &mut Definition| d.print = mix(d.print, hash))
+            .or_insert(Definition {
+                kind,
+                print: hash,
+                line: tokens[range.start].line,
+            });
     };
     let name_at = |i: usize| tokens.get(i).and_then(Token::ident);
     match lang {
@@ -599,7 +660,7 @@ pub fn definitions(lang: Lang, tokens: &[Token]) -> BTreeMap<String, Definition>
                 }
             }
         }
-        Lang::Python | Lang::Rust | Lang::Css | Lang::Json => {}
+        Lang::Css | Lang::Json => {}
     }
     out
 }
@@ -694,6 +755,57 @@ foo.import("./not-an-import");
         assert_eq!(
             imports_of(Lang::Json, "{\"$ref\":\n  \"defs.json#/a\", \"x\": {\"$ref\": \"#/local\"}, \"y\": {\"$ref\": \"https://x/s.json\"}}"),
             [("defs.json".into(), 1, vec![])]
+        );
+        assert_eq!(
+            imports_of(Lang::C, "#import \"View.h\"\n#import <UIKit/UIKit.h>\n"),
+            [("View.h".into(), 1, vec![])],
+            "Objective-C imports"
+        );
+    }
+
+    #[test]
+    fn a_style_sheet_ending_inside_an_import_is_read() {
+        for source in [
+            "@import url(\"b.css\"",
+            "@import url(\"b.css\")",
+            "@import \"b.css\"",
+        ] {
+            let (tokens, _) = tokens(Lang::Css, source);
+            let found = imports(Lang::Css, &tokens);
+            assert_eq!(found.len(), 1, "{source}");
+            assert!(found[0].tokens.end <= tokens.len());
+            uses(&tokens, &found);
+        }
+    }
+
+    #[test]
+    fn only_the_script_blocks_of_a_component_are_kept() {
+        let vue = "<template>\n  <p>It`s {{ x }}</p>\n</template>\n<SCRIPT setup lang=\"ts\">\nimport { x } from './x';\n</SCRIPT>\n<style>a{}</style>\n";
+        let script = script_blocks(vue);
+        assert_eq!(script.lines().count(), vue.lines().count());
+        assert!(!script.contains('`') && !script.contains("style"));
+        let (tokens, _) = tokens(Lang::Script, &script);
+        let found = imports(Lang::Script, &tokens);
+        assert_eq!((found[0].spec.as_str(), found[0].line), ("./x", 5));
+        let generic = "<script setup lang=\"ts\" generic=\"T extends Array<string>\">\nimport { y } from './y';\n</script>\n";
+        assert_eq!(
+            script_blocks(generic),
+            format!(
+                "{}\nimport {{ y }} from './y';\n{}\n",
+                " ".repeat(generic.find('\n').unwrap()),
+                " ".repeat("</script>".len())
+            )
+        );
+    }
+
+    #[test]
+    fn a_name_defined_twice_changes_with_either_definition() {
+        let of = |s| definitions(Lang::C, &tokens(Lang::C, s).0);
+        let before = of("int f(int a);\nint f(int a) { return a; }\n");
+        let after = of("int f(int a);\nint f(int a) { return a + 1; }\n");
+        assert_eq!(
+            changed(&before, &after).into_iter().collect::<Vec<_>>(),
+            [("f".into(), (Kind::Function, false))]
         );
     }
 

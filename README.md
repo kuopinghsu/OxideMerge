@@ -76,9 +76,9 @@ It supports text and folder merging, as well as binary, image and web page compa
 - Use OxideMerge with Git, from the command line, or from your system's file manager.
 
 The interface includes light and dark themes, a command search (⌘K / Ctrl+K), color-blind
-friendly, high-contrast, reduced-motion and compact options, and 10 built-in languages: English, Traditional
-Chinese, Simplified Chinese, Japanese, Korean, German, French, Spanish, Russian and Brazilian
-Portuguese. Additional translations can be loaded from language files.
+friendly, high-contrast, reduced-motion and compact options, and 11 built-in languages: English, Traditional
+Chinese, Simplified Chinese, Japanese, Korean, German, French, Spanish, Russian, Brazilian
+Portuguese and Italian. Additional translations can be loaded from language files.
 
 ### Interface and screenshots
 

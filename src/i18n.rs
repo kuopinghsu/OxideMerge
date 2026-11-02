@@ -21,6 +21,7 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("es", include_str!("../lang/es.json")),
     ("ru", include_str!("../lang/ru.json")),
     ("pt-BR", include_str!("../lang/pt-BR.json")),
+    ("it", include_str!("../lang/it.json")),
 ];
 
 #[derive(Clone, Debug)]

@@ -264,9 +264,9 @@ fn spawn_reader(
     items: Vec<(usize, DirItem)>,
     roots: Vec<PathBuf>,
     dopts: DiffOptions,
-) -> Receiver<Read> {
+) -> (Receiver<Read>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::sync_channel(4);
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         for (f, it) in items {
             let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 read_card(it.clone(), &roots, &dopts)
@@ -282,7 +282,7 @@ fn spawn_reader(
             }
         }
     });
-    rx
+    (rx, reader)
 }
 
 fn body_of(mut loaded: Loaded) -> (DirItem, Body) {
@@ -344,7 +344,7 @@ pub struct DiffsView {
     cards: Vec<Card>,
     loading: Option<Receiver<Read>>,
     /// Files whose text, dropped to save memory, is being read again; one reader each.
-    refills: Vec<(usize, Receiver<Read>)>,
+    refills: Vec<(usize, Receiver<Read>, std::thread::JoinHandle<()>)>,
     lines: Vec<Line>,
     /// Top of every line, and the height of all of them.
     tops: Vec<f32>,
@@ -525,7 +525,7 @@ impl DiffsView {
             .iter()
             .map(|&f| (f, self.cards[f].item.clone()))
             .collect();
-        let rx = spawn_reader(items, self.roots.clone(), self.dopts.clone());
+        let (rx, _) = spawn_reader(items, self.roots.clone(), self.dopts.clone());
         for f in which {
             self.cards[f].body = Body::Loading;
             self.forget_cells(f);
@@ -560,7 +560,7 @@ impl DiffsView {
             }
         }
         let mut got = Vec::new();
-        self.refills.retain(|(_, rx)| match rx.try_recv() {
+        self.refills.retain(|(_, rx, _)| match rx.try_recv() {
             Ok(read) => {
                 got.push(read);
                 false
@@ -579,12 +579,12 @@ impl DiffsView {
     /// Reads file `f` again on another thread: its text, dropped to save memory, or what changed
     /// on disk. A few at a time; asked again while still needed.
     fn refill(&mut self, f: usize) {
-        if self.refills.len() >= MAX_REFILLS || self.refills.iter().any(|(rf, _)| *rf == f) {
+        if self.refills.len() >= MAX_REFILLS || self.refills.iter().any(|(rf, ..)| *rf == f) {
             return;
         }
         let items = vec![(f, self.cards[f].item.clone())];
-        let rx = spawn_reader(items, self.roots.clone(), self.dopts.clone());
-        self.refills.push((f, rx));
+        let (rx, reader) = spawn_reader(items, self.roots.clone(), self.dopts.clone());
+        self.refills.push((f, rx, reader));
     }
 
     /// Shows what reading file `f` again found. Returns whether it was the same on disk.
@@ -617,7 +617,20 @@ impl DiffsView {
 
     /// Forgets a reading of file `f` still on its way: it would be older than what is here now.
     fn cancel_refill(&mut self, f: usize) {
-        self.refills.retain(|(rf, _)| *rf != f);
+        self.refills.retain(|(rf, ..)| *rf != f);
+    }
+
+    /// [`Self::cancel_refill`], waiting for the reading to finish: Windows does not replace a
+    /// file another thread has open.
+    fn end_refill(&mut self, f: usize) {
+        let (ending, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.refills)
+            .into_iter()
+            .partition(|(rf, ..)| *rf == f);
+        self.refills = kept;
+        for (_, rx, reader) in ending {
+            drop(rx);
+            let _ = reader.join();
+        }
     }
 
     /// Reads file `f` again now. Returns whether it was the same on disk as before.
@@ -852,6 +865,16 @@ impl DiffsView {
         let mut errors = Vec::new();
         // Files whose mixed line endings were written as one kind.
         let mut unified = Vec::new();
+        let writing: Vec<usize> = (0..self.cards.len())
+            .filter(|&f| {
+                self.cards[f]
+                    .diffs()
+                    .is_some_and(|d| d.docs.iter().any(|doc| doc.modified && !doc.read_only))
+            })
+            .collect();
+        for f in writing {
+            self.end_refill(f);
+        }
         for (f, card) in self.cards.iter_mut().enumerate() {
             let Body::Diffs(d) = &mut card.body else {
                 continue;

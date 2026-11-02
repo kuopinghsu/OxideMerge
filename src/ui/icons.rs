@@ -58,11 +58,13 @@ pub enum Icon {
     Export,
     Sidebar,
     Inline,
+    /// The file compare docked below the folder list.
+    BottomPane,
 }
 
 #[cfg(test)]
 impl Icon {
-    pub const ALL: [Icon; 51] = [
+    pub const ALL: [Icon; 52] = [
         Icon::First,
         Icon::Prev,
         Icon::Next,
@@ -114,6 +116,7 @@ impl Icon {
         Icon::Export,
         Icon::Sidebar,
         Icon::Inline,
+        Icon::BottomPane,
     ];
 }
 
@@ -478,6 +481,11 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             // The drawer opens on the right.
             g.rounded(3.0, 4.0, 18.0, 16.0, 2.0);
             g.line(&[(15.0, 4.0), (15.0, 20.0)]);
+        }
+        Icon::BottomPane => {
+            // The file compare opens below the list.
+            g.rounded(3.0, 4.0, 18.0, 16.0, 2.0);
+            g.line(&[(3.0, 13.0), (21.0, 13.0)]);
         }
         Icon::Inline => {
             // One column: a removed line over an added one.

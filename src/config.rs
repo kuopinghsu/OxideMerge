@@ -332,6 +332,16 @@ impl Config {
         self.recent_compares.truncate(20);
     }
 
+    /// Puts back recent comparisons that were cleared, after any made since.
+    pub fn restore_recent_compares(&mut self, cleared: Vec<Vec<String>>) {
+        for paths in cleared {
+            if !self.recent_compares.contains(&paths) {
+                self.recent_compares.push(paths);
+            }
+        }
+        self.recent_compares.truncate(20);
+    }
+
     pub fn remove_recent_compare(&mut self, paths: &[String]) {
         self.recent_compares.retain(|x| x != paths);
     }

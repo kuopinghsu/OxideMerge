@@ -5,9 +5,85 @@ section of this file as the release notes.
 
 ## [0.9.8] - Unreleased
 
+### Added
+
+- **Italian** interface language (`--lang it`, or *Italiano* in *Options → General*).
+- A toolbar button in folder compares, and `Alt+P`, show or hide the *File compare below the folder
+  list*.
+- **Clear recent comparisons:** *Clear* beside the start page's *Recent* heading and *File → Open
+  recent → Clear recent comparisons* empty the list, with *Undo* in the message that follows.
+
 ### Changed
 
 - The README shows the OxideMerge icon next to its title.
+- **Semantic TOML and YAML:** numbers compare by value also between integers and decimals (`1`
+  equals `1.0`, `1e23` equals `100000000000000000000000`) and exactly, not as 64-bit floats; YAML
+  integers too large for 128 bits compare by their digits, and a TOML integer outside 64 bits is
+  reported as out of range, as the TOML specification requires. TOML date-times with a time zone
+  compare by the moment they name, and YAML keys by value
+  (`0x10:` and `16:` are one key, so a mapping with both `0x10:` and `"16":` is refused). An empty
+  YAML document is `null`; `!!int`, `!!float`, `!!bool` and `!!null` must fit their value; tags on keys
+  other than `!!str`, and on mappings or sequences other than `!!map` and `!!seq`, are refused.
+  TOML files are limited to 4 MiB like YAML.
+- **Release baselines:** a suspected rename with edits needs at least three shared lines, so two
+  tiny files with one line in common are no longer paired. An important path also flags a move
+  or rename from it. `--split-rename` and `--important-path` accept `\` between folders and a
+  leading `./`; `--split-rename` reports a path that is not an added file, and both are refused
+  outside baseline, release report and impact analysis.
+- **Impact analysis:** Objective-C `#import "…"`, TypeScript `import x = require(…)` and `.js`
+  imports of `.ts` sources are exact imports; a `.h` header that only reads as C++ is read as C++;
+  only the `<script>` blocks of Vue and Svelte components are read; Rust attributes such as
+  `#[derive(…)]` count as part of a definition, and a name defined twice changes with either
+  definition. Several reasons for one line are one finding (rule `literal-reference-v2`, so
+  name and path findings dismissed before need dismissing again), and lines with an exact finding are
+  dropped before the 500 name and key findings are counted. Files of up to 1 MiB are indexed in
+  parallel.
+- Every interface language now translates the *Text layout* choices (*Aligned rows*, *Compact
+  rows*).
+- **User guides:** reorganized by task (text, merging, folders, binary, images, web pages, filters
+  and rules, saving and reports, analysis tools, then the reference chapters), with the long
+  paragraphs split into steps, lists and tables. The English guide uses short sentences in plain
+  English for readers whose first language is not English; the Traditional Chinese guide uses
+  Taiwanese terms and the program's own wording, without mixed-in English. The guides now
+  describe the *Important path fragments* field of the baseline panel. All screenshots were
+  taken again from the current version, and new ones show the *Select files or folders* dialog,
+  the file compare below the folder list, the inline view, the CSV table view, the Formatted web
+  mode, merge verification, semantic comparison, the review workspace and the release summary.
+
+### Fixed
+
+- **Impact analysis:** a style sheet ending inside an `@import` no longer stops the analysis;
+  files with lone carriage-return line endings report the right lines; cancelling stops the
+  symbol phase too; the index cache no longer mixes up files read by different grammars; the
+  first use of an imported name is no longer a property or key of the same name.
+- **Semantic TOML:** changes in a table point at the table's own lines.
+- **File compare below the folder list:** *Next difference* and *Previous difference*
+  (`Alt+↓`/`Alt+↑`, the *Compare* menu) now work in it, and past the last or first
+  difference, they and its arrow buttons move on to the next or previous file with differences;
+  *First difference* and *Last difference* (`Alt+Home`/`Alt+End`) work there too. A key pressed
+  while a file is still loading waits for it. Without the docked compare, they select the next,
+  previous, first or last file with differences, and with a review filter only the files it lists.
+- The *Diff algorithm* option shows *LCS* instead of *Lcs*, and `--help` lists TOML and YAML for
+  `--semantic`.
+- **Merge verification** reports a merged preview that no longer parses as a semantic document.
+- **Folder merge undo:** the copies are kept next to the merged files, so a deleted file is only
+  moved, and moved back on undo, and no room is needed on another disk; files are put back
+  atomically, a new `.bak` is removed only after its file was put back, removed folders come back
+  with their permissions, and when a file cannot be put back the copies folder is kept, named in
+  the error, and lists in `index.txt` which file each copy was. Each file is
+  checked again just before it is written.
+- **Review workspace:** saving waits until the decisions were checked against the files, and a
+  decision on files that changed is saved stale instead of renewed. A file that cannot be read
+  for a moment no longer passes its decision to another file with the same content.
+- **Saving on Windows** no longer fails while a background re-read of the file is running, and
+  retries briefly when another program, such as a virus scanner, has the file open.
+- **Formatted web pages:** a list item, definition or block element now ends a hidden paragraph
+  as in a browser; a stray end tag no longer ends a hidden element early; the `<base href>` in
+  the page head resolves links; very deep hidden markup no longer slows the conversion.
+- The *Array matching key* field stays in place and keeps its focus while the report is made.
+- Folder column headers tell screen readers the sort direction again.
+- *Review* links from impact findings do nothing for a file that is not in the comparison, instead
+  of selecting a missing file.
 
 ## [0.9.7] - 2026-11-01
 

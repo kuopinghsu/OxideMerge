@@ -1207,8 +1207,16 @@ struct Toast {
     error: bool,
     /// When the toast appeared, or when the pointer last left it, in `egui::InputState::time`.
     shown: Option<f64>,
-    /// Tab whose last edit the toast offers to undo.
-    undo_tab: Option<u64>,
+    undo: Option<ToastUndo>,
+}
+
+/// What a toast's Undo button puts back.
+#[derive(Clone, PartialEq)]
+enum ToastUndo {
+    /// The last edit of this tab.
+    Tab(u64),
+    /// These recent comparisons, after they were cleared.
+    Recent(Vec<Vec<String>>),
 }
 
 pub struct OxideMergeApp {
@@ -1400,6 +1408,7 @@ struct Menus {
     /// Compare rules file picked for the active tab ("" = none).
     rules: Option<String>,
     recent: Option<Vec<String>>,
+    clear_recent: bool,
 }
 
 impl Menus {
@@ -1431,7 +1440,11 @@ impl Menus {
             ) => true,
             (SaveComparison, Folder) => !self.folder_busy,
             (ClearSyncPoints, Text) => self.has_sync_points,
-            (Find | CopyRight | CopyLeft | SelectPattern | Statistics, Folder) => true,
+            (
+                Find | CopyRight | CopyLeft | SelectPattern | Statistics | NextDiff | PrevDiff
+                | FirstDiff | LastDiff | ToggleFilePane,
+                Folder,
+            ) => true,
             // A report or patch of a folder compare still running would miss files.
             (ReportWithDiffs | ExportHtml | Report | Slideshow, Folder) => !self.folder_busy,
             (Patch, Folder) => self.sides == 2 && !self.folder_busy,
@@ -2065,14 +2078,14 @@ impl OxideMergeApp {
         self.push_toast(msg.into(), false, None);
     }
 
-    fn push_toast(&mut self, text: String, error: bool, undo_tab: Option<u64>) {
+    fn push_toast(&mut self, text: String, error: bool, undo: Option<ToastUndo>) {
         self.toasts
-            .retain(|t| t.text != text && (undo_tab.is_none() || t.undo_tab != undo_tab));
+            .retain(|t| t.text != text && (undo.is_none() || t.undo != undo));
         self.toasts.push(Toast {
             text,
             error,
             shown: None,
-            undo_tab,
+            undo,
         });
         if self.toasts.len() > 4 {
             self.toasts.remove(0);
@@ -3252,6 +3265,7 @@ impl OxideMergeApp {
             Cmd::CompareOptions => self.open_options(OptTab::Compare),
             Cmd::ToggleCollapse => self.cfg.collapse_unchanged ^= true,
             Cmd::ToggleWrap => self.cfg.word_wrap ^= true,
+            Cmd::ToggleFilePane => self.cfg.folder_file_pane ^= true,
             Cmd::Palette => {
                 let entries = self.palette_entries();
                 self.palette = Some((Palette::default(), entries));
@@ -3445,6 +3459,10 @@ impl OxideMergeApp {
                         Cmd::CopyLeft => v.copy_selected(false, &cfg),
                         Cmd::AutoMerge => v.request_merge(),
                         Cmd::SelectPattern => v.open_select_pattern(),
+                        Cmd::NextDiff => v.step_diff(true, &cfg),
+                        Cmd::PrevDiff => v.step_diff(false, &cfg),
+                        Cmd::FirstDiff => v.edge_diff(true, &cfg),
+                        Cmd::LastDiff => v.edge_diff(false, &cfg),
                         _ => {}
                     },
                     Content::Diffs(v) => match cmd {
@@ -3486,6 +3504,7 @@ impl OxideMergeApp {
 
     /// Acts on a view of the active tab having run past its last or first difference.
     fn take_step_file(&mut self) {
+        let mut notice = None;
         let step = self
             .tabs
             .get_mut(self.active)
@@ -3494,8 +3513,15 @@ impl OxideMergeApp {
                 Content::Binary(v) => v.step_file.take(),
                 Content::Image(v) => v.step_file.take(),
                 Content::Web(v) => v.formatted.as_mut().and_then(|f| f.step_file.take()),
+                Content::Folder(v) => {
+                    notice = v.take_notice();
+                    None
+                }
                 _ => None,
             });
+        if let Some(msg) = notice {
+            self.notify(tr(msg));
+        }
         if let Some(forward) = step {
             self.step_file(forward);
         }
@@ -4268,6 +4294,7 @@ impl OxideMergeApp {
             picked: None,
             rules: None,
             recent: None,
+            clear_recent: false,
         }
     }
 
@@ -4381,6 +4408,9 @@ impl OxideMergeApp {
                 ..Default::default()
             });
         }
+        if m.clear_recent {
+            self.clear_recent();
+        }
         if let Some(c) = m.picked {
             self.run(c, ctx);
         }
@@ -4457,6 +4487,11 @@ impl OxideMergeApp {
                         ui.close();
                     }
                 }
+                ui.separator();
+                if ui.button(tr("menu.clear_recent")).clicked() {
+                    m.clear_recent = true;
+                    ui.close();
+                }
             });
         });
         m.item(ui, Cmd::OpenConflict);
@@ -4506,7 +4541,7 @@ impl OxideMergeApp {
                 ui,
                 &mut cfg.folder_file_pane,
                 tr("view.folder_file_pane"),
-                "",
+                &Cmd::ToggleFilePane.shown_key(),
             );
             ui.separator();
             ui.label(egui::RichText::new(tr("view.show")).weak().small());
@@ -4995,6 +5030,7 @@ impl OxideMergeApp {
         let mut compare: Option<Vec<String>> = None;
         let mut edit: Option<Vec<String>> = None;
         let mut remove: Option<Vec<String>> = None;
+        let mut clear_recent = false;
         egui::ScrollArea::vertical().show(ui, |ui| {
             let w = 760.0_f32.min(ui.available_width() - 48.0).max(320.0);
             ui.horizontal(|ui| {
@@ -5113,7 +5149,19 @@ impl OxideMergeApp {
                     }
                     if !self.cfg.recent_compares.is_empty() {
                         ui.add_space(16.0);
-                        widgets::caption(ui, tr("label.recent"));
+                        ui.horizontal(|ui| {
+                            ui.set_width(w);
+                            widgets::caption(ui, tr("label.recent"));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let full = tr("menu.clear_recent");
+                                if widgets::ghost_button_named(ui, tr("start.recent_clear"), full)
+                                    .on_hover_text(full)
+                                    .clicked()
+                                {
+                                    clear_recent = true;
+                                }
+                            });
+                        });
                         let card_w = (w - 12.0) / 2.0;
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = vec2(12.0, 12.0);
@@ -5180,6 +5228,31 @@ impl OxideMergeApp {
         }
         if let Some(paths) = remove {
             self.cfg.remove_recent_compare(&paths);
+        }
+        if clear_recent {
+            self.clear_recent();
+        }
+    }
+
+    /// Empties the recent comparisons, with a toast that can put them back, together with any
+    /// cleared just before whose toast this one replaces.
+    fn clear_recent(&mut self) {
+        let mut cleared = std::mem::take(&mut self.cfg.recent_compares);
+        let earlier = self.toasts.iter().find_map(|t| match &t.undo {
+            Some(ToastUndo::Recent(earlier)) => Some(earlier.clone()),
+            _ => None,
+        });
+        for paths in earlier.into_iter().flatten() {
+            if !cleared.contains(&paths) {
+                cleared.push(paths);
+            }
+        }
+        if !cleared.is_empty() {
+            self.push_toast(
+                tr("msg.recent_cleared").to_owned(),
+                false,
+                Some(ToastUndo::Recent(cleared)),
+            );
         }
     }
 
@@ -5707,8 +5780,13 @@ impl OxideMergeApp {
                                         .on_hover_text(tr("opt.prettify_hint"));
                                     ui.checkbox(&mut o.ignore_codepage, tr("opt.ignore_codepage"));
                                     ui.checkbox(&mut o.detect_moved, tr("opt.detect_moved"));
+                                    let algorithm_name = |a: DiffAlgorithm| match a {
+                                        DiffAlgorithm::Myers => "Myers",
+                                        DiffAlgorithm::Patience => "Patience",
+                                        DiffAlgorithm::Lcs => "LCS",
+                                    };
                                     egui::ComboBox::from_label(tr("opt.algorithm"))
-                                        .selected_text(format!("{:?}", o.algorithm))
+                                        .selected_text(algorithm_name(o.algorithm))
                                         .show_ui(ui, |ui| {
                                             for a in [
                                                 DiffAlgorithm::Myers,
@@ -5718,7 +5796,7 @@ impl OxideMergeApp {
                                                 ui.selectable_value(
                                                     &mut o.algorithm,
                                                     a,
-                                                    format!("{a:?}"),
+                                                    algorithm_name(a),
                                                 );
                                             }
                                         });
@@ -6294,14 +6372,14 @@ impl OxideMergeApp {
         let p = theme::palette(self.cfg.dark_mode);
         let now = ctx.input(|i| i.time);
         let mut close: Option<usize> = None;
-        let mut undo: Option<u64> = None;
+        let mut undo: Option<ToastUndo> = None;
         let screen = ctx.content_rect();
         let mut bottom = screen.bottom() - 40.0;
         for i in (0..self.toasts.len()).rev() {
             let t = &mut self.toasts[i];
             let shown = *t.shown.get_or_insert(now);
             let age = now - shown;
-            let life = if t.undo_tab.is_some() {
+            let life = if t.undo.is_some() {
                 UNDO_TOAST_SECS
             } else {
                 TOAST_SECS
@@ -6345,13 +6423,12 @@ impl OxideMergeApp {
                                     )
                                     .wrap(),
                                 );
-                                if let Some(tab) = t.undo_tab {
-                                    if widgets::ghost_icon_button(ui, Icon::Undo, tr("cmd.undo"))
+                                if t.undo.is_some()
+                                    && widgets::ghost_icon_button(ui, Icon::Undo, tr("cmd.undo"))
                                         .clicked()
-                                    {
-                                        undo = Some(tab);
-                                        close = Some(i);
-                                    }
+                                {
+                                    undo = t.undo.clone();
+                                    close = Some(i);
                                 }
                                 if widgets::icon_button(ui, Icon::Close, tr("btn.close")).clicked()
                                 {
@@ -6371,14 +6448,18 @@ impl OxideMergeApp {
         if let Some(i) = close {
             self.toasts.remove(i);
         }
-        if let Some(id) = undo {
-            if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
-                match t.content.view_mut() {
-                    Content::Text(v) => v.undo(),
-                    Content::Binary(v) => v.undo(),
-                    _ => {}
+        match undo {
+            Some(ToastUndo::Tab(id)) => {
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    match t.content.view_mut() {
+                        Content::Text(v) => v.undo(),
+                        Content::Binary(v) => v.undo(),
+                        _ => {}
+                    }
                 }
             }
+            Some(ToastUndo::Recent(cleared)) => self.cfg.restore_recent_compares(cleared),
+            None => {}
         }
         if self.toasts.iter().any(|t| !t.error) {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -6692,6 +6773,7 @@ impl eframe::App for OxideMergeApp {
                     self.cfg.folder.method = method;
                     self.cfg.folder.recursive = recursive;
                 }
+                FolderAction::FilePane(on) => self.cfg.folder_file_pane = on,
                 FolderAction::ShowAll => {
                     self.cfg.show_identical = true;
                     self.cfg.show_different = true;
@@ -6752,7 +6834,7 @@ impl eframe::App for OxideMergeApp {
             }
         }
         for (m, id) in bulk {
-            self.push_toast(m, false, Some(id));
+            self.push_toast(m, false, Some(ToastUndo::Tab(id)));
         }
         self.toasts_ui(ctx);
         drop_overlay(ctx, self.open_dlg.is_some());

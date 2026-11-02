@@ -245,12 +245,21 @@ fn is_hidden(e: &std::fs::DirEntry) -> bool {
     false
 }
 
-fn list_dir(dir: &Path, skip_hidden: bool) -> std::io::Result<Vec<Entry>> {
+/// Start of the name of the folder a folder merge keeps its undo copies in, at the top of the
+/// merged folder. Scans leave such folders out there, so a merge never deletes copies kept after
+/// a failed undo.
+pub const UNDO_PREFIX: &str = ".oxidemerge-undo-";
+
+/// The entries of `dir`, the top of a compared folder when `top`.
+fn list_dir(dir: &Path, skip_hidden: bool, top: bool) -> std::io::Result<Vec<Entry>> {
     let rd = std::fs::read_dir(dir)?;
     let mut v = Vec::new();
     for e in rd {
         let e = e?;
-        if skip_hidden && is_hidden(&e) {
+        let undo_copies = top
+            && e.file_name().to_string_lossy().starts_with(UNDO_PREFIX)
+            && e.file_type().is_ok_and(|t| t.is_dir());
+        if (skip_hidden && is_hidden(&e)) || undo_copies {
             continue;
         }
         let md = e.metadata()?;
@@ -384,7 +393,7 @@ impl<'a> Scanner<'a> {
                     dir.push(p);
                 }
             }
-            let entries = match list_dir(&dir, self.fopts.skip_hidden) {
+            let entries = match list_dir(&dir, self.fopts.skip_hidden, rel.is_empty()) {
                 Ok(entries) => entries,
                 Err(e) => {
                     // An incomplete listing cannot establish that any child is missing.

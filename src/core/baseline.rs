@@ -332,6 +332,9 @@ const RENAME_SIMILARITY: usize = 50;
 const RENAME_MAX_BYTES: usize = 256 << 10;
 /// More candidate pairs than this skips the similarity search.
 const RENAME_MAX_PAIRS: usize = 250_000;
+/// Fewest non-blank lines a suspected rename shares, so that two tiny files with one line
+/// in common are not paired.
+const RENAME_MIN_SHARED: usize = 3;
 
 /// The lines of a text file, counted.
 fn line_counts(bytes: &[u8]) -> Option<(std::collections::HashMap<&str, usize>, usize)> {
@@ -386,7 +389,7 @@ fn similar_renames(
                 .map(|(line, c)| (*c).min(ncounts.get(line).copied().unwrap_or(0)))
                 .sum();
             let score = common * 200 / (ototal + ntotal);
-            if score >= RENAME_SIMILARITY {
+            if score >= RENAME_SIMILARITY && common >= RENAME_MIN_SHARED {
                 pairs.push((score, *o, *n));
             }
         }
@@ -549,7 +552,9 @@ pub fn compare_with(
             _ => continue,
         };
         let mut risk_flags = if !matches!(category, Category::Unchanged)
-            && important.iter().any(|p| path.contains(p))
+            && important
+                .iter()
+                .any(|p| path.contains(p) || old_path.as_ref().is_some_and(|o| o.contains(p)))
         {
             vec!["User important-path rule matched; compatibility has not been validated".into()]
         } else {
@@ -592,7 +597,7 @@ pub fn compare_with(
         changes.iter().filter(|c| c.high_priority()).count(),
     );
     let mut limitations = vec![
-        "Exact unique-content moves are moves. Renames with edits are suspected from shared lines (at least 50%, same extension, text up to 256 KiB, a clear best match only) and can be split back into added and deleted files.".to_owned(),
+        "Exact unique-content moves are moves. Renames with edits are suspected from shared lines (at least 50% and 3 lines, same extension, text up to 256 KiB, a clear best match only) and can be split back into added and deleted files.".to_owned(),
         "Heuristic priority flags do not validate release compatibility; source references are relative to captured baseline paths.".into(),
         "Files vs directories and excluded ancestors require manual review; unreadable paths are never counted identical.".into(),
     ];
@@ -910,6 +915,9 @@ mod tests {
         std::fs::write(b.join("notes.txt"), lines("notes", 6) + "more\n").unwrap();
         std::fs::write(a.join("gone.cfg"), lines("gone", 8)).unwrap();
         std::fs::write(b.join("fresh.cfg"), lines("fresh", 8)).unwrap();
+        // one line in common is too little, however short the files
+        std::fs::write(a.join("tiny.ini"), "x=1\n").unwrap();
+        std::fs::write(b.join("small.ini"), "x=1\ny=2\n").unwrap();
         let cancel = AtomicBool::new(false);
         let take = |root: &PathBuf| {
             capture(
@@ -944,6 +952,8 @@ mod tests {
             ("notes.txt", "added"),
             ("gone.cfg", "deleted"),
             ("fresh.cfg", "added"),
+            ("tiny.ini", "deleted"),
+            ("small.ini", "added"),
         ] {
             assert_eq!(find(&summary, path), Some((category, None, None)), "{path}");
         }
@@ -955,6 +965,8 @@ mod tests {
         assert!(html.contains("High priority (1)"));
         assert!(html.contains("<style>body{font:") && !html.contains("{{"));
         assert!(html.contains(&left.metadata.captured_at));
+        let by_old = compare(&left, &right, &["old.rs".into()], &cancel).unwrap();
+        assert_eq!(by_old.counts["high_priority"], 1);
 
         let split = BTreeSet::from(["new.rs".to_owned()]);
         let summary = compare_with(&left, &right, &[], &split, &cancel).unwrap();
