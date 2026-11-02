@@ -16,6 +16,9 @@ section of this file as the release notes.
 ### Changed
 
 - The README shows the OxideMerge icon next to its title.
+- The English and Traditional Chinese READMEs are reorganized for users and use simpler wording.
+  The build, test, continuous integration and release instructions moved to a new development
+  guide (`docs/development.md`, `docs/development.zh-TW.md`).
 - **Semantic TOML and YAML:** numbers compare by value also between integers and decimals (`1`
   equals `1.0`, `1e23` equals `100000000000000000000000`) and exactly, not as 64-bit floats; YAML
   integers too large for 128 bits compare by their digits, and a TOML integer outside 64 bits is
