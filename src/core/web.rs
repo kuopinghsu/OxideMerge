@@ -1,6 +1,6 @@
 //! Web page compare: fetching pages, extracting their visible text and linked resources, and
 //! finding an installed Chromium-based browser (Edge, Chrome, Chromium, Brave), which
-//! `web_render` drives to render pages, read their text and take screenshots.
+//! `web_render` drives to take screenshots.
 
 use crate::core::text::{self, TextEncoding};
 use anyhow::{bail, Context, Result};
@@ -118,10 +118,12 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-/// Reads `r` to the end, failing once it gives more than `limit` bytes.
-fn read_limited(r: impl Read, limit: u64) -> std::io::Result<Vec<u8>> {
+/// Reads `r` to the end, failing once it gives more than `limit` bytes or `abort` is set.
+fn read_limited(r: impl Read, limit: u64, abort: &AtomicBool) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    r.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    Abortable { r, abort }
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
         return Err(std::io::Error::other(format!(
             "larger than {} MB",
@@ -129,6 +131,29 @@ fn read_limited(r: impl Read, limit: u64) -> std::io::Result<Vec<u8>> {
         )));
     }
     Ok(bytes)
+}
+
+/// A reader that fails once `abort` is set, so that stopping ends a download between reads.
+struct Abortable<'a, R> {
+    r: R,
+    abort: &'a AtomicBool,
+}
+
+impl<R: Read> Read for Abortable<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.abort.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("stopped"));
+        }
+        self.r.read(buf)
+    }
+}
+
+/// Fails once `abort` is set.
+fn check(abort: &AtomicBool) -> Result<()> {
+    if abort.load(Ordering::Relaxed) {
+        bail!("stopped");
+    }
+    Ok(())
 }
 
 struct Fetched {
@@ -229,8 +254,16 @@ fn is_local_page(url: &Url) -> bool {
 }
 
 /// Downloads `url`, following up to 10 redirects. Unless `local_ok`, a redirect to a local
-/// file, this computer or a private network is refused.
-fn fetch(agent: &ureq::Agent, url: &Url, limit: u64, local_ok: bool) -> Result<Fetched> {
+/// file, this computer or a private network is refused. Setting `abort` ends the download
+/// before each request and between reads; a request waiting for an answer ends by its timeout.
+fn fetch(
+    agent: &ureq::Agent,
+    url: &Url,
+    limit: u64,
+    local_ok: bool,
+    abort: &AtomicBool,
+) -> Result<Fetched> {
+    check(abort)?;
     if url.scheme() == "file" {
         let path = url
             .to_file_path()
@@ -239,7 +272,7 @@ fn fetch(agent: &ureq::Agent, url: &Url, limit: u64, local_ok: bool) -> Result<F
             bail!("{}: not a file", path.display());
         }
         let file = std::fs::File::open(&path).with_context(|| path.display().to_string())?;
-        let bytes = read_limited(file, limit).with_context(|| path.display().to_string())?;
+        let bytes = read_limited(file, limit, abort).with_context(|| path.display().to_string())?;
         return Ok(Fetched {
             url: url.clone(),
             status: 200,
@@ -274,6 +307,7 @@ fn fetch(agent: &ureq::Agent, url: &Url, limit: u64, local_ok: bool) -> Result<F
         }
         hops += 1;
         final_url = next;
+        check(abort)?;
         resp = agent
             .get(final_url.as_str())
             .call()
@@ -287,7 +321,7 @@ fn fetch(agent: &ureq::Agent, url: &Url, limit: u64, local_ok: bool) -> Result<F
     let status = resp.status().as_u16();
     // The limit applies to the bytes as decompressed, which a small download can make huge.
     let reader = resp.body_mut().with_config().limit(u64::MAX).reader();
-    let bytes = read_limited(reader, limit).with_context(|| url.to_string())?;
+    let bytes = read_limited(reader, limit, abort).with_context(|| url.to_string())?;
     Ok(Fetched {
         url: final_url,
         status,
@@ -335,8 +369,8 @@ fn decode_html(bytes: &[u8], content_type: Option<&str>) -> String {
     text::decode(bytes, forced).0
 }
 
-/// Downloads every page in parallel.
-pub fn fetch_pages(urls: &[Url]) -> Result<Vec<Page>> {
+/// Downloads every page in parallel; setting `abort` stops them (see [`fetch`]).
+pub fn fetch_pages(urls: &[Url], abort: &AtomicBool) -> Result<Vec<Page>> {
     let agent = agent();
     std::thread::scope(|s| {
         let handles: Vec<_> = urls
@@ -344,7 +378,7 @@ pub fn fetch_pages(urls: &[Url]) -> Result<Vec<Page>> {
             .map(|u| {
                 let agent = agent.clone();
                 s.spawn(move || -> Result<Page> {
-                    let f = fetch(&agent, u, PAGE_LIMIT, is_local_page(u))?;
+                    let f = fetch(&agent, u, PAGE_LIMIT, is_local_page(u), abort)?;
                     let html = decode_html(&f.bytes, f.content_type.as_deref());
                     Ok(Page {
                         url: f.url,
@@ -661,10 +695,11 @@ fn push_collapsed(out: &mut String, s: &str) {
     }
 }
 
-/// The text a browser would show, one block element per line.
+/// The text a browser would show, one block element per line and the cells of a table row
+/// separated by tabs. Hidden elements are left out.
 pub fn html_to_text(html: &str) -> String {
     let mut out = String::new();
-    for tok in tokens(html) {
+    for tok in super::web_markdown::visible_tokens(html) {
         match tok {
             Token::Text(t) => push_text(&mut out, t),
             Token::Tag(name, _, closing) => {
@@ -690,6 +725,19 @@ pub fn html_to_text(html: &str) -> String {
         }
     }
     lines.join("\n")
+}
+
+/// The text of a downloaded page as `mode` compares it: its visible text, its HTML or its
+/// Markdown.
+pub fn page_text(page: &Page, mode: WebMode) -> String {
+    match mode {
+        WebMode::Html => format_html(&page.html),
+        WebMode::Markdown => super::web_markdown::to_text(&super::web_markdown::html_to_blocks(
+            &page.html,
+            Some(&page.url),
+        )),
+        _ => html_to_text(&page.html),
+    }
 }
 
 /// Breaks minified HTML into one tag per line so that line-based diffs stay readable.
@@ -993,14 +1041,20 @@ pub fn download_trees(pages: &[Page], roots: &[PathBuf], progress: &Progress) ->
                     break;
                 };
                 let dest = roots[job.side].join(&job.path);
-                let ok = fetch(&agent, &job.url, RESOURCE_LIMIT, job.local_ok)
-                    .ok()
-                    .is_some_and(|f| {
-                        dest.parent()
-                            .is_none_or(|d| std::fs::create_dir_all(d).is_ok())
-                            && f.status < 400
-                            && std::fs::write(&dest, &f.bytes).is_ok()
-                    });
+                let ok = fetch(
+                    &agent,
+                    &job.url,
+                    RESOURCE_LIMIT,
+                    job.local_ok,
+                    &progress.abort,
+                )
+                .ok()
+                .is_some_and(|f| {
+                    dest.parent()
+                        .is_none_or(|d| std::fs::create_dir_all(d).is_ok())
+                        && f.status < 400
+                        && std::fs::write(&dest, &f.bytes).is_ok()
+                });
                 if !ok {
                     failed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1102,11 +1156,13 @@ mod tests {
         let html = r#"<!DOCTYPE html><html><head><title>Hi &amp; bye</title>
             <style>p { color: red }</style><script>var x = "<p>no</p>";</script></head>
             <body><!-- hidden --><h1>Head&nbsp;line</h1><p>One
-            two</p><ul><li>A</li><li>B &#x263A;</li></ul>
+            two</p><ul><li>A</li><li hidden>gone<li>B &#x263A;</li></ul>
+            <p style="display: none">gone</p><span aria-hidden="true">gone</span>
+            <select><option>gone</option></select>
             <table><tr><td>x</td><td>y</td></tr></table>a < b</body></html>"#;
         assert_eq!(
             html_to_text(html),
-            "Hi & bye\nHead line\nOne two\nA\nB ☺\nx\ty\na < b"
+            "Head line\nOne two\nA\nB ☺\nx\ty\na < b"
         );
     }
 
@@ -1177,8 +1233,8 @@ mod tests {
 
     #[test]
     fn nested_heads_are_read_without_going_deeper() {
-        let html = format!("{}<title>t</title>", "<head>".repeat(50_000));
-        assert_eq!(html_to_text(&html).trim(), "t");
+        let html = format!("{}<title>t</title></head>x", "<head>".repeat(50_000));
+        assert_eq!(html_to_text(&html).trim(), "x");
         // A title tag still open at the end of <head> or of the page.
         for html in [
             "<head><title</head>x",
@@ -1436,7 +1492,8 @@ mod tests {
         });
         let agent = agent();
         let url = |p: &str| Url::parse(&format!("http://127.0.0.1:{port}{p}")).unwrap();
-        let get = |p: &str, local_ok| fetch(&agent, &url(p), 1 << 20, local_ok);
+        let go = AtomicBool::new(false);
+        let get = |p: &str, local_ok| fetch(&agent, &url(p), 1 << 20, local_ok, &go);
 
         let f = get("/moved", true).unwrap();
         assert_eq!((f.url, f.status), (url("/page"), 200));
@@ -1455,11 +1512,11 @@ mod tests {
         assert!(err(get("/to-self", false)).contains("not followed"));
         assert!(get("/to-self", true).is_ok());
         assert!(err(get("/garbage", true)).contains(url("/garbage").as_str()));
-        assert!(err(fetch(&agent, &url("/big"), 1024, true)).contains(url("/big").as_str()));
+        assert!(err(fetch(&agent, &url("/big"), 1024, true, &go)).contains(url("/big").as_str()));
         // 133 bytes that decompress to 100,000
-        assert!(err(fetch(&agent, &url("/bomb"), 1024, true)).contains("larger than"));
+        assert!(err(fetch(&agent, &url("/bomb"), 1024, true, &go)).contains("larger than"));
         assert_eq!(
-            fetch(&agent, &url("/bomb"), 1 << 20, true)
+            fetch(&agent, &url("/bomb"), 1 << 20, true, &go)
                 .unwrap()
                 .bytes
                 .len(),
@@ -1469,7 +1526,12 @@ mod tests {
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let gone = Url::parse(&format!("http://{}/", closed.local_addr().unwrap())).unwrap();
         drop(closed);
-        assert!(err(fetch(&agent, &gone, 1024, true)).contains(gone.as_str()));
+        assert!(err(fetch(&agent, &gone, 1024, true, &go)).contains(gone.as_str()));
+
+        // Stopped: no request is made, and a body being read ends.
+        let stop = AtomicBool::new(true);
+        assert!(err(fetch(&agent, &url("/page"), 1 << 20, true, &stop)).contains("stopped"));
+        assert!(read_limited(&[0u8; 64][..], 1024, &stop).is_err());
     }
 
     #[test]
@@ -1484,7 +1546,7 @@ mod tests {
             _ => response("404 Not Found", "", b""),
         });
         let url = Url::parse(&format!("http://127.0.0.1:{port}/index.html")).unwrap();
-        let pages = fetch_pages(std::slice::from_ref(&url)).unwrap();
+        let pages = fetch_pages(std::slice::from_ref(&url), &AtomicBool::new(false)).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let roots = [dir.path().to_path_buf()];
         let outcome = download_trees(&pages, &roots, &Progress::default());

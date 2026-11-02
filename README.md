@@ -62,9 +62,9 @@ It supports text and folder merging, as well as binary, image and web page compa
 - **Binary files:** inspect byte differences in a side-by-side hexadecimal view.
 - **Images:** compare images side by side or use overlay, swipe, blink and difference views.
 - **Web pages:** compare pages as formatted Markdown side by side (the default), with the
-  changed blocks and words highlighted, the text a page shows after its scripts run, full page
-  screenshots with the text differences highlighted on the page, HTML source or downloaded
-  resources. Local `.html` files open this way too.
+  changed blocks and words highlighted, their visible text, full page screenshots with the text
+  differences highlighted on the page, HTML source or downloaded resources. Only the screenshots
+  need a browser. Local `.html` files open this way too.
 
 ### Save and share your work
 
@@ -284,8 +284,8 @@ use Command where Windows and Linux use Ctrl; the interface displays the platfor
   supported.
 - JSON and XML files are read-only while automatic formatting is enabled. Turn it off to
   edit or merge them.
-- Web screenshots require an installed Chromium-based browser. Without one, the text and HTML
-  modes do not run JavaScript and may miss dynamically loaded content. Authenticated browsing is
+- Web screenshots require an installed Chromium-based browser. Only the screenshots run
+  JavaScript; the other web modes may miss dynamically loaded content. Authenticated browsing is
   not supported; pages that require a login may show the login page instead.
 - Text editing is line-based and is intended for reviewing and merging changes.
 - WinMerge project files and filter files are supported, but WinMerge plugin DLLs and scripts

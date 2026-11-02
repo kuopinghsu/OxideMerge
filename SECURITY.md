@@ -21,15 +21,13 @@ following as **untrusted** and handles them without running anything they contai
 - **Archives** (zip, tar, 7z) are extracted to a private temporary folder. Entries that would land
   outside it are skipped, and so are links that point outside the archive. An archive that
   unpacks to more than 8 GB or 500,000 files is refused. Extracted sides are read-only.
-- **Web pages.** When a Chromium-based browser is found, the text, HTML source and screenshot
-  modes hand the pages to it: it runs their scripts, headless, in a fresh profile that is deleted
-  afterwards, with extensions and sync off. What such a page may load is up to the browser's own
-  security, not the limits below. OxideMerge talks to the browser over a private pipe on macOS
-  and Linux; on Windows, over a port on `127.0.0.1` that is open only while the pages load, which
-  other programs on the same computer could reach meanwhile. Turn off *Render pages in the
-  browser for text and HTML* to keep the text and HTML modes from running scripts.
-  Pages OxideMerge downloads itself (the resource tree, and text and HTML without a browser) run
-  no scripts. Such a web page may not load local files, and only a page on this computer or a
+- **Web pages.** The screenshot modes hand the pages to a Chromium-based browser: it runs their
+  scripts, headless, in a fresh profile that is deleted afterwards, with extensions and sync off.
+  What such a page may load is up to the browser's own security, not the limits below.
+  OxideMerge talks to the browser over a private pipe on macOS and Linux; on Windows, over a port
+  on `127.0.0.1` that is open only while the pages load, which other programs on the same
+  computer could reach meanwhile. The other modes use pages OxideMerge downloads itself, which
+  run no scripts. Such a web page may not load local files, and only a page on this computer or a
   private network may load resources from one or redirect to one. Responses are limited in size,
   count and time (see the user guide); the size counts what a compressed response unpacks to.
   Resource tree downloads are written only inside the folder you chose, whatever the addresses

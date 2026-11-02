@@ -1065,9 +1065,9 @@ Choose a mode in the selector at the top of the tab. OxideMerge remembers the la
 |Mode |What is compared
 
 |Text
-|The text that you see on each page, in the text comparison.
-Each heading, paragraph, list item, table cell and form field value is one line.
-Each line of preformatted text is also one line.
+|The text of each page, in the text comparison.
+Each heading, paragraph and list item is one line.
+The cells of a table row are on one line, separated by tabs.
 Hidden elements are not included.
 Changed words are highlighted, and the comparison options, filters and reports all apply.
 
@@ -1084,7 +1084,7 @@ See <<web-screenshots>>.
 The size is the screenshot width and height in the options.
 
 |HTML source
-|The HTML of each page after its scripts ran, in the text comparison.
+|The HTML of each page, in the text comparison.
 Long minified lines are split between tags.
 
 |Resource tree
@@ -1136,13 +1136,6 @@ The current difference is in the accent color, and the visible part of the page 
 Click or drag in the location pane to go to that place.
 To show or hide it, choose *View → Text compare → Location pane*.
 
-Content that the page hides is not included:
-
-* When a browser renders the page, everything that the browser does not show is left out,
-  including content that a style sheet hides.
-* When the downloaded HTML is used, elements with `hidden`, `aria-hidden` or an inline
-  `display: none` style are left out.
-
 [[web-screenshots]]
 === The screenshot modes
 
@@ -1161,10 +1154,20 @@ Pages that are taller than 16384 pixels are cut.
 
 === How pages are loaded
 
-OxideMerge uses a Chromium-based browser to load the pages for the Text, Formatted, HTML source
-and screenshot modes. It finds Edge, Chrome, Chromium and Brave automatically.
+The Text, HTML source, Formatted and Resource tree modes use the HTML as the server sends it, or as
+the file is saved.
+They do not need a browser, so they open quickly.
+The scripts of the page do not run, so content that scripts add is missing.
+To see that content, use a screenshot mode.
+
+The Text and Formatted modes leave out content that the page hides: elements with `hidden`,
+`aria-hidden="true"`, or an inline `display: none` or `visibility: hidden` style.
+Content that only a style sheet hides is still compared.
+
+The screenshot modes use a Chromium-based browser. OxideMerge finds Edge, Chrome, Chromium and
+Brave automatically.
 The browser runs without a window.
-It runs the scripts of each page, so you see each page as it looks in a browser.
+It runs the scripts of each page, so the screenshots show each page as it looks in a browser.
 
 * All pages load at the same time, each in its own browser tab.
 * After 45 seconds, OxideMerge uses each page as it is at that moment.
@@ -1173,17 +1176,8 @@ It runs the scripts of each page, so you see each page as it looks in a browser.
 * On macOS and Linux, OxideMerge talks to the browser through a private pipe.
   On Windows, it uses a network port that only this computer can reach.
   The port is open only while the pages load.
-
-In some cases, the Text, Formatted and HTML source modes use the HTML as downloaded, without a
-browser. Then the scripts do not run, and content that they add is missing.
-This happens in these cases:
-
-* No browser is found.
-* *Render pages in the browser for text and HTML (runs their scripts)* is off.
-* The browser fails. The status bar then tells you why.
-* The browser cannot load a page: the page cannot be reached, does not load in time, or its tab
-  crashes.
-  In the screenshot modes, that page is blank and its pane header shows the error.
+* If the browser cannot load a page (the page cannot be reached, does not load in time, or its tab
+  crashes), that page is blank and its pane header shows the error.
   The other pages are still compared.
 
 OxideMerge decodes pages the same way as browsers.
@@ -1209,26 +1203,25 @@ It does not follow links inside style sheets or scripts.
   Other resources of this kind are skipped and counted in the status bar.
 * The addresses that you enter yourself are always loaded.
 
-These limits do not apply to pages that the browser renders: the browser loads everything that a
-page asks for.
+These limits do not apply to the screenshot modes: the browser loads everything that a page asks
+for.
 
 === Web page settings
 
 These settings are in *Options → Image / Binary / Web*:
 
-* *Browser used to render pages*. Leave it empty to find a supported browser automatically.
-* *Render pages in the browser for text and HTML (runs their scripts)*.
-* *Screenshot width* and *Screenshot height*: the size of the browser window, for every mode.
+* *Browser used to render pages*: the browser for the screenshot modes.
+  Leave it empty to find a supported browser automatically.
+* *Screenshot width* and *Screenshot height*: the size of the browser window.
 
 The console comparison (`--cli` with HTML files, or with `-t web`) uses the last mode that you
-chose in the window:
+chose in the window. It does not use a browser:
 
 * Formatted (the default) compares the Markdown of the pages line by line.
 * HTML source compares the HTML.
 * The other modes compare the visible text.
 
-NOTE: The Resource tree mode compares the HTML as the server sends it.
-The other modes run the scripts of the page when a browser is used.
+NOTE: Only the screenshot modes run the scripts of the page.
 Logins are not supported, so a page that needs a login can show its login page.
 No mode saves changes to a web server.
 
@@ -2426,9 +2419,8 @@ Folder::
 *Skip hidden files and folders*, *Date tolerance (seconds)* and
 *Worker threads (0 = automatic)*.
 Image / Binary / Web::
-*Bytes per line (binary)*, *Browser used to render pages*,
-*Render pages in the browser for text and HTML (runs their scripts)*, *Screenshot width* and
-*Screenshot height*. The screenshot size is the size of the browser window, for every web mode.
+*Bytes per line (binary)*, *Browser used to render pages*, *Screenshot width* and
+*Screenshot height*. The screenshot size is the size of the browser window.
 Plugins::
 The unpacker plugins (see <<unpackers>>).
 
@@ -2649,11 +2641,9 @@ The screenshot modes need Edge, Chrome, Chromium or Brave.
 Set the browser in *Options → Image / Binary / Web*.
 
 A web comparison is missing content that the browser shows::
-Check that a browser is found and that
-*Render pages in the browser for text and HTML (runs their scripts)* is on.
-Without them, Text, Formatted and HTML source use the HTML from the server, without the content that
-scripts add.
-The Resource tree mode always uses the HTML from the server.
+The Text, HTML source, Formatted and Resource tree modes use the HTML from the server, without the
+content that scripts add.
+Use a screenshot mode to see that content.
 Content inside frames is not included.
 The status bar counts the resources that could not be downloaded, and the resources that were
 skipped because they are on this computer or on a private network.
@@ -2685,7 +2675,8 @@ content (see <<compare-methods>>).
 * Unpacker plugins use external commands. WinMerge plugin DLLs and scripts are not supported.
 * Web page comparison does not support cookies or logins. A page that needs a login shows its login
   page.
-  Without a Chromium-based browser, page scripts do not run, so content that they add is missing.
+  Only the screenshot modes run page scripts. In the other modes, content that scripts add is
+  missing.
   Content inside frames is not compared.
 * Semantic comparison cannot write changes back to the files.
 * The translations were made with the help of machines and have not been reviewed by native

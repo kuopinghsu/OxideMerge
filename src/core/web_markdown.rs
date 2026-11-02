@@ -813,6 +813,34 @@ pub fn html_to_blocks(html: &str, base: Option<&Url>) -> Vec<Block> {
     c.blocks
 }
 
+/// The tokens of the text and elements a page shows: hidden elements and elements without text
+/// to show, such as `<head>` and `<select>`, are left out as in [`html_to_blocks`].
+pub(super) fn visible_tokens(html: &str) -> Vec<Token<'_>> {
+    let mut out = Vec::new();
+    let mut skip: Vec<String> = Vec::new();
+    let mut opened = OpenElements::default();
+    for tok in tokens(html) {
+        if !skip.is_empty() && skipped(&mut skip, &tok, |name| opened.contains(name)) {
+            continue;
+        }
+        match &tok {
+            Token::Text(_) => {}
+            Token::Tag(name, attrs, false) => {
+                if SKIP.contains(&name.as_str()) || is_hidden(attrs) {
+                    if !VOID.contains(&name.as_str()) && !attrs.trim_end().ends_with('/') {
+                        skip.push(name.clone());
+                    }
+                    continue;
+                }
+                opened.start(name.clone(), attrs);
+            }
+            Token::Tag(name, _, true) => opened.end(name),
+        }
+        out.push(tok);
+    }
+    out
+}
+
 /// Elements open outside the elements left out, as far as [`MAX_OPEN_DEPTH`] deep.
 #[derive(Default)]
 struct OpenElements {

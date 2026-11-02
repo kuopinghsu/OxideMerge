@@ -1,11 +1,10 @@
-//! Renders web pages in a headless browser (over the DevTools protocol) so they are compared as
-//! the user sees them: after scripts have run, as visible text laid out in blocks, as the live
-//! DOM, or as screenshots of the visible area or the whole page with text differences
-//! highlighted on the page itself (like WinMerge's "View Differences").
+//! Renders web pages in a headless browser (over the DevTools protocol) for the screenshot
+//! modes: screenshots of the visible area or the whole page as the user sees it, after scripts
+//! have run, with text differences highlighted on the page itself (like WinMerge's "View
+//! Differences").
 
 use crate::core::cdp::{self, Browser};
-use crate::core::web::{self, Page, Progress, WebMode};
-use crate::core::web_markdown;
+use crate::core::web::Progress;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use similar::{Algorithm, DiffTag, TextDiff};
@@ -46,11 +45,6 @@ pub struct Rendered {
     pub status: u16,
     /// Visible text, one block (paragraph, heading, list item, table cell, line...) per entry.
     pub blocks: Vec<String>,
-    /// The DOM after scripts have run.
-    pub html: String,
-    /// The body as shown, without the elements the page hides and with absolute links and
-    /// image addresses: what its Markdown is made from.
-    pub visible_html: String,
     /// PNG screenshot.
     pub shot: Option<Vec<u8>>,
     /// Whether the page was taller than the full size screenshot.
@@ -59,25 +53,6 @@ pub struct Rendered {
     pub marked: usize,
     /// Why the page could not be shown (fully); the others are shown all the same.
     pub error: Option<String>,
-}
-
-impl Rendered {
-    /// The page as Markdown blocks; links are made absolute against its address, else `asked`.
-    pub fn markdown(&self, asked: Option<&Url>) -> Vec<web_markdown::Block> {
-        let html = if self.visible_html.is_empty() {
-            &self.html
-        } else {
-            &self.visible_html
-        };
-        web_markdown::html_to_blocks(html, self.url.as_ref().or(asked))
-    }
-
-    /// The visible text, one block per line.
-    pub fn text(&self) -> String {
-        let mut s = self.blocks.join("\n");
-        s.push('\n');
-        s
-    }
 }
 
 /// Collects the visible text of the page into blocks and remembers, for each block, which text
@@ -121,7 +96,7 @@ const EXTRACT_JS: &str = r#"(() => {
     return el.value || '';
   };
   const root = document.body || document.documentElement;
-  if (!root) return { url: location.href, html: '', visible: '', blocks: [] };
+  if (!root) return { url: location.href, blocks: [] };
   // The tree as rendered: open shadow roots instead of their hosts' children, and the nodes
   // assigned to a slot instead of its fallback content.
   const children = n => {
@@ -182,31 +157,8 @@ const EXTRACT_JS: &str = r#"(() => {
   }
   flush();
   window.__oxidemergeBlocks = blocks;
-  // The body as shown: a copy without what is hidden, its links and images made absolute.
-  const copy = root.cloneNode(true);
-  const absolute = (sel, prop, attr) => {
-    const o = root.querySelectorAll(sel), c = copy.querySelectorAll(sel);
-    for (let i = 0; i < o.length && i < c.length; i++) if (o[i][prop]) c[i].setAttribute(attr, o[i][prop]);
-  };
-  absolute('a[href]', 'href', 'href');
-  absolute('img', 'currentSrc', 'src');
-  const prune = (o, c) => {
-    const oc = o.childNodes, cc = c.childNodes;
-    for (let i = Math.min(oc.length, cc.length) - 1; i >= 0; i--) {
-      const n = oc[i];
-      if (n.nodeType !== 1) continue;
-      if (SKIP.has(tag(n)) || !shown(n) || style(n).v === 'hidden') c.removeChild(cc[i]);
-      else prune(n, cc[i]);
-    }
-  };
-  prune(root, copy);
-  const dt = document.doctype;
-  const doctype = dt ? '<!DOCTYPE ' + dt.name + (dt.publicId ? ' PUBLIC "' + dt.publicId + '"' : '') +
-    (dt.systemId ? (dt.publicId ? ' ' : ' SYSTEM ') + '"' + dt.systemId + '"' : '') + '>\n' : '';
   return {
     url: location.href,
-    html: wf(doctype + document.documentElement.outerHTML),
-    visible: wf(copy.outerHTML),
     blocks: blocks.map(b => wf(b.text)),
   };
 })()"#;
@@ -419,74 +371,6 @@ fn session_of(v: &Value) -> Option<&str> {
     v.get("sessionId").and_then(Value::as_str)
 }
 
-/// Pages for the text and HTML modes.
-pub enum TextSource {
-    /// As the browser shows them, after their scripts have run.
-    Rendered(Vec<Rendered>),
-    /// As downloaded, without running their scripts; with why the browser was not used, when
-    /// it failed.
-    Downloaded(Vec<Page>, Option<String>),
-}
-
-impl TextSource {
-    /// The visible text, the HTML or the Markdown of each page, as `mode` shows them.
-    pub fn texts(&self, mode: WebMode) -> Vec<String> {
-        match self {
-            TextSource::Rendered(r) => r
-                .iter()
-                .map(|r| match mode {
-                    WebMode::Html => web::format_html(&r.html),
-                    WebMode::Markdown => web_markdown::to_text(&r.markdown(None)),
-                    _ => r.text(),
-                })
-                .collect(),
-            TextSource::Downloaded(pages, _) => pages
-                .iter()
-                .map(|p| match mode {
-                    WebMode::Html => web::format_html(&p.html),
-                    WebMode::Markdown => {
-                        web_markdown::to_text(&web_markdown::html_to_blocks(&p.html, Some(&p.url)))
-                    }
-                    _ => web::html_to_text(&p.html),
-                })
-                .collect(),
-        }
-    }
-}
-
-/// The pages for the text and HTML modes: rendered by `browser` when there is one, otherwise,
-/// or when rendering fails, as downloaded. Stopping (`progress.abort`) is an error either way.
-pub fn load_text(
-    browser: Option<&Path>,
-    urls: &[Url],
-    width: u32,
-    height: u32,
-    progress: &Progress,
-) -> Result<TextSource> {
-    let failed = match browser {
-        None => None,
-        Some(exe) => {
-            let opts = RenderOptions {
-                width,
-                height,
-                capture: Capture::None,
-                highlight: false,
-            };
-            match render(exe, urls, &opts, progress) {
-                Ok(r) => match r.iter().find_map(|r| r.error.clone()) {
-                    None => return Ok(TextSource::Rendered(r)),
-                    Some(e) => Some(e),
-                },
-                Err(_) if progress.abort.load(Ordering::Relaxed) => {
-                    bail!("{}", crate::i18n::tr("msg.aborted"))
-                }
-                Err(e) => Some(format!("{e:#}")),
-            }
-        }
-    };
-    Ok(TextSource::Downloaded(web::fetch_pages(urls)?, failed))
-}
-
 /// Loads every page in its own tab of one headless browser and extracts, marks and captures
 /// them. `progress.done` counts finished pages. A page that fails keeps its error in
 /// [`Rendered::error`] (with a blank screenshot); the others are shown all the same.
@@ -615,8 +499,6 @@ pub fn render(
                     .collect()
             })
             .unwrap_or_default();
-        r.html = v["html"].as_str().unwrap_or_default().to_string();
-        r.visible_html = v["visible"].as_str().unwrap_or_default().to_string();
     }
     if opts.capture == Capture::None {
         progress.done.store(urls.len(), Ordering::Relaxed);
@@ -803,32 +685,6 @@ mod tests {
         found
     }
 
-    #[test]
-    fn text_falls_back_to_the_pages_as_downloaded() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("a.html");
-        std::fs::write(&p, "<p>Hello</p>").unwrap();
-        let urls = [
-            Url::from_file_path(&p).unwrap(),
-            Url::from_file_path(&p).unwrap(),
-        ];
-        let progress = Progress::default();
-        // No browser: downloaded, and nothing to report.
-        let source = load_text(None, &urls, 800, 600, &progress).unwrap();
-        assert!(matches!(source, TextSource::Downloaded(_, None)));
-        // A browser that can't start: downloaded, saying why.
-        let missing = d.path().join("no-such-browser");
-        let source = load_text(Some(&missing), &urls, 800, 600, &progress).unwrap();
-        let TextSource::Downloaded(pages, Some(why)) = source else {
-            panic!("expected the pages as downloaded");
-        };
-        assert_eq!(pages.len(), 2);
-        assert!(why.contains("no-such-browser"), "{why}");
-        // Stopped: an error, not the downloaded pages.
-        progress.abort.store(true, Ordering::Relaxed);
-        assert!(load_text(Some(&missing), &urls, 800, 600, &progress).is_err());
-    }
-
     /// Renders two pages in a real browser (see [`test_browser`]).
     #[test]
     fn renders_pages_in_a_browser() {
@@ -889,20 +745,6 @@ mod tests {
                 "Shadow slotted",
                 "From script"
             ])
-        );
-        assert!(text[1].html.contains("<p>From script</p>"));
-        // Markdown leaves out what the page hides, also by its style sheets, and makes links
-        // absolute.
-        let md = web_markdown::to_text(&text[0].markdown(None));
-        assert!(
-            md.contains("# Hello\nThe **quick** brown fox\ntall\n"),
-            "{md}"
-        );
-        assert!(md.contains(&format!("end [next]({b})")), "{md}");
-        assert!(md.contains("From script"), "{md}");
-        assert!(
-            !md.contains("hidden") && !md.contains("styled away"),
-            "{md}"
         );
         for capture in [Capture::Viewport, Capture::FullPage] {
             let shots = render(

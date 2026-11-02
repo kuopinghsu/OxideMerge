@@ -1,20 +1,19 @@
 //! Web page compare: loads pages in the background, then shows them as screenshots of the visible
-//! area or the whole page with text differences highlighted (image view), rendered text or HTML
-//! (text view), Markdown shown formatted, or a downloaded resource tree (folder view). Text, HTML
-//! and Markdown are taken from the page as the browser renders it when a browser is available,
-//! else from the page as downloaded.
+//! area or the whole page with text differences highlighted (image view), text or HTML (text
+//! view), Markdown shown formatted, or a downloaded resource tree (folder view). Only the
+//! screenshots need a browser; the other modes convert the pages as downloaded.
 
 use crate::config::Config;
 use crate::core::filter::FltFilter;
 use crate::core::text::TextDoc;
 use crate::core::web::{self, Page, Progress, WebMode};
 use crate::core::web_markdown;
-use crate::core::web_render::{self, Capture, RenderOptions, Rendered, TextSource};
+use crate::core::web_render::{self, Capture, RenderOptions, Rendered};
 use crate::i18n::{tr, trf};
 use crate::ui::app::Content;
 use crate::ui::folder_view::FolderView;
 use crate::ui::image_view::ImageView;
-use crate::ui::markdown_view::MarkdownView;
+use crate::ui::markdown_view::{MarkdownView, Prepared};
 use crate::ui::text_view::TextView;
 use crate::ui::widgets::{self, Icon, Outcome};
 use egui::Ui;
@@ -26,15 +25,13 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 enum Loaded {
-    /// Pages as downloaded for the text and HTML modes, with why the browser was not used when
-    /// it failed.
-    Pages(Arc<Vec<Page>>, Option<String>),
-    /// Pages rendered by the browser, with their screenshots saved in the folder when taken.
-    Rendered(
-        Arc<Vec<Rendered>>,
-        Option<(tempfile::TempDir, Vec<PathBuf>)>,
-    ),
+    /// Pages downloaded for the text and HTML modes, with the text shown of each.
+    Pages(Arc<Vec<Page>>, Vec<String>),
+    /// Pages rendered by the browser, with their screenshots saved in the folder.
+    Rendered(Vec<Rendered>, tempfile::TempDir, Vec<PathBuf>),
     Tree(Arc<Vec<Page>>, Vec<tempfile::TempDir>, web::TreeOutcome),
+    /// Pages downloaded for the formatted mode, already lined up and compared.
+    Formatted(Arc<Vec<Page>>, Box<Prepared>),
 }
 
 struct Job {
@@ -46,14 +43,9 @@ struct Job {
 pub struct WebView {
     pub urls: Vec<Url>,
     pub mode: WebMode,
-    /// Pages fetched for the HTML, text and resource modes, reused when switching between them.
+    /// Pages fetched for the formatted, HTML, text and resource modes, reused when switching
+    /// between them.
     pages: Option<Arc<Vec<Page>>>,
-    /// Pages rendered by the browser, reused by the text and HTML modes while rendered the
-    /// same way (see [`RenderKey`]).
-    rendered: Option<(RenderKey, Arc<Vec<Rendered>>)>,
-    /// Set when the text and HTML modes show `pages` as downloaded, with why the browser was not
-    /// used when it failed; switching between the two modes then keeps to them.
-    downloaded_text: Option<Option<String>>,
     /// Whether screenshots show text differences highlighted.
     pub highlight: bool,
     pub inner: Option<Box<Content>>,
@@ -63,13 +55,6 @@ pub struct WebView {
     error: Option<String>,
     shots: Option<tempfile::TempDir>,
     note: String,
-}
-
-/// The settings pages are rendered with: browser, width and height.
-type RenderKey = (String, u32, u32);
-
-fn render_key(cfg: &Config) -> RenderKey {
-    (cfg.web_browser.clone(), cfg.web_width, cfg.web_height)
 }
 
 impl Drop for WebView {
@@ -130,8 +115,6 @@ impl WebView {
             urls,
             mode: cfg.web_mode,
             pages: None,
-            rendered: None,
-            downloaded_text: None,
             highlight: cfg.web_highlight,
             inner: None,
             formatted: None,
@@ -151,8 +134,6 @@ impl WebView {
     /// Fetches the pages again and redraws the current mode.
     pub fn reload(&mut self, cfg: &Config) {
         self.pages = None;
-        self.rendered = None;
-        self.downloaded_text = None;
         self.start(cfg);
     }
 
@@ -176,48 +157,39 @@ impl WebView {
         let progress = Arc::new(Progress::default());
         let urls = self.urls.clone();
         let cached = self.pages.clone();
+        let fetching = progress.clone();
         let pages = move || -> anyhow::Result<Arc<Vec<Page>>> {
             match cached {
                 Some(p) => Ok(p),
-                None => web::fetch_pages(&urls).map(Arc::new),
+                None => web::fetch_pages(&urls, &fetching.abort).map(Arc::new),
             }
         };
         let (w, h) = (cfg.web_width, cfg.web_height);
         let render_urls = self.urls.clone();
         match self.mode {
-            WebMode::Html | WebMode::Text | WebMode::Markdown => {
-                let key = render_key(cfg);
-                let rendered = self
-                    .rendered
-                    .clone()
-                    .filter(|(k, _)| cfg.web_render && *k == key);
-                let browser = cfg
-                    .web_render
-                    .then(|| web::find_browser(&cfg.web_browser))
-                    .flatten();
-                // Pages downloaded because rendering failed stay so; those downloaded without
-                // a browser are rendered once there is one.
-                let downloaded = self
-                    .downloaded_text
-                    .clone()
-                    .filter(|failed| failed.is_some() || browser.is_none());
-                if let Some((_, r)) = rendered {
-                    let _ = tx.send(Ok(Loaded::Rendered(r, None)));
-                } else if let (Some(p), Some(failed)) = (self.pages.clone(), downloaded) {
-                    let _ = tx.send(Ok(Loaded::Pages(p, failed)));
-                } else {
-                    let pr = progress.clone();
-                    std::thread::spawn(move || {
-                        let r = web_render::load_text(browser.as_deref(), &render_urls, w, h, &pr)
-                            .map(|source| match source {
-                                TextSource::Rendered(r) => Loaded::Rendered(Arc::new(r), None),
-                                TextSource::Downloaded(p, failed) => {
-                                    Loaded::Pages(Arc::new(p), failed)
-                                }
-                            });
-                        let _ = tx.send(r);
+            WebMode::Markdown => {
+                // The downloaded HTML as Markdown: no browser is needed.
+                let opts = cfg.comparison_options();
+                std::thread::spawn(move || {
+                    let r = pages().map(|pages| {
+                        let blocks = pages
+                            .iter()
+                            .map(|p| web_markdown::html_to_blocks(&p.html, Some(&p.url)))
+                            .collect();
+                        Loaded::Formatted(pages, Box::new(Prepared::new(blocks, &opts)))
                     });
-                }
+                    let _ = tx.send(r);
+                });
+            }
+            WebMode::Html | WebMode::Text => {
+                let mode = self.mode;
+                std::thread::spawn(move || {
+                    let r = pages().map(|pages| {
+                        let texts = pages.iter().map(|p| web::page_text(p, mode)).collect();
+                        Loaded::Pages(pages, texts)
+                    });
+                    let _ = tx.send(r);
+                });
             }
             WebMode::Screenshot | WebMode::FullScreenshot => {
                 let Some(exe) = web::find_browser(&cfg.web_browser) else {
@@ -245,7 +217,7 @@ impl WebView {
                             std::fs::write(&p, r.shot.take().unwrap_or_default())?;
                             paths.push(p);
                         }
-                        Ok(Loaded::Rendered(Arc::new(rendered), Some((dir, paths))))
+                        Ok(Loaded::Rendered(rendered, dir, paths))
                     })();
                     let _ = tx.send(r);
                 });
@@ -290,49 +262,19 @@ impl WebView {
 
     fn show(&mut self, loaded: Loaded, cfg: &Config, named: &[FltFilter]) -> anyhow::Result<()> {
         let content = match loaded {
-            Loaded::Pages(pages, failed) if self.mode == WebMode::Markdown => {
-                let blocks = pages
-                    .iter()
-                    .map(|p| web_markdown::html_to_blocks(&p.html, Some(&p.url)))
-                    .collect();
-                self.formatted = Some(MarkdownView::new(
-                    blocks,
-                    pages.iter().map(label).collect(),
-                    &cfg.comparison_options(),
-                ));
+            Loaded::Formatted(pages, prepared) => {
+                let labels = pages.iter().map(label).collect();
+                self.formatted = Some(MarkdownView::from_prepared(*prepared, labels));
                 self.pages = Some(pages);
-                if let Some(e) = &failed {
-                    self.note = trf("web.fallback", &[("error", e.clone())]);
-                }
-                self.downloaded_text = Some(failed);
                 return Ok(());
             }
-            Loaded::Rendered(rendered, None) if self.mode == WebMode::Markdown => {
-                let blocks = rendered
-                    .iter()
-                    .zip(&self.urls)
-                    .map(|(r, u)| r.markdown(Some(u)))
-                    .collect();
-                let labels = rendered
-                    .iter()
-                    .zip(&self.urls)
-                    .map(|(r, u)| rendered_label(r, u))
-                    .collect();
-                self.formatted = Some(MarkdownView::new(blocks, labels, &cfg.comparison_options()));
-                self.rendered = Some((render_key(cfg), rendered));
-                return Ok(());
-            }
-            Loaded::Pages(pages, failed) => {
+            Loaded::Pages(pages, texts) => {
                 let html = self.mode == WebMode::Html;
                 let docs = pages
                     .iter()
-                    .map(|p| {
-                        let text = if html {
-                            web::format_html(&p.html)
-                        } else {
-                            web::html_to_text(&p.html)
-                        };
-                        let mut d = TextDoc::from_text(None, &text);
+                    .zip(&texts)
+                    .map(|(p, text)| {
+                        let mut d = TextDoc::from_text(None, text);
                         d.read_only = true;
                         d.description = Some(label(p));
                         d.syntax = html.then(|| "html".into());
@@ -340,13 +282,9 @@ impl WebView {
                     })
                     .collect();
                 self.pages = Some(pages);
-                if let Some(e) = &failed {
-                    self.note = trf("web.fallback", &[("error", e.clone())]);
-                }
-                self.downloaded_text = Some(failed);
                 Content::Text(TextView::new(docs, cfg))
             }
-            Loaded::Rendered(rendered, Some((dir, paths))) => {
+            Loaded::Rendered(rendered, dir, paths) => {
                 let mut v = ImageView::load(paths, cfg)?;
                 v.descriptions = rendered
                     .iter()
@@ -370,30 +308,7 @@ impl WebView {
                 }
                 self.note = notes.join(" · ");
                 self.shots = Some(dir);
-                // The text and HTML modes can show these pages without loading them again.
-                self.rendered = Some((render_key(cfg), rendered));
                 Content::Image(v)
-            }
-            Loaded::Rendered(rendered, None) => {
-                let html = self.mode == WebMode::Html;
-                let docs = rendered
-                    .iter()
-                    .zip(&self.urls)
-                    .map(|(r, u)| {
-                        let text = if html {
-                            web::format_html(&r.html)
-                        } else {
-                            r.text()
-                        };
-                        let mut d = TextDoc::from_text(None, &text);
-                        d.read_only = true;
-                        d.description = Some(rendered_label(r, u));
-                        d.syntax = html.then(|| "html".into());
-                        d
-                    })
-                    .collect();
-                self.rendered = Some((render_key(cfg), rendered));
-                Content::Text(TextView::new(docs, cfg))
             }
             Loaded::Tree(pages, temps, outcome) => {
                 let roots = temps.iter().map(|t| t.path().to_path_buf()).collect();
