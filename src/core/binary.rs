@@ -50,19 +50,26 @@ pub fn parse_pattern(query: &str) -> Option<Vec<u8>> {
     if let Some(t) = q.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
         return (!t.is_empty()).then(|| t.as_bytes().to_vec());
     }
-    let digits: String = q
+    parse_hex(q).or_else(|| Some(q.as_bytes().to_vec()))
+}
+
+/// Bytes written in hexadecimal, such as `DE AD BE EF`, `deadbeef` or `0xDE 0xAD`; `None` for
+/// anything else, including an odd number of digits.
+pub fn parse_hex(text: &str) -> Option<Vec<u8>> {
+    let digits: String = text
         .split_whitespace()
         .map(|w| w.strip_prefix("0x").or(w.strip_prefix("0X")).unwrap_or(w))
         .collect();
-    let hex = digits.len().is_multiple_of(2) && digits.bytes().all(|b| b.is_ascii_hexdigit());
-    if hex {
-        (0..digits.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).ok())
-            .collect()
-    } else {
-        Some(q.as_bytes().to_vec())
+    let hex = !digits.is_empty()
+        && digits.len().is_multiple_of(2)
+        && digits.bytes().all(|b| b.is_ascii_hexdigit());
+    if !hex {
+        return None;
     }
+    (0..digits.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).ok())
+        .collect()
 }
 
 /// An offset typed as decimal, or as hex with a `0x` prefix, an `h` suffix or hex letters.
@@ -121,6 +128,10 @@ mod tests {
         assert_eq!(parse_pattern("hello"), Some(b"hello".to_vec()));
         assert_eq!(parse_pattern("abc"), Some(b"abc".to_vec()));
         assert_eq!(parse_pattern("  "), None);
+        assert_eq!(parse_hex(" de AD\n0xbe "), Some(vec![0xDE, 0xAD, 0xBE]));
+        assert_eq!(parse_hex("abc"), None);
+        assert_eq!(parse_hex("hello"), None);
+        assert_eq!(parse_hex(""), None);
 
         assert_eq!(parse_offset("0x10"), Some(16));
         assert_eq!(parse_offset("10h"), Some(16));

@@ -176,11 +176,12 @@ impl MarkdownView {
         next.map(|d| self.go(d)).is_some()
     }
 
-    /// Steps to the last difference before the cursor row.
+    /// Steps to the last difference before the cursor row, or the last one without a cursor.
     pub fn prev_diff(&mut self) -> bool {
-        let prev = self
-            .cursor
-            .and_then(|r| self.diffs.iter().rposition(|d| d.start < r));
+        let prev = match self.cursor {
+            Some(r) => self.diffs.iter().rposition(|d| d.start < r),
+            None => self.diffs.len().checked_sub(1),
+        };
         prev.map(|d| self.go(d)).is_some()
     }
 
@@ -254,12 +255,14 @@ impl MarkdownView {
             if widgets::icon_button_enabled(ui, any, Icon::First, &Cmd::FirstDiff.tip()).clicked() {
                 self.first_diff();
             }
-            if widgets::icon_button(ui, Icon::Prev, &Cmd::PrevDiff.tip()).clicked()
+            if widgets::icon_button_hint(ui, Icon::Prev, &Cmd::PrevDiff.tip(), tr("tip.nav_diff"))
+                .clicked()
                 && !self.prev_diff()
             {
                 self.step_file = Some(false);
             }
-            if widgets::icon_button(ui, Icon::Next, &Cmd::NextDiff.tip()).clicked()
+            if widgets::icon_button_hint(ui, Icon::Next, &Cmd::NextDiff.tip(), tr("tip.nav_diff"))
+                .clicked()
                 && !self.next_diff()
             {
                 self.step_file = Some(true);
@@ -997,10 +1000,14 @@ mod tests {
         let left = vec![block("a"), block("b"), block("c"), block("d")];
         let right = vec![block("a"), block("B"), block("c"), block("D"), block("e")];
         let opts = DiffOptions::default();
-        let mut v = MarkdownView::new(vec![left, right], vec!["l".into(), "r".into()], &opts);
+        let pages = vec![left, right];
+        // Without a cursor, previous goes to the last difference, as in the other views.
+        let mut back = MarkdownView::new(pages.clone(), Vec::new(), &opts);
+        assert!(back.prev_diff());
+        assert_eq!(back.cur, Some(2));
+        let mut v = MarkdownView::new(pages, vec!["l".into(), "r".into()], &opts);
         assert_eq!(v.diffs, [1..2, 3..4, 4..5]);
         assert_eq!(v.outcome(), Outcome::Different);
-        assert!(!v.prev_diff());
         assert!(v.next_diff());
         assert_eq!((v.cur, v.cursor, v.scroll_to), (Some(0), Some(1), Some(1)));
         assert!(v.next_diff());

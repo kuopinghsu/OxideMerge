@@ -185,17 +185,38 @@ impl Table {
         value: &str,
         delim: char,
     ) -> Result<String, String> {
+        self.replace_cells(record, &[(column, value)], delim)
+    }
+
+    /// The source with several cells of one record replaced at once.
+    pub fn replace_cells(
+        &self,
+        record: usize,
+        cells: &[(usize, &str)],
+        delim: char,
+    ) -> Result<String, String> {
         let record = self.records.get(record).ok_or("Record no longer exists")?;
-        let span = record.fields.get(column).ok_or("Column no longer exists")?;
-        let quoted =
-            self.source[span.clone()].starts_with('"') || value.contains([delim, '"', '\r', '\n']);
-        let replacement = if quoted {
-            format!("\"{}\"", value.replace('"', "\"\""))
-        } else {
-            value.to_string()
-        };
+        let mut spans = cells
+            .iter()
+            .map(|&(column, value)| {
+                let span = record.fields.get(column).ok_or("Column no longer exists")?;
+                Ok((span.clone(), value))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        // Last first, so the spans before stay where they are.
+        spans.sort_unstable_by_key(|(span, _)| std::cmp::Reverse(span.start));
+        spans.dedup_by_key(|(span, _)| span.start);
         let mut source = self.source.clone();
-        source.replace_range(span.clone(), &replacement);
+        for (span, value) in spans {
+            let quoted = self.source[span.clone()].starts_with('"')
+                || value.contains([delim, '"', '\r', '\n']);
+            let replacement = if quoted {
+                format!("\"{}\"", value.replace('"', "\"\""))
+            } else {
+                value.to_string()
+            };
+            source.replace_range(span, &replacement);
+        }
         Ok(source)
     }
 

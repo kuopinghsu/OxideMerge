@@ -12,6 +12,7 @@ pub mod image_view;
 mod macos;
 pub mod markdown_view;
 pub mod palette;
+pub mod sync_dialog;
 pub mod syntax;
 pub mod text_view;
 pub mod theme;

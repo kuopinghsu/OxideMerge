@@ -97,6 +97,28 @@ impl FileFilter {
         }
     }
 
+    /// Whether some file or folder could be left out, so a folder compare may not list all.
+    pub fn excludes_anything(&self) -> bool {
+        match self {
+            FileFilter::Mask {
+                includes,
+                excludes,
+                dir_excludes,
+            } => {
+                !excludes.is_empty()
+                    || !dir_excludes.is_empty()
+                    || !(includes.is_empty() || includes.iter().any(|r| r.as_str() == "^.*$"))
+            }
+            FileFilter::Flt(f) => {
+                !(f.default_include
+                    && f.files.is_empty()
+                    && f.dirs.is_empty()
+                    && f.file_except.is_empty()
+                    && f.dir_except.is_empty())
+            }
+        }
+    }
+
     /// `rel_path` uses '/' separators and is relative to the compared root.
     pub fn include_file(&self, rel_path: &str, name: &str) -> bool {
         match self {

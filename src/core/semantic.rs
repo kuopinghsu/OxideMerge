@@ -1,11 +1,15 @@
-//! Opt-in read-only structured comparison. Text ignore rules are deliberately not applied.
+//! Opt-in structured comparison of two files, or of three in [`three_way`]. Text ignore rules
+//! are deliberately not applied. Comparing changes nothing; [`write`] copies a value from one
+//! file into the other.
 use super::analysis;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Range;
 pub mod json;
+pub mod three_way;
 pub mod toml_doc;
+pub mod write;
 pub mod xml;
 pub mod yaml_doc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +93,12 @@ pub struct Change {
     /// that an insertion may have shifted. To be checked by hand.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ambiguous: bool,
+    /// The path of the node on each side, or on a side without it, where it would go.
+    #[serde(skip)]
+    pub at: [String; 2],
+    /// The structure of the node on each side, which equal values share however written.
+    #[serde(skip)]
+    pub prints: [Option<String>; 2],
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SemanticReport {
@@ -242,30 +252,29 @@ struct Walk<'a> {
     budget: usize,
 }
 impl Walk<'_> {
-    /// Records a change of `path` between `a` and `b`, charged against the report budget.
+    /// Records a change between `a` at `at[0]` and `b` at `at[1]`, charged against the report
+    /// budget. Its path is where it is on the second side, or else where it was on the first.
     fn push(
         &mut self,
-        path: &str,
+        at: [&str; 2],
         from: Option<String>,
         kind: ChangeKind,
         [a, b]: [Option<&Node>; 2],
         pairing: Pairing,
     ) -> Result<()> {
-        let cost = path.len()
+        let path = if b.is_some() { at[1] } else { at[0] };
+        let cost = at[0].len()
+            + at[1].len()
             + a.map_or(0, |node| node.span.bytes.len())
             + b.map_or(0, |node| node.span.bytes.len())
-            + 256;
+            + 384;
         if cost > self.budget {
             bail!("Semantic changes exceed the 32 MiB comparison budget; use Text view");
         }
         self.budget -= cost;
+        let prints = [a.map(node_fingerprint), b.map(node_fingerprint)];
         self.changes.push(Change {
-            id: analysis::identity(&(
-                path,
-                &from,
-                a.map(node_fingerprint),
-                b.map(node_fingerprint),
-            )),
+            id: analysis::identity(&(path, &from, &prints[0], &prints[1])),
             path: path.into(),
             from,
             kind,
@@ -274,17 +283,19 @@ impl Walk<'_> {
             spans: [a.map(|n| n.span.clone()), b.map(|n| n.span.clone())],
             confidence: pairing.confidence.into(),
             ambiguous: pairing.ambiguous,
+            at: at.map(str::to_owned),
+            prints,
         });
         Ok(())
     }
     fn node(
         &mut self,
-        path: &str,
+        at: [&str; 2],
         a: Option<&Node>,
         b: Option<&Node>,
         mut pairing: Pairing,
     ) -> Result<()> {
-        if path.len() > 4096 {
+        if at.iter().any(|path| path.len() > 4096) {
             bail!("Semantic path exceeds 4 KiB; use Text view");
         }
         let kind = match (a, b) {
@@ -295,7 +306,7 @@ impl Walk<'_> {
             _ => None,
         };
         if let Some(kind) = kind {
-            return self.push(path, None, kind, [a, b], pairing);
+            return self.push(at, None, kind, [a, b], pairing);
         }
         let (Some(a), Some(b)) = (a, b) else {
             return Ok(());
@@ -305,20 +316,21 @@ impl Walk<'_> {
             match array_pairs(&xs, &ys, self.options) {
                 Pairs::Keyed(pairs) => {
                     pairing.confidence = "array_key";
-                    return self.array(path, &xs, &ys, &pairs, pairing);
+                    return self.array(at, &xs, &ys, &pairs, pairing);
                 }
                 Pairs::Reordered(pairs) => {
                     pairing.confidence = "reordered";
-                    return self.array(path, &xs, &ys, &pairs, pairing);
+                    return self.array(at, &xs, &ys, &pairs, pairing);
                 }
                 Pairs::Position => {
                     let records = || xs.iter().chain(&ys).any(|n| n.kind == "object");
                     if let Some(key) = &self.options.array_key {
                         if !xs.is_empty() && !ys.is_empty() && records() {
                             self.note(format!(
-                                "Array matching key {key:?} not used at {path}: not every \
+                                "Array matching key {key:?} not used at {}: not every \
                                  element has a unique scalar value for it, so elements are \
-                                 compared by position."
+                                 compared by position.",
+                                at[1]
                             ));
                         }
                     }
@@ -338,7 +350,7 @@ impl Walk<'_> {
             .collect::<std::collections::BTreeSet<_>>()
         {
             self.node(
-                &format!("{path}{key}"),
+                [&format!("{}{key}", at[0]), &format!("{}{key}", at[1])],
                 a.children.get(key),
                 b.children.get(key),
                 pairing,
@@ -353,10 +365,11 @@ impl Walk<'_> {
     }
     /// Compares arrays whose elements are paired: an element out of the order of the others is
     /// moved, unpaired elements are added or removed, and paired elements are compared member
-    /// by member.
+    /// by member. An unpaired element would go on the other side after the counterpart of the
+    /// nearest paired element before it.
     fn array(
         &mut self,
-        path: &str,
+        [path_a, path_b]: [&str; 2],
         xs: &[&Node],
         ys: &[&Node],
         pairs: &[(usize, usize)],
@@ -382,33 +395,47 @@ impl Walk<'_> {
         let paired_old: std::collections::BTreeSet<_> = pairs.iter().map(|&(i, _)| i).collect();
         let paired_new: std::collections::BTreeSet<_> = pairs.iter().map(|&(_, j)| j).collect();
         let mut next = by_new.iter().peekable();
+        // one past the last first-side element paired so far
+        let mut after = 0;
         for (j, y) in ys.iter().enumerate() {
-            let here = format!("{path}[{j}]");
+            let here = format!("{path_b}[{j}]");
             if !paired_new.contains(&j) {
-                self.node(&here, None, Some(y), pairing)?;
+                self.node(
+                    [&format!("{path_a}[{after}]"), &here],
+                    None,
+                    Some(y),
+                    pairing,
+                )?;
                 continue;
             }
             let &(_, i, stays, could_stay) = next.next().expect("paired element");
+            after = after.max(i + 1);
+            let there = format!("{path_a}[{i}]");
             if !stays {
                 let duplicated = seen.get(&node_fingerprint(xs[i])).is_some_and(|&n| n > 1);
                 let moved = Pairing {
                     ambiguous: pairing.ambiguous || could_stay || duplicated,
                     ..pairing
                 };
-                let from = Some(format!("{path}[{i}]"));
                 self.push(
-                    &here,
-                    from,
+                    [&there, &here],
+                    Some(there.clone()),
                     ChangeKind::Moved,
                     [Some(xs[i]), Some(y)],
                     moved,
                 )?;
             }
-            self.node(&here, Some(xs[i]), Some(y), pairing)?;
+            self.node([&there, &here], Some(xs[i]), Some(y), pairing)?;
         }
+        let mut pairs = pairs.iter().peekable();
+        let mut after = 0;
         for (i, x) in xs.iter().enumerate() {
+            while let Some(&(_, j)) = pairs.next_if(|&&(paired, _)| paired < i) {
+                after = after.max(j + 1);
+            }
             if !paired_old.contains(&i) {
-                self.node(&format!("{path}[{i}]"), Some(x), None, pairing)?;
+                let at = [format!("{path_a}[{i}]"), format!("{path_b}[{after}]")];
+                self.node([&at[0], &at[1]], Some(x), None, pairing)?;
             }
         }
         Ok(())
@@ -680,7 +707,7 @@ pub fn compare_with(a: &str, b: &str, format: Format, options: &Options) -> Sema
             notes: Vec::new(),
             budget: analysis::MAX_REPORT,
         };
-        if let Err(error) = walk.node("$", Some(a), Some(b), BY_PATH) {
+        if let Err(error) = walk.node(["$", "$"], Some(a), Some(b), BY_PATH) {
             report.errors.push(error.to_string());
             return report;
         }
@@ -1208,6 +1235,87 @@ mod tests {
                 assert!(r.errors.is_empty() || !r.identical());
             }
         }
+    }
+
+    #[test]
+    fn fixed_seed_fuzzing_copies_every_change_until_the_sides_agree() {
+        let mut rng = Rng(0x0C0F_FEE5);
+        let keyed = Options {
+            array_key: Some("id".into()),
+        };
+        let (mut copies, mut yaml_copies, mut yaml_refused) = (0, 0, 0);
+        for round in 0..150 {
+            let doc = value(&mut rng, 0);
+            let mut other = doc.clone();
+            let mut paths = Vec::new();
+            leaves(&doc, "$".into(), &mut paths);
+            for _ in 0..3 {
+                if let Some(path) = paths.get(rng.below(paths.len().max(1))) {
+                    edit(&mut other, path, "$", &mut rng);
+                }
+            }
+            shuffle_a_list(&mut other, &mut rng);
+            let fresh = value(&mut rng, 0);
+            for b in [json(&other, &mut rng), json(&fresh, &mut rng)] {
+                for options in [Options::default(), keyed.clone()] {
+                    for from in [0, 1] {
+                        let mut docs = [json(&doc, &mut rng), b.clone()];
+                        let mut steps = 0;
+                        loop {
+                            let r = compare_with(&docs[0], &docs[1], Format::Json, &options);
+                            assert!(r.errors.is_empty(), "{round}: {:?}", r.errors);
+                            let Some(change) =
+                                r.changes.iter().find(|c| c.kind != ChangeKind::Moved)
+                            else {
+                                break;
+                            };
+                            let copied = write::copy_change(
+                                change,
+                                [&docs[0], &docs[1]],
+                                Format::Json,
+                                from,
+                            )
+                            .unwrap_or_else(|e| panic!("{round}: {e:?} {change:?}\n{docs:?}"));
+                            docs[1 - from] = copied;
+                            copies += 1;
+                            steps += 1;
+                            assert!(steps < 200, "{round}: {docs:?}");
+                        }
+                        // JSON is YAML too, where an escaped string has no span to copy
+                        let mut docs = [json(&doc, &mut rng), b.clone()];
+                        for _ in 0..200 {
+                            let r = compare_with(&docs[0], &docs[1], Format::Yaml, &options);
+                            let Some(change) =
+                                r.changes.iter().find(|c| c.kind != ChangeKind::Moved)
+                            else {
+                                break;
+                            };
+                            match write::copy_change(
+                                change,
+                                [&docs[0], &docs[1]],
+                                Format::Yaml,
+                                from,
+                            ) {
+                                Ok(text) => {
+                                    docs[1 - from] = text;
+                                    yaml_copies += 1;
+                                }
+                                Err(write::Refusal::NoEdit) => {
+                                    yaml_refused += 1;
+                                    break;
+                                }
+                                Err(e) => panic!("{round}: {e:?} {change:?}\n{docs:?}"),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(copies > 1000, "{copies} copies");
+        assert!(
+            yaml_copies > 10 * yaml_refused,
+            "{yaml_copies} copies, {yaml_refused} refused"
+        );
     }
 
     /// The scalar of `v` at the semantic `path`.

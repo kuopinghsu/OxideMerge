@@ -1,0 +1,19 @@
+{
+  "paths": [
+    "orders-left.csv",
+    "orders-right.csv"
+  ],
+  "table": {
+    "header": true,
+    "keys": [
+      {
+        "name": "order_id"
+      }
+    ],
+    "columns": "name",
+    "ignore_order": true,
+    "abs_tolerance": 0.01,
+    "rel_tolerance": 0.0,
+    "order": "key"
+  }
+}

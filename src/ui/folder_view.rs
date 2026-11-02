@@ -5,18 +5,20 @@ use crate::core::diff::DiffOptions;
 use crate::core::filter::{FileFilter, FltFilter};
 use crate::core::folder::{self, CmpStatus, DirItem, FolderOptions, Progress, Scanner};
 use crate::core::folder_merge::{self, Step};
+use crate::core::folder_sync;
 use crate::core::patch::{self, PatchStyle};
 use crate::core::report::{self, fmt_size, fmt_time, side_name, status_text, ReportFormat};
 use crate::core::rules::{self, RuleDraft};
 use crate::core::text::{self, FileKind, TextDoc};
 use crate::i18n::{tr, trf};
 use crate::ui::commands::Cmd;
+use crate::ui::sync_dialog::SyncDialog;
 use crate::ui::text_view::TextView;
 use crate::ui::theme::{self, Colors};
 use crate::ui::widgets::{self, Icon, Outcome};
 use egui::{vec2, Align, Color32, FontId, Key, Layout, Margin, Modifiers, Sense, Stroke, Ui};
 use egui_extras::{Column, TableBuilder};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -354,9 +356,19 @@ pub struct FolderView {
     finished: Option<Duration>,
     /// The item shown in the docked file compare, and how far its compare has got.
     dock: Option<(usize, Dock)>,
-    /// An item stepped to from the end of the previous file, and whether its docked compare
-    /// starts at the first difference (or the last) once it loads.
-    dock_land: Option<(usize, bool)>,
+    /// Where the docked compare of the item it is loading opens.
+    dock_land: Option<Land>,
+    /// Counts changes of the items or of how they are listed.
+    list_gen: u64,
+    /// The file and difference under the cursor among those next and previous stop at.
+    nav_text: Option<String>,
+    /// The way the last step went, for skipping a file that cannot be shown.
+    dock_forward: bool,
+    /// The last step went through open conflicts only.
+    dock_conflicts: bool,
+    /// The files next and previous step through, in order, while the list and the options
+    /// it depends on stay the same.
+    stops: std::cell::RefCell<Option<(StopsKey, std::rc::Rc<Stops>)>>,
     /// A message for the status bar, until the app takes it.
     notice: Option<&'static str>,
     /// Text of the "select by name" dialog while it is open.
@@ -369,6 +381,8 @@ pub struct FolderView {
     file_job: Option<(JoinHandle<OpResult>, bool)>,
     /// Set to stop the auto merge running as `file_job`, which then undoes what it changed.
     merge_stop: Option<Arc<AtomicBool>>,
+    /// The synchronization of the two folders being previewed or applied.
+    sync: Option<Box<SyncDialog>>,
     /// Sides nothing may be copied to or deleted from, such as an extracted Git revision.
     pub read_only: Vec<bool>,
     /// Compare rules file used (a name or path, "" = none); read again on every refresh.
@@ -410,10 +424,65 @@ const DOCK_DELAY: Duration = Duration::from_millis(150);
 
 enum Dock {
     Waiting(Instant),
-    Loading(std::sync::mpsc::Receiver<Option<Box<TextView>>>),
+    Loading(std::sync::mpsc::Receiver<DockLoad>),
     /// The compare, or `None` when the item is not a text file, with the files' modification
     /// times and when they were last checked, to load it again when a file is saved.
     Ready(Option<Box<TextView>>, Vec<Option<SystemTime>>, Instant),
+    /// The files could not be read.
+    Failed(String),
+}
+
+/// The docked compare of a file, `None` when it is not a text file, or why it failed.
+type DockLoad = Result<Option<Box<TextView>>, String>;
+
+/// Where the docked compare of the item it is loading opens: at its first or last difference,
+/// or the difference it showed before it was loaded again, then moved on by the next (+1) and
+/// previous (-1) steps asked for while it loaded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Land {
+    item: usize,
+    at: LandAt,
+    steps: isize,
+    /// Open conflicts only: a file without one is passed over.
+    conflicts: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LandAt {
+    First,
+    Last,
+    Nth(usize),
+}
+
+impl Land {
+    fn new(item: usize, first: bool) -> Self {
+        Land {
+            item,
+            at: if first { LandAt::First } else { LandAt::Last },
+            steps: 0,
+            conflicts: false,
+        }
+    }
+
+    fn conflict(item: usize, first: bool) -> Self {
+        Land {
+            conflicts: true,
+            ..Land::new(item, first)
+        }
+    }
+}
+
+/// What the files stepped through depend on besides the list: tree mode and the status chips.
+type StopsKey = (u64, bool, bool, bool, [bool; 3]);
+
+/// The order next and previous go through items in, and the files they stop at.
+struct Stops {
+    /// The files stopped at, in order.
+    files: Vec<usize>,
+    /// The place of each item in the order, by item; `None` for an item not in it.
+    rank: Vec<Option<usize>>,
+    /// The item of each path in the order.
+    item: HashMap<String, usize>,
 }
 
 /// How often the docked file compare checks whether its files changed.
@@ -437,48 +506,51 @@ fn may_dock(it: &DirItem) -> bool {
 
 /// The sides of `it` as read-only documents for the docked file compare, or `None` when it
 /// is not a text file small enough to show.
-fn load_dock_docs(it: &DirItem, roots: &[PathBuf], opts: &DiffOptions) -> Option<Vec<TextDoc>> {
+/// The files of `it` for the docked compare: `None` when it is not a text file.
+fn load_dock_docs(
+    it: &DirItem,
+    roots: &[PathBuf],
+    opts: &DiffOptions,
+) -> Result<Option<Vec<TextDoc>>, String> {
     let n = roots.len();
     if !may_dock(it) {
-        return None;
+        return Ok(None);
     }
-    (0..n)
-        .map(|s| {
-            let p = it.path(&roots[s]);
-            let mut d = if it.exists[s] {
-                if crate::core::unpacker::find(&opts.unpackers, &p).is_none()
-                    && text::detect_kind(&p) == FileKind::Binary
-                {
-                    return None;
-                }
-                crate::core::unpacker::load_doc(&p, &opts.unpackers, None).ok()?
-            } else {
-                let mut d = TextDoc::empty(None);
-                d.description = Some(format!("{} — {}", p.display(), tr("peek.missing")));
-                d
-            };
-            d.read_only = true;
-            Some(d)
-        })
-        .collect()
+    let mut docs = Vec::with_capacity(n);
+    for (s, root) in roots.iter().enumerate() {
+        let p = it.path(root);
+        let mut d = if it.exists[s] {
+            if crate::core::unpacker::find(&opts.unpackers, &p).is_none()
+                && text::detect_kind(&p) == FileKind::Binary
+            {
+                return Ok(None);
+            }
+            crate::core::unpacker::load_doc(&p, &opts.unpackers, None)
+                .map_err(|e| format!("{}: {e}", p.display()))?
+        } else {
+            let mut d = TextDoc::empty(None);
+            d.description = Some(format!("{} — {}", p.display(), tr("peek.missing")));
+            d
+        };
+        d.read_only = true;
+        docs.push(d);
+    }
+    Ok(Some(docs))
 }
 
 /// The read-only compare of `it` for the docked file compare, when it is a text file. It reads
 /// and diffs the files, so it runs on another thread.
-fn load_dock_view(
-    it: &DirItem,
-    roots: &[PathBuf],
-    cfg: &Config,
-    dopts: &DiffOptions,
-) -> Option<Box<TextView>> {
-    let docs = load_dock_docs(it, roots, dopts)?;
+fn load_dock_view(it: &DirItem, roots: &[PathBuf], cfg: &Config, dopts: &DiffOptions) -> DockLoad {
+    let Some(docs) = load_dock_docs(it, roots, dopts)? else {
+        return Ok(None);
+    };
     let cfg = Config {
         diff: dopts.clone(),
         ..cfg.clone()
     };
     let mut v = TextView::new(docs, &cfg);
     v.keys_enabled = false;
-    Some(Box::new(v))
+    Ok(Some(Box::new(v)))
 }
 
 /// Case-insensitive ordering without allocating lowercase copies.
@@ -675,12 +747,18 @@ impl FolderView {
             finished: None,
             dock: None,
             dock_land: None,
+            dock_forward: true,
+            dock_conflicts: false,
+            list_gen: 0,
+            nav_text: None,
+            stops: Default::default(),
             notice: None,
             select_pattern: None,
             merge_job: None,
             merge_plan: None,
             file_job: None,
             merge_stop: None,
+            sync: None,
             read_only: Vec::new(),
             rules: cfg.rules.clone(),
             rules_found: false,
@@ -745,6 +823,7 @@ impl FolderView {
         self.workspace.current = Some(path.clone());
         self.workspace.entries.insert(path, decision);
         self.view_key = None;
+        self.list_gen += 1;
     }
 
     pub fn save_review(&self, path: &Path, selected_only: bool) -> anyhow::Result<()> {
@@ -938,6 +1017,7 @@ impl FolderView {
         self.anchor = None;
         self.cursor = None;
         self.view_key = None;
+        self.list_gen += 1;
         self.status.clear();
     }
 
@@ -1004,6 +1084,9 @@ impl FolderView {
         if let Some(stop) = &self.merge_stop {
             stop.store(true, Ordering::Relaxed);
         }
+        if let Some(sync) = &self.sync {
+            sync.stop();
+        }
     }
 
     fn poll(&mut self) {
@@ -1019,6 +1102,7 @@ impl FolderView {
             self.elapsed = Some(r.started.elapsed());
             self.selected.retain(|&i| i < self.items.len());
             self.view_key = None;
+            self.list_gen += 1;
             self.peek_cache = None;
             if self.failed {
                 self.status = tr("status.error").into();
@@ -1054,6 +1138,7 @@ impl FolderView {
         let panes = self.n();
         folder::aggregate(&mut self.items, panes);
         self.view_key = None;
+        self.list_gen += 1;
     }
 
     // ---------- visibility & sorting ----------
@@ -1156,6 +1241,7 @@ impl FolderView {
         if cfg.tree_mode && self.sort.0 == Col::Folder {
             self.sort = (Col::Name, true);
             self.view_key = None;
+            self.list_gen += 1;
         }
         let key = (
             cfg.tree_mode,
@@ -1173,6 +1259,7 @@ impl FolderView {
     }
 
     fn rebuild_visible(&mut self, cfg: &Config) {
+        self.list_gen += 1;
         (self.tallies, self.total) = Tally::of(&self.items, self.n());
         let item = |at: Option<usize>| at.and_then(|v| self.visible.get(v).copied());
         let (cursor, anchor) = (item(self.cursor), item(self.anchor));
@@ -1219,16 +1306,6 @@ impl FolderView {
             .collect()
     }
 
-    /// The items stepping between files goes through: those listed, as if every folder were
-    /// expanded.
-    fn step_order(&self, cfg: &Config) -> Vec<usize> {
-        if self.review_filtering() {
-            self.review_list(cfg)
-        } else {
-            self.display_order(cfg, true)
-        }
-    }
-
     /// Listed items in display order; with `expand_all`, as if every folder were expanded.
     fn display_order(&self, cfg: &Config, expand_all: bool) -> Vec<usize> {
         if !cfg.tree_mode {
@@ -1259,38 +1336,149 @@ impl FolderView {
         !it.is_dir && matches!(it.status, CmpStatus::Different | CmpStatus::Unique)
     }
 
-    /// The file with differences listed after (or before) the item at `rel`, in display order,
-    /// also when the review filter leaves that item out.
-    pub fn adjacent_different_file(&self, cfg: &Config, rel: &str, forward: bool) -> Option<usize> {
-        // the review filter lists a part of the flat list, in its order
-        let (order, listed) = if self.review_filtering() {
-            let listed: HashSet<usize> = self.review_list(cfg).into_iter().collect();
+    /// A text file of a three-way compare that both sides changed, unlike the middle and each
+    /// other: the files next and previous conflict look for open conflicts in.
+    fn may_conflict(&self, i: usize) -> bool {
+        let it = &self.items[i];
+        self.n() == 3
+            && !it.is_dir
+            && !it.binary
+            && it.status == CmpStatus::Different
+            && it.diff_side.is_none()
+            && it.exists.iter().all(|&e| e)
+    }
+
+    /// The order next and previous go through items in: as listed with every folder
+    /// expanded, or the flat list for the review filter; with the files the review filter
+    /// lists, which alone are stopped at.
+    fn step_base(&self, cfg: &Config) -> (Vec<usize>, Option<HashSet<usize>>) {
+        if self.review_filtering() {
+            let listed = self.review_list(cfg).into_iter().collect();
             (self.flat_list(cfg), Some(listed))
         } else {
             (self.display_order(cfg, true), None)
-        };
-        let pos = order
-            .iter()
-            .position(|&i| self.items[i].rel_path() == rel)?;
-        let fits = |i: &&usize| {
-            self.is_different_file(**i) && listed.as_ref().is_none_or(|l| l.contains(*i))
-        };
+        }
+    }
+
+    /// The files next and previous stop at: the changed files listed, in display order.
+    fn stops(&self, cfg: &Config) -> std::rc::Rc<Stops> {
+        let key = (
+            self.list_gen,
+            cfg.tree_mode,
+            cfg.show_identical,
+            cfg.show_different,
+            cfg.show_unique,
+        );
+        if let Some((k, stops)) = &*self.stops.borrow() {
+            if *k == key {
+                return stops.clone();
+            }
+        }
+        let (order, listed) = self.step_base(cfg);
+        let mut rank = vec![None; self.items.len()];
+        let mut item = HashMap::with_capacity(order.len());
+        for (r, &i) in order.iter().enumerate() {
+            rank[i] = Some(r);
+            item.insert(self.items[i].rel_path(), i);
+        }
+        let files = order
+            .into_iter()
+            .filter(|&i| {
+                self.is_different_file(i) && listed.as_ref().is_none_or(|l| l.contains(&i))
+            })
+            .collect();
+        let stops = std::rc::Rc::new(Stops { files, rank, item });
+        *self.stops.borrow_mut() = Some((key, stops.clone()));
+        stops
+    }
+
+    /// The file with differences listed after (or before) the item at `rel`, in display order,
+    /// also when the review filter leaves that item out.
+    pub fn adjacent_different_file(&self, cfg: &Config, rel: &str, forward: bool) -> Option<usize> {
+        self.adjacent_stop(cfg, rel, forward, false)
+    }
+
+    /// As [`Self::adjacent_different_file`], among the files that may have open conflicts.
+    pub fn adjacent_conflict_file(&self, cfg: &Config, rel: &str, forward: bool) -> Option<usize> {
+        self.adjacent_stop(cfg, rel, forward, true)
+    }
+
+    fn adjacent_stop(
+        &self,
+        cfg: &Config,
+        rel: &str,
+        forward: bool,
+        conflicts: bool,
+    ) -> Option<usize> {
+        let s = self.stops(cfg);
+        let pos = s.rank[*s.item.get(rel)?]?;
+        let wanted = |i: &&usize| !conflicts || self.may_conflict(**i);
         if forward {
-            order[pos + 1..].iter().find(fits).copied()
+            let after = s.files.partition_point(|&i| s.rank[i] <= Some(pos));
+            s.files[after..].iter().find(wanted).copied()
         } else {
-            order[..pos].iter().rev().find(fits).copied()
+            let before = s.files.partition_point(|&i| s.rank[i] < Some(pos));
+            s.files[..before].iter().rev().find(wanted).copied()
         }
     }
 
     /// The first (or last) file with differences, in display order.
     fn edge_different_file(&self, cfg: &Config, first: bool) -> Option<usize> {
-        let order = self.step_order(cfg);
-        let differs = |i: &&usize| self.is_different_file(**i);
+        let stops = &self.stops(cfg).files;
         if first {
-            order.iter().find(differs).copied()
+            stops.first().copied()
         } else {
-            order.iter().rev().find(differs).copied()
+            stops.last().copied()
         }
+    }
+
+    /// "File 8 / 42" for item `item` among the files next and previous stop at, or
+    /// "File 8 · Scanning…" while the count may still grow.
+    fn stop_label(&self, cfg: &Config, item: Option<usize>) -> String {
+        let stops = &self.stops(cfg).files;
+        let pos = item.and_then(|item| stops.iter().position(|&i| i == item));
+        let n = pos.map_or("–".to_string(), |p| (p + 1).to_string());
+        if self.running.is_some() {
+            format!("{} · {}", trf("nav.file", &[("n", n)]), tr("nav.scanning"))
+        } else {
+            trf(
+                "nav.file_of",
+                &[("n", n), ("total", stops.len().to_string())],
+            )
+        }
+    }
+
+    /// The position of file `rel` among the files next and previous stop at, for the status
+    /// bar of a tab opened from this compare.
+    pub fn file_label(&self, cfg: &Config, rel: &str) -> String {
+        let (dir, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+        let item = self
+            .items
+            .iter()
+            .position(|it| it.name == name && it.rel_dir == dir);
+        self.stop_label(cfg, item)
+    }
+
+    /// The position shown in the status bar: the file under the cursor among the files next
+    /// and previous stop at, and the difference of its docked compare.
+    fn nav_label(&self, cfg: &Config) -> Option<String> {
+        let cur = self.cursor_item()?;
+        if self.items[cur].is_dir {
+            return None;
+        }
+        let mut label = self.stop_label(cfg, Some(cur));
+        if let Some((i, Dock::Ready(Some(v), ..))) = &self.dock {
+            if *i == cur {
+                let (pos, total) = v.diff_position();
+                let n = pos.map_or("–".to_string(), |p| (p + 1).to_string());
+                label.push_str(" · ");
+                label.push_str(&trf(
+                    "nav.diff_of",
+                    &[("n", n), ("total", total.to_string())],
+                ));
+            }
+        }
+        Some(label)
     }
 
     /// The item under the cursor.
@@ -1313,17 +1501,26 @@ impl FolderView {
     /// The item under the cursor, while the docked file compare is still loading it as text.
     fn docking(&self, cfg: &Config) -> Option<usize> {
         let cur = self.cursor_item()?;
-        let ready = matches!(self.dock, Some((i, Dock::Ready(..))) if i == cur);
+        let ready = matches!(self.dock, Some((i, Dock::Ready(..) | Dock::Failed(_))) if i == cur);
         (cfg.folder_file_pane && !ready && may_dock(&self.items[cur])).then_some(cur)
     }
 
     /// Next or previous difference: in the docked file compare, then on to the adjacent file
     /// with differences, which the docked compare opens at its first (or last) difference.
     pub fn step_diff(&mut self, forward: bool, cfg: &Config) {
-        // Moving on before the file shows would skip its differences: it opens at its first
-        // (or last) one instead.
+        self.dock_forward = forward;
+        self.dock_conflicts = false;
+        // Moving on before the file shows would skip its differences: the step waits for it.
         if let Some(cur) = self.docking(cfg) {
-            self.dock_land = Some((cur, forward));
+            let step = if forward { 1 } else { -1 };
+            match &mut self.dock_land {
+                Some(land) if land.item == cur && !land.conflicts => land.steps += step,
+                land => *land = Some(Land::new(cur, forward)),
+            }
+            return;
+        }
+        if matches!(&self.dock, Some((i, Dock::Failed(_))) if Some(*i) == self.cursor_item()) {
+            self.step_file(forward, cfg);
             return;
         }
         let moved = self.docked_text().is_some_and(|v| {
@@ -1342,7 +1539,7 @@ impl FolderView {
     /// with differences.
     pub fn edge_diff(&mut self, first: bool, cfg: &Config) {
         if let Some(cur) = self.docking(cfg) {
-            self.dock_land = Some((cur, first));
+            self.dock_land = Some(Land::new(cur, first));
         } else if let Some(v) = self.docked_text() {
             if first {
                 v.first_diff();
@@ -1353,12 +1550,86 @@ impl FolderView {
             self.step_to(i, first, cfg);
         } else if self.review_filtering() {
             self.notice = Some("msg.no_listed_different_files");
+        } else if self.running.is_some() || self.stopped {
+            self.notice = Some(self.no_more_files(first, false));
         } else {
             self.notice = Some("msg.no_different_files");
         }
     }
 
+    /// What to say when there is no file to step to: the compare may still list more, or
+    /// may have been stopped before it listed them all.
+    pub fn no_more_files(&self, forward: bool, conflicts: bool) -> &'static str {
+        if self.running.is_some() {
+            "msg.no_more_files_yet"
+        } else if self.stopped {
+            "msg.no_more_files_stopped"
+        } else {
+            match (forward, conflicts) {
+                (true, false) => "msg.no_next_file",
+                (false, false) => "msg.no_prev_file",
+                (true, true) => "msg.no_next_conflict_file",
+                (false, true) => "msg.no_prev_conflict_file",
+            }
+        }
+    }
+
+    /// Next or previous open conflict: in the docked file compare, then on through the files
+    /// both sides changed, passing over those without open conflicts once they are loaded.
+    pub fn step_conflict(&mut self, forward: bool, cfg: &Config) {
+        self.dock_forward = forward;
+        self.dock_conflicts = true;
+        if let Some(cur) = self.docking(cfg) {
+            let step = if forward { 1 } else { -1 };
+            match &mut self.dock_land {
+                Some(land) if land.item == cur && land.conflicts => land.steps += step,
+                land => *land = Some(Land::conflict(cur, forward)),
+            }
+            return;
+        }
+        if matches!(&self.dock, Some((i, Dock::Failed(_))) if Some(*i) == self.cursor_item()) {
+            self.step_conflict_file(forward, cfg);
+            return;
+        }
+        let moved = self.docked_text().is_some_and(|v| {
+            if forward {
+                v.next_diff(true)
+            } else {
+                v.prev_diff(true)
+            }
+        });
+        if !moved {
+            self.step_conflict_file(forward, cfg);
+        }
+    }
+
+    fn step_conflict_file(&mut self, forward: bool, cfg: &Config) {
+        self.dock_forward = forward;
+        self.dock_conflicts = true;
+        let next = match self.cursor_item() {
+            Some(i) => self.adjacent_conflict_file(cfg, &self.items[i].rel_path(), forward),
+            None => {
+                let stops = &self.stops(cfg).files;
+                let mut open = stops.iter().copied().filter(|&i| self.may_conflict(i));
+                if forward {
+                    open.next()
+                } else {
+                    open.last()
+                }
+            }
+        };
+        if let Some(i) = next {
+            if self.reveal(i, cfg) && self.docking(cfg) == Some(i) {
+                self.dock_land = Some(Land::conflict(i, forward));
+            }
+        } else {
+            self.notice = Some(self.no_more_files(forward, true));
+        }
+    }
+
     fn step_file(&mut self, forward: bool, cfg: &Config) {
+        self.dock_forward = forward;
+        self.dock_conflicts = false;
         let next = match self.cursor_item() {
             Some(i) => self.adjacent_different_file(cfg, &self.items[i].rel_path(), forward),
             None => self.edge_different_file(cfg, forward),
@@ -1366,11 +1637,7 @@ impl FolderView {
         if let Some(i) = next {
             self.step_to(i, forward, cfg);
         } else {
-            self.notice = Some(if forward {
-                "msg.no_next_file"
-            } else {
-                "msg.no_prev_file"
-            });
+            self.notice = Some(self.no_more_files(forward, false));
         }
     }
 
@@ -1378,7 +1645,7 @@ impl FolderView {
     /// difference.
     fn step_to(&mut self, i: usize, first: bool, cfg: &Config) {
         if self.reveal(i, cfg) && self.docking(cfg) == Some(i) {
-            self.dock_land = Some((i, first));
+            self.dock_land = Some(Land::new(i, first));
         }
     }
 
@@ -1389,14 +1656,45 @@ impl FolderView {
         self.open_action(i, None)
     }
 
+    /// Selects file `rel` without opening it, as a tab of all differences moves to it.
+    pub fn select_rel(&mut self, rel: &str, cfg: &Config) {
+        if self
+            .cursor_item()
+            .is_some_and(|i| self.items[i].rel_path() == rel)
+        {
+            return;
+        }
+        if let Some(i) = self.items.iter().position(|it| it.rel_path() == rel) {
+            self.reveal(i, cfg);
+        }
+    }
+
+    /// The file under the cursor and the difference its docked compare shows.
+    pub fn cursor_position(&self) -> Option<(String, Option<usize>)> {
+        let cur = self.cursor_item()?;
+        let at = match &self.dock {
+            Some((i, Dock::Ready(Some(v), ..))) if *i == cur => v.diff_position().0,
+            _ => None,
+        };
+        Some((self.items[cur].rel_path(), at))
+    }
+
     /// Selects item `i`, expanding its folders and scrolling to it; whether it is listed.
     fn reveal(&mut self, i: usize, cfg: &Config) -> bool {
         let mut p = self.items[i].parent;
+        let mut expanded = false;
         while let Some(pi) = p {
-            self.expanded.insert(self.items[pi].rel_path());
+            expanded |= self.expanded.insert(self.items[pi].rel_path());
             p = self.items[pi].parent;
         }
-        self.rebuild_visible(cfg);
+        if expanded || !self.visible.contains(&i) {
+            // the files stopped at are in order as if every folder were expanded
+            let kept = self.stops.take().filter(|(k, _)| k.0 == self.list_gen);
+            self.rebuild_visible(cfg);
+            if let Some((k, stops)) = kept {
+                *self.stops.borrow_mut() = Some(((self.list_gen, k.1, k.2, k.3, k.4), stops));
+            }
+        }
         let Some(v) = self.visible.iter().position(|&x| x == i) else {
             return false;
         };
@@ -1525,6 +1823,7 @@ impl FolderView {
         let n = self.n();
         folder::aggregate(&mut self.items, n);
         self.view_key = None;
+        self.list_gen += 1;
     }
 
     fn open_action(&self, i: usize, kind: Option<FileKind>) -> Option<FolderAction> {
@@ -1820,6 +2119,7 @@ impl FolderView {
         }
         self.rebuild_visible(cfg);
         self.view_key = None;
+        self.list_gen += 1;
         let first = self.visible.iter().position(|i| self.selected.contains(i));
         self.anchor = first;
         self.cursor = first;
@@ -1935,7 +2235,46 @@ impl FolderView {
 
     /// Whether one of the view's dialogs is open, so the app leaves the keyboard to it.
     pub fn has_dialog(&self) -> bool {
-        self.confirm.is_some() || self.merge_plan.is_some() || self.select_pattern.is_some()
+        self.confirm.is_some()
+            || self.merge_plan.is_some()
+            || self.select_pattern.is_some()
+            || self.sync.is_some()
+    }
+
+    /// Whether a synchronization is changing files now, which quitting would cut short.
+    pub fn syncing(&self) -> bool {
+        self.sync.as_ref().is_some_and(|d| d.busy())
+    }
+
+    /// Whether copying or deleting files is still going on.
+    pub fn has_file_job(&self) -> bool {
+        self.file_job.is_some()
+    }
+
+    /// Opens the preview of synchronizing the two folders, which changes nothing until asked.
+    pub fn request_sync(&mut self) {
+        if self.n() != 2 || self.running.is_some() || self.file_job.is_some() {
+            return;
+        }
+        if self.stopped || !self.whole_tree {
+            self.status = tr("folder_sync.err_incomplete").to_string();
+            return;
+        }
+        let scope = folder_sync::Scope {
+            complete: true,
+            excluded: self.filter.excludes_anything() || self.fopts.skip_hidden,
+            filter: self.filter_spec.clone(),
+            skip_hidden: self.fopts.skip_hidden,
+        };
+        let writable = [self.writable(0), self.writable(1)];
+        self.sync = Some(Box::new(SyncDialog::new(
+            self.items.clone(),
+            self.roots.clone(),
+            self.display_roots.clone(),
+            scope,
+            writable,
+            self.id,
+        )));
     }
 
     fn merge_dialog(&mut self, ui: &Ui, cfg: &Config) {
@@ -2067,7 +2406,7 @@ impl FolderView {
 
     #[cfg(test)]
     fn dock_view(&self, i: usize, cfg: &Config) -> Option<Box<TextView>> {
-        load_dock_view(&self.items[i], &self.roots, cfg, &self.dopts)
+        load_dock_view(&self.items[i], &self.roots, cfg, &self.dopts).unwrap()
     }
 
     /// The item the docked file compare shows once loaded, and its current difference.
@@ -2087,12 +2426,22 @@ impl FolderView {
         let cur = self.cursor_item();
         if cur != self.dock.as_ref().map(|d| d.0) {
             self.dock = cur.map(|i| (i, Dock::Waiting(Instant::now())));
-            self.dock_land = self.dock_land.filter(|&(i, _)| Some(i) == cur);
+            self.dock_land = self.dock_land.filter(|l| Some(l.item) == cur);
         }
-        if let Some((i, Dock::Ready(_, stamp, checked))) = &mut self.dock {
+        if let Some((i, Dock::Ready(view, stamp, checked))) = &mut self.dock {
             if checked.elapsed() >= DOCK_RECHECK {
                 *checked = Instant::now();
                 if mtimes(&self.items[*i], &self.roots) != *stamp {
+                    // Loaded again, it shows the same difference as before.
+                    let at = view.as_ref().and_then(|v| v.diff_position().0);
+                    if let Some(n) = at {
+                        self.dock_land.get_or_insert(Land {
+                            item: *i,
+                            at: LandAt::Nth(n),
+                            steps: 0,
+                            conflicts: false,
+                        });
+                    }
                     let since = Instant::now().checked_sub(DOCK_DELAY);
                     self.dock = Some((*i, Dock::Waiting(since.unwrap_or_else(Instant::now))));
                 }
@@ -2102,11 +2451,11 @@ impl FolderView {
             return;
         };
         let i = *i;
+        let mut step_on = None;
         let next = match state {
             // A file stepped to is wanted at once.
             Dock::Waiting(since)
-                if since.elapsed() >= DOCK_DELAY
-                    || self.dock_land.is_some_and(|(li, _)| li == i) =>
+                if since.elapsed() >= DOCK_DELAY || self.dock_land.is_some_and(|l| l.item == i) =>
             {
                 let (it, roots) = (self.items[i].clone(), self.roots.clone());
                 let (cfg, dopts) = (cfg.clone(), self.dopts.clone());
@@ -2117,13 +2466,42 @@ impl FolderView {
                 Some(Dock::Loading(rx))
             }
             Dock::Loading(rx) => match rx.try_recv() {
-                Ok(mut view) => {
-                    let land = self.dock_land.take().filter(|&(li, _)| li == i);
-                    if let (Some(v), Some((_, first))) = (&mut view, land) {
-                        if first {
-                            v.first_diff();
-                        } else {
-                            v.last_diff();
+                Ok(Ok(mut view)) => {
+                    let land = self.dock_land.take().filter(|l| l.item == i);
+                    if let Some(land) = land {
+                        let first = !matches!(land.at, LandAt::Last);
+                        // passed over, the file leaves every step asked for to the next one
+                        match (&mut view, land.at) {
+                            (Some(v), LandAt::First | LandAt::Last) if land.conflicts => {
+                                if !v.edge_conflict(first) {
+                                    step_on = Some((first, true, land.steps));
+                                }
+                            }
+                            (Some(v), LandAt::First) => v.first_diff(),
+                            (Some(v), LandAt::Last) => v.last_diff(),
+                            (Some(v), LandAt::Nth(n)) => v.go_to_diff(n),
+                            // Not shown as text, so it has no conflicts to stop at.
+                            (None, _) if land.conflicts => {
+                                step_on = Some((first, true, land.steps));
+                            }
+                            (None, _) => {}
+                        }
+                        if let (Some(v), None) = (&mut view, step_on) {
+                            let (n, sign) = (land.steps.abs(), land.steps.signum());
+                            for taken in 0..n {
+                                let forward = sign > 0;
+                                let moved = if forward {
+                                    v.next_diff(land.conflicts)
+                                } else {
+                                    v.prev_diff(land.conflicts)
+                                };
+                                if !moved {
+                                    // this step lands in the next file; the rest go on from there
+                                    let rest = (n - taken - 1) * sign;
+                                    step_on = Some((forward, land.conflicts, rest));
+                                    break;
+                                }
+                            }
                         }
                     }
                     Some(Dock::Ready(
@@ -2132,8 +2510,13 @@ impl FolderView {
                         Instant::now(),
                     ))
                 }
+                Ok(Err(error)) => {
+                    self.dock_land = None;
+                    Some(Dock::Failed(error))
+                }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    Some(Dock::Ready(None, Vec::new(), Instant::now()))
+                    self.dock_land = None;
+                    Some(Dock::Failed(tr("dock.load_failed").to_string()))
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => None,
             },
@@ -2142,7 +2525,18 @@ impl FolderView {
         if let Some(state) = next {
             self.dock = Some((i, state));
         }
-        if !matches!(self.dock, Some((_, Dock::Ready(..)))) {
+        // Steps asked for while the file loaded went past its differences or conflicts.
+        if let Some((forward, conflicts, rest)) = step_on {
+            if conflicts {
+                self.step_conflict_file(forward, cfg);
+            } else {
+                self.step_file(forward, cfg);
+            }
+            if let Some(land) = self.dock_land.as_mut() {
+                land.steps += rest;
+            }
+        }
+        if !matches!(self.dock, Some((_, Dock::Ready(..) | Dock::Failed(_)))) {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
@@ -2152,6 +2546,9 @@ impl FolderView {
         let avail = ui.available_height();
         let rules = self.used_rules().to_string();
         let mut step = None;
+        let mut conflict_step = None;
+        let mut skip = false;
+        let mut retry = false;
         egui::Panel::bottom(self.id.with("dock"))
             .resizable(true)
             .default_size(avail * 0.45)
@@ -2162,6 +2559,7 @@ impl FolderView {
                     v.set_options(&self.dopts);
                     v.ui(ui, cfg, c);
                     step = v.step_file.take();
+                    conflict_step = v.step_conflict.take();
                     if let Some(r) = v.rule_request.take() {
                         self.rule_request = Some(r);
                     }
@@ -2169,6 +2567,17 @@ impl FolderView {
                         let name = report::html_file_name(&v.titles());
                         self.file_report = Some((name, v.html_report_job(&rules)));
                     }
+                }
+                Some((i, Dock::Failed(error))) => {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(ui.available_height() / 3.0);
+                        ui.label(self.items[*i].rel_path());
+                        ui.colored_label(c.ui.warning, error.as_str());
+                        ui.horizontal(|ui| {
+                            retry = ui.button(tr("btn.retry")).clicked();
+                            skip = ui.button(tr("btn.skip")).clicked();
+                        });
+                    });
                 }
                 other => {
                     let key = match other {
@@ -2182,8 +2591,22 @@ impl FolderView {
                     });
                 }
             });
+        if retry {
+            if let Some((i, _)) = self.dock {
+                let since = Instant::now().checked_sub(DOCK_DELAY);
+                self.dock = Some((i, Dock::Waiting(since.unwrap_or_else(Instant::now))));
+            }
+        }
+        if skip && self.dock_conflicts {
+            self.step_conflict_file(self.dock_forward, cfg);
+        } else if skip {
+            self.step_file(self.dock_forward, cfg);
+        }
         if let Some(forward) = step {
             self.step_file(forward, cfg);
+        }
+        if let Some(forward) = conflict_step {
+            self.step_conflict_file(forward, cfg);
         }
     }
 
@@ -2363,9 +2786,12 @@ impl FolderView {
     /// The status line for the status bar: the chips above the list show the counts.
     pub fn status_detail(&self) -> String {
         if self.running.is_some() {
-            return self.status_line();
+            return match &self.nav_text {
+                Some(nav) => format!("{nav}  |  {}", self.status_line()),
+                None => self.status_line(),
+            };
         }
-        let mut parts = Vec::new();
+        let mut parts: Vec<String> = self.nav_text.iter().cloned().collect();
         if let Some(e) = self.elapsed {
             let secs = format!("{:.2}", e.as_secs_f32());
             parts.push(trf("folder.compared_in", &[("s", secs)]));
@@ -2394,6 +2820,7 @@ impl FolderView {
             self.expanded.clear();
         }
         self.view_key = None;
+        self.list_gen += 1;
     }
 
     // ---------- UI ----------
@@ -2505,6 +2932,17 @@ impl FolderView {
                 {
                     self.request_op_copy(1, 0, cfg);
                 }
+                let idle = self.running.is_none() && self.file_job.is_none();
+                if ui
+                    .add_enabled_ui(idle, |ui| {
+                        labelled(ui, Icon::CopyAllRight, tr("cmd.sync_folders"))
+                            .on_hover_text(tr("folder_sync.tip"))
+                    })
+                    .inner
+                    .clicked()
+                {
+                    self.request_sync();
+                }
             } else {
                 let sel = sel && self.writable(1);
                 if widgets::icon_button_enabled(ui, sel, Icon::CopyRight, tr("cmd.copy_from_left"))
@@ -2577,9 +3015,11 @@ impl FolderView {
                 if search.lost_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
                     self.search.clear();
                     self.view_key = None;
+                    self.list_gen += 1;
                 }
                 if search.changed() {
                     self.view_key = None;
+                    self.list_gen += 1;
                 }
 
                 let method_id = self.id.with("method_popup");
@@ -2910,6 +3350,7 @@ impl FolderView {
                 if widgets::secondary_button(ui, tr("btn.clear_search")).clicked() {
                     self.search.clear();
                     self.view_key = None;
+                    self.list_gen += 1;
                 }
             });
             return None;
@@ -2967,6 +3408,7 @@ impl FolderView {
             .bind_policy(&self.dopts, &self.fopts, &self.filter_spec)
         {
             self.view_key = None;
+            self.list_gen += 1;
         }
         if self.running.is_none() {
             if let Some(path) = self.review_resume.take() {
@@ -3015,6 +3457,7 @@ impl FolderView {
                 self.review_fingerprints = None;
                 self.review_checked = true;
                 self.view_key = None;
+                self.list_gen += 1;
             }
         }
         let Some(ui) = ui else { return };
@@ -3053,6 +3496,7 @@ impl FolderView {
                     .changed();
                 if changed {
                     self.view_key = None;
+                    self.list_gen += 1;
                 }
                 if ui.button(tr("workspace.next")).clicked() {
                     let current = self.workspace.current.as_deref();
@@ -3079,6 +3523,7 @@ impl FolderView {
                         self.review_filter = None;
                         self.review_stale_only = false;
                         self.view_key = None;
+                        self.list_gen += 1;
                         self.workspace.current = Some(path);
                         self.reveal(i, cfg);
                     }
@@ -3184,6 +3629,7 @@ impl FolderView {
                 if changed {
                     self.workspace.entries.insert(path, Decision { ..decision });
                     self.view_key = None;
+                    self.list_gen += 1;
                 }
             }
         }
@@ -3248,6 +3694,7 @@ impl FolderView {
         self.poll();
         // Before the header, whose chips show the counts worked out with the list.
         self.update_visible(ui.ctx(), cfg);
+        self.nav_text = self.nav_label(cfg);
         let (refresh, header_action) = self.header_bar(ui, cfg, named);
         if refresh {
             self.refresh(cfg, named);
@@ -3790,6 +4237,7 @@ impl FolderView {
                 (col, true)
             };
             self.view_key = None;
+            self.list_gen += 1;
         }
         if let Some((vi, mods)) = click {
             let idx = self.visible[vi];
@@ -3815,6 +4263,7 @@ impl FolderView {
                 self.expanded.insert(key);
             }
             self.view_key = None;
+            self.list_gen += 1;
         }
         if let Some(i) = double {
             let it = &self.items[i];
@@ -3824,6 +4273,7 @@ impl FolderView {
                     self.expanded.insert(key);
                 }
                 self.view_key = None;
+                self.list_gen += 1;
             } else {
                 result = self.open_action(i, None);
                 self.peek = false;
@@ -3940,6 +4390,12 @@ impl FolderView {
         }
         self.merge_dialog(ui, cfg);
         self.select_pattern_dialog(ui, cfg);
+        if let Some(rescan) = self.sync.as_mut().and_then(|d| d.show(ui)) {
+            self.sync = None;
+            if rescan {
+                self.start_compare();
+            }
+        }
         if let Some(i) = self.cursor.and_then(|v| self.visible.get(v)).copied() {
             if !self.items[i].is_dir {
                 self.workspace.current = Some(self.items[i].rel_path());
@@ -3947,6 +4403,42 @@ impl FolderView {
         }
         result
     }
+}
+
+/// Compares `roots`, then steps from the first file with differences to the last as Next
+/// Difference does without the docked compare, reading the status bar position at each.
+#[cfg(test)]
+pub(crate) fn navigation_bench(roots: &[PathBuf]) -> String {
+    let cfg = Config::default();
+    let display = roots.iter().map(|r| r.display().to_string()).collect();
+    let started = Instant::now();
+    let mut v = FolderView::new(roots.to_vec(), display, Vec::new(), "", &[], &cfg);
+    while v.running.is_some() {
+        std::thread::sleep(Duration::from_millis(2));
+        v.poll();
+    }
+    let compared = started.elapsed();
+    v.rebuild_visible(&cfg);
+    let started = Instant::now();
+    v.edge_diff(true, &cfg);
+    let first = started.elapsed();
+    let mut steps = 1;
+    loop {
+        std::hint::black_box(v.nav_label(&cfg));
+        v.step_diff(true, &cfg);
+        if v.take_notice().is_some() {
+            break;
+        }
+        steps += 1;
+    }
+    let walked = started.elapsed();
+    format!(
+        "{steps} files in {} ms, {:.2} ms a step, first {} ms; compare {} ms",
+        walked.as_millis(),
+        walked.as_secs_f64() * 1000.0 / steps as f64,
+        first.as_millis(),
+        compared.as_millis()
+    )
 }
 
 #[cfg(test)]
@@ -4268,8 +4760,8 @@ mod tests {
         v.edge_diff(true, &cfg);
         assert_eq!(v.take_notice(), Some("msg.no_listed_different_files"));
 
-        // While the docked compare loads a file, a step waits for it, and First or Last is
-        // where it opens.
+        // While the docked compare loads a file, steps wait for it and are all kept, and First
+        // or Last is where it opens.
         v.review_filter = None;
         v.rebuild_visible(&cfg);
         v.edge_diff(true, &cfg);
@@ -4277,14 +4769,321 @@ mod tests {
         cfg.folder_file_pane = true;
         v.step_diff(true, &cfg);
         assert_eq!(v.cursor_item(), Some(a));
-        assert_eq!(v.dock_land, Some((a, true)));
+        assert_eq!(v.dock_land, Some(Land::new(a, true)));
+        v.step_diff(true, &cfg);
+        v.step_diff(true, &cfg);
         v.step_diff(false, &cfg);
-        assert_eq!(v.dock_land, Some((a, false)));
+        assert_eq!(
+            v.dock_land.map(|l| (l.at, l.steps)),
+            Some((LandAt::First, 1))
+        );
         v.edge_diff(false, &cfg);
-        assert_eq!(v.dock_land, Some((a, false)));
+        assert_eq!(v.dock_land, Some(Land::new(a, false)));
         v.edge_diff(true, &cfg);
-        assert_eq!(v.dock_land, Some((a, true)));
+        assert_eq!(v.dock_land, Some(Land::new(a, true)));
         assert_eq!(v.cursor_item(), Some(a));
+    }
+
+    #[test]
+    fn steps_asked_for_while_the_docked_compare_loads_are_all_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let far = |v: [&str; 3]| v.join(&format!("\n{}", "same\n".repeat(12))) + "\n";
+        let files = [
+            ("a.txt", far(["1", "2", "3"]), far(["one", "two", "three"])),
+            ("b.txt", "p\n".to_string(), "q\n".to_string()),
+            ("c.txt", "r\n".to_string(), "s\n".to_string()),
+        ];
+        for (name, left, right) in &files {
+            for (side, text) in [("left", left), ("right", right)] {
+                std::fs::create_dir_all(dir.path().join(side)).unwrap();
+                std::fs::write(dir.path().join(side).join(name), text).unwrap();
+            }
+        }
+        let roots = vec![dir.path().join("left"), dir.path().join("right")];
+        let display = roots.iter().map(|r| r.display().to_string()).collect();
+        let cfg = Config {
+            folder_file_pane: true,
+            ..Config::default()
+        };
+        let mut v = FolderView::new(roots, display, Vec::new(), "", &[], &cfg);
+        while v.running.is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+            v.poll();
+        }
+        v.rebuild_visible(&cfg);
+        let ctx = egui::Context::default();
+        let settle = |v: &mut FolderView| {
+            let start = Instant::now();
+            loop {
+                v.update_dock(&ctx, &cfg);
+                let loading = matches!(v.dock, Some((_, Dock::Waiting(_) | Dock::Loading(_))));
+                if !loading && v.dock_land.is_none() {
+                    return;
+                }
+                assert!(start.elapsed() < Duration::from_secs(20), "never docked");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let docked = |v: &FolderView| v.docked().map(|(rel, at)| (rel, at.map(|a| a + 1)));
+
+        v.edge_diff(true, &cfg);
+        v.step_diff(true, &cfg);
+        v.step_diff(true, &cfg);
+        settle(&mut v);
+        assert_eq!(docked(&v), Some(("a.txt".into(), Some(3))));
+        assert_eq!(
+            v.nav_label(&cfg).as_deref(),
+            Some("File 1 / 3 · Difference 3 / 3")
+        );
+        v.step_diff(true, &cfg);
+        settle(&mut v);
+        assert_eq!(docked(&v), Some(("b.txt".into(), Some(1))));
+        // Back to the last difference of a.txt, then two steps on while it loads: past its
+        // end to b.txt, and past the one difference of b.txt on to c.txt.
+        v.step_diff(false, &cfg);
+        v.step_diff(true, &cfg);
+        v.step_diff(true, &cfg);
+        settle(&mut v);
+        assert_eq!(docked(&v), Some(("c.txt".into(), Some(1))));
+        assert_eq!(v.take_notice(), None);
+        v.step_diff(false, &cfg);
+        settle(&mut v);
+        assert_eq!(docked(&v), Some(("b.txt".into(), Some(1))));
+
+        // A file that cannot be read stops the steps, to retry or skip it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let c = dir.path().join("left/c.txt");
+            std::fs::set_permissions(&c, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::File::open(&c).is_err() {
+                v.step_diff(true, &cfg);
+                settle(&mut v);
+                assert!(matches!(v.dock, Some((_, Dock::Failed(_)))));
+                assert_eq!(v.nav_label(&cfg).as_deref(), Some("File 3 / 3"));
+                v.step_diff(true, &cfg);
+                assert_eq!(v.take_notice(), Some("msg.no_next_file"));
+                v.step_diff(false, &cfg);
+                settle(&mut v);
+                assert_eq!(docked(&v), Some(("b.txt".into(), Some(1))));
+            }
+            std::fs::set_permissions(&c, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+
+    #[test]
+    fn next_conflict_goes_through_open_conflicts_of_the_files_both_sides_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let far = |v: [&str; 2]| v.join(&format!("\n{}", "same\n".repeat(12))) + "\n";
+        // Left, middle, right. b.txt changed on both sides in different places merges
+        // cleanly; c.txt changed on the left only.
+        let files = [
+            (
+                "a.txt",
+                [far(["L1", "L2"]), far(["1", "2"]), far(["R1", "R2"])],
+            ),
+            (
+                "b.txt",
+                [far(["L1", "2"]), far(["1", "2"]), far(["1", "R2"])],
+            ),
+            ("c.txt", ["L\n".into(), "m\n".into(), "m\n".into()]),
+            ("d.txt", ["L\n".into(), "m\n".into(), "R\n".into()]),
+        ];
+        let sides = ["left", "middle", "right"];
+        for (name, texts) in &files {
+            for (side, text) in sides.iter().zip(texts) {
+                std::fs::create_dir_all(dir.path().join(side)).unwrap();
+                std::fs::write(dir.path().join(side).join(name), text).unwrap();
+            }
+        }
+        let roots: Vec<PathBuf> = sides.iter().map(|s| dir.path().join(s)).collect();
+        let display = roots.iter().map(|r| r.display().to_string()).collect();
+        let cfg = Config {
+            folder_file_pane: true,
+            ..Config::default()
+        };
+        let mut v = FolderView::new(roots, display, Vec::new(), "", &[], &cfg);
+        while v.running.is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+            v.poll();
+        }
+        v.rebuild_visible(&cfg);
+        let ctx = egui::Context::default();
+        let settle = |v: &mut FolderView| {
+            let start = Instant::now();
+            loop {
+                v.update_dock(&ctx, &cfg);
+                let loading = matches!(v.dock, Some((_, Dock::Waiting(_) | Dock::Loading(_))));
+                if !loading && v.dock_land.is_none() {
+                    return;
+                }
+                assert!(start.elapsed() < Duration::from_secs(20), "never docked");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let docked = |v: &FolderView| v.docked().map(|(rel, at)| (rel, at.map(|a| a + 1)));
+
+        v.step_conflict(true, &cfg);
+        settle(&mut v);
+        assert_eq!(docked(&v), Some(("a.txt".into(), Some(1))));
+        v.step_conflict(true, &cfg);
+        assert_eq!(docked(&v), Some(("a.txt".into(), Some(2))));
+        // b.txt has no open conflict once loaded, so the step goes on to d.txt.
+        v.step_conflict(true, &cfg);
+        settle(&mut v);
+        assert_eq!(docked(&v), Some(("d.txt".into(), Some(1))));
+        v.step_conflict(true, &cfg);
+        assert_eq!(v.take_notice(), Some("msg.no_next_conflict_file"));
+        assert_eq!(docked(&v), Some(("d.txt".into(), Some(1))));
+        // Back to the last conflict of a.txt, and steps asked for while files load are taken.
+        v.step_conflict(false, &cfg);
+        settle(&mut v);
+        assert_eq!(docked(&v), Some(("a.txt".into(), Some(2))));
+        v.step_conflict(false, &cfg);
+        assert_eq!(docked(&v), Some(("a.txt".into(), Some(1))));
+        v.step_conflict(false, &cfg);
+        assert_eq!(v.take_notice(), Some("msg.no_prev_conflict_file"));
+        // Next difference still stops at every changed file, c.txt too.
+        v.step_diff(true, &cfg);
+        v.step_diff(true, &cfg);
+        settle(&mut v);
+        assert_eq!(docked(&v).map(|d| d.0), Some("b.txt".into()));
+        // From the last conflict of a.txt, two steps while b.txt loads: b.txt has none, so the
+        // first lands in d.txt and the second finds no file after it.
+        v.step_conflict(false, &cfg);
+        settle(&mut v);
+        assert_eq!(docked(&v), Some(("a.txt".into(), Some(2))));
+        v.step_conflict(true, &cfg);
+        v.step_conflict(true, &cfg);
+        settle(&mut v);
+        assert_eq!(docked(&v), Some(("d.txt".into(), Some(1))));
+        assert_eq!(v.take_notice(), Some("msg.no_next_conflict_file"));
+    }
+
+    #[test]
+    fn steps_through_every_kind_of_file_and_files_changed_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let far = |v: [&str; 3]| v.join(&format!("\n{}", "same\n".repeat(12))) + "\n";
+        let png = |shade: u8| [b"\x89PNG\r\n\x1a\n".as_slice(), &[0, shade, 0, 0]].concat();
+        let files: [(&str, Vec<u8>, Vec<u8>); 7] = [
+            ("added.txt", b"a\n".to_vec(), b"a\nb\n".to_vec()),
+            ("bin.dat", vec![0, 1, 2], vec![0, 1, 3]),
+            ("img.png", png(1), png(2)),
+            (
+                "multi.txt",
+                far(["1", "2", "3"]).into_bytes(),
+                far(["one", "two", "three"]).into_bytes(),
+            ),
+            ("only-left.txt", b"x\n".to_vec(), Vec::new()),
+            ("removed.txt", b"a\nb\n".to_vec(), b"a\n".to_vec()),
+            ("same.txt", b"s\n".to_vec(), b"s\n".to_vec()),
+        ];
+        for side in ["left", "right"] {
+            std::fs::create_dir_all(dir.path().join(side)).unwrap();
+        }
+        for (name, left, right) in &files {
+            std::fs::write(dir.path().join("left").join(name), left).unwrap();
+            if *name != "only-left.txt" {
+                std::fs::write(dir.path().join("right").join(name), right).unwrap();
+            }
+        }
+        let roots = vec![dir.path().join("left"), dir.path().join("right")];
+        let display = roots.iter().map(|r| r.display().to_string()).collect();
+        let cfg = Config {
+            folder_file_pane: true,
+            ..Config::default()
+        };
+        let mut v = FolderView::new(roots, display, Vec::new(), "", &[], &cfg);
+        while v.running.is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+            v.poll();
+        }
+        v.rebuild_visible(&cfg);
+        let ctx = egui::Context::default();
+        let settle = |v: &mut FolderView| {
+            let start = Instant::now();
+            loop {
+                v.update_dock(&ctx, &cfg);
+                let loading = matches!(v.dock, Some((_, Dock::Waiting(_) | Dock::Loading(_))));
+                if !loading && v.dock_land.is_none() {
+                    return;
+                }
+                assert!(start.elapsed() < Duration::from_secs(20), "never docked");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let at = |v: &FolderView| {
+            let rel = v.cursor_item().map(|i| v.items[i].rel_path()).unwrap();
+            (rel, v.docked().and_then(|d| d.1).map(|a| a + 1))
+        };
+        let walk = |v: &mut FolderView| {
+            let mut walked = Vec::new();
+            let first = v.edge_different_file(&cfg, true).unwrap();
+            v.step_to(first, true, &cfg);
+            loop {
+                settle(v);
+                walked.push(at(v));
+                v.step_diff(true, &cfg);
+                if let Some(notice) = v.take_notice() {
+                    assert_eq!(notice, "msg.no_next_file");
+                    return walked;
+                }
+                assert!(walked.len() < 20, "{walked:?}");
+            }
+        };
+        let s = |rel: &str, n: Option<usize>| (rel.to_string(), n);
+        assert_eq!(
+            walk(&mut v),
+            [
+                s("added.txt", Some(1)),
+                s("bin.dat", None),
+                s("img.png", None),
+                s("multi.txt", Some(1)),
+                s("multi.txt", Some(2)),
+                s("multi.txt", Some(3)),
+                s("only-left.txt", Some(1)),
+                s("removed.txt", Some(1)),
+            ]
+        );
+        // A compare stopped part way says so at the end of what it listed.
+        v.stopped = true;
+        v.step_diff(true, &cfg);
+        assert_eq!(v.take_notice(), Some("msg.no_more_files_stopped"));
+        v.stopped = false;
+
+        // Since the compare, multi.txt became the same on both sides and only-left.txt went:
+        // the first shows no differences, the second fails to load, and steps go on past both.
+        let right_multi = dir.path().join("right/multi.txt");
+        std::fs::copy(&right_multi, dir.path().join("left/multi.txt")).unwrap();
+        std::fs::remove_file(dir.path().join("left/only-left.txt")).unwrap();
+        let walked = walk(&mut v);
+        assert_eq!(walked.len(), 6, "{walked:?}");
+        assert_eq!(
+            walked[3..],
+            [
+                s("multi.txt", None),
+                s("only-left.txt", None),
+                s("removed.txt", Some(1)),
+            ]
+        );
+        // A docked file changed while shown is loaded again at the same difference.
+        assert_eq!(
+            v.nav_label(&cfg).as_deref(),
+            Some("File 6 / 6 · Difference 1 / 1")
+        );
+        let same = "same\n".repeat(12);
+        std::fs::write(
+            dir.path().join("left/removed.txt"),
+            format!("a\nb\n{same}c\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("right/removed.txt"), format!("a\n{same}")).unwrap();
+        std::thread::sleep(DOCK_RECHECK + Duration::from_millis(100));
+        settle(&mut v);
+        assert_eq!(
+            v.nav_label(&cfg).as_deref(),
+            Some("File 6 / 6 · Difference 1 / 2")
+        );
     }
 
     #[test]

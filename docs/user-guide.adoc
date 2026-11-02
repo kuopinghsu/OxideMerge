@@ -421,7 +421,45 @@ Binary comparisons and the Formatted mode of web page comparisons have a locatio
 
 If you opened the file from a folder comparison, you can continue to other files.
 After the last difference, kbd:[Alt+↓] opens the next file that has differences.
-Before the first difference, kbd:[Alt+↑] opens the previous one.
+Before the first difference, kbd:[Alt+↑] opens the previous one, at its last difference.
+In a three-way folder comparison, kbd:[Alt+PgDn] and kbd:[Alt+PgUp] go on in the same way to the
+next or previous file that still has an open conflict.
+
+Hold the pointer over a navigation button to see what it goes through, its keys, and that it
+stops at the end instead of starting again at the top.
+
+[[folder-navigation]]
+==== Moving through the differences of a folder
+
+In a folder comparison, the same keys work on the file shown below the folder list, and on the
+other files of the folder:
+
+* kbd:[Alt+↓] goes to the next difference of the file. After its last difference, it selects the
+  next file that has differences and goes to its first difference.
+* kbd:[Alt+↑] goes the other way: before the first difference, it goes to the last difference of
+  the previous file.
+* kbd:[Alt+Home] and kbd:[Alt+End] go to the first difference of the first file and the last
+  difference of the last file.
+* The status bar shows where you are, for example _File 2 / 5 · Difference 3 / 7_.
+
+The files are the ones that the folder list shows as different, in the order of the list.
+Binary files are included. Files that could not be read are not.
+At the last difference of the last file, OxideMerge says so; it does not start again at the top.
+
+If you press a key while a file is still loading, OxideMerge remembers it and moves when the file
+is shown, so no difference is skipped. If a file cannot be read, the pane says so and offers
+*Retry* and *Skip*. While the folders are still being compared, more files may follow: the
+message says so instead of ending. If the comparison was stopped, the message at the end says
+that it covers only the files compared.
+
+A file that changed after the comparison is shown as it is now. If it no longer has differences,
+the next step goes on to the next file. A file shown below the list that changes on disk is
+loaded again at the same difference.
+
+In a three-way folder comparison, kbd:[Alt+PgDn] and kbd:[Alt+PgUp] go through the open conflicts
+of the files that both sides changed. A file whose changes merge without conflicts is passed over
+once it is loaded, and a file changed on one side only is not visited. kbd:[Alt+↓] still stops at
+every changed file.
 
 === Copying differences
 
@@ -586,7 +624,45 @@ When you copy a difference in the table view, only its selected lines change.
 If this would break the CSV quoting, OxideMerge refuses the copy and does not change the document.
 In this case, copy cells or use the text view.
 If a quoted record is not valid, the table shows an error; switch to the text view to correct it.
-Matching rows by a key column is not available.
+
+[[table-keys]]
+==== Matching rows by key
+
+By default, the table view pairs records by their position, like lines. When records are
+sorted differently, or some are added or removed, pair them by a key instead.
+In a two-way comparison, the bar above the table has these settings:
+
+*Match rows by*:: *Position* (the default) or *Key columns*.
+*Keys*:: The columns that identify a record, such as `id`. Choose one or more.
+*First row is header*:: Use the first row for column names. It is not compared.
+*Columns by*:: Pair columns by *Position* or by *Header name*, so that reordered columns still match.
+*Ignore row order*:: A record that only moved is not a difference: next and previous difference
+skip it, but it keeps its `↕` mark.
+*Numeric tolerance*:: Numbers this close count as equal. `0.01` is a difference, `1%` a
+fraction of the larger number. Leave it empty to compare exactly.
+*Rows in*:: *Left order* (the default) lists the rows as the left table has them, with records
+only on the right after the record before them. *Right order* follows the right table.
+*Key order* sorts by key: numbers by value, before text, and rows without a key last.
+
+The summary shows how many records were added, removed, modified, reordered and ambiguous.
+The row markers are `+` added, `−` removed, `~` modified, `↕` moved and `?` ambiguous.
+
+* Next and previous difference go through the records that differ.
+* *Copy cell* copies into the paired column of the matching record.
+  Copying a whole record replaces the cells of the matching record, or adds or removes it.
+* A key that is empty, or used by more than one record, is _ambiguous_.
+  Ambiguous records are never copied. *Next ambiguous row* finds them.
+* If a key column is missing on one side, OxideMerge matches by position and says why.
+
+Tables with more than 100,000 records on both sides together are matched in the background. The
+bar shows how many records are done, with *Cancel*. After a cancel, the rows are matched by
+position, and *Match by key* starts again.
+
+HTML and XML reports of a table matched by key say how the rows were matched: the keys, the
+header row, how columns were paired, the row order, the tolerance, the counts and the warnings.
+XML reports hold them in a `<table-match>` element.
+
+The settings are saved in projects. Older projects open with matching by position.
 
 [[git-revision]]
 === Comparing with a Git revision
@@ -798,6 +874,8 @@ From left to right:
 * *Copy to right* and *Copy to left* copy the selected items.
   In a three-way comparison, these buttons are *Copy from left to middle*, *Copy from right to
   middle* and *Auto merge folders...*.
+* *Synchronize folders...*, in a two-way comparison, previews and applies a synchronization
+  (see <<folder-sync>>).
 * *Select by name...* selects the items whose names match wildcards, such as `*.c; *.h`.
 * *All differences* opens all changed text files in one tab (see <<all-differences>>).
 * *Export HTML* saves an HTML report (see <<reports>>).
@@ -911,6 +989,9 @@ The filter and the *Show* settings of the folder comparison apply.
   Click the arrow in a card header to collapse or expand the card.
   The toolbar collapses or expands all cards.
 * kbd:[Alt+↓] and kbd:[Alt+↑] go through the differences of all files.
+  When you open *All differences* from a folder comparison, it starts at the difference that
+  was selected there. A card that is still loading is waited for, not skipped.
+  The status bar shows the position, as in <<folder-navigation>>.
 * The arrows next to a difference copy it to another side.
   In a two-way comparison, the buttons in a card header copy the whole file.
 * *Undo* reverses the last change.
@@ -943,7 +1024,7 @@ In a three-way folder comparison, the middle folder is the base.
 
 ==== Before you start
 
-. In *Options → Folder*, turn on *Include subfolders* and *Include unique subfolders contents*.
+. In *Options → Folder*, turn on *Include subfolders* and *Include contents of unique subfolders*.
 . Let the comparison finish.
 
 IMPORTANT: The merge writes the result into the middle folder.
@@ -984,6 +1065,107 @@ If OxideMerge cannot put a file back, it keeps the undo folder and shows where i
 The `index.txt` file in that folder lists the original path of each copy, so you can restore the
 files by hand.
 
+[[folder-sync]]
+=== Synchronizing two folders
+
+In a two-way folder comparison, *Synchronize folders...* (on the toolbar and in the *Merge* menu)
+makes one folder, the _destination_, match the other, the _source_. You see the plan first.
+Nothing changes until you apply it.
+
+==== Modes
+
+*Mirror left → right*, *Mirror right → left*::
+The destination ends up with the files of the source. New and changed files are copied, and
+files and folders that only the destination has are deleted.
+*Update right from left*, *Update left from right*::
+New and changed files are copied. Nothing is deleted.
+
+A read-only side, such as a Git revision, cannot be the destination.
+OxideMerge decides by the contents (SHA-256), never by a newer modification time alone.
+Files that compared identical but differ in size or time are read to be sure.
+
+==== Before you start
+
+. Turn on *Include subfolders* and *Include contents of unique subfolders* in *Options → Folder*.
+. Let the comparison finish. A stopped comparison cannot be synchronized.
+
+The two folders must be different folders, and neither may be inside the other.
+
+==== The preview
+
+The preview is read-only. It lists each item with its action and the reason:
+
+[cols="1,3"]
+|===
+|Action |Meaning
+
+|Create folder, Copy
+|The item is only in the source.
+
+|Replace
+|The contents differ. The destination file is overwritten.
+
+|Delete, Remove folder
+|The item is only in the destination (mirror only). A folder is removed only when it is empty
+afterwards.
+
+|Skip
+|The item is only in the destination, and the mode is update.
+
+|Conflict
+|OxideMerge leaves the item alone because it is not safe to decide.
+|===
+
+Conflicts are items that cannot be read, symbolic links (never followed or copied), devices,
+a file on one side and a folder on the other, names that differ from another only in letter case
+or in how accents on Latin letters are written (composed or not), and items that changed after
+the comparison.
+
+Click an item for its details: the size and the start of the SHA-256 on each side, and whether
+the action adds to, or overwrites and deletes in, the destination.
+
+A copy whose contents match a file that the plan deletes is a file renamed or moved in the
+source. *Rename* lists such pairs as _old name → new name_, and the copy and the deletion show the
+other name too. They are still applied as a copy and a deletion.
+
+Warnings appear above the list:
+
+* When a filter or the hidden-file setting left items out, a mirror does not delete them,
+  so the destination may not be an exact mirror. A folder that still holds such items is kept.
+* Large deletions are flagged and ask for a second confirmation.
+
+*Export plan...* saves the plan as JSON, with a version number and paths relative to the folders.
+It does not contain the folders' absolute paths. It records the filter, and a SHA-256 of the two
+folder paths, so a plan is applied only to the folders it was made for.
+
+==== Applying the plan
+
+*Apply changes...* asks for confirmation and names the destination. When many items would be
+deleted, you must also tick a box that states their number.
+
+OxideMerge then works in this order: it creates folders, copies and replaces files, deletes files
+and finally removes empty folders. The dialog shows the count and the item being changed. For each item it first checks that the source and the
+destination are still as in the preview. Every file is copied to a temporary file next to its
+destination, checked against the planned SHA-256 and then renamed into place. At the end, all
+copied files are checked again.
+
+If a file changed after the preview, even with the same size and modification time, nothing is
+applied, and the file is named.
+
+==== If something goes wrong
+
+Before it replaces or deletes a file, OxideMerge copies it into a recovery journal in the
+`sync-recovery` folder of the settings folder, never inside the synchronized folders.
+
+* If a change fails, or you click *Stop*, OxideMerge undoes the changes made so far, last first.
+* If a file was changed again meanwhile, OxideMerge does not overwrite it. It reports
+  _Partially applied — recovery required_ and keeps the journal with the copies.
+* If OxideMerge ends before the synchronization finishes, the next start offers to undo it or
+  to keep the folders as they are. Until then, these folders cannot be synchronized again.
+
+IMPORTANT: Applying is not one atomic step for several files. Each file is replaced atomically,
+but another program can see some files already changed. The trash is not used.
+
 [[archives]]
 === Archives
 
@@ -1014,6 +1196,29 @@ Bytes that are different are highlighted, and the sides scroll together.
 
 To change the number of bytes on each line, use *Bytes per line (binary)* in
 *Options → Image / Binary / Web*.
+
+=== Editing bytes
+
+. Click a byte on the side that you want to change.
+  Click in the hexadecimal column to type hexadecimal digits, or in the text column on the right
+  to type characters.
+. Type the new value.
+  In the hexadecimal column, two digits make one byte: the first digit changes the first half of
+  the byte, and the second digit changes the second half.
+  In the text column, each character replaces one byte. Only ASCII characters can be typed.
+. Save with kbd:[Ctrl+S].
+
+By default, typing replaces the bytes at the cursor. To insert bytes instead, press kbd:[Insert]
+or click *Insert* on the toolbar. Typing after the last byte always adds bytes.
+
+* The arrow keys, kbd:[PgUp], kbd:[PgDn], kbd:[Home] and kbd:[End] move the cursor.
+  kbd:[Ctrl+Home] and kbd:[Ctrl+End] go to the start and the end of the file.
+* kbd:[Delete] deletes the byte at the cursor. kbd:[Backspace] deletes the byte before it.
+* Paste (kbd:[Ctrl+V]) in the hexadecimal column writes hexadecimal bytes such as `DE AD BE EF`.
+  Other text is refused there. In the text column, the text is written as it is.
+* kbd:[Ctrl+Z] undoes the typing since you last moved the cursor, or a paste.
+
+Sides that are read-only cannot be changed. Click the lock icon above a side to change this.
 
 [[image-comparison]]
 == Comparing images
@@ -1697,7 +1902,7 @@ For the exact rules of each analysis, see xref:analysis-guide.md[the analysis gu
 
 ==== Text files
 
-In a three-way text comparison, open the *Merge Verification* tab.
+In a three-way text comparison, open the *Merge verification* tab.
 
 .Merge verification after Preview merge
 image::verify.png[Merge verification]
@@ -1743,7 +1948,7 @@ Recommended order: preview the merge, run the merge, then validate the result ag
 
 For JSON, XML, TOML and YAML files, choose *Semantic* to compare the structure instead of the
 lines.
-The semantic view never writes to the files.
+Comparing never writes to the files; only the copy buttons described below change a pane.
 If OxideMerge cannot read a file, the view shows why, and one click takes you back to the text
 view.
 
@@ -1770,7 +1975,8 @@ TOML and YAML::
 * Comments and layout do not count.
 * TOML date-times with a time zone are compared by the moment they name.
   For example, `10:00+02:00` equals `08:00Z`.
-* YAML follows the YAML 1.2 core schema, so `yes` and `on` are text.
+* YAML follows the YAML 1.2 core schema, so `yes` and `on` are text, and `0777` is the number
+  777, not an octal number as YAML 1.1 reads it.
   Keys are compared by value too, so `0x10:` and `16:` are the same key.
 
 Limits:
@@ -1809,6 +2015,35 @@ Check these changes yourself. Examples:
 
 Reports record for each change its `confidence` (`parser_exact`, `array_key`, `reordered` or
 `position`), `ambiguous` when it is set, and its `notes`.
+
+==== Copying values
+
+Each change has *Copy value to left* and *Copy value to right* buttons for the panes that are not
+read-only. A copy replaces the value on the other side, adds it where it belongs, or removes it
+when the source side does not have it.
+
+* Only the text where the value is written changes. Comments, layout and the rest of the file stay
+  as they are.
+* The edited file is read again before the copy is kept. If the result is not exactly the
+  expected structure, nothing changes and the view says why. Edit such a value in the text view.
+* Moves are not copied, because a move changes the order of the whole array.
+* A copy is one step of *Undo*. The file is written only when you save it.
+
+==== Three files
+
+In a three-way comparison, *Semantic* compares the left and right files with the middle one.
+Each path that differs is listed once, by its path in the middle file:
+
+* *Only left differs* or *Only right differs*: one side changed it.
+* *Both differ the same way*: both sides made the same change.
+* *Conflict*: the sides changed it differently, or one side changed a value inside a value that
+  the other side changed. Changes to different members of one object do not conflict. When both
+  sides changed an array whose elements could be paired in more than one way, such as arrays of
+  different lengths paired by position, the whole array is one conflict.
+
+Use the filters to show only the conflicts. *Use left* and *Use right* copy that side's value into
+the middle pane, in the same way as *Copy value*. The middle pane is compared as it is now: after
+you take a side, that path no longer differs from the side you took.
 
 [[review-workspace]]
 === Review workspace
@@ -2021,6 +2256,7 @@ oxidemerge --merge-plan left.txt base.txt right.txt --report merge-plan.json
 oxidemerge --validate-merge merged.txt left.txt base.txt right.txt --report validation.json
 oxidemerge --semantic --format json old.json new.json --report semantic.html
 oxidemerge --semantic --array-key id old.yaml new.yaml
+oxidemerge --semantic left.yaml base.yaml right.yaml --report conflicts.json
 oxidemerge --review-summary review.oxmreview --report review-summary.json
 oxidemerge --baseline-left git:v1.0:/repo --baseline-right git:v1.1:/repo --release-report release.html
 oxidemerge --impact old-folder new-folder --report impact.json
@@ -2061,7 +2297,11 @@ Other notes:
 * `--format` accepts `json`, `xml`, `toml` and `yaml`.
   The default comes from the extension of the first file.
 * Use one analysis option for each run.
-* OxideMerge cannot write structured changes back. Edit the files in the text comparison.
+* `--semantic` only reports. To copy values, open the files and use the semantic view (see
+  <<semantic>>).
+* A three-file `--semantic` report lists each path with its `state` (`left`, `right`, `both` or
+  `conflict`) and the changes from each side. It exits with `1` when any path differs, including
+  conflicts.
 * Source positions in semantic results are byte ranges of the decoded UTF-8 text and line numbers
   of the file. They are not offsets in a UTF-16 or legacy-encoded file.
 
@@ -2154,6 +2394,9 @@ three-way comparison.
 |`--prettify`
 |Format JSON and XML before comparing.
 
+|`--structured`
+|In folder comparisons, JSON, XML, TOML and YAML files with the same structure are identical.
+
 |`--numeric-tolerance <AMOUNT>`
 |Numbers that are at most this far apart are the same.
 
@@ -2202,7 +2445,8 @@ Text comparisons: `.html` or `.xml`.
 |Check a merge result against three files or folders (left, base, right).
 
 |`--semantic`
-|Compare two JSON, XML, TOML or YAML files by their structure.
+|Compare two JSON, XML, TOML or YAML files by their structure. With three files (left, base,
+right), list what each side changed from the base, with the conflicts.
 
 |`--format <FORMAT>`
 |The semantic format: `json`, `xml`, `toml` or `yaml`. Needs `--semantic`.
@@ -2230,6 +2474,19 @@ Needs `--impact`, `--release-report` or `--baseline-left`.
 |`--split-rename <PATH>`
 |Keep this added path as added, not as a suspected rename. Can be repeated.
 Needs `--impact`, `--release-report` or `--baseline-left`.
+
+|`--sync-plan <MODE>`
+|Write a read-only plan to synchronize two folders (source, destination). `MODE` is `mirror`
+or `update`. Writes JSON to the standard output, or to the `--report` file.
+
+|`--sync-apply <PLAN>`
+|Apply a plan to the folders it was made for, given in the same order. Needs `--yes`.
+
+|`--yes`
+|Confirm that `--sync-apply` may replace and delete files in the destination.
+
+|`--sync-recover`
+|Undo the folder synchronizations that did not finish.
 |===
 
 Use one analysis option for each run.
@@ -2286,6 +2543,40 @@ successfully.
 
 IMPORTANT: Exit code `1` is a comparison result, not an error. Make sure that your scripts treat it
 that way.
+
+Folder synchronization (see <<folder-sync>>) has its own codes:
+
+[cols="1,4"]
+|===
+|Code |Meaning
+
+|`0`
+|`--sync-plan`: nothing to do. `--sync-apply`: every change was applied and checked.
+`--sync-recover`: everything was undone.
+
+|`1`
+|`--sync-plan`: the plan has changes or conflicts.
+
+|`2`
+|An error occurred, or the plan was refused and nothing was changed, for example because a file
+changed after the plan was made.
+
+|`4`
+|`--sync-apply` failed or was stopped, and every change was undone.
+
+|`5`
+|Partly applied: some changes could not be undone, also by `--sync-recover`. The journals named
+in the output keep the original files.
+|===
+
+[source,sh]
+----
+oxidemerge --sync-plan mirror source destination --report plan.json
+oxidemerge --sync-apply plan.json --yes source destination
+----
+
+`--sync-apply` compares the folders again and refuses a plan that no longer matches them, one made
+with another filter or for other folders, or one written by a newer version.
 
 * The command line uses your saved options, unless you change them with options.
   For runs that must not depend on your settings, set `OXIDEMERGE_CONFIG_DIR` to a separate folder
@@ -2415,9 +2706,17 @@ The comparison options (see <<compare-options>>).
 Compare rules::
 The compare rules files (see <<compare-rules>>).
 Folder::
-*Compare method*, *Include subfolders*, *Include unique subfolders contents*,
-*Skip hidden files and folders*, *Date tolerance (seconds)* and
-*Worker threads (0 = automatic)*.
+*Compare method*, *Include subfolders*, *Include contents of unique subfolders*,
+*Skip hidden files and folders*, *Treat JSON, XML, TOML and YAML files with the same structure as
+identical*, *Date tolerance (seconds)* and *Worker threads (0 = automatic)*.
++
+The structure option works with the *Full contents* method. A file whose text differs is read as
+structured data, and it counts as identical when the values are the same. Key order, layout and
+comments do not count, as in <<semantic>>, and TOML and YAML numbers compare by value: `30` and
+`30.0` are the same, even where a program reading the file tells them apart. Opening such a file
+still shows its text differences;
+choose *Semantic* to see that the structure is the same. Folder synchronization still copies a
+file whose contents differ.
 Image / Binary / Web::
 *Bytes per line (binary)*, *Browser used to render pages*, *Screenshot width* and
 *Screenshot height*. The screenshot size is the size of the browser window.
@@ -2628,7 +2927,7 @@ OxideMerge could not read the file. The message names the file.
 Check its permissions. On macOS, also check the folder access described above.
 
 Automatic folder merge does not start, or merges nothing::
-Turn on *Include subfolders* and *Include unique subfolders contents*, and let the comparison
+Turn on *Include subfolders* and *Include contents of unique subfolders*, and let the comparison
 finish.
 If a file changed after the comparison, nothing is merged and the file is listed.
 If a change fails during the merge, all changes made so far are undone.
@@ -2678,6 +2977,9 @@ content (see <<compare-methods>>).
   Only the screenshot modes run page scripts. In the other modes, content that scripts add is
   missing.
   Content inside frames is not compared.
-* Semantic comparison cannot write changes back to the files.
+* Semantic comparison copies one value at a time, and only when the edit can be confirmed by
+  reading the file again. It does not move array elements or merge all changes at once.
+* Folder synchronization works on local folders only, and only when you start it.
+  A renamed file appears as a deletion and a copy.
 * The translations were made with the help of machines and have not been reviewed by native
   speakers.

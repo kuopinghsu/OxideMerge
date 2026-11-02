@@ -12,6 +12,60 @@ section of this file as the release notes.
   list*.
 - **Clear recent comparisons:** *Clear* beside the start page's *Recent* heading and *File → Open
   recent → Clear recent comparisons* empty the list, with *Undo* in the message that follows.
+- **Binary editing:** click a byte in a binary compare and type hexadecimal digits, or text in the
+  text column. *Insert* (or the `Insert` key) inserts bytes instead of replacing them; `Delete` and
+  `Backspace` delete bytes; the arrow, page, `Home` and `End` keys move the cursor; pasting writes
+  hexadecimal bytes in the hexadecimal column and text in the text column. Typing until the cursor
+  moves is one undo step, and read-only sides refuse edits.
+- **Table rows matched by key:** in a two-way CSV or TSV table compare, *Match rows by → Key
+  columns* pairs records by one or more key columns instead of by position, *Columns by → Header
+  name* pairs reordered columns, and *Numeric tolerance* (`0.01` or `1%`) counts close numbers as
+  equal. A summary counts added, removed, modified, reordered and ambiguous records; next and
+  previous difference go through the differing records; copying a cell or record uses the
+  matching record and paired column, and records with an empty or duplicate key are never
+  copied. A missing key column falls back to matching by position and says why. *Rows in*
+  lists the matched rows in left, right or key order. Tables of more than 100,000 records are
+  matched in the background with progress and *Cancel*. HTML and XML reports record the keys,
+  column pairing, row order, tolerance, counts and warnings (a `<table-match>` element in XML).
+  Projects save the settings.
+- **One way through the differences of a folder:** next and previous difference go through the
+  file compare below the folder list and on to the first (or last) difference of the next (or
+  previous) changed file, in the order of the list, and *All differences* opens at the difference
+  selected there. The status bar shows *File 2 / 5 · Difference 3 / 7*. Keys pressed while a file
+  loads are taken once it is shown, a file that cannot be read offers *Retry* and *Skip*, and
+  there is no wrapping around at the ends. In three-way folder compares, next and previous
+  conflict go on to the files changed on both sides, passing over those that merge without
+  conflicts, also from a tab opened from the folder compare. The navigation buttons' tooltips
+  say what they go through and that they stop at the end, and the message at the end says when
+  the folder compare was stopped before it finished.
+- **Folder synchronization:** *Synchronize folders...* in a two-way folder compare (toolbar and
+  *Merge* menu) previews mirroring one folder into the other, or updating it without deleting.
+  The read-only preview lists each copy, replacement, deletion, skip and conflict with its reason,
+  groups a copy and a deletion of the same contents as a *Rename*, warns when the filter leaves
+  items out, and exports the plan as versioned JSON with relative paths, the filter and a
+  fingerprint of the folder paths, so it is applied only to those folders. Applying asks for confirmation (twice for large deletions), checks every file against
+  its SHA-256 fingerprint first, so a file edited after the preview is never overwritten, copies
+  through a verified temporary file, shows the item being changed, and keeps replaced and
+  deleted files in a recovery journal outside both folders. A failure or *Stop* undoes the changes; a synchronization cut short is
+  offered for undoing at the next start. Symbolic links, file/folder clashes and names that
+  differ only in case or in how accents on Latin letters are written are left alone, and folders
+  inside each other are refused.
+  On the command line: `--sync-plan mirror|update`, `--sync-apply <PLAN> --yes` and
+  `--sync-recover`, with exit codes 4 (undone) and 5 (recovery required).
+- **Copy values in the semantic view:** *Copy value to left* and *Copy value to right* on each
+  JSON, XML, TOML or YAML change replace, add or remove that one value on the other side. Only the
+  value's text changes; comments and layout stay. The edited file is parsed again and the copy is
+  kept only when it has exactly the expected structure; otherwise nothing changes and the view says
+  why. Moves are not copied. Each copy is one undo step.
+- **Three-way semantic comparison:** in a three-way compare, *Semantic* lists each path that the
+  left or right file changed from the middle one as *Only left differs*, *Only right differs*,
+  *Both differ the same way* or *Conflict*, with a filter for each. *Use left* and *Use right*
+  copy that side's value into the middle pane. An array that both sides changed, where elements
+  pair ambiguously, is one conflict for the whole array. `--semantic left base right` writes the
+  same report, with `state` per path.
+- **Structured files in folder compares:** *Treat JSON, XML, TOML and YAML files with the same
+  structure as identical* in *Options → Folder* (or `--structured`) counts such files as identical
+  in the *Full contents* method when only key order, layout or comments differ.
 
 ### Changed
 
@@ -66,6 +120,12 @@ section of this file as the release notes.
 
 ### Fixed
 
+- **Translations:** the message about skipped web resources now gives the right reason in every
+  language, and *Saved as* no longer reads as a future action. English counts read correctly
+  for one item (`1 difference(s)`). German, French and Russian messages read correctly with the
+  side names filled in, and Russian counts agree in number. Terms are more consistent within
+  each language (for example *tab*, *merge*, *fold* and *only on one side*), and Simplified
+  Chinese uses *访达* for Finder.
 - **Web page compare:** *Stop* also ends the download of the pages and their resources as
   data arrives, instead of letting it run on in the background; a server that sends nothing is
   still waited for until its 30-second timeout.
@@ -74,6 +134,9 @@ section of this file as the release notes.
   symbol phase too; the index cache no longer mixes up files read by different grammars; the
   first use of an imported name is no longer a property or key of the same name.
 - **Semantic TOML:** changes in a table point at the table's own lines.
+- **Semantic paths inside paired arrays:** a change inside an array paired by key or reordered
+  now names the element on each side; before, nested paths and the old place of a move used the
+  second side's position. An XML attribute change points at the attribute, not the whole tag.
 - **File compare below the folder list:** *Next difference* and *Previous difference*
   (`Alt+↓`/`Alt+↑`, the *Compare* menu) now work in it, and past the last or first
   difference, they and its arrow buttons move on to the next or previous file with differences;

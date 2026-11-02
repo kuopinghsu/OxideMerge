@@ -55,6 +55,9 @@ pub struct WebView {
     error: Option<String>,
     shots: Option<tempfile::TempDir>,
     note: String,
+    /// Whether the pages open at their first difference (or the last) once loaded, when
+    /// stepped to from another file.
+    pub land: Option<bool>,
 }
 
 impl Drop for WebView {
@@ -122,6 +125,7 @@ impl WebView {
             error: None,
             shots: None,
             note: String::new(),
+            land: None,
         };
         v.start(cfg);
         v
@@ -264,7 +268,13 @@ impl WebView {
         let content = match loaded {
             Loaded::Formatted(pages, prepared) => {
                 let labels = pages.iter().map(label).collect();
-                self.formatted = Some(MarkdownView::from_prepared(*prepared, labels));
+                let mut view = MarkdownView::from_prepared(*prepared, labels);
+                match self.land.take() {
+                    Some(true) => view.first_diff(),
+                    Some(false) => view.last_diff(),
+                    None => {}
+                }
+                self.formatted = Some(view);
                 self.pages = Some(pages);
                 return Ok(());
             }
@@ -330,6 +340,14 @@ impl WebView {
                 Content::Folder(v)
             }
         };
+        let mut content = content;
+        match (self.land.take(), &mut content) {
+            (Some(true), Content::Text(v)) => v.first_diff(),
+            (Some(false), Content::Text(v)) => v.last_diff(),
+            (Some(true), Content::Image(v)) => v.first_diff(),
+            (Some(false), Content::Image(v)) => v.last_diff(),
+            _ => {}
+        }
         self.inner = Some(Box::new(content));
         Ok(())
     }

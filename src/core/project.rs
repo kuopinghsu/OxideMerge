@@ -28,6 +28,9 @@ pub struct Project {
     /// Compare rules file (a name or path, "" = none).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rules: Option<String>,
+    /// How a table compare matches records (by position when absent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<crate::core::table_match::TableMatch>,
 }
 
 pub fn is_project(path: &Path) -> bool {
@@ -241,5 +244,31 @@ mod tests {
         assert_eq!(w.read_only, [false, true]);
         assert_eq!(w.filter.as_deref(), Some("*.c;*.h"));
         assert_eq!(w.recursive, Some(true));
+    }
+
+    #[test]
+    fn table_matching_is_kept_and_older_projects_match_by_position() {
+        use crate::core::table_match::{KeyColumn, TableMatch};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.oxmproj");
+        let p = Project {
+            paths: vec!["a.csv".into(), "b.csv".into()],
+            table: Some(TableMatch {
+                header: true,
+                keys: vec![KeyColumn::Name("id".into()), KeyColumn::Index(2)],
+                ignore_order: true,
+                rel_tolerance: 0.01,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        p.save(&file).unwrap();
+        assert_eq!(Project::load(&file).unwrap(), p);
+
+        std::fs::write(&file, r#"{"paths":["a.csv","b.csv"],"kind":"text"}"#).unwrap();
+        let old = Project::load(&file).unwrap();
+        assert!(old.table.is_none());
+        let saved = serde_json::to_string(&old).unwrap();
+        assert!(!saved.contains("table"));
     }
 }

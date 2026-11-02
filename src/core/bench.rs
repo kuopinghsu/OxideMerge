@@ -66,6 +66,41 @@ const WORKLOADS: &[Workload] = &[
         run: |d| diff_files(d, &["a.txt", "b.txt"]),
     },
     Workload {
+        name: "table-10k",
+        what: "2 CSV tables of 10,000 records in another order, matched by key, 1% changed",
+        level: 0,
+        make: |d| table_pair(d, 10_000),
+        run: match_tables,
+    },
+    Workload {
+        name: "table-10k-position",
+        what: "the tables of table-10k compared row by row, as without a key",
+        level: 0,
+        make: |d| table_pair(d, 10_000),
+        run: table_by_position,
+    },
+    Workload {
+        name: "table-100k",
+        what: "2 CSV tables of 100,000 records in another order, matched by key, 1% changed",
+        level: 0,
+        make: |d| table_pair(d, 100_000),
+        run: match_tables,
+    },
+    Workload {
+        name: "table-100k-position",
+        what: "the tables of table-100k compared row by row, as without a key",
+        level: 0,
+        make: |d| table_pair(d, 100_000),
+        run: table_by_position,
+    },
+    Workload {
+        name: "table-cancel-1m",
+        what: "2 CSV tables of 1,000,000 records matched by key, stopped half way",
+        level: 0,
+        make: |d| table_pair(d, 1_000_000),
+        run: cancel_table_match,
+    },
+    Workload {
         name: "merge3-10mb",
         what: "3 text files of 10 MB, compared and merged",
         level: 0,
@@ -106,6 +141,20 @@ const WORKLOADS: &[Workload] = &[
         level: 0,
         make: small_files,
         run: compare_folders,
+    },
+    Workload {
+        name: "sync-preview-20k",
+        what: "a mirror plan for 2 folders of 20,000 files of 1 KB, 1% changed: scan, then plan",
+        level: 0,
+        make: small_files,
+        run: preview_sync,
+    },
+    Workload {
+        name: "folder-navigation-20k",
+        what: "the folders of folder-small-files compared, then stepped through file by file",
+        level: 0,
+        make: small_files,
+        run: |d| crate::ui::folder_view::navigation_bench(&[d.join("left"), d.join("right")]),
     },
     Workload {
         name: "folder-large-files",
@@ -221,6 +270,42 @@ fn merge_triple(dir: &Path) {
     for (name, text) in [("left.txt", l), ("base.txt", base), ("right.txt", r)] {
         write(&dir.join(name), text.as_bytes());
     }
+}
+
+/// Two tables of `n` records keyed by `id`: the right one shuffled, with 1% of the amounts
+/// changed, 0.5% of the records removed and as many added.
+fn table_pair(dir: &Path, n: usize) {
+    let mut rng = Rng(37);
+    let row = |id: usize, rng: &mut Rng| {
+        format!(
+            "{id},{},{}.{:02}\n",
+            WORDS[rng.below(WORDS.len())],
+            rng.below(10_000),
+            rng.below(100)
+        )
+    };
+    let records: Vec<String> = (0..n).map(|id| row(id, &mut rng)).collect();
+    let mut right: Vec<String> = Vec::with_capacity(records.len());
+    for (id, record) in records.iter().enumerate() {
+        match rng.below(200) {
+            0 => {}
+            1 | 2 => right.push(row(id, &mut rng)),
+            _ => right.push(record.clone()),
+        }
+    }
+    right.extend((0..n / 200).map(|i| row(n + i, &mut rng)));
+    for i in (1..right.len()).rev() {
+        right.swap(i, rng.below(i + 1));
+    }
+    let header = "id,name,amount\n";
+    write(
+        &dir.join("a.csv"),
+        (header.to_string() + &records.concat()).as_bytes(),
+    );
+    write(
+        &dir.join("b.csv"),
+        (header.to_string() + &right.concat()).as_bytes(),
+    );
 }
 
 fn binary_pair(dir: &Path, size: usize) {
@@ -384,6 +469,86 @@ fn merge_files(dir: &Path) -> String {
     format!("{found}, {merged}")
 }
 
+fn load_tables(dir: &Path) -> (super::table::Table, super::table::Table) {
+    let load = |n| {
+        let doc = super::text::load_doc(&dir.join(n), None).unwrap();
+        super::table::Table::parse(super::table::source(&doc), ',').unwrap()
+    };
+    (load("a.csv"), load("b.csv"))
+}
+
+fn match_tables(dir: &Path) -> String {
+    use super::table_match::{self, Compare, KeyColumn, TableMatch};
+    let (a, b) = load_tables(dir);
+    let opts = TableMatch {
+        header: true,
+        keys: vec![KeyColumn::Name("id".into())],
+        ..Default::default()
+    };
+    let key = |s: &str| s.to_string();
+    let eq = |x: &str, y: &str| x == y;
+    let d = table_match::compare(&a, &b, &opts, &Compare { key: &key, eq: &eq }).unwrap();
+    let n = d.counts;
+    format!(
+        "{} modified, {} added, {} removed, {} reordered",
+        n.modified, n.added, n.removed, n.moved
+    )
+}
+
+fn table_by_position(dir: &Path) -> String {
+    let (a, b) = load_tables(dir);
+    let opts = DiffOptions::default();
+    let keys = [a.keys(opts.ignore_eol), b.keys(opts.ignore_eol)];
+    let r = diff::compute_with(&[&keys[0][..], &keys[1][..]], &opts, None);
+    format!("{} differences", r.blocks.len())
+}
+
+/// Matches by key on another thread and stops it once half the records are keyed, as the
+/// Cancel button does; reports how long stopping took.
+fn cancel_table_match(dir: &Path) -> String {
+    use super::table_match::{self, Compare, KeyColumn, Problem, TableMatch};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (a, b) = load_tables(dir);
+    let total = a.records.len() + b.records.len();
+    let opts = TableMatch {
+        header: true,
+        keys: vec![KeyColumn::Name("id".into())],
+        ..Default::default()
+    };
+    let (cancel, done) = (AtomicBool::new(false), AtomicUsize::new(0));
+    let key = |s: &str| s.to_string();
+    let eq = |x: &str, y: &str| x == y;
+    let (result, asked, stopped) = std::thread::scope(|s| {
+        let job = s.spawn(|| {
+            let stop = |n: usize| {
+                done.store(n, Ordering::Relaxed);
+                cancel.load(Ordering::Relaxed)
+            };
+            let r = table_match::compare_with_stop(
+                &a,
+                &b,
+                &opts,
+                &Compare { key: &key, eq: &eq },
+                &stop,
+            );
+            (r, Instant::now())
+        });
+        while done.load(Ordering::Relaxed) < total / 2 && !job.is_finished() {
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        let asked = Instant::now();
+        cancel.store(true, Ordering::Relaxed);
+        let (r, stopped) = job.join().unwrap();
+        (r, asked, stopped)
+    });
+    assert!(matches!(result, Err(Problem::Cancelled)), "not stopped");
+    format!(
+        "stopped {:.1} ms after asked, at {} of {total} records",
+        stopped.duration_since(asked).as_secs_f64() * 1000.0,
+        done.load(Ordering::Relaxed),
+    )
+}
+
 fn diff_binary(dir: &Path) -> String {
     let a = std::fs::read(dir.join("a.bin")).unwrap();
     let b = std::fs::read(dir.join("b.bin")).unwrap();
@@ -395,6 +560,36 @@ fn diff_images(dir: &Path) -> String {
     let (a, b) = (load("a.png"), load("b.png"));
     let d = super::image_cmp::compare(&[&a, &b], 0, 8);
     format!("{} pixels differ", d.diff_pixels)
+}
+
+fn preview_sync(dir: &Path) -> String {
+    use super::folder_sync::{self, Scope, Side, SyncMode, SyncPolicy};
+    let roots = [dir.join("left"), dir.join("right")];
+    let items = Scanner {
+        roots: &roots,
+        filter: &FileFilter::parse_mask("*.*"),
+        fopts: &FolderOptions::default(),
+        dopts: &DiffOptions::default(),
+        progress: &Progress::default(),
+    }
+    .run();
+    let started = Instant::now();
+    let policy = SyncPolicy {
+        mode: SyncMode::Mirror,
+        source: Side::Left,
+    };
+    let scope = Scope {
+        complete: true,
+        ..Scope::default()
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let plan = folder_sync::plan(&items, &roots, policy, scope, &stop).unwrap();
+    format!(
+        "{} copies, {} replaces, plan {} ms",
+        plan.estimate.copies,
+        plan.estimate.replaces,
+        started.elapsed().as_millis()
+    )
 }
 
 fn compare_folders(dir: &Path) -> String {

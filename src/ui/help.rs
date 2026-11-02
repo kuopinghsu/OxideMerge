@@ -82,6 +82,11 @@ const KEYBOARD: &[Section] = &[
     (
         "help.binary_compare",
         &[
+            (&["← → ↑ ↓", "PgUp PgDn", "Home End"], "help.move_cursor"),
+            (&["Ctrl+Home", "Ctrl+End"], "help.move_cursor"),
+            (&["0–9 A–F"], "help.type_bytes"),
+            (&["Insert"], "tip.insert_mode"),
+            (&["Delete", "Backspace"], "help.delete_byte"),
             (&["Ctrl+F"], "cmd.find"),
             (&["F3", "Shift+F3"], "help.find_next_prev"),
             (&["Ctrl+G"], "cmd.goto_offset"),

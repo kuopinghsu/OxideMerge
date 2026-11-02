@@ -389,12 +389,14 @@ impl ImageView {
                 ui.add(egui::Slider::new(&mut self.overlay_alpha, 0.0..=1.0).show_value(false));
             }
             widgets::toolbar_sep(ui);
-            if widgets::icon_button(ui, Icon::Prev, &Cmd::PrevDiff.tip()).clicked()
+            if widgets::icon_button_hint(ui, Icon::Prev, &Cmd::PrevDiff.tip(), tr("tip.nav_diff"))
+                .clicked()
                 && !self.prev_diff()
             {
                 self.step_file = Some(false);
             }
-            if widgets::icon_button(ui, Icon::Next, &Cmd::NextDiff.tip()).clicked()
+            if widgets::icon_button_hint(ui, Icon::Next, &Cmd::NextDiff.tip(), tr("tip.nav_diff"))
+                .clicked()
                 && !self.next_diff()
             {
                 self.step_file = Some(true);

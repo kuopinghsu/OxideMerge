@@ -47,6 +47,14 @@ enum WsArg {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum SyncArg {
+    /// Make the destination match the source, deleting what only it has
+    Mirror,
+    /// Copy new and changed files to the destination; delete nothing
+    Update,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum PatchArg {
     Normal,
     Context,
@@ -116,6 +124,10 @@ struct Cli {
     /// Reformat JSON and XML files before comparing them
     #[arg(long)]
     prettify: bool,
+    /// Folder compares: JSON, XML, TOML and YAML files that read as the same structure are
+    /// identical (full contents method)
+    #[arg(long)]
+    structured: bool,
     /// Treat numbers at most this far apart as equal (for example 0.001)
     #[arg(long, value_name = "AMOUNT", value_parser = finite_number)]
     numeric_tolerance: Option<f64>,
@@ -154,7 +166,23 @@ struct Cli {
     /// Validate this existing result against the three input files (left, base, right)
     #[arg(long, value_name = "RESULT")]
     validate_merge: Option<PathBuf>,
-    /// Read-only JSON/XML/TOML/YAML semantic comparison (two files)
+    /// Read-only plan to synchronize two folders (source, destination): JSON on stdout, or
+    /// --report; exit code 0 = nothing to do, 1 = changes or conflicts, 2 = error
+    #[arg(long, value_enum, value_name = "MODE")]
+    sync_plan: Option<SyncArg>,
+    /// Apply a --sync-plan file to the folders it was made for, given in the same order, after
+    /// checking every file again; needs --yes. Exit code 0 = applied, 2 = nothing changed,
+    /// 4 = failed or stopped and undone, 5 = partly applied, recovery required
+    #[arg(long, value_name = "PLAN", requires = "yes")]
+    sync_apply: Option<PathBuf>,
+    /// Confirm that --sync-apply may change and delete files in the destination folder
+    #[arg(long, requires = "sync_apply")]
+    yes: bool,
+    /// Undo folder synchronizations that did not finish; exit code 0 = undone, 5 = not all
+    #[arg(long)]
+    sync_recover: bool,
+    /// Read-only JSON/XML/TOML/YAML semantic comparison of two files, or of three (left, base,
+    /// right) with conflicts by path
     #[arg(long)]
     semantic: bool,
     /// Semantic format: json, xml, toml or yaml (default: from the first file's extension)
@@ -284,6 +312,7 @@ fn apply_cli_options(cli: &Cli, cfg: &mut Config) {
     if cli.recursive {
         cfg.folder.recursive = true;
     }
+    cfg.folder.structured |= cli.structured;
 }
 
 fn method(m: MethodArg) -> CompareMethod {
@@ -657,6 +686,9 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
 
 fn analysis_mode(cli: &Cli) -> bool {
     cli.merge_plan
+        || cli.sync_plan.is_some()
+        || cli.sync_apply.is_some()
+        || cli.sync_recover
         || cli.validate_merge.is_some()
         || cli.semantic
         || cli.review_summary.is_some()
@@ -679,6 +711,162 @@ fn analysis_output<T: serde::Serialize>(
         Ok(())
     }
 }
+/// Plans the synchronization of the two folders of the command line, as of a fresh compare.
+fn sync_plan(
+    cli: &Cli,
+    cfg: &Config,
+    policy: core::folder_sync::SyncPolicy,
+) -> anyhow::Result<core::folder_sync::SyncPlan> {
+    use std::sync::atomic::AtomicBool;
+    anyhow::ensure!(
+        cli.paths.len() == 2 && cli.paths.iter().all(|p| p.is_dir()),
+        "Folder synchronization requires two folders: source, then destination"
+    );
+    let progress = Progress::default();
+    let mut folder = cfg.folder.clone();
+    folder.recursive = true;
+    folder.include_unique_subfolders = true;
+    let spec = cli.filter.as_deref().unwrap_or(&cfg.filter);
+    let mask = FileFilter::resolve(spec, &core::filter::load_all_filters());
+    let items = Scanner {
+        roots: &cli.paths,
+        filter: &mask,
+        fopts: &folder,
+        dopts: &cfg.diff,
+        progress: &progress,
+    }
+    .run();
+    let scope = core::folder_sync::Scope {
+        complete: true,
+        excluded: mask.excludes_anything() || folder.skip_hidden,
+        filter: spec.to_string(),
+        skip_hidden: folder.skip_hidden,
+    };
+    core::folder_sync::plan(&items, &cli.paths, policy, scope, &AtomicBool::new(false))
+        .map_err(anyhow::Error::msg)
+}
+
+/// How `--sync-apply` and `--sync-recover` ended, printed as JSON.
+#[derive(serde::Serialize)]
+struct SyncReport {
+    status: &'static str,
+    changes: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    messages: Vec<String>,
+    /// Recovery journals kept because something could not be undone.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    journals: Vec<PathBuf>,
+}
+
+fn run_sync(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
+    use core::folder_sync::{self, Side, SyncMode, SyncOutcome, SyncPlan, SyncPolicy};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    if let Some(mode) = cli.sync_plan {
+        let mode = match mode {
+            SyncArg::Mirror => SyncMode::Mirror,
+            SyncArg::Update => SyncMode::Update,
+        };
+        let plan = sync_plan(
+            cli,
+            cfg,
+            SyncPolicy {
+                mode,
+                source: Side::Left,
+            },
+        )?;
+        let code = u8::from(plan.changes() > 0 || plan.estimate.conflicts > 0);
+        let json = plan.to_json()?;
+        match &cli.report {
+            Some(path) => core::fsutil::write_atomic_report(path, json.as_bytes())?,
+            None => println!("{json}"),
+        }
+        return Ok(code);
+    }
+    let journal_root =
+        folder_sync::journal_root().ok_or_else(|| anyhow::anyhow!("No settings folder"))?;
+    if cli.sync_recover {
+        anyhow::ensure!(cli.paths.is_empty(), "--sync-recover takes no paths");
+        let mut report = SyncReport {
+            status: "recovered",
+            changes: 0,
+            messages: Vec::new(),
+            journals: Vec::new(),
+        };
+        for u in folder_sync::unfinished(&journal_root) {
+            let r = folder_sync::recover(&u);
+            report.changes += r.restored;
+            if !r.complete() {
+                report.status = "recovery_required";
+                report.journals.extend(r.journal);
+                report
+                    .messages
+                    .extend(r.failed.into_iter().map(|(p, e)| format!("{p}: {e}")));
+            }
+        }
+        println!("{}", core::analysis::json(&report)?);
+        return Ok(if report.status == "recovered" { 0 } else { 5 });
+    }
+    let Some(path) = &cli.sync_apply else {
+        unreachable!("a synchronization mode")
+    };
+    let text = String::from_utf8(core::analysis::read(path)?)?;
+    let planned = SyncPlan::from_json(&text).map_err(anyhow::Error::msg)?;
+    let fresh = sync_plan(cli, cfg, planned.policy)?;
+    anyhow::ensure!(
+        (&planned.filter, planned.skip_hidden) == (&fresh.filter, fresh.skip_hidden),
+        "The plan was made with another filter or hidden-file setting; use the same --filter and settings, or make a new plan with --sync-plan"
+    );
+    anyhow::ensure!(
+        planned.agrees_with(&fresh),
+        "The folders are no longer as planned; make a new plan with --sync-plan"
+    );
+    let (stop, done) = (AtomicBool::new(false), AtomicUsize::new(0));
+    let outcome = folder_sync::apply(&planned, &cli.paths, &journal_root, &stop, &done);
+    let (code, report) = match outcome {
+        SyncOutcome::Applied { changes, kept } => (
+            0,
+            SyncReport {
+                status: "applied",
+                changes,
+                messages: kept,
+                journals: Vec::new(),
+            },
+        ),
+        SyncOutcome::NotApplied(messages) => (
+            2,
+            SyncReport {
+                status: "not_applied",
+                changes: 0,
+                messages,
+                journals: Vec::new(),
+            },
+        ),
+        SyncOutcome::Stopped { reason, rollback } => (
+            if rollback.complete() { 4 } else { 5 },
+            SyncReport {
+                status: if rollback.complete() {
+                    "rolled_back"
+                } else {
+                    "recovery_required"
+                },
+                changes: rollback.restored,
+                messages: reason
+                    .into_iter()
+                    .chain(
+                        rollback
+                            .failed
+                            .into_iter()
+                            .map(|(p, e)| format!("{p}: {e}")),
+                    )
+                    .collect(),
+                journals: rollback.journal.into_iter().collect(),
+            },
+        ),
+    };
+    println!("{}", core::analysis::json(&report)?);
+    Ok(code)
+}
+
 fn run_analysis(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     use core::{analysis, baseline, merge_validation, review, semantic};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -691,6 +879,9 @@ fn run_analysis(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         "Analysis is read-only; do not combine it with output/patch/git-rev/slideshow/report-diffs"
     );
     let modes = usize::from(cli.merge_plan || cli.validate_merge.is_some())
+        + usize::from(cli.sync_plan.is_some())
+        + usize::from(cli.sync_apply.is_some())
+        + usize::from(cli.sync_recover)
         + usize::from(cli.semantic)
         + usize::from(cli.review_summary.is_some())
         + usize::from(cli.impact || cli.baseline_left.is_some() || cli.release_report.is_some());
@@ -702,6 +893,9 @@ fn run_analysis(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         "--important-path and --split-rename need --impact, --release-report or --baseline-left/--baseline-right"
     );
     anyhow::ensure!(modes == 1, "Choose one analysis mode per invocation");
+    if cli.sync_plan.is_some() || cli.sync_apply.is_some() || cli.sync_recover {
+        return run_sync(cli, cfg);
+    }
     if let Some(path) = &cli.review_summary {
         anyhow::ensure!(
             cli.paths.is_empty(),
@@ -721,8 +915,8 @@ fn run_analysis(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     }
     if cli.semantic {
         anyhow::ensure!(
-            cli.paths.len() == 2,
-            "Semantic comparison requires two files"
+            matches!(cli.paths.len(), 2 | 3),
+            "Semantic comparison requires two files, or three: left, base, right"
         );
         let format = match cli.format.as_deref() {
             Some(name) => semantic::Format::of_extension(name).ok_or_else(|| {
@@ -739,6 +933,16 @@ fn run_analysis(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         let options = semantic::Options {
             array_key: cli.array_key.clone().filter(|k| !k.is_empty()),
         };
+        if let [left, base, right] = &docs[..] {
+            let report = semantic::three_way::compare_three(left, base, right, format, &options);
+            let code = if !report.errors.is_empty() {
+                2
+            } else {
+                u8::from(!report.identical())
+            };
+            analysis_output(cli, &report, Vec::new())?;
+            return Ok(code);
+        }
         let report = semantic::compare_with(&docs[0], &docs[1], format, &options);
         let code = if !report.errors.is_empty() {
             2

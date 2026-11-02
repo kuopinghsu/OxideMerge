@@ -7,7 +7,7 @@ measure the work behind it: loading, comparing and merging. Run them on an idle 
 cargo test --release --bin oxidemerge bench -- --ignored --nocapture --test-threads 1
 ```
 
-The inputs are made once into `target/bench-data`: about 850 MB on disk, 1.3 GB with
+The inputs are made once into `target/bench-data`: about 1 GB on disk, 1.3 GB with
 `OXIDEMERGE_BENCH_LARGE=1` and 3.2 GB with `=2`; `=3` adds about 2 GB for the 1 GB text pair. Each workload then runs three times, each in a process of its own; the median time and
 the highest peak memory are reported and written to `target/bench/results.md`, with the machine,
 the commit and the build. Peak memory is measured with `/usr/bin/time`, so it is missing on
@@ -43,6 +43,14 @@ so CI reports the numbers without failing on them.
   content.
 - **text-1gb**: two 1 GiB UTF-8 source-like files, with one line in 200 changed, inserted or
   deleted. Fixture generation writes incrementally, avoiding whole-file generation buffers.
+- **table-10k**, **table-100k**: two CSV tables of 10,000 (or 100,000) records keyed by `id`, the
+  right one shuffled, with 1% of the amounts changed, 0.5% of the records removed and as many
+  added; parsed and matched by key.
+- **table-10k-position**, **table-100k-position**: the same tables compared row by row, as a table
+  is compared without a key.
+- **table-cancel-1m**: two such tables of 1,000,000 records matched by key on another thread,
+  stopped once half the records are read, as *Cancel* does. The result says how long stopping
+  took, freeing what was built so far included.
 - **merge3-10mb**: three 10 MB files compared as a 3-way compare, then merged automatically.
 - **binary-10mb**, **binary-100mb**, **binary-1gb**: two random files with 100 bytes changed.
 - **image-4k**: two 3840 x 2160 PNG images with 1% of the pixels changed, decoded and compared.
@@ -50,6 +58,12 @@ so CI reports the numbers without failing on them.
   side only. "First result" is the time until the first item reaches the folder list.
 - **folder-large-files**: 20 files of 8 MB, two changed in their last byte.
 - **folder-mixed**: 2,000 files of 100 bytes to 2 MB, some 60 folders deep.
+- **sync-preview-20k**: the folders of folder-small-files compared, then a mirror plan made from
+  the result. The plan reads every file it would touch, and every file on both sides whose size or
+  time differs, to fingerprint it; "plan" is the time of that step alone.
+- **folder-navigation-20k**: the folders of folder-small-files compared, then stepped through
+  from the first file with differences to the last, as *Next Difference* does without the file
+  pane, reading the status bar position at each file.
 
 ## Baseline
 
@@ -72,6 +86,26 @@ above) and counts of zero are left out, and large numbers have thousands separat
 | folder-small-files | 0.568 s | 31 MB | 220 differ, 198 unique; first result after 2 ms |
 | folder-large-files | 0.014 s | 138 MB | 2 differ |
 | folder-mixed | 0.056 s | 36 MB | 80 differ; first result after 2 ms |
+
+Added later, on the same machine with OxideMerge 0.9.8:
+
+| Workload | Time (median) | Peak memory | Result |
+| --- | ---: | ---: | --- |
+| sync-preview-20k | 2.005 s | 33 MB | 198 copies, 220 replaces; plan 1,427 ms |
+
+Added with 0.9.8's table, navigation and synchronization changes (2026-11-02, same machine):
+
+| Workload | Time (median) | Peak memory | Result |
+| --- | ---: | ---: | --- |
+| table-10k | 0.012 s | 24 MB | 95 modified, 50 added, 55 removed, 9,749 reordered |
+| table-10k-position | 0.016 s | 22 MB | 197 differences |
+| table-100k | 0.133 s | 135 MB | 1,030 modified, 500 added, 532 removed, 98,850 reordered |
+| table-100k-position | 0.231 s | 125 MB | 614 differences |
+| table-cancel-1m | 0.479 s | 748 MB | stopped 22.6 ms after asked, at 1,008,192 of 1,999,985 records |
+| folder-navigation-20k | 0.653 s | 40 MB | 418 files in 79 ms, 0.19 ms a step, first 4 ms; compare 572 ms |
+
+The table rows are from five runs each; the navigation row from three. Before the order of the
+files stepped through was kept between steps, a step took 2.48 ms (1,035 ms for the 418 files).
 
 ## Findings
 
@@ -140,6 +174,34 @@ value findings and 517 heuristic ones, with 1,724 more name and configuration ke
 in a note. Five files are listed as partly assessed because the Rust grammar does not read
 `dyn 'a + Fn(…)` trait objects and some attribute positions. The release executable grew from
 27.6 to 37.5 MB with the grammars.
+
+## Recorded comparison: 0.9.8 table, navigation and synchronization changes (2026-11-02)
+
+Commit `00eda61` (extracted with `git archive`) and the working tree were built as release test
+executables, then run one after the other on the macOS aarch64 host above with the default
+workloads, three runs each, reading the same generated inputs. The working tree passed the 1.5x
+gate against the commit's saved baseline with the same result counts:
+
+| Workload | Commit | Working tree |
+| --- | ---: | ---: |
+| text-10mb | 0.108 s, 98 MB | 0.112 s, 100 MB |
+| text-repeated | 0.026 s, 42 MB | 0.025 s, 41 MB |
+| merge3-10mb | 0.309 s, 148 MB | 0.321 s, 149 MB |
+| binary-10mb | 0.003 s, 29 MB | 0.003 s, 29 MB |
+| image-4k | 0.104 s, 105 MB | 0.103 s, 105 MB |
+| folder-small-files | 0.567 s, 33 MB | 0.599 s, 33 MB |
+| folder-large-files | 0.013 s, 139 MB | 0.013 s, 139 MB |
+| folder-mixed | 0.054 s, 35 MB | 0.054 s, 37 MB |
+
+The differences are within the variation between runs seen in the earlier records. The commit
+has no table, synchronization or navigation workloads, so those have no before figures.
+
+Matching by key is faster than comparing row by row on these shuffled tables, as the line
+alignment of the positional compare has many more changes to work through. Tables of more than
+100,000 records (both sides together) are matched on another thread, which checks for a stop
+every 4,096 records; stopping one half way through 1,000,000 records took 23 ms, freeing the keys
+it had built included. Stepping to the next file with differences among 20,000
+files takes about 2.5 ms, as each step finds the file's place in the listed order again.
 
 ## Large UTF-8 text comparison
 

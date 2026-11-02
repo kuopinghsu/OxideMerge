@@ -18,7 +18,7 @@ an envelope separate from existing comparison reports. Standard comparisons rema
   retained exactly (for example `1` and `1.0` can differ). Missing is distinct from null. XML uses
   expanded namespaces; attributes are unordered; child order, whitespace, comments and mixed
   content matter. DTDs/external entities/XML 1.1 are unsupported. Source spans refer to decoded
-  UTF-8, not encoded bytes. Structured write-back is intentionally deferred.
+  UTF-8, not encoded bytes.
 - Array elements are compared by position. When two arrays hold exactly the same elements in a
   different order, the elements out of order are reported as `moved` (with `from`, the old path);
   the longest run kept in order stays unmoved. With an array matching key (`--array-key id`, or
@@ -53,6 +53,34 @@ an envelope separate from existing comparison reports. Standard comparisons rema
   never recurses. Aliases, several documents, complex keys, tags on keys other than `!!str`, tags on
   mappings or sequences other than `!!map`, `!!seq` and `!`, and other tags are refused with an
   error, so the CLI returns 2.
+- Each change is located on both sides: the path where the node is, or, on the side that lacks it,
+  where it would go (for an array element, one past the counterpart of the nearest earlier paired
+  element). `from` of a moved change is its first-side path, so paths inside key-paired or
+  reordered arrays name the element on each side, not the second side's position.
+- Copying a value in the semantic view (GUI only) is a verified edit. The expected result is the
+  target tree with that one node replaced, inserted or removed; candidate splices of the target
+  text (the source span re-indented to the target line or column, the bare scalar literal,
+  whole-line or comma-aware removal, insertion before or after a sibling, into an empty `{}`, `[]`
+  or element) are re-parsed in order, and the first whose structure equals the expected tree is
+  kept. When none does, or the report is stale, nothing is written and the user edits the text.
+  Moves are refused because they reorder the whole array. Only the value's text changes; comments
+  and layout elsewhere stay byte for byte. A copy is one undo step and the file is written only
+  on save. Fixed-seed fuzzing copies every change until two JSON files agree, with no refusals;
+  for YAML, refusals must stay under a tenth of the copies.
+- Three-way semantic comparison (`--semantic left base right`, or *Semantic* in a three-way
+  compare, where the middle pane is the base) compares base→left and base→right and groups the
+  changes by base path: paths that are prefixes of one another form one entry. An entry is `left`
+  or `right` when only that side changed it, `both` when both made the same change (same kind,
+  base location and new value, and the same destination for moves), and `conflict` otherwise.
+  Changes to different members of one object are separate entries and do not conflict. *Use left*
+  / *Use right* copy that side's value into the base pane with the verified edit above; the base
+  is compared live, so there is no apply-all. Parse errors name the side (`Left:`, `Base:`,
+  `Right:`); the CLI exits 2 on errors, 1 when any entry exists and 0 when none does.
+- The folder option *Treat JSON, XML, TOML and YAML files with the same structure as identical*
+  (`--structured`; off by default) applies only to the *Full contents* method. A file pair whose
+  text differs, with a semantic format known from the extension, is parsed and counts as identical
+  when no semantic change is found. Text comparison rules do not apply to that check. Folder
+  synchronization still hashes such files, so a file whose bytes differ is copied.
 - Review version 2 extends the existing ZIP manifest; version 1 defaults to unreviewed, and future
   versions fail. SHA-256 entry digests detect accidental/corrupt captured-content changes, not
   authenticity. Reviewer names are free-form. State edits do not mutate captured source content.
@@ -132,8 +160,8 @@ an envelope separate from existing comparison reports. Standard comparisons rema
 ## Still outside this implementation
 
 Type-aware dependency analysis (a name is matched to what a file imports by name, not resolved
-through types, methods or re-exports), semantic path ignore rules, automatic structured editing
-and cryptographic reviewer identity are not provided. Folder auto merge checks every item before
+through types, methods or re-exports), semantic path ignore rules, moving array elements or
+merging every structured change at once, and cryptographic reviewer identity are not provided. Folder auto merge checks every item before
 writing, keeps a copy of everything it replaces or deletes in a temporary folder, and undoes its
 changes when one fails or it is stopped; a crash or power loss during the merge can still leave
 it partly applied, with per-file atomic saves and backups as before.

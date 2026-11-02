@@ -56,6 +56,11 @@ pub struct FolderOptions {
     /// Tolerance for date comparisons (FAT file systems store 2 second precision).
     pub time_tolerance_secs: u64,
     pub threads: usize,
+    /// Full contents: JSON, XML, TOML and YAML files that read as the same structure are
+    /// identical, however their text differs. Left out while off, so the policy digest of reviews
+    /// saved before it existed stays the same.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub structured: bool,
 }
 
 impl Default for FolderOptions {
@@ -67,6 +72,7 @@ impl Default for FolderOptions {
             skip_hidden: false,
             time_tolerance_secs: 2,
             threads: 0,
+            structured: false,
         }
     }
 }
@@ -740,6 +746,20 @@ fn text_equal(a: &Loaded, b: &Loaded, norm: &Normalizer, dopts: &DiffOptions, pa
     }
 }
 
+/// Whether two text files read as the same JSON, XML, TOML or YAML structure, the format
+/// coming from the extension of `path`.
+fn same_structure(a: &Loaded, b: &Loaded, path: &Path) -> bool {
+    let Some(format) = super::semantic::Format::of_extension(&text::extension(path)) else {
+        return false;
+    };
+    if a.binary || b.binary {
+        return false;
+    }
+    let (ta, _, _) = text::decode_cow(&a.bytes, None);
+    let (tb, _, _) = text::decode_cow(&b.bytes, None);
+    super::semantic::compare(&ta, &tb, format).identical()
+}
+
 fn line_keys<'a>(text: &'a str, norm: &'a Normalizer) -> impl Iterator<Item = Cow<'a, str>> {
     text::lines(text)
         .map(|(l, _)| l)
@@ -766,9 +786,12 @@ fn full_contents(
     paths: &[PathBuf],
     item: &DirItem,
     norm: &Normalizer,
-    dopts: &DiffOptions,
+    (dopts, structured): (&DiffOptions, bool),
     load_limit: u64,
 ) -> Result<(CmpStatus, Option<usize>, bool)> {
+    let equal = |a: &Loaded, b: &Loaded, path: &Path| {
+        text_equal(a, b, norm, dopts, path) || structured && same_structure(a, b, path)
+    };
     let n = paths.len();
     if item.size[..n]
         .iter()
@@ -781,7 +804,7 @@ fn full_contents(
             .collect::<Result<_>>()?;
         let any_bin = loaded.iter().any(|l| l.binary);
         return pairwise(n, any_bin, |a, b| {
-            Ok(text_equal(&loaded[a], &loaded[b], norm, dopts, &paths[a]))
+            Ok(equal(&loaded[a], &loaded[b], &paths[a]))
         });
     }
     let binary: Vec<bool> = paths
@@ -802,7 +825,7 @@ fn full_contents(
             }
         }
         let (la, lb) = (loaded[a].as_ref().unwrap(), loaded[b].as_ref().unwrap());
-        Ok(text_equal(la, lb, norm, dopts, &paths[a]))
+        Ok(equal(la, lb, &paths[a]))
     })
 }
 
@@ -856,7 +879,9 @@ fn compare_files_with_cancel(
                 same_bytes(&paths[a], &paths[b], size[a], size[b])
             })
         }
-        CompareMethod::FullContents => full_contents(paths, item, norm, dopts, LOAD_LIMIT),
+        CompareMethod::FullContents => {
+            full_contents(paths, item, norm, (dopts, fopts.structured), LOAD_LIMIT)
+        }
     }
 }
 
@@ -1037,6 +1062,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn structured_files_equal_by_structure_are_identical_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots: Vec<PathBuf> = ["a", "b", "c"].iter().map(|n| dir.path().join(n)).collect();
+        let files = [
+            (
+                "conf.json",
+                "{\"a\": 1, \"b\": [1, 2]}",
+                "{\n  \"b\": [1, 2],\n  \"a\": 1\n}\n",
+            ),
+            (
+                "conf.yaml",
+                "a: 1\nb: [1, 2]\n",
+                "# same\nb:\n  - 1\n  - 2\na: 1\n",
+            ),
+            ("conf.toml", "a = 1\n", "a = 1.0 # same\n"),
+            ("conf.xml", "<r a='1' b='2'/>", "<r b=\"2\" a=\"1\"></r>"),
+            ("notes.txt", "a b", "a  b"),
+            ("changed.json", "{\"a\": 1}", "{\"a\": 2}"),
+        ];
+        for root in &roots {
+            std::fs::create_dir(root).unwrap();
+        }
+        for (name, a, b) in files {
+            std::fs::write(roots[0].join(name), a).unwrap();
+            std::fs::write(roots[1].join(name), b).unwrap();
+            std::fs::write(roots[2].join(name), a).unwrap();
+        }
+        let dopts = DiffOptions::default();
+        let norm = Normalizer::new(&dopts);
+        let status = |fopts: &FolderOptions, name: &str, n: usize| {
+            let paths: Vec<PathBuf> = roots[..n].iter().map(|r| r.join(name)).collect();
+            let mut item = DirItem {
+                rel_dir: String::new(),
+                name: name.into(),
+                is_dir: false,
+                exists: [true; 3],
+                size: [None; 3],
+                mtime: [None; 3],
+                status: CmpStatus::Pending,
+                diff_side: None,
+                binary: false,
+                error: None,
+                depth: 0,
+                parent: None,
+                children: Vec::new(),
+            };
+            for (side, path) in paths.iter().enumerate() {
+                item.size[side] = Some(std::fs::metadata(path).unwrap().len());
+            }
+            compare_files(&paths, &item, fopts, &dopts, &norm).unwrap()
+        };
+        let mut fopts = FolderOptions::default();
+        for (name, _, _) in files {
+            assert_eq!(status(&fopts, name, 2).0, CmpStatus::Different, "{name}");
+        }
+        fopts.structured = true;
+        for (name, _, _) in &files[..4] {
+            assert_eq!(status(&fopts, name, 2).0, CmpStatus::Identical, "{name}");
+            assert_eq!(status(&fopts, name, 3).0, CmpStatus::Identical, "{name}");
+        }
+        for name in ["notes.txt", "changed.json"] {
+            assert_eq!(status(&fopts, name, 2).0, CmpStatus::Different, "{name}");
+        }
+        assert_eq!(
+            status(&fopts, "changed.json", 3),
+            (CmpStatus::Different, Some(1), false)
+        );
+        // byte methods are not affected
+        fopts.method = CompareMethod::QuickContents;
+        assert_eq!(status(&fopts, "conf.json", 2).0, CmpStatus::Different);
+    }
+
+    #[test]
     fn refuses_to_copy_onto_itself_or_into_itself() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1213,7 +1311,8 @@ mod tests {
                 CmpStatus::Different
             };
             for limit in [0, LOAD_LIMIT] {
-                let (status, _, _) = full_contents(&paths, &item, &norm, &dopts, limit).unwrap();
+                let (status, _, _) =
+                    full_contents(&paths, &item, &norm, (&dopts, false), limit).unwrap();
                 assert_eq!(status, expected, "{name} with load limit {limit}");
             }
             item.size[1] = item.size[0];

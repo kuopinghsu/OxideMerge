@@ -157,7 +157,7 @@ fn write_staged(
 /// Renames the temporary file `tmp` over `target`, or removes it. Windows refuses while
 /// another program, such as a virus scanner or the search indexer, has `target` open without
 /// sharing it, so there the rename is tried again for about a second.
-fn persist(tmp: tempfile::NamedTempFile, target: &Path) -> std::io::Result<()> {
+pub(crate) fn persist(tmp: tempfile::NamedTempFile, target: &Path) -> std::io::Result<()> {
     let path = tmp.into_temp_path();
     let mut waits = [10, 20, 50, 100, 200, 300, 400].into_iter();
     loop {

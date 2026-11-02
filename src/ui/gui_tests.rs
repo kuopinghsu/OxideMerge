@@ -968,6 +968,72 @@ fn folder_merges_are_previewed_then_carried_out() {
 }
 
 #[test]
+fn folders_are_synchronized_after_a_preview_and_a_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("left/a.txt", "new\n"),
+            ("left/sub/b.txt", "b\n"),
+            ("right/a.txt", "old\n"),
+            ("right/extra.txt", "extra\n"),
+        ],
+    );
+    let roots = [d.join("left"), d.join("right")];
+    let mut gui = Gui::start("folder_sync", compare_folders(&roots));
+    gui.wait_until("the compare", |g| !g.busy());
+    gui.click(tr("cmd.sync_folders"));
+    gui.wait_until("the preview", |g| {
+        g.shows_text(tr("folder_sync.preview_only"))
+    });
+    let summary = trf(
+        "folder_sync.summary",
+        &[
+            ("dirs", "1".into()),
+            ("copies", "1".into()),
+            ("replaces", "1".into()),
+            ("deletes", "1".into()),
+            ("bytes", crate::core::report::fmt_size(Some(6))),
+        ],
+    );
+    assert!(gui.shows(&summary), "the plan is not summarized");
+    assert!(gui.shows_text("extra.txt"), "the deletion is not listed");
+    assert_eq!(
+        read(&roots[1].join("a.txt")),
+        "old\n",
+        "changed by the preview"
+    );
+
+    gui.click(tr("folder_sync.apply"));
+    let Content::Folder(v) = gui.app.tabs[0].content.view() else {
+        panic!("not a folder compare");
+    };
+    let confirm = trf(
+        "folder_sync.confirm",
+        &[("n", "4".into()), ("root", v.display_roots[1].clone())],
+    );
+    assert!(gui.shows(&confirm), "the destination is not named");
+    assert_eq!(
+        read(&roots[1].join("a.txt")),
+        "old\n",
+        "changed before confirming"
+    );
+    gui.click(tr("folder_sync.apply_now"));
+    let done = trf("folder_sync.done", &[("n", "4".into())]);
+    gui.wait_until("the outcome", |g| g.shows(&done));
+    // the dialog takes its new size on the next frame
+    gui.frames(2);
+    assert_eq!(read(&roots[1].join("a.txt")), "new\n");
+    assert_eq!(read(&roots[1].join("sub/b.txt")), "b\n");
+    assert!(!roots[1].join("extra.txt").exists());
+    assert_eq!(read(&roots[0].join("a.txt")), "new\n");
+    gui.click(tr("btn.close"));
+    gui.wait_until("the compare again", |g| !g.busy());
+    assert!(!gui.shows(&done));
+}
+
+#[test]
 fn folder_merges_leave_alone_what_changed_meanwhile() {
     let dir = tempfile::tempdir().unwrap();
     let roots = merge_folders(dir.path());
@@ -1087,6 +1153,8 @@ fn the_docked_file_compare_steps_through_differences_and_on_to_other_files() {
     assert_eq!(docked(&mut gui, "a.txt"), Some(0));
     gui.key(ALT, Key::ArrowDown);
     assert_eq!(docked(&mut gui, "a.txt"), Some(1));
+    gui.frames(2);
+    assert!(gui.shows_text("File 1 / 2 · Difference 2 / 2"));
     // Past the last difference, the identical b.txt is skipped.
     gui.key(ALT, Key::ArrowDown);
     assert_eq!(docked(&mut gui, "c.txt"), Some(0));
@@ -1107,6 +1175,98 @@ fn the_docked_file_compare_steps_through_differences_and_on_to_other_files() {
     assert_eq!(docked(&mut gui, "a.txt"), Some(1));
     gui.click_a(accesskit::Role::Button, tr("cmd.prev_diff"));
     assert_eq!(docked(&mut gui, "a.txt"), Some(0));
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+
+    // All differences opens at the file and difference shown, and the folder compare follows
+    // the file it moves to.
+    gui.key(ALT, Key::ArrowDown);
+    assert_eq!(docked(&mut gui, "a.txt"), Some(1));
+    gui.app.run(Cmd::AllDiffs, &gui.ctx);
+    let diffs_status = |gui: &Gui| match &gui.app.tabs[1].content {
+        Content::Diffs(v) => v.status_line(),
+        _ => String::new(),
+    };
+    let start = Instant::now();
+    while !diffs_status(&gui).starts_with("File 1 / 2 · Difference 2 / 2  |  2 file(s)") {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{}",
+            diffs_status(&gui)
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        gui.frame();
+    }
+    gui.app.run(Cmd::NextDiff, &gui.ctx);
+    gui.frames(2);
+    assert!(gui.shows_text("File 2 / 2 · Difference 1 / 1"));
+    gui.app.active = 0;
+    assert_eq!(docked(&mut gui, "c.txt"), Some(0));
+
+    // A file opened in its own tab tells where it is among the files too.
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.frames(3);
+    assert!(gui.shows_text("File 2 / 2 · Difference 1 / 1"));
+}
+
+#[test]
+fn next_conflict_in_a_tab_opened_from_a_folder_goes_on_to_files_with_open_conflicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let far = |v: [&str; 2]| v.join(&format!("\n{}", "same\n".repeat(12))) + "\n";
+    let files = [
+        (
+            "a.txt",
+            [far(["L1", "L2"]), far(["1", "2"]), far(["R1", "R2"])],
+        ),
+        (
+            "b.txt",
+            [far(["L1", "2"]), far(["1", "2"]), far(["1", "R2"])],
+        ),
+        ("c.txt", ["L\n".into(), "m\n".into(), "m\n".into()]),
+        ("d.txt", ["L\n".into(), "m\n".into(), "R\n".into()]),
+    ];
+    let sides = ["left", "middle", "right"];
+    for (name, texts) in &files {
+        for (side, text) in sides.iter().zip(texts) {
+            write(d, &[(&format!("{side}/{name}"), text.as_str())]);
+        }
+    }
+    let roots: Vec<PathBuf> = sides.iter().map(|s| d.join(s)).collect();
+    let mut gui = Gui::start("tab_conflicts", compare_folders(&roots));
+    let shown = |gui: &Gui| {
+        let v = gui.text_view();
+        let name = v.titles()[0]
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap()
+            .to_string();
+        (name, v.diff_position())
+    };
+
+    gui.click("a.txt");
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.frames(3);
+    assert_eq!(shown(&gui).0, "a.txt");
+    // Through the two conflicts of a.txt, then on.
+    for _ in 0..3 {
+        if shown(&gui).0 != "a.txt" {
+            break;
+        }
+        gui.key(ALT, Key::PageDown);
+        gui.frames(2);
+    }
+    // b.txt merges cleanly, so the conflict of d.txt is next, a frame later.
+    assert_eq!(shown(&gui), ("d.txt".into(), (Some(0), 1)));
+    let passed = trf("msg.file_switched", &[("file", "b.txt".into())]);
+    assert!(!gui.toasts().iter().any(|(_, t)| *t == passed));
+    gui.key(ALT, Key::PageDown);
+    gui.frames(2);
+    assert!(gui
+        .toasts()
+        .contains(&(false, tr("msg.no_next_conflict_file").to_string())));
+    gui.key(ALT, Key::PageUp);
+    gui.frames(2);
+    assert_eq!(shown(&gui), ("a.txt".into(), (Some(1), 2)));
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
 }
 
@@ -2021,6 +2181,53 @@ fn table_keyboard_navigation_cell_editing_and_go_to_line_work() {
 }
 
 #[test]
+fn table_rows_matched_by_key_from_the_toolbar_copy_and_reopen_from_a_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let left = "id,name,price\n1,Ann,10\n2,Bob,20\n3,Cy,30\n";
+    let right = "id,name,price\n3,Cy,30\n2,Bob,20\n1,Ann,11\n";
+    write(dir.path(), &[("left.csv", left), ("right.csv", right)]);
+    let mut gui = Gui::start(
+        "table_match_by_key",
+        compare(&[dir.path().join("left.csv"), dir.path().join("right.csv")]),
+    );
+    assert!(gui.shows("Match rows by"));
+    gui.click("Position");
+    gui.click("Key columns");
+    assert!(gui.text_view().table_match.by_key());
+    assert!(gui.shows_text("Modified 1 · Reordered 2 · Ambiguous 0"));
+    assert_eq!(gui.text_view().diff_position(), (None, 2));
+    gui.click("Ignore row order");
+    assert!(gui.shows("(row order ignored)"));
+    assert_eq!(gui.text_view().diff_position(), (None, 1));
+
+    gui.app.run(Cmd::NextDiff, &gui.ctx);
+    gui.settle();
+    assert_eq!(gui.text_view().diff_position(), (Some(0), 1));
+    gui.app.run(Cmd::CopyRight, &gui.ctx);
+    gui.settle();
+    assert_eq!(
+        gui.text_view().panes[1].doc.text(),
+        right.replace("1,Ann,11", "1,Ann,10")
+    );
+    assert_eq!(gui.text_view().diff_position().1, 0);
+
+    let file = dir.path().join("table.oxmproj");
+    let project = gui.app.tabs[0]
+        .project()
+        .unwrap()
+        .relative_to(&file)
+        .unwrap();
+    assert!(project.table.as_ref().is_some_and(|m| m.ignore_order));
+    project.save(&file).unwrap();
+    let gui = Gui::start(
+        "table_match_reopened",
+        Some(project_request(&file).unwrap()),
+    );
+    assert!(gui.text_view().table_match.by_key());
+    assert!(gui.shows("(row order ignored)"));
+}
+
+#[test]
 fn clicking_multiline_cell_selects_and_merges_a_later_line_difference() {
     let dir = tempfile::tempdir().unwrap();
     let left = "id,note\n1,\"same\nold\"\n";
@@ -2118,7 +2325,82 @@ fn compact_pane_keyboard_skips_the_other_sides_insertions() {
 }
 
 #[test]
-fn semantic_view_is_read_only_and_can_jump_back_to_source() {
+fn semantic_values_copy_between_sides_and_undo() {
+    let dir = tempfile::tempdir().unwrap();
+    let left = "{\n  \"name\": \"svc\",\n  \"timeout\": 30,\n  \"old\": true\n}\n";
+    let right = "{\n  \"name\": \"svc\",\n  \"timeout\": 60\n}\n";
+    write(dir.path(), &[("a.json", left), ("b.json", right)]);
+    let mut gui = Gui::start(
+        "semantic_copy",
+        compare(&[dir.path().join("a.json"), dir.path().join("b.json")]),
+    );
+    gui.click(tr("analysis.semantic"));
+    gui.wait_until("semantic report", |gui| gui.shows_text("30 → 60"));
+    // the last button belongs to the last change, the timeout
+    gui.click(tr("analysis.copy_to_left"));
+    gui.wait_until("copied", |gui| {
+        gui.text_view().panes[0].doc.text().contains("60")
+    });
+    gui.wait_until("one change left", |gui| {
+        !gui.shows_text("30 → 60") && gui.shows_text("true → ∅")
+    });
+    gui.click(tr("analysis.copy_to_right"));
+    gui.wait_until("same", |gui| gui.shows(tr("analysis.semantic_identical")));
+    assert_eq!(
+        gui.text_view().panes[0].doc.text(),
+        left.replace("30", "60")
+    );
+    assert_eq!(
+        gui.text_view().panes[1].doc.text(),
+        "{\n  \"name\": \"svc\",\n  \"timeout\": 60,\n  \"old\": true\n}\n"
+    );
+    gui.app.run(Cmd::Undo, &gui.ctx);
+    gui.settle();
+    assert_eq!(gui.text_view().panes[1].doc.text(), right);
+    // nothing is saved until asked
+    assert_eq!(read(&dir.path().join("b.json")), right);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn semantic_three_way_shows_conflicts_and_takes_a_side_into_the_middle() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[
+            ("left.yaml", "port: 8080\nmode: fast\nname: a\n"),
+            ("base.yaml", "port: 80\nmode: slow\nname: a\n"),
+            ("right.yaml", "port: 80\nmode: safe\nname: b\n"),
+        ],
+    );
+    let mut gui = Gui::start(
+        "semantic_three_way",
+        compare(&[
+            dir.path().join("left.yaml"),
+            dir.path().join("base.yaml"),
+            dir.path().join("right.yaml"),
+        ]),
+    );
+    gui.click(tr("analysis.semantic"));
+    let conflict = format!("{} · $[\"mode\"]", tr("analysis.state_conflict"));
+    gui.wait_until("three-way report", |gui| gui.shows(&conflict));
+    assert!(gui.shows(&format!("{} · $[\"port\"]", tr("analysis.state_left"))));
+    assert!(gui.shows(&format!("{} · $[\"name\"]", tr("analysis.state_right"))));
+    assert!(gui.shows_text(&trf(
+        "analysis.three_way_summary",
+        &[("n", "3".into()), ("conflicts", "1".into())]
+    )));
+    gui.click(tr("analysis.state_conflict"));
+    assert!(!gui.shows(&format!("{} · $[\"port\"]", tr("analysis.state_left"))));
+    gui.click(tr("analysis.use_right"));
+    gui.wait_until("taken", |gui| {
+        gui.text_view().panes[1].doc.text() == "port: 80\nmode: safe\nname: a\n"
+    });
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn semantic_view_jumps_back_to_source_without_writing() {
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
@@ -2135,7 +2417,7 @@ fn semantic_view_is_read_only_and_can_jump_back_to_source() {
     gui.wait_until("semantic report", |gui| {
         gui.shows_text("timeout") && gui.shows_text("30 → 60")
     });
-    assert!(gui.shows(tr("analysis.semantic_read_only")));
+    assert!(gui.shows(tr("analysis.semantic_policy")));
     gui.click(&format!("{} 2:2", tr("analysis.source")));
     assert_eq!(gui.text_view().active_pane, 1);
     assert_eq!(gui.text_view().panes[1].doc.lines[1], "  \"timeout\": 60");
@@ -2838,4 +3120,53 @@ fn controls_fit_scaled_and_narrow_windows() {
         }
     }
     assert!(found.is_empty(), "crowded controls: {found:#?}");
+}
+
+#[test]
+fn clicked_bytes_take_typed_digits_and_text_and_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = [dir.path().join("a.bin"), dir.path().join("b.bin")];
+    std::fs::write(&paths[0], [0x00, 0x11, 0x22]).unwrap();
+    std::fs::write(&paths[1], [0x00, 0x11, 0x33]).unwrap();
+    let mut gui = Gui::start("binary_typing", compare(&paths));
+    let body = gui.widget(tr("help.binary_compare")).rect;
+    let font = egui::FontId::monospace(config().font_size);
+    let (char_w, row_h) = gui
+        .ctx
+        .fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font) + 2.0));
+    let bpl = config().binary_bytes_per_line as f32;
+    // Each line is the offset, a hexadecimal "HH " for each byte, a space and the text.
+    let at = |col: f32| {
+        Pos2::new(
+            body.left() + body.width() / 2.0 + 4.0 + (col + 0.5) * char_w,
+            body.top() + row_h / 2.0,
+        )
+    };
+    let binary = |gui: &Gui| match gui.app.tabs[gui.app.active].content.view() {
+        Content::Binary(v) => (v.data[1].clone(), v.pane, v.is_modified()),
+        _ => panic!("binary compare expected"),
+    };
+
+    gui.click_at(at(10.0 + 3.0));
+    gui.type_text("4");
+    gui.type_text("1");
+    assert_eq!(binary(&gui), (vec![0x00, 0x41, 0x33], Some(1), true));
+
+    gui.click_at(at(10.0 + 3.0 * bpl + 1.0));
+    for pressed in [true, false] {
+        gui.events.push(Event::Key {
+            key: Key::Questionmark,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        });
+    }
+    gui.type_text("?");
+    assert!(!gui.app.help, "? in the text column is typed, not Help");
+    assert_eq!(binary(&gui).0, [b'?', 0x41, 0x33]);
+
+    gui.key(CMD, Key::S);
+    assert_eq!(std::fs::read(&paths[1]).unwrap(), [b'?', 0x41, 0x33]);
+    assert_eq!(std::fs::read(&paths[0]).unwrap(), [0x00, 0x11, 0x22]);
 }

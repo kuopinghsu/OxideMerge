@@ -53,10 +53,37 @@ Each pair below can also be opened on its own, for example
   you to resolve. `--merge-plan` lists the same actions and warnings for each format.
 - `folders/`: a 3-way folder compare with a file changed on one side, on the other, the same on
   both, in conflict, added on the left, and removed on the right. Use **Auto merge** on the folder
-  compare too.
+  compare too. **Next conflict** (Alt+PgDn) goes through the open conflicts of `conflict.txt`
+  and `docs/install.md`, passing over `docs/guide.md`, which both sides changed but which merges
+  cleanly. Turn on **View → File compare below the folder list** to step through them without
+  opening tabs.
 - `conflict.txt` and `diff3-conflict.py`: files with version-control conflict markers. The second
   has two conflicts in Git's diff3 style, with the base version between `|||||||` and `=======`,
   so it opens as a 3-way merge.
+
+## Tables matched by key: `tables`
+
+    cargo run -- samples/tables/orders.oxmproj
+
+The project opens two order lists matched by `order_id`, their columns paired by header name and
+the rows shown in key order. The right list is in another order with `status` before `amount`:
+order 1003 was returned, 1004 is gone, 1007 is new, and 1006 is listed twice, which is reported
+as a duplicate key and left unmatched. Grace's amount of 75.505 equals 75.50 within the tolerance
+of 0.01. Change the key, the column pairing, the row order or the tolerance above the table, and
+write a report from the **File** menu to record how the records were matched.
+
+## Folder synchronization: `sync`
+
+Synchronizing changes the files, so copy the folders first:
+
+    cp -R samples/sync /tmp/sync-demo
+    cargo run -- -r /tmp/sync-demo/source /tmp/sync-demo/destination
+
+Choose **Synchronize folders...** in the folder compare, then **Mirror left → right**. The
+preview lists a folder to create, a replaced `README.txt`, a copied `new.txt` and a deleted
+`obsolete.txt`; `q3-report.txt` moved to `reports/2026-q3.txt` in the source, so it shows under
+**Rename** too. **Update right from left** keeps `obsolete.txt` and `q3-report.txt`. Nothing
+changes until you choose **Apply changes**, and **Stop** undoes what was done.
 
 ## Web page compare: `web`
 
