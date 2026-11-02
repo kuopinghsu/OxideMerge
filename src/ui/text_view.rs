@@ -3002,13 +3002,10 @@ impl TextView {
             let wide = ui.available_width() > 1250.0;
             let caption = |key: &'static str| wide.then(|| tr(key));
             widgets::tool_group(ui, caption("toolbar.differences"), |ui| {
-                if widgets::icon_button(ui, Icon::First, &Cmd::FirstDiff.tip_if(self.keys_enabled))
-                    .clicked()
-                {
+                if widgets::icon_button(ui, Icon::First, &Cmd::FirstDiff.tip()).clicked() {
                     self.first_diff();
                 }
-                if widgets::icon_button(ui, Icon::Prev, &Cmd::PrevDiff.tip_if(self.keys_enabled))
-                    .clicked()
+                if widgets::icon_button(ui, Icon::Prev, &Cmd::PrevDiff.tip()).clicked()
                     && !self.prev_diff(false)
                 {
                     self.step_file = Some(false);
@@ -3031,15 +3028,12 @@ impl TextView {
                             &[("add", add.to_string()), ("del", del.to_string())],
                         ));
                 }
-                if widgets::icon_button(ui, Icon::Next, &Cmd::NextDiff.tip_if(self.keys_enabled))
-                    .clicked()
+                if widgets::icon_button(ui, Icon::Next, &Cmd::NextDiff.tip()).clicked()
                     && !self.next_diff(false)
                 {
                     self.step_file = Some(true);
                 }
-                if widgets::icon_button(ui, Icon::Last, &Cmd::LastDiff.tip_if(self.keys_enabled))
-                    .clicked()
-                {
+                if widgets::icon_button(ui, Icon::Last, &Cmd::LastDiff.tip()).clicked() {
                     self.last_diff();
                 }
             });
@@ -5327,11 +5321,45 @@ impl TextView {
         if !self.semantic_mode {
             return false;
         }
-        // While the array key is being typed, the report keeps the key it was made with.
+        // While the array key is being typed, the report keeps the key it was made with. The
+        // field stays shown while a report is made, so typing in it goes on.
         let typed_id = self.id.with("array_key_typed");
-        let typing = ui
-            .data(|d| d.get_temp::<std::time::Instant>(typed_id))
-            .is_some();
+        if format.keyed() {
+            ui.horizontal(|ui| {
+                let label = tr("analysis.array_key");
+                ui.label(label);
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.semantic_array_key)
+                        .hint_text(tr("analysis.array_key_hint"))
+                        .char_limit(256)
+                        .desired_width(160.0),
+                );
+                let key = self.semantic_array_key.as_str();
+                response.widget_info(|| {
+                    let mut info = egui::WidgetInfo::text_edit(true, key, key, "");
+                    info.label = Some(label.into());
+                    info
+                });
+                let now = ui.input(|i| i.time);
+                if response.changed() {
+                    ui.data_mut(|d| d.insert_temp(typed_id, now));
+                }
+                if let Some(typed) = ui.data(|d| d.get_temp::<f64>(typed_id)) {
+                    const PAUSE: f64 = 0.3;
+                    let waited = now - typed;
+                    if waited >= PAUSE || response.lost_focus() {
+                        ui.data_mut(|d| d.remove::<f64>(typed_id));
+                        ui.ctx().request_repaint();
+                    } else {
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_secs_f64(
+                                PAUSE - waited,
+                            ));
+                    }
+                }
+            });
+        }
+        let typing = ui.data(|d| d.get_temp::<f64>(typed_id)).is_some();
         let options = match self.semantic_cache.as_ref().filter(|_| typing) {
             Some((_, report)) => report.options.clone(),
             None => semantic::Options {
@@ -5432,37 +5460,6 @@ impl TextView {
                     }
                 }
             });
-            if format.keyed() {
-                ui.horizontal(|ui| {
-                    let label = tr("analysis.array_key");
-                    ui.label(label);
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.semantic_array_key)
-                            .hint_text(tr("analysis.array_key_hint"))
-                            .char_limit(256)
-                            .desired_width(160.0),
-                    );
-                    let key = self.semantic_array_key.as_str();
-                    response.widget_info(|| {
-                        let mut info = egui::WidgetInfo::text_edit(true, key, key, "");
-                        info.label = Some(label.into());
-                        info
-                    });
-                    if response.changed() {
-                        ui.data_mut(|d| d.insert_temp(typed_id, std::time::Instant::now()));
-                    }
-                    if let Some(typed) = ui.data(|d| d.get_temp::<std::time::Instant>(typed_id)) {
-                        let pause = std::time::Duration::from_millis(300);
-                        let waited = typed.elapsed();
-                        if waited >= pause || response.lost_focus() {
-                            ui.data_mut(|d| d.remove::<std::time::Instant>(typed_id));
-                            ui.ctx().request_repaint();
-                        } else {
-                            ui.ctx().request_repaint_after(pause - waited);
-                        }
-                    }
-                });
-            }
             for note in &report.notes {
                 ui.colored_label(widgets::pal(ui).warning, note);
             }

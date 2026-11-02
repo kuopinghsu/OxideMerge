@@ -31,6 +31,14 @@ impl Format {
     pub fn keyed(self) -> bool {
         self != Format::Xml
     }
+    pub fn label(self) -> &'static str {
+        match self {
+            Format::Json => "JSON",
+            Format::Xml => "XML",
+            Format::Toml => "TOML",
+            Format::Yaml => "YAML",
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,6 +113,75 @@ pub fn span(_source: &str, start: usize, end: usize) -> SourceSpan {
         bytes: start..end,
         line: 0,
     }
+}
+/// Larger TOML and YAML input is left to the text view.
+pub const MAX_CONFIG_BYTES: usize = 4 << 20;
+/// Trailing or leading zeros a number's text writes out; past this it has an exponent, so the
+/// text is never much longer than what the file wrote.
+const MAX_WRITTEN_ZEROS: i64 = 20;
+/// The text a TOML or YAML float written `raw` compares by: its exact decimal value, so `1`,
+/// `1.0` and `1e0` are equal, `1e23` equals its 24-digit spelling, `-0.0` is `0`, `1e400` is
+/// `10e+399` and `1e-400` is not `0`.
+fn float_literal(raw: &str) -> String {
+    let lower = raw.replace('_', "").to_ascii_lowercase();
+    let (negative, unsigned) = match lower.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, lower.strip_prefix('+').unwrap_or(&lower)),
+    };
+    let exact = decimal_parts(unsigned)
+        .and_then(|(digits, exponent)| decimal_text(negative, &digits, exponent));
+    if let Some(text) = exact {
+        return text;
+    }
+    match lower.parse::<f64>() {
+        Ok(f) if f.is_nan() => "nan".into(),
+        Ok(f) if f.is_infinite() && lower.contains("inf") => {
+            if f > 0.0 { "inf" } else { "-inf" }.into()
+        }
+        // an exponent too large for 64 bits
+        _ => lower.trim_start_matches('+').to_owned(),
+    }
+}
+/// The digits and power of ten of the decimal float `unsigned`, such as `1.5e3`.
+fn decimal_parts(unsigned: &str) -> Option<(String, i64)> {
+    let (mantissa, exponent) = unsigned.split_once('e').unwrap_or((unsigned, "0"));
+    let exponent: i64 = exponent.parse().ok()?;
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty() && fraction.is_empty()
+        || !whole
+            .chars()
+            .chain(fraction.chars())
+            .all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((
+        format!("{whole}{fraction}"),
+        exponent.checked_sub(fraction.len() as i64)?,
+    ))
+}
+/// The text the number `digits` × 10^`exponent` compares by, the same for every way of writing
+/// it: without leading or trailing zeros beyond [`MAX_WRITTEN_ZEROS`], else with an exponent.
+fn decimal_text(negative: bool, digits: &str, exponent: i64) -> Option<String> {
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some("0".into());
+    }
+    let significant = digits.trim_end_matches('0');
+    let exponent = exponent.checked_add((digits.len() - significant.len()) as i64)?;
+    let places = significant.len() as i64;
+    let text = if (0..=MAX_WRITTEN_ZEROS).contains(&exponent) {
+        format!("{significant}{}", "0".repeat(exponent as usize))
+    } else if exponent < 0 && exponent >= -places {
+        let (whole, fraction) = significant.split_at((places + exponent) as usize);
+        format!("{}.{fraction}", if whole.is_empty() { "0" } else { whole })
+    } else if exponent < 0 && exponent >= -(places + MAX_WRITTEN_ZEROS) {
+        let zeros = "0".repeat((-exponent - places) as usize);
+        format!("0.{zeros}{significant}")
+    } else {
+        format!("{significant}e{exponent}")
+    };
+    Some(if negative { format!("-{text}") } else { text })
 }
 pub fn parse(source: &str, format: Format) -> Result<Node> {
     if source.len() as u64 > analysis::MAX_FILE {
@@ -583,7 +660,7 @@ pub fn compare_with(a: &str, b: &str, format: Format, options: &Options) -> Sema
         policies: vec![
             "Read-only; text comparison rules are not semantic path rules and are not applied.".into(),
             "JSON objects unordered; duplicate keys rejected. Arrays ordered: elements are compared by position, an exact reordering is reported as moves, and with an array matching key, object elements are paired by that member's unique scalar value. XML attributes unordered; child/mixed-content order and text whitespace significant; expanded namespace names; comments included. No external entities/DTDs.".into(),
-            "TOML and YAML compare as JSON-shaped values: tables and mappings are unordered objects, numbers compare by value, and comments and formatting are ignored. YAML follows the YAML 1.2 core schema (yes/no/on/off are strings); aliases, several documents, complex keys and custom tags are refused, and input is limited to 4 MiB, 64 levels and 100,000 nodes.".into(),
+            "TOML and YAML compare as JSON-shaped values: tables and mappings are unordered objects, numbers compare by value (1 equals 1.0), date-times with an offset by the moment they name, and comments and formatting are ignored. YAML follows the YAML 1.2 core schema (yes/no/on/off are strings) and its keys compare by value; aliases, several documents, complex keys and tags other than the core ones are refused. Input is limited to 4 MiB, 64 levels and 100,000 nodes.".into(),
         ],
         options: options.clone(),
         notes: Vec::new(),
@@ -1216,7 +1293,7 @@ mod tests {
         );
         assert!(r.changes.iter().any(|c| c.kind == ChangeKind::Moved));
         let deep = format!("{}1{}", "[".repeat(100_000), "]".repeat(100_000));
-        let big = format!("a: \"{}\"\n", "x".repeat(yaml_doc::MAX_BYTES));
+        let big = format!("a: \"{}\"\n", "x".repeat(MAX_CONFIG_BYTES));
         let block = nested_block(80);
         for (bad, reason) in [
             ("a: &x 1\nb: *x\n", "aliases"),
@@ -1237,6 +1314,182 @@ mod tests {
         }
         assert_eq!(Format::of_extension("YML"), Some(Format::Yaml));
         assert!(!Format::Xml.keyed());
+    }
+
+    #[test]
+    fn toml_and_yaml_numbers_and_dates_compare_by_value() {
+        for (a, b) in [
+            ("a = 1\n", "a = 1.0\n"),
+            ("a = 0.0\n", "a = -0.0\n"),
+            ("a = inf\n", "a = +inf\n"),
+            ("a = nan\n", "a = -nan\n"),
+            ("a = 1e3\n", "a = 1000\n"),
+            ("a = 1e400\n", "a = 10e+399\n"),
+            ("a = 1.5e1\n", "a = 15\n"),
+            (
+                "t = 1979-05-27T07:32:00Z\n",
+                "t = 1979-05-27T07:32:00.000+00:00\n",
+            ),
+            (
+                "t = 1979-05-27T07:32:00Z\n",
+                "t = 1979-05-27T09:32:00+02:00\n",
+            ),
+            (
+                "t = 1979-05-27T00:10:00+01:00\n",
+                "t = 1979-05-26T23:10:00Z\n",
+            ),
+            ("t = 07:32:00\n", "t = 07:32:00.0\n"),
+        ] {
+            let r = compare(a, b, Format::Toml);
+            assert!(r.identical(), "{a} {b} {:?} {:?}", r.changes, r.errors);
+        }
+        assert!(!compare("t = 07:32:00\n", "t = 07:32:01\n", Format::Toml).identical());
+        assert!(!compare("a = 1e400\n", "a = 2e400\n", Format::Toml).identical());
+        let r = compare("a = 9223372036854775808\n", "a = 1\n", Format::Toml);
+        assert!(r.errors[0].contains("out of range"), "{:?}", r.errors);
+        for (a, b) in [
+            ("a: 1\n", "a: 1.0\n"),
+            ("a: -0.0\n", "a: 0\n"),
+            ("a: 1e3\n", "a: 1000\n"),
+            ("a: !!float 1\n", "a: 1.0\n"),
+            ("a: 1e23\n", "a: 100000000000000000000000\n"),
+            ("a: 1e38\n", "a: 100000000000000000000000000000000000000\n"),
+            ("a: 1e400\n", "a: 1e+400\n"),
+            ("a: -0.5e1\n", "a: -5\n"),
+            ("a: 0.10\n", "a: 0.1\n"),
+            ("a: 1.5e-3\n", "a: 0.0015\n"),
+            ("a: 1e-30\n", "a: 0.000000000000000000000000000001\n"),
+            ("0x10: a\n", "16: a\n"),
+            ("~: a\n", "null: a\n"),
+            ("a: ! 1\n", "a: '1'\n"),
+        ] {
+            let r = compare(a, b, Format::Yaml);
+            assert!(r.identical(), "{a} {b} {:?} {:?}", r.changes, r.errors);
+        }
+        let big = "a: 170141183460469231731687303715884105728\n";
+        assert!(!compare(big, &big.replace("28\n", "29\n"), Format::Yaml).identical());
+        assert_eq!(
+            compare(big, "a: '1'\n", Format::Yaml).changes[0].kind,
+            ChangeKind::TypeChanged
+        );
+        assert_eq!(
+            compare("a: 1e400\n", "a: '1e400'\n", Format::Yaml).changes[0].kind,
+            ChangeKind::TypeChanged
+        );
+        assert!(!compare("a: 1e400\n", "a: 2e400\n", Format::Yaml).identical());
+        assert!(!compare("a: 0.1\n", "a: 0.2\n", Format::Yaml).identical());
+        let long = format!("a: 1{}\n", "0".repeat(1000));
+        assert!(compare("a: 1e1000\n", &long, Format::Yaml).identical());
+        for (a, b) in [
+            ("a: 1e-400\n", "a: 0\n"),
+            ("a: 1e-400\n", "a: 2e-400\n"),
+            ("a: 1.00000000000000001\n", "a: 1\n"),
+            ("a: 1.00000000000000001\n", "a: 1.00000000000000002\n"),
+        ] {
+            assert!(!compare(a, b, Format::Yaml).identical(), "{a} {b}");
+        }
+        // Exponents at the ends of 64 bits neither overflow nor write out their zeros.
+        for huge in [
+            "a: 1e9223372036854775807\n",
+            "a: 10e9223372036854775807\n",
+            "a: 1e-9223372036854775808\n",
+            "1e9223372036854775807: x\n",
+        ] {
+            let r = compare(huge, "a: 1\n", Format::Yaml);
+            assert!(
+                r.errors.is_empty() && !r.identical(),
+                "{huge} {:?}",
+                r.errors
+            );
+            let toml = huge.replace(": ", " = ");
+            let r = compare(&toml, "a = 1\n", Format::Toml);
+            assert!(!r.identical(), "{toml}");
+        }
+        assert_eq!(float_literal("1e400"), "1e400");
+        assert_eq!(float_literal("-1.50e2"), "-150");
+        assert_eq!(float_literal("0.001"), "0.001");
+        assert_eq!(float_literal("1e-25"), "1e-25");
+        let r = compare("0x10: a\n\"16\": b\n", "a: 1\n", Format::Yaml);
+        assert!(
+            r.errors.iter().any(|e| e.contains("0x10 and \"16\"")),
+            "{:?}",
+            r.errors
+        );
+        assert!(compare("", "# only a comment\n", Format::Yaml).identical());
+        assert!(compare("", "a: 1\n", Format::Yaml).errors.is_empty());
+    }
+
+    #[test]
+    fn yaml_tags_other_than_the_core_ones_are_refused_everywhere() {
+        for bad in [
+            "a: !custom {k: v}\n",
+            "a: !!set {x, y}\n",
+            "a: !!omap [a]\n",
+            "a: !custom\n  k: v\n",
+            "a: !custom\n- 1\n",
+            "!binary k: v\n",
+            "a: !!int abc\n",
+            "a: !!int 1.5\n",
+            "a: !!bool yes\n",
+            "a: !!int\n",
+            "1: a\n01: b\n",
+            "a: !!float 0x10\n",
+            "a: !!float 0o7\n",
+            "- !custom\n- 1\n",
+        ] {
+            let r = compare(bad, "a: 1\n", Format::Yaml);
+            assert!(!r.errors.is_empty(), "{bad}");
+        }
+        for good in [
+            "a: !!map {k: v}\n",
+            "a: !!seq [1]\n",
+            "a: !!str\n",
+            "a: !!null\n",
+            "- !!null\n- 1\n",
+            "- !!str\n- x\n",
+            "a: !!seq\n- 1\n",
+            "a: &x !!seq\n- 1\n",
+            "a:\n  - !!null\n  - b: !!str\n    c: 1\n",
+        ] {
+            let r = compare(good, "a: 1\n", Format::Yaml);
+            assert!(r.errors.is_empty(), "{good}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn changed_tables_and_mappings_show_their_members() {
+        let r = compare(
+            "[a]\nx = 1\n",
+            "[a]\nx = 1\n\n[b]\ny = 2\nz = 3\n",
+            Format::Toml,
+        );
+        assert_eq!(r.changes[0].after.as_deref(), Some("[b]\ny = 2\nz = 3"));
+        let r = compare("x = 1\n", "x = 1\na.b = 2\n", Format::Toml);
+        assert_eq!(r.changes[0].after.as_deref(), Some("a.b = 2"));
+        let r = compare(
+            "[[w]]\nn = 1\n",
+            "[[w]]\nn = 1\n[[w]]\nn = 2\nm = 3\n",
+            Format::Toml,
+        );
+        assert_eq!(r.changes[0].after.as_deref(), Some("[[w]]\nn = 2\nm = 3"));
+        let r = compare("a: [x]\n", "a: [x, k: 1, y]\n", Format::Yaml);
+        assert!(
+            r.changes.iter().any(|c| c.after.as_deref() == Some("k: 1")),
+            "{:?}",
+            r.changes
+        );
+        let r = compare(
+            "a:\n  x: 1\nb: 2\n",
+            "a:\n  x: 1\n  y: 2\n# about b\nb: 2\n",
+            Format::Yaml,
+        );
+        assert_eq!(r.changes[0].after.as_deref(), Some("2"));
+        let r = compare(
+            "b: 2\n",
+            "a:\n  x: 1\n  y: 2\n# about b\nb: 2\n",
+            Format::Yaml,
+        );
+        assert_eq!(r.changes[0].after.as_deref(), Some("x: 1\n  y: 2"));
     }
 
     #[test]

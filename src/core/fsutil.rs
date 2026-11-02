@@ -145,13 +145,41 @@ fn write_staged(
     } else {
         perm.as_ref().is_some_and(|p| p.readonly()) && make_writable(target)
     };
-    let written = tmp.persist(target).map(|_| ()).map_err(|e| e.error);
+    let written = persist(tmp, target);
     if unlocked {
         if let Some(p) = perm {
             let _ = std::fs::set_permissions(target, p);
         }
     }
     written
+}
+
+/// Renames the temporary file `tmp` over `target`, or removes it. Windows refuses while
+/// another program, such as a virus scanner or the search indexer, has `target` open without
+/// sharing it, so there the rename is tried again for about a second.
+fn persist(tmp: tempfile::NamedTempFile, target: &Path) -> std::io::Result<()> {
+    let path = tmp.into_temp_path();
+    let mut waits = [10, 20, 50, 100, 200, 300, 400].into_iter();
+    loop {
+        match std::fs::rename(&path, target) {
+            Ok(()) => {
+                let _ = path.keep();
+                return Ok(());
+            }
+            // access denied, sharing violation, lock violation; a folder is denied for good
+            Err(e)
+                if cfg!(windows)
+                    && matches!(e.raw_os_error(), Some(5 | 32 | 33))
+                    && !target.is_dir() =>
+            {
+                match waits.next() {
+                    Some(ms) => std::thread::sleep(std::time::Duration::from_millis(ms)),
+                    None => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Clears the read-only flag of the file `path`; whether it was set and is now cleared.
@@ -207,8 +235,8 @@ pub fn copy_atomic(from: &Path, to: &Path, backup: bool) -> Result<()> {
     // can't rename over a read-only file either, so that is made writable for the rename.
     let old = std::fs::symlink_metadata(to).map(|m| m.permissions());
     let unlocked = cfg!(windows) && make_writable(to);
-    match tmp.persist(to) {
-        Ok(_) => {
+    match persist(tmp, to) {
+        Ok(()) => {
             let _ = std::fs::set_permissions(to, perm);
             Ok(())
         }
@@ -216,7 +244,7 @@ pub fn copy_atomic(from: &Path, to: &Path, backup: bool) -> Result<()> {
             if let (true, Ok(p)) = (unlocked, old) {
                 let _ = std::fs::set_permissions(to, p);
             }
-            Err(e.error).with_context(copying)
+            Err(e).with_context(copying)
         }
     }
 }

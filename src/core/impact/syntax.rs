@@ -12,7 +12,7 @@ use tree_sitter::{Language, Node, Parser, Tree};
 /// deep a Rust `use` tree is followed.
 const MAX_NESTING: usize = 64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Grammar {
     JavaScript,
     TypeScript,
@@ -20,6 +20,8 @@ pub enum Grammar {
     Python,
     C,
     Cpp,
+    /// A `.h` header: C, or C++ when it only reads as C++.
+    Header,
     Rust,
 }
 
@@ -31,7 +33,8 @@ impl Grammar {
                 "ts" | "mts" | "cts" => Grammar::TypeScript,
                 "tsx" => Grammar::Tsx,
                 "py" | "pyi" => Grammar::Python,
-                "c" | "h" => Grammar::C,
+                "c" => Grammar::C,
+                "h" => Grammar::Header,
                 "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Grammar::Cpp,
                 "rs" => Grammar::Rust,
                 _ => return None,
@@ -45,7 +48,7 @@ impl Grammar {
             Grammar::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Grammar::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Grammar::Python => tree_sitter_python::LANGUAGE.into(),
-            Grammar::C => tree_sitter_c::LANGUAGE.into(),
+            Grammar::C | Grammar::Header => tree_sitter_c::LANGUAGE.into(),
             Grammar::Cpp => tree_sitter_cpp::LANGUAGE.into(),
             Grammar::Rust => tree_sitter_rust::LANGUAGE.into(),
         }
@@ -88,8 +91,23 @@ fn parse(grammar: Grammar, source: &str, cancel: &AtomicBool) -> anyhow::Result<
     tree.ok_or_else(|| anyhow::anyhow!("The file could not be parsed"))
 }
 
+/// Leaves of these kinds name a member or a key, not something a file imports.
+const MEMBER_NAMES: [&str; 3] = [
+    "property_identifier",
+    "field_identifier",
+    "shorthand_property_identifier_pattern",
+];
+
 /// Reads `source`, a file in `grammar`.
 pub fn read(grammar: Grammar, source: &str, cancel: &AtomicBool) -> anyhow::Result<Syntax> {
+    if grammar == Grammar::Header {
+        let c = read(Grammar::C, source, cancel)?;
+        if !c.errors {
+            return Ok(c);
+        }
+        let cpp = read(Grammar::Cpp, source, cancel)?;
+        return Ok(if cpp.errors { c } else { cpp });
+    }
     let tree = parse(grammar, source, cancel)?;
     let root = tree.root_node();
     let text = |node: Node| node.utf8_text(source.as_bytes()).unwrap_or_default();
@@ -108,10 +126,15 @@ pub fn read(grammar: Grammar, source: &str, cancel: &AtomicBool) -> anyhow::Resu
         let found = imports_at(grammar, node, &text, line(node));
         let skip = found.is_some();
         imports.extend(found.into_iter().flatten());
+        let member = MEMBER_NAMES.contains(&node.kind())
+            || node.parent().is_some_and(|p| {
+                p.kind() == "attribute" && p.child_by_field_name("attribute") == Some(node)
+            });
         if !skip
             && node.child_count() == 0
             && node.is_named()
             && node.kind().ends_with("identifier")
+            && !member
         {
             uses.entry(text(node).to_owned()).or_insert(line(node));
         }
@@ -170,7 +193,13 @@ fn imports_at<'a>(
     let field_text = |node: Node, field: &str| node.child_by_field_name(field).map(text);
     match (grammar, node.kind()) {
         (g, "import_statement" | "export_statement") if g.script() => {
-            let source = node.child_by_field_name("source")?;
+            // import a = require("./a")
+            let mut cursor = node.walk();
+            let required = node
+                .named_children(&mut cursor)
+                .find(|n| n.kind() == "import_require_clause")
+                .and_then(|n| n.child_by_field_name("source"));
+            let source = node.child_by_field_name("source").or(required)?;
             let Some(spec) = string_value(source, text).filter(|s| code::relative(s)) else {
                 return Some(Vec::new());
             };
@@ -297,6 +326,23 @@ fn imports_at<'a>(
                 .and_then(|p| string_value(p, text));
             Some(spec.map(|s| import(s, Vec::new())).into_iter().collect())
         }
+        // Objective-C #import "a.h", which the C grammar reads as an unknown directive.
+        (Grammar::C | Grammar::Cpp, "preproc_call") => {
+            let directive = field_text(node, "directive")?;
+            if directive.replace(char::is_whitespace, "") != "#import" {
+                return None;
+            }
+            let spec = field_text(node, "argument")
+                .and_then(|a| a.trim_start().strip_prefix('"'))
+                .and_then(|a| a.split_once('"'))
+                .map(|(spec, _)| spec)
+                .filter(|spec| !spec.is_empty());
+            Some(
+                spec.map(|s| import(s.to_owned(), Vec::new()))
+                    .into_iter()
+                    .collect(),
+            )
+        }
         _ => None,
     }
 }
@@ -416,13 +462,28 @@ fn definitions(grammar: Grammar, root: Node, source: &str) -> BTreeMap<String, D
     let text = |node: Node| node.utf8_text(source.as_bytes()).unwrap_or_default();
     let mut out = BTreeMap::new();
     let mut add = |name: &str, kind: Kind, node: Node| {
-        if !name.is_empty() {
-            out.entry(name.to_owned()).or_insert(Definition {
+        if name.is_empty() {
+            return;
+        }
+        let mut hash = print(node, source);
+        // Rust attributes are items of their own before the item they belong to.
+        let mut before = node.prev_named_sibling();
+        while let Some(n) = before {
+            match n.kind() {
+                "attribute_item" => hash = code::mix(hash, print(n, source)),
+                kind if kind.contains("comment") => {}
+                _ => break,
+            }
+            before = n.prev_named_sibling();
+        }
+        // Overloads, `#[cfg]` variants and prototypes are one name defined more than once.
+        out.entry(name.to_owned())
+            .and_modify(|d: &mut Definition| d.print = code::mix(d.print, hash))
+            .or_insert(Definition {
                 kind,
-                print: print(node, source),
+                print: hash,
                 line: node.start_position().row + 1,
             });
-        }
     };
     let name_of = |node: Node| node.child_by_field_name("name").map(text);
     // Nodes holding top-level items, with how deep they are.
@@ -745,6 +806,14 @@ if (debug) { require("./nested"); }
             imports_of("a.c", c),
             [("x.h".into(), 2, vec![]), ("y.h".into(), 5, vec![])]
         );
+        let objc = "#import \"View.h\"\n#import <UIKit/UIKit.h>\n# import \"Model.h\" // model\n#pragma \"no.h\"\n@interface A : NSObject\n@end\n";
+        for path in ["a.h", "a.c"] {
+            assert_eq!(
+                imports_of(path, objc),
+                [("View.h".into(), 1, vec![]), ("Model.h".into(), 3, vec![])],
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -848,6 +917,75 @@ if (debug) { require("./nested"); }
                 ("c".into(), (Kind::Function, true)),
             ]
         );
+    }
+
+    #[test]
+    fn typescript_import_require_is_an_import() {
+        assert_eq!(
+            imports_of(
+                "a.ts",
+                "import util = require(\"./util\");\nimport fs = require(\"fs\");\n"
+            ),
+            [("./util".into(), 1, vec![])]
+        );
+    }
+
+    #[test]
+    fn the_first_use_is_not_a_member_or_key_of_the_same_name() {
+        let source = "import { p } from './p';\nconst o = { p: 1 };\no.p = 2;\nconst { p: q } = o;\nrun(p);\n";
+        let syntax = read(Grammar::JavaScript, source, &AtomicBool::new(false)).unwrap();
+        assert_eq!(syntax.uses.get("p"), Some(&5));
+        let python = "from .m import name\nobj.name = 1\nprint(name)\n";
+        let syntax = read(Grammar::Python, python, &AtomicBool::new(false)).unwrap();
+        assert_eq!(syntax.uses.get("name"), Some(&3));
+    }
+
+    #[test]
+    fn every_definition_of_a_name_and_rust_attributes_count() {
+        let changed = |path: &str, before: &str, after: &str| {
+            let of = |s| {
+                read(Grammar::of(path).unwrap(), s, &AtomicBool::new(false))
+                    .unwrap()
+                    .definitions
+            };
+            code::changed(&of(before), &of(after))
+                .into_keys()
+                .collect::<Vec<_>>()
+        };
+        let overloads = "export function f(a: string): string;\nexport function f(a: number): number;\nexport function f(a: any) { return a; }\n";
+        assert_eq!(
+            changed(
+                "a.ts",
+                overloads,
+                &overloads.replace("return a", "return 0")
+            ),
+            ["f"]
+        );
+        let variants = "#[cfg(unix)]\nfn open() { 1 }\n#[cfg(windows)]\nfn open() { 2 }\n";
+        assert_eq!(
+            changed("a.rs", variants, &variants.replace("2", "3")),
+            ["open"]
+        );
+        let derived =
+            "/// A config.\n#[derive(Clone)]\n// note\n#[serde(default)]\npub struct Config;\n";
+        assert_eq!(
+            changed("a.rs", derived, &derived.replace("Clone", "Debug")),
+            ["Config"]
+        );
+        assert!(changed("a.rs", derived, &derived.replace("note", "other")).is_empty());
+    }
+
+    #[test]
+    fn a_header_reads_as_cpp_when_it_does_not_read_as_c() {
+        let cpp =
+            "#include \"base.h\"\nnamespace ns {\ntemplate <typename T> class Box { T t; };\n}\n";
+        let syntax = read(Grammar::Header, cpp, &AtomicBool::new(false)).unwrap();
+        assert!(!syntax.errors);
+        assert!(syntax.definitions.contains_key("Box"));
+        assert_eq!(syntax.imports[0].spec, "base.h");
+        let c = "struct point { int x; };\n";
+        let syntax = read(Grammar::Header, c, &AtomicBool::new(false)).unwrap();
+        assert!(!syntax.errors && syntax.definitions.contains_key("point"));
     }
 
     #[test]

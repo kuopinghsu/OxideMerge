@@ -152,6 +152,20 @@ impl Gui {
         self.frames(3);
     }
 
+    /// Runs frames until `done`, such as a background report being shown.
+    fn wait_until(&mut self, what: &str, done: impl Fn(&Gui) -> bool) {
+        let start = Instant::now();
+        while !done(self) {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "{}: {what} not shown after a minute",
+                self.name
+            );
+            std::thread::sleep(Duration::from_millis(1));
+            self.frame();
+        }
+    }
+
     fn busy(&self) -> bool {
         self.app.report_job.is_some()
             || self
@@ -597,6 +611,53 @@ fn the_first_start_offers_a_sample_that_leaves_no_trace() {
 }
 
 #[test]
+fn the_recent_comparisons_are_cleared_from_the_start_page_and_the_file_menu() {
+    let recent = vec![
+        vec!["/tmp/a/old.txt".to_owned(), "/tmp/b/old.txt".to_owned()],
+        vec!["/tmp/a/new.txt".to_owned(), "/tmp/b/new.txt".to_owned()],
+    ];
+    let cfg = Config {
+        recent_compares: recent.clone(),
+        ..config()
+    };
+    let mut gui = Gui::with_config("clear_recent", cfg, None);
+    assert!(gui.shows_text("old.txt"));
+
+    // the start page's short "Clear" is named in full for screen readers
+    gui.click(tr("menu.clear_recent"));
+    assert!(gui.app.cfg.recent_compares.is_empty());
+    assert!(!gui.shows_text("old.txt"));
+    assert!(gui.shows(tr("start.try_title")));
+    assert_eq!(gui.toasts(), [(false, tr("msg.recent_cleared").to_owned())]);
+
+    gui.click(tr("cmd.undo"));
+    assert_eq!(gui.app.cfg.recent_compares, recent);
+    assert!(gui.toasts().is_empty());
+    assert!(gui.shows_text("old.txt"));
+
+    // clearing again before the first toast is gone keeps both for one undo
+    gui.click(tr("menu.clear_recent"));
+    let newer = vec!["/tmp/a/newer.txt".to_owned(), "/tmp/b/newer.txt".to_owned()];
+    gui.app.cfg.add_recent_compare(&newer);
+    gui.settle();
+    gui.click(tr("menu.clear_recent"));
+    assert_eq!(gui.toasts().len(), 1);
+    gui.click(tr("cmd.undo"));
+    let mut all = vec![newer];
+    all.extend(recent);
+    assert_eq!(gui.app.cfg.recent_compares, all);
+
+    gui.menu(&[
+        tr("menu.file"),
+        tr("menu.open_recent"),
+        tr("menu.clear_recent"),
+    ]);
+    assert!(gui.app.cfg.recent_compares.is_empty());
+    gui.click_menu(tr("menu.file"));
+    assert!(!gui.widget(tr("menu.open_recent")).enabled);
+}
+
+#[test]
 fn the_start_page_compares_the_typed_paths() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
@@ -866,6 +927,14 @@ fn folder_merges_are_previewed_then_carried_out() {
     let roots = merge_folders(dir.path());
     let mut gui = Gui::start("folder_merge", compare_folders(&roots));
     assert!(matches!(gui.app.tabs[0].content, Content::Folder(_)));
+    let ascending = format!("{}, {}", tr("col.name"), tr("col.sorted_ascending"));
+    assert!(gui.shows(&ascending), "the sort is not announced");
+    gui.click(&ascending);
+    assert!(gui.shows(&format!(
+        "{}, {}",
+        tr("col.name"),
+        tr("col.sorted_descending")
+    )));
 
     gui.menu(&[tr("menu.merge"), tr("cmd.folder_merge")]);
     let plan = trf(
@@ -976,6 +1045,101 @@ fn formatted_web_pages_step_on_to_the_next_file() {
     gui.key(ALT, Key::ArrowDown);
     gui.key(ALT, Key::ArrowDown);
     assert!(shown(&mut gui).ends_with("/two.html"));
+}
+
+#[test]
+fn the_docked_file_compare_steps_through_differences_and_on_to_other_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("left/a.txt", "1\nx\n3\n4\n5\n6\n7\n8\ny\n10\n"),
+            ("right/a.txt", "1\nX\n3\n4\n5\n6\n7\n8\nY\n10\n"),
+            ("left/b.txt", "same\n"),
+            ("right/b.txt", "same\n"),
+            ("left/c.txt", "one\n"),
+            ("right/c.txt", "two\n"),
+        ],
+    );
+    let cfg = Config {
+        folder_file_pane: true,
+        ..config()
+    };
+    let roots = [d.join("left"), d.join("right")];
+    let mut gui = Gui::with_config("dock_steps", cfg, compare_folders(&roots));
+    let docked = |gui: &mut Gui, rel: &str| {
+        let start = Instant::now();
+        loop {
+            gui.frame();
+            if let Content::Folder(f) = &gui.app.tabs[0].content {
+                if let Some((shown, pos)) = f.docked().filter(|(shown, _)| shown == rel) {
+                    assert_eq!(shown, rel);
+                    return pos;
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "{rel} was never docked"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    gui.click("a.txt");
+    assert_eq!(docked(&mut gui, "a.txt"), Some(0));
+    gui.key(ALT, Key::ArrowDown);
+    assert_eq!(docked(&mut gui, "a.txt"), Some(1));
+    // Past the last difference, the identical b.txt is skipped.
+    gui.key(ALT, Key::ArrowDown);
+    assert_eq!(docked(&mut gui, "c.txt"), Some(0));
+    gui.key(ALT, Key::ArrowDown);
+    assert!(
+        gui.toasts()
+            .contains(&(false, tr("msg.no_next_file").to_string())),
+        "{:?}",
+        gui.toasts()
+    );
+    gui.key(ALT, Key::ArrowUp);
+    assert_eq!(docked(&mut gui, "a.txt"), Some(1));
+
+    // The docked compare's own buttons step on to the next file too.
+    gui.click_a(accesskit::Role::Button, tr("cmd.next_diff"));
+    assert_eq!(docked(&mut gui, "c.txt"), Some(0));
+    gui.click_a(accesskit::Role::Button, tr("cmd.prev_diff"));
+    assert_eq!(docked(&mut gui, "a.txt"), Some(1));
+    gui.click_a(accesskit::Role::Button, tr("cmd.prev_diff"));
+    assert_eq!(docked(&mut gui, "a.txt"), Some(0));
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn the_file_compare_below_the_folder_list_is_shown_and_hidden_from_the_toolbar_and_keyboard() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("left/a.txt", "one\n"), ("right/a.txt", "two\n")]);
+    let roots = [d.join("left"), d.join("right")];
+    let mut gui = Gui::start("file_pane_toggle", compare_folders(&roots));
+    assert!(!gui.app.cfg.folder_file_pane);
+
+    gui.click(tr("view.folder_file_pane"));
+    assert!(gui.app.cfg.folder_file_pane);
+    gui.click("a.txt");
+    let start = Instant::now();
+    while !matches!(&gui.app.tabs[0].content, Content::Folder(f) if f.docked().is_some()) {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "a.txt was never docked"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        gui.frame();
+    }
+
+    gui.key(ALT, Key::P);
+    assert!(!gui.app.cfg.folder_file_pane);
+    assert!(matches!(&gui.app.tabs[0].content, Content::Folder(f) if f.docked().is_none()));
+    gui.key(ALT, Key::P);
+    assert!(gui.app.cfg.folder_file_pane);
 }
 
 #[test]
@@ -1974,15 +2138,9 @@ fn semantic_view_is_read_only_and_can_jump_back_to_source() {
         compare(&[dir.path().join("a.json"), dir.path().join("b.json")]),
     );
     gui.click(tr("analysis.semantic"));
-    let start = Instant::now();
-    while !gui.shows_text("timeout") || !gui.shows_text("30 → 60") {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "semantic worker did not finish"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-        gui.frame();
-    }
+    gui.wait_until("semantic report", |gui| {
+        gui.shows_text("timeout") && gui.shows_text("30 → 60")
+    });
     assert!(gui.shows(tr("analysis.semantic_read_only")));
     gui.click(&format!("{} 2:2", tr("analysis.source")));
     assert_eq!(gui.text_view().active_pane, 1);
@@ -2014,17 +2172,7 @@ fn semantic_tree_groups_paths_and_an_array_key_pairs_moved_elements() {
         compare(&[dir.path().join("a.json"), dir.path().join("b.json")]),
     );
     gui.click(tr("analysis.semantic"));
-    let wait_for = |gui: &mut Gui, label: &str| {
-        let start = Instant::now();
-        while !gui.shows(label) {
-            assert!(
-                start.elapsed() < Duration::from_secs(5),
-                "semantic view did not show {label:?}"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-            gui.frame();
-        }
-    };
+    let wait_for = |gui: &mut Gui, label: &str| gui.wait_until(label, |gui| gui.shows(label));
     wait_for(&mut gui, "[\"items\"] (4)");
     assert!(gui.shows("[\"name\"] (1)"));
     assert!(gui.shows("[0] (2)"));
@@ -2073,12 +2221,7 @@ fn yaml_and_toml_compares_offer_the_semantic_view() {
             ]),
         );
         gui.click(tr("analysis.semantic"));
-        let start = Instant::now();
-        while !gui.shows(before) {
-            assert!(start.elapsed() < Duration::from_secs(5), "{name}");
-            std::thread::sleep(Duration::from_millis(1));
-            gui.frame();
-        }
+        gui.wait_until(before, |gui| gui.shows(before));
         assert!(gui.shows("[\"db\"][\"port\"] (1)"));
         assert!(gui.shows(tr("analysis.array_key")));
         gui.click(&format!("{} 2:2", tr("analysis.source")));
@@ -2108,15 +2251,9 @@ fn merge_verification_preview_never_edits_the_middle_pane() {
     gui.click(tr("drawer.toggle"));
     assert!(gui.shows(tr("analysis.merge_verification")));
     gui.click(tr("analysis.preview_merge"));
-    let start = Instant::now();
-    while !gui.shows_text(tr("analysis.planned_changes")) {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "merge preview did not finish"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-        gui.frame();
-    }
+    gui.wait_until("merge preview", |gui| {
+        gui.shows_text(tr("analysis.planned_changes"))
+    });
     assert!(gui.shows(tr("analysis.not_run")));
     assert_eq!(gui.text_view().panes[1].doc.text(), "a\nb\nc\nd\n");
     assert_eq!(read(&dir.path().join("base.txt")), "a\nb\nc\nd\n");
@@ -2149,17 +2286,7 @@ fn start_page_baselines_open_frozen_binary_bytes_without_original_inputs() {
     gui.click(tr("baseline.right"));
     gui.type_text(&format!("folder:{}", b.display()));
     gui.click(tr("baseline.compare"));
-    let wait_for = |gui: &mut Gui, label: &str| {
-        let start = Instant::now();
-        while !gui.shows(label) {
-            assert!(
-                start.elapsed() < Duration::from_secs(5),
-                "baseline worker did not show {label:?}"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-            gui.frame();
-        }
-    };
+    let wait_for = |gui: &mut Gui, label: &str| gui.wait_until(label, |gui| gui.shows(label));
     wait_for(&mut gui, tr("baseline.captured"));
     let category = |key: &'static str, rest: &str| format!("{} {rest}", tr(key));
     let renamed = category("baseline.cat.renamed_modified", "new.cfg");
@@ -2216,13 +2343,8 @@ fn semantic_source_navigation_merges_the_selected_later_block_only() {
         compare(&[dir.path().join("a.json"), dir.path().join("b.json")]),
     );
     gui.click(tr("analysis.semantic"));
-    let start = Instant::now();
     let source = format!("{} 2:6", tr("analysis.source"));
-    while !gui.shows(&source) {
-        assert!(start.elapsed() < Duration::from_secs(5));
-        std::thread::sleep(Duration::from_millis(1));
-        gui.frame();
-    }
+    gui.wait_until(&source, |gui| gui.shows(&source));
     gui.click(&source);
     gui.app.run(Cmd::CopyRight, &gui.ctx);
     gui.settle();
@@ -2274,15 +2396,7 @@ fn exact_impact_findings_link_to_the_folder_review_workspace() {
     gui.click(tr("impact.title"));
     gui.click(tr("baseline.compare"));
     let finding = format!("{} · src/app.ts:1", tr("impact.exact"));
-    let start = Instant::now();
-    while !gui.shows(&finding) {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "impact worker did not finish"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-        gui.frame();
-    }
+    gui.wait_until(&finding, |gui| gui.shows(&finding));
     gui.scroll_to(tr("impact.review"));
     gui.click(tr("impact.review"));
     let Content::Folder(view) = &gui.app.tabs[0].content else {

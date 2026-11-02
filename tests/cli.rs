@@ -912,12 +912,33 @@ fn semantic_merge_validation_and_release_analysis_are_opt_in_and_read_only() {
             "--baseline-right",
             "folder:new",
             "--split-rename",
-            "main.ini",
+            "./main.ini",
         ],
     );
     assert_eq!(split.code, 1, "{}", split.stderr);
     assert!(!split.stdout.contains("\"renamed_modified\""));
     assert!(split.stdout.contains("\"split_renames\""));
+    assert!(split.stderr.is_empty(), "{}", split.stderr);
+    let unmatched = oxidemerge(
+        d,
+        &[
+            "--baseline-left",
+            "folder:old",
+            "--baseline-right",
+            "folder:new",
+            "--split-rename",
+            "nowhere.ini",
+        ],
+    );
+    assert_eq!(unmatched.code, 1, "{}", unmatched.stderr);
+    assert!(
+        unmatched.stderr.contains("nowhere.ini: not an added path"),
+        "{}",
+        unmatched.stderr
+    );
+    let alone = oxidemerge(d, &["--split-rename", "main.ini", "old", "new"]);
+    assert_eq!(alone.code, 2, "{}", alone.stderr);
+    assert!(alone.stderr.contains("--split-rename"), "{}", alone.stderr);
     let scoped = oxidemerge(d, &["--impact", "--filter", "*.rs", "old", "new"]);
     assert_eq!(scoped.code, 0, "{}", scoped.stderr);
     assert!(scoped.stdout.contains("File excluded by scope"));

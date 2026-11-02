@@ -69,10 +69,14 @@ const ENDS_P: &[&str] = &[
     "article",
     "aside",
     "blockquote",
+    "center",
+    "dd",
     "details",
     "dialog",
+    "dir",
     "div",
     "dl",
+    "dt",
     "fieldset",
     "figcaption",
     "figure",
@@ -87,17 +91,25 @@ const ENDS_P: &[&str] = &[
     "header",
     "hgroup",
     "hr",
+    "li",
+    "listing",
     "main",
     "menu",
     "nav",
     "ol",
     "p",
+    "plaintext",
     "pre",
     "search",
     "section",
+    "summary",
     "table",
     "ul",
+    "xmp",
 ];
+
+/// Most elements followed open in an element being left out; deeper ones are taken as empty.
+const MAX_SKIP_DEPTH: usize = 256;
 
 /// Whether a start tag `tag` ends the open element `open`, whose end tag was left out.
 fn ended_by(open: &str, tag: &str) -> bool {
@@ -118,8 +130,9 @@ fn ended_by(open: &str, tag: &str) -> bool {
 /// Follows `tok` through `open`, the elements open in an element being left out, outermost
 /// first: whether it is part of them. As in a browser, an element whose end tag was left out
 /// ends at a tag that cannot be inside it, such as the next `<li>` after `<li hidden>`, or at
-/// the end tag of the element around it; that tag is then not part of them.
-fn skipped(open: &mut Vec<String>, tok: &Token) -> bool {
+/// the end tag of the element around it, when `around` says that element is open; that tag is
+/// then not part of them.
+fn skipped(open: &mut Vec<String>, tok: &Token, around: impl Fn(&str) -> bool) -> bool {
     let Token::Tag(name, attrs, closing) = tok else {
         return true;
     };
@@ -129,10 +142,10 @@ fn skipped(open: &mut Vec<String>, tok: &Token) -> bool {
             open.truncate(i);
             return true;
         }
-        let around = matches!(name, "td" | "th")
+        let ends = matches!(name, "td" | "th")
             || (BLOCK.contains(&name)
                 && !matches!(name, "p" | "br" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"));
-        if around && OPTIONAL_END.contains(&open[0].as_str()) {
+        if ends && OPTIONAL_END.contains(&open[0].as_str()) && around(name) {
             open.clear();
             return false;
         }
@@ -142,6 +155,10 @@ fn skipped(open: &mut Vec<String>, tok: &Token) -> bool {
     for (i, o) in open.iter().enumerate().rev() {
         if ended_by(o, name) {
             cut = Some(i);
+        } else if matches!(name, "li" | "dd" | "dt")
+            && matches!(o.as_str(), "p" | "div" | "address")
+        {
+            // a browser looks past these for the item to end
         } else if BLOCK.contains(&o.as_str()) || OPTIONAL_END.contains(&o.as_str()) {
             break;
         }
@@ -152,7 +169,7 @@ fn skipped(open: &mut Vec<String>, tok: &Token) -> bool {
             return false;
         }
     }
-    if !VOID.contains(&name) && !attrs.trim_end().ends_with('/') {
+    if !VOID.contains(&name) && !attrs.trim_end().ends_with('/') && open.len() < MAX_SKIP_DEPTH {
         open.push(name.to_string());
     }
     true
@@ -258,6 +275,8 @@ struct Table {
 
 struct Converter {
     base: Option<Url>,
+    /// Whether a `<base href>` set `base`: only the first one counts.
+    based: bool,
     blocks: Vec<Block>,
     /// Inline text of the block being read.
     line: String,
@@ -532,8 +551,11 @@ impl Converter {
         let in_table = self.table.is_some();
         match name {
             "base" => {
-                if let Some(href) = attr(attrs, "href") {
-                    self.base = Some(self.resolve(href)).and_then(|u| Url::parse(&u).ok());
+                if let Some(href) = attr(attrs, "href").filter(|_| !self.based) {
+                    self.based = true;
+                    if let Ok(url) = Url::parse(&self.resolve(href)) {
+                        self.base = Some(url);
+                    }
                 }
             }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" if !in_table => {
@@ -745,6 +767,7 @@ fn code_language(attrs: &str) -> String {
 pub fn html_to_blocks(html: &str, base: Option<&Url>) -> Vec<Block> {
     let mut c = Converter {
         base: base.cloned(),
+        based: false,
         blocks: Vec::new(),
         line: String::new(),
         ctx: Vec::new(),
@@ -754,8 +777,16 @@ pub fn html_to_blocks(html: &str, base: Option<&Url>) -> Vec<Block> {
         table: None,
         skip: Vec::new(),
     };
+    // The elements open outside the elements left out, outermost first.
+    let mut opened = OpenElements::default();
     for tok in tokens(html) {
-        if !c.skip.is_empty() && skipped(&mut c.skip, &tok) {
+        if !c.skip.is_empty() && skipped(&mut c.skip, &tok, |name| opened.contains(name)) {
+            // the page's `<base>` is in its `<head>`, which is otherwise left out
+            if let Token::Tag(name, attrs, false) = &tok {
+                if name == "base" && c.skip == ["head"] {
+                    c.start_tag(name, attrs);
+                }
+            }
             continue;
         }
         match tok {
@@ -768,14 +799,71 @@ pub fn html_to_blocks(html: &str, base: Option<&Url>) -> Vec<Block> {
                     continue;
                 }
                 c.start_tag(&name, attrs);
+                opened.start(name, attrs);
             }
-            Token::Tag(name, _, true) => c.end_tag(&name),
+            Token::Tag(name, _, true) => {
+                opened.end(&name);
+                c.end_tag(&name);
+            }
         }
     }
     c.end_pre();
     c.end_table();
     c.flush();
     c.blocks
+}
+
+/// Elements open outside the elements left out, as far as [`MAX_OPEN_DEPTH`] deep.
+#[derive(Default)]
+struct OpenElements {
+    /// Outermost first.
+    stack: Vec<String>,
+    /// How many of each name are on the stack.
+    counts: std::collections::HashMap<String, usize>,
+}
+
+/// Elements nested deeper than this are not followed; a page cannot make each tag cost more.
+const MAX_OPEN_DEPTH: usize = 1024;
+
+impl OpenElements {
+    fn contains(&self, name: &str) -> bool {
+        self.counts.get(name).is_some_and(|&n| n > 0)
+    }
+
+    fn pop(&mut self) {
+        if let Some(name) = self.stack.pop() {
+            if let Some(n) = self.counts.get_mut(&name) {
+                *n -= 1;
+            }
+        }
+    }
+
+    /// The start tag `name`, which first ends the elements it cannot be inside.
+    fn start(&mut self, name: String, attrs: &str) {
+        while self.stack.last().is_some_and(|o| ended_by(o, &name)) {
+            self.pop();
+        }
+        if !VOID.contains(&name.as_str())
+            && !attrs.trim_end().ends_with('/')
+            && self.stack.len() < MAX_OPEN_DEPTH
+        {
+            *self.counts.entry(name.clone()).or_default() += 1;
+            self.stack.push(name);
+        }
+    }
+
+    /// The end tag `name`, which ends the elements inside its element; a stray one ends nothing.
+    fn end(&mut self, name: &str) {
+        if self.contains(name) {
+            while let Some(top) = self.stack.last() {
+                let done = top == name;
+                self.pop();
+                if done {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Markdown blocks as one text, for comparing line by line: nested blocks are indented.
@@ -1275,6 +1363,38 @@ mod tests {
             md("<div hidden><p>Gone<li>Gone too</ul></div><p>After"),
             "After"
         );
+        assert_eq!(md("<ul><li><p hidden>Gone<li>b</ul>"), "- b");
+        assert_eq!(md("<ul><li hidden><div>Gone<li>b</ul>"), "- b");
+        assert_eq!(md("<dl><dd hidden><p>Gone<dt>Term</dt></dl>"), "**Term**");
+        // a stray end tag of an element that is not open does not end the hidden one
+        assert_eq!(md("<p hidden>Gone</div>Still gone<p>Shown"), "Shown");
+        // nor does one of an element that was closed when the element around it was
+        assert_eq!(
+            md("<table><tr><td>a<td>b</table><p hidden>Gone</td>Still gone<p>Shown"),
+            format!("{}\n\nShown", md("<table><tr><td>a<td>b</table>"))
+        );
+        assert_eq!(
+            md("<ul><li>a<li>b</ul><p hidden>Gone</li>Still gone<p>Shown"),
+            "- a\n\n- b\n\nShown"
+        );
+        // many end tags against deep markup stay fast
+        let stray = format!(
+            "<p>a</p>{}{}",
+            "<span>".repeat(60_000),
+            "</i>".repeat(60_000)
+        );
+        let start = std::time::Instant::now();
+        md(&stray);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        let deep = format!("<div hidden>{}Gone</div><p>After", "<b>".repeat(10_000));
+        assert!(!md(&deep).contains("Gone"));
+    }
+
+    #[test]
+    fn the_first_base_of_the_head_resolves_links() {
+        let html = r#"<html><head><base href="https://cdn.example.org/v2/"><base href="/no/">
+            <title>T</title></head><body><a href="guide.html">Guide</a></body></html>"#;
+        assert_eq!(md(html), "[Guide](https://cdn.example.org/v2/guide.html)");
     }
 
     #[test]

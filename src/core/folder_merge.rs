@@ -5,7 +5,7 @@
 //! symbolic links and names that are a file on one side and a folder on another.
 
 use super::diff::merge3;
-use super::folder::{delete_path, name_key, CmpStatus, DirItem};
+use super::folder::{self, delete_path, name_key, CmpStatus, DirItem};
 use super::fsutil;
 use super::text::{self, TextDoc};
 use crate::i18n::tr;
@@ -393,7 +393,7 @@ fn escapes(root: &Path, it: &DirItem, target: &Path) -> bool {
 /// What a path held before the merge changed it, to put back if the merge does not finish.
 enum Before {
     Missing,
-    Dir,
+    Dir(std::fs::Permissions),
     File {
         copy: PathBuf,
         permissions: std::fs::Permissions,
@@ -402,8 +402,9 @@ enum Before {
 }
 
 /// The paths a merge changes, each with what it held before, in the order they changed.
-#[derive(Default)]
 struct Journal {
+    /// The folder the copies are made in, on the volume of the files merged.
+    near: PathBuf,
     /// Copies of the files changed, made on first use.
     dir: Option<tempfile::TempDir>,
     entries: Vec<(PathBuf, Before)>,
@@ -411,6 +412,48 @@ struct Journal {
 }
 
 impl Journal {
+    fn new(root: &Path) -> Journal {
+        Journal {
+            near: root.to_path_buf(),
+            dir: None,
+            entries: Vec::new(),
+            seen: HashSet::new(),
+        }
+    }
+
+    /// Where the copy of the next entry goes. The copies are kept next to the files merged, so
+    /// they need no room on another disk and a deleted file is only moved; the system's
+    /// temporary folder is used when that folder cannot be written.
+    fn next_copy(&mut self, of: &Path) -> std::io::Result<PathBuf> {
+        let dir = match &mut self.dir {
+            Some(d) => d,
+            none => {
+                let near = tempfile::Builder::new()
+                    .prefix(folder::UNDO_PREFIX)
+                    .tempdir_in(&self.near);
+                none.insert(match near {
+                    Ok(d) => d,
+                    Err(_) => tempfile::Builder::new()
+                        .prefix(folder::UNDO_PREFIX)
+                        .tempdir()?,
+                })
+            }
+        };
+        // Named after the file, so a copy kept after a failed undo can be told apart, but
+        // short enough for any file system however long the file's name is.
+        let name = of
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        let mut end = name.len().min(MAX_COPY_NAME);
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        Ok(dir
+            .path()
+            .join(format!("{}-{}", self.entries.len(), &name[..end])))
+    }
+
     /// Keeps what `path` holds now, unless it was kept already.
     fn remember(&mut self, path: &Path) -> std::io::Result<()> {
         if self.seen.contains(path) {
@@ -419,17 +462,9 @@ impl Journal {
         let before = match std::fs::symlink_metadata(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Before::Missing,
             Err(e) => return Err(e),
-            Ok(m) if m.is_dir() => Before::Dir,
+            Ok(m) if m.is_dir() => Before::Dir(m.permissions()),
             Ok(m) if m.is_file() => {
-                let dir = match &mut self.dir {
-                    Some(d) => d,
-                    none => none.insert(
-                        tempfile::Builder::new()
-                            .prefix("oxidemerge-undo")
-                            .tempdir()?,
-                    ),
-                };
-                let copy = dir.path().join(self.entries.len().to_string());
+                let copy = self.next_copy(path)?;
                 std::fs::copy(path, &copy)?;
                 fsutil::make_writable(&copy);
                 Before::File {
@@ -445,13 +480,37 @@ impl Journal {
         Ok(())
     }
 
-    /// Keeps `path` and its `<name>.bak` when one is made.
-    fn remember_with_backup(&mut self, path: &Path, backup: bool) -> std::io::Result<()> {
+    /// Deletes the file `path`, moving it to the copies when it was not kept already.
+    fn take(&mut self, path: &Path) -> anyhow::Result<()> {
+        let m = std::fs::symlink_metadata(path)?;
+        if !self.seen.contains(path) && m.is_file() {
+            let copy = self.next_copy(path)?;
+            if std::fs::rename(path, &copy).is_ok() {
+                // writable, as the copies `remember` makes, for putting it back
+                fsutil::make_writable(&copy);
+                self.seen.insert(path.to_path_buf());
+                self.entries.push((
+                    path.to_path_buf(),
+                    Before::File {
+                        copy,
+                        permissions: m.permissions(),
+                        modified: m.modified().ok(),
+                    },
+                ));
+                return Ok(());
+            }
+        }
         self.remember(path)?;
+        delete_path(path, false)
+    }
+
+    /// Keeps `path` and its `<name>.bak` when one is made, the `.bak` first so that it is put
+    /// back after the file.
+    fn remember_with_backup(&mut self, path: &Path, backup: bool) -> std::io::Result<()> {
         if backup {
             self.remember(&fsutil::backup_path(path))?;
         }
-        Ok(())
+        self.remember(path)
     }
 
     /// Keeps the folders missing on the way to `dir`, outermost first.
@@ -463,10 +522,30 @@ impl Journal {
         missing.into_iter().rev().try_for_each(|d| self.remember(d))
     }
 
-    /// Puts back every path kept, the last changed first. Returns the paths it could not.
-    fn roll_back(self) -> Vec<String> {
+    /// Puts back every path kept, the last changed first. Returns the paths it could not, and
+    /// then where the copies are kept for putting them back by hand.
+    fn roll_back(mut self) -> Vec<String> {
         let mut errors = Vec::new();
-        for (path, before) in self.entries.into_iter().rev() {
+        let mut failed: HashSet<PathBuf> = HashSet::new();
+        let index: String = self
+            .entries
+            .iter()
+            .filter_map(|(path, before)| match before {
+                Before::File { copy, .. } => Some(format!(
+                    "{}\t{}\n",
+                    copy.file_name()?.to_string_lossy(),
+                    path.display()
+                )),
+                _ => None,
+            })
+            .collect();
+        for (path, before) in std::mem::take(&mut self.entries).into_iter().rev() {
+            // A `.bak` the merge made is the other copy of a file not put back.
+            if matches!(before, Before::Missing)
+                && failed.iter().any(|f| fsutil::backup_path(f) == path)
+            {
+                continue;
+            }
             if let Err(e) = restore(&path, before) {
                 errors.push(crate::i18n::trf(
                     "msg.folder_merge_undo_failed",
@@ -475,11 +554,39 @@ impl Journal {
                         ("error", e.to_string()),
                     ],
                 ));
+                failed.insert(path);
+            }
+        }
+        if !errors.is_empty() {
+            if let Some(dir) = self.dir.take() {
+                // which file each copy was, as the copies are named after the file only
+                let _ = std::fs::write(dir.path().join(COPY_INDEX), index);
+                errors.push(crate::i18n::trf(
+                    "msg.folder_merge_copies_kept",
+                    &[("folder", dir.keep().display().to_string())],
+                ));
             }
         }
         errors
     }
+
+    /// Removes the copies after a merge that needs no undo; a warning if they stay.
+    fn finish(mut self) -> Option<String> {
+        let dir = self.dir.take()?;
+        let folder = dir.path().display().to_string();
+        dir.close().err().map(|e| {
+            crate::i18n::trf(
+                "msg.folder_merge_copies_left",
+                &[("folder", folder), ("error", e.to_string())],
+            )
+        })
+    }
 }
+
+/// The longest file name part of a copy's name, in bytes.
+const MAX_COPY_NAME: usize = 100;
+/// The file in a kept copies folder that names the file each copy was.
+const COPY_INDEX: &str = "index.txt";
 
 fn restore(path: &Path, before: Before) -> std::io::Result<()> {
     let now = std::fs::symlink_metadata(path);
@@ -501,8 +608,11 @@ fn restore(path: &Path, before: Before) -> std::io::Result<()> {
                 std::fs::remove_file(path)
             }
         },
-        Before::Dir => match now {
-            None => std::fs::create_dir(path),
+        Before::Dir(permissions) => match now {
+            None => {
+                std::fs::create_dir(path)?;
+                std::fs::set_permissions(path, permissions)
+            }
             Some(m) if m.is_dir() => Ok(()),
             Some(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
         },
@@ -511,18 +621,15 @@ fn restore(path: &Path, before: Before) -> std::io::Result<()> {
             permissions,
             modified,
         } => {
-            match now {
-                Some(m) if m.is_dir() => return Err(std::io::ErrorKind::AlreadyExists.into()),
-                Some(_) => {
-                    if cfg!(windows) {
-                        fsutil::make_writable(path);
-                    }
-                    std::fs::remove_file(path)?;
-                }
-                None => {}
+            if now.as_ref().is_some_and(|m| m.is_dir()) {
+                return Err(std::io::ErrorKind::AlreadyExists.into());
             }
-            std::fs::copy(&copy, path)?;
-            fsutil::make_writable(path);
+            // Moved back when nothing is there, so it is the same file with its links and
+            // extended attributes; otherwise replaced in one step, so a failure leaves the
+            // file as the merge left it.
+            if now.is_some() || std::fs::rename(&copy, path).is_err() {
+                fsutil::copy_atomic(&copy, path, false).map_err(std::io::Error::other)?;
+            }
             if let Some(t) = modified {
                 std::fs::File::options()
                     .write(true)
@@ -593,11 +700,13 @@ pub fn apply_until(
         let replaces = matches!(step, Step::Copy(_) | Step::Merge(_)) && target.is_file();
         let problem = if backup && replaces && listed.contains(&bak) {
             Some("msg.backup_listed")
-        } else if plan
-            .stamps
-            .get(i)
-            .is_some_and(|s| Some(*s) != stamp(it, roots))
+        } else if !matches!(step, Step::Conflict)
+            && plan
+                .stamps
+                .get(i)
+                .is_some_and(|s| Some(*s) != stamp(it, roots))
         {
+            // a conflict is left as it is, so a change to it does no harm
             Some("msg.changed_since_plan")
         } else if !matches!(step, Step::Conflict) && escapes(&roots[BASE], it, &target) {
             Some("msg.outside_folder")
@@ -616,7 +725,7 @@ pub fn apply_until(
         return (0, errors);
     }
 
-    let mut journal = Journal::default();
+    let mut journal = Journal::new(&roots[BASE]);
     let mut done = 0;
     let mut prune = Vec::new();
     let mut failure = None;
@@ -627,6 +736,21 @@ pub fn apply_until(
         }
         let it = &items[i];
         let target = it.path(&roots[BASE]);
+        // again just before writing: another program may have changed it since the check
+        if !it.is_dir
+            && !matches!(step, Step::Conflict)
+            && plan
+                .stamps
+                .get(&i)
+                .is_some_and(|s| Some(*s) != stamp(it, roots))
+        {
+            failure = Some(format!(
+                "{}: {}",
+                it.rel_path(),
+                tr("msg.changed_since_plan")
+            ));
+            break;
+        }
         let r = match step {
             Step::Copy(_) if it.is_dir => journal
                 .remember_new_dirs(&target)
@@ -638,10 +762,11 @@ pub fn apply_until(
                 .and_then(|()| journal.remember_with_backup(&target, backup))
                 .map_err(Into::into)
                 .and_then(|()| fsutil::copy_atomic(&it.path(&roots[from]), &target, backup)),
-            Step::Delete => journal
+            Step::Delete if use_recycle_bin => journal
                 .remember(&target)
                 .map_err(Into::into)
-                .and_then(|()| delete_path(&target, use_recycle_bin)),
+                .and_then(|()| delete_path(&target, true)),
+            Step::Delete => journal.take(&target),
             Step::Prune => {
                 prune.push(i);
                 continue;
@@ -681,7 +806,7 @@ pub fn apply_until(
         }
     }
     let Some(failure) = failure else {
-        return (done, Vec::new());
+        return (done, journal.finish().into_iter().collect());
     };
     let mut errors = vec![failure];
     let undo = journal.roll_back();
@@ -1303,6 +1428,210 @@ mod tests {
         assert_eq!(done, 0);
         assert_eq!(errors[0], tr("msg.folder_merge_stopped").to_string());
         assert_eq!(read(b, "a.txt"), "old\n");
+    }
+
+    #[test]
+    fn a_conflicted_file_changed_during_the_merge_is_left_alone() {
+        let (_dirs, roots) = folders();
+        let [l, b, r] = [&roots[0], &roots[1], &roots[2]];
+        write(b, "a.txt", "old\n");
+        write(r, "a.txt", "old\n");
+        write(l, "a.txt", "new\n");
+        write(b, "z.txt", "base\n");
+        write(l, "z.txt", "left\n");
+        write(r, "z.txt", "right\n");
+        let items = scan(&roots);
+        let plan = plan(&items, &roots);
+        assert!(matches!(
+            step_of(&plan, &items, "z.txt"),
+            Some(Step::Conflict)
+        ));
+        let asked = std::cell::Cell::new(0);
+        let stop = || {
+            asked.set(asked.get() + 1);
+            if asked.get() == 1 {
+                write(b, "z.txt", "resolved by hand\n");
+            }
+            false
+        };
+        let (done, errors) = apply_until(plan, &items, &roots, false, false, &stop);
+        assert_eq!(done, 1, "{errors:?}");
+        assert_eq!(read(b, "a.txt"), "new\n");
+        assert_eq!(read(b, "z.txt"), "resolved by hand\n");
+    }
+
+    #[test]
+    fn a_file_changed_during_the_merge_stops_it() {
+        let (_dirs, roots) = folders();
+        let [l, b, r] = [&roots[0], &roots[1], &roots[2]];
+        for root in [b, r] {
+            write(root, "a.txt", "old\n");
+            write(root, "z.txt", "old\n");
+        }
+        write(l, "a.txt", "new\n");
+        write(l, "z.txt", "new\n");
+        let items = scan(&roots);
+        let plan = plan(&items, &roots);
+        let asked = std::cell::Cell::new(0);
+        let stop = || {
+            asked.set(asked.get() + 1);
+            if asked.get() == 2 {
+                write(b, "z.txt", "edited meanwhile\n");
+            }
+            false
+        };
+        let (done, errors) = apply_until(plan, &items, &roots, false, false, &stop);
+        assert_eq!(done, 0);
+        assert!(errors[0].starts_with("z.txt"), "{errors:?}");
+        assert_eq!(errors[1], tr("msg.folder_merge_undone").to_string());
+        assert_eq!(read(b, "a.txt"), "old\n");
+        assert_eq!(read(b, "z.txt"), "edited meanwhile\n");
+        let left: Vec<_> = std::fs::read_dir(b)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".oxidemerge-undo"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleted_files_are_moved_beside_the_merge() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "old\n").unwrap();
+        // read-only, as in a Perforce workspace
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let inode = std::fs::metadata(&file).unwrap().ino();
+        let mut journal = Journal::new(dir.path());
+        journal.take(&file).unwrap();
+        assert!(!file.exists());
+        let Before::File { copy, .. } = &journal.entries[0].1 else {
+            panic!("not kept as a file");
+        };
+        assert!(copy.starts_with(dir.path()));
+        assert_eq!(std::fs::metadata(copy).unwrap().ino(), inode);
+        assert!(copy
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-a.txt"));
+        let errors = journal.roll_back();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(read(dir.path(), "a.txt"), "old\n");
+        assert_eq!(std::fs::metadata(&file).unwrap().ino(), inode, "moved back");
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o444);
+    }
+
+    #[test]
+    fn files_with_the_longest_names_are_deleted_and_put_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!("{}.txt", "é".repeat(125));
+        let file = dir.path().join(&name);
+        std::fs::write(&file, "old\n").unwrap();
+        let mut journal = Journal::new(dir.path());
+        journal.take(&file).unwrap();
+        assert!(!file.exists());
+        let Before::File { copy, .. } = &journal.entries[0].1 else {
+            panic!("not kept as a file");
+        };
+        assert!(copy.file_name().unwrap().len() <= 2 + MAX_COPY_NAME);
+        assert!(journal.roll_back().is_empty());
+        assert_eq!(read(dir.path(), &name), "old\n");
+    }
+
+    #[test]
+    fn copies_kept_after_a_failed_undo_are_never_merged_away() {
+        let (_dirs, roots) = folders();
+        for root in &roots {
+            write(root, "a.txt", "same\n");
+        }
+        let kept = format!("{}abc123", folder::UNDO_PREFIX);
+        write(&roots[1], &format!("{kept}/0-a.txt"), "the only copy\n");
+        // only a folder at the top is taken for one, not the user's own files
+        let own = [
+            format!("{}notes.txt", folder::UNDO_PREFIX),
+            format!("sub/{kept}/x.txt"),
+        ];
+        for root in &roots {
+            for rel in &own {
+                write(root, rel, "mine\n");
+            }
+        }
+        let items = scan(&roots);
+        assert!(
+            items.iter().all(|it| it.rel_path() != kept),
+            "the copies are listed"
+        );
+        for rel in &own {
+            assert!(items.iter().any(|it| &it.rel_path() == rel), "{rel}");
+        }
+        let (_, errors) = apply_with(plan(&items, &roots), &items, &roots, false, false);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            read(&roots[1], &format!("{kept}/0-a.txt")),
+            "the only copy\n"
+        );
+    }
+
+    #[test]
+    fn a_failed_undo_keeps_the_copies_and_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "old\n").unwrap();
+        let mut journal = Journal::new(dir.path());
+        journal.remember_with_backup(&file, true).unwrap();
+        std::fs::rename(&file, fsutil::backup_path(&file)).unwrap();
+        // something put a folder where the file was, so it cannot be put back
+        std::fs::create_dir(&file).unwrap();
+        let errors = journal.roll_back();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].contains("a.txt"), "{errors:?}");
+        assert_eq!(read(dir.path(), "a.txt.bak"), "old\n");
+        let kept = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".oxidemerge-undo")
+            })
+            .expect("copies kept");
+        assert!(
+            errors[1].contains(&kept.display().to_string()),
+            "{errors:?}"
+        );
+        let index = std::fs::read_to_string(kept.join(COPY_INDEX)).unwrap();
+        assert!(
+            index.ends_with(&format!("-a.txt\t{}\n", file.display())),
+            "{index}"
+        );
+        let copies: Vec<_> = std::fs::read_dir(&kept)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| !p.ends_with(COPY_INDEX))
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect();
+        assert_eq!(copies, ["old\n"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_removed_folder_comes_back_with_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        std::fs::set_permissions(&gone, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut journal = Journal::new(dir.path());
+        journal.remember(&gone).unwrap();
+        std::fs::remove_dir(&gone).unwrap();
+        assert!(journal.roll_back().is_empty());
+        let mode = std::fs::metadata(&gone).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[test]

@@ -117,7 +117,7 @@
       "limitations": "This import/include/$ref statement resolves to exactly the changed path. Statements are read from the syntax tree (Tree-sitter) of JavaScript/TypeScript, Python, C/C++ and Rust files and from the tokens of others, so comments and strings are not imports; conditional, generated or macro-built imports can be missed. It is not proof of a build or runtime failure."
     },
     {
-      "id": "387ead252bad345c6df2b08fe260700dede7863f2ea7e9220791baa1f41f87eb",
+      "id": "7695e693ab068437d3678b746b4ca5457f7cb9b8aa986c284cce655b4f38de15",
       "origin_change_id": "68c1dfd5e50cfc9089da0f22260d1aeddc160adf1d35bba00d82f340bb8a3f53",
       "related_paths": [
         "c/main.c"
@@ -131,11 +131,11 @@
       },
       "severity": "review",
       "confidence": "heuristic",
-      "rule_id": "literal-reference-v1:symbol_name_reference",
+      "rule_id": "literal-reference-v2:symbol_name_reference",
       "limitations": "LIMIT names a definition changed or removed in c/limits.h; this file does not import it by name from there, so the word may name something else. Inspect or dismiss it manually."
     },
     {
-      "id": "039c97a15dfde4b53898dd8d50856307bd555791f95f8b8ab220fbdad5bee072",
+      "id": "87440e8a3e4aeedd0d29b51a8554e975b50d7f1e24f0bad53d110c417832bb13",
       "origin_change_id": "b8226198f63ac3d9de23ea1b3b84c8e8c703d0a8fe85c595cfc4f227af215d23",
       "related_paths": [
         "README.md"
@@ -149,7 +149,7 @@
       },
       "severity": "review",
       "confidence": "heuristic",
-      "rule_id": "literal-reference-v1:config_key_path",
+      "rule_id": "literal-reference-v2:config_key_path",
       "limitations": "A delimited name/path occurrence is evidence of text only; it does not prove a dependency or runtime/build/test failure. Inspect or dismiss it manually."
     },
     {

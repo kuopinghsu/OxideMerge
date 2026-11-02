@@ -274,11 +274,16 @@ pub fn icon_button_enabled(ui: &mut Ui, enabled: bool, icon: Icon, tip: &str) ->
 
 /// Frameless text button that highlights on hover.
 pub fn ghost_button(ui: &mut Ui, label: &str) -> Response {
+    ghost_button_named(ui, label, label)
+}
+
+/// [`ghost_button`] whose short label needs a fuller name for assistive technologies.
+pub fn ghost_button_named(ui: &mut Ui, label: &str, name: &str) -> Response {
     paint_button(
         ui,
         None,
         label,
-        label,
+        name,
         FontId::proportional(theme::size::CONTROL),
         Vec2::new(0.0, 28.0),
         Look::Ghost,
@@ -363,11 +368,17 @@ pub fn toggle_icon_button(
     label: &str,
     tip: &str,
 ) -> Response {
+    // named by the tip without the key `with_key` adds to it
+    let name = if label.is_empty() {
+        tip.rsplit_once("  (").map_or(tip, |(name, _)| name)
+    } else {
+        label
+    };
     let r = paint_button(
         ui,
         icon,
         label,
-        if label.is_empty() { tip } else { label },
+        name,
         FontId::proportional(theme::size::CONTROL),
         Vec2::new(30.0, 28.0),
         Look::Toggle(*on),
@@ -517,7 +528,12 @@ pub fn tool_group<R>(ui: &mut Ui, caption: Option<&str>, add: impl FnOnce(&mut U
     // A group starts a new toolbar row when it did not fit on this one last time. Groups are
     // told apart by their order in the toolbar, which counts them afresh each frame.
     let order = ui.data_mut(|d| {
-        let n = d.get_temp_mut_or_default::<usize>(ui.scope_id().with("tool_groups"));
+        let id = ui.scope_id().with("tool_groups");
+        debug_assert!(
+            d.get_temp::<usize>(id).is_some(),
+            "tool_group outside a toolbar"
+        );
+        let n = d.get_temp_mut_or_default::<usize>(id);
         *n += 1;
         *n
     });

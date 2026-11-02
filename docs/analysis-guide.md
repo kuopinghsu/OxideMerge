@@ -36,12 +36,23 @@ an envelope separate from existing comparison reports. Standard comparisons rema
   that a one-value edit reports exactly that path, that results are symmetric, and that text
   `serde_json` rejects is never reported identical.
 - TOML (`toml` crate) and YAML (`yaml-rust`, one document) compare as JSON-shaped values: tables
-  and mappings are unordered, numbers compare by value (`1_000` = `1000`, `0x10` = `16`), and
-  comments and layout are ignored. YAML plain scalars follow the YAML 1.2 core schema, so
-  `yes`/`no`/`on`/`off` are strings. YAML input is limited to 4 MiB, 64 levels and 100,000 nodes;
-  the parser is driven event by event so nesting never recurses. Aliases, several documents,
-  complex keys and tags other than `!!str`, `!!int`, `!!float`, `!!bool`, `!!null` and `!` are
-  refused with an error, so the CLI returns 2.
+  and mappings are unordered, numbers compare by value (`1_000` = `1000`, `0x10` = `16`, `1` =
+  `1.0` = `1e0`, `-0.0` = `0`; every number compares by its exact decimal value, not as a
+  64-bit float, so `1e23` = `100000000000000000000000`, `1e400` = `10e+399`, and `1e-400` is not
+  `0`; YAML integers too large for 128 bits compare by their digits, while TOML integers must fit
+  64 bits as the TOML specification requires), and
+  comments and layout are ignored. TOML date-times with an offset compare by the moment they name
+  (`10:00:00+02:00` = `08:00:00Z`), and local times compare with their seconds written out
+  (`07:32` = `07:32:00.0`). YAML plain scalars follow the YAML 1.2 core schema, so
+  `yes`/`no`/`on`/`off` are strings, and plain mapping keys compare by value the same way
+  (`0x10:`, `16:` and `"16":` are one key, so a mapping holding two of them is an error; a quoted
+  `"0x10":` stays `0x10`). An empty YAML
+  document is `null`. `!!int`, `!!float`, `!!bool` and `!!null` must fit their value (`!!int abc`
+  and `!!float 0x10` are errors), and `!!str` or `!` makes any scalar a string. TOML and YAML input is limited to 4
+  MiB, 64 levels and 100,000 nodes; the YAML parser is driven event by event so nesting
+  never recurses. Aliases, several documents, complex keys, tags on keys other than `!!str`, tags on
+  mappings or sequences other than `!!map`, `!!seq` and `!`, and other tags are refused with an
+  error, so the CLI returns 2.
 - Review version 2 extends the existing ZIP manifest; version 1 defaults to unreviewed, and future
   versions fail. SHA-256 entry digests detect accidental/corrupt captured-content changes, not
   authenticity. Reviewer names are free-form. State edits do not mutate captured source content.
@@ -57,47 +68,61 @@ an envelope separate from existing comparison reports. Standard comparisons rema
   Git filters remain trusted as documented in SECURITY.md. Exclusions are listed, not identical.
   Each capture records when it was read (UTC); the time is not part of its fingerprint. Moves
   require a unique exact digest match. A rename with edits is suspected when a deleted and an
-  added text file with the same extension (each at most 256 KiB) share at least 50% of their
-  non-blank lines and are each other's clear best match; ties stay added/deleted, and more than
-  250,000 candidate pairs skips the search (listed under limitations). *Not a rename* in the
-  panel, or `--split-rename PATH`, keeps an added file added; the summary lists `split_renames`.
-  The panel shows counts per category as filters, a *High priority* list of changes with risk
-  flags, and each suspected rename with its share of matching lines.
+  added text file with the same extension (each at most 256 KiB) share at least 50% and at
+  least 3 of their non-blank lines and are each other's clear best match; ties stay
+  added/deleted, and more than 250,000 candidate pairs skips the search (listed under
+  limitations). *Not a rename* in the panel, or `--split-rename PATH` (with `/` or `\` between
+  folders), keeps an added file added; the summary lists `split_renames`, and a path that is not
+  an added file of the comparison is reported on standard error. `--split-rename` and
+  `--important-path` need `--impact`, `--release-report` or `--baseline-left/--baseline-right`.
+  An important path fragment flags a change when it is in the path or, for a move or rename, in
+  the old path. The panel shows counts per category as filters, a *High priority* list of changes
+  with risk flags, and each suspected rename with its share of matching lines.
 - Impact indexes are keyed by SHA-256. They index only the selected captured root/filter and do
   not follow file links or execute source code. Every finding includes line, digest and evidence.
   Delimited occurrences are heuristic; matching a name proves neither dependency nor runtime
   behavior. Changed keys of JSON, TOML and YAML files are searched for as the leaf key and, for
   nested keys, as the dotted path (`db.timeout`). Findings labelled exact come from an import
   statement that resolves to exactly a changed, deleted or renamed path: relative JavaScript and
-  TypeScript `import`/`export … from`/`require`, Python `import` and `from … import` (from the
-  root, `src/` or relative), C/C++ `#include "…"`, CSS `@import`, Rust `mod name;` and
+  TypeScript `import`/`export … from`/`require`/`import x = require(…)` (a `.js` specifier also
+  matches the `.ts`/`.tsx` source it is compiled from), Python `import` and `from … import` (from
+  the root, `src/` or relative), C/C++ `#include "…"`, Objective-C `#import "…"`, CSS `@import`,
+  Rust `mod name;` and
   `use crate|super|self::…` (resolved from the nearest folder with `lib.rs` or `main.rs`), plus
   JSON `$ref` file references (rule `import-reference-v3`). JavaScript/TypeScript, Python, C/C++
-  and Rust statements are read from Tree-sitter syntax trees (`use` trees up to 64 levels deep);
-  a file with error or missing nodes, including valid code the grammar does not cover (such as
-  Rust `dyn 'a + Fn(…)`), is listed as partly unassessed. Vue/Svelte script, Objective-C, CSS and
-  JSON statements are read from tokens that skip comments and keep strings whole (up to 512
+  and Rust statements are read from Tree-sitter syntax trees (`use` trees up to 64 levels deep); a
+  `.h` header is read as C, or as C++ when only the C++ grammar reads it without errors. A file
+  with error or missing nodes, including valid code the grammar does not cover (such as Rust
+  `dyn 'a + Fn(…)`), is listed as partly unassessed. The `<script>` blocks of Vue/Svelte
+  components (not their template or style), Objective-C, CSS and JSON statements are read from
+  tokens that skip comments and keep strings whole (up to 512
   tokens per statement, 2,000,000 per file, beyond which the file is listed as partly
   unassessed). Either way a statement may span lines and comments and strings are not code.
   Conditional, generated or macro-built imports can be missed; an exact finding replaces
   heuristic ones on its line.
 - For changed or deleted JavaScript/TypeScript, Python, C/C++ and Rust files, top-level
   definitions (functions, classes/structs/enums/traits/interfaces/typedefs, and constants or
-  module-level assignments) of the old and new bytes are compared by the leaves of their syntax
-  trees, so comments and layout do not count. A file importing a changed or removed definition by name from the changed
+  module-level assignments; C/C++ global variables are not compared) of the old and new bytes are
+  compared by the leaves of their syntax trees, so comments and layout do not count. Rust
+  attributes such as `#[derive(…)]` count as part of the definition they precede, and a name
+  defined more than once changes when any of its definitions does. A file importing a changed or
+  removed definition by name from the changed
   file gets an exact `function_reference`, `type_reference` or `value_reference` finding (rule
-  `symbol-reference-v2`) at the first use of the name it is imported as, or at the import when it
-  is not used. Names of at least four characters are also searched for in other files of the same
+  `symbol-reference-v2`) at the first use of the name it is imported as (not a member such as
+  `obj.name` or an object key of the same name), or at the import when it is not used. Names of at least four characters are also searched for in other files of the same
   language as heuristic `symbol_name_reference` findings, at their first use as a name (not in a
   comment, string or import) and not in files with the exact finding. Methods, names reached
   through a namespace import and C/C++ headers (which include all names) give heuristic findings
   only. A Rust `use` tree gives one import finding per changed file it imports from.
-- Name and leaf configuration key occurrences together are listed up to 500; the rest are counted
+- Name and leaf configuration key occurrences together are listed up to 500, after findings on a
+  line that already has an exact finding are dropped and several reasons for one line are joined
+  into one finding (a path or key path first; its `limitations` name the others); the rest are counted
   in a report `notes` entry instead of failing the analysis, so common keys such as `version` in a
   broad change leave room for the other findings, which still fail beyond 2,000.
   Unsupported syntax/symbols are unassessed. Findings can be dismissed without writes, and in a
   folder compare *Review* opens the evidence file in the review workspace.
-- Parser limits are 64 levels / 100,000 nodes; impact stops at 2,000 findings. UI jobs can be
+- Semantic (JSON, XML, TOML, YAML) parser limits are 64 levels / 100,000 nodes; impact stops at
+  2,000 findings and reads files of up to 1 MiB in parallel. UI jobs can be
   cancelled, but a bounded parse or merge is interrupted only before/after the operation. Both
   baselines and an impact text index occupy memory; the limits apply per capture, not total RSS.
 - Report output cannot replace an input (including a hard-link alias) or appear inside a selected

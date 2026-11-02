@@ -76,6 +76,7 @@ const KEYBOARD: &[Section] = &[
             (&["Space"], "help.quick_preview"),
             (&["→", "←"], "help.expand_collapse"),
             (&["Alt+→", "Alt+←"], "help.copy_selection"),
+            (&["Alt+P"], "view.folder_file_pane"),
         ],
     ),
     (

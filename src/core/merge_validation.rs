@@ -125,13 +125,15 @@ fn nearby_and_shared_settings(edits: &[Edit], findings: &mut Vec<ValidationFindi
             );
         }
     }
+    let left: std::collections::BTreeSet<&String> = edits
+        .iter()
+        .filter(|e| e.0 == "left")
+        .flat_map(|e| &e.4)
+        .collect();
     let mut seen = std::collections::BTreeSet::new();
     for right in edits.iter().filter(|e| e.0 == "right") {
         for key in &right.4 {
-            let shared = edits
-                .iter()
-                .any(|left| left.0 == "left" && left.4.contains(key));
-            if shared && seen.insert(key) {
+            if left.contains(key) && seen.insert(key) {
                 warn(
                     "shared_setting",
                     format!("Both sides change the setting `{key}` in different places."),
@@ -141,6 +143,39 @@ fn nearby_and_shared_settings(edits: &[Edit], findings: &mut Vec<ValidationFindi
             }
         }
     }
+}
+
+/// A warning when the inputs are JSON, XML, TOML or YAML that reads but the merged preview
+/// does not, as when both sides add the same table or key in different places.
+fn structure_lost(docs: &[TextDoc], preview: &TextDoc) -> Option<ValidationFinding> {
+    let format = docs.iter().find_map(|d| {
+        let name = d
+            .path
+            .as_ref()
+            .map_or_else(|| d.title(), |p| p.to_string_lossy().into_owned());
+        let extension = Path::new(&name).extension()?.to_str()?.to_owned();
+        super::semantic::Format::of_extension(&extension)
+    })?;
+    let texts: Vec<String> = docs.iter().map(TextDoc::text).collect();
+    if texts
+        .iter()
+        .any(|t| t.len() > super::semantic::MAX_CONFIG_BYTES)
+        || texts
+            .iter()
+            .any(|t| super::semantic::parse(t, format).is_err())
+    {
+        return None;
+    }
+    let error = super::semantic::parse(&preview.text(), format).err()?;
+    Some(finding(
+        "merged_structure_invalid",
+        ValidationSeverity::Warning,
+        false,
+        &format!(
+            "The merged file no longer reads as {}: {error:#}. Both sides may add the same table or key.",
+            format.label()
+        ),
+    ))
 }
 
 pub fn doc_fingerprint(doc: &TextDoc) -> String {
@@ -250,6 +285,7 @@ pub fn text_plan(
         actions.push(action);
     }
     nearby_and_shared_settings(&edits, &mut findings);
+    findings.extend(structure_lost(docs, preview));
     let bytes = text::encode(&preview.text(), preview.encoding, preview.bom);
     if text::decode(&bytes, Some(preview.encoding)).0 != preview.text() {
         findings.push(finding(
@@ -1025,6 +1061,37 @@ mod tests {
             ValidationStatus::Failed
         );
         assert!(plan.findings.iter().any(|f| f.hunk_id.is_some()));
+    }
+
+    #[test]
+    fn a_merge_that_breaks_the_structure_of_its_inputs_is_flagged() {
+        let cfg = crate::config::Config::default();
+        let findings = |name: &str, texts: [&str; 3]| {
+            let docs = texts.map(|t| {
+                let mut doc = TextDoc::from_text(None, t);
+                doc.path = Some(PathBuf::from(name));
+                doc
+            });
+            let view = crate::ui::text_view::TextView::new(docs.to_vec(), &cfg);
+            let plan = view.preview_merge(&cfg).unwrap();
+            plan.findings
+                .iter()
+                .map(|f| f.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let base = "[server]\nport = 1\n\n[db]\nhost = \"a\"\nuser = \"b\"\npool = 3\n";
+        let left = format!("{base}\n[metrics]\nendpoint = \"/m\"\n");
+        let right = base.replace("[server]", "[metrics]\nport = 9\n\n[server]");
+        assert!(findings("c.toml", [&left, base, &right])
+            .contains(&"merged_structure_invalid".to_owned()));
+        let base = "server:\n  port: 1\ndb:\n  host: a\n  user: b\n  pool: 3\n";
+        let left = format!("{base}metrics:\n  endpoint: /m\n");
+        let right = format!("metrics:\n  port: 9\n{base}");
+        assert!(findings("c.yaml", [&left, base, &right])
+            .contains(&"merged_structure_invalid".to_owned()));
+        let fine = format!("{base}extra: 1\n");
+        assert!(!findings("c.yaml", [&fine, base, base])
+            .contains(&"merged_structure_invalid".to_owned()));
     }
 
     #[test]

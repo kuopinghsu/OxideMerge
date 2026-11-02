@@ -266,11 +266,18 @@ pub fn save_with_workspace(
         manifest.workspace.current = None;
     }
     // A decision still current for the compared files holds for what the review stores, which
-    // for a converted document is its text, compared without converters.
+    // for a converted document is its text, compared without converters. A decision whose plain
+    // files no longer match it is stale, not renewed.
     let digests: BTreeMap<(usize, &str), &str> = manifest
         .entries
         .iter()
         .filter_map(|e| Some(((e.side, e.path.as_str()), e.digest.as_deref()?)))
+        .collect();
+    let converted: HashSet<&str> = manifest
+        .entries
+        .iter()
+        .filter(|e| e.converted)
+        .map(|e| e.path.as_str())
         .collect();
     for (path, decision) in &mut manifest.workspace.entries {
         if decision.stale {
@@ -279,6 +286,16 @@ pub fn save_with_workspace(
         let sides: Vec<_> = (0..manifest.labels.len())
             .map(|side| digests.get(&(side, path.as_str())).map(|d| d.to_string()))
             .collect();
+        if !converted.contains(path.as_str())
+            && super::review_state::fingerprint_digests(path, &sides, options)
+                != decision.fingerprint
+        {
+            decision.stale = true;
+            for hunk in decision.hunks.values_mut() {
+                hunk.stale = true;
+            }
+            continue;
+        }
         let prints = super::review_state::prints_of_digests(path, &sides, &manifest.options);
         decision.fingerprint = prints.fingerprint;
         decision.content = prints.content;
@@ -582,6 +599,26 @@ mod tests {
             &workspace,
         )
         .unwrap();
+        // a decision made on other content is saved stale, not renewed for these files
+        let mut outdated = workspace.clone();
+        outdated.entries.get_mut("a.txt").unwrap().fingerprint = "earlier files".into();
+        let stale_path = out.path().join("stale.oxmreview");
+        save_with_workspace(
+            &stale_path,
+            Capture {
+                roots: &roots,
+                labels: &["Left".into(), "Right".into()],
+                items: &items.iter().collect::<Vec<_>>(),
+                options: &opts,
+                folder: &folder,
+                filter: "*",
+                notes: &BTreeMap::new(),
+            },
+            &outdated,
+        )
+        .unwrap();
+        let stale = load(&stale_path).unwrap().manifest.workspace.entries;
+        assert!(stale["a.txt"].stale && stale["a.txt"].hunks["hunk-id"].stale);
         drop(original);
         let review = load(&path).unwrap();
         assert_eq!(review.manifest.version, 2);

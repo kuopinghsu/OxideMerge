@@ -143,7 +143,7 @@
         "policies": [
           "Read-only; text comparison rules are not semantic path rules and are not applied.",
           "JSON objects unordered; duplicate keys rejected. Arrays ordered: elements are compared by position, an exact reordering is reported as moves, and with an array matching key, object elements are paired by that member's unique scalar value. XML attributes unordered; child/mixed-content order and text whitespace significant; expanded namespace names; comments included. No external entities/DTDs.",
-          "TOML and YAML compare as JSON-shaped values: tables and mappings are unordered objects, numbers compare by value, and comments and formatting are ignored. YAML follows the YAML 1.2 core schema (yes/no/on/off are strings); aliases, several documents, complex keys and custom tags are refused, and input is limited to 4 MiB, 64 levels and 100,000 nodes."
+          "TOML and YAML compare as JSON-shaped values: tables and mappings are unordered objects, numbers compare by value (1 equals 1.0), date-times with an offset by the moment they name, and comments and formatting are ignored. YAML follows the YAML 1.2 core schema (yes/no/on/off are strings) and its keys compare by value; aliases, several documents, complex keys and tags other than the core ones are refused. Input is limited to 4 MiB, 64 levels and 100,000 nodes."
         ],
         "options": {}
       },
@@ -281,7 +281,7 @@
   },
   "excluded": [],
   "limitations": [
-    "Exact unique-content moves are moves. Renames with edits are suspected from shared lines (at least 50%, same extension, text up to 256 KiB, a clear best match only) and can be split back into added and deleted files.",
+    "Exact unique-content moves are moves. Renames with edits are suspected from shared lines (at least 50% and 3 lines, same extension, text up to 256 KiB, a clear best match only) and can be split back into added and deleted files.",
     "Heuristic priority flags do not validate release compatibility; source references are relative to captured baseline paths.",
     "Files vs directories and excluded ancestors require manual review; unreadable paths are never counted identical."
   ]
