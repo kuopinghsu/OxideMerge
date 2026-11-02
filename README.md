@@ -4,83 +4,119 @@ English | [繁體中文](README_zh-TW.md)
 
 ![OxideMerge on Windows, macOS and Linux](images/banner.jpg)
 
-OxideMerge is a free, open-source tool for comparing and merging files and folders on
-**Windows, macOS and Linux**. Use it to review changes, combine edits and resolve merge
-conflicts in a visual interface.
+OxideMerge is a free and open-source tool that compares and merges files and folders. It runs
+on **Windows, macOS and Linux**. Use it to review changes, combine edits and resolve merge
+conflicts.
 
-Inspired by [WinMerge](https://github.com/WinMerge/winmerge), OxideMerge is written in Rust.
-It supports text and folder merging, as well as binary, image and web page comparison.
+OxideMerge is written in Rust and is inspired by [WinMerge](https://github.com/WinMerge/winmerge).
+It compares text, folders, binary files, images and web pages.
 
-[Download](https://github.com/kuopinghsu/OxideMerge/releases) ·
+**[Download](https://github.com/kuopinghsu/OxideMerge/releases)** ·
 [User guide](docs/user-guide.adoc) ·
-[Release history](CHANGELOG.md)
+[Changelog](CHANGELOG.md)
 
 ![OxideMerge start page](images/start.png)
 
 ## Contents
 
 - [Features](#features)
+- [Screenshots](#screenshots)
 - [Installation](#installation)
-- [Getting started](#getting-started)
-- [Command-line usage](#command-line-usage)
+- [Quick start](#quick-start)
+- [Command line](#command-line)
 - [Git and file manager integration](#git-and-file-manager-integration)
 - [Configuration](#configuration)
-- [Documentation](#documentation)
-- [Limitations](#limitations)
+- [Documentation and help](#documentation-and-help)
+- [Known limitations](#known-limitations)
 - [Development](#development)
-- [Releases](#releases)
 - [Contributing](#contributing)
 - [Security](#security)
 - [License](#license)
 
 ## Features
 
-### Compare files and folders
+### Files and folders
 
-- Compare two versions, or compare three versions with a shared original version.
-- Scan folders and subfolders, filter files by name, and copy selected items between folders.
-- Review changed text files together in the **All differences** view.
-- Compare supported archives as folders, including ZIP, TAR and 7z.
-- Compare a file or folder with a Git revision, such as a branch, tag or commit.
+- Compare two files or folders. You can also compare three, with the original version that
+  the other two are based on.
+- Compare folders with their subfolders, filter items by name, and copy items from one folder
+  to the other.
+- See all changed text files of a folder comparison in one list with **All differences**.
+- Open ZIP, TAR, 7z and other supported archives as folders.
+- Compare a file or folder with a Git branch, tag or commit.
 
-### Review and merge text
+### Text
 
-- See changes side by side or in a single inline column, including changes within a line and
-  moved blocks of text.
-- Copy individual changes between versions, edit text, and undo or redo edits.
-- Automatically merge compatible changes in a three-way comparison, then work through the
-  remaining conflicts with a merge bar that counts them down to a saved result.
-- Open files that contain version-control conflict markers and resolve them visually.
-- Focus on relevant changes with options to ignore whitespace, comments or selected patterns.
-  Reusable comparison rules and numeric tolerance help with generated files and measurement data.
-- Use syntax highlighting, search and replace, bookmarks, and CSV/TSV table views with
-  multiline records, cell editing and cell merging.
-- Set synchronization points to line up lines the compare pairs wrongly.
+- See the changes side by side or in one column. Changed words and moved blocks are marked.
+- Copy changes from one side to the other, edit the text, and undo or redo your edits.
+- In a three-way comparison, merge all changes that do not conflict in one step. The merge bar
+  shows how many conflicts are left.
+- Open a file with conflict markers from Git or another version control system, and resolve the
+  conflicts side by side.
+- Ignore white space, comments or lines that match a pattern. Saved comparison rules and number
+  tolerances help with generated files and measurement data.
+- Use syntax highlighting, search and replace, and bookmarks. CSV and TSV files open in a table
+  view that supports records with line breaks, cell editing and cell merging.
+- Add synchronization points to match lines that the comparison paired wrongly.
+- Choose one of two row layouts in **View → Text compare** or **Options → General**:
+  - **Compact rows** (the default) shows the text without gaps.
+  - **Aligned rows** adds blank space opposite inserted and deleted lines, so that matching
+    lines stay side by side.
 
-### Compare other content
+### Other file types
 
-- **Binary files:** inspect byte differences in a side-by-side hexadecimal view.
-- **Images:** compare images side by side or use overlay, swipe, blink and difference views.
-- **Web pages:** compare pages as formatted Markdown side by side (the default), with the
-  changed blocks and words highlighted, their visible text, full page screenshots with the text
-  differences highlighted on the page, HTML source or downloaded resources. Only the screenshots
-  need a browser. Local `.html` files open this way too.
+- **Binary files:** see the changed bytes in a side-by-side hexadecimal view.
+- **Images:** compare images side by side, or with the overlay, swipe, blink and difference
+  views.
+- **Web pages:** by default, both pages are converted to Markdown and shown formatted side by
+  side, with changed blocks and words highlighted. Other modes show the visible text, the HTML
+  source, screenshots with the changed text highlighted, or the downloaded resources. Only the
+  screenshot modes need a web browser. Local `.html` files also open as web pages.
 
-### Save and share your work
+### Reports and saved work
 
-- Export HTML reports for review in a browser, HTML slideshows that show one difference at a
-  time, XML reports for other programs, or folder summaries in CSV and plain text.
-- Create patches and apply unified patches for review before saving.
-- Save comparison settings as project files, save annotated text comparisons, or capture portable
-  folder reviews with file contents, comparison settings, bookmarks and comments.
-- Use OxideMerge with Git, from the command line, or from your system's file manager.
+- Export HTML reports, HTML slideshows with one difference per slide, and XML reports for other
+  programs. Export folder summaries as CSV or plain text.
+- Create patches. Apply unified patches and review the result before you save it.
+- Save comparison settings as project files. Save text comparisons with their bookmarks and
+  notes. Save portable folder reviews with the file contents, settings, bookmarks and comments.
 
-The interface includes light and dark themes, a command search (⌘K / Ctrl+K), color-blind
-friendly, high-contrast, reduced-motion and compact options, and 11 built-in languages: English, Traditional
-Chinese, Simplified Chinese, Japanese, Korean, German, French, Spanish, Russian, Brazilian
-Portuguese and Italian. Additional translations can be loaded from language files.
+### Review and analysis
 
-### Interface and screenshots
+These tools only read files. They run only when you open them.
+
+- **Merge verification:** in a three-way text or folder comparison, expand **Merge
+  Verification**. Preview the merge in memory, or check the bytes of the saved result.
+- **Semantic comparison:** **Text / Semantic** compares JSON, XML, TOML and YAML files by their
+  structure. It does not edit or reformat the files. Changes appear in a tree of paths. Moved
+  array items are marked, and you can choose a key that matches array items.
+- **Review workspace:** in a folder comparison, record a decision for each file and each change.
+  Add comments, reasons and tags, and go to the next item that is not reviewed yet. Save the
+  review as an `.oxmreview` file to continue on another computer. When the files change, earlier
+  decisions are marked as out of date. A changed block is never accepted automatically.
+- **Release summary:** compare two folders, Git revisions or saved reviews as two releases.
+  Moved and renamed files are listed separately from added and deleted files.
+- **Potential impact:** find the code that the changes may affect, with the source lines as
+  evidence:
+  - imports of changed files, and uses of changed functions and types (marked *exact*);
+  - places that name a changed path, name or configuration key (marked *heuristic*).
+
+  These results do not prove how the program behaves when it runs. They also do not show that
+  a build or its tests pass.
+
+For the rules and limits of each tool, see the [analysis guide](docs/analysis-guide.md).
+
+### Interface and integration
+
+- Light and dark themes, and settings for color-blind friendly colors, high contrast, reduced
+  motion and a compact layout.
+- Command search: press ⌘K on macOS, or Ctrl+K on Windows and Linux.
+- 11 built-in languages: English, Traditional Chinese, Simplified Chinese, Japanese, Korean,
+  German, French, Spanish, Russian, Brazilian Portuguese and Italian. You can add more with
+  language files.
+- Use OxideMerge with Git, from the command line, or from your file manager.
+
+## Screenshots
 
 **Folder comparison**
 
@@ -90,86 +126,110 @@ Portuguese and Italian. Additional translations can be loaded from language file
 
 ![Text comparison](images/text.png)
 
+**Three-way merge**
+
+![Three-way merge with the merge bar](images/three.png)
+
+**Web pages in the Formatted mode**
+
+![Two web pages compared in the Formatted mode](images/web.png)
+
 ## Installation
 
-Download a package for your system from [GitHub Releases](https://github.com/kuopinghsu/OxideMerge/releases).
-Release downloads also include PDF user guides in English and Traditional Chinese. The release
-page lists each download's SHA-256 digest for verifying it.
+Download the package for your system from
+[GitHub Releases](https://github.com/kuopinghsu/OxideMerge/releases). Each release also has PDF
+user guides in English and Traditional Chinese. The release page lists the SHA-256 checksum of
+each file, so you can check your download.
+
+| System | Supported versions | Package |
+| --- | --- | --- |
+| Windows | Windows 10 and 11, on x64 and Arm64 | `windows-x64.zip` or `windows-arm64.zip` |
+| macOS | macOS 11 or later, on Apple silicon and Intel | `macos-universal.dmg` |
+| Linux | x64 and Arm64, with X11 or Wayland | `.AppImage` or `.tar.gz` |
+
+File names start with the version, for example `oxidemerge-<version>-windows-x64.zip`.
 
 ### Windows
 
-Supports Windows 10 and 11 on x64 and Arm64.
-
-Download the `windows-x64.zip` or `windows-arm64.zip` package for your processor, unzip it and
-run `oxidemerge.exe`. No installer is required. Release filenames include the version, for
-example `oxidemerge-<version>-windows-x64.zip`.
+Unzip the package and run `oxidemerge.exe`. You do not need an installer.
 
 ### macOS
 
-Supports macOS 11 or later on Apple silicon and Intel Macs.
+Open the DMG file and drag **OxideMerge** to **Applications**.
 
-Open the `macos-universal.dmg` package and drag **OxideMerge** to **Applications**.
-
-The app is signed ad hoc and is not notarized. If macOS blocks the first launch, try opening
-the app once, then choose **Open Anyway** in **System Settings → Privacy & Security**.
-See [macOS signing](docs/macos-signing.md) for more information.
+The app has an ad hoc signature, and Apple has not notarized it. If macOS blocks the app the
+first time, try to open it once. Then go to **System Settings → Privacy & Security** and click
+**Open Anyway**. For more information, see [macOS signing](docs/macos-signing.md).
 
 ### Linux
 
-Supports x64 and Arm64 systems with X11 or Wayland.
+- **AppImage:** runs on Ubuntu 20.04, RHEL 8, Debian 10 and newer. Make the file executable with
+  `chmod +x <filename>.AppImage`, then run it. If FUSE is not available, start it with
+  `--appimage-extract-and-run`.
+- **TAR.GZ:** contains the program, a desktop file and an icon.
 
-- **AppImage:** runs on Ubuntu 20.04, RHEL 8, Debian 10 and newer. Make the downloaded file
-  executable with `chmod +x <filename>.AppImage`, then run it. If FUSE is unavailable, add
-  `--appimage-extract-and-run` when starting it.
-- **TAR archive:** the standalone executable, with a desktop file and icon, for users who
-  prefer it.
+File dialogs use `xdg-desktop-portal`. Most desktop environments include it. To show Chinese,
+Japanese and Korean text, install a font such as Noto Sans CJK.
 
-File dialogs use `xdg-desktop-portal`, which desktop environments normally provide.
-For Chinese, Japanese and Korean text, install a suitable font such as Noto Sans CJK.
+## Quick start
 
-## Getting started
+When OxideMerge starts, it shows the start page. To start a comparison, do one of these:
 
-Launch OxideMerge to open the start page. Type or browse the files or folders to compare and
-click **Compare**, drag them onto the window, or reopen a recent comparison. On the first start,
-**Open a sample** shows a small sample comparison.
+- Enter or browse for the files or folders, and click **Compare**.
+- Drag the files or folders onto the window.
+- Click a recent comparison.
 
-### Compare two files or folders
+The first time, you can click **Open a sample** to try a small example.
 
-Open two files to see their differences side by side. Use **Compare** to move between
-differences and **Merge** to copy changes to the other side. Save when you are ready.
+### Compare two files
 
-For folders, enable subfolders when needed. Select an item to preview it or open it in a
-separate comparison tab. Use **All differences** to review changed text files together.
+1. Open the two files. The differences are highlighted side by side.
+2. Use the **Compare** menu to go to the next or previous difference.
+3. Use the **Merge** menu to copy a change to the other side.
+4. Save the file.
 
-### Merge three versions
+### Compare two folders
 
-Open the files in this order: **your version, the common ancestor, the other version**.
-The common ancestor is the original version that both versions were based on; it appears in
-the middle pane.
+1. Open the two folders. Turn on subfolders if you need them.
+2. Select an item to preview it, or open it in its own comparison tab.
+3. Use **All differences** to review all changed text files together.
 
-Choose **Merge → Auto merge** to combine compatible changes. The merge bar above the panes counts
-the remaining conflicts; take the left, right or both changes, or edit and mark them resolved,
-then save the result. You can also open a single file that contains conflict markers.
+### Merge three files
 
-Three-way folder merging writes into the middle folder. **Merge → Auto merge folders...**
-shows the planned copies, deletions and merges for confirmation before applying them. The merge
-is all or nothing: if an item changed since the plan, nothing is merged, and stopping it or a
-failed change undoes what it already changed.
+Open the files in this order: **your version, the base version, the other version**. The base
+version is the original version that the other two are based on. It appears in the middle pane.
 
-## Command-line usage
+1. Choose **Merge → Auto merge** to merge all changes that do not conflict.
+2. The merge bar above the panes shows how many conflicts are left. For each conflict, take the
+   left, right or both changes. Or edit the text and mark the conflict as resolved.
+3. Save the result.
 
-These examples assume that `oxidemerge` is available in your `PATH`. Otherwise, use the full
-path to the executable. On macOS, the executable is normally at
+You can also open one file that contains conflict markers.
+
+### Merge three folders
+
+A three-way folder merge writes into the middle folder. **Merge → Auto merge folders...** first
+shows the planned copies, deletions and merges. Nothing changes until you confirm.
+
+The merge either completes fully or changes nothing:
+
+- If an item changed after the plan was made, nothing is merged.
+- If you stop the merge, or a change fails, all changes made so far are undone.
+
+## Command line
+
+The examples below assume that `oxidemerge` is in your `PATH`. If it is not, use the full path
+to the program. On macOS, the program is usually
 `/Applications/OxideMerge.app/Contents/MacOS/oxidemerge`.
 
 ```sh
 # Compare two text files
 oxidemerge old.txt new.txt
 
-# Compare folders, including subfolders
+# Compare two folders and their subfolders
 oxidemerge -r old-folder new-folder
 
-# Merge three files and save the middle pane to a separate output file
+# Merge three files and save the middle pane to another file
 oxidemerge mine.txt base.txt theirs.txt -o merged.txt
 
 # Open a file with merge conflict markers
@@ -179,398 +239,37 @@ oxidemerge conflict.txt
 oxidemerge -r old-folder new-folder --report report.html --report-diffs
 ```
 
-For scripts, `--cli` runs without a window and returns `0` for identical content, `1` for
-differences and `2` for an error. Run `oxidemerge --help` for all command-line options.
-Common options include:
-
-- `-r`: include subfolders; `-f "*.rs;!target/"`: filter folder contents.
-- `-t text`, `-t binary`, `-t image`, `-t web`: choose the comparison type.
-- `-o <file>`: save the merge result to a separate file.
-- `--ignore-case`, `--ignore-eol`, `--ignore-comments`: ignore selected types of changes.
-- `--rules <name-or-path>`: use a comparison rules file.
-- `--git-rev <revision>`: compare a single file or folder with a Git revision.
-- `--report <file>`: export a report as `.html`, `.xml`, or for folders also `.csv` or `.txt`; add
-  `--report-diffs` for text differences in a folder HTML report, or `--slideshow` for an HTML
-  slideshow with one difference per slide.
-- `--patch <file>`: export a patch from a two-way file or folder comparison.
-
-`--cli`, `--report` and `--patch` run without opening a window. On Windows, supported
-WinMerge-style switches such as `/r`, `/f` and `/o` are also accepted.
-See the [user guide](docs/user-guide.adoc) for the full option reference and scripting examples.
-
-## Git and file manager integration
-
-### Git
-
-OxideMerge can serve as Git's visual diff and merge tool. With `oxidemerge` available in your
-`PATH`, configure Git as follows in a POSIX-compatible shell, such as Bash or Git Bash:
-
-```sh
-git config --global diff.tool oxidemerge
-git config --global difftool.oxidemerge.cmd 'oxidemerge "$LOCAL" "$REMOTE"'
-git config --global merge.tool oxidemerge
-git config --global mergetool.oxidemerge.cmd \
-  'oxidemerge "$LOCAL" "$BASE" "$REMOTE" -o "$MERGED" --dl Local --dr Remote --wl --wr'
-git config --global mergetool.oxidemerge.trustExitCode false
-```
-
-Use `git difftool` for individual files or `git difftool --dir-diff` for a folder comparison.
-Use `git mergetool` to resolve conflicts: review the three versions, merge into the middle
-pane and save. The result is written to Git's merge output file, leaving the base unchanged.
-
-If the executable is outside your `PATH`, use its full path in the configured commands.
-See the [user guide](docs/user-guide.adoc) for details.
-
-### File managers
-
-Register integration from **Tools**, or run `oxidemerge --register-shell` from the installed
-copy. Use `oxidemerge --unregister-shell` to remove it.
-
-- **Windows Explorer:** compare selected files or folders through the context menu.
-  On Windows 11, the entries appear under **Show more options**.
-- **macOS Finder:** use the OxideMerge Quick Actions and Services entries.
-- **Linux:** use the available Nautilus, Nemo or Dolphin menu entries.
-
-You can compare selected items immediately, or remember an item with **Select Left** or
-**Select Middle** and choose another item later. Entries refer to the registered executable;
-register again if you move it.
-
-## Configuration
-
-Use **Options** to adjust comparison behavior, appearance and language. Settings are stored
-in the user configuration folder:
-
-- **Windows:** `%APPDATA%\OxideMerge\config.json`
-- **macOS:** `~/Library/Application Support/OxideMerge/config.json`
-- **Linux:** `~/.config/OxideMerge/config.json`
-
-For a portable setup, create an empty `oxidemerge.json` next to the executable.
-For a separate configuration, set `OXIDEMERGE_CONFIG_DIR` to the desired folder.
-
-### Filters and comparison rules
-
-File filters select which items appear in folder comparisons. Separate patterns with `;`,
-use `!` to exclude a match, and add a trailing `/` or `\` to match folders. For example,
-`*.rs;*.toml;!target/` includes Rust and TOML files while excluding the `target` folder.
-WinMerge `.flt` files in the configuration folder's `Filters` directory are also available.
-
-Comparison rules control which content differences are ignored. Use **Options → Compare rules**
-to manage `.oxrules` files with ignored lines, substitutions and ignored blocks. Rules can be
-imported and exported for use across projects or teams. A folder comparison can select its own
-rules file.
-
-### Languages
-
-Built-in translations are stored in [lang/](lang). To add or override a translation, copy
-`lang/en.json` to `<code>.json`, translate the values and keep all `{placeholder}` names unchanged.
-Place the file in a `Languages` folder next to the executable or inside the configuration folder.
-Missing messages and translations with invalid placeholders fall back to English.
-
-## Documentation
-
-- [User guide — English](docs/user-guide.adoc): workflows, comparison options, keyboard
-  shortcuts, Git integration and troubleshooting.
-- [User guide — Traditional Chinese](docs/user-guide.zh-TW.adoc).
-- [Benchmarks](docs/benchmarks.md): performance measurements and how to run them.
-- [Changelog](CHANGELOG.md): changes by version.
-
-Press **F1** or click the **?** button in the app for Help & Shortcuts. The dialog lists
-keyboard and mouse actions and shows the active settings location. On macOS, most shortcuts
-use Command where Windows and Linux use Ctrl; the interface displays the platform's keys.
-
-## Limitations
-
-- Archives are compared read-only; changes cannot be saved back into an archive. RAR is not
-  supported.
-- JSON and XML files are read-only while automatic formatting is enabled. Turn it off to
-  edit or merge them.
-- Web screenshots require an installed Chromium-based browser. Only the screenshots run
-  JavaScript; the other web modes may miss dynamically loaded content. Authenticated browsing is
-  not supported; pages that require a login may show the login page instead.
-- Text editing is line-based and is intended for reviewing and merging changes.
-- WinMerge project files and filter files are supported, but WinMerge plugin DLLs and scripts
-  are not. Unpacker plugins use external commands consistently in file, full-content folder, CLI
-  and report comparisons; PDF and Office presets require separately installed conversion tools.
-- Machine-assisted translations have not been reviewed by native speakers.
-
-## Development
-
-### Build from source
-
-Install a Rust toolchain with [rustup](https://rustup.rs/). Linux also requires a C compiler.
-X11, Wayland, keyboard and OpenGL libraries are loaded at runtime; their development packages
-are not required to build OxideMerge.
-
-Run these commands from the repository root:
-
-```sh
-cargo build --release --locked
-cargo test --locked
-```
-
-The executable is `target/release/oxidemerge` on macOS and Linux, or
-`target/release/oxidemerge.exe` on Windows. To try the sample folder comparison, run `make demo`.
-
-### Build and maintenance commands
-
-The [Makefile](Makefile) provides shortcuts for common tasks and requires GNU Make.
-Run `make help` to list all targets.
-
-**Build and run**
-
-- `make` or `make release`: build an optimized executable.
-- `make build`: build a debug executable.
-- `make run ARGS="a.txt b.txt"`: run the debug build with comparison paths.
-- `make demo`, `make demo-text`, `make demo-3way`, `make demo-3way-merge`, `make demo-3way-folder`,
-  `make demo-conflict`: open sample comparisons. `samples/README.md` lists every sample and the
-  feature it shows; for web page compare, see `samples/web/README.md`.
-- `make demo-web`, `make demo-web-text`, `make demo-web-headings`, `make demo-web-tables`: open
-  the sample web page comparisons; the last three are for the *Formatted* mode.
-- `make install` or `make uninstall`: install to, or remove from, Cargo's binary directory
-  (`~/.cargo/bin` by default).
-- `make shell-register`: install the executable and register file manager integration.
-- `make clean`: remove build output and local distribution packages.
-
-**Check code quality**
-
-- `make fmt-check`: check Rust formatting; `make fmt` applies formatting.
-- `make check`: type-check all targets in the current build configuration.
-- `make lint`: run Clippy with warnings treated as errors.
-- `make test`: run unit, interface and command-line tests.
-- `make ci`: run `check`, `lint` and `test`.
-- `make gui-smoke`: build a release, open real windows and verify their comparison results.
-- `make check-platforms`: type-check the Windows, macOS and Linux targets listed in the
-  Makefile. Install their standard libraries with `rustup target add` first.
-
-**Build distribution files**
-
-- `make dist`: create a ZIP package on Windows or a TAR.GZ package on macOS and Linux in `dist/`.
-- `make appimage`: create a Linux AppImage for the host architecture, x86_64 or aarch64.
-  Requires the X11, Wayland and keyboard libraries and downloads `appimagetool`.
-- `make user-guide`: create English and Traditional Chinese PDF guides in `dist/`.
-  Requires Asciidoctor PDF, `curl`, `shasum`, Python 3 with `fontTools`, fontconfig and DejaVu Sans.
-  The build script downloads the required Noto Sans CJK fonts.
-
-### Testing
-
-`cargo test` covers three areas:
-
-- **Core behavior:** comparison, merging, patches, folders and file operations. Randomized tests
-  in `src/core/regress.rs` also check generated diff, merge and patch cases.
-- **Interface behavior:** tests drive the actual views without a display, including menus,
-  editing, file drops and saved results. Failed window tests write diagnostic output to
-  `target/gui-tests/<test>.txt`.
-- **Command-line behavior:** tests in `tests/cli.rs` run the executable and verify exit codes,
-  reports, patches and error messages. Semantic, release summary and impact reports of fixed
-  inputs must match the JSON and XML reports saved in `tests/fixtures/reports`, apart from capture
-  times. After an intended report change, run
-  `OXIDEMERGE_UPDATE_REPORTS=1 cargo test --test cli reports_match` and review the diff of the
-  saved reports.
-
-Tests use a separate configuration folder and do not change your application settings.
-For other isolated runs, set `OXIDEMERGE_CONFIG_DIR` to a dedicated configuration folder.
-Some web tests start a local HTTP server, so the test environment must allow local listening
-sockets.
-
-Run `cargo test --release --locked format_regression -- --nocapture` for the focused
-format checks. They cover BOM and line-ending patch round trips, ignored text changes,
-mixed-ending merge/save/undo, and Git checkout and patch compatibility. Git must be installed.
-CI includes these checks in the full test suite on Windows, Linux and macOS.
-
-Randomized test failures print a seed that can be used to reproduce the case:
-
-```sh
-OXIDEMERGE_TEST_SEED=<seed> cargo test regress
-OXIDEMERGE_TEST_CASES=20000 cargo test --release regress
-```
-
-For checks with real application windows, run `make gui-smoke` or
-`scripts/gui-smoke.sh path/to/oxidemerge`. The script checks two-file, three-file and folder
-comparisons. On Linux without a display, it starts Xvfb. With `OXIDEMERGE_SMOKE_REPORT=<file>`,
-the application records its tabs and messages after comparison, then closes.
-
-Benchmarks run separately. See [Benchmarks](docs/benchmarks.md) for commands, methodology and
-baseline results.
-
-### Continuous integration
-
-The [CI workflow](.github/workflows/ci.yml) runs on pushes to `main` and on pull requests.
-Pull requests check code with Clippy, run the complete test suite, build release executables,
-and verify command-line and window behavior on Windows x64, Linux x64 and macOS Apple silicon.
-Windows and Linux window checks use Mesa's software renderer; Linux also uses Xvfb. Failed test output is retained as `test-output-*`
-artifacts. A separate `cargo deny` job checks dependencies; see [Security](SECURITY.md).
-
-Every push to `main` and every release-tag push runs full package validation, including native
-Windows/Linux Arm64 checks, the Intel macOS build, AppImages and PDF guides. Pushes to `main`
-produce validated build artifacts without publishing a release; only release-tag pushes publish.
-Pull requests skip this packaging work while retaining the complete tests on the three default
-platforms. Manual runs can also validate all packages by enabling **packages**.
-
-Manual runs can also enable randomized test cases and benchmarks. Release publishing does not
-depend on these optional runs.
-
-Pushes to `main`, release tags and manual packaging runs produce and validate these distribution files:
-
-- **Windows x64 and Arm64:** ZIP packages holding only `oxidemerge.exe`, which is checked to be
-  for the right processor and to run.
-- **Linux x64 and Arm64:** TAR.GZ packages built on Ubuntu 22.04. The program in them is run
-  and checked not to change application settings.
-- **Linux AppImage:** packages built on AlmaLinux 8 with glibc 2.28. Required X11, Wayland and
-  keyboard libraries are bundled and used when system libraries are unavailable. Packages are
-  checked on Ubuntu 22.04 and AlmaLinux 8 for both architectures, including library resolution,
-  command-line behavior and window startup.
-- **macOS:** an ad-hoc signed universal application in a DMG package. Both Apple silicon
-  and Intel architectures are verified, and the Intel executable is tested through Rosetta.
-- **Documentation:** English and Traditional Chinese PDF guides. Missing font coverage fails
-  the document build.
-
-Windows and Linux Arm64 packages are built and tested on native Arm runners.
-
-## Releases
-
-### Release requirements
-
-A tag such as `v0.9.8` triggers package publication on GitHub Releases. The tag must match the
-version in `Cargo.toml`, and `CHANGELOG.md` must contain a section for that version. Tags with
-`-`, such as `v1.0.0-rc1`, are published as pre-releases.
-
-Release notes come from the matching changelog section, followed by download instructions.
-The workflow reads the changelog without changing it. Before publishing, it checks that all
-expected packages, and nothing else, exist and that the release has not already been published.
-Each release includes PDF guides and the source commit used for the build, and GitHub lists the
-SHA-256 digest of every file. A release holds exactly these files (for version 0.9.8):
-
-```text
-oxidemerge-0.9.8-linux-arm64.AppImage
-oxidemerge-0.9.8-linux-arm64.tar.gz
-oxidemerge-0.9.8-linux-x64.AppImage
-oxidemerge-0.9.8-linux-x64.tar.gz
-oxidemerge-0.9.8-macos-universal.dmg
-oxidemerge-0.9.8-user-guide.pdf
-oxidemerge-0.9.8-user-guide.zh-TW.pdf
-oxidemerge-0.9.8-windows-arm64.zip
-oxidemerge-0.9.8-windows-x64.zip
-```
-
-### Release procedure
-
-The following example uses `0.9.8`; replace it with the version you intend to release.
-
-1. Update `version` in `Cargo.toml` and run `cargo build` to update `Cargo.lock`.
-2. Review the matching section in `CHANGELOG.md`. Replace `Unreleased` in its heading with the
-   release date, using `YYYY-MM-DD`.
-3. Run `make fmt-check ci`. Preview the release notes with
-   `scripts/release-notes.sh 0.9.8`.
-4. Commit and push to `main`. Wait for the required CI checks to pass on every platform.
-5. Tag the verified commit and push the tag:
-
-   ```sh
-   git tag -a v0.9.8 -m "OxideMerge 0.9.8"
-   git push origin v0.9.8
-   ```
-
-6. Add an `Unreleased` section for the next version to `CHANGELOG.md` and record subsequent
-   changes there.
-
-Do not move or reuse a pushed release tag. Downloaded packages must continue to match their
-published checksums. If a release build fails or a published release needs a correction, fix
-it on `main` and create a new patch version. Keep failed tags in place; a failed build does not
-publish a partial release because publication waits for all required package jobs.
-
-### Recover from a failed or incorrect release
-
-For example, if `v0.9.7` fails to build or needs a correction after publication, release the
-fix as `v0.9.8`. Choose a new, unused patch version; keep the original tag and published assets.
-
-1. Start with a clean working tree and update `main`. If local changes are present, commit
-   them or save them with `git stash` before switching branches.
-
-   ```sh
-   git status --short
-   git switch main
-   git pull --ff-only origin main
-   ```
-
-2. Fix the source code, packaging or workflow on `main`. Update `version` in `Cargo.toml`
-   to `0.9.8`. Add or update the `0.9.8` section in `CHANGELOG.md`, describe the correction,
-   and replace `Unreleased` with the release date. Keep the `0.9.7` history unchanged.
-
-3. Update the lockfile, run the checks and review the new release notes:
-
-   ```sh
-   cargo build
-   make fmt-check ci
-   scripts/release-notes.sh 0.9.8
-   git diff --check
-   git diff
-   ```
-
-4. Stage the fixes and version files, review the staged changes, then commit and push.
-   `git add -p` lets you select the changes that belong to this correction. Add any new files
-   explicitly with `git add <path>`.
-
-   ```sh
-   git add -p
-   git add Cargo.toml Cargo.lock CHANGELOG.md
-   git diff --cached
-   git commit -m "Fix release issues and prepare 0.9.8"
-   git push origin main
-   git rev-parse HEAD
-   ```
-
-5. Wait for the required CI checks to pass for the commit printed above on every platform.
-   Confirm that `HEAD` still points to that verified commit before tagging. Do not tag a newer,
-   unchecked commit.
-
-   ```sh
-   git log -1 --oneline
-   git tag -a v0.9.8 -m "OxideMerge 0.9.8"
-   git push origin v0.9.8
-   ```
-
-6. Check the tag's workflow and the new GitHub release. Confirm that all expected packages and
-   PDF guides are available and that the release notes describe the fix.
-   Then add an `Unreleased` section for the next version to `CHANGELOG.md`.
-
-If the new release build also fails, repeat this process with another unused patch version.
-Do not delete or force-push the old tag, or replace assets attached to the old release.
-
-## Contributing
-
-Bug reports, feature requests, documentation improvements and translations are welcome through
-[GitHub Issues](https://github.com/kuopinghsu/OxideMerge/issues) and pull requests.
-For code changes, follow the [development instructions](#development) and run the relevant
-checks before submitting a pull request.
-
-## Security
-
-See [SECURITY.md](SECURITY.md) for vulnerability reporting, the handling of untrusted input
-and dependency checks.
-
-## License
-
-OxideMerge is licensed under the [MIT License](LICENSE).
-
-## Optional review and analysis
-
-These actions are read-only and opt-in. In a three-way text or folder view, expand **Merge Verification**
-for an in-memory merge preview or to check the saved result's bytes. **Text / Semantic** compares
-JSON, XML, TOML and YAML paths without editing or reserializing the originals, as a tree of
-changed paths with moved array elements and an optional array matching key. Duplicate keys, XML
-DTDs/entities and YAML aliases are rejected.
-
-Folder comparisons include a **Review workspace** for file/hunk decisions, comments, rationale,
-tags and next-unreviewed navigation. Save `.oxmreview` to resume elsewhere. Version 1 bundles
-still open; new version 2 bundles add bounded annotations and captured-content SHA-256 digests.
-Updating review inputs flags stale decisions; it never automatically accepts a changed hunk.
-
-**Compare baselines** / **Release summary** accepts folders, immutable Git revisions and sides of
-review snapshots. Exact unique-content moves and suspected renames with edits are distinguished
-from added/deleted files, and category counts filter the list. Optional **Potential impact** shows
-imports of changed files and uses of the changed functions and types they import by name, labelled
-exact, and delimited path, name and config-key occurrences, labelled heuristic, with concrete
-source evidence; neither establishes runtime behavior or build/test success.
-Git sources honor trusted Git configuration, as existing revision comparisons do.
+### Common options
+
+| Option | Description |
+| --- | --- |
+| `-r` | Include subfolders. |
+| `-f "*.rs;!target/"` | Filter the folder contents. |
+| `-t text`, `-t binary`, `-t image`, `-t web` | Choose the comparison type. |
+| `-o <file>` | Save the merge result to another file. |
+| `--ignore-case`, `--ignore-eol`, `--ignore-comments` | Ignore letter case, line endings or comments. |
+| `--rules <name-or-path>` | Use a comparison rules file. |
+| `--git-rev <revision>` | Compare one file or folder with a Git revision. |
+| `--report <file>` | Export a report as `.html` or `.xml`. Folder comparisons can also use `.csv` or `.txt`. |
+| `--report-diffs` | Add text differences to a folder HTML report. |
+| `--slideshow` | Export an HTML slideshow with one difference per slide. |
+| `--patch <file>` | Export a patch from a two-way file or folder comparison. |
+| `--cli` | Compare without opening a window, for scripts. |
+
+`--cli`, `--report` and `--patch` do not open a window. On Windows, OxideMerge also accepts
+the supported WinMerge-style switches, such as `/r`, `/f` and `/o`. Run `oxidemerge --help`
+for all options. For the full reference and script examples, see the
+[user guide](docs/user-guide.adoc).
+
+### Exit codes for scripts
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The content is the same. |
+| `1` | The content is different. |
+| `2` | An error happened. |
+
+### Review and analysis commands
 
 ```sh
 oxidemerge --merge-plan left.txt base.txt right.txt --report merge-plan.json
@@ -581,17 +280,161 @@ oxidemerge --baseline-left git:v1.0:/path/to/repo --baseline-right git:v1.1:/pat
 oxidemerge --impact old-folder new-folder --report impact.json
 ```
 
-Analysis reports use a separate versioned envelope (JSON, HTML or XML); old report formats are
-unchanged. Analysis never overwrites an input or exports a report inside a selected input folder.
-Exit codes remain 0/1/2 (equal-or-success / different-or-warning / error), with **3** reserved for a
-failed `--validate-merge`. Unreadable or unsupported baseline paths produce exit 2. Intentional filter exclusions are listed as outside scope.
-See the [analysis guide](docs/analysis-guide.md) for policies, bounds and limitations.
+These commands write analysis reports as JSON, HTML or XML. The analysis reports have their
+own format with a version number. The other reports do not change. These commands never
+overwrite an input file, and never write a report inside an input folder.
 
-Text comparisons offer **Compact rows** (default, no insertion/deletion padding) and **Aligned
-rows** (blank space keeps corresponding lines aligned). Change **Text layout** in Options → General
-or View → Text compare. Location panes appear on the right in text and binary comparisons.
+| Code | Meaning |
+| --- | --- |
+| `0` | Success, or no differences. |
+| `1` | Differences or warnings were found. |
+| `2` | An error happened, for example a baseline path cannot be read. |
+| `3` | `--validate-merge` found a problem. |
 
-About and `--version` identify development builds with the short Git revision and append `-dirty`
-for tracked working-tree or index changes. Clean optimized builds of the matching `vVERSION` tag
-show the UTC build date instead; `SOURCE_DATE_EPOCH` still controls that date for reproducibility.
-Without Git metadata, builds use a valid `GITHUB_SHA` when available, otherwise `unknown`.
+## Git and file manager integration
+
+### Git
+
+OxideMerge can be Git's visual diff and merge tool. Put `oxidemerge` in your `PATH`. Then run
+these commands in a POSIX shell, such as Bash or Git Bash:
+
+```sh
+git config --global diff.tool oxidemerge
+git config --global difftool.oxidemerge.cmd 'oxidemerge "$LOCAL" "$REMOTE"'
+git config --global merge.tool oxidemerge
+git config --global mergetool.oxidemerge.cmd \
+  'oxidemerge "$LOCAL" "$BASE" "$REMOTE" -o "$MERGED" --dl Local --dr Remote --wl --wr'
+git config --global mergetool.oxidemerge.trustExitCode false
+```
+
+- `git difftool` compares single files. `git difftool --dir-diff` opens a folder comparison.
+- `git mergetool` resolves conflicts. Review the three versions, merge into the middle pane,
+  and save. The result goes to Git's merge output file. The base file does not change.
+
+If the program is not in your `PATH`, use its full path in these commands. For more details,
+see the [user guide](docs/user-guide.adoc).
+
+### File managers
+
+To add OxideMerge to your file manager, use the **Tools** menu. Or run
+`oxidemerge --register-shell` from the installed program. To remove it, run
+`oxidemerge --unregister-shell`.
+
+- **Windows Explorer:** compare the selected files or folders from the context menu. On
+  Windows 11, the commands are under **Show more options**.
+- **macOS Finder:** use the OxideMerge Quick Actions and Services.
+- **Linux:** use the menu commands in Nautilus, Nemo or Dolphin.
+
+You can compare the selected items right away. Or mark one item with **Select Left** or
+**Select Middle**, and choose the other item later. The commands start the program from the
+place where you registered it. If you move the program, register it again.
+
+## Configuration
+
+Use **Options** to change the comparison settings, the appearance and the language. OxideMerge
+saves the settings in this file:
+
+| System | Settings file |
+| --- | --- |
+| Windows | `%APPDATA%\OxideMerge\config.json` |
+| macOS | `~/Library/Application Support/OxideMerge/config.json` |
+| Linux | `~/.config/OxideMerge/config.json` |
+
+- **Portable use:** create an empty `oxidemerge.json` file next to the program. OxideMerge
+  then keeps its settings there.
+- **Separate settings:** set the `OXIDEMERGE_CONFIG_DIR` environment variable to another
+  folder.
+
+### Filters
+
+File filters choose which items a folder comparison shows:
+
+- Separate patterns with `;`.
+- Start a pattern with `!` to exclude matching items.
+- End a pattern with `/` or `\` to match folders.
+
+For example, `*.rs;*.toml;!target/` shows Rust and TOML files and hides the `target` folder.
+You can also use WinMerge `.flt` files. Put them in the `Filters` folder inside the settings
+folder.
+
+### Comparison rules
+
+Comparison rules choose which differences to ignore. Use **Options → Compare rules** to manage
+`.oxrules` files. A rules file can ignore lines, replace text and ignore blocks of text. You can
+import and export rules, so that other projects or team members can use them. Each folder
+comparison can use its own rules file.
+
+### Languages
+
+The built-in translations are in [lang/](lang). To add or change a translation:
+
+1. Copy `lang/en.json` to `<code>.json`, for example `nl.json`.
+2. Set `_name` to the name of the language in that language, for example `Nederlands`. The
+   language menu shows this name.
+3. Translate the other values. Do not change the `{placeholder}` names.
+4. Put the file in a `Languages` folder next to the program or inside the settings folder.
+
+Missing messages, and translations with wrong placeholders, are shown in English.
+
+## Documentation and help
+
+- [User guide](docs/user-guide.adoc): how to compare and merge, comparison options, keyboard
+  shortcuts, Git integration and troubleshooting.
+- [User guide in Traditional Chinese](docs/user-guide.zh-TW.adoc).
+- [Analysis guide](docs/analysis-guide.md): merge verification, semantic comparison, review
+  workspaces, release summaries and potential impact.
+- [Benchmarks](docs/benchmarks.md): performance results and how to measure them.
+- [Changelog](CHANGELOG.md): the changes in each version.
+- [Development guide](docs/development.md): how to build, test and release OxideMerge.
+
+In the app, press **F1** or click the **?** button to open **Help & Shortcuts**. It lists the
+keyboard and mouse actions, and shows where your settings are saved. On macOS, most shortcuts
+use Command instead of Ctrl. The app shows the right keys for your system.
+
+## Known limitations
+
+- Archives are read-only. You cannot save changes into an archive. RAR files are not supported.
+- JSON and XML files are read-only when automatic formatting is on. Turn it off to edit or
+  merge them.
+- Web page screenshots need a Chromium-based browser, such as Chrome or Edge. Only the
+  screenshot modes run JavaScript, so the other web modes can miss content that a page loads
+  later.
+- Pages that need a login are not supported. They may show the login page instead.
+- Text editing works line by line. It is meant for reviewing and merging changes.
+- WinMerge project files and filter files work. WinMerge plugin DLLs and scripts do not work.
+- Unpacker plugins run external commands. They work the same way in file comparisons, folder
+  comparisons of full contents, the command line and reports. The PDF and Office presets need
+  conversion tools that you install separately.
+- The translations were made with machine help. Native speakers have not reviewed them yet.
+
+## Development
+
+To build OxideMerge from source, install a Rust toolchain with [rustup](https://rustup.rs/).
+Linux also needs a C compiler. Then run these commands in the repository folder:
+
+```sh
+cargo build --release --locked
+cargo test --locked
+```
+
+The program is `target/release/oxidemerge`, or `target/release/oxidemerge.exe` on Windows.
+Run `make demo` to open a sample folder comparison.
+
+For the Make targets, tests, continuous integration and release steps, see the
+[development guide](docs/development.md).
+
+## Contributing
+
+Bug reports, feature ideas, documentation fixes and translations are welcome. Open an issue on
+[GitHub Issues](https://github.com/kuopinghsu/OxideMerge/issues), or send a pull request. For
+code changes, follow the [development guide](docs/development.md) and run the checks before
+you send a pull request.
+
+## Security
+
+To report a security problem, see [SECURITY.md](SECURITY.md). It also explains how OxideMerge
+handles untrusted files and how the dependencies are checked.
+
+## License
+
+OxideMerge is released under the [MIT License](LICENSE).

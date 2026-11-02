@@ -142,7 +142,7 @@ sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin
 . 在儲存庫資料夾中執行 `cargo build --release --locked`。
 
 建置完成的程式位於 `target/release/oxidemerge`（Windows 為 `target/release/oxidemerge.exe`）。
-建置需求與檢查方式，請參閱 xref:../README_zh-TW.md#開發[讀我檔案的「開發」一節]。
+建置需求與檢查方式，請參閱 xref:development.zh-TW.md[開發指南]。
 
 == 快速入門
 

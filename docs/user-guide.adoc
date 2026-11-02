@@ -139,7 +139,7 @@ sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin
 . In the repository folder, run `cargo build --release --locked`.
 
 The program is `target/release/oxidemerge` (`target/release/oxidemerge.exe` on Windows).
-For the requirements and checks, see xref:../README.md#development[Development in the README].
+For the requirements and checks, see xref:development.md[the development guide].
 
 == Getting started
 
