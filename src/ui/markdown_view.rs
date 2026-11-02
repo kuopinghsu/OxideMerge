@@ -48,17 +48,31 @@ pub struct MarkdownView {
     active: usize,
     /// Height of each row as last laid out.
     heights: Vec<f32>,
+    /// The tables laid out so far, by row and page.
+    tables: std::collections::HashMap<(usize, usize), TableLayout>,
     /// How far the pages are scrolled down, in pixels.
     scroll: f32,
+    /// How much taller the rows above the view were found while drawn, added to `scroll` so
+    /// that what is in view stays put.
+    shift: f32,
     scroll_to: Option<usize>,
     cache: CommonMarkCache,
     /// Set when stepping ran past the last (`true`) or first (`false`) difference.
     pub step_file: Option<bool>,
 }
 
-impl MarkdownView {
+/// The pages lined up and compared for the view, worked out away from the window: for large
+/// pages this takes a while.
+pub struct Prepared {
+    pages: Vec<Vec<Block>>,
+    rows: Vec<Row>,
+    marks: Vec<Vec<Option<Marks>>>,
+    diffs: Vec<Range<usize>>,
+}
+
+impl Prepared {
     /// `opts` says whether and how changed words are found, as in the text compare.
-    pub fn new(pages: Vec<Vec<Block>>, labels: Vec<String>, opts: &DiffOptions) -> Self {
+    pub fn new(pages: Vec<Vec<Block>>, opts: &DiffOptions) -> Self {
         let rows = web_markdown::align(&pages);
         let mut marks = web_markdown::marks(&pages, &rows, opts);
         for (row, marks) in rows.iter().zip(&mut marks) {
@@ -74,8 +88,32 @@ impl MarkdownView {
             .filter(|&i| rows[i].changed)
             .map(|i| i..i + 1)
             .collect();
+        Prepared {
+            pages,
+            rows,
+            marks,
+            diffs,
+        }
+    }
+}
+
+impl MarkdownView {
+    #[cfg(test)]
+    pub fn new(pages: Vec<Vec<Block>>, labels: Vec<String>, opts: &DiffOptions) -> Self {
+        Self::from_prepared(Prepared::new(pages, opts), labels)
+    }
+
+    pub fn from_prepared(prepared: Prepared, labels: Vec<String>) -> Self {
+        let Prepared {
+            pages,
+            rows,
+            marks,
+            diffs,
+        } = prepared;
         MarkdownView {
             heights: vec![ESTIMATE; rows.len()],
+            tables: Default::default(),
+            shift: 0.0,
             pages,
             labels,
             rows,
@@ -253,7 +291,7 @@ impl MarkdownView {
         let view_h = view.height().max(1.0);
         let total = self.top(self.heights.len());
         let max_scroll = (total - view_h).max(0.0);
-        let mut offset = self.scroll;
+        let mut offset = self.scroll + std::mem::take(&mut self.shift);
         if let Some(r) = self.scroll_to.take() {
             if let Some(to) = reveal(self.top(r), self.heights[r], offset, view_h) {
                 offset = to;
@@ -300,6 +338,7 @@ impl MarkdownView {
         let sel = self.cur.map(|d| self.diffs[d].clone());
         let (cursor, active) = (self.cursor, self.active);
         let mut relaid = false;
+        let mut shift = 0.0;
         let mut clicked = None;
         let mut pages_ui = ui.new_child(UiBuilder::new().max_rect(view));
         let out = area.show_viewport(&mut pages_ui, |ui, viewport| {
@@ -311,6 +350,7 @@ impl MarkdownView {
                 rows,
                 marks,
                 heights,
+                tables,
                 cache,
                 ..
             } = self;
@@ -328,6 +368,8 @@ impl MarkdownView {
                         .map(|_| ui.painter().add(Shape::Noop))
                         .collect();
                     let mut height: f32 = 0.0;
+                    // How much taller the rows of its tables above the view were found.
+                    let mut grew: f32 = 0.0;
                     for (p, left) in lefts.iter().enumerate() {
                         let Some(b) = row.cells.get(p).copied().flatten() else {
                             continue;
@@ -350,7 +392,12 @@ impl MarkdownView {
                         cell.set_width(inner.width());
                         let id = Id::unique(("md_block", i, p));
                         match marks.get(i).and_then(|m| m.get(p)).and_then(Option::as_ref) {
-                            Some(Marks::Table(t)) => table(&mut cell, cache, id, t, words),
+                            Some(Marks::Table(t)) => {
+                                let layout = tables.entry((i, p)).or_default();
+                                let (r, g) = table(&mut cell, cache, layout, id, t, words);
+                                relaid |= r;
+                                grew = grew.max(g);
+                            }
                             Some(Marks::Text(r)) => {
                                 show_marked(&mut cell, cache, id, &block.text, r, words);
                             }
@@ -359,6 +406,11 @@ impl MarkdownView {
                         height = height.max(cell.min_rect().height() + 2.0 * PAD);
                     }
                     let height = height.max(2.0 * PAD + 4.0);
+                    if y + heights[i] <= viewport.min.y {
+                        shift += height - heights[i];
+                    } else if y < viewport.min.y {
+                        shift += grew;
+                    }
                     if (height - heights[i]).abs() > 0.5 {
                         heights[i] = height;
                         relaid = true;
@@ -414,6 +466,12 @@ impl MarkdownView {
             ui.advance_cursor_after_rect(Rect::from_min_size(origin, vec2(width, y)));
         });
         self.scroll = out.state.clamped_offset().y;
+        if shift.abs() > 0.5 {
+            // Drawn again at once, scrolled by as much, before this pass is shown.
+            self.shift = shift;
+            ui.ctx()
+                .request_discard("rows above the web page view were measured");
+        }
         if let Some((row, page)) = clicked {
             self.click(row, page);
         }
@@ -507,38 +565,76 @@ fn show_marked(
         .show_with_id(id, ui, cache, text);
 }
 
+/// What is kept of a table between frames, so that only its rows in view are laid out.
+#[derive(Default)]
+struct TableLayout {
+    /// The body and code font sizes the natural widths were measured with.
+    fonts: [f32; 2],
+    /// How wide each column is on one line.
+    natural: Vec<f32>,
+    /// Height of each row as last laid out, its padding included.
+    heights: Vec<f32>,
+}
+
 /// Draws a table as a grid of cells with lines around them and the header row shaded. What
 /// differs is highlighted in `words`: changed words, and whole cells the other page lacks.
+/// Only the rows in view are laid out. Returns whether a row's height changed, and how much
+/// taller the rows above the view were found.
 fn table(
     ui: &mut Ui,
     cache: &mut CommonMarkCache,
+    layout: &mut TableLayout,
     id: Id,
     rows: &[Vec<(String, Cell)>],
     words: Color32,
-) {
+) -> (bool, f32) {
     let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
     if cols == 0 {
-        return;
+        return (false, 0.0);
     }
     let [px, py] = CELL_PAD;
-    let mut natural = vec![0.0_f32; cols];
-    for row in rows {
-        for (k, (text, _)) in row.iter().enumerate() {
-            natural[k] = natural[k].max(natural_width(ui, text));
-        }
+    let fonts =
+        [egui::TextStyle::Body, egui::TextStyle::Monospace].map(|s| s.resolve(ui.style()).size);
+    if layout.fonts != fonts || layout.natural.len() != cols {
+        layout.fonts = fonts;
+        layout.natural = vec![0.0_f32; cols];
+        let body = egui::TextStyle::Body.resolve(ui.style());
+        let mono = egui::TextStyle::Monospace.resolve(ui.style());
+        ui.ctx().fonts_mut(|fonts| {
+            for row in rows {
+                for (k, (text, _)) in row.iter().enumerate() {
+                    let w = natural_width(fonts, &body, &mono, text);
+                    layout.natural[k] = layout.natural[k].max(w);
+                }
+            }
+        });
+        layout.heights.clear();
     }
-    let widths = fit(&natural, ui.available_width() - cols as f32 * 2.0 * px);
+    let line_height = ui.text_style_height(&egui::TextStyle::Body);
+    if layout.heights.len() != rows.len() {
+        layout.heights = vec![line_height + 2.0 * py; rows.len()];
+    }
+    let widths = fit(
+        &layout.natural,
+        ui.available_width() - cols as f32 * 2.0 * px,
+    );
     let origin = ui.cursor().min;
     let mut xs = vec![origin.x];
     for w in &widths {
         xs.push(xs[xs.len() - 1] + w + 2.0 * px);
     }
     let clip = ui.clip_rect();
+    let shown = clip.expand2(vec2(0.0, OVERSCAN)).y_range();
     let shade = ui.visuals().text_color().gamma_multiply(0.07);
-    let line_height = ui.text_style_height(&egui::TextStyle::Body);
+    let mut relaid = false;
+    let mut grew = 0.0;
     let mut ys = vec![origin.y];
     for (r, row) in rows.iter().enumerate() {
         let top = ys[r];
+        if top + layout.heights[r] < shown.min || top > shown.max {
+            ys.push(top + layout.heights[r]);
+            continue;
+        }
         let backs: Vec<_> = (0..cols).map(|_| ui.painter().add(Shape::Noop)).collect();
         let mut height = line_height;
         for (k, (text, cell)) in row.iter().enumerate() {
@@ -562,6 +658,13 @@ fn table(
             height = height.max(c.min_rect().height());
         }
         let bottom = top + height + 2.0 * py;
+        if (bottom - top - layout.heights[r]).abs() > 0.5 {
+            if top < clip.min.y {
+                grew += bottom - top - layout.heights[r];
+            }
+            layout.heights[r] = bottom - top;
+            relaid = true;
+        }
         for (k, back) in backs.into_iter().enumerate() {
             let fill = match row.get(k) {
                 Some((_, Cell::Whole)) => words,
@@ -581,12 +684,16 @@ fn table(
         painter.vline(x, outer.y_range(), stroke);
     }
     for (r, &y) in ys.iter().enumerate().take(ys.len() - 1).skip(1) {
+        if !shown.contains(y) {
+            continue;
+        }
         // The header row ends with a heavier line.
         let width = if r == 1 { 2.0 } else { 1.0 };
         painter.hline(outer.x_range(), y, Stroke::new(width, color));
     }
     painter.rect_stroke(outer, 2.0, stroke, StrokeKind::Inside);
     ui.advance_cursor_after_rect(outer);
+    (relaid, grew)
 }
 
 /// Column widths for columns `natural` wide on one line, in `room`: all as wide as they need
@@ -614,27 +721,30 @@ fn fit(natural: &[f32], room: f32) -> Vec<f32> {
     widths
 }
 
-/// About how wide Markdown `text` is shown on one line.
-fn natural_width(ui: &Ui, text: &str) -> f32 {
-    let body = egui::TextStyle::Body.resolve(ui.style());
-    let mono = egui::TextStyle::Monospace.resolve(ui.style());
+/// About how wide Markdown `text` is shown on one line in `body`, with its code in `mono`.
+fn natural_width(
+    fonts: &mut egui::epaint::FontsView<'_>,
+    body: &egui::FontId,
+    mono: &egui::FontId,
+    text: &str,
+) -> f32 {
     let mut width = 2.0;
     for (i, part) in text.split('`').enumerate() {
         if part.is_empty() {
             continue;
         }
-        // Inline code, with room for its background.
-        let (shown, font, extra) = if i % 2 == 1 {
-            (part.to_string(), mono.clone(), 4.0)
+        width += if i % 2 == 1 {
+            // Inline code, with room for its background.
+            part.chars()
+                .map(|c| fonts.glyph_width(mono, c))
+                .sum::<f32>()
+                + 4.0
         } else {
-            (visible(part), body.clone(), 0.0)
+            visible(part)
+                .chars()
+                .map(|c| fonts.glyph_width(body, c))
+                .sum()
         };
-        width += ui
-            .painter()
-            .layout_no_wrap(shown, font, Color32::WHITE)
-            .size()
-            .x
-            + extra;
     }
     width
 }
@@ -771,6 +881,108 @@ mod tests {
             visible("**Free** \\| [docs](https://x/y) ~~old~~"),
             "Free | docs old"
         );
+    }
+
+    #[test]
+    fn only_the_rows_of_a_table_in_view_are_laid_out() {
+        let mut html = String::from("<table><tr><th>Id</th><th>Text</th></tr>");
+        for r in 0..2000 {
+            html.push_str(&format!(
+                "<tr><td>{r}</td><td>{}</td></tr>",
+                "word ".repeat(80)
+            ));
+        }
+        html.push_str("</table>");
+        let page = web_markdown::html_to_blocks(&html, None);
+        let opts = DiffOptions::default();
+        let mut v = MarkdownView::new(vec![page.clone(), page], Vec::new(), &opts);
+        let ctx = egui::Context::default();
+        let c = crate::ui::theme::colors(false);
+        let mut measured = || {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1280.0, 800.0))),
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| v.ui(ui, &c, false))
+                .textures_delta
+                .clear();
+            let heights = &v.tables[&(0, 0)].heights;
+            // Rows not laid out keep the one-line estimate, which the wrapped rows exceed.
+            let estimate = heights[heights.len() - 1];
+            heights.iter().filter(|&&h| h > estimate + 0.5).count()
+        };
+        let first = measured();
+        assert!(first > 0 && first < 100, "{first} rows laid out");
+        // Drawn again, the rows in view keep their measured heights.
+        assert_eq!(measured(), first);
+    }
+
+    #[test]
+    fn scrolling_up_through_a_table_moves_it_as_far_as_scrolled() {
+        let mut html = String::from("<table><tr><th>Id</th><th>Text</th></tr>");
+        for r in 0..2000 {
+            html.push_str(&format!(
+                "<tr><td>{r}</td><td>{}</td></tr>",
+                "word ".repeat(80)
+            ));
+        }
+        html.push_str("</table><p>after</p>");
+        let page = web_markdown::html_to_blocks(&html, None);
+        let mut v = MarkdownView::new(
+            vec![page.clone(), page],
+            Vec::new(),
+            &DiffOptions::default(),
+        );
+        let ctx = egui::Context::default();
+        let c = crate::ui::theme::colors(false);
+        let mut time = 0.0;
+        let mut frame = |v: &mut MarkdownView, wheel: f32| {
+            time += 0.25;
+            let mut raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1280.0, 800.0))),
+                time: Some(time),
+                ..Default::default()
+            };
+            if wheel != 0.0 {
+                raw.events
+                    .push(egui::Event::PointerMoved(egui::pos2(400.0, 400.0)));
+                raw.events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, wheel),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            ctx.run_ui(raw, |ui| v.ui(ui, &c, false))
+                .textures_delta
+                .clear();
+        };
+        let settle = |v: &mut MarkdownView, frame: &mut dyn FnMut(&mut MarkdownView, f32)| {
+            for _ in 0..4 {
+                frame(v, 0.0);
+            }
+        };
+        settle(&mut v, &mut frame);
+        // To the paragraph after the table: the rows above it were never laid out.
+        v.scroll_to = Some(1);
+        settle(&mut v, &mut frame);
+        // Where table row `k` is in the view.
+        let y_of = |v: &MarkdownView, k: usize| {
+            let h = &v.tables[&(0, 0)].heights;
+            v.top(0) + PAD + h[..k].iter().sum::<f32>() - v.scroll
+        };
+        let mut k = 0;
+        while y_of(&v, k) < 200.0 {
+            k += 1;
+        }
+        for _ in 0..6 {
+            let before = y_of(&v, k);
+            frame(&mut v, 120.0);
+            settle(&mut v, &mut frame);
+            let moved = y_of(&v, k) - before;
+            assert!((moved - 120.0).abs() < 1.0, "row {k} moved {moved}");
+        }
     }
 
     fn block(t: &str) -> Block {

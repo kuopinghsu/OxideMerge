@@ -1016,10 +1016,7 @@ fn formatted_web_pages_step_on_to_the_next_file() {
             ("right/two.html", "<p>two</p><p>right</p>"),
         ],
     );
-    let cfg = Config {
-        web_render: false,
-        ..config()
-    };
+    let cfg = config();
     let roots = [d.join("left"), d.join("right")];
     let mut gui = Gui::with_config("web_step_file", cfg, compare_folders(&roots));
     let shown = |gui: &mut Gui| {
@@ -1773,10 +1770,7 @@ fn review_pane_decisions_survive_a_saved_review_and_follow_renamed_files() {
     );
     let mut gui = Gui::with_config(
         "review_pane",
-        Config {
-            web_render: false,
-            ..config()
-        },
+        config(),
         compare(&[d.join("left"), d.join("right")]),
     );
     let counts = |unreviewed: usize, accepted: usize, needs: usize| {
@@ -2385,10 +2379,7 @@ fn exact_impact_findings_link_to_the_folder_review_workspace() {
     );
     let mut gui = Gui::with_config(
         "impact_review_link",
-        Config {
-            web_render: false,
-            ..config()
-        },
+        config(),
         compare(&[d.join("left"), d.join("right")]),
     );
     gui.click(tr("drawer.toggle"));

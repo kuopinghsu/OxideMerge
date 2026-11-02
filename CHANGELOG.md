@@ -49,9 +49,23 @@ section of this file as the release notes.
   taken again from the current version, and new ones show the *Select files or folders* dialog,
   the file compare below the folder list, the inline view, the CSV table view, the Formatted web
   mode, merge verification, semantic comparison, the review workspace and the release summary.
+- **Only the screenshot web modes use a browser:** the Formatted, Text and HTML source modes
+  convert the HTML as downloaded, in the window and with `--cli`, so `samples/web/left.html`
+  against `right.html` opens in a few milliseconds instead of about 2 seconds (starting the
+  browser and letting each page settle). Content that a page's scripts add is now only in the
+  screenshots. The Text mode leaves out hidden elements, as the Formatted mode does, and no
+  longer includes the page title. The *Render pages in the browser for text and HTML* option is
+  removed.
+- **Formatted web compare is faster:** a large table lays out only the rows in view, and measures
+  its column widths once, so scrolling a page with a table of 1,500 rows takes about 2 ms a frame
+  instead of 35 ms. The pages are converted, lined up and compared on the loading thread, so
+  opening a large page no longer holds up the window.
 
 ### Fixed
 
+- **Web page compare:** *Stop* also ends the download of the pages and their resources as
+  data arrives, instead of letting it run on in the background; a server that sends nothing is
+  still waited for until its 30-second timeout.
 - **Impact analysis:** a style sheet ending inside an `@import` no longer stops the analysis;
   files with lone carriage-return line endings report the right lines; cancelling stops the
   symbol phase too; the index cache no longer mixes up files read by different grammars; the

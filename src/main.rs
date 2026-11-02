@@ -543,25 +543,10 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             .iter()
             .map(|p| core::web::location(p))
             .collect::<Result<Vec<_>, _>>()?;
-        // As the text, HTML and Markdown modes show them: rendered by the browser when there is one.
-        let browser = cfg
-            .web_render
-            .then(|| core::web::find_browser(&cfg.web_browser))
-            .flatten();
-        let source = core::web_render::load_text(
-            browser.as_deref(),
-            &urls,
-            cfg.web_width,
-            cfg.web_height,
-            &core::web::Progress::default(),
-        )?;
-        if let core::web_render::TextSource::Downloaded(_, Some(e)) = &source {
-            eprintln!("{}", i18n::trf("web.fallback", &[("error", e.clone())]));
-        }
-        source
-            .texts(cfg.web_mode)
+        core::web::fetch_pages(&urls, &Default::default())?
             .iter()
-            .map(|text| core::text::TextDoc::from_text(None, text))
+            .map(|p| core::web::page_text(p, cfg.web_mode))
+            .map(|text| core::text::TextDoc::from_text(None, &text))
             .collect()
     } else {
         paths

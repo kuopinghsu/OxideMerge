@@ -22,18 +22,18 @@ What to look for in each mode:
   emphasis, links, lists and the table, with the changed blocks highlighted and, as in Text, the
   changed words within them. The pages in [`formatted/`](#formatted-mode-samples) try it on
   harder content.
-- **Text:** changed words are highlighted within lines. The hidden build line (`display: none`)
-  differs between the files but is not shown, because it is not on the page as you see it. The
-  "Known issues" list is filled in by a script, and its changes are still there.
+- **Text:** changed words are highlighted within lines. The build line differs between the files
+  and a style sheet rule hides it. Only the screenshots apply style sheets, so Formatted and Text
+  show the change.
 - **Full page:** the whole page, including the part below the first screen, with the text
   differences highlighted on the page. The note added near the top of 2.4 moves everything
   below it down, yet only the text that really changed is marked.
 - **Screenshot (visible area):** the top of each page only.
-- **HTML source:** the HTML after the script has run, so the generated `<li>` items are in it.
+- **HTML source:** the HTML of the files, with the script but without the `<li>` items it adds.
 
-Full page, Screenshot and the script-generated content need Edge, Chrome, Chromium or Brave.
-Without one, or if it fails, Text, Formatted and HTML source use the files as they are: the
-known issues list is empty, and the hidden build line shows up in Text as a difference.
+Formatted, Text and HTML source convert the files as they are, without a browser, so they open at
+once; the "Known issues" list that a script fills in is empty in them. Full page and Screenshot
+run the script, so the list is there, and need Edge, Chrome, Chromium or Brave.
 
 ## Formatted mode samples
 
@@ -64,7 +64,7 @@ the other modes too; Text shows the same changes as lines of words.
 - **Paragraphs:** a long paragraph where one phrase changes, and a paragraph split in two.
 - **Hidden content:** a draft note hidden by the style sheet, a screen reader hint and the body
   of a closed `<details>` are not shown, so their changes do not count. The "Last reviewed"
-  line is written by a script and is only there when a browser renders the page.
+  line is written by a script, so it is only in the screenshots.
 
 ### `headings/`: a user guide outline
 
@@ -87,7 +87,7 @@ the other modes too; Text shows the same changes as lines of words.
 - **Release schedule:** a cell spanning two columns (`colspan`) is replaced by two dates.
 - **Contact:** a layout table without header cells; its first row is used as the header.
 - **Limits:** a table nested in a cell, whose cells run together as text.
-- **Server status:** rows added by a script, so the table is empty without a browser.
+- **Server status:** rows added by a script, so the table is empty except in the screenshots.
 
 Each table is one block, drawn with lines around its cells: a change anywhere in it highlights
 the table on both sides. Within it, rows are lined up (by their first cell when they changed),

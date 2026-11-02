@@ -5907,7 +5907,6 @@ impl OxideMergeApp {
                                         .small()
                                         .color(pal(ui).text_dim),
                                     );
-                                    ui.checkbox(&mut c.web_render, tr("opt.web_render"));
                                     ui.add(
                                         egui::Slider::new(&mut c.web_width, 320..=3840)
                                             .text(tr("opt.web_width")),
