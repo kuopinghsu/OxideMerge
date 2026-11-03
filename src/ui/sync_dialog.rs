@@ -125,6 +125,11 @@ impl SyncDialog {
         }
     }
 
+    /// Whether the preview is still being worked out.
+    pub fn planning(&self) -> bool {
+        matches!(self.state, State::Planning { .. })
+    }
+
     /// Stops planning or applying, as when the view closes; applying then undoes its changes.
     pub fn stop(&self) {
         match &self.state {

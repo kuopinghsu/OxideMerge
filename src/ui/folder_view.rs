@@ -2246,6 +2246,11 @@ impl FolderView {
         self.sync.as_ref().is_some_and(|d| d.busy())
     }
 
+    /// Whether a synchronization is being planned or applied, so its dialog is not settled yet.
+    pub fn sync_settling(&self) -> bool {
+        self.sync.as_ref().is_some_and(|d| d.planning() || d.busy())
+    }
+
     /// Whether copying or deleting files is still going on.
     pub fn has_file_job(&self) -> bool {
         self.file_job.is_some()

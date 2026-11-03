@@ -19,6 +19,12 @@ const MAX_OUTPUT: usize = 16 << 20;
 /// than unpacked, so that a small file cannot ask for a large amount of memory.
 const MAX_PART: u64 = 64 << 20;
 
+/// The largest PDF or RTF file read, since those are read whole.
+const MAX_FILE: u64 = 256 << 20;
+
+/// The most sections of an ELF file listed.
+const MAX_SECTIONS: usize = 4096;
+
 /// What a file is read as.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,7 +79,9 @@ impl Kind {
             Kind::Rtf => rtf(path),
             Kind::Spreadsheet => spreadsheet(path),
             Kind::Elf => elf(path),
-            Kind::Pdf => pdf::text(&std::fs::read(path)?).map(tidy),
+            Kind::Pdf => read_whole(path)
+                .and_then(|bytes| pdf::text(&bytes))
+                .map(tidy),
         }
         .with_context(|| {
             crate::i18n::trf(
@@ -91,6 +99,37 @@ fn elf_magic(path: &Path) -> bool {
     std::fs::File::open(path)
         .and_then(|mut f| f.read_exact(&mut head))
         .is_ok_and(|()| head == *b"\x7fELF")
+}
+
+/// The bytes of the file at `path`, refused when there are more than [`MAX_FILE`].
+fn read_whole(path: &Path) -> Result<Vec<u8>> {
+    let too_large = || anyhow::anyhow!("the file is larger than {} MiB", MAX_FILE >> 20);
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    if size > MAX_FILE {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    // The file may grow while it is read.
+    file.take(MAX_FILE + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
+/// Up to `size` bytes of `file` from `offset`, as many of them as the file has, and never more
+/// than [`MAX_PART`].
+fn piece(file: &mut std::fs::File, offset: u64, size: u64, len: u64) -> Result<Vec<u8>> {
+    use std::io::{Seek, SeekFrom};
+    if offset >= len {
+        return Ok(Vec::new());
+    }
+    let size = size.min(len - offset).min(MAX_PART);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut out = Vec::with_capacity(size as usize);
+    file.by_ref().take(size).read_to_end(&mut out)?;
+    Ok(out)
 }
 
 /// Keeps the text within [`MAX_OUTPUT`], saying so at the end when it does not fit.
@@ -113,22 +152,31 @@ fn cut(mut text: String) -> String {
 
 /// The bytes of the part `name` of the zipped document `path`.
 fn part(path: &Path, name: &str) -> Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-    let entry = archive
-        .by_name(name)
-        .with_context(|| format!("{name} is missing"))?;
-    if entry.size() > MAX_PART {
-        bail!("{name} is too large to read");
-    }
-    let mut bytes = Vec::with_capacity(entry.size().min(1 << 20) as usize);
-    entry.take(MAX_PART).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    optional_part(path, name)?.with_context(|| format!("{name} is missing"))
 }
 
-/// The same, for a part that a document need not have.
-fn optional_part(path: &Path, name: &str) -> Option<Vec<u8>> {
-    part(path, name).ok()
+/// The same, for a part that a document need not have: `None` only when it has not. One that
+/// is there but cannot be read is an error, since reading on without it would show the
+/// document as something it is not, such as a sheet whose words are all missing.
+fn optional_part(path: &Path, name: &str) -> Result<Option<Vec<u8>>> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let entry = match archive.by_name(name) {
+        Ok(entry) => entry,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("{name} cannot be read")),
+    };
+    let too_large = || anyhow::anyhow!("{name} is larger than {} MiB", MAX_PART >> 20);
+    if entry.size() > MAX_PART {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::with_capacity(entry.size().min(1 << 20) as usize);
+    // The size an archive gives for an entry need not be the size it unpacks to.
+    entry.take(MAX_PART + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PART {
+        return Err(too_large());
+    }
+    Ok(Some(bytes))
 }
 
 /// Namespaces, so that a document is read by what its elements mean rather than by the prefix
@@ -377,25 +425,29 @@ fn column_of(reference: &str) -> Option<usize> {
 }
 
 fn xlsx(path: &Path) -> Result<String> {
-    let shared = match optional_part(path, "xl/sharedStrings.xml") {
+    let shared = match optional_part(path, "xl/sharedStrings.xml")? {
         Some(xml) => shared_strings(&xml)?,
         None => Vec::new(),
     };
     let targets =
-        relationships(&optional_part(path, "xl/_rels/workbook.xml.rels").unwrap_or_default());
+        relationships(&optional_part(path, "xl/_rels/workbook.xml.rels")?.unwrap_or_default());
     let sheets = workbook_sheets(&part(path, "xl/workbook.xml")?)?;
     let mut out = String::new();
     let many = sheets.len() > 1;
+    let mut found = false;
     for (name, id) in &sheets {
         let target = id
             .as_ref()
             .and_then(|id| targets.iter().find(|(r, _)| r == id))
-            .map(|(_, t)| t.clone());
-        let Some(xml) =
-            target.and_then(|t| optional_part(path, &format!("xl/{}", t.trim_start_matches('/'))))
-        else {
+            .and_then(|(_, t)| part_name("xl", t));
+        let xml = match target {
+            Some(t) => optional_part(path, &t)?,
+            None => None,
+        };
+        let Some(xml) = xml else {
             continue;
         };
+        found = true;
         if many {
             out.push_str(&format!(
                 "# {}\n",
@@ -413,7 +465,31 @@ fn xlsx(path: &Path) -> Result<String> {
     if sheets.is_empty() {
         bail!("the workbook lists no sheets");
     }
+    if !found {
+        bail!("none of the sheets the workbook lists is in the file");
+    }
     Ok(out)
+}
+
+/// The part a relationship of a part in `folder` leads to: a target that starts with `/` is
+/// named from the top of the package, any other from `folder`. `None` for one that leads out of
+/// the package.
+fn part_name(folder: &str, target: &str) -> Option<String> {
+    let mut names: Vec<&str> = if target.starts_with('/') {
+        Vec::new()
+    } else {
+        folder.split('/').filter(|s| !s.is_empty()).collect()
+    };
+    for name in target.split('/') {
+        match name {
+            "" | "." => {}
+            ".." => {
+                names.pop()?;
+            }
+            other => names.push(other),
+        }
+    }
+    (!names.is_empty()).then(|| names.join("/"))
 }
 
 /// The sheets of `xl/workbook.xml`: each name with the relationship that leads to its part.
@@ -715,7 +791,7 @@ fn ods(xml: &[u8]) -> Result<String> {
 /// The text of an RTF file: its control words read, its tables to tab separated lines, and the
 /// parts that describe fonts, colors and pictures rather than text left out.
 fn rtf(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)?;
+    let bytes = read_whole(path)?;
     Ok(tidy(rtf_text(&bytes)))
 }
 
@@ -887,30 +963,50 @@ fn rtf_control(bytes: &[u8], at: usize) -> (String, Option<i32>, usize) {
 /// The header and section table of an ELF file, as lines. Addresses and sizes are written in
 /// full so that two builds of the same program line up line by line.
 fn elf(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() < 64 || bytes[..4] != *b"\x7fELF" {
+    // A program or a core file can be very large, and only its header and the table of its
+    // sections are read, so those are all that is taken from the file.
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let header = piece(&mut file, 0, 64, len)?;
+    if header.len() < 64 || header[..4] != *b"\x7fELF" {
         bail!("not an ELF file");
     }
-    let wide = match bytes[4] {
+    let wide = match header[4] {
         1 => false,
         2 => true,
         other => bail!("unknown ELF class {other}"),
     };
-    let little = match bytes[5] {
+    let little = match header[5] {
         1 => true,
         2 => false,
         other => bail!("unknown ELF byte order {other}"),
     };
-    let at = |offset: usize, size: usize| -> u64 {
-        let Some(slice) = bytes.get(offset..offset + size) else {
-            return 0;
-        };
+    let (abi, abi_version) = (header[7], header[8]);
+    let number = |bytes: &[u8]| -> u64 {
         let mut value = 0u64;
-        for (i, b) in slice.iter().enumerate() {
-            let shift = if little { i } else { size - 1 - i } * 8;
+        for (i, b) in bytes.iter().enumerate() {
+            let shift = if little { i } else { bytes.len() - 1 - i } * 8;
             value |= (*b as u64) << shift;
         }
         value
+    };
+    let (shoff_o, shentsize_o, shnum_o) = if wide { (40, 58, 60) } else { (32, 46, 48) };
+    let shoff = number(&header[shoff_o..shoff_o + if wide { 8 } else { 4 }]);
+    let size = number(&header[shentsize_o..shentsize_o + 2]) as usize;
+    let count = number(&header[shnum_o..shnum_o + 2]) as usize;
+    let table = piece(
+        &mut file,
+        shoff,
+        (count.min(MAX_SECTIONS) * size) as u64,
+        len,
+    )?;
+    let pieces = [(0u64, header), (shoff, table)];
+    let at = |offset: usize, size: usize| -> u64 {
+        let found = pieces.iter().find_map(|(start, bytes)| {
+            let from = (offset as u64).checked_sub(*start)? as usize;
+            bytes.get(from..from.checked_add(size)?)
+        });
+        found.map_or(0, number)
     };
     let half = |o: usize| at(o, 2);
     let word = |o: usize| at(o, 4);
@@ -925,14 +1021,13 @@ fn elf(path: &Path) -> Result<String> {
         other => format!("type {other}"),
     };
     let machine = machine_name(half(18));
-    let (entry_o, phoff_o, shoff_o) = if wide { (24, 32, 40) } else { (24, 28, 32) };
+    let (entry_o, phoff_o) = if wide { (24, 32) } else { (24, 28) };
     let entry = addr(entry_o);
     let phoff = addr(phoff_o);
-    let shoff = addr(shoff_o);
-    let (ehsize_o, phentsize_o, phnum_o, shentsize_o, shnum_o, shstrndx_o) = if wide {
-        (52, 54, 56, 58, 60, 62)
+    let (ehsize_o, phentsize_o, phnum_o, shstrndx_o) = if wide {
+        (52, 54, 56, 62)
     } else {
-        (40, 42, 44, 46, 48, 50)
+        (40, 42, 44, 50)
     };
     let mut out = String::new();
     out.push_str(&format!(
@@ -946,11 +1041,7 @@ fn elf(path: &Path) -> Result<String> {
         kind
     ));
     out.push_str(&format!("Machine: {machine}\n"));
-    out.push_str(&format!(
-        "ABI: {} version {}\n",
-        abi_name(bytes[7]),
-        bytes[8]
-    ));
+    out.push_str(&format!("ABI: {} version {}\n", abi_name(abi), abi_version));
     out.push_str(&format!("Version: {}\n", word(20)));
     out.push_str(&format!("Entry point: 0x{entry:016x}\n"));
     out.push_str(&format!(
@@ -963,26 +1054,25 @@ fn elf(path: &Path) -> Result<String> {
         half(phnum_o),
         half(phentsize_o)
     ));
-    let count = half(shnum_o) as usize;
-    let size = half(shentsize_o) as usize;
     out.push_str(&format!(
         "Section headers: {count} of {size} bytes at 0x{shoff:x}\n"
     ));
 
     // The names of the sections are in the section the header points at.
     let names_index = half(shstrndx_o) as usize;
-    let names = (names_index < count && size >= 16)
+    let names_at = (names_index < count && size >= 16)
         .then(|| {
             let head = (shoff as usize).checked_add(names_index.checked_mul(size)?)?;
             let (offset_o, size_o) = if wide { (24, 32) } else { (16, 20) };
-            let start = addr(head + offset_o) as usize;
-            let length = addr(head + size_o) as usize;
-            bytes
-                .get(start..start.saturating_add(length))
-                .map(<[u8]>::to_vec)
+            let start = addr(head.checked_add(offset_o)?);
+            let length = addr(head.checked_add(size_o)?);
+            (start.checked_add(length)? <= len).then_some((start, length))
         })
-        .flatten()
-        .unwrap_or_default();
+        .flatten();
+    let names = match names_at {
+        Some((start, length)) => piece(&mut file, start, length, len)?,
+        None => Vec::new(),
+    };
     let name_at = |offset: usize| -> String {
         let rest = names.get(offset..).unwrap_or_default();
         let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
@@ -990,11 +1080,12 @@ fn elf(path: &Path) -> Result<String> {
     };
 
     out.push_str("\nSections:\n");
-    for i in 0..count.min(4096) {
+    for i in 0..count.min(MAX_SECTIONS) {
         let Some(head) = (shoff as usize).checked_add(i * size) else {
             break;
         };
-        if head.saturating_add(size) > bytes.len() {
+        // The table was read as far as the file goes.
+        if pieces[1].1.len() < (i + 1) * size {
             break;
         }
         let (type_o, flags_o, addr_o, offset_o, size_o, link_o, info_o, align_o, entsize_o) =
@@ -1323,6 +1414,102 @@ mod tests {
             .collect();
         let path = zipped(dir.path(), "gap.xlsx", &borrowed);
         assert_eq!(Kind::Spreadsheet.read(&path).unwrap(), "1,,3\n");
+    }
+
+    /// A relationship may name its part from the top of the package, as some programs other
+    /// than Excel write them.
+    #[test]
+    fn a_workbook_whose_sheets_are_named_from_the_top_of_the_package_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parts = workbook(
+            &[("Only", r#"<row r="1"><c r="A1"><v>7</v></c></row>"#)],
+            &[],
+        );
+        for (name, body) in &mut parts {
+            if name == "xl/_rels/workbook.xml.rels" {
+                *body = body.replace("Target=\"worksheets/", "Target=\"/xl/worksheets/");
+            }
+        }
+        let borrowed: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let path = zipped(dir.path(), "absolute.xlsx", &borrowed);
+        assert_eq!(Kind::Spreadsheet.read(&path).unwrap(), "7\n");
+    }
+
+    /// The words of a workbook's cells are kept in a part of their own. If that part is there
+    /// but cannot be read, going on without it would show every one of those cells as empty.
+    #[test]
+    fn a_workbook_whose_words_cannot_be_read_is_reported_rather_than_shown_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = r#"<row r="1"><c r="A1" t="s"><v>0</v></c></row>"#;
+        let parts = workbook(&[("Only", rows)], &["unmistakable"]);
+        let path = dir.path().join("damaged.xlsx");
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let stored: zip::write::FileOptions<()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (entry, body) in &parts {
+            zip.start_file(entry.as_str(), stored).unwrap();
+            std::io::Write::write_all(&mut zip, body.as_bytes()).unwrap();
+        }
+        let mut bytes = zip.finish().unwrap().into_inner();
+        // One letter of the stored words changed, so the part no longer matches its checksum.
+        let at = bytes
+            .windows(12)
+            .position(|w| w == b"unmistakable")
+            .unwrap();
+        bytes[at] = b'U';
+        std::fs::write(&path, bytes).unwrap();
+        assert!(Kind::Spreadsheet.read(&path).is_err());
+    }
+
+    /// A workbook none of whose sheets can be found is reported, rather than compared as if
+    /// it were empty.
+    #[test]
+    fn a_workbook_whose_sheets_are_all_missing_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let parts = workbook(&[("Only", "")], &[]);
+        let borrowed: Vec<(&str, &str)> = parts
+            .iter()
+            .filter(|(a, _)| !a.starts_with("xl/worksheets/"))
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let path = zipped(dir.path(), "missing.xlsx", &borrowed);
+        assert!(Kind::Spreadsheet.read(&path).is_err());
+    }
+
+    #[test]
+    fn a_relationship_target_is_named_from_its_folder_or_from_the_top() {
+        assert_eq!(
+            part_name("xl", "worksheets/sheet1.xml").as_deref(),
+            Some("xl/worksheets/sheet1.xml")
+        );
+        assert_eq!(
+            part_name("xl", "/xl/worksheets/sheet1.xml").as_deref(),
+            Some("xl/worksheets/sheet1.xml")
+        );
+        assert_eq!(
+            part_name("xl", "./worksheets/../worksheets/sheet1.xml").as_deref(),
+            Some("xl/worksheets/sheet1.xml")
+        );
+        assert_eq!(
+            part_name("xl", "../docProps/app.xml").as_deref(),
+            Some("docProps/app.xml")
+        );
+        assert_eq!(part_name("xl", "../../outside.xml"), None);
+    }
+
+    /// A PDF is read whole, so one far larger than any document is refused before it is read.
+    #[test]
+    fn a_pdf_too_large_to_read_whole_is_refused_before_it_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.pdf");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_FILE + 1).unwrap();
+        drop(file);
+        let e = Kind::Pdf.read(&path).unwrap_err();
+        assert!(format!("{e:#}").contains("larger than"), "{e:#}");
     }
 
     /// An ELF file may say its sections are anywhere at all, including past its own end.
