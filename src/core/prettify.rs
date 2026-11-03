@@ -21,7 +21,8 @@ const HTML_EXTS: &[&str] = &["html", "htm", "xhtml", "shtml", "xht"];
 /// Whether this is an HTML page rather than an XML document. The two are not the same: an
 /// XHTML page opens with an XML declaration and would otherwise pass for XML, and reading
 /// HTML as a tree of elements says nothing a reader of the page would recognise. `text` need
-/// only be the start of the file; an XML declaration before the doctype is stepped over.
+/// only be the start of the file; an XML declaration and comments before the doctype are
+/// stepped over.
 pub fn is_html(path: Option<&Path>, text: &str) -> bool {
     if path
         .map(super::text::extension)
@@ -29,14 +30,17 @@ pub fn is_html(path: Option<&Path>, text: &str) -> bool {
     {
         return true;
     }
-    let head = text.trim_start_matches('\u{feff}').trim_start();
-    let head = match head.strip_prefix("<?xml") {
-        Some(rest) => rest
-            .split_once("?>")
-            .map_or("", |(_, after)| after)
-            .trim_start(),
-        None => head,
-    };
+    let mut head = text.trim_start_matches('\u{feff}').trim_start();
+    loop {
+        let rest = if let Some(rest) = head.strip_prefix("<?xml") {
+            rest.split_once("?>")
+        } else if let Some(rest) = head.strip_prefix("<!--") {
+            rest.split_once("-->")
+        } else {
+            break;
+        };
+        head = rest.map_or("", |(_, after)| after).trim_start();
+    }
     let start: String = head
         .chars()
         .take(16)
@@ -191,6 +195,10 @@ mod tests {
         assert!(is_html(None, page));
         assert!(is_html(None, xhtml));
         assert!(is_html(None, "\u{feff}  \n<HTML>\n"));
+        let commented =
+            "<?xml version=\"1.0\"?>\n<!-- generated -->\n<!-- twice -->\n<!DOCTYPE html>\n";
+        assert!(is_html(None, commented));
+        assert!(!is_html(None, "<!-- a feed -->\n<rss/>\n"));
         assert!(is_html(Some(Path::new("page.htm")), "anything"));
         assert!(is_html(Some(Path::new("source.html")), ""));
         // An XML document, including one named like a page, is not HTML.

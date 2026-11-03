@@ -18,6 +18,12 @@ const MAX_OBJECTS: usize = 500_000;
 const MAX_STREAM: usize = 128 << 20;
 /// The most pages read.
 const MAX_PAGES: usize = 20_000;
+/// The most items kept of one value with everything inside it, so that a short run of bytes
+/// such as `0 0 0 …` cannot become a much larger amount of memory.
+const MAX_ITEMS: usize = 1 << 18;
+/// How many objects may be part way through being read at once. Reading one may need another,
+/// such as a stream's length; a file can make those lead back to themselves or on and on.
+const MAX_NESTING: usize = 32;
 
 /// A value in a PDF file.
 #[derive(Clone, Debug, PartialEq)]
@@ -69,11 +75,17 @@ fn delimiter(b: u8) -> bool {
 struct Lexer<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// How many more items the value being read may keep; see [`MAX_ITEMS`].
+    room: usize,
 }
 
 impl<'a> Lexer<'a> {
     fn new(bytes: &'a [u8], at: usize) -> Self {
-        Lexer { bytes, at }
+        Lexer {
+            bytes,
+            at,
+            room: MAX_ITEMS,
+        }
     }
 
     fn skip_space(&mut self) {
@@ -232,6 +244,9 @@ impl<'a> Lexer<'a> {
         if depth > 64 {
             return None;
         }
+        if depth == 0 {
+            self.room = MAX_ITEMS;
+        }
         self.skip_space();
         let b = *self.bytes.get(self.at)?;
         match b {
@@ -254,8 +269,13 @@ impl<'a> Lexer<'a> {
                             self.at += 1;
                             break;
                         }
+                        // Past the room there is, the rest is still read to find the end.
                         _ => match self.object(depth + 1) {
-                            Some(o) => items.push(o),
+                            Some(o) if self.room > 0 => {
+                                self.room -= 1;
+                                items.push(o);
+                            }
+                            Some(_) => {}
                             None => break,
                         },
                     }
@@ -279,7 +299,10 @@ impl<'a> Lexer<'a> {
                     let Some(value) = self.object(depth + 1) else {
                         break;
                     };
-                    map.insert(key, value);
+                    if self.room > 0 {
+                        self.room -= 1;
+                        map.insert(key, value);
+                    }
                 }
                 // A dictionary followed by `stream` describes the bytes after it.
                 let save = self.at;
@@ -357,6 +380,8 @@ pub struct Document<'a> {
     trailer: HashMap<String, Object>,
     /// Objects already read, so that a shared one is read once.
     cache: std::cell::RefCell<HashMap<u32, Object>>,
+    /// How many objects are being read now, one needing the next; see [`MAX_NESTING`].
+    nesting: std::cell::Cell<usize>,
     /// Streams of objects already unpacked.
     bundles: std::cell::RefCell<HashMap<u32, Vec<(u32, usize)>>>,
     bundle_bytes: std::cell::RefCell<HashMap<u32, Vec<u8>>>,
@@ -376,6 +401,7 @@ impl<'a> Document<'a> {
             places: HashMap::new(),
             trailer: HashMap::new(),
             cache: Default::default(),
+            nesting: Default::default(),
             bundles: Default::default(),
             bundle_bytes: Default::default(),
         };
@@ -603,7 +629,16 @@ impl<'a> Document<'a> {
         if let Some(found) = self.cache.borrow().get(&number) {
             return found.clone();
         }
+        let nesting = self.nesting.get();
+        if nesting >= MAX_NESTING {
+            return Object::Null;
+        }
+        // Null while it is read, so that an object reached again from inside itself is
+        // nothing rather than another read of the same object, and so on without end.
+        self.cache.borrow_mut().insert(number, Object::Null);
+        self.nesting.set(nesting + 1);
         let value = self.read_object(number).unwrap_or(Object::Null);
+        self.nesting.set(nesting);
         self.cache.borrow_mut().insert(number, value.clone());
         value
     }
@@ -827,7 +862,7 @@ impl<'a> Document<'a> {
             let fonts = self.fonts(page);
             let content = self.page_content(page);
             out.push_str(&self.page_text(&content, &fonts));
-            if out.len() > MAX_STREAM {
+            if out.len() > super::MAX_OUTPUT {
                 break;
             }
         }
@@ -992,7 +1027,7 @@ impl<'a> Document<'a> {
                 _ => {}
             }
             stack.clear();
-            if out.len() > MAX_STREAM {
+            if out.len() > super::MAX_OUTPUT {
                 break;
             }
         }
@@ -1624,6 +1659,64 @@ second page
         );
         let e = text(&file).unwrap_err();
         assert!(format!("{e}").contains("encrypted"), "{e}");
+    }
+
+    /// A content stream drawing `words`, whose `/Length` is `length` rather than a number.
+    fn stream_with_length(length: &str, words: &str) -> Vec<u8> {
+        let mut out = format!("<< /Length {length} >>\nstream\n").into_bytes();
+        out.extend_from_slice(format!("BT /F1 12 Tf 72 720 Td ({words}) Tj ET\n").as_bytes());
+        out.extend_from_slice(b"endstream");
+        out
+    }
+
+    /// Reading a stream reads its length, which may be the stream itself.
+    #[test]
+    fn a_stream_whose_length_is_itself_is_read_to_its_end() {
+        let file = build(
+            &one_page(stream_with_length("4 0 R", "still read"), HELVETICA),
+            "",
+        );
+        assert_eq!(text(&file).unwrap(), "still read\n");
+    }
+
+    /// Or another stream, whose length is another, and so on: following each would run out
+    /// of stack long before the file runs out of objects.
+    #[test]
+    fn a_long_chain_of_lengths_is_not_followed_to_its_end() {
+        let mut objects = one_page(stream_with_length("6 0 R", "still read"), HELVETICA);
+        let chain = 20_000;
+        for i in 0..chain {
+            let next = 6 + i + 1;
+            objects.push(format!("<< /Length {next} 0 R >>\nstream\nx\nendstream").into_bytes());
+        }
+        let file = build(&objects, "");
+        assert_eq!(text(&file).unwrap(), "still read\n");
+    }
+
+    #[test]
+    fn a_value_keeps_no_more_items_than_there_is_room_for_and_is_still_read_to_its_end() {
+        let many = MAX_ITEMS + 10;
+        let mut source = b"[".to_vec();
+        source.extend(b"0 ".repeat(many));
+        source.extend_from_slice(b"] /after");
+        let mut lexer = Lexer::new(&source, 0);
+        match lexer.object(0) {
+            Some(Object::Array(items)) => assert_eq!(items.len(), MAX_ITEMS),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(lexer.object(0), Some(Object::Name("after".into())));
+
+        let mut source = b"<<".to_vec();
+        for i in 0..many {
+            source.extend(format!("/k{i} 0 ").bytes());
+        }
+        source.extend_from_slice(b">> /after");
+        let mut lexer = Lexer::new(&source, 0);
+        match lexer.object(0) {
+            Some(Object::Dict(map)) => assert_eq!(map.len(), MAX_ITEMS),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(lexer.object(0), Some(Object::Name("after".into())));
     }
 
     #[test]

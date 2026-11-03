@@ -1286,6 +1286,15 @@ pub struct OxideMergeApp {
     screenshot: Option<Screenshot>,
 }
 
+/// Set when the picture `OXIDEMERGE_SCREENSHOT` asks for was not saved.
+static SCREENSHOT_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the picture `OXIDEMERGE_SCREENSHOT` asks for was not saved, so that the program
+/// can end with an error rather than as if it had been.
+pub fn screenshot_failed() -> bool {
+    SCREENSHOT_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A picture of the window asked for by `OXIDEMERGE_SCREENSHOT`.
 struct Screenshot {
     path: PathBuf,
@@ -7148,14 +7157,25 @@ impl OxideMergeApp {
     /// For documentation pictures: once compares are done (or after about a minute), runs the
     /// asked-for command, lets the window settle, saves a picture of it and closes it.
     fn take_screenshot(&mut self, ctx: &egui::Context) {
-        let busy = self.busy();
+        // A command such as synchronizing opens a dialog that works out what it shows in the
+        // background; the picture is of what it shows once it has.
+        let busy = self.busy()
+            || self
+                .tabs
+                .iter()
+                .any(|t| matches!(t.content.view(), Content::Folder(f) if f.sync_settling()));
         let Some(shot) = &mut self.screenshot else {
             return;
         };
         shot.frames += 1;
         ctx.request_repaint();
         if let Some(saved) = &shot.taken {
-            if saved.load(std::sync::atomic::Ordering::Acquire) || shot.frames > 600 {
+            let saved = saved.load(std::sync::atomic::Ordering::Acquire);
+            if saved || shot.frames > 600 {
+                if !saved {
+                    eprintln!("{}: the window gave no picture", shot.path.display());
+                    SCREENSHOT_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 self.screenshot = None;
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -7173,6 +7193,8 @@ impl OxideMergeApp {
         }
         let saved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         shot.taken = Some(saved.clone());
+        // Counted again from here, so the time allowed for saving is not spent waiting.
+        shot.frames = 0;
         let path = shot.path.clone();
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
             egui::ScreenshotCallback::new(move |img| {
@@ -7183,6 +7205,7 @@ impl OxideMergeApp {
                     .unwrap_or_else(|| Err("bad image size".into()));
                 if let Err(e) = result {
                     eprintln!("{}: {e}", path.display());
+                    SCREENSHOT_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 saved.store(true, std::sync::atomic::Ordering::Release);
             }),

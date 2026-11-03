@@ -1342,6 +1342,7 @@ fn main() -> ExitCode {
         Box::new(move |cc| Ok(Box::new(OxideMergeApp::new(cc, cfg, stored, initial)))),
     );
     match result {
+        Ok(()) if ui::app::screenshot_failed() => ExitCode::from(2),
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");

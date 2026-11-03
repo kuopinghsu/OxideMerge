@@ -1222,6 +1222,18 @@ A file read this way is *read-only*: the pane says what was read (for example
 text is a reading of the file, not a copy of it, so the layout, fonts, formulas and anything else
 the format holds are not compared.
 
+Some limits and rules:
+
+* A PDF or RTF file can be at most 256 MiB, since it is read whole. A larger one is reported
+  rather than read.
+* Each part of a `.docx`, `.odt`, `.xlsx` or `.ods` file can be at most 64 MiB. A file with a
+  larger part, or a part that cannot be read, is reported rather than compared without it.
+* An ELF file can be any size: only its header and section table are read.
+* The text read from one file can be at most 16 MiB. The rest is left out, and a line at the end
+  says so.
+* A workbook none of whose listed sheets can be found in the file is reported rather than
+  compared as empty.
+
 A converter under *Options → Plugins* is used in preference to this, so a better reader can
 always be put in front — `pdftotext` for PDF, or Pandoc or Tika for more formats. Turning
 *Read documents, spreadsheets and ELF files as text* off there compares these files as the
