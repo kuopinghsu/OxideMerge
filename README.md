@@ -256,7 +256,8 @@ menu. The comparison must include subfolders and must be finished.
 Before each change, OxideMerge checks that the file is still the one in the preview. A file
 edited after the preview is not overwritten. The files that are replaced or deleted are kept in
 a recovery journal in the settings folder until the synchronization finishes. If OxideMerge
-ends before that, it offers to undo the changes the next time it starts.
+ends before that, it offers to undo the changes the next time it starts. A plan that does not fit
+in the free space of the destination or the journal's drive is refused before anything changes.
 
 ## Command line
 

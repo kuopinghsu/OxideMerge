@@ -202,6 +202,7 @@
   "folder_sync.err_stopped": "Detenido",
   "folder_sync.err_two_folders": "La sincronización necesita exactamente dos carpetas",
   "folder_sync.err_unfinished": "Una sincronización anterior de estas carpetas no terminó; primero deshágala o conserve sus cambios",
+  "folder_sync.err_no_space": "No hay suficiente espacio libre en {path}: se necesitan {need}, hay {free} libres; no se cambió nada",
   "folder_sync.err_verify": "{path} no contiene lo que se copió",
   "folder_sync.export": "Exportar plan…",
   "folder_sync.failed_undone": "La aplicación falló y se deshicieron todos los cambios: {reason}",

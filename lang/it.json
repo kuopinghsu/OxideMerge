@@ -202,6 +202,7 @@
   "folder_sync.err_stopped": "Interrotto",
   "folder_sync.err_two_folders": "La sincronizzazione richiede esattamente due cartelle",
   "folder_sync.err_unfinished": "Una sincronizzazione precedente di queste cartelle non è terminata; prima annullala o mantieni le sue modifiche",
+  "folder_sync.err_no_space": "Spazio libero insufficiente su {path}: servono {need}, liberi {free}; non è stato modificato nulla",
   "folder_sync.err_verify": "{path} non contiene ciò che è stato copiato",
   "folder_sync.export": "Esporta piano…",
   "folder_sync.failed_undone": "L'applicazione non è riuscita e tutte le modifiche sono state annullate: {reason}",

@@ -750,6 +750,9 @@ fn sync_plan(
 #[derive(serde::Serialize)]
 struct SyncReport {
     status: &'static str,
+    /// Why it did not simply succeed, in the shared taxonomy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    problem: Option<core::problem::Problem>,
     changes: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     messages: Vec<String>,
@@ -788,6 +791,7 @@ fn run_sync(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         anyhow::ensure!(cli.paths.is_empty(), "--sync-recover takes no paths");
         let mut report = SyncReport {
             status: "recovered",
+            problem: None,
             changes: 0,
             messages: Vec::new(),
             journals: Vec::new(),
@@ -797,6 +801,7 @@ fn run_sync(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             report.changes += r.restored;
             if !r.complete() {
                 report.status = "recovery_required";
+                report.problem = Some(core::problem::Problem::RecoveryNeeded);
                 report.journals.extend(r.journal);
                 report
                     .messages
@@ -822,28 +827,34 @@ fn run_sync(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     );
     let (stop, done) = (AtomicBool::new(false), AtomicUsize::new(0));
     let outcome = folder_sync::apply(&planned, &cli.paths, &journal_root, &stop, &done);
+    let problem = outcome.problem();
     let (code, report) = match outcome {
         SyncOutcome::Applied { changes, kept } => (
             0,
             SyncReport {
+                problem,
                 status: "applied",
                 changes,
                 messages: kept,
                 journals: Vec::new(),
             },
         ),
-        SyncOutcome::NotApplied(messages) => (
+        SyncOutcome::NotApplied(_, messages) => (
             2,
             SyncReport {
+                problem,
                 status: "not_applied",
                 changes: 0,
                 messages,
                 journals: Vec::new(),
             },
         ),
-        SyncOutcome::Stopped { reason, rollback } => (
+        SyncOutcome::Stopped {
+            reason, rollback, ..
+        } => (
             if rollback.complete() { 4 } else { 5 },
             SyncReport {
+                problem,
                 status: if rollback.complete() {
                     "rolled_back"
                 } else {

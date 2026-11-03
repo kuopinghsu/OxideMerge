@@ -68,7 +68,10 @@ section of this file as the release notes.
   differ only in case or in how accents on Latin letters are written are left alone, and folders
   inside each other are refused.
   On the command line: `--sync-plan mirror|update`, `--sync-apply <PLAN> --yes` and
-  `--sync-recover`, with exit codes 4 (undone) and 5 (recovery required).
+  `--sync-recover`, with exit codes 4 (undone) and 5 (recovery required). A plan whose files or
+  journal copies do not fit in the free space of their drives is refused before anything changes,
+  and the JSON result has a `problem` (`stale`, `unsupported`, `read_failure`, `write_failure`,
+  `canceled`, `recovery_needed`) when it is not a plain success.
 - **Copy values in the semantic view:** *Copy value to left* and *Copy value to right* on each
   JSON, XML, TOML or YAML change replace, add or remove that one value on the other side. Only the
   value's text changes; comments and layout stay. The edited file is parsed again and the copy is

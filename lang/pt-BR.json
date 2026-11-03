@@ -202,6 +202,7 @@
   "folder_sync.err_stopped": "Interrompido",
   "folder_sync.err_two_folders": "A sincronização precisa de exatamente duas pastas",
   "folder_sync.err_unfinished": "Uma sincronização anterior destas pastas não foi concluída; primeiro desfaça-a ou mantenha suas alterações",
+  "folder_sync.err_no_space": "Espaço livre insuficiente em {path}: {need} necessários, {free} livres; nada foi alterado",
   "folder_sync.err_verify": "{path} não contém o que foi copiado",
   "folder_sync.export": "Exportar plano…",
   "folder_sync.failed_undone": "A aplicação falhou e todas as alterações foram desfeitas: {reason}",

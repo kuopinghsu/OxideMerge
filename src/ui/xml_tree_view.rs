@@ -494,6 +494,9 @@ impl XmlTreeView {
         let response = ui
             .add(
                 egui::TextEdit::singleline(&mut self.keys)
+                    // A fixed id keeps focus while typing when the field moves
+                    // into the toolbar once the comparison finishes.
+                    .id(egui::Id::unique("xml_tree_keys"))
                     .hint_text(tr(hint))
                     .char_limit(512)
                     .desired_width(200.0),

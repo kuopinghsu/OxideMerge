@@ -2546,7 +2546,7 @@ fn xml_tree_key_rules_pair_reordered_elements_and_warn_about_duplicates() {
         compare(&[dir.path().join("a.xml"), dir.path().join("b.xml")]),
     );
     gui.click(tr("analysis.tree"));
-    gui.wait_until("tree", |gui| gui.shows(tr("analysis.tree_keys")));
+    gui.wait_until("tree", |gui| gui.shows(tr("analysis.tree_expand_changes")));
     gui.click(tr("analysis.tree_keys"));
     gui.type_text("book@id");
     let keyed = trf("analysis.tree_keyed", &[("n", "2".into())]);
@@ -2558,7 +2558,7 @@ fn xml_tree_key_rules_pair_reordered_elements_and_warn_about_duplicates() {
         compare(&[dir.path().join("a.xml"), dir.path().join("c.xml")]),
     );
     gui.click(tr("analysis.tree"));
-    gui.wait_until("tree", |gui| gui.shows(tr("analysis.tree_keys")));
+    gui.wait_until("tree", |gui| gui.shows(tr("analysis.tree_expand_changes")));
     gui.click(tr("analysis.tree_keys"));
     gui.type_text("book@id");
     let warning = trf(

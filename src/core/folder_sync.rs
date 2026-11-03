@@ -20,6 +20,7 @@ use super::analysis;
 use super::folder::{CmpStatus, DirItem};
 use super::folder_merge::escapes;
 use super::fsutil;
+use super::problem::Problem;
 use crate::i18n::{tr, trf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -964,7 +965,7 @@ pub fn plan(
 #[derive(Debug)]
 pub enum SyncOutcome {
     /// Nothing was changed: the plan no longer fits the folders, or they may not be synced.
-    NotApplied(Vec<String>),
+    NotApplied(Problem, Vec<String>),
     /// Every planned change was made and checked. `kept` lists folders left in place
     /// because they still hold items the compare did not list.
     Applied { changes: usize, kept: Vec<String> },
@@ -973,7 +974,24 @@ pub enum SyncOutcome {
     Stopped {
         reason: Option<String>,
         rollback: RollbackOutcome,
+        /// What the failure was; `None` when the user stopped it.
+        failure: Option<Problem>,
     },
+}
+
+impl SyncOutcome {
+    /// What kept the synchronization from simply succeeding, in the shared taxonomy.
+    pub fn problem(&self) -> Option<Problem> {
+        match self {
+            SyncOutcome::Applied { .. } => None,
+            SyncOutcome::NotApplied(problem, _) => Some(*problem),
+            SyncOutcome::Stopped { rollback, .. } if !rollback.complete() => {
+                Some(Problem::RecoveryNeeded)
+            }
+            SyncOutcome::Stopped { reason: None, .. } => Some(Problem::Canceled),
+            SyncOutcome::Stopped { failure, .. } => Some(failure.unwrap_or(Problem::WriteFailure)),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1127,8 +1145,29 @@ impl Journal {
     }
 }
 
+/// A path that is no longer as the preview found it.
+#[derive(Debug)]
+struct Changed;
+
+impl std::fmt::Display for Changed {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(tr("folder_sync.err_changed"))
+    }
+}
+
+impl std::error::Error for Changed {}
+
 fn changed_since_preview() -> std::io::Error {
-    std::io::Error::other(tr("folder_sync.err_changed"))
+    std::io::Error::other(Changed)
+}
+
+/// The problem a failed step is.
+fn problem_of(e: &std::io::Error) -> Problem {
+    if e.get_ref().is_some_and(|inner| inner.is::<Changed>()) {
+        Problem::Stale
+    } else {
+        Problem::of_io(e, true)
+    }
 }
 
 /// Where [`publish`] may put a file.
@@ -1203,6 +1242,8 @@ enum Point {
 enum Fault {
     None,
     Fail,
+    /// Fail as a write to a full file system does.
+    Full,
     /// End at once, as if the program ended, leaving the journal.
     Crash,
 }
@@ -1225,36 +1266,130 @@ pub fn apply(
     apply_with(plan, roots, journal_root, stop, done, &|_, _| Fault::None)
 }
 
+/// Refuses a plan whose new files, or whose journal copies of the files it replaces and
+/// deletes, do not fit in the free space of their file systems, both counted against one
+/// when the journal is on the destination's file system.
+fn check_space(plan: &SyncPlan, destination: &Path, journal_root: &Path) -> Result<(), String> {
+    let changes = || plan.operations.iter().filter(|o| o.action.changes());
+    let written: u64 = changes()
+        .filter(|o| matches!(o.action, Action::Copy | Action::Replace))
+        .map(|o| o.bytes)
+        .sum();
+    let kept: u64 = changes()
+        .filter(|o| matches!(o.action, Action::Replace | Action::Delete))
+        .filter_map(|o| o.destination.size)
+        .sum();
+    let mut needs = vec![(destination, written), (journal_root, kept)];
+    if same_volume(destination, journal_root) {
+        needs = vec![(destination, written + kept)];
+    }
+    for (path, need) in needs {
+        match free_space(path) {
+            Some(free) if need > free => {
+                return Err(trf(
+                    "folder_sync.err_no_space",
+                    &[
+                        ("path", path.display().to_string()),
+                        ("need", mib(need)),
+                        ("free", mib(free)),
+                    ],
+                ))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+#[cfg(unix)]
+fn same_volume(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_volume(_: &Path, _: &Path) -> bool {
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The free space tests pretend every file system has.
+    static FREE_SPACE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Bytes the user may still write on the file system holding `path`, when it can be told.
+fn free_space(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(free) = FREE_SPACE.with(|f| f.get()) {
+        return Some(free);
+    }
+    free_space_of(path)
+}
+
+#[cfg(unix)]
+fn free_space_of(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a NUL-terminated path and `st` a writable statvfs.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+/// Not known here; a full disk then fails a write, which is undone like any other failure.
+#[cfg(not(unix))]
+fn free_space_of(_: &Path) -> Option<u64> {
+    None
+}
+
 /// Every check that may refuse the plan before anything is changed.
 fn preflight(
     plan: &SyncPlan,
     roots: &[PathBuf],
     journal_root: &Path,
     stop: &AtomicBool,
-) -> Result<(), Vec<String>> {
-    let one = |s: String| vec![s];
+) -> Result<(), (Problem, Vec<String>)> {
+    let one = |p: Problem| move |s: String| (p, vec![s]);
     if plan.version != PLAN_VERSION {
-        return Err(one(trf(
+        return Err(one(Problem::Unsupported)(trf(
             "folder_sync.err_future_version",
             &[("n", plan.version.to_string())],
         )));
     }
     if plan.id != plan.identity() {
-        return Err(one(tr("folder_sync.err_plan_altered").to_string()));
+        return Err(one(Problem::Stale)(
+            tr("folder_sync.err_plan_altered").to_string(),
+        ));
     }
-    check_roots(roots).map_err(one)?;
+    check_roots(roots).map_err(one(Problem::Unsupported))?;
     if plan.folders != folders_digest(roots) {
-        return Err(one(tr("folder_sync.err_other_folders").to_string()));
+        return Err(one(Problem::Stale)(
+            tr("folder_sync.err_other_folders").to_string(),
+        ));
     }
     // Checked before it is created, so a refused journal leaves nothing in a synced folder.
     let journal = real_path(journal_root);
     for r in roots {
-        let r = std::fs::canonicalize(r).map_err(|e| one(e.to_string()))?;
+        let r = std::fs::canonicalize(r).map_err(|e| one(Problem::ReadFailure)(e.to_string()))?;
         if journal.starts_with(&r) || r.starts_with(&journal) {
-            return Err(one(tr("folder_sync.err_journal_inside").to_string()));
+            return Err(one(Problem::Unsupported)(
+                tr("folder_sync.err_journal_inside").to_string(),
+            ));
         }
     }
-    std::fs::create_dir_all(journal_root).map_err(|e| one(e.to_string()))?;
+    std::fs::create_dir_all(journal_root).map_err(|e| one(Problem::WriteFailure)(e.to_string()))?;
+    check_space(plan, &roots[plan.policy.destination()], journal_root)
+        .map_err(one(Problem::WriteFailure))?;
     let pending = journals(journal_root);
     let same = |a: &Path, b: &Path| {
         std::fs::canonicalize(a)
@@ -1265,17 +1400,23 @@ fn preflight(
         .iter()
         .any(|u| u.roots.iter().any(|j| roots.iter().any(|r| same(j, r))))
     {
-        return Err(one(tr("folder_sync.err_unfinished").to_string()));
+        return Err(one(Problem::RecoveryNeeded)(
+            tr("folder_sync.err_unfinished").to_string(),
+        ));
     }
     let (s, d) = (plan.policy.source(), plan.policy.destination());
     let mut errors = Vec::new();
+    let mut problem = Problem::Stale;
     for o in plan.operations.iter().filter(|o| o.action.changes()) {
         if stop.load(Ordering::Relaxed) {
-            return Err(one(tr("folder_sync.err_stopped").to_string()));
+            return Err(one(Problem::Canceled)(
+                tr("folder_sync.err_stopped").to_string(),
+            ));
         }
         let (sp, dp) = (under(&roots[s], &o.path), under(&roots[d], &o.path));
         if escapes(&roots[d], &o.path, &dp) {
             errors.push(trf("folder_sync.err_outside", &[("path", o.path.clone())]));
+            problem = Problem::Unsupported;
             continue;
         }
         let hash = |p: &Precondition| p.sha256.is_some();
@@ -1285,15 +1426,18 @@ fn preflight(
             || !o.destination.matches(&read(&dp, &o.destination))
         {
             if stop.load(Ordering::Relaxed) {
-                return Err(one(tr("folder_sync.err_stopped").to_string()));
+                return Err(one(Problem::Canceled)(
+                    tr("folder_sync.err_stopped").to_string(),
+                ));
             }
             errors.push(trf("folder_sync.err_stale", &[("path", o.path.clone())]));
+            problem = Problem::Stale;
         }
     }
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(errors)
+        Err((problem, errors))
     }
 }
 
@@ -1305,8 +1449,8 @@ fn apply_with(
     done: &AtomicUsize,
     fault: Faults,
 ) -> SyncOutcome {
-    if let Err(errors) = preflight(plan, roots, journal_root, stop) {
-        return SyncOutcome::NotApplied(errors);
+    if let Err((problem, errors)) = preflight(plan, roots, journal_root, stop) {
+        return SyncOutcome::NotApplied(problem, errors);
     }
     // Recovery may run from another working folder.
     let absolute = |p: &Path| std::path::absolute(p).map_err(|e| vec![e.to_string()]);
@@ -1318,19 +1462,26 @@ fn apply_with(
         absolute(journal_root),
     ) {
         (Ok(r), Ok(j)) => (r, j),
-        (Err(e), _) | (_, Err(e)) => return SyncOutcome::NotApplied(e),
+        (Err(e), _) | (_, Err(e)) => return SyncOutcome::NotApplied(Problem::ReadFailure, e),
     };
     let roots = &roots[..];
     let mut journal = match Journal::create(&journal_root, plan, roots) {
         Ok(j) => j,
         Err(e) => {
-            return SyncOutcome::NotApplied(vec![format!("{}: {e}", tr("folder_sync.journal"))])
+            return SyncOutcome::NotApplied(
+                Problem::WriteFailure,
+                vec![format!("{}: {e}", tr("folder_sync.journal"))],
+            )
         }
     };
     let (s, d) = (plan.policy.source(), plan.policy.destination());
     let mut kept = Vec::new();
     let mut failure: Option<Option<String>> = None;
-    let fail = |path: &str, e: std::io::Error| Some(Some(format!("{path}: {e}")));
+    let mut problem = None;
+    let fail = |path: &str, e: std::io::Error, problem: &mut Option<Problem>| {
+        *problem = Some(problem_of(&e));
+        Some(Some(format!("{path}: {e}")))
+    };
     for o in plan.operations.iter().filter(|o| o.action.changes()) {
         if stop.load(Ordering::Relaxed) {
             failure = Some(None);
@@ -1339,13 +1490,22 @@ fn apply_with(
         match fault(Point::Before, &o.path) {
             Fault::None => {}
             Fault::Fail => {
-                failure = fail(&o.path, injected());
+                failure = fail(&o.path, injected(), &mut problem);
+                break;
+            }
+            Fault::Full => {
+                failure = fail(
+                    &o.path,
+                    std::io::ErrorKind::StorageFull.into(),
+                    &mut problem,
+                );
                 break;
             }
             Fault::Crash => return crashed(journal),
         }
         let (sp, dp) = (under(&roots[s], &o.path), under(&roots[d], &o.path));
         if escapes(&roots[d], &o.path, &dp) {
+            problem = Some(Problem::Unsupported);
             failure = Some(Some(trf(
                 "folder_sync.err_outside",
                 &[("path", o.path.clone())],
@@ -1357,7 +1517,7 @@ fn apply_with(
             failure = if stop.load(Ordering::Relaxed) {
                 Some(None)
             } else {
-                fail(&o.path, e)
+                fail(&o.path, e, &mut problem)
             };
             break;
         }
@@ -1365,7 +1525,15 @@ fn apply_with(
         match fault(Point::Written, &o.path) {
             Fault::None => {}
             Fault::Fail => {
-                failure = fail(&o.path, injected());
+                failure = fail(&o.path, injected(), &mut problem);
+                break;
+            }
+            Fault::Full => {
+                failure = fail(
+                    &o.path,
+                    std::io::ErrorKind::StorageFull.into(),
+                    &mut problem,
+                );
                 break;
             }
             Fault::Crash => return crashed(journal),
@@ -1379,6 +1547,7 @@ fn apply_with(
             }
             let now = Precondition::read(&under(&roots[d], &o.path), true);
             if now.sha256 != o.source.sha256 {
+                problem = Some(Problem::WriteFailure);
                 failure = Some(Some(trf(
                     "folder_sync.err_verify",
                     &[("path", o.path.clone())],
@@ -1404,7 +1573,11 @@ fn apply_with(
         Some(reason) => {
             let mut rollback = roll_back(&header, &entries, fault);
             settle(&dir, file, &mut rollback);
-            SyncOutcome::Stopped { reason, rollback }
+            SyncOutcome::Stopped {
+                failure: problem.filter(|_| reason.is_some()),
+                reason,
+                rollback,
+            }
         }
     }
 }
@@ -1412,6 +1585,7 @@ fn apply_with(
 fn crashed(journal: Journal) -> SyncOutcome {
     SyncOutcome::Stopped {
         reason: Some("crash".into()),
+        failure: Some(Problem::RecoveryNeeded),
         rollback: RollbackOutcome {
             journal: Some(journal.dir),
             ..RollbackOutcome::default()
@@ -2030,7 +2204,7 @@ mod tests {
         assert!(!p.agrees_with(&filtered));
         let elsewhere = sample();
         let before = tree(&elsewhere.roots[1]);
-        let SyncOutcome::NotApplied(errors) = run(&elsewhere, &p, &|_, _| Fault::None) else {
+        let SyncOutcome::NotApplied(_, errors) = run(&elsewhere, &p, &|_, _| Fault::None) else {
             panic!("applied to other folders");
         };
         assert_eq!(errors, [tr("folder_sync.err_other_folders")]);
@@ -2042,7 +2216,7 @@ mod tests {
         let json = bare.to_json().unwrap();
         assert!(!json.contains("\"folders\""));
         assert_eq!(SyncPlan::from_json(&json).unwrap(), bare);
-        let SyncOutcome::NotApplied(errors) = run(&f, &bare, &|_, _| Fault::None) else {
+        let SyncOutcome::NotApplied(_, errors) = run(&f, &bare, &|_, _| Fault::None) else {
             panic!("applied without its folders");
         };
         assert_eq!(errors, [tr("folder_sync.err_other_folders")]);
@@ -2062,7 +2236,7 @@ mod tests {
             .set_modified(time)
             .unwrap();
         let before = (tree(&f.roots[0]), tree(&f.roots[1]));
-        let SyncOutcome::NotApplied(errors) = run(&f, &plan, &|_, _| Fault::None) else {
+        let SyncOutcome::NotApplied(_, errors) = run(&f, &plan, &|_, _| Fault::None) else {
             panic!("applied a stale plan");
         };
         assert_eq!(
@@ -2080,7 +2254,7 @@ mod tests {
         write(&f.roots[0], "d/b.txt", "B\n");
         assert!(matches!(
             run(&f, &plan, &|_, _| Fault::None),
-            SyncOutcome::NotApplied(_)
+            SyncOutcome::NotApplied(_, _)
         ));
         assert!(!f.roots[1].join("d").exists());
     }
@@ -2105,6 +2279,7 @@ mod tests {
             let SyncOutcome::Stopped {
                 reason: Some(reason),
                 rollback,
+                ..
             } = outcome
             else {
                 panic!("not stopped at {at}");
@@ -2114,6 +2289,53 @@ mod tests {
             assert_eq!((tree(&f.roots[0]), tree(&f.roots[1])), before, "at {at}");
             assert!(unfinished(&f.journal).is_empty());
         }
+    }
+
+    #[test]
+    fn too_little_free_space_changes_nothing() {
+        let f = sample();
+        let before = tree(&f.roots[1]);
+        let plan = make(&f, MIRROR);
+        FREE_SPACE.with(|s| s.set(Some(3)));
+        let outcome = run(&f, &plan, &|_, _| Fault::None);
+        FREE_SPACE.with(|s| s.set(None));
+        assert_eq!(outcome.problem(), Some(Problem::WriteFailure));
+        let SyncOutcome::NotApplied(_, errors) = outcome else {
+            panic!("applied without room");
+        };
+        assert!(errors[0].contains("MiB"), "{errors:?}");
+        assert_eq!(tree(&f.roots[1]), before);
+        assert!(unfinished(&f.journal).is_empty());
+        FREE_SPACE.with(|s| s.set(Some(1 << 30)));
+        let outcome = run(&f, &plan, &|_, _| Fault::None);
+        FREE_SPACE.with(|s| s.set(None));
+        assert!(matches!(outcome, SyncOutcome::Applied { .. }));
+    }
+
+    #[test]
+    fn a_file_system_filling_up_part_way_is_undone() {
+        let f = sample();
+        let before = tree(&f.roots[1]);
+        let plan = make(&f, MIRROR);
+        let outcome = run(&f, &plan, &|p, path| {
+            if p == Point::Before && path == "old.txt" {
+                Fault::Full
+            } else {
+                Fault::None
+            }
+        });
+        assert_eq!(outcome.problem(), Some(Problem::WriteFailure));
+        let SyncOutcome::Stopped {
+            reason: Some(reason),
+            rollback,
+            ..
+        } = outcome
+        else {
+            panic!("not stopped");
+        };
+        assert!(reason.starts_with("old.txt"), "{reason}");
+        assert!(rollback.complete(), "{:?}", rollback.failed);
+        assert_eq!(tree(&f.roots[1]), before);
     }
 
     #[test]
@@ -2131,6 +2353,7 @@ mod tests {
         let SyncOutcome::Stopped {
             reason: None,
             rollback,
+            ..
         } = outcome
         else {
             panic!("not stopped");
@@ -2158,7 +2381,7 @@ mod tests {
         assert_eq!(pending[0].roots[1], f.roots[1]);
         assert_eq!(pending[0].changes, 4);
         // No other synchronization of these folders until it is dealt with.
-        let SyncOutcome::NotApplied(errors) = run(&f, &make(&f, UPDATE), &|_, _| Fault::None)
+        let SyncOutcome::NotApplied(_, errors) = run(&f, &make(&f, UPDATE), &|_, _| Fault::None)
         else {
             panic!("applied over an unfinished synchronization");
         };
@@ -2421,7 +2644,7 @@ mod tests {
         let plan = make(&journal_inside, MIRROR);
         let (stop, done) = (AtomicBool::new(false), AtomicUsize::new(0));
         let inside = journal_inside.roots[1].join("journal");
-        let SyncOutcome::NotApplied(errors) =
+        let SyncOutcome::NotApplied(_, errors) =
             apply(&plan, &journal_inside.roots, &inside, &stop, &done)
         else {
             panic!("journal inside a synced folder");
@@ -2626,6 +2849,7 @@ mod tests {
         let SyncOutcome::Stopped {
             reason: Some(reason),
             rollback,
+            ..
         } = outcome
         else {
             panic!("not stopped: {outcome:?}");
@@ -2652,6 +2876,7 @@ mod tests {
         let SyncOutcome::Stopped {
             reason: None,
             rollback,
+            ..
         } = outcome
         else {
             panic!("not stopped: {outcome:?}");
@@ -2707,6 +2932,7 @@ mod tests {
         let SyncOutcome::Stopped {
             reason: None,
             rollback,
+            ..
         } = outcome
         else {
             panic!("not stopped: {outcome:?}");
@@ -2853,6 +3079,7 @@ mod tests {
         let SyncOutcome::Stopped {
             reason: Some(reason),
             rollback,
+            ..
         } = outcome
         else {
             panic!("not stopped: {outcome:?}");
@@ -2876,6 +3103,7 @@ mod tests {
         let SyncOutcome::Stopped {
             reason: Some(reason),
             rollback,
+            ..
         } = outcome
         else {
             panic!("not stopped: {outcome:?}");

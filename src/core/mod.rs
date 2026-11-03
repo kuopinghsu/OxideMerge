@@ -16,6 +16,7 @@ pub mod html_report;
 pub mod image_cmp;
 pub mod patch;
 pub mod prettify;
+pub mod problem;
 pub mod project;
 #[cfg(test)]
 mod regress;

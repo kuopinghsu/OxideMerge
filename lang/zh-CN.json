@@ -202,6 +202,7 @@
   "folder_sync.err_stopped": "已停止",
   "folder_sync.err_two_folders": "同步需要恰好两个文件夹",
   "folder_sync.err_unfinished": "这些文件夹之前的同步未完成；请先撤销或保留其更改",
+  "folder_sync.err_no_space": "{path} 的可用空间不足：需要 {need}，可用 {free}；未做任何更改",
   "folder_sync.err_verify": "{path} 的内容与复制的不一致",
   "folder_sync.export": "导出计划…",
   "folder_sync.failed_undone": "应用失败，所有更改均已撤销：{reason}",

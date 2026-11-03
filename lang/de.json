@@ -202,6 +202,7 @@
   "folder_sync.err_stopped": "Gestoppt",
   "folder_sync.err_two_folders": "Die Synchronisierung braucht genau zwei Ordner",
   "folder_sync.err_unfinished": "Eine frühere Synchronisierung dieser Ordner wurde nicht abgeschlossen; zuerst rückgängig machen oder ihre Änderungen behalten",
+  "folder_sync.err_no_space": "Nicht genug freier Speicher auf {path}: {need} benötigt, {free} frei; nichts wurde geändert",
   "folder_sync.err_verify": "{path} enthält nicht, was kopiert wurde",
   "folder_sync.export": "Plan exportieren…",
   "folder_sync.failed_undone": "Das Anwenden ist fehlgeschlagen, alle Änderungen wurden rückgängig gemacht: {reason}",

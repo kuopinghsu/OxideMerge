@@ -68,6 +68,10 @@ so CI reports the numbers without failing on them.
 - **sync-preview-20k**: the folders of folder-small-files compared, then a mirror plan made from
   the result. The plan reads every file it would touch, and every file on both sides whose size or
   time differs, to fingerprint it; "plan" is the time of that step alone.
+- **sync-apply-large** (`OXIDEMERGE_BENCH_LARGE=2`): three random 2 GB files mirrored into a
+  copy of a folder that has one of them equal, one changed in its last byte and one missing. The
+  time covers the scan, the plan and the apply, which fingerprints, copies through a verified
+  temporary file, keeps the replaced file in the journal and checks the result.
 - **folder-navigation-20k**: the folders of folder-small-files compared, then stepped through
   from the first file with differences to the last, as *Next Difference* does without the file
   pane, reading the status bar position at each file.
@@ -122,6 +126,15 @@ The table rows are from five runs each; the navigation row from three. Added wit
 By position, the Semantic view reports 29,430 changes for the same 0.5% insertions; the Tree view
 reports about 380. In the shuffled catalog nearly every item is out of order, so most are moves. Before the order of the
 files stepped through was kept between steps, a step took 2.48 ms (1,035 ms for the 418 files).
+
+Added with the free-space check (2026-11-03, same machine, three runs):
+
+| Workload | Time (median) | Peak memory | Result |
+| --- | ---: | ---: | --- |
+| sync-apply-large | 74.653 s | 15 MB | 2 changes applied; preview 28,494 ms, apply 45,620 ms |
+
+Files are streamed, so memory stays flat however large they are; the time is reading and
+writing the files several times over (scan, fingerprints, copy, journal and final check).
 
 ## Findings
 
