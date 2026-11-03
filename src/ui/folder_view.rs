@@ -520,12 +520,12 @@ fn load_dock_docs(
     for (s, root) in roots.iter().enumerate() {
         let p = it.path(root);
         let mut d = if it.exists[s] {
-            if crate::core::unpacker::find(&opts.unpackers, &p).is_none()
+            if crate::core::unpacker::find(opts, &p).is_none()
                 && text::detect_kind(&p) == FileKind::Binary
             {
                 return Ok(None);
             }
-            crate::core::unpacker::load_doc(&p, &opts.unpackers, None)
+            crate::core::unpacker::load_doc(&p, opts, None)
                 .map_err(|e| format!("{}: {e}", p.display()))?
         } else {
             let mut d = TextDoc::empty(None);
@@ -2190,7 +2190,7 @@ impl FolderView {
         }
         let (mut items, roots) = (self.items.clone(), self.roots.clone());
         for item in &mut items {
-            if crate::core::unpacker::find(&self.dopts.unpackers, &item.path(&roots[0])).is_some() {
+            if crate::core::unpacker::find(&self.dopts, &item.path(&roots[0])).is_some() {
                 item.binary = true;
             }
         }

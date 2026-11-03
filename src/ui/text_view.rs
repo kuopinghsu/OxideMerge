@@ -5737,7 +5737,14 @@ impl TextView {
             }
             Some(Err(problem)) => {
                 ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(c.ui.warning, problem_text(problem));
+                    ui.colored_label(
+                        c.ui.warning,
+                        format!(
+                            "{}: {}",
+                            crate::core::problem::Problem::of_table(problem).label(),
+                            problem_text(problem)
+                        ),
+                    );
                     if *problem == table_match::Problem::Cancelled {
                         again = ui.button(tr("table.match_again")).clicked();
                     }
@@ -6437,11 +6444,21 @@ impl TextView {
                     .filter(|f| matches!(f, semantic::Format::Toml | semantic::Format::Yaml))
             })
             .or_else(|| {
-                crate::core::prettify::detect(
-                    path,
-                    &p.doc.lines.first().cloned().unwrap_or_default(),
-                )
-                .map(|f| match f {
+                // Enough of the start to tell an HTML page from an XML document: the doctype
+                // may follow an XML declaration, a comment or a blank line.
+                let mut head = String::new();
+                for line in p.doc.lines.iter().take(8) {
+                    if head.len() >= 512 {
+                        break;
+                    }
+                    head.push_str(line);
+                    head.push('\n');
+                }
+                if crate::core::prettify::is_html(path, &head) {
+                    // HTML is not one of the formats these views read.
+                    return None;
+                }
+                crate::core::prettify::detect(path, &head).map(|f| match f {
                     crate::core::prettify::Format::Json => semantic::Format::Json,
                     crate::core::prettify::Format::Xml => semantic::Format::Xml,
                 })

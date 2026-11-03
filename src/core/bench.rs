@@ -116,6 +116,13 @@ const WORKLOADS: &[Workload] = &[
         run: |d| xml_tree(d, "item@id"),
     },
     Workload {
+        name: "xml-tree-view-12k",
+        what: "the comparison of xml-tree-12k drawn in the Tree view: first rows, scrolling, folding and stepping",
+        level: 0,
+        make: |d| xml_pair(d, false),
+        run: |d| crate::ui::xml_tree_view::render_bench(d),
+    },
+    Workload {
         name: "xml-semantic-12k",
         what: "the files of xml-tree-12k compared path by path, as the Semantic view does",
         level: 0,

@@ -254,14 +254,14 @@ pub fn prints(path: &str, roots: &[PathBuf], options: &DiffOptions) -> Result<Pr
     Ok(prints_of_digests(path, &sides, options))
 }
 pub fn fingerprint_digests(path: &str, sides: &[Option<String>], options: &DiffOptions) -> String {
-    let converter = super::unpacker::find(&options.unpackers, std::path::Path::new(path));
+    let converter = super::unpacker::find(options, std::path::Path::new(path));
     analysis::identity(&(path, sides, options, converter))
 }
 pub fn prints_of_digests(path: &str, sides: &[Option<String>], options: &DiffOptions) -> Prints {
-    let converter = super::unpacker::find(&options.unpackers, std::path::Path::new(path));
+    let converter = super::unpacker::find(options, std::path::Path::new(path));
     Prints {
         fingerprint: fingerprint_digests(path, sides, options),
-        content: analysis::identity(&(sides, options, converter.map(|c| &c.command))),
+        content: analysis::identity(&(sides, options, converter.map(|c| c.key()))),
     }
 }
 /// Opt-in additive annotation: comparison tables and CSV columns retain their old shape.

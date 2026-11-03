@@ -205,7 +205,7 @@ pub fn save_with_workspace(
             }
             let converted = folder.method == super::folder::CompareMethod::FullContents
                 && !item.is_dir
-                && unpacker::find(&options.unpackers, &input).is_some();
+                && unpacker::find(options, &input).is_some();
             let mut entry = Entry {
                 side,
                 path: rel.clone(),
@@ -219,7 +219,7 @@ pub fn save_with_workspace(
                 writer.add_directory(format!("{name}/"), zip_options)?;
             } else {
                 let bytes = if converted {
-                    unpacker::load_doc(&input, &options.unpackers, None)?
+                    unpacker::load_doc(&input, options, None)?
                         .text()
                         .into_bytes()
                 } else {

@@ -230,25 +230,27 @@ impl Unpacker {
 /// their binary originals, and output is interpreted identically in every entry point.
 pub fn load_doc(
     path: &Path,
-    unpackers: &[Unpacker],
+    opts: &super::diff::DiffOptions,
     cancel: Option<&AtomicBool>,
 ) -> Result<super::text::TextDoc> {
-    if let Some(converter) = find(unpackers, path) {
-        let bytes = match cancel {
-            Some(cancel) => converter.run_with(path, Some(cancel))?,
-            None => converter.run(path)?,
-        };
-        let mut doc = super::text::doc_from_bytes(Some(path.to_path_buf()), &bytes, None);
-        doc.read_only = true;
-        doc.description = Some(format!(
-            "{} [{}]",
-            path.display(),
-            crate::i18n::tr("label.unpacked")
-        ));
-        Ok(doc)
-    } else {
-        super::text::load_doc(path, None)
-    }
+    let (bytes, label) = match find(opts, path) {
+        Some(Converter::Command(converter)) => {
+            let bytes = match cancel {
+                Some(cancel) => converter.run_with(path, Some(cancel))?,
+                None => converter.run(path)?,
+            };
+            (bytes, crate::i18n::tr("label.unpacked"))
+        }
+        Some(Converter::BuiltIn(kind)) => {
+            (kind.read(path)?.into_bytes(), crate::i18n::tr(kind.label()))
+        }
+        None => return super::text::load_doc(path, None),
+    };
+    let mut doc = super::text::doc_from_bytes(Some(path.to_path_buf()), &bytes, None);
+    // Read from the file rather than being it: what is shown cannot be written back.
+    doc.read_only = true;
+    doc.description = Some(format!("{} [{label}]", path.display()));
+    Ok(doc)
 }
 
 pub fn load_compare_doc(
@@ -256,7 +258,7 @@ pub fn load_compare_doc(
     opts: &super::diff::DiffOptions,
     cancel: Option<&AtomicBool>,
 ) -> Result<super::text::TextDoc> {
-    let mut doc = load_doc(path, &opts.unpackers, cancel)?;
+    let mut doc = load_doc(path, opts, cancel)?;
     if opts.prettify {
         let source = doc.text();
         if let Some(pretty) = super::prettify::detect(doc.path.as_deref(), &source)
@@ -269,8 +271,41 @@ pub fn load_compare_doc(
     Ok(doc)
 }
 
-pub fn find<'a>(unpackers: &'a [Unpacker], path: &Path) -> Option<&'a Unpacker> {
-    unpackers.iter().find(|u| u.matches(path))
+/// How a file is made into text before it is compared.
+///
+/// Serialized without a tag of its own, so that a file converted by a command keeps the
+/// fingerprint it had before OxideMerge read any format itself, and a saved review of one does
+/// not become stale on an upgrade.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize)]
+#[serde(untagged)]
+pub enum Converter<'a> {
+    /// A command line the user configured, which is run on the file.
+    Command(&'a Unpacker),
+    /// A format OxideMerge reads itself, with no other program involved.
+    BuiltIn(super::extract::Kind),
+}
+
+impl Converter<'_> {
+    /// What tells one converter from another, for the fingerprints that record how a result
+    /// was made. A command is its own text; a built-in reader is named by its kind.
+    pub fn key(&self) -> String {
+        match self {
+            Converter::Command(u) => u.command.clone(),
+            Converter::BuiltIn(kind) => format!("{kind:?}"),
+        }
+    }
+}
+
+/// What turns `path` into text, if anything does. A converter the user configured comes first,
+/// so a better one can always be put in front of what OxideMerge reads itself.
+pub fn find<'a>(opts: &'a super::diff::DiffOptions, path: &Path) -> Option<Converter<'a>> {
+    if let Some(u) = opts.unpackers.iter().find(|u| u.matches(path)) {
+        return Some(Converter::Command(u));
+    }
+    if !opts.extract_documents {
+        return None;
+    }
+    super::extract::Kind::of(path).map(Converter::BuiltIn)
 }
 
 #[cfg(all(test, unix))]

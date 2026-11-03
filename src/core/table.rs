@@ -6,6 +6,8 @@ pub fn delimiter_for(path: &Path) -> Option<char> {
     match super::text::extension(path).as_str() {
         "csv" => Some(','),
         "tsv" | "tab" => Some('\t'),
+        // A spreadsheet is read as comma separated records, so it is compared as a table too.
+        "xlsx" | "xlsm" | "ods" => Some(','),
         _ => None,
     }
 }

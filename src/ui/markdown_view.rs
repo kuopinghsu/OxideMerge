@@ -46,8 +46,16 @@ pub struct MarkdownView {
     cursor: Option<usize>,
     /// The page last clicked, whose outline is drawn strongest.
     active: usize,
-    /// Height of each row as last laid out.
-    heights: Vec<f32>,
+    /// Height of each row as last laid out. `pub(crate)` so that a window test can tell
+    /// whether a row has been measured yet.
+    pub(crate) heights: Vec<f32>,
+    /// A height for each row worked out from its content alone. Rows are measured only once
+    /// they are drawn, so `heights` grows as the pages are scrolled and everything below a row
+    /// moves down with it. The overview and the scroll bar are drawn in these heights instead,
+    /// so a difference mark stays where it is however far the pages have been scrolled.
+    stable: Vec<f32>,
+    /// The column width and line height `stable` was worked out for.
+    stable_for: (f32, f32),
     /// The tables laid out so far, by row and page.
     tables: std::collections::HashMap<(usize, usize), TableLayout>,
     /// How far the pages are scrolled down, in pixels.
@@ -112,6 +120,8 @@ impl MarkdownView {
         } = prepared;
         MarkdownView {
             heights: vec![ESTIMATE; rows.len()],
+            stable: Vec::new(),
+            stable_for: (0.0, 0.0),
             tables: Default::default(),
             shift: 0.0,
             pages,
@@ -209,11 +219,93 @@ impl MarkdownView {
         self.heights[..r].iter().map(|h| h + ROW_GAP).sum()
     }
 
-    /// The overview of the differences in the location pane, in pixels down the pages.
-    fn location_marks(&self, c: &Colors) -> Vec<Mark> {
+    /// Works out a height for every row from its content, for a column `col` wide, unless that
+    /// has been done for this width already. Nothing here lays text out: the estimate has only
+    /// to be steady and roughly in proportion, since what it places is the overview.
+    fn update_stable(&mut self, ui: &Ui, col: f32) {
+        let line = ui.text_style_height(&egui::TextStyle::Body);
+        if self.stable.len() == self.rows.len() && self.stable_for == (col, line) {
+            return;
+        }
+        let body = egui::TextStyle::Body.resolve(ui.style());
+        let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&body, 'n')).max(1.0);
+        self.stable = (0..self.rows.len())
+            .map(|i| {
+                let mut tall: f32 = 2.0 * PAD + 4.0;
+                for p in 0..self.pages.len() {
+                    let Some(b) = self.rows[i].cells.get(p).copied().flatten() else {
+                        continue;
+                    };
+                    let block = &self.pages[p][b];
+                    let indent = INDENT * block.depth as f32;
+                    let width = (col - 2.0 * PAD - indent).max(20.0);
+                    let inner = match self
+                        .marks
+                        .get(i)
+                        .and_then(|m| m.get(p))
+                        .and_then(Option::as_ref)
+                    {
+                        Some(Marks::Table(t)) => t.len() as f32 * (line + 2.0 * CELL_PAD[1]),
+                        _ => {
+                            let per = (width / char_w).max(1.0);
+                            let lines: f32 = block
+                                .text
+                                .lines()
+                                .map(|l| (l.chars().count() as f32 / per).ceil().max(1.0))
+                                .sum();
+                            lines.max(1.0) * line
+                        }
+                    };
+                    tall = tall.max(inner + 2.0 * PAD);
+                }
+                tall
+            })
+            .collect();
+        self.stable_for = (col, line);
+    }
+
+    /// Where row `r` starts below the first, in stable heights.
+    fn stable_top(&self, r: usize) -> f32 {
+        self.stable[..r.min(self.stable.len())]
+            .iter()
+            .map(|h| h + ROW_GAP)
+            .sum()
+    }
+
+    fn stable_total(&self) -> f32 {
+        self.stable_top(self.stable.len())
+    }
+
+    /// The same place in the pages, measured in `to` heights rather than `from` heights. The
+    /// overview is drawn in stable heights while the pages are scrolled in measured ones, so
+    /// the viewport box and a click in the overview are carried from one to the other.
+    fn convert(&self, at: f32, from: &[f32], to: &[f32]) -> f32 {
+        if from.len() != to.len() {
+            return at;
+        }
+        let (mut a, mut b) = (0.0_f32, 0.0_f32);
+        for (i, h) in from.iter().enumerate() {
+            let step = h + ROW_GAP;
+            if at < a + step {
+                let part = if step > 0.0 { (at - a) / step } else { 0.0 };
+                return b + part.clamp(0.0, 1.0) * (to[i] + ROW_GAP);
+            }
+            a += step;
+            b += to[i] + ROW_GAP;
+        }
+        b + (at - a)
+    }
+
+    /// The overview of the differences in the location pane, in stable heights down the pages.
+    /// `pub(crate)` so that a window test can check it does not move while the pages scroll.
+    pub(crate) fn location_marks(&self, c: &Colors) -> Vec<Mark> {
+        let heights = if self.stable.len() == self.rows.len() {
+            &self.stable
+        } else {
+            &self.heights
+        };
         let mut y = 0.0;
-        let tops: Vec<f32> = self
-            .heights
+        let tops: Vec<f32> = heights
             .iter()
             .map(|h| {
                 let top = y;
@@ -226,7 +318,7 @@ impl MarkdownView {
             .enumerate()
             .map(|(d, run)| {
                 let start = tops[run.start];
-                let end = tops[run.end - 1] + self.heights[run.end - 1];
+                let end = tops[run.end - 1] + heights[run.end - 1];
                 let columns = std::array::from_fn(|p| {
                     let present = self.rows[run.clone()]
                         .iter()
@@ -300,36 +392,47 @@ impl MarkdownView {
                 offset = to;
             }
         }
+        // The overview and the scroll bar are drawn in the steady heights, so they do not
+        // shift as rows are measured for the first time on their way into view.
+        self.update_stable(ui, self.columns(view.left(), view.width()).1);
+        let steady = self.stable_total();
+        let at = |v: &Self, y: f32| v.convert(y, &v.heights, &v.stable);
         if location {
             let rect = Rect::from_min_max(
                 pos2(view.right(), body.top()),
                 pos2(view.right() + loc_w - 2.0, body.bottom()),
             );
             let marks = self.location_marks(c);
+            let shown = (at(self, offset + view_h) - at(self, offset)).max(1.0);
             if let Some(to) = widgets::location_pane(
                 ui,
                 Id::unique("md_location"),
                 rect,
-                total as usize,
+                steady as usize,
                 n,
                 &marks,
-                offset,
-                view_h,
+                at(self, offset),
+                shown,
                 c.location_bg,
                 c.viewport,
             ) {
-                offset = to - view_h / 2.0;
+                offset = self.convert(to, &self.stable, &self.heights) - view_h / 2.0;
             }
         }
         let bar = Rect::from_min_max(pos2(body.right() - BAR, body.top()), body.max);
+        let mut dragged = at(self, offset);
+        let was = dragged;
         widgets::vscrollbar(
             ui,
             Id::unique("md_vbar"),
             bar,
-            &mut offset,
-            total as usize,
-            view_h,
+            &mut dragged,
+            steady as usize,
+            (at(self, offset + view_h) - was).max(1.0),
         );
+        if (dragged - was).abs() > 0.01 {
+            offset = self.convert(dragged, &self.stable, &self.heights);
+        }
         let offset = offset.clamp(0.0, max_scroll);
         let mut area = egui::ScrollArea::vertical()
             .id_salt("web_markdown")
@@ -1107,5 +1210,46 @@ mod tests {
             marks[1].columns[..2],
             [Some(c.ui.border_strong), Some(c.change_bar)]
         );
+    }
+
+    /// Rows are measured only as they are drawn, so a row further down grows from its estimate
+    /// the first time it comes into view, and everything below it moves. The overview must not
+    /// move with it: a mark that jumped while the pages were scrolled would be useless.
+    #[test]
+    fn the_overview_stays_put_as_rows_are_measured() {
+        let table = "| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n| 5 | 6 |\n";
+        let left: Vec<Block> = ["one", "two", table, "four", "five"]
+            .iter()
+            .map(|t| block(t))
+            .collect();
+        let mut right = left.clone();
+        right[4] = block("FIVE");
+        let opts = DiffOptions::default();
+        let mut v = MarkdownView::new(vec![left, right], vec!["l".into(), "r".into()], &opts);
+        let c = crate::ui::theme::colors(true);
+        // Steady heights as the window works them out, which drawing never changes.
+        v.stable = vec![30.0, 30.0, 300.0, 30.0, 30.0];
+        v.stable_for = (500.0, 14.0);
+        v.heights = vec![ESTIMATE; v.rows.len()];
+        let before = v.location_marks(&c);
+        assert!(!before.is_empty(), "no difference to mark");
+
+        // The tall table is reached and measured: ten times the estimate it started with.
+        v.heights[2] = 10.0 * ESTIMATE;
+        assert_eq!(
+            v.location_marks(&c)
+                .iter()
+                .map(|m| (m.start, m.len))
+                .collect::<Vec<_>>(),
+            before.iter().map(|m| (m.start, m.len)).collect::<Vec<_>>(),
+            "the overview moved when a row was measured"
+        );
+
+        // A place in the pages is the same place in either set of heights.
+        let top_of_last = v.heights[..4].iter().map(|h| h + ROW_GAP).sum::<f32>();
+        let steady = v.convert(top_of_last, &v.heights, &v.stable);
+        assert!((steady - v.stable_top(4)).abs() < 0.5, "{steady}");
+        let back = v.convert(steady, &v.stable, &v.heights);
+        assert!((back - top_of_last).abs() < 0.5, "{back}");
     }
 }

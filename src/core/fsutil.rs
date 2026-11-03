@@ -16,6 +16,53 @@ pub fn backup_on() -> bool {
     BACKUP.load(Ordering::Relaxed)
 }
 
+/// A path in the form Windows accepts however long it is, once it is longer than the old
+/// 260-character limit. The standard library does this itself, but calls into the system from
+/// elsewhere — the rename in `tempfile`, for one — are refused without it. Shorter paths, and
+/// every path on other systems, are left exactly as they are.
+pub fn long_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    long_path_for(path, 0)
+}
+
+/// As [`long_path`], for a folder that a name of up to `room` characters will be made in: the
+/// limit is on the whole path, so a folder just under it still cannot hold a file.
+pub fn long_path_for(path: &Path, room: usize) -> std::borrow::Cow<'_, Path> {
+    use std::borrow::Cow;
+    #[cfg(not(windows))]
+    {
+        let _ = room;
+        Cow::Borrowed(path)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use std::path::{Component, Prefix};
+        // 260 is the limit for a whole path; the separator before the name counts too.
+        if path.as_os_str().len() + room + 1 < 255 {
+            return Cow::Borrowed(path);
+        }
+        // `\\?\` turns off the rewriting of a path, so it has to be absolute and plain first.
+        let Ok(full) = std::path::absolute(path) else {
+            return Cow::Borrowed(path);
+        };
+        let wide: Vec<u16> = full.as_os_str().encode_wide().collect();
+        let (prefix, rest) = match full.components().next() {
+            Some(Component::Prefix(p)) => match p.kind() {
+                Prefix::Verbatim(_) | Prefix::VerbatimUNC(..) | Prefix::VerbatimDisk(_) => {
+                    return Cow::Owned(full)
+                }
+                Prefix::Disk(_) => (r"\\?\", &wide[..]),
+                // `\\server\share` becomes `\\?\UNC\server\share`.
+                Prefix::UNC(..) => (r"\\?\UNC", &wide[1..]),
+                Prefix::DeviceNS(_) => return Cow::Owned(full),
+            },
+            _ => return Cow::Owned(full),
+        };
+        let joined: Vec<u16> = prefix.encode_utf16().chain(rest.iter().copied()).collect();
+        Cow::Owned(PathBuf::from(std::ffi::OsString::from_wide(&joined)))
+    }
+}
+
 fn writing(path: &Path) -> String {
     crate::i18n::trf("msg.cannot_write", &[("file", path.display().to_string())])
 }
@@ -279,6 +326,36 @@ pub fn remove_empty_dirs(dir: &Path, root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_short_path_is_left_alone_and_a_long_one_is_given_its_extended_form() {
+        let short = Path::new("a.txt");
+        assert_eq!(long_path(short).as_ref(), short);
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join(
+            (0..10)
+                .map(|i| format!("a-directory-with-a-rather-long-name-{i:02}"))
+                .collect::<Vec<_>>()
+                .join(std::path::MAIN_SEPARATOR_STR),
+        );
+        assert!(deep.as_os_str().len() > 260);
+        let long = long_path(&deep);
+        if cfg!(windows) {
+            let text = long.to_string_lossy();
+            assert!(text.starts_with(r"\\?\"), "{text}");
+            assert!(
+                text.ends_with("a-directory-with-a-rather-long-name-09"),
+                "{text}"
+            );
+            // A path already given that way is not given it twice.
+            assert_eq!(long_path(&long).as_ref(), long.as_ref());
+            // Still the same place: it can be made and found again.
+            std::fs::create_dir_all(&long).unwrap();
+            assert!(long.is_dir() && deep.is_dir());
+        } else {
+            assert_eq!(long.as_ref(), deep.as_path());
+        }
+    }
 
     #[test]
     fn replaces_contents_keeps_permissions_and_follows_links() {

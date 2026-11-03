@@ -1118,7 +1118,7 @@ impl Journal {
         let md = src.metadata()?;
         let mut tmp = tempfile::Builder::new()
             .prefix(".oxidemerge-")
-            .tempfile_in(&files)?;
+            .tempfile_in(fsutil::long_path_for(&files, ".oxidemerge-".len() + 16))?;
         let sha256 = copy_hashing(&mut src, tmp.as_file_mut(), stop)?;
         let stamp = Stamp::of(&md);
         if sha256 != expected || Stamp::at(path) != Some(stamp) {
@@ -1129,7 +1129,7 @@ impl Journal {
         }
         let _ = tmp.as_file().set_permissions(md.permissions());
         tmp.as_file().sync_all()?;
-        tmp.persist(&to).map_err(|e| e.error)?;
+        tmp.persist(fsutil::long_path(&to)).map_err(|e| e.error)?;
         sync_dir(&files)?;
         Ok((
             Before::File {
@@ -1193,7 +1193,12 @@ fn publish(
         .ok_or_else(|| std::io::Error::other(tr("folder_sync.err_not_file")))?;
     let mut src = open_nofollow(from)?;
     let md = src.metadata()?;
-    let mut tmp = tempfile::Builder::new().prefix(prefix).tempfile_in(dir)?;
+    // Staged beside the file under its long-path name, so the rename below is not refused.
+    // The temporary name is the prefix and the random characters `tempfile` adds to it, which
+    // count towards the limit as much as the folder does.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempfile_in(fsutil::long_path_for(dir, prefix.len() + 16))?;
     if copy_hashing(&mut src, tmp.as_file_mut(), stop)? != expected {
         return Err(changed_since_preview());
     }
@@ -1203,7 +1208,8 @@ fn publish(
     tmp.as_file().sync_all()?;
     match place {
         Place::New => {
-            tmp.persist_noclobber(to).map_err(|e| e.error)?;
+            tmp.persist_noclobber(fsutil::long_path(to))
+                .map_err(|e| e.error)?;
         }
         Place::Over(stamp) => {
             if stamp.is_some_and(|s| Stamp::at(to) != Some(s)) {
@@ -1406,7 +1412,9 @@ fn preflight(
     }
     let (s, d) = (plan.policy.source(), plan.policy.destination());
     let mut errors = Vec::new();
-    let mut problem = Problem::Stale;
+    // The first thing found wrong, which is the one the errors below name first.
+    let mut problem = None;
+    let mut found = |p: Problem| problem = problem.or(Some(p));
     for o in plan.operations.iter().filter(|o| o.action.changes()) {
         if stop.load(Ordering::Relaxed) {
             return Err(one(Problem::Canceled)(
@@ -1416,28 +1424,40 @@ fn preflight(
         let (sp, dp) = (under(&roots[s], &o.path), under(&roots[d], &o.path));
         if escapes(&roots[d], &o.path, &dp) {
             errors.push(trf("folder_sync.err_outside", &[("path", o.path.clone())]));
-            problem = Problem::Unsupported;
+            found(Problem::Unsupported);
             continue;
         }
         let hash = |p: &Precondition| p.sha256.is_some();
         let read =
             |p: &Path, planned: &Precondition| Precondition::read_until(p, hash(planned), stop);
-        if !o.source.matches(&read(&sp, &o.source))
-            || !o.destination.matches(&read(&dp, &o.destination))
-        {
-            if stop.load(Ordering::Relaxed) {
-                return Err(one(Problem::Canceled)(
-                    tr("folder_sync.err_stopped").to_string(),
-                ));
-            }
+        let now = (read(&sp, &o.source), read(&dp, &o.destination));
+        if stop.load(Ordering::Relaxed) {
+            return Err(one(Problem::Canceled)(
+                tr("folder_sync.err_stopped").to_string(),
+            ));
+        }
+        // A path that cannot be read now has not been shown to have changed: say which it is,
+        // since a file another program holds open is put right in another way.
+        let shut = |planned: &Precondition, now: &Precondition| {
+            now.kind == Kind::Unreadable && planned.kind != Kind::Unreadable
+        };
+        if shut(&o.source, &now.0) || shut(&o.destination, &now.1) {
+            errors.push(trf(
+                "folder_sync.err_unreadable",
+                &[("path", o.path.clone())],
+            ));
+            found(Problem::ReadFailure);
+            continue;
+        }
+        if !o.source.matches(&now.0) || !o.destination.matches(&now.1) {
             errors.push(trf("folder_sync.err_stale", &[("path", o.path.clone())]));
-            problem = Problem::Stale;
+            found(Problem::Stale);
         }
     }
     if errors.is_empty() {
         Ok(())
     } else {
-        Err((problem, errors))
+        Err((problem.unwrap_or(Problem::Stale), errors))
     }
 }
 
@@ -1859,6 +1879,11 @@ pub fn unfinished(journal_root: &Path) -> Vec<Unfinished> {
         .into_iter()
         .filter_map(|h| {
             let file = claim(&h.dir).ok()??;
+            // The header was read before the lock was taken. A synchronization that finishes in
+            // between removes its header and only then lets the lock go, so the header is read
+            // again now that it is held: without this, one that has just succeeded would be
+            // offered for undoing, and undoing it would take back correct work.
+            read_header(&h.dir).ok()?;
             Some(Unfinished {
                 changes: read_entries(&file).len(),
                 dir: h.dir,
@@ -1876,16 +1901,22 @@ pub fn recover(u: &Unfinished) -> RollbackOutcome {
         journal: Some(u.dir.clone()),
         ..RollbackOutcome::default()
     };
+    // The lock first, then the header, so a synchronization that finished since this one was
+    // listed cannot be undone: it removes its header before letting the lock go, and a journal
+    // without a header is not one that did not finish.
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let file = match claim(&u.dir) {
+        Ok(Some(f)) => f,
+        Ok(None) => return failed(tr("folder_sync.err_in_use").to_string()),
+        Err(e) if gone(&e) => return RollbackOutcome::default(),
+        Err(e) => return failed(e.to_string()),
+    };
     let header = match read_header(&u.dir) {
         Ok(h) if h.version > JOURNAL_VERSION => {
             return failed(tr("folder_sync.err_newer_journal").to_string())
         }
         Ok(h) => h,
-        Err(e) => return failed(e.to_string()),
-    };
-    let file = match claim(&u.dir) {
-        Ok(Some(f)) => f,
-        Ok(None) => return failed(tr("folder_sync.err_in_use").to_string()),
+        Err(e) if gone(&e) => return RollbackOutcome::default(),
         Err(e) => return failed(e.to_string()),
     };
     let mut out = roll_back(&header, &read_entries(&file), &|_, _| Fault::None);
@@ -1895,9 +1926,12 @@ pub fn recover(u: &Unfinished) -> RollbackOutcome {
 
 /// Forgets an unfinished synchronization, leaving the folders as they are now.
 pub fn discard(u: &Unfinished) -> std::io::Result<()> {
-    match claim(&u.dir)? {
-        Some(file) => remove_journal(&u.dir, file),
-        None => Err(std::io::Error::other(tr("folder_sync.err_in_use"))),
+    match claim(&u.dir) {
+        Ok(Some(file)) => remove_journal(&u.dir, file),
+        Ok(None) => Err(std::io::Error::other(tr("folder_sync.err_in_use"))),
+        // Already gone, which is what this asks for.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -2389,6 +2423,35 @@ mod tests {
         let rollback = recover(&pending[0]);
         assert!(rollback.complete(), "{:?}", rollback.failed);
         assert_eq!(tree(&f.roots[1]), before);
+        assert!(unfinished(&f.journal).is_empty());
+    }
+
+    /// A window looking for synchronizations to undo must never find one that is running:
+    /// offering it would let someone put back what has just been correctly copied. Looked for
+    /// from another thread throughout, since the journal is made, written and removed in steps.
+    #[test]
+    fn a_synchronization_under_way_is_never_offered_for_recovery() {
+        let f = sample();
+        let plan = make(&f, MIRROR);
+        let watching = AtomicBool::new(true);
+        let found = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while watching.load(Ordering::Relaxed) {
+                    for u in unfinished(&f.journal) {
+                        found.lock().unwrap().push((u.dir.clone(), u.changes));
+                    }
+                }
+            });
+            let outcome = run(&f, &plan, &|_, _| Fault::None);
+            watching.store(false, Ordering::Relaxed);
+            assert!(
+                matches!(outcome, SyncOutcome::Applied { .. }),
+                "{outcome:?}"
+            );
+        });
+        let offered = found.into_inner().unwrap();
+        assert!(offered.is_empty(), "offered while it ran: {offered:?}");
         assert!(unfinished(&f.journal).is_empty());
     }
 
@@ -3114,5 +3177,215 @@ mod tests {
         );
         assert!(rollback.complete(), "{:?}", rollback.failed);
         assert_eq!(tree(&f.roots[1]), before);
+    }
+
+    /// Makes `link` a junction (a directory reparse point) to `target`; whether the system
+    /// allowed one, which needs no privilege but may be refused on a file system without them.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+            && std::fs::symlink_metadata(link).is_ok()
+    }
+
+    /// A junction is a reparse point, not a folder of its own: a synchronization must leave it
+    /// where it is rather than walk into it, copy what it points at, or delete it.
+    #[cfg(windows)]
+    #[test]
+    fn junctions_are_never_followed_copied_or_deleted() {
+        let f = folders();
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path(), "secret.txt", "outside");
+        if !junction(&f.roots[1].join("jdir"), outside.path())
+            || !junction(&f.roots[0].join("sdir"), outside.path())
+        {
+            return;
+        }
+        let plan = make(&f, MIRROR);
+        assert!(!plan.operations.is_empty());
+        assert!(
+            plan.operations
+                .iter()
+                .all(|o| o.action == Action::Conflict && o.reason == Reason::Link),
+            "{:?}",
+            ops(&plan)
+        );
+        run(&f, &plan, &|_, _| Fault::None);
+        assert!(
+            std::fs::symlink_metadata(f.roots[1].join("jdir")).is_ok(),
+            "the junction in the destination was deleted"
+        );
+        assert!(
+            std::fs::symlink_metadata(f.roots[0].join("sdir")).is_ok(),
+            "the junction in the source was changed"
+        );
+        assert!(
+            std::fs::symlink_metadata(f.roots[1].join("sdir")).is_err(),
+            "the junction was copied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "outside",
+            "what the junction points at was changed"
+        );
+    }
+
+    /// Windows refuses to read, replace or delete a file another program holds open without
+    /// sharing. Such a file is reported as one that cannot be read, not as one that changed,
+    /// and nothing is touched: the checks before the first change find it.
+    #[cfg(windows)]
+    #[test]
+    fn a_destination_file_held_open_is_refused_before_anything_changes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let f = sample();
+        let before = tree(&f.roots[1]);
+        let plan = make(&f, MIRROR);
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(f.roots[1].join("old.txt"))
+            .unwrap();
+        let outcome = run(&f, &plan, &|_, _| Fault::None);
+        drop(held);
+        assert_eq!(outcome.problem(), Some(Problem::ReadFailure));
+        let SyncOutcome::NotApplied(_, errors) = outcome else {
+            panic!("a file that cannot be read did not stop the synchronization");
+        };
+        assert_eq!(
+            errors,
+            [trf(
+                "folder_sync.err_unreadable",
+                &[("path", "old.txt".into())]
+            )]
+        );
+        assert_eq!(tree(&f.roots[1]), before);
+        assert!(unfinished(&f.journal).is_empty());
+    }
+
+    /// The same file held open only once the changes are under way: the step that reaches it
+    /// fails, and what was done before it is undone.
+    #[cfg(windows)]
+    #[test]
+    fn a_destination_file_held_open_part_way_stops_and_undoes_the_rest() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let f = sample();
+        let before = tree(&f.roots[1]);
+        let plan = make(&f, MIRROR);
+        let held = std::cell::RefCell::new(None);
+        // old.txt is deleted last, so the copies before it have to be undone
+        let outcome = run(&f, &plan, &|point, path| {
+            if point == Point::Before && path == "old.txt" {
+                *held.borrow_mut() = std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0)
+                    .open(f.roots[1].join("old.txt"))
+                    .ok();
+            }
+            Fault::None
+        });
+        let opened = held.borrow_mut().take().is_some();
+        assert!(opened, "the file could not be held open");
+        assert_eq!(outcome.problem(), Some(Problem::WriteFailure));
+        let SyncOutcome::Stopped {
+            reason: Some(reason),
+            rollback,
+            ..
+        } = outcome
+        else {
+            panic!("not stopped");
+        };
+        assert!(reason.starts_with("old.txt: "), "{reason}");
+        assert!(rollback.complete(), "{:?}", rollback.failed);
+        assert_eq!(tree(&f.roots[1]), before);
+    }
+
+    /// A folder just under the old limit still cannot hold a file: the name of the temporary
+    /// copy counts towards it too. This band is what a length check on the folder alone would
+    /// let through.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_just_under_the_old_windows_limit_can_still_be_copied_into() {
+        let f = folders();
+        // Long enough that the folder itself fits but a file made in it does not.
+        let room = 233usize.saturating_sub(f.roots[0].as_os_str().len() + 1);
+        let rel = format!("{}/f.txt", "d".repeat(room.max(1)));
+        write(
+            &f.roots[0],
+            &rel,
+            "deep
+",
+        );
+        let full = f.roots[0].join(&rel);
+        let folder = full.parent().unwrap().as_os_str().len();
+        assert!(
+            (224..260).contains(&folder),
+            "{folder} characters is not in the band"
+        );
+        let plan = make(&f, MIRROR);
+        let outcome = run(&f, &plan, &|_, _| Fault::None);
+        assert!(
+            matches!(outcome, SyncOutcome::Applied { .. }),
+            "a folder near the limit was not copied into: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.roots[1].join(&rel)).unwrap(),
+            "deep
+"
+        );
+    }
+
+    /// Paths longer than the old 260-character Windows limit are copied and deleted like any
+    /// other, since every path goes to the system in its extended form.
+    #[cfg(windows)]
+    #[test]
+    fn a_path_past_the_old_windows_limit_is_copied_then_deleted() {
+        let f = folders();
+        let deep: Vec<String> = (0..10)
+            .map(|i| format!("a-directory-with-a-rather-long-name-{i:02}"))
+            .collect();
+        let rel = format!("{}/file.txt", deep.join("/"));
+        write(
+            &f.roots[0],
+            &rel,
+            "deep
+",
+        );
+        let full = f.roots[0].join(&rel);
+        assert!(
+            full.as_os_str().len() > 260,
+            "{} characters is not past the limit",
+            full.as_os_str().len()
+        );
+        let plan = make(&f, MIRROR);
+        let outcome = run(&f, &plan, &|_, _| Fault::None);
+        assert!(
+            matches!(outcome, SyncOutcome::Applied { .. }),
+            "the long path was not copied: {outcome:?}"
+        );
+        let copied = f.roots[1].join(&rel);
+        assert_eq!(
+            std::fs::read_to_string(&copied).unwrap(),
+            "deep
+"
+        );
+
+        std::fs::remove_file(&full).unwrap();
+        let plan = make(&f, MIRROR);
+        assert!(
+            matches!(
+                run(&f, &plan, &|_, _| Fault::None),
+                SyncOutcome::Applied { .. }
+            ),
+            "the long path was not deleted"
+        );
+        assert!(!copied.exists(), "the long path is still there");
     }
 }

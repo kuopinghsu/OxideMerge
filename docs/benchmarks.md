@@ -56,6 +56,12 @@ so CI reports the numbers without failing on them.
   aligned as the XML Tree view does.
 - **xml-tree-12k-keyed**: the same items with the right catalog shuffled, paired by the key rule
   `item@id`.
+- **xml-tree-view-12k**: the same comparison put through the real Tree view, a frame at a time,
+  off screen. Besides the comparison it reports the first rows drawn, a frame while scrolling
+  (the viewport moved to a different stretch of the tree each frame, 100 of them), unfolding the
+  whole tree and folding the unchanged rows again, and a step from one change to the next with
+  the frame it is drawn in. These are the costs of using the view rather than of the engine
+  behind it.
 - **xml-semantic-12k**: the files of xml-tree-12k compared by the Semantic view's path-by-path
   engine, for comparison.
 - **merge3-10mb**: three 10 MB files compared as a 3-way compare, then merged automatically.
@@ -135,6 +141,26 @@ Added with the free-space check (2026-11-03, same machine, three runs):
 
 Files are streamed, so memory stays flat however large they are; the time is reading and
 writing the files several times over (scan, fingerprints, copy, journal and final check).
+
+Added with the XML Tree view's drawing and keyboard measurements (2026-11-03), on
+**windows x86_64**, Intel Core (24 threads), OxideMerge 0.9.8, release build, three runs each.
+Peak memory is measured with `/usr/bin/time`, which Windows has not, so it is missing:
+
+| Workload | Time (median) | Result |
+| --- | ---: | --- |
+| xml-tree-12k | 0.226 s | 72,297 rows; 59 added, 64 removed, 252 modified, 1 moved, 1 ambiguous |
+| xml-tree-12k-keyed | 0.260 s | 72,302 rows; 60 added, 65 removed, 248 modified, 11,718 moved, 96 ambiguous |
+| xml-tree-view-12k | 0.785 s | 72,297 rows, 376 changes; compare 218 ms, first rows 5 ms, a scrolled frame 0.29 ms, unfold 2 ms, fold 1 ms, a step 1.40 ms over 376 |
+| xml-semantic-12k | 0.152 s | 29,430 changes |
+
+Drawing is not what the Tree view costs: of the 785 ms, 218 ms is the comparison and 5 ms the
+first rows, and a frame while scrolling 72,297 rows takes 0.29 ms because only the rows in view
+are built. Folding and unfolding the whole tree cost 1–2 ms, since neither re-runs the
+comparison. A step to the next change costs 1.40 ms, which includes unfolding the ancestors of
+the row, scrolling it into view and drawing the frame.
+
+These Windows numbers are not comparable with the macOS numbers above: another machine, and the
+times there were measured with the memory tool attached.
 
 ## Findings
 

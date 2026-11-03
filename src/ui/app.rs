@@ -439,6 +439,7 @@ const OPT_INDEX: &[(OptTab, &str)] = &[
     (OptTab::Media, "opt.web_browser"),
     (OptTab::Media, "opt.web_width"),
     (OptTab::Media, "opt.web_height"),
+    (OptTab::Plugins, "opt.extract_documents"),
     (OptTab::Plugins, "opt.unpackers_hint"),
     (OptTab::Plugins, "opt.pattern"),
     (OptTab::Plugins, "opt.command"),
@@ -2143,11 +2144,11 @@ impl OxideMergeApp {
     fn load_text(&self, p: &Path, missing: bool) -> anyhow::Result<TextDoc> {
         if missing {
             let mut d = TextDoc::empty(Some(p.to_path_buf()));
-            d.read_only = unpacker::find(&self.cfg.unpackers, p).is_some();
+            d.read_only = unpacker::find(&self.cfg.comparison_options(), p).is_some();
             d.description = Some(format!("{} ({})", p.display(), tr("label.missing")));
             return Ok(d);
         }
-        unpacker::load_doc(p, &self.cfg.unpackers, None)
+        unpacker::load_doc(p, &self.cfg.comparison_options(), None)
     }
 
     pub fn open(&mut self, req: OpenRequest) {
@@ -2319,9 +2320,10 @@ impl OxideMergeApp {
         }
         if req.kind.is_none()
             && req.snapshot_options.is_none()
-            && paths
-                .iter()
-                .all(|p| archive::is_archive(p) && unpacker::find(&self.cfg.unpackers, p).is_none())
+            && paths.iter().all(|p| {
+                archive::is_archive(p)
+                    && unpacker::find(&self.cfg.comparison_options(), p).is_none()
+            })
         {
             let mut temps = Vec::new();
             for p in &paths {
@@ -2342,7 +2344,8 @@ impl OxideMergeApp {
             if existing.iter().all(|p| text::is_image_path(p)) {
                 FileKind::Image
             } else if existing.iter().any(|p| {
-                (req.snapshot_options.is_some() || unpacker::find(&self.cfg.unpackers, p).is_none())
+                (req.snapshot_options.is_some()
+                    || unpacker::find(&self.cfg.comparison_options(), p).is_none())
                     && text::detect_kind(p) == FileKind::Binary
             }) {
                 FileKind::Binary
@@ -6082,6 +6085,12 @@ impl OxideMergeApp {
                                     );
                                 }
                                 OptTab::Plugins => {
+                                    ui.checkbox(
+                                        &mut d.cfg.diff.extract_documents,
+                                        tr("opt.extract_documents"),
+                                    )
+                                    .on_hover_text(tr("opt.extract_documents_hint"));
+                                    ui.separator();
                                     ui.label(tr("opt.unpackers_hint"));
                                     ui.horizontal_wrapped(|ui| {
                                         for (name, preset) in Unpacker::presets() {

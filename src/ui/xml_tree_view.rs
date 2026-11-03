@@ -99,6 +99,7 @@ pub struct XmlTreeView {
     pub values: bool,
     /// The comparison the state belongs to.
     attached: u64,
+    /// Whether the keyboard belongs to the tree, so the arrow keys move through its rows.
     focused: bool,
 }
 
@@ -146,6 +147,20 @@ impl XmlTreeView {
         self.expanded = (0..diff.rows.len())
             .filter(|&r| diff.rows[r].changes > 0 && !diff.rows[r].children.is_empty())
             .collect();
+        self.expansion += 1;
+    }
+
+    /// Unfolds every row less than `level` deep and folds the rest; `0` folds them all.
+    fn expand_to_level(&mut self, diff: &TreeDiff, level: usize) {
+        self.expanded = (0..diff.rows.len())
+            .filter(|&r| diff.rows[r].depth < level && !diff.rows[r].children.is_empty())
+            .collect();
+        self.expansion += 1;
+    }
+
+    /// Folds every row with no change under it, leaving the rest as they are.
+    fn collapse_unchanged(&mut self, diff: &TreeDiff) {
+        self.expanded.retain(|&r| diff.rows[r].changes > 0);
         self.expansion += 1;
     }
 
@@ -420,17 +435,12 @@ impl XmlTreeView {
                 self.reset(diff);
             }
             if ui.button(tr("analysis.tree_collapse_unchanged")).clicked() {
-                self.expanded.retain(|&r| diff.rows[r].changes > 0);
-                self.expansion += 1;
+                self.collapse_unchanged(diff);
             }
             ui.label(tr("analysis.tree_expand_level"));
             let level = ui.add(egui::DragValue::new(&mut self.level).range(0..=64));
             if level.changed() {
-                let level = self.level;
-                self.expanded = (0..diff.rows.len())
-                    .filter(|&r| diff.rows[r].depth < level && !diff.rows[r].children.is_empty())
-                    .collect();
-                self.expansion += 1;
+                self.expand_to_level(diff, self.level);
             }
             if ui.button(tr("analysis.tree_reset")).clicked() {
                 self.reset(diff);
@@ -614,8 +624,10 @@ impl XmlTreeView {
         scroll.show_rows(ui, height, visible.len(), |ui, range| {
             self.shown = range.clone();
             for &r in &visible[range] {
-                let (rect, response) = ui
-                    .allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
+                // Rows do not take the keyboard themselves: the tree has one place in the Tab
+                // order, taken below, so Tab does not walk through thousands of rows.
+                let (rect, response) =
+                    ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::CLICK);
                 let label = self.row_text(diff, r);
                 response.widget_info(|| {
                     egui::WidgetInfo::selected(
@@ -651,18 +663,42 @@ impl XmlTreeView {
                 self.expanded.insert(r);
             }
             self.expansion += 1;
-            self.focused = true;
         }
         if let Some(r) = clicked {
             self.select(diff, r);
             self.scroll_to = None;
-            self.focused = true;
         }
-        if ui.input(|i| i.pointer.any_click()) && clicked.is_none() && toggled.is_none() {
-            let pointer = ui.input(|i| i.pointer.interact_pos());
-            if pointer.is_some_and(|p| !ui.min_rect().contains(p)) {
-                self.focused = false;
-            }
+        self.take_keyboard(ui, diff, clicked.or(toggled).is_some());
+    }
+
+    /// Gives the whole tree one place in the Tab order, as a tree widget has: it is named after
+    /// the row the keyboard is on, so that is what a screen reader reads out; it draws a focus
+    /// outline; and it keeps the arrow keys, which egui would otherwise use to move the
+    /// keyboard to the next widget. `pressed` is a click in the rows, which takes the keyboard
+    /// as clicking a list does.
+    fn take_keyboard(&mut self, ui: &Ui, diff: &TreeDiff, pressed: bool) {
+        let id = egui::Id::unique("xml_tree_keyboard");
+        let rect = ui.min_rect();
+        // Focusable but not clickable, so the rows below it keep the mouse.
+        let response = ui.interact(rect, id, Sense::focusable_noninteractive());
+        let label = match self.selected {
+            Some(r) => self.row_text(diff, r),
+            None => tr("analysis.tree").to_owned(),
+        };
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Tree, true, &label));
+        if pressed {
+            response.request_focus();
+        }
+        self.focused = response.has_focus();
+        if self.focused {
+            let keys = egui::EventFilter {
+                tab: false,
+                horizontal_arrows: true,
+                vertical_arrows: true,
+                escape: false,
+            };
+            ui.memory_mut(|m| m.set_focus_lock_filter(id, keys));
+            widgets::focus_ring(ui, &response, rect.shrink(1.0), theme::radius::SM);
         }
     }
 
@@ -1441,6 +1477,97 @@ fn excerpt(result: &TreeResult, s: usize, r: usize, dark: bool) -> Vec<Excerpt> 
             text,
         })
         .collect()
+}
+
+#[cfg(test)]
+/// Times the Tree view on the XML files in `dir`, for the benchmarks: the comparison itself,
+/// the first rows drawn, a frame while scrolling, unfolding and folding the whole tree, and a
+/// step from one change to the next. Each measurement includes the frame it is drawn in, so
+/// what is timed is what pressing the key costs, not only the work behind it.
+pub(crate) fn render_bench(dir: &std::path::Path) -> String {
+    use crate::core::semantic::xml_tree::TreeOptions;
+    use std::fmt::Write as _;
+    use std::time::Instant;
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap();
+    let (a, b) = (read("a.xml"), read("b.xml"));
+    let options = TreeOptions::parse("").unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let started = Instant::now();
+    let diff = TreeDiff::compare_as(&a, &b, Format::Xml, &options, &cancel).unwrap();
+    let compared = started.elapsed();
+    let (rows, changes) = (diff.rows.len(), diff.targets.len());
+    let result = TreeResult {
+        diff,
+        sources: [a, b],
+        format: Format::Xml,
+    };
+    let ctx = egui::Context::default();
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0));
+    let mut time = 0.0;
+    let mut paint = |view: &mut XmlTreeView| {
+        time += 1.0 / 60.0;
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(time),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(input, |ui| {
+            view.ui(ui, &result, ["a.xml", "b.xml"]);
+        });
+        std::hint::black_box(out.shapes.len());
+    };
+    let mut view = XmlTreeView::default();
+    let started = Instant::now();
+    paint(&mut view);
+    let first = started.elapsed();
+
+    // scrolling: a different stretch of the tree in the viewport each frame
+    let shown = view.visible.len().max(1);
+    let scrolls = 100.min(shown);
+    let started = Instant::now();
+    for i in 0..scrolls {
+        view.scroll_to = Some(view.visible[i * shown / scrolls]);
+        paint(&mut view);
+    }
+    let scrolled = started.elapsed();
+
+    let started = Instant::now();
+    view.expand_to_level(&result.diff, 64);
+    paint(&mut view);
+    let expanded = started.elapsed();
+    let started = Instant::now();
+    view.collapse_unchanged(&result.diff);
+    paint(&mut view);
+    let collapsed = started.elapsed();
+
+    view.selected = None;
+    let mut steps = 0;
+    let started = Instant::now();
+    while view.step(&result.diff, true) {
+        paint(&mut view);
+        steps += 1;
+    }
+    let walked = started.elapsed();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let mut out = format!("{rows} rows, {changes} changes;");
+    for (what, value) in [
+        ("compare", format!("{:.0} ms", ms(compared))),
+        ("first rows", format!("{:.0} ms", ms(first))),
+        (
+            "a scrolled frame",
+            format!("{:.2} ms", ms(scrolled) / scrolls as f64),
+        ),
+        ("unfold", format!("{:.0} ms", ms(expanded))),
+        ("fold", format!("{:.0} ms", ms(collapsed))),
+        (
+            "a step",
+            format!("{:.2} ms over {steps}", ms(walked) / steps.max(1) as f64),
+        ),
+    ] {
+        let _ = write!(out, " {what} {value},");
+    }
+    out.pop();
+    out
 }
 
 #[cfg(test)]

@@ -296,6 +296,9 @@ as downloaded resources.
 Web pages are read-only. OxideMerge never saves anything to a web server.
 |===
 
+Documents, spreadsheets and programs are compared as the text OxideMerge reads from them, which
+is a text or table comparison of what was read rather than a type of its own; see <<documents>>.
+
 When *Compare as* is *Automatic*, OxideMerge checks these conditions in this order and uses the
 first one that matches:
 
@@ -305,12 +308,17 @@ first one that matches:
   Exception: a merge with an output file (`-o`) or a console patch (`--patch`) compares the files
   as text.
 . Every side is a folder: folder comparison.
+. Every file is one OxideMerge reads as text — a document, a spreadsheet or an ELF program (see
+  <<documents>>) — or an unpacker plugin converts it (see <<unpackers>>): text comparison of what
+  was read, read-only. A spreadsheet opens as a table comparison.
+  This comes before the archive and binary rules, so `.docx`, `.xlsx` and `.odt` open as their
+  text rather than as the zip archives they are. Turning off *Read documents, spreadsheets and
+  ELF files as text* in *Options → Plugins* leaves them to the rules below.
 . Every side is an archive: the archives are extracted and compared as folders.
 . Every file has an image extension, such as `.png`, `.jpg`, `.gif`, `.bmp`, `.tif` or `.webp`:
   image comparison.
 . A file has a zero byte in its first 8 KB: binary comparison.
-  Exceptions: an unpacker plugin can convert the file to text (see <<unpackers>>), and UTF-16
-  text with a byte order mark is still text.
+  Exception: UTF-16 text with a byte order mark is still text.
 . Anything else: text comparison.
 
 To choose the type yourself, use *Compare as* in the dialog, *Compare → Compare as* in an open
@@ -597,6 +605,7 @@ image::inline.png[Inline view]
   The arrow keys move from line to line, and kbd:[Ctrl+C] copies the current line.
 * To edit or select lines, go back to the side-by-side view.
 
+[[table-compare]]
 === CSV and TSV files
 
 For CSV and TSV files, the toolbar has a *Table view*.
@@ -1152,6 +1161,12 @@ copied files are checked again.
 If a file changed after the preview, even with the same size and modification time, nothing is
 applied, and the file is named.
 
+A file that cannot be read now is reported as such, not as one that changed: on Windows, another
+program holding a file open without sharing it stops the synchronization before anything is
+changed, and the message names that file. Close the other program and preview again.
+
+On Windows, paths longer than the old 260-character limit are copied and deleted like any other.
+
 Nothing is applied either when the new and replacing files, or the journal copies of the files
 that are replaced and deleted, do not fit in the free space of their drive. The message names
 the drive, the space needed and the space free. If a drive still fills up part way, the write
@@ -1170,6 +1185,50 @@ Before it replaces or deletes a file, OxideMerge copies it into a recovery journ
 
 IMPORTANT: Applying is not one atomic step for several files. Each file is replaced atomically,
 but another program can see some files already changed. The trash is not used.
+
+[[documents]]
+=== Documents, spreadsheets and programs
+
+Some files are not text but hold text. OxideMerge reads these itself, with nothing to install:
+
+[cols="1,3"]
+|===
+|Files |What is compared
+
+|`.pdf`
+|The text of each page, in the order it is drawn, with a blank line between pages. The
+characters come from the `ToUnicode` table the file carries for its fonts, or from the encoding
+the font names. An encrypted file is reported rather than read.
+
+|`.docx`, `.odt`, `.rtf`
+|The words of the document, a line to a paragraph or heading. The cells of a table are separated
+by tabs, a row to a line.
+
+|`.xlsx`, `.xlsm`, `.ods`
+|Every sheet, a line to a row and its cells separated by commas, which opens as a
+<<table-compare,table compare>>: columns, sorting and *Match rows by → Key columns* all apply.
+A workbook of more than one sheet names each one before its rows.
+
+|ELF programs, shared objects and object files
+|The header — class, byte order, kind, machine, ABI, entry point and the counts of the
+headers — and then the section table, a line to a section with its name, type, address, offset,
+size, alignment and flags. Two builds of the same program line up section by section.
+|===
+
+A file read this way is *read-only*: the pane says what was read (for example
+`report.docx [text of the document]`), and nothing can be edited or saved over the original. The
+text is a reading of the file, not a copy of it, so the layout, fonts, formulas and anything else
+the format holds are not compared.
+
+A converter under *Options → Plugins* is used in preference to this, so a better reader can
+always be put in front — `pdftotext` for PDF, or Pandoc or Tika for more formats. Turning
+*Read documents, spreadsheets and ELF files as text* off there compares these files as the
+archive or the bytes they are instead.
+
+NOTE: The older Word `.doc` and the older Excel `.xls` are not read here yet; use a converter
+under *Options → Plugins* for those. A PDF holds the places of glyphs rather than words, so
+columns, tables and ligatures may not come out as they look; a converter such as `pdftotext
+-layout` reads a complicated page better.
 
 [[archives]]
 === Archives
@@ -1592,9 +1651,12 @@ next to the program.
 === Unpacker plugins
 
 An unpacker plugin converts a file to text before the comparison.
-Use plugins for document formats that need an external conversion program, such as PDF or Office
-files.
 OxideMerge compares the text that the program writes to its standard output.
+
+OxideMerge reads PDF, `.docx`, `.odt`, `.rtf`, `.xlsx` and `.ods` files, and ELF programs,
+itself (see <<documents>>), so a plugin is needed only for a format it does not read — the older
+Word `.doc` and Excel `.xls` among them — or to read one of those formats better than it does.
+A plugin whose pattern matches is always used in preference.
 
 To add a plugin:
 
@@ -2084,8 +2146,14 @@ What counts as a change is the same as in the Semantic view:
 `Alt+Home` and `Alt+End`) and the buttons above the tree go through the changes in tree order.
 A change inside a folded node is not skipped: its parents unfold. *Change 3 / 12* shows where
 you are. The filters show and visit only added, removed, modified, moved or ambiguous changes,
-and the change counts on folded rows follow the filter. Click a row to select it; the arrow keys
-then move up and down and fold and unfold.
+and the change counts on folded rows follow the filter.
+
+*Keyboard*:: The tree is one stop in the tab order, as a tree is: press `Tab` until it has an
+outline, or click a row. The arrow keys then move: kbd:[↑] and kbd:[↓] from row to row, kbd:[→]
+to unfold a row, and kbd:[←] to fold it or to go to its parent. `Tab` leaves the tree rather than
+stepping to the next row, and `Esc` lets go of it. While the tree has the keyboard, a screen
+reader reads out the selected row: what it is, then each side. Every row is in the accessibility
+tree to be read one by one, whether the tree has the keyboard or not.
 
 *Folding*:: *Expand changes* (also the starting state) unfolds every node with changes inside.
 *Collapse unchanged* folds the rest, *Expand to level* unfolds to a depth, and *Reset expansion*
@@ -2691,7 +2759,10 @@ with another filter or for other folders, or one written by a newer version.
 `not_applied`, `rolled_back`, `recovery_required` or `recovered`). When the result is not a plain
 success it also has a `problem`: `stale` (a file or folder changed after the plan), `unsupported`,
 `read_failure`, `write_failure` (for example no permission or not enough free space), `canceled`
-or `recovery_needed`.
+or `recovery_needed`. These seven names are the same throughout OxideMerge: a view that leads
+with the kind of problem before its detail uses them too, so the same situation is called the
+same thing wherever it appears (`ambiguous` is the seventh: another reading of the input is as
+likely, as with repeated items that cannot be told apart).
 
 * The command line uses your saved options, unless you change them with options.
   For runs that must not depend on your settings, set `OXIDEMERGE_CONFIG_DIR` to a separate folder

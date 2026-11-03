@@ -1343,11 +1343,8 @@ impl DiffsView {
         whole: bool,
     ) {
         if !self.writable(to)
-            || crate::core::unpacker::find(
-                &self.dopts.unpackers,
-                &self.cards[f].item.path(&self.roots[to]),
-            )
-            .is_some()
+            || crate::core::unpacker::find(&self.dopts, &self.cards[f].item.path(&self.roots[to]))
+                .is_some()
             || self.cards[f].diffs().is_some_and(|d| d.docs[to].read_only)
         {
             self.status = tr("msg.readonly").into();
