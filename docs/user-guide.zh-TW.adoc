@@ -1026,6 +1026,9 @@ OxideMerge 依內容（SHA-256）判斷，絕不會只因修改時間較新就�
 
 若有檔案在預覽後被變更（即使大小與修改時間相同），就不會套用任何變更，並會指出該檔案。
 
+若新增與取代的檔案，或被取代與刪除檔案的日誌副本，超出所在磁碟的可用空間，也不會套用任何變更。
+訊息會指出該磁碟、所需空間與可用空間。若磁碟仍在中途寫滿，該次寫入會失敗，並復原已做的變更。
+
 ==== 發生問題時
 
 取代或刪除檔案之前，OxideMerge 會先將它複製到設定資料夾中 `sync-recovery` 資料夾內的復原日誌，絕不會放在被同步的資料夾裡。
@@ -2372,6 +2375,11 @@ oxidemerge --sync-apply plan.json --yes source destination
 ----
 
 `--sync-apply` 會重新比較資料夾，若計畫已與資料夾不符、以不同的篩選條件或為其他資料夾製作，或由較新版本產生，就會拒絕套用。
+
+`--sync-apply` 與 `--sync-recover` 會輸出 JSON 結果，其中 `status` 為 `applied`、`not_applied`、
+`rolled_back`、`recovery_required` 或 `recovered`。結果不是單純成功時，還會有 `problem`：
+`stale`（計畫製作後檔案或資料夾有變更）、`unsupported`、`read_failure`、`write_failure`
+（例如沒有權限或可用空間不足）、`canceled` 或 `recovery_needed`。
 
 * 命令列會使用您已儲存的選項，除非以參數另外指定。
   若要讓執行結果不受個人設定影響，請將 `OXIDEMERGE_CONFIG_DIR` 指向一個專用資料夾（請參閱 <<configuration>>）。

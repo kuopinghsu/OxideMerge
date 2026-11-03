@@ -8,7 +8,8 @@
 //! memory can be measured (with `/usr/bin/time` where there is one). Inputs are generated once
 //! into `target/bench-data`; results are printed and written to `target/bench/results.md`.
 //!
-//! - `OXIDEMERGE_BENCH_LARGE=1` adds 100 MB inputs, `=2` also a 1 GB binary compare, `=3` a 1 GB text compare.
+//! - `OXIDEMERGE_BENCH_LARGE=1` adds 100 MB inputs, `=2` also a 1 GB binary compare and a
+//!   synchronization of 2 GB files, `=3` a 1 GB text compare.
 //! - `OXIDEMERGE_BENCH_ONLY=text,folder` runs the workloads whose names contain one of these.
 //! - `OXIDEMERGE_BENCH_RUNS=<n>` sets the number of runs (the median time is reported).
 //! - `OXIDEMERGE_BENCH_SAVE=<file>` saves the results as a baseline (after the comparison
@@ -169,6 +170,13 @@ const WORKLOADS: &[Workload] = &[
         level: 0,
         make: small_files,
         run: preview_sync,
+    },
+    Workload {
+        name: "sync-apply-large",
+        what: "a mirror of 3 files of 2 GB, one new and one changed in its last byte: plan, then apply",
+        level: 2,
+        make: huge_files,
+        run: apply_sync,
     },
     Workload {
         name: "folder-navigation-20k",
@@ -462,6 +470,34 @@ fn large_files(dir: &Path) {
     }
 }
 
+/// Three random 2 GB files on the left; on the right one is equal, one differs in its last
+/// byte and one is missing.
+fn huge_files(dir: &Path) {
+    use std::io::Write as _;
+    let mut rng = Rng(37);
+    for i in 0..3 {
+        let path = |side: &str| dir.join(side).join(format!("h{i}.bin"));
+        std::fs::create_dir_all(dir.join("left")).unwrap();
+        std::fs::create_dir_all(dir.join("right")).unwrap();
+        let mut left = std::io::BufWriter::new(std::fs::File::create(path("left")).unwrap());
+        let mut right =
+            (i < 2).then(|| std::io::BufWriter::new(std::fs::File::create(path("right")).unwrap()));
+        let mut chunk = vec![0u8; MB];
+        for n in 0..2048 {
+            for word in chunk.chunks_mut(8) {
+                word.copy_from_slice(&rng.next().to_le_bytes());
+            }
+            left.write_all(&chunk).unwrap();
+            if let Some(right) = &mut right {
+                if i == 1 && n == 2047 {
+                    *chunk.last_mut().unwrap() ^= 1;
+                }
+                right.write_all(&chunk).unwrap();
+            }
+        }
+    }
+}
+
 fn mixed_files(dir: &Path) {
     let mut rng = Rng(31);
     for i in 0..2000 {
@@ -673,6 +709,55 @@ fn preview_sync(dir: &Path) -> String {
         plan.estimate.copies,
         plan.estimate.replaces,
         started.elapsed().as_millis()
+    )
+}
+
+/// Plans and applies a mirror into a fresh copy of the right folder, so every run starts the same.
+fn apply_sync(dir: &Path) -> String {
+    use super::folder_sync::{self, Scope, Side, SyncMode, SyncOutcome, SyncPolicy};
+    let work = dir.join("work");
+    let journal = dir.join("journal");
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_dir_all(&journal);
+    std::fs::create_dir_all(&work).unwrap();
+    for entry in std::fs::read_dir(dir.join("right")).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), work.join(entry.file_name())).unwrap();
+    }
+    let roots = [dir.join("left"), work.clone()];
+    let started = Instant::now();
+    let items = Scanner {
+        roots: &roots,
+        filter: &FileFilter::parse_mask("*.*"),
+        fopts: &FolderOptions::default(),
+        dopts: &DiffOptions::default(),
+        progress: &Progress::default(),
+    }
+    .run();
+    let policy = SyncPolicy {
+        mode: SyncMode::Mirror,
+        source: Side::Left,
+    };
+    let scope = Scope {
+        complete: true,
+        ..Scope::default()
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let plan = folder_sync::plan(&items, &roots, policy, scope, &stop).unwrap();
+    let previewed = started.elapsed();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let outcome = folder_sync::apply(&plan, &roots, &journal, &stop, &done);
+    let applied = started.elapsed() - previewed;
+    let result = match outcome {
+        SyncOutcome::Applied { changes, .. } => format!("{changes} changes applied"),
+        other => panic!("not applied: {:?}", other.problem()),
+    };
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_dir_all(&journal);
+    format!(
+        "{result}; preview {} ms, apply {} ms",
+        previewed.as_millis(),
+        applied.as_millis()
     )
 }
 

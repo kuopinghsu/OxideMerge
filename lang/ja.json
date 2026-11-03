@@ -202,6 +202,7 @@
   "folder_sync.err_stopped": "停止しました",
   "folder_sync.err_two_folders": "同期にはちょうど 2 つのフォルダーが必要です",
   "folder_sync.err_unfinished": "これらのフォルダーの以前の同期が完了していません。先に元に戻すか、変更をそのまま残してください",
+  "folder_sync.err_no_space": "{path} の空き容量が不足しています：{need} 必要、空き {free}。何も変更されていません",
   "folder_sync.err_verify": "{path} の内容がコピーしたものと一致しません",
   "folder_sync.export": "計画をエクスポート…",
   "folder_sync.failed_undone": "適用に失敗したため、すべての変更を元に戻しました: {reason}",

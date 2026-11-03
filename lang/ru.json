@@ -202,6 +202,7 @@
   "folder_sync.err_stopped": "Остановлено",
   "folder_sync.err_two_folders": "Для синхронизации нужны ровно две папки",
   "folder_sync.err_unfinished": "Предыдущая синхронизация этих папок не завершилась; сначала отмените её или сохраните её изменения",
+  "folder_sync.err_no_space": "Недостаточно свободного места на {path}: нужно {need}, свободно {free}; ничего не изменено",
   "folder_sync.err_verify": "{path} не содержит скопированного",
   "folder_sync.export": "Экспорт плана…",
   "folder_sync.failed_undone": "Применить не удалось, все изменения отменены: {reason}",

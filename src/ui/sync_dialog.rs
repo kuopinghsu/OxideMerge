@@ -146,18 +146,20 @@ impl SyncDialog {
             return;
         }
         let state = std::mem::replace(&mut self.state, State::Failed(String::new()));
-        self.state =
-            match state {
-                State::Planning { job, .. } => match job.join() {
-                    Ok(Ok(plan)) => State::Preview(Arc::new(plan)),
-                    Ok(Err(e)) => State::Failed(e),
-                    Err(_) => State::Failed(tr("status.error").to_string()),
-                },
-                State::Applying { job, .. } => State::Done(job.join().unwrap_or_else(|_| {
-                    SyncOutcome::NotApplied(vec![tr("status.error").to_string()])
-                })),
-                other => other,
-            };
+        self.state = match state {
+            State::Planning { job, .. } => match job.join() {
+                Ok(Ok(plan)) => State::Preview(Arc::new(plan)),
+                Ok(Err(e)) => State::Failed(e),
+                Err(_) => State::Failed(tr("status.error").to_string()),
+            },
+            State::Applying { job, .. } => State::Done(job.join().unwrap_or_else(|_| {
+                SyncOutcome::NotApplied(
+                    crate::core::problem::Problem::ReadFailure,
+                    vec![tr("status.error").to_string()],
+                )
+            })),
+            other => other,
+        };
     }
 
     fn start_apply(&mut self, plan: Arc<SyncPlan>) {
@@ -170,7 +172,10 @@ impl SyncDialog {
         let applied = plan.clone();
         let job = std::thread::spawn(move || match folder_sync::journal_root() {
             Some(journal) => folder_sync::apply(&applied, &roots, &journal, &flag, &count),
-            None => SyncOutcome::NotApplied(vec![tr("folder_sync.journal").to_string()]),
+            None => SyncOutcome::NotApplied(
+                crate::core::problem::Problem::WriteFailure,
+                vec![tr("folder_sync.journal").to_string()],
+            ),
         });
         self.state = State::Applying {
             total: plan.changes(),
@@ -383,7 +388,7 @@ impl SyncDialog {
                 }
                 State::Done(outcome) => {
                     outcome_ui(ui, outcome);
-                    let changed = !matches!(outcome, SyncOutcome::NotApplied(_));
+                    let changed = !matches!(outcome, SyncOutcome::NotApplied(..));
                     widgets::dialog_footer(ui, |ui| {
                         if widgets::primary_button(ui, tr("btn.close")).clicked()
                             || ui.input(|i| i.key_pressed(Key::Escape))
@@ -711,7 +716,7 @@ fn outcome_ui(ui: &mut Ui, outcome: &SyncOutcome) {
                 list(ui, kept.iter().map(String::as_str));
             }
         }
-        SyncOutcome::NotApplied(errors) => {
+        SyncOutcome::NotApplied(_, errors) => {
             ui.label(
                 RichText::new(tr("folder_sync.not_applied"))
                     .color(pal.warning)
@@ -719,7 +724,9 @@ fn outcome_ui(ui: &mut Ui, outcome: &SyncOutcome) {
             );
             list(ui, errors.iter().map(String::as_str));
         }
-        SyncOutcome::Stopped { reason, rollback } if rollback.complete() => {
+        SyncOutcome::Stopped {
+            reason, rollback, ..
+        } if rollback.complete() => {
             let text = match reason {
                 None => trf(
                     "folder_sync.stopped_undone",
@@ -729,7 +736,9 @@ fn outcome_ui(ui: &mut Ui, outcome: &SyncOutcome) {
             };
             ui.label(RichText::new(text).color(pal.warning));
         }
-        SyncOutcome::Stopped { reason, rollback } => {
+        SyncOutcome::Stopped {
+            reason, rollback, ..
+        } => {
             ui.label(
                 RichText::new(tr("folder_sync.recovery_required"))
                     .color(pal.danger)

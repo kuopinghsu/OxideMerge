@@ -1152,6 +1152,11 @@ copied files are checked again.
 If a file changed after the preview, even with the same size and modification time, nothing is
 applied, and the file is named.
 
+Nothing is applied either when the new and replacing files, or the journal copies of the files
+that are replaced and deleted, do not fit in the free space of their drive. The message names
+the drive, the space needed and the space free. If a drive still fills up part way, the write
+fails and the changes are undone.
+
 ==== If something goes wrong
 
 Before it replaces or deletes a file, OxideMerge copies it into a recovery journal in the
@@ -2681,6 +2686,12 @@ oxidemerge --sync-apply plan.json --yes source destination
 
 `--sync-apply` compares the folders again and refuses a plan that no longer matches them, one made
 with another filter or for other folders, or one written by a newer version.
+
+`--sync-apply` and `--sync-recover` print a JSON result with a `status` (`applied`,
+`not_applied`, `rolled_back`, `recovery_required` or `recovered`). When the result is not a plain
+success it also has a `problem`: `stale` (a file or folder changed after the plan), `unsupported`,
+`read_failure`, `write_failure` (for example no permission or not enough free space), `canceled`
+or `recovery_needed`.
 
 * The command line uses your saved options, unless you change them with options.
   For runs that must not depend on your settings, set `OXIDEMERGE_CONFIG_DIR` to a separate folder

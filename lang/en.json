@@ -202,6 +202,7 @@
   "folder_sync.err_stopped": "Stopped",
   "folder_sync.err_two_folders": "Synchronization needs exactly two folders",
   "folder_sync.err_unfinished": "An earlier synchronization of these folders did not finish; undo it or keep its changes first",
+  "folder_sync.err_no_space": "Not enough free space on {path}: {need} needed, {free} free; nothing was changed",
   "folder_sync.err_verify": "{path} does not hold what was copied",
   "folder_sync.export": "Export plan…",
   "folder_sync.failed_undone": "Applying failed and every change was undone: {reason}",
