@@ -9,6 +9,7 @@ program, see the [README](../README.md) and the [user guide](user-guide.adoc).
 
 - [Build from source](#build-from-source)
 - [Make targets](#make-targets)
+- [How outcomes are named](#how-outcomes-are-named)
 - [Testing](#testing)
 - [Continuous integration](#continuous-integration)
 - [Releases](#releases)
@@ -85,6 +86,34 @@ For the web page samples, see [samples/web/README.md](../samples/web/README.md).
 `make user-guide` needs Asciidoctor PDF, `curl`, `shasum`, Python 3 with `fontTools`,
 fontconfig and the DejaVu Sans font. The build script downloads the Noto Sans CJK fonts that
 it needs.
+
+## How outcomes are named
+
+Every feature that can end in something other than plain success reports which of seven
+outcomes it was. `core::problem::Problem` is that taxonomy, and nothing else should invent a
+parallel one:
+
+| Outcome | What it means | Where it comes from |
+| --- | --- | --- |
+| `ambiguous` | Another reading of the input is as likely; the result stands but is to be checked by hand | Repeated items that cannot be told apart: the semantic and Tree views mark such rows themselves |
+| `stale` | The input is no longer as it was when the result or the plan was made | A file changed after a synchronization preview |
+| `unsupported` | The input or the request is of a kind this feature refuses | A format, version or file type it does not handle; a key column that is missing or repeated; a table past the record limit |
+| `read_failure` | Reading failed, or would | No permission; a file another program holds open without sharing it |
+| `write_failure` | Writing failed, or would | No permission; no room on the drive |
+| `canceled` | The user stopped it | *Stop* or *Cancel* |
+| `recovery_needed` | A change was cut short and could not be wholly undone; a recovery journal is kept | A rollback that could not put everything back |
+
+A feature with outcomes of its own maps them onto these rather than replacing them:
+`Problem::of_io` for an I/O error (which differs by whether it was reading or writing) and
+`Problem::of_table` for a key or table that cannot be used as asked. Add a mapping function
+beside those rather than a new enum.
+
+The names reach users two ways. `--sync-apply` and `--sync-recover` put the outcome in their
+JSON as `problem`, which is the serialized name in the table above, so scripts can branch on it;
+this is a compatibility surface, so do not rename a variant without a release note.
+`Problem::label()` gives the translated short name (`problem.*` in `lang/*.json`) for a view
+that leads with the kind of problem before the detail of what went wrong. The detail stays the
+feature's own wording: the taxonomy says what kind of thing happened, not what happened.
 
 ## Testing
 

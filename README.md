@@ -81,6 +81,12 @@ It compares text, folders, binary files, images and web pages.
   change it: type hexadecimal digits or text, insert or delete bytes, and save.
 - **Images:** compare images side by side, or with the overlay, swipe, blink and difference
   views.
+- **Documents, spreadsheets and programs:** PDF, Word (`.docx`), OpenDocument text (`.odt`),
+  Rich Text (`.rtf`), Excel (`.xlsx`) and OpenDocument spreadsheets (`.ods`) are compared as the
+  text in them, and ELF programs, shared objects and object files as their header and section
+  table — with nothing to install. A spreadsheet opens as a table comparison, with the columns
+  and key matching that offers. These comparisons are read-only: the file itself is never
+  written back.
 - **Web pages:** by default, both pages are converted to Markdown and shown formatted side by
   side, with changed blocks and words highlighted. Other modes show the visible text, the HTML
   source, screenshots with the changed text highlighted, or the downloaded resources. Only the
@@ -472,9 +478,15 @@ use Command instead of Ctrl. The app shows the right keys for your system.
 - Pages that need a login are not supported. They may show the login page instead.
 - Text editing works line by line. It is meant for reviewing and merging changes.
 - WinMerge project files and filter files work. WinMerge plugin DLLs and scripts do not work.
+- The documents, spreadsheets and programs that OxideMerge reads itself are compared as the text
+  it reads from them, not as the files they are: layout, fonts, formulas and anything else the
+  format holds are not compared, and the comparison is read-only. A PDF records where each glyph
+  goes rather than words, so columns, tables and ligatures may not come out as they look. The
+  older Word `.doc` and Excel `.xls` are not read; use a plugin for those.
 - Unpacker plugins run external commands. They work the same way in file comparisons, folder
-  comparisons of full contents, the command line and reports. The PDF and Office presets need
-  conversion tools that you install separately.
+  comparisons of full contents, the command line and reports, and a plugin is always used in
+  preference to what OxideMerge reads itself. The presets need conversion tools that you install
+  separately.
 - Folder synchronization changes files one at a time, so it is not one atomic step. A renamed
   or moved file is listed as a rename, but it is applied as a copy and a deletion. Symbolic
   links, and names that differ only in letter case or in how accents on Latin letters are

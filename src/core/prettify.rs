@@ -16,6 +16,35 @@ const XML_EXTS: &[&str] = &[
     "resx", "nuspec", "wsdl", "pom", "plist", "config", "manifest", "rss", "atom", "gpx", "kml",
 ];
 
+const HTML_EXTS: &[&str] = &["html", "htm", "xhtml", "shtml", "xht"];
+
+/// Whether this is an HTML page rather than an XML document. The two are not the same: an
+/// XHTML page opens with an XML declaration and would otherwise pass for XML, and reading
+/// HTML as a tree of elements says nothing a reader of the page would recognise. `text` need
+/// only be the start of the file; an XML declaration before the doctype is stepped over.
+pub fn is_html(path: Option<&Path>, text: &str) -> bool {
+    if path
+        .map(super::text::extension)
+        .is_some_and(|e| HTML_EXTS.contains(&e.as_str()))
+    {
+        return true;
+    }
+    let head = text.trim_start_matches('\u{feff}').trim_start();
+    let head = match head.strip_prefix("<?xml") {
+        Some(rest) => rest
+            .split_once("?>")
+            .map_or("", |(_, after)| after)
+            .trim_start(),
+        None => head,
+    };
+    let start: String = head
+        .chars()
+        .take(16)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    start.starts_with("<!doctype html") || start.starts_with("<html")
+}
+
 /// The format of a file, from its extension, or else from how its text starts.
 pub fn detect(path: Option<&Path>, text: &str) -> Option<Format> {
     if let Some(ext) = path.map(super::text::extension) {
@@ -154,6 +183,27 @@ fn xml(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_html_page_is_not_taken_for_an_xml_document() {
+        let page = "<!DOCTYPE html>\n<html><body><table></table></body></html>\n";
+        let xhtml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html>\n<html></html>\n";
+        assert!(is_html(None, page));
+        assert!(is_html(None, xhtml));
+        assert!(is_html(None, "\u{feff}  \n<HTML>\n"));
+        assert!(is_html(Some(Path::new("page.htm")), "anything"));
+        assert!(is_html(Some(Path::new("source.html")), ""));
+        // An XML document, including one named like a page, is not HTML.
+        assert!(!is_html(None, "<?xml version=\"1.0\"?>\n<catalog/>\n"));
+        assert!(!is_html(None, "<catalog><item/></catalog>"));
+        assert!(!is_html(
+            Some(Path::new("a.xml")),
+            "<?xml version=\"1.0\"?>"
+        ));
+        assert!(!is_html(None, "{\"a\": 1}"));
+        // An XHTML page would otherwise pass for XML on its declaration alone.
+        assert_eq!(detect(None, xhtml), Some(Format::Xml));
+    }
 
     #[test]
     fn formats_json_and_xml_the_same_way_whatever_their_layout() {

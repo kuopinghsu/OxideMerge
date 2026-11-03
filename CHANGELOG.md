@@ -24,6 +24,20 @@ section of this file as the release notes.
   conservatively. Search by key, name or value, by a `$.path` prefix or with an XPath subset, and
   *View as collection* tables arrays of objects and repeated elements. Read-only, built in the
   background with *Cancel*, within the semantic parsers' limits. Sample: `samples/xml`.
+- **Documents, spreadsheets and programs read as text**, with no other program to install:
+  PDF is compared as the text of its pages, read through the file's own tables and turned back
+  into characters with the `ToUnicode` table it carries for each font, so a page reads as it
+  does on screen; an encrypted file says so rather than coming out as nothing, and a file whose
+  tables are damaged is still read by looking for the objects themselves.
+  Word (`.docx`), OpenDocument text (`.odt`) and Rich Text (`.rtf`) are compared as the words of
+  the document, with the cells of a table separated by tabs; Excel (`.xlsx`, `.xlsm`) and
+  OpenDocument spreadsheets (`.ods`) as their sheets, which opens as a **table compare** with
+  the columns and the key matching it offers; and ELF programs, shared objects and object files
+  as their header and section table, so two builds line up section by section. The file itself
+  is never written back: a compare read this way is read-only, and the pane says what was read.
+  A converter under *Options → Plugins* is used in preference, so a better one can always be put
+  in front, and *Read documents, spreadsheets and ELF files as text* there turns this off to
+  compare such files as the archive or the bytes they are.
 - **Italian** interface language (`--lang it`, or *Italiano* in *Options → General*).
 - A toolbar button in folder compares, and `Alt+P`, show or hide the *File compare below the folder
   list*.
@@ -145,7 +159,10 @@ section of this file as the release notes.
   for one item (`1 difference(s)`). German, French and Russian messages read correctly with the
   side names filled in, and Russian counts agree in number. Terms are more consistent within
   each language (for example *tab*, *merge*, *fold* and *only on one side*), and Simplified
-  Chinese uses *访达* for Finder.
+  Chinese uses *访达* for Finder. Every kind of outcome a comparison or a synchronization can
+  report — *another reading is as likely*, *no longer as it was*, *not supported*, *could not be
+  read*, *could not be written*, *stopped* and *needs putting back* — now has one name in each
+  language, used wherever a feature leads with the kind of problem before its detail.
 - **Web page compare:** *Stop* also ends the download of the pages and their resources as
   data arrives, instead of letting it run on in the background; a server that sends nothing is
   still waited for until its 30-second timeout.
@@ -184,6 +201,40 @@ section of this file as the release notes.
 - Folder column headers tell screen readers the sort direction again.
 - *Review* links from impact findings do nothing for a file that is not in the comparison, instead
   of selecting a missing file.
+- **Windows:** folder synchronization copies into a folder whose path is just under the old
+  260-character limit. The name of the temporary copy counts towards the limit as much as the
+  folder does, so a folder of 224 to 259 characters was still refused with *The system cannot
+  find the path specified*.
+- **Formatted web pages:** the difference marks beside the pages stay where they are while the
+  pages are scrolled. A row is measured only once it is drawn, so scrolling through a page of
+  tables replaced each estimate with a real height and moved everything below it, taking the
+  marks and the scroll thumb with it. The overview and the scroll bar now use a height worked
+  out from each row's content, which drawing never changes; the pages themselves still scroll
+  by their measured heights, and the viewport box is carried between the two.
+- **HTML:** comparing pages as *HTML source* no longer offers the Semantic and Tree views. HTML
+  is not XML, and a page that opens with an XML declaration, as an XHTML page does, was taken
+  for an XML document; the views then had nothing useful to show.
+- **Folder synchronization:** a synchronization that has just succeeded is no longer offered for
+  undoing. A window looking for synchronizations that did not finish read each journal's header
+  before taking its lock, so one that finished in between — removing its header and only then
+  letting the lock go — was still listed, and undoing it would have taken back correct work. The
+  header is now read again once the lock is held, and *Undo those changes* takes the lock before
+  the header for the same reason. A journal that has gone by then is nothing to undo rather than
+  a failure.
+- **Windows:** folder synchronization copies and deletes files whose path is longer than the old
+  260-character limit. Such a path was staged correctly but could not be renamed into place, so
+  the file was refused with *The system cannot find the path specified* and the changes before it
+  were undone. Paths are now handed to the system in their extended form where they are too long
+  for the old one.
+- **Folder synchronization:** a file another program holds open is reported as one that cannot be
+  read, rather than as one that changed after the preview. Nothing is touched either way, but the
+  advice the message leads to is different. Where several things are wrong at once, the kind of
+  problem reported is the one named by the first message rather than the last.
+- **Tree view:** `Tab` reaches the tree, which is one stop in the tab order as a tree should be:
+  it draws a focus outline, the arrow keys then move through the rows without clicking a row
+  first, and what holds the keyboard is named after the current row, so a screen reader reads out
+  the row's state and both of its sides. Previously the tab order went past the rows and the
+  arrow keys only worked after a click.
 
 ## [0.9.7] - 2026-11-01
 

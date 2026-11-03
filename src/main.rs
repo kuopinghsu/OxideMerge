@@ -539,7 +539,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         }
         None => {
             if paths.iter().any(|p| {
-                core::unpacker::find(&cfg.unpackers, p).is_none()
+                core::unpacker::find(&cfg.comparison_options(), p).is_none()
                     && core::text::detect_kind(p) == FileKind::Binary
             }) {
                 FileKind::Binary
@@ -580,7 +580,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     } else {
         paths
             .iter()
-            .map(|p| core::unpacker::load_doc(p, &cfg.unpackers, None))
+            .map(|p| core::unpacker::load_doc(p, &cfg.comparison_options(), None))
             .collect::<Result<_, _>>()?
     };
     if cfg.diff.prettify {

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 const SCREEN: egui::Vec2 = egui::vec2(1280.0, 820.0);
 
+#[derive(Clone)]
 struct Widget {
     role: accesskit::Role,
     label: String,
@@ -46,6 +47,8 @@ struct Gui {
     widgets: Vec<Widget>,
     /// Every control that can be clicked or set, named or not.
     controls: Vec<Widget>,
+    /// The widget with the keyboard, which a screen reader reads out.
+    focus: Option<Widget>,
     copied: Vec<String>,
     closed: bool,
 }
@@ -86,6 +89,7 @@ impl Gui {
             focused: true,
             widgets: Vec::new(),
             controls: Vec::new(),
+            focus: None,
             copied: Vec::new(),
             closed: false,
         };
@@ -121,6 +125,7 @@ impl Gui {
         if let Some(tree) = &out.platform_output.accesskit_update {
             self.widgets = widgets_of(tree);
             self.controls = controls_of(tree);
+            self.focus = focused_of(tree);
         }
         self.closed |= out
             .viewport_output
@@ -329,6 +334,47 @@ impl Gui {
         self.settle();
     }
 
+    /// Moves the keyboard focus on, as Tab does, without waiting for background work. egui
+    /// hands the focus over on the frame after the key, so one more frame is run.
+    fn tab(&mut self, back: bool) {
+        let modifiers = if back {
+            Modifiers::SHIFT
+        } else {
+            Modifiers::NONE
+        };
+        self.modifiers = modifiers;
+        for pressed in [true, false] {
+            self.events.push(Event::Key {
+                key: Key::Tab,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers,
+            });
+            self.frame();
+        }
+        self.modifiers = Modifiers::NONE;
+        self.frames(2);
+    }
+
+    /// Tabs until the keyboard reaches a widget `wanted` accepts, naming where it went if it
+    /// never does.
+    fn tab_to(&mut self, what: &str, wanted: impl Fn(&Widget) -> bool) -> Widget {
+        let mut seen = Vec::new();
+        for _ in 0..200 {
+            self.tab(false);
+            let Some(f) = &self.focus else { continue };
+            if wanted(f) {
+                return f.clone();
+            }
+            let step = format!("{:?} {:?}", f.role, f.label);
+            if seen.last() != Some(&step) {
+                seen.push(step);
+            }
+        }
+        panic!("{}: Tab never reached {what}; it went {seen:#?}", self.name);
+    }
+
     fn type_text(&mut self, text: &str) {
         self.events.push(Event::Text(text.into()));
         self.frames(2);
@@ -410,6 +456,33 @@ impl Drop for Gui {
             eprintln!("window state: {}", file.display());
         }
     }
+}
+
+/// What the keyboard is on and how a screen reader would announce it.
+fn focused_of(tree: &accesskit::TreeUpdate) -> Option<Widget> {
+    let nodes: std::collections::HashMap<accesskit::NodeId, &accesskit::Node> =
+        tree.nodes.iter().map(|(id, n)| (*id, n)).collect();
+    let n = nodes.get(&tree.focus)?;
+    let caption = n
+        .labelled_by()
+        .iter()
+        .find_map(|id| nodes.get(id).and_then(|c| c.label().or(c.value())));
+    let b = n.bounds()?;
+    Some(Widget {
+        role: n.role(),
+        label: n
+            .label()
+            .or(caption)
+            .or(n.value())
+            .or(n.placeholder())
+            .unwrap_or("")
+            .to_string(),
+        rect: Rect::from_min_max(
+            Pos2::new(b.x0 as f32, b.y0 as f32),
+            Pos2::new(b.x1 as f32, b.y1 as f32),
+        ),
+        enabled: !n.is_disabled(),
+    })
 }
 
 fn named(w: &Widget, label: &str) -> bool {
@@ -1109,6 +1182,273 @@ fn formatted_web_pages_step_on_to_the_next_file() {
     gui.key(ALT, Key::ArrowDown);
     gui.key(ALT, Key::ArrowDown);
     assert!(shown(&mut gui).ends_with("/two.html"));
+}
+
+/// A Word document and a spreadsheet, built as the real formats are, so that the window is
+/// driven over files OxideMerge has to read for itself.
+#[cfg(test)]
+fn zipped_document(path: &Path, parts: &[(&str, String)]) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options: zip::write::FileOptions<()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (entry, text) in parts {
+        zip.start_file(*entry, options).unwrap();
+        std::io::Write::write_all(&mut zip, text.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+/// Documents and spreadsheets are compared as the text in them, without another program, and
+/// what is shown cannot be written back over the file it was read from.
+#[test]
+fn documents_and_spreadsheets_are_compared_as_their_text_and_stay_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    let document = |second: &str| {
+        (
+            "word/document.xml",
+            format!(
+                "<w:document xmlns:w=\"{w}\"><w:body>\
+                 <w:p><w:r><w:t>Shared opening line</w:t></w:r></w:p>\
+                 <w:p><w:r><w:t>{second}</w:t></w:r></w:p>\
+                 </w:body></w:document>"
+            ),
+        )
+    };
+    zipped_document(&d.join("left.docx"), &[document("the left wording")]);
+    zipped_document(&d.join("right.docx"), &[document("the right wording")]);
+
+    let mut gui = Gui::start(
+        "extract_docx",
+        compare(&[d.join("left.docx"), d.join("right.docx")]),
+    );
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let v = gui.text_view();
+    assert_eq!(
+        v.panes[0].doc.text(),
+        "Shared opening line\nthe left wording\n"
+    );
+    assert_eq!(
+        v.panes[1].doc.text(),
+        "Shared opening line\nthe right wording\n"
+    );
+    // Read from the file, not the file itself: it cannot be edited or saved over.
+    assert!(v.panes.iter().all(|p| p.doc.read_only), "not read-only");
+    assert!(
+        v.panes[0]
+            .doc
+            .description
+            .as_ref()
+            .is_some_and(|t| t.contains(tr("label.extracted_document"))),
+        "{:?}",
+        v.panes[0].doc.description
+    );
+    // One block differs, which is the point of reading the words rather than the bytes.
+    assert_eq!(v.diff.significant_blocks(), 1, "{} rows", v.diff.rows.len());
+}
+
+#[test]
+fn spreadsheets_are_compared_as_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    let rels = "http://schemas.openxmlformats.org/package/2006/relationships";
+    let book = |amount: &str| {
+        vec![
+            (
+                "xl/workbook.xml",
+                format!(
+                    "<workbook xmlns=\"{ns}\" xmlns:r=\"{rels}\"><sheets>\
+                     <sheet name=\"Prices\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"
+                ),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                format!(
+                    "<Relationships xmlns=\"{rels}\">\
+                     <Relationship Id=\"rId1\" Target=\"worksheets/sheet1.xml\"/></Relationships>"
+                ),
+            ),
+            (
+                "xl/sharedStrings.xml",
+                format!("<sst xmlns=\"{ns}\"><si><t>item</t></si><si><t>price</t></si>\
+                         <si><t>apple</t></si></sst>"),
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                format!(
+                    "<worksheet xmlns=\"{ns}\"><sheetData>\
+                     <row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c><c r=\"B1\" t=\"s\"><v>1</v></c></row>\
+                     <row r=\"2\"><c r=\"A2\" t=\"s\"><v>2</v></c><c r=\"B2\"><v>{amount}</v></c></row>\
+                     </sheetData></worksheet>"
+                ),
+            ),
+        ]
+    };
+    for (name, amount) in [("left.xlsx", "10"), ("right.xlsx", "12")] {
+        zipped_document(&d.join(name), &book(amount));
+    }
+    let mut gui = Gui::start(
+        "extract_xlsx",
+        compare(&[d.join("left.xlsx"), d.join("right.xlsx")]),
+    );
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let v = gui.text_view();
+    assert_eq!(v.panes[0].doc.text(), "item,price\napple,10\n");
+    assert!(v.panes.iter().all(|p| p.doc.read_only));
+    // A spreadsheet is read as records, so the compare opens as a table with its columns.
+    assert_eq!(v.table_delim, Some(','), "not compared as a table");
+}
+
+/// A page of tables is far taller than the estimate a row starts with, so scrolling through it
+/// measures rows and moves everything below them. The difference marks beside the pages must
+/// stay where they are all the same.
+#[test]
+fn the_formatted_overview_does_not_move_while_the_pages_are_scrolled() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let table = |n: usize, last: &str| {
+        let mut t = String::from("<table>\n");
+        for r in 0..n {
+            let cell = if r + 1 == n { last } else { "same" };
+            t.push_str(&format!("<tr><td>row {r}</td><td>{cell}</td></tr>\n"));
+        }
+        t.push_str("</table>\n");
+        t
+    };
+    let page = |last: &str| {
+        let mut p = String::from("<!DOCTYPE html>\n<html><body>\n<p>first</p>\n");
+        for _ in 0..6 {
+            p.push_str(&table(20, "same"));
+            p.push_str("<p>between the tables</p>\n");
+        }
+        p.push_str(&table(20, last));
+        p.push_str("<p>last</p>\n</body></html>\n");
+        p
+    };
+    write(
+        d,
+        &[
+            ("left/tables.html", &page("left")),
+            ("right/tables.html", &page("right")),
+        ],
+    );
+    let roots = [d.join("left"), d.join("right")];
+    let mut gui = Gui::with_config("formatted_overview", config(), compare_folders(&roots));
+    gui.click("tables.html");
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.wait_until(
+        "the pages",
+        |g| matches!(&g.app.tabs[g.app.active].content, Content::Web(w) if w.formatted.is_some()),
+    );
+    gui.frames(5);
+    let c = crate::ui::theme::colors(false);
+    let marks = |g: &Gui| {
+        let Content::Web(w) = &g.app.tabs[g.app.active].content else {
+            panic!("not a web compare");
+        };
+        let v = w.formatted.as_ref().expect("no formatted view");
+        v.location_marks(&c)
+            .iter()
+            .map(|m| (m.start, m.len))
+            .collect::<Vec<_>>()
+    };
+    let before = marks(&gui);
+    assert!(!before.is_empty(), "no difference was marked");
+
+    // Scroll to the end, which lays out and measures every table on the way.
+    let middle = Pos2::new(SCREEN.x / 2.0, SCREEN.y / 2.0);
+    for _ in 0..40 {
+        gui.events.push(Event::PointerMoved(middle));
+        gui.events.push(Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -400.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        });
+        gui.frames(2);
+    }
+    gui.frames(5);
+    let Content::Web(w) = &gui.app.tabs[gui.app.active].content else {
+        panic!("not a web compare");
+    };
+    let v = w.formatted.as_ref().unwrap();
+    assert!(
+        v.heights.iter().any(|&h| h > 200.0),
+        "no table was measured, so nothing was proved: {:?}",
+        &v.heights[..v.heights.len().min(8)]
+    );
+    assert_eq!(
+        marks(&gui),
+        before,
+        "the overview moved as the pages scrolled"
+    );
+}
+
+/// HTML is not one of the formats the Semantic and Tree views can read, so a compare of HTML
+/// source must not offer them.
+#[test]
+fn html_source_does_not_offer_the_semantic_and_tree_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let page = |head: &str, cell: &str| {
+        format!("{head}<html><body>\n<table><tr><td>{cell}</td></tr></table>\n</body></html>\n")
+    };
+    // A plain page, and one opening with an XML declaration, as an XHTML page does.
+    let heads = [
+        ("plain", "<!DOCTYPE html>\n"),
+        (
+            "xhtml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html>\n",
+        ),
+    ];
+    for (name, head) in heads {
+        write(
+            d,
+            &[
+                (&format!("left/{name}.html"), &page(head, "left")),
+                (&format!("right/{name}.html"), &page(head, "right")),
+            ],
+        );
+    }
+    let roots = [d.join("left"), d.join("right")];
+    for (name, _) in heads {
+        let mut gui = Gui::with_config("html_source_tabs", config(), compare_folders(&roots));
+        gui.click(&format!("{name}.html"));
+        gui.key(Modifiers::NONE, Key::Enter);
+        gui.wait_until("the pages", |g| {
+            matches!(&g.app.tabs[g.app.active].content, Content::Web(w) if w.formatted.is_some())
+        });
+        gui.click(tr("web.html"));
+        gui.wait_until("the HTML source", |g| {
+            matches!(&g.app.tabs[g.app.active].content,
+                     Content::Web(w) if matches!(w.inner.as_deref(), Some(Content::Text(_))))
+        });
+        assert!(
+            !gui.shows(tr("analysis.semantic")),
+            "{name}.html source offers the Semantic view"
+        );
+        assert!(
+            !gui.shows(tr("analysis.tree")),
+            "{name}.html source offers the Tree view"
+        );
+        // The source itself is still there to compare as text.
+        let Content::Web(w) = &gui.app.tabs[gui.app.active].content else {
+            panic!("{name}.html is not a web compare");
+        };
+        let Some(Content::Text(v)) = w.inner.as_deref() else {
+            panic!("{name}.html has no text compare");
+        };
+        assert!(
+            v.panes[0].doc.text().contains("<td>left</td>"),
+            "{name}.html lost its source"
+        );
+    }
 }
 
 #[test]
@@ -3167,6 +3507,222 @@ fn every_control_is_named_for_screen_readers() {
         }
     }
     assert!(found.is_empty(), "controls without a name: {found:#?}");
+}
+
+/// A tree is one stop in the Tab order, as a tree widget should be: the keyboard reaches it
+/// without a click, the row it is on is what a screen reader reads, the arrow keys move from
+/// there, and Tab leaves the tree rather than walking through every row.
+#[test]
+fn the_xml_tree_takes_the_keyboard_with_tab_alone_and_moves_with_the_arrow_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = "<catalog>
+  <book id=\"1\">
+    <title>Rust</title>
+  </book>
+  <book id=\"2\" year=\"2020\"/>
+</catalog>
+";
+    let b = "<catalog>
+  <book id=\"0\"/>
+  <book id=\"1\">
+    <title>Rust</title>
+  </book>
+  <book id=\"2\" year=\"2021\"/>
+</catalog>
+";
+    write(dir.path(), &[("a.xml", a), ("b.xml", b)]);
+    let mut gui = Gui::start(
+        "xml_tree_keyboard",
+        compare(&[dir.path().join("a.xml"), dir.path().join("b.xml")]),
+    );
+    gui.click(tr("analysis.tree"));
+    gui.wait_until("the tree rows", |gui| {
+        gui.widgets
+            .iter()
+            .filter(|w| w.role == accesskit::Role::ListItem)
+            .count()
+            > 2
+    });
+    assert!(
+        gui.text_view().tree.view.selected.is_none(),
+        "a row was selected before the keyboard or the mouse picked one"
+    );
+
+    let tree = gui.tab_to("the tree", |w| w.role == accesskit::Role::Tree);
+    assert_eq!(tree.label, tr("analysis.tree"), "the tree is not named");
+
+    // The arrow keys move through the rows from there, with no click first, and what the
+    // keyboard is on is named after the row, which is what a screen reader reads out.
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    let first = gui
+        .focus
+        .as_ref()
+        .expect("nothing has the keyboard")
+        .clone();
+    assert_eq!(first.role, accesskit::Role::Tree, "{:?}", first.label);
+    assert!(
+        gui.text_view().tree.view.selected.is_some(),
+        "the arrow keys did not reach the rows"
+    );
+    // What it says is the state of the row and then both of its sides.
+    let (status, sides) = first
+        .label
+        .split_once(": ")
+        .unwrap_or_else(|| panic!("{:?} does not say what the row is", first.label));
+    assert!(
+        status.chars().any(char::is_alphanumeric),
+        "{:?}",
+        first.label
+    );
+    assert!(sides.contains(" | "), "{:?} is not both sides", first.label);
+
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    let next = gui
+        .focus
+        .as_ref()
+        .expect("nothing has the keyboard")
+        .clone();
+    assert_ne!(
+        next.label, first.label,
+        "the keyboard stayed on the same row"
+    );
+
+    // Every row is still there to be read, one by one, even though only the tree is a stop.
+    assert!(
+        gui.widgets
+            .iter()
+            .filter(|w| w.role == accesskit::Role::ListItem)
+            .count()
+            > 2
+    );
+
+    // One stop: Tab leaves the tree instead of stepping from row to row.
+    gui.tab(false);
+    assert!(
+        gui.focus
+            .as_ref()
+            .is_none_or(|f| f.role != accesskit::Role::Tree),
+        "Tab stayed in the tree: {:?}",
+        gui.focus.as_ref().map(|f| f.label.clone())
+    );
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+/// Difference navigation without the mouse: the file list takes the arrow keys as it is, the
+/// Previous and Next buttons can be reached with Tab and run with the space bar, and the count
+/// of files and differences follows along for anyone reading the window out.
+#[test]
+fn differences_are_walked_with_the_keyboard_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            (
+                "left/a.txt",
+                "1
+x
+3
+4
+5
+6
+7
+8
+y
+10
+",
+            ),
+            (
+                "right/a.txt",
+                "1
+X
+3
+4
+5
+6
+7
+8
+Y
+10
+",
+            ),
+            (
+                "left/b.txt",
+                "same
+",
+            ),
+            (
+                "right/b.txt",
+                "same
+",
+            ),
+            (
+                "left/c.txt",
+                "one
+",
+            ),
+            (
+                "right/c.txt",
+                "two
+",
+            ),
+        ],
+    );
+    let cfg = Config {
+        folder_file_pane: true,
+        ..config()
+    };
+    let roots = [d.join("left"), d.join("right")];
+    let mut gui = Gui::with_config("keyboard_only_nav", cfg, compare_folders(&roots));
+    gui.settle();
+
+    // The list takes the arrow keys without being clicked into first.
+    gui.key(Modifiers::NONE, Key::Home);
+    gui.settle();
+    gui.wait_until("the first file", |gui| {
+        gui.shows_text(&format!(
+            "{} · {}",
+            trf("nav.file_of", &[("n", "1".into()), ("total", "2".into())]),
+            trf("nav.diff_of", &[("n", "1".into()), ("total", "2".into())])
+        ))
+    });
+
+    // Alt+Down steps through the differences and on to the next changed file.
+    gui.key(ALT, Key::ArrowDown);
+    gui.frames(3);
+    assert!(gui.shows_text(&trf(
+        "nav.diff_of",
+        &[("n", "2".into()), ("total", "2".into())]
+    )));
+
+    // The buttons are reachable with Tab and run with the space bar.
+    let next = gui.tab_to(&format!("the {} button", tr("cmd.next_diff")), |w| {
+        w.role == accesskit::Role::Button && named(w, tr("cmd.next_diff"))
+    });
+    assert!(next.enabled, "{:?} is disabled", next.label);
+    gui.key(Modifiers::NONE, Key::Space);
+    gui.frames(3);
+    assert!(
+        gui.shows_text(&trf(
+            "nav.file_of",
+            &[("n", "2".into()), ("total", "2".into())]
+        )),
+        "the space bar did not step on to the next file"
+    );
+    let previous = gui.tab_to(&format!("the {} button", tr("cmd.prev_diff")), |w| {
+        w.role == accesskit::Role::Button && named(w, tr("cmd.prev_diff"))
+    });
+    assert!(previous.enabled);
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.frames(3);
+    assert!(
+        gui.shows_text(&trf(
+            "nav.file_of",
+            &[("n", "1".into()), ("total", "2".into())]
+        )),
+        "Enter did not step back"
+    );
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
 }
 
 /// Notes controls of `view` that reach past the window's edges or lie over one another.

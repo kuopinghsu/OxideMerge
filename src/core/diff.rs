@@ -36,6 +36,15 @@ pub struct DiffOptions {
     /// Runtime-only converters from trusted application settings; never loaded from reviews.
     #[serde(skip)]
     pub unpackers: Vec<super::unpacker::Unpacker>,
+    /// Whether documents, spreadsheets and ELF files OxideMerge can read itself are compared
+    /// as the text it reads from them rather than as the bytes or the archive they are. A
+    /// converter configured above is used in preference to this.
+    ///
+    /// Left out when it is on, which is how it comes: these options are part of the
+    /// fingerprint that says whether a saved review still describes the same comparison, and
+    /// writing a setting nobody changed would make every review saved before it look stale.
+    #[serde(skip_serializing_if = "is_on")]
+    pub extract_documents: bool,
     pub whitespace: WhitespaceMode,
     pub ignore_case: bool,
     pub ignore_blank_lines: bool,
@@ -62,10 +71,15 @@ pub struct DiffOptions {
     pub block_filters: Vec<(String, String)>,
 }
 
+fn is_on(value: &bool) -> bool {
+    *value
+}
+
 impl Default for DiffOptions {
     fn default() -> Self {
         DiffOptions {
             unpackers: Vec::new(),
+            extract_documents: true,
             whitespace: WhitespaceMode::Compare,
             ignore_case: false,
             ignore_blank_lines: false,

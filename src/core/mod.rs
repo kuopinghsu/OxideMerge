@@ -6,6 +6,7 @@ pub mod cdp;
 pub mod comments;
 pub mod conflict;
 pub mod diff;
+pub mod extract;
 pub mod filter;
 pub mod folder;
 pub mod folder_merge;

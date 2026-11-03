@@ -852,7 +852,7 @@ fn compare_files_with_cancel(
     if fopts.method == CompareMethod::FullContents
         && paths
             .iter()
-            .any(|p| super::unpacker::find(&dopts.unpackers, p).is_some())
+            .any(|p| super::unpacker::find(dopts, p).is_some())
     {
         let docs = paths
             .iter()
