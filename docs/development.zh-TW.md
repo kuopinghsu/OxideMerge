@@ -160,6 +160,11 @@ OXIDEMERGE_TEST_CASES=20000 cargo test --release regress
 Linux 沒有顯示環境時，會自動啟動 Xvfb。設定 `OXIDEMERGE_SMOKE_REPORT=<file>` 後，
 程式會在比較完成時，將分頁與訊息寫入該檔案，然後關閉。
 
+若要製作文件圖片，設定 `OXIDEMERGE_SCREENSHOT=<file.png>` 後，程式會在比較完成時，
+直接儲存它所繪製的視窗畫面（不需擷取螢幕），然後關閉。將 `OXIDEMERGE_SCREENSHOT_COMMAND`
+設為命令的標籤鍵（例如 `cmd.sync_folders`），會先執行該命令。搭配 `OXIDEMERGE_CONFIG_DIR`
+與設定 `language` 的 `config.json`，即可擷取其他語言的畫面。
+
 ### 效能測試
 
 效能測試不包含在 `cargo test` 中。指令、量測方法與參考結果，請參閱[效能測試說明](benchmarks.md)（英文）。

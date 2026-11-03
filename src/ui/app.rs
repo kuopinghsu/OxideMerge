@@ -1280,6 +1280,19 @@ pub struct OxideMergeApp {
     /// `OXIDEMERGE_SMOKE_REPORT`: where to write what the window shows once its compares are
     /// done, then close; and the frames drawn so far.
     smoke: Option<(PathBuf, u32)>,
+    /// `OXIDEMERGE_SCREENSHOT`: where to save a picture of the window once its compares are done,
+    /// then close; with the command named by `OXIDEMERGE_SCREENSHOT_COMMAND` (its label key, such
+    /// as `cmd.sync_folders`) run first; and the frames drawn so far.
+    screenshot: Option<Screenshot>,
+}
+
+/// A picture of the window asked for by `OXIDEMERGE_SCREENSHOT`.
+struct Screenshot {
+    path: PathBuf,
+    command: Option<Cmd>,
+    frames: u32,
+    /// Set once the picture is asked for; true when it has been saved.
+    taken: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 fn kind_name(k: FileKind) -> &'static str {
@@ -2006,6 +2019,20 @@ impl OxideMergeApp {
             smoke: std::env::var_os("OXIDEMERGE_SMOKE_REPORT")
                 .filter(|p| !p.is_empty())
                 .map(|p| (PathBuf::from(p), 0)),
+            screenshot: std::env::var_os("OXIDEMERGE_SCREENSHOT")
+                .filter(|p| !p.is_empty())
+                .map(|p| Screenshot {
+                    path: PathBuf::from(p),
+                    command: std::env::var("OXIDEMERGE_SCREENSHOT_COMMAND").ok().and_then(|k| {
+                        let cmd = commands::PALETTE.iter().find(|c| c.label() == k);
+                        if cmd.is_none() {
+                            eprintln!("OXIDEMERGE_SCREENSHOT_COMMAND={k}: no such command");
+                        }
+                        cmd.copied()
+                    }),
+                    frames: 0,
+                    taken: None,
+                }),
         };
         app.text_layout = (app.cfg.collapse_unchanged, app.cfg.word_wrap);
         crate::core::fsutil::set_backup(app.cfg.backup_on_save);
@@ -7068,6 +7095,7 @@ impl eframe::App for OxideMergeApp {
             }
         }
         self.smoke_report(ctx);
+        self.take_screenshot(ctx);
     }
 }
 
@@ -7075,15 +7103,12 @@ impl OxideMergeApp {
     /// For automated checks of a real window: after a few frames, and once compares are done
     /// (or after about a minute), writes what the window shows and closes it.
     fn smoke_report(&mut self, ctx: &egui::Context) {
+        let busy = self.busy();
         let Some((path, frames)) = &mut self.smoke else {
             return;
         };
         *frames += 1;
         ctx.request_repaint();
-        let busy = self
-            .tabs
-            .iter()
-            .any(|t| matches!(t.content.outcome(), Some(Outcome::Busy)));
         let frames = *frames;
         if frames < 10 || (busy && frames < 3600) {
             return;
@@ -7110,6 +7135,56 @@ impl OxideMergeApp {
         // An automated check never waits for an answer about unsaved files.
         self.allow_close = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn busy(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|t| matches!(t.content.outcome(), Some(Outcome::Busy)))
+    }
+
+    /// For documentation pictures: once compares are done (or after about a minute), runs the
+    /// asked-for command, lets the window settle, saves a picture of it and closes it.
+    fn take_screenshot(&mut self, ctx: &egui::Context) {
+        let busy = self.busy();
+        let Some(shot) = &mut self.screenshot else {
+            return;
+        };
+        shot.frames += 1;
+        ctx.request_repaint();
+        if let Some(saved) = &shot.taken {
+            if saved.load(std::sync::atomic::Ordering::Acquire) || shot.frames > 600 {
+                self.screenshot = None;
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
+        if shot.frames < 10 || (busy && shot.frames < 3600) {
+            return;
+        }
+        if let Some(cmd) = shot.command.take() {
+            // Counted again from here, so what the command opens is drawn and done first.
+            shot.frames = 0;
+            self.run(cmd, ctx);
+            return;
+        }
+        let saved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        shot.taken = Some(saved.clone());
+        let path = shot.path.clone();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(
+            move |img| {
+                let [w, h] = img.size;
+                let rgba: Vec<u8> = img.pixels.iter().flat_map(|p| p.to_array()).collect();
+                let result = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+                    .map(|i| i.save(&path).map_err(|e| e.to_string()))
+                    .unwrap_or_else(|| Err("bad image size".into()));
+                if let Err(e) = result {
+                    eprintln!("{}: {e}", path.display());
+                }
+                saved.store(true, std::sync::atomic::Ordering::Release);
+            },
+        )));
     }
 }
 
