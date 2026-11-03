@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Book catalog, summer edition -->
+<c:catalog xmlns:c="urn:example:catalog" version="3">
+  <c:book id="b100" lang="en">
+    <c:title>Tree Algorithms</c:title>
+    <c:price currency="EUR">35.00</c:price>
+  </c:book>
+  <c:book id="b103" lang="de">
+    <c:title>Datenstrukturen</c:title>
+    <c:price currency="EUR">42.00</c:price>
+  </c:book>
+  <c:book lang="en" id="b101">
+    <c:title>Practical Rust</c:title>
+    <c:price currency="EUR">39.00</c:price>
+  </c:book>
+  <c:book id="b102" lang="en">
+    <c:title>XML in Depth, 2nd edition</c:title>
+    <c:price currency="EUR">29.00</c:price>
+  </c:book>
+  <c:note>Prices include <em>VAT</em> where applicable.</c:note>
+</c:catalog>

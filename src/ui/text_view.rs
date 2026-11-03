@@ -934,6 +934,12 @@ pub struct TextView {
     semantic_message: Option<String>,
     /// The array matching key of the semantic view; empty compares arrays by position.
     semantic_array_key: String,
+    /// The Tree view of two XML files, which takes the place of the text panes.
+    tree_mode: bool,
+    /// Whether the Tree view was shown last frame, so difference commands step through it.
+    tree_active: bool,
+    /// The comparison and state of the Tree view.
+    pub tree: Box<super::xml_tree_view::TreeSession>,
     merge_validation_generation: Option<u64>,
     merge_freshness: Option<(u64, bool)>,
     merge_preview_job: Option<(
@@ -1049,6 +1055,9 @@ impl TextView {
             semantic_state_filter: None,
             semantic_message: None,
             semantic_array_key: String::new(),
+            tree_mode: false,
+            tree_active: false,
+            tree: Default::default(),
             merge_validation_generation: None,
             merge_freshness: None,
             merge_preview_job: None,
@@ -1701,7 +1710,26 @@ impl TextView {
         self.scroll_to = Some(row);
     }
 
+    /// Runs `step` on the Tree view and its comparison while the Tree view is shown.
+    fn tree_step<R>(
+        &mut self,
+        step: impl FnOnce(
+            &mut super::xml_tree_view::XmlTreeView,
+            &crate::core::semantic::xml_tree::TreeDiff,
+        ) -> R,
+    ) -> Option<R> {
+        match &self.tree.cache {
+            Some((_, _, Ok(result))) if self.tree_active => {
+                Some(step(&mut self.tree.view, &result.diff))
+            }
+            _ => None,
+        }
+    }
+
     pub fn first_diff(&mut self) {
+        if self.tree_step(|view, diff| view.edge(diff, true)).is_some() {
+            return;
+        }
         if let Some(rows) = self.keyed_differences() {
             if let Some(&r) = rows.first() {
                 self.select_keyed_row(r);
@@ -1729,6 +1757,12 @@ impl TextView {
     }
 
     pub fn last_diff(&mut self) {
+        if self
+            .tree_step(|view, diff| view.edge(diff, false))
+            .is_some()
+        {
+            return;
+        }
         if let Some(rows) = self.keyed_differences() {
             if let Some(&r) = rows.last() {
                 self.select_keyed_row(r);
@@ -1813,6 +1847,9 @@ impl TextView {
 
     /// Selects the next difference; false when there is none after the cursor.
     pub fn next_diff(&mut self, conflicts_only: bool) -> bool {
+        if let Some(found) = self.tree_step(|view, diff| !conflicts_only && view.step(diff, true)) {
+            return found;
+        }
         if self.matching() {
             return false;
         }
@@ -1832,6 +1869,10 @@ impl TextView {
 
     /// Selects the previous difference; false when there is none before the cursor.
     pub fn prev_diff(&mut self, conflicts_only: bool) -> bool {
+        if let Some(found) = self.tree_step(|view, diff| !conflicts_only && view.step(diff, false))
+        {
+            return found;
+        }
         if self.matching() {
             return false;
         }
@@ -6380,6 +6421,7 @@ impl TextView {
     /// Returns true when the semantic view took the place of the text panes.
     fn analysis_ui(&mut self, ui: &mut Ui) -> bool {
         use crate::core::{analysis, semantic};
+        self.tree_active = false;
         if !matches!(self.n(), 2 | 3) {
             return false;
         }
@@ -6408,10 +6450,34 @@ impl TextView {
         let Some(format) = format else {
             return false;
         };
+        let tree = format == semantic::Format::Xml && self.n() == 2;
+        self.tree_mode &= tree;
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.semantic_mode, false, tr("analysis.text"));
-            ui.selectable_value(&mut self.semantic_mode, true, tr("analysis.semantic"));
+            let mut mode = if self.tree_mode {
+                2
+            } else {
+                self.semantic_mode as u8
+            };
+            ui.selectable_value(&mut mode, 0, tr("analysis.text"));
+            ui.selectable_value(&mut mode, 1, tr("analysis.semantic"));
+            if tree {
+                ui.selectable_value(&mut mode, 2, tr("analysis.tree"))
+                    .on_hover_text(tr("analysis.tree_tip"));
+            }
+            if mode == 2 && !self.tree_mode {
+                // the Tree view opens where the text cursor is
+                self.tree.cursor = self.cursor_row.and_then(|row| {
+                    let line = self.diff.rows.get(row)?.line(self.active_pane.min(1))?;
+                    Some((self.active_pane.min(1), line + 1))
+                });
+            }
+            self.semantic_mode = mode == 1;
+            self.tree_mode = mode == 2;
         });
+        if self.tree_mode {
+            self.tree_ui(ui);
+            return true;
+        }
         if !self.semantic_mode {
             return false;
         }
@@ -6544,18 +6610,7 @@ impl TextView {
         self.semantic_cache = Some((generation, report));
         match action {
             Some(SemanticAction::Jump(side, line)) => {
-                self.active_pane = side;
-                self.cursor_row = self
-                    .diff
-                    .rows
-                    .iter()
-                    .position(|r| r.line(side) == Some(line));
-                self.scroll_to = self.cursor_row;
-                self.sel_anchor = None;
-                self.cur_block = self
-                    .cursor_row
-                    .and_then(|row| self.diff.rows[row].block())
-                    .filter(|&b| !self.diff.blocks[b].ignored);
+                self.show_line(side, line);
                 self.semantic_mode = false;
             }
             Some(SemanticAction::Copy(change, from)) => {
@@ -6576,6 +6631,117 @@ impl TextView {
             Some(SemanticAction::Take(..)) | None => {}
         }
         true
+    }
+
+    /// Moves the cursor of the text panes to 0-based `line` of pane `side`.
+    fn show_line(&mut self, side: usize, line: usize) {
+        self.active_pane = side;
+        self.cursor_row = self
+            .diff
+            .rows
+            .iter()
+            .position(|r| r.line(side) == Some(line));
+        self.scroll_to = self.cursor_row;
+        self.sel_anchor = None;
+        self.cur_block = self
+            .cursor_row
+            .and_then(|row| self.diff.rows[row].block())
+            .filter(|&b| !self.diff.blocks[b].ignored);
+    }
+
+    /// The Tree view of two XML files, made in the background and kept until the files or the
+    /// key rules change.
+    fn tree_ui(&mut self, ui: &mut Ui) {
+        use super::xml_tree_view::{TreeAction, TreeResult};
+        use crate::core::semantic::xml_tree::{TreeDiff, TreeOptions};
+        self.tree_active = true;
+        ui.small(tr("analysis.tree_policy"));
+        let keys = self.tree.view.applied_keys.trim().to_owned();
+        let options = TreeOptions::parse(&keys);
+        let want = (self.layout_gen, keys.clone());
+        let made =
+            |entry: Option<(u64, &String)>| entry.is_some_and(|(g, k)| (g, k.clone()) == want);
+        if let Ok(options) = &options {
+            if !made(self.tree.cache.as_ref().map(|c| (c.0, &c.1)))
+                && !made(self.tree.job.as_ref().map(|j| (j.0, &j.1)))
+            {
+                let docs = [self.panes[0].doc.text(), self.panes[1].doc.text()];
+                let options = options.clone();
+                self.tree.job = Some((
+                    self.layout_gen,
+                    keys.clone(),
+                    super::analysis::Task::start(move |cancel, _| {
+                        let [a, b] = docs;
+                        let diff = TreeDiff::compare(&a, &b, &options, cancel)?;
+                        Ok(TreeResult {
+                            diff,
+                            sources: [a, b],
+                        })
+                    }),
+                ));
+            }
+        }
+        if let Some((generation, keys, task)) = &mut self.tree.job {
+            if let Some(result) = task.poll() {
+                self.tree.cache = Some((
+                    *generation,
+                    std::mem::take(keys),
+                    result.map(Box::new).map_err(|e| format!("{e:#}")),
+                ));
+                self.tree.job = None;
+            }
+        }
+        if let Err(e) = &options {
+            ui.colored_label(widgets::pal(ui).danger, e.to_string());
+        }
+        if let Some((_, _, task)) = &self.tree.job {
+            task.status(ui);
+            // the last comparison stays shown, so typing a key rule goes on
+            if !matches!(self.tree.cache, Some((_, _, Ok(_)))) {
+                ui.horizontal(|ui| self.tree.view.keys_ui(ui));
+                return;
+            }
+        }
+        let Some((generation, keys, result)) = self.tree.cache.take() else {
+            return;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                ui.colored_label(widgets::pal(ui).danger, &error);
+                let mut retry = false;
+                ui.horizontal(|ui| {
+                    if ui.button(tr("analysis.text_fallback")).clicked() {
+                        self.tree_mode = false;
+                    }
+                    retry = ui.button(tr("analysis.tree_retry")).clicked();
+                });
+                if !retry {
+                    self.tree.cache = Some((generation, keys, Err(error)));
+                }
+                return;
+            }
+        };
+        if let Some((side, line)) = self.tree.cursor.take() {
+            self.tree.view.attach(&result.diff);
+            if let Some(row) = result.diff.row_at_line(side, line) {
+                self.tree.view.select(&result.diff, row);
+            }
+        }
+        let titles = [self.panes[0].doc.title(), self.panes[1].doc.title()];
+        let action = self
+            .tree
+            .view
+            .ui(ui, &result, [titles[0].as_str(), titles[1].as_str()]);
+        self.tree.cache = Some((generation, keys, Ok(result)));
+        match action {
+            Some(TreeAction::Jump(side, line)) => {
+                self.show_line(side, line.saturating_sub(1));
+                self.tree_mode = false;
+                self.tree_active = false;
+            }
+            None => {}
+        }
     }
 
     /// Puts the text a semantic copy made into pane `to`, or says why there is none.

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Book catalog, spring edition -->
+<cat:catalog xmlns:cat="urn:example:catalog" version="3">
+  <cat:book id="b101" lang="en">
+    <cat:title>Practical Rust</cat:title>
+    <cat:price currency="EUR">39.00</cat:price>
+  </cat:book>
+  <cat:book id="b102" lang="en">
+    <cat:title>XML in Depth</cat:title>
+    <cat:price currency="EUR">29.00</cat:price>
+  </cat:book>
+  <cat:book id="b103" lang="de">
+    <cat:title>Datenstrukturen</cat:title>
+    <cat:price currency="EUR">45.00</cat:price>
+  </cat:book>
+  <cat:note>Prices include <em>VAT</em> where applicable.</cat:note>
+</cat:catalog>

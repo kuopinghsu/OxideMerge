@@ -11,6 +11,7 @@ pub mod three_way;
 pub mod toml_doc;
 pub mod write;
 pub mod xml;
+pub mod xml_tree;
 pub mod yaml_doc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -545,7 +546,7 @@ fn increasing_lengths(seq: &[usize]) -> Vec<usize> {
 }
 /// The indexes of `seq`, of distinct values, in at least one longest strictly increasing
 /// subsequence.
-fn in_some_increasing(seq: &[usize]) -> std::collections::BTreeSet<usize> {
+pub(crate) fn in_some_increasing(seq: &[usize]) -> std::collections::BTreeSet<usize> {
     let ending = increasing_lengths(seq);
     let reversed: Vec<usize> = seq.iter().rev().map(|&v| usize::MAX - v).collect();
     let starting: Vec<usize> = increasing_lengths(&reversed).into_iter().rev().collect();
@@ -555,7 +556,7 @@ fn in_some_increasing(seq: &[usize]) -> std::collections::BTreeSet<usize> {
         .collect()
 }
 /// The indexes of `seq` in one longest strictly increasing subsequence.
-fn increasing(seq: &[usize]) -> std::collections::BTreeSet<usize> {
+pub(crate) fn increasing(seq: &[usize]) -> std::collections::BTreeSet<usize> {
     let mut tails: Vec<usize> = Vec::new();
     let mut prev = vec![usize::MAX; seq.len()];
     for (i, &value) in seq.iter().enumerate() {

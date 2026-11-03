@@ -1884,7 +1884,8 @@ Choose the format (*Normal*, *Context* or *Unified*) and the number of context l
 OxideMerge has optional tools that help you check merges and review larger changes:
 
 * <<merge-verification>> previews a merge and checks a saved result.
-* <<semantic>> compares JSON, XML, TOML and YAML files by their structure.
+* <<semantic>> compares JSON, XML, TOML and YAML files by their structure, and
+  <<xml-tree>> shows two XML files as one aligned tree.
 * <<review-workspace>> records review decisions for each file and difference.
 * <<baselines>> summarizes the changes between two releases.
 * <<impact>> lists the places where changed files may be used.
@@ -2028,6 +2029,86 @@ when the source side does not have it.
   expected structure, nothing changes and the view says why. Edit such a value in the text view.
 * Moves are not copied, because a move changes the order of the whole array.
 * A copy is one step of *Undo*. The file is written only when you save it.
+
+[[xml-tree]]
+==== XML tree view
+
+For two XML files, *Tree* shows both documents as one aligned tree. An element and its
+counterpart share a row: the left file on the left, the right file on the right, so both sides
+scroll together. A node that exists on one side only has an empty placeholder row on the other
+side. The view only reads the files.
+
+image::xml-tree.png[XML tree view]
+
+The column between the sides tells what each row is, also without color: `+` added, `−`
+removed, `~` modified, `↕` moved, `•` changes below, and `?` ambiguous. Elements show their
+name as written and their `id`, `name`, `key` and `ref` attributes and any changed attributes as
+short labels. Expand an element to see its attributes, text, comments and processing
+instructions. A folded element with changes inside shows how many, such as *3 changes*.
+
+Rows are paired sibling by sibling below paired parents, so a node is never shown under another
+parent:
+
+. by a key rule you give (see below);
+. as identical content, keeping the order;
+. as identical content out of order, when that content occurs once on each side: a *Moved* row;
+. by kind and name between the rows paired so far.
+
+Inserting an element is one addition: the elements after it stay paired with their counterparts.
+Because the Semantic view compares by position, it can list more changes for the same files.
+What counts as a change is the same as in the Semantic view: attribute order and namespace
+prefixes do not count, CDATA is text, and child order, whitespace in text and comments count.
+Rows of whitespace-only text that did not change are left out, and whitespace added or removed
+next to an added or removed element, such as its indentation, is part of that element.
+
+*Moving between changes*:: The previous and next difference commands (`Alt+↑` and `Alt+↓`,
+`Alt+Home` and `Alt+End`) and the buttons above the tree go through the changes in tree order.
+A change inside a folded element is not skipped: its parents unfold. *Change 3 / 12* shows where
+you are. The filters show and visit only added, removed, modified, moved or ambiguous changes,
+and the change counts on folded rows follow the filter. Click a row to select it; the arrow keys
+then move up and down and fold and unfold.
+
+*Folding*:: *Expand changes* (also the starting state) unfolds every element with changes inside.
+*Collapse unchanged* folds the rest, *Expand to level* unfolds to a depth, and *Reset expansion*
+returns to the start.
+
+*Details and source*:: Below the tree, the selected row shows its path on each side (such as
+`/catalog/book[2]/@id`), how it was paired, its line and column, its value and the lines of the
+file where it is written, as they are in the file. *Show source* opens the Text view at that line.
+Choosing *Tree* while the text cursor is in an XML node selects that node.
+
+*Search*:: Type a name or value to show the matching rows with their parents. Text starting with
+`/` is a small XPath subset: `/` and `//` steps of element names or `*`, `@name`, `text()` and
+`comment()`, with `[@a]`, `[@a='value']` and `[n]` conditions, such as `//book[@id='b102']/title`.
+Other XPath is refused with a message.
+
+*Key rules*:: Repeated elements are paired by position unless you give a rule: `book@id` pairs
+`book` elements by their `id` attribute, `book@id+lang` by two attributes, and `catalog/book@id`
+only below `catalog`. Separate several rules with `;`; they apply once you stop typing. A rule matches local names,
+but never pairs elements of different namespaces. Books that swapped places are then shown as
+a move plus the content that changed, not as two replacements. A rule is used for a group of
+siblings only when every element it covers on both sides has a complete and unique key. Otherwise
+a warning gives the number of duplicate and missing keys, and those elements are paired as
+without the rule and marked ambiguous. Key rules belong to this view: they do not change the
+Semantic view or `--semantic` reports.
+
+*Collections*:: When the selected element holds repeated elements, *View as collection* lists
+them as a table: one row each, with a column per attribute, per child element that holds only
+text and per attribute of such a child (and one for the text when they hold only text), the value
+on each side, and the status. Choose the columns and filter by status; click a row to select it
+in the tree. Elements that hold deeper elements or mixed content are flagged, as the table does
+not show those.
++
+image::xml-collection.png[XML collection table]
+
+Ambiguous rows:: A row is marked ambiguous when another pairing fits as well: several siblings of
+the same name on one side with fewer on the other, a key rule that could not be used, an
+addition next to an identical sibling, or a swap where either element could be the one that
+moved. Check these yourself.
+
+The Tree view is built in the background with progress and *Cancel*, within the same limits as
+the Semantic view (100,000 nodes and 64 levels). It is available for two files; three-way XML
+comparisons use the Semantic view.
 
 ==== Three files
 

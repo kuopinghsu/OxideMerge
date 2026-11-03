@@ -85,6 +85,17 @@ preview lists a folder to create, a replaced `README.txt`, a copied `new.txt` an
 **Rename** too. **Update right from left** keeps `obsolete.txt` and `q3-report.txt`. Nothing
 changes until you choose **Apply changes**, and **Stop** undoes what was done.
 
+## XML tree compare: `xml`
+
+    cargo run -- samples/xml/catalog-left.xml samples/xml/catalog-right.xml
+
+Choose **Tree**. The right catalog writes its namespace with another prefix (`c:` for `cat:`) and an
+attribute of `b101` in another order, which do not count; it adds `b100` at the top, moves `b103`
+up, changes its price and changes the title of `b102`. Without a key rule the reordered books pair
+by name in order; type `book@id` in **Key rules** to pair them by `id`: one addition, one move and
+two edits remain. Search `//book[@id='b102']/title`, or select the catalog and choose **View as
+collection** to see the books as a table.
+
 ## Web page compare: `web`
 
 See [web/README.md](web/README.md): a release notes page in three versions, and pairs of pages

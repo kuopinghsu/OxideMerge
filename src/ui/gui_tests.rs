@@ -2428,6 +2428,107 @@ fn semantic_view_jumps_back_to_source_without_writing() {
 }
 
 #[test]
+fn xml_tree_view_aligns_rows_navigates_and_shows_source_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = "<catalog>\n  <book id=\"1\">\n    <title>Rust</title>\n  </book>\n  <book id=\"2\" year=\"2020\"/>\n</catalog>\n";
+    let b = "<catalog>\n  <book id=\"0\"/>\n  <book id=\"1\">\n    <title>Rust</title>\n  </book>\n  <book id=\"2\" year=\"2021\"/>\n</catalog>\n";
+    write(dir.path(), &[("a.xml", a), ("b.xml", b)]);
+    let mut gui = Gui::start(
+        "xml_tree_view",
+        compare(&[dir.path().join("a.xml"), dir.path().join("b.xml")]),
+    );
+    gui.click(tr("analysis.tree"));
+    let summary = trf(
+        "analysis.tree_summary",
+        &[
+            ("added", "1".into()),
+            ("removed", "0".into()),
+            ("modified", "1".into()),
+            ("moved", "0".into()),
+            ("ambiguous", "0".into()),
+        ],
+    );
+    gui.wait_until("tree summary", |gui| gui.shows(&summary));
+    assert!(gui.shows(tr("analysis.tree_policy")));
+    // the inserted book is one row with a placeholder on the left
+    assert!(gui.shows_text(&format!(
+        "{}: {} | <book>",
+        tr("analysis.added"),
+        tr("analysis.tree_missing")
+    )));
+    gui.key(Modifiers::ALT, Key::End);
+    assert!(gui.text_view().tree.view.selected.is_some());
+    assert!(gui.shows(&trf(
+        "analysis.tree_position",
+        &[("n", "2".into()), ("total", "2".into())]
+    )));
+    assert!(gui.shows_text("@year = \"2021\""));
+    gui.key(Modifiers::ALT, Key::ArrowUp);
+    assert!(gui.shows(&trf(
+        "analysis.tree_position",
+        &[("n", "1".into()), ("total", "2".into())]
+    )));
+    gui.key(Modifiers::ALT, Key::End);
+    gui.click(&format!("{} 2:6", tr("analysis.source")));
+    assert_eq!(gui.text_view().active_pane, 1);
+    assert!(!gui.shows(tr("analysis.tree_policy")));
+    assert_eq!(read(&dir.path().join("a.xml")), a);
+    assert_eq!(read(&dir.path().join("b.xml")), b);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn xml_tree_key_rules_pair_reordered_elements_and_warn_about_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[
+            (
+                "a.xml",
+                "<lib><book id='1'>A</book><book id='2'>B</book></lib>",
+            ),
+            (
+                "b.xml",
+                "<lib><book id='2'>B</book><book id='1'>A2</book></lib>",
+            ),
+            (
+                "c.xml",
+                "<lib><book id='1'>A</book><book id='1'>B</book></lib>",
+            ),
+        ],
+    );
+    let mut gui = Gui::start(
+        "xml_tree_keys",
+        compare(&[dir.path().join("a.xml"), dir.path().join("b.xml")]),
+    );
+    gui.click(tr("analysis.tree"));
+    gui.wait_until("tree", |gui| gui.shows(tr("analysis.tree_keys")));
+    gui.click(tr("analysis.tree_keys"));
+    gui.type_text("book@id");
+    let keyed = trf("analysis.tree_keyed", &[("n", "2".into())]);
+    gui.wait_until("keyed pairing", |gui| gui.shows(&keyed));
+    assert!(gui.shows_text(tr("analysis.moved")));
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let mut gui = Gui::start(
+        "xml_tree_duplicates",
+        compare(&[dir.path().join("a.xml"), dir.path().join("c.xml")]),
+    );
+    gui.click(tr("analysis.tree"));
+    gui.wait_until("tree", |gui| gui.shows(tr("analysis.tree_keys")));
+    gui.click(tr("analysis.tree_keys"));
+    gui.type_text("book@id");
+    let warning = trf(
+        "analysis.tree_key_warning",
+        &[
+            ("rule", "book@id".into()),
+            ("duplicates", "2".into()),
+            ("missing", "0".into()),
+        ],
+    );
+    gui.wait_until("duplicate key warning", |gui| gui.shows(&warning));
+}
+
+#[test]
 fn semantic_tree_groups_paths_and_an_array_key_pairs_moved_elements() {
     let dir = tempfile::tempdir().unwrap();
     write(
