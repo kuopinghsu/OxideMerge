@@ -174,6 +174,12 @@ comparisons. On Linux without a display, it starts Xvfb. If you set
 `OXIDEMERGE_SMOKE_REPORT=<file>`, the program writes its tabs and messages to that file after
 the comparison, and then closes.
 
+For documentation pictures, `OXIDEMERGE_SCREENSHOT=<file.png>` saves the window as the program
+draws it, without a screen grab, once the comparison is done, and then closes. Set
+`OXIDEMERGE_SCREENSHOT_COMMAND` to a command's label key, such as `cmd.sync_folders`, to run it
+first. Use `OXIDEMERGE_CONFIG_DIR` with a `config.json` that sets `language` to take a picture in
+another language.
+
 ### Benchmarks
 
 Benchmarks are not part of `cargo test`. For the commands, the method and the reference

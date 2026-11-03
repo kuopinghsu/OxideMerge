@@ -1081,6 +1081,8 @@ In a two-way folder comparison, *Synchronize folders...* (on the toolbar and in 
 makes one folder, the _destination_, match the other, the _source_. You see the plan first.
 Nothing changes until you apply it.
 
+image::sync.png[Synchronize folders preview]
+
 ==== Modes
 
 *Mirror left → right*, *Mirror right → left*::
