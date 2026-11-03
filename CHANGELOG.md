@@ -7,6 +7,17 @@ section of this file as the release notes.
 
 ### Added
 
+- **XML tree view:** *Tree*, beside *Text* and *Semantic* for two XML files, shows both documents as
+  one aligned tree: matching nodes share a row, a node on one side only has a placeholder, and
+  `+ − ~ ↕ ?` mark added, removed, modified, moved and ambiguous rows. Inserting a sibling is one
+  addition rather than a change at every later position. Next/previous difference visits each
+  change once in tree order and unfolds collapsed parents; folded rows count the changes inside
+  them under the current filter. The details pane shows each side's path, pairing, line and column
+  and the source lines as written, and *Show source* opens the Text view there. Key rules
+  (`book@id`, `book@id+lang`, `catalog/book@id`) pair repeated elements and report reorders as
+  moves; duplicate or missing keys warn and fall back conservatively. Search by name or value or
+  with an XPath subset, and *View as collection* tables repeated elements. Read-only, built in the
+  background with *Cancel*, within the semantic parser's limits. Sample: `samples/xml`.
 - **Italian** interface language (`--lang it`, or *Italiano* in *Options → General*).
 - A toolbar button in folder compares, and `Alt+P`, show or hide the *File compare below the folder
   list*.

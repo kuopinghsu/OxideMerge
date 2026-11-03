@@ -51,6 +51,13 @@ so CI reports the numbers without failing on them.
 - **table-cancel-1m**: two such tables of 1,000,000 records matched by key on another thread,
   stopped once half the records are read, as *Cancel* does. The result says how long stopping
   took, freeing what was built so far included.
+- **xml-tree-12k**: two XML catalogs of 12,000 `<item>` elements (about 84,000 parser nodes, near
+  the 100,000-node limit), 1% of the items changed and 0.5% inserted and removed, parsed and
+  aligned as the XML Tree view does.
+- **xml-tree-12k-keyed**: the same items with the right catalog shuffled, paired by the key rule
+  `item@id`.
+- **xml-semantic-12k**: the files of xml-tree-12k compared by the Semantic view's path-by-path
+  engine, for comparison.
 - **merge3-10mb**: three 10 MB files compared as a 3-way compare, then merged automatically.
 - **binary-10mb**, **binary-100mb**, **binary-1gb**: two random files with 100 bytes changed.
 - **image-4k**: two 3840 x 2160 PNG images with 1% of the pixels changed, decoded and compared.
@@ -104,7 +111,16 @@ Added with 0.9.8's table, navigation and synchronization changes (2026-11-02, sa
 | table-cancel-1m | 0.479 s | 748 MB | stopped 22.6 ms after asked, at 1,008,192 of 1,999,985 records |
 | folder-navigation-20k | 0.653 s | 40 MB | 418 files in 79 ms, 0.19 ms a step, first 4 ms; compare 572 ms |
 
-The table rows are from five runs each; the navigation row from three. Before the order of the
+The table rows are from five runs each; the navigation row from three. Added with the XML Tree view (2026-11-03, same machine, three runs each):
+
+| Workload | Time (median) | Peak memory | Result |
+| --- | ---: | ---: | --- |
+| xml-tree-12k | 0.153 s | 116 MB | 72,297 rows; 59 added, 64 removed, 252 modified, 1 moved, 1 ambiguous |
+| xml-tree-12k-keyed | 0.172 s | 120 MB | 72,302 rows; 60 added, 65 removed, 248 modified, 11,718 moved, 96 ambiguous |
+| xml-semantic-12k | 0.131 s | 128 MB | 29,430 changes |
+
+By position, the Semantic view reports 29,430 changes for the same 0.5% insertions; the Tree view
+reports about 380. In the shuffled catalog nearly every item is out of order, so most are moves. Before the order of the
 files stepped through was kept between steps, a step took 2.48 ms (1,035 ms for the 418 files).
 
 ## Findings

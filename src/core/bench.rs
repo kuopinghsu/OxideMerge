@@ -101,6 +101,27 @@ const WORKLOADS: &[Workload] = &[
         run: cancel_table_match,
     },
     Workload {
+        name: "xml-tree-12k",
+        what: "2 XML files of 12,000 elements, 1% changed, 0.5% inserted and removed, aligned as the Tree view does",
+        level: 0,
+        make: |d| xml_pair(d, false),
+        run: |d| xml_tree(d, ""),
+    },
+    Workload {
+        name: "xml-tree-12k-keyed",
+        what: "the elements of xml-tree-12k in another order, paired by the key rule item@id",
+        level: 0,
+        make: |d| xml_pair(d, true),
+        run: |d| xml_tree(d, "item@id"),
+    },
+    Workload {
+        name: "xml-semantic-12k",
+        what: "the files of xml-tree-12k compared path by path, as the Semantic view does",
+        level: 0,
+        make: |d| xml_pair(d, false),
+        run: xml_semantic,
+    },
+    Workload {
         name: "merge3-10mb",
         what: "3 text files of 10 MB, compared and merged",
         level: 0,
@@ -306,6 +327,69 @@ fn table_pair(dir: &Path, n: usize) {
         &dir.join("b.csv"),
         (header.to_string() + &right.concat()).as_bytes(),
     );
+}
+
+/// Two catalogs of 12,000 items, near the semantic parser's 100,000-node limit, written
+/// `a.xml`/`b.xml` in order or `a.xml`/`c.xml` with the right one shuffled.
+fn xml_pair(dir: &Path, shuffled: bool) {
+    let mut rng = Rng(53);
+    let n = 12_000;
+    let item = |id: usize, rng: &mut Rng| {
+        format!(
+            "  <item id=\"{id}\" kind=\"{}\"><name>{}</name></item>\n",
+            WORDS[rng.below(WORDS.len())],
+            rng.below(1_000_000)
+        )
+    };
+    let items: Vec<String> = (0..n).map(|id| item(id, &mut rng)).collect();
+    let mut right = Vec::with_capacity(n);
+    for (id, it) in items.iter().enumerate() {
+        match rng.below(200) {
+            0 => {}
+            1 | 2 => right.push(item(id, &mut rng)),
+            3 => {
+                right.push(item(n + id, &mut rng));
+                right.push(it.clone());
+            }
+            _ => right.push(it.clone()),
+        }
+    }
+    if shuffled {
+        for i in (1..right.len()).rev() {
+            right.swap(i, rng.below(i + 1));
+        }
+    }
+    let doc = |items: &[String]| format!("<catalog>\n{}</catalog>\n", items.concat());
+    write(&dir.join("a.xml"), doc(&items).as_bytes());
+    write(
+        &dir.join(if shuffled { "c.xml" } else { "b.xml" }),
+        doc(&right).as_bytes(),
+    );
+}
+
+fn xml_tree(dir: &Path, keys: &str) -> String {
+    use super::semantic::xml_tree::{TreeDiff, TreeOptions};
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap();
+    let other = if keys.is_empty() { "b.xml" } else { "c.xml" };
+    let options = TreeOptions::parse(keys).unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let d = TreeDiff::compare(&read("a.xml"), &read(other), &options, &cancel).unwrap();
+    let c = d.counts;
+    format!(
+        "{} rows; {} added, {} removed, {} modified, {} moved, {} ambiguous",
+        d.rows.len(),
+        c.added,
+        c.removed,
+        c.modified,
+        c.moved,
+        c.ambiguous
+    )
+}
+
+fn xml_semantic(dir: &Path) -> String {
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap();
+    let r = super::semantic::compare(&read("a.xml"), &read("b.xml"), super::semantic::Format::Xml);
+    format!("{} changes, {} errors", r.changes.len(), r.errors.len())
 }
 
 fn binary_pair(dir: &Path, size: usize) {
