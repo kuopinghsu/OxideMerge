@@ -105,12 +105,15 @@ These tools only read files. They run only when you open them.
   a key that matches array items. Copy a single value to the other side without touching the rest
   of the file, or compare three files and take the left or right value for each conflict. A
   folder option counts files with the same structure as identical.
-- **XML tree view:** **Tree** shows two XML files as one aligned tree, with matching elements on
-  the same row and placeholders where a node exists on one side only. Changes inside folded
-  elements are counted and never skipped by next/previous difference; the selected node's source
-  lines and *Show source* link back to the Text view. Key rules such as `book@id` pair repeated
-  elements, a small XPath subset searches the tree, and *View as collection* lists repeated
-  elements as a table.
+- **Tree view:** **Tree** shows two JSON, YAML, TOML or XML files as one aligned tree, with
+  matching nodes on the same row and placeholders where a node exists on one side only. Object
+  members and attributes share a row whatever their order or style, an inserted array element or
+  XML element is one addition, and a reorder is a move. Changes inside folded nodes are counted and
+  never skipped by next/previous difference; the selected node's source lines and *Show source*
+  link back to the Text view. Arrays of objects are paired by their `id`, `name` or `key` member,
+  and key rules such as `servers@name` or `book@id` pair other repeated entries. Search by
+  `$.server.port` or a small XPath subset, and *View as collection* lists repeated entries as a
+  table.
 - **Review workspace:** in a folder comparison, record a decision for each file and each change.
   Add comments, reasons and tags, and go to the next item that is not reviewed yet. Save the
   review as an `.oxmreview` file to continue on another computer. When the files change, earlier

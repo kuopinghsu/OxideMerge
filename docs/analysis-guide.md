@@ -157,38 +157,57 @@ an envelope separate from existing comparison reports. Standard comparisons rema
   input directory. Report HTML/XML escape all embedded data. JSON/XML/HTML reports are snapshots
   of analysis, not executable instructions or cryptographically authenticated attestations.
 
-## XML Tree view
+## Tree view
 
-The Tree view (*Tree* beside *Text* and *Semantic* for two XML files) is a read-only
-presentation built from the same parser, limits and comparison rules as the semantic XML
-adapter; it never re-serializes or writes either file.
+The Tree view (*Tree* beside *Text* and *Semantic* for two JSON, YAML, TOML or XML files) is a
+read-only presentation built from the same parsers, limits and comparison rules as the semantic
+adapters; it never re-serializes or writes either file. Values therefore compare exactly as in
+the Semantic view: for JSON, YAML and TOML, key order, comments, quoting and flow or block style
+do not count, and YAML and TOML numbers compare by value (`1` equals `1.0`) while JSON keeps
+numeric spellings (`1` and `1.0` differ); for XML, attributes are unordered and child order, text whitespace and comments
+count.
 
 - **Projection.** Each document becomes nodes with per-load ids (not persistent across reloads),
-  kind, expanded name `{uri}local`, the name as written with its prefix, attributes in source
-  order, ordered children, parent, byte span, 1-based line and column. Selections are carried to a
-  new comparison by path (`/catalog/book[2]/@id`); when that path is gone the view says so.
-- **Pairing** runs below paired parents only (no cross-parent moves): (1) explicit key rules
-  `element@attr[+attr]`, matched by local name but pairing only elements of the same expanded
-  name, used for a sibling group only when every covered element on both sides
-  has a complete and unique key — otherwise a warning counts duplicates and missing keys and the
-  covered elements fall back and are marked ambiguous; (2) a longest common subsequence of
-  identical subtrees; (3) identical subtrees occurring once on each side, out of order, as moves;
-  (4) between those anchors, an order-preserving pairing by kind and name, marked ambiguous when
-  the group holds unpaired siblings of the same kind and name. Key-paired elements out of the
-  longest increasing order are moves, ambiguous when they belong to some longest order (a swap).
-  An addition beside an identical paired sibling is ambiguous too.
-- **Counts** are of aligned rows: an added or removed subtree is one change, a changed attribute,
-  text, comment or processing instruction is one, and a move is one. They can be lower than the
-  path-by-path semantic report, which compares by position. Both agree on whether the documents are
-  identical. Unchanged whitespace-only text rows are hidden; changed ones are shown, except whitespace
-  added or removed next to an added or removed element (its indentation), which is part of it.
-- **Search** matches names, attribute values, text and comments, or an XPath subset (`/`, `//`,
-  names, `*`, `@name`, `text()`, `comment()`, `[@a]`, `[@a='v']`, `[n]`, at most 32 steps); other
-  expressions are refused.
-- **Collections** tabulate repeated child elements of the selected row by attribute, by
-  text-only child element (grouped by expanded name, with that child's attributes as
-  `child/@attr` columns) and by text when they hold only text; deeper or mixed content is
-  flagged, not flattened.
+  kind, ordered children, parent, byte span, 1-based line and column. JSON, YAML and TOML give
+  objects, arrays and scalars: members keep the order they are written in (by the start of their
+  value) and their span starts at their key, array elements their index, and a scalar keeps its type (`string`, `number`, `bool`,
+  `null`, `datetime`). XML gives elements with their expanded name `{uri}local`, the name as
+  written with its prefix and attributes in source order, plus text, comments and processing
+  instructions. Paths are JSON-shaped (`$.server.port`, `$.ports[1]`, `$["a b"]`) or XPath-shaped
+  (`/catalog/book[2]/@id`); selections are carried to a new comparison by path, and when that path
+  is gone the view says so.
+- **Pairing** runs below paired parents only (no cross-parent moves). Object members and XML
+  attributes pair by key or expanded name, never as moves, in the order of the second file with
+  those only the first has after their predecessor; two members of different types are paired and
+  reported as a type change. Array elements and XML child nodes are sibling groups, paired by:
+  (1) key rules `name@key[+key]` — for JSON, YAML and TOML, `name` is the key of the array, a path
+  of keys (`spec/ports`) or `*`/`$` (which also cover a top-level array; only `*` covers an array
+  directly inside another, which has no key) and the keys are scalar members of its objects; for XML, `name` is an element's local name or a path ending in it, the
+  keys are attributes, and only elements of the same expanded name pair. A rule is used for a
+  group only when every covered node on both sides has a complete and unique key — otherwise a
+  warning counts duplicates and missing keys and the covered nodes fall back and are marked
+  ambiguous. Without a rule, the objects of an array are paired by the first of `id`, `name` and
+  `key` that every element on both sides holds as a scalar with a unique value, when at least one
+  value is shared; the toolbar counts these by member name. Then (2) a longest common subsequence of identical subtrees; (3) identical
+  subtrees occurring once on each side, out of order, as moves; (4) between those anchors, an
+  order-preserving pairing by kind and name, marked ambiguous when the group holds unpaired
+  siblings of the same kind and name. Key-paired nodes out of the longest increasing order are
+  moves, ambiguous when they belong to some longest order (a swap). An addition beside an
+  identical paired sibling is ambiguous too.
+- **Counts** are of aligned rows: an added or removed subtree is one change, a changed scalar,
+  attribute, text, comment or processing instruction is one, and a move is one. They can be lower
+  than the path-by-path semantic report, which compares by position. Both agree on whether the
+  documents are identical. In XML, unchanged whitespace-only text rows are hidden; changed ones are
+  shown, except whitespace added or removed next to an added or removed element (its indentation),
+  which is part of it.
+- **Search** matches keys, names, values, attribute values, text and comments. For JSON, YAML and
+  TOML a query starting with `$` selects a path and everything below it, by whole steps. For XML a
+  query starting with `/` is an XPath subset (`/`, `//`, names, `*`, `@name`, `text()`,
+  `comment()`, `[@a]`, `[@a='v']`, `[n]`, at most 32 steps); other expressions are refused.
+- **Collections** tabulate the objects of an array by their scalar members, or repeated XML child
+  elements by attribute, by text-only child element (grouped by expanded name, with that child's
+  attributes as `child/@attr` columns) and by text when they hold only text. Nested objects and
+  arrays, and deeper or mixed XML content, are flagged, not flattened.
 - Building runs on a background thread with cancellation; rows are drawn virtualized. Key rules
   apply to this view only and change neither `--semantic` output nor reports.
 

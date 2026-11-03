@@ -2288,10 +2288,19 @@ mod tests {
         std::fs::create_dir_all(empty.join("files")).unwrap();
         std::fs::write(empty.join(JOURNAL_FILE), "").unwrap();
         let old = SystemTime::now() - std::time::Duration::from_secs(3600);
-        std::fs::File::open(&empty)
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
+        #[cfg(not(windows))]
+        let folder = std::fs::File::open(&empty);
+        // Windows opens a folder only with FILE_FLAG_BACKUP_SEMANTICS, and its times only
+        // for writing.
+        #[cfg(windows)]
+        let folder = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(0x0200_0000)
+                .open(&empty)
+        };
+        folder.unwrap().set_modified(old).unwrap();
 
         let pending = unfinished(&f.journal);
         assert_eq!(pending.len(), 1);

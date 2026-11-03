@@ -1885,7 +1885,7 @@ OxideMerge has optional tools that help you check merges and review larger chang
 
 * <<merge-verification>> previews a merge and checks a saved result.
 * <<semantic>> compares JSON, XML, TOML and YAML files by their structure, and
-  <<xml-tree>> shows two XML files as one aligned tree.
+  <<tree>> shows two of them as one aligned tree.
 * <<review-workspace>> records review decisions for each file and difference.
 * <<baselines>> summarizes the changes between two releases.
 * <<impact>> lists the places where changed files may be used.
@@ -2030,84 +2030,107 @@ when the source side does not have it.
 * Moves are not copied, because a move changes the order of the whole array.
 * A copy is one step of *Undo*. The file is written only when you save it.
 
-[[xml-tree]]
-==== XML tree view
+[[tree]]
+==== Tree view
 
-For two XML files, *Tree* shows both documents as one aligned tree. An element and its
-counterpart share a row: the left file on the left, the right file on the right, so both sides
-scroll together. A node that exists on one side only has an empty placeholder row on the other
-side. The view only reads the files.
+For two JSON, YAML, TOML or XML files, *Tree* shows both documents as one aligned tree. A node
+and its counterpart share a row: the left file on the left, the right file on the right, so both
+sides scroll together. A node that exists on one side only has an empty placeholder row on the
+other side. The view only reads the files.
 
-image::xml-tree.png[XML tree view]
+image::xml-tree.png[Tree view]
 
 The column between the sides tells what each row is, also without color: `+` added, `−`
-removed, `~` modified, `↕` moved, `•` changes below, and `?` ambiguous. Elements show their
-name as written and their `id`, `name`, `key` and `ref` attributes and any changed attributes as
-short labels. Expand an element to see its attributes, text, comments and processing
-instructions. A folded element with changes inside shows how many, such as *3 changes*.
+removed, `~` modified, `↕` moved, `•` changes below, and `?` ambiguous. A folded node with
+changes inside shows how many, such as *3 changes*. What a row shows depends on the format:
 
-Rows are paired sibling by sibling below paired parents, so a node is never shown under another
-parent:
+* *JSON, YAML and TOML*: a key and its value, such as `port: 8080`; an object or array with the
+  number of members, such as `env {2}` or `ports [2]`; and an array element by its position, with
+  its `id`, `name` or `key` member, such as `[0] id="report"`.
+* *XML*: elements by their name as written, with their `id`, `name`, `key` and `ref` attributes
+  and any changed attributes as short labels. Expand an element to see its attributes, text,
+  comments and processing instructions.
 
-. by a key rule you give (see below);
+Rows are paired below paired parents, so a node is never shown under another parent:
+
+* Object members, and XML attributes, are paired by their key or name, whatever order they are
+  written in.
+* Array elements and XML child nodes are paired sibling by sibling:
+. by a key rule you give, or for an array of objects that all have an `id`, `name` or `key`
+  member with a different value, by that member (see *Key rules* below);
 . as identical content, keeping the order;
 . as identical content out of order, when that content occurs once on each side: a *Moved* row;
 . by kind and name between the rows paired so far.
 
 Inserting an element is one addition: the elements after it stay paired with their counterparts.
 Because the Semantic view compares by position, it can list more changes for the same files.
-What counts as a change is the same as in the Semantic view: attribute order and namespace
-prefixes do not count, CDATA is text, and child order, whitespace in text and comments count.
-Rows of whitespace-only text that did not change are left out, and whitespace added or removed
-next to an added or removed element, such as its indentation, is part of that element.
+What counts as a change is the same as in the Semantic view:
+
+* *JSON, YAML and TOML*: key order, comments, quoting and block or flow style do not count. In
+  YAML and TOML, how a number is written (`8_080`, `0x1F90`, `1.0`) does not count either; in
+  JSON, `1` and `1.0` differ. A value that changed type, such as a number that became a string,
+  is shown as *Type changed*.
+* *XML*: attribute order and namespace prefixes do not count, CDATA is text, and child order,
+  whitespace in text and comments count. Rows of whitespace-only text that did not change are
+  left out, and whitespace added or removed next to an added or removed element, such as its
+  indentation, is part of that element.
 
 *Moving between changes*:: The previous and next difference commands (`Alt+↑` and `Alt+↓`,
 `Alt+Home` and `Alt+End`) and the buttons above the tree go through the changes in tree order.
-A change inside a folded element is not skipped: its parents unfold. *Change 3 / 12* shows where
+A change inside a folded node is not skipped: its parents unfold. *Change 3 / 12* shows where
 you are. The filters show and visit only added, removed, modified, moved or ambiguous changes,
 and the change counts on folded rows follow the filter. Click a row to select it; the arrow keys
 then move up and down and fold and unfold.
 
-*Folding*:: *Expand changes* (also the starting state) unfolds every element with changes inside.
+*Folding*:: *Expand changes* (also the starting state) unfolds every node with changes inside.
 *Collapse unchanged* folds the rest, *Expand to level* unfolds to a depth, and *Reset expansion*
 returns to the start.
 
 *Details and source*:: Below the tree, the selected row shows its path on each side (such as
-`/catalog/book[2]/@id`), how it was paired, its line and column, its value and the lines of the
-file where it is written, as they are in the file. *Show source* opens the Text view at that line.
-Choosing *Tree* while the text cursor is in an XML node selects that node.
+`$.server.port` or `/catalog/book[2]/@id`), how it was paired, its line and column, its value and
+the lines of the file where it is written, as they are in the file. *Show source* opens the Text
+view at that line. Choosing *Tree* while the text cursor is in a node, including on the line of
+its key, selects that node.
 
-*Search*:: Type a name or value to show the matching rows with their parents. Text starting with
-`/` is a small XPath subset: `/` and `//` steps of element names or `*`, `@name`, `text()` and
-`comment()`, with `[@a]`, `[@a='value']` and `[n]` conditions, such as `//book[@id='b102']/title`.
-Other XPath is refused with a message.
+*Search*:: Type a key, name or value to show the matching rows with their parents. In JSON, YAML
+and TOML, text starting with `$` is a path, such as `$.server.port`, and shows that node and what
+is below it. In XML, text starting with `/` is a small XPath subset: `/` and `//` steps of element
+names or `*`, `@name`, `text()` and `comment()`, with `[@a]`, `[@a='value']` and `[n]`
+conditions, such as `//book[@id='b102']/title`. Other XPath is refused with a message.
 
-*Key rules*:: Repeated elements are paired by position unless you give a rule: `book@id` pairs
-`book` elements by their `id` attribute, `book@id+lang` by two attributes, and `catalog/book@id`
-only below `catalog`. Separate several rules with `;`; they apply once you stop typing. A rule matches local names,
-but never pairs elements of different namespaces. Books that swapped places are then shown as
-a move plus the content that changed, not as two replacements. A rule is used for a group of
-siblings only when every element it covers on both sides has a complete and unique key. Otherwise
-a warning gives the number of duplicate and missing keys, and those elements are paired as
+*Key rules*:: Repeated nodes are paired by position unless they can be told apart. In JSON, YAML
+and TOML, the objects of an array that all have an `id`, `name` or `key` member with a different
+value on each side are paired by it without a rule, and the toolbar says how many were, such as
+*3 objects paired by their id member*. Otherwise, write a rule as `name@key`. In
+JSON, YAML and TOML, `servers@name` pairs the objects of arrays named `servers` by their `name`
+member, `ports@name+protocol` by two members, and `spec/ports@name` only below `spec`; `*@id`
+covers every array, including a file that is a single array and an array directly inside another
+array, which has no name. In XML, `book@id` pairs `book`
+elements by their `id` attribute, `book@id+lang` by two attributes, and `catalog/book@id` only
+below `catalog`; a rule matches local names, but never pairs elements of different namespaces.
+Separate several rules with `;`; they apply once you stop typing. Entries that swapped places are
+then shown as a move plus the content that changed, not as two replacements. A rule is used for a
+group of siblings only when every node it covers on both sides has a complete and unique key.
+Otherwise a warning gives the number of duplicate and missing keys, and those nodes are paired as
 without the rule and marked ambiguous. Key rules belong to this view: they do not change the
 Semantic view or `--semantic` reports.
 
-*Collections*:: When the selected element holds repeated elements, *View as collection* lists
-them as a table: one row each, with a column per attribute, per child element that holds only
-text and per attribute of such a child (and one for the text when they hold only text), the value
-on each side, and the status. Choose the columns and filter by status; click a row to select it
-in the tree. Elements that hold deeper elements or mixed content are flagged, as the table does
-not show those.
+*Collections*:: When the selected row holds an array of objects or repeated XML elements, *View as
+collection* lists them as a table: one row each, with the status and the value on each side in a
+column per member that holds a single value, or per attribute, child element that holds only text
+and attribute of such a child (and one for the text when they hold only text). Choose the columns
+and filter by status; click a row to select it in the tree. Entries that hold deeper objects,
+arrays, elements or mixed content are flagged, as the table does not show those.
 +
-image::xml-collection.png[XML collection table]
+image::xml-collection.png[Collection table]
 
 Ambiguous rows:: A row is marked ambiguous when another pairing fits as well: several siblings of
 the same name on one side with fewer on the other, a key rule that could not be used, an
-addition next to an identical sibling, or a swap where either element could be the one that
-moved. Check these yourself.
+addition next to an identical sibling, or a swap where either node could be the one that moved.
+Check these yourself.
 
 The Tree view is built in the background with progress and *Cancel*, within the same limits as
-the Semantic view (100,000 nodes and 64 levels). It is available for two files; three-way XML
+the Semantic view (100,000 nodes and 64 levels). It is available for two files; three-way
 comparisons use the Semantic view.
 
 ==== Three files

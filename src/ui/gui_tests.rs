@@ -997,7 +997,8 @@ fn folders_are_synchronized_after_a_preview_and_a_confirmation() {
             ("bytes", crate::core::report::fmt_size(Some(6))),
         ],
     );
-    assert!(gui.shows(&summary), "the plan is not summarized");
+    // the preview is shown while the files are still being read
+    gui.wait_until("the plan summary", |g| g.shows(&summary));
     assert!(gui.shows_text("extra.txt"), "the deletion is not listed");
     assert_eq!(
         read(&roots[1].join("a.txt")),
@@ -2474,6 +2475,49 @@ fn xml_tree_view_aligns_rows_navigates_and_shows_source_without_writing() {
     assert!(!gui.shows(tr("analysis.tree_policy")));
     assert_eq!(read(&dir.path().join("a.xml")), a);
     assert_eq!(read(&dir.path().join("b.xml")), b);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn value_tree_view_aligns_json_yaml_and_toml_by_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = "{\"name\":\"w\",\"server\":{\"port\":8080,\"timeout\":30},\"tags\":[\"x\",\"y\"],\"users\":[{\"id\":1},{\"id\":2}]}";
+    let b = "{\n  \"server\": {\"timeout\": 45, \"port\": 8080},\n  \"name\": \"w\",\n  \"tags\": [\"x\", \"y\", \"z\"],\n  \"users\": [{\"id\": 1}, {\"id\": 2}]\n}\n";
+    write(dir.path(), &[("a.json", a), ("b.json", b)]);
+    let mut gui = Gui::start(
+        "value_tree_view",
+        compare(&[dir.path().join("a.json"), dir.path().join("b.json")]),
+    );
+    gui.click(tr("analysis.tree"));
+    let summary = trf(
+        "analysis.tree_summary",
+        &[
+            ("added", "1".into()),
+            ("removed", "0".into()),
+            ("modified", "1".into()),
+            ("moved", "0".into()),
+            ("ambiguous", "0".into()),
+        ],
+    );
+    gui.wait_until("tree summary", |gui| gui.shows(&summary));
+    assert!(gui.shows(tr("analysis.tree_policy_values")));
+    assert!(gui.shows(&trf(
+        "analysis.tree_identified",
+        &[("n", "2".into()), ("member", "id".into())]
+    )));
+    assert!(gui.shows_text(&format!(
+        "{}: timeout: 30 | timeout: 45",
+        tr("analysis.modified")
+    )));
+    assert!(gui.shows_text(&format!(
+        "{}: {} | [2]: \"z\"",
+        tr("analysis.added"),
+        tr("analysis.tree_missing")
+    )));
+    gui.key(Modifiers::ALT, Key::Home);
+    assert!(gui.shows_text("$.server.timeout"));
+    assert_eq!(read(&dir.path().join("a.json")), a);
+    assert_eq!(read(&dir.path().join("b.json")), b);
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
 }
 
