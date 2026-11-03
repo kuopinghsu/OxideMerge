@@ -3,6 +3,7 @@
 //! nothing here edits the files.
 use super::{syntax, theme, widgets};
 use crate::core::semantic::xml_tree::{Collection, Pairing, RowKind, Side, TreeDiff, XKind};
+use crate::core::semantic::Format;
 use crate::i18n::{tr, trf};
 use egui::{Color32, Rect, Sense, Ui};
 use std::collections::HashSet;
@@ -11,6 +12,7 @@ use std::collections::HashSet;
 pub struct TreeResult {
     pub diff: TreeDiff,
     pub sources: [String; 2],
+    pub format: Format,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,6 +95,8 @@ pub struct XmlTreeView {
     collection_table: Option<((u64, usize, String), Collection)>,
     collection_hidden: HashSet<String>,
     collection_filter: Option<Filter>,
+    /// The files are JSON, YAML or TOML rather than XML.
+    pub values: bool,
     /// The comparison the state belongs to.
     attached: u64,
     focused: bool,
@@ -437,7 +441,11 @@ impl XmlTreeView {
             ui.label(tr("analysis.tree_search"));
             let search = ui.add(
                 egui::TextEdit::singleline(&mut self.search)
-                    .hint_text(tr("analysis.tree_search_hint"))
+                    .hint_text(tr(if self.values {
+                        "analysis.tree_search_hint_values"
+                    } else {
+                        "analysis.tree_search_hint"
+                    }))
                     .char_limit(512)
                     .desired_width(220.0),
             );
@@ -461,22 +469,36 @@ impl XmlTreeView {
             if diff.keyed > 0 {
                 ui.small(trf("analysis.tree_keyed", &[("n", diff.keyed.to_string())]));
             }
+            for (member, n) in &diff.identified {
+                ui.small(trf(
+                    "analysis.tree_identified",
+                    &[("n", n.to_string()), ("member", member.to_string())],
+                ))
+                .on_hover_text(tr("analysis.tree_identified_tip"));
+            }
         });
     }
 
     /// The key rules field. What is typed is applied once typing pauses or the field is left,
     /// so a comparison is not made for every key pressed.
     pub fn keys_ui(&mut self, ui: &mut Ui) {
-        ui.label(tr("analysis.tree_keys"))
-            .on_hover_text(tr("analysis.tree_keys_tip"));
+        let (hint, tip) = if self.values {
+            (
+                "analysis.tree_keys_hint_values",
+                "analysis.tree_keys_tip_values",
+            )
+        } else {
+            ("analysis.tree_keys_hint", "analysis.tree_keys_tip")
+        };
+        ui.label(tr("analysis.tree_keys")).on_hover_text(tr(tip));
         let response = ui
             .add(
                 egui::TextEdit::singleline(&mut self.keys)
-                    .hint_text(tr("analysis.tree_keys_hint"))
+                    .hint_text(tr(hint))
                     .char_limit(512)
                     .desired_width(200.0),
             )
-            .on_hover_text(tr("analysis.tree_keys_tip"));
+            .on_hover_text(tr(tip));
         labeled(&response, tr("analysis.tree_keys"), &self.keys);
         let now = ui.input(|i| i.time);
         if response.changed() {
@@ -902,6 +924,61 @@ impl XmlTreeView {
                             fmt(dim, mono),
                         );
                     }
+                    XKind::Object | XKind::Array | XKind::Value => {
+                        // array positions and the root are dimmed: keys are what pairs
+                        let key = if node.name.is_empty() { dim } else { text };
+                        job.append(&node.display, 0.0, fmt(key, mono));
+                        match node.kind {
+                            XKind::Value => {
+                                job.append(": ", 0.0, fmt(dim, mono));
+                                let other =
+                                    row.sides[1 - s].map(|o| &diff.docs[1 - s].nodes[o.node()]);
+                                let mut f = fmt(text, mono);
+                                if other.is_some_and(|o| o.kind != node.kind || o.tag != node.tag) {
+                                    f.background = colors.inline;
+                                }
+                                job.append(&shorten(&node.value, 200), 0.0, f);
+                            }
+                            XKind::Object => {
+                                // the key members of an array element, as short chips
+                                let mut shown = 0;
+                                for &c in &node.children {
+                                    let member = &doc.nodes[c];
+                                    let key = matches!(
+                                        member.name.as_str(),
+                                        "id" | "name" | "key" | "ref"
+                                    ) || self
+                                        .applied_keys
+                                        .split(['@', '+', ';'])
+                                        .any(|k| k.trim() == member.name);
+                                    if member.kind == XKind::Value && key && shown < 2 {
+                                        shown += 1;
+                                        job.append(
+                                            &format!(
+                                                " {}={}",
+                                                member.name,
+                                                shorten(&member.value, 24)
+                                            ),
+                                            0.0,
+                                            fmt(dim, mono),
+                                        );
+                                    }
+                                }
+                                job.append(
+                                    &format!("  {{{}}}", node.children.len()),
+                                    0.0,
+                                    fmt(dim, font),
+                                );
+                            }
+                            _ => {
+                                job.append(
+                                    &format!("  [{}]", node.children.len()),
+                                    0.0,
+                                    fmt(dim, font),
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -910,7 +987,7 @@ impl XmlTreeView {
     fn details_ui(&mut self, ui: &mut Ui, result: &TreeResult, action: &mut Option<TreeAction>) {
         let diff = &result.diff;
         let Some(r) = self.selected.filter(|&r| r < diff.rows.len()) else {
-            ui.small(tr("analysis.tree_policy"));
+            ui.small(tr(policy_key(self.values)));
             return;
         };
         let row = &diff.rows[r];
@@ -921,8 +998,9 @@ impl XmlTreeView {
                     for (name, display, n) in groups {
                         if ui
                             .button(format!(
-                                "{} <{display}> ({n})",
-                                tr("analysis.tree_collection")
+                                "{} {} ({n})",
+                                tr("analysis.tree_collection"),
+                                shown_name(diff, &display)
                             ))
                             .clicked()
                         {
@@ -945,6 +1023,8 @@ impl XmlTreeView {
                 Pairing::Exact => "analysis.tree_pairing_exact",
                 Pairing::Key => "analysis.tree_pairing_key",
                 Pairing::Name => "analysis.tree_pairing_name",
+                Pairing::Member => "analysis.tree_pairing_member",
+                Pairing::Identity => "analysis.tree_pairing_identity",
                 Pairing::Unpaired => "analysis.tree_pairing_unpaired",
             }));
         });
@@ -1091,7 +1171,11 @@ impl XmlTreeView {
             if ui.button(tr("analysis.tree_collection_tree")).clicked() {
                 self.collection = None;
             }
-            ui.strong(format!("<{display}> ({})", table.rows.len()));
+            ui.strong(format!(
+                "{} ({})",
+                shown_name(diff, display),
+                table.rows.len()
+            ));
             ui.selectable_value(&mut self.collection_filter, None, tr("analysis.all"));
             for (f, key) in [
                 (Filter::Added, "analysis.added"),
@@ -1223,6 +1307,7 @@ fn status_name(diff: &TreeDiff, r: usize) -> &'static str {
     tr(match row.kind {
         RowKind::Added => "analysis.added",
         RowKind::Removed => "analysis.removed",
+        RowKind::Modified if diff.type_changed(r) => "analysis.type_changed",
         RowKind::Modified => "analysis.modified",
         RowKind::Same if row.moved.is_some() => "analysis.moved",
         RowKind::Same if row.changes > 0 => "analysis.tree_contains",
@@ -1256,6 +1341,24 @@ fn status_symbol(diff: &TreeDiff, r: usize, ui: &Ui) -> (String, Color32) {
     (symbol, color)
 }
 
+/// The policy line of the Tree view of XML, or of JSON, YAML and TOML.
+pub fn policy_key(values: bool) -> &'static str {
+    if values {
+        "analysis.tree_policy_values"
+    } else {
+        "analysis.tree_policy"
+    }
+}
+
+/// How repeated elements, or the objects of an array, are named.
+fn shown_name(diff: &TreeDiff, display: &str) -> String {
+    if diff.docs[0].values {
+        display.to_owned()
+    } else {
+        format!("<{display}>")
+    }
+}
+
 /// A short description of one side of row `r`.
 fn node_label(diff: &TreeDiff, s: usize, r: usize) -> String {
     match diff.rows[r].sides[s] {
@@ -1271,6 +1374,9 @@ fn node_label(diff: &TreeDiff, s: usize, r: usize) -> String {
                 XKind::Text => quoted(&shorten(&node.value, 80)),
                 XKind::Comment => format!("<!--{}-->", shorten(&node.value, 80)),
                 XKind::Pi => format!("<?{}?>", shorten(&node.value, 80)),
+                XKind::Object => format!("{} {{{}}}", node.display, node.children.len()),
+                XKind::Array => format!("{} [{}]", node.display, node.children.len()),
+                XKind::Value => format!("{}: {}", node.display, shorten(&node.value, 80)),
             }
         }
     }
@@ -1316,7 +1422,7 @@ fn excerpt(result: &TreeResult, s: usize, r: usize, dark: bool) -> Vec<Excerpt> 
         .take(last + 1 - line)
         .map(|(text, _)| shorten(text, 500))
         .collect();
-    let spans = syntax::highlight(&lines, "xml", dark);
+    let spans = syntax::highlight(&lines, &result.format.label().to_lowercase(), dark);
     lines
         .into_iter()
         .enumerate()
@@ -1439,6 +1545,7 @@ mod tests {
         let result = TreeResult {
             diff: diff(a, "<r/>"),
             sources: [a.into(), "<r/>".into()],
+            format: Format::Xml,
         };
         let removed = *result
             .diff
@@ -1457,5 +1564,22 @@ mod tests {
             text.contains(&(2, "  <a")) && text.contains(&(3, "    x='1'/>")),
             "{text:?}"
         );
+
+        let (a, b) = ("{\n  \"n\": [1,\n    2]\n}", "{\"n\": [1]}");
+        let options = TreeOptions::default();
+        let result = TreeResult {
+            diff: TreeDiff::compare_as(a, b, Format::Json, &options, &AtomicBool::new(false))
+                .unwrap(),
+            sources: [a.into(), b.into()],
+            format: Format::Json,
+        };
+        let row = result.diff.rows[result.diff.top[0]].children[0];
+        let lines = excerpt(&result, 0, row, false);
+        let text: Vec<String> = lines.iter().map(|e| e.text.clone()).collect();
+        assert_eq!(text, ["  \"n\": [1,", "    2]"], "from the key on");
+        let spans: Vec<_> = lines.into_iter().map(|e| e.spans).collect();
+        let json = syntax::highlight(&text, "json", false).unwrap();
+        assert_ne!(Some(&json), syntax::highlight(&text, "xml", false).as_ref());
+        assert_eq!(spans, json.into_iter().map(Some).collect::<Vec<_>>());
     }
 }

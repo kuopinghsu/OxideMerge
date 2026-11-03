@@ -1,6 +1,11 @@
-//! The Tree view of two XML documents: one logical tree whose rows pair a node of the first
-//! document with its counterpart in the second, or with nothing where a node was added or
-//! removed. Read-only: building it parses with [`super::xml`] and writes nothing.
+//! The Tree view of two XML documents, or of two JSON, YAML or TOML documents: one logical
+//! tree whose rows pair a node of the first document with its counterpart in the second, or
+//! with nothing where a node was added or removed. Read-only: building it parses with the
+//! semantic parsers and writes nothing.
+//!
+//! JSON, YAML and TOML values are objects, arrays and scalars. Object members are paired by
+//! key, as objects are unordered; array elements are siblings paired as below, a key rule
+//! `servers@name` pairing the objects of arrays named `servers` by their `name` member.
 //!
 //! Pairing works sibling group by sibling group below paired parents, so a node never moves
 //! to another parent. In a group, siblings are paired, in this order:
@@ -33,6 +38,18 @@ pub enum XKind {
     Text,
     Comment,
     Pi,
+    /// A JSON, YAML or TOML object, whose children are its members.
+    Object,
+    Array,
+    /// A JSON, YAML or TOML scalar.
+    Value,
+}
+
+impl XKind {
+    /// Whether nodes of this kind hold a value of their own rather than children.
+    fn leaf(self) -> bool {
+        !matches!(self, XKind::Element | XKind::Object | XKind::Array)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -50,12 +67,16 @@ pub struct XAttr {
 #[derive(Clone, Debug)]
 pub struct XNode {
     pub kind: XKind,
-    /// `{uri}local` of an element; empty for other nodes.
+    /// `{uri}local` of an element, or the key of an object member; empty for other nodes.
     pub name: String,
-    /// The element name as written, with its prefix.
+    /// The element name as written, with its prefix; the key of an object member, or `[2]`
+    /// for an array element.
     pub display: String,
-    /// Text, comment or processing-instruction content; empty for elements.
+    /// Text, comment or processing-instruction content, or a scalar as it compares (strings
+    /// quoted as in JSON); empty for elements.
     pub value: String,
+    /// The type of a scalar: `string`, `number`, `bool`, `null` or `datetime`.
+    pub tag: String,
     /// In source order.
     pub attrs: Vec<XAttr>,
     pub children: Vec<usize>,
@@ -86,12 +107,16 @@ fn local(expanded: &str) -> &str {
     expanded.rsplit_once('}').map_or(expanded, |(_, l)| l)
 }
 
-/// One XML document as nodes with ids, which hold only while it stays loaded.
+/// One XML, JSON, YAML or TOML document as nodes with ids, which hold only while it stays
+/// loaded.
 #[derive(Clone, Debug, Default)]
 pub struct XmlDoc {
     pub nodes: Vec<XNode>,
-    /// Comments and processing instructions before the root, the root, and those after it.
+    /// Comments and processing instructions before the root, the root, and those after it;
+    /// the root value of a JSON, YAML or TOML document.
     pub top: Vec<usize>,
+    /// A JSON, YAML or TOML document.
+    pub values: bool,
 }
 
 impl XmlDoc {
@@ -129,6 +154,111 @@ impl XmlDoc {
             doc.nodes[id].print = doc.fingerprint(id);
         }
         Ok(doc)
+    }
+
+    /// Parses JSON, YAML or TOML `source` with the semantic parser of `format` and its limits,
+    /// keeping members in the order they are written.
+    pub fn parse_values(source: &str, format: Format) -> Result<Self> {
+        if format == Format::Xml {
+            return Self::parse(source);
+        }
+        let parsed = super::parse(source, format)?;
+        let starts: Vec<usize> = std::iter::once(0)
+            .chain(
+                crate::core::text::lines(source)
+                    .skip(1)
+                    .map(|(line, _)| line.as_ptr() as usize - source.as_ptr() as usize),
+            )
+            .collect();
+        let mut doc = XmlDoc {
+            values: true,
+            ..Default::default()
+        };
+        let root = doc.add_value(&parsed, None, String::new(), "$".into(), source, &starts);
+        doc.top.push(root);
+        for id in (0..doc.nodes.len()).rev() {
+            doc.nodes[id].print = doc.fingerprint(id);
+        }
+        Ok(doc)
+    }
+
+    fn add_value(
+        &mut self,
+        node: &Node,
+        parent: Option<usize>,
+        name: String,
+        display: String,
+        source: &str,
+        starts: &[usize],
+    ) -> usize {
+        let at = |pos: usize| {
+            let line = starts.partition_point(|&s| s <= pos);
+            let from = starts.get(line.wrapping_sub(1)).copied().unwrap_or(0);
+            let col = source.get(from..pos).map_or(1, |s| s.chars().count() + 1);
+            (line.max(1), col)
+        };
+        let mut bytes = node.span.bytes.clone();
+        // a member starts at its key, so a cursor on the key line is in it
+        if parent.is_some_and(|p| self.nodes[p].kind == XKind::Object) {
+            bytes.start = super::write::member_start(source, bytes.start.min(source.len()));
+        }
+        let (line, col) = at(bytes.start);
+        let end_line = at(bytes.end.saturating_sub(1).max(bytes.start)).0;
+        let kind = match node.kind.as_str() {
+            "object" => XKind::Object,
+            "array" => XKind::Array,
+            _ => XKind::Value,
+        };
+        let id = self.nodes.len();
+        self.nodes.push(XNode {
+            kind,
+            name,
+            display,
+            value: node.value.clone().unwrap_or_default(),
+            tag: if kind == XKind::Value {
+                node.kind.clone()
+            } else {
+                String::new()
+            },
+            attrs: Vec::new(),
+            children: Vec::new(),
+            parent,
+            bytes,
+            line,
+            col,
+            end_line,
+            print: 0,
+        });
+        let mut children: Vec<(usize, String, &Node)> = node
+            .children
+            .iter()
+            .map(|(key, child)| match kind {
+                XKind::Array => (index(key, "[").unwrap_or(0), String::new(), child),
+                _ => {
+                    let name = key
+                        .strip_prefix('[')
+                        .and_then(|k| k.strip_suffix(']'))
+                        .and_then(|k| serde_json::from_str::<String>(k).ok())
+                        .unwrap_or_else(|| key.clone());
+                    (child.span.bytes.start, name, child)
+                }
+            })
+            .collect();
+        children.sort_by_key(|c| c.0);
+        let ids = children
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_, name, child))| {
+                let display = if kind == XKind::Array {
+                    format!("[{i}]")
+                } else {
+                    name.clone()
+                };
+                self.add_value(child, Some(id), name, display, source, starts)
+            })
+            .collect();
+        self.nodes[id].children = ids;
+        id
     }
 
     fn add(&mut self, node: &Node, parent: Option<usize>, source: &str, starts: &[usize]) -> usize {
@@ -170,6 +300,7 @@ impl XmlDoc {
             name,
             display,
             value,
+            tag: String::new(),
             attrs: Vec::new(),
             children: Vec::new(),
             parent,
@@ -223,6 +354,7 @@ impl XmlDoc {
             node.kind.hash(&mut h);
             node.name.hash(&mut h);
             node.value.hash(&mut h);
+            node.tag.hash(&mut h);
             let mut attrs: Vec<_> = node.attrs.iter().map(|a| (&a.name, &a.value)).collect();
             attrs.sort();
             attrs.hash(&mut h);
@@ -237,6 +369,19 @@ impl XmlDoc {
     /// `/catalog/book[2]/@id`: names as written, with a position where a parent has several
     /// children of the same name.
     pub fn path(&self, id: usize, attr: Option<usize>) -> String {
+        if self.values {
+            let mut steps = Vec::new();
+            let mut at = Some(id);
+            while let Some(i) = at {
+                let node = &self.nodes[i];
+                if node.parent.is_some() {
+                    steps.push(value_step(node));
+                }
+                at = node.parent;
+            }
+            steps.reverse();
+            return format!("${}", steps.concat());
+        }
         let mut steps = Vec::new();
         let mut at = Some(id);
         while let Some(i) = at {
@@ -254,6 +399,7 @@ impl XmlDoc {
                 XKind::Text => "text()".into(),
                 XKind::Comment => "comment()".into(),
                 XKind::Pi => "processing-instruction()".into(),
+                XKind::Object | XKind::Array | XKind::Value => unreachable!("an XML node"),
             };
             let count = siblings.iter().filter(same).count();
             steps.push(if count > 1 {
@@ -281,6 +427,17 @@ impl XmlDoc {
     /// of them rather than once for each.
     pub fn paths(&self) -> Vec<String> {
         let mut out = vec![String::new(); self.nodes.len()];
+        if self.values {
+            // ids are given parents first
+            for id in 0..self.nodes.len() {
+                let node = &self.nodes[id];
+                out[id] = match node.parent {
+                    Some(p) => format!("{}{}", out[p], value_step(node)),
+                    None => "$".into(),
+                };
+            }
+            return out;
+        }
         let name = |parent: &str, list: &[usize], out: &mut Vec<String>| {
             let key = |id: usize| (self.nodes[id].kind, self.nodes[id].name.as_str());
             let mut total: HashMap<(XKind, &str), usize> = HashMap::new();
@@ -295,6 +452,7 @@ impl XmlDoc {
                     XKind::Text => "text()",
                     XKind::Comment => "comment()",
                     XKind::Pi => "processing-instruction()",
+                    XKind::Object | XKind::Array | XKind::Value => unreachable!("an XML node"),
                 };
                 let n = seen.entry(key(id)).or_default();
                 *n += 1;
@@ -315,6 +473,30 @@ impl XmlDoc {
             }
         }
         out
+    }
+}
+
+/// The step of a JSON-shaped path to `node`: `.key`, `["odd key"]` or `[2]`.
+fn value_step(node: &XNode) -> String {
+    if node.display.starts_with('[') && node.name.is_empty() {
+        return node.display.clone();
+    }
+    let plain = node
+        .name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_')
+        && node
+            .name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+    if plain {
+        format!(".{}", node.name)
+    } else {
+        format!(
+            "[{}]",
+            serde_json::to_string(&node.name).unwrap_or_default()
+        )
     }
 }
 
@@ -357,6 +539,10 @@ pub enum Pairing {
     Key,
     /// By kind and name between other pairs.
     Name,
+    /// Object members, by key.
+    Member,
+    /// Objects of an array, by the value of their `id`, `name` or `key` member.
+    Identity,
     /// Only on one side.
     Unpaired,
 }
@@ -454,13 +640,30 @@ pub struct TreeDiff {
     pub warnings: Vec<KeyWarning>,
     /// Elements the key rules paired.
     pub keyed: usize,
+    /// Array objects paired without a rule, by each member name used: `id`, `name` or `key`.
+    pub identified: BTreeMap<&'static str, usize>,
     /// Different for every comparison made, so a view can tell a new one from the last.
     pub serial: u64,
 }
 
 impl TreeDiff {
+    #[cfg(test)]
     pub fn compare(a: &str, b: &str, options: &TreeOptions, cancel: &AtomicBool) -> Result<Self> {
-        let docs = [XmlDoc::parse(a)?, XmlDoc::parse(b)?];
+        Self::compare_as(a, b, Format::Xml, options, cancel)
+    }
+
+    /// Compares two documents of `format`.
+    pub fn compare_as(
+        a: &str,
+        b: &str,
+        format: Format,
+        options: &TreeOptions,
+        cancel: &AtomicBool,
+    ) -> Result<Self> {
+        let docs = [
+            XmlDoc::parse_values(a, format)?,
+            XmlDoc::parse_values(b, format)?,
+        ];
         Self::of(docs, options, cancel)
     }
 
@@ -471,13 +674,15 @@ impl TreeDiff {
             rows: Vec::new(),
             warnings: BTreeMap::new(),
             keyed: 0,
+            identified: BTreeMap::new(),
             cancel,
         };
-        let top = builder.group(&docs[0].top, &docs[1].top, None, 0, false)?;
+        let top = builder.group(&docs[0].top, &docs[1].top, None, 0, false, false)?;
         let Builder {
             rows,
             warnings,
             keyed,
+            identified,
             ..
         } = builder;
         let mut diff = TreeDiff {
@@ -495,6 +700,7 @@ impl TreeDiff {
                 })
                 .collect(),
             keyed,
+            identified,
             serial: {
                 static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 SERIAL.fetch_add(1, Ordering::Relaxed)
@@ -532,6 +738,15 @@ impl TreeDiff {
 
     pub fn identical(&self) -> bool {
         self.targets.is_empty()
+    }
+
+    /// Whether the two sides of `row` are values of different types, such as a number that
+    /// became a string or an object that became an array.
+    pub fn type_changed(&self, row: usize) -> bool {
+        match [0, 1].map(|s| self.node(s, row)) {
+            [Some(x), Some(y)] => self.docs[0].values && (x.kind != y.kind || x.tag != y.tag),
+            _ => false,
+        }
     }
 
     /// The rows in tree order.
@@ -639,7 +854,24 @@ impl TreeDiff {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        if query.starts_with('/') {
+        let values = self.docs[0].values;
+        if values && query.starts_with('$') {
+            // a path and what is below it
+            let paths = [0, 1].map(|side| self.docs[side].paths());
+            let under = |path: &str| {
+                path.strip_prefix(query)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+            };
+            return Ok(self
+                .preorder()
+                .into_iter()
+                .filter(|&r| {
+                    let row = &self.rows[r];
+                    (0..2).any(|s| row.sides[s].is_some_and(|x| under(&paths[s][x.node()])))
+                })
+                .collect());
+        }
+        if !values && query.starts_with('/') {
             let path = xpath::parse(query)?;
             let found = [0, 1].map(|side| xpath::select(&self.docs[side], &path));
             return Ok(self
@@ -697,7 +929,14 @@ impl TreeDiff {
         let side = r.sides.iter().position(Option::is_some)?;
         match r.sides[side]? {
             Side::Node(n) => {
-                let node = &self.docs[side].nodes[n];
+                let doc = &self.docs[side];
+                let node = &doc.nodes[n];
+                if doc.values {
+                    // the objects of an array, named after it
+                    let array = &doc.nodes[node.parent?];
+                    return (node.kind == XKind::Object && array.kind == XKind::Array)
+                        .then(|| (String::new(), format!("{}[]", array.display)));
+                }
                 (node.kind == XKind::Element).then(|| (node.name.clone(), node.display.clone()))
             }
             Side::Attr(..) => None,
@@ -746,13 +985,20 @@ impl TreeDiff {
                     .children
                     .iter()
                     .map(|&c| &doc.nodes[c])
-                    .filter(|c| c.kind == XKind::Element)
+                    .filter(|c| {
+                        matches!(
+                            c.kind,
+                            XKind::Element | XKind::Object | XKind::Array | XKind::Value
+                        )
+                    })
                     .collect();
                 for child in &elements {
-                    let simple = child
-                        .children
-                        .iter()
-                        .all(|&g| doc.nodes[g].kind == XKind::Text)
+                    // a member that is an object or array is not flattened
+                    let simple = !matches!(child.kind, XKind::Object | XKind::Array)
+                        && child
+                            .children
+                            .iter()
+                            .all(|&g| doc.nodes[g].kind == XKind::Text)
                         && elements.iter().filter(|e| e.name == child.name).count() == 1;
                     if simple {
                         add(Column::Child(child.name.clone()), child.display.clone());
@@ -780,6 +1026,9 @@ impl TreeDiff {
             add(Column::Text, "text()".into());
         }
         let text_of = |side: usize, node: &XNode| -> String {
+            if node.kind == XKind::Value {
+                return node.value.clone();
+            }
             node.children
                 .iter()
                 .map(|&c| self.docs[side].nodes[c].value.as_str())
@@ -798,7 +1047,7 @@ impl TreeDiff {
                                 node.children
                                     .iter()
                                     .map(|&c| &doc.nodes[c])
-                                    .find(|c| c.kind == XKind::Element && c.name == n)
+                                    .find(|c| c.kind != XKind::Text && c.name == n)
                             };
                             match column {
                                 Column::Attr(n) => node
@@ -862,6 +1111,7 @@ struct Builder<'a> {
     /// Per rule: duplicate and missing keys.
     warnings: BTreeMap<String, (usize, usize)>,
     keyed: usize,
+    identified: BTreeMap<&'static str, usize>,
     cancel: &'a AtomicBool,
 }
 
@@ -886,8 +1136,13 @@ impl Builder<'_> {
         parent: Option<usize>,
         depth: usize,
         within: bool,
+        members: bool,
     ) -> Result<Vec<usize>> {
-        let pairs = self.align(xs, ys);
+        let pairs = if members {
+            self.members(xs, ys)
+        } else {
+            self.align(xs, ys)
+        };
         let places: [HashMap<usize, usize>; 2] =
             [xs, ys].map(|list| list.iter().enumerate().map(|(i, &id)| (id, i)).collect());
         let mut out = Vec::with_capacity(pairs.len());
@@ -915,7 +1170,8 @@ impl Builder<'_> {
             (None, Some(_)) => RowKind::Added,
             (Some(a), Some(b)) => {
                 let (x, y) = (self.node(0, a), self.node(1, b));
-                if x.kind != XKind::Element && x.value != y.value {
+                // an object member whose type changed is paired by its key
+                if x.kind != y.kind || x.kind.leaf() && (x.value != y.value || x.tag != y.tag) {
                     RowKind::Modified
                 } else {
                     RowKind::Same
@@ -946,7 +1202,10 @@ impl Builder<'_> {
                 .clone()
         };
         let (xs, ys) = (kids(0, a), kids(1, b));
-        children.extend(self.group(&xs, &ys, Some(row), depth + 1, below)?);
+        let members = [(0, a), (1, b)]
+            .iter()
+            .all(|&(side, id)| id.is_some_and(|id| self.node(side, id).kind == XKind::Object));
+        children.extend(self.group(&xs, &ys, Some(row), depth + 1, below, members)?);
         self.rows[row].children = children;
         Ok(row)
     }
@@ -1015,9 +1274,139 @@ impl Builder<'_> {
         Ok(rows)
     }
 
-    /// The key rule covering element `id` on `side`.
+    /// Array elements `xs` and `ys` paired by the first of `id`, `name` and `key` that every
+    /// one of them, all objects, has as a scalar member of unique value on its side, when at
+    /// least one value is on both sides.
+    fn identity(&self, xs: &[usize], ys: &[usize]) -> Option<(&'static str, Vec<(usize, usize)>)> {
+        let lists = [xs, ys];
+        if !self.docs[0].values {
+            return None;
+        }
+        let objects = (0..2).all(|side| {
+            lists[side].iter().all(|&id| {
+                let node = self.node(side, id);
+                node.kind == XKind::Object
+                    && node
+                        .parent
+                        .is_some_and(|p| self.node(side, p).kind == XKind::Array)
+            })
+        });
+        if !objects {
+            return None;
+        }
+        ["id", "name", "key"].into_iter().find_map(|member| {
+            let keys = [0, 1].map(|side| -> Option<Vec<(String, usize)>> {
+                let mut out = Vec::with_capacity(lists[side].len());
+                let mut seen = HashSet::new();
+                for &id in lists[side] {
+                    let value = self
+                        .node(side, id)
+                        .children
+                        .iter()
+                        .map(|&c| self.node(side, c))
+                        .find(|c| c.kind == XKind::Value && c.name == member)?;
+                    let key = format!("{}:{}", value.tag, value.value);
+                    if !seen.insert(key.clone()) {
+                        return None;
+                    }
+                    out.push((key, id));
+                }
+                Some(out)
+            });
+            let [Some(kx), Some(ky)] = keys else {
+                return None;
+            };
+            let ky: HashMap<String, usize> = ky.into_iter().collect();
+            let found: Vec<(usize, usize)> = kx
+                .into_iter()
+                .filter_map(|(key, x)| ky.get(&key).map(|&y| (x, y)))
+                .collect();
+            (!found.is_empty()).then_some((member, found))
+        })
+    }
+
+    /// The members of two objects, paired by key in the order of the second, with those only
+    /// the first has after the member before them there.
+    fn members(&mut self, xs: &[usize], ys: &[usize]) -> Vec<Pair> {
+        let by_name: HashMap<&str, usize> = ys
+            .iter()
+            .map(|&y| (self.node(1, y).name.as_str(), y))
+            .collect();
+        let mut pairs = Vec::with_capacity(xs.len().max(ys.len()));
+        let mut paired = HashSet::new();
+        for &x in xs {
+            let node = self.node(0, x);
+            let y = by_name.get(node.name.as_str()).copied();
+            if let Some(y) = y {
+                paired.insert(y);
+            }
+            pairs.push(Pair {
+                sides: [Some(x), y],
+                pairing: match y {
+                    None => Pairing::Unpaired,
+                    Some(y) if self.node(1, y).print == node.print => Pairing::Exact,
+                    Some(_) => Pairing::Member,
+                },
+                ambiguous: false,
+                moved: false,
+                attached: false,
+            });
+        }
+        for &y in ys {
+            if !paired.contains(&y) {
+                pairs.push(Pair {
+                    sides: [None, Some(y)],
+                    pairing: Pairing::Unpaired,
+                    ambiguous: false,
+                    moved: false,
+                    attached: false,
+                });
+            }
+        }
+        let position = |list: &[usize]| -> HashMap<usize, usize> {
+            list.iter().enumerate().map(|(i, &id)| (id, i)).collect()
+        };
+        order_pairs(pairs, &position(xs), &position(ys))
+    }
+
+    /// The key rule covering element `id` on `side`, or an object element of an array.
     fn rule(&self, side: usize, id: usize) -> Option<usize> {
         let node = self.node(side, id);
+        if self.docs[side].values {
+            let array = self.node(side, node.parent?);
+            if node.kind != XKind::Object || array.kind != XKind::Array {
+                return None;
+            }
+            // steps are the keys of the arrays and objects above, array elements left out
+            let named = |mut at: Option<usize>| {
+                std::iter::from_fn(move || {
+                    while let Some(n) = at {
+                        let node = self.node(side, n);
+                        at = node.parent;
+                        if !node.name.is_empty() {
+                            return Some(node.name.as_str());
+                        }
+                    }
+                    None
+                })
+            };
+            return self.options.keys.iter().position(|rule| {
+                let mut steps = rule.element.rsplit('/');
+                // the last step names the array itself: `$` is the top-level array, and an
+                // array directly in another has no name, so only `*` covers it
+                let own = match (steps.next(), array.parent) {
+                    (Some("*"), _) => true,
+                    (Some(step), None) => step == "$",
+                    (Some(step), Some(_)) => !array.name.is_empty() && step == array.name,
+                    (None, _) => false,
+                };
+                let mut names = named(array.parent);
+                own && steps.all(|step| match names.next() {
+                    Some(n) => step == "*" || step == n,
+                    None => step == "*" || step == "$",
+                })
+            });
+        }
         if node.kind != XKind::Element {
             return None;
         }
@@ -1041,6 +1430,19 @@ impl Builder<'_> {
     /// names, but elements of other namespaces are never paired by it.
     fn key(&self, side: usize, id: usize, rule: &KeyRule) -> Option<Vec<String>> {
         let node = self.node(side, id);
+        if self.docs[side].values {
+            return rule
+                .attrs
+                .iter()
+                .map(|want| {
+                    node.children
+                        .iter()
+                        .map(|&c| self.node(side, c))
+                        .find(|c| c.kind == XKind::Value && &c.name == want)
+                        .map(|c| format!("{}:{}", c.tag, c.value))
+                })
+                .collect();
+        }
         std::iter::once(Some(node.name.clone()))
             .chain(rule.attrs.iter().map(|want| {
                 node.attrs
@@ -1110,6 +1512,26 @@ impl Builder<'_> {
                         attached: false,
                     });
                 }
+            }
+        }
+        // Without a rule, the objects of an array that all have a unique `id`, `name` or `key`
+        // on both sides are paired by it.
+        if pairs.is_empty() && settled.iter().chain(&doubtful).all(HashSet::is_empty) {
+            if let Some((member, found)) = self.identity(xs, ys) {
+                *self.identified.entry(member).or_default() += found.len();
+                for (x, y) in found {
+                    settled[0].insert(x);
+                    settled[1].insert(y);
+                    pairs.push(Pair {
+                        sides: [Some(x), Some(y)],
+                        pairing: Pairing::Identity,
+                        ambiguous: false,
+                        moved: false,
+                        attached: false,
+                    });
+                }
+                settled[0].extend(xs);
+                settled[1].extend(ys);
             }
         }
         let position = |list: &[usize]| -> HashMap<usize, usize> {
@@ -1659,6 +2081,221 @@ mod tests {
         )
         .unwrap()
     }
+    fn values(a: &str, b: &str, format: Format, keys: &str) -> TreeDiff {
+        TreeDiff::compare_as(
+            a,
+            b,
+            format,
+            &TreeOptions::parse(keys).unwrap(),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+    }
+
+    /// Each change row as `status path`, by the path of the side that has it.
+    fn value_changes(d: &TreeDiff) -> Vec<String> {
+        d.targets
+            .iter()
+            .map(|&r| {
+                let row = &d.rows[r];
+                let status = match row.kind {
+                    RowKind::Added => "added",
+                    RowKind::Removed => "removed",
+                    RowKind::Modified if d.type_changed(r) => "type",
+                    RowKind::Modified => "modified",
+                    RowKind::Same => "moved",
+                };
+                let side = if row.sides[1].is_some() { 1 } else { 0 };
+                format!("{status} {}", d.path(side, r).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn json_members_pair_by_key_whatever_their_order() {
+        let d = values(
+            r#"{"name":"w","server":{"port":8080,"host":"a"},"tags":["x","y"]}"#,
+            "{\n  \"server\": {\"host\": \"a\", \"port\": \"8080\"},\n  \"name\": \"w\",\n  \"tags\": [\"x\", \"z\", \"y\"]\n}",
+            Format::Json,
+            "",
+        );
+        assert_eq!(
+            value_changes(&d),
+            ["type $.server.port", "added $.tags[1]"],
+            "member order is not a change; an inserted element is one addition"
+        );
+        let root = d.top[0];
+        let names: Vec<_> = d.rows[root]
+            .children
+            .iter()
+            .map(|&r| d.node(1, r).unwrap().display.clone())
+            .collect();
+        assert_eq!(
+            names,
+            ["server", "name", "tags"],
+            "rows follow the second file"
+        );
+        let port = d.targets[0];
+        assert_eq!(d.rows[port].pairing, Pairing::Member);
+        assert_eq!(d.location(1, port).unwrap().1, 2);
+    }
+
+    #[test]
+    fn array_key_rules_pair_objects_by_member() {
+        let a = "ports:\n  - name: http\n    port: 8080\n  - name: metrics\n    port: 9090\n";
+        let b = "ports:\n  - {name: metrics, port: 9090}\n  - {name: http, port: 0x1F90}\n";
+        let plain = values(a, b, Format::Yaml, "");
+        assert_eq!(
+            value_changes(&plain).len(),
+            1,
+            "paired by name without a rule"
+        );
+        let keyed = values(a, b, Format::Yaml, "ports@name");
+        assert_eq!(keyed.keyed, 2);
+        let changes = value_changes(&keyed);
+        assert!(
+            changes.len() == 1 && changes[0].starts_with("moved $.ports["),
+            "a swap is one move, and 0x1F90 is 8080: {changes:?}"
+        );
+        let nested = values(
+            "spec: {ports: [{name: a, n: 1}, {name: b, n: 2}]}",
+            "spec: {ports: [{name: b, n: 2}, {name: a, n: 3}]}",
+            Format::Yaml,
+            "spec/ports@name",
+        );
+        assert_eq!(nested.keyed, 2);
+        assert!(value_changes(&nested).contains(&"modified $.spec.ports[1].n".to_owned()));
+        let missing = values(
+            r#"[{"id":1},{"x":2}]"#,
+            r#"[{"x":2},{"id":1}]"#,
+            Format::Json,
+            "*@id",
+        );
+        assert_eq!(missing.warnings.len(), 1);
+        // an array directly in a named one has no name of its own: only `*` covers it
+        let (a, b) = (
+            r#"{"outer":[[{"id":1},{"id":2}]]}"#,
+            r#"{"outer":[[{"id":2},{"id":1}]]}"#,
+        );
+        assert_eq!(values(a, b, Format::Json, "outer@id").keyed, 0);
+        assert_eq!(values(a, b, Format::Json, "*@id").keyed, 2);
+        assert_eq!(values(a, b, Format::Json, "outer/*@id").keyed, 2);
+    }
+
+    #[test]
+    fn array_objects_pair_by_id_name_or_key_without_a_rule() {
+        let a = "[[workers]]\nid = \"import\"\nthreads = 2\n\n[[workers]]\nid = \"report\"\nthreads = 1\n";
+        let b = "[[workers]]\nid = \"report\"\nthreads = 4\n\n[[workers]]\nid = \"import\"\nthreads = 2\n\n[[workers]]\nid = \"cleanup\"\nthreads = 1\n";
+        let d = values(a, b, Format::Toml, "");
+        let changes = value_changes(&d);
+        assert!(
+            changes.contains(&"added $.workers[2]".to_owned()),
+            "{changes:?}"
+        );
+        assert!(
+            changes.contains(&"modified $.workers[0].threads".to_owned()),
+            "report is paired with report, not with cleanup: {changes:?}"
+        );
+        assert_eq!(d.keyed, 0, "no key rule was used");
+        assert_eq!(
+            d.identified,
+            BTreeMap::from([("id", 2)]),
+            "but the pairing is told"
+        );
+        let workers = d.rows[d.top[0]].children[0];
+        assert!(d.rows[workers]
+            .children
+            .iter()
+            .any(|&r| d.rows[r].pairing == Pairing::Identity));
+        // a duplicate id leaves the pairing to position
+        let dup = values(
+            r#"[{"id":1,"v":1},{"id":1,"v":2}]"#,
+            r#"[{"id":1,"v":2},{"id":1,"v":1}]"#,
+            Format::Json,
+            "",
+        );
+        assert!(dup.rows.iter().all(|r| r.pairing != Pairing::Identity));
+        assert!(dup.identified.is_empty());
+    }
+
+    #[test]
+    fn a_member_starts_at_its_key() {
+        let yaml = "title: x\nserver:\n  port: 1\n  hosts:\n    - a\n";
+        let json = "{\n  \"server\":\n    {\"port\": 1},\n  \"odd \\\" key\" : 2\n}";
+        let toml = "title = \"x\"\n\n[server]\nport = 1\nhosts = [\n  \"a\",\n]\n";
+        for (source, format, line, path, written) in [
+            (yaml, Format::Yaml, 2, "$.server", "server:"),
+            (yaml, Format::Yaml, 4, "$.server.hosts", "hosts:"),
+            (json, Format::Json, 2, "$.server", "\"server\":"),
+            (
+                json,
+                Format::Json,
+                4,
+                r#"$["odd \" key"]"#,
+                "\"odd \\\" key\" :",
+            ),
+            (toml, Format::Toml, 3, "$.server", "[server]"),
+            (toml, Format::Toml, 5, "$.server.hosts", "hosts ="),
+        ] {
+            let d = values(source, source, format, "");
+            let row = d.row_at_line(0, line).unwrap();
+            assert_eq!(d.path(0, row).unwrap(), path, "{format:?} line {line}");
+            let (bytes, at, _) = d.location(0, row).unwrap();
+            assert_eq!(at, line, "{format:?} {path}");
+            assert!(source[bytes].starts_with(written), "{format:?} {path}");
+        }
+    }
+
+    #[test]
+    fn toml_tables_compare_by_value_and_search_by_path() {
+        let d = values(
+            "title = \"x\"\n[server]\nport = 1\nhost = \"h\"\n",
+            "title = \"x\"\n\n[server]\nhost = \"h\"\nport = 1.0\ntimeout = 5\n",
+            Format::Toml,
+            "",
+        );
+        assert_eq!(value_changes(&d), ["added $.server.timeout"]);
+        let hits = d.search("$.server").unwrap();
+        assert_eq!(hits.len(), 4, "the table and its members");
+        assert!(d.search("$.serv").unwrap().is_empty(), "whole steps only");
+        assert_eq!(d.search("timeout").unwrap().len(), 1);
+        let line = d.row_at_line(1, 6).unwrap();
+        assert_eq!(d.path(1, line).unwrap(), "$.server.timeout");
+    }
+
+    #[test]
+    fn arrays_of_objects_tabulate_their_scalar_members() {
+        let d = values(
+            r#"{"users":[{"id":1,"name":"a","roles":["x"]},{"id":2,"name":"b"}]}"#,
+            r#"{"users":[{"id":1,"name":"A","roles":["x"]},{"id":2,"name":"b"},{"id":3,"name":"c"}]}"#,
+            Format::Json,
+            "users@id",
+        );
+        let users = d.rows[d.top[0]].children[0];
+        let groups = d.collections(users);
+        assert_eq!(groups, [(String::new(), "users[]".to_owned(), 3)]);
+        let table = d.collection(users, "");
+        assert_eq!(table.columns, ["id", "name"]);
+        assert!(table.nested, "roles is an array");
+        assert_eq!(
+            table.rows[0].cells[1],
+            [Some("\"a\"".into()), Some("\"A\"".into())]
+        );
+        assert_eq!(table.rows[2].cells[0], [None, Some("3".into())]);
+        assert_eq!(d.path(1, d.rows[users].children[1]).unwrap(), "$.users[1]");
+    }
+
+    #[test]
+    fn odd_keys_are_quoted_in_paths() {
+        let d = values(
+            r#"{"a b":{"x.y":1}}"#,
+            r#"{"a b":{"x.y":2}}"#,
+            Format::Json,
+            "",
+        );
+        assert_eq!(value_changes(&d), [r#"modified $["a b"]["x.y"]"#]);
+    }
+
     /// A row as `kind name/value | kind name/value` for both sides.
     fn show(d: &TreeDiff, r: usize) -> String {
         let side = |s: usize| match d.rows[r].sides[s] {

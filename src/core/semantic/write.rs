@@ -218,7 +218,7 @@ fn indent(text: &str, line: usize) -> &str {
 
 /// Where the member whose value starts at `value` starts: at its key, written before a `:` or
 /// `=`, when it has one.
-fn member_start(text: &str, value: usize) -> usize {
+pub(super) fn member_start(text: &str, value: usize) -> usize {
     let bytes = text.as_bytes();
     let Some(separator) = prev_word(text, value).filter(|&i| matches!(bytes[i], b':' | b'='))
     else {

@@ -6450,7 +6450,7 @@ impl TextView {
         let Some(format) = format else {
             return false;
         };
-        let tree = format == semantic::Format::Xml && self.n() == 2;
+        let tree = self.n() == 2;
         self.tree_mode &= tree;
         ui.horizontal(|ui| {
             let mut mode = if self.tree_mode {
@@ -6462,7 +6462,11 @@ impl TextView {
             ui.selectable_value(&mut mode, 1, tr("analysis.semantic"));
             if tree {
                 ui.selectable_value(&mut mode, 2, tr("analysis.tree"))
-                    .on_hover_text(tr("analysis.tree_tip"));
+                    .on_hover_text(tr(if format == semantic::Format::Xml {
+                        "analysis.tree_tip"
+                    } else {
+                        "analysis.tree_tip_values"
+                    }));
             }
             if mode == 2 && !self.tree_mode {
                 // the Tree view opens where the text cursor is
@@ -6475,7 +6479,7 @@ impl TextView {
             self.tree_mode = mode == 2;
         });
         if self.tree_mode {
-            self.tree_ui(ui);
+            self.tree_ui(ui, format);
             return true;
         }
         if !self.semantic_mode {
@@ -6649,15 +6653,19 @@ impl TextView {
             .filter(|&b| !self.diff.blocks[b].ignored);
     }
 
-    /// The Tree view of two XML files, made in the background and kept until the files or the
-    /// key rules change.
-    fn tree_ui(&mut self, ui: &mut Ui) {
+    /// The Tree view of two XML, JSON, YAML or TOML files, made in the background and kept
+    /// until the files or the key rules change.
+    fn tree_ui(&mut self, ui: &mut Ui, format: crate::core::semantic::Format) {
         use super::xml_tree_view::{TreeAction, TreeResult};
         use crate::core::semantic::xml_tree::{TreeDiff, TreeOptions};
         self.tree_active = true;
-        ui.small(tr("analysis.tree_policy"));
+        let values = format != crate::core::semantic::Format::Xml;
+        self.tree.view.values = values;
+        ui.small(tr(super::xml_tree_view::policy_key(values)));
         let keys = self.tree.view.applied_keys.trim().to_owned();
         let options = TreeOptions::parse(&keys);
+        // a comparison of one format is not kept for another
+        let keys = format!("{}\u{1f}{keys}", format.label());
         let want = (self.layout_gen, keys.clone());
         let made =
             |entry: Option<(u64, &String)>| entry.is_some_and(|(g, k)| (g, k.clone()) == want);
@@ -6672,10 +6680,11 @@ impl TextView {
                     keys.clone(),
                     super::analysis::Task::start(move |cancel, _| {
                         let [a, b] = docs;
-                        let diff = TreeDiff::compare(&a, &b, &options, cancel)?;
+                        let diff = TreeDiff::compare_as(&a, &b, format, &options, cancel)?;
                         Ok(TreeResult {
                             diff,
                             sources: [a, b],
+                            format,
                         })
                     }),
                 ));
