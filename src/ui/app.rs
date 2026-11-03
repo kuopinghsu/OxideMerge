@@ -2023,13 +2023,15 @@ impl OxideMergeApp {
                 .filter(|p| !p.is_empty())
                 .map(|p| Screenshot {
                     path: PathBuf::from(p),
-                    command: std::env::var("OXIDEMERGE_SCREENSHOT_COMMAND").ok().and_then(|k| {
-                        let cmd = commands::PALETTE.iter().find(|c| c.label() == k);
-                        if cmd.is_none() {
-                            eprintln!("OXIDEMERGE_SCREENSHOT_COMMAND={k}: no such command");
-                        }
-                        cmd.copied()
-                    }),
+                    command: std::env::var("OXIDEMERGE_SCREENSHOT_COMMAND")
+                        .ok()
+                        .and_then(|k| {
+                            let cmd = commands::PALETTE.iter().find(|c| c.label() == k);
+                            if cmd.is_none() {
+                                eprintln!("OXIDEMERGE_SCREENSHOT_COMMAND={k}: no such command");
+                            }
+                            cmd.copied()
+                        }),
                     frames: 0,
                     taken: None,
                 }),
@@ -7172,8 +7174,8 @@ impl OxideMergeApp {
         let saved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         shot.taken = Some(saved.clone());
         let path = shot.path.clone();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(
-            move |img| {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+            egui::ScreenshotCallback::new(move |img| {
                 let [w, h] = img.size;
                 let rgba: Vec<u8> = img.pixels.iter().flat_map(|p| p.to_array()).collect();
                 let result = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
@@ -7183,8 +7185,8 @@ impl OxideMergeApp {
                     eprintln!("{}: {e}", path.display());
                 }
                 saved.store(true, std::sync::atomic::Ordering::Release);
-            },
-        )));
+            }),
+        ));
     }
 }
 
