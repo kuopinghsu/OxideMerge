@@ -1653,3 +1653,283 @@ fn sync_links_copies_symbolic_links_as_links_from_a_plan_and_a_job() {
     assert_eq!(bad.code, 2);
     assert!(bad.stdout.contains("copy_links"), "{}", bad.stdout);
 }
+
+#[test]
+fn diff_style_labels_title_the_sides_and_descriptions_win_over_them() {
+    let d = tmp();
+    let d = d.path();
+    files(d, &[("old.txt", "a\nb\n"), ("new.txt", "a\nB\n")]);
+    // As Subversion's --diff-cmd calls it: -u, then one -L per file, then the files.
+    let run = oxidemerge(
+        d,
+        &[
+            "--report",
+            "labels.html",
+            "-u",
+            "-L",
+            "f.txt\t(revision 1)",
+            "-L",
+            "f.txt\t(working copy)",
+            "old.txt",
+            "new.txt",
+        ],
+    );
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let html = read(d.join("labels.html"));
+    assert!(html.contains("f.txt\t(revision 1)"), "left label");
+    assert!(html.contains("f.txt\t(working copy)"), "right label");
+
+    let run = oxidemerge(
+        d,
+        &[
+            "--report",
+            "described.html",
+            "--label",
+            "Left label",
+            "--label",
+            "Right label",
+            "--dr",
+            "Mine",
+            "old.txt",
+            "new.txt",
+        ],
+    );
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let html = read(d.join("described.html"));
+    assert!(
+        html.contains("Left label"),
+        "a label fills a side with no description"
+    );
+    assert!(
+        html.contains("Mine") && !html.contains("Right label"),
+        "--dr wins"
+    );
+}
+
+#[test]
+fn subversion_working_copies_compare_with_their_revisions() {
+    let d = tmp();
+    let d = d.path();
+    let svn = |dir: &Path, program: &str, args: &[&str]| {
+        Command::new(program)
+            .args(args)
+            .current_dir(dir)
+            .env(
+                "LC_CTYPE",
+                if cfg!(target_os = "macos") {
+                    "UTF-8"
+                } else {
+                    "C.UTF-8"
+                },
+            )
+            .output()
+    };
+    let repo = d.join("repo");
+    if svn(d, "svnadmin", &["create", repo.to_str().unwrap()]).is_err() {
+        eprintln!("Subversion is not installed; skipped");
+        return;
+    }
+    let url = format!(
+        "file:///{}",
+        repo.to_str()
+            .unwrap()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+    );
+    let wc = d.join("wc");
+    let ok = |dir: &Path, program: &str, args: &[&str]| {
+        let out = svn(dir, program, args).unwrap();
+        assert!(
+            out.status.success(),
+            "{program} {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    ok(d, "svn", &["checkout", "-q", &url, wc.to_str().unwrap()]);
+    // A name with an @ (a peg revision to svn) and letters that are not ASCII.
+    files(&wc, &[("f.txt", "one\n"), ("a @b/é.txt", "x\n")]);
+    ok(&wc, "svn", &["add", "-q", "f.txt", "a @b@"]);
+    ok(&wc, "svn", &["commit", "-q", "-m", "first"]);
+    files(&wc, &[("f.txt", "two\n"), ("later.txt", "new\n")]);
+    ok(&wc, "svn", &["add", "-q", "later.txt"]);
+    ok(&wc, "svn", &["commit", "-q", "-m", "second"]);
+    ok(&wc, "svn", &["update", "-q"]);
+
+    let run = oxidemerge(&wc, &["--cli", "--rev", "BASE", "f.txt"]);
+    assert_eq!(run.code, 0, "unchanged since BASE: {}", run.stderr);
+    files(&wc, &[("f.txt", "three\n"), ("a @b/é.txt", "y\n")]);
+    let run = oxidemerge(&wc, &["--cli", "--rev", "BASE", "f.txt"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(
+        run.stdout.contains("-two") && run.stdout.contains("+three"),
+        "{}",
+        run.stdout
+    );
+    // r1, as svn log prints it, is revision 1.
+    let run = oxidemerge(&wc, &["--cli", "--git-rev", "r1", "f.txt"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(
+        run.stdout.contains("-one") && run.stdout.contains("+three"),
+        "{}",
+        run.stdout
+    );
+    let run = oxidemerge(&wc, &["--cli", "--rev", "BASE", "a @b/é.txt"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(
+        run.stdout.contains("-x") && run.stdout.contains("+y"),
+        "{}",
+        run.stdout
+    );
+
+    // A folder: later.txt was added after revision 1.
+    let run = oxidemerge(
+        &wc,
+        &[
+            "--lang", "en", "--cli", "--rev", "1", "-f", "*.txt", "-r", ".",
+        ],
+    );
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let later = run.stdout.lines().find(|l| l.starts_with("later.txt"));
+    assert!(
+        later.is_some_and(|l| l.contains("Right only")),
+        "{}",
+        run.stdout
+    );
+    let run = oxidemerge(&wc, &["--cli", "--rev", "BASE", "a @b"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(run.stdout.contains("é.txt"), "{}", run.stdout);
+
+    // A folder that was not there in revision 1 compares as empty, as in Git.
+    files(&wc, &[("added/n.txt", "n\n")]);
+    ok(&wc, "svn", &["add", "-q", "added"]);
+    ok(&wc, "svn", &["commit", "-q", "-m", "third"]);
+    let run = oxidemerge(&wc, &["--lang", "en", "--cli", "--rev", "1", "-r", "added"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(run.stdout.contains("Right only"), "{}", run.stdout);
+
+    let run = oxidemerge(&wc, &["--cli", "--rev", "99", "f.txt"]);
+    assert_eq!(run.code, 2);
+    assert!(run.stderr.contains("E160006"), "{}", run.stderr);
+    let run = oxidemerge(&wc, &["--cli", "--rev=-r1", "f.txt"]);
+    assert_eq!(run.code, 2);
+    assert!(run.stderr.contains("invalid revision"), "{}", run.stderr);
+}
+
+#[test]
+fn mercurial_repositories_compare_with_their_revisions() {
+    let d = tmp();
+    let d = d.path();
+    let repo = d.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let hgrc = d.join("hgrc");
+    std::fs::write(&hgrc, "").unwrap();
+    let hg = |args: &[&str]| {
+        Command::new("hg")
+            .args(args)
+            .current_dir(&repo)
+            .env("HGRCPATH", &hgrc)
+            .env("HGUSER", "test")
+            .env("HGPLAIN", "1")
+            .env("HGENCODING", "utf-8")
+            .output()
+    };
+    if hg(&["init"]).is_err() {
+        eprintln!("Mercurial is not installed; skipped");
+        return;
+    }
+    let ok = |args: &[&str]| {
+        let out = hg(args).unwrap();
+        assert!(
+            out.status.success(),
+            "hg {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    // Brackets would be a pattern to hg, and letters that are not ASCII.
+    files(&repo, &[("f.txt", "one\n"), ("a b[x]/é.txt", "x\n")]);
+    ok(&["add", "-q"]);
+    ok(&["commit", "-q", "-m", "first"]);
+    files(&repo, &[("f.txt", "two\n"), ("later.txt", "new\n")]);
+    ok(&["add", "-q", "later.txt"]);
+    ok(&["commit", "-q", "-m", "second"]);
+    let env = [("HGRCPATH", hgrc.to_str().unwrap())];
+
+    let run = oxidemerge_with_env(&repo, &["--cli", "--rev", ".", "f.txt"], &env);
+    assert_eq!(run.code, 0, "unchanged since the parent: {}", run.stderr);
+    files(&repo, &[("f.txt", "three\n"), ("a b[x]/é.txt", "y\n")]);
+    // No revision is the working copy's parent, and the title says which.
+    let run = oxidemerge_with_env(&repo, &["--cli", "--rev", "", "f.txt"], &env);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(
+        run.stdout.contains("-two") && run.stdout.contains("+three"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("f.txt @ ."), "{}", run.stdout);
+    let run = oxidemerge_with_env(&repo, &["--cli", "--rev", "0", "f.txt"], &env);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(run.stdout.contains("-one"), "{}", run.stdout);
+    let run = oxidemerge_with_env(&repo, &["--cli", "--rev", ".", "a b[x]/é.txt"], &env);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(
+        run.stdout.contains("-x") && run.stdout.contains("+y"),
+        "{}",
+        run.stdout
+    );
+
+    let run = oxidemerge_with_env(
+        &repo,
+        &[
+            "--lang", "en", "--cli", "--rev", "0", "-f", "*.txt", "-r", ".",
+        ],
+        &env,
+    );
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let later = run.stdout.lines().find(|l| l.starts_with("later.txt"));
+    assert!(
+        later.is_some_and(|l| l.contains("Right only")),
+        "{}",
+        run.stdout
+    );
+    assert!(!run.stdout.contains(".hg_archival"), "{}", run.stdout);
+    // A folder with no files in that revision compares as empty.
+    files(&repo, &[("new/n.txt", "n\n")]);
+    let run = oxidemerge_with_env(
+        &repo,
+        &["--lang", "en", "--cli", "--rev", "0", "-r", "new"],
+        &env,
+    );
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(run.stdout.contains("n.txt"), "{}", run.stdout);
+
+    // Mercurial counts back from the tip with negative numbers.
+    let run = oxidemerge_with_env(&repo, &["--cli", "--rev=-2", "f.txt"], &env);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(run.stdout.contains("-one"), "{}", run.stdout);
+
+    let run = oxidemerge_with_env(&repo, &["--cli", "--rev", "nosuch", "f.txt"], &env);
+    assert_eq!(run.code, 2);
+    assert!(run.stderr.contains("unknown revision"), "{}", run.stderr);
+}
+
+#[test]
+fn a_path_in_no_working_copy_names_every_system_looked_for() {
+    let d = tmp();
+    let d = d.path();
+    files(d, &[("f.txt", "a\n")]);
+    let run = oxidemerge_with_env(
+        d,
+        &["--cli", "--rev", "HEAD", "f.txt"],
+        &[(
+            "GIT_CEILING_DIRECTORIES",
+            d.parent().unwrap().to_str().unwrap(),
+        )],
+    );
+    assert_eq!(run.code, 2);
+    assert!(
+        run.stderr
+            .contains("is not in a Git, Subversion or Mercurial working copy"),
+        "{}",
+        run.stderr
+    );
+}

@@ -3927,3 +3927,173 @@ fn a_folder_compare_saves_as_a_job_and_a_sync_job_runs_only_once_allowed() {
     gui.wait_until("the compare tab", |g| g.app.tabs.len() == 2 && !g.busy());
     assert!(!gui.shows_text(&applied), "the results close");
 }
+
+#[test]
+fn compare_with_revision_lists_and_opens_subversion_revisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let svn = |cwd: &Path, program: &str, args: &[&str]| {
+        std::process::Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .output()
+    };
+    let repo = d.join("repo");
+    if svn(d, "svnadmin", &["create", repo.to_str().unwrap()]).is_err() {
+        eprintln!("Subversion is not installed; skipped");
+        return;
+    }
+    let url = format!(
+        "file:///{}",
+        repo.to_str()
+            .unwrap()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+    );
+    let wc = d.join("wc");
+    let ok = |cwd: &Path, args: &[&str]| {
+        let out = svn(cwd, "svn", args).unwrap();
+        assert!(
+            out.status.success(),
+            "svn {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    ok(d, &["checkout", "-q", &url, wc.to_str().unwrap()]);
+    write(&wc, &[("f.txt", "one\n")]);
+    ok(&wc, &["add", "-q", "f.txt"]);
+    ok(&wc, &["commit", "-q", "-m", "first"]);
+    write(&wc, &[("f.txt", "two\n")]);
+    ok(&wc, &["commit", "-q", "-m", "second"]);
+    ok(&wc, &["update", "-q"]);
+    write(&wc, &[("f.txt", "three\n")]);
+    let file = wc.join("f.txt");
+
+    let mut gui = Gui::start("svn_revision", None);
+    gui.menu(&[tr("menu.file"), tr("menu.git_compare")]);
+    gui.app.git_dlg.as_mut().unwrap().path = file.display().to_string();
+    gui.wait_until("the revisions", |g| {
+        g.app.git_dlg.as_ref().is_some_and(|d| d.commits.len() == 2)
+    });
+    let commits = gui.app.git_dlg.as_ref().unwrap().commits.clone();
+    assert_eq!(
+        commits,
+        vec![
+            ("r2".into(), "second".into()),
+            ("r1".into(), "first".into())
+        ]
+    );
+    // An empty revision is BASE, the revision the working copy was updated to.
+    gui.click(tr("btn.compare"));
+    gui.wait_until("the compare tab", |g| g.app.tabs.len() == 1 && !g.busy());
+    let v = gui.text_view();
+    assert_eq!(v.panes[0].doc.text(), "two\n");
+    assert_eq!(v.panes[1].doc.text(), "three\n");
+    assert!(v.panes[0].doc.read_only, "the revision is read-only");
+    assert!(
+        v.panes[0]
+            .doc
+            .description
+            .as_ref()
+            .is_some_and(|t| t.ends_with("@ BASE")),
+        "{:?}",
+        v.panes[0].doc.description
+    );
+
+    // A revision picked from the list, as svn log names it.
+    gui.menu(&[tr("menu.file"), tr("menu.git_compare")]);
+    gui.app.git_dlg.as_mut().unwrap().path = file.display().to_string();
+    gui.wait_until("the revisions", |g| {
+        g.app.git_dlg.as_ref().is_some_and(|d| d.commits.len() == 2)
+    });
+    gui.click(tr("label.recent_commits"));
+    gui.click("r1  first");
+    assert_eq!(gui.app.git_dlg.as_ref().unwrap().rev, "r1");
+    gui.click(tr("btn.compare"));
+    gui.wait_until("the second tab", |g| g.app.tabs.len() == 2 && !g.busy());
+    assert_eq!(gui.text_view().panes[0].doc.text(), "one\n");
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn compare_with_revision_lists_and_opens_mercurial_revisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let hgrc = dir.path().join("hgrc");
+    std::fs::write(&hgrc, "").unwrap();
+    let hg = |args: &[&str]| {
+        std::process::Command::new("hg")
+            .args(args)
+            .current_dir(&repo)
+            .env("HGRCPATH", &hgrc)
+            .env("HGUSER", "test")
+            .stdin(std::process::Stdio::null())
+            .output()
+    };
+    if hg(&["init"]).is_err() {
+        eprintln!("Mercurial is not installed; skipped");
+        return;
+    }
+    let ok = |args: &[&str]| {
+        let out = hg(args).unwrap();
+        assert!(
+            out.status.success(),
+            "hg {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    write(&repo, &[("f.txt", "one\n")]);
+    ok(&["add", "-q", "f.txt"]);
+    ok(&["commit", "-q", "-m", "first"]);
+    write(&repo, &[("f.txt", "two\n")]);
+    ok(&["commit", "-q", "-m", "second"]);
+    write(&repo, &[("f.txt", "three\n")]);
+    let file = repo.join("f.txt");
+    let first = String::from_utf8(
+        hg(&["log", "-r", "0", "-T", "{node|short}"])
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+
+    let mut gui = Gui::start("hg_revision", None);
+    gui.menu(&[tr("menu.file"), tr("menu.git_compare")]);
+    gui.app.git_dlg.as_mut().unwrap().path = file.display().to_string();
+    gui.wait_until("the revisions", |g| {
+        g.app.git_dlg.as_ref().is_some_and(|d| d.commits.len() == 2)
+    });
+    let commits = gui.app.git_dlg.as_ref().unwrap().commits.clone();
+    assert_eq!(commits[0].1, "second");
+    assert_eq!(commits[1], (first.clone(), "first".into()));
+    // An empty revision is the working copy's parent.
+    gui.click(tr("btn.compare"));
+    gui.wait_until("the compare tab", |g| g.app.tabs.len() == 1 && !g.busy());
+    let v = gui.text_view();
+    assert_eq!(v.panes[0].doc.text(), "two\n");
+    assert_eq!(v.panes[1].doc.text(), "three\n");
+    assert!(v.panes[0].doc.read_only, "the revision is read-only");
+    assert!(
+        v.panes[0]
+            .doc
+            .description
+            .as_ref()
+            .is_some_and(|t| t.ends_with("@ .")),
+        "{:?}",
+        v.panes[0].doc.description
+    );
+
+    gui.menu(&[tr("menu.file"), tr("menu.git_compare")]);
+    gui.app.git_dlg.as_mut().unwrap().path = file.display().to_string();
+    gui.wait_until("the revisions", |g| {
+        g.app.git_dlg.as_ref().is_some_and(|d| d.commits.len() == 2)
+    });
+    gui.click(tr("label.recent_commits"));
+    gui.click(&format!("{first}  first"));
+    assert_eq!(gui.app.git_dlg.as_ref().unwrap().rev, first);
+    gui.click(tr("btn.compare"));
+    gui.wait_until("the second tab", |g| g.app.tabs.len() == 2 && !g.busy());
+    assert_eq!(gui.text_view().panes[0].doc.text(), "one\n");
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}

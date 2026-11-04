@@ -654,19 +654,36 @@ XML 報告將這些資訊放在 `<table-match>` 元素中。
 這些設定會儲存在專案中；較舊的專案開啟時會依位置配對。
 
 [[git-revision]]
-=== 與 Git 修訂版本比較
+=== 與修訂版本比較
 
-「檔案 → 與 Git 修訂版本比較...」會將檔案或資料夾與 Git 中較早的版本比較。
-版本可以是 `HEAD`、分支、標籤或某次提交；對話框會列出最近的提交供您選擇。
+「檔案 → 與修訂版本比較...」會將檔案或資料夾與 Git、Subversion 或 Mercurial 中較早的版本比較。
+路徑上方最近的工作複本決定使用哪一種。
+對話框會列出最近變更過該路徑的修訂版本供您選擇。
 
-Git 中的版本以唯讀方式顯示在左側，目前的檔案或資料夾顯示在右側。
-必須先安裝 Git 並加入 `PATH`，而且路徑必須位於 Git 儲存庫中。
+NOTE: 與 Subversion 或 Mercurial 修訂版本比較屬於實驗性功能，尚未完整測試：
+僅在 macOS 上以本機儲存庫試過。
 
-在命令列中使用 `--git-rev`：
+在 Git 中，版本可以是 `HEAD`、分支、標籤或某次提交；留空即為 `HEAD`。
+在 Subversion 中，可以是 `BASE`（工作複本更新到的修訂版本）、`PREV`、`HEAD`、
+`1234` 或 `r1234` 這類編號，或 `{2026-11-01}` 這類日期；留空即為 `BASE`。
+在 Mercurial 中，可以是 `.`（工作複本的父修訂版本）、`.^`、`tip`、編號、雜湊值、標籤、書籤或其他 revset；
+留空即為 `.`。
+
+較早的版本以唯讀方式顯示在左側，目前的檔案或資料夾顯示在右側。
+必須先安裝 Git、Subversion 或 Mercurial 並加入 `PATH`。
+Git 與 Mercurial 從本機儲存庫讀取修訂版本。
+Subversion 從工作複本讀取 `BASE`；其他修訂版本與最近修訂版本清單則來自儲存庫伺服器，
+伺服器可能要求 OxideMerge 無法提供的登入，請先用 `svn` 本身登入。
+比較工作複本的最上層資料夾時，`.git`、`.svn` 或 `.hg` 資料夾只會列在右側；
+「Exclude Source Control」篩選器可將其隱藏。
+
+在命令列中使用 `--rev`（或同一選項 `--git-rev`）：
 
 [source,sh]
 ----
-oxidemerge --git-rev HEAD~1 src/main.rs
+oxidemerge --rev HEAD~1 src/main.rs
+oxidemerge --rev PREV src/main.c
+oxidemerge --rev .^ docs
 ----
 
 [[merging]]
@@ -2342,11 +2359,14 @@ oxidemerge review.oxmcmp                        # 開啟已儲存的比較
 |`--dl`、`--dm`、`--dr <TEXT>`
 |取代左側、中間與右側路徑顯示的說明文字。
 
+|`-L`、`--label <TITLE>`
+|依序為每一側指定標題，與 `diff -L` 相同（請參閱 <<other-vcs>>）；`--dl`、`--dm` 與 `--dr` 優先。
+
 |`--wl`、`--wm`、`--wr`
 |以唯讀方式開啟左側、中間或右側。
 
-|`--git-rev <REV>`
-|將指定的單一路徑，與它在 Git 修訂版本中的內容比較。
+|`--rev`、`--git-rev <REV>`
+|將指定的單一路徑，與它在 Git、Subversion 或 Mercurial 修訂版本中的內容比較（請參閱 <<git-revision>>）。
 |===
 
 .資料夾比較
@@ -2762,6 +2782,202 @@ git config --global mergetool.oxidemerge.trustExitCode false
 若看起來沒有變更，Git 可能會詢問合併是否成功。
 請在儲存並檢查結果後，才回答成功。
 只是關閉視窗，並不代表合併成功。
+
+[[other-vcs]]
+=== Subversion、Mercurial 與 Perforce（實驗性）
+
+WARNING: 對 Subversion、Mercurial 與 Perforce 的支援屬於實驗性功能，尚未完整測試。
+下列設定僅在 macOS 上以本機儲存庫與本機 Perforce 伺服器試過。
+接受任何合併結果前請先檢查，若有無法運作之處請回報。
+
+OxideMerge 接受 `diff` 用來指定標題的參數：`-u` 會被忽略，
+每個 `-L <TITLE>` 依路徑順序為下一側命名。
+因此窗格標題會顯示修訂版本名稱，而不是暫存檔的路徑。
+`--dl`、`--dm` 與 `--dr` 優先於 `-L`。
+
+Subversion 與 Perforce 傳入合併檔案的順序，OxideMerge 無法直接使用，
+因此合併要透過一個小型包裝指令碼。
+若合併結果檔沒有儲存，包裝指令碼會回報失敗，
+所以未儲存就關閉視窗時，衝突仍會保持未解決。
+
+==== Subversion
+
+`svn diff --diff-cmd oxidemerge` 會逐一比較每個已變更的檔案。
+Subversion 會傳入 `-u -L <舊標題> -L <新標題> <舊檔> <新檔>`，
+因此標題會顯示如 `f.txt (revision 12)` 與 `f.txt (working copy)`。
+若要讓每次 `svn diff` 都使用 OxideMerge，請在 `~/.subversion/config`
+（Windows 上為 `%APPDATA%\Subversion\config`）中設定：
+
+[source,ini]
+----
+[helpers]
+diff-cmd = oxidemerge
+merge-tool-cmd = /path/to/oxidemerge-svn-merge
+----
+
+請勿對 `svn diff` 傳入 `-x` 選項：Subversion 會改傳這些選項，而不傳 `-u`。
+
+合併時，Subversion 會傳入五個路徑：基底、對方版本、我的版本、合併結果檔與工作檔。
+請將下列包裝指令碼存為 `oxidemerge-svn-merge`，設為可執行，並在 `merge-tool-cmd` 中指定：
+
+[source,sh]
+----
+#!/bin/sh
+# Subversion passes: base, theirs, mine, merged, working file.
+before=$(cksum < "$4")
+oxidemerge "$3" "$1" "$2" -o "$4" --dl Mine --dm Base --dr Theirs --wl --wr
+[ "$(cksum < "$4")" != "$before" ]
+----
+
+在 Subversion 的衝突提示中選擇 *l*（launch），或執行 `svn update --accept launch`。
+包裝指令碼一成功（也就是您已儲存），Subversion 就會將衝突標示為已解決。
+
+==== Mercurial
+
+請將下列內容加入 `~/.hgrc`（Windows 上為 `%USERPROFILE%\mercurial.ini`）：
+
+[source,ini]
+----
+[extensions]
+extdiff =
+
+[extdiff]
+cmd.oxidemerge = oxidemerge
+
+[diff-tools]
+oxidemerge.diffargs = -L $plabel1 -L $clabel $parent $child
+
+[ui]
+merge = oxidemerge
+
+[merge-tools]
+oxidemerge.args = $local $base $other -o $output --dl $labellocal --dm $labelbase --dr $labelother --wl --wr
+oxidemerge.checkchanged = true
+----
+
+`hg oxidemerge` 會比較已變更的檔案：只有一個檔案時直接比較，多個檔案時以資料夾比較開啟。
+`hg oxidemerge -c REV` 則顯示單一變更集。
+請勿同時設定 `opts.oxidemerge`：Mercurial 會因此忽略 `diffargs`，標題也就不會顯示。
+`hg merge` 與 `hg resolve` 會開啟三方合併，中間為基底。
+設定 `checkchanged` 後，若合併結果檔沒有變更，Mercurial 會詢問合併是否成功。
+
+==== Perforce
+
+Perforce 可從 p4 命令列、P4V 或兩者使用 OxideMerge。
+兩者需分別設定：p4 讀取 `P4DIFF` 與 `P4MERGE`，P4V 則使用自己的偏好設定。
+
+===== p4 命令列
+
+p4 會以兩個檔案執行 `P4DIFF` 指定的程式：depot 修訂版本（暫存檔）與您工作區中的檔案。
+並以四個檔案執行 `P4MERGE` 指定的程式：基底、對方版本、您的版本與結果。
+OxideMerge 接受合併檔案的順序不同，因此合併需透過包裝指令碼。
+
+設定步驟：
+
+. 將下列指令碼存成 `PATH` 中某個資料夾內的 `oxidemerge-p4-merge`，例如
+`~/bin/oxidemerge-p4-merge`：
++
+[source,sh]
+----
+#!/bin/sh
+# Perforce passes: base, theirs, yours, result.
+before=$(cksum < "$4")
+oxidemerge "$3" "$1" "$2" -o "$4" --dl Yours --dm Base --dr Theirs --wl --wr
+[ "$(cksum < "$4")" != "$before" ]
+----
++
+最後一行會在結果未儲存時讓包裝指令碼失敗，使檔案維持未解決。
+. 讓它可以執行：
++
+[source,sh]
+----
+chmod +x ~/bin/oxidemerge-p4-merge
+----
+. 以 `p4 set`（或同名的環境變數）讓 p4 使用 OxideMerge：
++
+[source,sh]
+----
+p4 set P4DIFF=oxidemerge
+p4 set P4MERGE=$HOME/bin/oxidemerge-p4-merge
+----
++
+若 `oxidemerge` 不在 `PATH` 中，請使用完整路徑，例如 macOS 上的
+`/Applications/OxideMerge.app/Contents/MacOS/oxidemerge`。
+請勿在 `P4DIFF` 加上 `--cli`：檔案不同時它會以 1 結束，p4 會回報 *Execution Failed*。
+. 執行 `p4 set` 檢查設定；兩行都應指向 OxideMerge。
+
+要將檔案與 depot 比較，請執行 `p4 diff f.txt`；OxideMerge 會在左側顯示 depot 修訂版本，
+右側顯示您工作區中的檔案。
+
+合併衝突的步驟：
+
+. 執行 `p4 resolve f.txt`。
+. 在提示時輸入 *m*（merge）。
+OxideMerge 會開啟，左側為 *Yours*、中間為 *Base*、右側為 *Theirs*。
+. 以「下一個衝突」搭配「採用左側」、「採用右側」或「採用兩側」，或直接編輯中間窗格，解決每個衝突。
+. 按一下「儲存結果」並關閉視窗。
+. 回到提示後，p4 會建議 *ae*（accept edit）；輸入 *ae* 接受合併後的檔案。
+
+若未儲存就關閉視窗，p4 會回報 *Execution Failed*，檔案仍維持未解決；
+此時輸入 *ae* 會警告檔案仍含有變更標記。
+請再次執行 `p4 resolve` 重新開始。
+
+===== P4V
+
+P4V 不會讀取 `P4DIFF` 或 `P4MERGE`，而是使用自己的比較與合併設定。
+它會直接執行 OxideMerge，因此不需要包裝指令碼。
+
+設定步驟：
+
+. 在 P4V 中開啟 *Preferences*（macOS 上為 *P4V → Preferences*，Windows 與 Linux 上為
+*Edit → Preferences*）。
+. 在左側清單中選取 *Diff*。
+. 選取 *Other application*。
+只填寫下方欄位並不夠：只要仍選取 *P4Merge*，P4V 就會繼續使用 P4Merge。
+. 在 *Location* 中填入 `oxidemerge` 程式本身的路徑，而不是應用程式套件或包裝指令碼：
++
+[cols="1,3"]
+|===
+|macOS |`/Applications/OxideMerge.app/Contents/MacOS/oxidemerge`
+|Windows |解壓縮資料夾中 `oxidemerge.exe` 的路徑
+|Linux |`command -v oxidemerge` 的輸出，例如 `/usr/bin/oxidemerge`
+|===
+. 在 *Arguments* 中輸入 `%1 %2`。
+. 在左側清單中選取 *Merge*，同樣選取 *Other application*，並填入相同的 *Location*。
+. 在 *Arguments* 中輸入：
++
+----
+%2 %b %1 -o %r --dl Yours --dm Base --dr Theirs --wl --wr
+----
++
+在 P4V 的合併參數中，`%1` 是對方版本，`%2` 是您的版本，`%b` 是基底，`%r` 是結果。
+. 按一下 *OK*。
+
+合併衝突的步驟：
+
+. 在 *Workspace* 或 *Pending* 分頁中選取檔案；需要解決的檔案會顯示問號圖示。
+. 選擇 *Actions → Resolving → Resolve...*，或在檔案上按右鍵並選擇 *Resolve...*。
+. 在 Resolve 對話方塊中按一下 *Run Merge Tool*。
+OxideMerge 會開啟，左側為 *Yours*、中間為 *Base*、右側為 *Theirs*。
+若開啟的是 P4Merge，請回到 *Preferences → Merge*，確認已選取 *Other application*。
+. 解決每個衝突，按一下「儲存結果」並關閉視窗。
+P4V 傳入的結果檔案已含有 P4V 自己的衝突標記；儲存後會取代這些標記。
+. 在 Resolve 對話方塊中按一下 *Accept Merged*。
+請先檢查結果：OxideMerge 只在您儲存時寫入結果，若未儲存就關閉，結果仍會保留 P4V 的標記。
+若要整個採用對方版本或您的版本，請改用 *Accept Source* 或 *Accept Target*。
+
+在 Windows 上，請將包裝指令碼寫成 `.cmd` 檔，內容為
+`oxidemerge.exe "%3" "%1" "%2" -o "%4" --dl Yours --dm Base --dr Theirs --wl --wr`
+（Subversion 請用 *Mine* 取代 *Yours*）。
+它無法判斷您是否已儲存，因此接受結果前請先檢查。
+
+NOTE: 已試過：在 macOS 上，以 Subversion 1.15 試過 Subversion 的命令與包裝指令碼，
+以 Mercurial 7.2 試過 Mercurial 的設定，且僅使用本機儲存庫。
+Perforce：以 p4 2026.1 試過 `P4DIFF` 與 `oxidemerge-p4-merge` 包裝指令碼，
+並試過由 P4V 的 Resolve 對話方塊開啟 OxideMerge，皆使用本機個人伺服器。
+尚未試過：Windows 與 Linux、Windows 的 `.cmd` 包裝指令碼、透過網路連線的 Subversion 伺服器
+（`svn://`、`https://`）及其登入、透過網路連線的 Perforce 伺服器、P4V 的比較設定，
+以及在 OxideMerge 中儲存後於 P4V 接受合併。
 
 [[file-manager]]
 === 檔案管理員

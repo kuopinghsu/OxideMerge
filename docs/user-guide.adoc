@@ -737,19 +737,38 @@ XML reports hold them in a `<table-match>` element.
 The settings are saved in projects. Older projects open with matching by position.
 
 [[git-revision]]
-=== Comparing with a Git revision
+=== Comparing with a revision
 
-*File → Compare with Git revision...* compares a file or folder with an earlier version from Git.
-The version can be `HEAD`, a branch, a tag or a commit. The dialog lists recent commits.
+*File → Compare with revision...* compares a file or folder with an earlier version from Git,
+Subversion or Mercurial. The nearest working copy above the path decides which one.
+The dialog lists the recent revisions that changed the path.
 
-The Git version is shown read-only on the left. The current file or folder is on the right.
-Git must be installed and in your `PATH`, and the path must be in a Git repository.
+NOTE: Comparing with a Subversion or Mercurial revision is experimental and not fully tested:
+it was tried on macOS only, with local repositories.
 
-On the command line, use `--git-rev`:
+In Git, the version can be `HEAD`, a branch, a tag or a commit; left empty, it is `HEAD`.
+In Subversion, it can be `BASE` (the revision the working copy was updated to), `PREV`,
+`HEAD`, a number such as `1234` or `r1234`, or a date such as `{2026-11-01}`; left empty, it is
+`BASE`.
+In Mercurial, it can be `.` (the working copy's parent), `.^`, `tip`, a number, a hash, a tag,
+a bookmark or another revset; left empty, it is `.`.
+
+The older version is shown read-only on the left. The current file or folder is on the right.
+Git, Subversion or Mercurial must be installed and in your `PATH`.
+Git and Mercurial read their revisions from the local repository.
+Subversion reads `BASE` from the working copy; other revisions, and the list of recent ones,
+come from the repository server, which may ask for a sign-in that OxideMerge cannot give.
+Sign in with `svn` itself first.
+When you compare the top folder of a working copy, the `.git`, `.svn` or `.hg` folder is listed
+on the right only; the *Exclude Source Control* filter hides it.
+
+On the command line, use `--rev` (or `--git-rev`, the same option):
 
 [source,sh]
 ----
-oxidemerge --git-rev HEAD~1 src/main.rs
+oxidemerge --rev HEAD~1 src/main.rs
+oxidemerge --rev PREV src/main.c
+oxidemerge --rev .^ docs
 ----
 
 [[merging]]
@@ -2683,11 +2702,16 @@ three-way comparison.
 |`--dl`, `--dm`, `--dr <TEXT>`
 |Descriptions to show instead of the left, middle and right paths.
 
+|`-L`, `--label <TITLE>`
+|A title for each side in turn, as `diff -L` takes them (see <<other-vcs>>); `--dl`, `--dm` and
+`--dr` take precedence.
+
 |`--wl`, `--wm`, `--wr`
 |Open the left, middle or right side read-only.
 
-|`--git-rev <REV>`
-|Compare the one path given with its version in a Git revision.
+|`--rev`, `--git-rev <REV>`
+|Compare the one path given with its version in a Git, Subversion or Mercurial revision
+(see <<git-revision>>).
 |===
 
 .Folder comparisons
@@ -3129,6 +3153,215 @@ With `trustExitCode false`, Git checks whether the output file changed.
 If it looks unchanged, Git can ask you whether the merge was successful.
 Answer yes only after you saved and checked the result.
 Closing the window alone does not mean that the merge was successful.
+
+[[other-vcs]]
+=== Subversion, Mercurial and Perforce (experimental)
+
+WARNING: Support for Subversion, Mercurial and Perforce is experimental and not fully tested.
+The settings below were tried on macOS only, with local repositories and a local Perforce
+server.
+Check the result of every merge before you accept it, and report what does not work.
+
+OxideMerge accepts the arguments that `diff` takes for titles: `-u` is ignored, and each
+`-L <TITLE>` names the next side, in the order of the paths.
+So the pane headers show revision names rather than the paths of temporary files.
+`--dl`, `--dm` and `--dr` take precedence over `-L`.
+
+Subversion and Perforce pass the files of a merge in an order that OxideMerge cannot take
+directly, so a merge goes through a small wrapper script.
+The wrapper fails when the merged file was not saved, so that the conflict stays unresolved
+when you close the window without saving.
+
+==== Subversion
+
+`svn diff --diff-cmd oxidemerge` compares each changed file in turn.
+Subversion passes `-u -L <old title> -L <new title> <old> <new>`, so the headers show, for
+example, `f.txt (revision 12)` and `f.txt (working copy)`.
+To use OxideMerge for every `svn diff`, set it in `~/.subversion/config`
+(`%APPDATA%\Subversion\config` on Windows):
+
+[source,ini]
+----
+[helpers]
+diff-cmd = oxidemerge
+merge-tool-cmd = /path/to/oxidemerge-svn-merge
+----
+
+Do not pass `-x` options to `svn diff`: Subversion then passes them instead of `-u`.
+
+For merges, Subversion passes five paths: base, theirs, mine, merged file and working file.
+Save this wrapper as `oxidemerge-svn-merge`, make it executable and name it in
+`merge-tool-cmd`:
+
+[source,sh]
+----
+#!/bin/sh
+# Subversion passes: base, theirs, mine, merged, working file.
+before=$(cksum < "$4")
+oxidemerge "$3" "$1" "$2" -o "$4" --dl Mine --dm Base --dr Theirs --wl --wr
+[ "$(cksum < "$4")" != "$before" ]
+----
+
+Choose *l* (launch) at Subversion's conflict prompt, or run `svn update --accept launch`.
+Subversion marks the conflict resolved as soon as the wrapper succeeds, that is when you saved.
+
+==== Mercurial
+
+Add this to `~/.hgrc` (`%USERPROFILE%\mercurial.ini` on Windows):
+
+[source,ini]
+----
+[extensions]
+extdiff =
+
+[extdiff]
+cmd.oxidemerge = oxidemerge
+
+[diff-tools]
+oxidemerge.diffargs = -L $plabel1 -L $clabel $parent $child
+
+[ui]
+merge = oxidemerge
+
+[merge-tools]
+oxidemerge.args = $local $base $other -o $output --dl $labellocal --dm $labelbase --dr $labelother --wl --wr
+oxidemerge.checkchanged = true
+----
+
+`hg oxidemerge` compares the changed files: one file directly, several as a folder comparison.
+`hg oxidemerge -c REV` shows one changeset.
+Do not also set `opts.oxidemerge`: Mercurial then ignores `diffargs`, and the titles are lost.
+`hg merge` and `hg resolve` open a three-way merge with the base in the middle.
+With `checkchanged`, Mercurial asks whether the merge was successful when the merged file did
+not change.
+
+==== Perforce
+
+Perforce can use OxideMerge from the p4 command line, from P4V, or from both.
+The two are set up separately: p4 reads `P4DIFF` and `P4MERGE`, while P4V keeps its own
+preferences.
+
+===== The p4 command line
+
+p4 runs the program named by `P4DIFF` with two files: the depot revision (in a temporary file)
+and your workspace file.
+It runs the program named by `P4MERGE` with four: base, theirs, yours and the result.
+OxideMerge takes the merge files in a different order, so the merge goes through a wrapper.
+
+To set it up:
+
+. Save this script as `oxidemerge-p4-merge` in a folder on your `PATH`, for example
+`~/bin/oxidemerge-p4-merge`:
++
+[source,sh]
+----
+#!/bin/sh
+# Perforce passes: base, theirs, yours, result.
+before=$(cksum < "$4")
+oxidemerge "$3" "$1" "$2" -o "$4" --dl Yours --dm Base --dr Theirs --wl --wr
+[ "$(cksum < "$4")" != "$before" ]
+----
++
+The last line makes the wrapper fail when the result was not saved, so the file stays
+unresolved.
+. Make it executable:
++
+[source,sh]
+----
+chmod +x ~/bin/oxidemerge-p4-merge
+----
+. Tell p4 to use OxideMerge, with `p4 set` (or as environment variables of the same names):
++
+[source,sh]
+----
+p4 set P4DIFF=oxidemerge
+p4 set P4MERGE=$HOME/bin/oxidemerge-p4-merge
+----
++
+If `oxidemerge` is not on your `PATH`, give its full path, for example
+`/Applications/OxideMerge.app/Contents/MacOS/oxidemerge` on macOS.
+Do not add `--cli` to `P4DIFF`: it exits with 1 when the files differ, which p4 reports as
+*Execution Failed*.
+. Check the settings with `p4 set`; both lines should name OxideMerge.
+
+To compare a file with the depot, run `p4 diff f.txt`; OxideMerge opens with the depot revision
+on the left and your workspace file on the right.
+
+To merge a conflict:
+
+. Run `p4 resolve f.txt`.
+. At the prompt, type *m* (merge).
+OxideMerge opens with *Yours* on the left, *Base* in the middle and *Theirs* on the right.
+. Resolve each conflict, with *Next conflict* and then *Take left*, *Take right* or *Take both*,
+or by editing the middle pane.
+. Click *Save result* and close the window.
+. Back at the prompt, p4 suggests *ae* (accept edit); type *ae* to accept the merged file.
+
+If you close the window without saving, p4 reports *Execution Failed* and the file stays
+unresolved; typing *ae* then warns that the file still has change markers.
+Run `p4 resolve` again to start over.
+
+===== P4V
+
+P4V does not read `P4DIFF` or `P4MERGE`; it has its own diff and merge settings.
+It runs OxideMerge directly, so no wrapper is needed.
+
+To set it up:
+
+. In P4V, open *Preferences* (*P4V → Preferences* on macOS, *Edit → Preferences* on Windows
+and Linux).
+. Select *Diff* in the list on the left.
+. Select *Other application*.
+Filling in the fields below it is not enough: while *P4Merge* stays selected, P4V keeps using
+P4Merge.
+. In *Location*, give the path of the `oxidemerge` program itself, not of the app or a wrapper:
++
+[cols="1,3"]
+|===
+|macOS |`/Applications/OxideMerge.app/Contents/MacOS/oxidemerge`
+|Windows |the path of `oxidemerge.exe` in the folder you extracted it to
+|Linux |the output of `command -v oxidemerge`, for example `/usr/bin/oxidemerge`
+|===
+. In *Arguments*, type `%1 %2`.
+. Select *Merge* in the list on the left, select *Other application* there too, and give the
+same *Location*.
+. In *Arguments*, type:
++
+----
+%2 %b %1 -o %r --dl Yours --dm Base --dr Theirs --wl --wr
+----
++
+In P4V's merge arguments, `%1` is theirs, `%2` is yours, `%b` the base and `%r` the result.
+. Click *OK*.
+
+To merge a conflict:
+
+. Select the file in the *Workspace* or *Pending* tab; a file that needs resolving shows a
+question mark.
+. Choose *Actions → Resolving → Resolve...*, or right-click the file and choose *Resolve...*.
+. In the Resolve dialog, click *Run Merge Tool*.
+OxideMerge opens with *Yours* on the left, *Base* in the middle and *Theirs* on the right.
+If P4Merge opens instead, go back to *Preferences → Merge* and check that *Other application*
+is selected.
+. Resolve each conflict, click *Save result* and close the window.
+The result file P4V passes already holds P4V's own conflict markers; saving replaces them.
+. In the Resolve dialog, click *Accept Merged*.
+Check the result first: OxideMerge writes the result only when you save, so if you closed it
+without saving, the result still holds P4V's markers.
+Use *Accept Source* or *Accept Target* instead to take theirs or yours whole.
+
+On Windows, write a wrapper as a `.cmd` file with the line
+`oxidemerge.exe "%3" "%1" "%2" -o "%4" --dl Yours --dm Base --dr Theirs --wl --wr`
+(*Mine* rather than *Yours* for Subversion).
+It cannot tell whether you saved, so check the result before you accept it.
+
+NOTE: What was tried: the Subversion commands and wrapper with Subversion 1.15, and the
+Mercurial settings with Mercurial 7.2, on macOS, with local repositories only.
+Perforce: `P4DIFF` and the `oxidemerge-p4-merge` wrapper with p4 2026.1, and P4V opening
+OxideMerge from its Resolve dialog, against a local personal server.
+Not tried: Windows and Linux, the Windows `.cmd` wrappers, Subversion servers reached over the
+network (`svn://`, `https://`) and their sign-in, Perforce servers reached over the network,
+P4V's diff setting, and accepting a merge in P4V after saving in OxideMerge.
 
 [[file-manager]]
 === File manager

@@ -168,6 +168,22 @@ section of this file as the release notes.
 - **Structured files in folder compares:** *Treat JSON, XML, TOML and YAML files with the same
   structure as identical* in *Options → Folder* (or `--structured`) counts such files as identical
   in the *Full contents* method when only key order, layout or comments differ.
+- **Subversion, Mercurial and Perforce (experimental, not fully tested):** `-L <title>` (`--label`) titles the sides in order, as
+  `diff -L` does, and `-u` is accepted and ignored, so `svn diff --diff-cmd oxidemerge` shows
+  revision names in the pane headers; `--dl`, `--dm` and `--dr` take precedence. The user guide
+  sets up diffs and merges for Subversion, Mercurial and Perforce, with wrapper scripts that leave
+  a conflict unresolved when the merge was not saved, and the P4V *Diff* and *Merge* arguments.
+  Tried with Subversion 1.15, Mercurial 7.2 and p4 2026.1 (with P4V) on macOS.
+- **Compare with revision in Subversion and Mercurial (experimental, not fully tested; macOS
+  and local repositories only):** *File → Compare with revision...*
+  (formerly *Compare with Git revision...*) and `--rev` (`--git-rev` still works) also take
+  Subversion and Mercurial working copies: the nearest `.git`, `.svn` or `.hg` above the path
+  decides. Subversion revisions are `BASE`
+  (the default), `PREV`, `HEAD`, a number, `r1234` as `svn log` prints it, or a date; the dialog
+  lists the recent revisions with their messages. Names with `@` or letters outside ASCII work
+  when the program starts without a UTF-8 locale. Revisions other than `BASE` are read from the
+  repository server, as `svn` does. Mercurial revisions are `.` (the default), `.^`, `tip`, a
+  number, a hash, a tag or another revset, read from the local repository.
 
 ### Changed
 
