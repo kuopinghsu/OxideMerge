@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Field Service Handbook</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0 auto; max-width: 900px; padding: 24px 40px; color: #222; line-height: 1.5; }
+  table { border-collapse: collapse; margin: 12px 0 24px; }
+  th, td { border: 1px solid #bbb; padding: 6px 10px; text-align: left; vertical-align: top; }
+  thead th { background: #1f3864; color: #fff; }
+  tfoot td { font-weight: 600; background: #eef2f8; }
+  caption { caption-side: top; font-weight: 600; text-align: left; padding-bottom: 4px; }
+  .note { border-left: 4px solid #c9a227; padding: 4px 12px; background: #fbf6e6; }
+</style>
+</head>
+<body>
+<header>
+  <p><a href="https://example.com/">Northwind Services</a> › <a href="https://example.com/handbook/">Handbook</a></p>
+</header>
+
+<main>
+<h1>Field Service Handbook</h1>
+<p>This handbook is for <strong>field engineers</strong> and <em>dispatch coordinators</em>.
+It describes how a service visit is planned, carried out and closed. Version <code>3.2</code>,
+updated on 4 August 2026.</p>
+<p style="display: none">Draft: the regional tables are not final.</p>
+
+<h2>1. Before a visit</h2>
+<p>Every visit starts with a work order in the dispatch system. Read the whole work order before
+you leave, and call the customer if the access notes are unclear.</p>
+
+<h3>1.1 What to bring</h3>
+<ul>
+  <li>The standard tool kit, checked against the list inside the lid.</li>
+  <li>Spare parts for the device model:
+    <ul>
+      <li>two fuses of each rating;</li>
+      <li>one control board, for models R-200 and R-300 only.</li>
+    </ul>
+  </li>
+  <li>A charged tablet with the latest service app.</li>
+</ul>
+
+<h3>1.2 Safety checks</h3>
+<ol>
+  <li>Switch the device off and lock the isolator.</li>
+  <li>Test that the supply is dead with a <em>two-pole</em> tester.</li>
+  <li>Put up the warning sign.</li>
+</ol>
+
+<blockquote class="note">
+  <p><strong>Never</strong> work on a live device. If the isolator cannot be locked, stop and
+  call your team lead.</p>
+</blockquote>
+
+<h2>2. Response times</h2>
+<p>The table below shows the agreed response times by region and priority, in hours from the
+moment the work order is created.</p>
+
+<table>
+  <caption>Table 1. Response times (hours)</caption>
+  <thead>
+    <tr><th rowspan="2">Region</th><th rowspan="2">Area</th><th colspan="3">Priority</th></tr>
+    <tr><th>P1</th><th>P2</th><th>P3</th></tr>
+  </thead>
+  <tbody>
+    <tr><td rowspan="2"><strong>North</strong></td><td>City</td><td>4</td><td>8</td><td>24</td></tr>
+    <tr><td>Rural</td><td>6</td><td>12</td><td>48</td></tr>
+    <tr><td rowspan="2"><strong>South</strong></td><td>City</td><td>4</td><td>8</td><td>24</td></tr>
+    <tr><td>Coast</td><td>8</td><td>16</td><td>48</td></tr>
+    <tr><td><strong>Islands</strong></td><td>All</td><td>24</td><td>48</td><td>72</td></tr>
+  </tbody>
+  <tfoot>
+    <tr><td colspan="2">Target met in July</td><td>96%</td><td>98%</td><td>99%</td></tr>
+    <tr><td colspan="5">Times are measured on working days only.</td></tr>
+  </tfoot>
+</table>
+
+<h2>3. Spare parts</h2>
+<table>
+  <caption>Table 2. Parts kept in each van</caption>
+  <thead>
+    <tr><th>Part</th><th>Code</th><th>Models</th><th>Quantity</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Fuse, 5 A</td><td><code>FU-05</code></td><td rowspan="2">All</td><td>4</td></tr>
+    <tr><td>Fuse, 10 A</td><td><code>FU-10</code></td><td>4</td></tr>
+    <tr><td>Control board</td><td><code>CB-200</code></td><td>R-200, R-300</td><td>1</td></tr>
+    <tr><td>Door seal</td><td><code>DS-1</code></td><td>R-100</td><td>2</td></tr>
+  </tbody>
+</table>
+
+<figure>
+  <img src="images/van-layout.png" alt="Layout of the parts shelves in a service van" width="480">
+  <figcaption>Figure 1. Where each part is kept in the van.</figcaption>
+</figure>
+
+<h2>4. After a visit</h2>
+<p>Close the work order in the service app before you leave the site. Record the parts you used
+and the time you spent, and ask the customer to sign on the tablet.</p>
+
+<h3>4.1 Terms</h3>
+<dl>
+  <dt>First-time fix</dt>
+  <dd>A fault that is fixed on the first visit, without a return trip.</dd>
+  <dt>Return visit</dt>
+  <dd>A second visit to the same fault within 30 days.</dd>
+</dl>
+
+<h3>4.2 Report template</h3>
+<pre><code class="language-text">Work order: WO-000000
+Fault found: ...
+Action taken: ...
+Parts used: FU-05 x1</code></pre>
+
+<p>Questions about this handbook go to <a href="mailto:handbook@example.com">handbook@example.com</a>.</p>
+</main>
+
+<footer>
+  <p>© 2026 Northwind Services. Internal use only.</p>
+</footer>
+</body>
+</html>
