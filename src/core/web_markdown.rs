@@ -199,7 +199,7 @@ fn decode(s: &str) -> String {
 }
 
 /// Characters that would otherwise be read as Markdown within a line.
-fn escapes(c: char) -> bool {
+pub(crate) fn escapes(c: char) -> bool {
     matches!(
         c,
         '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '~' | '|'
@@ -217,7 +217,7 @@ fn entity_follows(rest: &str) -> bool {
 }
 
 /// Escapes what would start a heading, list item or rule at the start of a line.
-fn escape_line_start(line: &str) -> String {
+pub(crate) fn escape_line_start(line: &str) -> String {
     if line.starts_with(['#', '+', '-', '=']) {
         return format!("\\{line}");
     }
@@ -229,7 +229,7 @@ fn escape_line_start(line: &str) -> String {
 }
 
 /// A link destination, in angle brackets when it has characters that would end it.
-fn destination(url: &str) -> String {
+pub(crate) fn destination(url: &str) -> String {
     if url.contains([' ', '(', ')']) {
         format!("<{}>", url.replace('<', "%3C").replace('>', "%3E"))
     } else {
@@ -265,7 +265,12 @@ struct Open {
 
 #[derive(Default)]
 struct Table {
-    rows: Vec<Vec<String>>,
+    rows: Vec<Vec<SpanCell>>,
+    /// The rows where a row group (`thead`, `tbody`, `tfoot`) starts or ends: a cell spans
+    /// rows only within its own group.
+    groups: Vec<usize>,
+    /// How many rows and columns the cell being read spans.
+    span: (usize, usize),
     in_cell: bool,
     in_caption: bool,
     caption: String,
@@ -471,6 +476,7 @@ impl Converter {
                 t.rows.push(Vec::new());
             }
             t.in_cell = true;
+            t.span = (1, 1);
         }
         self.line.clear();
     }
@@ -488,7 +494,12 @@ impl Converter {
         if t.in_caption {
             t.caption = text;
         } else if let Some(row) = t.rows.last_mut() {
-            row.push(text);
+            let (rows, cols) = t.span;
+            row.push(SpanCell {
+                text: escape_cell(&text),
+                rows,
+                cols,
+            });
         }
         t.in_cell = false;
         t.in_caption = false;
@@ -500,9 +511,29 @@ impl Converter {
         if !t.caption.is_empty() {
             self.emit(&escape_line_start(&t.caption));
         }
-        let rows: Vec<&Vec<String>> = t.rows.iter().filter(|r| !r.is_empty()).collect();
+        // Each row group is laid out on its own, so that no cell spans into the next one. An
+        // empty row still counts, as a row a cell above may span, and is left out only when
+        // nothing covers it.
+        let mut rows = Vec::new();
+        let mut cells = t.rows.into_iter();
+        let mut at = 0;
+        let mut ends = t.groups;
+        ends.push(usize::MAX);
+        for end in ends {
+            if end <= at {
+                continue;
+            }
+            let group: Vec<_> = cells.by_ref().take(end - at).collect();
+            at += group.len();
+            rows.extend(lay_out(group).into_iter().filter(|r| !r.is_empty()));
+        }
         let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-        if cols == 0 || rows.iter().all(|r| r.iter().all(String::is_empty)) {
+        if cols == 0
+            || rows.iter().all(|r| {
+                r.iter()
+                    .all(|c| c.is_empty() || c == COVERED_LEFT || c == COVERED_ABOVE)
+            })
+        {
             return;
         }
         let line = |cells: &mut dyn Iterator<Item = &str>| {
@@ -616,13 +647,33 @@ impl Converter {
                 }
             }
             "caption" if in_table => self.start_cell(true),
+            "thead" | "tbody" | "tfoot" if in_table => {
+                self.end_cell();
+                if let Some(t) = &mut self.table {
+                    t.groups.push(t.rows.len());
+                }
+            }
             "tr" if in_table => {
                 self.end_cell();
                 if let Some(t) = &mut self.table {
                     t.rows.push(Vec::new());
                 }
             }
-            "td" | "th" if in_table => self.start_cell(false),
+            "td" | "th" if in_table => {
+                self.start_cell(false);
+                // `rowspan="0"` reaches to the end of the row group.
+                let span = |name, zero, most| {
+                    attr(attrs, name)
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .map_or(1, |n| if n == 0 { zero } else { n.min(most) })
+                };
+                if let Some(t) = &mut self.table {
+                    t.span = (
+                        span("rowspan", usize::MAX, 65_534),
+                        span("colspan", 1, 1_000),
+                    );
+                }
+            }
             "br" => {
                 if in_table || self.heading.is_some() {
                     self.space();
@@ -692,6 +743,12 @@ impl Converter {
             "table" => self.end_table(),
             "td" | "th" | "caption" if in_table => self.end_cell(),
             "tr" if in_table => self.end_cell(),
+            "thead" | "tbody" | "tfoot" if in_table => {
+                self.end_cell();
+                if let Some(t) = &mut self.table {
+                    t.groups.push(t.rows.len());
+                }
+            }
             "dt" | "summary" => {
                 self.close_mark(name);
                 self.flush();
@@ -1102,6 +1159,150 @@ fn split_row(line: &str) -> Vec<String> {
     cells
 }
 
+/// Written in a table cell that a merged cell to its left covers, as in MultiMarkdown.
+pub const COVERED_LEFT: &str = "<";
+/// Written in a table cell that a merged cell above it covers.
+pub const COVERED_ABOVE: &str = "^";
+
+/// The most columns a table with merged cells is laid out to.
+pub const MAX_TABLE_COLUMNS: usize = 1_024;
+
+/// The most cells a table with merged cells is laid out to, the ones merged cells cover
+/// included: past it, a cell no longer spans other cells, so that a few cells with large spans
+/// cannot fill memory.
+pub const MAX_TABLE_CELLS: usize = 1 << 20;
+
+/// A cell of a table, as Markdown, with how many rows and columns it spans.
+pub struct SpanCell {
+    pub text: String,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// Lays out rows of cells, each placed in the first column not yet covered by a cell above it
+/// that spans rows, as a cell for every column of every row: the cells a merged cell covers are
+/// written as [`COVERED_ABOVE`] below it and [`COVERED_LEFT`] elsewhere. A span reaching past
+/// the last row, or past [`MAX_TABLE_COLUMNS`], stops there; once the table holds
+/// [`MAX_TABLE_CELLS`], cells no longer span, and past that the rest is left out.
+pub fn lay_out(rows: Vec<Vec<SpanCell>>) -> Vec<Vec<String>> {
+    let count = rows.len();
+    let mut grid: Vec<Vec<Option<String>>> = vec![Vec::new(); count];
+    let mut slots = 0usize;
+    'rows: for (r, row) in rows.into_iter().enumerate() {
+        let mut c = 0;
+        for cell in row {
+            while grid[r].get(c).is_some_and(Option::is_some) {
+                c += 1;
+            }
+            if c >= MAX_TABLE_COLUMNS {
+                break;
+            }
+            let mut span_rows = cell.rows.clamp(1, count - r);
+            let mut span_cols = cell.cols.clamp(1, MAX_TABLE_COLUMNS - c);
+            let grow = |rows: usize, cols: usize| -> usize {
+                grid[r..r + rows]
+                    .iter()
+                    .map(|line| (c + cols).saturating_sub(line.len()))
+                    .sum()
+            };
+            let mut more = grow(span_rows, span_cols);
+            if slots + more > MAX_TABLE_CELLS {
+                (span_rows, span_cols) = (1, 1);
+                more = grow(1, 1);
+                if slots + more > MAX_TABLE_CELLS {
+                    break 'rows;
+                }
+            }
+            slots += more;
+            let mut text = Some(cell.text);
+            for (dr, line) in grid[r..r + span_rows].iter_mut().enumerate() {
+                if line.len() < c + span_cols {
+                    line.resize(c + span_cols, None);
+                }
+                for (dc, slot) in line[c..c + span_cols].iter_mut().enumerate() {
+                    *slot = Some(match (dr, dc) {
+                        (0, 0) => text.take().unwrap_or_default(),
+                        (_, 0) => COVERED_ABOVE.to_string(),
+                        _ => COVERED_LEFT.to_string(),
+                    });
+                }
+            }
+            c += span_cols;
+        }
+    }
+    grid.into_iter()
+        .map(|r| r.into_iter().map(Option::unwrap_or_default).collect())
+        .collect()
+}
+
+/// A cell's Markdown with a lone `<` or `^` escaped, so it is not taken for a merged cell.
+pub fn escape_cell(text: &str) -> String {
+    if text == COVERED_LEFT || text == COVERED_ABOVE {
+        format!("\\{text}")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Where a table cell is, when its cells may be merged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    /// The first cell of a merged area this many columns wide and rows tall (1 and 1 when it
+    /// is not merged), whose text is shown across the whole area.
+    Anchor { cols: usize, rows: usize },
+    /// A cell that the merged area starting at this row and column covers.
+    Covered { row: usize, col: usize },
+}
+
+/// The merged areas of a table's `cells` (from [`table_cells`]): a cell that is
+/// [`COVERED_LEFT`] belongs to the area of the cell left of it, one that is [`COVERED_ABOVE`]
+/// to the area of the cell above it. A marker with no cell to belong to is text.
+pub fn spans<S: AsRef<str>>(cells: &[Vec<S>]) -> Vec<Vec<Slot>> {
+    let mut owner: Vec<Vec<(usize, usize)>> = Vec::with_capacity(cells.len());
+    for (r, row) in cells.iter().enumerate() {
+        let mut line: Vec<(usize, usize)> = Vec::with_capacity(row.len());
+        for (k, text) in row.iter().enumerate() {
+            let above = r.checked_sub(1).and_then(|up| owner[up].get(k).copied());
+            let o = match text.as_ref() {
+                COVERED_LEFT if k > 0 => line[k - 1],
+                COVERED_ABOVE if above.is_some() => above.unwrap_or((r, k)),
+                _ => (r, k),
+            };
+            line.push(o);
+        }
+        owner.push(line);
+    }
+    // Each area reaches as far right and down as the cells it owns.
+    let mut reach: std::collections::HashMap<(usize, usize), (usize, usize)> =
+        std::collections::HashMap::new();
+    for (r, line) in owner.iter().enumerate() {
+        for (k, &o) in line.iter().enumerate() {
+            let e = reach.entry(o).or_insert((r, k));
+            *e = (e.0.max(r), e.1.max(k));
+        }
+    }
+    owner
+        .iter()
+        .enumerate()
+        .map(|(r, line)| {
+            line.iter()
+                .enumerate()
+                .map(|(k, &(ar, ak))| {
+                    if (ar, ak) == (r, k) {
+                        let (er, ek) = reach[&(r, k)];
+                        Slot::Anchor {
+                            cols: ek - k + 1,
+                            rows: er - r + 1,
+                        }
+                    } else {
+                        Slot::Covered { row: ar, col: ak }
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// What differs within a block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Marks {
@@ -1316,6 +1517,99 @@ mod tests {
             md("<p>&amp;copy; &amp;#169; AT&amp;T &amp; &amp;x y; <code>&amp;lt;</code></p>"),
             "\\&copy; \\&#169; AT&T & &x y; `&lt;`"
         );
+    }
+
+    #[test]
+    fn cells_that_span_rows_and_columns_are_written_as_markers() {
+        let html = "<table><tr><th rowspan=2>Area</th><th colspan=\"2\">Revenue</th></tr>\
+            <tr><th>Q2</th><th>Q3</th></tr>\
+            <tr><td rowspan=\"0\">East</td><td>1</td><td>2</td></tr>\
+            <tr><td colspan=2>Both</td></tr>\
+            <tr><td>^</td><td>x</td></tr></table>";
+        assert_eq!(
+            md(html),
+            "| Area | Revenue | < |\n| --- | --- | --- |\n| ^ | Q2 | Q3 |\n| East | 1 | 2 |\n\
+             | ^ | Both | < |\n| ^ | \\^ | x |"
+        );
+    }
+
+    #[test]
+    fn a_cell_spans_rows_only_within_its_row_group() {
+        let html = "<table><thead><tr><th rowspan=0>Region</th><th rowspan=3>P1</th></tr>\
+            <tr></tr></thead>\
+            <tbody><tr><td>North</td><td>4</td></tr></tbody></table>";
+        assert_eq!(
+            md(html),
+            "| Region | P1 |\n| --- | --- |\n| ^ | ^ |\n| North | 4 |"
+        );
+    }
+
+    #[test]
+    fn an_empty_row_still_counts_for_the_cells_spanning_it() {
+        let html = "<table><tr><td rowspan=3>A</td><td>1</td></tr><tr></tr>\
+            <tr><td>2</td></tr><tr><td>x</td><td>y</td></tr></table>";
+        assert_eq!(
+            md(html),
+            "| A | 1 |\n| --- | --- |\n| ^ |  |\n| ^ | 2 |\n| x | y |"
+        );
+        // A row nothing covers is left out.
+        assert_eq!(
+            md("<table><tr><td>a</td></tr><tr></tr><tr><td>b</td></tr></table>"),
+            "| a |\n| --- |\n| b |"
+        );
+    }
+
+    #[test]
+    fn large_spans_are_laid_out_within_a_bounded_number_of_cells() {
+        let mut rows = vec![vec![SpanCell {
+            text: "x".into(),
+            rows: usize::MAX,
+            cols: 1_000,
+        }]];
+        rows.extend((0..20_000).map(|_| {
+            vec![SpanCell {
+                text: "a".into(),
+                rows: 1,
+                cols: 1,
+            }]
+        }));
+        let grid = lay_out(rows);
+        let cells: usize = grid.iter().map(Vec::len).sum();
+        assert!(cells <= MAX_TABLE_CELLS, "{cells}");
+        // The span that did not fit is a single cell, and the rows are all still there.
+        assert_eq!(grid.len(), 20_001);
+        assert_eq!(grid[0], ["x"]);
+        assert!(grid[1..].iter().all(|r| r == &["a"]));
+    }
+
+    #[test]
+    fn merged_cells_are_read_from_their_markers() {
+        let cells = |rows: &[&[&str]]| -> Vec<Vec<String>> {
+            rows.iter()
+                .map(|r| r.iter().map(|c| c.to_string()).collect())
+                .collect()
+        };
+        // A 2 by 2 merged cell, and markers with nothing to belong to.
+        let slots = spans(&cells(&[
+            &["<", "A", "<"],
+            &["^", "^", "^"],
+            &["x", "^", "y"],
+        ]));
+        assert_eq!(slots[0][0], Slot::Anchor { cols: 1, rows: 2 });
+        assert_eq!(slots[0][1], Slot::Anchor { cols: 2, rows: 3 });
+        assert_eq!(slots[1][2], Slot::Covered { row: 0, col: 1 });
+        assert_eq!(slots[2][1], Slot::Covered { row: 0, col: 1 });
+        assert_eq!(slots[2][2], Slot::Anchor { cols: 1, rows: 1 });
+        // A cell of a web page that only holds a marker character is text.
+        let blocks = html_to_blocks(
+            "<table><tr><td>a</td><td>^</td><td>&lt;</td></tr></table>",
+            None,
+        );
+        let row = &table_cells(&blocks[0].text).unwrap()[0];
+        assert_eq!(row, &["a", "\\^", "\\<"]);
+        assert!(spans(std::slice::from_ref(row))[0]
+            .iter()
+            .all(|s| *s == Slot::Anchor { cols: 1, rows: 1 }));
     }
 
     #[test]
@@ -1648,7 +1942,7 @@ mod tests {
         assert!(tables[1].contains("| **Family** | $9 | 50 GB shared by 6 people | Unlimited |"));
         assert!(tables[2].ends_with("| Toggle sidebar | `Ctrl`+`\\` | `⌘`+`\\` | `Ctrl`+`\\` |"));
         assert!(tables[3].contains("| `q` | string | Words to find. Use `a\\|b` to match"));
-        assert!(tables[4].contains("| 2.4 | To be announced |  |"));
+        assert!(tables[4].contains("| 2.4 | To be announced | < |"));
         assert!(tables[6].contains("| Attachment size | Free 10 MB Paid 250 MB |"));
     }
 }

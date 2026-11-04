@@ -34,8 +34,7 @@ enum KindArg {
     Binary,
     Image,
     /// Web pages (URLs or HTML files, which are compared so by default); the console compare
-    /// uses the pages as Markdown, or the web mode last chosen, after the pages' scripts have
-    /// run when a browser is found
+    /// uses the pages as Markdown, or the web mode last chosen
     Web,
 }
 

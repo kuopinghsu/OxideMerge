@@ -6,10 +6,33 @@ pub fn delimiter_for(path: &Path) -> Option<char> {
     match super::text::extension(path).as_str() {
         "csv" => Some(','),
         "tsv" | "tab" => Some('\t'),
-        // A spreadsheet is read as comma separated records, so it is compared as a table too.
-        "xlsx" | "xlsm" | "ods" => Some(','),
         _ => None,
     }
+}
+
+/// The delimiter of the records `doc` holds, when they are a table. A spreadsheet OxideMerge
+/// reads itself is comma separated records, so it is compared as a table too, unless it has
+/// several sheets, which are not one table. What a converter the user configured writes is
+/// not known, so it is compared as text.
+pub fn delimiter_of_doc(
+    doc: &super::text::TextDoc,
+    opts: &super::diff::DiffOptions,
+) -> Option<char> {
+    let path = doc.path.as_deref()?;
+    if let Some(d) = delimiter_for(path) {
+        return Some(d);
+    }
+    let read_here = matches!(
+        super::unpacker::find(opts, path),
+        Some(super::unpacker::Converter::BuiltIn(
+            super::extract::Kind::Spreadsheet
+        ))
+    );
+    let several = doc
+        .lines
+        .first()
+        .is_some_and(|l| super::extract::is_sheet_heading(l));
+    (read_here && !several).then_some(',')
 }
 
 /// Splits one line into cells, honoring double quotes.

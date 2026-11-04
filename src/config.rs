@@ -104,13 +104,7 @@ pub struct Config {
     pub image_block: u32,
     pub binary_bytes_per_line: usize,
     pub unpackers: Vec<Unpacker>,
-    /// Browser used for web page screenshots ("" = detect Edge, Chrome or Chromium).
-    pub web_browser: String,
-    pub web_width: u32,
-    pub web_height: u32,
     pub web_mode: WebMode,
-    /// Whether screenshots show the text differences between the pages highlighted.
-    pub web_highlight: bool,
     pub restore_session: bool,
     /// Text compares fold long runs of unchanged lines.
     pub collapse_unchanged: bool,
@@ -175,11 +169,7 @@ impl Default for Config {
                 pattern: "*.docx;*.odt;*.rtf".into(),
                 command: "pandoc -t plain ${file}".into(),
             }],
-            web_browser: String::new(),
-            web_width: 1280,
-            web_height: 1600,
             web_mode: WebMode::Markdown,
-            web_highlight: true,
             restore_session: true,
             collapse_unchanged: false,
             word_wrap: false,
@@ -282,7 +272,14 @@ impl Config {
     }
 
     fn parse(s: &str) -> Option<Config> {
-        let value: serde_json::Value = serde_json::from_str(s).ok()?;
+        let mut value: serde_json::Value = serde_json::from_str(s).ok()?;
+        // Settings from when web pages could be compared as screenshots: those modes are gone,
+        // so open the pages formatted instead of dropping all the settings as unreadable.
+        if let Some(mode) = value.get_mut("web_mode") {
+            if matches!(mode.as_str(), Some("Screenshot" | "FullScreenshot")) {
+                *mode = serde_json::Value::from("Markdown");
+            }
+        }
         let has_theme = value.get("theme").is_some();
         let mut cfg: Config = serde_json::from_value(value).ok()?;
         // Settings from before the theme choice existed: keep an explicit dark mode.
@@ -414,6 +411,17 @@ mod tests {
             assert_eq!(reopened, cfg);
             assert_eq!(reopened.diff, old.diff);
         }
+    }
+
+    #[test]
+    fn removed_screenshot_web_modes_open_formatted() {
+        for old in ["Screenshot", "FullScreenshot"] {
+            let cfg =
+                Config::parse(&format!(r#"{{"web_mode": "{old}", "web_browser": "x"}}"#)).unwrap();
+            assert_eq!(cfg.web_mode, WebMode::Markdown);
+        }
+        let cfg = Config::parse(r#"{"web_mode": "Html"}"#).unwrap();
+        assert_eq!(cfg.web_mode, WebMode::Html);
     }
 
     #[test]

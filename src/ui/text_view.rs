@@ -14,6 +14,7 @@ use crate::core::text::{self, Eol, TextDoc, TextEncoding, COMMON_ENCODINGS};
 use crate::i18n::{tr, trf};
 use crate::ui::commands::Cmd;
 use crate::ui::icons;
+use crate::ui::markdown_view::{MarkdownView, Prepared};
 use crate::ui::syntax::{self, LineSpans};
 use crate::ui::theme::{self, Colors};
 use crate::ui::widgets::{self, Icon, Mark, Outcome};
@@ -918,6 +919,59 @@ pub enum TextPanel {
     Verification,
 }
 
+/// What a file is shown as in the Formatted view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormattedKind {
+    Document,
+    Workbook,
+    /// A PDF file, read from the structure it is tagged with.
+    Pdf,
+}
+
+/// Whether `path` can be shown in the Formatted view, and as what.
+fn formatted_kind(path: &std::path::Path) -> Option<FormattedKind> {
+    match text::extension(path).as_str() {
+        "docx" => Some(FormattedKind::Document),
+        "xlsx" | "xlsm" => Some(FormattedKind::Workbook),
+        "pdf" => Some(FormattedKind::Pdf),
+        _ => None,
+    }
+}
+
+/// A file's size and time of last change, when they can be read.
+type FileStamp = Option<(u64, Option<SystemTime>)>;
+
+/// What a Formatted view was made from: each file as it was on disk, and the compare options.
+#[derive(Clone, PartialEq)]
+struct FormattedKey {
+    files: Vec<(std::path::PathBuf, FileStamp)>,
+    opts: DiffOptions,
+}
+
+/// The Formatted view of Word documents.
+#[derive(Default)]
+struct FormattedSession {
+    /// The view and what it was made from, or why it could not be made.
+    view: Option<(FormattedKey, Result<MarkdownView, String>)>,
+    /// The view being made, and what from.
+    job: Option<(FormattedKey, super::analysis::Task<Prepared>)>,
+}
+
+impl FormattedKey {
+    fn of(paths: &[std::path::PathBuf], opts: &DiffOptions) -> Self {
+        FormattedKey {
+            files: paths
+                .iter()
+                .map(|p| {
+                    let meta = std::fs::metadata(p).ok();
+                    (p.clone(), meta.map(|m| (m.len(), m.modified().ok())))
+                })
+                .collect(),
+            opts: opts.clone(),
+        }
+    }
+}
+
 pub struct TextView {
     /// Whether the side drawer is open, and the panel it shows.
     pub drawer_open: bool,
@@ -940,6 +994,12 @@ pub struct TextView {
     tree_active: bool,
     /// The comparison and state of the Tree view.
     pub tree: Box<super::xml_tree_view::TreeSession>,
+    /// The Formatted view of Word documents, which takes the place of the text panes.
+    formatted_mode: bool,
+    /// Whether the Formatted view was shown last frame, so difference commands step through it.
+    formatted_active: bool,
+    /// The Formatted view and the one being made.
+    formatted: Box<FormattedSession>,
     merge_validation_generation: Option<u64>,
     merge_freshness: Option<(u64, bool)>,
     merge_preview_job: Option<(
@@ -1037,10 +1097,10 @@ pub struct TextView {
 
 impl TextView {
     pub fn new(docs: Vec<TextDoc>, cfg: &Config) -> Self {
+        let comparison = cfg.comparison_options();
         let table_delim = docs
             .iter()
-            .filter_map(|d| d.path.as_deref())
-            .find_map(table::delimiter_for);
+            .find_map(|d| table::delimiter_of_doc(d, &comparison));
         let bookmarks = vec![BTreeMap::new(); docs.len()];
         let mut v = TextView {
             drawer_open: false,
@@ -1058,6 +1118,9 @@ impl TextView {
             tree_mode: false,
             tree_active: false,
             tree: Default::default(),
+            formatted_mode: false,
+            formatted_active: false,
+            formatted: Default::default(),
             merge_validation_generation: None,
             merge_freshness: None,
             merge_preview_job: None,
@@ -1710,6 +1773,14 @@ impl TextView {
         self.scroll_to = Some(row);
     }
 
+    /// Runs `step` on the Formatted view while it is shown.
+    fn formatted_step<R>(&mut self, step: impl FnOnce(&mut MarkdownView) -> R) -> Option<R> {
+        match &mut self.formatted.view {
+            Some((_, Ok(view))) if self.formatted_active => Some(step(view)),
+            _ => None,
+        }
+    }
+
     /// Runs `step` on the Tree view and its comparison while the Tree view is shown.
     fn tree_step<R>(
         &mut self,
@@ -1727,6 +1798,9 @@ impl TextView {
     }
 
     pub fn first_diff(&mut self) {
+        if self.formatted_step(MarkdownView::first_diff).is_some() {
+            return;
+        }
         if self.tree_step(|view, diff| view.edge(diff, true)).is_some() {
             return;
         }
@@ -1757,6 +1831,9 @@ impl TextView {
     }
 
     pub fn last_diff(&mut self) {
+        if self.formatted_step(MarkdownView::last_diff).is_some() {
+            return;
+        }
         if self
             .tree_step(|view, diff| view.edge(diff, false))
             .is_some()
@@ -1847,6 +1924,9 @@ impl TextView {
 
     /// Selects the next difference; false when there is none after the cursor.
     pub fn next_diff(&mut self, conflicts_only: bool) -> bool {
+        if let Some(found) = self.formatted_step(|view| !conflicts_only && view.next_diff()) {
+            return found;
+        }
         if let Some(found) = self.tree_step(|view, diff| !conflicts_only && view.step(diff, true)) {
             return found;
         }
@@ -1869,6 +1949,9 @@ impl TextView {
 
     /// Selects the previous difference; false when there is none before the cursor.
     pub fn prev_diff(&mut self, conflicts_only: bool) -> bool {
+        if let Some(found) = self.formatted_step(|view| !conflicts_only && view.prev_diff()) {
+            return found;
+        }
         if let Some(found) = self.tree_step(|view, diff| !conflicts_only && view.step(diff, false))
         {
             return found;
@@ -6670,6 +6753,106 @@ impl TextView {
             .filter(|&b| !self.diff.blocks[b].ignored);
     }
 
+    /// The Word documents or workbooks the panes show, when every pane shows one of the same
+    /// kind read from its file.
+    fn documents(&self) -> Option<Vec<std::path::PathBuf>> {
+        if !matches!(self.n(), 2 | 3) {
+            return None;
+        }
+        self.panes
+            .iter()
+            .map(|p| {
+                p.doc
+                    .path
+                    .clone()
+                    .filter(|path| p.doc.read_only && formatted_kind(path).is_some())
+            })
+            .collect::<Option<Vec<_>>>()
+            .filter(|paths| {
+                let kind = formatted_kind(&paths[0]);
+                paths.iter().all(|p| formatted_kind(p) == kind)
+            })
+    }
+
+    /// The Text / Formatted switch of Word document, workbook and PDF compares, and the
+    /// Formatted view: the files as Markdown, block by block side by side, with their tables
+    /// drawn as tables, merged cells included; a workbook is a heading and a table for each sheet,
+    /// a PDF is read from the structure it is tagged with. Made in the background and kept until
+    /// a file or the compare options change. Returns true when the Formatted view took the place
+    /// of the text panes.
+    fn formatted_ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) -> bool {
+        self.formatted_active = false;
+        let Some(paths) = self.documents() else {
+            return false;
+        };
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.formatted_mode, false, tr("analysis.text"));
+            ui.selectable_value(&mut self.formatted_mode, true, tr("analysis.formatted"))
+                .on_hover_text(tr("analysis.formatted_tip"));
+        });
+        if !self.formatted_mode {
+            return false;
+        }
+        self.formatted_active = true;
+        let key = FormattedKey::of(&paths, &self.opts);
+        let made = self.formatted.view.as_ref().is_some_and(|(k, _)| *k == key)
+            || self.formatted.job.as_ref().is_some_and(|(k, _)| *k == key);
+        if !made {
+            let opts = self.opts.clone();
+            self.formatted.job = Some((
+                key,
+                super::analysis::Task::start(move |cancel, _| {
+                    let pages = paths
+                        .iter()
+                        .map(|p| match formatted_kind(p) {
+                            Some(FormattedKind::Workbook) => {
+                                crate::core::extract::xlsx_blocks(p, Some(cancel))
+                            }
+                            Some(FormattedKind::Pdf) => {
+                                crate::core::extract::pdf_blocks(p, Some(cancel))
+                            }
+                            _ => crate::core::extract::docx_blocks(p, Some(cancel)),
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    Ok(Prepared::new(pages, &opts))
+                }),
+            ));
+        }
+        if let Some((key, task)) = &mut self.formatted.job {
+            if let Some(result) = task.poll() {
+                let labels = self.panes.iter().map(|p| p.doc.title()).collect();
+                let view = result
+                    .map(|prepared| MarkdownView::from_prepared(prepared, labels))
+                    .map_err(|e| format!("{e:#}"));
+                self.formatted.view = Some((key.clone(), view));
+                self.formatted.job = None;
+            }
+        }
+        if let Some((_, task)) = &self.formatted.job {
+            task.status(ui);
+            // the last view stays shown while the next is made
+            if !matches!(self.formatted.view, Some((_, Ok(_)))) {
+                return true;
+            }
+        }
+        match &mut self.formatted.view {
+            Some((_, Ok(view))) => {
+                view.ui(ui, c, cfg.show_location_pane);
+                if let Some(forward) = view.step_file.take() {
+                    self.step_file = Some(forward);
+                }
+            }
+            Some((_, Err(error))) => {
+                ui.colored_label(widgets::pal(ui).danger, error.as_str());
+                if ui.button(tr("analysis.text_fallback")).clicked() {
+                    self.formatted_mode = false;
+                }
+            }
+            None => {}
+        }
+        true
+    }
+
     /// The Tree view of two XML, JSON, YAML or TOML files, made in the background and kept
     /// until the files or the key rules change.
     fn tree_ui(&mut self, ui: &mut Ui, format: crate::core::semantic::Format) {
@@ -6982,7 +7165,7 @@ impl TextView {
         } else {
             self.verification_ui(None, cfg);
         }
-        if self.analysis_ui(ui) {
+        if self.formatted_ui(ui, cfg, c) || self.analysis_ui(ui) {
             return;
         }
         if self.outcome() == Outcome::Identical {

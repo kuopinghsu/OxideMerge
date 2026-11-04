@@ -1,6 +1,5 @@
-//! Web page compare: fetching pages, extracting their visible text and linked resources, and
-//! finding an installed Chromium-based browser (Edge, Chrome, Chromium, Brave), which
-//! `web_render` drives to take screenshots.
+//! Web page compare: fetching pages and extracting their visible text and linked resources.
+//! The pages are compared as downloaded; nothing renders them in a browser.
 
 use crate::core::text::{self, TextEncoding};
 use anyhow::{bail, Context, Result};
@@ -23,10 +22,6 @@ pub const PAGE_FILE: &str = "index.html";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum WebMode {
-    /// The visible area of each page.
-    Screenshot,
-    /// Each whole page, top to bottom.
-    FullScreenshot,
     Html,
     Text,
     /// The pages as Markdown, shown formatted.
@@ -36,23 +31,15 @@ pub enum WebMode {
 }
 
 impl WebMode {
-    pub const ALL: [WebMode; 6] = [
+    pub const ALL: [WebMode; 4] = [
         WebMode::Text,
         WebMode::Markdown,
-        WebMode::FullScreenshot,
-        WebMode::Screenshot,
         WebMode::Html,
         WebMode::Resources,
     ];
 
-    pub fn is_screenshot(self) -> bool {
-        matches!(self, WebMode::Screenshot | WebMode::FullScreenshot)
-    }
-
     pub fn key(self) -> &'static str {
         match self {
-            WebMode::Screenshot => "web.screenshot",
-            WebMode::FullScreenshot => "web.full_screenshot",
             WebMode::Html => "web.html",
             WebMode::Text => "web.text",
             WebMode::Markdown => "web.markdown",
@@ -1064,64 +1051,6 @@ pub fn download_trees(pages: &[Page], roots: &[PathBuf], progress: &Progress) ->
     });
     outcome.failed += failed.into_inner();
     outcome
-}
-
-// ---------- screenshots ----------
-
-/// The configured browser, or the first Chromium-based browser found on this system.
-pub fn find_browser(configured: &str) -> Option<PathBuf> {
-    let configured = configured.trim().trim_matches('"');
-    if !configured.is_empty() {
-        return Some(PathBuf::from(configured))
-            .filter(|p| p.is_file())
-            .or_else(|| which(configured));
-    }
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if cfg!(windows) {
-        for var in ["ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"] {
-            if let Some(dir) = std::env::var_os(var).map(PathBuf::from) {
-                candidates.push(dir.join(r"Microsoft\Edge\Application\msedge.exe"));
-                candidates.push(dir.join(r"Google\Chrome\Application\chrome.exe"));
-                candidates.push(dir.join(r"Chromium\Application\chrome.exe"));
-                candidates.push(dir.join(r"BraveSoftware\Brave-Browser\Application\brave.exe"));
-            }
-        }
-    } else if cfg!(target_os = "macos") {
-        for app in [
-            "Google Chrome",
-            "Microsoft Edge",
-            "Chromium",
-            "Brave Browser",
-        ] {
-            candidates.push(PathBuf::from(format!(
-                "/Applications/{app}.app/Contents/MacOS/{app}"
-            )));
-        }
-    }
-    candidates.into_iter().find(|p| p.is_file()).or_else(|| {
-        [
-            "google-chrome",
-            "google-chrome-stable",
-            "chromium",
-            "chromium-browser",
-            "microsoft-edge",
-            "microsoft-edge-stable",
-            "brave-browser",
-        ]
-        .iter()
-        .find_map(|n| which(n))
-    })
-}
-
-fn which(name: &str) -> Option<PathBuf> {
-    let exe = if cfg!(windows) && !name.to_ascii_lowercase().ends_with(".exe") {
-        format!("{name}.exe")
-    } else {
-        name.to_string()
-    };
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join(&exe))
-        .find(|p| p.is_file())
 }
 
 #[cfg(test)]

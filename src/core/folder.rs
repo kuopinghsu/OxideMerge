@@ -852,7 +852,7 @@ fn compare_files_with_cancel(
     if fopts.method == CompareMethod::FullContents
         && paths
             .iter()
-            .any(|p| super::unpacker::find(dopts, p).is_some())
+            .any(|p| super::unpacker::find(dopts, p).is_some_and(|c| c.compares_by_text()))
     {
         let docs = paths
             .iter()
@@ -1132,6 +1132,48 @@ mod tests {
         // byte methods are not affected
         fopts.method = CompareMethod::QuickContents;
         assert_eq!(status(&fopts, "conf.json", 2).0, CmpStatus::Different);
+    }
+
+    /// The text of a program is only its header and section table, which two different builds
+    /// can share, so programs are compared by their bytes.
+    #[test]
+    fn programs_with_the_same_header_and_different_code_are_different() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut header = vec![0u8; 64];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 1;
+        header[6] = 1;
+        let paths = [dir.path().join("a/lib.so"), dir.path().join("b/lib.so")];
+        for (path, code) in paths.iter().zip([b"code one", b"code two"]) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, [header.as_slice(), code].concat()).unwrap();
+        }
+        let dopts = DiffOptions::default();
+        assert!(super::super::unpacker::find(&dopts, &paths[0]).is_some());
+        let mut item = DirItem {
+            rel_dir: String::new(),
+            name: "lib.so".into(),
+            is_dir: false,
+            exists: [true, true, false],
+            size: [Some(72), Some(72), None],
+            mtime: [None; 3],
+            status: CmpStatus::Pending,
+            diff_side: None,
+            binary: false,
+            error: None,
+            depth: 0,
+            parent: None,
+            children: Vec::new(),
+        };
+        let fopts = FolderOptions::default();
+        assert_eq!(fopts.method, CompareMethod::FullContents);
+        let status = compare_files(&paths, &item, &fopts, &dopts, &Normalizer::new(&dopts));
+        assert_eq!(status.unwrap().0, CmpStatus::Different);
+        std::fs::copy(&paths[0], &paths[1]).unwrap();
+        item.status = CmpStatus::Pending;
+        let status = compare_files(&paths, &item, &fopts, &dopts, &Normalizer::new(&dopts));
+        assert_eq!(status.unwrap().0, CmpStatus::Identical);
     }
 
     #[test]

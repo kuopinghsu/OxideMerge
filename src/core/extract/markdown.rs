@@ -20,7 +20,8 @@ use super::{
     shared_strings, MARKUP_COMPATIBILITY, MAX_OUTPUT, SHEET_NS, W,
 };
 use crate::core::web_markdown::{
-    destination, escape_cell, escape_line_start, escapes, Block, COVERED_ABOVE, COVERED_LEFT,
+    destination, escape_cell, escape_line_start, escapes, lay_out, Block, SpanCell, COVERED_ABOVE,
+    COVERED_LEFT,
 };
 use anyhow::{bail, Result};
 use std::collections::HashMap;
@@ -619,7 +620,7 @@ impl Reader<'_> {
                 .map(|bytes| fingerprint(&bytes))
         };
         let label = described.filter(|d| !d.trim().is_empty());
-        let shown = image_markdown(label.as_deref(), &name, print.as_deref());
+        let shown = image_markdown(label.as_deref(), print.as_deref().or(Some(&name)));
         self.images.insert(key, shown.clone());
         Some(shown)
     }
@@ -731,18 +732,20 @@ pub(super) fn fingerprint(bytes: &[u8]) -> String {
     digest[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// How an image is shown: slanted, with its description and fingerprint, or its file name
-/// when its picture cannot be read. The name is left out otherwise, since Word renames the
-/// pictures of a document whenever it saves it.
-fn image_markdown(description: Option<&str>, name: &str, print: Option<&str>) -> String {
+/// How an image is shown: slanted, with its description and what tells its picture apart,
+/// such as its fingerprint. A Word document's image gives its file name only when its picture
+/// cannot be read, since Word renames the pictures of a document whenever it saves it.
+fn image_markdown(description: Option<&str>, print: Option<&str>) -> String {
     let mut text = String::from("Image");
     if let Some(d) = description {
         text.push_str(": ");
         text.push_str(&d.split_whitespace().collect::<Vec<_>>().join(" "));
     }
-    text.push_str(" (");
-    text.push_str(print.unwrap_or(name));
-    text.push(')');
+    if let Some(print) = print {
+        text.push_str(" (");
+        text.push_str(print);
+        text.push(')');
+    }
     format!("*{}*", escape(&text))
 }
 
@@ -1496,6 +1499,7 @@ pub fn pdf_blocks(path: &Path, cancel: Option<&AtomicBool>) -> Result<Vec<Block>
         cancel,
         blocks: Vec::new(),
         size: 0,
+        sections: 0,
     };
     writer.block(&tree, 0, 0)?;
     if writer.blocks.is_empty() {
@@ -1515,8 +1519,11 @@ enum Role {
     Figure,
     /// Text inside a block, such as a span, a link or a word in bold.
     Inline,
-    /// A block of text, as are the elements this does not know.
+    /// A block of text.
     Paragraph,
+    /// A type this does not know, which the file's role map does not say the standard type
+    /// of: a group when it holds blocks, otherwise a paragraph.
+    Unknown,
     /// Left out, as an artifact is.
     Hidden,
 }
@@ -1526,7 +1533,9 @@ fn role_of(role: &str) -> Role {
         "Document" | "DocumentFragment" | "Part" | "Art" | "Sect" | "Div" | "BlockQuote"
         | "NonStruct" | "Private" | "TOC" | "Index" | "Aside" | "Form" | "THead" | "TBody"
         | "TFoot" => Role::Group,
-        "Title" | "H" => Role::Heading(1),
+        "Title" => Role::Heading(1),
+        // A heading whose level is how many sections it is in.
+        "H" => Role::Heading(0),
         "H1" | "H2" | "H3" | "H4" | "H5" | "H6" => {
             Role::Heading((role.as_bytes()[1] - b'0') as usize)
         }
@@ -1536,7 +1545,27 @@ fn role_of(role: &str) -> Role {
         "Span" | "Link" | "Quote" | "Reference" | "Em" | "Strong" | "Lbl" | "Annot" | "Ruby"
         | "RB" | "RT" | "RP" | "Warichu" | "WT" | "WP" | "Sub" => Role::Inline,
         "Artifact" => Role::Hidden,
-        _ => Role::Paragraph,
+        "P" | "Caption" | "Note" | "Code" | "Formula" | "TOCI" | "BibEntry" | "FENote" | "LI"
+        | "LBody" | "TR" | "TH" | "TD" => Role::Paragraph,
+        _ => Role::Unknown,
+    }
+}
+
+/// Whether `e` holds blocks, such as paragraphs, headings or tables, rather than only text.
+fn holds_blocks(e: &pdf::Element) -> bool {
+    e.kids.iter().any(|k| match k {
+        pdf::Kid::Element(k) => !matches!(role_of(&k.role), Role::Inline | Role::Hidden),
+        pdf::Kid::Text(_) => false,
+    })
+}
+
+/// What an element is read as where blocks are written: a type this does not know is a group
+/// when it holds blocks.
+fn block_role_of(e: &pdf::Element) -> Role {
+    match role_of(&e.role) {
+        Role::Unknown if holds_blocks(e) => Role::Group,
+        Role::Unknown => Role::Paragraph,
+        role => role,
     }
 }
 
@@ -1545,6 +1574,8 @@ struct Tagged<'a> {
     cancel: Option<&'a AtomicBool>,
     blocks: Vec<Block>,
     size: usize,
+    /// How many sections the element being written is in.
+    sections: usize,
 }
 
 /// The pieces of text of a block being read, with the lists found in it.
@@ -1552,18 +1583,43 @@ struct Tagged<'a> {
 struct Gathered<'e> {
     pieces: Vec<Piece>,
     lists: Vec<&'e pdf::Element>,
-    /// The page and line the last text was drawn on, so that a run on another line is
-    /// written after a space.
-    line: Option<(usize, f64)>,
+    /// Where the last text was drawn, so that a run on another line, or far along the same
+    /// one, is written after a space.
+    last: Option<Place>,
+}
+
+/// Where a run of text was drawn: its page, line, where it ends and how large it is.
+#[derive(Clone, Copy)]
+struct Place {
+    page: usize,
+    y: f64,
+    end: f64,
+    size: f64,
+}
+
+impl Place {
+    fn of(run: &pdf::Run) -> Place {
+        Place {
+            page: run.page,
+            y: run.y,
+            end: run.end,
+            size: run.size,
+        }
+    }
+
+    /// Whether `next`, drawn after this, is set apart from it by a space.
+    fn apart_from(&self, next: &pdf::Run) -> bool {
+        self.page != next.page
+            || (self.y - next.y).abs() >= 1.0
+            || pdf::gap_is_space(next.x - self.end, self.size.max(next.size))
+    }
 }
 
 impl<'e> Gathered<'e> {
     fn text(&mut self, format: Format, runs: &[pdf::Run]) {
         for run in runs {
-            if let Some((page, y)) = self.line {
-                if page != run.page || (y - run.y).abs() >= 1.0 {
-                    self.pieces.push(Piece::Text(format, " ".to_string()));
-                }
+            if self.last.is_some_and(|last| last.apart_from(run)) {
+                self.pieces.push(Piece::Text(format, " ".to_string()));
             }
             let f = Format {
                 bold: format.bold || run.bold,
@@ -1571,7 +1627,7 @@ impl<'e> Gathered<'e> {
                 strike: false,
             };
             self.pieces.push(Piece::Text(f, run.text.clone()));
-            self.line = Some((run.page, run.y));
+            self.last = Some(Place::of(run));
         }
     }
 
@@ -1618,12 +1674,12 @@ impl<'e> Gathered<'e> {
             self.pieces.push(Piece::Text(format, actual.clone()));
         } else if let Some(url) = e.link.as_deref().filter(|u| u.contains(':')) {
             let mut inner = Gathered {
-                line: self.line,
+                last: self.last,
                 ..Default::default()
             };
             inner.kids(&e.kids, Format::default(), depth);
             self.lists.extend(inner.lists);
-            self.line = inner.line;
+            self.last = inner.last;
             let text = markdown(&inner.pieces, false);
             if text.is_empty() {
                 self.pieces.push(Piece::Text(format, url.to_string()));
@@ -1644,15 +1700,8 @@ impl<'e> Gathered<'e> {
 fn figure(e: &pdf::Element) -> String {
     let mut prints = Vec::new();
     images_of(e, &mut prints, 0);
-    let mut text = String::from("Image");
-    if let Some(d) = e.alt.as_deref().or(e.actual.as_deref()) {
-        text.push_str(": ");
-        text.push_str(&d.split_whitespace().collect::<Vec<_>>().join(" "));
-    }
-    if !prints.is_empty() {
-        text.push_str(&format!(" ({})", prints.join(", ")));
-    }
-    format!("*{}*", escape(&text))
+    let prints = Some(prints.join(", ")).filter(|p| !p.is_empty());
+    image_markdown(e.alt.as_deref().or(e.actual.as_deref()), prints.as_deref())
 }
 
 fn images_of(e: &pdf::Element, out: &mut Vec<String>, depth: usize) {
@@ -1686,9 +1735,11 @@ impl Tagged<'_> {
         if depth > MAX_DEPTH {
             return Ok(());
         }
-        match role_of(&e.role) {
+        match block_role_of(e) {
             Role::Hidden => {}
             Role::Group => {
+                let section = e.role == "Sect";
+                self.sections += usize::from(section);
                 // Text directly in a group, and its inline elements, are read as paragraphs,
                 // as many neighbours as there are together.
                 let mut start = 0;
@@ -1706,8 +1757,14 @@ impl Tagged<'_> {
                     }
                 }
                 self.paragraph(&e.kids[start..], list, depth)?;
+                self.sections -= usize::from(section);
             }
             Role::Heading(level) => {
+                let level = if level == 0 {
+                    self.sections.clamp(1, 6)
+                } else {
+                    level
+                };
                 let mut gathered = Gathered::default();
                 gathered.element(e, Format::default(), depth);
                 let text = markdown(&plain_if_whole(gathered.pieces), false);
@@ -1718,7 +1775,7 @@ impl Tagged<'_> {
             Role::List => self.list(e, list, depth)?,
             Role::Table => self.table(e, depth),
             Role::Figure => self.emit(0, figure(e)),
-            Role::Inline | Role::Paragraph => {
+            Role::Inline | Role::Paragraph | Role::Unknown => {
                 let mut gathered = Gathered::default();
                 gathered.element(e, Format::default(), depth);
                 self.write(gathered, list, depth)?;
@@ -1798,16 +1855,10 @@ impl Tagged<'_> {
         let mut rows = Vec::new();
         let mut captions = Vec::new();
         rows_and_captions(t, &mut rows, &mut captions, depth);
-        let mut grid: Vec<Vec<Option<String>>> = vec![Vec::new(); rows.len()];
-        for (r, row) in rows.iter().enumerate() {
-            let mut c = 0;
+        let mut cells = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut line = Vec::with_capacity(row.len());
             for cell in row {
-                while grid[r].get(c).is_some_and(Option::is_some) {
-                    c += 1;
-                }
-                if c >= MAX_SHEET_COLUMNS {
-                    break;
-                }
                 let mut gathered = Gathered::default();
                 gathered.kids(&cell.kids, Format::default(), depth);
                 // A list in a cell is read as the words of its items.
@@ -1816,29 +1867,15 @@ impl Tagged<'_> {
                     gathered.kids(&l.kids, Format::default(), depth + 1);
                 }
                 let text = escape_cell(&markdown(&gathered.pieces, false).replace("\\\n", " "));
-                let (span_rows, span_cols) =
-                    (cell.rows.max(1), cell.cols.clamp(1, MAX_SHEET_COLUMNS - c));
-                for dr in 0..span_rows.min(rows.len() - r) {
-                    let line = &mut grid[r + dr];
-                    if line.len() < c + span_cols {
-                        line.resize(c + span_cols, None);
-                    }
-                    for dc in 0..span_cols {
-                        line[c + dc] = Some(match (dr, dc) {
-                            (0, 0) => text.clone(),
-                            (_, 0) => COVERED_ABOVE.to_string(),
-                            _ => COVERED_LEFT.to_string(),
-                        });
-                    }
-                }
-                c += span_cols;
+                line.push(SpanCell {
+                    text,
+                    rows: cell.rows,
+                    cols: cell.cols,
+                });
             }
+            cells.push(line);
         }
-        let rows: Vec<Vec<String>> = grid
-            .into_iter()
-            .map(|r| r.into_iter().map(Option::unwrap_or_default).collect())
-            .collect();
-        let text = pipe_table(&rows);
+        let text = pipe_table(&lay_out(cells));
         self.emit(0, text);
         for caption in captions {
             let mut gathered = Gathered::default();

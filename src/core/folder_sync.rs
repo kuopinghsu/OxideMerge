@@ -1273,22 +1273,25 @@ pub fn apply(
 }
 
 /// Refuses a plan whose new files, or whose journal copies of the files it replaces and
-/// deletes, do not fit in the free space of their file systems, both counted against one
-/// when the journal is on the destination's file system.
+/// deletes, do not fit in the free space of their file systems. When the journal is on the
+/// destination's file system, each file it keeps a copy of is replaced or deleted straight
+/// after, so only the largest of them is there twice at once.
 fn check_space(plan: &SyncPlan, destination: &Path, journal_root: &Path) -> Result<(), String> {
     let changes = || plan.operations.iter().filter(|o| o.action.changes());
     let written: u64 = changes()
         .filter(|o| matches!(o.action, Action::Copy | Action::Replace))
         .map(|o| o.bytes)
         .sum();
-    let kept: u64 = changes()
-        .filter(|o| matches!(o.action, Action::Replace | Action::Delete))
-        .filter_map(|o| o.destination.size)
-        .sum();
-    let mut needs = vec![(destination, written), (journal_root, kept)];
-    if same_volume(destination, journal_root) {
-        needs = vec![(destination, written + kept)];
-    }
+    let kept = || {
+        changes()
+            .filter(|o| matches!(o.action, Action::Replace | Action::Delete))
+            .filter_map(|o| o.destination.size)
+    };
+    let needs = if same_volume(destination, journal_root) {
+        vec![(destination, written + kept().max().unwrap_or(0))]
+    } else {
+        vec![(destination, written), (journal_root, kept().sum())]
+    };
     for (path, need) in needs {
         match free_space(path) {
             Some(free) if need > free => {
@@ -1894,6 +1897,33 @@ pub fn unfinished(journal_root: &Path) -> Vec<Unfinished> {
         .collect()
 }
 
+/// What became of a synchronization of `roots` that ended without saying, as when the work
+/// failed in a way nothing caught. A journal it left behind holds what it changed, to be undone
+/// from there; without one, nothing was started or everything was finished.
+pub fn abandoned(journal_root: Option<&Path>, roots: &[PathBuf], why: String) -> SyncOutcome {
+    let same = |a: &Path, b: &Path| {
+        std::fs::canonicalize(a)
+            .ok()
+            .is_some_and(|a| std::fs::canonicalize(b).is_ok_and(|b| a == b))
+    };
+    let left = journal_root
+        .map(unfinished)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|u| u.roots.iter().any(|j| roots.iter().any(|r| same(j, r))));
+    match left {
+        Some(u) => SyncOutcome::Stopped {
+            reason: Some(why),
+            failure: Some(Problem::RecoveryNeeded),
+            rollback: RollbackOutcome {
+                journal: Some(u.dir),
+                ..RollbackOutcome::default()
+            },
+        },
+        None => SyncOutcome::NotApplied(Problem::WriteFailure, vec![why]),
+    }
+}
+
 /// Undoes an unfinished synchronization from its journal.
 pub fn recover(u: &Unfinished) -> RollbackOutcome {
     let failed = |e: String| RollbackOutcome {
@@ -2344,6 +2374,65 @@ mod tests {
         let outcome = run(&f, &plan, &|_, _| Fault::None);
         FREE_SPACE.with(|s| s.set(None));
         assert!(matches!(outcome, SyncOutcome::Applied { .. }));
+    }
+
+    /// A file the journal keeps a copy of is replaced or deleted straight after, so on one file
+    /// system only the largest of them is there twice at once.
+    #[test]
+    fn the_space_needed_on_one_file_system_counts_only_the_largest_kept_file_twice() {
+        let f = sample();
+        let plan = make(&f, MIRROR);
+        let destination = &f.roots[plan.policy.destination()];
+        std::fs::create_dir_all(&f.journal).unwrap();
+        assert!(same_volume(destination, &f.journal));
+        let changes = || plan.operations.iter().filter(|o| o.action.changes());
+        let written: u64 = changes()
+            .filter(|o| matches!(o.action, Action::Copy | Action::Replace))
+            .map(|o| o.bytes)
+            .sum();
+        let kept: Vec<u64> = changes()
+            .filter(|o| matches!(o.action, Action::Replace | Action::Delete))
+            .filter_map(|o| o.destination.size)
+            .collect();
+        assert!(kept.len() > 1, "{kept:?}");
+        let need = written + kept.iter().max().unwrap();
+        FREE_SPACE.with(|s| s.set(Some(need)));
+        let fits = check_space(&plan, destination, &f.journal);
+        FREE_SPACE.with(|s| s.set(Some(need - 1)));
+        let short = check_space(&plan, destination, &f.journal);
+        FREE_SPACE.with(|s| s.set(None));
+        assert!(fits.is_ok(), "{fits:?}");
+        assert!(short.is_err());
+    }
+
+    /// When the work ends without saying how, as when it fails in a way nothing catches, the
+    /// journal it left says whether anything is to be undone.
+    #[test]
+    fn a_synchronization_that_ended_without_an_outcome_is_reported_from_its_journal() {
+        let f = sample();
+        let plan = make(&f, MIRROR);
+        let why = || "failed".to_string();
+        let outcome = abandoned(Some(&f.journal), &f.roots, why());
+        assert!(
+            matches!(outcome, SyncOutcome::NotApplied(..)),
+            "{outcome:?}"
+        );
+        run(&f, &plan, &|p, path| {
+            if p == Point::Written && path == "a.txt" {
+                Fault::Crash
+            } else {
+                Fault::None
+            }
+        });
+        let outcome = abandoned(Some(&f.journal), &f.roots, why());
+        assert_eq!(outcome.problem(), Some(Problem::RecoveryNeeded));
+        let SyncOutcome::Stopped { rollback, .. } = outcome else {
+            panic!("not reported as needing recovery");
+        };
+        assert_eq!(
+            rollback.journal,
+            Some(unfinished(&f.journal)[0].dir.clone())
+        );
     }
 
     #[test]

@@ -6,11 +6,15 @@
 //! What is read here needs no external program. An [`Unpacker`](super::unpacker::Unpacker) the
 //! user configured is used in preference, so a better converter can always be put in front.
 
+mod markdown;
 mod pdf;
+
+pub use markdown::{docx_blocks, pdf_blocks, xlsx_blocks};
 
 use anyhow::{bail, Context, Result};
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The most text one file is read as, as for the external converters.
 const MAX_OUTPUT: usize = 16 << 20;
@@ -24,6 +28,8 @@ const MAX_FILE: u64 = 256 << 20;
 
 /// The most sections of an ELF file listed.
 const MAX_SECTIONS: usize = 4096;
+/// The most symbols listed of one symbol table of an ELF file.
+const MAX_SYMBOLS: usize = 100_000;
 
 /// What a file is read as.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
@@ -72,15 +78,21 @@ impl Kind {
         }
     }
 
-    /// Reads the file at `path` as text.
-    pub fn read(self, path: &Path) -> Result<String> {
+    /// Whether two files of this kind are the same when their text is. The text of an ELF file
+    /// is only its header and section table, so two different programs can read the same.
+    pub fn compares_by_text(self) -> bool {
+        self != Kind::Elf
+    }
+
+    /// Reads the file at `path` as text, giving up once `cancel` is set.
+    pub fn read(self, path: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
         let text = match self {
-            Kind::Document => document(path),
+            Kind::Document => document(path, cancel),
             Kind::Rtf => rtf(path),
-            Kind::Spreadsheet => spreadsheet(path),
+            Kind::Spreadsheet => spreadsheet(path, cancel),
             Kind::Elf => elf(path),
             Kind::Pdf => read_whole(path)
-                .and_then(|bytes| pdf::text(&bytes))
+                .and_then(|bytes| pdf::text(&bytes, cancel))
                 .map(tidy),
         }
         .with_context(|| {
@@ -186,6 +198,7 @@ const SHEET_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/mai
 const RELS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const ODF_TEXT: &str = "urn:oasis:names:tc:opendocument:xmlns:text:1.0";
 const ODF_TABLE: &str = "urn:oasis:names:tc:opendocument:xmlns:table:1.0";
+const MARKUP_COMPATIBILITY: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
 
 /// An element's namespace and local name, so that a document is read by what its elements mean
 /// rather than by the prefix it happens to use for them.
@@ -201,27 +214,52 @@ fn named(
     (ns, local.as_ref().to_owned())
 }
 
-/// The value of the attribute `name` of `e`, whatever namespace it is in.
+/// The value of the attribute `name` of `e`, whatever namespace it is in, with its references
+/// such as `&amp;` read.
 fn attribute(e: &quick_xml::events::BytesStart<'_>, name: &str) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
         let key = a.key.as_ref().to_owned();
         let local = key.rsplit(':').next().unwrap_or(&key);
-        (local == name).then(|| a.value.as_ref().to_owned())
+        (local == name).then(|| {
+            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map_or_else(|_| a.value.to_string(), |v| v.into_owned())
+        })
     })
+}
+
+/// The characters a reference in a document's text such as `&amp;` or `&#65;` stands for. One
+/// the document defines for itself is kept as it is written.
+fn reference(e: &quick_xml::events::BytesRef<'_>) -> String {
+    match e.resolve_char_ref() {
+        Ok(Some(c)) => c.to_string(),
+        _ => quick_xml::escape::resolve_xml_entity(e)
+            .map_or_else(|| format!("&{};", &**e), str::to_string),
+    }
+}
+
+/// Fails once `cancel` is set, so that a long read stops when it is no longer wanted.
+fn check(cancel: Option<&AtomicBool>) -> Result<()> {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        bail!("cancelled");
+    }
+    Ok(())
 }
 
 // ---------- Word and OpenDocument text ----------
 
-fn document(path: &Path) -> Result<String> {
+fn document(path: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
     match super::text::extension(path).as_str() {
-        "odt" => odf_text(&part(path, "content.xml")?),
-        _ => docx(&part(path, "word/document.xml")?),
+        "odt" => odf_text(&part(path, "content.xml")?, cancel),
+        _ => docx(&part(path, "word/document.xml")?, cancel),
     }
 }
 
+/// How many elements are read between looks at whether the read has been cancelled.
+const CHECK_EVERY: usize = 4096;
+
 /// The text of a `word/document.xml`: one line a paragraph, a table row to a line with its
 /// cells separated by tabs.
-fn docx(xml: &[u8]) -> Result<String> {
+fn docx(xml: &[u8], cancel: Option<&AtomicBool>) -> Result<String> {
     let source = String::from_utf8_lossy(xml).into_owned();
     let mut reader = quick_xml::NsReader::from_str(&source);
     reader.config_mut().trim_text(false);
@@ -230,17 +268,35 @@ fn docx(xml: &[u8]) -> Result<String> {
     reader.config_mut().expand_empty_elements = true;
     let mut out = String::new();
     let mut cells = 0usize;
+    // Inside a run, inside a paragraph's properties (whose tab stops are not tabs), and inside
+    // the text of a run; deleted text and field codes are in elements of their own.
+    let (mut runs, mut properties, mut words) = (0usize, 0usize, 0usize);
     let mut buf = Vec::new();
-    loop {
+    let mut skipped = Vec::new();
+    for read in 0.. {
+        if read % CHECK_EVERY == 0 {
+            check(cancel)?;
+        }
         buf.clear();
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(ref e)) => {
                 let (ns, local) = named(&reader, e.name());
+                // What a reader that cannot show the choice before it shows instead, such as a
+                // text box drawn the old way, holding the same words a second time.
+                if ns.as_deref() == Some(MARKUP_COMPATIBILITY) && local == "Fallback" {
+                    let end = e.to_end().into_owned();
+                    skipped.clear();
+                    reader.read_to_end_into(end.name(), &mut skipped)?;
+                    continue;
+                }
                 if ns.as_deref() == Some(W) {
                     match local.as_str() {
                         "tc" => cells += 1,
-                        "tab" => out.push('\t'),
-                        "br" | "cr" => out.push('\n'),
+                        "r" => runs += 1,
+                        "pPr" => properties += 1,
+                        "t" => words += 1,
+                        "tab" if runs > 0 && properties == 0 => out.push('\t'),
+                        "br" | "cr" if runs > 0 => out.push('\n'),
                         _ => {}
                     }
                 }
@@ -251,6 +307,9 @@ fn docx(xml: &[u8]) -> Result<String> {
                     continue;
                 }
                 match local.as_str() {
+                    "r" => runs = runs.saturating_sub(1),
+                    "pPr" => properties = properties.saturating_sub(1),
+                    "t" => words = words.saturating_sub(1),
                     // A paragraph inside a cell is part of the cell, not a line of its own.
                     "p" if cells == 0 => out.push('\n'),
                     "p" => out.push(' '),
@@ -270,8 +329,11 @@ fn docx(xml: &[u8]) -> Result<String> {
                     _ => {}
                 }
             }
-            Ok(quick_xml::events::Event::Text(e)) => {
+            Ok(quick_xml::events::Event::Text(e)) if words > 0 => {
                 out.push_str(&e.xml10_content());
+            }
+            Ok(quick_xml::events::Event::GeneralRef(e)) if words > 0 => {
+                out.push_str(&reference(&e));
             }
             Ok(quick_xml::events::Event::Eof) => break,
             Ok(_) => {}
@@ -286,7 +348,7 @@ fn docx(xml: &[u8]) -> Result<String> {
 
 /// The text of an OpenDocument `content.xml`: one line a paragraph or heading, a table row to a
 /// line with its cells separated by tabs.
-fn odf_text(xml: &[u8]) -> Result<String> {
+fn odf_text(xml: &[u8], cancel: Option<&AtomicBool>) -> Result<String> {
     let source = String::from_utf8_lossy(xml).into_owned();
     let mut reader = quick_xml::NsReader::from_str(&source);
     reader.config_mut().trim_text(false);
@@ -296,7 +358,10 @@ fn odf_text(xml: &[u8]) -> Result<String> {
     let mut out = String::new();
     let mut cells = 0usize;
     let mut buf = Vec::new();
-    loop {
+    for read in 0.. {
+        if read % CHECK_EVERY == 0 {
+            check(cancel)?;
+        }
         buf.clear();
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(ref e)) => {
@@ -337,6 +402,7 @@ fn odf_text(xml: &[u8]) -> Result<String> {
                 }
             }
             Ok(quick_xml::events::Event::Text(e)) => out.push_str(&e.xml10_content()),
+            Ok(quick_xml::events::Event::GeneralRef(e)) => out.push_str(&reference(&e)),
             Ok(quick_xml::events::Event::Eof) => break,
             Ok(_) => {}
             Err(e) => bail!("{e}"),
@@ -373,11 +439,36 @@ fn tidy(text: String) -> String {
 
 // ---------- spreadsheets ----------
 
-fn spreadsheet(path: &Path) -> Result<String> {
+fn spreadsheet(path: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
     match super::text::extension(path).as_str() {
-        "ods" => ods(&part(path, "content.xml")?),
-        _ => xlsx(path),
+        "ods" => ods(&part(path, "content.xml")?, cancel),
+        _ => xlsx(path, cancel),
     }
+}
+
+/// The first line of a sheet's records when a workbook has several, so that a reader can tell
+/// a workbook of several sheets, which is not one table, from a workbook of one.
+pub fn is_sheet_heading(line: &str) -> bool {
+    let heading = crate::i18n::trf("label.sheet", &[("name", String::new())]);
+    line.strip_prefix("# ")
+        .is_some_and(|rest| rest.starts_with(heading.trim_end()))
+}
+
+/// The heading of the sheet `name`.
+fn sheet_heading(name: &str) -> String {
+    format!(
+        "# {}\n",
+        crate::i18n::trf("label.sheet", &[("name", name.to_string())])
+    )
+}
+
+/// The most columns a row is read as; as many as the widest spreadsheet programs allow.
+const MAX_COLUMNS: usize = 16_384;
+
+/// How many more copies of `line` fit when `used` bytes are already read, at least one.
+fn copies_that_fit(line: &str, used: usize, wanted: usize) -> usize {
+    let room = MAX_OUTPUT.saturating_sub(used) / line.len().max(1);
+    wanted.min(room.max(1))
 }
 
 /// A record of cells as one comma separated line, quoted as a CSV reader expects.
@@ -424,7 +515,7 @@ fn column_of(reference: &str) -> Option<usize> {
     Some(n - 1)
 }
 
-fn xlsx(path: &Path) -> Result<String> {
+fn xlsx(path: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
     let shared = match optional_part(path, "xl/sharedStrings.xml")? {
         Some(xml) => shared_strings(&xml)?,
         None => Vec::new(),
@@ -449,12 +540,9 @@ fn xlsx(path: &Path) -> Result<String> {
         };
         found = true;
         if many {
-            out.push_str(&format!(
-                "# {}\n",
-                crate::i18n::trf("label.sheet", &[("name", name.clone())])
-            ));
+            out.push_str(&sheet_heading(name));
         }
-        out.push_str(&sheet(&xml, &shared)?);
+        out.push_str(&sheet(&xml, &shared, out.len(), cancel)?);
         if many {
             out.push('\n');
         }
@@ -556,6 +644,8 @@ fn shared_strings(xml: &[u8]) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut current: Option<String> = None;
     let mut in_text = false;
+    // The reading of East Asian words written over them, which is not part of the value.
+    let mut phonetic = 0usize;
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -566,6 +656,7 @@ fn shared_strings(xml: &[u8]) -> Result<Vec<String>> {
                     match local.as_str() {
                         "si" => current = Some(String::new()),
                         "t" => in_text = true,
+                        "rPh" => phonetic += 1,
                         _ => {}
                     }
                 }
@@ -576,14 +667,22 @@ fn shared_strings(xml: &[u8]) -> Result<Vec<String>> {
                     match local.as_str() {
                         "si" => out.push(current.take().unwrap_or_default()),
                         "t" => in_text = false,
+                        "rPh" => phonetic = phonetic.saturating_sub(1),
                         _ => {}
                     }
                 }
             }
             Ok(quick_xml::events::Event::Text(e)) => {
-                if in_text {
+                if in_text && phonetic == 0 {
                     if let Some(s) = &mut current {
                         s.push_str(&e.xml10_content());
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::GeneralRef(e)) => {
+                if in_text && phonetic == 0 {
+                    if let Some(s) = &mut current {
+                        s.push_str(&reference(&e));
                     }
                 }
             }
@@ -595,8 +694,13 @@ fn shared_strings(xml: &[u8]) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// One worksheet as comma separated records.
-fn sheet(xml: &[u8], shared: &[String]) -> Result<String> {
+/// One worksheet as comma separated records, when `used` bytes of the workbook are already read.
+fn sheet(
+    xml: &[u8],
+    shared: &[String],
+    used: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<String> {
     let source = String::from_utf8_lossy(xml).into_owned();
     let mut reader = quick_xml::NsReader::from_str(&source);
     reader.config_mut().trim_text(false);
@@ -606,11 +710,17 @@ fn sheet(xml: &[u8], shared: &[String]) -> Result<String> {
     let mut out = String::new();
     let mut cells: Vec<String> = Vec::new();
     let mut column = 0usize;
+    // The number of the row the next one is when the sheet leaves none out, from one.
+    let mut next_row = 1usize;
     let mut kind = String::new();
     let mut value = String::new();
     let mut in_value = false;
+    let mut phonetic = 0usize;
     let mut buf = Vec::new();
-    loop {
+    for read in 0.. {
+        if read % CHECK_EVERY == 0 {
+            check(cancel)?;
+        }
         buf.clear();
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(ref e))
@@ -623,6 +733,14 @@ fn sheet(xml: &[u8], shared: &[String]) -> Result<String> {
                     "row" => {
                         cells.clear();
                         column = 0;
+                        // Rows with nothing in them are not written, so the rows on either side
+                        // of them are kept apart by as many empty records.
+                        let number = attribute(e, "r").and_then(|r| r.trim().parse::<usize>().ok());
+                        if let Some(number) = number.filter(|&n| n > next_row) {
+                            let gap = copies_that_fit("\n", used + out.len(), number - next_row);
+                            out.push_str(&"\n".repeat(gap));
+                        }
+                        next_row = number.map_or(next_row, |n| n.max(next_row)) + 1;
                     }
                     "c" => {
                         column = attribute(e, "r")
@@ -632,16 +750,24 @@ fn sheet(xml: &[u8], shared: &[String]) -> Result<String> {
                         kind = attribute(e, "t").unwrap_or_default();
                         value.clear();
                     }
-                    "v" | "t" => {
+                    "v" => {
                         value.clear();
                         in_value = true;
                     }
+                    // The words of an inline string may be in several runs, each with its own.
+                    "t" => in_value = true,
+                    "rPh" => phonetic += 1,
                     _ => {}
                 }
             }
             Ok(quick_xml::events::Event::Text(e)) => {
-                if in_value {
+                if in_value && phonetic == 0 {
                     value.push_str(&e.xml10_content());
+                }
+            }
+            Ok(quick_xml::events::Event::GeneralRef(e)) => {
+                if in_value && phonetic == 0 {
+                    value.push_str(&reference(&e));
                 }
             }
             Ok(quick_xml::events::Event::End(ref e)) => {
@@ -651,6 +777,8 @@ fn sheet(xml: &[u8], shared: &[String]) -> Result<String> {
                 }
                 match local.as_str() {
                     "v" | "t" => in_value = false,
+                    "rPh" => phonetic = phonetic.saturating_sub(1),
+                    "c" if column >= MAX_COLUMNS => value.clear(),
                     "c" => {
                         let text = match kind.as_str() {
                             "s" => value
@@ -683,7 +811,7 @@ fn sheet(xml: &[u8], shared: &[String]) -> Result<String> {
             Ok(_) => {}
             Err(e) => bail!("{e}"),
         }
-        if out.len() > MAX_OUTPUT {
+        if used + out.len() > MAX_OUTPUT {
             break;
         }
     }
@@ -691,7 +819,7 @@ fn sheet(xml: &[u8], shared: &[String]) -> Result<String> {
 }
 
 /// An OpenDocument spreadsheet `content.xml` as comma separated records.
-fn ods(xml: &[u8]) -> Result<String> {
+fn ods(xml: &[u8], cancel: Option<&AtomicBool>) -> Result<String> {
     let source = String::from_utf8_lossy(xml).into_owned();
     let mut reader = quick_xml::NsReader::from_str(&source);
     reader.config_mut().trim_text(false);
@@ -703,11 +831,26 @@ fn ods(xml: &[u8]) -> Result<String> {
     let mut names: Vec<String> = Vec::new();
     let mut sheets: Vec<String> = Vec::new();
     let mut cells: Vec<String> = Vec::new();
+    // The bytes of the row so far, and of every sheet so far.
+    let (mut row_bytes, mut used) = (0usize, 0usize);
     let mut cell = String::new();
     let mut repeat = 1usize;
+    let mut rows_repeat = 1usize;
+    // Empty rows not yet written: only those with a row after them in the same sheet are, so
+    // that the unused rows a sheet records at its end are not part of it.
+    let mut blank_rows = 0usize;
     let mut in_cell = false;
     let mut buf = Vec::new();
-    loop {
+    let repeated = |e: &quick_xml::events::BytesStart<'_>, name: &str| -> usize {
+        attribute(e, name)
+            .and_then(|r| r.trim().parse().ok())
+            .unwrap_or(1usize)
+            .max(1)
+    };
+    for read in 0.. {
+        if read % CHECK_EVERY == 0 {
+            check(cancel)?;
+        }
         buf.clear();
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(ref e))
@@ -718,17 +861,19 @@ fn ods(xml: &[u8]) -> Result<String> {
                         tables += 1;
                         names.push(attribute(e, "name").unwrap_or_default());
                         sheets.push(String::new());
+                        blank_rows = 0;
                     }
-                    (Some(ODF_TABLE), "table-row") => cells.clear(),
+                    (Some(ODF_TABLE), "table-row") => {
+                        cells.clear();
+                        row_bytes = 0;
+                        rows_repeat = repeated(e, "number-rows-repeated");
+                    }
                     (Some(ODF_TABLE), "table-cell" | "covered-table-cell") => {
                         cell.clear();
                         in_cell = true;
                         // A run of equal cells is recorded once; a long trailing run of empty
-                        // ones is how a sheet records its unused width, so it is capped.
-                        repeat = attribute(e, "number-columns-repeated")
-                            .and_then(|r| r.parse().ok())
-                            .unwrap_or(1)
-                            .min(1024);
+                        // ones is how a sheet records its unused width.
+                        repeat = repeated(e, "number-columns-repeated");
                     }
                     _ => {}
                 }
@@ -738,6 +883,11 @@ fn ods(xml: &[u8]) -> Result<String> {
                     cell.push_str(&e.xml10_content());
                 }
             }
+            Ok(quick_xml::events::Event::GeneralRef(e)) => {
+                if in_cell {
+                    cell.push_str(&reference(&e));
+                }
+            }
             Ok(quick_xml::events::Event::End(ref e)) => {
                 let (ns, local) = named(&reader, e.name());
                 match (ns.as_deref(), local.as_str()) {
@@ -745,15 +895,29 @@ fn ods(xml: &[u8]) -> Result<String> {
                     (Some(ODF_TABLE), "table-cell" | "covered-table-cell") => {
                         in_cell = false;
                         let text = cell.trim().to_string();
-                        for _ in 0..repeat {
-                            cells.push(text.clone());
+                        let mut copies = repeat.min(MAX_COLUMNS.saturating_sub(cells.len()));
+                        if !text.is_empty() {
+                            let field = text.len() + 1;
+                            copies =
+                                copies.min(MAX_OUTPUT.saturating_sub(used + row_bytes) / field + 1);
+                            row_bytes += copies * field;
                         }
+                        cells.extend(std::iter::repeat_n(text, copies));
                         repeat = 1;
                     }
                     (Some(ODF_TABLE), "table-row") => {
                         let line = record(&trim_record(std::mem::take(&mut cells)));
-                        if let Some(s) = sheets.last_mut() {
-                            s.push_str(&line);
+                        let Some(s) = sheets.last_mut() else { continue };
+                        if line == "\n" {
+                            blank_rows = blank_rows.saturating_add(rows_repeat);
+                        } else {
+                            let gap = copies_that_fit("\n", used, blank_rows);
+                            s.push_str(&"\n".repeat(gap));
+                            used += gap;
+                            blank_rows = 0;
+                            let copies = copies_that_fit(&line, used, rows_repeat);
+                            s.push_str(&line.repeat(copies));
+                            used += copies * line.len();
                         }
                     }
                     _ => {}
@@ -763,7 +927,7 @@ fn ods(xml: &[u8]) -> Result<String> {
             Ok(_) => {}
             Err(e) => bail!("{e}"),
         }
-        if sheets.iter().map(String::len).sum::<usize>() > MAX_OUTPUT {
+        if used > MAX_OUTPUT {
             break;
         }
     }
@@ -773,10 +937,7 @@ fn ods(xml: &[u8]) -> Result<String> {
             continue;
         }
         if tables > 1 {
-            out.push_str(&format!(
-                "# {}\n",
-                crate::i18n::trf("label.sheet", &[("name", names[i].clone())])
-            ));
+            out.push_str(&sheet_heading(&names[i]));
         }
         out.push_str(body);
         if tables > 1 {
@@ -960,11 +1121,13 @@ fn rtf_control(bytes: &[u8], at: usize) -> (String, Option<i32>, usize) {
 
 // ---------- ELF ----------
 
-/// The header and section table of an ELF file, as lines. Addresses and sizes are written in
-/// full so that two builds of the same program line up line by line.
+/// The header, section table and symbols of an ELF file, as lines. Addresses and sizes are
+/// written in full so that two builds of the same program line up line by line, and the symbols
+/// of each symbol table are sorted by name, so that a symbol that moved is one changed line.
 fn elf(path: &Path) -> Result<String> {
-    // A program or a core file can be very large, and only its header and the table of its
-    // sections are read, so those are all that is taken from the file.
+    // A program or a core file can be very large, so only its headers, the table of its
+    // sections, the program's interpreter and its symbol and string tables are read, each at
+    // most `MAX_PART`.
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let header = piece(&mut file, 0, 64, len)?;
@@ -1058,6 +1221,55 @@ fn elf(path: &Path) -> Result<String> {
         "Section headers: {count} of {size} bytes at 0x{shoff:x}\n"
     ));
 
+    // The program headers: the segments the program is loaded as.
+    let (ph_count, ph_size) = (half(phnum_o) as usize, half(phentsize_o) as usize);
+    let ph_wanted = if wide { 56 } else { 32 };
+    if ph_count > 0 && ph_size >= ph_wanted {
+        let headers = piece(
+            &mut file,
+            phoff,
+            (ph_count.min(MAX_SECTIONS) * ph_size) as u64,
+            len,
+        )?;
+        out.push_str("\nProgram headers:\n");
+        for (i, h) in headers.chunks_exact(ph_size).enumerate() {
+            let read = |o: usize, n: usize| number(&h[o..o + n]);
+            let (kind, flags, offset, vaddr, paddr, filesz, memsz, align) = if wide {
+                (
+                    read(0, 4),
+                    read(4, 4),
+                    read(8, 8),
+                    read(16, 8),
+                    read(24, 8),
+                    read(32, 8),
+                    read(40, 8),
+                    read(48, 8),
+                )
+            } else {
+                (
+                    read(0, 4),
+                    read(24, 4),
+                    read(4, 4),
+                    read(8, 4),
+                    read(12, 4),
+                    read(16, 4),
+                    read(20, 4),
+                    read(28, 4),
+                )
+            };
+            out.push_str(&format!(
+                "[{i:3}] {:<14} off 0x{offset:08x} vaddr 0x{vaddr:016x} paddr 0x{paddr:016x} filesz {filesz:>10} memsz {memsz:>10} align {align:>6} flags {}\n",
+                segment_type(kind),
+                segment_flags(flags),
+            ));
+            // The program that loads a dynamically linked one.
+            if kind == 3 {
+                let path = piece(&mut file, offset, filesz.min(4096), len)?;
+                out.push_str(&format!("      interpreter {}\n", c_string(&path, 0)));
+            }
+        }
+    }
+
     // The names of the sections are in the section the header points at.
     let names_index = half(shstrndx_o) as usize;
     let names_at = (names_index < count && size >= 16)
@@ -1073,13 +1285,10 @@ fn elf(path: &Path) -> Result<String> {
         Some((start, length)) => piece(&mut file, start, length, len)?,
         None => Vec::new(),
     };
-    let name_at = |offset: usize| -> String {
-        let rest = names.get(offset..).unwrap_or_default();
-        let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-        String::from_utf8_lossy(&rest[..end]).into_owned()
-    };
+    let name_at = |offset: usize| c_string(&names, offset);
 
     out.push_str("\nSections:\n");
+    let mut sections = Vec::new();
     for i in 0..count.min(MAX_SECTIONS) {
         let Some(head) = (shoff as usize).checked_add(i * size) else {
             break;
@@ -1094,21 +1303,197 @@ fn elf(path: &Path) -> Result<String> {
             } else {
                 (4, 8, 12, 16, 20, 24, 28, 32, 36)
             };
+        let section = Section {
+            name: name_at(word(head) as usize),
+            kind: word(head + type_o),
+            offset: addr(head + offset_o),
+            size: addr(head + size_o),
+            link: word(head + link_o) as usize,
+        };
         out.push_str(&format!(
             "[{i:3}] {:<20} {:<14} addr 0x{:016x} off 0x{:08x} size {:>10} align {:>5} entsize {:>4} link {} info {} flags {}\n",
-            name_at(word(head) as usize),
-            section_type(word(head + type_o)),
+            section.name,
+            section_type(section.kind),
             addr(head + addr_o),
-            addr(head + offset_o),
-            addr(head + size_o),
+            section.offset,
+            section.size,
             addr(head + align_o),
             addr(head + entsize_o),
-            word(head + link_o),
+            section.link,
             word(head + info_o),
             section_flags(addr(head + flags_o)),
         ));
+        sections.push(section);
+    }
+
+    // The symbols of each symbol table, the full one and the one for dynamic linking.
+    let entry_size = if wide { 24 } else { 16 };
+    // All the symbol tables together are read up to this much, so that a file of many tables
+    // cannot take long to read.
+    let mut budget = 4 * MAX_PART;
+    for (table_index, table) in sections.iter().enumerate() {
+        if !matches!(table.kind, 2 | 11) {
+            continue;
+        }
+        // The text is cut to `MAX_OUTPUT` in the end; nothing past it is worth making.
+        if out.len() > MAX_OUTPUT || budget == 0 {
+            break;
+        }
+        let entries = piece(&mut file, table.offset, table.size.min(budget), len)?;
+        budget -= entries.len() as u64;
+        // The section indexes that do not fit the symbols' 16 bits, in a table of their own.
+        let wide_indexes = match sections
+            .iter()
+            .find(|s| s.kind == 18 && s.link == table_index)
+        {
+            Some(s) => piece(&mut file, s.offset, s.size, len)?,
+            None => Vec::new(),
+        };
+        let strings = match sections.get(table.link).filter(|s| s.kind == 3) {
+            Some(s) => piece(&mut file, s.offset, s.size, len)?,
+            None => Vec::new(),
+        };
+        let mut symbols = Vec::new();
+        let (mut mapping, mut unlisted) = (0usize, 0usize);
+        // The first entry of a table is always empty.
+        for (n, entry) in entries.chunks_exact(entry_size).enumerate().skip(1) {
+            let read = |o: usize, n: usize| number(&entry[o..o + n]);
+            let (value, size, info, other, index) = if wide {
+                (read(8, 8), read(16, 8), entry[4], entry[5], read(6, 2))
+            } else {
+                (read(4, 4), read(8, 4), entry[12], entry[13], read(14, 2))
+            };
+            let name = c_string(&strings, read(0, 4) as usize);
+            // A section's own symbol has no name; the section table already lists it.
+            if name.is_empty() {
+                continue;
+            }
+            // The marks ARM and RISC-V assemblers put where code or data starts (`$x`, `$d`,
+            // `$t.n`, `$xrv32i2p1…`) say nothing of the program and change with every build.
+            if info == 0 && name.starts_with('$') {
+                mapping += 1;
+                continue;
+            }
+            if symbols.len() == MAX_SYMBOLS {
+                unlisted += 1;
+                continue;
+            }
+            let named = |i: u64| {
+                sections
+                    .get(i as usize)
+                    .map_or_else(|| format!("[{i}]"), |s| s.name.clone())
+            };
+            let section = match index {
+                0 => "UND".to_string(),
+                0xfff1 => "ABS".to_string(),
+                0xfff2 => "COMMON".to_string(),
+                // The index is in the table of wide indexes, at the symbol's place.
+                0xffff => wide_indexes
+                    .get(n * 4..n * 4 + 4)
+                    .map_or_else(|| "XINDEX".to_string(), |i| named(number(i))),
+                i @ 0xff00.. => format!("reserved 0x{i:x}"),
+                i => named(i),
+            };
+            symbols.push((name, value, size, info, other, section));
+        }
+        symbols.sort();
+        out.push_str(&format!("\nSymbols in {}: {}\n", table.name, symbols.len()));
+        for (name, value, size, info, other, section) in &symbols {
+            if out.len() > MAX_OUTPUT {
+                break;
+            }
+            out.push_str(&format!(
+                "{name:<32} addr 0x{value:016x} size {size:>8} {:<7} {:<6} {:<9} {section}\n",
+                symbol_type(info & 0xf),
+                symbol_binding(info >> 4),
+                symbol_visibility(other & 0x3),
+            ));
+        }
+        if mapping > 0 {
+            out.push_str(&format!("({mapping} mapping symbols left out)\n"));
+        }
+        if unlisted > 0 {
+            out.push_str(&format!("... {unlisted} more symbols not listed\n"));
+        }
     }
     Ok(out)
+}
+
+/// What the symbols of an ELF file need of a section.
+struct Section {
+    name: String,
+    kind: u64,
+    offset: u64,
+    size: u64,
+    link: usize,
+}
+
+/// The text from `offset` in a table of strings, to the zero byte that ends it.
+fn c_string(table: &[u8], offset: usize) -> String {
+    let rest = table.get(offset..).unwrap_or_default();
+    let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    String::from_utf8_lossy(&rest[..end]).into_owned()
+}
+
+fn segment_type(value: u64) -> String {
+    match value {
+        0 => "NULL".into(),
+        1 => "LOAD".into(),
+        2 => "DYNAMIC".into(),
+        3 => "INTERP".into(),
+        4 => "NOTE".into(),
+        5 => "SHLIB".into(),
+        6 => "PHDR".into(),
+        7 => "TLS".into(),
+        0x6474e550 => "GNU_EH_FRAME".into(),
+        0x6474e551 => "GNU_STACK".into(),
+        0x6474e552 => "GNU_RELRO".into(),
+        0x6474e553 => "GNU_PROPERTY".into(),
+        0x70000001 => "ARM_EXIDX".into(),
+        0x70000003 => "RISCV_ATTRIBUTES".into(),
+        other => format!("0x{other:x}"),
+    }
+}
+
+/// The flags of a segment as the letters `readelf` uses: read, write, execute.
+fn segment_flags(value: u64) -> String {
+    [(4, 'R'), (2, 'W'), (1, 'E')]
+        .iter()
+        .map(|&(bit, letter)| if value & bit != 0 { letter } else { '-' })
+        .collect()
+}
+
+fn symbol_type(value: u8) -> String {
+    match value {
+        0 => "NOTYPE".into(),
+        1 => "OBJECT".into(),
+        2 => "FUNC".into(),
+        3 => "SECTION".into(),
+        4 => "FILE".into(),
+        5 => "COMMON".into(),
+        6 => "TLS".into(),
+        10 => "IFUNC".into(),
+        other => format!("type{other}"),
+    }
+}
+
+fn symbol_binding(value: u8) -> String {
+    match value {
+        0 => "LOCAL".into(),
+        1 => "GLOBAL".into(),
+        2 => "WEAK".into(),
+        10 => "UNIQUE".into(),
+        other => format!("bind{other}"),
+    }
+}
+
+fn symbol_visibility(value: u8) -> &'static str {
+    match value {
+        1 => "INTERNAL",
+        2 => "HIDDEN",
+        3 => "PROTECTED",
+        _ => "DEFAULT",
+    }
 }
 
 fn machine_name(value: u64) -> String {
@@ -1227,7 +1612,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = zipped(dir.path(), "a.docx", &[("word/document.xml", DOCX)]);
         assert_eq!(Kind::of(&path), Some(Kind::Document));
-        let text = Kind::Document.read(&path).unwrap();
+        let text = Kind::Document.read(&path, None).unwrap();
         assert_eq!(text, "First line\nSecond\tafter a tab\na1\tb1\n");
     }
 
@@ -1248,7 +1633,7 @@ mod tests {
         );
         let path = zipped(dir.path(), "a.odt", &[("content.xml", content)]);
         assert_eq!(Kind::of(&path), Some(Kind::Document));
-        let text = Kind::Document.read(&path).unwrap();
+        let text = Kind::Document.read(&path, None).unwrap();
         assert_eq!(text, "Title\nA line\tand more\na1\tb1\n");
     }
 
@@ -1262,10 +1647,193 @@ mod tests {
             .replace("</w:", "</x:")
             .replace("xmlns:w=", "xmlns:x=");
         let path = zipped(dir.path(), "b.docx", &[("word/document.xml", &odd)]);
-        assert_eq!(Kind::Document.read(&path).unwrap(), DOCX_TEXT);
+        assert_eq!(Kind::Document.read(&path, None).unwrap(), DOCX_TEXT);
     }
 
     const DOCX_TEXT: &str = "First line\nSecond\tafter a tab\na1\tb1\n";
+
+    /// A Word document whose body is `body`.
+    fn docx_with(dir: &Path, body: &str) -> std::path::PathBuf {
+        let xml = format!(
+            r#"<?xml version="1.0"?><w:document xmlns:w="{W}" xmlns:mc="{MARKUP_COMPATIBILITY}"><w:body>{body}</w:body></w:document>"#
+        );
+        zipped(dir, "doc.docx", &[("word/document.xml", &xml)])
+    }
+
+    /// Characters a document cannot write as they are, such as `&` and `<`, are written as
+    /// references, which are read as the characters they stand for.
+    #[test]
+    fn the_references_in_a_document_are_read_as_their_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = docx_with(
+            dir.path(),
+            "<w:p><w:r><w:t>AT&amp;T &lt;x&gt; &#65;&#x42; &quot;q&apos;</w:t></w:r></w:p>",
+        );
+        assert_eq!(
+            Kind::Document.read(&path, None).unwrap(),
+            "AT&T <x> AB \"q'\n"
+        );
+        let content = concat!(
+            r#"<?xml version="1.0"?><office:document-content "#,
+            r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" "#,
+            r#"xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">"#,
+            r#"<text:p>a &amp; b &#8212; c</text:p></office:document-content>"#
+        );
+        let path = zipped(dir.path(), "a.odt", &[("content.xml", content)]);
+        assert_eq!(Kind::Document.read(&path, None).unwrap(), "a & b — c\n");
+    }
+
+    /// Only the words of a document's runs are its text: not its tab stops, not the words it
+    /// shows as deleted, not the codes of its fields, and not the second copy of a text box
+    /// kept for programs that cannot show the first.
+    #[test]
+    fn a_word_document_is_read_as_the_words_it_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = concat!(
+            r#"<w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/></w:tabs></w:pPr>"#,
+            r#"<w:r><w:t>kept</w:t></w:r>"#,
+            r#"<w:del><w:r><w:delText>deleted</w:delText></w:r></w:del>"#,
+            r#"<w:r><w:instrText> PAGE </w:instrText></w:r>"#,
+            r#"<w:r><w:tab/><w:t>after</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><mc:AlternateContent><mc:Choice Requires="wps">"#,
+            r#"<w:t>box</w:t></mc:Choice><mc:Fallback><w:t>box</w:t></mc:Fallback>"#,
+            r#"</mc:AlternateContent></w:r></w:p>"#
+        );
+        let path = docx_with(dir.path(), body);
+        assert_eq!(
+            Kind::Document.read(&path, None).unwrap(),
+            "kept\tafter\nbox\n"
+        );
+    }
+
+    /// The words of an inline string may be split over several runs, and a shared string may
+    /// carry the reading of its words, which is not part of the value.
+    #[test]
+    fn a_workbook_reads_every_run_of_a_string_and_not_its_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = concat!(
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><r><t>ab</t></r><r><t>cd</t></r></is></c>"#,
+            r#"<c r="B1" t="s"><v>0</v></c><c r="C1" t="s"><v>1</v></c></row>"#
+        );
+        let parts = workbook(
+            &[("Only", rows)],
+            &[
+                r#"漢字</t><rPh sb="0" eb="2"><t>かんじ</t></rPh><t>"#,
+                "AT&amp;T",
+            ],
+        );
+        let borrowed: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let path = zipped(dir.path(), "runs.xlsx", &borrowed);
+        assert_eq!(
+            Kind::Spreadsheet.read(&path, None).unwrap(),
+            "abcd,漢字,AT&T\n"
+        );
+    }
+
+    /// Rows with nothing in them are not written, but the rows around them stay apart.
+    #[test]
+    fn a_workbook_keeps_the_empty_rows_between_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>1</v></c></row>"#,
+            r#"<row r="4"><c r="A4"><v>4</v></c></row>"#,
+            r#"<row r="1048576"><c r="A1048576"><v>last</v></c></row>"#
+        );
+        let parts = workbook(&[("Only", rows)], &[]);
+        let borrowed: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let path = zipped(dir.path(), "gaps.xlsx", &borrowed);
+        let text = Kind::Spreadsheet.read(&path, None).unwrap();
+        assert!(text.starts_with("1\n\n\n4\n"), "{:?}", &text[..20]);
+        assert_eq!(text.lines().count(), 1_048_576);
+        assert!(text.ends_with("\nlast\n"));
+    }
+
+    /// An OpenDocument spreadsheet `content.xml` with the rows `rows` in one sheet.
+    fn ods_with(dir: &Path, rows: &str) -> std::path::PathBuf {
+        let content = format!(
+            "{}{rows}{}",
+            concat!(
+                r#"<?xml version="1.0"?><office:document-content "#,
+                r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" "#,
+                r#"xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" "#,
+                r#"xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0">"#,
+                r#"<table:table table:name="S">"#
+            ),
+            "</table:table></office:document-content>"
+        );
+        zipped(dir, "rows.ods", &[("content.xml", &content)])
+    }
+
+    /// A run of equal rows is recorded once, as the unused rows at the end of a sheet are.
+    #[test]
+    fn an_opendocument_spreadsheet_repeats_the_rows_it_records_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = concat!(
+            r#"<table:table-row table:number-rows-repeated="2">"#,
+            r#"<table:table-cell><text:p>same</text:p></table:table-cell></table:table-row>"#,
+            r#"<table:table-row table:number-rows-repeated="2"><table:table-cell/></table:table-row>"#,
+            r#"<table:table-row><table:table-cell><text:p>a &amp; b</text:p></table:table-cell>"#,
+            r#"</table:table-row>"#,
+            r#"<table:table-row table:number-rows-repeated="1048000">"#,
+            r#"<table:table-cell table:number-columns-repeated="1024"/></table:table-row>"#
+        );
+        let path = ods_with(dir.path(), rows);
+        assert_eq!(
+            Kind::Spreadsheet.read(&path, None).unwrap(),
+            "same\nsame\n\n\na & b\n"
+        );
+    }
+
+    /// A small file can say a long value is repeated across every column of a million rows;
+    /// the text it is read as stays within the limit all the same.
+    #[test]
+    fn a_long_value_repeated_everywhere_is_read_only_as_far_as_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "x".repeat(4096);
+        let rows = format!(
+            r#"<table:table-row table:number-rows-repeated="1000000"><table:table-cell table:number-columns-repeated="100000"><text:p>{long}</text:p></table:table-cell></table:table-row>"#
+        );
+        let path = ods_with(dir.path(), &rows);
+        let text = Kind::Spreadsheet.read(&path, None).unwrap();
+        assert!(text.len() <= MAX_OUTPUT + 1024, "{}", text.len());
+        assert!(text.ends_with(&format!("{}\n", crate::i18n::tr("msg.extract_truncated"))));
+    }
+
+    /// The sheets of a workbook of several are not one table, so it is compared as text.
+    #[test]
+    fn a_workbook_of_several_sheets_is_not_compared_as_one_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let parts = workbook(
+            &[
+                ("First", r#"<row r="1"><c r="A1"><v>1</v></c></row>"#),
+                ("Second", r#"<row r="1"><c r="A1"><v>2</v></c></row>"#),
+            ],
+            &[],
+        );
+        let borrowed: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let path = zipped(dir.path(), "two.xlsx", &borrowed);
+        let opts = super::super::diff::DiffOptions::default();
+        let doc = super::super::unpacker::load_doc(&path, &opts, None).unwrap();
+        assert!(is_sheet_heading(&doc.lines[0]), "{:?}", doc.lines);
+        assert_eq!(super::super::table::delimiter_of_doc(&doc, &opts), None);
+    }
+
+    #[test]
+    fn a_cancelled_read_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = zipped(dir.path(), "a.docx", &[("word/document.xml", DOCX)]);
+        let cancel = AtomicBool::new(true);
+        assert!(Kind::Document.read(&path, Some(&cancel)).is_err());
+    }
 
     fn workbook(sheets: &[(&str, &str)], shared: &[&str]) -> Vec<(String, String)> {
         let mut parts = Vec::new();
@@ -1328,11 +1896,16 @@ mod tests {
             .collect();
         let path = zipped(dir.path(), "a.xlsx", &borrowed);
         assert_eq!(Kind::of(&path), Some(Kind::Spreadsheet));
-        let text = Kind::Spreadsheet.read(&path).unwrap();
+        let text = Kind::Spreadsheet.read(&path, None).unwrap();
         // The gap at B2 is kept so that the columns line up, and a comma in a value is quoted.
         assert_eq!(text, "name,note\n12.5,,\"a, comma\"\nTRUE\n");
         // Read as comma separated records, so the table compare shows it as a table.
-        assert_eq!(super::super::table::delimiter_for(&path), Some(','));
+        let opts = super::super::diff::DiffOptions::default();
+        let doc = super::super::unpacker::load_doc(&path, &opts, None).unwrap();
+        assert_eq!(
+            super::super::table::delimiter_of_doc(&doc, &opts),
+            Some(',')
+        );
     }
 
     #[test]
@@ -1350,7 +1923,7 @@ mod tests {
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .collect();
         let path = zipped(dir.path(), "two.xlsx", &borrowed);
-        let text = Kind::Spreadsheet.read(&path).unwrap();
+        let text = Kind::Spreadsheet.read(&path, None).unwrap();
         assert!(text.contains("First"), "{text}");
         assert!(text.contains("Second"), "{text}");
         assert!(text.contains("\n1\n"), "{text}");
@@ -1374,7 +1947,7 @@ mod tests {
         let path = zipped(dir.path(), "a.ods", &[("content.xml", content)]);
         assert_eq!(Kind::of(&path), Some(Kind::Spreadsheet));
         // The long run of empty cells that records the sheet's width is not part of the row.
-        assert_eq!(Kind::Spreadsheet.read(&path).unwrap(), "x,y,y,y\n");
+        assert_eq!(Kind::Spreadsheet.read(&path, None).unwrap(), "x,y,y,y\n");
     }
 
     /// A cell with nothing in it is written as one element, and every cell after it is in a
@@ -1396,7 +1969,7 @@ mod tests {
             r#"</office:document-content>"#
         );
         let path = zipped(dir.path(), "gap.ods", &[("content.xml", content)]);
-        assert_eq!(Kind::Spreadsheet.read(&path).unwrap(), "a,,,,c\n");
+        assert_eq!(Kind::Spreadsheet.read(&path, None).unwrap(), "a,,,,c\n");
     }
 
     /// The same for a worksheet, where a cell may also be written as one element.
@@ -1413,7 +1986,7 @@ mod tests {
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .collect();
         let path = zipped(dir.path(), "gap.xlsx", &borrowed);
-        assert_eq!(Kind::Spreadsheet.read(&path).unwrap(), "1,,3\n");
+        assert_eq!(Kind::Spreadsheet.read(&path, None).unwrap(), "1,,3\n");
     }
 
     /// A relationship may name its part from the top of the package, as some programs other
@@ -1435,7 +2008,7 @@ mod tests {
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .collect();
         let path = zipped(dir.path(), "absolute.xlsx", &borrowed);
-        assert_eq!(Kind::Spreadsheet.read(&path).unwrap(), "7\n");
+        assert_eq!(Kind::Spreadsheet.read(&path, None).unwrap(), "7\n");
     }
 
     /// The words of a workbook's cells are kept in a part of their own. If that part is there
@@ -1461,7 +2034,7 @@ mod tests {
             .unwrap();
         bytes[at] = b'U';
         std::fs::write(&path, bytes).unwrap();
-        assert!(Kind::Spreadsheet.read(&path).is_err());
+        assert!(Kind::Spreadsheet.read(&path, None).is_err());
     }
 
     /// A workbook none of whose sheets can be found is reported, rather than compared as if
@@ -1476,7 +2049,7 @@ mod tests {
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .collect();
         let path = zipped(dir.path(), "missing.xlsx", &borrowed);
-        assert!(Kind::Spreadsheet.read(&path).is_err());
+        assert!(Kind::Spreadsheet.read(&path, None).is_err());
     }
 
     #[test]
@@ -1508,7 +2081,7 @@ mod tests {
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(MAX_FILE + 1).unwrap();
         drop(file);
-        let e = Kind::Pdf.read(&path).unwrap_err();
+        let e = Kind::Pdf.read(&path, None).unwrap_err();
         assert!(format!("{e:#}").contains("larger than"), "{e:#}");
     }
 
@@ -1521,7 +2094,7 @@ mod tests {
         bytes[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
         // Read, and says what it can, rather than ending the program.
-        let text = Kind::Elf.read(&path).unwrap();
+        let text = Kind::Elf.read(&path, None).unwrap();
         assert!(text.starts_with("ELF 64-bit"), "{text}");
     }
 
@@ -1539,7 +2112,7 @@ mod tests {
         let path = dir.path().join("a.rtf");
         std::fs::write(&path, rtf).unwrap();
         assert_eq!(Kind::of(&path), Some(Kind::Rtf));
-        let text = Kind::Rtf.read(&path).unwrap();
+        let text = Kind::Rtf.read(&path, None).unwrap();
         assert_eq!(text, "Hello bold world\nSecond\tline\ncafé and —dash\n");
     }
 
@@ -1589,7 +2162,7 @@ mod tests {
         std::fs::write(&path, elf_file()).unwrap();
         // A program usually has no extension, so it is told by the bytes it starts with.
         assert_eq!(Kind::of(&path), Some(Kind::Elf));
-        let text = Kind::Elf.read(&path).unwrap();
+        let text = Kind::Elf.read(&path, None).unwrap();
         assert!(
             text.starts_with("ELF 64-bit little-endian executable\n"),
             "{text}"
@@ -1603,12 +2176,124 @@ mod tests {
         assert!(text.contains(".shstrtab"), "{text}");
     }
 
+    /// A 64-bit little-endian program with one segment and a symbol table of the given
+    /// symbols: (name, value, size, info, other, section index).
+    fn elf_with_symbols(symbols: &[(&str, u64, u64, u8, u8, u16)]) -> Vec<u8> {
+        let names = b"\0.text\0.shstrtab\0.symtab\0.strtab\0";
+        let mut strings = vec![0u8];
+        let mut offsets = Vec::new();
+        for (name, ..) in symbols {
+            offsets.push(strings.len() as u32);
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        let (phoff, shoff) = (64usize, 64 + 56);
+        let names_at = shoff + 5 * 64;
+        let symtab_at = names_at + names.len();
+        let symtab_size = (symbols.len() + 1) * 24;
+        let strtab_at = symtab_at + symtab_size;
+        let mut bytes = vec![0u8; strtab_at + strings.len()];
+        bytes[..8].copy_from_slice(b"\x7fELF\x02\x01\x01\x00");
+        bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[32..40].copy_from_slice(&(phoff as u64).to_le_bytes());
+        bytes[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+        bytes[58..60].copy_from_slice(&64u16.to_le_bytes());
+        bytes[60..62].copy_from_slice(&5u16.to_le_bytes());
+        bytes[62..64].copy_from_slice(&2u16.to_le_bytes());
+        // One loadable segment, read and execute.
+        let ph = &mut bytes[phoff..phoff + 56];
+        ph[0..4].copy_from_slice(&1u32.to_le_bytes());
+        ph[4..8].copy_from_slice(&5u32.to_le_bytes());
+        ph[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
+        ph[16..24].copy_from_slice(&0x401000u64.to_le_bytes());
+        ph[24..32].copy_from_slice(&0x401000u64.to_le_bytes());
+        ph[32..40].copy_from_slice(&0x20u64.to_le_bytes());
+        ph[40..48].copy_from_slice(&0x30u64.to_le_bytes());
+        ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes());
+        let mut put = |index: usize, name: u32, kind: u32, off: usize, size: usize, link: u32| {
+            let at = shoff + index * 64;
+            bytes[at..at + 4].copy_from_slice(&name.to_le_bytes());
+            bytes[at + 4..at + 8].copy_from_slice(&kind.to_le_bytes());
+            bytes[at + 24..at + 32].copy_from_slice(&(off as u64).to_le_bytes());
+            bytes[at + 32..at + 40].copy_from_slice(&(size as u64).to_le_bytes());
+            bytes[at + 40..at + 44].copy_from_slice(&link.to_le_bytes());
+        };
+        put(1, 1, 1, 0x1000, 0, 0); // .text
+        put(2, 7, 3, names_at, names.len(), 0); // .shstrtab
+        put(3, 17, 2, symtab_at, symtab_size, 4); // .symtab, names in section 4
+        put(4, 25, 3, strtab_at, strings.len(), 0); // .strtab
+        bytes[names_at..symtab_at].copy_from_slice(names);
+        for (i, &(_, value, size, info, other, index)) in symbols.iter().enumerate() {
+            let at = symtab_at + (i + 1) * 24;
+            bytes[at..at + 4].copy_from_slice(&offsets[i].to_le_bytes());
+            bytes[at + 4] = info;
+            bytes[at + 5] = other;
+            bytes[at + 6..at + 8].copy_from_slice(&index.to_le_bytes());
+            bytes[at + 8..at + 16].copy_from_slice(&value.to_le_bytes());
+            bytes[at + 16..at + 24].copy_from_slice(&size.to_le_bytes());
+        }
+        bytes[strtab_at..].copy_from_slice(&strings);
+        bytes
+    }
+
+    #[test]
+    fn segment_flags_are_always_three_letters() {
+        assert_eq!(segment_flags(0), "---");
+        assert_eq!(segment_flags(2), "-W-");
+        assert_eq!(segment_flags(5), "R-E");
+        assert_eq!(segment_flags(6), "RW-");
+        assert_eq!(segment_flags(7), "RWE");
+    }
+
+    #[test]
+    fn an_elf_program_lists_its_segments_and_its_symbols_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("program");
+        let bytes = elf_with_symbols(&[
+            ("main", 0x401010, 16, 0x12, 0, 1),        // FUNC GLOBAL in .text
+            ("$x", 0x401000, 0, 0, 0, 1),              // a mapping symbol, left out
+            ("counter", 0x402000, 4, 0x01, 2, 0xfff1), // OBJECT LOCAL HIDDEN, ABS
+            ("abort", 0, 0, 0x22, 0, 0),               // FUNC WEAK, undefined
+            ("tune", 8, 0, 0x10, 0, 0xff1f),           // a processor's own reserved section
+        ]);
+        std::fs::write(&path, bytes).unwrap();
+        let text = Kind::Elf.read(&path, None).unwrap();
+        assert!(
+            text.contains(
+                "[  0] LOAD           off 0x00001000 vaddr 0x0000000000401000 paddr 0x0000000000401000 filesz         32 memsz         48 align   4096 flags R-E\n"
+            ),
+            "{text}"
+        );
+        let symbols: Vec<&str> = text
+            .split("Symbols in .symtab: 4\n")
+            .nth(1)
+            .expect(&text)
+            .lines()
+            .collect();
+        let words = |line: &str| line.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            symbols.iter().map(|l| words(l)).collect::<Vec<_>>(),
+            [
+                "abort addr 0x0000000000000000 size 0 FUNC WEAK DEFAULT UND",
+                "counter addr 0x0000000000402000 size 4 OBJECT LOCAL HIDDEN ABS",
+                "main addr 0x0000000000401010 size 16 FUNC GLOBAL DEFAULT .text",
+                "tune addr 0x0000000000000008 size 0 NOTYPE GLOBAL DEFAULT reserved 0xff1f",
+                "(1 mapping symbols left out)",
+            ]
+        );
+    }
+
     #[test]
     fn a_file_that_is_not_what_its_name_says_is_reported_rather_than_shown_as_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broken.docx");
         std::fs::write(&path, b"not a zip at all").unwrap();
-        let e = Kind::Document.read(&path).unwrap_err();
+        let e = Kind::Document.read(&path, None).unwrap_err();
         assert!(format!("{e:#}").contains("broken.docx"), "{e:#}");
         // A plain file keeps its own name and is compared as it is.
         let plain = dir.path().join("notes.txt");
