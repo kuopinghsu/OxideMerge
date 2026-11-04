@@ -120,6 +120,15 @@ pub struct Job {
     pub patch_style: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<usize>,
+    /// A .pdf report: `a4` or `letter`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub portrait: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unified: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub whole_file: bool,
 }
 
 impl JobFile {
@@ -233,6 +242,9 @@ impl Job {
             (self.structured, "structured"),
             (self.report_diffs, "report-diffs"),
             (self.slideshow, "slideshow"),
+            (self.portrait, "portrait"),
+            (self.unified, "unified"),
+            (self.whole_file, "whole-file"),
         ] {
             if on {
                 opt(name, None);
@@ -252,6 +264,9 @@ impl Job {
         }
         if let Some(c) = self.context {
             opt("context", text(&c.to_string()));
+        }
+        if let Some(p) = &self.page_size {
+            opt("page-size", text(p));
         }
         // Paths after `--`, so one starting with `-` is not read as an option.
         args.push("--".into());
@@ -302,6 +317,10 @@ impl Job {
                     (self.context.is_some(), "context"),
                     (self.report_diffs, "report_diffs"),
                     (self.slideshow, "slideshow"),
+                    (self.page_size.is_some(), "page_size"),
+                    (self.portrait, "portrait"),
+                    (self.unified, "unified"),
+                    (self.whole_file, "whole_file"),
                     // A synchronization always compares every subfolder.
                     (self.recursive, "recursive"),
                 ] {

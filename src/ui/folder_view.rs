@@ -2682,6 +2682,65 @@ impl FolderView {
         }
     }
 
+    /// Makes the PDF report of the listed items with the differences of every changed text
+    /// file, review notes and the review summary, as the HTML report with differences; it reads
+    /// every changed file, so it runs on another thread.
+    pub fn pdf_job(
+        &self,
+        cfg: &Config,
+        pdf: crate::core::pdf_report::PdfOptions,
+        lang: String,
+    ) -> impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static {
+        use crate::core::pdf_report::Section;
+        let items: Vec<DirItem> = self
+            .flat_list(cfg)
+            .into_iter()
+            .map(|i| self.items[i].clone())
+            .collect();
+        let display: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
+        let (roots, dopts) = (self.roots.clone(), self.dopts.clone());
+        let rules = self.used_rules().to_string();
+        let mut sections = Vec::new();
+        if !self.notes.is_empty() {
+            sections.push(Section {
+                title: crate::i18n::tr("review.notes").to_string(),
+                lines: self
+                    .notes
+                    .iter()
+                    .map(|(path, note)| format!("{path}: {note}"))
+                    .collect(),
+                mono: false,
+            });
+        }
+        if !self.workspace.entries.is_empty() {
+            let summary = self
+                .workspace
+                .summary(items.iter().filter(|i| !i.is_dir).map(|i| i.rel_path()));
+            let json = serde_json::to_string_pretty(&summary).unwrap_or_default();
+            sections.push(Section {
+                title: "Review workspace".into(),
+                lines: json.lines().map(str::to_owned).collect(),
+                mono: true,
+            });
+        }
+        let temps = self.temps.clone();
+        move || {
+            let _keep_alive = temps;
+            let refs: Vec<&DirItem> = items.iter().collect();
+            let fonts = crate::ui::fonts::document_fonts(&lang);
+            crate::core::pdf_report::folder_pdf(
+                &refs,
+                &roots,
+                &display,
+                Some(&dopts),
+                &rules,
+                &sections,
+                &fonts,
+                &pdf,
+            )
+        }
+    }
+
     /// Makes the HTML slideshow of the listed items: a slide for each difference of every
     /// changed text file. It reads every changed file, so it can run on another thread.
     pub fn slideshow_job(&self, cfg: &Config) -> impl FnOnce() -> String + Send + 'static {

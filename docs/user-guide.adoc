@@ -511,13 +511,69 @@ The next save replaces this backup, so it is not a version history.
 
 === Editing text
 
-You can edit each pane that is not read-only. Editing is line-based.
+You can edit each pane that is not read-only.
 
-* To edit a line, double-click it, or press kbd:[F2] or kbd:[Enter].
-* To select lines, drag over them, kbd:[Shift]+click, or press kbd:[Shift+↑] and kbd:[Shift+↓].
-* kbd:[Ctrl+C] copies the selected lines.
-  kbd:[Ctrl+V] pastes below the current line, or replaces the selected lines.
+Click in the text to place the cursor there, and type, as in any text editor.
+
+* kbd:[Enter] starts a new line, with the indentation of the line above.
+  kbd:[Backspace] and kbd:[Delete] remove a character, or join a line to the one next to it.
+* kbd:[Ctrl+V] pastes at the cursor, any number of lines at once.
+* To select text, drag over it, kbd:[Shift]+click, or move the cursor with kbd:[Shift] held.
+  Double-click selects a word, and kbd:[Ctrl+A] selects the whole file.
+  Typing or pasting replaces the selection.
+* kbd:[Ctrl+C] copies the selection and kbd:[Ctrl+X] cuts it.
+  With nothing selected, they copy or cut the whole line.
+* The arrow keys, kbd:[Home], kbd:[End], kbd:[PgUp] and kbd:[PgDn] move the cursor.
+  kbd:[Ctrl+Home] and kbd:[Ctrl+End] go to the start and end of the file.
+  On macOS, kbd:[Cmd+←] and kbd:[Cmd+→] go to the line start and end.
+* kbd:[Esc] ends the selection; a second kbd:[Esc] removes the cursor, and the arrow keys then
+  move from row to row again.
+* Input methods work at the cursor, so you can type Chinese, Japanese or Korean.
+* A selection over several lines also selects their rows, so the copy buttons and
+  kbd:[Alt+→] and kbd:[Alt+←] copy those lines to the other side.
 * kbd:[Ctrl+\]] indents the selected lines, and kbd:[Ctrl+[] unindents them.
+* Without a cursor, kbd:[F2] or kbd:[Enter] puts it at the end of the current line.
+
+The cursor works in the side-by-side view. In the inline view and the table view, double-click
+a line or cell to edit it.
+
+The bar under each pane shows whether you can edit it:
+
+* *Writable*: you can edit the file and save it.
+* *Read-only*: the pane is locked, for example with the lock button in its header, and does not
+  take edits.
+* *Read-only on disk*: you can edit, but the system does not let OxideMerge write the file, so
+  save it under another name.
+* *Compare only*: the pane shows text that OxideMerge read from the file, not the file itself:
+  a document, spreadsheet, PDF or program, a web page, or a formatted copy of JSON or XML.
+  It cannot be unlocked, edited or saved back.
+* *Modified* appears while the file has changes that are not saved.
+
+The status bar at the bottom of the window shows the same for the active pane.
+It also shows *Compare only* for the Tree and Formatted views and for web pages shown as
+Markdown.
+
+To select a column of text, hold kbd:[Alt] (kbd:[Option] on macOS) and drag.
+The selection covers the same columns on every line it crosses.
+It does not work with word wrap or in the table view.
+
+* Typing replaces the selected columns on every line.
+  A selection with no width is a cursor on every line, so typing inserts the same text on each.
+* kbd:[Backspace] and kbd:[Delete] remove the selected columns, or one character on each line.
+* kbd:[Ctrl+C] copies the columns, one line per row, and kbd:[Ctrl+X] cuts them.
+* kbd:[Ctrl+V] pastes.
+  A single line goes into every selected line.
+  Several lines go in one per line, and lines past the selection go into the lines below it.
+* kbd:[Esc] or a click ends the column selection.
+
+Columns are counted as the lines are shown: a tab reaches the next tab stop.
+Text put past the end of a short line is padded with spaces so that it lines up.
+Characters that are drawn wider than others, such as Chinese characters, still count as one
+column, so a column selection across them can look uneven.
+
+Each edit, paste, cut or deletion is one undo step; typing within a line is one step until the
+cursor moves.
+Saving keeps each file's line endings, encoding and byte order mark.
 
 Right-click a line to edit it, insert a line below it, delete it, copy its text, set a bookmark,
 or create a compare rule from it (see <<add-rule>>).
@@ -1871,7 +1927,10 @@ The recipient can open it in any browser, without OxideMerge.
   highlighted.
 * The report has summary cards, an index, a side-by-side or unified view, light and dark themes,
   a file filter and search.
-* kbd:[N] and kbd:[P] go to the next and the previous difference.
+* kbd:[N] and kbd:[P] go to the next and the previous difference, which pulses briefly.
+* The header carries the OxideMerge icon, and the page animates as it opens: the sections fade in
+  and the counts in the summary cards count up. A browser set to reduce motion shows a still
+  page, and so does printing.
 * The report names the compare rules file and counts the ignored differences.
 * A folder report includes the differences of each changed text file.
 
@@ -1955,6 +2014,50 @@ In the browser:
 * kbd:[F] switches to full screen.
 * Each slide has its own address, such as `#3` for the third slide, so you can link to it.
 * When you print the page, each slide is printed on its own page.
+
+[[pdf-reports]]
+=== PDF reports and printing
+
+*File → Export → Export PDF report...* saves the report of a text or folder comparison as a PDF
+file. *File → Print...* (kbd:[Ctrl+P]) writes the same PDF to a temporary file and opens it in
+your system's PDF viewer, where you print it. No browser is used.
+
+A PDF report holds what the HTML report holds:
+
+* The compared files, the compare rules file, the counts of differences and of added, removed and
+  changed lines, and bookmark comments.
+* Every difference with three lines of context, line numbers and the changed words marked, side
+  by side. With the inline view switched on, a two-way report has one column, with the removed
+  lines above the added ones, on portrait pages.
+* For a folder comparison, the list of files with their status, sizes and dates, then the
+  differences of every changed text file, review notes and the review summary.
+* What matching by key found, for a table compared by key.
+
+Each page has a header with the OxideMerge icon and the report title, and a footer with *Page n of
+m* and *OxideMerge*, which links to the project page
+(https://github.com/kuopinghsu/OxideMerge). The PDF has a bookmark for each file and each
+difference. The fonts OxideMerge uses are embedded, only with the characters the report needs,
+so Chinese, Japanese and Korean text prints as it shows on screen.
+
+Color is never the only cue, so a report printed in black and white still shows what changed:
+
+* Each changed line starts with a sign: `-` removed, `+` added, `~` changed, `!` conflict, `=`
+  ignored.
+* Changed words are underlined as well as highlighted.
+* The place of a line missing on one side is hatched.
+* With *Color-blind friendly diff colors* on in *Options → General*, blue and orange take the
+  place of green and red.
+
+Pages are A4 and landscape. Select *File → Export → US Letter pages for PDF reports* for Letter
+pages. On the command line, `--page-size`, `--portrait`, `--unified`, `--whole-file` and
+`--context` set the layout (see <<command-line>>):
+
+[source,sh]
+----
+oxidemerge old.c new.c --report changes.pdf
+oxidemerge -r old new --report review.pdf --report-diffs --page-size letter
+oxidemerge old.c new.c --report full.pdf --whole-file --unified --portrait
+----
 
 [[patches]]
 === Patches
@@ -2627,11 +2730,11 @@ three-way comparison.
 |Compare without a window. See <<scripting>> for the exit codes.
 
 |`--report <FILE>`
-|Write a report. Folder comparisons: `.html`, `.csv`, `.txt` or `.xml`.
-Text comparisons: `.html` or `.xml`.
+|Write a report. Folder comparisons: `.html`, `.pdf`, `.csv`, `.txt` or `.xml`.
+Text comparisons: `.html`, `.pdf` or `.xml`. See <<pdf-reports>>.
 
 |`--report-diffs`
-|Add the differences of each changed text file to an HTML folder report.
+|Add the differences of each changed text file to an HTML or PDF folder report.
 
 |`--slideshow`
 |Write the `.html` report as a slideshow, with one difference on each slide.
@@ -2643,7 +2746,20 @@ Text comparisons: `.html` or `.xml`.
 |`normal`, `context` or `unified` (the default).
 
 |`--context <N>`
-|The number of context lines in context and unified patches. The default is 3.
+|The number of context lines in context and unified patches and in PDF reports. The default is
+3.
+
+|`--page-size <SIZE>`
+|The pages of a PDF report: `a4` (the default) or `letter`.
+
+|`--portrait`
+|Portrait pages in a PDF report. The default is landscape.
+
+|`--unified`
+|One column in a two-way PDF report, with the removed lines above the added ones.
+
+|`--whole-file`
+|Show the whole files in a PDF report, not only the differences with their context.
 |===
 
 .Analysis
@@ -2913,8 +3029,9 @@ refused unless the job has `"allow_large_deletion": true`.
 
 All kinds also take `filter`, `method`, `rules`, `whitespace`, `ignore_case`, `ignore_blank`,
 `ignore_eol`, `ignore_numbers`, `ignore_comments`, `prettify`, `structured` and
-`numeric_tolerance`, with the meanings of the command-line options of the same names. A field
-that does not fit the kind, such as `apply` in a compare, is an error.
+`numeric_tolerance`, and the compare and sync plan kinds `page_size`, `portrait`, `unified` and
+`whole_file` for a `.pdf` report, with the meanings of the command-line options of the same names.
+A field that does not fit the kind, such as `apply` in a compare, is an error.
 
 Paths, including `rules`, are relative to the folder of the job file, unless they are absolute or
 URLs. In paths and `rules`, `${env:NAME}` is replaced by the environment variable `NAME`; an unset
@@ -3105,6 +3222,7 @@ On macOS, use kbd:[⌘] for kbd:[Ctrl] and kbd:[⌥] for kbd:[Alt].
 |kbd:[Ctrl+S] |Save
 |kbd:[Ctrl+Shift+S] |Save all
 |kbd:[Ctrl+Shift+E] |Export HTML report
+|kbd:[Ctrl+P] |Print: open the PDF report in the system's viewer
 |kbd:[F5] |Refresh
 |kbd:[Ctrl+W], kbd:[Ctrl+F4], kbd:[Esc] |Close the tab. kbd:[Esc] first closes an open dialog, search bar or editor
 |kbd:[Ctrl+Tab], kbd:[Ctrl+Shift+Tab] |Next or previous tab
@@ -3135,10 +3253,13 @@ On macOS, use kbd:[⌘] for kbd:[Ctrl] and kbd:[⌥] for kbd:[Alt].
 |kbd:[Ctrl+G] |Go to a line (an offset in a binary comparison)
 |kbd:[Ctrl+Home], kbd:[Ctrl+End] |First or last line
 |kbd:[←], kbd:[→] |Make the left or right pane active
-|kbd:[F2], kbd:[Enter] |Edit the current line
-|kbd:[Shift+↑], kbd:[Shift+↓], kbd:[Shift+PgUp], kbd:[Shift+PgDn] |Select lines
-|kbd:[Ctrl+C] |Copy the selected lines
-|kbd:[Ctrl+V] |Paste below the current line, or over the selected lines
+|kbd:[F2], kbd:[Enter] |Without a cursor, put it at the end of the current line
+|kbd:[Ctrl+A] |Select the whole file
+|kbd:[Shift+←], kbd:[Shift+→], kbd:[Shift+↑], kbd:[Shift+↓], kbd:[Shift+PgUp], kbd:[Shift+PgDn] |Select text
+|kbd:[Ctrl+C], kbd:[Ctrl+X] |Copy or cut the selection or columns, or the whole line
+|kbd:[Ctrl+V] |Paste at the cursor, or over the selection or columns
+|kbd:[Delete], kbd:[Backspace] |Delete a character, the selection or the columns
+|kbd:[Alt]+drag (kbd:[Option]+drag on macOS) |Select columns
 |kbd:[Ctrl+\]], kbd:[Ctrl+[] |Indent or unindent the selected lines
 |kbd:[Ctrl+Z], kbd:[Ctrl+Y] / kbd:[Ctrl+Shift+Z] |Undo, redo
 |kbd:[Ctrl+F2], kbd:[F4], kbd:[Shift+F4] |Set or remove a bookmark, next bookmark, previous bookmark
@@ -3286,7 +3407,9 @@ content (see <<compare-methods>>).
 
 * Archives: ZIP-based formats, TAR (plain, gzip, bzip2 and xz) and 7z are supported.
   RAR is not supported. Extracted archive contents are read-only.
-* Text editing is line-based. It is intended for reviewing and merging changes.
+* The text panes are meant for reviewing and merging changes, not as a full editor.
+  There is no word-by-word cursor movement, no multiple cursors except a column selection, and
+  no cursor in the inline view.
 * Unpacker plugins use external commands. WinMerge plugin DLLs and scripts are not supported.
 * Web page comparison does not support cookies or logins. A page that needs a login shows its login
   page.

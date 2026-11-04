@@ -101,6 +101,8 @@ It compares text, folders, binary files, images and web pages.
 
 - Export HTML reports, HTML slideshows with one difference per slide, and XML reports for other
   programs. Export folder summaries as CSV or plain text.
+- Export PDF reports and print them, with the fonts embedded so Chinese, Japanese and Korean
+  text prints too, and markers that still show in black and white.
 - Create patches. Apply unified patches and review the result before you save it.
 - Save comparison settings as project files. Save text comparisons with their bookmarks and
   notes. Save portable folder reviews with the file contents, settings, bookmarks and comments.
@@ -305,8 +307,9 @@ oxidemerge -r old-folder new-folder --report report.html --report-diffs
 | `--structured` | In folder comparisons, count JSON, XML, TOML and YAML files with the same structure as identical. |
 | `--rules <name-or-path>` | Use a comparison rules file. |
 | `--git-rev <revision>` | Compare one file or folder with a Git revision. |
-| `--report <file>` | Export a report as `.html` or `.xml`. Folder comparisons can also use `.csv` or `.txt`. |
-| `--report-diffs` | Add text differences to a folder HTML report. |
+| `--report <file>` | Export a report as `.html`, `.pdf` or `.xml`. Folder comparisons can also use `.csv` or `.txt`. |
+| `--report-diffs` | Add text differences to a folder HTML or PDF report. |
+| `--page-size a4\|letter`, `--portrait`, `--unified`, `--whole-file` | Lay out a `.pdf` report: page size, portrait pages, one column for two files, or the whole files instead of the differences with `--context` lines. |
 | `--slideshow` | Export an HTML slideshow with one difference per slide. |
 | `--patch <file>` | Export a patch from a two-way file or folder comparison. |
 | `--cli` | Compare without opening a window, for scripts. |
@@ -503,7 +506,9 @@ use Command instead of Ctrl. The app shows the right keys for your system.
   merge them.
 - Web page compare does not run JavaScript, so it can miss content that a page's scripts add.
 - Pages that need a login are not supported. They may show the login page instead.
-- Text editing works line by line. It is meant for reviewing and merging changes.
+- The text panes are meant for reviewing and merging changes, not as a full editor. You can type
+  at the cursor and select across lines, and Alt+drag selects columns, but there is no
+  word-by-word movement and no cursor in the inline view.
 - WinMerge project files and filter files work. WinMerge plugin DLLs and scripts do not work.
 - The documents, spreadsheets and programs that OxideMerge reads itself are compared as the text
   it reads from them, not as the files they are: layout, fonts, formulas and anything else the

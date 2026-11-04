@@ -259,6 +259,7 @@ pub fn load_doc(
     let mut doc = super::text::doc_from_bytes(Some(path.to_path_buf()), &bytes, None);
     // Read from the file rather than being it: what is shown cannot be written back.
     doc.read_only = true;
+    doc.compare_only = true;
     doc.description = Some(format!("{} [{label}]", path.display()));
     Ok(doc)
 }
@@ -276,6 +277,7 @@ pub fn load_compare_doc(
         {
             doc.lines = super::text::split_lines(&pretty).0;
             doc.read_only = true;
+            doc.compare_only = true;
         }
     }
     Ok(doc)
@@ -329,6 +331,19 @@ pub fn find<'a>(opts: &'a super::diff::DiffOptions, path: &Path) -> Option<Conve
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn documents_read_as_text_are_compare_only() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/left");
+        let opts = super::super::diff::DiffOptions::default();
+        for name in ["docs/report.docx", "docs/budget.xlsx", "docs/report.pdf"] {
+            let doc = load_doc(&root.join(name), &opts, None).unwrap();
+            assert!(doc.read_only && doc.compare_only, "{name}");
+        }
+        // A plain text file is the file itself.
+        let doc = load_doc(&root.join("same.txt"), &opts, None).unwrap();
+        assert!(!doc.read_only && !doc.compare_only);
+    }
 
     #[test]
     fn file_names_are_never_run_as_commands() {

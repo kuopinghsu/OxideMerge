@@ -2655,10 +2655,10 @@ fn compact_pane_keyboard_skips_the_other_sides_insertions() {
     gui.key(Modifiers::NONE, Key::ArrowDown);
     let v = gui.text_view();
     assert_eq!(v.diff.rows[v.cursor_row.unwrap()].line(0), Some(1));
+    // F2 puts the caret at the end of the line; Shift+Home selects it, and typing replaces it.
     gui.key(Modifiers::NONE, Key::F2);
-    gui.key(CMD, Key::A);
+    gui.key(Modifiers::SHIFT, Key::Home);
     gui.type_text("edited common");
-    gui.key(Modifiers::NONE, Key::Enter);
     assert_eq!(gui.text_view().panes[0].doc.lines[1], "edited common");
     gui.key(Modifiers::NONE, Key::ArrowDown);
     let v = gui.text_view();

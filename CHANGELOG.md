@@ -113,6 +113,33 @@ section of this file as the release notes.
   journal copies do not fit in the free space of their drives is refused before anything changes,
   and the JSON result has a `problem` (`stale`, `unsupported`, `read_failure`, `write_failure`,
   `canceled`, `recovery_needed`) when it is not a plain success.
+- **Edit state in the status bars:** the bar under each text pane shows *Writable*, *Read-only*
+  (the pane is locked), *Read-only on disk* (the file cannot be written; save it under another
+  name) or *Compare only* (text read from a document, spreadsheet, PDF, program or web page, or a
+  formatted copy), and *Modified* while it has unsaved changes. The window's status bar shows the
+  same for the active pane, and *Compare only* for the Tree and Formatted views and web pages
+  shown as Markdown. A compare-only pane can no longer be unlocked, so its text cannot be saved
+  over the file it was read from.
+- **Editing at a cursor:** the side-by-side panes edit like a text editor. Click to place the
+  cursor and type; Enter splits the line (keeping its indentation), Backspace and Delete join
+  lines, and paste puts any number of lines at the cursor. Drag, Shift+click, Shift+arrows,
+  double-click (a word) and Ctrl+A select text, which typing replaces; copy and cut take the
+  selection or the whole line. Input methods compose at the cursor. Alt+drag (Option+drag on
+  macOS) makes a column selection: typing, Backspace, Delete, copy, cut and paste work on the same
+  columns of every line. Each action is one undo step (typing in a line is one until the cursor
+  moves), and saving keeps each file's line endings, encoding and byte order mark.
+- **PDF reports and printing:** *File → Export → Export PDF report...* and `--report out.pdf`
+  write the report of a text or folder compare as a PDF, with no browser: the compared files,
+  rules, counts and every difference with its context, line numbers and changed words, side by
+  side or in one column (the inline view, `--unified`), with a page header that carries the app
+  icon, page numbers, a footer whose *OxideMerge* links to the project page, and a bookmark for
+  each file and difference. A folder report lists the files, then with
+  `--report-diffs` (always from the menu) the differences of each changed text file, review notes
+  and the review summary. The fonts are embedded as subsets, so Chinese, Japanese and Korean
+  print. A sign before each changed line, underlined words and hatched gaps keep the report
+  readable in black and white; the color-blind colors apply. *File → Print...* (Ctrl+P) opens
+  the PDF in the system's viewer. Options: `--page-size a4|letter` (or *US Letter pages* in the
+  menu), `--portrait`, `--whole-file` and `--context`; job files take the same fields.
 - **Jobs:** `--job <FILE>` runs the compares, reports, sync plans and syncs listed in a versioned
   JSON job file (`.oxjob`) in order, each as its command line would, and prints a JSON summary
   whose exit code is the worst of the jobs. Paths are relative to the job file, `${env:NAME}` in
@@ -136,6 +163,11 @@ section of this file as the release notes.
   in the *Full contents* method when only key order, layout or comments differ.
 
 ### Changed
+
+- **HTML reports** carry the OxideMerge icon in their header, embedded in the file (about 10 KB),
+  and move: the sections and file cards fade in, the counts in the summary cards count up, cards
+  lift under the pointer, opening a file slides its differences in, and the difference that
+  N or P goes to pulses. A browser set to reduce motion, and printing, get a still page.
 
 - The README shows the OxideMerge icon next to its title.
 - The English and Traditional Chinese READMEs are reorganized for users and use simpler wording.

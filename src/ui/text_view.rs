@@ -3,6 +3,7 @@
 use crate::config::{Config, TextLayout};
 use crate::core::comments;
 use crate::core::diff::{self, BlockKind, DiffOptions, DiffResult, InlineMode, SyncPoint};
+use crate::core::edit;
 use crate::core::patch::{self, PatchStyle};
 use crate::core::prettify;
 use crate::core::report::side_name;
@@ -18,7 +19,7 @@ use crate::ui::markdown_view::{MarkdownView, Prepared};
 use crate::ui::syntax::{self, LineSpans};
 use crate::ui::theme::{self, Colors};
 use crate::ui::widgets::{self, Icon, Mark, Outcome};
-use egui::text::LayoutJob;
+use egui::text::{CCursor, LayoutJob};
 use egui::{
     pos2, vec2, Align2, Color32, FontId, Galley, Key, Modifiers, Rect, RichText, Sense, Stroke,
     StrokeKind, TextFormat, Ui,
@@ -88,6 +89,7 @@ impl Pane {
         };
         let mut d = text::load_doc(&path, Some(self.doc.encoding)).map_err(|e| e.to_string())?;
         d.read_only = self.doc.read_only;
+        d.compare_only = self.doc.compare_only;
         if d.lines != self.doc.lines {
             self.hl_dirty = true;
         }
@@ -164,6 +166,7 @@ fn prettified(doc: &TextDoc) -> Option<TextDoc> {
     d.bom = doc.bom;
     d.syntax = doc.syntax.clone();
     d.read_only = true;
+    d.compare_only = true;
     let name = doc
         .description
         .clone()
@@ -173,11 +176,68 @@ fn prettified(doc: &TextDoc) -> Option<TextDoc> {
     Some(d)
 }
 
+/// A line being typed in its own editor in one pane (see [`TextView::begin_edit`]).
 struct EditState {
     row: usize,
     pane: usize,
     text: String,
     focus: bool,
+}
+
+/// A column (rectangular) selection: the same display columns of the rows from `anchor` to
+/// `head` in one pane. Each end is (row, column); equal columns make a caret on every row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColSel {
+    pub pane: usize,
+    pub anchor: (usize, usize),
+    pub head: (usize, usize),
+}
+
+/// The text caret of a pane: where typing goes, and the other end of its selection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Caret {
+    pub pane: usize,
+    pub pos: edit::Pos,
+    pub anchor: edit::Pos,
+    /// The display column that Up and Down keep to.
+    want: Option<usize>,
+}
+
+impl Caret {
+    fn range(&self) -> (edit::Pos, edit::Pos) {
+        (self.pos.min(self.anchor), self.pos.max(self.anchor))
+    }
+
+    fn has_selection(&self) -> bool {
+        self.pos != self.anchor
+    }
+}
+
+/// The caret with the text the input method is composing at it.
+struct CaretState {
+    at: Caret,
+    preedit: String,
+}
+
+/// What a key or input event asks of the caret, in the order they came.
+enum CaretInput {
+    Text(String),
+    Paste(String),
+    Copy,
+    Cut,
+    Key(Key, Modifiers),
+}
+
+impl ColSel {
+    fn rows(&self) -> (usize, usize) {
+        let (a, b) = (self.anchor.0, self.head.0);
+        (a.min(b), a.max(b))
+    }
+
+    fn cols(&self) -> std::ops::Range<usize> {
+        let (a, b) = (self.anchor.1, self.head.1);
+        a.min(b)..a.max(b)
+    }
 }
 
 #[derive(Default)]
@@ -1024,6 +1084,15 @@ pub struct TextView {
     redo: Vec<Snapshot>,
     inline_cache: HashMap<usize, [Vec<Range<usize>>; 3]>,
     edit: Option<EditState>,
+    /// The column selection made by Alt+dragging, if any (boxed: it is rare).
+    pub col_sel: Option<Box<ColSel>>,
+    /// The text caret, once a pane was clicked (boxed to keep the view small).
+    caret: Option<Box<CaretState>>,
+    /// Whether the last edit was typing in a line, which the next keystroke joins as one undo
+    /// step.
+    typing_group: bool,
+    /// Whether to scroll sideways to the caret when it is next drawn.
+    caret_reveal: bool,
     pub find: FindState,
     /// The compiled find query, rebuilt when the query or its options change.
     find_re: Option<(FindKey, Result<Regex, String>)>,
@@ -1141,6 +1210,10 @@ impl TextView {
             redo: Vec::new(),
             inline_cache: HashMap::new(),
             edit: None,
+            col_sel: None,
+            caret: None,
+            typing_group: false,
+            caret_reveal: false,
             find: FindState::default(),
             find_re: None,
             goto: None,
@@ -1229,13 +1302,10 @@ impl TextView {
                     .and_then(|r| r.cells.get(e.column))
                     != Some(&e.value)
             })
-            || self.edit.as_ref().is_some_and(|e| {
-                let line = self.diff.rows.get(e.row).and_then(|r| r.line(e.pane));
-                match line {
-                    Some(l) => self.panes[e.pane].doc.lines[l] != e.text,
-                    None => !e.text.is_empty(),
-                }
-            })
+            || self
+                .edit
+                .as_ref()
+                .is_some_and(|e| self.edit_original(e) != e.text)
     }
 
     /// Local overlays/editors get Escape before the tab-level close shortcut.
@@ -1243,6 +1313,8 @@ impl TextView {
         self.find.open
             || self.goto.is_some()
             || self.edit.is_some()
+            || self.col_sel.is_some()
+            || self.caret.is_some()
             || self.note_edit.is_some()
             || self.table.edit.is_some()
     }
@@ -1402,6 +1474,17 @@ impl TextView {
         self.update_edited();
         self.inline_cache.clear();
         self.sel_anchor = None;
+        let rows = self.diff.rows.len();
+        let n = self.panes.len();
+        if self
+            .col()
+            .is_some_and(|c| c.pane >= n || c.rows().1 >= rows)
+        {
+            self.col_sel = None;
+        }
+        if self.caret().is_some_and(|c| c.pane >= n) {
+            self.caret = None;
+        }
         self.layout_gen += 1;
         if let Some(b) = self.cur_block {
             if b >= self.diff.blocks.len() {
@@ -2007,6 +2090,7 @@ impl TextView {
     }
 
     fn push_undo(&mut self) {
+        self.typing_group = false;
         let s = self.snapshot();
         // Each snapshot copies every pane, so keep fewer levels for large files.
         let lines: usize = s.lines.iter().map(Vec::len).sum();
@@ -2042,6 +2126,12 @@ impl TextView {
             p.doc.modified = s.modified[i] || s.saves[i] != p.saves;
         }
         self.rediff();
+        self.typing_group = false;
+        if let Some(c) = self.caret() {
+            let lines = &self.panes[c.pane].doc.lines;
+            let pos = edit::clamp(lines, c.pos);
+            self.place_caret(c.pane, pos, false);
+        }
     }
 
     pub fn can_undo(&self) -> bool {
@@ -2241,14 +2331,7 @@ impl TextView {
             .filter_map(|r| r.line(from))
             .map(|l| self.panes[from].doc.lines[l].clone())
             .collect();
-        let dst: Vec<usize> = rows.iter().filter_map(|r| r.line(to)).collect();
-        let range = match (dst.first(), dst.last()) {
-            (Some(&a), Some(&b)) => a..b + 1,
-            _ => {
-                let at = self.insert_index(to, r0);
-                at..at
-            }
-        };
+        let range = self.line_range(to, r0, r1);
         if self.panes[to].doc.lines[range.clone()] == src[..] {
             return;
         }
@@ -2580,45 +2663,504 @@ impl TextView {
             self.status = tr("msg.readonly").to_string();
             return;
         }
-        let text = self
-            .diff
-            .rows
-            .get(row)
-            .and_then(|r| r.line(pane))
-            .map(|l| self.panes[pane].doc.lines[l].clone())
-            .unwrap_or_default();
-        self.edit = Some(EditState {
+        self.col_sel = None;
+        self.caret = None;
+        let mut e = EditState {
             row,
             pane,
-            text,
+            text: String::new(),
             focus: true,
-        });
+        };
+        e.text = self.edit_original(&e);
+        self.edit = Some(e);
     }
 
+    /// The lines of `pane` in rows `r0..=r1`, or the place where lines would go there when those
+    /// rows have none of its lines.
+    fn line_range(&self, pane: usize, r0: usize, r1: usize) -> std::ops::Range<usize> {
+        let rows = self.diff.rows.get(r0..=r1).unwrap_or(&[]);
+        let mut lines = rows.iter().filter_map(|r| r.line(pane));
+        match (lines.next(), lines.next_back()) {
+            (Some(a), b) => a..b.unwrap_or(a) + 1,
+            _ => {
+                let at = self.insert_index(pane, r0);
+                at..at
+            }
+        }
+    }
+
+    /// The text an edit started from: its lines joined by newlines.
+    fn edit_original(&self, e: &EditState) -> String {
+        self.panes[e.pane].doc.lines[self.line_range(e.pane, e.row, e.row)].join("\n")
+    }
+
+    /// Replaces the lines of the edit with its text, as one undo step.
     fn commit_edit(&mut self, e: EditState) {
+        let range = self.line_range(e.pane, e.row, e.row);
         let new_lines: Vec<String> = e
             .text
             .split('\n')
             .map(|s| s.trim_end_matches('\r').to_string())
             .collect();
-        let existing = self.diff.rows.get(e.row).and_then(|r| r.line(e.pane));
-        if let Some(l) = existing {
-            if new_lines.len() == 1 && self.panes[e.pane].doc.lines[l] == new_lines[0] {
+        let doc = &self.panes[e.pane].doc;
+        // Leaving an untouched editor, or an empty one on a row without a line, changes nothing.
+        if doc.lines[range.clone()] == new_lines[..] || (range.is_empty() && e.text.is_empty()) {
+            return;
+        }
+        self.push_undo();
+        self.panes[e.pane].doc.lines.splice(range, new_lines);
+        self.mark_changed(&[e.pane]);
+    }
+
+    /// Removes the lines of `pane` in rows `r0..=r1` as one undo step, and returns how many.
+    fn delete_rows(&mut self, pane: usize, r0: usize, r1: usize) -> usize {
+        if !self.writable(pane) {
+            return 0;
+        }
+        let range = self.line_range(pane, r0, r1);
+        if range.is_empty() {
+            return 0;
+        }
+        let (start, n) = (range.start, range.len());
+        self.push_undo();
+        self.panes[pane].doc.lines.drain(range);
+        self.mark_changed(&[pane]);
+        let len = self.panes[pane].doc.lines.len();
+        let row = self
+            .diff
+            .row_of_line(pane, start.min(len.saturating_sub(1)));
+        self.cursor_row = (row < self.diff.rows.len()).then_some(row);
+        self.cur_block = self.cursor_row.and_then(|r| self.diff.rows[r].block());
+        self.status = trf("msg.deleted_lines", &[("n", n.to_string())]);
+        n
+    }
+
+    pub fn caret(&self) -> Option<Caret> {
+        self.caret.as_deref().map(|s| s.at)
+    }
+
+    /// Whether typed keys go into a pane, so that one-key shortcuts must leave them alone.
+    pub fn takes_text(&self) -> bool {
+        self.caret.is_some() && !self.table_mode
+    }
+
+    /// Puts the caret of `pane` at `pos`; `extend` keeps the other end of the selection.
+    pub fn place_caret(&mut self, pane: usize, pos: edit::Pos, extend: bool) {
+        if pane >= self.n() {
+            return;
+        }
+        let pos = edit::clamp(&self.panes[pane].doc.lines, pos);
+        let anchor = match self.caret() {
+            Some(c) if extend && c.pane == pane => c.anchor,
+            _ => pos,
+        };
+        self.caret = Some(Box::new(CaretState {
+            at: Caret {
+                pane,
+                pos,
+                anchor,
+                want: None,
+            },
+            preedit: String::new(),
+        }));
+        self.col_sel = None;
+        self.typing_group = false;
+        self.follow_caret();
+    }
+
+    /// Points the cursor row and the row selection at the caret, and scrolls to it.
+    fn follow_caret(&mut self) {
+        let Some(c) = self.caret() else { return };
+        self.active_pane = c.pane;
+        self.caret_reveal = true;
+        if self.diff.rows.is_empty() {
+            return;
+        }
+        let row = self.diff.row_of_line(c.pane, c.pos.0);
+        self.cursor_row = Some(row);
+        self.scroll_to = Some(row);
+        self.cur_block = self.diff.rows[row]
+            .block()
+            .filter(|&b| !self.diff.blocks[b].ignored);
+        // A selection over several lines selects their rows, for copying them to another side.
+        self.sel_anchor =
+            (c.anchor.0 != c.pos.0).then(|| self.diff.row_of_line(c.pane, c.anchor.0));
+    }
+
+    /// The selected text of the caret's pane, with the document's line ending between lines.
+    pub fn caret_text(&self) -> Option<String> {
+        let c = self.caret().filter(Caret::has_selection)?;
+        let doc = &self.panes[c.pane].doc;
+        let (a, b) = c.range();
+        Some(edit::text_between(&doc.lines, a, b, doc.eol.as_str()))
+    }
+
+    /// Applies `f` to the lines of the caret's pane, given the selection's ends, and puts the
+    /// caret where it returns. Each edit is one undo step, except that typing within a line
+    /// (`typing`) joins the step of the keystroke before it.
+    fn caret_edit(
+        &mut self,
+        typing: bool,
+        f: impl FnOnce(&mut Vec<String>, edit::Pos, edit::Pos) -> edit::Pos,
+    ) {
+        let Some(c) = self.caret() else { return };
+        if c.pane >= self.n() || self.matching() || !self.writable(c.pane) {
+            return;
+        }
+        let joins = typing && self.typing_group && !self.undo.is_empty();
+        if !joins {
+            self.push_undo();
+        }
+        let (a, b) = c.range();
+        let pos = f(&mut self.panes[c.pane].doc.lines, a, b);
+        if joins {
+            // The lines stay where they were, so bookmarks and synchronization points do too.
+            self.invalidate_review();
+            let pane = &mut self.panes[c.pane];
+            pane.doc.modified = true;
+            pane.hl_dirty = true;
+            self.redo.clear();
+            self.rediff();
+        } else {
+            self.mark_changed(&[c.pane]);
+        }
+        self.place_caret(c.pane, pos, false);
+        self.typing_group = typing;
+    }
+
+    /// Types `text` at the caret, over the selection.
+    pub fn caret_insert(&mut self, text: &str) {
+        let Some(c) = self.caret() else { return };
+        if text.is_empty() && !c.has_selection() {
+            return;
+        }
+        let typing = !c.has_selection() && !text.contains(['\n', '\r']);
+        self.caret_edit(typing, |lines, a, b| {
+            let at = edit::remove(lines, a, b);
+            edit::insert(lines, at, text)
+        });
+    }
+
+    /// Enter: a new line, indented like the one the caret is on.
+    fn caret_newline(&mut self) {
+        let Some(c) = self.caret() else { return };
+        let line = self.panes[c.pane]
+            .doc
+            .lines
+            .get(c.range().0 .0)
+            .map_or("", String::as_str);
+        let indent: String = line
+            .chars()
+            .take_while(|ch| *ch == ' ' || *ch == '\t')
+            .take(c.range().0 .1)
+            .collect();
+        self.caret_insert(&format!("\n{indent}"));
+    }
+
+    /// Backspace (`forward` false) or Delete: removes the selection, or the character before
+    /// or after the caret, joining lines at their ends.
+    fn caret_delete(&mut self, forward: bool) {
+        let Some(c) = self.caret() else { return };
+        let lines = &self.panes[c.pane].doc.lines;
+        let (a, b) = if c.has_selection() {
+            c.range()
+        } else if forward {
+            (c.pos, edit::after(lines, c.pos))
+        } else {
+            (edit::before(lines, c.pos), c.pos)
+        };
+        if a == b {
+            return;
+        }
+        let typing = !c.has_selection() && a.0 == b.0;
+        self.caret_edit(typing, move |lines, _, _| edit::remove(lines, a, b));
+    }
+
+    /// Copy or Cut at the caret: the selection, or with none the whole line.
+    fn caret_copy(&mut self, ctx: &egui::Context, cut: bool) {
+        let Some(c) = self.caret() else { return };
+        if let Some(text) = self.caret_text() {
+            ctx.copy_text(text);
+            if cut {
+                self.caret_delete(false);
+            }
+            return;
+        }
+        let doc = &self.panes[c.pane].doc;
+        let Some(line) = doc.lines.get(c.pos.0) else {
+            return;
+        };
+        ctx.copy_text(format!("{line}{}", doc.eol.as_str()));
+        if cut {
+            let l = c.pos.0;
+            let n = doc.lines.len();
+            let (a, b) = if l + 1 < n {
+                ((l, 0), (l + 1, 0))
+            } else if l > 0 {
+                ((l - 1, doc.lines[l - 1].len()), (l, line.len()))
+            } else {
+                ((l, 0), (l, line.len()))
+            };
+            self.caret_edit(false, move |lines, _, _| edit::remove(lines, a, b));
+        }
+    }
+
+    /// Moves the caret to `pos`, extending the selection with Shift.
+    fn caret_to(&mut self, pos: edit::Pos, extend: bool) {
+        if let Some(c) = self.caret() {
+            self.place_caret(c.pane, pos, extend);
+        }
+    }
+
+    /// Moves the caret `delta` lines up or down, keeping its column.
+    fn caret_lines(&mut self, delta: isize, extend: bool) {
+        let Some(c) = self.caret() else { return };
+        let lines = &self.panes[c.pane].doc.lines;
+        let tab = self.tab_size;
+        let want = c.want.unwrap_or_else(|| {
+            edit::col_at(
+                &lines[c.pos.0.min(lines.len().saturating_sub(1))],
+                c.pos.1,
+                tab,
+            )
+        });
+        let last = lines.len().saturating_sub(1);
+        let target = c.pos.0.saturating_add_signed(delta).min(last);
+        let pos = match lines.get(target) {
+            Some(t) if target != c.pos.0 => (target, edit::byte_at(t, want, tab).0),
+            // Past the first or last line: to its start or end.
+            Some(t) if delta > 0 => (target, t.len()),
+            Some(_) => (target, 0),
+            None => (0, 0),
+        };
+        self.place_caret(c.pane, pos, extend);
+        if let Some(c) = &mut self.caret {
+            c.at.want = Some(want);
+        }
+    }
+
+    /// The keys of the caret. Returns false when there is no caret to take them.
+    fn caret_keys(&mut self, ui: &Ui) -> bool {
+        let Some(c) = self.caret() else { return false };
+        if c.pane >= self.n() || self.table_mode {
+            self.caret = None;
+            return false;
+        }
+        let mut inputs = Vec::new();
+        let mut preedit = None;
+        ui.input_mut(|i| {
+            for e in &i.events {
+                match e {
+                    egui::Event::Text(t) => inputs.push(CaretInput::Text(t.clone())),
+                    egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
+                        preedit = Some(String::new());
+                        inputs.push(CaretInput::Text(t.clone()));
+                    }
+                    egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                        preedit = Some(text.clone());
+                    }
+                    egui::Event::Paste(t) => inputs.push(CaretInput::Paste(t.clone())),
+                    egui::Event::Copy => inputs.push(CaretInput::Copy),
+                    egui::Event::Cut => inputs.push(CaretInput::Cut),
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if Self::caret_key(*key, *modifiers) => {
+                        inputs.push(CaretInput::Key(*key, *modifiers));
+                    }
+                    _ => {}
+                }
+            }
+            // Taken here, so that the row keys and the shortcuts leave them alone.
+            for input in &inputs {
+                if let CaretInput::Key(key, m) = input {
+                    i.consume_key(*m, *key);
+                }
+            }
+        });
+        if let (Some(p), Some(c)) = (preedit, &mut self.caret) {
+            c.preedit = p;
+        }
+        for input in inputs {
+            match input {
+                CaretInput::Text(t) => {
+                    let t: String = t.chars().filter(|c| !c.is_control()).collect();
+                    if !t.is_empty() {
+                        self.caret_insert(&t);
+                    }
+                }
+                CaretInput::Paste(t) => self.caret_insert(&t),
+                CaretInput::Copy => self.caret_copy(ui.ctx(), false),
+                CaretInput::Cut => self.caret_copy(ui.ctx(), true),
+                CaretInput::Key(key, m) => self.caret_key_pressed(key, m),
+            }
+        }
+        true
+    }
+
+    /// Whether the caret takes `key` with modifiers `m`. Alt combinations stay with the
+    /// difference commands.
+    fn caret_key(key: Key, m: Modifiers) -> bool {
+        if m.alt {
+            return false;
+        }
+        match key {
+            Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown => true,
+            Key::Home | Key::End | Key::PageUp | Key::PageDown => true,
+            Key::Enter | Key::Tab => !m.command && !m.shift,
+            Key::Backspace | Key::Delete | Key::Escape => !m.command,
+            Key::A => m.command && !m.shift,
+            _ => false,
+        }
+    }
+
+    fn caret_key_pressed(&mut self, key: Key, m: Modifiers) {
+        let Some(c) = self.caret() else { return };
+        let lines = &self.panes[c.pane].doc.lines;
+        let shift = m.shift;
+        let end = lines
+            .len()
+            .checked_sub(1)
+            .map_or((0, 0), |l| (l, lines[l].len()));
+        let line_len = lines.get(c.pos.0).map_or(0, String::len);
+        // Left and Right first end a selection at its side.
+        let (start, stop) = c.range();
+        match key {
+            Key::ArrowLeft if m.mac_cmd => self.caret_to((c.pos.0, 0), shift),
+            Key::ArrowRight if m.mac_cmd => self.caret_to((c.pos.0, line_len), shift),
+            Key::ArrowUp if m.mac_cmd => self.caret_to((0, 0), shift),
+            Key::ArrowDown if m.mac_cmd => self.caret_to(end, shift),
+            Key::ArrowLeft if c.has_selection() && !shift => self.caret_to(start, false),
+            Key::ArrowRight if c.has_selection() && !shift => self.caret_to(stop, false),
+            Key::ArrowLeft => {
+                let to = edit::before(lines, c.pos);
+                self.caret_to(to, shift);
+            }
+            Key::ArrowRight => {
+                let to = edit::after(lines, c.pos);
+                self.caret_to(to, shift);
+            }
+            Key::ArrowUp => self.caret_lines(-1, shift),
+            Key::ArrowDown => self.caret_lines(1, shift),
+            Key::PageUp => self.caret_lines(-(self.page_rows.max(1) as isize), shift),
+            Key::PageDown => self.caret_lines(self.page_rows.max(1) as isize, shift),
+            Key::Home if m.command => self.caret_to((0, 0), shift),
+            Key::End if m.command => self.caret_to(end, shift),
+            Key::Home => {
+                // To the first character that is not a space, then to the line start.
+                let indent = lines
+                    .get(c.pos.0)
+                    .map_or(0, |t| t.len() - t.trim_start_matches([' ', '\t']).len());
+                let to = if c.pos.1 == indent { 0 } else { indent };
+                self.caret_to((c.pos.0, to), shift);
+            }
+            Key::End => self.caret_to((c.pos.0, line_len), shift),
+            Key::Enter => self.caret_newline(),
+            Key::Tab => self.caret_insert("\t"),
+            Key::Backspace => self.caret_delete(false),
+            Key::Delete => self.caret_delete(true),
+            Key::A => {
+                self.place_caret(c.pane, (0, 0), false);
+                self.place_caret(c.pane, end, true);
+            }
+            Key::Escape if c.has_selection() => self.caret_to(c.pos, false),
+            Key::Escape => self.caret = None,
+            _ => {}
+        }
+    }
+
+    fn col(&self) -> Option<ColSel> {
+        self.col_sel.as_deref().copied()
+    }
+
+    /// The text of the column selection, one line per row with a line.
+    pub fn col_text(&self) -> Option<String> {
+        let s = self.col()?;
+        let (r0, r1) = s.rows();
+        let doc = &self.panes.get(s.pane)?.doc;
+        let lines: Vec<&str> = doc.lines[self.line_range(s.pane, r0, r1)]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        (!lines.is_empty())
+            .then(|| edit::take(&lines, &s.cols(), self.tab_size).join(doc.eol.as_str()))
+    }
+
+    /// Replaces the column selection with `with` (one line goes into every row, several go
+    /// row by row) as one undo step, and leaves a caret after the new text.
+    pub fn col_replace(&mut self, with: &[String]) {
+        let Some(s) = self.col() else { return };
+        if !self.writable(s.pane) {
+            return;
+        }
+        let (r0, r1) = s.rows();
+        let range = self.line_range(s.pane, r0, r1);
+        let cols = s.cols();
+        if range.is_empty() || (cols.is_empty() && with.iter().all(String::is_empty)) {
+            return;
+        }
+        let tab = self.tab_size;
+        let mut lines = self.panes[s.pane].doc.lines.clone();
+        edit::replace(&mut lines, range.start, range.len(), &cols, with, tab);
+        if lines == self.panes[s.pane].doc.lines {
+            return;
+        }
+        self.push_undo();
+        self.panes[s.pane].doc.lines = lines;
+        self.mark_changed(&[s.pane]);
+        // The caret goes after the text put in, on the rows the selection covered.
+        let width = with.iter().map(|w| edit::col_at(w, w.len(), tab)).max();
+        let col = cols.start
+            + if with.len() == 1 {
+                width.unwrap_or(0)
+            } else {
+                0
+            };
+        let last = range.start + range.len().max(with.len()) - 1;
+        let len = self.panes[s.pane].doc.lines.len();
+        let (a, b) = (
+            self.diff.row_of_line(s.pane, range.start),
+            self.diff
+                .row_of_line(s.pane, last.min(len.saturating_sub(1))),
+        );
+        let b = a.max(b);
+        self.col_sel = Some(Box::new(ColSel {
+            pane: s.pane,
+            anchor: (a, col),
+            head: (b, col),
+        }));
+        self.cursor_row = Some(b.min(self.diff.rows.len().saturating_sub(1)));
+    }
+
+    /// Backspace (`forward` false) or Delete on the column selection: removes the selected
+    /// columns, or one column on each side of a caret.
+    fn col_delete(&mut self, forward: bool) {
+        let Some(mut s) = self.col() else { return };
+        let cols = s.cols();
+        if cols.is_empty() {
+            let c = cols.start;
+            let (from, to) = if forward {
+                (c, c + 1)
+            } else {
+                (c.saturating_sub(1), c)
+            };
+            if from == to {
                 return;
             }
+            s.anchor.1 = from;
+            s.head.1 = to;
+            self.col_sel = Some(Box::new(s));
         }
-        let insert_at = self.insert_index(e.pane, e.row);
-        self.push_undo();
-        let lines = &mut self.panes[e.pane].doc.lines;
-        match existing {
-            Some(l) => {
-                lines.splice(l..l + 1, new_lines);
-            }
-            None => {
-                lines.splice(insert_at..insert_at, new_lines);
-            }
-        }
-        self.mark_changed(&[e.pane]);
+        self.col_replace(&[]);
+    }
+
+    /// The rows Cut and Delete act on: the selected rows, or the cursor row.
+    fn edit_rows(&self) -> Option<(usize, usize)> {
+        self.selection()
+            .or_else(|| self.cursor_row.map(|r| (r, r)))
+            .filter(|&(_, b)| b < self.diff.rows.len())
     }
 
     fn insert_below(&mut self, row: usize, pane: usize) {
@@ -2653,17 +3195,7 @@ impl TextView {
         let range = if blank {
             0..doc.lines.len()
         } else if let Some((r0, r1)) = self.selection() {
-            let lines: Vec<usize> = self.diff.rows[r0..=r1]
-                .iter()
-                .filter_map(|r| r.line(p))
-                .collect();
-            match (lines.first(), lines.last()) {
-                (Some(&a), Some(&b)) => a..b + 1,
-                _ => {
-                    let at = self.insert_index(p, r0);
-                    at..at
-                }
-            }
+            self.line_range(p, r0, r1)
         } else if let Some(r) = self.cursor_row {
             let at = self.insert_index(p, r + 1);
             at..at
@@ -2688,13 +3220,8 @@ impl TextView {
     }
 
     fn delete_line(&mut self, row: usize, pane: usize) {
-        if !self.writable(pane) {
-            return;
-        }
-        if let Some(l) = self.diff.rows.get(row).and_then(|r| r.line(pane)) {
-            self.push_undo();
-            self.panes[pane].doc.lines.remove(l);
-            self.mark_changed(&[pane]);
+        if self.diff.rows.get(row).and_then(|r| r.line(pane)).is_some() {
+            self.delete_rows(pane, row, row);
         }
     }
 
@@ -2790,6 +3317,7 @@ impl TextView {
             match text::load_doc(&path, Some(pane.doc.encoding)) {
                 Ok(mut d) => {
                     d.read_only = pane.doc.read_only;
+                    d.compare_only = pane.doc.compare_only;
                     let before = std::mem::replace(&mut pane.doc, d).lines;
                     pane.hl_dirty = true;
                     pane.saves += 1;
@@ -2848,6 +3376,7 @@ impl TextView {
             Ok(mut d) => {
                 let old = &self.panes[p].doc;
                 d.read_only = old.read_only;
+                d.compare_only = old.compare_only;
                 d.description = old.description.clone();
                 self.panes[p].doc = d;
                 self.panes[p].hl_dirty = true;
@@ -2944,15 +3473,7 @@ impl TextView {
     ) -> crate::core::report::ReportJob {
         let titles = self.titles();
         let lines: Vec<Vec<String>> = self.panes.iter().map(|p| p.doc.lines.clone()).collect();
-        let found = match &self.rules {
-            Some(_) => self.rule_set.is_some(),
-            None => rules::find(default_rules).is_some(),
-        };
-        let rules = match &self.rules {
-            Some(r) if found => r.clone(),
-            None if found => default_rules.to_string(),
-            _ => String::new(),
-        };
+        let rules = self.report_rules(default_rules);
         let (diff, opts, notes) = (self.diff.clone(), self.opts.clone(), self.bookmarks.clone());
         let table = self.keyed().map(|d| {
             let summary = self.table_report_lines(d);
@@ -2974,6 +3495,52 @@ impl TextView {
                 }
                 None => report,
             }
+        })
+    }
+
+    /// The compare rules file a report names: the tab's own, or `default_rules`, when found.
+    fn report_rules(&self, default_rules: &str) -> String {
+        let found = match &self.rules {
+            Some(_) => self.rule_set.is_some(),
+            None => rules::find(default_rules).is_some(),
+        };
+        match &self.rules {
+            Some(r) if found => r.clone(),
+            None if found => default_rules.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// Makes the PDF report of this compare, with the same content as its HTML report; it loads
+    /// the fonts for `lang` and lays out every page, so it runs on another thread.
+    pub fn pdf_job(
+        &self,
+        default_rules: &str,
+        pdf: crate::core::pdf_report::PdfOptions,
+        lang: String,
+    ) -> crate::core::pdf_report::PdfJob {
+        let titles = self.titles();
+        let lines: Vec<Vec<String>> = self.panes.iter().map(|p| p.doc.lines.clone()).collect();
+        let rules = self.report_rules(default_rules);
+        let (diff, opts, notes) = (self.diff.clone(), self.opts.clone(), self.bookmarks.clone());
+        let sections: Vec<crate::core::pdf_report::Section> = self
+            .keyed()
+            .map(|d| {
+                let mut summary = self.table_report_lines(d).into_iter();
+                crate::core::pdf_report::Section {
+                    title: summary.next().unwrap_or_default(),
+                    lines: summary.collect(),
+                    mono: false,
+                }
+            })
+            .into_iter()
+            .collect();
+        Box::new(move || {
+            let refs: Vec<&[String]> = lines.iter().map(Vec::as_slice).collect();
+            let fonts = crate::ui::fonts::document_fonts(&lang);
+            crate::core::pdf_report::text_pdf(
+                &titles, &refs, &diff, &opts, &notes, &rules, &sections, &fonts, &pdf,
+            )
         })
     }
 
@@ -3077,6 +3644,7 @@ impl TextView {
                 d.description = Some(p.title.clone());
                 d.syntax = p.syntax.clone();
                 d.read_only = true;
+                d.compare_only = true;
                 d
             })
             .collect();
@@ -3350,6 +3918,25 @@ impl TextView {
 
     /// The status line for the status bar: the toolbar shows where among the differences the
     /// cursor is and how many lines changed, and the merge bar how many conflicts are left.
+    /// The words for whether a document can be edited and saved: locked in the app, a file the
+    /// system will not let us write, or writable.
+    fn access_key(doc: &TextDoc) -> &'static str {
+        if doc.compare_only {
+            "label.compare_only"
+        } else if doc.read_only {
+            "label.read_only"
+        } else if doc
+            .path
+            .as_deref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .is_some_and(|m| m.permissions().readonly())
+        {
+            "label.read_only_disk"
+        } else {
+            "label.writable"
+        }
+    }
+
     pub fn status_detail(&self) -> String {
         self.status_text(false)
     }
@@ -3388,6 +3975,19 @@ impl TextView {
                 .and_then(|row| row.line(self.active_pane))
             {
                 s.push_str(&format!("  |  {} {}", tr("label.line"), l + 1));
+            }
+        }
+        if self.tree_active || self.formatted_active {
+            // The Tree and Formatted views show the files, but edits go to the text panes.
+            s.push_str(&format!("  |  {}", tr("label.compare_only")));
+        } else if let Some(pane) = self.panes.get(self.active_pane) {
+            s.push_str(&format!(
+                "  |  {}: {}",
+                side_name(self.active_pane, self.n()),
+                tr(Self::access_key(&pane.doc))
+            ));
+            if pane.doc.modified {
+                s.push_str(&format!(", {}", tr("label.modified")));
             }
         }
         if let Some((r0, r1)) = self.selection() {
@@ -4493,19 +5093,27 @@ impl TextView {
                     };
                     let modified = doc.modified;
                     let mut ro = doc.read_only;
+                    let compare_only = doc.compare_only;
                     widgets::side_chip(ui, p, n);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         let lock = if ro { Icon::Lock } else { Icon::Unlock };
-                        if widgets::toggle_icon_button(
-                            ui,
-                            &mut ro,
-                            Some(lock),
-                            "",
-                            tr("label.read_only"),
-                        )
-                        .clicked()
-                        {
+                        // Text read from a file cannot be unlocked: saving it would replace the
+                        // file with its text.
+                        let unlocked = ui
+                            .add_enabled_ui(!compare_only, |ui| {
+                                widgets::toggle_icon_button(
+                                    ui,
+                                    &mut ro,
+                                    Some(lock),
+                                    "",
+                                    tr("label.read_only"),
+                                )
+                                .on_disabled_hover_text(tr("tip.compare_only"))
+                                .clicked()
+                            })
+                            .inner;
+                        if unlocked {
                             self.panes[p].doc.read_only = ro;
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -4613,6 +5221,8 @@ impl TextView {
                 .and_then(|r| self.diff.rows.get(r))
                 .and_then(|r| r.line(p))
                 .map_or(0, |l| l + 1);
+            let access_key = Self::access_key(&self.panes[p].doc);
+            let read_only = access_key != "label.writable";
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add(
                     egui::Label::new(
@@ -4622,6 +5232,27 @@ impl TextView {
                     )
                     .truncate(),
                 );
+                if self.panes[p].doc.modified {
+                    ui.add(egui::Label::new(
+                        RichText::new(tr("label.modified"))
+                            .small()
+                            .color(pal.accent),
+                    ))
+                    .on_hover_text(tr("tip.modified"));
+                }
+                // Whether typing goes into this pane.
+                let access = RichText::new(tr(access_key)).small();
+                ui.add(egui::Label::new(if read_only {
+                    access.color(pal.warning)
+                } else {
+                    access.color(pal.text_dim)
+                }))
+                .on_hover_text(match access_key {
+                    "label.read_only" => tr("msg.readonly"),
+                    "label.compare_only" => tr("tip.compare_only"),
+                    "label.read_only_disk" => tr("tip.read_only_disk"),
+                    _ => tr("tip.writable"),
+                });
             });
         });
         if let Some(e) = enc_choice {
@@ -4823,6 +5454,12 @@ impl TextView {
         {
             return;
         }
+        if self.col_sel.is_some() && self.col_keys(ui) {
+            return;
+        }
+        if self.caret.is_some() && self.caret_keys(ui) {
+            return;
+        }
         let pasted = ui.input(|i| {
             i.events.iter().find_map(|e| match e {
                 egui::Event::Paste(s) => Some(s.clone()),
@@ -4831,6 +5468,24 @@ impl TextView {
         });
         if let Some(text) = pasted {
             self.paste(&text);
+        }
+        let cut = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Cut)));
+        let delete = self.selection().is_some()
+            && ui.input_mut(|i| {
+                i.consume_key(Modifiers::NONE, Key::Delete)
+                    | i.consume_key(Modifiers::NONE, Key::Backspace)
+            });
+        if cut || delete {
+            let p = self.active_pane;
+            if let Some((r0, r1)) = self.edit_rows().filter(|_| p < self.n()) {
+                if cut {
+                    if let Some(text) = self.selected_text(p) {
+                        ui.ctx().copy_text(text);
+                    }
+                }
+                self.delete_rows(p, r0, r1);
+                self.sel_anchor = None;
+            }
         }
         let pane_layout = &self.layout.panes[self.active_pane];
         let total = pane_layout.shared.len();
@@ -4900,6 +5555,7 @@ impl TextView {
             }
         }
         if let Some(row) = target.and_then(|(v, fwd)| self.row_near(v, fwd)) {
+            self.col_sel = None;
             self.sel_anchor = if extend {
                 self.sel_anchor.or(self.cursor_row)
             } else {
@@ -4914,10 +5570,69 @@ impl TextView {
         if ui.input(|i| {
             i.modifiers.is_none() && (i.key_pressed(Key::F2) || i.key_pressed(Key::Enter))
         }) {
-            if let Some(r) = self.cursor_row {
-                self.begin_edit(r, self.active_pane);
+            if let Some(r) = self.cursor_row.filter(|&r| r < self.diff.rows.len()) {
+                let p = self.active_pane;
+                if self.table_mode {
+                    self.begin_edit(r, p);
+                } else {
+                    // The caret goes to the end of the row's line, ready for typing.
+                    let pos = match self.diff.rows[r].line(p) {
+                        Some(l) => (l, self.panes[p].doc.lines[l].len()),
+                        None => (self.insert_index(p, r), 0),
+                    };
+                    self.place_caret(p, pos, false);
+                }
             }
         }
+    }
+
+    /// The keys of a column selection: typing, Backspace, Delete, Copy, Cut and Paste edit it,
+    /// and Escape ends it. Returns true when the frame's keys were taken.
+    fn col_keys(&mut self, ui: &Ui) -> bool {
+        let mut typed = String::new();
+        let mut paste = None;
+        let (mut copy, mut cut) = (false, false);
+        let (mut back, mut del, mut escape) = (false, false, false);
+        ui.input_mut(|i| {
+            for e in &i.events {
+                match e {
+                    egui::Event::Text(t) => typed.push_str(t),
+                    egui::Event::Paste(t) => paste = Some(t.clone()),
+                    egui::Event::Copy => copy = true,
+                    egui::Event::Cut => cut = true,
+                    _ => {}
+                }
+            }
+            back = i.consume_key(Modifiers::NONE, Key::Backspace);
+            del = i.consume_key(Modifiers::NONE, Key::Delete);
+            escape = i.consume_key(Modifiers::NONE, Key::Escape);
+        });
+        if escape {
+            self.col_sel = None;
+            return true;
+        }
+        if copy || cut {
+            if let Some(text) = self.col_text() {
+                ui.ctx().copy_text(text);
+            }
+        }
+        if let Some(text) = paste {
+            let (lines, ..) = text::split_lines(&text);
+            if !lines.is_empty() {
+                self.col_replace(&lines);
+            }
+        } else if !typed.is_empty() {
+            self.col_replace(&[typed]);
+        } else if cut || back || del {
+            if cut || !self.col().is_some_and(|s| s.cols().is_empty()) {
+                self.col_replace(&[]);
+            } else {
+                self.col_delete(del);
+            }
+        } else {
+            return false;
+        }
+        true
     }
 
     /// The cursor row of every side one above the other, wrapped to the full width.
@@ -7290,6 +8005,8 @@ impl TextView {
         let fresh = self.layout.key.is_none();
         self.ensure_layout(wrap_cols, tab);
         self.handle_keys(ui);
+        // Keys may have edited the text; the rows drawn below are those of the new compare.
+        self.ensure_layout(wrap_cols, tab);
 
         // scrolling
         let now = ui.input(|i| i.time);
@@ -7426,6 +8143,41 @@ impl TextView {
             }
         }
 
+        // Where a point is in the text of pane `p`: the line and byte the caret goes to.
+        let show_ws = cfg.show_whitespace;
+        let caret_hit = |this: &Self, p: usize, v: usize, x: f32| -> Option<edit::Pos> {
+            let VLine::Row(r, seg) = *this.layout.lines.get(v)? else {
+                return None;
+            };
+            let Some(l) = this.diff.rows[r].line(p) else {
+                // A gap row: the start of the line that comes after it.
+                return Some((this.insert_index(p, r), 0));
+            };
+            let line = &this.panes[p].doc.lines[l];
+            let left = content_left + p as f32 * pane_step + gutter_w + 4.0;
+            let job = Self::line_job(
+                line,
+                None,
+                &[],
+                &[],
+                Color32::TRANSPARENT,
+                Color32::TRANSPARENT,
+                Color32::WHITE,
+                &font,
+                tab,
+                show_ws,
+            );
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            let gx = if wrap {
+                let xs = segment_x(&galley, &wrap_starts(line, tab, wrap_cols));
+                xs.get(seg as usize).copied().unwrap_or(0.0) + (x - left)
+            } else {
+                x - left + this.hscroll
+            };
+            let col = galley.cursor_from_pos(vec2(gx.max(0.0), 1.0)).index.0;
+            Some((l, edit::byte_at(line, col, tab).0))
+        };
+
         // clicks
         if resp.clicked() || resp.double_clicked() || resp.secondary_clicked() {
             if let Some(pos) = resp
@@ -7438,6 +8190,7 @@ impl TextView {
                         let in_sel = self.selection().is_some_and(|(a, b)| (a..=b).contains(&r));
                         // Right-clicking the selection keeps it for the context menu.
                         if !(resp.secondary_clicked() && in_sel && p == self.active_pane) {
+                            self.col_sel = None;
                             self.sel_anchor = if ui.input(|i| i.modifiers.shift) {
                                 self.sel_anchor.or(self.cursor_row)
                             } else {
@@ -7450,7 +8203,20 @@ impl TextView {
                                     self.cur_block = Some(b);
                                 }
                             }
-                            if resp.double_clicked() {
+                            let hit = line_at(p, pos.y).and_then(|v| caret_hit(self, p, v, pos.x));
+                            if let Some(at) = hit.filter(|_| !self.table_mode) {
+                                // The caret goes where the text was clicked; a double-click
+                                // selects the word there.
+                                let shift = ui.input(|i| i.modifiers.shift);
+                                if resp.double_clicked() {
+                                    let line = &self.panes[p].doc.lines;
+                                    let w = line.get(at.0).map_or(0..0, |t| edit::word_at(t, at.1));
+                                    self.place_caret(p, (at.0, w.start), false);
+                                    self.place_caret(p, (at.0, w.end), true);
+                                } else if !resp.secondary_clicked() {
+                                    self.place_caret(p, at, shift);
+                                }
+                            } else if resp.double_clicked() {
                                 self.begin_edit(r, p);
                             }
                         }
@@ -7467,13 +8233,37 @@ impl TextView {
             }
         }
 
-        // dragging selects rows of the pane where the drag started
+        // dragging selects rows of the pane where the drag started; Alt+dragging selects columns
+        let hscroll = self.hscroll;
+        let col_at_x = |p: usize, x: f32| {
+            let left = content_left + p as f32 * pane_step + gutter_w + 4.0;
+            ((x - left + hscroll) / char_w.max(1.0)).round().max(0.0) as usize
+        };
         if resp.dragged_by(egui::PointerButton::Primary) {
             if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                 if resp.drag_started() {
                     let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
                     self.active_pane = pane_at(origin.x);
-                    if !ui.input(|i| i.modifiers.shift) {
+                    self.col_sel = None;
+                    let columns = ui.input(|i| i.modifiers.alt) && !wrap && !self.table_mode;
+                    if let Some(VLine::Row(r, _)) = line_at(self.active_pane, origin.y)
+                        .map(|v| self.layout.lines[v])
+                        .filter(|_| columns)
+                    {
+                        let at = (r, col_at_x(self.active_pane, origin.x));
+                        self.caret = None;
+                        self.col_sel = Some(Box::new(ColSel {
+                            pane: self.active_pane,
+                            anchor: at,
+                            head: at,
+                        }));
+                    }
+                    let at = line_at(self.active_pane, origin.y)
+                        .and_then(|v| caret_hit(self, self.active_pane, v, origin.x));
+                    if let Some(at) = at.filter(|_| self.col_sel.is_none() && !self.table_mode) {
+                        let shift = ui.input(|i| i.modifiers.shift);
+                        self.place_caret(self.active_pane, at, shift);
+                    } else if self.col_sel.is_none() && !ui.input(|i| i.modifiers.shift) {
                         self.sel_anchor = match line_at(self.active_pane, origin.y)
                             .map(|v| self.layout.lines[v])
                         {
@@ -7492,9 +8282,18 @@ impl TextView {
                     ui.ctx().request_repaint();
                 }
                 let y = pos.y.clamp(body_top, body_bottom - 1.0);
-                if let Some(VLine::Row(r, _)) =
-                    line_at(self.active_pane, y).map(|v| self.layout.lines[v])
-                {
+                let row = line_at(self.active_pane, y).map(|v| self.layout.lines[v]);
+                let at = line_at(self.active_pane, y)
+                    .and_then(|v| caret_hit(self, self.active_pane, v, pos.x));
+                if let (Some(s), Some(VLine::Row(r, _))) = (self.col_sel.as_deref_mut(), row) {
+                    s.head = (r, col_at_x(s.pane, pos.x));
+                    self.sel_anchor = None;
+                    self.cursor_row = Some(r);
+                } else if let (Some(at), Some(c)) = (at, self.caret()) {
+                    if c.pane == self.active_pane && !self.table_mode {
+                        self.place_caret(c.pane, at, true);
+                    }
+                } else if let Some(VLine::Row(r, _)) = row {
                     if self.sel_anchor.is_none() {
                         self.sel_anchor = Some(r);
                     }
@@ -7506,6 +8305,8 @@ impl TextView {
             }
         }
         let selection = self.selection();
+        let caret = self.caret().filter(|_| !self.table_mode);
+        let mut caret_rect: Option<Rect> = None;
 
         // painting
         let painter = ui.painter();
@@ -7544,12 +8345,30 @@ impl TextView {
                         );
                     }
                 }
-                if p == self.active_pane && selection.is_some_and(|(a, b)| (a..=b).contains(&r)) {
+                // With a caret, its own selection is drawn instead of whole rows.
+                if p == self.active_pane
+                    && caret.is_none()
+                    && selection.is_some_and(|(a, b)| (a..=b).contains(&r))
+                {
                     tp.rect_filled(
                         row_rect,
                         0.0,
                         ui.visuals().selection.bg_fill.gamma_multiply(0.7),
                     );
+                }
+                if let Some(s) = self.col().filter(|s| s.pane == p) {
+                    let (a, b) = s.rows();
+                    if (a..=b).contains(&r) {
+                        let cols = s.cols();
+                        let x = text_rect.left() + 4.0 - self.hscroll;
+                        let x0 = x + cols.start as f32 * char_w;
+                        let x1 = (x + cols.end as f32 * char_w).max(x0 + 1.5);
+                        tp.rect_filled(
+                            Rect::from_min_max(pos2(x0, y), pos2(x1, y + row_h)),
+                            0.0,
+                            ui.visuals().selection.bg_fill.gamma_multiply(0.8),
+                        );
+                    }
                 }
                 let row = self.diff.rows[r];
                 let Some(l) = row.line(p) else { continue };
@@ -7677,6 +8496,48 @@ impl TextView {
                     continue;
                 };
                 let left = text_rect.left() + 4.0;
+                // Screen x of display column `col` of this line, when it is in this segment.
+                let col_x = |col: usize| -> Option<f32> {
+                    let gx = galley.pos_from_cursor(CCursor::new(col)).min.x;
+                    if !wrap {
+                        return Some(left - self.hscroll + gx);
+                    }
+                    let start = *xs.get(seg)?;
+                    let end = xs.get(seg + 1).copied().unwrap_or(f32::INFINITY);
+                    (start <= gx && (gx < end || xs.len() == seg + 1)).then_some(left + gx - start)
+                };
+                if let Some(k) = caret.filter(|k| k.pane == p && k.has_selection()) {
+                    let (a, b) = k.range();
+                    if (a.0..=b.0).contains(&l) {
+                        let from = if l == a.0 {
+                            edit::col_at(line, a.1, tab)
+                        } else {
+                            0
+                        };
+                        let to_byte = if l == b.0 { b.1 } else { line.len() };
+                        let to = edit::col_at(line, to_byte, tab);
+                        // In galley x, then cut to this wrapped segment.
+                        let gx = |col: usize| galley.pos_from_cursor(CCursor::new(col)).min.x;
+                        let mut g0 = gx(from);
+                        let mut g1 = gx(to) + if l < b.0 { char_w * 0.6 } else { 0.0 };
+                        let (x0, x1) = if wrap {
+                            let start = xs.get(seg).copied().unwrap_or(0.0);
+                            let end = xs.get(seg + 1).copied().unwrap_or(f32::INFINITY);
+                            g0 = g0.max(start);
+                            g1 = g1.min(end);
+                            (left + g0 - start, left + g1 - start)
+                        } else {
+                            (left - self.hscroll + g0, left - self.hscroll + g1)
+                        };
+                        if x1 > x0 {
+                            tp.rect_filled(
+                                Rect::from_min_max(pos2(x0, y), pos2(x1, y + row_h)),
+                                0.0,
+                                ui.visuals().selection.bg_fill.gamma_multiply(0.8),
+                            );
+                        }
+                    }
+                }
                 if !wrap {
                     tp.galley(pos2(left - self.hscroll, y + 1.0), galley.clone(), fg);
                 } else if let Some(&sx) = xs.get(seg) {
@@ -7688,6 +8549,32 @@ impl TextView {
                             .intersect(text_rect);
                     tp.with_clip_rect(clip)
                         .galley(pos2(left - sx, y + 1.0), galley.clone(), fg);
+                }
+                if let Some(k) = caret.filter(|k| k.pane == p && k.pos.0 == l) {
+                    if let Some(x) = col_x(edit::col_at(line, k.pos.1, tab)) {
+                        let rect =
+                            Rect::from_min_max(pos2(x, y + 1.0), pos2(x + 2.0, y + row_h - 1.0));
+                        let preedit = self.caret.as_ref().map_or("", |s| s.preedit.as_str());
+                        if !preedit.is_empty() {
+                            // Text the input method is composing, underlined at the caret.
+                            let g = ui.fonts_mut(|f| {
+                                f.layout_no_wrap(preedit.to_string(), font.clone(), fg)
+                            });
+                            let w = g.size().x;
+                            tp.rect_filled(
+                                Rect::from_min_size(pos2(x, y), vec2(w, row_h)),
+                                0.0,
+                                c.text_bg,
+                            );
+                            tp.galley(pos2(x, y + 1.0), g, fg);
+                            tp.line_segment(
+                                [pos2(x, y + row_h - 2.0), pos2(x + w, y + row_h - 2.0)],
+                                Stroke::new(1.0_f32, fg),
+                            );
+                        }
+                        tp.rect_filled(rect, 0.0, c.text);
+                        caret_rect = Some(rect);
+                    }
                 }
             }
             if let Some((v0, v1)) = self.cursor_row.and_then(|cr| self.row_span(cr)) {
@@ -7896,14 +8783,36 @@ impl TextView {
             self.copy_block(b, from, to);
         }
 
+        // the caret: keep it in view sideways, and tell the input method where it is
+        if let (Some(k), Some(rect)) = (caret, caret_rect) {
+            if self.caret_reveal && !wrap {
+                let x0 = content_left + k.pane as f32 * pane_step + gutter_w + 4.0;
+                let x1 = x0 + text_w - 12.0;
+                if rect.left() < x0 {
+                    self.hscroll = (self.hscroll - (x0 - rect.left()) - 4.0 * char_w).max(0.0);
+                } else if rect.right() > x1 {
+                    self.hscroll += rect.right() - x1 + 4.0 * char_w;
+                }
+                ui.ctx().request_repaint();
+            }
+            self.caret_reveal = false;
+            if !widgets::typing(ui.ctx()) && !self.panes[k.pane].doc.read_only {
+                ui.output_mut(|o| {
+                    o.ime = Some(egui::output::IMEOutput {
+                        purpose: egui::IMEPurpose::Normal,
+                        rect: body_rect,
+                        cursor_rect: rect,
+                        should_interrupt_composition: false,
+                    });
+                });
+            }
+        }
+
         // inline editor
         let edit_line = self.edit.as_ref().and_then(|e| {
-            self.row_span(e.row).map(|(v0, v1)| {
-                (
-                    self.layout.panes[e.pane].boundaries[v0],
-                    self.layout.panes[e.pane].boundaries[v1],
-                )
-            })
+            let (v0, v1) = self.row_span(e.row)?;
+            let b = &self.layout.panes[e.pane].boundaries;
+            Some((b[v0], b[v1]))
         });
         if let Some(e) = &mut self.edit {
             let mut done: Option<bool> = None;
@@ -9410,6 +10319,481 @@ mod tests {
         v.set_options(&opts);
         assert!(v.panes[0].original.is_none() && lines(&v, 0) == [r#"{"b":1,"a":[1,2]}"#]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_caret_types_splits_and_pastes_lines_like_an_editor() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("a\nb\nc\n", "a\nb\nc\n");
+        frame(&mut v, &ctx, vec![]);
+        v.place_caret(1, (1, 1), false);
+        assert!(v.takes_text());
+        let text = |t: &str| egui::Event::Text(t.into());
+        frame(&mut v, &ctx, vec![text("X"), text("Y")]);
+        assert_eq!(lines(&v, 1), ["a", "bXY", "c"]);
+        // Enter splits the line; the caret goes to the new one.
+        frame(
+            &mut v,
+            &ctx,
+            vec![key(Key::Enter, Modifiers::NONE), text("Z")],
+        );
+        assert_eq!(lines(&v, 1), ["a", "bXY", "Z", "c"]);
+        assert_eq!(v.caret().map(|c| c.pos), Some((2, 1)));
+        // Several lines paste at the caret at once.
+        frame(&mut v, &ctx, vec![egui::Event::Paste("1\n2\n3".into())]);
+        assert_eq!(lines(&v, 1), ["a", "bXY", "Z1", "2", "3", "c"]);
+        assert_eq!(v.caret().map(|c| c.pos), Some((4, 1)));
+        // Backspace at a line start joins it to the line above.
+        frame(&mut v, &ctx, vec![key(Key::Home, Modifiers::NONE)]);
+        frame(&mut v, &ctx, vec![key(Key::Backspace, Modifiers::NONE)]);
+        assert_eq!(lines(&v, 1), ["a", "bXY", "Z1", "23", "c"]);
+        // Shift+arrows select across lines; copying gives the text, typing replaces it.
+        v.place_caret(1, (1, 1), false);
+        frame(&mut v, &ctx, vec![key(Key::ArrowDown, Modifiers::SHIFT)]);
+        let out = frame(&mut v, &ctx, vec![egui::Event::Copy]);
+        assert!(out
+            .platform_output
+            .commands
+            .contains(&egui::OutputCommand::CopyText("XY\nZ".into())));
+        assert_eq!(
+            v.selection(),
+            Some((1, 2)),
+            "the rows follow, for copying across"
+        );
+        frame(&mut v, &ctx, vec![text("-")]);
+        assert_eq!(lines(&v, 1), ["a", "b-1", "23", "c"]);
+        assert_eq!(lines(&v, 0), ["a", "b", "c"], "only the caret's pane");
+        // Cut without a selection takes the whole line.
+        let out = frame(&mut v, &ctx, vec![egui::Event::Cut]);
+        assert!(out
+            .platform_output
+            .commands
+            .contains(&egui::OutputCommand::CopyText("b-1\n".into())));
+        assert_eq!(lines(&v, 1), ["a", "23", "c"]);
+        // Each action is one undo step; typing in a line is one step until the caret moves.
+        v.undo();
+        assert_eq!(lines(&v, 1), ["a", "b-1", "23", "c"]);
+        v.undo();
+        assert_eq!(lines(&v, 1), ["a", "bXY", "Z1", "23", "c"]);
+        for _ in 0..4 {
+            v.undo();
+        }
+        assert_eq!(lines(&v, 1), ["a", "bXY", "c"]);
+        v.undo();
+        assert_eq!(lines(&v, 1), ["a", "b", "c"], "XY typed as one step");
+        // Select all, then Escape ends the selection and a second Escape the caret.
+        v.place_caret(1, (0, 0), false);
+        frame(&mut v, &ctx, vec![key(Key::A, Modifiers::COMMAND)]);
+        assert_eq!(v.caret_text().as_deref(), Some("a\nb\nc"));
+        frame(&mut v, &ctx, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(v.caret().is_some() && v.caret_text().is_none());
+        frame(&mut v, &ctx, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(v.caret().is_none());
+    }
+
+    #[test]
+    fn clicks_place_the_caret_and_drags_select_text() {
+        let ctx = egui::Context::default();
+        crate::ui::fonts::setup(&ctx, "en");
+        let text = "alpha beta\ngamma\ndelta\n";
+        let mut v = two_way(text, text);
+        frame(&mut v, &ctx, vec![]);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let click = |v: &mut TextView, p: egui::Pos2| {
+            frame(v, &ctx, vec![egui::Event::PointerMoved(p), button(p, true)]);
+            frame(v, &ctx, vec![button(p, false)]);
+            frame(v, &ctx, vec![]);
+            frame(v, &ctx, vec![]);
+        };
+        // Find a point in the first and third lines of the left pane.
+        let mut at = [None; 3];
+        for y in (0..500).step_by(3) {
+            let p = pos2(400.0, y as f32);
+            click(&mut v, p);
+            if let Some(c) = v.caret().filter(|c| c.pane == 0 && c.pos.0 < 3) {
+                at[c.pos.0].get_or_insert(p.y);
+            }
+        }
+        let (Some(y0), Some(y2)) = (at[0], at[2]) else {
+            panic!("lines not found: {at:?}");
+        };
+        // Find the x of each column by clicking along the line.
+        let mut x_of = std::collections::HashMap::new();
+        for x in (0..400).step_by(2) {
+            click(&mut v, pos2(x as f32, y0 + 2.0));
+            if let Some(c) = v.caret().filter(|c| c.pane == 0 && c.pos.0 == 0) {
+                x_of.entry(c.pos.1).or_insert(x as f32);
+            }
+        }
+        assert!((0..=10).all(|c| x_of.contains_key(&c)), "{x_of:?}");
+        // A double-click selects the word.
+        let p = pos2(x_of[&7] + 1.0, y0 + 2.0);
+        frame(
+            &mut v,
+            &ctx,
+            vec![egui::Event::PointerMoved(p), button(p, true)],
+        );
+        frame(&mut v, &ctx, vec![button(p, false)]);
+        frame(&mut v, &ctx, vec![button(p, true), button(p, false)]);
+        assert_eq!(v.caret_text().as_deref(), Some("beta"));
+        // A drag selects from the press to the pointer, across lines.
+        let (from, to) = (
+            pos2(x_of[&2] + 1.0, y0 + 2.0),
+            pos2(x_of[&3] + 1.0, y2 + 2.0),
+        );
+        frame(
+            &mut v,
+            &ctx,
+            vec![egui::Event::PointerMoved(from), button(from, true)],
+        );
+        for k in 1..=4 {
+            let p = from + (to - from) * (k as f32 / 4.0);
+            frame(&mut v, &ctx, vec![egui::Event::PointerMoved(p)]);
+        }
+        frame(&mut v, &ctx, vec![button(to, false)]);
+        assert_eq!(v.caret_text().as_deref(), Some("pha beta\ngamma\ndel"));
+        // Clicking right of the text puts the caret at the line end, where typing goes.
+        frame(&mut v, &ctx, vec![]);
+        frame(&mut v, &ctx, vec![]);
+        click(&mut v, pos2(400.0, y0 + 2.0));
+        assert_eq!(v.caret().map(|c| (c.pane, c.pos)), Some((0, (0, 10))));
+        frame(&mut v, &ctx, vec![egui::Event::Text("!".into())]);
+        assert_eq!(lines(&v, 0)[0], "alpha beta!");
+    }
+
+    #[test]
+    fn the_status_says_whether_the_active_pane_is_writable_and_modified() {
+        let mut v = two_way("a\n", "a\n");
+        v.panes[0].doc.read_only = true;
+        v.active_pane = 0;
+        let read_only = format!("{}: {}", side_name(0, 2), tr("label.read_only"));
+        assert!(
+            v.status_detail().contains(&read_only),
+            "{}",
+            v.status_detail()
+        );
+        v.place_caret(1, (0, 1), false);
+        v.caret_insert("b");
+        let s = v.status_detail();
+        let writable = format!(
+            "{}: {}, {}",
+            side_name(1, 2),
+            tr("label.writable"),
+            tr("label.modified")
+        );
+        assert!(s.contains(&writable), "{s}");
+        // A file the system will not let us write says so, though the pane can be edited.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.txt");
+        std::fs::write(&path, "a\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms.clone()).unwrap();
+        v.panes[1].doc.path = Some(path.clone());
+        assert!(v.status_detail().contains(tr("label.read_only_disk")));
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    #[test]
+    fn compare_only_text_says_so_and_stays_locked() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("a\n", "a\n");
+        v.panes[0].doc.read_only = true;
+        v.panes[0].doc.compare_only = true;
+        let s = v.status_detail();
+        let expected = format!("{}: {}", side_name(0, 2), tr("label.compare_only"));
+        assert!(s.contains(&expected), "{s}");
+        // Typing does nothing, and the lock in the header cannot be opened.
+        frame(&mut v, &ctx, vec![]);
+        v.place_caret(0, (0, 1), false);
+        frame(&mut v, &ctx, vec![egui::Event::Text("x".into())]);
+        assert_eq!(lines(&v, 0), ["a"]);
+        // The Tree and Formatted views only compare.
+        v.tree_active = true;
+        assert!(v.status_detail().contains(tr("label.compare_only")));
+        assert!(!v.status_detail().contains(tr("label.writable")));
+    }
+
+    #[test]
+    fn a_read_only_pane_takes_the_caret_but_not_edits() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("a\n", "a\n");
+        v.panes[0].doc.read_only = true;
+        frame(&mut v, &ctx, vec![]);
+        v.place_caret(0, (0, 1), false);
+        frame(&mut v, &ctx, vec![egui::Event::Text("x".into())]);
+        assert_eq!(lines(&v, 0), ["a"]);
+        assert!(!v.status.is_empty());
+    }
+
+    /// Runs one frame of the side-by-side view with `events`.
+    fn frame(v: &mut TextView, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+        frame_with(v, ctx, events, Modifiers::NONE)
+    }
+
+    /// Runs one frame with `modifiers` held.
+    fn frame_with(
+        v: &mut TextView,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        modifiers: Modifiers,
+    ) -> egui::FullOutput {
+        let (cfg, colors) = (Config::default(), theme::colors(false));
+        let mut events = events;
+        events.insert(0, egui::Event::ModifiersChanged(modifiers));
+        thread_local!(static CLOCK: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) });
+        // Frames are 0.15 s apart: clicks a frame apart make a double-click, three apart do not.
+        let time = CLOCK.with(|c| {
+            c.set(c.get() + 0.15);
+            c.get()
+        });
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 500.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| v.ui(ui, &cfg, &colors));
+        });
+        out.textures_delta.clear();
+        out
+    }
+
+    fn key(key: Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn cut_and_delete_remove_the_selected_rows() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("a\nb\nc\nd\n", "a\nb\nc\nd\n");
+        frame(&mut v, &ctx, vec![]);
+        v.active_pane = 1;
+        v.sel_anchor = Some(1);
+        v.cursor_row = Some(2);
+        let out = frame(&mut v, &ctx, vec![egui::Event::Cut]);
+        assert!(out
+            .platform_output
+            .commands
+            .contains(&egui::OutputCommand::CopyText("b\nc\n".into())));
+        assert_eq!(lines(&v, 1), ["a", "d"]);
+        assert_eq!(lines(&v, 0), ["a", "b", "c", "d"], "only the active pane");
+        v.undo();
+        assert_eq!(lines(&v, 1), ["a", "b", "c", "d"]);
+
+        // Delete needs a selection: on the cursor row alone it does nothing.
+        v.sel_anchor = None;
+        v.cursor_row = Some(0);
+        frame(&mut v, &ctx, vec![key(Key::Delete, Modifiers::NONE)]);
+        assert_eq!(lines(&v, 1), ["a", "b", "c", "d"]);
+        v.sel_anchor = Some(0);
+        v.cursor_row = Some(1);
+        frame(&mut v, &ctx, vec![key(Key::Backspace, Modifiers::NONE)]);
+        assert_eq!(lines(&v, 1), ["c", "d"]);
+    }
+
+    #[test]
+    fn column_selections_copy_type_delete_and_paste() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("let a = 1;\nlet b = 2;\nx\n", "let a = 1;\nlet b = 2;\nx\n");
+        frame(&mut v, &ctx, vec![]);
+        let sel = |a, b| {
+            Some(Box::new(ColSel {
+                pane: 1,
+                anchor: a,
+                head: b,
+            }))
+        };
+        v.col_sel = sel((2, 6), (0, 4));
+        let out = frame(&mut v, &ctx, vec![egui::Event::Copy]);
+        assert!(out
+            .platform_output
+            .commands
+            .contains(&egui::OutputCommand::CopyText("a \nb \n".into())));
+        // Typing replaces the columns on every row and leaves a caret after the text.
+        frame(&mut v, &ctx, vec![egui::Event::Text("v".into())]);
+        assert_eq!(lines(&v, 1), ["let v= 1;", "let v= 2;", "x   v"]);
+        assert_eq!(v.col().map(|s| (s.rows(), s.cols())), Some(((0, 2), 5..5)));
+        frame(&mut v, &ctx, vec![egui::Event::Text(" ".into())]);
+        assert_eq!(lines(&v, 1), ["let v = 1;", "let v = 2;", "x   v "]);
+        // Backspace at a caret removes a column on each row.
+        frame(&mut v, &ctx, vec![key(Key::Backspace, Modifiers::NONE)]);
+        frame(&mut v, &ctx, vec![key(Key::Backspace, Modifiers::NONE)]);
+        assert_eq!(lines(&v, 1), ["let = 1;", "let = 2;", "x   "]);
+        // Each action is one undo step.
+        v.undo();
+        assert_eq!(lines(&v, 1), ["let v= 1;", "let v= 2;", "x   v"]);
+        // A pasted block goes row by row.
+        v.col_sel = sel((0, 0), (1, 3));
+        frame(
+            &mut v,
+            &ctx,
+            vec![egui::Event::Paste("var\nconst\n".into())],
+        );
+        assert_eq!(lines(&v, 1), ["var v= 1;", "const v= 2;", "x   v"]);
+        // Cut copies the columns and removes them; Escape ends the selection.
+        v.col_sel = sel((0, 0), (1, 4));
+        let out = frame(&mut v, &ctx, vec![egui::Event::Cut]);
+        assert!(out
+            .platform_output
+            .commands
+            .contains(&egui::OutputCommand::CopyText("var \ncons".into())));
+        assert_eq!(lines(&v, 1), ["v= 1;", "t v= 2;", "x   v"]);
+        frame(&mut v, &ctx, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(v.col_sel.is_none());
+        assert_eq!(
+            lines(&v, 0),
+            ["let a = 1;", "let b = 2;", "x"],
+            "only its pane"
+        );
+    }
+
+    #[test]
+    fn alt_dragging_selects_columns() {
+        let ctx = egui::Context::default();
+        let text = "abcdefgh\nabcdefgh\nabcdefgh\n";
+        let mut v = two_way(text, text);
+        crate::ui::fonts::setup(&ctx, "en");
+        frame(&mut v, &ctx, vec![]);
+        let button = |pos, pressed, modifiers| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers,
+        };
+        // Find the heights of the first and third rows of the left pane by clicking.
+        let mut at = [None; 3];
+        for y in (0..500).step_by(3) {
+            let p = pos2(120.0, y as f32);
+            frame(
+                &mut v,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(p),
+                    button(p, true, Modifiers::NONE),
+                ],
+            );
+            frame(&mut v, &ctx, vec![button(p, false, Modifiers::NONE)]);
+            if let Some(r) = v.cursor_row.filter(|&r| r < 3 && v.active_pane == 0) {
+                at[r].get_or_insert(p.y);
+            }
+            v.cursor_row = None;
+        }
+        let (Some(y0), Some(y2)) = (at[0], at[2]) else {
+            panic!("rows not found: {at:?}");
+        };
+        let (from, to) = (pos2(120.0, y0 + 2.0), pos2(170.0, y2 + 2.0));
+        frame_with(
+            &mut v,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(from),
+                button(from, true, Modifiers::ALT),
+            ],
+            Modifiers::ALT,
+        );
+        for k in 1..=4 {
+            let p = from + (to - from) * (k as f32 / 4.0);
+            frame_with(
+                &mut v,
+                &ctx,
+                vec![egui::Event::PointerMoved(p)],
+                Modifiers::ALT,
+            );
+        }
+        frame_with(
+            &mut v,
+            &ctx,
+            vec![button(to, false, Modifiers::ALT)],
+            Modifiers::ALT,
+        );
+        let s = v.col().expect("a column selection");
+        assert_eq!((s.pane, s.rows()), (0, (0, 2)));
+        assert!(!s.cols().is_empty(), "{s:?}");
+        assert!(v.selection().is_none(), "no row selection with it");
+        // A plain click ends it.
+        frame(
+            &mut v,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(from),
+                button(from, true, Modifiers::NONE),
+            ],
+        );
+        frame(&mut v, &ctx, vec![button(from, false, Modifiers::NONE)]);
+        assert!(v.col_sel.is_none());
+    }
+
+    #[test]
+    fn block_and_column_edits_keep_line_endings_and_bom_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crlf.txt");
+        std::fs::write(&path, b"\xEF\xBB\xBFone\r\ntwo\r\nthree\r\n").unwrap();
+        let left = TextDoc::from_text(None, "one\ntwo\nthree\n");
+        let right = text::load_doc(&path, None).unwrap();
+        let mut v = TextView::new(vec![left, right], &Config::default());
+        // A paste over a selection across lines, then a column insert.
+        v.place_caret(1, (0, 0), false);
+        v.place_caret(1, (1, 3), true);
+        v.caret_insert("ONE\nTWO\nnew");
+        v.col_sel = Some(Box::new(ColSel {
+            pane: 1,
+            anchor: (0, 0),
+            head: (3, 0),
+        }));
+        v.col_replace(&["> ".to_string()]);
+        assert_eq!(lines(&v, 1), ["> ONE", "> TWO", "> new", "> three"]);
+        v.save_pane(1).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"\xEF\xBB\xBF> ONE\r\n> TWO\r\n> new\r\n> three\r\n"
+        );
+        // Two undo steps bring back the exact text.
+        v.undo();
+        v.undo();
+        assert_eq!(lines(&v, 1), ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn edits_in_a_large_file_stay_quick() {
+        let text: String = (0..100_000)
+            .map(|i| format!("line {i} of the file\n"))
+            .collect();
+        let mut v = two_way(&text, &text.replace("line 50000 ", "LINE 50000 "));
+        let start = std::time::Instant::now();
+        v.col_sel = Some(Box::new(ColSel {
+            pane: 1,
+            anchor: (10, 0),
+            head: (20, 0),
+        }));
+        for ch in ["a", "b", "c"] {
+            v.col_replace(&[ch.to_string()]);
+        }
+        // Typing at the caret: three keys, Enter and a paste of two lines.
+        v.place_caret(1, (30, 0), false);
+        for ch in ["x", "y", "z"] {
+            v.caret_insert(ch);
+        }
+        v.caret_newline();
+        v.caret_insert("p\nq");
+        let took = start.elapsed();
+        eprintln!("8 edits of a 100,000-line file: {took:?}");
+        assert!(lines(&v, 1)[10].starts_with("abcline 10"));
+        assert_eq!(lines(&v, 1)[30..33], ["xyz", "p", "qline 30 of the file"]);
+        assert!(took < std::time::Duration::from_secs(20), "{took:?}");
     }
 
     #[test]
