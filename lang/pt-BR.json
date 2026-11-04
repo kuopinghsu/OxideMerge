@@ -253,7 +253,7 @@
   "folder_sync.recovered": "As alterações foram desfeitas.",
   "folder_sync.recovery_detail": "Algumas alterações não puderam ser desfeitas. Cópias dos arquivos substituídos e excluídos estão guardadas em {path}.",
   "folder_sync.recovery_required": "Aplicado parcialmente — recuperação necessária",
-  "folder_sync.renamed_detail": "Renomeado ou movido na origem: {from} → {to}. Aplicado como uma cópia com o novo nome e, depois, a exclusão do antigo.",
+  "folder_sync.renamed_detail": "Renomeado ou movido na origem: {from} → {to}. Aplicado movendo o arquivo no destino; copiado e excluído somente quando as duas pastas estão em unidades diferentes.",
   "folder_sync.risk_adds": "Adiciona ao destino",
   "folder_sync.risk_destructive": "Sobrescreve ou exclui no destino",
   "folder_sync.risk_none": "Não altera nada",

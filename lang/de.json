@@ -253,7 +253,7 @@
   "folder_sync.recovered": "Die Änderungen wurden rückgängig gemacht.",
   "folder_sync.recovery_detail": "Einige Änderungen konnten nicht rückgängig gemacht werden. Kopien der ersetzten und gelöschten Dateien liegen in {path}.",
   "folder_sync.recovery_required": "Teilweise angewendet – Wiederherstellung erforderlich",
-  "folder_sync.renamed_detail": "In der Quelle umbenannt oder verschoben: {from} → {to}. Wird als Kopie unter dem neuen Namen und anschließendes Löschen des alten ausgeführt.",
+  "folder_sync.renamed_detail": "In der Quelle umbenannt oder verschoben: {from} → {to}. Wird ausgeführt, indem die Datei im Ziel verschoben wird; nur wenn die beiden Ordner auf verschiedenen Laufwerken liegen, wird kopiert und gelöscht.",
   "folder_sync.risk_adds": "Fügt dem Ziel etwas hinzu",
   "folder_sync.risk_destructive": "Überschreibt oder löscht im Ziel",
   "folder_sync.risk_none": "Ändert nichts",

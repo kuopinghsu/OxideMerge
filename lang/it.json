@@ -253,7 +253,7 @@
   "folder_sync.recovered": "Le modifiche sono state annullate.",
   "folder_sync.recovery_detail": "Alcune modifiche non sono state annullate. Le copie dei file sostituiti ed eliminati sono conservate in {path}.",
   "folder_sync.recovery_required": "Applicato in parte: è necessario un ripristino",
-  "folder_sync.renamed_detail": "Rinominato o spostato nell’origine: {from} → {to}. Applicato come copia con il nuovo nome, poi eliminando il vecchio.",
+  "folder_sync.renamed_detail": "Rinominato o spostato nell’origine: {from} → {to}. Applicato spostando il file nella destinazione; copiato ed eliminato solo se le due cartelle sono su unità diverse.",
   "folder_sync.risk_adds": "Aggiunge alla destinazione",
   "folder_sync.risk_destructive": "Sovrascrive o elimina nella destinazione",
   "folder_sync.risk_none": "Non modifica nulla",

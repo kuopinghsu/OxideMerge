@@ -253,7 +253,7 @@
   "folder_sync.recovered": "已復原變更。",
   "folder_sync.recovery_detail": "部分變更無法復原。被取代和刪除的檔案副本保存在 {path}。",
   "folder_sync.recovery_required": "部分套用 — 需要復原",
-  "folder_sync.renamed_detail": "在來源中重新命名或移動：{from} → {to}。會先以新名稱複製，再刪除舊檔案。",
+  "folder_sync.renamed_detail": "在來源中重新命名或移動：{from} → {to}。會在目的地中移動該檔案；只有兩個資料夾位於不同磁碟時，才會先複製再刪除。",
   "folder_sync.risk_adds": "向目的地新增內容",
   "folder_sync.risk_destructive": "會覆寫或刪除目的地中的內容",
   "folder_sync.risk_none": "不做任何變更",

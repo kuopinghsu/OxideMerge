@@ -253,7 +253,7 @@
   "folder_sync.recovered": "Les modifications ont été annulées.",
   "folder_sync.recovery_detail": "Certaines modifications n'ont pas pu être annulées. Des copies des fichiers remplacés et supprimés sont conservées dans {path}.",
   "folder_sync.recovery_required": "Appliqué partiellement — récupération nécessaire",
-  "folder_sync.renamed_detail": "Renommé ou déplacé dans la source : {from} → {to}. Appliqué comme une copie sous le nouveau nom, puis la suppression de l’ancien.",
+  "folder_sync.renamed_detail": "Renommé ou déplacé dans la source : {from} → {to}. Appliqué en déplaçant le fichier dans la destination ; copié puis supprimé seulement si les deux dossiers sont sur des lecteurs différents.",
   "folder_sync.risk_adds": "Ajoute à la destination",
   "folder_sync.risk_destructive": "Écrase ou supprime dans la destination",
   "folder_sync.risk_none": "Ne modifie rien",

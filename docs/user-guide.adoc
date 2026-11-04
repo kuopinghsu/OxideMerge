@@ -1137,14 +1137,21 @@ afterwards.
 Conflicts are items that cannot be read, symbolic links (never followed or copied), devices,
 a file on one side and a folder on the other, names that differ from another only in letter case
 or in how accents on Latin letters are written (composed or not), and items that changed after
-the comparison.
+the comparison. A file whose name the two sides spell differently only in case or in that way,
+with the same contents on both, is not a conflict when mirroring: it is renamed (see below).
 
 Click an item for its details: the size and the start of the SHA-256 on each side, and whether
 the action adds to, or overwrites and deletes in, the destination.
 
 A copy whose contents match a file that the plan deletes is a file renamed or moved in the
 source. *Rename* lists such pairs as _old name → new name_, and the copy and the deletion show the
-other name too. They are still applied as a copy and a deletion.
+other name too. A rename is applied by moving the file in the destination, so nothing is
+copied or kept in the journal: the file is first renamed to a temporary name, which the journal
+records, and then to its new name. A rename that only changes the case of a name, or how its
+accents are written, is made the same way, also on file systems that take both names for one,
+such as those of Windows and macOS. When the old and the new place are on different drives, the
+file is copied and the old one deleted. A folder renamed only in case is still left alone, and
+so is a file renamed only in case whose contents changed too.
 
 Warnings appear above the list:
 
@@ -1164,8 +1171,8 @@ deleted, you must also tick a box that states their number.
 OxideMerge then works in this order: it creates folders, copies and replaces files, deletes files
 and finally removes empty folders. The dialog shows the count and the item being changed. For each item it first checks that the source and the
 destination are still as in the preview. Every file is copied to a temporary file next to its
-destination, checked against the planned SHA-256 and then renamed into place. At the end, all
-copied files are checked again.
+destination, checked against the planned SHA-256 and then renamed into place; a renamed file is
+moved instead. At the end, all copied and moved files are checked again.
 
 If a file changed after the preview, even with the same size and modification time, nothing is
 applied, and the file is named.
@@ -2689,10 +2696,14 @@ or `update`. Writes JSON to the standard output, or to the `--report` file.
 |Apply a plan to the folders it was made for, given in the same order. Needs `--yes`.
 
 |`--yes`
-|Confirm that `--sync-apply` may replace and delete files in the destination.
+|Confirm that `--sync-apply`, or the sync jobs of `--job`, may replace and delete files in the
+destination.
 
 |`--sync-recover`
 |Undo the folder synchronizations that did not finish.
+
+|`--job <FILE>`
+|Run the jobs of a job file in order and print a JSON summary (see <<jobs>>). Takes no paths.
 |===
 
 Use one analysis option for each run.
@@ -2832,6 +2843,99 @@ case "$result" in
   1) echo "Differences found" ;;
   *) echo "Comparison failed" >&2; exit "$result" ;;
 esac
+----
+
+[[jobs]]
+=== Jobs
+
+A job file keeps a set of runs in one place, so a nightly report or backup is one command. It is
+a JSON file, usually with the `.oxjob` extension:
+
+[source,json]
+----
+{
+  "version": 1,
+  "continue_on_error": false,
+  "jobs": [
+    {
+      "name": "nightly report",
+      "left": "a",
+      "right": "b",
+      "recursive": true,
+      "report": "report.html"
+    },
+    {
+      "name": "plan",
+      "kind": "sync_plan",
+      "source": "a",
+      "destination": "${env:BACKUP}",
+      "mode": "mirror",
+      "report": "plan.json"
+    },
+    {
+      "name": "backup",
+      "kind": "sync",
+      "source": "a",
+      "destination": "${env:BACKUP}",
+      "mode": "mirror",
+      "apply": true
+    }
+  ]
+}
+----
+
+[source,sh]
+----
+oxidemerge --job nightly.oxjob          # runs the first two jobs, refuses the sync
+oxidemerge --job nightly.oxjob --yes    # runs all three
+----
+
+Each job is turned into the options of a command line and run as that command line would be, so
+a job and its command line give the same result. Your saved options apply, as they do on the
+command line.
+
+`version`:: Required; `1`. A file of a newer version is refused.
+`continue_on_error`:: When `false` (the default), the jobs after one that ends with an error
+(code 2 or higher) are not run. When `true`, every job runs.
+`jobs`:: The jobs, in order. A field OxideMerge does not know is an error, so a misspelled name
+is never ignored.
+
+Every job has an optional `name`, shown in the summary and in error messages, and a `kind`:
+
+`compare` (the default):: `left` and `right` (and `base` for a three-way compare) are required.
+Options: `recursive`, `report`, `report_diffs`, `slideshow`, `patch`, `patch_style`, `context`,
+`compare_as`.
+`sync_plan`:: Writes a sync plan. `source`, `destination`, `mode` (`mirror` or `update`) and
+`report` (the plan file) are required.
+`sync`:: Plans and applies a synchronization at once. `source`, `destination`, `mode` and
+`"apply": true` are required; the run also needs `--yes`. A sync that would delete many items is
+refused unless the job has `"allow_large_deletion": true`.
+
+All kinds also take `filter`, `method`, `rules`, `whitespace`, `ignore_case`, `ignore_blank`,
+`ignore_eol`, `ignore_numbers`, `ignore_comments`, `prettify`, `structured` and
+`numeric_tolerance`, with the meanings of the command-line options of the same names. A field
+that does not fit the kind, such as `apply` in a compare, is an error.
+
+Paths, including `rules`, are relative to the folder of the job file, unless they are absolute or
+URLs. In paths and `rules`, `${env:NAME}` is replaced by the environment variable `NAME`; an unset
+variable is an error. Nothing else is expanded, and no job runs a shell or another program.
+
+`--job` prints a JSON summary. Its `exit_code` is the worst of the jobs' codes, which is also the
+exit code of the run. Each entry of `jobs` has the `name`, the `kind`, the `exit_code`, an `error`
+when the job failed, and for a sync job the same `sync` result that `--sync-apply` prints.
+`not_run` lists the jobs skipped after a failure:
+
+[source,json]
+----
+{
+  "exit_code": 2,
+  "jobs": [
+    { "name": "nightly report", "kind": "compare", "exit_code": 1 },
+    { "name": "plan", "kind": "sync_plan", "exit_code": 1 },
+    { "name": "backup", "kind": "sync", "exit_code": 2,
+      "error": "this job changes … and runs only with --yes" }
+  ]
+}
 ----
 
 [[integration]]

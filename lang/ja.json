@@ -253,7 +253,7 @@
   "folder_sync.recovered": "変更を元に戻しました。",
   "folder_sync.recovery_detail": "一部の変更を元に戻せませんでした。置き換えたファイルと削除したファイルのコピーは {path} に保管されています。",
   "folder_sync.recovery_required": "一部のみ適用 — 復旧が必要です",
-  "folder_sync.renamed_detail": "ソース側で名前変更または移動されました: {from} → {to}。新しい名前でコピーしてから古い方を削除します。",
+  "folder_sync.renamed_detail": "ソース側で名前変更または移動されました: {from} → {to}。出力先のファイルを移動して適用します。2 つのフォルダーが別のドライブにある場合のみ、コピーしてから削除します。",
   "folder_sync.risk_adds": "転送先に追加します",
   "folder_sync.risk_destructive": "転送先で上書きまたは削除します",
   "folder_sync.risk_none": "何も変更しません",

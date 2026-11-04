@@ -372,6 +372,30 @@ plan.
 | `4` | Applying failed or was stopped, and every change was undone. |
 | `5` | Partly applied: some changes could not be undone, also by `--sync-recover`. The recovery journals named in the output are kept. |
 
+### Jobs
+
+A job file (`.oxjob`, JSON) lists compares, reports, sync plans and syncs to run in order:
+
+```json
+{
+  "version": 1,
+  "jobs": [
+    { "name": "report", "left": "a", "right": "b", "recursive": true, "report": "report.html" },
+    { "kind": "sync", "source": "a", "destination": "${env:BACKUP}", "mode": "mirror", "apply": true }
+  ]
+}
+```
+
+```sh
+oxidemerge --job nightly.oxjob --yes
+```
+
+Each job runs as its command line would. Paths are relative to the job file's folder, and in
+paths `${env:NAME}` is the only expansion; nothing is run through a shell. A sync job needs
+`"apply": true` in the file and `--yes` on the command line. The run stops at the first job that
+fails, unless `"continue_on_error": true`, prints a JSON summary, and exits with the worst code of
+its jobs. See the user guide for every field.
+
 ## Git and file manager integration
 
 ### Git
@@ -495,9 +519,10 @@ use Command instead of Ctrl. The app shows the right keys for your system.
   preference to what OxideMerge reads itself. The presets need conversion tools that you install
   separately.
 - Folder synchronization changes files one at a time, so it is not one atomic step. A renamed
-  or moved file is listed as a rename, but it is applied as a copy and a deletion. Symbolic
-  links, and names that differ only in letter case or in how accents on Latin letters are
-  written (composed or not), are left alone.
+  or moved file is moved in the destination, also when only its letter case or the way its
+  accents are written changed, but it is copied and deleted when the two places are on different
+  drives. Symbolic links, folders renamed only in letter case, and other names that differ only
+  in letter case or accents (composed or not) are left alone.
 - The translations were made with machine help. Native speakers have not reviewed them yet.
 
 ## Development
