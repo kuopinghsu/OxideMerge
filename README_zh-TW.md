@@ -269,7 +269,8 @@ oxidemerge -r old-folder new-folder --report report.html --report-diffs
 | `--ignore-case`、`--ignore-eol`、`--ignore-comments` | 忽略大小寫、換行字元或註解。 |
 | `--structured` | 在資料夾比較中，將結構相同的 JSON、XML、TOML 與 YAML 檔案視為相同。 |
 | `--rules <name-or-path>` | 使用比較規則檔。 |
-| `--git-rev <revision>` | 將單一檔案或資料夾與 Git 修訂版本比較。 |
+| `--rev <revision>` | 將單一檔案或資料夾與 Git、Subversion 或 Mercurial 修訂版本比較（亦可用 `--git-rev`）。 |
+| `-L <title>` | 依序為下一側指定標題，與 `diff -L` 相同（Subversion 會傳入）。 |
 | `--report <file>` | 匯出 `.html`、`.pdf` 或 `.xml` 報告；資料夾比較也可匯出 `.csv` 或 `.txt`。 |
 | `--report-diffs` | 在資料夾的 HTML 或 PDF 報告中加入文字差異。 |
 | `--page-size a4\|letter`、`--portrait`、`--unified`、`--whole-file` | 設定 `.pdf` 報告的版面：紙張大小、直式頁面、兩個檔案以單欄顯示，或顯示完整檔案而非只顯示差異與 `--context` 行前後文。 |
@@ -382,6 +383,16 @@ git config --global mergetool.oxidemerge.trustExitCode false
 
 若程式不在 `PATH` 中，請在上述指令中使用完整路徑。詳情請參閱[使用者指南](docs/user-guide.zh-TW.adoc)。
 
+### Subversion、Mercurial 與 Perforce（實驗性）
+
+> 對 Subversion、Mercurial 與 Perforce 的支援屬於實驗性功能，尚未完整測試。
+> 僅在 macOS 上以本機儲存庫與本機 Perforce 伺服器試過。
+
+`svn diff --diff-cmd oxidemerge` 可直接使用：OxideMerge 接受 Subversion 傳入的 `-u` 與 `-L` 標題，
+因此窗格會顯示修訂版本名稱。Mercurial（`extdiff` 與 `merge-tools`）與 Perforce（`P4DIFF`、`P4MERGE`，或 P4V 的 Diff 與 Merge 偏好設定）
+需在各自的設定中設定；Subversion 與 p4 命令列的合併要透過一個簡短的包裝指令碼。
+請參閱使用者指南中的 [Subversion、Mercurial 與 Perforce](docs/user-guide.zh-TW.adoc#other-vcs)。
+
 ### 檔案管理員
 
 若要將 OxideMerge 加入檔案管理員，請使用「**工具**」選單，
@@ -470,6 +481,8 @@ git config --global mergetool.oxidemerge.trustExitCode false
   只改變大小寫或重音寫法的也一樣；但若新舊位置位於不同磁碟，則會先複製再刪除。
   只改變大小寫的資料夾，以及其他只有大小寫或拉丁字母重音寫法（組合或分解）不同的名稱，都不會被變更。
   符號連結也一樣，除非開啟 *將符號連結以連結本身複製*（`--sync-links`）；此功能僅適用於 macOS 與 Linux。
+- 對 Subversion、Mercurial 與 Perforce 的支援（比較與合併設定，以及「與修訂版本比較」）屬於實驗性功能，尚未完整測試：
+  僅在 macOS 上以本機儲存庫與本機 Perforce 伺服器試過。Windows、Linux，以及透過網路連線的 Subversion 與 Perforce 伺服器皆尚未試過。
 - 各語言翻譯由機器輔助完成，尚未經母語人士審閱。
 
 ## 開發

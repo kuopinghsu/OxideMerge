@@ -6,7 +6,6 @@ use crate::core::conflict;
 use crate::core::diff::{DiffAlgorithm, DiffOptions, InlineMode, WhitespaceMode};
 use crate::core::filter::{self, FltFilter, FLT_PREFIX};
 use crate::core::folder::CompareMethod;
-use crate::core::git;
 use crate::core::patch::{self, PatchStyle};
 use crate::core::project::{self, Project};
 use crate::core::report::{self, side_name, ReportFormat};
@@ -14,6 +13,7 @@ use crate::core::rules::{self, RuleDraft, RuleKind, RuleSet};
 use crate::core::saved::{self, SavedCompare};
 use crate::core::text::{self, FileKind, TextDoc};
 use crate::core::unpacker::{self, Unpacker};
+use crate::core::vcs;
 use crate::core::web;
 use crate::i18n::{self, tr, trf};
 use crate::ui::binary_view::BinaryView;
@@ -1172,14 +1172,20 @@ struct GitDialog {
     /// Recent commits of `commits_for`: short hash and subject.
     commits: Vec<(String, String)>,
     commits_for: String,
-    /// Recent commits being read with `git log`, for the path it was started for.
-    commits_job: Option<(String, CommitsRx)>,
+    /// Recent revisions being read, for the path it was started for, and when it started.
+    commits_job: Option<(String, CommitsRx, std::time::Instant)>,
     /// The path as last typed and when, so `git log` waits until typing pauses.
     typed: (String, std::time::Instant),
+    /// Example revisions for the system holding the typed path, found when the path changes
+    /// rather than on every frame.
+    rev_hint: &'static str,
 }
 
 /// How long the Git dialog's path must stay unchanged before its commits are read.
 const GIT_LOG_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+/// How long a log read for an earlier path may run before a new path's starts anyway, so a
+/// Subversion server that does not answer cannot hold up the list for every later path.
+const STALE_LOG: std::time::Duration = std::time::Duration::from_secs(2);
 
 struct PatchDialog {
     style: PatchStyle,
@@ -2467,15 +2473,13 @@ impl OxideMergeApp {
         Ok(())
     }
 
-    /// Compares `path` with how it was in Git revision `rev` (the left side, read-only).
+    /// Compares `path` with how it was in revision `rev` of its Git repository, Subversion
+    /// working copy or Mercurial repository (the left side, read-only).
     fn open_git_revision(&mut self, path: &Path, rev: &str) -> anyhow::Result<()> {
-        let rev = match rev.trim() {
-            "" => "HEAD",
-            r => r,
-        };
+        let rev = vcs::rev_or_default(path, rev);
         let label = format!("{} @ {rev}", path.display());
         let (temp, content) = if path.is_dir() {
-            let (temp, copy) = git::export_folder(path, rev)?;
+            let (temp, copy) = vcs::export_folder(path, rev)?;
             let display = vec![label, path.display().to_string()];
             let mut v = FolderView::new(
                 vec![copy, path.to_path_buf()],
@@ -2488,7 +2492,7 @@ impl OxideMergeApp {
             v.read_only[0] = true;
             (temp, Content::Folder(v))
         } else {
-            let bytes = git::show_file(path, rev)?;
+            let bytes = vcs::show_file(path, rev)?;
             let temp = tempfile::tempdir()?;
             let copy = temp.path().join(path.file_name().unwrap_or_default());
             std::fs::write(&copy, bytes)?;
@@ -3474,11 +3478,12 @@ impl OxideMergeApp {
                     .unwrap_or_default();
                 self.git_dlg = Some(GitDialog {
                     path,
-                    rev: "HEAD".into(),
+                    rev: String::new(),
                     commits: Vec::new(),
                     commits_for: String::new(),
                     commits_job: None,
                     typed: (String::new(), std::time::Instant::now()),
+                    rev_hint: vcs::Vcs::Git.rev_hint(),
                 });
             }
             Cmd::CompareAs(kind) => {
@@ -4277,7 +4282,7 @@ impl OxideMergeApp {
             return;
         };
         let path = PathBuf::from(d.path.trim());
-        if let Some((for_path, rx)) = &d.commits_job {
+        if let Some((for_path, rx, _)) = &d.commits_job {
             match rx.try_recv() {
                 Ok(commits) => {
                     d.commits = commits;
@@ -4292,19 +4297,29 @@ impl OxideMergeApp {
         }
         if d.typed.0 != d.path {
             d.typed = (d.path.clone(), std::time::Instant::now());
+            d.rev_hint = vcs::Vcs::of(&path).rev_hint();
         }
         let wait = GIT_LOG_DELAY.saturating_sub(d.typed.1.elapsed());
-        let started_for = d.commits_job.as_ref().map(|(p, _)| p.as_str());
+        let started_for = d.commits_job.as_ref().map(|(p, _, _)| p.as_str());
         let pending = d.commits_for != d.path && started_for != Some(d.path.as_str());
+        // An earlier path's log is let finish for a while rather than piling up `svn log`s on a
+        // slow server; past that it is dropped (its thread ends on its own) and this one starts.
+        let busy = d
+            .commits_job
+            .as_ref()
+            .map(|(_, _, at)| STALE_LOG.saturating_sub(at.elapsed()))
+            .filter(|left| !left.is_zero());
         if pending && !wait.is_zero() {
             ctx.request_repaint_after(wait);
+        } else if let (true, Some(left)) = (pending, busy) {
+            ctx.request_repaint_after(left);
         } else if pending && path.exists() {
             let (tx, rx) = std::sync::mpsc::channel();
             let p = path.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(git::recent_commits(&p, 20));
+                let _ = tx.send(vcs::recent_revisions(&p, 20));
             });
-            d.commits_job = Some((d.path.clone(), rx));
+            d.commits_job = Some((d.path.clone(), rx, std::time::Instant::now()));
         }
         if d.commits_for != d.path {
             d.commits.clear();
@@ -4346,7 +4361,7 @@ impl OxideMergeApp {
                         let r = ui.add(
                             egui::TextEdit::singleline(&mut d.rev)
                                 .margin(vec2(8.0, 5.0))
-                                .hint_text("HEAD, HEAD~1, main, v1.0 …")
+                                .hint_text(d.rev_hint)
                                 .desired_width(ui.available_width() - 36.0),
                         );
                         if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {

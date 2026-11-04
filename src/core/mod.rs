@@ -32,6 +32,7 @@ pub mod table;
 pub mod table_match;
 pub mod text;
 pub mod unpacker;
+pub mod vcs;
 pub mod web;
 pub mod web_markdown;
 pub mod xml_report;

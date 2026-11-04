@@ -6,7 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn command(dir: &Path) -> Command {
-    let mut cmd = Command::new("git");
+    tool("git", dir)
+}
+
+/// A command for `program` run in `dir`, with no console window on Windows.
+pub(super) fn tool(program: &str, dir: &Path) -> Command {
+    let mut cmd = Command::new(program);
     cmd.current_dir(dir);
     #[cfg(windows)]
     {
@@ -18,7 +23,8 @@ fn command(dir: &Path) -> Command {
 }
 
 /// Runs `cmd`, writing `input` to it, and returns what it printed.
-fn run(mut cmd: Command, input: Option<Vec<u8>>) -> Result<Vec<u8>> {
+pub(super) fn run(mut cmd: Command, input: Option<Vec<u8>>) -> Result<Vec<u8>> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
     cmd.stdin(if input.is_some() {
         Stdio::piped()
     } else {
@@ -26,7 +32,9 @@ fn run(mut cmd: Command, input: Option<Vec<u8>>) -> Result<Vec<u8>> {
     })
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
-    let mut child = cmd.spawn().context("git could not be started")?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("{program} could not be started"))?;
     // written on another thread so a full output pipe cannot block the input
     let writer = child.stdin.take().zip(input).map(|(mut stdin, data)| {
         std::thread::spawn(move || {
@@ -39,7 +47,11 @@ fn run(mut cmd: Command, input: Option<Vec<u8>>) -> Result<Vec<u8>> {
     }
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        bail!("{}", err.lines().next().unwrap_or("git failed").trim());
+        let first = err.lines().find(|l| !l.trim().is_empty());
+        bail!(
+            "{}",
+            first.map_or(format!("{program} failed"), |l| l.trim().to_string())
+        );
     }
     Ok(out.stdout)
 }
@@ -53,13 +65,22 @@ fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
 /// The repository holding `path` and the path relative to its top folder, with `/`
 /// separators (empty for the top folder itself).
 pub fn locate(path: &Path) -> Result<(PathBuf, String)> {
+    locate_with(path, |dir| git(dir, &["rev-parse", "--show-toplevel"]))
+}
+
+/// The top folder that `top` prints when run in the folder of `path`, and the path relative
+/// to it with `/` separators (empty for the top folder itself).
+pub(super) fn locate_with(
+    path: &Path,
+    top: impl FnOnce(&Path) -> Result<Vec<u8>>,
+) -> Result<(PathBuf, String)> {
     let abs = dunce_canonical(path)?;
     let dir = if abs.is_dir() {
         abs.clone()
     } else {
         abs.parent().context("no parent folder")?.to_path_buf()
     };
-    let top = git(&dir, &["rev-parse", "--show-toplevel"])?;
+    let top = top(&dir)?;
     let root = dunce_canonical(Path::new(String::from_utf8_lossy(&top).trim()))?;
     let rel = abs
         .strip_prefix(&root)
@@ -73,7 +94,7 @@ pub fn locate(path: &Path) -> Result<(PathBuf, String)> {
 }
 
 /// Canonical path without the `\\?\` prefix Windows adds, which git does not print.
-fn dunce_canonical(path: &Path) -> Result<PathBuf> {
+pub(super) fn dunce_canonical(path: &Path) -> Result<PathBuf> {
     let p = std::fs::canonicalize(path).with_context(|| path.display().to_string())?;
     #[cfg(windows)]
     if let Some(s) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
@@ -85,7 +106,7 @@ fn dunce_canonical(path: &Path) -> Result<PathBuf> {
 }
 
 /// A revision is passed to git as an argument, so it must not look like an option.
-fn check_rev(rev: &str) -> Result<&str> {
+pub(super) fn check_rev(rev: &str) -> Result<&str> {
     let rev = rev.trim();
     if rev.is_empty() || rev.starts_with('-') {
         bail!("invalid revision: {rev}");

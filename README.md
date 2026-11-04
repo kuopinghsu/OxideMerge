@@ -306,7 +306,8 @@ oxidemerge -r old-folder new-folder --report report.html --report-diffs
 | `--ignore-case`, `--ignore-eol`, `--ignore-comments` | Ignore letter case, line endings or comments. |
 | `--structured` | In folder comparisons, count JSON, XML, TOML and YAML files with the same structure as identical. |
 | `--rules <name-or-path>` | Use a comparison rules file. |
-| `--git-rev <revision>` | Compare one file or folder with a Git revision. |
+| `--rev <revision>` | Compare one file or folder with a Git, Subversion or Mercurial revision (also `--git-rev`). |
+| `-L <title>` | Title the next side, as `diff -L` does (Subversion passes these). |
 | `--report <file>` | Export a report as `.html`, `.pdf` or `.xml`. Folder comparisons can also use `.csv` or `.txt`. |
 | `--report-diffs` | Add text differences to a folder HTML or PDF report. |
 | `--page-size a4\|letter`, `--portrait`, `--unified`, `--whole-file` | Lay out a `.pdf` report: page size, portrait pages, one column for two files, or the whole files instead of the differences with `--context` lines. |
@@ -427,6 +428,18 @@ git config --global mergetool.oxidemerge.trustExitCode false
 If the program is not in your `PATH`, use its full path in these commands. For more details,
 see the [user guide](docs/user-guide.adoc).
 
+### Subversion, Mercurial and Perforce (experimental)
+
+> Support for Subversion, Mercurial and Perforce is experimental and not fully tested. It was
+> tried on macOS only, with local repositories and a local Perforce server.
+
+`svn diff --diff-cmd oxidemerge` works as it is: OxideMerge accepts the `-u` and `-L` titles
+that Subversion passes, so the panes show revision names. Mercurial (`extdiff` and
+`merge-tools`) and Perforce (`P4DIFF`, `P4MERGE`, or P4V's *Diff* and *Merge* preferences) are
+set up in their own configuration; merges in Subversion and the p4 command line go through a
+short wrapper script. See
+[Subversion, Mercurial and Perforce](docs/user-guide.adoc#other-vcs) in the user guide.
+
 ### File managers
 
 To add OxideMerge to your file manager, use the **Tools** menu. Or run
@@ -534,6 +547,10 @@ use Command instead of Ctrl. The app shows the right keys for your system.
   drives. Folders renamed only in letter case, and other names that differ only in letter case
   or accents (composed or not), are left alone. So are symbolic links, unless *Copy symbolic
   links as links* (`--sync-links`) is on, which works on macOS and Linux only.
+- Support for Subversion, Mercurial and Perforce (diff and merge setup, and *Compare with
+  revision*) is experimental and not fully tested: it was tried on macOS only, with local
+  repositories and a local Perforce server. Windows, Linux, and Subversion and Perforce servers
+  over the network have not been tried.
 - The translations were made with machine help. Native speakers have not reviewed them yet.
 
 ## Development

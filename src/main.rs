@@ -103,6 +103,14 @@ struct Cli {
     /// Description of the right side
     #[arg(long)]
     dr: Option<String>,
+    /// Title of a side, given once per path in the same order (as diff -L, which Subversion and
+    /// other version control systems pass); --dl, --dm and --dr take precedence
+    #[arg(short = 'L', long = "label", value_name = "TITLE")]
+    labels: Vec<String>,
+    /// Accepted for diff compatibility (Subversion passes -u) and ignored
+    #[allow(dead_code)]
+    #[arg(short = 'u', hide = true)]
+    diff_unified: bool,
     /// Open the left side read-only
     #[arg(long)]
     wl: bool,
@@ -162,9 +170,10 @@ struct Cli {
     /// Write the .html report as a slideshow, one difference per slide
     #[arg(long)]
     slideshow: bool,
-    /// Compare the single path given with how it was in this Git revision (e.g. HEAD, HEAD~1,
-    /// a branch, tag or commit)
-    #[arg(long, value_name = "REV")]
+    /// Compare the single path given with how it was in this revision of its Git repository
+    /// (HEAD, HEAD~1, a branch, tag or commit), Subversion working copy (BASE, PREV, HEAD or a
+    /// number) or Mercurial repository (., .^, tip, a number or tag)
+    #[arg(long, visible_alias = "rev", value_name = "REV")]
     git_rev: Option<String>,
     /// Write a patch file without opening the GUI
     #[arg(long)]
@@ -371,13 +380,13 @@ fn patch_style(p: PatchArg) -> PatchStyle {
     }
 }
 
-/// `path` as it was in Git revision `rev`, in a temporary folder that lives as long as the
-/// returned guard.
+/// `path` as it was in revision `rev` of its Git repository, Subversion working copy or
+/// Mercurial repository, in a temporary folder that lives as long as the returned guard.
 fn git_copy(path: &std::path::Path, rev: &str) -> anyhow::Result<(tempfile::TempDir, PathBuf)> {
     if path.is_dir() {
-        return core::git::export_folder(path, rev);
+        return core::vcs::export_folder(path, rev);
     }
-    let bytes = core::git::show_file(path, rev)?;
+    let bytes = core::vcs::show_file(path, rev)?;
     let dir = tempfile::tempdir()?;
     let copy = dir.path().join(path.file_name().unwrap_or_default());
     std::fs::write(&copy, bytes)?;
@@ -479,6 +488,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     let mut git_desc = None;
     if let (Some(rev), [path]) = (&cli.git_rev, &cli.paths[..]) {
         let (temp, copy) = git_copy(path, rev)?;
+        let rev = core::vcs::rev_or_default(path, rev);
         git_desc = Some(format!("{} @ {rev}", path.display()));
         cli_paths = vec![copy, path.clone()];
         _git_temp = Some(temp);
@@ -1193,12 +1203,13 @@ fn run_analysis(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
 }
 
 fn cli_desc(cli: &Cli, i: usize) -> Option<String> {
-    match (cli.paths.len(), i) {
+    let desc = match (cli.paths.len(), i) {
         (_, 0) => cli.dl.clone(),
         (2, 1) => cli.dr.clone(),
         (3, 1) => cli.dm.clone(),
         _ => cli.dr.clone(),
-    }
+    };
+    desc.or_else(|| cli.labels.get(i).cloned())
 }
 
 fn app_icon() -> egui::IconData {
