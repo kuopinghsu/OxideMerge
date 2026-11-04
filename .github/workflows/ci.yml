@@ -91,9 +91,6 @@ jobs:
       - name: Test
         timeout-minutes: 20
         run: cargo test --release --locked --target ${{ matrix.target }}
-        env:
-          # Web compare's browser tests, with the runner's Edge or Chrome (x64 runners have both).
-          OXIDEMERGE_TEST_BROWSER: ${{ matrix.arch == 'x64' && 'auto' || '' }}
 
       # An explicit target, so the package is for this architecture even if the
       # toolchain on the runner is not.
@@ -240,9 +237,6 @@ jobs:
       - name: Test
         timeout-minutes: 20
         run: cargo test --release --locked
-        env:
-          # Web compare's browser tests, with the runner's Chrome (installed on x64 runners).
-          OXIDEMERGE_TEST_BROWSER: ${{ matrix.arch == 'x64' && 'auto' || '' }}
 
       - name: Build
         run: cargo build --release --locked
@@ -922,7 +916,7 @@ jobs:
 
           **User guide:** `oxidemerge-*-user-guide.pdf` in English and `oxidemerge-*-user-guide.zh-TW.pdf` in Traditional Chinese.
 
-          GitHub lists each download's SHA-256 digest on this page for checking it. Web page screenshots need a Chromium-based browser (Edge, Chrome, Chromium or Brave); every other compare works without one.
+          GitHub lists each download's SHA-256 digest on this page for checking it.
           EOF
             echo
             echo "Built from commit \`$GITHUB_SHA\` by [this workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."

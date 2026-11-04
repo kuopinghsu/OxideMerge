@@ -435,10 +435,6 @@ const OPT_INDEX: &[(OptTab, &str)] = &[
     (OptTab::Media, "img.threshold"),
     (OptTab::Media, "img.block_size"),
     (OptTab::Media, "opt.bytes_per_line"),
-    (OptTab::Media, "opt.web"),
-    (OptTab::Media, "opt.web_browser"),
-    (OptTab::Media, "opt.web_width"),
-    (OptTab::Media, "opt.web_height"),
     (OptTab::Plugins, "opt.extract_documents"),
     (OptTab::Plugins, "opt.unpackers_hint"),
     (OptTab::Plugins, "opt.pattern"),
@@ -6083,44 +6079,6 @@ impl OxideMergeApp {
                                         egui::Slider::new(&mut c.binary_bytes_per_line, 4..=64)
                                             .text(tr("opt.bytes_per_line")),
                                     );
-                                    ui.separator();
-                                    ui.label(egui::RichText::new(tr("opt.web")).strong());
-                                    ui.label(tr("opt.web_browser"));
-                                    ui.horizontal(|ui| {
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut c.web_browser)
-                                                .hint_text(tr("opt.web_browser_hint"))
-                                                .desired_width(420.0),
-                                        );
-                                        if widgets::icon_button(
-                                            ui,
-                                            Icon::File,
-                                            tr("btn.browse_file"),
-                                        )
-                                        .clicked()
-                                        {
-                                            if let Some(p) = rfd::FileDialog::new().pick_file() {
-                                                c.web_browser = p.display().to_string();
-                                            }
-                                        }
-                                    });
-                                    let found = web::find_browser(&c.web_browser);
-                                    ui.label(
-                                        egui::RichText::new(match &found {
-                                            Some(p) => p.display().to_string(),
-                                            None => tr("web.no_browser").to_string(),
-                                        })
-                                        .small()
-                                        .color(pal(ui).text_dim),
-                                    );
-                                    ui.add(
-                                        egui::Slider::new(&mut c.web_width, 320..=3840)
-                                            .text(tr("opt.web_width")),
-                                    );
-                                    ui.add(
-                                        egui::Slider::new(&mut c.web_height, 240..=8000)
-                                            .text(tr("opt.web_height")),
-                                    );
                                 }
                                 OptTab::Plugins => {
                                     ui.checkbox(
@@ -6928,7 +6886,6 @@ impl eframe::App for OxideMergeApp {
             });
         if let Some(Content::Web(w)) = self.tabs.get(self.active).map(|t| &t.content) {
             self.cfg.web_mode = w.mode;
-            self.cfg.web_highlight = w.highlight;
         }
         self.sync_text_layout();
         crate::core::fsutil::set_backup(self.cfg.backup_on_save);

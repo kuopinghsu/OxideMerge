@@ -83,14 +83,19 @@ It compares text, folders, binary files, images and web pages.
   views.
 - **Documents, spreadsheets and programs:** PDF, Word (`.docx`), OpenDocument text (`.odt`),
   Rich Text (`.rtf`), Excel (`.xlsx`) and OpenDocument spreadsheets (`.ods`) are compared as the
-  text in them, and ELF programs, shared objects and object files as their header and section
-  table — with nothing to install. A spreadsheet opens as a table comparison, with the columns
-  and key matching that offers. These comparisons are read-only: the file itself is never
+  text in them, and ELF programs, shared objects and object files as their header, program
+  headers, section table and symbols sorted by name — with nothing to install. A workbook of one
+  sheet opens as a table comparison, with the columns and key matching that offers. These comparisons are read-only: the file itself is never
   written back.
+- **Formatted documents:** choose **Formatted** above the panes to see Word documents, Excel
+  workbooks and tagged PDF files as formatted Markdown side by side: headings, bold and italic
+  words, lists, links, and tables drawn with their merged cells. Each workbook sheet is a table
+  with its dates, amounts and percentages as their formats show them. Images are shown with
+  their description and a fingerprint of the picture, so a changed picture shows as a change.
 - **Web pages:** by default, both pages are converted to Markdown and shown formatted side by
   side, with changed blocks and words highlighted. Other modes show the visible text, the HTML
-  source, screenshots with the changed text highlighted, or the downloaded resources. Only the
-  screenshot modes need a web browser. Local `.html` files also open as web pages.
+  source, or the downloaded resources. No mode needs a web browser. Local `.html` files also open
+  as web pages.
 
 ### Reports and saved work
 
@@ -472,9 +477,7 @@ use Command instead of Ctrl. The app shows the right keys for your system.
 - Archives are read-only. You cannot save changes into an archive. RAR files are not supported.
 - JSON and XML files are read-only when automatic formatting is on. Turn it off to edit or
   merge them.
-- Web page screenshots need a Chromium-based browser, such as Chrome or Edge. Only the
-  screenshot modes run JavaScript, so the other web modes can miss content that a page loads
-  later.
+- Web page compare does not run JavaScript, so it can miss content that a page's scripts add.
 - Pages that need a login are not supported. They may show the login page instead.
 - Text editing works line by line. It is meant for reviewing and merging changes.
 - WinMerge project files and filter files work. WinMerge plugin DLLs and scripts do not work.
@@ -483,6 +486,10 @@ use Command instead of Ctrl. The app shows the right keys for your system.
   format holds are not compared, and the comparison is read-only. A PDF records where each glyph
   goes rather than words, so columns, tables and ligatures may not come out as they look. The
   older Word `.doc` and Excel `.xls` are not read; use a plugin for those.
+- The **Formatted** view of a PDF needs a tagged PDF, which says which text is a heading,
+  paragraph, list or table. Most word processors tag the PDFs they export; a scan or an untagged
+  PDF can be compared as text only. Fills, fonts, borders, formulas and charts are not compared
+  in the Formatted view either.
 - Unpacker plugins run external commands. They work the same way in file comparisons, folder
   comparisons of full contents, the command line and reports, and a plugin is always used in
   preference to what OxideMerge reads itself. The presets need conversion tools that you install

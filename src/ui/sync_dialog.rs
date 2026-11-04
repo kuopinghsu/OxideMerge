@@ -39,7 +39,11 @@ enum State {
         stop: Arc<AtomicBool>,
         done: Arc<AtomicUsize>,
     },
-    Done(SyncOutcome),
+    /// `rescan` when the folders may have changed since they were compared.
+    Done {
+        outcome: SyncOutcome,
+        rescan: bool,
+    },
 }
 
 pub struct SyncDialog {
@@ -157,12 +161,21 @@ impl SyncDialog {
                 Ok(Err(e)) => State::Failed(e),
                 Err(_) => State::Failed(tr("status.error").to_string()),
             },
-            State::Applying { job, .. } => State::Done(job.join().unwrap_or_else(|_| {
-                SyncOutcome::NotApplied(
-                    crate::core::problem::Problem::ReadFailure,
-                    vec![tr("status.error").to_string()],
-                )
-            })),
+            State::Applying { job, .. } => match job.join() {
+                Ok(outcome) => State::Done {
+                    rescan: !matches!(outcome, SyncOutcome::NotApplied(..)),
+                    outcome,
+                },
+                // What it changed before it failed is not known, so the folders are read again.
+                Err(_) => State::Done {
+                    outcome: folder_sync::abandoned(
+                        folder_sync::journal_root().as_deref(),
+                        &self.roots,
+                        tr("status.error").to_string(),
+                    ),
+                    rescan: true,
+                },
+            },
             other => other,
         };
     }
@@ -391,9 +404,9 @@ impl SyncDialog {
                         }
                     });
                 }
-                State::Done(outcome) => {
+                State::Done { outcome, rescan } => {
                     outcome_ui(ui, outcome);
-                    let changed = !matches!(outcome, SyncOutcome::NotApplied(..));
+                    let changed = *rescan;
                     widgets::dialog_footer(ui, |ui| {
                         if widgets::primary_button(ui, tr("btn.close")).clicked()
                             || ui.input(|i| i.key_pressed(Key::Escape))

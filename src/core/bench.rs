@@ -180,7 +180,7 @@ const WORKLOADS: &[Workload] = &[
     },
     Workload {
         name: "sync-apply-large",
-        what: "a mirror of 3 files of 2 GB, one new and one changed in its last byte: plan, then apply",
+        what: "a mirror of 3 files of 2 GiB, one new and one changed in its last byte: plan, then apply",
         level: 2,
         make: huge_files,
         run: apply_sync,
@@ -477,8 +477,8 @@ fn large_files(dir: &Path) {
     }
 }
 
-/// Three random 2 GB files on the left; on the right one is equal, one differs in its last
-/// byte and one is missing.
+/// Three random 2 GiB files on the left; on the right one is equal, one differs in its last
+/// byte and one is missing: 10 GiB in all.
 fn huge_files(dir: &Path) {
     use std::io::Write as _;
     let mut rng = Rng(37);

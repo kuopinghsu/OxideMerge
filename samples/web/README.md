@@ -23,17 +23,12 @@ What to look for in each mode:
   changed words within them. The pages in [`formatted/`](#formatted-mode-samples) try it on
   harder content.
 - **Text:** changed words are highlighted within lines. The build line differs between the files
-  and a style sheet rule hides it. Only the screenshots apply style sheets, so Formatted and Text
+  and a style sheet rule hides it. OxideMerge does not apply style sheets, so Formatted and Text
   show the change.
-- **Full page:** the whole page, including the part below the first screen, with the text
-  differences highlighted on the page. The note added near the top of 2.4 moves everything
-  below it down, yet only the text that really changed is marked.
-- **Screenshot (visible area):** the top of each page only.
 - **HTML source:** the HTML of the files, with the script but without the `<li>` items it adds.
 
-Formatted, Text and HTML source convert the files as they are, without a browser, so they open at
-once; the "Known issues" list that a script fills in is empty in them. Full page and Screenshot
-run the script, so the list is there, and need Edge, Chrome, Chromium or Brave.
+Every mode converts the files as they are, without a browser, so they open at once. Scripts do not
+run, so the "Known issues" list that a script fills in is empty.
 
 ## Formatted mode samples
 
@@ -62,9 +57,10 @@ the other modes too; Text shows the same changes as lines of words.
 - **Definition list and code block:** a changed definition, and a TOML block where two lines
   change.
 - **Paragraphs:** a long paragraph where one phrase changes, and a paragraph split in two.
-- **Hidden content:** a draft note hidden by the style sheet, a screen reader hint and the body
-  of a closed `<details>` are not shown, so their changes do not count. The "Last reviewed"
-  line is written by a script, so it is only in the screenshots.
+- **Hidden content:** a screen reader hint and the body of a closed `<details>` are not shown, so
+  their changes do not count. A draft note hidden only by the style sheet is still shown and
+  compared, since OxideMerge does not apply style sheets. The "Last reviewed"
+  line is written by a script, so it is not compared.
 
 ### `headings/`: a user guide outline
 
@@ -87,7 +83,7 @@ the other modes too; Text shows the same changes as lines of words.
 - **Release schedule:** a cell spanning two columns (`colspan`) is replaced by two dates.
 - **Contact:** a layout table without header cells; its first row is used as the header.
 - **Limits:** a table nested in a cell, whose cells run together as text.
-- **Server status:** rows added by a script, so the table is empty except in the screenshots.
+- **Server status:** rows added by a script, so the table is empty.
 
 Each table is one block, drawn with lines around its cells: a change anywhere in it highlights
 the table on both sides. Within it, rows are lined up (by their first cell when they changed),

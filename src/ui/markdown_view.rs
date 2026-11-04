@@ -2,7 +2,7 @@
 //! the blocks that differ highlighted.
 
 use crate::core::diff::DiffOptions;
-use crate::core::web_markdown::{self, Block, Cell, Marks, Row};
+use crate::core::web_markdown::{self, Block, Cell, Marks, Row, Slot};
 use crate::i18n::{tr, trf};
 use crate::ui::commands::Cmd;
 use crate::ui::theme::Colors;
@@ -635,12 +635,21 @@ fn viewer_ranges(text: &str, marks: &[Range<usize>]) -> Vec<Range<usize>> {
     out
 }
 
-/// Readies a table's cells to be shown: the header row bold, and the changed words placed as
+/// Readies a table's cells to be shown: the header rows bold, and the changed words placed as
 /// the viewer places them.
 fn prepare_table(rows: &mut [Vec<(String, Cell)>]) {
+    let slots = web_markdown::spans(
+        &rows
+            .iter()
+            .map(|r| r.iter().map(|c| &c.0).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+    );
+    let header = header_rows(&slots);
     for (r, row) in rows.iter_mut().enumerate() {
-        for (text, cell) in row {
-            if r == 0 && !text.is_empty() {
+        for (k, (text, cell)) in row.iter_mut().enumerate() {
+            let covered = matches!(slots[r].get(k), Some(Slot::Covered { .. }));
+            let bold = text.len() > 4 && text.starts_with("**") && text.ends_with("**");
+            if r < header && !text.is_empty() && !covered && !bold {
                 *text = format!("**{text}**");
                 if let Cell::Words(v) = cell {
                     v.iter_mut().for_each(|m| *m = m.start + 2..m.end + 2);
@@ -651,6 +660,20 @@ fn prepare_table(rows: &mut [Vec<(String, Cell)>]) {
             }
         }
     }
+}
+
+/// How many rows the header of a table is: the first row, and those its merged cells reach.
+fn header_rows(slots: &[Vec<Slot>]) -> usize {
+    slots.first().map_or(0, |first| {
+        first
+            .iter()
+            .map(|s| match s {
+                Slot::Anchor { rows, .. } => *rows,
+                Slot::Covered { .. } => 1,
+            })
+            .max()
+            .unwrap_or(1)
+    })
 }
 
 /// Shows Markdown `text` with the byte ranges `marks` of it highlighted in `color`.
@@ -680,12 +703,29 @@ struct TableLayout {
     natural: Vec<f32>,
     /// Height of each row as last laid out, its padding included.
     heights: Vec<f32>,
+    /// Where each cell is, when cells are merged.
+    slots: Vec<Vec<Slot>>,
+    /// The last row each row's merged cells reach down to.
+    reach: Vec<usize>,
+    /// How tall the text of each cell merged over several rows was, by its row and column.
+    tall: std::collections::HashMap<(usize, usize), f32>,
 }
 
-/// Draws a table as a grid of cells with lines around them and the header row shaded. What
-/// differs is highlighted in `words`: changed words, and whole cells the other page lacks.
-/// Only the rows in view are laid out. Returns whether a row's height changed, and how much
-/// taller the rows above the view were found.
+impl TableLayout {
+    /// The row and column of the merged area cell `k` of row `r` belongs to.
+    fn owner(&self, r: usize, k: usize) -> (usize, usize) {
+        match self.slots.get(r).and_then(|s| s.get(k)) {
+            Some(Slot::Covered { row, col }) => (*row, *col),
+            _ => (r, k),
+        }
+    }
+}
+
+/// Draws a table as a grid of cells with lines around them and the header rows shaded. A
+/// merged cell is drawn across the cells it covers. What differs is highlighted in `words`:
+/// changed words, and whole cells the other page lacks. Only the rows in view are laid out.
+/// Returns whether a row's height changed, and how much taller the rows above the view were
+/// found.
 fn table(
     ui: &mut Ui,
     cache: &mut CommonMarkCache,
@@ -699,6 +739,36 @@ fn table(
         return (false, 0.0);
     }
     let [px, py] = CELL_PAD;
+    if layout.slots.len() != rows.len() {
+        let texts: Vec<Vec<&String>> = rows
+            .iter()
+            .map(|r| r.iter().map(|c| &c.0).collect())
+            .collect();
+        layout.slots = web_markdown::spans(&texts);
+        layout.reach = layout
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(r, line)| {
+                line.iter()
+                    .map(|s| match s {
+                        Slot::Anchor { rows, .. } => r + rows - 1,
+                        Slot::Covered { .. } => r,
+                    })
+                    .max()
+                    .unwrap_or(r)
+            })
+            .collect();
+        layout.natural.clear();
+    }
+    let slot = |layout: &TableLayout, r: usize, k: usize| {
+        layout
+            .slots
+            .get(r)
+            .and_then(|s| s.get(k))
+            .copied()
+            .unwrap_or(Slot::Anchor { cols: 1, rows: 1 })
+    };
     let fonts =
         [egui::TextStyle::Body, egui::TextStyle::Monospace].map(|s| s.resolve(ui.style()).size);
     if layout.fonts != fonts || layout.natural.len() != cols {
@@ -706,20 +776,40 @@ fn table(
         layout.natural = vec![0.0_f32; cols];
         let body = egui::TextStyle::Body.resolve(ui.style());
         let mono = egui::TextStyle::Monospace.resolve(ui.style());
+        let mut wide = Vec::new();
         ui.ctx().fonts_mut(|fonts| {
-            for row in rows {
+            for (r, row) in rows.iter().enumerate() {
                 for (k, (text, _)) in row.iter().enumerate() {
-                    let w = natural_width(fonts, &body, &mono, text);
-                    layout.natural[k] = layout.natural[k].max(w);
+                    match slot(layout, r, k) {
+                        Slot::Anchor { cols: 1, .. } => {
+                            let w = natural_width(fonts, &body, &mono, text);
+                            layout.natural[k] = layout.natural[k].max(w);
+                        }
+                        Slot::Anchor { cols: n, .. } => {
+                            wide.push((k, n, natural_width(fonts, &body, &mono, text)))
+                        }
+                        Slot::Covered { .. } => {}
+                    }
                 }
             }
         });
+        // A merged cell wider than the columns it covers widens them all alike.
+        for (k, n, w) in wide {
+            let end = (k + n).min(cols);
+            let have: f32 = layout.natural[k..end].iter().sum::<f32>()
+                + (end - k).saturating_sub(1) as f32 * 2.0 * px;
+            if w > have {
+                let more = (w - have) / (end - k) as f32;
+                layout.natural[k..end].iter_mut().for_each(|c| *c += more);
+            }
+        }
         layout.heights.clear();
     }
     let line_height = ui.text_style_height(&egui::TextStyle::Body);
     if layout.heights.len() != rows.len() {
         layout.heights = vec![line_height + 2.0 * py; rows.len()];
     }
+    let header = header_rows(&layout.slots);
     let widths = fit(
         &layout.natural,
         ui.available_width() - cols as f32 * 2.0 * px,
@@ -737,31 +827,63 @@ fn table(
     let mut ys = vec![origin.y];
     for (r, row) in rows.iter().enumerate() {
         let top = ys[r];
-        if top + layout.heights[r] < shown.min || top > shown.max {
+        // A row is laid out while it or a cell merged down from it is in view.
+        let reach = layout
+            .reach
+            .get(r)
+            .copied()
+            .unwrap_or(r)
+            .min(rows.len() - 1);
+        let extent: f32 = layout.heights[r..=reach].iter().sum();
+        if top + extent < shown.min || top > shown.max {
             ys.push(top + layout.heights[r]);
             continue;
         }
         let backs: Vec<_> = (0..cols).map(|_| ui.painter().add(Shape::Noop)).collect();
         let mut height = line_height;
         for (k, (text, cell)) in row.iter().enumerate() {
-            let rect =
-                Rect::from_min_size(pos2(xs[k] + px, top + py), vec2(widths[k], f32::INFINITY));
+            let Slot::Anchor {
+                cols: n,
+                rows: down,
+            } = slot(layout, r, k)
+            else {
+                continue;
+            };
+            let end = (k + n).min(cols);
+            let width = xs[end] - xs[k] - 2.0 * px;
+            let rect = Rect::from_min_size(pos2(xs[k] + px, top + py), vec2(width, f32::INFINITY));
             let mut c = ui.new_child(
                 UiBuilder::new()
                     .max_rect(rect)
                     .layout(Layout::top_down(Align::Min))
                     .id_salt(("cell", r, k)),
             );
-            c.set_clip_rect(
-                Rect::from_x_y_ranges(xs[k]..=xs[k + 1], clip.y_range()).intersect(clip),
-            );
-            c.set_width(widths[k]);
+            c.set_clip_rect(Rect::from_x_y_ranges(xs[k]..=xs[end], clip.y_range()).intersect(clip));
+            c.set_width(width);
             let marks = match cell {
                 Cell::Words(v) => v.as_slice(),
                 Cell::Whole => &[],
             };
             show_marked(&mut c, cache, id.with(("cell", r, k)), text, marks, words);
-            height = height.max(c.min_rect().height());
+            let tall = c.min_rect().height();
+            if down == 1 {
+                height = height.max(tall);
+            } else {
+                let was = layout.tall.insert((r, k), tall);
+                relaid |= was.is_none_or(|w| (w - tall).abs() > 0.5);
+            }
+        }
+        // The last row a merged cell covers is made tall enough for the cell's text.
+        for k in 0..cols {
+            let (ar, ak) = layout.owner(r, k);
+            if let (Slot::Anchor { rows: down, .. }, Some(&tall)) =
+                (slot(layout, ar, ak), layout.tall.get(&(ar, ak)))
+            {
+                if down > 1 && ar + down - 1 == r && ak == k {
+                    let above: f32 = layout.heights[ar..r].iter().sum();
+                    height = height.max(tall - above);
+                }
+            }
         }
         let bottom = top + height + 2.0 * py;
         if (bottom - top - layout.heights[r]).abs() > 0.5 {
@@ -772,12 +894,34 @@ fn table(
             relaid = true;
         }
         for (k, back) in backs.into_iter().enumerate() {
-            let fill = match row.get(k) {
-                Some((_, Cell::Whole)) => words,
-                _ if r == 0 => shade,
-                _ => continue,
+            let changed = match row.get(k).map(|c| &c.1) {
+                Some(Cell::Whole) => true,
+                Some(Cell::Words(v)) => !v.is_empty(),
+                None => false,
             };
-            let rect = Rect::from_x_y_ranges(xs[k]..=xs[k + 1], top..=bottom);
+            let (fill, rect) = match slot(layout, r, k) {
+                Slot::Anchor {
+                    cols: n,
+                    rows: down,
+                } => {
+                    let end = (k + n).min(cols);
+                    let last = (r + down).min(rows.len());
+                    let below: f32 = layout.heights[r + 1..last].iter().sum();
+                    let rect = Rect::from_x_y_ranges(xs[k]..=xs[end], top..=bottom + below);
+                    match row.get(k) {
+                        Some((_, Cell::Whole)) => (words, rect),
+                        _ if r < header => (shade, rect),
+                        _ => continue,
+                    }
+                }
+                // A covered cell of a row or column the other page lacks, or one merged on
+                // one page only, is highlighted where it is.
+                Slot::Covered { .. } if changed => (
+                    words,
+                    Rect::from_x_y_ranges(xs[k]..=xs[k + 1], top..=bottom),
+                ),
+                Slot::Covered { .. } => continue,
+            };
             ui.painter().set(back, Shape::rect_filled(rect, 0.0, fill));
         }
         ys.push(bottom);
@@ -786,16 +930,27 @@ fn table(
     let stroke = Stroke::new(1.0, color);
     let outer = Rect::from_x_y_ranges(xs[0]..=xs[cols], origin.y..=ys[ys.len() - 1]);
     let painter = ui.painter();
-    for &x in &xs[1..cols] {
-        painter.vline(x, outer.y_range(), stroke);
-    }
-    for (r, &y) in ys.iter().enumerate().take(ys.len() - 1).skip(1) {
-        if !shown.contains(y) {
+    // Lines between cells, except within a merged cell.
+    for r in 0..rows.len() {
+        let (top, bottom) = (ys[r], ys[r + 1]);
+        if bottom < shown.min || top > shown.max {
             continue;
         }
-        // The header row ends with a heavier line.
-        let width = if r == 1 { 2.0 } else { 1.0 };
-        painter.hline(outer.x_range(), y, Stroke::new(width, color));
+        for (k, &x) in xs.iter().enumerate().take(cols).skip(1) {
+            if layout.owner(r, k - 1) != layout.owner(r, k) {
+                painter.vline(x, top..=bottom, stroke);
+            }
+        }
+        if r == 0 {
+            continue;
+        }
+        // The header rows end with a heavier line.
+        let line = Stroke::new(if r == header { 2.0 } else { 1.0 }, color);
+        for k in 0..cols {
+            if layout.owner(r - 1, k) != layout.owner(r, k) {
+                painter.hline(xs[k]..=xs[k + 1], top, line);
+            }
+        }
     }
     painter.rect_stroke(outer, 2.0, stroke, StrokeKind::Inside);
     ui.advance_cursor_after_rect(outer);
@@ -1021,6 +1176,52 @@ mod tests {
         assert!(first > 0 && first < 100, "{first} rows laid out");
         // Drawn again, the rows in view keep their measured heights.
         assert_eq!(measured(), first);
+    }
+
+    #[test]
+    fn merged_cells_span_the_rows_and_columns_they_cover() {
+        let long = "word ".repeat(60);
+        let text = format!(
+            "| Area | Revenue | < |\n| --- | --- | --- |\n| ^ | Q2 | Q3 |\n\
+             | {long} | 1 | 2 |\n| ^ | 3 | 4 |\n| Total spanning the first two columns | < | 9 |"
+        );
+        let page = vec![Block { depth: 0, text }];
+        let opts = DiffOptions::default();
+        let mut v = MarkdownView::new(vec![page.clone(), page], Vec::new(), &opts);
+        let ctx = egui::Context::default();
+        let c = crate::ui::theme::colors(false);
+        let mut frame = || {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(900.0, 800.0))),
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| v.ui(ui, &c, false))
+                .textures_delta
+                .clear();
+            let t = &v.tables[&(0, 0)];
+            (t.heights.clone(), t.tall.clone(), t.natural.clone())
+        };
+        let mut last = frame();
+        for _ in 0..4 {
+            let next = frame();
+            if next.0 == last.0 {
+                break;
+            }
+            last = next;
+        }
+        let (heights, tall, natural) = frame();
+        // Laid out again, nothing moves.
+        assert_eq!(heights, last.0);
+        // The long merged cell is taller than one row, and its two rows make room for it.
+        let need = tall[&(2, 0)];
+        assert!(need > heights[2], "{need} {heights:?}");
+        assert!(heights[2] + heights[3] >= need + 2.0 * CELL_PAD[1] - 0.5);
+        // The second row is a header row too, since a header cell reaches down into it.
+        let t = &v.tables[&(0, 0)];
+        assert_eq!(header_rows(&t.slots), 2);
+        assert_eq!(t.owner(1, 0), (0, 0));
+        assert_eq!(t.owner(4, 1), (4, 0));
+        assert_eq!(natural.len(), 3);
     }
 
     #[test]

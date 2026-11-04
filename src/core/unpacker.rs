@@ -242,7 +242,17 @@ pub fn load_doc(
             (bytes, crate::i18n::tr("label.unpacked"))
         }
         Some(Converter::BuiltIn(kind)) => {
-            (kind.read(path)?.into_bytes(), crate::i18n::tr(kind.label()))
+            // A reader is given what anyone sends it, so a mistake in one fails the file
+            // rather than the window or the scan that asked for it.
+            let read =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kind.read(path, cancel)))
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!(crate::i18n::trf(
+                            "msg.cannot_extract",
+                            &[("file", path.display().to_string())],
+                        )))
+                    });
+            (read?.into_bytes(), crate::i18n::tr(kind.label()))
         }
         None => return super::text::load_doc(path, None),
     };
@@ -292,6 +302,14 @@ impl Converter<'_> {
         match self {
             Converter::Command(u) => u.command.clone(),
             Converter::BuiltIn(kind) => format!("{kind:?}"),
+        }
+    }
+
+    /// Whether files this converter reads are the same when their text is.
+    pub fn compares_by_text(&self) -> bool {
+        match self {
+            Converter::Command(_) => true,
+            Converter::BuiltIn(kind) => kind.compares_by_text(),
         }
     }
 }

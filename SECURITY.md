@@ -21,15 +21,10 @@ following as **untrusted** and handles them without running anything they contai
 - **Archives** (zip, tar, 7z) are extracted to a private temporary folder. Entries that would land
   outside it are skipped, and so are links that point outside the archive. An archive that
   unpacks to more than 8 GB or 500,000 files is refused. Extracted sides are read-only.
-- **Web pages.** The screenshot modes hand the pages to a Chromium-based browser: it runs their
-  scripts, headless, in a fresh profile that is deleted afterwards, with extensions and sync off.
-  What such a page may load is up to the browser's own security, not the limits below.
-  OxideMerge talks to the browser over a private pipe on macOS and Linux; on Windows, over a port
-  on `127.0.0.1` that is open only while the pages load, which other programs on the same
-  computer could reach meanwhile. The other modes use pages OxideMerge downloads itself, which
-  run no scripts. Such a web page may not load local files, and only a page on this computer or a
-  private network may load resources from one or redirect to one. Responses are limited in size,
-  count and time (see the user guide); the size counts what a compressed response unpacks to.
+- **Web pages.** OxideMerge downloads the pages itself and never hands them to a browser, so
+  their scripts never run. Such a web page may not load local files, and only a page on this
+  computer or a private network may load resources from one or redirect to one. Responses are
+  limited in size, count and time (see the user guide); the size counts what a compressed response unpacks to.
   Resource tree downloads are written only inside the folder you chose, whatever the addresses
   contain. A local page may load files from this computer, but not from another one
   (`file://host/share`).
@@ -56,14 +51,13 @@ The following are **trusted**, because they configure what OxideMerge runs:
 - **Project files** (`.oxmproj`, `.winmerge`) only name paths and compare options; they can't
   name commands.
 
-OxideMerge also starts `git` for Git revisions and conflict files, the browser for web pages,
-and the system's file opener when you choose *Open with associated application* or *Show in file
-manager*. On Windows files are opened through the shell's file associations, and Explorer gets
-the path to show in quotes; neither goes through `cmd`.
+OxideMerge also starts `git` for Git revisions and conflict files, and the system's file opener
+when you choose *Open with associated application* or *Show in file manager*. On Windows files
+are opened through the shell's file associations, and Explorer gets the path to show in quotes; neither goes through `cmd`.
 
 OxideMerge has no application telemetry. Its own downloads are for the web addresses you
-compare and the resources those pages name. The browser, Git LFS, configured Git filters and
-unpacker commands can also access the network under their own configuration.
+compare and the resources those pages name. Git LFS, configured Git filters and unpacker commands
+can also access the network under their own configuration.
 
 ## Dependencies
 

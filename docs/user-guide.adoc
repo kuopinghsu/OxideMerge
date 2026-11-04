@@ -291,13 +291,15 @@ You can copy regions that are different from one image to the other.
 You can copy, delete and merge items, and open each file in its own comparison.
 
 |Web page
-|Two or three web pages: as visible text, as formatted Markdown, as screenshots, as HTML source or
-as downloaded resources.
+|Two or three web pages: as visible text, as formatted Markdown, as HTML source or as downloaded
+resources.
 Web pages are read-only. OxideMerge never saves anything to a web server.
 |===
 
 Documents, spreadsheets and programs are compared as the text OxideMerge reads from them, which
-is a text or table comparison of what was read rather than a type of its own; see <<documents>>.
+is a text or table comparison of what was read rather than a type of its own. Word documents,
+workbooks and tagged PDF files can also be shown *Formatted*, with their headings, lists and
+tables; see <<documents>>.
 
 When *Compare as* is *Automatic*, OxideMerge checks these conditions in this order and uses the
 first one that matches:
@@ -310,7 +312,8 @@ first one that matches:
 . Every side is a folder: folder comparison.
 . Every file is one OxideMerge reads as text — a document, a spreadsheet or an ELF program (see
   <<documents>>) — or an unpacker plugin converts it (see <<unpackers>>): text comparison of what
-  was read, read-only. A spreadsheet opens as a table comparison.
+  was read, read-only. A spreadsheet of one sheet that OxideMerge reads itself opens as a table
+  comparison.
   This comes before the archive and binary rules, so `.docx`, `.xlsx` and `.odt` open as their
   text rather than as the zip archives they are. Turning off *Read documents, spreadsheets and
   ELF files as text* in *Options → Plugins* leaves them to the rules below.
@@ -406,7 +409,8 @@ The +/− numbers next to the difference number are the numbers of added and rem
 
 The location pane, at the right, shows an overview of the whole file.
 Click in it to go to that place.
-Binary comparisons and the Formatted mode of web page comparisons have a location pane too.
+Binary comparisons, the Formatted mode of web page comparisons and the Formatted view of
+documents have a location pane too.
 
 === Moving between differences
 
@@ -480,6 +484,9 @@ Before you copy, check which pane is active and which way the arrow points.
 * kbd:[Alt+→] and kbd:[Alt+←] copy the current difference, or the selected lines, to the right or
   to the left.
 * kbd:[Ctrl+Alt+→] and kbd:[Ctrl+Alt+←] copy all differences to the right or to the left.
+* In a three-way comparison, the toolbar's *Merge* group copies the current difference, or all
+  differences, from the left or from the right into the middle. Right-click a difference to copy
+  it from the left or the right to the middle, or from the middle to the left or the right.
 * kbd:[Ctrl+Z] undoes a change. kbd:[Ctrl+Y] or kbd:[Ctrl+Shift+Z] redoes it.
 
 === Saving files
@@ -1198,23 +1205,35 @@ Some files are not text but hold text. OxideMerge reads these itself, with nothi
 |Files |What is compared
 
 |`.pdf`
-|The text of each page, in the order it is drawn, with a blank line between pages. The
-characters come from the `ToUnicode` table the file carries for its fonts, or from the encoding
-the font names. An encrypted file is reported rather than read.
+|The text of each page, in the order it is drawn, with a blank line between pages, including
+the text of forms a page draws. The characters come from the `ToUnicode` table the file carries
+for its fonts, or from the encoding the font names. An encrypted file is reported rather than
+read. When part of a file cannot be read — a stream in a compression OxideMerge does not read, or
+a font with no table of the characters its glyphs stand for — a line at the end says the text is
+incomplete and why; a file none of whose text can be read is reported.
 
 |`.docx`, `.odt`, `.rtf`
 |The words of the document, a line to a paragraph or heading. The cells of a table are separated
-by tabs, a row to a line.
+by tabs, a row to a line. Words shown as deleted and the codes of fields are left out.
 
 |`.xlsx`, `.xlsm`, `.ods`
-|Every sheet, a line to a row and its cells separated by commas, which opens as a
-<<table-compare,table compare>>: columns, sorting and *Match rows by → Key columns* all apply.
-A workbook of more than one sheet names each one before its rows.
+|Every sheet, a line to a row and its cells separated by commas. Empty rows between rows are
+kept, so rows keep their places; empty rows after the last one are not. A workbook of one sheet
+opens as a <<table-compare,table compare>>: columns, sorting and *Match rows by → Key columns*
+all apply. A workbook of more than one sheet names each one before its rows and is compared as
+text, since its sheets are not one table.
 
 |ELF programs, shared objects and object files
 |The header — class, byte order, kind, machine, ABI, entry point and the counts of the
-headers — and then the section table, a line to a section with its name, type, address, offset,
-size, alignment and flags. Two builds of the same program line up section by section.
+headers — then the program headers, a line to a segment with its type, offset, virtual and
+physical address, sizes in the file and in memory, alignment and `R`, `W`, `E` flags (and the
+interpreter a dynamically linked program asks for), then the section table, a line to a section
+with its name, type, address, offset, size, alignment and flags. Last come the symbols of each
+symbol table (`.symtab`, `.dynsym`), sorted by name, a line to a symbol with its address, size,
+type, binding, visibility and section (`UND` when it is undefined, `ABS` for an absolute value).
+So two builds line up function by function: a function that grew or moved shows as a changed
+line. The mapping symbols ARM and RISC-V assemblers add (`$x`, `$d`, …) are left out and only
+counted, and at most 100,000 symbols of a table are listed.
 |===
 
 A file read this way is *read-only*: the pane says what was read (for example
@@ -1222,20 +1241,65 @@ A file read this way is *read-only*: the pane says what was read (for example
 text is a reading of the file, not a copy of it, so the layout, fonts, formulas and anything else
 the format holds are not compared.
 
+Two or three `.docx` files can also be compared *Formatted*: choose it above the panes. The
+documents are shown as Markdown, block by block side by side: headings, paragraphs with their
+bold, slanted and struck-through words, list items, links and tables, each block that differs
+highlighted with its changed words. Tables are drawn as tables, with merged cells drawn across
+the rows and columns they cover; a row added inside a merged cell is highlighted where it is,
+and the rows a header cell reaches down into are part of the header. An image is shown as its
+description with a short fingerprint of its picture, so a changed picture shows as a change
+even when its description is the same. *Next difference* and *Previous difference* step through
+the changed blocks. Like the text, the Formatted view leaves out headers, footers, notes and
+comments, and shows tracked changes accepted.
+
+Workbooks (`.xlsx`, `.xlsm`) can be compared *Formatted* too, whether they have one sheet or
+several. Each sheet is a heading and a table, and sheets are lined up by name, so a sheet added
+or removed shows as one. Merged cells are drawn across the cells they cover. Numbers are shown in
+their number formats: dates and times in ISO form (`2026-09-30 18:00`) whatever order the format
+puts them in, and amounts with their decimals, thousands separators, currency and percent signs.
+A formula shows the result it was saved with. A run of three or more empty rows is shown as one
+row saying how many there are, so a value that moved down a row still shows as a change. Each
+picture placed on a sheet is listed after its table with its description, the cell it is placed
+at and a fingerprint of the picture, so a changed or moved picture shows as a change. Fills,
+fonts, borders, the formulas themselves and charts drawn from data are not compared.
+
+A tagged PDF file can be compared *Formatted* as well. Most word processors tag the PDFs they
+export, saying which text is a heading, a paragraph, a list item, a table cell or a figure, and
+which cells span several rows or columns; the view is read from those tags, so a PDF made from a
+document reads much as the document itself does. Text in a bold or slanted font keeps that
+format, unless a whole paragraph or heading is in it, as its style shows it. A figure is shown
+with its alternate text and a fingerprint of its picture. Running headers, footers and page
+numbers are left out, as the file marks them as artifacts. A PDF that is not tagged, such as a
+scan or one from a program that does not tag, says so instead; compare it as text.
+
+The *Text* / *Formatted* switch appears above the panes when every side is a `.docx` file, every
+side a workbook (`.xlsx`, `.xlsm`) or every side a `.pdf` file, read by OxideMerge itself. It is
+not offered for `.odt`, `.rtf` or `.ods` files. The Formatted view reads the files itself even
+when a converter under *Options → Plugins* is set up for them. Whether a block differs depends
+on its text alone; the comparison options decide only which words of a changed block are
+highlighted. The view is made again when a file or an option changes. While it is shown, the
+difference counter on the toolbar still counts the differences of the text comparison; *Next difference* and *Previous difference* step
+through the changed blocks of the Formatted view.
+
 Some limits and rules:
 
 * A PDF or RTF file can be at most 256 MiB, since it is read whole. A larger one is reported
   rather than read.
 * Each part of a `.docx`, `.odt`, `.xlsx` or `.ods` file can be at most 64 MiB. A file with a
   larger part, or a part that cannot be read, is reported rather than compared without it.
-* An ELF file can be any size: only its header and section table are read.
+* An ELF file can be any size: only its headers, section table and symbol tables are read, each
+  at most 64 MiB. Since two different builds can still read the same, a folder comparison by
+  *Full contents* compares programs by their bytes.
+* A PDF file can ask for at most 1 GiB of decoded content in all; a file that needs more is
+  reported rather than read.
 * The text read from one file can be at most 16 MiB. The rest is left out, and a line at the end
   says so.
 * A workbook none of whose listed sheets can be found in the file is reported rather than
   compared as empty.
 
 A converter under *Options → Plugins* is used in preference to this, so a better reader can
-always be put in front — `pdftotext` for PDF, or Pandoc or Tika for more formats. Turning
+always be put in front — `pdftotext` for PDF, or Pandoc or Tika for more formats. What a
+converter writes is compared as text, even for a spreadsheet. Turning
 *Read documents, spreadsheets and ELF files as text* off there compares these files as the
 archive or the bytes they are instead.
 
@@ -1273,7 +1337,7 @@ Bytes that are different are highlighted, and the sides scroll together.
 * You can copy differences to the other side and save them, as in a text comparison.
 
 To change the number of bytes on each line, use *Bytes per line (binary)* in
-*Options → Image / Binary / Web*.
+*Options → Image / Binary*.
 
 === Editing bytes
 
@@ -1358,14 +1422,6 @@ Changed words are highlighted, and the comparison options, filters and reports a
 |The default mode. Each page is converted to Markdown and shown formatted, side by side.
 See <<web-formatted>>.
 
-|Full page
-|A screenshot of each whole page, from top to bottom, in the image view.
-See <<web-screenshots>>.
-
-|Screenshot (visible area)
-|A screenshot of the top of each page only.
-The size is the screenshot width and height in the options.
-
 |HTML source
 |The HTML of each page, in the text comparison.
 Long minified lines are split between tags.
@@ -1401,6 +1457,8 @@ A block is a heading, a paragraph, a list item, a table, a quote or a code block
 * Tables have lines around their cells, and their rows are aligned.
   In a row that is different, the changed words are highlighted.
   If a row or a column is missing on the other page, its cells are highlighted completely.
+* A cell that spans rows or columns (`rowspan`, `colspan`) is drawn across the cells it covers,
+  so the other cells of its rows stay in their columns.
 * Each changed block is a separate difference, even when it follows another changed block.
 
 To move between differences, use the buttons above the pages, or the same keys as in the text
@@ -1419,49 +1477,15 @@ The current difference is in the accent color, and the visible part of the page 
 Click or drag in the location pane to go to that place.
 To show or hide it, choose *View → Text compare → Location pane*.
 
-[[web-screenshots]]
-=== The screenshot modes
-
-The Full page and Screenshot (visible area) modes show screenshots in the image view.
-
-When *Highlight differences* is on, OxideMerge highlights the text that is different on the page
-itself, before it takes the screenshot:
-
-* Changed blocks are yellow.
-* Changed words inside them are orange.
-
-This is like *View Differences* in WinMerge.
-Because OxideMerge compares the text, not the pixels, a change that moves the rest of the page down
-does not mark everything below it.
-Pages that are taller than 16384 pixels are cut.
-
 === How pages are loaded
 
-The Text, HTML source, Formatted and Resource tree modes use the HTML as the server sends it, or as
-the file is saved.
-They do not need a browser, so they open quickly.
+Every mode uses the HTML as the server sends it, or as the file is saved.
+OxideMerge does not open the pages in a browser, so they open quickly.
 The scripts of the page do not run, so content that scripts add is missing.
-To see that content, use a screenshot mode.
 
 The Text and Formatted modes leave out content that the page hides: elements with `hidden`,
 `aria-hidden="true"`, or an inline `display: none` or `visibility: hidden` style.
 Content that only a style sheet hides is still compared.
-
-The screenshot modes use a Chromium-based browser. OxideMerge finds Edge, Chrome, Chromium and
-Brave automatically.
-The browser runs without a window.
-It runs the scripts of each page, so the screenshots show each page as it looks in a browser.
-
-* All pages load at the same time, each in its own browser tab.
-* After 45 seconds, OxideMerge uses each page as it is at that moment.
-* Dialogs that a page opens, such as `alert`, are closed automatically.
-* If a page redirects after it loads, OxideMerge uses the page that it redirects to.
-* On macOS and Linux, OxideMerge talks to the browser through a private pipe.
-  On Windows, it uses a network port that only this computer can reach.
-  The port is open only while the pages load.
-* If the browser cannot load a page (the page cannot be reached, does not load in time, or its tab
-  crashes), that page is blank and its pane header shows the error.
-  The other pages are still compared.
 
 OxideMerge decodes pages the same way as browsers.
 It uses the first of these that it finds: a byte order mark, the charset in the HTTP
@@ -1486,25 +1510,16 @@ It does not follow links inside style sheets or scripts.
   Other resources of this kind are skipped and counted in the status bar.
 * The addresses that you enter yourself are always loaded.
 
-These limits do not apply to the screenshot modes: the browser loads everything that a page asks
-for.
-
-=== Web page settings
-
-These settings are in *Options → Image / Binary / Web*:
-
-* *Browser used to render pages*: the browser for the screenshot modes.
-  Leave it empty to find a supported browser automatically.
-* *Screenshot width* and *Screenshot height*: the size of the browser window.
+=== Comparing web pages in the console
 
 The console comparison (`--cli` with HTML files, or with `-t web`) uses the last mode that you
-chose in the window. It does not use a browser:
+chose in the window:
 
 * Formatted (the default) compares the Markdown of the pages line by line.
 * HTML source compares the HTML.
 * The other modes compare the visible text.
 
-NOTE: Only the screenshot modes run the scripts of the page.
+NOTE: No mode runs the scripts of the page.
 Logins are not supported, so a page that needs a login can show its login page.
 No mode saves changes to a web server.
 
@@ -2704,6 +2719,9 @@ Analysis options cannot be combined with `-o`, `--patch`, `--git-rev`, `--slides
 |`--compare-to <PATH>`
 |Compare a path with the remembered left side (and middle side).
 
+|`-h`, `--help`
+|List the options. `-h` gives a short summary.
+
 |`-V`, `--version`
 |Print the version.
 |===
@@ -2917,9 +2935,8 @@ comments do not count, as in <<semantic>>, and TOML and YAML numbers compare by 
 still shows its text differences;
 choose *Semantic* to see that the structure is the same. Folder synchronization still copies a
 file whose contents differ.
-Image / Binary / Web::
-*Bytes per line (binary)*, *Browser used to render pages*, *Screenshot width* and
-*Screenshot height*. The screenshot size is the size of the browser window.
+Image / Binary::
+*Color distance threshold*, *Block size* and *Bytes per line (binary)*.
 Plugins::
 The unpacker plugins (see <<unpackers>>).
 
@@ -3135,14 +3152,9 @@ Refresh the comparison and review the merge plan again.
 
 === Web pages
 
-A screenshot mode reports that no browser was found::
-The screenshot modes need Edge, Chrome, Chromium or Brave.
-Set the browser in *Options → Image / Binary / Web*.
-
-A web comparison is missing content that the browser shows::
-The Text, HTML source, Formatted and Resource tree modes use the HTML from the server, without the
-content that scripts add.
-Use a screenshot mode to see that content.
+A web comparison is missing content that a browser shows::
+OxideMerge compares the HTML from the server, without the content that scripts add.
+It does not open pages in a browser, so the scripts of the page never run.
 Content inside frames is not included.
 The status bar counts the resources that could not be downloaded, and the resources that were
 skipped because they are on this computer or on a private network.
@@ -3174,8 +3186,7 @@ content (see <<compare-methods>>).
 * Unpacker plugins use external commands. WinMerge plugin DLLs and scripts are not supported.
 * Web page comparison does not support cookies or logins. A page that needs a login shows its login
   page.
-  Only the screenshot modes run page scripts. In the other modes, content that scripts add is
-  missing.
+  Page scripts do not run, so content that scripts add is missing.
   Content inside frames is not compared.
 * Semantic comparison copies one value at a time, and only when the edit can be confirmed by
   reading the file again. It does not move array elements or merge all changes at once.

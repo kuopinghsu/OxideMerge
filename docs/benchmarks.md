@@ -1,22 +1,27 @@
 # Benchmarks
 
-The benchmarks time the compare engines on generated inputs. They don't run the window, so they
-measure the work behind it: loading, comparing and merging. Run them on an idle machine:
+The benchmarks time the compare engines on generated inputs. Most of them don't run the window,
+so they measure the work behind it: loading, comparing and merging. Two use a view as well:
+**xml-tree-view-12k** draws the XML Tree view off screen, and **folder-navigation-20k** steps
+through the folder compare's view without drawing it. Run them on an idle machine:
 
 ```sh
 cargo test --release --bin oxidemerge bench -- --ignored --nocapture --test-threads 1
 ```
 
 The inputs are made once into `target/bench-data`: about 1 GB on disk, 1.3 GB with
-`OXIDEMERGE_BENCH_LARGE=1` and 3.2 GB with `=2`; `=3` adds about 2 GB for the 1 GB text pair. Each workload then runs three times, each in a process of its own; the median time and
-the highest peak memory are reported and written to `target/bench/results.md`, with the machine,
+`OXIDEMERGE_BENCH_LARGE=1` and about 14 GB with `=2`, of which 10 GiB are the five 2 GiB files
+of sync-apply-large. That workload also needs about 10 GiB more free space while it runs, for
+its working copy, the new and replacement files and the journal. `=3` adds about 2 GB for the
+1 GB text pair. Each workload then runs three times, each in a process of its own; the median
+time and the highest peak memory are reported and written to `target/bench/results.md`, with the machine,
 the commit and the build. Peak memory is measured with `/usr/bin/time`, so it is missing on
 Windows. The files are read from the system's file cache after the first run, so the times
 don't include disk reads.
 
 | Variable | Effect |
 | --- | --- |
-| `OXIDEMERGE_BENCH_LARGE=1` | Adds the 100 MB text and binary compares; `=2` also a 1 GB binary compare; `=3` also two 1 GB text inputs |
+| `OXIDEMERGE_BENCH_LARGE=1` | Adds the 100 MB text and binary compares; `=2` also a 1 GB binary compare and the synchronization of 2 GB files; `=3` also two 1 GB text inputs |
 | `OXIDEMERGE_BENCH_ONLY=text,folder` | Runs only the workloads whose names contain one of these |
 | `OXIDEMERGE_BENCH_RUNS=5` | Number of runs per workload (default 3) |
 | `OXIDEMERGE_BENCH_SAVE=base.txt` | Saves the times as a baseline |
@@ -74,7 +79,7 @@ so CI reports the numbers without failing on them.
 - **sync-preview-20k**: the folders of folder-small-files compared, then a mirror plan made from
   the result. The plan reads every file it would touch, and every file on both sides whose size or
   time differs, to fingerprint it; "plan" is the time of that step alone.
-- **sync-apply-large** (`OXIDEMERGE_BENCH_LARGE=2`): three random 2 GB files mirrored into a
+- **sync-apply-large** (`OXIDEMERGE_BENCH_LARGE=2`): three random 2 GiB files mirrored into a
   copy of a folder that has one of them equal, one changed in its last byte and one missing. The
   time covers the scan, the plan and the apply, which fingerprints, copies through a verified
   temporary file, keeps the replaced file in the journal and checks the result.

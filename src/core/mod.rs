@@ -2,7 +2,6 @@ pub mod archive;
 #[cfg(test)]
 mod bench;
 pub mod binary;
-pub mod cdp;
 pub mod comments;
 pub mod conflict;
 pub mod diff;
@@ -32,7 +31,6 @@ pub mod text;
 pub mod unpacker;
 pub mod web;
 pub mod web_markdown;
-pub mod web_render;
 pub mod xml_report;
 
 pub mod analysis;

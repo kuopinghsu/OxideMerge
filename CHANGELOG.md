@@ -32,12 +32,35 @@ section of this file as the release notes.
   Word (`.docx`), OpenDocument text (`.odt`) and Rich Text (`.rtf`) are compared as the words of
   the document, with the cells of a table separated by tabs; Excel (`.xlsx`, `.xlsm`) and
   OpenDocument spreadsheets (`.ods`) as their sheets, which opens as a **table compare** with
-  the columns and the key matching it offers; and ELF programs, shared objects and object files
-  as their header and section table, so two builds line up section by section. The file itself
+  the columns and the key matching it offers (a workbook of several sheets is compared as text);
+  and ELF programs, shared objects and object files as their header, program headers (type,
+  offset, addresses, file and memory sizes, alignment, `RWE` flags and the interpreter), section
+  table and the symbols of `.symtab` and `.dynsym` sorted by name, with address, size, type,
+  binding, visibility and section, so two builds line up function by function. Assembler mapping
+  symbols (`$x`, `$d`, …) are left out, and at most 100,000 symbols a table are listed. A folder
+  compare by contents still compares programs by their bytes. Text a PDF draws through forms is read too, and a PDF whose streams or fonts cannot all
+  be read ends with a line saying the text is incomplete. The file itself
   is never written back: a compare read this way is read-only, and the pane says what was read.
   A converter under *Options → Plugins* is used in preference, so a better one can always be put
   in front, and *Read documents, spreadsheets and ELF files as text* there turns this off to
   compare such files as the archive or the bytes they are.
+- **Formatted documents:** *Formatted*, beside *Text* above the panes, shows two or three Word
+  documents, Excel workbooks (`.xlsx`, `.xlsm`) or tagged PDF files as formatted Markdown, block
+  by block side by side, each changed block highlighted with its changed words. Headings,
+  paragraphs with their bold, slanted and struck-through words, numbered and nested lists, and
+  links keep their form. Tables are drawn as tables, with merged cells spanning the rows and
+  columns they cover, so a row added inside a merged cell shows where it is. Each sheet of a
+  workbook is a heading and a table, its dates, amounts and percentages shown as their number
+  formats show them, runs of empty rows shown as one, and the pictures placed on it listed with
+  their cells. An image or figure is shown with its description and a fingerprint of its
+  picture, so a changed picture shows as a change. A PDF is read from the tags that most word
+  processors write, which name its headings, lists, tables and cell spans; its running headers
+  and page numbers are left out, and an untagged PDF says so. Next and previous difference step
+  through the changed blocks. Fills, fonts, borders, formulas and charts are not compared.
+  Samples: `samples/*/docs`.
+- **Merged cells in web pages:** the Formatted web mode draws a table cell that spans rows or
+  columns (`rowspan`, `colspan`) across the cells it covers, instead of shifting the cells after it
+  into the wrong columns. Sample: `samples/*/web/handbook.html`.
 - **Italian** interface language (`--lang it`, or *Italiano* in *Options → General*).
 - A toolbar button in folder compares, and `Alt+P`, show or hide the *File compare below the folder
   list*.
@@ -140,13 +163,15 @@ section of this file as the release notes.
   taken again from the current version, and new ones show the *Select files or folders* dialog,
   the file compare below the folder list, the inline view, the CSV table view, the Formatted web
   mode, merge verification, semantic comparison, the review workspace and the release summary.
-- **Only the screenshot web modes use a browser:** the Formatted, Text and HTML source modes
-  convert the HTML as downloaded, in the window and with `--cli`, so `samples/web/left.html`
-  against `right.html` opens in a few milliseconds instead of about 2 seconds (starting the
-  browser and letting each page settle). Content that a page's scripts add is now only in the
-  screenshots. The Text mode leaves out hidden elements, as the Formatted mode does, and no
-  longer includes the page title. The *Render pages in the browser for text and HTML* option is
-  removed.
+- **Web compare no longer uses a browser:** the Full page and Screenshot (visible area) modes are
+  removed, with the Edge, Chrome, Chromium or Brave they started headless and the *Browser used to
+  render pages*, *Screenshot width* and *Screenshot height* options (the options tab is now
+  *Image / Binary*). The Formatted, Text, HTML source and Resource tree modes convert the HTML as
+  downloaded, in the window and with `--cli`, so `samples/web/left.html` against `right.html`
+  opens in a few milliseconds instead of about 2 seconds. Page scripts never run, so content they
+  add is not compared. Settings saved with a screenshot mode open web pages in Formatted. The Text
+  mode leaves out hidden elements, as the Formatted mode does, and no longer includes the page
+  title. The *Render pages in the browser for text and HTML* option is removed.
 - **Formatted web compare is faster:** a large table lays out only the rows in view, and measures
   its column widths once, so scrolling a page with a table of 1,500 rows takes about 2 ms a frame
   instead of 35 ms. The pages are converted, lined up and compared on the loading thread, so

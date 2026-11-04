@@ -1,18 +1,15 @@
-//! Web page compare: loads pages in the background, then shows them as screenshots of the visible
-//! area or the whole page with text differences highlighted (image view), text or HTML (text
-//! view), Markdown shown formatted, or a downloaded resource tree (folder view). Only the
-//! screenshots need a browser; the other modes convert the pages as downloaded.
+//! Web page compare: loads pages in the background, then shows them as text or HTML (text view),
+//! Markdown shown formatted, or a downloaded resource tree (folder view). Every mode converts the
+//! pages as downloaded; nothing renders them in a browser.
 
 use crate::config::Config;
 use crate::core::filter::FltFilter;
 use crate::core::text::TextDoc;
 use crate::core::web::{self, Page, Progress, WebMode};
 use crate::core::web_markdown;
-use crate::core::web_render::{self, Capture, RenderOptions, Rendered};
 use crate::i18n::{tr, trf};
 use crate::ui::app::Content;
 use crate::ui::folder_view::FolderView;
-use crate::ui::image_view::ImageView;
 use crate::ui::markdown_view::{MarkdownView, Prepared};
 use crate::ui::text_view::TextView;
 use crate::ui::widgets::{self, Icon, Outcome};
@@ -27,8 +24,6 @@ use url::Url;
 enum Loaded {
     /// Pages downloaded for the text and HTML modes, with the text shown of each.
     Pages(Arc<Vec<Page>>, Vec<String>),
-    /// Pages rendered by the browser, with their screenshots saved in the folder.
-    Rendered(Vec<Rendered>, tempfile::TempDir, Vec<PathBuf>),
     Tree(Arc<Vec<Page>>, Vec<tempfile::TempDir>, web::TreeOutcome),
     /// Pages downloaded for the formatted mode, already lined up and compared.
     Formatted(Arc<Vec<Page>>, Box<Prepared>),
@@ -46,14 +41,11 @@ pub struct WebView {
     /// Pages fetched for the formatted, HTML, text and resource modes, reused when switching
     /// between them.
     pages: Option<Arc<Vec<Page>>>,
-    /// Whether screenshots show text differences highlighted.
-    pub highlight: bool,
     pub inner: Option<Box<Content>>,
     /// The pages as Markdown, shown formatted instead of an inner view.
     pub formatted: Option<MarkdownView>,
     job: Option<Job>,
     error: Option<String>,
-    shots: Option<tempfile::TempDir>,
     note: String,
     /// Whether the pages open at their first difference (or the last) once loaded, when
     /// stepped to from another file.
@@ -92,17 +84,6 @@ fn url_label(u: &Url) -> String {
     }
 }
 
-fn rendered_label(r: &Rendered, asked: &Url) -> String {
-    let url = url_label(r.url.as_ref().unwrap_or(asked));
-    if let Some(e) = &r.error {
-        format!("{url}  ({}: {e})", tr("status.error"))
-    } else if (200..300).contains(&r.status) {
-        url
-    } else {
-        format!("{url}  (HTTP {})", r.status)
-    }
-}
-
 fn label(p: &Page) -> String {
     let url = url_label(&p.url);
     if (200..300).contains(&p.status) {
@@ -118,12 +99,10 @@ impl WebView {
             urls,
             mode: cfg.web_mode,
             pages: None,
-            highlight: cfg.web_highlight,
             inner: None,
             formatted: None,
             job: None,
             error: None,
-            shots: None,
             note: String::new(),
             land: None,
         };
@@ -154,7 +133,6 @@ impl WebView {
         }
         self.inner = None;
         self.formatted = None;
-        self.shots = None;
         self.error = None;
         self.note.clear();
         let (tx, rx) = channel();
@@ -168,11 +146,9 @@ impl WebView {
                 None => web::fetch_pages(&urls, &fetching.abort).map(Arc::new),
             }
         };
-        let (w, h) = (cfg.web_width, cfg.web_height);
-        let render_urls = self.urls.clone();
         match self.mode {
             WebMode::Markdown => {
-                // The downloaded HTML as Markdown: no browser is needed.
+                // The downloaded HTML as Markdown.
                 let opts = cfg.comparison_options();
                 std::thread::spawn(move || {
                     let r = pages().map(|pages| {
@@ -192,37 +168,6 @@ impl WebView {
                         let texts = pages.iter().map(|p| web::page_text(p, mode)).collect();
                         Loaded::Pages(pages, texts)
                     });
-                    let _ = tx.send(r);
-                });
-            }
-            WebMode::Screenshot | WebMode::FullScreenshot => {
-                let Some(exe) = web::find_browser(&cfg.web_browser) else {
-                    self.error = Some(tr("web.no_browser").into());
-                    return;
-                };
-                let opts = RenderOptions {
-                    width: w,
-                    height: h,
-                    capture: if self.mode == WebMode::FullScreenshot {
-                        Capture::FullPage
-                    } else {
-                        Capture::Viewport
-                    },
-                    highlight: self.highlight,
-                };
-                let pr = progress.clone();
-                std::thread::spawn(move || {
-                    let r = (|| {
-                        let mut rendered = web_render::render(&exe, &render_urls, &opts, &pr)?;
-                        let dir = tempfile::tempdir()?;
-                        let mut paths = Vec::new();
-                        for (i, r) in rendered.iter_mut().enumerate() {
-                            let p = dir.path().join(format!("{i}.png"));
-                            std::fs::write(&p, r.shot.take().unwrap_or_default())?;
-                            paths.push(p);
-                        }
-                        Ok(Loaded::Rendered(rendered, dir, paths))
-                    })();
                     let _ = tx.send(r);
                 });
             }
@@ -294,32 +239,6 @@ impl WebView {
                 self.pages = Some(pages);
                 Content::Text(TextView::new(docs, cfg))
             }
-            Loaded::Rendered(rendered, dir, paths) => {
-                let mut v = ImageView::load(paths, cfg)?;
-                v.descriptions = rendered
-                    .iter()
-                    .zip(&self.urls)
-                    .map(|(r, u)| Some(rendered_label(r, u)))
-                    .collect();
-                let mut notes = Vec::new();
-                if self.highlight && rendered.len() > 1 {
-                    // The text highlights show what changed; pixel blocks would mostly repeat
-                    // them, and mark everything below a change that moved the page down.
-                    v.show_blocks = false;
-                    let marked: Vec<String> =
-                        rendered.iter().map(|r| r.marked.to_string()).collect();
-                    notes.push(trf("web.marked", &[("n", marked.join(" / "))]));
-                }
-                if rendered.iter().any(|r| r.cut) {
-                    notes.push(trf(
-                        "web.cut",
-                        &[("n", web_render::MAX_SHOT_HEIGHT.to_string())],
-                    ));
-                }
-                self.note = notes.join(" · ");
-                self.shots = Some(dir);
-                Content::Image(v)
-            }
             Loaded::Tree(pages, temps, outcome) => {
                 let roots = temps.iter().map(|t| t.path().to_path_buf()).collect();
                 let display = pages.iter().map(label).collect();
@@ -344,8 +263,6 @@ impl WebView {
         match (self.land.take(), &mut content) {
             (Some(true), Content::Text(v)) => v.first_diff(),
             (Some(false), Content::Text(v)) => v.last_diff(),
-            (Some(true), Content::Image(v)) => v.first_diff(),
-            (Some(false), Content::Image(v)) => v.last_diff(),
             _ => {}
         }
         self.inner = Some(Box::new(content));
@@ -369,8 +286,6 @@ impl WebView {
                     ("total", total.to_string()),
                 ],
             )
-        } else if self.mode.is_screenshot() {
-            tr("web.capturing").to_string()
         } else {
             tr("web.loading").to_string()
         };
@@ -410,7 +325,6 @@ impl WebView {
         let mut mode = self.mode;
         let mut reload = false;
         let mut stop = false;
-        let mut rehighlight = false;
         widgets::toolbar(ui, |ui| {
             let pal = widgets::pal(ui);
             widgets::inline_icon(ui, Icon::Globe, pal.text_dim);
@@ -419,17 +333,6 @@ impl WebView {
                 WebMode::ALL.iter().map(|&m| (m, tr(m.key()))).collect();
             widgets::segmented(ui, &mut mode, &options);
             widgets::toolbar_sep(ui);
-            if self.mode.is_screenshot() && self.urls.len() > 1 {
-                let was = self.highlight;
-                widgets::toggle_button(
-                    ui,
-                    &mut self.highlight,
-                    tr("web.highlight"),
-                    tr("web.highlight_tip"),
-                );
-                rehighlight = was != self.highlight;
-                widgets::toolbar_sep(ui);
-            }
             if self.job.is_some() {
                 if widgets::icon_button(ui, Icon::Stop, tr("btn.stop")).clicked() {
                     stop = true;
@@ -449,8 +352,6 @@ impl WebView {
             self.start(cfg);
         } else if reload {
             self.reload(cfg);
-        } else if rehighlight {
-            self.start(cfg);
         } else if stop {
             self.stop();
         }
