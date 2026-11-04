@@ -73,6 +73,9 @@ pub struct Job {
     /// Lets a sync job delete as many files as the second confirmation of the window is for.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_large_deletion: bool,
+    /// Synchronize symbolic links as links (`--sync-links`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub copy_links: bool,
     // What is compared.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recursive: bool,
@@ -154,6 +157,27 @@ impl JobFile {
     }
 }
 
+impl JobFile {
+    /// A job file holding `job` alone.
+    pub fn single(job: Job) -> JobFile {
+        JobFile {
+            version: JOB_VERSION,
+            continue_on_error: false,
+            jobs: vec![job],
+        }
+    }
+
+    /// The file's text, as saved: pretty JSON ending in a newline.
+    pub fn to_text(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_default() + "\n"
+    }
+
+    /// Whether running the file may change a folder: whether it holds a sync job.
+    pub fn changes_folders(&self) -> bool {
+        self.jobs.iter().any(|j| j.kind == JobKind::Sync)
+    }
+}
+
 /// What a job does once read: the command-line options that do it, and for a sync job the
 /// parts its apply step needs.
 #[derive(Debug, PartialEq)]
@@ -171,6 +195,11 @@ impl Job {
             Some(n) if !n.trim().is_empty() => n.clone(),
             _ => format!("job {}", index + 1),
         }
+    }
+
+    /// Checks the job, as running it would, without running it.
+    pub fn validate(&self) -> Result<(), String> {
+        self.check()
     }
 
     /// Checks the job and turns it into command-line options, with its paths made relative
@@ -241,6 +270,7 @@ impl Job {
             (self.prettify, "prettify"),
             (self.structured, "structured"),
             (self.report_diffs, "report-diffs"),
+            (self.copy_links, "sync-links"),
             (self.slideshow, "slideshow"),
             (self.portrait, "portrait"),
             (self.unified, "unified"),
@@ -277,6 +307,62 @@ impl Job {
         })
     }
 
+    /// The report or patch the job writes, resolved against `dir`, the folder of the job file.
+    pub fn output(&self, dir: &Path) -> Option<PathBuf> {
+        let v = self.report.as_deref().or(self.patch.as_deref())?;
+        let p = PathBuf::from(expand(v).ok()?);
+        Some(if p.is_absolute() { p } else { dir.join(p) })
+    }
+
+    /// The paths the job names, resolved against `dir`: left, base and right of a compare, or
+    /// source and destination of a synchronization.
+    pub fn paths(&self, dir: &Path) -> Vec<PathBuf> {
+        let fields = match self.kind {
+            JobKind::Compare => [&self.left, &self.base, &self.right],
+            JobKind::SyncPlan | JobKind::Sync => [&self.source, &None, &self.destination],
+        };
+        fields
+            .into_iter()
+            .flatten()
+            .filter_map(|v| expand(v).ok())
+            .map(|t| {
+                let p = PathBuf::from(t);
+                if p.is_absolute() {
+                    p
+                } else {
+                    dir.join(p)
+                }
+            })
+            .collect()
+    }
+
+    /// A copy whose paths are relative to the folder of `job_file`, so the job and its folders
+    /// can move together. URLs, rule names and `${env:…}` paths stay as they are.
+    pub fn relative_to(&self, job_file: &Path) -> std::io::Result<Job> {
+        let file = std::path::absolute(job_file)?;
+        let base = file.parent().unwrap_or(Path::new(""));
+        let rel = |v: &Option<String>| -> std::io::Result<Option<String>> {
+            match v {
+                Some(t) if !t.contains("${") && Path::new(t).is_absolute() => {
+                    super::project::relative_path(t, base)
+                        .map(Some)
+                        .map_err(std::io::Error::other)
+                }
+                other => Ok(other.clone()),
+            }
+        };
+        let mut j = self.clone();
+        j.left = rel(&self.left)?;
+        j.base = rel(&self.base)?;
+        j.right = rel(&self.right)?;
+        j.source = rel(&self.source)?;
+        j.destination = rel(&self.destination)?;
+        j.report = rel(&self.report)?;
+        j.patch = rel(&self.patch)?;
+        j.rules = rel(&self.rules)?;
+        Ok(j)
+    }
+
     /// Refuses a job missing what its kind needs, or giving what it does not take.
     fn check(&self) -> Result<(), String> {
         let kind = self.kind.key();
@@ -302,6 +388,7 @@ impl Job {
                 given(self.mode.is_some(), "mode")?;
                 given(self.apply, "apply")?;
                 given(self.allow_large_deletion, "allow_large_deletion")?;
+                given(self.copy_links, "copy_links")?;
             }
             JobKind::SyncPlan | JobKind::Sync => {
                 need(&self.source, "source")?;

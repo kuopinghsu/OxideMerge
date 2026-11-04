@@ -361,7 +361,8 @@ oxidemerge --sync-apply plan.json --yes source destination
 oxidemerge --sync-recover
 ```
 
-`--sync-plan` takes `mirror` or `update`. The plan file holds relative paths only, with the filter
+`--sync-plan` takes `mirror` or `update`, and `--sync-links` to synchronize symbolic links as
+links (macOS and Linux). The plan file holds relative paths only, with the filter
 and a fingerprint of the two folder paths, not the paths themselves. `--sync-apply` compares the
 folders again and refuses the plan when anything in it has changed, when the filter differs, or
 when it was made for other folders. A file touched without changing its contents still fits the
@@ -398,6 +399,10 @@ paths `${env:NAME}` is the only expansion; nothing is run through a shell. A syn
 `"apply": true` in the file and `--yes` on the command line. The run stops at the first job that
 fails, unless `"continue_on_error": true`, prints a JSON summary, and exits with the worst code of
 its jobs. See the user guide for every field.
+
+In the program, *File → Save as job...* saves a folder comparison as a job, and
+*File → Run job...* runs a job file and lists the results; a sync job runs there only after you
+allow its changes.
 
 ## Git and file manager integration
 
@@ -526,8 +531,9 @@ use Command instead of Ctrl. The app shows the right keys for your system.
 - Folder synchronization changes files one at a time, so it is not one atomic step. A renamed
   or moved file is moved in the destination, also when only its letter case or the way its
   accents are written changed, but it is copied and deleted when the two places are on different
-  drives. Symbolic links, folders renamed only in letter case, and other names that differ only
-  in letter case or accents (composed or not) are left alone.
+  drives. Folders renamed only in letter case, and other names that differ only in letter case
+  or accents (composed or not), are left alone. So are symbolic links, unless *Copy symbolic
+  links as links* (`--sync-links`) is on, which works on macOS and Linux only.
 - The translations were made with machine help. Native speakers have not reviewed them yet.
 
 ## Development

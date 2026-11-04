@@ -63,29 +63,7 @@ impl Project {
     pub fn relative_to(&self, project_file: &Path) -> Result<Project> {
         let project_file = std::path::absolute(project_file)?;
         let base = project_file.parent().unwrap_or(Path::new(""));
-        let relative = |value: &str| -> Result<String> {
-            if super::web::is_url(value) {
-                return Ok(value.to_string());
-            }
-            let path = std::path::absolute(value)?;
-            let a: Vec<_> = path.components().collect();
-            let b: Vec<_> = base.components().collect();
-            let common = a.iter().zip(&b).take_while(|(a, b)| a == b).count();
-            if common == 0 {
-                return Ok(path.display().to_string());
-            }
-            let mut rel = PathBuf::new();
-            for _ in &b[common..] {
-                rel.push("..");
-            }
-            for c in &a[common..] {
-                rel.push(c.as_os_str());
-            }
-            if rel.as_os_str().is_empty() {
-                rel.push(".");
-            }
-            Ok(rel.display().to_string())
-        };
+        let relative = |value: &str| relative_path(value, base);
         let mut copy = self.clone();
         copy.paths = self
             .paths
@@ -200,6 +178,32 @@ fn entity(name: &str) -> String {
         }),
     };
     code.map_or_else(|| format!("&{name};"), String::from)
+}
+
+/// `value` relative to the folder `base`, with `..` where needed. URLs, and paths that share
+/// nothing with `base` (another Windows drive), stay unchanged.
+pub fn relative_path(value: &str, base: &Path) -> Result<String> {
+    if super::web::is_url(value) {
+        return Ok(value.to_string());
+    }
+    let path = std::path::absolute(value)?;
+    let a: Vec<_> = path.components().collect();
+    let b: Vec<_> = base.components().collect();
+    let common = a.iter().zip(&b).take_while(|(a, b)| a == b).count();
+    if common == 0 {
+        return Ok(path.display().to_string());
+    }
+    let mut rel = PathBuf::new();
+    for _ in &b[common..] {
+        rel.push("..");
+    }
+    for c in &a[common..] {
+        rel.push(c.as_os_str());
+    }
+    if rel.as_os_str().is_empty() {
+        rel.push(".");
+    }
+    Ok(rel.display().to_string())
 }
 
 #[cfg(test)]

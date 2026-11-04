@@ -3871,3 +3871,59 @@ fn clicked_bytes_take_typed_digits_and_text_and_save() {
     assert_eq!(std::fs::read(&paths[1]).unwrap(), [b'?', 0x41, 0x33]);
     assert_eq!(std::fs::read(&paths[0]).unwrap(), [0x00, 0x11, 0x22]);
 }
+
+#[test]
+fn a_folder_compare_saves_as_a_job_and_a_sync_job_runs_only_once_allowed() {
+    use crate::ui::job_dialog::{SaveJob, SaveKind};
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("left/a.txt", "new\n"),
+            ("right/a.txt", "old\n"),
+            ("right/extra.txt", "extra\n"),
+        ],
+    );
+    let roots = [d.join("left"), d.join("right")];
+    let mut gui = Gui::start("save_job", compare_folders(&roots));
+    gui.wait_until("the compare", |g| !g.busy());
+
+    // Save as job offers the three kinds and names the folders.
+    gui.menu(&[tr("menu.file"), tr("menu.save_job")]);
+    assert!(gui.shows(tr("job.kind_compare")), "{}", gui.describe());
+    assert!(gui.shows_text(&roots[0].display().to_string()));
+    gui.click(tr("job.kind_sync"));
+    assert!(gui.shows_text(tr("job.sync_note")));
+    assert!(gui.shows(tr("job.mirror")));
+    gui.click(tr("btn.cancel"));
+    assert!(!gui.shows(tr("job.kind_sync")));
+
+    // The tab as a mirror job, written as the dialog's Save would.
+    let Content::Folder(v) = gui.app.tabs[0].content.view() else {
+        panic!("not a folder compare");
+    };
+    let mut save = SaveJob::new(v.as_job(&gui.app.cfg), "mirror");
+    save.kind = SaveKind::Sync;
+    save.relative = true;
+    let file = d.join("mirror.oxjob");
+    save.write(&file).unwrap();
+
+    gui.app.start_run_job(file);
+    gui.frames(2);
+    assert!(gui.shows_text(tr("job.confirm")), "{}", gui.describe());
+    assert_eq!(
+        read(&roots[1].join("a.txt")),
+        "old\n",
+        "changed before allowed"
+    );
+    gui.click(tr("job.run_changes"));
+    let applied = trf("job.applied", &[("n", "2".into())]);
+    gui.wait_until("the results", |g| g.shows_text(&applied));
+    assert_eq!(read(&roots[1].join("a.txt")), "new\n");
+    assert!(!roots[1].join("extra.txt").exists());
+    // Compare opens the job's folders in a tab.
+    gui.click(tr("job.open_compare"));
+    gui.wait_until("the compare tab", |g| g.app.tabs.len() == 2 && !g.busy());
+    assert!(!gui.shows_text(&applied), "the results close");
+}

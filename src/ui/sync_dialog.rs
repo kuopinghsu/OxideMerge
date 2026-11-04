@@ -479,6 +479,14 @@ impl SyncDialog {
                     }
                 }
             });
+            if cfg!(unix)
+                && ui
+                    .checkbox(&mut self.scope.copy_links, tr("folder_sync.copy_links"))
+                    .on_hover_text(tr("folder_sync.copy_links_tip"))
+                    .changed()
+            {
+                *action = Some(Step::Replan);
+            }
         });
         let pal = widgets::pal(ui);
         egui::Frame::new()

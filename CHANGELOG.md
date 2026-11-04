@@ -104,9 +104,12 @@ section of this file as the release notes.
   its SHA-256 fingerprint first, so a file edited after the preview is never overwritten, copies
   through a verified temporary file, shows the item being changed, and keeps replaced and
   deleted files in a recovery journal outside both folders. A failure or *Stop* undoes the changes; a synchronization cut short is
-  offered for undoing at the next start. Symbolic links, file/folder clashes, folders renamed
+  offered for undoing at the next start. File/folder clashes, folders renamed
   only in case and other names that differ only in case or in how accents on Latin letters are
-  written are left alone, and folders
+  written are left alone, and so are symbolic links unless *Copy symbolic links as links*
+  (`--sync-links`, `"copy_links"` in a job; macOS and Linux) is on: a link is then made, replaced
+  or deleted as the link itself, with its target text compared, never followed, and journaled
+  like a file so undoing puts it back; a link facing a file or folder stays a conflict. Folders
   inside each other are refused.
   On the command line: `--sync-plan mirror|update`, `--sync-apply <PLAN> --yes` and
   `--sync-recover`, with exit codes 4 (undone) and 5 (recovery required). A plan whose files or
@@ -128,7 +131,7 @@ section of this file as the release notes.
   macOS) makes a column selection: typing, Backspace, Delete, copy, cut and paste work on the same
   columns of every line. Each action is one undo step (typing in a line is one until the cursor
   moves), and saving keeps each file's line endings, encoding and byte order mark.
-- **PDF reports and printing:** *File → Export → Export PDF report...* and `--report out.pdf`
+- **PDF reports and printing:** *File → Export → PDF report...* and `--report out.pdf`
   write the report of a text or folder compare as a PDF, with no browser: the compared files,
   rules, counts and every difference with its context, line numbers and changed words, side by
   side or in one column (the inline view, `--unified`), with a page header that carries the app
@@ -146,7 +149,11 @@ section of this file as the release notes.
   paths is the only expansion, and no shell or other program is run. A sync job needs `"apply": true` in
   the file and `--yes`, and a large deletion also `"allow_large_deletion": true`. The jobs after a
   failure are skipped unless `"continue_on_error": true`; unknown fields and newer versions are
-  refused.
+  refused. *File → Save as job...* saves a folder comparison as a compare, sync plan or sync job,
+  with its folders, filter, method, rules and options, and paths absolute or relative to the job
+  file; *File → Run job...* runs a job file as `--job` does and lists each job's result, with the
+  report and the compare a click away. A file with a sync job lists the folders it changes and
+  runs only after you allow it, each time.
 - **Copy values in the semantic view:** *Copy value to left* and *Copy value to right* on each
   JSON, XML, TOML or YAML change replace, add or remove that one value on the other side. Only the
   value's text changes; comments and layout stay. The edited file is parsed again and the copy is
@@ -163,6 +170,13 @@ section of this file as the release notes.
   in the *Full contents* method when only key order, layout or comments differ.
 
 ### Changed
+
+- **File → Export** has three reports: *HTML report...*, *Slideshow report...* and
+  *PDF report...*. *Generate report...* and *Generate report with file differences...* are gone:
+  *HTML report...* does what both did (a folder report includes the differences of every changed
+  text file), and its save dialog also offers XML, and for a folder CSV and plain text.
+- **Slideshow reports** carry the OxideMerge icon in their header, embedded in the file; the icon
+  and the last slide link to the project page.
 
 - **HTML reports** carry the OxideMerge icon in their header, embedded in the file (about 10 KB),
   and move: the sections and file cards fade in, the counts in the summary cards count up, cards

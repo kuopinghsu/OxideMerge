@@ -1596,3 +1596,60 @@ fn pdf_reports_are_written_for_text_and_folder_compares() {
         run.stderr
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn sync_links_copies_symbolic_links_as_links_from_a_plan_and_a_job() {
+    let dir = tmp();
+    let d = dir.path();
+    files(d, &[("src/a.txt", "a\n"), ("dst/a.txt", "a\n")]);
+    std::os::unix::fs::symlink("a.txt", d.join("src/to-a")).unwrap();
+    std::os::unix::fs::symlink("gone", d.join("dst/old-link")).unwrap();
+
+    // Without --sync-links a link is left alone.
+    let plain = oxidemerge(d, &["--sync-plan", "mirror", "src", "dst"]);
+    assert!(plain.stdout.contains("\"conflict\""), "{}", plain.stdout);
+
+    let plan = oxidemerge(
+        d,
+        &[
+            "--sync-plan",
+            "mirror",
+            "--sync-links",
+            "src",
+            "dst",
+            "--report",
+            "plan.json",
+        ],
+    );
+    assert_eq!(plan.code, 1, "{}", plan.stderr);
+    assert!(read(d.join("plan.json")).contains("\"copy_links\": true"));
+    let applied = oxidemerge(d, &["--sync-apply", "plan.json", "--yes", "src", "dst"]);
+    assert_eq!(applied.code, 0, "{}{}", applied.stdout, applied.stderr);
+    assert_eq!(
+        std::fs::read_link(d.join("dst/to-a")).unwrap(),
+        Path::new("a.txt")
+    );
+    assert!(std::fs::symlink_metadata(d.join("dst/old-link")).is_err());
+
+    // A job takes it as "copy_links", only for synchronizations.
+    std::os::unix::fs::symlink("a.txt", d.join("src/second")).unwrap();
+    std::fs::write(
+        d.join("links.oxjob"),
+        r#"{"version": 1, "jobs": [{"kind": "sync", "source": "src", "destination": "dst",
+            "mode": "mirror", "apply": true, "copy_links": true}]}"#,
+    )
+    .unwrap();
+    let job = oxidemerge(d, &["--job", "links.oxjob", "--yes"]);
+    assert_eq!(job.code, 0, "{}{}", job.stdout, job.stderr);
+    assert!(std::fs::symlink_metadata(d.join("dst/second")).is_ok_and(|m| m.is_symlink()));
+    std::fs::write(
+        d.join("bad.oxjob"),
+        r#"{"version": 1, "jobs": [{"kind": "compare", "left": "src", "right": "dst",
+            "copy_links": true}]}"#,
+    )
+    .unwrap();
+    let bad = oxidemerge(d, &["--job", "bad.oxjob"]);
+    assert_eq!(bad.code, 2);
+    assert!(bad.stdout.contains("copy_links"), "{}", bad.stdout);
+}

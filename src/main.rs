@@ -187,6 +187,10 @@ struct Cli {
     /// --report; exit code 0 = nothing to do, 1 = changes or conflicts, 2 = error
     #[arg(long, value_enum, value_name = "MODE")]
     sync_plan: Option<SyncArg>,
+    /// With --sync-plan: synchronize symbolic links as links, never following them (Unix);
+    /// otherwise links are left alone
+    #[arg(long, requires = "sync_plan")]
+    sync_links: bool,
     /// Apply a --sync-plan file to the folders it was made for, given in the same order, after
     /// checking every file again; needs --yes. Exit code 0 = applied, 2 = nothing changed,
     /// 4 = failed or stopped and undone, 5 = partly applied, recovery required
@@ -823,6 +827,7 @@ fn sync_plan(
     cli: &Cli,
     cfg: &Config,
     policy: core::folder_sync::SyncPolicy,
+    copy_links: bool,
 ) -> anyhow::Result<core::folder_sync::SyncPlan> {
     use std::sync::atomic::AtomicBool;
     anyhow::ensure!(
@@ -848,6 +853,7 @@ fn sync_plan(
         excluded: mask.excludes_anything() || folder.skip_hidden,
         filter: spec.to_string(),
         skip_hidden: folder.skip_hidden,
+        copy_links,
     };
     core::folder_sync::plan(&items, &cli.paths, policy, scope, &AtomicBool::new(false))
         .map_err(anyhow::Error::msg)
@@ -855,14 +861,14 @@ fn sync_plan(
 
 /// How `--sync-apply` and `--sync-recover` ended, printed as JSON.
 #[derive(serde::Serialize)]
-struct SyncReport {
-    status: &'static str,
+pub(crate) struct SyncReport {
+    pub(crate) status: &'static str,
     /// Why it did not simply succeed, in the shared taxonomy.
     #[serde(skip_serializing_if = "Option::is_none")]
     problem: Option<core::problem::Problem>,
-    changes: usize,
+    pub(crate) changes: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    messages: Vec<String>,
+    pub(crate) messages: Vec<String>,
     /// Recovery journals kept because something could not be undone.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     journals: Vec<PathBuf>,
@@ -883,6 +889,7 @@ fn run_sync(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
                 mode,
                 source: Side::Left,
             },
+            cli.sync_links,
         )?;
         let code = u8::from(plan.changes() > 0 || plan.estimate.conflicts > 0);
         let json = plan.to_json()?;
@@ -923,7 +930,8 @@ fn run_sync(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     };
     let text = String::from_utf8(core::analysis::read(path)?)?;
     let planned = SyncPlan::from_json(&text).map_err(anyhow::Error::msg)?;
-    let fresh = sync_plan(cli, cfg, planned.policy)?;
+    // Planned again as the plan was: copying links or not is the plan's, not the command's.
+    let fresh = sync_plan(cli, cfg, planned.policy, planned.copy_links)?;
     anyhow::ensure!(
         (&planned.filter, planned.skip_hidden) == (&fresh.filter, fresh.skip_hidden),
         "The plan was made with another filter or hidden-file setting; use the same --filter and settings, or make a new plan with --sync-plan"
@@ -1275,29 +1283,42 @@ fn use_rules(
 
 /// How one job of `--job` ended, in its summary.
 #[derive(serde::Serialize)]
-struct JobReport {
-    name: String,
-    kind: &'static str,
-    exit_code: u8,
+pub(crate) struct JobReport {
+    pub(crate) name: String,
+    pub(crate) kind: &'static str,
+    pub(crate) exit_code: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub(crate) error: Option<String>,
     /// For a sync job, what applying did.
     #[serde(skip_serializing_if = "Option::is_none")]
-    sync: Option<SyncReport>,
+    pub(crate) sync: Option<SyncReport>,
 }
 
 #[derive(serde::Serialize)]
-struct JobsReport {
-    exit_code: u8,
-    jobs: Vec<JobReport>,
+pub(crate) struct JobsReport {
+    pub(crate) exit_code: u8,
+    pub(crate) jobs: Vec<JobReport>,
     /// Jobs not run because one before failed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    not_run: Vec<String>,
+    pub(crate) not_run: Vec<String>,
 }
 
 /// Runs the jobs of `file` one after another, as their command lines would, and prints a JSON
 /// summary. The exit code is the worst of the jobs'.
 fn run_jobs(file: &std::path::Path, yes: bool, base: &Config) -> anyhow::Result<u8> {
+    let summary = job_summary(file, yes, base)?;
+    println!("{}", core::analysis::json(&summary)?);
+    Ok(summary.exit_code)
+}
+
+/// Runs the jobs of `file` one after another, as their command lines would, and says how each
+/// ended. Sync jobs change folders only when `yes` is given. Used by `--job` and by
+/// *File → Run job…*.
+pub(crate) fn job_summary(
+    file: &std::path::Path,
+    yes: bool,
+    base: &Config,
+) -> anyhow::Result<JobsReport> {
     use core::job::{JobFile, JobKind};
     let text = String::from_utf8(core::analysis::read(file)?)?;
     let jobs = JobFile::parse(&text).map_err(anyhow::Error::msg)?;
@@ -1358,8 +1379,7 @@ fn run_jobs(file: &std::path::Path, yes: bool, base: &Config) -> anyhow::Result<
         summary.exit_code = summary.exit_code.max(report.exit_code);
         summary.jobs.push(report);
     }
-    println!("{}", core::analysis::json(&summary)?);
-    Ok(summary.exit_code)
+    Ok(summary)
 }
 
 /// Plans the synchronization of the two folders of `cli` and applies it at once, as a sync job
@@ -1378,6 +1398,7 @@ fn sync_now(cli: &Cli, cfg: &Config, allow_large: bool) -> anyhow::Result<(u8, S
             mode,
             source: Side::Left,
         },
+        cli.sync_links,
     )?;
     anyhow::ensure!(
         allow_large || !plan.large_deletion(),

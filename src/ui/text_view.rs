@@ -4456,7 +4456,7 @@ impl TextView {
                 }
             });
             ui.add_space(4.0);
-            let tip = Cmd::ExportHtml.tip_if(self.keys_enabled);
+            let tip = Cmd::HtmlReport.tip_if(self.keys_enabled);
             if widgets::ghost_icon_button(ui, Icon::Export, tr("btn.export_html"))
                 .on_hover_text(tip)
                 .clicked()

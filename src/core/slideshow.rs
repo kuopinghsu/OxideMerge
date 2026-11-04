@@ -32,7 +32,11 @@ body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-ap
 header{display:flex;align-items:center;gap:14px;padding:10px 22px;background:var(--surface);border-bottom:1px solid var(--border)}
 .brand{display:flex;align-items:center;gap:10px;font-weight:650;margin-right:auto;min-width:0}
 .brand span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.logo{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#ff8a3d,#5b6cff);display:grid;place-items:center;color:#fff;font-size:13px;font-weight:800;flex:none}
+.home{display:flex;flex:none;border-radius:7px}.home:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.logo{width:30px;height:30px;border-radius:7px;display:block;flex:none;transition:transform .3s}
+.home:hover .logo{transform:rotate(-12deg) scale(1.1)}
+.made{color:var(--dim);font-size:13px;margin-top:28px}.made a{color:inherit}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
 button{font:inherit;font-size:14px;padding:5px 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer}
 button:hover{border-color:var(--accent)}button:disabled{opacity:.4;cursor:default}
 .count{font-variant-numeric:tabular-nums;color:var(--dim);min-width:5.5em;text-align:center}
@@ -98,12 +102,14 @@ fn page_start(out: &mut String, title: &str) {
     let _ = write!(
         out,
         "<!DOCTYPE html>\n<html lang=\"{}\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"generator\" content=\"OxideMerge {}\"><title>{}</title><style>:root{{{LIGHT}}}@media (prefers-color-scheme:dark){{:root{{{DARK}}}}}{CSS}</style></head><body>\
-<header><div class=\"brand\"><div class=\"logo\">⇄</div><span>{}</span></div>\
+<header><div class=\"brand\"><a class=\"home\" href=\"{}\" title=\"OxideMerge\" target=\"_blank\" rel=\"noopener\"><img class=\"logo\" alt=\"OxideMerge\" src=\"{}\"></a><span>{}</span></div>\
 <button id=\"prev\" title=\"←\">‹</button><span class=\"count\" id=\"count\"></span><button id=\"next\" title=\"→\">›</button>\
 <button id=\"full\" title=\"F\">⛶</button></header><div class=\"bar\"><div></div></div><main>\n",
         crate::i18n::current_language(),
         env!("CARGO_PKG_VERSION"),
         esc(title),
+        env!("CARGO_PKG_REPOSITORY"),
+        super::html_report::icon_data_uri(),
         esc(title)
     );
 }
@@ -276,8 +282,9 @@ fn diff_slide(
 fn end_slide(out: &mut String, text: &str, extra: &str) {
     let _ = writeln!(
         out,
-        "<section class=\"end\"><div><h1>{}</h1>{extra}</div></section>",
-        esc(text)
+        "<section class=\"end\"><div><h1>{}</h1>{extra}<p class=\"made\">{}</p></div></section>",
+        esc(text),
+        super::html_report::made_by_html()
     );
 }
 
@@ -524,6 +531,17 @@ mod tests {
         assert!(html.contains("renamed"), "bookmark comments are shown");
         assert!(html.contains("a.txt") && html.contains("b.txt"));
         assert!(html.trim_end().ends_with("</html>"));
+        assert!(
+            html.contains("<img class=\"logo\" alt=\"OxideMerge\" src=\"data:image/png;base64,"),
+            "the icon is embedded"
+        );
+        let home = format!("href=\"{}\"", env!("CARGO_PKG_REPOSITORY"));
+        assert_eq!(
+            html.matches(&home).count(),
+            2,
+            "the icon and the end slide link home"
+        );
+        assert!(!html.contains('⇄'));
     }
 
     #[test]

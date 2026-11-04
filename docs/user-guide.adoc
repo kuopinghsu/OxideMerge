@@ -1196,6 +1196,17 @@ or in how accents on Latin letters are written (composed or not), and items that
 the comparison. A file whose name the two sides spell differently only in case or in that way,
 with the same contents on both, is not a conflict when mirroring: it is renamed (see below).
 
+On macOS and Linux, select *Copy symbolic links as links* to synchronize links rather than leave
+them alone. A link is then treated as the link itself, never as what it points to:
+
+* A link only in the source is made in the destination, with the same target text.
+* A link whose target text differs is replaced.
+* When mirroring, a link only in the destination is deleted; an update keeps it.
+* A link facing a file or folder of the same name is still a conflict.
+
+What a link points to is never read, written or deleted, even when it is outside both folders,
+and the links changed are kept in the recovery journal like files, so undoing puts them back.
+
 Click an item for its details: the size and the start of the SHA-256 on each side, and whether
 the action adds to, or overwrites and deletes in, the destination.
 
@@ -1914,7 +1925,7 @@ To create an HTML report:
 . Open a text or folder comparison, and wait until it has finished.
 . Check the comparison options, compare rules and folder filters. They change which differences
   the report shows.
-. Click *Export HTML* on the toolbar, or choose *File → Export → Export HTML report...*
+. Click *Export HTML* on the toolbar, or choose *File → Export → HTML report...*
   (kbd:[Ctrl+Shift+E]).
 . Choose the output file. The suggested name is made from the compared names, with `_` in place of
   spaces.
@@ -1942,13 +1953,12 @@ Exporting a report never saves your edits to the compared files.
 [[other-reports]]
 === Other reports
 
-*File → Export → Generate report...* writes a report in the format that you choose:
+*File → Export → HTML report...* also saves other formats: choose the file type in the save
+dialog.
 
-* a folder comparison as HTML, CSV, plain text or XML;
-* a text comparison as HTML or XML.
-
-*File → Export → Generate report with file differences...* adds the differences of each changed
-text file to an HTML folder report.
+* A folder comparison: HTML (with the differences of each changed text file), CSV, plain text or
+  XML. CSV and plain text list the files with their status, sizes and dates.
+* A text comparison: HTML or XML.
 
 *Tools → Statistics...* shows numbers about the current comparison:
 
@@ -1961,7 +1971,7 @@ text file to an HTML folder report.
 
 XML reports are for other programs, such as scripts, review tools or a build that checks what
 changed.
-Choose the `.xml` type when you generate a report, or use `--report <name>.xml` on the command
+Choose the XML type in the save dialog of *File → Export → HTML report...*, or use `--report <name>.xml` on the command
 line.
 
 * A text comparison report lists each difference.
@@ -1996,7 +2006,7 @@ line.
 [[slideshows]]
 === Slideshows
 
-*File → Export → Generate slideshow report...* saves an HTML page that shows one difference at a
+*File → Export → Slideshow report...* saves an HTML page that shows one difference at a
 time. Use it to present a change in a meeting or a review.
 
 * The title slide names the compared sides and counts the differences.
@@ -2014,11 +2024,13 @@ In the browser:
 * kbd:[F] switches to full screen.
 * Each slide has its own address, such as `#3` for the third slide, so you can link to it.
 * When you print the page, each slide is printed on its own page.
+* The header carries the OxideMerge icon, which links to the project page, as does the last
+  slide.
 
 [[pdf-reports]]
 === PDF reports and printing
 
-*File → Export → Export PDF report...* saves the report of a text or folder comparison as a PDF
+*File → Export → PDF report...* saves the report of a text or folder comparison as a PDF
 file. *File → Print...* (kbd:[Ctrl+P]) writes the same PDF to a temporary file and opens it in
 your system's PDF viewer, where you print it. No browser is used.
 
@@ -2808,6 +2820,10 @@ Needs `--impact`, `--release-report` or `--baseline-left`.
 |Write a read-only plan to synchronize two folders (source, destination). `MODE` is `mirror`
 or `update`. Writes JSON to the standard output, or to the `--report` file.
 
+|`--sync-links`
+|With `--sync-plan`: synchronize symbolic links as links, never following them (macOS and
+Linux). The plan records it, so `--sync-apply` needs no flag. Without it, links are left alone.
+
 |`--sync-apply <PLAN>`
 |Apply a plan to the folders it was made for, given in the same order. Needs `--yes`.
 
@@ -3025,7 +3041,8 @@ Options: `recursive`, `report`, `report_diffs`, `slideshow`, `patch`, `patch_sty
 `report` (the plan file) are required.
 `sync`:: Plans and applies a synchronization at once. `source`, `destination`, `mode` and
 `"apply": true` are required; the run also needs `--yes`. A sync that would delete many items is
-refused unless the job has `"allow_large_deletion": true`.
+refused unless the job has `"allow_large_deletion": true`. Both kinds take
+`"copy_links": true` for `--sync-links`.
 
 All kinds also take `filter`, `method`, `rules`, `whitespace`, `ignore_case`, `ignore_blank`,
 `ignore_eol`, `ignore_numbers`, `ignore_comments`, `prettify`, `structured` and
@@ -3054,6 +3071,28 @@ when the job failed, and for a sync job the same `sync` result that `--sync-appl
   ]
 }
 ----
+
+[[jobs-in-the-program]]
+==== Saving and running jobs in the program
+
+*File → Save as job...* saves the active folder comparison as a job file. The job names the
+compared folders, the filter, the compare method, the compare rules file and the comparison
+options that are on, so it compares as the tab does. Choose what the job does:
+
+* *Compare and write a report*: the report file is relative to the job file, and its extension
+  (`.html`, `.pdf`, `.csv`, `.txt` or `.xml`) sets the format.
+* *Plan a synchronization*: writes a JSON plan and changes nothing.
+* *Synchronize*: plans and applies at once, left to right or right to left, as a mirror or an
+  update. The job has `"apply": true`; *Allow deleting many files* adds
+  `"allow_large_deletion": true`.
+
+Select *Store paths relative to the job file* to move the job and its folders together. Only a
+comparison of two folders can be saved as a sync job.
+
+*File → Run job...* runs a job file and lists how each job ended, with *Open* for the report or
+plan it wrote and *Compare* to open its folders in a tab. The jobs run as `--job` runs them, from
+your saved options. A file that holds a sync job first lists the folders it changes and runs only
+after you click *Run and allow changes*; that stands for `--yes`, for this run only.
 
 [[integration]]
 == Integrating with other tools
@@ -3221,7 +3260,7 @@ On macOS, use kbd:[⌘] for kbd:[Ctrl] and kbd:[⌥] for kbd:[Alt].
 |kbd:[Ctrl+O] |Open
 |kbd:[Ctrl+S] |Save
 |kbd:[Ctrl+Shift+S] |Save all
-|kbd:[Ctrl+Shift+E] |Export HTML report
+|kbd:[Ctrl+Shift+E] |HTML report
 |kbd:[Ctrl+P] |Print: open the PDF report in the system's viewer
 |kbd:[F5] |Refresh
 |kbd:[Ctrl+W], kbd:[Ctrl+F4], kbd:[Esc] |Close the tab. kbd:[Esc] first closes an open dialog, search bar or editor
