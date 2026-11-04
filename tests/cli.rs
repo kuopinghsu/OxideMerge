@@ -1552,3 +1552,47 @@ fn jobs_go_on_after_a_failure_only_when_asked_and_large_deletions_need_leave() {
     assert_eq!(future.code, 2);
     assert!(future.stderr.contains("version 9"), "{}", future.stderr);
 }
+
+#[test]
+fn pdf_reports_are_written_for_text_and_folder_compares() {
+    let dir = tmp();
+    let d = dir.path();
+    files(d, &[("a.txt", "one\ntwo\n"), ("b.txt", "one\nthree\n")]);
+    let run = oxidemerge(d, &["a.txt", "b.txt", "--report", "t.pdf", "--unified"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let pdf = std::fs::read(d.join("t.pdf")).unwrap();
+    assert!(pdf.starts_with(b"%PDF-"), "a PDF file");
+    assert!(!run.stderr.contains("note:"), "{}", run.stderr);
+
+    folders(d);
+    let run = oxidemerge(
+        d,
+        &[
+            "left",
+            "right",
+            "-r",
+            "--report",
+            "f.pdf",
+            "--report-diffs",
+            "--page-size",
+            "letter",
+            "--whole-file",
+        ],
+    );
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let pdf = std::fs::read(d.join("f.pdf")).unwrap();
+    assert!(pdf.starts_with(b"%PDF-"));
+    assert!(
+        String::from_utf8_lossy(&pdf).contains("612"),
+        "Letter pages"
+    );
+
+    // PDF options without a PDF report are pointed out.
+    let run = oxidemerge(d, &["a.txt", "b.txt", "--report", "t.html", "--portrait"]);
+    assert_eq!(run.code, 1);
+    assert!(
+        run.stderr.contains("--portrait only applies to .pdf"),
+        "{}",
+        run.stderr
+    );
+}

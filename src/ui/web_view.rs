@@ -231,6 +231,7 @@ impl WebView {
                     .map(|(p, text)| {
                         let mut d = TextDoc::from_text(None, text);
                         d.read_only = true;
+                        d.compare_only = true;
                         d.description = Some(label(p));
                         d.syntax = html.then(|| "html".into());
                         d
@@ -310,7 +311,13 @@ impl WebView {
         if let Some(e) = &self.error {
             return format!("{}: {e}", tr("status.error"));
         }
-        let inner = inner.or_else(|| self.formatted.as_ref().map(MarkdownView::status_line));
+        // Pages are compared, never written: the text view says so per pane, the Markdown
+        // view here.
+        let inner = inner.or_else(|| {
+            self.formatted
+                .as_ref()
+                .map(|m| format!("{}  |  {}", m.status_line(), tr("label.compare_only")))
+        });
         match (inner, self.note.is_empty()) {
             (Some(s), true) => s,
             (Some(s), false) => format!("{s}  |  {}", self.note),

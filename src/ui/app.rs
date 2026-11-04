@@ -1241,6 +1241,8 @@ pub struct OxideMergeApp {
     git_dlg: Option<GitDialog>,
     /// A folder report with file differences being written on another thread: its file.
     report_job: Option<(PathBuf, std::sync::mpsc::Receiver<Result<(), String>>)>,
+    /// Whether the report being written opens in the system's viewer once done, to be printed.
+    report_opens: bool,
     /// Ctrl+Tab presses taken from the input before egui saw them.
     tab_keys: Vec<Cmd>,
     filters_dlg: bool,
@@ -1380,6 +1382,8 @@ where
 
 /// Save dialog filters of report types: name and extensions.
 const HTML: (&str, &[&str]) = ("HTML", &["html", "htm"]);
+/// PDF files written to be printed, numbered so that each has a name of its own.
+static PRINTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const XML: (&str, &[&str]) = ("XML", &["xml"]);
 
 /// `path` with ".html" added to its name.
@@ -1493,11 +1497,13 @@ impl Menus {
                 Folder,
             ) => true,
             // A report or patch of a folder compare still running would miss files.
-            (ReportWithDiffs | ExportHtml | Report | Slideshow, Folder) => !self.folder_busy,
+            (ReportWithDiffs | ExportHtml | Report | Slideshow | ExportPdf | Print, Folder) => {
+                !self.folder_busy
+            }
             (Patch, Folder) => self.sides == 2 && !self.folder_busy,
             (SyncFolders, Folder) => self.sides == 2 && !self.folder_busy && !self.folder_job,
             (Patch, Text) => self.sides == 2,
-            (ExportHtml | Report | Slideshow | Statistics, Text) => true,
+            (ExportHtml | Report | Slideshow | ExportPdf | Print | Statistics, Text) => true,
             (Refresh, Text | Folder | Web) => true,
             (NextDiff | PrevDiff | FirstDiff | LastDiff, Web) => self.formatted,
             (AllDiffs, Folder) => !self.folder_busy,
@@ -2000,6 +2006,7 @@ impl OxideMergeApp {
             stats_dlg: None,
             git_dlg: None,
             report_job: None,
+            report_opens: false,
             tab_keys: Vec::new(),
             filters_dlg: false,
             rule_dlg: None,
@@ -3159,7 +3166,7 @@ impl OxideMergeApp {
                 out.push(entry(Icon::Inline, label, detail, PaletteAction::Inline));
             }
         }
-        let toggles: [(&str, ConfigFlag); 13] = [
+        let toggles: [(&str, ConfigFlag); 14] = [
             ("view.line_numbers", |c| &mut c.show_line_numbers),
             ("view.location_pane", |c| &mut c.show_location_pane),
             ("view.line_detail", |c| &mut c.show_line_detail),
@@ -3169,6 +3176,7 @@ impl OxideMergeApp {
             ("view.syntax", |c| &mut c.syntax_highlight),
             ("view.tree_mode", |c| &mut c.tree_mode),
             ("menu.open_reports", |c| &mut c.open_reports),
+            ("menu.pdf_letter", |c| &mut c.pdf_letter),
             ("opt.color_blind", |c| &mut c.color_blind_colors),
             ("opt.high_contrast", |c| &mut c.high_contrast),
             ("opt.reduce_motion", |c| &mut c.reduce_motion),
@@ -3328,6 +3336,8 @@ impl OxideMergeApp {
             Cmd::ExportHtml
                 | Cmd::Report
                 | Cmd::Slideshow
+                | Cmd::ExportPdf
+                | Cmd::Print
                 | Cmd::Patch
                 | Cmd::Statistics
                 | Cmd::SaveComparison
@@ -3419,7 +3429,13 @@ impl OxideMergeApp {
                     self.error(errors.join("\n"));
                 }
             }
-            Cmd::Patch | Cmd::ExportHtml | Cmd::Report | Cmd::ReportWithDiffs | Cmd::Slideshow
+            Cmd::Patch
+            | Cmd::ExportHtml
+            | Cmd::Report
+            | Cmd::ReportWithDiffs
+            | Cmd::Slideshow
+            | Cmd::ExportPdf
+            | Cmd::Print
                 if matches!(self.tabs.get(self.active).map(|t| t.content.view()),
                     Some(Content::Folder(v)) if v.is_running()) =>
             {
@@ -3437,6 +3453,8 @@ impl OxideMergeApp {
             Cmd::Report => self.save_report(),
             Cmd::ReportWithDiffs => self.save_report_with_diffs(),
             Cmd::Slideshow => self.save_slideshow(),
+            Cmd::ExportPdf => self.save_pdf(false),
+            Cmd::Print => self.save_pdf(true),
             Cmd::SaveComparison => self.save_comparison(),
             Cmd::Statistics => self.show_statistics(),
             Cmd::GitCompare => {
@@ -3696,6 +3714,85 @@ impl OxideMergeApp {
         self.write_html_report(tr("menu.report_diffs"), &name, job);
     }
 
+    /// Saves the PDF report of the active text or folder compare, with every difference; to
+    /// `print`, writes it to a temporary file and opens it in the system's viewer instead.
+    fn save_pdf(&mut self, print: bool) {
+        use crate::core::pdf_report::{Layout, PageSize, PdfOptions};
+        if self.report_job.is_some() {
+            self.notify(tr("msg.report_writing"));
+            return;
+        }
+        let mut pdf = PdfOptions {
+            page: if self.cfg.pdf_letter {
+                PageSize::Letter
+            } else {
+                PageSize::A4
+            },
+            color_blind: self.cfg.color_blind_colors,
+            ..Default::default()
+        };
+        let lang = crate::i18n::current_language().to_string();
+        let (name, job): (String, crate::core::pdf_report::PdfJob) =
+            match self.tabs.get(self.active).map(|t| t.content.view()) {
+                Some(Content::Text(v)) => {
+                    // The inline view prints as one column, on portrait pages.
+                    if v.unified && v.titles().len() == 2 {
+                        pdf.layout = Layout::Unified;
+                        pdf.portrait = true;
+                    }
+                    (
+                        report::html_file_name(&v.titles()),
+                        v.pdf_job(&self.cfg.rules, pdf, lang),
+                    )
+                }
+                Some(Content::Folder(v)) => (
+                    report::html_file_name(&v.display_roots),
+                    Box::new(v.pdf_job(&self.cfg, pdf, lang)),
+                ),
+                _ => {
+                    self.error(tr("msg.report_folder_only"));
+                    return;
+                }
+            };
+        let stem = name.strip_suffix(".html").unwrap_or(&name).to_string();
+        let path = if print {
+            let n = PRINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::env::temp_dir().join(format!(
+                "oxidemerge-print-{}-{n}-{stem}.pdf",
+                std::process::id()
+            ))
+        } else {
+            let title = tr("menu.export_pdf");
+            let Some(path) = rfd::FileDialog::new()
+                .set_title(title)
+                .add_filter("PDF", &["pdf"])
+                .set_file_name(&stem)
+                .save_file()
+            else {
+                return;
+            };
+            if crate::core::text::extension(&path) == "pdf" {
+                path
+            } else {
+                let mut p = path.into_os_string();
+                p.push(".pdf");
+                PathBuf::from(p)
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let file = path.clone();
+        std::thread::spawn(move || {
+            let written = job().and_then(|bytes| {
+                crate::core::fsutil::write_atomic_with(&file, &bytes, false)
+                    .map_err(|e| format!("{e:#}"))
+            });
+            let _ = tx.send(written);
+        });
+        self.report_job = Some((path, rx));
+        self.report_opens = print;
+        self.notify(tr("msg.report_writing"));
+    }
+
     /// Saves an HTML slideshow of the active text or folder compare: one difference per slide.
     fn save_slideshow(&mut self) {
         let (name, job): (String, Box<dyn FnOnce() -> String + Send>) =
@@ -3929,11 +4026,14 @@ impl OxideMergeApp {
 
     /// Announces a saved report, and opens it in the browser when it is HTML and set to.
     fn report_saved(&mut self, path: &Path) {
-        self.notify(trf("msg.saved", &[("file", path.display().to_string())]));
+        let print = std::mem::take(&mut self.report_opens);
+        if !print {
+            self.notify(trf("msg.saved", &[("file", path.display().to_string())]));
+        }
         let html = path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"));
-        if html && self.cfg.open_reports {
+        if print || (html && self.cfg.open_reports) {
             if let Err(e) = crate::ui::folder_view::system_open(path) {
                 self.error(e);
             }
@@ -3961,6 +4061,7 @@ impl OxideMergeApp {
             }
             Some(Err(e)) => {
                 self.report_job = None;
+                self.report_opens = false;
                 self.error(e);
             }
         }
@@ -4393,6 +4494,9 @@ impl OxideMergeApp {
         let text_typed = matches!(
             self.tabs.get(self.active).map(|t| t.content.view()),
             Some(Content::Binary(v)) if v.takes_text()
+        ) || matches!(
+            self.tabs.get(self.active).map(|t| t.content.view()),
+            Some(Content::Text(v)) if v.takes_text()
         );
         let menus = self.menus();
         let mut cmds = std::mem::take(&mut self.tab_keys);
@@ -4684,10 +4788,13 @@ impl OxideMergeApp {
             m.item(ui, Cmd::Report);
             m.item(ui, Cmd::ReportWithDiffs);
             m.item(ui, Cmd::Slideshow);
+            m.item(ui, Cmd::ExportPdf);
             m.item(ui, Cmd::Patch);
             ui.separator();
             check(ui, &mut self.cfg.open_reports, tr("menu.open_reports"), "");
+            check(ui, &mut self.cfg.pdf_letter, tr("menu.pdf_letter"), "");
         });
+        m.item(ui, Cmd::Print);
         m.item(ui, Cmd::ApplyPatch);
         ui.separator();
         m.item(ui, Cmd::CloseTab);

@@ -54,6 +54,12 @@ enum SyncArg {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum PageArg {
+    A4,
+    Letter,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum PatchArg {
     Normal,
     Context,
@@ -134,10 +140,22 @@ struct Cli {
     /// in the rules folder, or the path of an .oxrules file; "" for none
     #[arg(long, value_name = "NAME")]
     rules: Option<String>,
-    /// Write a report without opening the GUI: folder compares as .html, .csv, .txt or .xml,
-    /// text compares as side-by-side .html or as .xml
+    /// Write a report without opening the GUI: folder compares as .html, .pdf, .csv, .txt or
+    /// .xml, text compares as side-by-side .html, as .pdf or as .xml
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Page size of a .pdf report
+    #[arg(long, value_enum, default_value = "a4")]
+    page_size: PageArg,
+    /// Portrait pages in a .pdf report (landscape otherwise)
+    #[arg(long)]
+    portrait: bool,
+    /// Show the lines of a two-way .pdf report in one column, removed above added
+    #[arg(long)]
+    unified: bool,
+    /// Show the whole files in a .pdf report, not only the differences with --context lines
+    #[arg(long)]
+    whole_file: bool,
     /// Add the differences of every changed text file to an HTML folder report
     #[arg(long)]
     report_diffs: bool,
@@ -153,7 +171,7 @@ struct Cli {
     patch: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "unified")]
     patch_style: PatchArg,
-    /// Context lines for context/unified patches
+    /// Context lines for context/unified patches and .pdf reports
     #[arg(long, default_value_t = 3)]
     context: usize,
     /// Compare in the console only: print differences, exit code 0 = identical, 1 = different, 2 = error
@@ -403,6 +421,50 @@ fn export(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
     core::fsutil::write_atomic_with(path, text.as_bytes(), false)
 }
 
+/// Whether a report file is a PDF.
+fn is_pdf(path: &std::path::Path) -> bool {
+    core::text::extension(path) == "pdf"
+}
+
+/// How a .pdf report is laid out, from the command line and the color-blind setting.
+fn pdf_options(cli: &Cli, cfg: &Config) -> core::pdf_report::PdfOptions {
+    use core::pdf_report::{Layout, PageSize, PdfOptions};
+    PdfOptions {
+        page: match cli.page_size {
+            PageArg::A4 => PageSize::A4,
+            PageArg::Letter => PageSize::Letter,
+        },
+        portrait: cli.portrait,
+        layout: if cli.unified {
+            Layout::Unified
+        } else {
+            Layout::SideBySide
+        },
+        context: (!cli.whole_file).then_some(cli.context),
+        color_blind: cfg.color_blind_colors,
+    }
+}
+
+/// Notes options that only apply to a .pdf report when no such report is written.
+fn note_pdf_options(cli: &Cli) {
+    if cli.report.as_deref().is_some_and(is_pdf) {
+        return;
+    }
+    let set: Vec<&str> = [
+        (cli.portrait, "--portrait"),
+        (cli.unified, "--unified"),
+        (cli.whole_file, "--whole-file"),
+        (!matches!(cli.page_size, PageArg::A4), "--page-size"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    if !set.is_empty() {
+        let verb = if set.len() == 1 { "applies" } else { "apply" };
+        eprintln!("note: {} only {verb} to .pdf reports", set.join(", "));
+    }
+}
+
 /// Non-interactive operations (console compare, report, patch). Returns the process exit code.
 fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     if analysis_mode(cli) {
@@ -434,6 +496,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     if cli.slideshow && cli.report.is_none() {
         eprintln!("note: --slideshow needs --report");
     }
+    note_pdf_options(cli);
     // A slideshow is an HTML report.
     let report_format = |r: &std::path::Path| match ReportFormat::from_path(r) {
         ReportFormat::Html if cli.slideshow => ReportFormat::Slideshow,
@@ -479,7 +542,24 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             i.status != CmpStatus::Identical && !(i.is_dir && i.status == CmpStatus::NotCompared)
         });
         let failed = files.iter().any(|i| i.status == CmpStatus::Error);
-        if let Some(r) = &cli.report {
+        if let Some(r) = cli.report.as_deref().filter(|r| is_pdf(r)) {
+            if cli.slideshow {
+                eprintln!("note: --slideshow only applies to .html reports");
+            }
+            let fonts = ui::fonts::document_fonts(i18n::current_language());
+            let pdf = core::pdf_report::folder_pdf(
+                &files,
+                paths,
+                &shown,
+                cli.report_diffs.then_some(&cfg.diff),
+                &cfg.rules,
+                &[],
+                &fonts,
+                &pdf_options(cli, cfg),
+            )
+            .map_err(anyhow::Error::msg)?;
+            core::fsutil::write_atomic_with(r, &pdf, false)?;
+        } else if let Some(r) = &cli.report {
             let format = report_format(r);
             if cli.report_diffs {
                 match format {
@@ -487,7 +567,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
                     ReportFormat::Slideshow => {
                         eprintln!("note: a slideshow shows the differences; --report-diffs ignored")
                     }
-                    _ => eprintln!("note: --report-diffs only applies to .html reports"),
+                    _ => eprintln!("note: --report-diffs only applies to .html and .pdf reports"),
                 }
             }
             let text = match format {
@@ -603,7 +683,28 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
     let mut result = core::diff::compute_with(&refs, &cfg.diff, syntax);
     core::diff::include_doc_formats(&mut result, &docs.iter().collect::<Vec<_>>(), &cfg.diff);
-    if let Some(r) = &cli.report {
+    if let Some(r) = cli.report.as_deref().filter(|r| is_pdf(r)) {
+        if cli.slideshow {
+            eprintln!("note: --slideshow only applies to .html reports");
+        }
+        let titles: Vec<String> = (0..docs.len())
+            .map(|i| cli_desc(cli, i).unwrap_or_else(|| paths[i].display().to_string()))
+            .collect();
+        let fonts = ui::fonts::document_fonts(i18n::current_language());
+        let pdf = core::pdf_report::text_pdf(
+            &titles,
+            &refs,
+            &result,
+            &cfg.diff,
+            &[],
+            &cfg.rules,
+            &[],
+            &fonts,
+            &pdf_options(cli, cfg),
+        )
+        .map_err(anyhow::Error::msg)?;
+        core::fsutil::write_atomic_with(r, &pdf, false)?;
+    } else if let Some(r) = &cli.report {
         // One note per problem: another type is written as HTML, a slideshow if asked for.
         let format = match ReportFormat::from_path(r) {
             ReportFormat::Html | ReportFormat::Xml => report_format(r),

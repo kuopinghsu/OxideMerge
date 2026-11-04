@@ -74,6 +74,8 @@ pub struct Config {
     pub rules_migrated: bool,
     /// Whether HTML reports open in the browser once saved.
     pub open_reports: bool,
+    /// Whether PDF reports use US Letter pages rather than A4.
+    pub pdf_letter: bool,
     pub folder: FolderOptions,
     pub filter: String,
     pub recent_paths: Vec<String>,
@@ -134,6 +136,7 @@ impl Default for Config {
             rules: String::new(),
             rules_migrated: false,
             open_reports: true,
+            pdf_letter: false,
             folder: FolderOptions::default(),
             filter: "*.*".into(),
             recent_paths: Vec::new(),

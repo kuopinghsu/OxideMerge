@@ -48,6 +48,7 @@ tempfile = "3"
 trash = "5"
 sys-locale = "0.3"
 ttf-parser = "0.25"
+krilla = { version = "0.8", default-features = false, features = ["simple-text", "raster-images"] }
 ureq = "3"
 url = "2"
 tree-sitter = "0.27.1"

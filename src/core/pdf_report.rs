@@ -16,9 +16,12 @@ use super::html_report::{
 };
 use super::report::{fmt_size, fmt_time, side_name, status_text};
 use crate::i18n::{tr, trf};
+use krilla::action::LinkAction;
+use krilla::annotation::{LinkAnnotation, Target};
 use krilla::color::rgb;
 use krilla::destination::XyzDestination;
-use krilla::geom::{PathBuilder, Point, Rect};
+use krilla::geom::{PathBuilder, Point, Rect, Size, Transform};
+use krilla::image::Image;
 use krilla::metadata::Metadata;
 use krilla::outline::{Outline, OutlineNode};
 use krilla::page::PageSettings;
@@ -107,6 +110,20 @@ impl Default for PdfOptions {
 /// counted. A page holds about 50 rows, so this is some 2,000 pages.
 const REPORT_ROWS: usize = 100_000;
 const MARGIN: f32 = 36.0;
+/// Where the footer's "OxideMerge" links to.
+pub const HOME_URL: &str = env!("CARGO_PKG_REPOSITORY");
+
+/// The app icon, decoded once and shrunk to a size that keeps every page
+/// small: krilla embeds it once and every page refers to it.
+fn icon_image() -> Option<&'static Image> {
+    static ICON: std::sync::OnceLock<Option<Image>> = std::sync::OnceLock::new();
+    ICON.get_or_init(|| {
+        let img = super::html_report::icon_rgba(48)?;
+        let (w, h) = img.dimensions();
+        Some(Image::from_rgba8(img.into_raw(), w, h))
+    })
+    .as_ref()
+}
 const CODE_SIZE: f32 = 7.5;
 const CODE_LEAD: f32 = 9.6;
 const TEXT_SIZE: f32 = 9.0;
@@ -118,6 +135,8 @@ const TAB: usize = 4;
 type Color = (u8, u8, u8);
 const BLACK: Color = (0x1d, 0x23, 0x30);
 const DIM: Color = (0x66, 0x70, 0x85);
+/// The report's accent, for the footer link.
+const LINK: Color = (0x5b, 0x6c, 0xff);
 const RULE: Color = (0xd0, 0xd4, 0xdb);
 const SURFACE: Color = (0xf1, 0xf3, 0xf6);
 
@@ -855,8 +874,15 @@ impl<'a> Writer<'a> {
                 self.draw(&mut s, op);
             }
             // Header and footer.
+            // The app icon sits just left of the title, inside the margin.
+            let icon = SMALL_SIZE + 3.0;
+            if let (Some(img), Some(size)) = (icon_image(), Size::from_wh(icon, icon)) {
+                s.push_transform(&Transform::from_translate(MARGIN, MARGIN - icon + 2.0));
+                s.draw_image(img.clone(), size);
+                s.pop();
+            }
             let header = Op::Text {
-                x: MARGIN,
+                x: MARGIN + icon + 3.0,
                 y: MARGIN,
                 size: SMALL_SIZE,
                 family: Family::Sans,
@@ -895,10 +921,21 @@ impl<'a> Writer<'a> {
                 size: SMALL_SIZE,
                 family: Family::Sans,
                 text: "OxideMerge".into(),
-                color: DIM,
+                color: LINK,
             };
             self.draw(&mut s, &brand);
             s.finish();
+            let bw = self.faces.width(Family::Sans, SMALL_SIZE, "OxideMerge");
+            let at = self.h - MARGIN + 4.0 - SMALL_SIZE;
+            if let Some(rect) = Rect::from_xywh(MARGIN, at, bw, SMALL_SIZE + 2.0) {
+                page.add_annotation(
+                    LinkAnnotation::new(
+                        rect,
+                        Target::Action(LinkAction::new(HOME_URL.into()).into()),
+                    )
+                    .into(),
+                );
+            }
             page.finish();
         }
         let mut outline = Outline::new();
@@ -1353,6 +1390,21 @@ mod tests {
         let page = trf("report.page_n", &[("i", "1".into()), ("n", "1".into())]);
         let first_word = page.split_whitespace().next().unwrap().to_owned();
         assert!(text.contains(&first_word), "{page}: {text}");
+    }
+
+    #[test]
+    fn every_page_carries_the_icon_and_a_link_home() {
+        let a: Vec<String> = (0..400).map(|i| format!("line {i}")).collect();
+        let b: Vec<String> = (0..400).map(|i| format!("row {i}")).collect();
+        let pdf = report(&a, &b, &PdfOptions::default());
+        let raw = String::from_utf8_lossy(&pdf);
+        let pages = raw.matches("/Type/Page/").count();
+        assert!(pages > 1, "a long report spans pages: {pages}");
+        // One colour image plus its alpha mask, shared by every page.
+        assert_eq!(raw.matches("/Subtype/Image").count(), 2);
+        let link = format!("/S/URI/URI({HOME_URL})");
+        assert_eq!(raw.matches(&link).count(), pages, "each page links home");
+        assert_eq!(HOME_URL, "https://github.com/kuopinghsu/OxideMerge");
     }
 
     #[test]

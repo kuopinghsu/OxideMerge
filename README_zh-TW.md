@@ -83,6 +83,7 @@ OxideMerge 以 Rust 開發，設計上參考了 [WinMerge](https://github.com/Wi
 
 - 匯出 HTML 報告、每張投影片顯示一個差異的 HTML 投影片，以及供其他程式讀取的 XML 報告。
   資料夾比較摘要可匯出為 CSV 或純文字。
+- 匯出與列印 PDF 報告：內嵌字型，中文、日文與韓文也能正確列印；以黑白列印時，標記仍清楚可辨。
 - 產生修補檔。套用統一格式的修補檔時，可先檢查結果再儲存。
 - 將比較設定儲存為專案檔；將文字比較連同書籤與註記一起儲存；
   或將檔案內容、設定、書籤與註解一起儲存為可攜式資料夾審閱。
@@ -269,8 +270,9 @@ oxidemerge -r old-folder new-folder --report report.html --report-diffs
 | `--structured` | 在資料夾比較中，將結構相同的 JSON、XML、TOML 與 YAML 檔案視為相同。 |
 | `--rules <name-or-path>` | 使用比較規則檔。 |
 | `--git-rev <revision>` | 將單一檔案或資料夾與 Git 修訂版本比較。 |
-| `--report <file>` | 匯出 `.html` 或 `.xml` 報告；資料夾比較也可匯出 `.csv` 或 `.txt`。 |
-| `--report-diffs` | 在資料夾的 HTML 報告中加入文字差異。 |
+| `--report <file>` | 匯出 `.html`、`.pdf` 或 `.xml` 報告；資料夾比較也可匯出 `.csv` 或 `.txt`。 |
+| `--report-diffs` | 在資料夾的 HTML 或 PDF 報告中加入文字差異。 |
+| `--page-size a4\|letter`、`--portrait`、`--unified`、`--whole-file` | 設定 `.pdf` 報告的版面：紙張大小、直式頁面、兩個檔案以單欄顯示，或顯示完整檔案而非只顯示差異與 `--context` 行前後文。 |
 | `--slideshow` | 匯出每張投影片顯示一個差異的 HTML 投影片。 |
 | `--patch <file>` | 從雙向檔案或資料夾比較產生修補檔。 |
 | `--cli` | 不開啟視窗直接比較，適合在指令碼中使用。 |
@@ -449,7 +451,7 @@ git config --global mergetool.oxidemerge.trustExitCode false
 - 啟用自動格式化時，JSON 與 XML 檔案為唯讀。若要編輯或合併，請關閉此功能。
 - 網頁比較不會執行 JavaScript，因此可能缺少網頁指令碼加入的內容。
 - 不支援需要登入的網頁，這類網頁可能只會顯示登入畫面。
-- 文字編輯以行為單位，主要用於檢視與合併變更。
+- 文字窗格主要用於檢視與合併變更，並非完整的編輯器。可以在游標處輸入、跨行選取，並以 Alt+拖曳選取欄，但沒有逐字移動，內嵌檢視中也沒有游標。
 - 支援 WinMerge 專案檔與篩選器檔案，但不支援 WinMerge 的外掛程式動態連結程式庫與指令碼。
 - OxideMerge 自行讀取的文件、試算表與程式，是以讀取到的文字比較，而非以檔案本身比較：
   版面、字型、公式等格式中的其他內容並不會被比較，且比較為唯讀。

@@ -118,6 +118,10 @@ pub struct TextDoc {
     pub final_newline: bool,
     pub modified: bool,
     pub read_only: bool,
+    /// Text read from a file rather than the file itself (a document, spreadsheet or program
+    /// read as text, a formatted copy, a web page): it can be compared but never written back,
+    /// so it stays read-only.
+    pub compare_only: bool,
     pub description: Option<String>,
     /// File extension used to pick syntax highlighting when there is no path.
     pub syntax: Option<String>,
@@ -137,6 +141,7 @@ impl TextDoc {
             final_newline: true,
             modified: false,
             read_only: false,
+            compare_only: false,
             description: None,
             syntax: None,
         }

@@ -83,6 +83,10 @@ pub enum Cmd {
     ClearSyncPoints,
     /// Save an HTML slideshow report: one difference per slide.
     Slideshow,
+    /// Save the report as a PDF file.
+    ExportPdf,
+    /// Open the PDF report in the system's viewer, to print it from there.
+    Print,
     /// Show or hide the file compare below the folder list.
     ToggleFilePane,
 }
@@ -161,6 +165,8 @@ impl Cmd {
             SyncPoint => "cmd.sync_point",
             ClearSyncPoints => "cmd.clear_sync_points",
             Slideshow => "menu.slideshow",
+            ExportPdf => "menu.export_pdf",
+            Print => "menu.print",
             ToggleFilePane => "view.folder_file_pane",
         }
     }
@@ -174,7 +180,7 @@ impl Cmd {
             OpenConflict => Icon::Warning,
             Save | SaveAll | SaveAs(_) | SaveProject | SaveComparison => Icon::File,
             Patch | ApplyPatch | Report | ReportWithDiffs | BookmarkComment => Icon::Text,
-            Slideshow => Icon::Export,
+            Slideshow | ExportPdf | Print => Icon::Export,
             ExportHtml => Icon::Export,
             GitCompare | TakeBoth(_) | AllDiffs | SyncPoint => Icon::Compare,
             Statistics | GotoLine => Icon::Method,
@@ -318,6 +324,7 @@ pub const BINDINGS: &[Binding] = {
     &[
         bind(A, CTRL, Key::K, "Ctrl+K", Palette),
         bind(A, CTRL_SHIFT, Key::P, "Ctrl+Shift+P", Palette),
+        bind(A, CTRL, Key::P, "Ctrl+P", Print),
         bind(A, CTRL, Key::N, "Ctrl+N", New),
         bind(A, CTRL, Key::O, "Ctrl+O", Open),
         bind(A, CTRL_SHIFT, Key::S, "Ctrl+Shift+S", SaveAll),
@@ -422,6 +429,8 @@ pub const PALETTE: &[Cmd] = {
         Report,
         ReportWithDiffs,
         Slideshow,
+        ExportPdf,
+        Print,
         AllDiffs,
         SaveComparison,
         GitCompare,

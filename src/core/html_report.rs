@@ -19,7 +19,7 @@ pub(crate) const MAX_LINES: usize = 50_000;
 /// Files larger than this are listed in folder reports without their differences.
 const MAX_BYTES: u64 = 16 << 20;
 /// Characters of a line shown; the rest is cut off.
-const LINE_CHARS: usize = 2_000;
+pub(crate) const LINE_CHARS: usize = 2_000;
 /// Rows shown in a text report, all differences together; the differences after them are only
 /// counted, keeping the page small enough for a browser.
 const REPORT_ROWS: usize = 20_000;
@@ -42,7 +42,8 @@ const CSS: &str = r#"
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans","PingFang TC","Microsoft JhengHei",sans-serif}
 .top{position:sticky;top:0;z-index:5;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 24px;background:var(--surface);background:color-mix(in srgb,var(--surface) 88%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
 .brand{display:flex;align-items:center;gap:10px;font-weight:650;font-size:15px;margin-right:auto}
-.logo{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#ff8a3d,#5b6cff);display:grid;place-items:center;color:#fff;font-size:13px;font-weight:800}
+.logo{width:30px;height:30px;flex:none;border-radius:7px;display:block;transition:transform .35s cubic-bezier(.3,1.6,.5,1)}
+.brand:hover .logo{transform:rotate(-12deg) scale(1.1)}
 .brand small{font-weight:400;color:var(--dim);font-size:12px}
 .ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 input.q{width:220px;padding:6px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--text);font:inherit}
@@ -112,6 +113,26 @@ table.u{display:none}body.unified table.u{display:table}body.unified table.s2.tw
 kbd{font-family:var(--mono);font-size:11px;padding:0 5px;border:1px solid var(--border);border-bottom-width:2px;border-radius:4px;background:var(--surface)}
 @media (max-width:900px){.layout{grid-template-columns:minmax(0,1fr)}.toc{display:none}input.q{width:150px}}
 [hidden]{display:none!important}
+@keyframes oxm-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes oxm-pop{from{opacity:0;transform:scale(.6) rotate(-20deg)}to{opacity:1;transform:none}}
+@keyframes oxm-open{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+@keyframes oxm-pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--accent) 45%,transparent)}100%{box-shadow:0 0 0 10px transparent}}
+@keyframes oxm-flash{0%,100%{filter:none}40%{filter:brightness(.9) saturate(1.6)}}
+.logo{animation:oxm-pop .6s cubic-bezier(.3,1.6,.5,1) both}
+.sides,.stats,.meta,.chips,.toc,.file,.empty{animation:oxm-in .4s ease-out both}
+.stats{animation-delay:.05s}.meta,.chips{animation-delay:.1s}.toc{animation-delay:.12s}
+.file:nth-of-type(1){animation-delay:.14s}.file:nth-of-type(2){animation-delay:.18s}.file:nth-of-type(3){animation-delay:.22s}
+.file:nth-of-type(4){animation-delay:.26s}.file:nth-of-type(5){animation-delay:.3s}.file:nth-of-type(n+6){animation-delay:.34s}
+.stat,.side,.file{transition:transform .18s,box-shadow .18s,border-color .18s}
+.stat:hover,.side:hover{transform:translateY(-2px);border-color:var(--accent)}
+.file:hover{border-color:color-mix(in srgb,var(--accent) 45%,var(--border))}
+button,.toc a,.chip,.file>summary{transition:background-color .15s,border-color .15s,color .15s,transform .1s}
+button:active{transform:scale(.96)}
+details[open]>.body{animation:oxm-open .25s ease-out}
+.hunk.focus{animation:oxm-pulse .8s ease-out}.hunk.focus .hh{animation:oxm-flash .8s ease-out}
+.hunk:target{animation:oxm-pulse .8s ease-out}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+@media print{*,*::before,*::after{animation:none!important;transition:none!important}}
 @media print{*{-webkit-print-color-adjust:exact;print-color-adjust:exact}.top .ctl,.toc{display:none}.layout{grid-template-columns:1fr}.file{break-inside:avoid-page;box-shadow:none}body{background:#fff}}
 "#;
 
@@ -153,12 +174,18 @@ const a=tocLink(f.id);if(a)a.hidden=!ok});
 const e=document.getElementById('empty');if(e)e.hidden=shown>0}
 window.oxmStatus=function(b){status=b.dataset.status;$('.chip').forEach(c=>c.classList.toggle('on',c===b));apply()};
 const q=document.getElementById('q');if(q)q.addEventListener('input',apply);
+const calm=matchMedia('(prefers-reduced-motion: reduce)').matches;
+if(!calm&&window.requestAnimationFrame)$('.stat .v').forEach(v=>{const t=v.textContent,m=/^(\d[\d,]*)$/.exec(t.trim());if(!m)return;
+const n=+m[1].replace(/,/g,'');if(!(n>1))return;const comma=m[1].includes(','),t0=performance.now(),ms=700;
+const f=x=>comma?x.toLocaleString('en-US'):String(x);
+const step=now=>{const p=Math.min(1,(now-t0)/ms),e=1-Math.pow(1-p,3);v.textContent=p<1?f(Math.round(n*e)):t;if(p<1)requestAnimationFrame(step)};
+v.textContent=f(0);requestAnimationFrame(step)});
 document.addEventListener('click',e=>{const a=e.target.closest('a[href^="#"]');if(!a)return;const t=document.getElementById(a.getAttribute('href').slice(1));if(t){const d=t.closest('details')||t;if(d.tagName==='DETAILS')d.open=true}});
 function jump(dir){const hs=$('.hunk').filter(h=>!h.closest('.file').hidden);if(!hs.length)return;
 const c=hs.indexOf(document.querySelector('.hunk.focus'));let k;
 if(c>=0)k=c+dir;else{const top=h=>{const d=h.closest('details');return(d&&!d.open?d:h).getBoundingClientRect().top};let i=hs.findIndex(h=>top(h)>82);if(i<0)i=hs.length;k=dir>0?i:i-1}
 k=Math.max(0,Math.min(hs.length-1,k));const h=hs[k];const d=h.closest('details');if(d)d.open=true;
-$('.hunk.focus').forEach(x=>x.classList.remove('focus'));h.classList.add('focus');h.scrollIntoView({block:'start',behavior:'smooth'})}
+$('.hunk.focus').forEach(x=>x.classList.remove('focus'));void h.offsetWidth;h.classList.add('focus');h.scrollIntoView({block:'start',behavior:'smooth'})}
 document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'||e.ctrlKey||e.metaKey||e.altKey)return;
 const key=e.key.toLowerCase();if(key==='n'||key==='j')jump(1);else if(key==='p'||key==='k')jump(-1);else if(key==='/'&&q){e.preventDefault();q.focus()}});
 })();
@@ -167,6 +194,11 @@ const key=e.key.toLowerCase();if(key==='n'||key==='j')jump(1);else if(key==='p'|
 /// The differences to list, each with the rows shown for it: its own and up to `CONTEXT`
 /// unchanged rows around it, short of the next or previous difference.
 pub(crate) fn hunks(result: &DiffResult) -> Vec<(usize, Range<usize>)> {
+    hunks_with(result, CONTEXT)
+}
+
+/// Like [`hunks`], with up to `context` unchanged rows around each difference.
+pub(crate) fn hunks_with(result: &DiffResult, context: usize) -> Vec<(usize, Range<usize>)> {
     let end = |b: &super::diff::Block| b.first_row + b.rows;
     let listed: Vec<usize> = (0..result.blocks.len())
         .filter(|&b| !result.blocks[b].ignored)
@@ -182,8 +214,8 @@ pub(crate) fn hunks(result: &DiffResult) -> Vec<(usize, Range<usize>)> {
             let next = listed
                 .get(k + 1)
                 .map_or(result.rows.len(), |&j| result.blocks[j].first_row);
-            let from = blk.first_row.saturating_sub(CONTEXT).max(prev);
-            let to = (end(blk) + CONTEXT).min(next).max(end(blk));
+            let from = blk.first_row.saturating_sub(context).max(prev);
+            let to = end(blk).saturating_add(context).min(next).max(end(blk));
             (b, from.min(blk.first_row)..to)
         })
         .collect()
@@ -390,7 +422,7 @@ fn hunk_html(
     out.push_str("</div></section>\n");
 }
 
-fn ignored_blocks(result: &DiffResult) -> usize {
+pub(crate) fn ignored_blocks(result: &DiffResult) -> usize {
     result.blocks.iter().filter(|b| b.ignored).count()
 }
 
@@ -438,6 +470,53 @@ fn stat_badges(out: &mut String, s: &Stats) {
     }
 }
 
+/// The app icon the reports carry, as shipped in `images/icon.png`.
+const ICON_PNG: &[u8] = include_bytes!("../../images/icon.png");
+
+/// The app icon scaled to `size` pixels square, as RGBA.
+pub(crate) fn icon_rgba(size: u32) -> Option<image::RgbaImage> {
+    let img = image::load_from_memory_with_format(ICON_PNG, image::ImageFormat::Png).ok()?;
+    Some(
+        img.resize_exact(size, size, image::imageops::FilterType::Lanczos3)
+            .into_rgba8(),
+    )
+}
+
+/// The icon as a `data:` URI, so a report stays one self-contained file. It is
+/// shrunk to 64 px (crisp at the 30 px it is shown on a 2x screen), which keeps
+/// it to a few KB instead of the 80 KB original.
+fn icon_data_uri() -> &'static str {
+    static URI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URI.get_or_init(|| {
+        let mut png = Vec::new();
+        let ok = icon_rgba(64).is_some_and(|img| {
+            img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .is_ok()
+        });
+        let bytes = if ok { &png[..] } else { ICON_PNG };
+        format!("data:image/png;base64,{}", base64(bytes))
+    })
+}
+
+/// Standard base64 with padding.
+fn base64(data: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 struct Controls {
     filter: bool,
     view: bool,
@@ -454,7 +533,8 @@ fn page_start(out: &mut String, title: &str, c: &Controls) {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M");
     let _ = write!(
         out,
-        "<header class=\"top\"><div class=\"brand\"><div class=\"logo\">⇄</div><div>{}<br><small>{}</small></div></div><div class=\"ctl\">",
+        "<header class=\"top\"><div class=\"brand\"><img class=\"logo\" alt=\"\" src=\"{}\"><div>{}<br><small>{}</small></div></div><div class=\"ctl\">",
+        icon_data_uri(),
         esc(title),
         esc(&trf("report.generated", &[("date", now.to_string())]))
     );
@@ -985,6 +1065,44 @@ mod tests {
 
     fn v(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn base64_matches_the_standard_alphabet_and_padding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64(&[0xfb, 0xff]), "+/8=");
+    }
+
+    #[test]
+    fn reports_embed_a_small_icon_and_animate_only_when_motion_is_welcome() {
+        let a = v(&["x"]);
+        let b = v(&["y"]);
+        let opts = DiffOptions::default();
+        let r = compute(&[&a, &b], &opts);
+        let html = text_report(&["a".into(), "b".into()], &[&a, &b], &r, &opts, &[], "");
+        let start = html
+            .find("<img class=\"logo\" alt=\"\" src=\"data:image/png;base64,")
+            .expect("icon");
+        let uri = &html[start..];
+        let len = uri.find("\">").unwrap();
+        assert!(
+            len < 16_000,
+            "the icon is shrunk, not the 80 KB original: {len}"
+        );
+        let png = icon_rgba(64).unwrap();
+        assert_eq!(png.dimensions(), (64, 64));
+        for want in [
+            "@keyframes oxm-in",
+            "prefers-reduced-motion:reduce",
+            "prefers-reduced-motion: reduce",
+            "oxm-pulse",
+        ] {
+            assert!(html.contains(want), "{want}");
+        }
     }
 
     #[test]

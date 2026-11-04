@@ -280,34 +280,10 @@ fn fallback_tweak(primary: Option<VMetrics>, bytes: &[u8], index: u32) -> FontTw
     }
 }
 
-/// Installs the UI, title and code fonts, then fallback fonts: a Han/kana font (preferring the
-/// UI language's script variant), a Hangul font and a symbol font when available.
-pub fn setup(ctx: &egui::Context, lang: &str) {
-    let mut fonts = FontDefinitions::default();
-    let proportional = load_first(&mut fonts, UI_FONTS);
-    if let Some((name, _)) = &proportional {
-        fonts
-            .families
-            .entry(FontFamily::Proportional)
-            .or_default()
-            .insert(0, name.clone());
-    }
-    if let Some((name, _)) = load_first(&mut fonts, MONO_FONTS) {
-        fonts
-            .families
-            .entry(FontFamily::Monospace)
-            .or_default()
-            .insert(0, name);
-    }
-    let semibold = load_first(&mut fonts, UI_SEMIBOLD_FONTS).map(|(name, _)| name);
-    // San Francisco and SF Mono share vertical metrics, so one shift fits both families.
-    // Windows and Linux UI fonts already share a baseline with their CJK fallbacks.
-    let primary_metrics = if cfg!(target_os = "macos") {
-        proportional.and_then(|(_, metrics)| metrics)
-    } else {
-        None
-    };
-
+/// The fallback fonts for scripts the UI and code fonts lack, in the order they are tried: a
+/// Han/kana font (preferring the script variant of `lang`), a Hangul font and a symbol font,
+/// each when installed.
+fn fallbacks(lang: &str) -> Vec<LoadedFont> {
     let (win_han, fc_han): (Vec<&str>, Vec<&str>) = match lang {
         "zh-TW" => (
             [WIN_TW, WIN_CN, WIN_JA].concat(),
@@ -345,7 +321,38 @@ pub fn setup(ctx: &egui::Context, lang: &str) {
     } else {
         [han, hangul, symbols]
     };
-    for loaded in ordered.into_iter().flatten() {
+    ordered.into_iter().flatten().collect()
+}
+
+/// Installs the UI, title and code fonts, then fallback fonts: a Han/kana font (preferring the
+/// UI language's script variant), a Hangul font and a symbol font when available.
+pub fn setup(ctx: &egui::Context, lang: &str) {
+    let mut fonts = FontDefinitions::default();
+    let proportional = load_first(&mut fonts, UI_FONTS);
+    if let Some((name, _)) = &proportional {
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, name.clone());
+    }
+    if let Some((name, _)) = load_first(&mut fonts, MONO_FONTS) {
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .insert(0, name);
+    }
+    let semibold = load_first(&mut fonts, UI_SEMIBOLD_FONTS).map(|(name, _)| name);
+    // San Francisco and SF Mono share vertical metrics, so one shift fits both families.
+    // Windows and Linux UI fonts already share a baseline with their CJK fallbacks.
+    let primary_metrics = if cfg!(target_os = "macos") {
+        proportional.and_then(|(_, metrics)| metrics)
+    } else {
+        None
+    };
+
+    for loaded in fallbacks(lang) {
         let tweak = fallback_tweak(primary_metrics, &loaded.bytes, loaded.index);
         let name = insert(&mut fonts, &loaded.path, loaded.bytes, loaded.index, tweak);
         for fam in [FontFamily::Proportional, FontFamily::Monospace] {
@@ -365,6 +372,42 @@ pub fn setup(ctx: &egui::Context, lang: &str) {
         .families
         .insert(FontFamily::Name(crate::ui::theme::SEMIBOLD.into()), family);
     ctx.set_fonts(fonts);
+}
+
+/// The fonts a PDF report embeds: the code and UI fonts, then the fallbacks of [`fallbacks`], and
+/// last the fonts built into the program, so that every report has a font for Latin text even
+/// where none is installed.
+pub fn document_fonts(lang: &str) -> crate::core::pdf_report::Fonts {
+    use crate::core::pdf_report::FontFile;
+    let file = |bytes: Vec<u8>, index: u32| FontFile {
+        data: Arc::new(bytes),
+        index,
+    };
+    let first = |paths: &[&str]| {
+        first_font(paths.iter().map(|s| s.to_string())).map(|(_, bytes)| file(bytes, 0))
+    };
+    let rest: Vec<FontFile> = fallbacks(lang)
+        .into_iter()
+        .map(|f| file(f.bytes, f.index))
+        .collect();
+    let built_in = FontDefinitions::default();
+    let builtin = |name: &str| {
+        built_in.font_data.get(name).map(|d| FontFile {
+            data: d.font.clone(),
+            index: d.index,
+        })
+    };
+    let chain = |primary: Option<FontFile>, last: &str| -> Vec<FontFile> {
+        primary
+            .into_iter()
+            .chain(rest.iter().cloned())
+            .chain(builtin(last))
+            .collect()
+    };
+    crate::core::pdf_report::Fonts {
+        mono: chain(first(MONO_FONTS), "Hack"),
+        sans: chain(first(UI_FONTS), "Ubuntu-Light"),
+    }
 }
 
 #[cfg(test)]

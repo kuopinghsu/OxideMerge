@@ -7,7 +7,7 @@
 //! user configured is used in preference, so a better converter can always be put in front.
 
 mod markdown;
-mod pdf;
+pub(crate) mod pdf;
 
 pub use markdown::{docx_blocks, pdf_blocks, xlsx_blocks};
 
