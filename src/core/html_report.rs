@@ -485,7 +485,7 @@ pub(crate) fn icon_rgba(size: u32) -> Option<image::RgbaImage> {
 /// The icon as a `data:` URI, so a report stays one self-contained file. It is
 /// shrunk to 64 px (crisp at the 30 px it is shown on a 2x screen), which keeps
 /// it to a few KB instead of the 80 KB original.
-fn icon_data_uri() -> &'static str {
+pub(crate) fn icon_data_uri() -> &'static str {
     static URI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     URI.get_or_init(|| {
         let mut png = Vec::new();
@@ -598,6 +598,15 @@ fn page_end(out: &mut String, hunks: bool) {
     if hunks {
         let _ = write!(out, "{} · ", tr("report.keys"));
     }
+    let _ = writeln!(
+        out,
+        "{}</p></main></div><script>{JS}</script></body></html>",
+        made_by_html()
+    );
+}
+
+/// "Made by OxideMerge …", with *OxideMerge* linked to the project page.
+pub(crate) fn made_by_html() -> String {
     let made_by = esc(&trf(
         "report.made_by",
         &[("version", env!("CARGO_PKG_VERSION").to_string())],
@@ -606,11 +615,7 @@ fn page_end(out: &mut String, hunks: bool) {
         "<a href=\"{}\">OxideMerge</a>",
         env!("CARGO_PKG_REPOSITORY")
     );
-    let _ = writeln!(
-        out,
-        "{}</p></main></div><script>{JS}</script></body></html>",
-        made_by.replacen("OxideMerge", &link, 1)
-    );
+    made_by.replacen("OxideMerge", &link, 1)
 }
 
 /// The report of a 2-way or 3-way text compare: its differences, each with the lines around

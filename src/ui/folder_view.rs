@@ -61,7 +61,7 @@ pub enum FolderAction {
     /// Open the compare rules files in the options.
     EditRules,
     /// Save the HTML report of the folder compare with the differences of every changed file.
-    ExportHtml,
+    HtmlReport,
     /// Show or hide each kind of item.
     Show {
         identical: bool,
@@ -926,6 +926,53 @@ impl FolderView {
 
     pub fn set_method(&mut self, method: folder::CompareMethod) {
         self.fopts.method = method;
+    }
+
+    /// This comparison as a compare job: its folders, filter, method, rules and the comparison
+    /// options that are on, so the job compares as this tab does.
+    pub fn as_job(&self, cfg: &Config) -> crate::core::job::Job {
+        use crate::core::diff::WhitespaceMode;
+        use crate::core::folder::CompareMethod;
+        // An archive is compared through a copy; the job names the archive itself.
+        let path = |i: usize| -> String {
+            match self.display_roots.get(i) {
+                Some(d) if Path::new(d).exists() => d.clone(),
+                _ => self.roots[i].display().to_string(),
+            }
+        };
+        let n = self.roots.len();
+        let d = cfg.comparison_options();
+        let method = match self.fopts.method {
+            CompareMethod::FullContents => "full",
+            CompareMethod::QuickContents => "quick",
+            CompareMethod::BinaryContents => "binary",
+            CompareMethod::Date => "date",
+            CompareMethod::DateSize => "datesize",
+            CompareMethod::Size => "size",
+        };
+        crate::core::job::Job {
+            left: Some(path(0)),
+            base: (n == 3).then(|| path(1)),
+            right: Some(path(n.saturating_sub(1))),
+            recursive: self.fopts.recursive,
+            filter: Some(self.filter_spec.trim().to_string()).filter(|f| !f.is_empty()),
+            method: Some(method.into()),
+            structured: self.fopts.structured,
+            rules: Some(self.rules.clone()).filter(|r| !r.trim().is_empty()),
+            whitespace: match d.whitespace {
+                WhitespaceMode::Compare => None,
+                WhitespaceMode::IgnoreChange => Some("change".into()),
+                WhitespaceMode::IgnoreAll => Some("all".into()),
+            },
+            ignore_case: d.ignore_case,
+            ignore_blank: d.ignore_blank_lines,
+            ignore_eol: d.ignore_eol,
+            ignore_numbers: d.ignore_numbers,
+            ignore_comments: d.ignore_comments,
+            prettify: d.prettify,
+            numeric_tolerance: d.numeric_tolerance_enabled.then_some(d.numeric_tolerance),
+            ..Default::default()
+        }
     }
 
     /// Uses the compare rules file `rules` ("" = none) from the next comparison on.
@@ -2270,6 +2317,7 @@ impl FolderView {
             excluded: self.filter.excludes_anything() || self.fopts.skip_hidden,
             filter: self.filter_spec.clone(),
             skip_hidden: self.fopts.skip_hidden,
+            copy_links: false,
         };
         let writable = [self.writable(0), self.writable(1)];
         self.sync = Some(Box::new(SyncDialog::new(
@@ -3048,10 +3096,10 @@ impl FolderView {
                 action = Some(FolderAction::AllDiffs);
             }
             if labelled(ui, Icon::Export, tr("btn.export_html"))
-                .on_hover_text(Cmd::ExportHtml.tip())
+                .on_hover_text(Cmd::HtmlReport.tip())
                 .clicked()
             {
-                action = Some(FolderAction::ExportHtml);
+                action = Some(FolderAction::HtmlReport);
             }
             let left_end = ui.cursor().min.x + 4.0;
             if wrap {

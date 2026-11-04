@@ -16,8 +16,10 @@
 //! the journal first, then to its new name, so a rename is undone even after a crash, and a
 //! rename only in case or Unicode form works on file systems that take both for one name.
 //!
-//! Symbolic links are never followed or copied, and other names that may stand for another
-//! file on the destination's file system are left alone: those reaching an existing entry
+//! Symbolic links are never followed. They are left alone, unless the plan copies links: then a
+//! link is synchronized as the link itself, with the text of its target as its contents, and a
+//! link facing a file or folder of the same name is still left alone (Unix only). Other names
+//! that may stand for another file on the destination's file system are left alone: those reaching an existing entry
 //! under another case or Unicode form, and source names alike but for case or for accents on
 //! Latin letters, composed or not.
 
@@ -38,8 +40,9 @@ use std::time::SystemTime;
 
 /// The version of the plan file format; newer plans are refused.
 pub const PLAN_VERSION: u32 = 1;
-/// 2 records renames, which older versions would undo wrongly, so they refuse it.
-const JOURNAL_VERSION: u32 = 2;
+/// 2 records renames and 3 symbolic links, which older versions would undo wrongly, so they
+/// refuse it.
+const JOURNAL_VERSION: u32 = 3;
 const JOURNAL_FILE: &str = "journal.jsonl";
 const HEADER_FILE: &str = "header.json";
 /// Deleting at least this many items asks a second time.
@@ -260,6 +263,26 @@ impl Precondition {
         } else {
             Kind::Other
         };
+        if kind == Kind::Link {
+            // The target is the link's contents; nothing is read through it.
+            let Ok(target) = std::fs::read_link(path) else {
+                return Precondition::of(Kind::Unreadable);
+            };
+            let sha256 = if hash {
+                match link_hash(&target) {
+                    Some(h) => Some(h),
+                    None => return Precondition::of(Kind::Unreadable),
+                }
+            } else {
+                None
+            };
+            return Precondition {
+                kind,
+                size: Some(target.as_os_str().len() as u64),
+                modified: None,
+                sha256,
+            };
+        }
         if kind != Kind::File {
             return Precondition::of(kind);
         }
@@ -285,6 +308,69 @@ impl Precondition {
             && self.size == now.size
             && (self.sha256.is_none() || self.sha256 == now.sha256)
     }
+}
+
+/// The fingerprint of a symbolic link's target text, which no file's contents share. Only a
+/// target written as UTF-8 is taken, so the journal can record it as it is.
+fn link_hash(target: &Path) -> Option<String> {
+    let text = target.to_str()?;
+    let mut h = Sha256::new();
+    h.update(b"symlink\0");
+    h.update(text.as_bytes());
+    Some(format!("{:x}", h.finalize()))
+}
+
+/// The target of the link `path`, refused unless it is still the planned `expected` one.
+fn planned_link(path: &Path, expected: &str) -> std::io::Result<PathBuf> {
+    let target = std::fs::read_link(path).map_err(|_| changed_since_preview())?;
+    if link_hash(&target).as_deref() != Some(expected) {
+        return Err(changed_since_preview());
+    }
+    Ok(target)
+}
+
+/// Makes a symbolic link to `target` at `at`, where nothing may be.
+fn make_link(target: &Path, at: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, at)?;
+        if let Some(dir) = at.parent() {
+            let _ = sync_dir(dir);
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, at);
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// Puts a link to `target` in place of the link `at`, while that still has the fingerprint
+/// `expected`: made beside it under a temporary name starting with `prefix`, then renamed over.
+fn replace_link(target: &Path, at: &Path, expected: &str, prefix: &str) -> std::io::Result<()> {
+    let dir = at
+        .parent()
+        .ok_or_else(|| std::io::Error::other(tr("folder_sync.err_not_file")))?;
+    let tmp = (0..)
+        .map(|k| dir.join(format!("{prefix}link-{k}")))
+        .find(|p| std::fs::symlink_metadata(p).is_err())
+        .expect("a free name");
+    make_link(target, &tmp)?;
+    let still = std::fs::read_link(at)
+        .ok()
+        .and_then(|t| link_hash(&t))
+        .is_some_and(|h| h == expected);
+    if !still {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(changed_since_preview());
+    }
+    if let Err(e) = std::fs::rename(&tmp, at) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let _ = sync_dir(dir);
+    Ok(())
 }
 
 fn nanos(t: Option<SystemTime>) -> Option<u64> {
@@ -475,6 +561,10 @@ pub struct SyncPlan {
     /// folders it was made for without naming them.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub folders: String,
+    /// Symbolic links are synchronized as links, never followed. Plans without it leave links
+    /// alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub copy_links: bool,
     pub operations: Vec<SyncOperation>,
     pub warnings: Vec<PlanWarning>,
     pub estimate: Estimate,
@@ -483,7 +573,13 @@ pub struct SyncPlan {
 impl SyncPlan {
     fn identity(&self) -> String {
         let base = (self.version, &self.policy, &self.operations, &self.warnings);
-        analysis::identity(&(base, &self.filter, self.skip_hidden, &self.folders))
+        let all = (base, &self.filter, self.skip_hidden, &self.folders);
+        // Left out while off, so plans made before it keep their identity.
+        if self.copy_links {
+            analysis::identity(&(all, "copy_links"))
+        } else {
+            analysis::identity(&all)
+        }
     }
 
     pub fn changes(&self) -> usize {
@@ -567,6 +663,8 @@ pub struct Scope {
     /// The filter as written, recorded in the plan.
     pub filter: String,
     pub skip_hidden: bool,
+    /// Synchronize symbolic links as links rather than leave them alone.
+    pub copy_links: bool,
 }
 
 /// The SHA-256 of the two folders' full paths, as recorded in a plan.
@@ -597,6 +695,9 @@ fn pair_renames(operations: &mut [SyncOperation]) {
             Action::Delete => (&o.destination, false),
             _ => continue,
         };
+        if side.kind != Kind::File {
+            continue;
+        }
         if let (Some(h), Some(1..)) = (&side.sha256, side.size) {
             let (copies, deletes) = by_hash.entry(h.as_str()).or_default();
             let list = if copy { copies } else { deletes };
@@ -790,6 +891,7 @@ pub fn plan(
         return Err(tr("folder_sync.err_incomplete").to_string());
     }
     let (s, d) = (policy.source(), policy.destination());
+    let copy_links = scope.copy_links && cfg!(unix);
     // Two source names one destination may take for the same one.
     let mut folded: HashMap<(String, String), Vec<usize>> = HashMap::new();
     for (i, it) in items.iter().enumerate().filter(|(_, it)| it.exists[s]) {
@@ -899,27 +1001,37 @@ pub fn plan(
         let expected = if it.is_dir { Kind::Dir } else { Kind::File };
         let in_s = ks != Kind::Missing;
         let in_d = kd != Kind::Missing;
-        let conflict =
-            if it.status == CmpStatus::Error || ks == Kind::Unreadable || kd == Kind::Unreadable {
-                Some(Reason::Unreadable)
-            } else if ks == Kind::Link || kd == Kind::Link {
-                Some(Reason::Link)
-            } else if ks == Kind::Other || kd == Kind::Other {
-                Some(Reason::Special)
-            } else if (in_s && ks != expected) || (in_d && kd != expected) {
-                Some(Reason::TypeDiffers)
-            } else if (in_s && !it.exists[s])
-                || (in_d && !it.exists[d])
-                || (in_s && !names.exact(&sp))
-                || (in_d && !names.exact(&dp))
-                || clashing.contains(&i)
-            {
-                Some(Reason::NameClash)
-            } else if in_s != it.exists[s] || in_d != it.exists[d] {
-                Some(Reason::ChangedSinceCompare)
-            } else {
-                None
-            };
+        // A link on one side with a link or nothing on the other, synchronized as a link. The
+        // compare may have found it unreadable: it reads through the link, which this does not.
+        let link = copy_links
+            && matches!(
+                (ks, kd),
+                (Kind::Link, Kind::Link)
+                    | (Kind::Link, Kind::Missing)
+                    | (Kind::Missing, Kind::Link)
+            );
+        let conflict = if !link
+            && (it.status == CmpStatus::Error || ks == Kind::Unreadable || kd == Kind::Unreadable)
+        {
+            Some(Reason::Unreadable)
+        } else if !link && (ks == Kind::Link || kd == Kind::Link) {
+            Some(Reason::Link)
+        } else if ks == Kind::Other || kd == Kind::Other {
+            Some(Reason::Special)
+        } else if !link && ((in_s && ks != expected) || (in_d && kd != expected)) {
+            Some(Reason::TypeDiffers)
+        } else if (in_s && !it.exists[s])
+            || (in_d && !it.exists[d])
+            || (in_s && !names.exact(&sp))
+            || (in_d && !names.exact(&dp))
+            || clashing.contains(&i)
+        {
+            Some(Reason::NameClash)
+        } else if in_s != it.exists[s] || in_d != it.exists[d] {
+            Some(Reason::ChangedSinceCompare)
+        } else {
+            None
+        };
         let op = |action, reason, bytes, source, destination| SyncOperation {
             path: rel.clone(),
             action,
@@ -941,56 +1053,89 @@ pub fn plan(
             continue;
         }
         let fingerprint = |p: &Path| Precondition::read_until(p, true, stop);
-        let planned = match (in_s, in_d, it.is_dir) {
-            (true, false, true) => Some((
-                Action::CreateDir,
-                Reason::OnlyInSource,
-                Precondition::of(Kind::Dir),
-                Precondition::of(Kind::Missing),
-            )),
-            (true, false, false) => Some((
-                Action::Copy,
-                Reason::OnlyInSource,
-                fingerprint(&sp),
-                Precondition::of(Kind::Missing),
-            )),
-            // The compare may call files the same that differ in ignored ways, such as line
-            // endings: unless size and time agree too, the contents decide.
-            (true, true, false)
-                if !(it.status == CmpStatus::Identical
-                    && it.size[s] == it.size[d]
-                    && it.mtime[s] == it.mtime[d]) =>
-            {
-                let (a, b) = (fingerprint(&sp), fingerprint(&dp));
-                (a.sha256 != b.sha256 || a.kind != b.kind).then_some((
-                    Action::Replace,
-                    Reason::Changed,
-                    a,
-                    b,
-                ))
-            }
-            (false, true, _) if policy.mode == SyncMode::Update => {
-                cut.insert(i);
-                Some((
+        let planned = if link {
+            match (in_s, in_d) {
+                (true, false) => Some((
+                    Action::Copy,
+                    Reason::OnlyInSource,
+                    fingerprint(&sp),
+                    Precondition::of(Kind::Missing),
+                )),
+                (true, true) => {
+                    let (a, b) = (fingerprint(&sp), fingerprint(&dp));
+                    (a.sha256 != b.sha256 || a.sha256.is_none()).then_some((
+                        Action::Replace,
+                        Reason::Changed,
+                        a,
+                        b,
+                    ))
+                }
+                (false, true) if policy.mode == SyncMode::Update => Some((
                     Action::Skip,
                     Reason::OnlyInDestination,
                     Precondition::of(Kind::Missing),
                     Precondition::of(kd),
-                ))
+                )),
+                (false, true) => Some((
+                    Action::Delete,
+                    Reason::OnlyInDestination,
+                    Precondition::of(Kind::Missing),
+                    fingerprint(&dp),
+                )),
+                (false, false) => None,
             }
-            (false, true, true) => Some((
-                Action::RemoveDir,
-                Reason::OnlyInDestination,
-                Precondition::of(Kind::Missing),
-                Precondition::of(Kind::Dir),
-            )),
-            (false, true, false) => Some((
-                Action::Delete,
-                Reason::OnlyInDestination,
-                Precondition::of(Kind::Missing),
-                fingerprint(&dp),
-            )),
-            _ => None,
+        } else {
+            match (in_s, in_d, it.is_dir) {
+                (true, false, true) => Some((
+                    Action::CreateDir,
+                    Reason::OnlyInSource,
+                    Precondition::of(Kind::Dir),
+                    Precondition::of(Kind::Missing),
+                )),
+                (true, false, false) => Some((
+                    Action::Copy,
+                    Reason::OnlyInSource,
+                    fingerprint(&sp),
+                    Precondition::of(Kind::Missing),
+                )),
+                // The compare may call files the same that differ in ignored ways, such as line
+                // endings: unless size and time agree too, the contents decide.
+                (true, true, false)
+                    if !(it.status == CmpStatus::Identical
+                        && it.size[s] == it.size[d]
+                        && it.mtime[s] == it.mtime[d]) =>
+                {
+                    let (a, b) = (fingerprint(&sp), fingerprint(&dp));
+                    (a.sha256 != b.sha256 || a.kind != b.kind).then_some((
+                        Action::Replace,
+                        Reason::Changed,
+                        a,
+                        b,
+                    ))
+                }
+                (false, true, _) if policy.mode == SyncMode::Update => {
+                    cut.insert(i);
+                    Some((
+                        Action::Skip,
+                        Reason::OnlyInDestination,
+                        Precondition::of(Kind::Missing),
+                        Precondition::of(kd),
+                    ))
+                }
+                (false, true, true) => Some((
+                    Action::RemoveDir,
+                    Reason::OnlyInDestination,
+                    Precondition::of(Kind::Missing),
+                    Precondition::of(Kind::Dir),
+                )),
+                (false, true, false) => Some((
+                    Action::Delete,
+                    Reason::OnlyInDestination,
+                    Precondition::of(Kind::Missing),
+                    fingerprint(&dp),
+                )),
+                _ => None,
+            }
         };
         let Some((action, reason, source, destination)) = planned else {
             continue;
@@ -1009,6 +1154,7 @@ pub fn plan(
             continue;
         }
         let bytes = match action {
+            _ if link => 0,
             Action::Copy | Action::Replace => source.size.unwrap_or(0),
             Action::Delete => destination.size.unwrap_or(0),
             _ => 0,
@@ -1072,6 +1218,7 @@ pub fn plan(
         filter: scope.filter,
         skip_hidden: scope.skip_hidden,
         folders: folders_digest(roots),
+        copy_links,
         operations,
         warnings,
         estimate,
@@ -1166,6 +1313,11 @@ enum Before {
     Moved {
         from: String,
         via: String,
+    },
+    /// A symbolic link to `target`.
+    Link {
+        target: String,
+        sha256: String,
     },
 }
 
@@ -1818,7 +1970,7 @@ fn step(
     let unchanged = |p: &Path, planned: &Precondition| {
         planned.matches(&Precondition::read_until(
             p,
-            planned.sha256.is_some() && planned.kind == Kind::File,
+            planned.sha256.is_some() && matches!(planned.kind, Kind::File | Kind::Link),
             stop,
         ))
     };
@@ -1835,6 +1987,33 @@ fn step(
             }
             journal.record(entry(Before::Missing, None))?;
             std::fs::create_dir(dp)
+        }
+        Action::Copy if o.source.kind == Kind::Link => {
+            let expected = o.source.sha256.clone().unwrap_or_default();
+            let target = planned_link(sp, &expected)?;
+            if !unchanged(dp, &o.destination) {
+                return Err(changed_since_preview());
+            }
+            journal.record(entry(Before::Missing, Some(expected)))?;
+            make_link(&target, dp)
+        }
+        Action::Replace if o.source.kind == Kind::Link => {
+            let expected = o.source.sha256.clone().unwrap_or_default();
+            let target = planned_link(sp, &expected)?;
+            let old = o.destination.sha256.clone().unwrap_or_default();
+            let before = keep_link(dp, &old)?;
+            journal.record(entry(before, Some(expected)))?;
+            replace_link(&target, dp, &old, &prefix)
+        }
+        Action::Delete if o.destination.kind == Kind::Link => {
+            if Precondition::read(sp, false).kind != Kind::Missing {
+                return Err(changed_since_preview());
+            }
+            let old = o.destination.sha256.clone().unwrap_or_default();
+            let before = keep_link(dp, &old)?;
+            journal.record(entry(before, None))?;
+            planned_link(dp, &old)?;
+            remove_file(dp)
         }
         Action::Copy => {
             let expected = o.source.sha256.clone().unwrap_or_default();
@@ -1877,6 +2056,16 @@ fn step(
         }
         Action::Skip | Action::Conflict => Ok(()),
     }
+}
+
+/// What the destination link `path` was, for the journal, refused unless it is still the
+/// planned `expected` one.
+fn keep_link(path: &Path, expected: &str) -> std::io::Result<Before> {
+    let target = planned_link(path, expected)?;
+    Ok(Before::Link {
+        target: target.to_str().unwrap_or_default().to_string(),
+        sha256: expected.to_string(),
+    })
 }
 
 /// A name for a file being moved into `dir`, not yet taken, which no scan of a temporary file
@@ -2007,7 +2196,11 @@ fn roll_back(header: &Header, entries: &[Entry], fault: Faults) -> RollbackOutco
                 .file_name()
                 .to_str()
                 .is_some_and(|n| n.starts_with(&prefix));
-            if ours && item.file_type().is_ok_and(|t| t.is_file()) {
+            if ours
+                && item
+                    .file_type()
+                    .is_ok_and(|t| t.is_file() || t.is_symlink())
+            {
                 let _ = remove_file(&item.path());
             }
         }
@@ -2049,8 +2242,25 @@ fn undo(dir: &Path, e: &Entry, target: &Path, prefix: &str) -> std::io::Result<b
                 }
                 remove_file(target).map(|()| true)
             }
+            Kind::Link if now.sha256.is_some() && now.sha256 == e.written => {
+                remove_file(target).map(|()| true)
+            }
             _ => Err(not_ours()),
         },
+        Before::Link { target: to, sha256 } => {
+            if link_hash(Path::new(to)).as_ref() != Some(sha256) {
+                return Err(not_ours());
+            }
+            match now.kind {
+                Kind::Link if now.sha256.as_ref() == Some(sha256) => Ok(false),
+                Kind::Missing => make_link(Path::new(to), target).map(|()| true),
+                Kind::Link if now.sha256.is_some() && now.sha256 == e.written => {
+                    let written = e.written.clone().unwrap_or_default();
+                    replace_link(Path::new(to), target, &written, prefix).map(|()| true)
+                }
+                _ => Err(not_ours()),
+            }
+        }
         Before::Dir => match now.kind {
             Kind::Dir => Ok(false),
             Kind::Missing => std::fs::create_dir_all(target).map(|()| true),
@@ -2361,6 +2571,7 @@ mod tests {
         excluded: false,
         filter: String::new(),
         skip_hidden: false,
+        copy_links: false,
     };
 
     fn make(f: &Folders, policy: SyncPolicy) -> SyncPlan {
@@ -3451,6 +3662,189 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn linked(f: &Folders, policy: SyncPolicy) -> SyncPlan {
+        let scope = Scope {
+            copy_links: true,
+            ..ALL
+        };
+        plan(
+            &scan(&f.roots),
+            &f.roots,
+            policy,
+            scope,
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+    }
+
+    /// Left: new.lnk, dir.lnk (to a folder outside), moved.lnk, clash (a link), dangling.lnk.
+    /// Right: moved.lnk to another target, extra.lnk, clash (a file).
+    #[cfg(unix)]
+    fn links(outside: &Path) -> Folders {
+        let f = folders();
+        let link = |to: &Path, at: &Path| std::os::unix::fs::symlink(to, at).unwrap();
+        let (l, r) = (&f.roots[0], &f.roots[1]);
+        write(outside, "secret.txt", "outside");
+        write(l, "a.txt", "a\n");
+        link(Path::new("a.txt"), &l.join("new.lnk"));
+        link(outside, &l.join("dir.lnk"));
+        link(Path::new("a.txt"), &l.join("moved.lnk"));
+        link(Path::new("a.txt"), &l.join("clash"));
+        link(Path::new("nowhere/at/all"), &l.join("dangling.lnk"));
+        write(r, "a.txt", "a\n");
+        link(&outside.join("secret.txt"), &r.join("moved.lnk"));
+        link(&outside.join("secret.txt"), &r.join("extra.lnk"));
+        write(r, "clash", "a file");
+        f
+    }
+
+    #[cfg(unix)]
+    fn target(p: PathBuf) -> String {
+        std::fs::read_link(p).unwrap().display().to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_links_are_made_replaced_and_deleted_as_links_and_never_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        let f = links(outside.path());
+        let plan = linked(&f, MIRROR);
+        assert!(plan.copy_links);
+        let mut got = ops(&plan);
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                (Action::Copy, "dangling.lnk"),
+                (Action::Copy, "dir.lnk"),
+                (Action::Copy, "new.lnk"),
+                (Action::Replace, "moved.lnk"),
+                (Action::Delete, "extra.lnk"),
+                (Action::Conflict, "clash"),
+            ]
+        );
+        assert_eq!(plan.estimate.bytes, 0, "a link copies no file");
+        assert_eq!(plan.estimate.renames, 0, "links are not paired as renames");
+        let SyncOutcome::Applied { changes, .. } = run(&f, &plan, &|_, _| Fault::None) else {
+            panic!("not applied");
+        };
+        assert_eq!(changes, 5);
+        let r = &f.roots[1];
+        assert_eq!(target(r.join("new.lnk")), "a.txt");
+        assert_eq!(target(r.join("moved.lnk")), "a.txt");
+        assert_eq!(target(r.join("dangling.lnk")), "nowhere/at/all");
+        assert_eq!(
+            target(r.join("dir.lnk")),
+            outside.path().display().to_string()
+        );
+        assert!(std::fs::symlink_metadata(r.join("extra.lnk")).is_err());
+        assert_eq!(read_to(r.join("clash")), "a file");
+        // What the links point at is never read, written or deleted.
+        assert_eq!(read_to(outside.path().join("secret.txt")), "outside");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+        assert!(unfinished(&f.journal).is_empty());
+        // Planned again, nothing is left to do but the conflict.
+        assert_eq!(ops(&linked(&f, MIRROR)), [(Action::Conflict, "clash")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_update_keeps_links_only_the_destination_has() {
+        let outside = tempfile::tempdir().unwrap();
+        let f = links(outside.path());
+        let plan = linked(&f, UPDATE);
+        assert!(ops(&plan).contains(&(Action::Skip, "extra.lnk")));
+        run(&f, &plan, &|_, _| Fault::None);
+        assert!(std::fs::symlink_metadata(f.roots[1].join("extra.lnk")).is_ok());
+        assert_eq!(target(f.roots[1].join("new.lnk")), "a.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_changes_are_undone_when_applying_fails_or_the_program_ends() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt").display().to_string();
+        for crash in [false, true] {
+            let f = links(outside.path());
+            let plan = linked(&f, MIRROR);
+            let last = plan
+                .operations
+                .iter()
+                .rfind(|o| o.action.changes())
+                .unwrap()
+                .path
+                .clone();
+            let outcome = run(&f, &plan, &|p, path| match (p, path == last) {
+                (Point::Written, true) if crash => Fault::Crash,
+                (Point::Written, true) => Fault::Fail,
+                _ => Fault::None,
+            });
+            let SyncOutcome::Stopped { rollback, .. } = outcome else {
+                panic!("not stopped");
+            };
+            if crash {
+                let pending = unfinished(&f.journal);
+                assert_eq!(pending.len(), 1);
+                assert!(recover(&pending[0]).complete());
+            } else {
+                assert!(rollback.complete(), "{:?}", rollback.failed);
+            }
+            let r = &f.roots[1];
+            assert_eq!(target(r.join("moved.lnk")), secret, "crash {crash}");
+            assert_eq!(target(r.join("extra.lnk")), secret);
+            for gone in ["new.lnk", "dir.lnk", "dangling.lnk"] {
+                assert!(std::fs::symlink_metadata(r.join(gone)).is_err(), "{gone}");
+            }
+            let names: Vec<String> = std::fs::read_dir(r)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                names.iter().all(|n| !n.starts_with(".oxidemerge")),
+                "{names:?}"
+            );
+            assert!(unfinished(&f.journal).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_changed_after_the_preview_is_not_overwritten() {
+        let outside = tempfile::tempdir().unwrap();
+        let f = links(outside.path());
+        let plan = linked(&f, MIRROR);
+        let moved = f.roots[1].join("moved.lnk");
+        std::fs::remove_file(&moved).unwrap();
+        std::os::unix::fs::symlink("elsewhere", &moved).unwrap();
+        assert!(!matches!(
+            run(&f, &plan, &|_, _| Fault::None),
+            SyncOutcome::Applied { .. }
+        ));
+        assert_eq!(target(moved), "elsewhere");
+        assert!(std::fs::symlink_metadata(f.roots[1].join("new.lnk")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copying_links_is_part_of_what_a_plan_file_is() {
+        let outside = tempfile::tempdir().unwrap();
+        let f = links(outside.path());
+        let without = make(&f, MIRROR);
+        assert!(!without.to_json().unwrap().contains("copy_links"));
+        let with = linked(&f, MIRROR);
+        let mut altered = with.clone();
+        altered.copy_links = false;
+        assert_ne!(
+            altered.identity(),
+            with.id,
+            "switching it off is an alteration"
+        );
+        let back = SyncPlan::from_json(&with.to_json().unwrap()).unwrap();
+        assert!(back.copy_links);
+        assert_eq!(back.id, back.identity());
+    }
+
+    #[cfg(unix)]
     fn read_to(p: PathBuf) -> String {
         std::fs::read_to_string(p).unwrap()
     }
@@ -3466,6 +3860,7 @@ mod tests {
             excluded: FileFilter::parse_mask("!*.log").excludes_anything(),
             filter: "!*.log".into(),
             skip_hidden: false,
+            copy_links: false,
         };
         let plan = plan(&items, &f.roots, MIRROR, scope, &AtomicBool::new(false)).unwrap();
         assert!(plan.warnings.contains(&PlanWarning::Excluded));

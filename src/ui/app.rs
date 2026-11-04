@@ -1238,6 +1238,8 @@ pub struct OxideMergeApp {
     rule_dlg: Option<RuleDialog>,
     patch_dlg: Option<PatchDialog>,
     stats_dlg: Option<StatsDialog>,
+    save_job: Option<crate::ui::job_dialog::SaveJob>,
+    run_job: Option<crate::ui::job_dialog::RunJob>,
     git_dlg: Option<GitDialog>,
     /// A folder report with file differences being written on another thread: its file.
     report_job: Option<(PathBuf, std::sync::mpsc::Receiver<Result<(), String>>)>,
@@ -1471,6 +1473,8 @@ impl Menus {
             (SaveAs(p), _) => p < self.panes,
             (TakeBoth(_), _) => self.can_take_both,
             (SaveProject, _) => self.has_source,
+            (SaveJob, Folder) => !self.folder_busy,
+            (RunJob, _) => true,
             (Refresh, _) if self.web => true,
             (NextTab | PrevTab, _) => self.tabs > 1,
             (CloseTab | CloseAllTabs | SaveAll, _) => self.tabs > 0,
@@ -1497,13 +1501,11 @@ impl Menus {
                 Folder,
             ) => true,
             // A report or patch of a folder compare still running would miss files.
-            (ReportWithDiffs | ExportHtml | Report | Slideshow | ExportPdf | Print, Folder) => {
-                !self.folder_busy
-            }
+            (HtmlReport | Slideshow | ExportPdf | Print, Folder) => !self.folder_busy,
             (Patch, Folder) => self.sides == 2 && !self.folder_busy,
             (SyncFolders, Folder) => self.sides == 2 && !self.folder_busy && !self.folder_job,
             (Patch, Text) => self.sides == 2,
-            (ExportHtml | Report | Slideshow | ExportPdf | Print | Statistics, Text) => true,
+            (HtmlReport | Slideshow | ExportPdf | Print | Statistics, Text) => true,
             (Refresh, Text | Folder | Web) => true,
             (NextDiff | PrevDiff | FirstDiff | LastDiff, Web) => self.formatted,
             (AllDiffs, Folder) => !self.folder_busy,
@@ -2004,6 +2006,8 @@ impl OxideMergeApp {
             options_dlg: None,
             patch_dlg: None,
             stats_dlg: None,
+            save_job: None,
+            run_job: None,
             git_dlg: None,
             report_job: None,
             report_opens: false,
@@ -3333,8 +3337,7 @@ impl OxideMergeApp {
         }
         if matches!(
             cmd,
-            Cmd::ExportHtml
-                | Cmd::Report
+            Cmd::HtmlReport
                 | Cmd::Slideshow
                 | Cmd::ExportPdf
                 | Cmd::Print
@@ -3375,6 +3378,19 @@ impl OxideMergeApp {
                 }
             }
             Cmd::SaveProject => self.save_project(),
+            Cmd::SaveJob => self.begin_save_job(),
+            Cmd::RunJob => {
+                if self.run_job.as_ref().is_some_and(|r| r.is_running()) {
+                    return;
+                }
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_title(tr("dlg.run_job"))
+                    .add_filter(tr("label.job"), &["oxjob", "json"])
+                    .pick_file()
+                {
+                    self.start_run_job(p);
+                }
+            }
             Cmd::ApplyPatch => self.apply_patch(),
             Cmd::Open => self.open_dlg = Some(self.new_open_dialog(None)),
             Cmd::OpenConflict => {
@@ -3429,13 +3445,7 @@ impl OxideMergeApp {
                     self.error(errors.join("\n"));
                 }
             }
-            Cmd::Patch
-            | Cmd::ExportHtml
-            | Cmd::Report
-            | Cmd::ReportWithDiffs
-            | Cmd::Slideshow
-            | Cmd::ExportPdf
-            | Cmd::Print
+            Cmd::Patch | Cmd::HtmlReport | Cmd::Slideshow | Cmd::ExportPdf | Cmd::Print
                 if matches!(self.tabs.get(self.active).map(|t| t.content.view()),
                     Some(Content::Folder(v)) if v.is_running()) =>
             {
@@ -3448,10 +3458,8 @@ impl OxideMergeApp {
                     path: String::new(),
                 })
             }
-            Cmd::ExportHtml => self.export_html(),
+            Cmd::HtmlReport => self.save_html_report(),
             Cmd::AllDiffs => self.show_all_diffs(),
-            Cmd::Report => self.save_report(),
-            Cmd::ReportWithDiffs => self.save_report_with_diffs(),
             Cmd::Slideshow => self.save_slideshow(),
             Cmd::ExportPdf => self.save_pdf(false),
             Cmd::Print => self.save_pdf(true),
@@ -3669,49 +3677,52 @@ impl OxideMergeApp {
         }
     }
 
-    fn save_report(&mut self) {
-        if let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) {
-            // A text compare's report is HTML or XML, by the type picked.
-            let name = report::html_file_name(&v.titles());
-            let Some(path) = self.report_path(tr("menu.report"), &name, &[HTML, XML]) else {
-                return;
-            };
-            let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view())
-            else {
-                return;
-            };
-            let job = v.report_job(ReportFormat::from_path(&path), &self.cfg.rules);
-            self.spawn_report(path, job);
-            return;
+    /// Saves the report of the active text or folder compare. HTML has every difference, of
+    /// every changed text file for a folder; the save dialog also offers XML, and for a folder
+    /// CSV and plain text, which list the files.
+    fn save_html_report(&mut self) {
+        let title = tr("menu.export_html").replace("...", "");
+        match self.tabs.get(self.active).map(|t| t.content.view()) {
+            Some(Content::Text(v)) => {
+                let name = report::html_file_name(&v.titles());
+                let Some(path) = self.report_path(&title, &name, &[HTML, XML]) else {
+                    return;
+                };
+                let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view())
+                else {
+                    return;
+                };
+                match ReportFormat::from_path(&path) {
+                    ReportFormat::Xml => {
+                        let job = v.report_job(ReportFormat::Xml, &self.cfg.rules);
+                        self.spawn_report(path, job);
+                    }
+                    _ => self.export_text_html_to(path),
+                }
+            }
+            Some(Content::Folder(v)) => {
+                let name = report::html_file_name(&v.display_roots);
+                let filters = [HTML, ("CSV", &["csv"][..]), ("Text", &["txt"][..]), XML];
+                let Some(path) = self.report_path(&title, &name, &filters) else {
+                    return;
+                };
+                let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view())
+                else {
+                    return;
+                };
+                match ReportFormat::from_path(&path) {
+                    ReportFormat::Html | ReportFormat::Slideshow => {
+                        let job = v.report_with_diffs_job(&self.cfg);
+                        self.spawn_report(path, job);
+                    }
+                    format => {
+                        let text = v.report(format, &self.cfg);
+                        self.spawn_report(path, move || text);
+                    }
+                }
+            }
+            _ => self.error(tr("msg.report_folder_only")),
         }
-        let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
-            self.error(tr("msg.report_folder_only"));
-            return;
-        };
-        let name = report::html_file_name(&v.display_roots);
-        let filters = [HTML, ("CSV", &["csv"][..]), ("Text", &["txt"][..]), XML];
-        let Some(path) = self.report_path(tr("menu.report"), &name, &filters) else {
-            return;
-        };
-        let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
-            return;
-        };
-        let text = v.report(ReportFormat::from_path(&path), &self.cfg);
-        self.spawn_report(path, move || text);
-    }
-
-    fn save_report_with_diffs(&mut self) {
-        if let Some(Content::Text(_)) = self.tabs.get(self.active).map(|t| t.content.view()) {
-            self.export_text_html(tr("menu.report_diffs"));
-            return;
-        }
-        let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
-            self.error(tr("msg.report_folder_only"));
-            return;
-        };
-        let name = report::html_file_name(&v.display_roots);
-        let job = v.report_with_diffs_job(&self.cfg);
-        self.write_html_report(tr("menu.report_diffs"), &name, job);
     }
 
     /// Saves the PDF report of the active text or folder compare, with every difference; to
@@ -3943,25 +3954,7 @@ impl OxideMergeApp {
         }
     }
 
-    fn export_html(&mut self) {
-        match self.tabs.get(self.active).map(|t| t.content.view()) {
-            Some(Content::Text(_)) => self.export_text_html(tr("menu.export_html")),
-            Some(Content::Folder(_)) => self.save_report_with_diffs(),
-            _ => self.error(tr("msg.report_folder_only")),
-        }
-    }
-
-    /// Saves the HTML report of the active text compare, made on another thread once the file is
-    /// picked.
-    fn export_text_html(&mut self, title: &str) {
-        let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
-            return;
-        };
-        if let Some(path) = self.html_report_path(title, &report::html_file_name(&v.titles())) {
-            self.export_text_html_to(path);
-        }
-    }
-
+    /// Writes the HTML report of the active text compare to `path`, on another thread.
     fn export_text_html_to(&mut self, path: PathBuf) {
         let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
             return;
@@ -4151,6 +4144,82 @@ impl OxideMergeApp {
                 None
             }
         };
+    }
+
+    /// Offers the active folder comparison to save as a job file.
+    fn begin_save_job(&mut self) {
+        let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
+            self.error(tr("msg.job_folder_only"));
+            return;
+        };
+        let name = report::html_file_name(&v.display_roots);
+        let stem = name.strip_suffix(".html").unwrap_or(&name).to_string();
+        self.save_job = Some(crate::ui::job_dialog::SaveJob::new(
+            v.as_job(&self.cfg),
+            &stem,
+        ));
+    }
+
+    fn save_job_dialog(&mut self, ctx: &egui::Context) {
+        use crate::ui::job_dialog::SaveStep;
+        let Some(d) = self.save_job.as_mut() else {
+            return;
+        };
+        match d.show(ctx) {
+            Some(SaveStep::Close) => self.save_job = None,
+            Some(SaveStep::Save) => {
+                let name = format!("{}.oxjob", d.name.trim()).replace(['/', '\\'], "_");
+                let Some(path) = rfd::FileDialog::new()
+                    .set_title(tr("dlg.save_job"))
+                    .add_filter(tr("label.job"), &["oxjob"])
+                    .set_file_name(name)
+                    .save_file()
+                else {
+                    return;
+                };
+                match d.write(&path) {
+                    Ok(()) => {
+                        self.save_job = None;
+                        self.notify(trf("msg.saved", &[("file", path.display().to_string())]));
+                    }
+                    Err(e) => d.failed(e),
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Reads the job file at `path` and runs it, or first asks when it changes folders.
+    pub fn start_run_job(&mut self, path: PathBuf) {
+        let mut run = crate::ui::job_dialog::RunJob::new(path);
+        if !run.needs_confirmation() {
+            run.start(self.cfg.clone(), false);
+        }
+        self.run_job = Some(run);
+    }
+
+    fn run_job_dialog(&mut self, ctx: &egui::Context) {
+        use crate::ui::job_dialog::RunStep;
+        let Some(d) = self.run_job.as_mut() else {
+            return;
+        };
+        match d.show(ctx) {
+            Some(RunStep::Close) => self.run_job = None,
+            Some(RunStep::Start { yes }) => d.start(self.cfg.clone(), yes),
+            Some(RunStep::Open(path)) => {
+                if let Err(e) = crate::ui::folder_view::system_open(&path) {
+                    self.error(e);
+                }
+            }
+            Some(RunStep::Compare(paths)) => {
+                self.run_job = None;
+                self.open(OpenRequest {
+                    paths,
+                    ..Default::default()
+                });
+            }
+            None => {}
+        }
     }
 
     fn stats_dialog(&mut self, ctx: &egui::Context) {
@@ -4765,6 +4834,8 @@ impl OxideMergeApp {
         ui.separator();
         m.item(ui, Cmd::OpenProject);
         m.item(ui, Cmd::SaveProject);
+        m.item(ui, Cmd::SaveJob);
+        m.item(ui, Cmd::RunJob);
         ui.separator();
         m.item(ui, Cmd::Save);
         m.item(ui, Cmd::SaveAll);
@@ -4784,9 +4855,7 @@ impl OxideMergeApp {
         m.item(ui, Cmd::SaveComparison);
         ui.separator();
         submenu(ui, tr("menu.export"), |ui| {
-            m.item(ui, Cmd::ExportHtml);
-            m.item(ui, Cmd::Report);
-            m.item(ui, Cmd::ReportWithDiffs);
+            m.item(ui, Cmd::HtmlReport);
             m.item(ui, Cmd::Slideshow);
             m.item(ui, Cmd::ExportPdf);
             m.item(ui, Cmd::Patch);
@@ -7082,7 +7151,7 @@ impl eframe::App for OxideMergeApp {
                 }
                 FolderAction::AddRule(draft) => self.open_rule_dialog(self.active, draft),
                 FolderAction::EditRules => self.open_options(OptTab::Rules),
-                FolderAction::ExportHtml => self.export_html(),
+                FolderAction::HtmlReport => self.save_html_report(),
                 FolderAction::AllDiffs => self.show_all_diffs(),
                 FolderAction::SaveReview(selected_only) => self.save_folder_review(selected_only),
                 FolderAction::ExportFileReport { name, job } => {
@@ -7100,7 +7169,7 @@ impl eframe::App for OxideMergeApp {
             self.open_rule_dialog(self.active, draft);
         }
         if export {
-            self.export_html();
+            self.save_html_report();
         }
 
         self.palette_ui(ctx);
@@ -7110,6 +7179,8 @@ impl eframe::App for OxideMergeApp {
         self.patch_dialog(ctx);
         self.rule_dialog(ctx);
         self.stats_dialog(ctx);
+        self.save_job_dialog(ctx);
+        self.run_job_dialog(ctx);
         self.git_dialog(ctx);
         if let Some(r) = &mut self.sync_recovery {
             if !r.show(ctx) {

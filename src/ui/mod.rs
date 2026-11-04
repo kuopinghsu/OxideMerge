@@ -8,6 +8,7 @@ pub mod fonts;
 pub mod help;
 pub mod icons;
 pub mod image_view;
+pub mod job_dialog;
 #[cfg(target_os = "macos")]
 mod macos;
 pub mod markdown_view;
