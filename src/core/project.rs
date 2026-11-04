@@ -180,7 +180,8 @@ fn entity(name: &str) -> String {
     code.map_or_else(|| format!("&{name};"), String::from)
 }
 
-/// `value` relative to the folder `base`, with `..` where needed. URLs, and paths that share
+/// `value` relative to the folder `base`, with `..` where needed. The result uses `/`, so a
+/// job or project file saved on Windows still opens elsewhere. URLs, and paths that share
 /// nothing with `base` (another Windows drive), stay unchanged.
 pub fn relative_path(value: &str, base: &Path) -> Result<String> {
     if super::web::is_url(value) {
@@ -193,17 +194,17 @@ pub fn relative_path(value: &str, base: &Path) -> Result<String> {
     if common == 0 {
         return Ok(path.display().to_string());
     }
-    let mut rel = PathBuf::new();
+    let mut parts = Vec::new();
     for _ in &b[common..] {
-        rel.push("..");
+        parts.push("..".to_string());
     }
     for c in &a[common..] {
-        rel.push(c.as_os_str());
+        parts.push(c.as_os_str().to_string_lossy().into_owned());
     }
-    if rel.as_os_str().is_empty() {
-        rel.push(".");
+    if parts.is_empty() {
+        parts.push(".".to_string());
     }
-    Ok(rel.display().to_string())
+    Ok(parts.join("/"))
 }
 
 #[cfg(test)]
@@ -274,5 +275,15 @@ mod tests {
         assert!(old.table.is_none());
         let saved = serde_json::to_string(&old).unwrap();
         assert!(!saved.contains("table"));
+    }
+
+    #[test]
+    fn relative_paths_use_slashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = dir.path().join("jobs");
+        std::fs::create_dir(&jobs).unwrap();
+        let rel = relative_path(&dir.path().join("left").to_string_lossy(), &jobs).unwrap();
+        assert_eq!(rel, "../left");
+        assert!(!rel.contains('\\'));
     }
 }
