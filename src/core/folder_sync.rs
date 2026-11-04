@@ -11,10 +11,15 @@
 //! when that fails too, or the program ends first, the journal stays and is offered for
 //! recovery the next time.
 //!
-//! Symbolic links are never followed or copied, and names that may stand for another file
-//! on the destination's file system are left alone: those reaching an existing entry under
-//! another case or Unicode form, and source names alike but for case or for accents on Latin
-//! letters, composed or not.
+//! A file renamed or moved in the source, whose contents a file the plan deletes still has, is
+//! moved in the destination rather than copied again: renamed to a temporary name recorded in
+//! the journal first, then to its new name, so a rename is undone even after a crash, and a
+//! rename only in case or Unicode form works on file systems that take both for one name.
+//!
+//! Symbolic links are never followed or copied, and other names that may stand for another
+//! file on the destination's file system are left alone: those reaching an existing entry
+//! under another case or Unicode form, and source names alike but for case or for accents on
+//! Latin letters, composed or not.
 
 use super::analysis;
 use super::folder::{CmpStatus, DirItem};
@@ -33,7 +38,8 @@ use std::time::SystemTime;
 
 /// The version of the plan file format; newer plans are refused.
 pub const PLAN_VERSION: u32 = 1;
-const JOURNAL_VERSION: u32 = 1;
+/// 2 records renames, which older versions would undo wrongly, so they refuse it.
+const JOURNAL_VERSION: u32 = 2;
 const JOURNAL_FILE: &str = "journal.jsonl";
 const HEADER_FILE: &str = "header.json";
 /// Deleting at least this many items asks a second time.
@@ -401,7 +407,7 @@ pub struct SyncOperation {
     pub destination: Precondition,
     /// For a copy, the path of a deleted destination file with the same contents; for that
     /// deletion, the path of the copy. Together they are a file renamed or moved in the
-    /// source, still applied as a copy and a deletion.
+    /// source, applied by moving the destination file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renamed: Option<String>,
 }
@@ -581,7 +587,11 @@ fn folders_digest(roots: &[PathBuf]) -> String {
 /// them. Empty files are left alone, as their contents say nothing.
 fn pair_renames(operations: &mut [SyncOperation]) {
     let mut by_hash: HashMap<&str, (Vec<usize>, Vec<usize>)> = HashMap::new();
-    for (i, o) in operations.iter().enumerate() {
+    for (i, o) in operations
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.renamed.is_none())
+    {
         let (side, copy) = match o.action {
             Action::Copy => (&o.source, true),
             Action::Delete => (&o.destination, false),
@@ -647,10 +657,7 @@ pub fn check_roots(roots: &[PathBuf]) -> Result<(), String> {
 struct Names(HashMap<PathBuf, Option<HashSet<OsString>>>);
 
 impl Names {
-    fn exact(&mut self, path: &Path) -> bool {
-        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
-            return true;
-        };
+    fn of(&mut self, dir: &Path) -> Option<&HashSet<OsString>> {
         self.0
             .entry(dir.to_path_buf())
             .or_insert_with(|| {
@@ -659,8 +666,53 @@ impl Names {
                     .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
             })
             .as_ref()
-            .is_none_or(|names| names.contains(name))
     }
+
+    fn exact(&mut self, path: &Path) -> bool {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return true;
+        };
+        self.of(dir).is_none_or(|names| names.contains(name))
+    }
+
+    /// How the one entry in `path`'s folder whose name folds as `path`'s does is spelled, if
+    /// exactly one does.
+    fn spelling(&mut self, path: &Path) -> Option<String> {
+        let (dir, name) = (path.parent()?, path.file_name()?.to_str()?);
+        let key = fold(name);
+        let mut alike = self
+            .of(dir)?
+            .iter()
+            .filter_map(|n| n.to_str())
+            .filter(|n| fold(n) == key);
+        let one = alike.next()?.to_string();
+        alike.next().is_none().then_some(one)
+    }
+}
+
+/// Whether the entry `path` names is in its folder under exactly that name, not only reached
+/// through a file system that ignores case or Unicode form. A folder that cannot be listed
+/// does not say otherwise.
+fn named_exactly(path: &Path) -> bool {
+    Names::default().exact(path)
+}
+
+/// As [`Precondition::read_until`], but a name reaching an entry only under another case or
+/// Unicode form is missing.
+fn read_exact(path: &Path, hash: bool, stop: &AtomicBool) -> Precondition {
+    if named_exactly(path) {
+        Precondition::read_until(path, hash, stop)
+    } else {
+        Precondition::of(Kind::Missing)
+    }
+}
+
+/// Whether `o` is half of a rename only in case or Unicode form, whose two names a file
+/// system may take for one: its paths are then read only as spelled.
+fn respelled(o: &SyncOperation) -> bool {
+    o.renamed
+        .as_deref()
+        .is_some_and(|r| r != o.path && fold(r) == fold(&o.path))
 }
 
 /// `path` with its nearest existing folder resolved, as it will be once the rest is created.
@@ -758,6 +810,8 @@ pub fn plan(
     let mut names = Names::default();
     let mut cut: HashSet<usize> = HashSet::new();
     let mut operations = Vec::new();
+    // Renames only in case or Unicode form planned so far, by folder and folded name.
+    let mut respelt: HashSet<(String, String)> = HashSet::new();
     for (rel, i) in order {
         if stop.load(Ordering::Relaxed) {
             return Err(tr("folder_sync.err_stopped").to_string());
@@ -772,6 +826,76 @@ pub fn plan(
             Precondition::read(&sp, false).kind,
             Precondition::read(&dp, false).kind,
         );
+        // A file whose name the two sides spell differently only in case or Unicode form,
+        // which a file system ignoring those takes for one name, with the same contents on
+        // both: a mirror renames it. Planned once, as the copy and the deletion of a rename.
+        if !it.is_dir
+            && policy.mode == SyncMode::Mirror
+            && (ks, kd) == (Kind::File, Kind::File)
+            && !clashing.contains(&i)
+        {
+            if let (Some(a), Some(b)) = (names.spelling(&sp), names.spelling(&dp)) {
+                if a != b {
+                    if !respelt.insert((it.rel_dir.clone(), fold(&a))) {
+                        continue;
+                    }
+                    let join = |n: &str| {
+                        if it.rel_dir.is_empty() {
+                            n.to_string()
+                        } else {
+                            format!("{}/{n}", it.rel_dir)
+                        }
+                    };
+                    let (new, old) = (join(&a), join(&b));
+                    let source = Precondition::read_until(&under(&roots[s], &new), true, stop);
+                    let destination = Precondition::read_until(&under(&roots[d], &old), true, stop);
+                    let same = source.sha256.is_some() && source.sha256 == destination.sha256;
+                    let pair =
+                        |path: &str, other: &str, action, reason, bytes, src, dst| SyncOperation {
+                            path: path.to_string(),
+                            action,
+                            reason,
+                            bytes,
+                            source: src,
+                            destination: dst,
+                            renamed: same.then(|| other.to_string()),
+                        };
+                    if same {
+                        let bytes = source.size.unwrap_or(0);
+                        operations.push(pair(
+                            &new,
+                            &old,
+                            Action::Copy,
+                            Reason::OnlyInSource,
+                            bytes,
+                            source,
+                            Precondition::of(Kind::Missing),
+                        ));
+                        operations.push(pair(
+                            &old,
+                            &new,
+                            Action::Delete,
+                            Reason::OnlyInDestination,
+                            bytes,
+                            Precondition::of(Kind::Missing),
+                            destination,
+                        ));
+                    } else {
+                        // Renamed and changed: left alone, as any other name clash.
+                        operations.push(pair(
+                            &rel,
+                            "",
+                            Action::Conflict,
+                            Reason::NameClash,
+                            0,
+                            Precondition::of(Kind::File),
+                            Precondition::of(Kind::File),
+                        ));
+                    }
+                    continue;
+                }
+            }
+        }
         let expected = if it.is_dir { Kind::Dir } else { Kind::File };
         let in_s = ks != Kind::Missing;
         let in_d = kd != Kind::Missing;
@@ -1037,6 +1161,12 @@ enum Before {
         backup: String,
         sha256: String,
     },
+    /// Nothing was there; the destination file `from` (relative to the folder) was moved
+    /// there, through `via` beside it, a temporary name of its own.
+    Moved {
+        from: String,
+        via: String,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1239,6 +1369,8 @@ enum Point {
     Before,
     /// After a file was written, before it is checked.
     Written,
+    /// Half way through moving a renamed file: at its temporary name.
+    Moving,
     /// Before putting a path back.
     Rollback,
 }
@@ -1255,6 +1387,18 @@ enum Fault {
 }
 
 type Faults<'a> = &'a dyn Fn(Point, &str) -> Fault;
+
+/// The program ending, injected by tests inside a step.
+#[derive(Debug)]
+struct Crash;
+
+impl std::fmt::Display for Crash {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("crash")
+    }
+}
+
+impl std::error::Error for Crash {}
 
 fn injected() -> std::io::Error {
     std::io::Error::other("injected failure")
@@ -1277,7 +1421,12 @@ pub fn apply(
 /// destination's file system, each file it keeps a copy of is replaced or deleted straight
 /// after, so only the largest of them is there twice at once.
 fn check_space(plan: &SyncPlan, destination: &Path, journal_root: &Path) -> Result<(), String> {
-    let changes = || plan.operations.iter().filter(|o| o.action.changes());
+    // A rename moves the file it deletes into the copy's place: nothing is written or kept.
+    let changes = || {
+        plan.operations
+            .iter()
+            .filter(|o| o.action.changes() && o.renamed.is_none())
+    };
     let written: u64 = changes()
         .filter(|o| matches!(o.action, Action::Copy | Action::Replace))
         .map(|o| o.bytes)
@@ -1431,8 +1580,14 @@ fn preflight(
             continue;
         }
         let hash = |p: &Precondition| p.sha256.is_some();
-        let read =
-            |p: &Path, planned: &Precondition| Precondition::read_until(p, hash(planned), stop);
+        let exact = respelled(o);
+        let read = |p: &Path, planned: &Precondition| {
+            if exact {
+                read_exact(p, hash(planned), stop)
+            } else {
+                Precondition::read_until(p, hash(planned), stop)
+            }
+        };
         let now = (read(&sp, &o.source), read(&dp, &o.destination));
         if stop.load(Ordering::Relaxed) {
             return Err(one(Problem::Canceled)(
@@ -1505,10 +1660,22 @@ fn apply_with(
         *problem = Some(problem_of(&e));
         Some(Some(format!("{path}: {e}")))
     };
+    // The deletions renames are made from, by path, and those already moved away.
+    let sources: HashMap<&str, &SyncOperation> = plan
+        .operations
+        .iter()
+        .filter(|o| o.action == Action::Delete && o.renamed.is_some())
+        .map(|o| (o.path.as_str(), o))
+        .collect();
+    let mut moved: HashSet<&str> = HashSet::new();
     for o in plan.operations.iter().filter(|o| o.action.changes()) {
         if stop.load(Ordering::Relaxed) {
             failure = Some(None);
             break;
+        }
+        if o.action == Action::Delete && moved.contains(o.path.as_str()) {
+            done.fetch_add(1, Ordering::Relaxed);
+            continue;
         }
         match fault(Point::Before, &o.path) {
             Fault::None => {}
@@ -1535,8 +1702,32 @@ fn apply_with(
             )));
             break;
         }
-        let result = step(&mut journal, o, (&sp, &dp), &mut kept, stop);
+        // A file is moved only within one file system; across two it is copied and deleted.
+        let from = (o.action == Action::Copy)
+            .then(|| o.renamed.as_deref().and_then(|r| sources.get(r)))
+            .flatten()
+            .filter(|old| {
+                let odp = under(&roots[d], &old.path);
+                match (odp.parent(), dp.parent()) {
+                    (Some(a), Some(b)) => same_volume(a, b),
+                    _ => false,
+                }
+            });
+        let result = match from {
+            Some(old) => {
+                let (osp, odp) = (under(&roots[s], &old.path), under(&roots[d], &old.path));
+                let r = step_move(&mut journal, o, old, (&sp, &dp, &osp, &odp), fault, stop);
+                if r.is_ok() {
+                    moved.insert(old.path.as_str());
+                }
+                r
+            }
+            None => step(&mut journal, o, (&sp, &dp), &mut kept, stop),
+        };
         if let Err(e) = result {
+            if e.get_ref().is_some_and(|inner| inner.is::<Crash>()) {
+                return crashed(journal);
+            }
             failure = if stop.load(Ordering::Relaxed) {
                 Some(None)
             } else {
@@ -1688,6 +1879,98 @@ fn step(
     }
 }
 
+/// A name for a file being moved into `dir`, not yet taken, which no scan of a temporary file
+/// takes for a leftover copy: recovery finds it through the journal.
+fn move_name(dir: &Path, plan_id: &str, n: usize) -> PathBuf {
+    let base = format!(
+        ".oxidemerge-move-{}-{n}",
+        plan_id.get(..12).unwrap_or(plan_id)
+    );
+    (0..)
+        .map(|k| {
+            dir.join(if k == 0 {
+                base.clone()
+            } else {
+                format!("{base}-{k}")
+            })
+        })
+        .find(|p| std::fs::symlink_metadata(p).is_err())
+        .expect("a free name")
+}
+
+/// Renames `from` to `to`, refusing when `to` names anything, also under another case or
+/// Unicode form.
+fn move_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    std::fs::rename(fsutil::long_path(from), fsutil::long_path(to))?;
+    for dir in [from.parent(), to.parent()].into_iter().flatten() {
+        let _ = sync_dir(dir);
+    }
+    Ok(())
+}
+
+/// Makes the copy `o` by moving the destination file that `old`, its rename, deletes, after
+/// checking all four paths are as planned. `(sp, dp)` are the copy's paths and `(osp, odp)`
+/// the deletion's.
+fn step_move(
+    journal: &mut Journal,
+    o: &SyncOperation,
+    old: &SyncOperation,
+    (sp, dp, osp, odp): (&Path, &Path, &Path, &Path),
+    fault: Faults,
+    stop: &AtomicBool,
+) -> std::io::Result<()> {
+    let exact = respelled(o);
+    let read = |p: &Path, hash: bool| {
+        if exact {
+            read_exact(p, hash, stop)
+        } else {
+            Precondition::read_until(p, hash, stop)
+        }
+    };
+    let expected = o.source.sha256.clone().unwrap_or_default();
+    let stamp = Stamp::at(odp);
+    let there = read(odp, true);
+    if !o.source.matches(&read(sp, true))
+        || read(dp, false).kind != Kind::Missing
+        || read(osp, false).kind != Kind::Missing
+        || !old.destination.matches(&there)
+        || there.sha256.as_deref() != Some(expected.as_str())
+        || stamp.is_none()
+    {
+        return Err(changed_since_preview());
+    }
+    let dir = dp
+        .parent()
+        .ok_or_else(|| std::io::Error::other(tr("folder_sync.err_not_file")))?;
+    let via = move_name(dir, &journal.header.plan, journal.entries.len());
+    let via_name = via
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    journal.record(Entry {
+        path: o.path.clone(),
+        before: Before::Moved {
+            from: old.path.clone(),
+            via: via_name,
+        },
+        written: Some(expected),
+    })?;
+    if Stamp::at(odp) != stamp {
+        return Err(changed_since_preview());
+    }
+    move_new(odp, &via)?;
+    match fault(Point::Moving, &o.path) {
+        Fault::None => {}
+        Fault::Crash => return Err(std::io::Error::other(Crash)),
+        _ => return Err(injected()),
+    }
+    move_new(&via, dp)
+}
+
 /// Puts back what `entries` changed, last first. A path changed again since is left as it is
 /// and reported.
 fn roll_back(header: &Header, entries: &[Entry], fault: Faults) -> RollbackOutcome {
@@ -1773,6 +2056,46 @@ fn undo(dir: &Path, e: &Entry, target: &Path, prefix: &str) -> std::io::Result<b
             Kind::Missing => std::fs::create_dir_all(target).map(|()| true),
             _ => Err(not_ours()),
         },
+        Before::Moved { from, via } => {
+            let root = target
+                .ancestors()
+                .nth(e.path.split('/').count())
+                .unwrap_or(target);
+            let from_rel = from;
+            let from = under(root, from_rel);
+            // Read from a file: only a name of the kind this writes, beside the target.
+            if escapes(root, from_rel, &from)
+                || !via.starts_with(".oxidemerge-move-")
+                || via.contains(['/', '\\'])
+                || via.contains("..")
+            {
+                return Err(std::io::Error::other(trf(
+                    "folder_sync.err_outside",
+                    &[("path", from_rel.clone())],
+                )));
+            }
+            let via = target.with_file_name(via);
+            let ours = |p: &Precondition| p.kind == Kind::File && p.sha256 == e.written;
+            // Where the move got to: at the new name, at the temporary one, or not started.
+            if named_exactly(target) && ours(&now) {
+                if read_exact(&from, false, &NEVER).kind != Kind::Missing
+                    || Stamp::at(target) != stamp
+                {
+                    return Err(not_ours());
+                }
+                move_new(target, &via)?;
+                move_new(&via, &from).map(|()| true)
+            } else if ours(&Precondition::read(&via, true)) {
+                if read_exact(&from, false, &NEVER).kind != Kind::Missing {
+                    return Err(not_ours());
+                }
+                move_new(&via, &from).map(|()| true)
+            } else if ours(&read_exact(&from, true, &NEVER)) {
+                Ok(false)
+            } else {
+                Err(not_ours())
+            }
+        }
         Before::File { backup, sha256 } => {
             if now.sha256.as_ref() == Some(sha256) {
                 return Ok(false);
@@ -2183,7 +2506,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_renamed_in_the_source_shows_as_a_rename_and_is_copied_then_deleted() {
+    fn a_file_renamed_in_the_source_shows_as_a_rename_and_is_moved() {
         let f = folders();
         let (l, r) = (&f.roots[0], &f.roots[1]);
         write(l, "docs/new name.txt", "moved\n");
@@ -2219,6 +2542,245 @@ mod tests {
             std::fs::read_to_string(r.join("docs/new name.txt")).unwrap(),
             "moved\n"
         );
+    }
+
+    /// The names under `root` that a synchronization leaves only while it runs.
+    fn leftovers(root: &Path) -> Vec<String> {
+        tree(root)
+            .into_keys()
+            .filter(|k| k.contains(".oxidemerge-"))
+            .collect()
+    }
+
+    #[test]
+    fn a_renamed_file_is_moved_in_the_destination_rather_than_copied() {
+        let f = folders();
+        let (l, r) = (&f.roots[0], &f.roots[1]);
+        write(l, "new/name.txt", "moved\n");
+        write(r, "old.txt", "moved\n");
+        let p = make(&f, MIRROR);
+        assert_eq!(p.estimate.renames, 1);
+        #[cfg(unix)]
+        let inode =
+            std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(r.join("old.txt")).unwrap());
+        // Nothing is kept in the journal for a file that is only moved.
+        let kept = std::cell::Cell::new(0);
+        let outcome = run(&f, &p, &|point, _| {
+            if point == Point::Written {
+                kept.set(
+                    std::fs::read_dir(&f.journal)
+                        .unwrap()
+                        .flatten()
+                        .map(|j| std::fs::read_dir(j.path().join("files")).unwrap().count())
+                        .sum(),
+                );
+            }
+            Fault::None
+        });
+        assert!(
+            matches!(outcome, SyncOutcome::Applied { changes: 3, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(kept.get(), 0);
+        assert!(!r.join("old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(r.join("new/name.txt")).unwrap(),
+            "moved\n"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::ino(
+                &std::fs::metadata(r.join("new/name.txt")).unwrap()
+            ),
+            inode
+        );
+        assert!(leftovers(r).is_empty(), "{:?}", leftovers(r));
+        assert!(unfinished(&f.journal).is_empty());
+    }
+
+    #[test]
+    fn a_rename_that_fails_part_way_or_after_is_moved_back() {
+        for (point, path) in [
+            (Point::Moving, "b.txt"),
+            (Point::Written, "b.txt"),
+            (Point::Before, "x.txt"),
+        ] {
+            let f = folders();
+            let (l, r) = (&f.roots[0], &f.roots[1]);
+            write(l, "b.txt", "same\n");
+            write(l, "x.txt", "new\n");
+            write(r, "a.txt", "same\n");
+            let before = tree(r);
+            let p = make(&f, MIRROR);
+            let outcome = run(&f, &p, &|at, at_path| {
+                if at == point && at_path == path {
+                    Fault::Fail
+                } else {
+                    Fault::None
+                }
+            });
+            let SyncOutcome::Stopped { rollback, .. } = outcome else {
+                panic!("not stopped at {point:?}");
+            };
+            assert!(rollback.complete(), "{point:?}: {rollback:?}");
+            assert_eq!(tree(r), before, "{point:?}");
+            assert!(unfinished(&f.journal).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_rename_the_program_ended_in_is_undone_on_recovery() {
+        let f = folders();
+        let (l, r) = (&f.roots[0], &f.roots[1]);
+        write(l, "b.txt", "same\n");
+        write(r, "a.txt", "same\n");
+        let before = tree(r);
+        let p = make(&f, MIRROR);
+        let outcome = run(&f, &p, &|at, _| {
+            if at == Point::Moving {
+                Fault::Crash
+            } else {
+                Fault::None
+            }
+        });
+        assert!(matches!(outcome, SyncOutcome::Stopped { .. }));
+        // The file is at its temporary name, which only the journal knows.
+        assert!(!r.join("a.txt").exists() && !r.join("b.txt").exists());
+        assert_eq!(leftovers(r).len(), 1);
+        let left = unfinished(&f.journal);
+        assert_eq!(left.len(), 1);
+        assert!(recover(&left[0]).complete());
+        assert_eq!(tree(r), before);
+    }
+
+    #[test]
+    fn a_journal_naming_a_place_outside_the_folder_is_not_followed() {
+        let f = folders();
+        let r = &f.roots[1];
+        write(r, "b.txt", "x");
+        let header = Header {
+            version: JOURNAL_VERSION,
+            plan: "0".repeat(64),
+            roots: [f.roots[0].clone(), r.clone()],
+            destination: 1,
+            started: 0,
+            dir: f.journal.clone(),
+        };
+        let entry = |from: &str, via: &str| Entry {
+            path: "b.txt".into(),
+            before: Before::Moved {
+                from: from.into(),
+                via: via.into(),
+            },
+            written: None,
+        };
+        for e in [
+            entry("../outside.txt", ".oxidemerge-move-1"),
+            entry("a.txt", "../x"),
+        ] {
+            let out = roll_back(&header, &[e], &|_, _| Fault::None);
+            assert_eq!(out.failed.len(), 1);
+        }
+        assert_eq!(std::fs::read_to_string(r.join("b.txt")).unwrap(), "x");
+    }
+
+    /// Whether names that differ in case reach the same entry under `dir`.
+    fn ignores_case(dir: &Path) -> bool {
+        write(dir, "probe.txt", "");
+        let same = dir.join("PROBE.TXT").exists();
+        std::fs::remove_file(dir.join("probe.txt")).unwrap();
+        same
+    }
+
+    #[test]
+    fn a_rename_only_in_case_is_made_even_where_case_is_ignored() {
+        let f = folders();
+        let (l, r) = (&f.roots[0], &f.roots[1]);
+        write(l, "README.md", "readme\n");
+        write(r, "readme.md", "readme\n");
+        let p = make(&f, MIRROR);
+        let renamed: Vec<_> = p
+            .operations
+            .iter()
+            .filter_map(|o| Some((o.action, o.path.as_str(), o.renamed.as_deref()?)))
+            .collect();
+        assert_eq!(
+            renamed,
+            [
+                (Action::Copy, "README.md", "readme.md"),
+                (Action::Delete, "readme.md", "README.md"),
+            ],
+            "{:?}",
+            ops(&p)
+        );
+        // Undone when it fails after the move.
+        let outcome = run(&f, &p, &|at, _| {
+            if at == Point::Written {
+                Fault::Fail
+            } else {
+                Fault::None
+            }
+        });
+        assert!(matches!(&outcome, SyncOutcome::Stopped { rollback, .. } if rollback.complete()));
+        let names = |root: &Path| -> Vec<String> {
+            std::fs::read_dir(root)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect()
+        };
+        assert_eq!(names(r), ["readme.md"]);
+        assert!(matches!(
+            run(&f, &make(&f, MIRROR), &|_, _| Fault::None),
+            SyncOutcome::Applied { .. }
+        ));
+        assert_eq!(names(r), ["README.md"]);
+        assert_eq!(
+            std::fs::read_to_string(r.join("README.md")).unwrap(),
+            "readme\n"
+        );
+    }
+
+    #[test]
+    fn a_rename_only_in_unicode_form_is_made_too() {
+        let f = folders();
+        let (l, r) = (&f.roots[0], &f.roots[1]);
+        let (composed, decomposed) = ("caf\u{e9}.txt", "cafe\u{301}.txt");
+        write(l, composed, "menu\n");
+        write(r, decomposed, "menu\n");
+        let p = make(&f, MIRROR);
+        assert_eq!(p.estimate.renames, 1, "{:?}", ops(&p));
+        assert!(matches!(
+            run(&f, &p, &|_, _| Fault::None),
+            SyncOutcome::Applied { .. }
+        ));
+        let names: Vec<String> = std::fs::read_dir(r)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, [composed]);
+    }
+
+    #[test]
+    fn a_rename_only_in_case_with_new_contents_is_left_alone() {
+        let f = folders();
+        write(&f.roots[0], "Notes.txt", "new\n");
+        write(&f.roots[1], "notes.txt", "old\n");
+        let p = make(&f, MIRROR);
+        if ignores_case(&f.roots[1]) {
+            assert!(
+                p.operations
+                    .iter()
+                    .all(|o| o.action == Action::Conflict && o.reason == Reason::NameClash),
+                "{:?}",
+                ops(&p)
+            );
+        } else {
+            // Two names to a file system that keeps case apart.
+            assert_eq!(
+                ops(&p),
+                [(Action::Copy, "Notes.txt"), (Action::Delete, "notes.txt")]
+            );
+        }
     }
 
     #[test]
@@ -2385,7 +2947,11 @@ mod tests {
         let destination = &f.roots[plan.policy.destination()];
         std::fs::create_dir_all(&f.journal).unwrap();
         assert!(same_volume(destination, &f.journal));
-        let changes = || plan.operations.iter().filter(|o| o.action.changes());
+        let changes = || {
+            plan.operations
+                .iter()
+                .filter(|o| o.action.changes() && o.renamed.is_none())
+        };
         let written: u64 = changes()
             .filter(|o| matches!(o.action, Action::Copy | Action::Replace))
             .map(|o| o.bytes)

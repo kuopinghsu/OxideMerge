@@ -14,6 +14,7 @@ pub mod fsutil;
 pub mod git;
 pub mod html_report;
 pub mod image_cmp;
+pub mod job;
 pub mod patch;
 pub mod prettify;
 pub mod problem;

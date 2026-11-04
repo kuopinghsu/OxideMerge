@@ -253,7 +253,7 @@
   "folder_sync.recovered": "已撤销更改。",
   "folder_sync.recovery_detail": "部分更改无法撤销。被替换和删除的文件副本保存在 {path}。",
   "folder_sync.recovery_required": "部分应用 — 需要恢复",
-  "folder_sync.renamed_detail": "在源中重命名或移动：{from} → {to}。会先以新名称复制，再删除旧文件。",
+  "folder_sync.renamed_detail": "在源中重命名或移动：{from} → {to}。通过在目标中移动该文件来应用；仅当两个文件夹位于不同驱动器时才先复制再删除。",
   "folder_sync.risk_adds": "向目标添加内容",
   "folder_sync.risk_destructive": "会覆盖或删除目标中的内容",
   "folder_sync.risk_none": "不做任何更改",

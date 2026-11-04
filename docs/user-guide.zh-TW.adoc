@@ -1016,11 +1016,17 @@ OxideMerge 依內容（SHA-256）判斷，絕不會只因修改時間較新就�
 
 衝突包括：無法讀取的項目、符號連結（絕不跟隨或複製）、裝置、一側是檔案另一側是資料夾、
 名稱與另一個只差在大小寫或拉丁字母重音寫法（組合或分解），以及比較後又變更的項目。
+若某個檔案在兩側的名稱只差在大小寫或上述重音寫法，且兩側內容相同，鏡像時不算衝突，而會重新命名（見下文）。
 
 按一下項目可查看詳細資料：兩側的大小與 SHA-256 開頭，以及該動作是向目的地新增，還是會覆寫或刪除目的地的內容。
 
 若某個複製的內容與計畫要刪除的檔案相同，代表該檔案在來源中被重新命名或移動過。
-「重新命名」會以「舊名稱 → 新名稱」列出這些配對，複製與刪除項目也會顯示對方的名稱；套用時仍是一次複製加一次刪除。
+「重新命名」會以「舊名稱 → 新名稱」列出這些配對，複製與刪除項目也會顯示對方的名稱。
+套用重新命名時，會在目的地中移動該檔案，因此不需複製，也不會在日誌中保留副本：
+檔案會先改成日誌所記錄的暫存名稱，再改成新名稱。只改變名稱大小寫或重音寫法的重新命名也以相同方式進行，
+即使檔案系統把兩個名稱視為同一個（例如 Windows 與 macOS 的檔案系統）也一樣。
+若新舊位置位於不同磁碟，則會先複製再刪除舊檔案。只差在大小寫的資料夾重新命名，以及只差在大小寫且內容也變更的檔案，
+仍不會被變更。
 
 清單上方會顯示警告：
 
@@ -1037,7 +1043,7 @@ OxideMerge 依內容（SHA-256）判斷，絕不會只因修改時間較新就�
 接著 OxideMerge 依下列順序處理：建立資料夾、複製與取代檔案、刪除檔案，最後移除空的資料夾。
 對話框會顯示已完成的數量與正在變更的項目。
 每個項目都會先確認來源與目的地仍與預覽時相同。每個檔案會先複製到目的地旁的暫存檔，與計畫中的 SHA-256 核對後，
-再改名放到定位。最後會再檢查一次所有複製的檔案。
+再改名放到定位；重新命名的檔案則改為移動。最後會再檢查一次所有複製與移動的檔案。
 
 若有檔案在預覽後被變更（即使大小與修改時間相同），就不會套用任何變更，並會指出該檔案。
 
@@ -2364,10 +2370,13 @@ oxidemerge review.oxmcmp                        # 開啟已儲存的比較
 |將計畫套用到產生它的資料夾，資料夾須依相同順序指定。需搭配 `--yes`。
 
 |`--yes`
-|確認 `--sync-apply` 可以取代與刪除目的地中的檔案。
+|確認 `--sync-apply` 或 `--job` 的同步工作可以取代與刪除目的地中的檔案。
 
 |`--sync-recover`
 |復原未完成的資料夾同步。
+
+|`--job <FILE>`
+|依序執行工作檔中的工作並輸出 JSON 摘要（請參閱 <<jobs>>）。不接受路徑。
 |===
 
 每次執行只能使用一個分析選項，
@@ -2496,6 +2505,92 @@ case "$result" in
   1) echo "找到差異" ;;
   *) echo "比較失敗" >&2; exit "$result" ;;
 esac
+----
+
+[[jobs]]
+=== 工作
+
+工作檔把一組執行集中在一處，讓每晚的報告或備份只需一個指令。工作檔是 JSON 檔案，副檔名通常為 `.oxjob`：
+
+[source,json]
+----
+{
+  "version": 1,
+  "continue_on_error": false,
+  "jobs": [
+    {
+      "name": "nightly report",
+      "left": "a",
+      "right": "b",
+      "recursive": true,
+      "report": "report.html"
+    },
+    {
+      "name": "plan",
+      "kind": "sync_plan",
+      "source": "a",
+      "destination": "${env:BACKUP}",
+      "mode": "mirror",
+      "report": "plan.json"
+    },
+    {
+      "name": "backup",
+      "kind": "sync",
+      "source": "a",
+      "destination": "${env:BACKUP}",
+      "mode": "mirror",
+      "apply": true
+    }
+  ]
+}
+----
+
+[source,sh]
+----
+oxidemerge --job nightly.oxjob          # 執行前兩個工作，拒絕同步
+oxidemerge --job nightly.oxjob --yes    # 執行全部三個工作
+----
+
+每個工作都會轉換成命令列選項，並以該命令列的方式執行，因此工作與其命令列的結果相同。
+與命令列一樣，會套用您已儲存的選項。
+
+`version`:: 必填，值為 `1`。版本較新的檔案會被拒絕。
+`continue_on_error`:: 為 `false`（預設）時，某個工作以錯誤結束（代碼 2 或以上）後，之後的工作不會執行。
+為 `true` 時，所有工作都會執行。
+`jobs`:: 依序列出的工作。OxideMerge 不認識的欄位會視為錯誤，因此拼錯的名稱絕不會被忽略。
+
+每個工作都有選用的 `name`（顯示在摘要與錯誤訊息中）以及 `kind`：
+
+`compare`（預設）:: 必須指定 `left` 與 `right`（三方比較另需 `base`）。
+選項：`recursive`、`report`、`report_diffs`、`slideshow`、`patch`、`patch_style`、`context`、`compare_as`。
+`sync_plan`:: 寫出同步計畫。必須指定 `source`、`destination`、`mode`（`mirror` 或 `update`）
+與 `report`（計畫檔）。
+`sync`:: 一次完成同步的規劃與套用。必須指定 `source`、`destination`、`mode` 與 `"apply": true`；
+執行時還需要 `--yes`。會刪除大量項目的同步會被拒絕，除非工作中設定 `"allow_large_deletion": true`。
+
+所有類型也接受 `filter`、`method`、`rules`、`whitespace`、`ignore_case`、`ignore_blank`、
+`ignore_eol`、`ignore_numbers`、`ignore_comments`、`prettify`、`structured` 與 `numeric_tolerance`，
+意義與同名的命令列選項相同。不符合類型的欄位（例如比較工作中的 `apply`）會視為錯誤。
+
+路徑（包括 `rules`）相對於工作檔所在的資料夾，絕對路徑與 URL 除外。在路徑與 `rules` 中，
+`${env:NAME}` 會換成環境變數 `NAME` 的值；未設定的變數會視為錯誤。不會展開其他內容，
+也沒有任何工作會執行命令殼層或其他程式。
+
+`--job` 會輸出 JSON 摘要。其中 `exit_code` 是所有工作中最差的代碼，也是這次執行的結束代碼。
+`jobs` 的每個項目包含 `name`、`kind`、`exit_code`，工作失敗時還有 `error`，同步工作則有與
+`--sync-apply` 輸出相同的 `sync` 結果。`not_run` 列出因先前失敗而略過的工作：
+
+[source,json]
+----
+{
+  "exit_code": 2,
+  "jobs": [
+    { "name": "nightly report", "kind": "compare", "exit_code": 1 },
+    { "name": "plan", "kind": "sync_plan", "exit_code": 1 },
+    { "name": "backup", "kind": "sync", "exit_code": 2,
+      "error": "this job changes … and runs only with --yes" }
+  ]
+}
 ----
 
 [[integration]]

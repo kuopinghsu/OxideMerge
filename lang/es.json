@@ -253,7 +253,7 @@
   "folder_sync.recovered": "Se deshicieron los cambios.",
   "folder_sync.recovery_detail": "Algunos cambios no se pudieron deshacer. Las copias de los archivos reemplazados y eliminados se conservan en {path}.",
   "folder_sync.recovery_required": "Aplicado parcialmente: se requiere recuperación",
-  "folder_sync.renamed_detail": "Renombrado o movido en el origen: {from} → {to}. Se aplica como una copia con el nombre nuevo y luego se elimina el antiguo.",
+  "folder_sync.renamed_detail": "Renombrado o movido en el origen: {from} → {to}. Se aplica moviendo el archivo en el destino; solo se copia y se elimina si las dos carpetas están en unidades distintas.",
   "folder_sync.risk_adds": "Añade al destino",
   "folder_sync.risk_destructive": "Sobrescribe o elimina en el destino",
   "folder_sync.risk_none": "No cambia nada",

@@ -253,7 +253,7 @@
   "folder_sync.recovered": "The changes were undone.",
   "folder_sync.recovery_detail": "Some changes could not be undone. Copies of the replaced and deleted files are kept in {path}.",
   "folder_sync.recovery_required": "Partially applied — recovery required",
-  "folder_sync.renamed_detail": "Renamed or moved in the source: {from} → {to}. Applied as a copy under the new name, then deleting the old one.",
+  "folder_sync.renamed_detail": "Renamed or moved in the source: {from} → {to}. Applied by moving the file in the destination; copied and deleted only when the two folders are on different drives.",
   "folder_sync.risk_adds": "Adds to the destination",
   "folder_sync.risk_destructive": "Overwrites or deletes in the destination",
   "folder_sync.risk_none": "Changes nothing",

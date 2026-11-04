@@ -174,9 +174,16 @@ struct Cli {
     /// 4 = failed or stopped and undone, 5 = partly applied, recovery required
     #[arg(long, value_name = "PLAN", requires = "yes")]
     sync_apply: Option<PathBuf>,
-    /// Confirm that --sync-apply may change and delete files in the destination folder
-    #[arg(long, requires = "sync_apply")]
+    /// Confirm that --sync-apply, or the sync jobs of --job, may change and delete files in the
+    /// destination folder
+    #[arg(long)]
     yes: bool,
+    /// Run the jobs of a .oxjob file (JSON: compares, reports, sync plans and syncs) in order,
+    /// stopping at the first that fails; prints a JSON summary. Sync jobs that apply changes need
+    /// --yes. Exit code: the worst of the jobs (0 identical or applied, 1 different, 2 error,
+    /// 4 undone, 5 recovery required)
+    #[arg(long, value_name = "FILE")]
+    job: Option<PathBuf>,
     /// Undo folder synchronizations that did not finish; exit code 0 = undone, 5 = not all
     #[arg(long)]
     sync_recover: bool,
@@ -761,7 +768,7 @@ struct SyncReport {
 }
 
 fn run_sync(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
-    use core::folder_sync::{self, Side, SyncMode, SyncOutcome, SyncPlan, SyncPolicy};
+    use core::folder_sync::{self, Side, SyncMode, SyncPlan, SyncPolicy};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     if let Some(mode) = cli.sync_plan {
         let mode = match mode {
@@ -826,53 +833,7 @@ fn run_sync(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     );
     let (stop, done) = (AtomicBool::new(false), AtomicUsize::new(0));
     let outcome = folder_sync::apply(&planned, &cli.paths, &journal_root, &stop, &done);
-    let problem = outcome.problem();
-    let (code, report) = match outcome {
-        SyncOutcome::Applied { changes, kept } => (
-            0,
-            SyncReport {
-                problem,
-                status: "applied",
-                changes,
-                messages: kept,
-                journals: Vec::new(),
-            },
-        ),
-        SyncOutcome::NotApplied(_, messages) => (
-            2,
-            SyncReport {
-                problem,
-                status: "not_applied",
-                changes: 0,
-                messages,
-                journals: Vec::new(),
-            },
-        ),
-        SyncOutcome::Stopped {
-            reason, rollback, ..
-        } => (
-            if rollback.complete() { 4 } else { 5 },
-            SyncReport {
-                problem,
-                status: if rollback.complete() {
-                    "rolled_back"
-                } else {
-                    "recovery_required"
-                },
-                changes: rollback.restored,
-                messages: reason
-                    .into_iter()
-                    .chain(
-                        rollback
-                            .failed
-                            .into_iter()
-                            .map(|(p, e)| format!("{p}: {e}")),
-                    )
-                    .collect(),
-                journals: rollback.journal.into_iter().collect(),
-            },
-        ),
-    };
+    let (code, report) = sync_report(outcome);
     println!("{}", core::analysis::json(&report)?);
     Ok(code)
 }
@@ -1171,6 +1132,216 @@ fn wsl_gl_defaults() {
     }
 }
 
+/// The compare rules `--rules` names, relative to `base`: the spec, and the rules
+/// (`Some(None)` for `--rules ''`, which turns the rules of the options off).
+type CliRules = (Option<String>, Option<Option<core::rules::RuleSet>>);
+
+fn resolve_rules(cli: &Cli, base: &std::path::Path) -> Result<CliRules, String> {
+    let spec = cli
+        .rules
+        .as_deref()
+        .map(|r| core::rules::absolute_spec(r, base));
+    let rules = match spec.as_deref() {
+        None => None,
+        Some("") => Some(None),
+        Some(name) => match core::rules::find(name) {
+            Some(set) => Some(Some(set)),
+            None => return Err(format!("no compare rules named {name:?}")),
+        },
+    };
+    Ok((spec, rules))
+}
+
+/// Puts the rules of the command line, or else those of the settings while they exist, into
+/// the options a console run compares with.
+fn use_rules(
+    cfg: &mut Config,
+    spec: &Option<String>,
+    rules: &Option<Option<core::rules::RuleSet>>,
+) {
+    if let (Some(set), Some(name)) = (rules, spec) {
+        cfg.diff = core::rules::options_with(&cfg.diff, set.as_ref());
+        cfg.rules = name.clone();
+    } else if !cfg.rules.is_empty() && core::rules::find(&cfg.rules).is_none() {
+        eprintln!(
+            "note: the selected compare rules {:?} are missing; comparing without them",
+            cfg.rules
+        );
+        cfg.rules.clear();
+    }
+    warn_bad_patterns(&cfg.diff);
+}
+
+/// How one job of `--job` ended, in its summary.
+#[derive(serde::Serialize)]
+struct JobReport {
+    name: String,
+    kind: &'static str,
+    exit_code: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// For a sync job, what applying did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sync: Option<SyncReport>,
+}
+
+#[derive(serde::Serialize)]
+struct JobsReport {
+    exit_code: u8,
+    jobs: Vec<JobReport>,
+    /// Jobs not run because one before failed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    not_run: Vec<String>,
+}
+
+/// Runs the jobs of `file` one after another, as their command lines would, and prints a JSON
+/// summary. The exit code is the worst of the jobs'.
+fn run_jobs(file: &std::path::Path, yes: bool, base: &Config) -> anyhow::Result<u8> {
+    use core::job::{JobFile, JobKind};
+    let text = String::from_utf8(core::analysis::read(file)?)?;
+    let jobs = JobFile::parse(&text).map_err(anyhow::Error::msg)?;
+    let dir = std::path::absolute(file)?
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let mut summary = JobsReport {
+        exit_code: 0,
+        jobs: Vec::new(),
+        not_run: Vec::new(),
+    };
+    for (i, job) in jobs.jobs.iter().enumerate() {
+        let name = job.label(i);
+        if summary.exit_code >= 2 && !jobs.continue_on_error {
+            summary.not_run.push(name);
+            continue;
+        }
+        let mut report = JobReport {
+            name,
+            kind: job.kind.key(),
+            exit_code: 2,
+            error: None,
+            sync: None,
+        };
+        let run = || -> anyhow::Result<(u8, Option<SyncReport>)> {
+            let prepared = job.prepare(&dir).map_err(anyhow::Error::msg)?;
+            let argv = std::iter::once(std::ffi::OsString::from("oxidemerge")).chain(prepared.args);
+            let cli = Cli::try_parse_from(argv).map_err(|e| {
+                let text = e.to_string();
+                anyhow::anyhow!("{}", text.lines().next().unwrap_or_default())
+            })?;
+            let mut cfg = base.clone();
+            apply_cli_options(&cli, &mut cfg);
+            let (spec, rules) = resolve_rules(&cli, &dir).map_err(anyhow::Error::msg)?;
+            use_rules(&mut cfg, &spec, &rules);
+            if job.kind != JobKind::Sync {
+                return Ok((run_batch(&cli, &cfg)?, None));
+            }
+            anyhow::ensure!(
+                yes,
+                "this job changes {} and runs only with --yes",
+                cli.paths[1].display()
+            );
+            let (code, report) = sync_now(&cli, &cfg, prepared.allow_large_deletion)?;
+            Ok((code, Some(report)))
+        };
+        match run() {
+            Ok((code, sync)) => {
+                report.exit_code = code;
+                report.sync = sync;
+            }
+            Err(e) => {
+                eprintln!("error: {}: {e:#}", report.name);
+                report.error = Some(format!("{e:#}"));
+            }
+        }
+        summary.exit_code = summary.exit_code.max(report.exit_code);
+        summary.jobs.push(report);
+    }
+    println!("{}", core::analysis::json(&summary)?);
+    Ok(summary.exit_code)
+}
+
+/// Plans the synchronization of the two folders of `cli` and applies it at once, as a sync job
+/// does: refused when it would delete many files unless the job allows it.
+fn sync_now(cli: &Cli, cfg: &Config, allow_large: bool) -> anyhow::Result<(u8, SyncReport)> {
+    use core::folder_sync::{self, Side, SyncMode, SyncPolicy};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    let mode = match cli.sync_plan {
+        Some(SyncArg::Update) => SyncMode::Update,
+        _ => SyncMode::Mirror,
+    };
+    let plan = sync_plan(
+        cli,
+        cfg,
+        SyncPolicy {
+            mode,
+            source: Side::Left,
+        },
+    )?;
+    anyhow::ensure!(
+        allow_large || !plan.large_deletion(),
+        "this synchronization would delete {} items; set \"allow_large_deletion\": true in the job to allow it",
+        plan.deletions()
+    );
+    let journal_root =
+        folder_sync::journal_root().ok_or_else(|| anyhow::anyhow!("No settings folder"))?;
+    let (stop, done) = (AtomicBool::new(false), AtomicUsize::new(0));
+    let outcome = folder_sync::apply(&plan, &cli.paths, &journal_root, &stop, &done);
+    Ok(sync_report(outcome))
+}
+
+/// The exit code and JSON report of a synchronization's outcome.
+fn sync_report(outcome: core::folder_sync::SyncOutcome) -> (u8, SyncReport) {
+    use core::folder_sync::SyncOutcome;
+    let problem = outcome.problem();
+    match outcome {
+        SyncOutcome::Applied { changes, kept } => (
+            0,
+            SyncReport {
+                problem,
+                status: "applied",
+                changes,
+                messages: kept,
+                journals: Vec::new(),
+            },
+        ),
+        SyncOutcome::NotApplied(_, messages) => (
+            2,
+            SyncReport {
+                problem,
+                status: "not_applied",
+                changes: 0,
+                messages,
+                journals: Vec::new(),
+            },
+        ),
+        SyncOutcome::Stopped {
+            reason, rollback, ..
+        } => (
+            if rollback.complete() { 4 } else { 5 },
+            SyncReport {
+                problem,
+                status: if rollback.complete() {
+                    "rolled_back"
+                } else {
+                    "recovery_required"
+                },
+                changes: rollback.restored,
+                messages: reason
+                    .into_iter()
+                    .chain(
+                        rollback
+                            .failed
+                            .into_iter()
+                            .map(|(p, e)| format!("{p}: {e}")),
+                    )
+                    .collect(),
+                journals: rollback.journal.into_iter().collect(),
+            },
+        ),
+    }
+}
+
 fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
     wsl_gl_defaults();
@@ -1231,6 +1402,8 @@ fn main() -> ExitCode {
         paths = shell::compare_paths(paths);
     }
 
+    // What each job of --job starts from: the settings, without this command line's options.
+    let base_cfg = cfg.clone();
     apply_cli_options(&cli, &mut cfg);
     if cli.git_rev.is_some() && paths.len() != 1 {
         eprintln!("error: --git-rev compares exactly one file or folder with a revision");
@@ -1238,35 +1411,39 @@ fn main() -> ExitCode {
     }
 
     let cwd = std::env::current_dir().unwrap_or_default();
-    let cli_rules = cli
-        .rules
-        .as_deref()
-        .map(|r| core::rules::absolute_spec(r, &cwd));
-    // `Some(None)` turns the rules of the options off ("--rules ''").
-    let rules = match cli_rules.as_deref() {
-        None => None,
-        Some("") => Some(None),
-        Some(name) => match core::rules::find(name) {
-            Some(set) => Some(Some(set)),
-            None => {
-                eprintln!("error: no compare rules named {name:?}");
-                return ExitCode::from(2);
-            }
-        },
+    let (cli_rules, rules) = match resolve_rules(&cli, &cwd) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
     };
 
-    if cli.cli || cli.report.is_some() || cli.patch.is_some() || analysis_mode(&cli) {
-        if let (Some(set), Some(name)) = (&rules, &cli_rules) {
-            cfg.diff = core::rules::options_with(&cfg.diff, set.as_ref());
-            cfg.rules = name.clone();
-        } else if !cfg.rules.is_empty() && core::rules::find(&cfg.rules).is_none() {
-            eprintln!(
-                "note: the selected compare rules {:?} are missing; comparing without them",
-                cfg.rules
-            );
-            cfg.rules.clear();
+    if let Some(file) = &cli.job {
+        let others = !cli.paths.is_empty()
+            || cli.cli
+            || cli.report.is_some()
+            || cli.patch.is_some()
+            || analysis_mode(&cli);
+        if others {
+            eprintln!("error: --job takes no paths, and the options of each job are in the file");
+            return ExitCode::from(2);
         }
-        warn_bad_patterns(&cfg.diff);
+        return match run_jobs(file, cli.yes, &base_cfg) {
+            Ok(code) => ExitCode::from(code),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if cli.yes && cli.sync_apply.is_none() {
+        eprintln!("error: --yes only confirms --sync-apply or --job");
+        return ExitCode::from(2);
+    }
+
+    if cli.cli || cli.report.is_some() || cli.patch.is_some() || analysis_mode(&cli) {
+        use_rules(&mut cfg, &cli_rules, &rules);
         return match run_batch(&cli, &cfg) {
             Ok(code) => ExitCode::from(code),
             Err(e) => {

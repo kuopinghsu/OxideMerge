@@ -95,20 +95,31 @@ section of this file as the release notes.
 - **Folder synchronization:** *Synchronize folders...* in a two-way folder compare (toolbar and
   *Merge* menu) previews mirroring one folder into the other, or updating it without deleting.
   The read-only preview lists each copy, replacement, deletion, skip and conflict with its reason,
-  groups a copy and a deletion of the same contents as a *Rename*, warns when the filter leaves
+  groups a copy and a deletion of the same contents as a *Rename* and applies it by moving the
+  file in the destination (through a temporary name the journal records, so even a crash part
+  way is undone), also for a rename only in letter case or accents on file systems that ignore
+  them; warns when the filter leaves
   items out, and exports the plan as versioned JSON with relative paths, the filter and a
   fingerprint of the folder paths, so it is applied only to those folders. Applying asks for confirmation (twice for large deletions), checks every file against
   its SHA-256 fingerprint first, so a file edited after the preview is never overwritten, copies
   through a verified temporary file, shows the item being changed, and keeps replaced and
   deleted files in a recovery journal outside both folders. A failure or *Stop* undoes the changes; a synchronization cut short is
-  offered for undoing at the next start. Symbolic links, file/folder clashes and names that
-  differ only in case or in how accents on Latin letters are written are left alone, and folders
+  offered for undoing at the next start. Symbolic links, file/folder clashes, folders renamed
+  only in case and other names that differ only in case or in how accents on Latin letters are
+  written are left alone, and folders
   inside each other are refused.
   On the command line: `--sync-plan mirror|update`, `--sync-apply <PLAN> --yes` and
   `--sync-recover`, with exit codes 4 (undone) and 5 (recovery required). A plan whose files or
   journal copies do not fit in the free space of their drives is refused before anything changes,
   and the JSON result has a `problem` (`stale`, `unsupported`, `read_failure`, `write_failure`,
   `canceled`, `recovery_needed`) when it is not a plain success.
+- **Jobs:** `--job <FILE>` runs the compares, reports, sync plans and syncs listed in a versioned
+  JSON job file (`.oxjob`) in order, each as its command line would, and prints a JSON summary
+  whose exit code is the worst of the jobs. Paths are relative to the job file, `${env:NAME}` in
+  paths is the only expansion, and no shell or other program is run. A sync job needs `"apply": true` in
+  the file and `--yes`, and a large deletion also `"allow_large_deletion": true`. The jobs after a
+  failure are skipped unless `"continue_on_error": true`; unknown fields and newer versions are
+  refused.
 - **Copy values in the semantic view:** *Copy value to left* and *Copy value to right* on each
   JSON, XML, TOML or YAML change replace, add or remove that one value on the other side. Only the
   value's text changes; comments and layout stay. The edited file is parsed again and the copy is

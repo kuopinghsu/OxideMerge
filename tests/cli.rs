@@ -1426,3 +1426,129 @@ fn folders_are_synchronized_from_a_plan_checked_again_before_applying() {
     let yes_alone = oxidemerge(d, &["--yes", "src", "dst"]);
     assert_eq!(yes_alone.code, 2, "{}", yes_alone.stdout);
 }
+
+#[test]
+fn a_compare_job_writes_what_its_command_line_writes() {
+    let t = tmp();
+    let d = t.path();
+    folders(d);
+    files(
+        d,
+        &[(
+            "jobs/nightly.oxjob",
+            r#"{"version": 1, "jobs": [
+                {"name": "folders", "kind": "compare", "left": "../left", "right": "../right",
+                 "recursive": true, "report": "../job.csv"}]}"#,
+        )],
+    );
+    let job = oxidemerge(d, &["--job", "jobs/nightly.oxjob"]);
+    assert_eq!(job.code, 1, "{}{}", job.stdout, job.stderr);
+    let summary: serde_json::Value = serde_json::from_str(&job.stdout).unwrap();
+    assert_eq!(summary["exit_code"], 1);
+    assert_eq!(summary["jobs"][0]["name"], "folders");
+    assert_eq!(summary["jobs"][0]["exit_code"], 1);
+    let direct = oxidemerge(d, &["-r", "left", "right", "--report", "direct.csv"]);
+    assert_eq!(direct.code, 1);
+    // The same rows; the header names the folders as the job file's folder reaches them.
+    let rows = |p: &str| {
+        read(d.join(p))
+            .lines()
+            .skip(2)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(rows("job.csv"), rows("direct.csv"));
+    let header = read(d.join("job.csv"));
+    let first = header.lines().next().unwrap();
+    assert!(
+        first.ends_with(&format!("jobs{}../left", std::path::MAIN_SEPARATOR)),
+        "{first}"
+    );
+}
+
+#[test]
+fn a_sync_job_changes_nothing_without_yes_and_stops_the_jobs_after_it() {
+    let t = tmp();
+    let d = t.path();
+    files(
+        d,
+        &[
+            ("src/a.txt", "new\n"),
+            ("dst/a.txt", "old\n"),
+            ("dst/extra.txt", "extra\n"),
+            (
+                "sync.oxjob",
+                r#"{"version": 1, "jobs": [
+                    {"kind": "sync_plan", "source": "src", "destination": "dst",
+                     "mode": "mirror", "report": "plan.json"},
+                    {"name": "mirror", "kind": "sync", "source": "src", "destination": "dst",
+                     "mode": "mirror", "apply": true},
+                    {"name": "after", "kind": "compare", "left": "src", "right": "dst"}]}"#,
+            ),
+        ],
+    );
+    let refused = oxidemerge(d, &["--job", "sync.oxjob"]);
+    assert_eq!(refused.code, 2, "{}{}", refused.stdout, refused.stderr);
+    let summary: serde_json::Value = serde_json::from_str(&refused.stdout).unwrap();
+    assert_eq!(summary["jobs"][0]["exit_code"], 1, "the plan has changes");
+    assert!(summary["jobs"][1]["error"]
+        .as_str()
+        .unwrap()
+        .contains("--yes"));
+    assert_eq!(summary["not_run"][0], "after");
+    assert!(read(d.join("plan.json")).contains("\"delete\""));
+    assert_eq!(read(d.join("dst/a.txt")), "old\n");
+    assert_eq!(read(d.join("dst/extra.txt")), "extra\n");
+
+    let applied = oxidemerge(d, &["--job", "sync.oxjob", "--yes"]);
+    assert_eq!(applied.code, 1, "{}{}", applied.stdout, applied.stderr);
+    let summary: serde_json::Value = serde_json::from_str(&applied.stdout).unwrap();
+    assert_eq!(summary["jobs"][1]["sync"]["status"], "applied");
+    assert_eq!(
+        summary["jobs"][2]["exit_code"], 0,
+        "identical after the sync"
+    );
+    assert_eq!(read(d.join("dst/a.txt")), "new\n");
+    assert!(!d.join("dst/extra.txt").exists());
+}
+
+#[test]
+fn jobs_go_on_after_a_failure_only_when_asked_and_large_deletions_need_leave() {
+    let t = tmp();
+    let d = t.path();
+    std::fs::create_dir_all(d.join("src")).unwrap();
+    for i in 0..60 {
+        files(d, &[(&format!("dst/f{i}.txt"), "x\n")]);
+    }
+    files(
+        d,
+        &[
+            ("a.txt", "a\n"),
+            (
+                "jobs.oxjob",
+                r#"{"version": 1, "continue_on_error": true, "jobs": [
+                    {"kind": "compare", "left": "missing.txt", "right": "a.txt"},
+                    {"kind": "sync", "source": "src", "destination": "dst",
+                     "mode": "mirror", "apply": true},
+                    {"kind": "compare", "left": "a.txt", "right": "a.txt"}]}"#,
+            ),
+        ],
+    );
+    let run = oxidemerge(d, &["--job", "jobs.oxjob", "--yes"]);
+    assert_eq!(run.code, 2);
+    let summary: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(summary["jobs"][0]["exit_code"], 2);
+    assert!(summary["jobs"][1]["error"]
+        .as_str()
+        .unwrap()
+        .contains("allow_large_deletion"));
+    assert_eq!(summary["jobs"][2]["exit_code"], 0);
+    assert_eq!(std::fs::read_dir(d.join("dst")).unwrap().count(), 60);
+
+    let with_paths = oxidemerge(d, &["--job", "jobs.oxjob", "a.txt", "a.txt"]);
+    assert_eq!(with_paths.code, 2);
+    files(d, &[("future.oxjob", r#"{"version": 9, "jobs": []}"#)]);
+    let future = oxidemerge(d, &["--job", "future.oxjob"]);
+    assert_eq!(future.code, 2);
+    assert!(future.stderr.contains("version 9"), "{}", future.stderr);
+}
