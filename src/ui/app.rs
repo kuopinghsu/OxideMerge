@@ -1166,19 +1166,71 @@ struct StatsDialog {
 
 type CommitsRx = std::sync::mpsc::Receiver<Vec<(String, String)>>;
 
+/// A log of recent revisions being read on another thread. Dropping it (when a newer path's log
+/// replaces it, or the dialog closes) stops its `svn` or `hg` process.
+struct LogJob {
+    path: String,
+    rx: CommitsRx,
+    started: std::time::Instant,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for LogJob {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// What the revision dialog does about its list on this frame.
+#[derive(Debug, PartialEq)]
+enum LogStep {
+    /// Nothing to start.
+    Idle,
+    /// Look again after this long: typing has not paused yet, or an earlier path's log is
+    /// still let finish.
+    WaitFor(std::time::Duration),
+    /// Start this path's log, stopping an earlier path's that is still running.
+    Start,
+}
+
+/// `pending`: the list is not for the typed path and no log for it runs. `typing`: how long
+/// the path has stayed the same. `running`: how long an earlier path's log has run, if one does.
+fn log_step(
+    pending: bool,
+    typing: std::time::Duration,
+    running: Option<std::time::Duration>,
+) -> LogStep {
+    if !pending {
+        return LogStep::Idle;
+    }
+    if typing < GIT_LOG_DELAY {
+        return LogStep::WaitFor(GIT_LOG_DELAY - typing);
+    }
+    match running {
+        // let it finish for a while rather than piling up `svn log`s on a slow server
+        Some(ran) if ran < STALE_LOG => LogStep::WaitFor(STALE_LOG - ran),
+        _ => LogStep::Start,
+    }
+}
+
 struct GitDialog {
     path: String,
     rev: String,
     /// Recent commits of `commits_for`: short hash and subject.
     commits: Vec<(String, String)>,
     commits_for: String,
-    /// Recent revisions being read, for the path it was started for, and when it started.
-    commits_job: Option<(String, CommitsRx, std::time::Instant)>,
+    /// Recent revisions being read.
+    commits_job: Option<LogJob>,
     /// The path as last typed and when, so `git log` waits until typing pauses.
     typed: (String, std::time::Instant),
-    /// Example revisions for the system holding the typed path, found when the path changes
-    /// rather than on every frame.
+    /// Example revisions for the system holding the typed path, found on another thread when
+    /// the path changes, since that looks through every parent folder (slow on a network share).
     rev_hint: &'static str,
+    /// The path `rev_hint` was found for.
+    hint_for: String,
+    /// The hint being found, and the path it is for: one at a time, once typing pauses.
+    hint_job: Option<(String, std::sync::mpsc::Receiver<&'static str>)>,
 }
 
 /// How long the Git dialog's path must stay unchanged before its commits are read.
@@ -1450,6 +1502,8 @@ struct Menus {
     /// Sides of a text or folder compare (0 otherwise).
     sides: usize,
     can_take_both: bool,
+    /// The text compare shows the inline view, which edits no text (differences still copy).
+    inline_view: bool,
     /// The text compare has synchronization points, or a line picked for one.
     has_sync_points: bool,
     /// The tab compares two or more paths.
@@ -1494,9 +1548,10 @@ impl Menus {
                 Text | Binary,
             ) => true,
             (NextConflict | PrevConflict | AutoMerge, Text | Folder) => self.sides == 3,
+            (Replace | Indent(_) | DuplicateLines | MoveLines(_), Text) => !self.inline_view,
             (
-                Replace | ToggleBookmark | NextBookmark | PrevBookmark | ClearBookmarks
-                | BookmarkComment | Indent(_) | SaveComparison | SyncPoint,
+                ToggleBookmark | NextBookmark | PrevBookmark | ClearBookmarks | BookmarkComment
+                | SaveComparison | SyncPoint,
                 Text,
             ) => true,
             (SaveComparison, Folder) => !self.folder_busy,
@@ -1633,6 +1688,9 @@ fn edit_menu(ui: &mut egui::Ui, m: &mut Menus) {
     });
     m.item(ui, Cmd::Indent(false));
     m.item(ui, Cmd::Indent(true));
+    m.item(ui, Cmd::DuplicateLines);
+    m.item(ui, Cmd::MoveLines(true));
+    m.item(ui, Cmd::MoveLines(false));
     m.item(ui, Cmd::SelectPattern);
     ui.separator();
     m.item(ui, Cmd::Options);
@@ -3484,6 +3542,8 @@ impl OxideMergeApp {
                     commits_job: None,
                     typed: (String::new(), std::time::Instant::now()),
                     rev_hint: vcs::Vcs::Git.rev_hint(),
+                    hint_for: String::new(),
+                    hint_job: None,
                 });
             }
             Cmd::CompareAs(kind) => {
@@ -3515,6 +3575,10 @@ impl OxideMergeApp {
                     }
                 }
                 let mut err: Option<String> = None;
+                if let Content::Text(v) = tab.content.view_mut() {
+                    // Commands read the comparison, which typing may have put off.
+                    v.settle_diff();
+                }
                 match tab.content.view_mut() {
                     Content::Text(v) => match cmd {
                         Cmd::Save => {
@@ -3557,6 +3621,8 @@ impl OxideMergeApp {
                         Cmd::ClearSyncPoints => v.clear_sync_points(),
                         Cmd::TakeBoth(left_first) => v.take_both(left_first),
                         Cmd::Indent(outdent) => v.indent(outdent),
+                        Cmd::DuplicateLines => v.duplicate_lines(),
+                        Cmd::MoveLines(up) => v.move_lines(up),
                         Cmd::BookmarkComment => v.edit_note(),
                         _ => {}
                     },
@@ -4282,11 +4348,11 @@ impl OxideMergeApp {
             return;
         };
         let path = PathBuf::from(d.path.trim());
-        if let Some((for_path, rx, _)) = &d.commits_job {
-            match rx.try_recv() {
+        if let Some(job) = &d.commits_job {
+            match job.rx.try_recv() {
                 Ok(commits) => {
                     d.commits = commits;
-                    d.commits_for = for_path.clone();
+                    d.commits_for = job.path.clone();
                     d.commits_job = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => d.commits_job = None,
@@ -4295,31 +4361,67 @@ impl OxideMergeApp {
                 }
             }
         }
+        if let Some((for_path, rx)) = &d.hint_job {
+            match rx.try_recv() {
+                Ok(hint) => {
+                    // a hint for a path typed over since is not shown
+                    if *for_path == d.path {
+                        d.rev_hint = hint;
+                    }
+                    d.hint_for = for_path.clone();
+                    d.hint_job = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => d.hint_job = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
+            }
+        }
         if d.typed.0 != d.path {
             d.typed = (d.path.clone(), std::time::Instant::now());
-            d.rev_hint = vcs::Vcs::of(&path).rev_hint();
         }
-        let wait = GIT_LOG_DELAY.saturating_sub(d.typed.1.elapsed());
-        let started_for = d.commits_job.as_ref().map(|(p, _, _)| p.as_str());
+        // The hint looks through every parent folder (slow on a network share), so it is found
+        // once typing pauses, one path at a time, as the log is.
+        let hint_wait = GIT_LOG_DELAY.saturating_sub(d.typed.1.elapsed());
+        if d.hint_for != d.path && d.hint_job.is_none() {
+            if hint_wait.is_zero() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(vcs::Vcs::of(&p).rev_hint());
+                });
+                d.hint_job = Some((d.path.clone(), rx));
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            } else {
+                ctx.request_repaint_after(hint_wait);
+            }
+        }
+        let started_for = d.commits_job.as_ref().map(|j| j.path.as_str());
         let pending = d.commits_for != d.path && started_for != Some(d.path.as_str());
-        // An earlier path's log is let finish for a while rather than piling up `svn log`s on a
-        // slow server; past that it is dropped (its thread ends on its own) and this one starts.
-        let busy = d
-            .commits_job
-            .as_ref()
-            .map(|(_, _, at)| STALE_LOG.saturating_sub(at.elapsed()))
-            .filter(|left| !left.is_zero());
-        if pending && !wait.is_zero() {
-            ctx.request_repaint_after(wait);
-        } else if let (true, Some(left)) = (pending, busy) {
-            ctx.request_repaint_after(left);
-        } else if pending && path.exists() {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let p = path.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(vcs::recent_revisions(&p, 20));
-            });
-            d.commits_job = Some((d.path.clone(), rx, std::time::Instant::now()));
+        let running = d.commits_job.as_ref().map(|j| j.started.elapsed());
+        match log_step(pending, d.typed.1.elapsed(), running) {
+            LogStep::Idle => {}
+            LogStep::WaitFor(wait) => ctx.request_repaint_after(wait),
+            LogStep::Start => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (p, stop) = (path.clone(), cancel.clone());
+                std::thread::spawn(move || {
+                    let commits = if p.exists() {
+                        vcs::recent_revisions(&p, 20, &stop)
+                    } else {
+                        Vec::new()
+                    };
+                    let _ = tx.send(commits);
+                });
+                // replacing an earlier path's job drops it, which stops its process
+                d.commits_job = Some(LogJob {
+                    path: d.path.clone(),
+                    rx,
+                    started: std::time::Instant::now(),
+                    cancel,
+                });
+            }
         }
         if d.commits_for != d.path {
             d.commits.clear();
@@ -4582,12 +4684,23 @@ impl OxideMergeApp {
             self.tabs.get(self.active).map(|t| t.content.view()),
             Some(Content::Text(v)) if v.takes_text()
         );
+        let caret = match self.tabs.get(self.active).map(|t| t.content.view()) {
+            Some(Content::Text(v)) => Some(v),
+            _ => None,
+        };
+        // keys the text caret takes (on macOS, Option+Left and Option+Right move by word)
+        let caret_takes = |b: &commands::Binding| {
+            caret.is_some_and(|v| v.takes_key(b.key.logical_key, b.key.modifiers))
+        };
+        let reserved: Vec<bool> = BINDINGS.iter().map(caret_takes).collect();
         let menus = self.menus();
         let mut cmds = std::mem::take(&mut self.tab_keys);
         ctx.input_mut(|i| {
-            for b in BINDINGS {
+            for (b, &reserved) in BINDINGS.iter().zip(&reserved) {
                 if b.key.logical_key == Key::Escape && escape_reserved
                     || b.key.logical_key == Key::Questionmark && text_typed
+                    || text_typed && commands::types_text(b)
+                    || reserved
                 {
                     continue;
                 }
@@ -4634,6 +4747,7 @@ impl OxideMergeApp {
                 _ => 0,
             },
             can_take_both: matches!(view, Some(Content::Text(v)) if v.can_take_both()),
+            inline_view: matches!(view, Some(Content::Text(v)) if v.shows_inline()),
             has_sync_points: matches!(view, Some(Content::Text(v)) if v.has_sync_points()),
             has_source: tab.is_some_and(|t| t.source.len() >= 2),
             folder_busy: matches!(view, Some(Content::Folder(v)) if v.is_running()),

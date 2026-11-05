@@ -7,6 +7,50 @@ section of this file as the release notes.
 
 ### Added
 
+- **Tab and Shift+Tab indent in the text cursor:** `Tab` indents the selected lines when the
+  selection goes over more than one line or is a whole line, and otherwise still types a tab;
+  `Shift+Tab` outdents the selected lines or the cursor's line, and `Ctrl+]` and `Ctrl+[` do the
+  same with the cursor in a pane. Indenting uses a tab in files indented with tabs and the tab
+  size in spaces otherwise, leaves blank lines alone, and skips a line the selection only
+  reaches the start of. The selection moves with its text, so `Shift+Tab` right after `Tab` gives
+  back the same text and selection, each as one undo step.
+- **Triple-click selects a line:** a triple-click in the text selects the line with its line
+  break (the last line to its end), as the keys `Home` and `Shift+↓` do.
+- **Fast typing in large files:** typing within a line no longer compares the files again at every
+  key when that takes long (over 8 ms; about 35 ms for 200,000 lines): it waits for a 0.3 s pause
+  or for the next key, click or command that is not typing, so a keystroke takes about 2 ms at any
+  size. The first key of a burst also skips moving bookmarks and the view, which a change within
+  a line cannot move. A new line, a paste and undo still compare at once.
+- **Several text cursors:** Ctrl+click (⌘-click on macOS) adds a text cursor in a pane or
+  removes one, and `Ctrl+Alt+↑`/`Ctrl+Alt+↓` (`⌘⌥↑`/`⌘⌥↓`) add one on the line above or below.
+  Typing, deleting, Enter, the arrow keys, Home and End act at every cursor, and cursors that meet
+  merge. Each edit is one undo step, and undo puts the cursors back. Pasting as many lines as
+  cursors puts one at each, copying gives the selections one per line, and Tab, Shift+Tab,
+  *Duplicate lines* and *Move lines* act on every cursor's lines once. `Esc` first goes back to
+  one cursor. The column selection stays as it was, separate from these cursors.
+- **Duplicate and move lines:** `Ctrl+D` (`⌘D` on macOS) puts a copy of the selected lines, or
+  the text cursor's line, under them and selects the copy; `Alt+Shift+↑` and `Alt+Shift+↓` move
+  them up or down with their selection. They take the same lines as `Tab` (or, without a text
+  cursor, the active pane's lines in the selected rows), are one undo step each, and are in the
+  *Edit* menu and the command palette. `Alt+Shift+↓` and `Alt+Shift+↑` no longer also step through
+  the differences; `Alt+↓` and `Alt+↑` still do.
+- **Where typing goes:** the text cursor is a solid bar only where typing goes into the text;
+  it is thin and faint in a read-only pane, while a field such as the search bar has the
+  keyboard, and while the window is in the background. Typing into a read-only pane says which
+  side it is and that the lock in its header unlocks it, or, for text read from a document,
+  that it can only be compared.
+- **Edit side by side from the inline view:** the inline view says at its top that it only shows
+  the files, with an *Edit side by side* button; it, a double-click on a line, `Enter` or `F2`
+  opens the side-by-side view with the text cursor at the start of that line. Switching views
+  keeps every edit, the selected difference and the text cursor with its selection.
+- **Word moves and word deletes in the text cursor:** `Ctrl+←` and `Ctrl+→` (`Option+←` and
+  `Option+→` on macOS) move by word, with `Shift` to select by word, and `Ctrl+Backspace` and
+  `Ctrl+Delete` (`Option+Backspace` and `Option+Delete`) delete the word before or after the
+  cursor as one undo step, or the selection when there is one. Words follow Unicode word
+  boundaries, so accents, emoji sequences and Chinese, Japanese and Korean characters stay whole;
+  letters, digits and `_` make one word and a run of punctuation is its own. On macOS the cursor
+  takes `Option+←` and `Option+→` while it is in the text, so they no longer copy the difference
+  there; `Esc` leaves the text.
 - **Tree view:** *Tree*, beside *Text* and *Semantic* for two JSON, YAML, TOML or XML files,
   shows both documents as one aligned tree: matching nodes share a row, a node on one side only has
   a placeholder, and `+ − ~ ↕ ?` mark added, removed, modified, moved and ambiguous rows. Object
@@ -252,6 +296,71 @@ section of this file as the release notes.
 
 ### Fixed
 
+- **Compare with revision stays responsive on slow repositories:** revision hints are detected in
+  the background. Closing the dialog or replacing an obsolete revision request cancels its
+  Subversion or Mercurial log process instead of leaving the request running.
+
+- Multi-cursor word deletion merges overlapping deletion ranges before editing, preventing extra
+  text from being removed. Copy and Cut read the original selections and copy each whole line
+  once; multiple cursors on one line no longer cut subsequent lines. Undo restores all original
+  cursors in one step.
+
+- **The view and the text cursor stay with their text after an edit:** copying a difference, Undo,
+  Redo, a paste or a file reloaded from disk that adds or removes rows above the view no longer
+  slides other text into it; the line at the top, the cursor row, the column selection and the
+  text cursor with its selection move with their lines. A cursor moved or typed just past the
+  top or bottom edge scrolls one line rather than jumping to a third of the way down. Clicking
+  one of the last two lines in view, or dragging a selection to the bottom edge, no longer jumps
+  the view either: the drag scrolls smoothly with the selection's end at the edge.
+  With word wrap on, an edit above the view keeps it on the same display line of a wrapped line
+  rather than the first one.
+- **An edit makes only the hunks it changed need a new review:** editing a reviewed file still
+  puts the file's decision out of date, but a decision on a difference goes out of date only when
+  the edit changed its lines or the two lines around them. Before, every difference's decision did.
+- **Saving no longer replaces a file that is read-only on disk:** *Save* and *Save As* in a text
+  compare, and *Save* in *All differences*, used to replace such a file whenever its folder could
+  be written, although the pane said it could not be. They now refuse with a message and keep the
+  edits, so the file can be saved under another name. Folder synchronization still replaces
+  read-only files, as before.
+- **High contrast in the dark theme:** the changed-word highlights were made lighter, which left
+  the light text on them at as little as 2.6:1. The high-contrast look now keeps the text on every
+  line color at 4.5:1 or more; a test checks that, and that the text cursor has 3:1 or more on
+  every line color in every look.
+- **One thing per Escape:** with the search bar open and text selected, one `Esc` closed the bar
+  and also ended the selection, and with a context menu open it ended the selection too. Now
+  each `Esc` does one thing, in order: a menu, a dialog or a field being typed in, the search
+  bar, the selection, then the text cursor; only then does `Esc` close the tab.
+- **Option+letter on macOS:** with the text cursor in the text, `Option+Z`, `Option+S`,
+  `Option+C` and `Option+P` typed their character (Ω, ß, ç, π) and also switched wrapping, set a
+  synchronization point, collapsed the matching lines or showed the file pane. They now only type;
+  the commands stay in the menus, and the keys work again once the cursor leaves the text.
+- **Right-click and the text selection:** a right-click in the selected text keeps it, and
+  *Copy text* copies just that text rather than the whole line; a right-click elsewhere moves
+  the cursor there first, so the menu acts where it was opened. A selection that ends at the
+  start of a line no longer counts that line among the selected rows, so copying the rows of a
+  whole selected line to the other side copies only that line.
+- **Keys in the inline view:** a text cursor left in the side-by-side view no longer takes keys
+  while the inline view is shown, so `Esc` and, on macOS, `Option+←` and `Option+→` work there
+  again, and `Ctrl+]`, `Ctrl+[` and *Replace* no longer change text the inline view does not
+  edit.
+- **Undo steps and unsaved state:** a paste in the text cursor is an undo step of its own
+  rather than joining the typing before it, and a save ends the typing step, so Undo stops at
+  the saved text and shows it as saved. Undo and Redo never write a read-only pane: a step that
+  would change only read-only panes is refused with a message, and other steps leave those panes
+  as they are. Choosing another encoding for a writable file can be undone, and text from before
+  a file was read again from disk comes back as unsaved. Undo and Redo mark a review as out of
+  date, as other edits do.
+- **Accents and emoji stay whole in the text cursor:** the arrow keys, Backspace and Delete move
+  over and remove whole characters, so a letter with a combining accent, a flag, an emoji
+  sequence such as 👩‍💻 or a Hangul syllable written as jamo is never split, and a click, Up or
+  Down never puts the cursor inside one.
+- **Clicks on wrapped lines:** with word wrap on, a click to the right of a wrapped display
+  line puts the cursor at the end of that line instead of on a character of the next one.
+- **The text cursor on wrapped lines:** with word wrap on, the up and down arrows, `PgUp` and
+  `PgDn` move by display line, keeping the column, instead of jumping over the rest of a long
+  line, and `Home` and `End` (`⌘←` and `⌘→` on macOS) go to the start or end of the display
+  line first, then of the whole line. With `Shift` they extend one selection, and the view
+  follows the cursor down a line longer than the window.
 - **Translations:** the message about skipped web resources now gives the right reason in every
   language, and *Saved as* no longer reads as a future action. English counts read correctly
   for one item (`1 difference(s)`). German, French and Russian messages read correctly with the

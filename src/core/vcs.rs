@@ -9,6 +9,7 @@
 use super::git;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Vcs {
@@ -74,10 +75,14 @@ impl Vcs {
 }
 
 fn svn(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    git::run(svn_command(dir, args), None)
+}
+
+fn svn_command(dir: &Path, args: &[&str]) -> std::process::Command {
     let mut cmd = git::tool("svn", dir);
     utf8_locale(&mut cmd);
     cmd.arg("--non-interactive").args(args);
-    git::run(cmd, None)
+    cmd
 }
 
 /// `svn` converts paths and messages with the locale's character set, so without a UTF-8
@@ -263,16 +268,21 @@ pub fn export_folder(path: &Path, rev: &str) -> Result<(tempfile::TempDir, PathB
 }
 
 /// Recent revisions that changed `path`, newest first: (revision, first line of the message).
-pub fn recent_revisions(path: &Path, n: usize) -> Vec<(String, String)> {
+/// Setting `cancel` stops a Subversion or Mercurial log that is still running (one waiting on a
+/// server), and the list comes back empty.
+pub fn recent_revisions(path: &Path, n: usize, cancel: &AtomicBool) -> Vec<(String, String)> {
     match Vcs::detect(path) {
         Some(Vcs::Subversion) => {
             let Ok((dir, target)) = svn_target(path) else {
                 return Vec::new();
             };
             let limit = n.to_string();
-            svn(&dir, &["log", "-l", &limit, "--", &target])
-                .map(|out| parse_svn_log(&String::from_utf8_lossy(&out)))
-                .unwrap_or_default()
+            git::run_cancellable(
+                svn_command(&dir, &["log", "-l", &limit, "--", &target]),
+                cancel,
+            )
+            .map(|out| parse_svn_log(&String::from_utf8_lossy(&out)))
+            .unwrap_or_default()
         }
         Some(Vcs::Mercurial) => {
             let Ok((root, rel)) = hg_locate(path) else {
@@ -290,7 +300,7 @@ pub fn recent_revisions(path: &Path, n: usize) -> Vec<(String, String)> {
             if !rel.is_empty() {
                 args.extend(["--", pattern.as_str()]);
             }
-            hg(&root, &args)
+            git::run_cancellable(hg_command(&root, &args), cancel)
                 .map(|out| {
                     String::from_utf8_lossy(&out)
                         .lines()
@@ -307,12 +317,16 @@ pub fn recent_revisions(path: &Path, n: usize) -> Vec<(String, String)> {
 /// `hg` with the plain, untranslated behavior meant for scripts, UTF-8 file names and no
 /// prompts.
 fn hg(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    git::run(hg_command(dir, args), None)
+}
+
+fn hg_command(dir: &Path, args: &[&str]) -> std::process::Command {
     let mut cmd = git::tool("hg", dir);
     cmd.env("HGPLAIN", "1")
         .env("HGENCODING", "utf-8")
         .arg("-y")
         .args(args);
-    git::run(cmd, None)
+    cmd
 }
 
 /// The repository holding `path` and the path relative to its top folder, with `/`

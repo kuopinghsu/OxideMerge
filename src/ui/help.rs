@@ -11,6 +11,16 @@ type Shortcut = (&'static [&'static str], &'static str);
 /// Language key of a heading, and its rows.
 type Section = (&'static str, &'static [Shortcut]);
 
+const MAC: bool = cfg!(target_os = "macos");
+/// The word keys of the text cursor: Option on macOS (written Alt, as elsewhere here), Ctrl
+/// on other systems.
+const WORD_MOVE: &str = if MAC { "Alt+← →" } else { "Ctrl+← →" };
+const WORD_DELETE: &str = if MAC {
+    "Alt+Backspace Delete"
+} else {
+    "Ctrl+Backspace Delete"
+};
+
 const KEYBOARD: &[Section] = &[
     (
         "help.general",
@@ -50,13 +60,21 @@ const KEYBOARD: &[Section] = &[
             (&["Ctrl+Home", "Ctrl+End"], "help.first_last_line"),
             (&["← →"], "help.switch_pane"),
             (&["Shift+↑ ↓", "Shift+PgUp PgDn"], "help.select_lines"),
+            (&[WORD_MOVE], "help.move_word"),
+            (&[WORD_DELETE], "help.delete_word"),
             (&["Ctrl+C"], "help.copy_lines"),
             (&["Ctrl+V"], "help.paste"),
             (&["F2", "Enter"], "cmd.edit_line"),
             (&["Ctrl+F2"], "cmd.toggle_bookmark"),
             (&["F4", "Shift+F4"], "help.next_prev_bookmark"),
             (&["Alt+S"], "help.sync_point"),
-            (&["Ctrl+]", "Ctrl+["], "help.indent_outdent"),
+            (
+                &["Ctrl+]", "Ctrl+[", "Tab", "Shift+Tab"],
+                "help.indent_outdent",
+            ),
+            (&["Ctrl+D"], "help.duplicate_lines"),
+            (&["Alt+Shift+↑", "Alt+Shift+↓"], "help.move_lines"),
+            (&["Ctrl+Alt+↑", "Ctrl+Alt+↓"], "help.add_caret_line"),
             (&["Ctrl+F"], "cmd.find"),
             (&[REPLACE_KEY], "cmd.replace"),
             (&["F3", "Shift+F3"], "help.find_next_prev"),
@@ -113,6 +131,7 @@ const MOUSE: &[Section] = &[
                 "help.select_lines",
             ),
             (&["gesture.double_click"], "cmd.edit_line"),
+            (&["Ctrl+gesture.click"], "help.add_caret"),
             (&["gesture.right_click"], "help.line_menu"),
             (&["gesture.click"], "help.expand_fold"),
             (&["gesture.wheel"], "help.scroll"),

@@ -1,9 +1,10 @@
 //! Files and folders as they were in a Git revision, read with the `git` command.
 
 use anyhow::{bail, Context, Result};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn command(dir: &Path) -> Command {
     tool("git", dir)
@@ -45,15 +46,74 @@ pub(super) fn run(mut cmd: Command, input: Option<Vec<u8>>) -> Result<Vec<u8>> {
     if let Some(w) = writer {
         let _ = w.join();
     }
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    finish(&program, out.status, out.stdout, &out.stderr)
+}
+
+/// Runs `cmd` like `run` with no input, stopping it (and failing) as soon as `cancel` is set, so
+/// a command waiting on a server that does not answer can be given up.
+pub(super) fn run_cancellable(mut cmd: Command, cancel: &AtomicBool) -> Result<Vec<u8>> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("{program} could not be started"))?;
+    // read on other threads so a full pipe cannot stop the command; on cancel they are left to
+    // end with the pipes, which a process the command started may still hold
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{program} was stopped");
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    finish(&program, status, stdout, &stderr)
+}
+
+/// What `program` printed when it succeeded, or the first line of its error output.
+fn finish(
+    program: &str,
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: &[u8],
+) -> Result<Vec<u8>> {
+    if !status.success() {
+        let err = String::from_utf8_lossy(stderr);
         let first = err.lines().find(|l| !l.trim().is_empty());
         bail!(
             "{}",
             first.map_or(format!("{program} failed"), |l| l.trim().to_string())
         );
     }
-    Ok(out.stdout)
+    Ok(stdout)
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
@@ -242,6 +302,39 @@ pub fn resolve_commit(path: &Path, revision: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cancelled_command_is_stopped_at_once() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("powershell");
+            c.args(["-NoProfile", "-Command", "Start-Sleep 30"]);
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        cmd.current_dir(std::env::temp_dir());
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let start = std::time::Instant::now();
+        let err = run_cancellable(cmd, &cancel).unwrap_err();
+        assert!(err.to_string().contains("was stopped"), "{err}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+
+        let mut cmd = Command::new(if cfg!(windows) { "cmd" } else { "echo" });
+        if cfg!(windows) {
+            cmd.args(["/c", "echo", "done"]);
+        } else {
+            cmd.arg("done");
+        }
+        let out = run_cancellable(cmd, &AtomicBool::new(false)).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "done");
+    }
 
     #[test]
     fn reads_files_and_folders_of_a_revision() {

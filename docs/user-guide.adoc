@@ -519,31 +519,101 @@ Click in the text to place the cursor there, and type, as in any text editor.
   kbd:[Backspace] and kbd:[Delete] remove a character, or join a line to the one next to it.
 * kbd:[Ctrl+V] pastes at the cursor, any number of lines at once.
 * To select text, drag over it, kbd:[Shift]+click, or move the cursor with kbd:[Shift] held.
-  Double-click selects a word, and kbd:[Ctrl+A] selects the whole file.
+  Double-click selects a word, triple-click selects the line with its line break, and
+  kbd:[Ctrl+A] selects the whole file. Dragging past the top or bottom of the pane scrolls it
+  and goes on selecting.
   Typing or pasting replaces the selection.
 * kbd:[Ctrl+C] copies the selection and kbd:[Ctrl+X] cuts it.
   With nothing selected, they copy or cut the whole line.
 * The arrow keys, kbd:[Home], kbd:[End], kbd:[PgUp] and kbd:[PgDn] move the cursor.
   kbd:[Ctrl+Home] and kbd:[Ctrl+End] go to the start and end of the file.
   On macOS, kbd:[Cmd+←] and kbd:[Cmd+→] go to the line start and end.
-* kbd:[Esc] ends the selection; a second kbd:[Esc] removes the cursor, and the arrow keys then
-  move from row to row again.
+  With word wrap on, the up and down arrows, kbd:[PgUp] and kbd:[PgDn] move by display line, so
+  a long line takes several presses, and kbd:[Home] and kbd:[End] (kbd:[Cmd+←] and kbd:[Cmd+→])
+  go to the start or end of the display line first and of the whole line on a second press.
+  With kbd:[Shift] held, each of these extends the same selection.
+* kbd:[Tab] types a tab, or indents the lines when the selection goes over more than one line
+  or is a whole line; kbd:[Shift+Tab] outdents the selected lines, or the cursor's line.
+  kbd:[Ctrl+\]] and kbd:[Ctrl+[] do the same with the text cursor in a pane.
+  A file that indents more lines with tabs than with spaces is indented with a tab, and any other
+  with the *Tab size* in spaces. Blank lines are not indented, and outdenting removes one tab or up
+  to the tab size in spaces. A selection that ends at the start of a line leaves that line alone,
+  and the selection moves with its text, so kbd:[Shift+Tab] right after kbd:[Tab] gives back the
+  same text and selection. Each is one undo step.
+* kbd:[Ctrl+←] and kbd:[Ctrl+→] (kbd:[Option+←] and kbd:[Option+→] on macOS) move by word, and
+  with kbd:[Shift] held they select by word.
+  A word move goes to the end of the next word, or to the start of the one before; from a line
+  end or start it goes to the next or previous line.
+  Letters, digits and `_` make one word (`snake_case` and `camelCase` are both one word), a run
+  of punctuation is a word of its own (`x.len` is three), and each Chinese, Japanese or Korean
+  character is a word.
+* kbd:[Ctrl+Backspace] and kbd:[Ctrl+Delete] (kbd:[Option+Backspace] and kbd:[Option+Delete] on
+  macOS) delete the word before or after the cursor, or the selection when there is one.
+  One kbd:[Ctrl+Z] brings the word back.
+* On macOS, while the cursor is in the text, kbd:[Option+←] and kbd:[Option+→] move by word
+  rather than copy the difference; press kbd:[Esc] to leave the text, or use the copy buttons.
+  kbd:[Option] with a letter, a digit or a sign types its character (kbd:[Option+S] types ß), so
+  kbd:[Alt+C], kbd:[Alt+Z], kbd:[Alt+P] and kbd:[Alt+S] wait until the cursor leaves the text;
+  their commands stay in the menus.
+* Each kbd:[Esc] does one thing, the first that applies: it closes an open menu, then a dialog
+  or a field you are typing in, then the search bar, then goes back from several cursors to one, then ends the selection (the cursor stays
+  where it was), then removes the cursor, so the arrow keys move from row to row again.
+  Only then does kbd:[Esc] close the tab.
 * Input methods work at the cursor, so you can type Chinese, Japanese or Korean.
+* In very large files, typing within a line stays fast: OxideMerge compares the files again once
+  you pause for a moment, or before any other key, click or command, so the colors of the line
+  you are typing in may lag briefly. A new line, a paste or an undo compares at once.
 * A selection over several lines also selects their rows, so the copy buttons and
   kbd:[Alt+→] and kbd:[Alt+←] copy those lines to the other side.
-* kbd:[Ctrl+\]] indents the selected lines, and kbd:[Ctrl+[] unindents them.
+* kbd:[Ctrl+\]] indents the selected lines, and kbd:[Ctrl+[] unindents them (with the text cursor,
+  also kbd:[Tab] and kbd:[Shift+Tab]; see above).
+* kbd:[Ctrl+D] puts a copy of the selected lines, or of the cursor's line, under them and selects
+  the copy. kbd:[Alt+Shift+↑] and kbd:[Alt+Shift+↓] move them up or down past the next line,
+  with their selection. Like kbd:[Tab], they take the lines of the text selection (one that ends
+  at the start of a line leaves that line out), or without a text cursor, the active pane's
+  lines in the selected rows. Each is one undo step, and both are also in the *Edit* menu.
+  Without kbd:[Shift], kbd:[Alt+↓] and kbd:[Alt+↑] still go to the next and previous difference.
 * Without a cursor, kbd:[F2] or kbd:[Enter] puts it at the end of the current line.
 
-The cursor works in the side-by-side view. In the inline view and the table view, double-click
-a line or cell to edit it.
+[[multiple-cursors]]
+==== Several cursors
+
+To type the same thing in several places of one pane, give it several text cursors:
+
+* kbd:[Ctrl]+click (kbd:[Cmd]+click on macOS) adds a cursor where you click, or removes the one
+  there. kbd:[Ctrl]+double-click and kbd:[Ctrl]+triple-click add a word or a line selection.
+* kbd:[Ctrl+Alt+↑] and kbd:[Ctrl+Alt+↓] (kbd:[Cmd+Option+↑] and kbd:[Cmd+Option+↓] on macOS) add a
+  cursor on the line above the first cursor or below the last, at the same column. Some Linux
+  desktops use these keys to switch workspaces; kbd:[Ctrl]+click works everywhere.
+
+Typing, deleting, kbd:[Enter], the arrow keys, kbd:[Home] and kbd:[End] then act at every
+cursor; cursors that meet become one. Each edit is one undo step for all of them, and undo puts
+the cursors back where they were. Pasting as many lines as there are cursors puts one line at
+each; any other text goes in at every cursor. Copying gives the selections one per line, in the
+order of the text. kbd:[Tab], kbd:[Shift+Tab], *Duplicate lines* and *Move lines* act on the lines
+of all the cursors, each line once. A read-only pane refuses the edit at every cursor.
+
+The last cursor added is the one the view follows and where an input method shows what you are
+composing. kbd:[Esc] first goes back to that one cursor, and a click without kbd:[Ctrl] does too.
+The column selection (kbd:[Alt]+drag) is separate: making one removes the extra cursors.
+
+The pane with the cursor has a colored line under its header. The cursor is a solid bar where
+typing goes into the text; it is thin and faint in a read-only pane, while a field such as the
+search bar has the keyboard, and while the window is in the background. Typing into a read-only
+pane changes nothing, and the status bar says which side it is and how to unlock it.
+
+The cursor works in the side-by-side view. In the inline view, double-click a line, or press
+kbd:[Enter] or kbd:[F2], to edit it side by side (see <<inline-view>>); in the table view,
+double-click a cell to edit it.
 
 The bar under each pane shows whether you can edit it:
 
 * *Writable*: you can edit the file and save it.
 * *Read-only*: the pane is locked, for example with the lock button in its header, and does not
   take edits.
-* *Read-only on disk*: you can edit, but the system does not let OxideMerge write the file, so
-  save it under another name.
+* *Read-only on disk*: you can edit, but the file is marked read-only, so *Save* refuses to
+  replace it and keeps your edits: save it under another name, or clear the read-only mark and
+  save again.
 * *Compare only*: the pane shows text that OxideMerge read from the file, not the file itself:
   a document, spreadsheet, PDF or program, a web page, or a formatted copy of JSON or XML.
   It cannot be unlocked, edited or saved back.
@@ -577,6 +647,8 @@ Saving keeps each file's line endings, encoding and byte order mark.
 
 Right-click a line to edit it, insert a line below it, delete it, copy its text, set a bookmark,
 or create a compare rule from it (see <<add-rule>>).
+A right-click in the selected text keeps the selection, and *Copy text* then copies just that
+text; a right-click elsewhere moves the cursor there first.
 
 Edit markers in the gutter show the lines that changed since you opened the files.
 
@@ -664,9 +736,14 @@ image::inline.png[Inline view]
 * Removed lines come first, then the lines that replace them.
   Each line shows its old and its new line number.
 * When *Collapse unchanged lines* is on, unchanged lines are hidden. Click a fold to show them.
-* You can move between differences and copy them as usual.
+* You can move between differences and copy them as usual, and Undo and Redo work.
   The arrow keys move from line to line, and kbd:[Ctrl+C] copies the current line.
-* To edit or select lines, go back to the side-by-side view.
+* The inline view only shows the files: a bar at its top says so, and typing, pasting, indenting
+  and *Replace* do nothing there.
+  To edit, click *Edit side by side* on that bar, double-click a line, or press kbd:[Enter] or
+  kbd:[F2]: the side-by-side view opens with the text cursor at the start of the current line.
+* Switching between the views keeps every edit, the selected difference, and the text cursor
+  and its selection from the side-by-side view, which come back when you switch back.
 
 [[table-compare]]
 === CSV and TSV files
@@ -1097,6 +1174,7 @@ Some details:
 * If a file changes on disk after it was loaded, you cannot save its card.
   The card offers to discard your edits and load the file again.
   Copy any edits that you need to keep before you choose this.
+* A file marked read-only on disk is not saved, replaced or deleted; its card keeps your edits.
 * Cards without edits reload when their files change on disk.
 * *Refresh* (kbd:[F5]) also reloads the compare rules and the options.
 * To include files that changed after you opened *All differences*, save or discard your edits,
@@ -2421,6 +2499,8 @@ longer match.
 * If several new files have the same content, each one is marked for a new review.
 * Changes to converted content, to converters or to rules can make earlier decisions invalid.
 * A decision that is out of date counts as needing action. It never counts as accepted.
+* Editing a reviewed file puts the file's decision out of date, and the decision on each difference
+  whose lines, or the two lines around them, the edit changed. Decisions on other differences stay.
 * If the context of a difference repeats or is not clear, you must review it by hand.
 
 ==== File versions and safety
@@ -3407,7 +3487,9 @@ General::
 * *Accessibility*:
 ** *Color-blind friendly diff colors*: blue for added, orange for removed, purple for changed
    lines and yellow for conflicts.
-** *High contrast*.
+** *High contrast*: stronger colors, with the text on every line color at a contrast of at
+   least 4.5:1, as WCAG asks for text. In every look the text cursor has at least 3:1 on every
+   line color.
 ** *Reduce motion*: no animations.
 ** *Compact density*: lower rows and less space.
 +
@@ -3531,8 +3613,13 @@ On macOS, use kbd:[⌘] for kbd:[Ctrl] and kbd:[⌥] for kbd:[Alt].
 |kbd:[Ctrl+C], kbd:[Ctrl+X] |Copy or cut the selection or columns, or the whole line
 |kbd:[Ctrl+V] |Paste at the cursor, or over the selection or columns
 |kbd:[Delete], kbd:[Backspace] |Delete a character, the selection or the columns
+|kbd:[Ctrl+←], kbd:[Ctrl+→] (kbd:[Option+←], kbd:[Option+→] on macOS) |Move by word; with kbd:[Shift], select by word
+|kbd:[Ctrl+Backspace], kbd:[Ctrl+Delete] (kbd:[Option+Backspace], kbd:[Option+Delete] on macOS) |Delete the word before or after the cursor
 |kbd:[Alt]+drag (kbd:[Option]+drag on macOS) |Select columns
-|kbd:[Ctrl+\]], kbd:[Ctrl+[] |Indent or unindent the selected lines
+|kbd:[Ctrl+\]], kbd:[Ctrl+[], kbd:[Tab], kbd:[Shift+Tab] |Indent or unindent the selected lines
+|kbd:[Ctrl+D] |Duplicate the selected lines
+|kbd:[Ctrl]+click, kbd:[Ctrl+Alt+↑], kbd:[Ctrl+Alt+↓] |Add a text cursor (see <<multiple-cursors>>)
+|kbd:[Alt+Shift+↑], kbd:[Alt+Shift+↓] |Move the selected lines up or down
 |kbd:[Ctrl+Z], kbd:[Ctrl+Y] / kbd:[Ctrl+Shift+Z] |Undo, redo
 |kbd:[Ctrl+F2], kbd:[F4], kbd:[Shift+F4] |Set or remove a bookmark, next bookmark, previous bookmark
 |kbd:[Alt+C] |Collapse unchanged lines
@@ -3680,8 +3767,7 @@ content (see <<compare-methods>>).
 * Archives: ZIP-based formats, TAR (plain, gzip, bzip2 and xz) and 7z are supported.
   RAR is not supported. Extracted archive contents are read-only.
 * The text panes are meant for reviewing and merging changes, not as a full editor.
-  There is no word-by-word cursor movement, no multiple cursors except a column selection, and
-  no cursor in the inline view.
+  There are no multiple cursors except a column selection, and the inline view does not edit.
 * Unpacker plugins use external commands. WinMerge plugin DLLs and scripts are not supported.
 * Web page comparison does not support cookies or logins. A page that needs a login shows its login
   page.

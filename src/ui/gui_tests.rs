@@ -4007,6 +4007,14 @@ fn compare_with_revision_lists_and_opens_subversion_revisions() {
     gui.wait_until("the revisions", |g| {
         g.app.git_dlg.as_ref().is_some_and(|d| d.commits.len() == 2)
     });
+    // Once typing pauses, the example revisions are those of Subversion.
+    let svn_hint = crate::core::vcs::Vcs::Subversion.rev_hint();
+    gui.wait_until("the Subversion hint", |g| {
+        g.app
+            .git_dlg
+            .as_ref()
+            .is_some_and(|d| d.rev_hint == svn_hint)
+    });
     gui.click(tr("label.recent_commits"));
     gui.click("r1  first");
     assert_eq!(gui.app.git_dlg.as_ref().unwrap().rev, "r1");
@@ -4096,4 +4104,480 @@ fn compare_with_revision_lists_and_opens_mercurial_revisions() {
     gui.wait_until("the second tab", |g| g.app.tabs.len() == 2 && !g.busy());
     assert_eq!(gui.text_view().panes[0].doc.text(), "one\n");
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn the_revision_list_waits_for_typing_and_drops_a_stale_log() {
+    let ms = Duration::from_millis;
+    // the list is for the typed path, or its log is already running
+    assert_eq!(log_step(false, ms(5000), None), LogStep::Idle);
+    // typing has not paused yet
+    assert_eq!(
+        log_step(true, ms(100), None),
+        LogStep::WaitFor(GIT_LOG_DELAY - ms(100))
+    );
+    assert_eq!(log_step(true, GIT_LOG_DELAY, None), LogStep::Start);
+    // an earlier path's log is let finish for a while, then replaced
+    assert_eq!(
+        log_step(true, ms(5000), Some(ms(500))),
+        LogStep::WaitFor(STALE_LOG - ms(500))
+    );
+    assert_eq!(log_step(true, ms(5000), Some(STALE_LOG)), LogStep::Start);
+
+    // replacing a job drops it, which stops its log
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (_tx, rx) = std::sync::mpsc::channel();
+    drop(LogJob {
+        path: "old".into(),
+        rx,
+        started: std::time::Instant::now(),
+        cancel: cancel.clone(),
+    });
+    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[test]
+fn the_text_caret_takes_the_word_keys_before_the_difference_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[("a.txt", "one two\nsame\n"), ("b.txt", "one 2\nsame\n")],
+    );
+    let mut gui = Gui::start("word_keys", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    gui.key(ALT, Key::ArrowDown);
+    assert_eq!(gui.text_view().cur_block, Some(0));
+    match gui.app.tabs[0].content.view_mut() {
+        Content::Text(v) => v.place_caret(1, (0, 0), false),
+        _ => unreachable!(),
+    }
+    let word = if cfg!(target_os = "macos") {
+        ALT
+    } else {
+        Modifiers::CTRL.plus(CMD)
+    };
+    gui.key(word, Key::ArrowRight);
+    assert_eq!(gui.text_view().caret().unwrap().pos, (0, 3));
+    assert_eq!(
+        gui.text_view().panes[1].doc.lines[0],
+        "one 2",
+        "Alt+Right did not copy the difference while the caret had it"
+    );
+    // Without the caret, Alt+Right copies the difference as before.
+    gui.key(Modifiers::NONE, Key::Escape);
+    assert!(gui.text_view().caret().is_none());
+    gui.key(ALT, Key::ArrowRight);
+    assert_eq!(gui.text_view().panes[1].doc.lines[0], "one two");
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn navigation_keys_in_the_text_move_the_caret_and_never_the_difference() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let same: String = (0..60).map(|i| format!("same {i}\n")).collect();
+    write(
+        d,
+        &[
+            ("a.txt", &format!("one two\n{same}old\n{same}")),
+            ("b.txt", &format!("one 2\n{same}new\n{same}")),
+        ],
+    );
+    let mut gui = Gui::start("caret_nav", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    assert_eq!(
+        gui.text_view().cur_block,
+        Some(0),
+        "the first difference is selected"
+    );
+    match gui.app.tabs[0].content.view_mut() {
+        Content::Text(v) => v.place_caret(1, (0, 2), false),
+        _ => unreachable!(),
+    }
+    let mac = cfg!(target_os = "macos");
+    // ⌘ on macOS is reported as both the Mac command key and the command modifier.
+    let (word, line) = if mac {
+        (ALT, Modifiers::MAC_CMD.plus(CMD))
+    } else {
+        (Modifiers::CTRL.plus(CMD), Modifiers::CTRL.plus(CMD))
+    };
+    let shift = Modifiers::SHIFT;
+    let keys = [
+        (Modifiers::NONE, Key::ArrowDown),
+        (Modifiers::NONE, Key::ArrowUp),
+        (Modifiers::NONE, Key::ArrowRight),
+        (Modifiers::NONE, Key::ArrowLeft),
+        (shift, Key::ArrowDown),
+        (shift, Key::ArrowUp),
+        (Modifiers::NONE, Key::PageDown),
+        (shift, Key::PageUp),
+        (Modifiers::NONE, Key::End),
+        (Modifiers::NONE, Key::Home),
+        (word, Key::ArrowRight),
+        (word.plus(shift), Key::ArrowLeft),
+        (line, Key::ArrowRight),
+        (line.plus(shift), Key::ArrowLeft),
+        (Modifiers::NONE, Key::Escape),
+    ];
+    let mut lines_seen = Vec::new();
+    for (m, k) in keys {
+        gui.key(m, k);
+        let v = gui.text_view();
+        let c = v
+            .caret()
+            .unwrap_or_else(|| panic!("{m:?}+{k:?} ended the caret"));
+        lines_seen.push(c.pos.0);
+        // The current difference follows the caret's row (or is none); no key jumps to one.
+        if let Some(b) = v.cur_block {
+            assert!(
+                v.diff.blocks[b].ranges[1].contains(&c.pos.0),
+                "{m:?}+{k:?} selected difference {b} away from the caret at {:?}",
+                c.pos
+            );
+        }
+        assert_eq!(
+            v.panes[1].doc.lines[0], "one 2",
+            "{m:?}+{k:?} changed the text"
+        );
+    }
+    assert_eq!(lines_seen[..4], [1, 0, 0, 0], "Down, Up, Right, Left");
+    assert_eq!(
+        gui.app.tabs.len(),
+        1,
+        "Esc ended the selection, not the tab"
+    );
+    // Alt+Down is still the next difference, with the caret in the text.
+    match gui.app.tabs[0].content.view_mut() {
+        Content::Text(v) => v.select_block(0),
+        _ => unreachable!(),
+    }
+    gui.key(ALT, Key::ArrowDown);
+    assert_eq!(gui.text_view().cur_block, Some(1));
+    assert!(gui.text_view().caret().is_some());
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn shift_tab_outdents_in_the_text_rather_than_moving_the_focus() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[("a.txt", "one\ntwo\n"), ("b.txt", "one\n    two\nthree\n")],
+    );
+    let mut gui = Gui::start("shift_tab", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    match gui.app.tabs[0].content.view_mut() {
+        Content::Text(v) => {
+            v.place_caret(1, (1, 6), false);
+            v.place_caret(1, (2, 2), true);
+        }
+        _ => unreachable!(),
+    }
+    gui.key(Modifiers::SHIFT, Key::Tab);
+    let v = gui.text_view();
+    assert_eq!(v.panes[1].doc.lines[1..], ["two", "three"]);
+    assert_eq!(v.caret_text().as_deref(), Some("o\nth"));
+    gui.key(Modifiers::NONE, Key::Tab);
+    let v = gui.text_view();
+    assert_eq!(v.panes[1].doc.lines[1..], ["    two", "    three"]);
+    assert_eq!(gui.app.tabs.len(), 1);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+fn text_view_mut(gui: &mut Gui) -> &mut TextView {
+    match gui.app.tabs[0].content.view_mut() {
+        Content::Text(v) => v,
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn option_with_a_letter_types_into_the_text_on_macos_instead_of_running_a_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "one\n"), ("b.txt", "two\n")]);
+    let mut gui = Gui::start("option_types", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    let wrap = gui.app.cfg.word_wrap;
+    // Without the caret in the text, Alt+Z switches wrapping.
+    gui.key(ALT, Key::Z);
+    assert_eq!(gui.app.cfg.word_wrap, !wrap);
+    text_view_mut(&mut gui).place_caret(1, (0, 3), false);
+    // Option+Z on macOS: the key and the character it types come together.
+    gui.modifiers = ALT;
+    gui.events.push(Event::Key {
+        key: Key::Z,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: ALT,
+    });
+    gui.events.push(Event::Text("Ω".into()));
+    gui.frames(2);
+    gui.modifiers = Modifiers::NONE;
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            gui.app.cfg.word_wrap, !wrap,
+            "Option+Z typed, it did not wrap"
+        );
+        assert_eq!(gui.text_view().panes[1].doc.lines[0], "twoΩ");
+    } else {
+        assert_eq!(
+            gui.app.cfg.word_wrap, wrap,
+            "Alt+Z is still the wrap command"
+        );
+    }
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn line_keys_duplicate_and_move_lines_and_leave_the_difference_keys_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("a.txt", "one\ntwo\nthree\nx\n"),
+            ("b.txt", "one\ntwo\nthree\ny\n"),
+        ],
+    );
+    let mut gui = Gui::start("line_keys", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    text_view_mut(&mut gui).place_caret(1, (0, 1), false);
+    let shift_alt = ALT.plus(Modifiers::SHIFT);
+    gui.key(CMD, Key::D);
+    assert_eq!(
+        gui.text_view().panes[1].doc.lines[..3],
+        ["one", "one", "two"]
+    );
+    gui.key(shift_alt, Key::ArrowDown);
+    gui.key(shift_alt, Key::ArrowDown);
+    assert_eq!(
+        gui.text_view().panes[1].doc.lines[..4],
+        ["one", "two", "three", "one"]
+    );
+    assert_eq!(gui.text_view().caret().map(|c| c.pos), Some((3, 1)));
+    gui.key(shift_alt, Key::ArrowUp);
+    assert_eq!(
+        gui.text_view().panes[1].doc.lines[..4],
+        ["one", "two", "one", "three"]
+    );
+    // Each is one undo step.
+    gui.key(CMD, Key::Z);
+    assert_eq!(
+        gui.text_view().panes[1].doc.lines[..4],
+        ["one", "two", "three", "one"]
+    );
+    // Alt+Down still goes to the next difference.
+    text_view_mut(&mut gui).select_block(0);
+    let before = gui.text_view().panes[1].doc.lines.clone();
+    gui.key(ALT, Key::ArrowDown);
+    assert_eq!(gui.text_view().panes[1].doc.lines, before);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn carets_added_above_and_below_type_together_and_escape_steps_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "a\nb\nc\nd\n"), ("b.txt", "a\nb\nc\ne\n")]);
+    let mut gui = Gui::start("multi_caret", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    text_view_mut(&mut gui).place_caret(1, (1, 1), false);
+    let add = CMD.plus(ALT);
+    gui.key(add, Key::ArrowDown);
+    gui.key(add, Key::ArrowUp);
+    assert_eq!(gui.text_view().carets().len(), 3);
+    gui.type_text("!");
+    assert_eq!(gui.text_view().panes[1].doc.lines, ["a!", "b!", "c!", "e"]);
+    gui.key(CMD, Key::Z);
+    assert_eq!(gui.text_view().panes[1].doc.lines, ["a", "b", "c", "e"]);
+    // Esc: one caret, then none, then the tab.
+    gui.key(Modifiers::NONE, Key::Escape);
+    assert_eq!(gui.text_view().carets().len(), 1);
+    gui.key(Modifiers::NONE, Key::Escape);
+    assert!(gui.text_view().caret().is_none());
+    assert_eq!(gui.app.tabs.len(), 1);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn a_file_can_be_edited_and_saved_with_the_keyboard_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("a.txt", "same\nold\nsame\n"),
+            ("b.txt", "same\nnew\nsame\n"),
+        ],
+    );
+    let mut gui = Gui::start(
+        "keyboard_only",
+        compare(&[d.join("a.txt"), d.join("b.txt")]),
+    );
+    // To the difference, into the text at its line end, and edit.
+    gui.key(ALT, Key::ArrowDown);
+    gui.key(Modifiers::NONE, Key::F2);
+    assert!(
+        gui.text_view().caret().is_some(),
+        "F2 puts the text cursor in"
+    );
+    gui.type_text("er");
+    gui.key(Modifiers::SHIFT, Key::Home);
+    gui.key(Modifiers::NONE, Key::Tab);
+    // Out of the text again, and save.
+    gui.key(Modifiers::NONE, Key::Escape);
+    gui.key(Modifiers::NONE, Key::Escape);
+    assert!(gui.text_view().caret().is_none());
+    gui.key(CMD, Key::S);
+    let read = |f: &str| std::fs::read_to_string(d.join(f)).unwrap();
+    let (a, b) = (read("a.txt"), read("b.txt"));
+    // F2 goes into the active side: one file has the edit, saved, and the other is unchanged.
+    assert!(
+        (a == "same\n    older\nsame\n" && b == "same\nnew\nsame\n")
+            || (a == "same\nold\nsame\n" && b == "same\n    newer\nsame\n"),
+        "{a:?} {b:?}"
+    );
+    assert!(!gui.text_view().panes.iter().any(|p| p.doc.modified));
+    assert_eq!(gui.app.tabs.len(), 1);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn the_inline_view_is_read_only_and_switching_views_keeps_every_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("a.txt", "one\ntwo\nthree\nfour\n"),
+            ("b.txt", "one\nTWO\nthree\nfour\nfive\n"),
+        ],
+    );
+    let mut gui = Gui::start("inline_edit", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    // A typed edit and a selection over several lines, then the inline view.
+    text_view_mut(&mut gui).place_caret(1, (2, 5), false);
+    gui.type_text("!");
+    let v = text_view_mut(&mut gui);
+    v.place_caret(1, (0, 1), false);
+    v.place_caret(1, (2, 2), true);
+    let selection = v.caret().map(|c| (c.anchor, c.pos));
+    let block = v.cur_block;
+    v.unified = true;
+    gui.frames(3);
+    assert!(gui.shows_text(tr("msg.inline_read_only")));
+    let v = gui.text_view();
+    assert!(v.shows_inline() && !v.takes_text() && !v.handles_escape());
+    assert_eq!(v.panes[1].doc.lines[2], "three!", "the edit is kept");
+    // Indenting, Replace and typing do nothing here.
+    gui.key(Modifiers::CTRL.plus(CMD), Key::CloseBracket);
+    gui.type_text("x");
+    assert_eq!(
+        gui.text_view().panes[1].doc.lines,
+        ["one", "TWO", "three!", "four", "five"]
+    );
+    // Back with the toggle: the selection and the selected difference are as they were.
+    text_view_mut(&mut gui).unified = false;
+    gui.frames(3);
+    let v = gui.text_view();
+    assert_eq!(v.caret().map(|c| (c.anchor, c.pos)), selection);
+    assert_eq!(v.cur_block, block);
+    assert!(v.takes_text());
+    // Edit side by side from another line of the inline view: the caret goes to its start.
+    text_view_mut(&mut gui).unified = true;
+    gui.frames(3);
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    let (row, pane) = {
+        let v = gui.text_view();
+        (v.cursor_row.unwrap(), v.active_pane)
+    };
+    gui.key(Modifiers::NONE, Key::Enter);
+    let v = gui.text_view();
+    assert!(!v.unified);
+    let line = v.diff.rows[row].line(pane).unwrap();
+    assert_eq!(v.caret().map(|c| (c.pane, c.pos)), Some((pane, (line, 0))));
+    // The button does the same, and typing then edits that line.
+    text_view_mut(&mut gui).unified = true;
+    gui.frames(3);
+    gui.click(tr("cmd.edit_side_by_side"));
+    assert!(!gui.text_view().unified);
+    assert!(gui.text_view().caret().is_some());
+    gui.type_text("+");
+    let v = gui.text_view();
+    let c = v.caret().unwrap();
+    assert!(v.panes[c.pane].doc.lines[c.pos.0].starts_with('+'));
+    // Every edit is still one undo step away.
+    text_view_mut(&mut gui).undo();
+    text_view_mut(&mut gui).undo();
+    assert_eq!(
+        gui.text_view().panes[1].doc.lines,
+        ["one", "TWO", "three", "four", "five"]
+    );
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn ime_selection_commit_cancel_and_save_keep_unicode_and_format_in_both_themes() {
+    use crate::config::TextLayout;
+    for theme in [ThemeMode::Light, ThemeMode::Dark] {
+        for layout in [TextLayout::Aligned, TextLayout::Compact] {
+            let dir = tempfile::tempdir().unwrap();
+            let d = dir.path();
+            let original = "\u{feff}keep alpha e\u{301} 😀\r\n中文 tail";
+            write(d, &[("left.txt", original), ("right.txt", original)]);
+            let cfg = Config {
+                theme,
+                text_layout: layout,
+                ..config()
+            };
+            let mut gui = Gui::with_config(
+                "ime_unicode_format",
+                cfg,
+                compare(&[d.join("left.txt"), d.join("right.txt")]),
+            );
+            text_view_mut(&mut gui).place_caret(1, (0, 5), false);
+            text_view_mut(&mut gui).place_caret(1, (0, 10), true);
+            let preedit = |text: &str| {
+                Event::Ime(egui::ImeEvent::Preedit {
+                    text: text.into(),
+                    active_range_chars: None,
+                })
+            };
+            gui.events.push(preedit("ni"));
+            gui.frame();
+            assert_eq!(gui.text_view().caret_text().as_deref(), Some("alpha"));
+            assert!(!gui.text_view().panes[1].doc.modified);
+            // A comparison refresh during preedit keeps the selection and the text.
+            text_view_mut(&mut gui).rediff();
+            gui.events.push(preedit(""));
+            gui.frame();
+            assert_eq!(gui.text_view().caret_text().as_deref(), Some("alpha"));
+            assert!(!gui.text_view().panes[1].doc.modified);
+            gui.events.push(preedit("ni"));
+            gui.frame();
+            let committed = "你好 e\u{301} 👩\u{200d}💻";
+            gui.events
+                .push(Event::Ime(egui::ImeEvent::Commit(committed.into())));
+            gui.frame();
+            let expected = original.replacen("alpha", committed, 1);
+            assert_eq!(
+                gui.text_view().panes[1].doc.lines[0],
+                "keep 你好 e\u{301} 👩\u{200d}💻 e\u{301} 😀"
+            );
+            gui.key(CMD, Key::Z);
+            assert_eq!(
+                gui.text_view().panes[1].doc.lines[0],
+                "keep alpha e\u{301} 😀"
+            );
+            gui.key(CMD.plus(Modifiers::SHIFT), Key::Z);
+            gui.key(CMD, Key::S);
+            assert_eq!(
+                std::fs::read(d.join("right.txt")).unwrap(),
+                expected.as_bytes()
+            );
+            assert_eq!(
+                std::fs::read(d.join("left.txt")).unwrap(),
+                original.as_bytes()
+            );
+            assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+        }
+    }
 }
