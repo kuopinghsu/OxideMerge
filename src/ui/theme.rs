@@ -357,8 +357,63 @@ pub fn colors_for(dark: bool, look: Look) -> Colors {
         }
         c.text = c.ui.text;
         c.gutter_text = c.ui.text_dim;
+        // Brighter highlights must not cost the text on them its contrast: WCAG AA for text.
+        let (text, bg) = (c.text, c.text_bg);
+        for col in [
+            &mut c.diff,
+            &mut c.diff_sel,
+            &mut c.added,
+            &mut c.added_sel,
+            &mut c.inline,
+            &mut c.inline_sel,
+            &mut c.missing,
+            &mut c.missing_sel,
+            &mut c.moved,
+            &mut c.ignored,
+            &mut c.conflict,
+            &mut c.conflict_sel,
+            &mut c.removed,
+            &mut c.removed_sel,
+            &mut c.inline_removed,
+            &mut c.inline_added,
+        ] {
+            *col = readable(*col, text, bg, 4.5);
+        }
     }
     c
+}
+
+/// WCAG contrast ratio of two opaque colors, from 1 to 21.
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let lum = |c: Color32| {
+        let ch = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    };
+    let (x, y) = (lum(a), lum(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+/// `col`, moved toward the background `bg` just far enough for `text` on it to have a contrast
+/// of at least `min`. When no blend gets there, the most readable of those that keep a quarter
+/// of `col`, so that the line still shows its kind.
+fn readable(col: Color32, text: Color32, bg: Color32, min: f32) -> Color32 {
+    let blend = |i: u8| col.lerp_to_gamma(bg, f32::from(i) * 0.05);
+    (0..=20)
+        .map(blend)
+        .find(|&c| contrast_ratio(text, c) >= min)
+        .unwrap_or_else(|| {
+            (0..=15)
+                .map(blend)
+                .max_by(|a, b| contrast_ratio(text, *a).total_cmp(&contrast_ratio(text, *b)))
+                .unwrap_or(col)
+        })
 }
 
 fn base_colors(dark: bool, ui: Palette) -> Colors {
@@ -560,6 +615,95 @@ pub fn apply(ctx: &egui::Context, dark: bool, look: Look) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_color_keeps_its_hue_when_no_blend_is_readable_enough() {
+        let (text, bg) = (Color32::from_gray(120), Color32::from_gray(100));
+        let col = Color32::from_rgb(200, 40, 40);
+        let c = readable(col, text, bg, 4.5);
+        assert_ne!(c, bg);
+        assert!(c.r() > c.g() + 20, "{c:?} lost its red");
+        // A reachable target still moves no further than needed.
+        let white = Color32::WHITE;
+        assert_eq!(
+            readable(Color32::from_gray(30), white, Color32::BLACK, 4.5),
+            Color32::from_gray(30)
+        );
+    }
+
+    #[test]
+    fn the_text_cursor_stands_out_on_every_line_color_in_every_look() {
+        let mut low = Vec::new();
+        for dark in [false, true] {
+            for (color_blind, high_contrast) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let look = Look {
+                    color_blind,
+                    high_contrast,
+                    ..Default::default()
+                };
+                let c = colors_for(dark, look);
+                let backgrounds = [
+                    ("text", c.text_bg),
+                    ("diff", c.diff),
+                    ("diff_sel", c.diff_sel),
+                    ("added", c.added),
+                    ("added_sel", c.added_sel),
+                    ("inline", c.inline),
+                    ("inline_sel", c.inline_sel),
+                    ("missing", c.missing),
+                    ("missing_sel", c.missing_sel),
+                    ("moved", c.moved),
+                    ("ignored", c.ignored),
+                    ("conflict", c.conflict),
+                    ("conflict_sel", c.conflict_sel),
+                    ("removed", c.removed),
+                    ("removed_sel", c.removed_sel),
+                    ("inline_removed", c.inline_removed),
+                    ("inline_added", c.inline_added),
+                ];
+                for (name, bg) in backgrounds {
+                    let ratio = contrast_ratio(c.text, bg);
+                    // WCAG 2.1: 3:1 for the cursor (1.4.11); the high-contrast look also keeps
+                    // the text on every line color at 4.5:1 (1.4.3).
+                    let min = if high_contrast { 4.5 } else { 3.0 };
+                    if ratio < min {
+                        low.push(format!("dark {dark}, cb {color_blind}, hc {high_contrast}: {name} {ratio:.2}:1"));
+                    }
+                }
+            }
+        }
+        assert!(low.is_empty(), "{}", low.join("\n"));
+        // The changed words still stand out on their lines in every look.
+        for dark in [false, true] {
+            for (color_blind, high_contrast) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let look = Look {
+                    color_blind,
+                    high_contrast,
+                    ..Default::default()
+                };
+                let c = colors_for(dark, look);
+                let apart = |a: Color32, b: Color32| {
+                    let d = |x: u8, y: u8| (x as i32 - y as i32).abs();
+                    d(a.r(), b.r()) + d(a.g(), b.g()) + d(a.b(), b.b())
+                };
+                for (word, line) in [
+                    (c.inline, c.diff),
+                    (c.inline_sel, c.diff_sel),
+                    (c.inline_added, c.added),
+                    (c.inline_removed, c.removed),
+                ] {
+                    assert!(
+                        apart(word, line) >= 30,
+                        "dark {dark}, {look:?}: {word:?} on {line:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn color_blind_and_high_contrast_looks_change_the_diff_colors() {

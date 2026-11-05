@@ -70,6 +70,10 @@ pub enum Cmd {
     Statistics,
     /// Indent (false) or outdent (true) the selected lines.
     Indent(bool),
+    /// Put a copy of the selected lines under them.
+    DuplicateLines,
+    /// Move the selected lines up (true) or down (false).
+    MoveLines(bool),
     BookmarkComment,
     SaveComparison,
     GitCompare,
@@ -155,6 +159,9 @@ impl Cmd {
             Statistics => "menu.statistics",
             Indent(false) => "cmd.indent",
             Indent(true) => "cmd.outdent",
+            DuplicateLines => "cmd.duplicate_lines",
+            MoveLines(true) => "cmd.move_lines_up",
+            MoveLines(false) => "cmd.move_lines_down",
             BookmarkComment => "cmd.bookmark_comment",
             SaveComparison => "menu.save_comparison",
             GitCompare => "menu.git_compare",
@@ -186,6 +193,9 @@ impl Cmd {
             Statistics | GotoLine => Icon::Method,
             Indent(false) | NextBookmark | FindNext | NextDiff | NextTab => Icon::Next,
             Indent(true) | PrevBookmark | FindPrev | PrevDiff | PrevTab => Icon::Prev,
+            DuplicateLines => Icon::Plus,
+            MoveLines(true) => Icon::Prev,
+            MoveLines(false) => Icon::Next,
             SelectPattern | ToggleBookmark => Icon::Check,
             ClearBookmarks | ClearSyncPoints | CloseTab | CloseTabAt(_) | CloseOtherTabs(_)
             | CloseTabsToRight(_) | CloseAllTabs | Exit => Icon::Close,
@@ -274,6 +284,7 @@ const ALT: Modifiers = Modifiers::ALT;
 const CTRL: Modifiers = Modifiers::COMMAND;
 const CTRL_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 const CTRL_ALT: Modifiers = Modifiers::COMMAND.plus(Modifiers::ALT);
+const ALT_SHIFT: Modifiers = Modifiers::ALT.plus(Modifiers::SHIFT);
 /// The Control key itself, also on macOS (where ⌘Tab switches applications).
 const CONTROL: Modifiers = Modifiers::CTRL;
 const CONTROL_SHIFT: Modifiers = Modifiers::CTRL.plus(Modifiers::SHIFT);
@@ -354,6 +365,15 @@ pub const BINDINGS: &[Binding] = {
         bind(V, CTRL, Key::Z, "Ctrl+Z", Undo),
         bind(V, CTRL_ALT, Key::ArrowRight, "Ctrl+Alt+→", CopyAllRight),
         bind(V, CTRL_ALT, Key::ArrowLeft, "Ctrl+Alt+←", CopyAllLeft),
+        // Before Alt+↓ and Alt+↑, which Alt+Shift+↓ and Alt+Shift+↑ would match too.
+        bind(
+            V,
+            ALT_SHIFT,
+            Key::ArrowDown,
+            "Alt+Shift+↓",
+            MoveLines(false),
+        ),
+        bind(V, ALT_SHIFT, Key::ArrowUp, "Alt+Shift+↑", MoveLines(true)),
         bind(V, ALT, Key::ArrowDown, "Alt+↓", NextDiff),
         bind(V, ALT, Key::ArrowUp, "Alt+↑", PrevDiff),
         bind(V, ALT, Key::Home, "Alt+Home", FirstDiff),
@@ -369,10 +389,28 @@ pub const BINDINGS: &[Binding] = {
         bind(V, CTRL, Key::F2, "Ctrl+F2", ToggleBookmark),
         bind(V, CTRL, Key::CloseBracket, "Ctrl+]", Indent(false)),
         bind(V, CTRL, Key::OpenBracket, "Ctrl+[", Indent(true)),
+        bind(V, CTRL, Key::D, "Ctrl+D", DuplicateLines),
         bind(V, SHIFT, Key::F4, "Shift+F4", PrevBookmark),
         bind(V, NONE, Key::F4, "F4", NextBookmark),
     ]
 };
+
+/// Whether `b` is a key that types a character into text: on macOS, Option (Alt) with a letter,
+/// a digit or a sign types one (Option+S types ß). While the text caret takes typing, such
+/// shortcuts are left to it and stay in the menus.
+pub fn types_text(b: &Binding) -> bool {
+    types_text_on(MAC, b)
+}
+
+/// [`types_text`] on macOS (`mac`) or on Windows and Linux, for tests of both.
+pub fn types_text_on(mac: bool, b: &Binding) -> bool {
+    let m = b.key.modifiers;
+    mac && m.alt
+        && !m.command
+        && !m.ctrl
+        && !m.mac_cmd
+        && b.key.logical_key.name().chars().count() == 1
+}
 
 /// Keys that some keyboard layouts type with AltGr, which arrives as Ctrl+Alt.
 fn typed_with_alt(key: Key) -> bool {
@@ -437,6 +475,9 @@ pub const PALETTE: &[Cmd] = {
         Statistics,
         Indent(false),
         Indent(true),
+        DuplicateLines,
+        MoveLines(true),
+        MoveLines(false),
         BookmarkComment,
         SelectPattern,
         ToggleBookmark,
@@ -559,6 +600,27 @@ mod tests {
         assert!(!consume(&mut press(Key::F, CTRL_ALT), find));
         let indent = BINDINGS.iter().find(|b| b.written == "Ctrl+]").unwrap();
         assert!(consume(&mut press(Key::CloseBracket, CTRL_ALT), indent));
+    }
+
+    #[test]
+    fn option_with_a_letter_types_on_macos_and_stays_a_shortcut_elsewhere() {
+        let find = |w: &str| BINDINGS.iter().find(|b| b.written == w).unwrap();
+        for w in ["Alt+S", "Alt+Z", "Alt+C", "Alt+P"] {
+            assert!(types_text_on(true, find(w)), "{w}");
+            assert!(!types_text_on(false, find(w)), "{w}");
+        }
+        // Option with an arrow, Home or a page key moves; ⌘ and Ctrl keys never type.
+        for w in [
+            "Alt+↓",
+            "Alt+→",
+            "Alt+Home",
+            "Alt+PgUp",
+            "Ctrl+Alt+→",
+            "Ctrl+S",
+            "F4",
+        ] {
+            assert!(!types_text_on(true, find(w)), "{w}");
+        }
     }
 
     #[test]

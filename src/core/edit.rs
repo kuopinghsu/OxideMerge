@@ -109,10 +109,13 @@ pub fn replace(
     reach
 }
 
-/// A place in a document: a line and a byte offset in it, on a character boundary.
+/// A place in a document: a line and a byte offset in it, between two user-perceived characters
+/// (grapheme clusters, UAX #29), so that an accent, an emoji sequence or a Hangul syllable written
+/// as jamo is never split.
 pub type Pos = (usize, usize);
 
-/// `pos` moved to the nearest place that exists in `lines`.
+/// `pos` moved to the nearest place that exists in `lines`: on the line, and at the start of the
+/// character it falls in.
 pub fn clamp(lines: &[String], pos: Pos) -> Pos {
     let Some(last) = lines.len().checked_sub(1) else {
         return (0, 0);
@@ -123,7 +126,40 @@ pub fn clamp(lines: &[String], pos: Pos) -> Pos {
     while !text.is_char_boundary(at) {
         at -= 1;
     }
-    (line, at)
+    (line, grapheme_floor(text, at))
+}
+
+/// The start of the grapheme cluster of `text` that byte `at` (a char boundary) is in.
+fn grapheme_floor(text: &str, at: usize) -> usize {
+    use unicode_segmentation::GraphemeCursor;
+    let mut c = GraphemeCursor::new(at, text.len(), true);
+    match c.is_boundary(text, 0) {
+        Ok(true) => at,
+        _ => c.prev_boundary(text, 0).ok().flatten().unwrap_or(0),
+    }
+}
+
+/// The end of the grapheme cluster of `text` that starts at byte `at`.
+fn grapheme_next(text: &str, at: usize) -> Option<usize> {
+    use unicode_segmentation::GraphemeCursor;
+    GraphemeCursor::new(at, text.len(), true)
+        .next_boundary(text, 0)
+        .ok()
+        .flatten()
+}
+
+/// The start of the character (grapheme cluster) of `text` that ends at byte `at`, or 0.
+pub fn char_before(text: &str, at: usize) -> usize {
+    grapheme_prev(text, at).unwrap_or(0)
+}
+
+/// The start of the grapheme cluster of `text` that ends at byte `at`.
+fn grapheme_prev(text: &str, at: usize) -> Option<usize> {
+    use unicode_segmentation::GraphemeCursor;
+    GraphemeCursor::new(at, text.len(), true)
+        .prev_boundary(text, 0)
+        .ok()
+        .flatten()
 }
 
 /// The text from `a` to `b` (in either order), its lines joined by `eol`.
@@ -188,8 +224,12 @@ pub fn insert(lines: &mut Vec<String>, at: Pos, text: &str) -> Pos {
 /// The place one character before `pos`, going to the end of the line above from a line start.
 pub fn before(lines: &[String], pos: Pos) -> Pos {
     let (l, b) = clamp(lines, pos);
-    match lines.get(l).and_then(|t| t[..b].chars().next_back()) {
-        Some(c) => (l, b - c.len_utf8()),
+    match lines
+        .get(l)
+        .filter(|_| b > 0)
+        .and_then(|t| grapheme_prev(t, b))
+    {
+        Some(a) => (l, a),
         None if l > 0 => (l - 1, lines[l - 1].len()),
         None => (l, b),
     }
@@ -198,11 +238,101 @@ pub fn before(lines: &[String], pos: Pos) -> Pos {
 /// The place one character after `pos`, going to the start of the line below from a line end.
 pub fn after(lines: &[String], pos: Pos) -> Pos {
     let (l, b) = clamp(lines, pos);
-    match lines.get(l).and_then(|t| t[b..].chars().next()) {
-        Some(c) => (l, b + c.len_utf8()),
+    match lines
+        .get(l)
+        .filter(|t| b < t.len())
+        .and_then(|t| grapheme_next(t, b))
+    {
+        Some(c) => (l, c),
         None if l + 1 < lines.len() => (l + 1, 0),
         None => (l, b),
     }
+}
+
+/// Where a word move left from `pos` lands: the start of the word before it, skipping spaces.
+/// Words follow Unicode word boundaries (UAX #29), so combining marks and emoji sequences stay
+/// whole and each CJK character is its own word; letters, digits and `_` join (`snake_case` and
+/// `camelCase` are one word), and a run of punctuation is a word of its own (`x.len` is three).
+/// From a line start it goes to the end of the line above.
+pub fn word_left(lines: &[String], pos: Pos) -> Pos {
+    let (l, b) = clamp(lines, pos);
+    let Some(line) = lines.get(l) else {
+        return (l, b);
+    };
+    if b == 0 {
+        return before(lines, (l, b));
+    }
+    let start = word_starts(line)
+        .filter(|&(i, blank)| i < b && !blank)
+        .last()
+        .map_or(0, |(i, _)| i);
+    (l, start)
+}
+
+/// Where a word move right from `pos` lands: the end of the word after it, skipping spaces (see
+/// [`word_left`]). From a line end it goes to the start of the line below.
+pub fn word_right(lines: &[String], pos: Pos) -> Pos {
+    let (l, b) = clamp(lines, pos);
+    let Some(line) = lines.get(l) else {
+        return (l, b);
+    };
+    if b == line.len() {
+        return after(lines, (l, b));
+    }
+    let end = word_spans(line)
+        .find(|&(_, end, blank)| end > b && !blank)
+        .map_or(line.len(), |(_, end, _)| end);
+    (l, end)
+}
+
+/// The words of `line` as (start, end, whether it is only spaces), joining runs that word
+/// boundaries split but that read as one word: a run of punctuation, and of spaces. Letters,
+/// digits and `_` form words (UAX #29 keeps `a_b` and `x1` whole).
+fn word_spans(line: &str) -> impl Iterator<Item = (usize, usize, bool)> + '_ {
+    use unicode_segmentation::UnicodeSegmentation;
+    let kind = |s: &str| {
+        if s.chars().all(char::is_whitespace) {
+            0
+        } else if s.chars().any(|c| c.is_alphanumeric() || c == '_') {
+            1
+        } else {
+            2
+        }
+    };
+    // UAX #29 keeps `x.len` and `it's` whole; in code, ASCII punctuation other than `_` is a
+    // word of its own
+    let split = |c: char| c.is_ascii_punctuation() && c != '_';
+    let segments = line.split_word_bound_indices().flat_map(|(i, seg)| {
+        let mut parts = Vec::new();
+        let mut from = 0;
+        for (j, c) in seg.char_indices() {
+            if split(c) {
+                parts.extend([(from, j), (j, j + c.len_utf8())]);
+                from = j + c.len_utf8();
+            }
+        }
+        parts.push((from, seg.len()));
+        parts
+            .into_iter()
+            .filter(|(a, b)| a < b)
+            .map(move |(a, b)| (i + a, &seg[a..b]))
+    });
+    let mut spans: Vec<(usize, usize, u8)> = Vec::new();
+    for (i, seg) in segments {
+        let k = kind(seg);
+        let end = i + seg.len();
+        match spans.last_mut() {
+            // spaces and punctuation runs join; words stay apart (two CJK characters are two
+            // words)
+            Some(last) if last.2 == k && k != 1 => last.1 = end,
+            _ => spans.push((i, end, k)),
+        }
+    }
+    spans.into_iter().map(|(a, b, k)| (a, b, k == 0))
+}
+
+fn word_starts(line: &str) -> impl Iterator<Item = (usize, bool)> + '_ {
+    word_spans(line).map(|(a, _, blank)| (a, blank))
 }
 
 /// The word (letters, digits and `_`) or other run of characters around byte `at` of `line`.
@@ -238,9 +368,154 @@ pub fn word_at(line: &str, at: usize) -> Range<usize> {
     start..end
 }
 
+/// Puts a copy of lines `first..=last` right after them. Returns how many lines were copied
+/// (0 when the range is not in `lines`).
+pub fn duplicate_lines(lines: &mut Vec<String>, first: usize, last: usize) -> usize {
+    if first > last || last >= lines.len() {
+        return 0;
+    }
+    let copy: Vec<String> = lines[first..=last].to_vec();
+    let n = copy.len();
+    lines.splice(last + 1..last + 1, copy);
+    n
+}
+
+/// Moves lines `first..=last` one line up (`up`) or down, past the line next to them. Returns
+/// false, changing nothing, at the top or bottom of `lines`.
+pub fn move_lines(lines: &mut [String], first: usize, last: usize, up: bool) -> bool {
+    if first > last || last >= lines.len() {
+        return false;
+    }
+    if up && first > 0 {
+        lines[first - 1..=last].rotate_left(1);
+        true
+    } else if !up && last + 1 < lines.len() {
+        lines[first..=last + 1].rotate_right(1);
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicating_and_moving_lines_keeps_every_line_once() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let mut l = v(&["a", "b", "c", "d"]);
+        assert_eq!(duplicate_lines(&mut l, 1, 2), 2);
+        assert_eq!(l, v(&["a", "b", "c", "b", "c", "d"]));
+        assert_eq!(duplicate_lines(&mut l, 5, 5), 1);
+        assert_eq!(l, v(&["a", "b", "c", "b", "c", "d", "d"]));
+        assert_eq!(duplicate_lines(&mut l, 7, 7), 0);
+        assert_eq!(duplicate_lines(&mut l, 2, 1), 0);
+
+        let mut l = v(&["a", "b", "c", "d"]);
+        assert!(move_lines(&mut l, 1, 2, true));
+        assert_eq!(l, v(&["b", "c", "a", "d"]));
+        assert!(!move_lines(&mut l, 0, 1, true), "already at the top");
+        assert!(move_lines(&mut l, 0, 1, false));
+        assert_eq!(l, v(&["a", "b", "c", "d"]));
+        assert!(move_lines(&mut l, 2, 3, true));
+        assert_eq!(l, v(&["a", "c", "d", "b"]));
+        assert!(!move_lines(&mut l, 1, 3, false), "already at the bottom");
+        assert!(!move_lines(&mut l, 3, 4, false), "past the end");
+        assert_eq!(l, v(&["a", "c", "d", "b"]));
+    }
+
+    /// Every stop of repeated word moves from `from`, as (line, byte).
+    fn stops(lines: &[&str], from: Pos, right: bool) -> Vec<Pos> {
+        let lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+        let mut out = Vec::new();
+        let mut at = from;
+        loop {
+            let next = if right {
+                word_right(&lines, at)
+            } else {
+                word_left(&lines, at)
+            };
+            if next == at {
+                return out;
+            }
+            assert!(
+                lines[next.0].is_char_boundary(next.1),
+                "{next:?} splits a character"
+            );
+            out.push(next);
+            at = next;
+        }
+    }
+
+    #[test]
+    fn word_moves_stop_at_word_ends_and_starts_and_cross_lines() {
+        let lines = ["let foo_bar = x.len();", "", "  camelCase  42"];
+        assert_eq!(
+            stops(&lines, (0, 0), true),
+            vec![
+                (0, 3),  // let
+                (0, 11), // foo_bar
+                (0, 13), // =
+                (0, 15), // x
+                (0, 16), // .
+                (0, 19), // len
+                (0, 22), // ();
+                (1, 0),  // the blank line
+                (2, 0),
+                (2, 11), // camelCase is one word
+                (2, 15), // 42
+            ]
+        );
+        assert_eq!(
+            stops(&lines, (2, 15), false),
+            vec![
+                (2, 13),
+                (2, 2),
+                (2, 0),
+                (1, 0),
+                (0, 22),
+                (0, 19),
+                (0, 16),
+                (0, 15),
+                (0, 14),
+                (0, 12),
+                (0, 4),
+                (0, 0),
+            ]
+        );
+        // From inside a word: to its own end or start.
+        let one = vec!["hello world".to_string()];
+        assert_eq!(word_right(&one, (0, 2)), (0, 5));
+        assert_eq!(word_left(&one, (0, 8)), (0, 6));
+        // Out of range positions are clamped first.
+        assert_eq!(word_right(&one, (5, 99)), (0, 11));
+    }
+
+    #[test]
+    fn word_moves_keep_characters_whole() {
+        // CJK characters are words of their own; a combining accent and an emoji sequence stay
+        // with what they mark.
+        let s = "中文 cafe\u{301} 👩\u{200d}💻 x".to_string();
+        let v = vec![s.clone()];
+        let mut at = (0, 0);
+        let mut ends = Vec::new();
+        while at.1 < s.len() {
+            at = word_right(&v, at);
+            ends.push(&s[..at.1]);
+        }
+        assert_eq!(
+            ends,
+            vec![
+                "中",
+                "中文",
+                "中文 cafe\u{301}",
+                "中文 cafe\u{301} 👩\u{200d}💻",
+                "中文 cafe\u{301} 👩\u{200d}💻 x",
+            ]
+        );
+        assert_eq!(word_left(&v, (0, s.len())), (0, s.len() - 1));
+    }
 
     fn v(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|s| s.to_string()).collect()
@@ -306,6 +581,29 @@ mod tests {
         let wide = v(&["中文"]);
         assert_eq!(after(&wide, (0, 0)), (0, 3));
         assert_eq!(clamp(&wide, (5, 4)), (0, 3));
+        // So do characters made of several code points: an accent, a flag, an emoji sequence,
+        // a Hangul syllable written as jamo.
+        let marks = v(&[
+            "e\u{301}x",
+            "🇹🇼!",
+            "👩\u{200d}💻.",
+            "\u{1100}\u{1161}\u{11a8}.",
+        ]);
+        let ends = [3, 8, 11, 9];
+        for (l, &end) in ends.iter().enumerate() {
+            assert_eq!(after(&marks, (l, 0)), (l, end), "line {l}");
+            assert_eq!(before(&marks, (l, end)), (l, 0), "line {l}");
+            for b in 1..end {
+                if marks[l].is_char_boundary(b) {
+                    assert_eq!(clamp(&marks, (l, b)), (l, 0), "line {l} byte {b}");
+                }
+            }
+            assert_eq!(clamp(&marks, (l, end)), (l, end));
+        }
+        let mut accent = v(&["ae\u{301}"]);
+        let from = before(&accent, (0, 4));
+        assert_eq!(remove(&mut accent, from, (0, 4)), (0, 1));
+        assert_eq!(accent, ["a"], "Backspace takes the accent with its letter");
         let mut empty = Vec::new();
         assert_eq!(insert(&mut empty, (0, 0), "hi"), (0, 2));
         assert_eq!(empty, ["hi"]);

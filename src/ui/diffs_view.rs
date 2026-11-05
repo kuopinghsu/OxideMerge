@@ -927,6 +927,11 @@ impl DiffsView {
                     errors.push(trf("diffs.changed_on_disk", &[("file", file)]));
                     continue;
                 }
+                // A file read-only on disk is neither replaced nor removed.
+                if let Err(e) = crate::core::text::refuse_read_only(&path) {
+                    errors.push(e.to_string());
+                    continue;
+                }
                 let mixed = d.docs[side].mixed_eol && !d.absent[side];
                 let done = if !d.absent[side] {
                     d.docs[side].save()
@@ -2433,6 +2438,34 @@ mod tests {
         v.save_modified().unwrap();
         assert!(!roots[0].join("sub").exists());
         assert!(roots[0].exists());
+    }
+
+    #[test]
+    fn refuses_to_save_over_a_file_read_only_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut v, roots) = view(
+            dir.path(),
+            &[("a.txt", &[Some("x\n"), Some("y\n")])],
+            vec![false, false],
+        );
+        let target = roots[1].join("a.txt");
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&target, perms.clone()).unwrap();
+        v.first();
+        v.copy_current(true);
+        let err = v.save_modified().unwrap_err().to_string();
+        assert!(
+            err.contains(&trf("msg.read_only_disk", &[("file", "a.txt".into())])),
+            "{err}"
+        );
+        assert_eq!(read(target.clone()), "y\n");
+        assert!(v.cards[0].modified());
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&target, perms).unwrap();
+        v.save_modified().unwrap();
+        assert_eq!(read(target.clone()), "x\n");
     }
 
     #[test]

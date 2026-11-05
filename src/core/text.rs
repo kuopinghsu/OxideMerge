@@ -242,6 +242,23 @@ impl TextDoc {
     }
 }
 
+/// Fails, with a message saying to save elsewhere, when `path` is a file the system marks
+/// read-only. Its folder may still let it be replaced, but a file the user only edited is not:
+/// the text compare and the diffs view refuse it, while folder synchronization replaces such
+/// files on purpose.
+pub fn refuse_read_only(path: &Path) -> Result<()> {
+    let read_only =
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().readonly());
+    if read_only {
+        let file = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        anyhow::bail!(crate::i18n::trf("msg.read_only_disk", &[("file", file)]));
+    }
+    Ok(())
+}
+
 pub fn join_lines(lines: &[String], eol: Eol, final_newline: bool) -> String {
     let mut s = lines.join(eol.as_str());
     if final_newline && !lines.is_empty() {

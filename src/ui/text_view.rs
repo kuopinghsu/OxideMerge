@@ -51,6 +51,18 @@ pub struct Pane {
 
 /// Modification time of a document's file. Documents with a description (unpacked or
 /// generated text) do not mirror their file, so they are not watched.
+const MAC: bool = cfg!(target_os = "macos");
+
+/// Whether `m` moves or deletes by word: Option on macOS (`mac`), Ctrl on Windows and Linux,
+/// with Shift to select.
+fn word_key_on(mac: bool, m: Modifiers) -> bool {
+    if mac {
+        m.alt && !m.mac_cmd && !m.ctrl
+    } else {
+        m.ctrl && !m.alt
+    }
+}
+
 fn disk_time(doc: &TextDoc) -> Option<SystemTime> {
     if doc.description.is_some() {
         return None;
@@ -92,6 +104,10 @@ impl Pane {
         d.compare_only = self.doc.compare_only;
         if d.lines != self.doc.lines {
             self.hl_dirty = true;
+        }
+        if d.lines != self.doc.lines || format_of(&d) != format_of(&self.doc) {
+            // Undo steps from before hold text that is no longer the file's.
+            self.saves += 1;
         }
         self.doc = d;
         self.disk_time = disk_time(&self.doc);
@@ -193,6 +209,19 @@ pub struct ColSel {
     pub head: (usize, usize),
 }
 
+/// Where the view was, by source line, while the comparison is computed again: the line at the
+/// top, the cursor row's line and the column selection's lines, so that an edit that adds or
+/// removes rows above them leaves the same text in view rather than the same row numbers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct HeldView {
+    /// (pane, line, how far into its row the view is scrolled, in display lines).
+    top: Option<(usize, usize, f32)>,
+    /// (pane, line) of the cursor row.
+    cursor: Option<(usize, usize)>,
+    /// (pane, anchor line, head line) of the column selection.
+    col: Option<(usize, usize, usize)>,
+}
+
 /// The text caret of a pane: where typing goes, and the other end of its selection.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Caret {
@@ -213,10 +242,71 @@ impl Caret {
     }
 }
 
+/// A comparison slower than this (in milliseconds) waits while typing goes on in a line.
+const SLOW_REDIFF_MS: f32 = 8.0;
+/// How long typing pauses (in seconds) before a comparison it put off is done.
+const TYPING_PAUSE: f64 = 0.3;
+
 /// The caret with the text the input method is composing at it.
 struct CaretState {
     at: Caret,
     preedit: String,
+    /// The other carets of the same pane, added with Ctrl+click (⌘-click on macOS) or Ctrl+Alt
+    /// with Up or Down; `at` is the primary one, the last added, which the view follows.
+    others: Vec<Caret>,
+    /// Set while one key is applied at each caret in turn: edits then only change the lines.
+    batch: Option<Batch>,
+}
+
+/// What applying one key at several carets did so far.
+#[derive(Clone, Copy, Debug)]
+struct Batch {
+    changed: bool,
+    /// Every edit was typing within a line, so the step can join the one before it.
+    typing: bool,
+}
+
+/// Sorts `carets` (the primary one marked) and merges those that overlap or meet at a bare
+/// caret, keeping the primary mark on the merged one.
+fn merge_carets(carets: &mut Vec<(Caret, bool)>) {
+    carets.sort_by_key(|(c, _)| c.range());
+    let mut out: Vec<(Caret, bool)> = Vec::with_capacity(carets.len());
+    for (c, primary) in carets.drain(..) {
+        if let Some((last, last_primary)) = out.last_mut() {
+            let (a0, a1) = last.range();
+            let (b0, b1) = c.range();
+            let touch = b0 == a1 && (!c.has_selection() || !last.has_selection());
+            if b0 < a1 || touch || (b0, b1) == (a0, a1) {
+                let (lo, hi) = (a0.min(b0), a1.max(b1));
+                // The merged caret keeps the direction of the primary one, or of the first.
+                let forward = if primary && !*last_primary {
+                    c.pos >= c.anchor
+                } else {
+                    last.pos >= last.anchor
+                };
+                let (anchor, pos) = if forward { (lo, hi) } else { (hi, lo) };
+                last.anchor = anchor;
+                last.pos = pos;
+                last.want = if primary { c.want } else { last.want };
+                *last_primary |= primary;
+                continue;
+            }
+        }
+        out.push((c, primary));
+    }
+    *carets = out;
+}
+
+/// Where position `p` of the text is after an edit before it changed the line count from
+/// `old_len`: `tail` is what followed `p` on its line, which the edit did not touch.
+fn shift_past_edit(after: &[String], old_len: usize, p: edit::Pos, tail: &str) -> edit::Pos {
+    let line = p.0 as isize + after.len() as isize - old_len as isize;
+    if let Some(t) = usize::try_from(line).ok().and_then(|l| after.get(l)) {
+        if t.ends_with(tail) {
+            return (line as usize, t.len() - tail.len());
+        }
+    }
+    edit::clamp(after, (line.max(0) as usize, p.1))
 }
 
 /// What a key or input event asks of the caret, in the order they came.
@@ -317,6 +407,8 @@ struct Snapshot {
     /// The synchronization points before this step, so that undo brings back the ones whose
     /// lines the step deleted.
     sync_points: Vec<SyncPoint>,
+    /// The carets, the primary one first, when there were several: undo and redo put them back.
+    carets: Vec<Caret>,
 }
 
 /// Save-format state shared by merge operations and their undo snapshots.
@@ -894,6 +986,47 @@ fn wrap_starts(text: &str, tab: usize, cols: usize) -> Vec<usize> {
     starts
 }
 
+/// Each character of `text` that wrapping lays out, with its byte and the display columns it
+/// covers, counted as [`wrap_starts`] counts them (a tab to its stop, a wide character as two).
+fn wrap_columns(text: &str, tab: usize) -> impl Iterator<Item = (usize, Range<usize>)> + '_ {
+    let tab = tab.max(1);
+    let (mut col, mut tcol) = (0, 0);
+    clip_line(text).char_indices().map(move |(i, ch)| {
+        let (w, n) = match ch {
+            '\t' => (1, tab - tcol % tab),
+            c => (if is_wide(c) { 2 } else { 1 }, 1),
+        };
+        let start = col;
+        col += w * n;
+        tcol += n;
+        (i, start..col)
+    })
+}
+
+/// The display column (as [`wrap_starts`] counts) where byte `at` of `text` starts.
+fn wrap_col(text: &str, tab: usize, at: usize) -> usize {
+    let mut end = 0;
+    for (i, cols) in wrap_columns(text, tab) {
+        if i >= at {
+            return cols.start;
+        }
+        end = cols.end;
+    }
+    end
+}
+
+/// The byte of `text` where the character covering display column `col` starts, or the end.
+fn wrap_byte(text: &str, tab: usize, col: usize) -> usize {
+    wrap_columns(text, tab)
+        .find(|(_, cols)| col < cols.end)
+        .map_or(text.len(), |(i, _)| i)
+}
+
+/// The wrapped display line of `starts` that display column `col` is on.
+fn wrap_segment(starts: &[usize], col: usize) -> usize {
+    starts.partition_point(|&s| s <= col).saturating_sub(1)
+}
+
 /// X offsets inside `galley` of the display columns in `starts`.
 fn segment_x(galley: &Galley, starts: &[usize]) -> Vec<f32> {
     let mut out = Vec::with_capacity(starts.len());
@@ -1093,9 +1226,13 @@ pub struct TextView {
     typing_group: bool,
     /// Whether to scroll sideways to the caret when it is next drawn.
     caret_reveal: bool,
+    /// The view by source line from before the comparison was last computed again, until the
+    /// rows and the layout are rebuilt.
+    held: Option<Box<HeldView>>,
     pub find: FindState,
     /// The compiled find query, rebuilt when the query or its options change.
-    find_re: Option<(FindKey, Result<Regex, String>)>,
+    /// The compiled find query (boxed: the view is kept small, and it is rare).
+    find_re: Option<Box<(FindKey, Result<Regex, String>)>>,
     pub goto: Option<String>,
     pub table_mode: bool,
     pub table_delim: Option<char>,
@@ -1108,6 +1245,13 @@ pub struct TextView {
     pub bulk_edit: Option<String>,
     scroll_to: Option<usize>,
     max_cols: usize,
+    /// How long the last comparison took, in milliseconds.
+    rediff_ms: f32,
+    /// When typing put off comparing again: the time it is done by, unless something else
+    /// needs the comparison first ([`Self::settle_diff`]).
+    rediff_due: Option<f64>,
+    /// The input time of the frame being drawn.
+    now: f64,
     ctx_target: Option<(usize, usize)>,
     page_rows: usize,
     /// Modified panes whose file was changed by another program.
@@ -1214,6 +1358,7 @@ impl TextView {
             caret: None,
             typing_group: false,
             caret_reveal: false,
+            held: None,
             find: FindState::default(),
             find_re: None,
             goto: None,
@@ -1226,6 +1371,9 @@ impl TextView {
             bulk_edit: None,
             scroll_to: None,
             max_cols: 0,
+            rediff_ms: 0.0,
+            rediff_due: None,
+            now: 0.0,
             ctx_target: None,
             page_rows: 30,
             disk_changed: Vec::new(),
@@ -1310,11 +1458,11 @@ impl TextView {
 
     /// Local overlays/editors get Escape before the tab-level close shortcut.
     pub fn handles_escape(&self) -> bool {
+        let editing = !self.shows_inline() && (self.col_sel.is_some() || self.caret.is_some());
         self.find.open
             || self.goto.is_some()
             || self.edit.is_some()
-            || self.col_sel.is_some()
-            || self.caret.is_some()
+            || editing
             || self.note_edit.is_some()
             || self.table.edit.is_some()
     }
@@ -1455,6 +1603,70 @@ impl TextView {
     }
 
     pub fn rediff(&mut self) {
+        let started = std::time::Instant::now();
+        self.rediff_due = None;
+        self.rediff_inner();
+        self.rediff_ms = started.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    /// After typing within a line: compares again now when that is quick, else once typing
+    /// pauses for [`TYPING_PAUSE`] or something else needs the comparison. The line count did not
+    /// change, so until then the rows stay right and only the edited line's colors lag.
+    fn rediff_soon(&mut self) {
+        if self.rediff_ms < SLOW_REDIFF_MS {
+            return self.rediff();
+        }
+        self.rediff_due = Some(self.now + TYPING_PAUSE);
+        // The edited line is drawn from the text, so its layout must be made again.
+        self.inline_cache.clear();
+        self.layout_gen += 1;
+    }
+
+    /// Compares again now if typing put it off; every command that reads the comparison
+    /// runs after this.
+    pub fn settle_diff(&mut self) {
+        if self.rediff_due.is_some() {
+            self.rediff();
+        }
+    }
+
+    /// The input of this frame: comparing again waits while it is only more typing, and is
+    /// done before anything else (a click, a key that is not typing) or once typing pauses.
+    fn settle_diff_for_input(&mut self, ctx: &egui::Context) {
+        let (now, only_typing, typed) = ctx.input(|i| {
+            let typing = |e: &egui::Event| match e {
+                egui::Event::Text(_) | egui::Event::Ime(_) => true,
+                egui::Event::PointerMoved(_) | egui::Event::ModifiersChanged(_) => true,
+                egui::Event::Key { pressed: false, .. } => true,
+                egui::Event::Key { key, modifiers, .. } => {
+                    !modifiers.command
+                        && !modifiers.ctrl
+                        && (key.name().chars().count() == 1
+                            || matches!(key, Key::Space | Key::Backspace | Key::Delete))
+                }
+                _ => false,
+            };
+            let typed = i.events.iter().any(|e| {
+                matches!(e, egui::Event::Text(_) | egui::Event::Ime(_))
+                    || matches!(e, egui::Event::Key { pressed: true, .. })
+            });
+            (i.time, i.events.iter().all(typing), typed)
+        });
+        self.now = now;
+        let Some(due) = self.rediff_due else { return };
+        if !only_typing || (!typed && now >= due) {
+            self.rediff();
+        } else {
+            if typed {
+                self.rediff_due = Some(now + TYPING_PAUSE);
+            }
+            let wait = self.rediff_due.map_or(0.0, |d| (d - now).max(0.0));
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
+        }
+    }
+
+    fn rediff_inner(&mut self) {
+        self.hold_view();
         let syntax = self.comment_syntax();
         let refs: Vec<&[String]> = self.panes.iter().map(|p| p.doc.lines.as_slice()).collect();
         let lens: Vec<usize> = refs.iter().map(|l| l.len()).collect();
@@ -1472,8 +1684,10 @@ impl TextView {
             marks.retain(|&l, _| l < n);
         }
         self.update_edited();
+        self.recheck_review_hunks();
         self.inline_cache.clear();
         self.sel_anchor = None;
+        self.restore_held_rows();
         let rows = self.diff.rows.len();
         let n = self.panes.len();
         if self
@@ -1483,7 +1697,7 @@ impl TextView {
             self.col_sel = None;
         }
         if self.caret().is_some_and(|c| c.pane >= n) {
-            self.caret = None;
+            self.drop_carets();
         }
         self.layout_gen += 1;
         if let Some(b) = self.cur_block {
@@ -1542,26 +1756,165 @@ impl TextView {
         }
     }
 
+    /// The text changed: the file's review decision is stale. Its hunks' decisions are checked
+    /// when the comparison is next computed ([`Self::recheck_review_hunks`]), so that only those
+    /// whose hunk changed go stale.
     fn invalidate_review(&mut self) {
         if let Some(review) = &mut self.review_decision {
             review.stale = true;
-            for h in review.hunks.values_mut() {
-                h.stale = true;
-            }
             self.review_dirty = true;
+        }
+    }
+
+    /// After the text of a reviewed file changed: a hunk decision goes stale when no hunk has its
+    /// identity any more (its lines, the two lines around them or the options changed). One whose
+    /// hunk is still there as it was stays as it is; a stale one never becomes current by itself.
+    /// Past the size the review handles, every hunk decision goes stale.
+    fn recheck_review_hunks(&mut self) {
+        let Some(review) = self.review_decision.as_deref() else {
+            return;
+        };
+        if !review.stale || review.hunks.values().all(|h| h.stale) {
+            return;
+        }
+        let current: Option<std::collections::HashSet<String>> =
+            (self.review_within_budget() && self.diff.blocks.len() <= 1000).then(|| {
+                self.diff
+                    .blocks
+                    .iter()
+                    .map(|b| self.review_hunk_id(b))
+                    .collect()
+            });
+        let Some(review) = self.review_decision.as_deref_mut() else {
+            return;
+        };
+        for (id, h) in &mut review.hunks {
+            if !h.stale && current.as_ref().is_none_or(|ids| !ids.contains(id)) {
+                h.stale = true;
+                self.review_dirty = true;
+            }
         }
     }
     fn mark_changed(&mut self, panes: &[usize]) {
         self.invalidate_review();
+        // the rows and layout are still those of the text before the change
+        self.hold_view();
         for &p in panes {
             self.panes[p].doc.modified = true;
             self.panes[p].hl_dirty = true;
             if let Some(before) = self.undo.last().map(|s| s.lines[p].clone()) {
                 self.remap_bookmarks(p, &before);
                 self.remap_sync_points(p, &before);
+                self.remap_view(p, &before);
             }
         }
         self.rediff();
+    }
+
+    /// Notes where the view is by source line, while the rows and the layout are still those of
+    /// the text as it is shown; kept until the layout is rebuilt, so several changes before the
+    /// next frame keep the first view.
+    fn hold_view(&mut self) {
+        if self.held.is_some() {
+            return;
+        }
+        let rows = &self.diff.rows;
+        let line_of = |r: usize, prefer: usize| {
+            let row = rows.get(r)?;
+            std::iter::once(prefer)
+                .chain(0..self.n())
+                .find_map(|p| row.line(p).map(|l| (p, l)))
+        };
+        let shown = self.layout.key.is_some_and(|k| k.3 == self.layout_gen)
+            && self.layout.row_line.len() == rows.len();
+        // The top keeps to a pane other than the active one when it can: that is the one an edit
+        // usually changes.
+        let other = (0..self.n()).find(|&p| p != self.active_pane).unwrap_or(0);
+        // How far into its row the view is: the display lines of a wrapped line above the top,
+        // and the part of a line scrolled past.
+        let scroll = self.scroll.max(0.0);
+        let top = shown
+            .then(|| self.layout.lines.get(scroll as usize))
+            .flatten()
+            .and_then(|l| match *l {
+                VLine::Row(r, _) | VLine::Fold(r, _) => {
+                    let into = scroll - self.layout.row_line.get(r).map_or(0.0, |&v| v as f32);
+                    line_of(r, other).map(|(p, l)| (p, l, into.max(0.0)))
+                }
+            });
+        let cursor = self.cursor_row.and_then(|r| line_of(r, self.active_pane));
+        let col = self.col().and_then(|c| {
+            let at = |r: usize| rows.get(r).and_then(|row| row.line(c.pane));
+            Some((c.pane, at(c.anchor.0)?, at(c.head.0)?))
+        });
+        self.held = Some(Box::new(HeldView { top, cursor, col }));
+    }
+
+    /// Moves the held view and the caret of pane `p` with its lines after they changed from
+    /// `before`: a line that is still there keeps its place in it, and one that went lands on
+    /// the nearest line after it.
+    fn remap_view(&mut self, p: usize, before: &[String]) {
+        let caret_here = self.caret().is_some_and(|c| c.pane == p);
+        let held = self.held.as_deref().copied().unwrap_or_default();
+        let in_pane = held.top.is_some_and(|t| t.0 == p)
+            || held.cursor.is_some_and(|c| c.0 == p)
+            || held.col.is_some_and(|c| c.0 == p);
+        if !caret_here && !in_pane {
+            return;
+        }
+        let after = &self.panes[p].doc.lines;
+        let map = line_map(before, after, false);
+        let last = after.len().saturating_sub(1);
+        let line = |l: usize| map.get(l).map_or(last, |&(to, _)| to.min(last));
+        let pos = |(l, b): edit::Pos| match map.get(l) {
+            Some(&(to, true)) => (to, b),
+            Some(&(to, false)) => (to.min(last), 0),
+            None => (last, usize::MAX),
+        };
+        if let Some(h) = &mut self.held {
+            if let Some(t) = h.top.as_mut().filter(|t| t.0 == p) {
+                t.1 = line(t.1);
+            }
+            if let Some(c) = h.cursor.as_mut().filter(|c| c.0 == p) {
+                c.1 = line(c.1);
+            }
+            if let Some(c) = h.col.as_mut().filter(|c| c.0 == p) {
+                (c.1, c.2) = (line(c.1), line(c.2));
+            }
+        }
+        if let Some(cs) = self.caret.as_deref_mut().filter(|cs| cs.at.pane == p) {
+            for k in std::iter::once(&mut cs.at).chain(cs.others.iter_mut()) {
+                k.pos = edit::clamp(after, pos(k.pos));
+                k.anchor = edit::clamp(after, pos(k.anchor));
+            }
+        }
+    }
+
+    /// Points the cursor row and the column selection at the rows their held lines now have.
+    fn restore_held_rows(&mut self) {
+        let Some(h) = self.held.as_mut() else { return };
+        let (cursor, col) = (h.cursor.take(), h.col.take());
+        if self.diff.rows.is_empty() {
+            return;
+        }
+        let row = |p: usize, l: usize| self.diff.row_of_line(p, l);
+        if let Some((p, l)) = cursor {
+            self.cursor_row = Some(row(p, l));
+        }
+        if let (Some((p, a, b)), Some(s)) = (col, self.col_sel.as_deref_mut()) {
+            if s.pane == p {
+                let (ra, rb) = (self.diff.row_of_line(p, a), self.diff.row_of_line(p, b));
+                s.anchor.0 = ra;
+                s.head.0 = rb;
+            }
+        }
+        if let Some(c) = self.caret.as_deref_mut() {
+            let lines = &self.panes[c.at.pane].doc.lines;
+            for k in std::iter::once(&mut c.at).chain(c.others.iter_mut()) {
+                k.pos = edit::clamp(lines, k.pos);
+                k.anchor = edit::clamp(lines, k.anchor);
+            }
+        }
     }
 
     /// Moves the bookmarks of pane `p` along with its lines after they changed from `before`.
@@ -2086,6 +2439,11 @@ impl TextView {
             saves: self.panes.iter().map(|p| p.saves).collect(),
             formats: vec![None; self.panes.len()],
             sync_points: self.sync_points.clone(),
+            carets: if self.multi_caret() {
+                self.carets()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -2103,19 +2461,26 @@ impl TextView {
     }
 
     fn restore(&mut self, s: Snapshot) {
+        self.hold_view();
+        let keep: Vec<bool> = self.panes.iter().map(|p| p.doc.read_only).collect();
+        if (0..self.n()).any(|i| !keep[i] && self.step_changes(&s, i)) {
+            // The text is no longer the one that was reviewed.
+            self.invalidate_review();
+        }
         for (i, f) in s.formats.into_iter().enumerate() {
-            if let Some(f) = f {
+            if let Some(f) = f.filter(|_| !keep[i]) {
                 f.restore(&mut self.panes[i].doc);
             }
         }
         for (i, lines) in s.lines.into_iter().enumerate() {
-            if self.panes[i].doc.lines == lines {
+            if keep[i] || self.panes[i].doc.lines == lines {
                 continue;
             }
             let before = std::mem::replace(&mut self.panes[i].doc.lines, lines);
             self.panes[i].hl_dirty = true;
             self.remap_bookmarks(i, &before);
             self.remap_sync_points(i, &before);
+            self.remap_view(i, &before);
         }
         // Points set since the step stay; ones the step dropped come back (crossing ones are
         // left out by the compare).
@@ -2123,14 +2488,27 @@ impl TextView {
         self.sync_points.sort_unstable();
         self.sync_points.dedup();
         for (i, p) in self.panes.iter_mut().enumerate() {
-            p.doc.modified = s.modified[i] || s.saves[i] != p.saves;
+            if !keep[i] {
+                p.doc.modified = s.modified[i] || s.saves[i] != p.saves;
+            }
         }
         self.rediff();
         self.typing_group = false;
         if let Some(c) = self.caret() {
+            // the caret moved with its line; the selection stays if both ends survived
             let lines = &self.panes[c.pane].doc.lines;
-            let pos = edit::clamp(lines, c.pos);
-            self.place_caret(c.pane, pos, false);
+            let (pos, anchor) = (edit::clamp(lines, c.pos), edit::clamp(lines, c.anchor));
+            self.place_caret(c.pane, anchor, false);
+            self.place_caret(c.pane, pos, true);
+        }
+        if !s.carets.is_empty() {
+            let list = s
+                .carets
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| (c, i == 0))
+                .collect();
+            self.set_carets(list);
         }
     }
 
@@ -2143,6 +2521,14 @@ impl TextView {
     }
 
     pub fn undo(&mut self) {
+        if self
+            .undo
+            .last()
+            .is_some_and(|s| self.steps_into_read_only(s))
+        {
+            self.status = tr("msg.readonly").to_string();
+            return;
+        }
         if let Some(s) = self.undo.pop() {
             let cur = self.snapshot_for(&s);
             self.redo.push(cur);
@@ -2151,6 +2537,14 @@ impl TextView {
     }
 
     pub fn redo(&mut self) {
+        if self
+            .redo
+            .last()
+            .is_some_and(|s| self.steps_into_read_only(s))
+        {
+            self.status = tr("msg.readonly").to_string();
+            return;
+        }
         if let Some(s) = self.redo.pop() {
             let cur = self.snapshot_for(&s);
             self.undo.push(cur);
@@ -2158,9 +2552,37 @@ impl TextView {
         }
     }
 
+    /// Whether going back to `s` would change pane `i`.
+    fn step_changes(&self, s: &Snapshot, i: usize) -> bool {
+        let doc = &self.panes[i].doc;
+        s.lines[i] != doc.lines || s.formats[i].as_ref().is_some_and(|f| *f != format_of(doc))
+    }
+
+    /// Whether `s` would change only panes that are read-only now (made read-only after the
+    /// step, or reloaded from disk since): the step then stays, with a message. Undo never
+    /// writes a read-only pane; it leaves such panes as they are and restores the others.
+    fn steps_into_read_only(&self, s: &Snapshot) -> bool {
+        let (mut read_only, mut writable) = (false, false);
+        for i in 0..self.n() {
+            if self.step_changes(s, i) {
+                if self.panes[i].doc.read_only {
+                    read_only = true;
+                } else {
+                    writable = true;
+                }
+            }
+        }
+        read_only && !writable
+    }
+
     /// The panes as they are, to go back to after restoring `s`: with the formats `s` changes.
     fn snapshot_for(&self, s: &Snapshot) -> Snapshot {
         let mut cur = self.snapshot();
+        // Several carets can merge into one during a deletion. Redo must restore that
+        // resulting caret too, rather than remapping the pre-edit carets through the text.
+        if !s.carets.is_empty() {
+            cur.carets = self.carets();
+        }
         for (i, f) in s.formats.iter().enumerate() {
             if f.is_some() {
                 cur.formats[i] = Some(format_of(&self.panes[i].doc));
@@ -2233,11 +2655,32 @@ impl TextView {
 
     fn writable(&mut self, pane: usize) -> bool {
         if self.panes[pane].doc.read_only {
-            self.status = tr("msg.readonly").to_string();
+            self.status = self.read_only_message(pane);
             false
         } else {
             true
         }
+    }
+
+    /// Why typing into pane `pane` was refused: which side it is, and how to edit it if it can be.
+    fn read_only_message(&self, pane: usize) -> String {
+        let side = side_name(pane, self.n()).to_string();
+        let key = if self.panes[pane].doc.compare_only {
+            "msg.side_compare_only"
+        } else {
+            "msg.side_read_only"
+        };
+        trf(key, &[("side", side)])
+    }
+
+    /// Whether typed text would go into the caret's pane now: it can be edited, no other field
+    /// has the keyboard and the window has it. The caret is drawn dimmed otherwise.
+    fn caret_live(&self, ctx: &egui::Context) -> bool {
+        self.caret()
+            .is_some_and(|c| !self.panes[c.pane].doc.read_only)
+            && !self.shows_inline()
+            && !widgets::typing(ctx)
+            && ctx.input(|i| i.focused)
     }
 
     pub fn copy_block(&mut self, b: usize, from: usize, to: usize) {
@@ -2660,11 +3103,11 @@ impl TextView {
             return;
         }
         if self.panes[pane].doc.read_only {
-            self.status = tr("msg.readonly").to_string();
+            self.status = self.read_only_message(pane);
             return;
         }
         self.col_sel = None;
-        self.caret = None;
+        self.drop_carets();
         let mut e = EditState {
             row,
             pane,
@@ -2739,9 +3182,299 @@ impl TextView {
         self.caret.as_deref().map(|s| s.at)
     }
 
-    /// Whether typed keys go into a pane, so that one-key shortcuts must leave them alone.
+    /// Every caret, the primary one first.
+    pub fn carets(&self) -> Vec<Caret> {
+        self.caret.as_deref().map_or_else(Vec::new, |s| {
+            std::iter::once(s.at)
+                .chain(s.others.iter().copied())
+                .collect()
+        })
+    }
+
+    /// Whether there is more than one caret.
+    fn multi_caret(&self) -> bool {
+        self.caret.as_ref().is_some_and(|s| !s.others.is_empty())
+    }
+
+    /// Makes `carets` the carets (marked `true`: the primary one), merged where they overlap,
+    /// and points the view at the primary one.
+    fn set_carets(&mut self, mut carets: Vec<(Caret, bool)>) {
+        merge_carets(&mut carets);
+        let Some(i) = carets
+            .iter()
+            .position(|(_, p)| *p)
+            .or(carets.len().checked_sub(1))
+        else {
+            self.drop_carets();
+            return;
+        };
+        let (primary, _) = carets.remove(i);
+        let preedit = self
+            .caret
+            .as_mut()
+            .map(|s| std::mem::take(&mut s.preedit))
+            .unwrap_or_default();
+        let lines = &self.panes[primary.pane].doc.lines;
+        let fit = |c: Caret| Caret {
+            pos: edit::clamp(lines, c.pos),
+            anchor: edit::clamp(lines, c.anchor),
+            ..c
+        };
+        self.caret = Some(Box::new(CaretState {
+            at: fit(primary),
+            preedit,
+            others: carets.into_iter().map(|(c, _)| fit(c)).collect(),
+            batch: None,
+        }));
+        self.col_sel = None;
+        self.follow_caret();
+    }
+
+    /// Removes every caret: the keys go back to the rows.
+    fn drop_carets(&mut self) {
+        self.caret = None;
+    }
+
+    /// Keeps only the primary caret.
+    fn single_caret(&mut self) {
+        if let Some(s) = &mut self.caret {
+            s.others.clear();
+        }
+    }
+
+    /// Applies `op`, written for one caret, at each caret in turn, from the last in the text to
+    /// the first, as one undo step: carets already done move with the text each edit changes
+    /// before them. `op` gets the caret's index in text order and the number of carets.
+    fn at_each_caret(&mut self, mut op: impl FnMut(&mut Self, usize, usize)) {
+        if !self.multi_caret() {
+            op(self, 0, 1);
+            return;
+        }
+        let state = self.caret.take().expect("carets");
+        let pane = state.at.pane;
+        let mut carets: Vec<(Caret, bool)> = std::iter::once((state.at, true))
+            .chain(state.others.iter().map(|&c| (c, false)))
+            .collect();
+        merge_carets(&mut carets);
+        // A key at a caret changes only the lines of its selection and the line on each side
+        // (Backspace at a line start, Delete at its end), so only those are kept for the undo
+        // step, not the whole file at every key.
+        let old_len = self.panes[pane].doc.lines.len();
+        let lo = carets
+            .iter()
+            .map(|(c, _)| c.range().0 .0)
+            .min()
+            .unwrap_or(0)
+            .saturating_sub(1)
+            .min(old_len);
+        let hi = carets
+            .iter()
+            .map(|(c, _)| c.range().1 .0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(2)
+            .clamp(lo, old_len);
+        let kept: Vec<String> = self.panes[pane].doc.lines[lo..hi].to_vec();
+        #[cfg(debug_assertions)]
+        let whole = self.panes[pane].doc.lines.clone();
+        let count = carets.len();
+        let mut batch = Batch {
+            changed: false,
+            typing: true,
+        };
+        let mut done: Vec<(Caret, bool)> = Vec::with_capacity(count);
+        for (index, &(c, primary)) in carets.iter().enumerate().rev() {
+            let lines = &self.panes[pane].doc.lines;
+            let old_len = lines.len();
+            let tail = |p: edit::Pos| {
+                lines
+                    .get(p.0)
+                    .and_then(|t| t.get(p.1..))
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let tails: Vec<(String, String)> = done
+                .iter()
+                .map(|(d, _)| (tail(d.pos), tail(d.anchor)))
+                .collect();
+            self.caret = Some(Box::new(CaretState {
+                at: c,
+                preedit: String::new(),
+                others: Vec::new(),
+                batch: Some(Batch {
+                    changed: false,
+                    typing: true,
+                }),
+            }));
+            op(self, index, count);
+            let Some(after) = self.caret.take() else {
+                done.push((c, primary));
+                continue;
+            };
+            let edited = after.batch.is_some_and(|b| b.changed);
+            if edited {
+                let b = after.batch.unwrap_or(batch);
+                batch.changed = true;
+                batch.typing &= b.typing;
+                let lines = &self.panes[pane].doc.lines;
+                for ((d, _), (pos_tail, anchor_tail)) in done.iter_mut().zip(&tails) {
+                    d.pos = shift_past_edit(lines, old_len, d.pos, pos_tail);
+                    d.anchor = shift_past_edit(lines, old_len, d.anchor, anchor_tail);
+                }
+            }
+            done.push((after.at, primary));
+        }
+        if batch.changed {
+            // One undo step for all of them, taken from the text before the first edit: the
+            // kept lines go back in for the snapshot, and the edited ones after it.
+            let new_len = self.panes[pane].doc.lines.len();
+            let end = (hi + new_len).saturating_sub(old_len).max(lo);
+            #[cfg(debug_assertions)]
+            {
+                let now = &self.panes[pane].doc.lines;
+                debug_assert!(
+                    now[..lo] == whole[..lo] && now[end..] == whole[hi..],
+                    "a caret edit changed lines outside {lo}..{hi}"
+                );
+            }
+            let joins = batch.typing && self.typing_group && !self.undo.is_empty();
+            self.caret = Some(state);
+            if !joins {
+                let lines = &mut self.panes[pane].doc.lines;
+                let edited: Vec<String> = lines.splice(lo..end, kept).collect();
+                self.push_undo();
+                self.panes[pane].doc.lines.splice(lo..hi, edited);
+            }
+            if batch.typing {
+                self.invalidate_review();
+                let p = &mut self.panes[pane];
+                p.doc.modified = true;
+                p.hl_dirty = true;
+                self.redo.clear();
+                self.rediff_soon();
+            } else {
+                self.mark_changed(&[pane]);
+            }
+        } else {
+            self.caret = Some(state);
+        }
+        self.set_carets(done);
+        self.typing_group = batch.changed && batch.typing;
+    }
+
+    /// Ctrl+click (⌘-click on macOS) at `at` of pane `pane`: adds a caret there, or removes the
+    /// one there when there are others. In another pane, or without a caret, it is just placed.
+    fn toggle_caret(&mut self, pane: usize, at: edit::Pos) {
+        let carets = self.carets();
+        if carets.first().is_none_or(|c| c.pane != pane) {
+            self.place_caret(pane, at, false);
+            return;
+        }
+        let hit = carets.iter().position(|c| {
+            let (a, b) = c.range();
+            c.pos == at || (c.has_selection() && a <= at && at <= b)
+        });
+        let mut list: Vec<(Caret, bool)> = carets.into_iter().map(|c| (c, false)).collect();
+        match hit {
+            Some(i) if list.len() > 1 => {
+                list.remove(i);
+                let last = list.len() - 1;
+                // The primary one stays, or the one added before it takes over.
+                let keep = if i == 0 { last } else { 0 };
+                list[keep].1 = true;
+            }
+            Some(_) => return,
+            None => {
+                let at = edit::clamp(&self.panes[pane].doc.lines, at);
+                list.push((
+                    Caret {
+                        pane,
+                        pos: at,
+                        anchor: at,
+                        want: None,
+                    },
+                    true,
+                ));
+            }
+        }
+        self.set_carets(list);
+        self.typing_group = false;
+    }
+
+    /// Ctrl+Alt+Up or Down (⌘⌥ on macOS): a new caret on the line above the first caret, or
+    /// below the last, at the same display column.
+    fn add_caret_line(&mut self, down: bool) {
+        let carets = self.carets();
+        let Some(&first) = carets.first() else { return };
+        let edge = if down {
+            carets.iter().max_by_key(|c| c.pos)
+        } else {
+            carets.iter().min_by_key(|c| c.pos)
+        };
+        let Some(&edge) = edge else { return };
+        let lines = &self.panes[first.pane].doc.lines;
+        let tab = self.tab_size;
+        let Some(line) = edge.pos.0.checked_add_signed(if down { 1 } else { -1 }) else {
+            return;
+        };
+        let Some(text) = lines.get(line) else { return };
+        let want = edge.want.unwrap_or_else(|| {
+            edit::col_at(
+                lines.get(edge.pos.0).map_or("", String::as_str),
+                edge.pos.1,
+                tab,
+            )
+        });
+        let at = (line, edit::byte_at(text, want, tab).0);
+        let mut list: Vec<(Caret, bool)> = carets.into_iter().map(|c| (c, false)).collect();
+        list.push((
+            Caret {
+                pane: first.pane,
+                pos: at,
+                anchor: at,
+                want: Some(want),
+            },
+            true,
+        ));
+        self.set_carets(list);
+        self.typing_group = false;
+    }
+
+    /// Whether typed keys go into a pane, so that one-key shortcuts must leave them alone. The
+    /// inline view only shows the files: a caret kept from the side-by-side view waits there.
     pub fn takes_text(&self) -> bool {
-        self.caret.is_some() && !self.table_mode
+        self.caret.is_some() && !self.table_mode && !self.shows_inline()
+    }
+
+    /// Whether the inline view is the one shown, which shows the files without editing them.
+    pub fn shows_inline(&self) -> bool {
+        self.unified && self.n() == 2 && !self.table_mode
+    }
+
+    /// Edit side by side: leaves the inline view for the side-by-side one, with the text caret
+    /// on the inline view's cursor line (or where it was, when it is still on that line).
+    pub fn edit_side_by_side(&mut self) {
+        let at = self.cursor_row.and_then(|row| {
+            let pane = self.active_pane;
+            let line = self.diff.rows.get(row)?.line(pane)?;
+            Some((row, pane, line))
+        });
+        self.unified = false;
+        let Some((row, pane, line)) = at else { return };
+        if !self
+            .caret()
+            .is_some_and(|c| c.pane == pane && c.pos.0 == line)
+        {
+            self.place_caret(pane, (line, 0), false);
+        }
+        self.cursor_row = Some(row);
+        self.scroll_to = Some(row);
+    }
+
+    /// Whether the text caret takes `key` with modifiers `m` before the shortcuts see it (the
+    /// word keys of macOS, Option+Left and Option+Right, are Alt+Left and Alt+Right).
+    pub fn takes_key(&self, key: Key, m: Modifiers) -> bool {
+        self.takes_text() && Self::caret_key(key, m)
     }
 
     /// Puts the caret of `pane` at `pos`; `extend` keeps the other end of the selection.
@@ -2754,6 +3487,7 @@ impl TextView {
             Some(c) if extend && c.pane == pane => c.anchor,
             _ => pos,
         };
+        let batch = self.caret.as_ref().and_then(|s| s.batch);
         self.caret = Some(Box::new(CaretState {
             at: Caret {
                 pane,
@@ -2762,6 +3496,8 @@ impl TextView {
                 want: None,
             },
             preedit: String::new(),
+            others: Vec::new(),
+            batch,
         }));
         self.col_sel = None;
         self.typing_group = false;
@@ -2776,15 +3512,38 @@ impl TextView {
         if self.diff.rows.is_empty() {
             return;
         }
-        let row = self.diff.row_of_line(c.pane, c.pos.0);
+        // A selection over several lines selects their rows, for copying them to another side;
+        // when it ends at the start of a line (a whole line, say), that line is not one of them.
+        let (a, b) = c.range();
+        let last = if b.0 > a.0 && b.1 == 0 { b.0 - 1 } else { b.0 };
+        let line_of = |end: edit::Pos| if end == b { last } else { end.0 };
+        let (pos_line, anchor_line) = (line_of(c.pos), line_of(c.anchor));
+        let row = self.diff.row_of_line(c.pane, pos_line);
         self.cursor_row = Some(row);
-        self.scroll_to = Some(row);
+        self.scroll_to = Some(self.diff.row_of_line(c.pane, c.pos.0));
         self.cur_block = self.diff.rows[row]
             .block()
             .filter(|&b| !self.diff.blocks[b].ignored);
-        // A selection over several lines selects their rows, for copying them to another side.
         self.sel_anchor =
-            (c.anchor.0 != c.pos.0).then(|| self.diff.row_of_line(c.pane, c.anchor.0));
+            (anchor_line != pos_line).then(|| self.diff.row_of_line(c.pane, anchor_line));
+    }
+
+    /// What *Copy text* in the context menu of row `r` of pane `p` copies: the text caret's
+    /// selection when the menu is on its lines, else the selected rows when the menu is on
+    /// them, else the line clicked.
+    fn menu_copy_text(&self, r: usize, p: usize) -> Option<String> {
+        let line = self.diff.rows.get(r).and_then(|row| row.line(p));
+        let on_caret = self.caret().is_some_and(|c| {
+            let (a, b) = c.range();
+            c.pane == p && c.has_selection() && line.is_some_and(|l| a.0 <= l && l <= b.0)
+        });
+        if on_caret {
+            return self.caret_text();
+        }
+        match self.selection() {
+            Some((a, b)) if (a..=b).contains(&r) && p == self.active_pane => self.selected_text(p),
+            _ => line.map(|l| self.panes[p].doc.lines[l].clone()),
+        }
     }
 
     /// The selected text of the caret's pane, with the document's line ending between lines.
@@ -2807,20 +3566,36 @@ impl TextView {
         if c.pane >= self.n() || self.matching() || !self.writable(c.pane) {
             return;
         }
+        if let Some(state) = self.caret.as_mut().filter(|s| s.batch.is_some()) {
+            // One of several carets: the caller makes the undo step once for all of them.
+            let (a, b) = c.range();
+            let pos = f(&mut self.panes[c.pane].doc.lines, a, b);
+            state.at = Caret {
+                pos,
+                anchor: pos,
+                want: None,
+                ..c
+            };
+            if let Some(batch) = &mut state.batch {
+                batch.changed = true;
+                batch.typing &= typing;
+            }
+            return;
+        }
         let joins = typing && self.typing_group && !self.undo.is_empty();
         if !joins {
             self.push_undo();
         }
         let (a, b) = c.range();
         let pos = f(&mut self.panes[c.pane].doc.lines, a, b);
-        if joins {
+        if typing {
             // The lines stay where they were, so bookmarks and synchronization points do too.
             self.invalidate_review();
             let pane = &mut self.panes[c.pane];
             pane.doc.modified = true;
             pane.hl_dirty = true;
             self.redo.clear();
-            self.rediff();
+            self.rediff_soon();
         } else {
             self.mark_changed(&[c.pane]);
         }
@@ -2836,6 +3611,18 @@ impl TextView {
         }
         let typing = !c.has_selection() && !text.contains(['\n', '\r']);
         self.caret_edit(typing, |lines, a, b| {
+            let at = edit::remove(lines, a, b);
+            edit::insert(lines, at, text)
+        });
+    }
+
+    /// Pastes `text` at the caret, over the selection, as an undo step of its own.
+    pub fn caret_paste(&mut self, text: &str) {
+        let Some(c) = self.caret() else { return };
+        if text.is_empty() && !c.has_selection() {
+            return;
+        }
+        self.caret_edit(false, |lines, a, b| {
             let at = edit::remove(lines, a, b);
             edit::insert(lines, at, text)
         });
@@ -2859,50 +3646,185 @@ impl TextView {
 
     /// Backspace (`forward` false) or Delete: removes the selection, or the character before
     /// or after the caret, joining lines at their ends.
-    fn caret_delete(&mut self, forward: bool) {
-        let Some(c) = self.caret() else { return };
+    /// Backspace (`forward` false) or Delete at the caret: the selection, or else one character,
+    /// or with `word` the word up to the caret (or after it), as one undo step.
+    fn caret_delete(&mut self, forward: bool, word: bool) {
+        let carets = self.carets();
+        let Some(c) = carets.first() else { return };
         let lines = &self.panes[c.pane].doc.lines;
-        let (a, b) = if c.has_selection() {
-            c.range()
-        } else if forward {
-            (c.pos, edit::after(lines, c.pos))
-        } else {
-            (edit::before(lines, c.pos), c.pos)
-        };
-        if a == b {
-            return;
-        }
-        let typing = !c.has_selection() && a.0 == b.0;
-        self.caret_edit(typing, move |lines, _, _| edit::remove(lines, a, b));
+        let ranges: Vec<_> = carets
+            .iter()
+            .map(|c| {
+                if c.has_selection() {
+                    c.range()
+                } else if forward && word {
+                    (c.pos, edit::word_right(lines, c.pos))
+                } else if forward {
+                    (c.pos, edit::after(lines, c.pos))
+                } else if word {
+                    (edit::word_left(lines, c.pos), c.pos)
+                } else {
+                    (edit::before(lines, c.pos), c.pos)
+                }
+            })
+            .collect();
+        let typing = !word
+            && carets.iter().all(|c| !c.has_selection())
+            && ranges.iter().all(|(a, b)| a.0 == b.0);
+        self.delete_at_carets(ranges, typing);
     }
 
-    /// Copy or Cut at the caret: the selection, or with none the whole line.
-    fn caret_copy(&mut self, ctx: &egui::Context, cut: bool) {
-        let Some(c) = self.caret() else { return };
-        if let Some(text) = self.caret_text() {
-            ctx.copy_text(text);
-            if cut {
-                self.caret_delete(false);
+    /// Deletes ranges computed against the original text, merging overlaps before editing.
+    /// Each caret lands at the start of its range, moved through every deletion. In particular,
+    /// overlapping word deletes and whole-line cuts never consume text that moved into place.
+    fn delete_at_carets(&mut self, ranges: Vec<(edit::Pos, edit::Pos)>, typing: bool) {
+        let carets = self.carets();
+        let Some(c) = carets.first() else { return };
+        let pane = c.pane;
+        if self.matching() || !self.writable(pane) {
+            return;
+        }
+        let mut merged: Vec<(edit::Pos, edit::Pos)> = Vec::new();
+        let mut ordered: Vec<_> = ranges.iter().copied().filter(|(a, b)| a < b).collect();
+        ordered.sort_unstable();
+        for (a, b) in ordered {
+            match merged.last_mut() {
+                Some((_, end)) if a <= *end => *end = (*end).max(b),
+                _ => merged.push((a, b)),
             }
+        }
+        if merged.is_empty() {
             return;
         }
+        let joins = typing && self.typing_group && !self.undo.is_empty();
+        if !joins {
+            self.push_undo();
+        }
+        let mut positions: Vec<_> = ranges.iter().map(|&(a, _)| a).collect();
+        for (a, b) in merged.into_iter().rev() {
+            edit::remove(&mut self.panes[pane].doc.lines, a, b);
+            for pos in &mut positions {
+                *pos = if *pos < a {
+                    *pos
+                } else if *pos <= b {
+                    a
+                } else if pos.0 == b.0 {
+                    (a.0, a.1 + pos.1 - b.1)
+                } else {
+                    (pos.0 - (b.0 - a.0), pos.1)
+                };
+            }
+        }
+        if typing {
+            self.invalidate_review();
+            let p = &mut self.panes[pane];
+            p.doc.modified = true;
+            p.hl_dirty = true;
+            self.redo.clear();
+            self.rediff_soon();
+        } else {
+            self.mark_changed(&[pane]);
+        }
+        self.set_carets(
+            carets
+                .iter()
+                .zip(positions)
+                .enumerate()
+                .map(|(i, (c, pos))| {
+                    (
+                        Caret {
+                            pos,
+                            anchor: pos,
+                            want: None,
+                            ..*c
+                        },
+                        i == 0,
+                    )
+                })
+                .collect(),
+        );
+        self.typing_group = typing;
+    }
+
+    /// Copy or Cut at the carets: their selections, or with none their whole lines. Read every
+    /// piece before editing, and copy a whole line only once when several carets are on it.
+    fn caret_copy(&mut self, ctx: &egui::Context, cut: bool) {
+        let mut carets = self.carets();
+        let Some(c) = carets.first() else { return };
         let doc = &self.panes[c.pane].doc;
-        let Some(line) = doc.lines.get(c.pos.0) else {
-            return;
-        };
-        ctx.copy_text(format!("{line}{}", doc.eol.as_str()));
-        if cut {
-            let l = c.pos.0;
-            let n = doc.lines.len();
-            let (a, b) = if l + 1 < n {
-                ((l, 0), (l + 1, 0))
-            } else if l > 0 {
-                ((l - 1, doc.lines[l - 1].len()), (l, line.len()))
-            } else {
-                ((l, 0), (l, line.len()))
-            };
-            self.caret_edit(false, move |lines, _, _| edit::remove(lines, a, b));
+        let eol = doc.eol.as_str();
+        carets.sort_by_key(Caret::range);
+        let mut pieces = Vec::new();
+        let mut whole_lines = std::collections::BTreeSet::new();
+        for c in &carets {
+            if c.has_selection() {
+                let (a, b) = c.range();
+                pieces.push((edit::text_between(&doc.lines, a, b, eol), false));
+            } else if whole_lines.insert(c.pos.0) {
+                if let Some(line) = doc.lines.get(c.pos.0) {
+                    pieces.push((format!("{line}{eol}"), true));
+                }
+            }
         }
+        let text = if pieces.iter().all(|(_, line)| *line) {
+            pieces.iter().map(|(t, _)| t.as_str()).collect::<String>()
+        } else {
+            pieces
+                .iter()
+                .map(|(t, line)| {
+                    if *line {
+                        t.strip_suffix(eol).unwrap_or(t)
+                    } else {
+                        t
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(eol)
+        };
+        if !pieces.is_empty() {
+            ctx.copy_text(text);
+        }
+        if cut {
+            // Keep the primary-first order for mapping the resulting carets and undo state.
+            let ranges = self
+                .carets()
+                .iter()
+                .map(|c| {
+                    if c.has_selection() {
+                        c.range()
+                    } else {
+                        let (mut first, mut last) = (c.pos.0, c.pos.0);
+                        while first > 0 && whole_lines.contains(&(first - 1)) {
+                            first -= 1;
+                        }
+                        while whole_lines.contains(&(last + 1)) {
+                            last += 1;
+                        }
+                        if last + 1 < doc.lines.len() {
+                            ((first, 0), (last + 1, 0))
+                        } else {
+                            let start = if first > 0 {
+                                (first - 1, doc.lines[first - 1].len())
+                            } else {
+                                (0, 0)
+                            };
+                            (start, (last, doc.lines.get(last).map_or(0, String::len)))
+                        }
+                    }
+                })
+                .collect();
+            self.delete_at_carets(ranges, false);
+        }
+    }
+
+    /// Paste at the carets: with as many lines as carets, one line at each, else all of `text`
+    /// at each, as one undo step.
+    fn paste_at_carets(&mut self, text: &str) {
+        let (lines, ..) = text::split_lines(text);
+        self.at_each_caret(|v, i, count| match lines.get(i) {
+            Some(line) if count > 1 && lines.len() == count => v.caret_paste(line),
+            _ => v.caret_paste(text),
+        });
     }
 
     /// Moves the caret to `pos`, extending the selection with Shift.
@@ -2913,8 +3835,109 @@ impl TextView {
     }
 
     /// Moves the caret `delta` lines up or down, keeping its column.
+    /// The display columns lines wrap at, or 0 when they do not wrap.
+    fn wrap_cols(&self) -> usize {
+        self.layout.key.map_or(0, |k| k.0)
+    }
+
+    /// The wrapped display lines of `line` of `pane`, by the display column each starts at.
+    fn wrap_starts_of(&self, pane: usize, line: usize) -> Vec<usize> {
+        let cols = self.wrap_cols();
+        match self.panes[pane].doc.lines.get(line) {
+            Some(t) if cols > 0 => wrap_starts(t, self.tab_size, cols),
+            _ => vec![0],
+        }
+    }
+
+    /// The bytes of `line` of `pane` that its wrapped display line `seg` shows: from its start
+    /// to its last place before the next display line (its end, for the last one).
+    fn wrap_span(&self, pane: usize, line: usize, starts: &[usize], seg: usize) -> (usize, usize) {
+        let text = self.panes[pane]
+            .doc
+            .lines
+            .get(line)
+            .map_or("", String::as_str);
+        let tab = self.tab_size;
+        let start = wrap_byte(text, tab, starts[seg]);
+        let end = match starts.get(seg + 1) {
+            Some(&next) => edit::char_before(text, wrap_byte(text, tab, next)).max(start),
+            None => text.len(),
+        };
+        (start, end)
+    }
+
+    /// Which wrapped display line of its line the caret is on (0 without wrapping).
+    fn caret_segment(&self, c: &Caret) -> usize {
+        let Some(text) = self.panes[c.pane].doc.lines.get(c.pos.0) else {
+            return 0;
+        };
+        let starts = self.wrap_starts_of(c.pane, c.pos.0);
+        wrap_segment(&starts, wrap_col(text, self.tab_size, c.pos.1))
+    }
+
+    /// Home and End (⌘← and ⌘→ on macOS) on a wrapped line: the start or the end of the
+    /// caret's display line, when the caret is not there yet and that is not the line's own.
+    fn caret_row_edge(&self, c: &Caret, end: bool) -> Option<edit::Pos> {
+        let starts = self.wrap_starts_of(c.pane, c.pos.0);
+        let seg = self.caret_segment(c);
+        let (a, b) = self.wrap_span(c.pane, c.pos.0, &starts, seg);
+        let (to, own) = if end {
+            (b, seg + 1 == starts.len())
+        } else {
+            (a, seg == 0)
+        };
+        (!own && c.pos.1 != to).then_some((c.pos.0, to))
+    }
+
+    /// Up and Down by `delta` display lines of wrapped text, keeping the column within them.
+    fn caret_rows(&mut self, c: Caret, delta: isize, extend: bool) {
+        let (pane, tab) = (c.pane, self.tab_size);
+        let doc_lines = self.panes[pane].doc.lines.len();
+        let text = |v: &Self, l: usize| v.panes[pane].doc.lines.get(l).cloned().unwrap_or_default();
+        let (mut l, mut starts) = (c.pos.0, self.wrap_starts_of(pane, c.pos.0));
+        let mut seg = self.caret_segment(&c);
+        let want = c
+            .want
+            .unwrap_or_else(|| wrap_col(&text(self, l), tab, c.pos.1) - starts[seg]);
+        let mut moved = 0;
+        for _ in 0..delta.unsigned_abs() {
+            if delta > 0 && seg + 1 < starts.len() {
+                seg += 1;
+            } else if delta > 0 && l + 1 < doc_lines {
+                l += 1;
+                starts = self.wrap_starts_of(pane, l);
+                seg = 0;
+            } else if delta < 0 && seg > 0 {
+                seg -= 1;
+            } else if delta < 0 && l > 0 {
+                l -= 1;
+                starts = self.wrap_starts_of(pane, l);
+                seg = starts.len() - 1;
+            } else {
+                break;
+            }
+            moved += 1;
+        }
+        let pos = if moved == 0 {
+            // Past the first or last display line: to its start or end.
+            let len = text(self, l).len();
+            (l, if delta > 0 { len } else { 0 })
+        } else {
+            let (a, b) = self.wrap_span(pane, l, &starts, seg);
+            let at = wrap_byte(&text(self, l), tab, starts[seg] + want);
+            (l, at.clamp(a, b))
+        };
+        self.place_caret(pane, pos, extend);
+        if let Some(c) = &mut self.caret {
+            c.at.want = Some(want);
+        }
+    }
+
     fn caret_lines(&mut self, delta: isize, extend: bool) {
         let Some(c) = self.caret() else { return };
+        if self.wrap_cols() > 0 {
+            return self.caret_rows(c, delta, extend);
+        }
         let lines = &self.panes[c.pane].doc.lines;
         let tab = self.tab_size;
         let want = c.want.unwrap_or_else(|| {
@@ -2943,7 +3966,7 @@ impl TextView {
     fn caret_keys(&mut self, ui: &Ui) -> bool {
         let Some(c) = self.caret() else { return false };
         if c.pane >= self.n() || self.table_mode {
-            self.caret = None;
+            self.drop_carets();
             return false;
         }
         let mut inputs = Vec::new();
@@ -2988,10 +4011,10 @@ impl TextView {
                 CaretInput::Text(t) => {
                     let t: String = t.chars().filter(|c| !c.is_control()).collect();
                     if !t.is_empty() {
-                        self.caret_insert(&t);
+                        self.at_each_caret(|v, _, _| v.caret_insert(&t));
                     }
                 }
-                CaretInput::Paste(t) => self.caret_insert(&t),
+                CaretInput::Paste(t) => self.paste_at_carets(&t),
                 CaretInput::Copy => self.caret_copy(ui.ctx(), false),
                 CaretInput::Cut => self.caret_copy(ui.ctx(), true),
                 CaretInput::Key(key, m) => self.caret_key_pressed(key, m),
@@ -3001,22 +4024,70 @@ impl TextView {
     }
 
     /// Whether the caret takes `key` with modifiers `m`. Alt combinations stay with the
-    /// difference commands.
+    /// difference commands, except the word keys of macOS (Option with Left, Right, Backspace
+    /// and Delete).
     fn caret_key(key: Key, m: Modifiers) -> bool {
+        Self::caret_key_on(MAC, key, m)
+    }
+
+    /// [`Self::caret_key`] on macOS (`mac`) or on Windows and Linux, for tests of both.
+    fn caret_key_on(mac: bool, key: Key, m: Modifiers) -> bool {
+        // Ctrl+Alt+Up and Down (⌘⌥ on macOS) add a caret above or below.
+        if m.alt && m.command && matches!(key, Key::ArrowUp | Key::ArrowDown) {
+            return true;
+        }
         if m.alt {
-            return false;
+            return mac
+                && !m.mac_cmd
+                && !m.ctrl
+                && matches!(
+                    key,
+                    Key::ArrowLeft | Key::ArrowRight | Key::Backspace | Key::Delete
+                );
         }
         match key {
             Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown => true,
             Key::Home | Key::End | Key::PageUp | Key::PageDown => true,
-            Key::Enter | Key::Tab => !m.command && !m.shift,
-            Key::Backspace | Key::Delete | Key::Escape => !m.command,
+            Key::Enter => !m.command && !m.shift,
+            // Shift+Tab outdents the caret's lines
+            Key::Tab => !m.command,
+            // Ctrl+Backspace and Ctrl+Delete remove a word, but on macOS ⌘ stays with the menus
+            Key::Backspace | Key::Delete => !m.command || !mac,
+            Key::Escape => !m.command,
             Key::A => m.command && !m.shift,
             _ => false,
         }
     }
 
     fn caret_key_pressed(&mut self, key: Key, m: Modifiers) {
+        self.caret_key_pressed_on(MAC, key, m);
+    }
+
+    /// [`Self::caret_key_pressed`] on macOS (`mac`) or on Windows and Linux, for tests of both.
+    fn caret_key_pressed_on(&mut self, mac: bool, key: Key, m: Modifiers) {
+        if m.alt && m.command && matches!(key, Key::ArrowUp | Key::ArrowDown) {
+            return self.add_caret_line(key == Key::ArrowDown);
+        }
+        if self.multi_caret() {
+            match key {
+                // Escape first goes back to the primary caret, with its selection.
+                Key::Escape => return self.single_caret(),
+                Key::A if m.command => self.single_caret(),
+                Key::Backspace | Key::Delete => {
+                    return self.caret_delete(key == Key::Delete, word_key_on(mac, m));
+                }
+                Key::Tab if m.shift => return self.caret_indent(true),
+                Key::Tab if self.carets().iter().any(|c| self.tab_indents(c)) => {
+                    return self.caret_indent(false)
+                }
+                _ => return self.at_each_caret(|v, _, _| v.caret_key_one(mac, key, m)),
+            }
+        }
+        self.caret_key_one(mac, key, m);
+    }
+
+    /// One caret's key, for [`Self::caret_key_pressed_on`].
+    fn caret_key_one(&mut self, mac: bool, key: Key, m: Modifiers) {
         let Some(c) = self.caret() else { return };
         let lines = &self.panes[c.pane].doc.lines;
         let shift = m.shift;
@@ -3027,9 +4098,18 @@ impl TextView {
         let line_len = lines.get(c.pos.0).map_or(0, String::len);
         // Left and Right first end a selection at its side.
         let (start, stop) = c.range();
+        let word = word_key_on(mac, m);
         match key {
-            Key::ArrowLeft if m.mac_cmd => self.caret_to((c.pos.0, 0), shift),
-            Key::ArrowRight if m.mac_cmd => self.caret_to((c.pos.0, line_len), shift),
+            Key::ArrowLeft if word => self.caret_to(edit::word_left(lines, c.pos), shift),
+            Key::ArrowRight if word => self.caret_to(edit::word_right(lines, c.pos), shift),
+            Key::ArrowLeft if m.mac_cmd => {
+                let to = self.caret_row_edge(&c, false).unwrap_or((c.pos.0, 0));
+                self.caret_to(to, shift);
+            }
+            Key::ArrowRight if m.mac_cmd => {
+                let to = self.caret_row_edge(&c, true).unwrap_or((c.pos.0, line_len));
+                self.caret_to(to, shift);
+            }
             Key::ArrowUp if m.mac_cmd => self.caret_to((0, 0), shift),
             Key::ArrowDown if m.mac_cmd => self.caret_to(end, shift),
             Key::ArrowLeft if c.has_selection() && !shift => self.caret_to(start, false),
@@ -3049,24 +4129,32 @@ impl TextView {
             Key::Home if m.command => self.caret_to((0, 0), shift),
             Key::End if m.command => self.caret_to(end, shift),
             Key::Home => {
-                // To the first character that is not a space, then to the line start.
+                // On a wrapped line, to the start of the display line first; then to the
+                // first character that is not a space, then to the line start.
                 let indent = lines
                     .get(c.pos.0)
                     .map_or(0, |t| t.len() - t.trim_start_matches([' ', '\t']).len());
                 let to = if c.pos.1 == indent { 0 } else { indent };
-                self.caret_to((c.pos.0, to), shift);
+                let to = self.caret_row_edge(&c, false).unwrap_or((c.pos.0, to));
+                self.caret_to(to, shift);
             }
-            Key::End => self.caret_to((c.pos.0, line_len), shift),
+            Key::End => {
+                // On a wrapped line, to the end of the display line first, then the line's.
+                let to = self.caret_row_edge(&c, true).unwrap_or((c.pos.0, line_len));
+                self.caret_to(to, shift);
+            }
             Key::Enter => self.caret_newline(),
+            Key::Tab if shift => self.caret_indent(true),
+            Key::Tab if self.tab_indents(&c) => self.caret_indent(false),
             Key::Tab => self.caret_insert("\t"),
-            Key::Backspace => self.caret_delete(false),
-            Key::Delete => self.caret_delete(true),
+            Key::Backspace => self.caret_delete(false, word),
+            Key::Delete => self.caret_delete(true, word),
             Key::A => {
                 self.place_caret(c.pane, (0, 0), false);
                 self.place_caret(c.pane, end, true);
             }
             Key::Escape if c.has_selection() => self.caret_to(c.pos, false),
-            Key::Escape => self.caret = None,
+            Key::Escape => self.drop_carets(),
             _ => {}
         }
     }
@@ -3233,15 +4321,21 @@ impl TextView {
         if doc.read_only {
             anyhow::bail!("{}", tr("msg.readonly"));
         }
-        if doc.path.is_none() {
-            let Some(path) = rfd::FileDialog::new()
-                .set_title(tr("dlg.save_as"))
-                .save_file()
-            else {
-                return Ok(false);
-            };
-            doc.path = Some(path);
-        }
+        let path = match doc.path.clone() {
+            Some(path) => path,
+            None => {
+                let Some(path) = rfd::FileDialog::new()
+                    .set_title(tr("dlg.save_as"))
+                    .save_file()
+                else {
+                    return Ok(false);
+                };
+                path
+            }
+        };
+        // A file read-only on disk is refused before the pane takes its name.
+        text::refuse_read_only(&path)?;
+        doc.path = Some(path);
         doc.save()?;
         self.status = trf("msg.saved", &[("file", doc.title())]);
         self.saved(p);
@@ -3254,6 +4348,8 @@ impl TextView {
         pane.saves += 1;
         pane.disk_time = disk_time(&pane.doc);
         self.disk_changed.retain(|&c| c != p);
+        // Typing after a save is a new undo step, so that undo can stop at the saved text.
+        self.typing_group = false;
     }
 
     /// Reacts to files changed by another program: unmodified panes are reloaded, and panes with
@@ -3297,6 +4393,7 @@ impl TextView {
             }
         }
         if !reloaded.is_empty() {
+            self.typing_group = false;
             self.rediff();
             self.status = trf("msg.reloaded", &[("file", reloaded.join(", "))]);
         }
@@ -3308,6 +4405,7 @@ impl TextView {
     /// Replaces the listed panes with the file contents on disk, discarding their edits (undoable).
     fn reload_changed(&mut self) {
         let panes = std::mem::take(&mut self.disk_changed);
+        self.hold_view();
         self.push_undo();
         for p in panes {
             let pane = &mut self.panes[p];
@@ -3323,9 +4421,10 @@ impl TextView {
                     pane.saves += 1;
                     pane.disk_time = disk_time(&pane.doc);
                     pane.reset_baseline();
-                    // Bookmarks and synchronization points stay with their lines.
+                    // Bookmarks, synchronization points and the view stay with their lines.
                     self.remap_bookmarks(p, &before);
                     self.remap_sync_points(p, &before);
+                    self.remap_view(p, &before);
                 }
                 Err(e) => self.status = e.to_string(),
             }
@@ -3347,6 +4446,7 @@ impl TextView {
         let Some(path) = dlg.save_file() else {
             return Ok(false);
         };
+        text::refuse_read_only(&path)?;
         self.panes[p].original = None;
         let doc = &mut self.panes[p].doc;
         doc.save_as(&path)?;
@@ -3378,10 +4478,23 @@ impl TextView {
                 d.read_only = old.read_only;
                 d.compare_only = old.compare_only;
                 d.description = old.description.clone();
-                self.panes[p].doc = d;
-                self.panes[p].hl_dirty = true;
-                self.panes[p].disk_time = disk_time(&self.panes[p].doc);
-                self.panes[p].reset_baseline();
+                let format = format_of(old);
+                self.hold_view();
+                if !d.read_only {
+                    // Reading the file again discards its edits, which undo brings back.
+                    self.push_undo();
+                    self.undo.last_mut().unwrap().formats[p] = Some(format);
+                }
+                let before = std::mem::replace(&mut self.panes[p].doc, d).lines;
+                let pane = &mut self.panes[p];
+                pane.hl_dirty = true;
+                pane.saves += 1;
+                pane.disk_time = disk_time(&pane.doc);
+                pane.reset_baseline();
+                self.remap_bookmarks(p, &before);
+                self.remap_sync_points(p, &before);
+                self.remap_view(p, &before);
+                self.invalidate_review();
                 self.rediff();
             }
             Err(e) => self.status = e.to_string(),
@@ -3411,6 +4524,7 @@ impl TextView {
             }
             let _ = p.reload();
         }
+        self.typing_group = false;
         if before.is_some_and(|(options, digests)| {
             options != self.opts
                 || digests
@@ -3702,9 +4816,119 @@ impl TextView {
             .collect()
     }
 
+    /// What one level of indentation is in `pane`: a tab when the file indents more lines with
+    /// tabs than with spaces, and otherwise the tab size in spaces.
+    fn indent_unit(&self, pane: usize) -> String {
+        let doc = &self.panes[pane].doc;
+        let (tabs, spaces) = doc.lines.iter().take(5000).fold((0, 0), |(t, s), l| {
+            (
+                t + l.starts_with('\t') as usize,
+                s + l.starts_with(' ') as usize,
+            )
+        });
+        if tabs > spaces {
+            "\t".to_string()
+        } else {
+            " ".repeat(self.tab_size.max(1))
+        }
+    }
+
+    /// `line` indented by `unit`, or outdented by one level (a leading tab, or up to the tab
+    /// size in spaces), and the bytes added or removed at its start. A blank line is not
+    /// indented, so that indenting adds no trailing spaces.
+    fn indent_line(line: &str, outdent: bool, unit: &str, tab: usize) -> (String, usize) {
+        if outdent {
+            let cut = if line.starts_with('\t') {
+                1
+            } else {
+                (line.len() - line.trim_start_matches(' ').len()).min(tab.max(1))
+            };
+            (line[cut..].to_string(), cut)
+        } else if line.trim().is_empty() {
+            (line.to_string(), 0)
+        } else {
+            (format!("{unit}{line}"), unit.len())
+        }
+    }
+
+    /// Whether Tab at the caret indents its lines rather than typing a tab: when the selection
+    /// goes over more than one line, or is a whole line.
+    fn tab_indents(&self, c: &Caret) -> bool {
+        let (a, b) = c.range();
+        let len = self.panes[c.pane].doc.lines.get(a.0).map_or(0, String::len);
+        b.0 > a.0 || (a.1 == 0 && b.1 == len && len > 0 && a != b)
+    }
+
+    /// Tab (indent) or Shift+Tab (`outdent`) at the caret: the lines of the selection, or the
+    /// caret's line, as one undo step; a selection ending at the start of a line leaves that
+    /// line alone. Both ends of the selection move with the indentation of their lines, so
+    /// outdenting right after indenting gives back the same text and selection.
+    fn caret_indent(&mut self, outdent: bool) {
+        let carets = self.carets();
+        let Some(&c) = carets.first() else { return };
+        if c.pane >= self.n() || self.matching() || !self.writable(c.pane) {
+            return;
+        }
+        let (unit, tab) = (self.indent_unit(c.pane), self.tab_size);
+        let doc = &self.panes[c.pane].doc;
+        let top = doc.lines.len().saturating_sub(1);
+        // The lines of every caret, each once.
+        let mut wanted: Vec<usize> = carets
+            .iter()
+            .flat_map(|k| {
+                let (a, b) = k.range();
+                let last = if b.0 > a.0 && b.1 == 0 { b.0 - 1 } else { b.0 };
+                a.0..=last.min(top)
+            })
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let changed: Vec<(usize, String, usize)> = wanted
+            .into_iter()
+            .filter_map(|l| {
+                let (text, n) = Self::indent_line(doc.lines.get(l)?, outdent, &unit, tab);
+                (n > 0).then_some((l, text, n))
+            })
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        self.push_undo();
+        for (l, text, _) in &changed {
+            self.panes[c.pane].doc.lines[*l] = text.clone();
+        }
+        self.mark_changed(&[c.pane]);
+        let moved = |(l, at): edit::Pos| match changed.iter().find(|(cl, ..)| *cl == l) {
+            Some(&(_, _, n)) if outdent => (l, at.saturating_sub(n)),
+            Some(&(_, _, n)) if at > 0 => (l, at + n),
+            _ => (l, at),
+        };
+        let list = carets
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let k = Caret {
+                    pos: moved(k.pos),
+                    anchor: moved(k.anchor),
+                    want: None,
+                    ..*k
+                };
+                (k, i == 0)
+            })
+            .collect();
+        self.set_carets(list);
+    }
+
     /// Indents (or outdents) the active pane's lines in the selected rows, or on the cursor
     /// row, by a tab when the file indents with tabs and by the tab size in spaces otherwise.
+    /// With the text caret in the pane, its lines are the ones indented.
     pub fn indent(&mut self, outdent: bool) {
+        if self.shows_inline() {
+            return;
+        }
+        if self.caret().is_some_and(|c| c.pane == self.active_pane) {
+            return self.caret_indent(outdent);
+        }
         let p = self.active_pane;
         let Some((r0, r1)) = self.selection().or_else(|| self.cursor_row.map(|r| (r, r))) else {
             return;
@@ -3719,36 +4943,11 @@ impl TextView {
         if !self.writable(p) {
             return;
         }
-        let tab = self.tab_size.max(1);
+        let (unit, tab) = (self.indent_unit(p), self.tab_size);
         let doc = &self.panes[p].doc;
-        let (tabs, spaces) = doc.lines.iter().take(5000).fold((0, 0), |(t, s), l| {
-            (
-                t + l.starts_with('\t') as usize,
-                s + l.starts_with(' ') as usize,
-            )
-        });
-        let unit = if tabs > spaces {
-            "\t".to_string()
-        } else {
-            " ".repeat(tab)
-        };
         let changed: Vec<String> = lines
             .iter()
-            .map(|&l| {
-                let line = &doc.lines[l];
-                if outdent {
-                    let cut = if line.starts_with('\t') {
-                        1
-                    } else {
-                        line.len() - line.trim_start_matches(' ').len()
-                    };
-                    line[cut.min(tab)..].to_string()
-                } else if line.trim().is_empty() {
-                    line.clone()
-                } else {
-                    format!("{unit}{line}")
-                }
-            })
+            .map(|&l| Self::indent_line(&doc.lines[l], outdent, &unit, tab).0)
             .collect();
         if lines.iter().zip(&changed).all(|(&l, c)| doc.lines[l] == *c) {
             return;
@@ -3766,6 +4965,158 @@ impl TextView {
         let (anchor, cursor) = if forward { (a, b) } else { (b, a) };
         self.sel_anchor = (r0 != r1).then_some(anchor);
         self.cursor_row = Some(cursor);
+    }
+
+    /// The lines the line commands act on, as their pane and runs of lines (first, last), in
+    /// order and apart: with the text caret in the active pane, the lines of each caret's
+    /// selection (one ending at the start of a line leaves that line out) or its line;
+    /// otherwise the active pane's lines in the selected rows, or on the cursor row.
+    fn command_lines(&self) -> Option<(usize, Vec<(usize, usize)>)> {
+        let carets = self.carets();
+        if let Some(c) = carets.first().filter(|c| c.pane == self.active_pane) {
+            let mut runs: Vec<(usize, usize)> = carets
+                .iter()
+                .map(|k| {
+                    let (a, b) = k.range();
+                    (a.0, if b.0 > a.0 && b.1 == 0 { b.0 - 1 } else { b.0 })
+                })
+                .collect();
+            runs.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+            for (f, l) in runs {
+                match merged.last_mut() {
+                    // Next to each other: moving them apart would swap their lines.
+                    Some(last) if f <= last.1 + 1 => last.1 = last.1.max(l),
+                    _ => merged.push((f, l)),
+                }
+            }
+            return Some((c.pane, merged));
+        }
+        let p = self.active_pane;
+        let (r0, r1) = self
+            .selection()
+            .or_else(|| self.cursor_row.map(|r| (r, r)))?;
+        let mut lines = self
+            .diff
+            .rows
+            .get(r0..=r1)?
+            .iter()
+            .filter_map(|r| r.line(p));
+        let first = lines.next()?;
+        Some((p, vec![(first, lines.next_back().unwrap_or(first))]))
+    }
+
+    /// Duplicate lines: puts a copy of the lines of [`Self::command_lines`] under them and selects
+    /// the copy, as one undo step.
+    pub fn duplicate_lines(&mut self) {
+        self.line_command(None);
+    }
+
+    /// Move lines up (`up`) or down: moves the lines of [`Self::command_lines`] past the line
+    /// next to them, with their selection, as one undo step.
+    pub fn move_lines(&mut self, up: bool) {
+        self.line_command(Some(up));
+    }
+
+    /// Duplicates the runs of [`Self::command_lines`] (`moving` `None`), or moves them up or
+    /// down; a move none of them can make changes nothing.
+    fn line_command(&mut self, moving: Option<bool>) {
+        if self.shows_inline() || self.matching() {
+            return;
+        }
+        let Some((p, runs)) = self.command_lines() else {
+            return;
+        };
+        let len = self.panes[p].doc.lines.len();
+        if runs.last().is_none_or(|&(_, l)| l >= len) || !self.writable(p) {
+            return;
+        }
+        let mut lines = self.panes[p].doc.lines.clone();
+        // How far down each run's selection goes.
+        let shifts: Vec<isize> = match moving {
+            None => {
+                for &(f, l) in runs.iter().rev() {
+                    edit::duplicate_lines(&mut lines, f, l);
+                }
+                let mut total = 0;
+                runs.iter()
+                    .map(|&(f, l)| {
+                        total += (l - f + 1) as isize;
+                        total
+                    })
+                    .collect()
+            }
+            Some(up) => {
+                let blocked = if up {
+                    runs[0].0 == 0
+                } else {
+                    runs[runs.len() - 1].1 + 1 >= len
+                };
+                if blocked {
+                    return;
+                }
+                for &(f, l) in &runs {
+                    edit::move_lines(&mut lines, f, l, up);
+                }
+                vec![if up { -1 } else { 1 }; runs.len()]
+            }
+        };
+        let carets: Vec<Caret> = self.carets().into_iter().filter(|c| c.pane == p).collect();
+        let forward = self.sel_anchor.is_none_or(|a| Some(a) <= self.cursor_row);
+        self.push_undo();
+        self.panes[p].doc.lines = lines;
+        self.mark_changed(&[p]);
+        let shift_of = |l: usize| {
+            let i = runs
+                .iter()
+                .position(|&(_, last)| l <= last)
+                .unwrap_or(runs.len() - 1);
+            shifts[i]
+        };
+        if carets.is_empty() {
+            let (first, last) = runs[0];
+            let a = self
+                .diff
+                .row_of_line(p, first.saturating_add_signed(shifts[0]));
+            let b = self
+                .diff
+                .row_of_line(p, last.saturating_add_signed(shifts[0]));
+            let (anchor, cursor) = if forward { (a, b) } else { (b, a) };
+            self.sel_anchor = (a != b).then_some(anchor);
+            self.cursor_row = Some(cursor);
+            self.scroll_to = Some(cursor);
+            return;
+        }
+        // A selection that ended at the start of the line under its lines ends at the end of the
+        // file once they are the last lines.
+        let doc = &self.panes[p].doc.lines;
+        let end = doc
+            .len()
+            .checked_sub(1)
+            .map_or((0, 0), |l| (l, doc[l].len()));
+        let list = carets
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let by = shift_of(c.range().0 .0);
+                let to = |(l, at): edit::Pos| {
+                    let l = l.saturating_add_signed(by);
+                    if l > end.0 {
+                        end
+                    } else {
+                        (l, at)
+                    }
+                };
+                let k = Caret {
+                    pos: to(c.pos),
+                    anchor: to(c.anchor),
+                    want: None,
+                    ..*c
+                };
+                (k, i == 0)
+            })
+            .collect();
+        self.set_carets(list);
     }
 
     // ---------- find ----------
@@ -3786,11 +5137,11 @@ impl TextView {
             return None;
         }
         let key = self.find.key();
-        if self.find_re.as_ref().map(|(k, _)| k) != Some(&key) {
+        if self.find_re.as_deref().map(|(k, _)| k) != Some(&key) {
             let re = find_regex(&key.0, key.1, key.2, key.3).map_err(|e| e.to_string());
-            self.find_re = Some((key, re));
+            self.find_re = Some(Box::new((key, re)));
         }
-        self.find_re.as_ref().map(|(_, re)| re.clone())
+        self.find_re.as_deref().map(|(_, re)| re.clone())
     }
 
     /// The compiled find query, with a status message when it is not a valid pattern.
@@ -4219,7 +5570,7 @@ impl TextView {
         if !self.find.open {
             return Vec::new();
         }
-        match &self.find_re {
+        match self.find_re.as_deref() {
             Some((key, Ok(re))) if *key == self.find.key() => re
                 .find_iter(line)
                 .filter(|m| !m.is_empty())
@@ -4653,6 +6004,41 @@ impl TextView {
             .max(1);
         // `show_rows` adds the spacing between items to each row.
         let step = row_h + ui.spacing().item_spacing.y;
+        // Enter or F2 edits the cursor line side by side, as they edit a line there.
+        let free = self.keys_enabled
+            && !widgets::typing(ui.ctx())
+            && self.goto.is_none()
+            && !widgets::modal_open(ui.ctx());
+        if free
+            && self.cursor_row.is_some()
+            && ui.input_mut(|i| {
+                i.consume_key(Modifiers::NONE, Key::Enter) | i.consume_key(Modifiers::NONE, Key::F2)
+            })
+        {
+            self.edit_side_by_side();
+            ui.ctx().request_repaint();
+            return;
+        }
+        // Read-only: say so, with the way to edit.
+        let mut to_edit = false;
+        widgets::toolbar(ui, |ui| {
+            let pal = widgets::pal(ui);
+            widgets::inline_icon(ui, Icon::Lock, pal.text_dim);
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(tr("msg.inline_read_only")).color(pal.text_dim));
+            if ui
+                .button(tr("cmd.edit_side_by_side"))
+                .on_hover_text(tr("tip.edit_side_by_side"))
+                .clicked()
+            {
+                to_edit = true;
+            }
+        });
+        if to_edit {
+            self.edit_side_by_side();
+            ui.ctx().request_repaint();
+            return;
+        }
         let moved_to = self.unified_keys(ui, &lines, step);
         let digits = self
             .panes
@@ -4701,6 +6087,7 @@ impl TextView {
             }
         }
         let mut clicked = None;
+        let mut double = false;
         let mut open = None;
         let tab = cfg.tab_size;
         let cursor_at = self.unified_cursor(&lines);
@@ -4830,7 +6217,10 @@ impl TextView {
                             StrokeKind::Inside,
                         );
                     }
-                    if resp.clicked() {
+                    if resp.double_clicked() {
+                        double = true;
+                    }
+                    if resp.clicked() || resp.double_clicked() {
                         clicked = Some((row, pane));
                     }
                 }
@@ -4851,6 +6241,10 @@ impl TextView {
             self.layout_gen += 1;
         }
         self.unified_lines = Some((key, lines));
+        if double && clicked.is_some() {
+            self.edit_side_by_side();
+            ui.ctx().request_repaint();
+        }
     }
 
     /// The index in `lines` of the cursor line: the one on the active side, or on the other
@@ -4987,10 +6381,13 @@ impl TextView {
                 self.find_next(!back);
                 r.request_focus();
             }
-            if ui.input(|i| i.key_pressed(Key::Escape))
-                && self.edit.is_none()
+            // Escape closes the find bar first, and only it: the selection and the caret stay
+            // for the next Escape.
+            if self.edit.is_none()
                 && self.goto.is_none()
                 && !widgets::modal_open(ui.ctx())
+                && !egui::Popup::is_any_open(ui.ctx())
+                && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
             {
                 self.find.open = false;
             }
@@ -5276,6 +6673,8 @@ impl TextView {
         if self.layout.key == Some(key) && self.layout.row_line.len() == rows {
             return;
         }
+        // after the comparison was computed again, the line that was at the top stays there
+        let held_top = self.held.take().and_then(|h| h.top);
         let top = self
             .layout
             .lines
@@ -5368,7 +6767,20 @@ impl TextView {
             row_line,
             panes,
         };
-        if let Some(&v) = top.and_then(|t| self.layout.row_line.get(t)) {
+        if let Some((p, l, into)) = held_top.filter(|_| rows > 0) {
+            let row = self.diff.row_of_line(p, l);
+            if let Some(&v) = self.layout.row_line.get(row) {
+                // Within the row as it is laid out now, which an edit may have made shorter.
+                let span = self
+                    .layout
+                    .row_line
+                    .get(row + 1)
+                    .map_or(self.layout.lines.len(), |&n| n)
+                    .saturating_sub(v)
+                    .max(1);
+                self.scroll = v as f32 + into.min(span as f32 - 0.001);
+            }
+        } else if let Some(&v) = top.and_then(|t| self.layout.row_line.get(t)) {
             self.scroll = v as f32 + self.scroll.fract();
         }
     }
@@ -5451,6 +6863,8 @@ impl TextView {
             || self.edit.is_some()
             || self.goto.is_some()
             || widgets::modal_open(ui.ctx())
+            // An open menu takes the keys, Escape first of all: it closes only the menu.
+            || egui::Popup::is_any_open(ui.ctx())
         {
             return;
         }
@@ -7852,6 +9266,7 @@ impl TextView {
     }
 
     pub fn ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
+        self.settle_diff_for_input(ui.ctx());
         if self.text_layout != cfg.text_layout {
             self.text_layout = cfg.text_layout;
             self.scroll_anim = None;
@@ -8021,8 +9436,27 @@ impl TextView {
         if let Some(row) = self.scroll_to.take() {
             self.reveal_row(row, wrap_cols, tab);
             if let Some(&v) = self.layout.row_line.get(row) {
-                let v = v as f32;
-                if v < self.scroll || v > self.scroll + visible - 2.0 {
+                // A caret further down a wrapped line: its own display line.
+                let seg = self
+                    .caret()
+                    .filter(|c| self.caret_reveal && self.diff.row_of_line(c.pane, c.pos.0) == row)
+                    .map_or(0, |c| self.caret_segment(&c));
+                let span = self
+                    .layout
+                    .row_line
+                    .get(row + 1)
+                    .map_or(self.layout.lines.len(), |&n| n)
+                    .saturating_sub(v)
+                    .max(1);
+                let v = (v + seg.min(span - 1)) as f32;
+                let (top, bottom) = (self.scroll, self.scroll + visible - 2.0);
+                // A caret that moved or typed just past an edge scrolls only as far as needed;
+                // a jump further away puts its line a third of the way down.
+                let near = self.caret_reveal && v > top - visible && v < bottom + visible;
+                if near && (v < top || v > bottom) {
+                    self.scroll_anim = None;
+                    self.scroll = if v < top { v } else { v - visible + 2.0 };
+                } else if v < top || v > bottom {
                     let target = v - (visible / 3.0).floor();
                     if fresh || ui.style().animation_time <= 0.0 {
                         self.scroll = target;
@@ -8168,15 +9602,32 @@ impl TextView {
                 show_ws,
             );
             let galley = ui.fonts_mut(|f| f.layout_job(job));
-            let gx = if wrap {
+            // With wrapping, the x where the display line of the point ends, if another follows.
+            let (gx, end) = if wrap {
                 let xs = segment_x(&galley, &wrap_starts(line, tab, wrap_cols));
-                xs.get(seg as usize).copied().unwrap_or(0.0) + (x - left)
+                let seg = seg as usize;
+                let x0 = xs.get(seg).copied().unwrap_or(0.0);
+                (x0 + (x - left), xs.get(seg + 1).copied())
             } else {
-                x - left + this.hscroll
+                (x - left + this.hscroll, None)
             };
-            let col = galley.cursor_from_pos(vec2(gx.max(0.0), 1.0)).index.0;
+            let mut cursor = galley.cursor_from_pos(vec2(gx.max(0.0), 1.0));
+            // Past the end of a wrapped display line, the caret stays on it, before the
+            // character the next display line starts with.
+            if let Some(end) = end {
+                let at_next = |c| galley.pos_from_cursor(c).min.x >= end - 0.5;
+                while cursor.index.0 > 0 && at_next(cursor) {
+                    cursor.index.0 -= 1;
+                }
+            }
+            let col = cursor.index.0;
             Some((l, edit::byte_at(line, col, tab).0))
         };
+
+        // A caret the pointer puts down is already where the pointer is, so it does not scroll
+        // to it: a click or drag on the last lines would otherwise jump the view. Dragging past
+        // an edge scrolls by itself, below.
+        let scroll_asked = self.scroll_to;
 
         // clicks
         if resp.clicked() || resp.double_clicked() || resp.secondary_clicked() {
@@ -8187,7 +9638,15 @@ impl TextView {
                 let p = pane_at(pos.x);
                 match line_at(p, pos.y).map(|v| self.layout.lines[v]) {
                     Some(VLine::Row(r, _)) => {
-                        let in_sel = self.selection().is_some_and(|(a, b)| (a..=b).contains(&r));
+                        let hit = line_at(p, pos.y).and_then(|v| caret_hit(self, p, v, pos.x));
+                        // In the text caret's selection, or in the selected rows without one.
+                        let in_sel = match self.caret().filter(|c| c.has_selection()) {
+                            Some(c) => {
+                                let (a, b) = c.range();
+                                c.pane == p && hit.is_some_and(|at| a <= at && at <= b)
+                            }
+                            None => self.selection().is_some_and(|(a, b)| (a..=b).contains(&r)),
+                        };
                         // Right-clicking the selection keeps it for the context menu.
                         if !(resp.secondary_clicked() && in_sel && p == self.active_pane) {
                             self.col_sel = None;
@@ -8203,18 +9662,49 @@ impl TextView {
                                     self.cur_block = Some(b);
                                 }
                             }
-                            let hit = line_at(p, pos.y).and_then(|v| caret_hit(self, p, v, pos.x));
                             if let Some(at) = hit.filter(|_| !self.table_mode) {
-                                // The caret goes where the text was clicked; a double-click
-                                // selects the word there.
+                                // The caret goes where the text was clicked (a right-click
+                                // outside the selection too, for the context menu); a
+                                // double-click selects the word there, and a triple-click the
+                                // line with its line break.
                                 let shift = ui.input(|i| i.modifiers.shift);
-                                if resp.double_clicked() {
+                                // Ctrl+click (⌘-click on macOS) adds a caret, or removes one;
+                                // with a double- or triple-click, the new one selects.
+                                let add = ui.input(|i| i.modifiers.command)
+                                    && !shift
+                                    && !resp.secondary_clicked()
+                                    && self.caret().is_some_and(|c| c.pane == p);
+                                let others: Vec<Caret> = if add {
+                                    self.carets().into_iter().skip(1).collect()
+                                } else {
+                                    Vec::new()
+                                };
+                                if add && !resp.double_clicked() && !resp.triple_clicked() {
+                                    self.toggle_caret(p, at);
+                                } else if resp.triple_clicked() {
+                                    let lines = &self.panes[p].doc.lines;
+                                    let end = if at.0 + 1 < lines.len() {
+                                        (at.0 + 1, 0)
+                                    } else {
+                                        (at.0, lines.get(at.0).map_or(0, String::len))
+                                    };
+                                    self.place_caret(p, (at.0, 0), false);
+                                    self.place_caret(p, end, true);
+                                } else if resp.double_clicked() {
                                     let line = &self.panes[p].doc.lines;
                                     let w = line.get(at.0).map_or(0..0, |t| edit::word_at(t, at.1));
                                     self.place_caret(p, (at.0, w.start), false);
                                     self.place_caret(p, (at.0, w.end), true);
-                                } else if !resp.secondary_clicked() {
-                                    self.place_caret(p, at, shift);
+                                } else {
+                                    self.place_caret(p, at, shift && !resp.secondary_clicked());
+                                }
+                                if add && (resp.double_clicked() || resp.triple_clicked()) {
+                                    if let Some(primary) = self.caret() {
+                                        let list = std::iter::once((primary, true))
+                                            .chain(others.into_iter().map(|c| (c, false)))
+                                            .collect();
+                                        self.set_carets(list);
+                                    }
                                 }
                             } else if resp.double_clicked() {
                                 self.begin_edit(r, p);
@@ -8251,7 +9741,7 @@ impl TextView {
                         .filter(|_| columns)
                     {
                         let at = (r, col_at_x(self.active_pane, origin.x));
-                        self.caret = None;
+                        self.drop_carets();
                         self.col_sel = Some(Box::new(ColSel {
                             pane: self.active_pane,
                             anchor: at,
@@ -8304,8 +9794,15 @@ impl TextView {
                 }
             }
         }
+        self.scroll_to = scroll_asked;
         let selection = self.selection();
         let caret = self.caret().filter(|_| !self.table_mode);
+        let carets = if self.table_mode {
+            Vec::new()
+        } else {
+            self.carets()
+        };
+        let caret_live = self.caret_live(ui.ctx());
         let mut caret_rect: Option<Rect> = None;
 
         // painting
@@ -8506,7 +10003,7 @@ impl TextView {
                     let end = xs.get(seg + 1).copied().unwrap_or(f32::INFINITY);
                     (start <= gx && (gx < end || xs.len() == seg + 1)).then_some(left + gx - start)
                 };
-                if let Some(k) = caret.filter(|k| k.pane == p && k.has_selection()) {
+                for k in carets.iter().filter(|k| k.pane == p && k.has_selection()) {
                     let (a, b) = k.range();
                     if (a.0..=b.0).contains(&l) {
                         let from = if l == a.0 {
@@ -8550,6 +10047,23 @@ impl TextView {
                     tp.with_clip_rect(clip)
                         .galley(pos2(left - sx, y + 1.0), galley.clone(), fg);
                 }
+                // The other carets: bars only (the input method composes at the primary one).
+                for k in carets
+                    .iter()
+                    .skip(1)
+                    .filter(|k| k.pane == p && k.pos.0 == l)
+                {
+                    if let Some(x) = col_x(edit::col_at(line, k.pos.1, tab)) {
+                        let rect =
+                            Rect::from_min_max(pos2(x, y + 1.0), pos2(x + 2.0, y + row_h - 1.0));
+                        if caret_live {
+                            tp.rect_filled(rect, 0.0, c.text);
+                        } else {
+                            let thin = Rect::from_min_size(rect.min, vec2(1.0, rect.height()));
+                            tp.rect_filled(thin, 0.0, c.text.gamma_multiply(0.45));
+                        }
+                    }
+                }
                 if let Some(k) = caret.filter(|k| k.pane == p && k.pos.0 == l) {
                     if let Some(x) = col_x(edit::col_at(line, k.pos.1, tab)) {
                         let rect =
@@ -8572,7 +10086,13 @@ impl TextView {
                                 Stroke::new(1.0_f32, fg),
                             );
                         }
-                        tp.rect_filled(rect, 0.0, c.text);
+                        // Dimmed and thin where typing would not go into the text.
+                        if caret_live {
+                            tp.rect_filled(rect, 0.0, c.text);
+                        } else {
+                            let thin = Rect::from_min_size(rect.min, vec2(1.0, rect.height()));
+                            tp.rect_filled(thin, 0.0, c.text.gamma_multiply(0.45));
+                        }
                         caret_rect = Some(rect);
                     }
                 }
@@ -8957,18 +10477,7 @@ impl TextView {
                 MenuAction::InsertBelow(r, p) => self.insert_below(r, p),
                 MenuAction::DeleteLine(r, p) => self.delete_line(r, p),
                 MenuAction::CopyText(r, p) => {
-                    let text = match selection {
-                        Some((a, b)) if (a..=b).contains(&r) && p == self.active_pane => {
-                            self.selected_text(p)
-                        }
-                        _ => self
-                            .diff
-                            .rows
-                            .get(r)
-                            .and_then(|row| row.line(p))
-                            .map(|l| self.panes[p].doc.lines[l].clone()),
-                    };
-                    if let Some(t) = text {
+                    if let Some(t) = self.menu_copy_text(r, p) {
                         ui.ctx().copy_text(t);
                     }
                 }
@@ -10466,6 +11975,1008 @@ mod tests {
         assert_eq!(lines(&v, 0)[0], "alpha beta!");
     }
 
+    /// The modifiers egui reports for a key on macOS (`mac`) or on Windows and Linux.
+    fn mods(mac: bool, names: &str) -> Modifiers {
+        let mut m = Modifiers::NONE;
+        for n in names.split('+').filter(|n| !n.is_empty()) {
+            match n {
+                "shift" => m.shift = true,
+                "alt" => m.alt = true,
+                "ctrl" if mac => m.ctrl = true,
+                "ctrl" => (m.ctrl, m.command) = (true, true),
+                "cmd" => (m.mac_cmd, m.command) = (true, true),
+                _ => panic!("{n}"),
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn the_caret_keys_follow_each_platform_and_leave_the_difference_commands_alone() {
+        use Key::*;
+        // (platform, modifiers, key, whether the caret takes it)
+        let both = [
+            ("", ArrowLeft, true),
+            ("shift", ArrowDown, true),
+            ("", Home, true),
+            ("shift", End, true),
+            ("", PageUp, true),
+            ("shift", PageDown, true),
+            ("", Enter, true),
+            ("", Tab, true),
+            ("shift", Tab, true),
+            ("", Escape, true),
+            ("", Backspace, true),
+            ("shift", Delete, true),
+            // the difference commands
+            ("alt", ArrowUp, false),
+            ("alt", ArrowDown, false),
+            ("alt", Home, false),
+            ("alt", End, false),
+            ("ctrl+alt", ArrowLeft, false),
+            ("ctrl+alt", ArrowRight, false),
+        ];
+        let mac = [
+            ("alt", ArrowLeft, true),
+            ("alt+shift", ArrowRight, true),
+            ("alt", Backspace, true),
+            ("alt", Delete, true),
+            ("cmd", ArrowLeft, true),
+            ("cmd+shift", ArrowDown, true),
+            ("cmd", A, true),
+            ("cmd+shift", A, false),
+            ("cmd", Backspace, false),
+            ("cmd", Enter, false),
+            ("cmd", Escape, false),
+            ("cmd+alt", ArrowLeft, false),
+            ("ctrl", A, false),
+        ];
+        let other = [
+            ("ctrl", ArrowLeft, true),
+            ("ctrl+shift", ArrowRight, true),
+            ("ctrl", Backspace, true),
+            ("ctrl", Delete, true),
+            ("ctrl", Home, true),
+            ("ctrl", A, true),
+            ("ctrl+shift", A, false),
+            ("ctrl", Enter, false),
+            ("alt", ArrowLeft, false),
+            ("alt", ArrowRight, false),
+            ("alt", Backspace, false),
+        ];
+        for (is_mac, extra) in [(true, &mac[..]), (false, &other[..])] {
+            for &(names, k, takes) in both.iter().chain(extra) {
+                let m = mods(is_mac, names);
+                assert_eq!(
+                    TextView::caret_key_on(is_mac, k, m),
+                    takes,
+                    "{} {names}+{k:?}",
+                    if is_mac { "macOS" } else { "Windows/Linux" }
+                );
+            }
+        }
+        // Only Option (macOS) or Ctrl (elsewhere) is the word key.
+        assert!(word_key_on(true, mods(true, "alt+shift")));
+        assert!(!word_key_on(true, mods(true, "ctrl")));
+        assert!(!word_key_on(true, mods(true, "cmd+alt")));
+        assert!(word_key_on(false, mods(false, "ctrl+shift")));
+        assert!(!word_key_on(false, mods(false, "alt")));
+        assert!(!word_key_on(false, mods(false, "ctrl+alt")));
+    }
+
+    #[test]
+    fn the_caret_moves_and_deletes_by_each_platforms_keys() {
+        use Key::*;
+        let text = "  let foo_bar = x;\nnext\n";
+        for is_mac in [true, false] {
+            let mut v = two_way("x\n", text);
+            let at = |v: &mut TextView, pos, names: &str, k: Key| {
+                v.place_caret(1, pos, false);
+                v.caret_key_pressed_on(is_mac, k, mods(is_mac, names));
+                let c = v.caret().unwrap();
+                (c.pos, v.caret_text())
+            };
+            let (word, line, doc) = if is_mac {
+                ("alt", "cmd", "cmd")
+            } else {
+                ("ctrl", "", "ctrl")
+            };
+            let p = |l, b| ((l, b), None);
+            let name = if is_mac { "macOS" } else { "Windows/Linux" };
+            assert_eq!(at(&mut v, (0, 6), word, ArrowRight), p(0, 13), "{name}");
+            assert_eq!(at(&mut v, (0, 13), word, ArrowLeft), p(0, 6), "{name}");
+            assert_eq!(
+                at(&mut v, (0, 6), &format!("{word}+shift"), ArrowRight)
+                    .1
+                    .as_deref(),
+                Some("foo_bar"),
+                "{name}"
+            );
+            // to the line's first character, then its start, and to its end
+            let (start, end) = if is_mac {
+                (ArrowLeft, ArrowRight)
+            } else {
+                (Home, End)
+            };
+            // (⌘← on macOS goes straight to the line start)
+            let first = if is_mac { 0 } else { 2 };
+            assert_eq!(at(&mut v, (0, 9), line, start), p(0, first), "{name}");
+            assert_eq!(at(&mut v, (0, 2), line, start), p(0, 0), "{name}");
+            assert_eq!(at(&mut v, (0, 9), line, end), p(0, 18), "{name}");
+            // to the document's start and end
+            let (top, bottom) = if is_mac {
+                (ArrowUp, ArrowDown)
+            } else {
+                (Home, End)
+            };
+            assert_eq!(at(&mut v, (1, 2), doc, top), p(0, 0), "{name}");
+            assert_eq!(at(&mut v, (0, 2), doc, bottom), p(1, 4), "{name}");
+            // word deletes, each one undo step
+            v.place_caret(1, (0, 13), false);
+            v.caret_key_pressed_on(is_mac, Backspace, mods(is_mac, word));
+            v.caret_key_pressed_on(is_mac, Delete, mods(is_mac, word));
+            assert_eq!(lines(&v, 1)[0], "  let  x;", "{name}");
+            v.undo();
+            assert_eq!(lines(&v, 1)[0], "  let  = x;", "{name}");
+            v.undo();
+            assert_eq!(lines(&v, 1)[0], "  let foo_bar = x;", "{name}");
+            // the other platform's word key is not one here
+            let other = if is_mac { "ctrl" } else { "alt" };
+            assert_eq!(at(&mut v, (0, 6), other, ArrowRight), p(0, 7), "{name}");
+            assert_eq!(lines(&v, 0), ["x"], "{name}: the other pane is untouched");
+        }
+    }
+
+    #[test]
+    fn arrows_and_deletes_keep_accents_emoji_and_wide_characters_whole() {
+        let ctx = egui::Context::default();
+        let line = "e\u{301}🇹🇼👩\u{200d}💻中\tz";
+        let mut v = two_way("x\n", &format!("{line}\n"));
+        frame(&mut v, &ctx, vec![]);
+        v.place_caret(1, (0, 0), false);
+        let mut stops = vec![0];
+        for _ in 0..7 {
+            frame(&mut v, &ctx, vec![key(Key::ArrowRight, Modifiers::NONE)]);
+            stops.push(v.caret().unwrap().pos.1);
+        }
+        assert_eq!(stops, [0, 3, 11, 22, 25, 26, 27, 27]);
+        stops.dedup();
+        for &b in stops.iter().rev().skip(1) {
+            frame(&mut v, &ctx, vec![key(Key::ArrowLeft, Modifiers::NONE)]);
+            assert_eq!(v.caret().unwrap().pos.1, b);
+        }
+        // Up and Down, and a click, never land inside a character.
+        v.place_caret(1, (0, 5), false);
+        assert_eq!(v.caret().unwrap().pos, (0, 3));
+        // Backspace and Delete take whole characters.
+        v.place_caret(1, (0, 22), false);
+        frame(&mut v, &ctx, vec![key(Key::Backspace, Modifiers::NONE)]);
+        assert_eq!(lines(&v, 1)[0], "e\u{301}🇹🇼中\tz");
+        v.place_caret(1, (0, 0), false);
+        frame(&mut v, &ctx, vec![key(Key::Delete, Modifiers::NONE)]);
+        assert_eq!(lines(&v, 1)[0], "🇹🇼中\tz");
+        // Typed and pasted text of any script goes in whole.
+        frame(
+            &mut v,
+            &ctx,
+            vec![
+                egui::Event::Text("é".into()),
+                egui::Event::Paste("한글\u{1f469}\u{200d}\u{1f52c}".into()),
+            ],
+        );
+        assert_eq!(lines(&v, 1)[0], "é한글👩\u{200d}🔬🇹🇼中\tz");
+        assert_eq!(v.caret().unwrap().pos, (0, 2 + 6 + 11));
+        v.undo();
+        v.undo();
+        v.undo();
+        v.undo();
+        assert_eq!(lines(&v, 1)[0], line);
+    }
+
+    #[test]
+    fn clicks_land_between_characters_with_tabs_wide_characters_and_wrapping() {
+        let ctx = egui::Context::default();
+        crate::ui::fonts::setup(&ctx, "en");
+        let mixed = "a\tb中文e\u{301}x";
+        let long = "word ".repeat(60);
+        let mut v = two_way(&format!("{mixed}\n{long}\n"), "x\n");
+        v.wrap = true;
+        frame(&mut v, &ctx, vec![]);
+        frame(&mut v, &ctx, vec![]);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let click = |v: &mut TextView, p: egui::Pos2| {
+            frame(v, &ctx, vec![egui::Event::PointerMoved(p), button(p, true)]);
+            frame(v, &ctx, vec![button(p, false)]);
+            frame(v, &ctx, vec![]);
+            frame(v, &ctx, vec![]);
+            v.caret().filter(|c| c.pane == 0).map(|c| c.pos)
+        };
+        // The y of each display line of the left pane, and the x where its text starts.
+        let mut ys: Vec<(edit::Pos, f32)> = Vec::new();
+        for y in (0..300).step_by(2) {
+            if let Some(pos) = click(&mut v, pos2(400.0, y as f32)) {
+                if ys.last().is_none_or(|&(p, _)| p != pos) {
+                    ys.push((pos, y as f32 + 1.0));
+                }
+            }
+        }
+        let y0 = ys.iter().find(|(p, _)| p.0 == 0).unwrap().1;
+        // Just left of where a click moves past the first character: inside it.
+        let left = (0..300)
+            .map(|x| x as f32)
+            .find(|&x| click(&mut v, pos2(x, y0)) == Some((0, 1)))
+            .unwrap()
+            - 2.0;
+        assert_eq!(click(&mut v, pos2(left, y0)), Some((0, 0)));
+        // Along the mixed line every place is a character boundary, in order, and every
+        // boundary can be clicked.
+        let mut seen = Vec::new();
+        for x in (left as usize..400).step_by(1) {
+            let pos = click(&mut v, pos2(x as f32, y0)).unwrap();
+            assert_eq!(pos.0, 0);
+            if seen.last() != Some(&pos.1) {
+                assert!(
+                    seen.last().is_none_or(|&b| b < pos.1),
+                    "{seen:?} then {pos:?}"
+                );
+                seen.push(pos.1);
+            }
+        }
+        assert_eq!(seen, [0, 1, 2, 3, 6, 9, 12, 13]);
+        // On the wrapped line, a click at the left of each display line is at its wrap start.
+        let (cols, tab) = (v.layout.key.unwrap().0, v.layout.key.unwrap().1);
+        assert!(cols > 0);
+        let starts = wrap_starts(&long, tab, cols);
+        assert!(starts.len() >= 3, "{starts:?}");
+        let rows: Vec<f32> = ys
+            .iter()
+            .filter(|(p, _)| p.0 == 1)
+            .map(|&(_, y)| y)
+            .collect();
+        assert_eq!(rows.len(), starts.len());
+        for (k, (&y, &start)) in rows.iter().zip(&starts).enumerate() {
+            assert_eq!(click(&mut v, pos2(left, y)), Some((1, start)), "row {k}");
+            // Right of the text, the caret stays on the display line.
+            let end = starts.get(k + 1).map_or(long.len(), |&next| next - 1);
+            assert_eq!(click(&mut v, pos2(400.0, y)), Some((1, end)), "row {k}");
+        }
+    }
+
+    #[test]
+    fn an_input_method_composes_over_a_selection_and_can_give_up() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("hello world\n", "hello world\n");
+        frame(&mut v, &ctx, vec![]);
+        let pre = |t: &str| {
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: t.into(),
+                active_range_chars: None,
+            })
+        };
+        let commit = |t: &str| egui::Event::Ime(egui::ImeEvent::Commit(t.into()));
+        let select = |v: &mut TextView| {
+            v.place_caret(1, (0, 0), false);
+            v.place_caret(1, (0, 5), true);
+        };
+        let preedit = |v: &TextView| v.caret.as_ref().map(|c| c.preedit.clone());
+        select(&mut v);
+        frame(&mut v, &ctx, vec![pre("n"), pre("ni")]);
+        // Composing shows the text but changes nothing, and the selection stays.
+        assert_eq!(preedit(&v).as_deref(), Some("ni"));
+        assert_eq!(lines(&v, 1), ["hello world"]);
+        assert_eq!(v.caret_text().as_deref(), Some("hello"));
+        // The differences are found again meanwhile (the other side changed).
+        v.panes[0].doc.lines[0] = "hello there".into();
+        v.mark_changed(&[0]);
+        assert_eq!(preedit(&v).as_deref(), Some("ni"));
+        assert_eq!(v.caret_text().as_deref(), Some("hello"));
+        // The result replaces the selection, as one undo step.
+        frame(&mut v, &ctx, vec![commit("你好")]);
+        assert_eq!(lines(&v, 1), ["你好 world"]);
+        assert_eq!(v.caret().unwrap().pos, (0, 6));
+        assert_eq!(preedit(&v).as_deref(), Some(""));
+        v.undo();
+        assert_eq!(lines(&v, 1), ["hello world"]);
+        // Given up (an empty preedit), or ended with a bare Enter: nothing is typed.
+        for end in [pre(""), commit("\n")] {
+            select(&mut v);
+            frame(&mut v, &ctx, vec![pre("x")]);
+            frame(&mut v, &ctx, vec![end]);
+            assert_eq!(preedit(&v).as_deref(), Some(""));
+            assert_eq!(lines(&v, 1), ["hello world"]);
+            assert_eq!(v.caret_text().as_deref(), Some("hello"));
+        }
+        assert_eq!(lines(&v, 0), ["hello there"], "only the caret's pane");
+    }
+
+    #[test]
+    fn ime_preedit_and_commit_keep_the_selection_while_a_diff_is_pending() {
+        for layout in [TextLayout::Aligned, TextLayout::Compact] {
+            for cancel in [false, true] {
+                let ctx = egui::Context::default();
+                let mut v = two_way("alpha tail\n", "alpha tail\n");
+                v.text_layout = layout;
+                frame(&mut v, &ctx, vec![]);
+                v.place_caret(1, (0, 10), false);
+                v.rediff_ms = 100.0;
+                frame(&mut v, &ctx, vec![egui::Event::Text("!".into())]);
+                assert!(v.rediff_due.is_some());
+                // Select backwards while that comparison is pending.
+                v.place_caret(1, (0, 5), false);
+                v.place_caret(1, (0, 0), true);
+                let selected = v.caret().unwrap();
+                let undo_steps = v.undo.len();
+                let pre = |t: &str| {
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: t.into(),
+                        active_range_chars: None,
+                    })
+                };
+                let out = frame(&mut v, &ctx, vec![pre("n"), pre("ni")]);
+                assert!(
+                    out.platform_output.ime.is_some(),
+                    "the native backend is told to allow IME"
+                );
+                assert!(v.rediff_due.is_some());
+                assert_eq!(v.caret(), Some(selected));
+                assert_eq!(v.undo.len(), undo_steps);
+                assert_eq!(lines(&v, 1), ["alpha tail!"]);
+                let end = if cancel {
+                    pre("")
+                } else {
+                    egui::Event::Ime(egui::ImeEvent::Commit("你好 e\u{301} 👩\u{200d}💻".into()))
+                };
+                frame(&mut v, &ctx, vec![end]);
+                v.settle_diff();
+                assert!(v.rediff_due.is_none());
+                if cancel {
+                    assert_eq!(lines(&v, 1), ["alpha tail!"]);
+                    assert_eq!(v.caret(), Some(selected));
+                    assert_eq!(v.undo.len(), undo_steps);
+                } else {
+                    assert_eq!(lines(&v, 1), ["你好 e\u{301} 👩\u{200d}💻 tail!"]);
+                    assert_eq!(v.undo.len(), undo_steps + 1);
+                    v.undo();
+                    assert_eq!(lines(&v, 1), ["alpha tail!"]);
+                    v.redo();
+                    assert_eq!(lines(&v, 1), ["你好 e\u{301} 👩\u{200d}💻 tail!"]);
+                }
+                assert_eq!(lines(&v, 0), ["alpha tail"]);
+            }
+        }
+    }
+
+    #[test]
+    fn edits_keep_the_shape_of_blank_unterminated_mixed_long_and_large_files() {
+        let ctx = &egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let edit = |path: &std::path::Path, f: &dyn Fn(&mut TextView)| {
+            let docs = vec![
+                TextDoc::from_text(None, "x\n"),
+                text::load_doc(path, None).unwrap(),
+            ];
+            let mut v = TextView::new(docs, &Config::default());
+            frame(&mut v, ctx, vec![]);
+            f(&mut v);
+            v.save_pane(1).unwrap();
+            std::fs::read(path).unwrap()
+        };
+        let typing = |pos: edit::Pos, text: &'static str| {
+            move |v: &mut TextView| {
+                v.place_caret(1, pos, false);
+                frame(v, ctx, vec![egui::Event::Text(text.into())]);
+            }
+        };
+        // A blank file takes typing; a file without a final newline keeps it that way.
+        let blank = file("blank.txt", b"");
+        // (a blank file has no line ending to keep, and gets the usual final newline)
+        assert_eq!(
+            edit(&blank, &typing((0, 0), "hi")),
+            format!("hi{}", Eol::platform().as_str()).as_bytes()
+        );
+        let open = file("open.txt", b"a\nb");
+        assert_eq!(edit(&open, &typing((1, 1), "c")), b"a\nbc");
+        // Mixed line endings are written as the file's usual one, as Save always has; Enter
+        // uses the file's line ending.
+        let mixed = file("mixed.txt", b"a\r\nb\nc\r\n");
+        assert_eq!(edit(&mixed, &typing((1, 1), "X")), b"a\r\nbX\r\nc\r\n");
+        let crlf = file("crlf.txt", b"a\r\nb\r\n");
+        let enter = |v: &mut TextView| {
+            v.place_caret(1, (0, 1), false);
+            frame(v, ctx, vec![key(Key::Enter, Modifiers::NONE)]);
+        };
+        assert_eq!(edit(&crlf, &enter), b"a\r\n\r\nb\r\n");
+        // A long line: End reaches its end, and typing there keeps the rest.
+        let long = "a".repeat(200_000);
+        let path = file("long.txt", format!("{long}\n").as_bytes());
+        let out = edit(&path, &|v: &mut TextView| {
+            v.place_caret(1, (0, 7), false);
+            frame(v, ctx, vec![key(Key::End, Modifiers::NONE)]);
+            assert_eq!(v.caret().unwrap().pos, (0, 200_000));
+            frame(v, ctx, vec![egui::Event::Text("!".into())]);
+        });
+        assert_eq!(out, format!("{long}!\n").as_bytes());
+        // A large file: the end of the document, an edit and a page up.
+        let big: String = (0..30_000).map(|i| format!("line {i}\n")).collect();
+        let path = file("big.txt", big.as_bytes());
+        let to_end = mods(MAC, if MAC { "cmd" } else { "ctrl" });
+        let out = edit(&path, &|v: &mut TextView| {
+            v.place_caret(1, (5, 0), false);
+            let end = if MAC { Key::ArrowDown } else { Key::End };
+            frame(v, ctx, vec![key(end, to_end)]);
+            assert_eq!(v.caret().unwrap().pos, (29_999, 10));
+            v.place_caret(1, (29_999, 0), false);
+            frame(v, ctx, vec![egui::Event::Text("#".into())]);
+            frame(v, ctx, vec![key(Key::PageUp, Modifiers::NONE)]);
+            assert!(v.caret().unwrap().pos.0 < 29_999);
+            assert_eq!(lines(v, 1)[29_999], "#line 29999");
+        });
+        assert_eq!(out, big.replacen("line 29999", "#line 29999", 1).as_bytes());
+    }
+
+    #[test]
+    fn home_end_and_the_vertical_keys_follow_wrapped_display_lines_and_keep_the_selection() {
+        use Key::*;
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let wide = "中文中文中文中文中文中文中文中文";
+        let text = format!("{long}\nshort\n{wide}\n");
+        let mut v = two_way("x\n", &text);
+        let tab = v.tab_size;
+        v.ensure_layout(20, tab);
+        v.page_rows = 2;
+        let starts = wrap_starts(long, tab, 20);
+        assert!(starts.len() >= 3, "{starts:?}");
+        // the bytes each display line of the long line shows
+        let span = |k: usize| {
+            let a = wrap_byte(long, tab, starts[k]);
+            let b = starts.get(k + 1).map_or(long.len(), |&n| {
+                edit::char_before(long, wrap_byte(long, tab, n))
+            });
+            (a, b)
+        };
+        let last = starts.len() - 1;
+        for mac in [true, false] {
+            let name = if mac { "macOS" } else { "Windows/Linux" };
+            let press = |v: &mut TextView, names: &str, k: Key| {
+                v.caret_key_pressed_on(mac, k, mods(mac, names));
+                v.caret().unwrap().pos
+            };
+            let (home, end, line) = if mac {
+                (ArrowLeft, ArrowRight, "cmd")
+            } else {
+                (Home, End, "")
+            };
+            // End: the display line's end, then the line's; Home: its start, then the line's.
+            v.place_caret(1, (0, 2), false);
+            assert_eq!(press(&mut v, line, end), (0, span(0).1), "{name}");
+            assert_eq!(press(&mut v, line, end), (0, long.len()), "{name}");
+            let shift = format!("{line}+shift").trim_start_matches('+').to_string();
+            assert_eq!(press(&mut v, &shift, home), (0, span(last).0), "{name}");
+            assert_eq!(
+                v.caret_text().as_deref(),
+                Some(&long[span(last).0..]),
+                "{name}"
+            );
+            assert_eq!(press(&mut v, &shift, home), (0, 0), "{name}");
+            assert_eq!(
+                v.caret_text().as_deref(),
+                Some(long),
+                "{name}: one selection"
+            );
+            // Shift+End from the middle of a display line selects to its end only.
+            v.place_caret(1, (0, span(1).0 + 2), false);
+            press(&mut v, &shift, end);
+            assert_eq!(
+                v.caret_text().as_deref(),
+                Some(&long[span(1).0 + 2..span(1).1]),
+                "{name}"
+            );
+        }
+        // Down and Up go through the display lines, keeping the column.
+        let down = |v: &mut TextView, names: &str, k: Key| {
+            v.caret_key_pressed_on(MAC, k, mods(MAC, names));
+            v.caret().unwrap().pos
+        };
+        v.place_caret(1, (0, 3), false);
+        for k in 1..=last {
+            assert_eq!(
+                down(&mut v, "", ArrowDown),
+                (0, span(k).0 + 3),
+                "display line {k}"
+            );
+        }
+        // on to the short line (its end), and back to the same column on the wide line
+        assert_eq!(down(&mut v, "", ArrowDown), (1, 3));
+        v.place_caret(1, (0, 8), false);
+        for _ in 0..last {
+            down(&mut v, "", ArrowDown);
+        }
+        assert_eq!(down(&mut v, "", ArrowDown), (1, 5));
+        // 8 columns are 4 wide characters (12 bytes); the second display line starts at 20
+        let wide_starts = wrap_starts(wide, tab, 20);
+        assert_eq!(wide_starts, [0, 20]);
+        assert_eq!(down(&mut v, "", ArrowDown), (2, 12));
+        assert_eq!(down(&mut v, "", ArrowDown), (2, 30 + 12));
+        assert_eq!(
+            down(&mut v, "", ArrowDown),
+            (2, wide.len()),
+            "past the last line"
+        );
+        assert_eq!(
+            down(&mut v, "", ArrowUp),
+            (2, 12),
+            "the column is kept past the end"
+        );
+        // Shift+PageDown and Shift+PageUp move two display lines and keep one selection.
+        v.place_caret(1, (0, 3), false);
+        assert_eq!(down(&mut v, "shift", PageDown), (0, span(2).0 + 3));
+        assert_eq!(v.caret_text().as_deref(), Some(&long[3..span(2).0 + 3]));
+        assert_eq!(down(&mut v, "shift", PageUp), (0, 3));
+        assert_eq!(v.caret_text(), None);
+        assert_eq!(down(&mut v, "shift", PageUp), (0, 0), "past the first line");
+        assert_eq!(v.caret_text().as_deref(), Some("alp"));
+        // Without wrapping, the keys go by whole lines as before.
+        v.ensure_layout(0, tab);
+        v.place_caret(1, (0, 3), false);
+        assert_eq!(down(&mut v, "", ArrowDown), (1, 3));
+        v.place_caret(1, (0, 3), false);
+        let end = if MAC { ArrowRight } else { End };
+        assert_eq!(
+            down(&mut v, if MAC { "cmd" } else { "" }, end),
+            (0, long.len())
+        );
+        assert_eq!(lines(&v, 0), ["x"]);
+    }
+
+    #[test]
+    fn the_view_follows_the_caret_down_a_long_wrapped_line() {
+        let ctx = egui::Context::default();
+        crate::ui::fonts::setup(&ctx, "en");
+        let long = "word ".repeat(600);
+        let mut v = two_way(&format!("{long}\nend\n"), "x\n");
+        v.wrap = true;
+        frame(&mut v, &ctx, vec![]);
+        frame(&mut v, &ctx, vec![]);
+        v.place_caret(0, (0, 0), false);
+        let visible = |v: &TextView| {
+            let c = v.caret().unwrap();
+            let line = v.layout.row_line[v.diff.row_of_line(0, c.pos.0)] + v.caret_segment(&c);
+            (
+                line as f32 >= v.scroll.floor(),
+                (line as f32) < v.scroll + v.page_rows as f32,
+                line,
+            )
+        };
+        let segs = v.wrap_starts_of(0, 0).len();
+        assert!(
+            segs > v.page_rows + 5,
+            "{segs} display lines, {} on a page",
+            v.page_rows
+        );
+        for _ in 0..segs - 1 {
+            frame(&mut v, &ctx, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+            frame(&mut v, &ctx, vec![]);
+            let (above, below, line) = visible(&v);
+            assert!(above && below, "display line {line} at scroll {}", v.scroll);
+        }
+        assert_eq!(v.caret().unwrap().pos.0, 0, "still on the long line");
+        frame(&mut v, &ctx, vec![key(Key::PageUp, Modifiers::NONE)]);
+        frame(&mut v, &ctx, vec![]);
+        let (above, below, line) = visible(&v);
+        assert!(above && below, "display line {line} at scroll {}", v.scroll);
+    }
+
+    #[test]
+    fn tab_and_shift_tab_indent_the_selected_lines_and_keep_the_selection() {
+        let ctx = egui::Context::default();
+        let text = "fn a() {\nx = 1;\n\ny = 2;\n}\n";
+        let mut v = two_way("other\n", text);
+        v.tab_size = 4;
+        frame(&mut v, &ctx, vec![]);
+        let select = |v: &mut TextView, a: edit::Pos, b: edit::Pos| {
+            v.place_caret(1, a, false);
+            v.place_caret(1, b, true);
+        };
+        let tab = |v: &mut TextView, m: Modifiers| frame(v, &ctx, vec![key(Key::Tab, m)]);
+        let ends = |v: &TextView| {
+            let c = v.caret().unwrap();
+            (c.anchor, c.pos)
+        };
+        // Several lines: each is indented by the tab size in spaces (the file has no tabs), the
+        // blank line is left alone, and the selection moves with its text.
+        select(&mut v, (1, 2), (3, 3));
+        tab(&mut v, Modifiers::NONE);
+        assert_eq!(
+            lines(&v, 1),
+            ["fn a() {", "    x = 1;", "", "    y = 2;", "}"]
+        );
+        assert_eq!(ends(&v), ((1, 6), (3, 7)));
+        assert_eq!(v.caret_text().as_deref(), Some("= 1;\n\n    y ="));
+        tab(&mut v, Modifiers::SHIFT);
+        assert_eq!(lines(&v, 1), lines_of(text));
+        assert_eq!(
+            ends(&v),
+            ((1, 2), (3, 3)),
+            "outdenting gives back the selection"
+        );
+        // A backward selection keeps its direction.
+        select(&mut v, (3, 3), (1, 2));
+        tab(&mut v, Modifiers::NONE);
+        assert_eq!(ends(&v), ((3, 7), (1, 6)));
+        v.undo();
+        assert_eq!(lines(&v, 1), lines_of(text), "one undo step");
+        // Whole lines (ending at the start of the next one) keep starting at column 0, and the
+        // line after them is not indented.
+        select(&mut v, (1, 0), (3, 0));
+        tab(&mut v, Modifiers::NONE);
+        assert_eq!(lines(&v, 1)[1..4], ["    x = 1;", "", "y = 2;"]);
+        assert_eq!(v.caret_text().as_deref(), Some("    x = 1;\n\n"));
+        tab(&mut v, Modifiers::SHIFT);
+        assert_eq!(lines(&v, 1), lines_of(text));
+        // One whole line is indented too; part of a line, or no selection, types a tab.
+        select(&mut v, (1, 0), (1, 6));
+        tab(&mut v, Modifiers::NONE);
+        assert_eq!(lines(&v, 1)[1], "    x = 1;");
+        assert_eq!(v.caret_text().as_deref(), Some("    x = 1;"));
+        v.undo();
+        select(&mut v, (1, 0), (1, 1));
+        tab(&mut v, Modifiers::NONE);
+        assert_eq!(lines(&v, 1)[1], "\t = 1;");
+        v.place_caret(1, (4, 0), false);
+        tab(&mut v, Modifiers::NONE);
+        assert_eq!(lines(&v, 1)[4], "\t}");
+        v.undo();
+        v.undo();
+        // Shift+Tab with a plain caret outdents its line by up to the tab size, and the caret
+        // stays with its text; a shorter indent goes entirely; no indent changes nothing.
+        let mut v = two_way("other\n", "      z\n  w\nq\n \tm\n");
+        v.tab_size = 4;
+        frame(&mut v, &ctx, vec![]);
+        v.place_caret(1, (0, 7), false);
+        tab(&mut v, Modifiers::SHIFT);
+        assert_eq!((lines(&v, 1)[0], ends(&v).1), ("  z", (0, 3)));
+        v.place_caret(1, (1, 1), false);
+        tab(&mut v, Modifiers::SHIFT);
+        assert_eq!((lines(&v, 1)[1], ends(&v).1), ("w", (1, 0)));
+        v.place_caret(1, (2, 1), false);
+        let steps = v.undo.len();
+        tab(&mut v, Modifiers::SHIFT);
+        assert_eq!(lines(&v, 1)[2], "q");
+        assert_eq!(v.undo.len(), steps, "no undo step for no change");
+        // Mixed: a space before a tab is removed first, then the tab.
+        v.place_caret(1, (3, 3), false);
+        tab(&mut v, Modifiers::SHIFT);
+        assert_eq!(lines(&v, 1)[3], "\tm");
+        tab(&mut v, Modifiers::SHIFT);
+        assert_eq!(lines(&v, 1)[3], "m");
+        assert_eq!(lines(&v, 0), ["other"], "only the caret's pane");
+        // A file indented with tabs is indented with tabs, by Tab and by Ctrl+] alike.
+        let mut v = two_way("other\n", "\ta\n\tb\nc\n");
+        frame(&mut v, &ctx, vec![]);
+        select(&mut v, (0, 1), (2, 1));
+        tab(&mut v, Modifiers::NONE);
+        assert_eq!(lines(&v, 1), ["\t\ta", "\t\tb", "\tc"]);
+        v.active_pane = 1;
+        v.indent(true);
+        assert_eq!(lines(&v, 1), ["\ta", "\tb", "c"]);
+        assert_eq!(
+            ends(&v),
+            ((0, 1), (2, 1)),
+            "Ctrl+[ outdents the caret's lines"
+        );
+        // A read-only pane is not changed.
+        v.panes[1].doc.read_only = true;
+        select(&mut v, (0, 1), (2, 1));
+        tab(&mut v, Modifiers::NONE);
+        tab(&mut v, Modifiers::SHIFT);
+        assert_eq!(lines(&v, 1), ["\ta", "\tb", "c"]);
+    }
+
+    fn lines_of(text: &str) -> Vec<&str> {
+        text.lines().collect()
+    }
+
+    #[test]
+    fn triple_clicks_drags_and_right_clicks_select_the_same_text_in_both_layouts() {
+        for layout in [TextLayout::Compact, TextLayout::Aligned] {
+            let ctx = egui::Context::default();
+            crate::ui::fonts::setup(&ctx, "en");
+            let mut v = two_way(
+                "alpha beta\ngamma\ndelta\n",
+                "alpha beta\nnew line\ngamma\ndelta\n",
+            );
+            v.text_layout = layout;
+            frame(&mut v, &ctx, vec![]);
+            frame(&mut v, &ctx, vec![]);
+            let button = |pos, pressed, secondary: bool| egui::Event::PointerButton {
+                pos,
+                button: if secondary {
+                    egui::PointerButton::Secondary
+                } else {
+                    egui::PointerButton::Primary
+                },
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            let settle = |v: &mut TextView| {
+                frame(v, &ctx, vec![]);
+                frame(v, &ctx, vec![]);
+            };
+            let click = |v: &mut TextView, p: egui::Pos2| {
+                frame(
+                    v,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(p), button(p, true, false)],
+                );
+                frame(v, &ctx, vec![button(p, false, false)]);
+                settle(v);
+                v.caret().map(|c| (c.pane, c.pos))
+            };
+            // The y of each line of each pane, and an x inside each pane's text.
+            let mut ys = std::collections::HashMap::new();
+            // (below the pane headers, and clear of the right pane's scroll bar at its edge)
+            for (pane, x) in [(0, 400.0), (1, 650.0)] {
+                for y in (90..300).step_by(2) {
+                    if let Some((p, pos)) = click(&mut v, pos2(x, y as f32)) {
+                        if p == pane {
+                            ys.entry((pane, pos.0)).or_insert(y as f32 + 2.0);
+                        }
+                    }
+                }
+            }
+            let y = |pane: usize, line: usize| ys[&(pane, line)];
+            let name = format!("{layout:?}");
+            // A triple-click selects the line with its line break, the last one to its end.
+            let p = pos2(650.0, y(1, 1));
+            frame(
+                &mut v,
+                &ctx,
+                vec![egui::Event::PointerMoved(p), button(p, true, false)],
+            );
+            frame(&mut v, &ctx, vec![button(p, false, false)]);
+            frame(
+                &mut v,
+                &ctx,
+                vec![button(p, true, false), button(p, false, false)],
+            );
+            assert_eq!(
+                v.caret_text().as_deref(),
+                Some("line"),
+                "{name}: a double-click, a word"
+            );
+            frame(
+                &mut v,
+                &ctx,
+                vec![button(p, true, false), button(p, false, false)],
+            );
+            assert_eq!(v.caret_text().as_deref(), Some("new line\n"), "{name}");
+            // Its row is the selected one: not the next, where the selection ends at column 0.
+            let row = v.diff.row_of_line(1, 1);
+            assert_eq!((v.cursor_row, v.selection()), (Some(row), None), "{name}");
+            // the same as the keys select
+            let mouse = v.caret().map(|c| (c.anchor, c.pos));
+            v.place_caret(1, (1, 4), false);
+            v.caret_key_pressed_on(MAC, Key::Home, Modifiers::NONE);
+            v.caret_key_pressed_on(MAC, Key::ArrowDown, Modifiers::SHIFT);
+            assert_eq!(v.caret().map(|c| (c.anchor, c.pos)), mouse, "{name}");
+            settle(&mut v);
+            for _ in 0..4 {
+                settle(&mut v);
+            }
+            let p = pos2(650.0, y(1, 3));
+            frame(
+                &mut v,
+                &ctx,
+                vec![egui::Event::PointerMoved(p), button(p, true, false)],
+            );
+            frame(&mut v, &ctx, vec![button(p, false, false)]);
+            frame(
+                &mut v,
+                &ctx,
+                vec![button(p, true, false), button(p, false, false)],
+            );
+            frame(
+                &mut v,
+                &ctx,
+                vec![button(p, true, false), button(p, false, false)],
+            );
+            assert_eq!(
+                v.caret_text().as_deref(),
+                Some("delta"),
+                "{name}: the last line"
+            );
+            for _ in 0..4 {
+                settle(&mut v);
+            }
+            // A drag across a line the other side does not have selects its text in order.
+            let (from, to) = (pos2(650.0, y(1, 0)), pos2(650.0, y(1, 2)));
+            click(&mut v, pos2(650.0, y(1, 3)));
+            for _ in 0..4 {
+                settle(&mut v);
+            }
+            frame(
+                &mut v,
+                &ctx,
+                vec![egui::Event::PointerMoved(from), button(from, true, false)],
+            );
+            for k in 1..=4 {
+                let p = from + (to - from) * (k as f32 / 4.0);
+                frame(&mut v, &ctx, vec![egui::Event::PointerMoved(p)]);
+            }
+            frame(&mut v, &ctx, vec![button(to, false, false)]);
+            let text = v.caret_text().unwrap();
+            assert!(
+                text.ends_with("\nnew line\ngam") || text.ends_with("\nnew line\ngamma"),
+                "{name}: {text:?}"
+            );
+            let (a, b) = v.caret().unwrap().range();
+            assert_eq!((a.0, b.0), (0, 2), "{name}");
+            // A right-click in the selection keeps it, and Copy text copies just it.
+            settle(&mut v);
+            let r = v.diff.row_of_line(1, 1);
+            let inside = pos2(650.0, y(1, 1));
+            frame(
+                &mut v,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(inside),
+                    button(inside, true, true),
+                ],
+            );
+            frame(&mut v, &ctx, vec![button(inside, false, true)]);
+            assert_eq!(v.caret_text().as_deref(), Some(text.as_str()), "{name}");
+            assert_eq!(v.ctx_target, Some((r, 1)));
+            assert_eq!(
+                v.menu_copy_text(r, 1).as_deref(),
+                Some(text.as_str()),
+                "{name}"
+            );
+            // Outside the selection, it moves the caret there first. (A click closes the menu
+            // first, as a click outside an open menu only closes it.)
+            let outside = pos2(650.0, y(1, 3));
+            click(&mut v, pos2(650.0, y(1, 0)));
+            for _ in 0..4 {
+                settle(&mut v);
+            }
+            v.place_caret(1, (0, 10), false);
+            v.place_caret(1, (2, 5), true);
+            for _ in 0..4 {
+                settle(&mut v);
+            }
+            frame(
+                &mut v,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(outside),
+                    button(outside, true, true),
+                ],
+            );
+            frame(&mut v, &ctx, vec![button(outside, false, true)]);
+            let c = v.caret().unwrap();
+            assert!(!c.has_selection() && c.pos.0 == 3, "{name}: {c:?}");
+            assert_eq!(
+                v.menu_copy_text(v.diff.row_of_line(1, 3), 1).as_deref(),
+                Some("delta")
+            );
+            assert_eq!(lines(&v, 1), ["alpha beta", "new line", "gamma", "delta"]);
+        }
+    }
+
+    #[test]
+    fn a_drag_past_the_bottom_scrolls_and_keeps_selecting() {
+        for layout in [TextLayout::Aligned, TextLayout::Compact] {
+            let ctx = egui::Context::default();
+            crate::ui::fonts::setup(&ctx, "en");
+            let text: String = (0..300)
+                .map(|i| format!("line {i} 中文 e\u{301} 👩\u{200d}💻\n"))
+                .collect();
+            let other: String = (0..300)
+                .map(|i| {
+                    if i % 7 == 0 {
+                        format!("changed {i} 中文 e\u{301} 👩\u{200d}💻\n")
+                    } else {
+                        format!("line {i} 中文 e\u{301} 👩\u{200d}💻\n")
+                    }
+                })
+                .collect();
+            let mut v = two_way(&text, &other);
+            v.text_layout = layout;
+            frame(&mut v, &ctx, vec![]);
+            frame(&mut v, &ctx, vec![]);
+            let press = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            // Find the first line, then drag from it to below the window and hold there.
+            let start = (0..200)
+                .step_by(2)
+                .map(|y| pos2(400.0, y as f32))
+                .find(|&p| {
+                    frame(
+                        &mut v,
+                        &ctx,
+                        vec![egui::Event::PointerMoved(p), press(p, true)],
+                    );
+                    frame(&mut v, &ctx, vec![press(p, false)]);
+                    frame(&mut v, &ctx, vec![]);
+                    frame(&mut v, &ctx, vec![]);
+                    v.caret().is_some_and(|c| c.pane == 0 && c.pos.0 == 0)
+                })
+                .unwrap();
+            for _ in 0..4 {
+                frame(&mut v, &ctx, vec![]);
+            }
+            frame(
+                &mut v,
+                &ctx,
+                vec![egui::Event::PointerMoved(start), press(start, true)],
+            );
+            let below = pos2(400.0, 560.0);
+            for k in 1..=5 {
+                let p = start + (below - start) * (k as f32 / 5.0);
+                frame(&mut v, &ctx, vec![egui::Event::PointerMoved(p)]);
+            }
+            let first = v.caret().unwrap().pos.0;
+            for _ in 0..40 {
+                frame(&mut v, &ctx, vec![]);
+            }
+            let c = v.caret().unwrap();
+            assert!(v.scroll > 5.0, "scrolled: {}", v.scroll);
+            assert!(
+                c.pos.0 > first + 5,
+                "kept selecting: {first} then {:?}",
+                c.pos
+            );
+            // Pressed right of the first line, so selection starts at its end.
+            assert_eq!(c.anchor, (0, v.panes[0].doc.lines[0].len()));
+            frame(&mut v, &ctx, vec![press(below, false)]);
+            let c = v.caret().unwrap();
+            let selected = v.caret_text().unwrap();
+            let offset = |p: edit::Pos| {
+                v.panes[0].doc.lines[..p.0]
+                    .iter()
+                    .map(|l| l.len() + 1)
+                    .sum::<usize>()
+                    + p.1
+            };
+            let expected = &text[offset(c.anchor)..offset(c.pos)];
+            assert_eq!(selected, expected);
+            assert!(c.pos.0 >= 14, "drag crossed at least two differences");
+            let output = frame(&mut v, &ctx, vec![egui::Event::Copy]);
+            assert!(output
+                .platform_output
+                .commands
+                .contains(&egui::OutputCommand::CopyText(expected.into())));
+            // Round-trip the clipboard through the other pane, undo/redo and saving.
+            v.place_caret(1, (0, 0), false);
+            frame(&mut v, &ctx, vec![egui::Event::Paste(selected)]);
+            let pasted = format!("{expected}{other}");
+            assert_eq!(v.panes[1].doc.text(), pasted);
+            v.undo();
+            assert_eq!(v.panes[1].doc.text(), other);
+            v.redo();
+            assert_eq!(v.panes[1].doc.text(), pasted);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pasted.txt");
+            v.panes[1].doc.path = Some(path.clone());
+            v.save_pane(1).unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), pasted.as_bytes());
+            assert_eq!(v.panes[0].doc.text(), text);
+        }
+    }
+
     #[test]
     fn the_status_says_whether_the_active_pane_is_writable_and_modified() {
         let mut v = two_way("a\n", "a\n");
@@ -10501,6 +13012,36 @@ mod tests {
         std::fs::set_permissions(&path, perms).unwrap();
     }
     #[test]
+    fn saving_over_a_file_read_only_on_disk_is_refused_and_keeps_the_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.txt");
+        std::fs::write(&path, "a\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms.clone()).unwrap();
+        let mut v = two_way("a\n", "a\n");
+        v.panes[1].doc.path = Some(path.clone());
+        v.active_pane = 1;
+        v.place_caret(1, (0, 1), false);
+        v.caret_insert("b");
+        let err = v.save_pane(1).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            trf("msg.read_only_disk", &[("file", "locked.txt".into())])
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n");
+        assert!(v.panes[1].doc.modified);
+        assert_eq!(lines(&v, 1), ["ab"]);
+        // Once the file may be written again, saving works.
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path, perms).unwrap();
+        assert!(v.save_pane(1).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ab\n");
+        assert!(!v.panes[1].doc.modified);
+    }
+
+    #[test]
     fn compare_only_text_says_so_and_stays_locked() {
         let ctx = egui::Context::default();
         let mut v = two_way("a\n", "a\n");
@@ -10530,6 +13071,737 @@ mod tests {
         frame(&mut v, &ctx, vec![egui::Event::Text("x".into())]);
         assert_eq!(lines(&v, 0), ["a"]);
         assert!(!v.status.is_empty());
+    }
+
+    #[test]
+    fn typing_into_a_read_only_side_says_which_side_and_how_to_edit_it() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("a\n", "a\n");
+        v.panes[1].doc.read_only = true;
+        frame(&mut v, &ctx, vec![]);
+        v.place_caret(1, (0, 1), false);
+        // The caret is drawn dimmed: typing would not go in.
+        assert!(!v.caret_live(&ctx));
+        frame(&mut v, &ctx, vec![egui::Event::Text("x".into())]);
+        assert_eq!(lines(&v, 1), ["a"]);
+        let want = trf("msg.side_read_only", &[("side", side_name(1, 2).into())]);
+        assert_eq!(v.status, want);
+        // Unlocked, the same caret takes the text.
+        v.panes[1].doc.read_only = false;
+        assert!(v.caret_live(&ctx));
+        frame(&mut v, &ctx, vec![egui::Event::Text("x".into())]);
+        assert_eq!(lines(&v, 1), ["ax"]);
+        // Text read from a document cannot be unlocked, and the message says so.
+        v.panes[0].doc.read_only = true;
+        v.panes[0].doc.compare_only = true;
+        v.place_caret(0, (0, 0), false);
+        frame(&mut v, &ctx, vec![egui::Event::Text("x".into())]);
+        assert_eq!(lines(&v, 0), ["a"]);
+        let want = trf("msg.side_compare_only", &[("side", side_name(0, 2).into())]);
+        assert_eq!(v.status, want);
+    }
+
+    #[test]
+    fn the_caret_is_dimmed_while_the_find_field_has_the_keys() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("alpha\n", "alpha\n");
+        frame(&mut v, &ctx, vec![]);
+        v.place_caret(0, (0, 2), false);
+        assert!(v.caret_live(&ctx));
+        v.find.open = true;
+        v.find.focus = true;
+        frame(&mut v, &ctx, vec![]);
+        frame(&mut v, &ctx, vec![]);
+        assert!(!v.caret_live(&ctx));
+        // Typed text goes to the find field, not the file.
+        frame(&mut v, &ctx, vec![egui::Event::Text("x".into())]);
+        assert_eq!(lines(&v, 0), ["alpha"]);
+    }
+
+    #[test]
+    fn escape_closes_a_menu_the_find_bar_the_selection_and_the_caret_one_at_a_time() {
+        let ctx = egui::Context::default();
+        let esc = || key(Key::Escape, Modifiers::NONE);
+        let mut v = two_way("alpha beta\n", "alpha beta\n");
+        frame(&mut v, &ctx, vec![]);
+        v.place_caret(0, (0, 0), false);
+        v.place_caret(0, (0, 5), true);
+        v.find.open = true;
+        frame(&mut v, &ctx, vec![]);
+        // An open menu takes Escape for itself.
+        egui::Popup::open_id(&ctx, egui::Id::unique("menu"));
+        frame(&mut v, &ctx, vec![esc()]);
+        assert!(v.find.open);
+        assert!(v.caret().is_some_and(|c| c.has_selection()));
+        egui::Popup::close_all(&ctx);
+        // Then the find bar.
+        frame(&mut v, &ctx, vec![esc()]);
+        assert!(!v.find.open);
+        assert!(v.caret().is_some_and(|c| c.has_selection()));
+        // Then the selection: the caret stays where it was.
+        assert!(v.handles_escape());
+        frame(&mut v, &ctx, vec![esc()]);
+        let c = v.caret().unwrap();
+        assert!(!c.has_selection());
+        assert_eq!(c.pos, (0, 5));
+        // Then the caret, and the next Escape is the tab's.
+        frame(&mut v, &ctx, vec![esc()]);
+        assert!(v.caret().is_none());
+        assert!(!v.handles_escape());
+        // A column selection goes the same way.
+        v.find.open = true;
+        v.col_sel = Some(Box::new(ColSel {
+            pane: 0,
+            anchor: (0, 0),
+            head: (0, 3),
+        }));
+        frame(&mut v, &ctx, vec![esc()]);
+        assert!(!v.find.open);
+        assert!(v.col_sel.is_some());
+        frame(&mut v, &ctx, vec![esc()]);
+        assert!(v.col_sel.is_none());
+    }
+
+    #[test]
+    fn enter_keeps_the_indentation_up_to_the_caret() {
+        let ctx = egui::Context::default();
+        let enter = || key(Key::Enter, Modifiers::NONE);
+        let mut v = two_way("x\n", "    if a {\n\t\tb\n");
+        frame(&mut v, &ctx, vec![]);
+        // Spaces, from the end of the line.
+        v.place_caret(1, (0, 10), false);
+        frame(&mut v, &ctx, vec![enter(), egui::Event::Text("c".into())]);
+        assert_eq!(lines(&v, 1), ["    if a {", "    c", "\t\tb"]);
+        // Tabs, and a caret inside the indentation keeps only what is before it.
+        v.place_caret(1, (2, 1), false);
+        frame(&mut v, &ctx, vec![enter()]);
+        assert_eq!(lines(&v, 1), ["    if a {", "    c", "\t", "\t\tb"]);
+        assert_eq!(v.caret().map(|c| c.pos), Some((3, 1)));
+        // A selection is replaced by the line break, indented like its first line.
+        v.place_caret(1, (0, 4), false);
+        v.place_caret(1, (0, 10), true);
+        frame(&mut v, &ctx, vec![enter()]);
+        assert_eq!(lines(&v, 1)[..2], ["    ", "    "]);
+        // One undo step brings the selected text back.
+        v.undo();
+        assert_eq!(lines(&v, 1)[0], "    if a {");
+    }
+
+    #[test]
+    fn duplicate_and_move_lines_take_the_caret_selection_or_the_selected_rows() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("a\nb\nc\nd\n", "a\nb\nc\nd\n");
+        frame(&mut v, &ctx, vec![]);
+        // The caret's line, with the caret on the copy.
+        v.place_caret(1, (1, 1), false);
+        v.duplicate_lines();
+        assert_eq!(lines(&v, 1), ["a", "b", "b", "c", "d"]);
+        assert_eq!(v.caret().map(|c| c.pos), Some((2, 1)));
+        v.undo();
+        assert_eq!(lines(&v, 1), ["a", "b", "c", "d"]);
+        // A selection to the start of a line leaves that line out, and moves with its lines.
+        v.place_caret(1, (1, 0), false);
+        v.place_caret(1, (3, 0), true);
+        v.move_lines(true);
+        assert_eq!(lines(&v, 1), ["b", "c", "a", "d"]);
+        let c = v.caret().unwrap();
+        assert_eq!((c.anchor, c.pos), ((0, 0), (2, 0)));
+        // At the top nothing changes, and there is nothing to undo for it.
+        let steps = v.undo.len();
+        v.move_lines(true);
+        assert_eq!(lines(&v, 1), ["b", "c", "a", "d"]);
+        assert_eq!(v.undo.len(), steps);
+        v.move_lines(false);
+        v.move_lines(false);
+        assert_eq!(lines(&v, 1), ["a", "d", "b", "c"]);
+        // At the bottom, the selection ends at the end of the file.
+        assert_eq!(v.caret().map(|c| c.range()), Some(((2, 0), (3, 1))));
+        // Duplicating a selection selects the copy.
+        v.duplicate_lines();
+        assert_eq!(lines(&v, 1), ["a", "d", "b", "c", "b", "c"]);
+        assert_eq!(v.caret().map(|c| c.range()), Some(((4, 0), (5, 1))));
+        // Without a caret: the active pane's lines in the selected rows.
+        v.caret = None;
+        v.panes[0].doc.lines = ["1", "2", "3"].map(String::from).to_vec();
+        v.rediff();
+        v.active_pane = 0;
+        v.sel_anchor = Some(0);
+        v.cursor_row = Some(v.diff.row_of_line(0, 1));
+        v.move_lines(false);
+        assert_eq!(lines(&v, 0), ["3", "1", "2"]);
+        assert_eq!(v.cursor_row, Some(v.diff.row_of_line(0, 2)));
+        assert_eq!(v.sel_anchor, Some(v.diff.row_of_line(0, 1)));
+        // A read-only side says so and keeps its lines.
+        v.panes[0].doc.read_only = true;
+        v.duplicate_lines();
+        assert_eq!(lines(&v, 0), ["3", "1", "2"]);
+        assert_eq!(v.status, v.read_only_message(0));
+    }
+
+    /// Puts carets at `at` in pane `pane`, the last one primary.
+    fn put_carets(v: &mut TextView, pane: usize, at: &[(edit::Pos, edit::Pos)]) {
+        let n = at.len();
+        let list = at
+            .iter()
+            .enumerate()
+            .map(|(i, &(anchor, pos))| {
+                let c = Caret {
+                    pane,
+                    pos,
+                    anchor,
+                    want: None,
+                };
+                (c, i + 1 == n)
+            })
+            .collect();
+        v.set_carets(list);
+    }
+
+    /// The carets in text order, as (anchor, pos).
+    fn caret_spots(v: &TextView) -> Vec<(edit::Pos, edit::Pos)> {
+        let mut c: Vec<_> = v.carets().iter().map(|c| (c.anchor, c.pos)).collect();
+        c.sort();
+        c
+    }
+
+    #[test]
+    fn overlapping_multi_caret_deletions_use_the_original_text_and_undo_once() {
+        for mac in [false, true] {
+            let modifiers = if mac { Modifiers::ALT } else { Modifiers::CTRL };
+            for (key, spots, expected) in [
+                (
+                    Key::Backspace,
+                    vec![((0, 2), (0, 2)), ((0, 4), (0, 4))],
+                    "o world",
+                ),
+                (
+                    Key::Delete,
+                    vec![((0, 1), (0, 1)), ((0, 3), (0, 3))],
+                    "h world",
+                ),
+                (
+                    Key::Backspace,
+                    vec![((0, 1), (0, 3)), ((0, 4), (0, 4))],
+                    "o world",
+                ),
+            ] {
+                let mut v = two_way("untouched\n", "hello world\n");
+                put_carets(&mut v, 1, &spots);
+                let original = caret_spots(&v);
+                v.caret_key_pressed_on(mac, key, modifiers);
+                assert_eq!(lines(&v, 1), [expected]);
+                assert_eq!(v.carets().len(), 1, "overlapping ranges collapse together");
+                let after = caret_spots(&v);
+                assert_eq!(lines(&v, 0), ["untouched"]);
+                assert_eq!(v.undo.len(), 1);
+                v.undo();
+                assert_eq!(lines(&v, 1), ["hello world"]);
+                assert_eq!(caret_spots(&v), original);
+                v.redo();
+                assert_eq!(lines(&v, 1), [expected]);
+                assert_eq!(caret_spots(&v), after);
+            }
+        }
+        // Newline joins, grapheme clusters, and non-overlapping positions on one line.
+        for (text, spots, key, expected) in [
+            (
+                "a\nb\nc\n",
+                vec![((1, 0), (1, 0)), ((2, 0), (2, 0))],
+                Key::Backspace,
+                vec!["abc"],
+            ),
+            (
+                "é漢😀\n",
+                vec![((0, 2), (0, 2)), ((0, 5), (0, 5))],
+                Key::Backspace,
+                vec!["😀"],
+            ),
+            (
+                "abcd\n",
+                vec![((0, 0), (0, 0)), ((0, 2), (0, 2))],
+                Key::Delete,
+                vec!["bd"],
+            ),
+        ] {
+            let mut v = two_way("x\n", text);
+            put_carets(&mut v, 1, &spots);
+            v.caret_key_pressed_on(false, key, Modifiers::NONE);
+            assert_eq!(lines(&v, 1), expected);
+            v.undo();
+            assert_eq!(v.panes[1].doc.text(), text);
+            v.redo();
+            assert_eq!(lines(&v, 1), expected);
+        }
+    }
+
+    #[test]
+    fn multi_caret_cuts_copy_original_lines_once_and_preserve_the_rest() {
+        for (spots, expected, copied) in [
+            (
+                vec![((0, 1), (0, 1)), ((0, 2), (0, 2))],
+                vec!["def", "ghi"],
+                "abc\n",
+            ),
+            (
+                vec![((0, 0), (0, 0)), ((0, 1), (0, 1)), ((0, 2), (0, 2))],
+                vec!["def", "ghi"],
+                "abc\n",
+            ),
+            (
+                vec![((1, 1), (1, 1)), ((2, 1), (2, 1))],
+                vec!["abc"],
+                "def\nghi\n",
+            ),
+            (
+                vec![((0, 1), (0, 1)), ((2, 1), (2, 1))],
+                vec!["def"],
+                "abc\nghi\n",
+            ),
+            (
+                vec![((0, 1), (0, 2)), ((0, 3), (0, 3))],
+                vec!["def", "ghi"],
+                "b\nabc",
+            ),
+            (
+                vec![((0, 0), (0, 0)), ((1, 0), (1, 0)), ((2, 0), (2, 0))],
+                vec![""],
+                "abc\ndef\nghi\n",
+            ),
+        ] {
+            for read_only in [false, true] {
+                let ctx = egui::Context::default();
+                let mut v = two_way("untouched\n", "abc\ndef\nghi\n");
+                put_carets(&mut v, 1, &spots);
+                let original = caret_spots(&v);
+                v.panes[1].doc.read_only = read_only;
+                let output = frame(&mut v, &ctx, vec![egui::Event::Cut]);
+                assert!(output
+                    .platform_output
+                    .commands
+                    .contains(&egui::OutputCommand::CopyText(copied.into())));
+                assert_eq!(lines(&v, 0), ["untouched"]);
+                if read_only {
+                    assert_eq!(lines(&v, 1), ["abc", "def", "ghi"]);
+                    assert_eq!(caret_spots(&v), original);
+                    assert!(v.undo.is_empty());
+                } else {
+                    assert_eq!(lines(&v, 1), expected);
+                    assert_eq!(v.undo.len(), 1);
+                    let after = caret_spots(&v);
+                    v.undo();
+                    assert_eq!(lines(&v, 1), ["abc", "def", "ghi"]);
+                    assert_eq!(caret_spots(&v), original);
+                    v.redo();
+                    assert_eq!(lines(&v, 1), expected);
+                    assert_eq!(caret_spots(&v), after);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn carets_merge_where_they_meet_and_follow_edits_before_them() {
+        let k = |a: edit::Pos, p: edit::Pos| Caret {
+            pane: 0,
+            pos: p,
+            anchor: a,
+            want: None,
+        };
+        let mut list = vec![
+            (k((0, 5), (0, 5)), false),
+            (k((0, 1), (0, 3)), true),
+            (k((0, 3), (0, 3)), false),
+            (k((1, 0), (1, 2)), false),
+            (k((1, 2), (1, 4)), false),
+            (k((0, 1), (0, 1)), false),
+        ];
+        merge_carets(&mut list);
+        let got: Vec<_> = list.iter().map(|(c, p)| (c.anchor, c.pos, *p)).collect();
+        // A bare caret inside or at the end of a selection joins it, with the primary mark;
+        // two selections that only touch stay apart.
+        assert_eq!(
+            got,
+            [
+                ((0, 1), (0, 3), true),
+                ((0, 5), (0, 5), false),
+                ((1, 0), (1, 2), false),
+                ((1, 2), (1, 4), false),
+            ]
+        );
+        let after: Vec<String> = ["xy", "ab", "aXcd"].map(String::from).to_vec();
+        // An edit before it on its line: the text after it says where it is now.
+        assert_eq!(shift_past_edit(&after, 3, (2, 2), "cd"), (2, 2));
+        // A line added above.
+        assert_eq!(shift_past_edit(&after, 2, (1, 1), "cd"), (2, 2));
+        assert_eq!(shift_past_edit(&after, 3, (0, 9), ""), (0, 2));
+    }
+
+    #[test]
+    fn typing_deleting_and_moving_at_several_carets_is_one_step_each() {
+        let ctx = egui::Context::default();
+        let text = |t: &str| egui::Event::Text(t.into());
+        let k = |key| super::tests::key(key, Modifiers::NONE);
+        let mut v = two_way("x\n", "alpha\nbeta\ngamma\n");
+        frame(&mut v, &ctx, vec![]);
+        put_carets(
+            &mut v,
+            1,
+            &[((0, 0), (0, 0)), ((1, 0), (1, 0)), ((2, 0), (2, 0))],
+        );
+        frame(&mut v, &ctx, vec![text("-"), text("-")]);
+        assert_eq!(lines(&v, 1), ["--alpha", "--beta", "--gamma"]);
+        assert_eq!(v.carets().len(), 3);
+        // Typing joins one undo step, which puts the carets back.
+        v.undo();
+        assert_eq!(lines(&v, 1), ["alpha", "beta", "gamma"]);
+        assert_eq!(
+            caret_spots(&v),
+            [((0, 0), (0, 0)), ((1, 0), (1, 0)), ((2, 0), (2, 0))]
+        );
+        v.redo();
+        assert_eq!(lines(&v, 1), ["--alpha", "--beta", "--gamma"]);
+        assert_eq!(
+            caret_spots(&v),
+            [((0, 2), (0, 2)), ((1, 2), (1, 2)), ((2, 2), (2, 2))]
+        );
+        // Backspace, End and Enter with each caret's own indentation.
+        frame(&mut v, &ctx, vec![k(Key::Backspace)]);
+        assert_eq!(lines(&v, 1), ["-alpha", "-beta", "-gamma"]);
+        frame(&mut v, &ctx, vec![k(Key::End), text("!")]);
+        assert_eq!(lines(&v, 1), ["-alpha!", "-beta!", "-gamma!"]);
+        // Up from the first line goes to its start, so two carets meet there and merge.
+        frame(&mut v, &ctx, vec![k(Key::ArrowUp)]);
+        assert_eq!(v.carets().len(), 3);
+        assert_eq!(v.carets().iter().filter(|c| c.pos == (0, 0)).count(), 1);
+        frame(&mut v, &ctx, vec![k(Key::ArrowUp)]);
+        assert_eq!(v.carets().len(), 2, "two reach the top and merge");
+        // Escape goes back to the primary caret; the next one removes it.
+        frame(&mut v, &ctx, vec![k(Key::Escape)]);
+        assert_eq!(v.carets().len(), 1);
+        frame(&mut v, &ctx, vec![k(Key::Escape)]);
+        assert!(v.caret().is_none());
+
+        // Several carets on one line, with characters of several bytes.
+        let mut v = two_way("x\n", "é漢😀\n");
+        frame(&mut v, &ctx, vec![]);
+        put_carets(
+            &mut v,
+            1,
+            &[((0, 2), (0, 2)), ((0, 5), (0, 5)), ((0, 9), (0, 9))],
+        );
+        frame(&mut v, &ctx, vec![text("|")]);
+        assert_eq!(lines(&v, 1), ["é|漢|😀|"]);
+        frame(&mut v, &ctx, vec![k(Key::Backspace), k(Key::Backspace)]);
+        assert_eq!(lines(&v, 1), [""]);
+        assert_eq!(v.carets().len(), 1, "all at the start, merged");
+    }
+
+    #[test]
+    fn several_carets_paste_one_line_each_copy_in_order_and_indent_once() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("x\n", "a\nb\nc\n");
+        frame(&mut v, &ctx, vec![]);
+        put_carets(
+            &mut v,
+            1,
+            &[((0, 1), (0, 1)), ((1, 1), (1, 1)), ((2, 1), (2, 1))],
+        );
+        // As many lines as carets: one each.
+        frame(&mut v, &ctx, vec![egui::Event::Paste("1\n2\n3".into())]);
+        assert_eq!(lines(&v, 1), ["a1", "b2", "c3"]);
+        // Otherwise the whole text at each, as one undo step.
+        frame(&mut v, &ctx, vec![egui::Event::Paste("z".into())]);
+        assert_eq!(lines(&v, 1), ["a1z", "b2z", "c3z"]);
+        v.undo();
+        assert_eq!(lines(&v, 1), ["a1", "b2", "c3"]);
+        // Copy: the selections one per line, in text order.
+        put_carets(&mut v, 1, &[((2, 0), (2, 1)), ((0, 0), (0, 2))]);
+        let copied = |out: egui::FullOutput, want: &str| {
+            assert!(
+                out.platform_output
+                    .commands
+                    .contains(&egui::OutputCommand::CopyText(want.into())),
+                "{:?}",
+                out.platform_output.commands
+            );
+        };
+        copied(frame(&mut v, &ctx, vec![egui::Event::Copy]), "a1\nc");
+        // Without selections, each caret's whole line.
+        put_carets(&mut v, 1, &[((0, 0), (0, 0)), ((2, 0), (2, 0))]);
+        copied(frame(&mut v, &ctx, vec![egui::Event::Copy]), "a1\nc3\n");
+        // Tab with two carets on one line indents it once; Shift+Tab takes it back.
+        put_carets(
+            &mut v,
+            1,
+            &[((1, 0), (1, 0)), ((1, 1), (1, 1)), ((0, 0), (0, 2))],
+        );
+        frame(&mut v, &ctx, vec![key(Key::Tab, Modifiers::NONE)]);
+        assert_eq!(lines(&v, 1), ["    a1", "    b2", "c3"]);
+        frame(&mut v, &ctx, vec![key(Key::Tab, Modifiers::SHIFT)]);
+        assert_eq!(lines(&v, 1), ["a1", "b2", "c3"]);
+        // Duplicate and move act on each caret's lines, as runs.
+        put_carets(&mut v, 1, &[((0, 0), (0, 0)), ((2, 1), (2, 1))]);
+        v.duplicate_lines();
+        assert_eq!(lines(&v, 1), ["a1", "a1", "b2", "c3", "c3"]);
+        assert_eq!(caret_spots(&v), [((1, 0), (1, 0)), ((4, 1), (4, 1))]);
+        v.move_lines(false);
+        assert_eq!(
+            lines(&v, 1),
+            ["a1", "a1", "b2", "c3", "c3"],
+            "the last can't move: none do"
+        );
+        put_carets(&mut v, 1, &[((2, 0), (2, 0)), ((4, 0), (4, 0))]);
+        v.move_lines(true);
+        assert_eq!(lines(&v, 1), ["a1", "b2", "a1", "c3", "c3"]);
+        assert_eq!(caret_spots(&v), [((1, 0), (1, 0)), ((3, 0), (3, 0))]);
+    }
+
+    #[test]
+    fn carets_move_with_lines_copied_in_and_a_read_only_side_refuses_them_all() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("new\na\nb\n", "a\nb\n");
+        frame(&mut v, &ctx, vec![]);
+        put_carets(&mut v, 1, &[((0, 1), (0, 1)), ((1, 1), (1, 1))]);
+        v.copy_block(0, 0, 1);
+        assert_eq!(lines(&v, 1), ["new", "a", "b"]);
+        assert_eq!(caret_spots(&v), [((1, 1), (1, 1)), ((2, 1), (2, 1))]);
+        // Ctrl+Alt+Down (⌘⌥ on macOS) adds a caret below the last, at its column.
+        let add = Modifiers::ALT.plus(Modifiers::COMMAND);
+        frame(&mut v, &ctx, vec![key(Key::ArrowUp, add)]);
+        assert_eq!(caret_spots(&v)[0], ((0, 1), (0, 1)));
+        assert_eq!(v.carets().len(), 3);
+        v.panes[1].doc.read_only = true;
+        frame(&mut v, &ctx, vec![egui::Event::Text("x".into())]);
+        assert_eq!(lines(&v, 1), ["new", "a", "b"]);
+        assert_eq!(v.status, v.read_only_message(1));
+        assert_eq!(v.carets().len(), 3, "the carets stay");
+    }
+
+    #[test]
+    fn ctrl_click_adds_and_removes_carets_in_both_layouts() {
+        for layout in [TextLayout::Compact, TextLayout::Aligned] {
+            let ctx = egui::Context::default();
+            crate::ui::fonts::setup(&ctx, "en");
+            let mut v = two_way("one\ntwo\nthree\n", "one\nextra\ntwo\nthree\n");
+            v.text_layout = layout;
+            frame(&mut v, &ctx, vec![]);
+            frame(&mut v, &ctx, vec![]);
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            let click = |v: &mut TextView, p: egui::Pos2, m: Modifiers| {
+                let down = vec![egui::Event::PointerMoved(p), button(p, true)];
+                frame_with(v, &ctx, down, m);
+                frame_with(v, &ctx, vec![button(p, false)], m);
+                // Apart from the next click, so it does not count as a double-click.
+                for _ in 0..3 {
+                    frame(v, &ctx, vec![]);
+                }
+            };
+            let mut ys = std::collections::HashMap::new();
+            for y in (90..300).step_by(2) {
+                click(&mut v, pos2(650.0, y as f32), Modifiers::NONE);
+                if let Some(c) = v.caret().filter(|c| c.pane == 1) {
+                    ys.entry(c.pos.0).or_insert(y as f32 + 2.0);
+                }
+            }
+            let name = format!("{layout:?}");
+            let at = |l: usize| pos2(650.0, ys[&l]);
+            click(&mut v, at(0), Modifiers::NONE);
+            click(&mut v, at(1), Modifiers::COMMAND);
+            click(&mut v, at(3), Modifiers::COMMAND);
+            let lines_of_carets: Vec<usize> = caret_spots(&v).iter().map(|c| c.1 .0).collect();
+            assert_eq!(lines_of_carets, [0, 1, 3], "{name}");
+            assert_eq!(
+                v.caret().map(|c| c.pos.0),
+                Some(3),
+                "{name}: the last added leads"
+            );
+            // Ctrl+click on a caret removes it.
+            click(&mut v, at(1), Modifiers::COMMAND);
+            let lines_of_carets: Vec<usize> = caret_spots(&v).iter().map(|c| c.1 .0).collect();
+            assert_eq!(lines_of_carets, [0, 3], "{name}");
+            // Typing goes in at both, as one undo step.
+            frame(&mut v, &ctx, vec![key(Key::Home, Modifiers::NONE)]);
+            frame(&mut v, &ctx, vec![egui::Event::Text("#".into())]);
+            assert_eq!(lines(&v, 1), ["#one", "extra", "two", "#three"], "{name}");
+            v.undo();
+            assert_eq!(lines(&v, 1), ["one", "extra", "two", "three"], "{name}");
+            // A plain click goes back to one caret.
+            click(&mut v, at(2), Modifiers::NONE);
+            assert_eq!(v.carets().len(), 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_slow_comparison_waits_while_typing_goes_on_and_never_longer() {
+        let ctx = egui::Context::default();
+        let text = |t: &str| egui::Event::Text(t.into());
+        let mut v = two_way("a\nb\n", "a\nb\n");
+        frame(&mut v, &ctx, vec![]);
+        v.place_caret(1, (0, 1), false);
+        let slow = |v: &mut TextView| v.rediff_ms = 100.0;
+        // Typing in a line: the text changes at once, the comparison waits.
+        slow(&mut v);
+        frame(&mut v, &ctx, vec![text("x")]);
+        frame(&mut v, &ctx, vec![text("y")]);
+        assert_eq!(lines(&v, 1), ["axy", "b"]);
+        assert!(v.rediff_due.is_some());
+        assert!(v.diff.blocks.is_empty(), "not compared yet");
+        // A pause in typing compares.
+        for _ in 0..3 {
+            frame(&mut v, &ctx, vec![]);
+        }
+        assert!(v.rediff_due.is_none());
+        assert_eq!(v.diff.blocks.len(), 1);
+        // So does any other key, before it acts,
+        slow(&mut v);
+        frame(&mut v, &ctx, vec![text("z")]);
+        assert!(v.rediff_due.is_some());
+        frame(&mut v, &ctx, vec![key(Key::ArrowLeft, Modifiers::NONE)]);
+        assert!(v.rediff_due.is_none());
+        // and any command, which the app runs after settling the comparison.
+        slow(&mut v);
+        frame(&mut v, &ctx, vec![text("w")]);
+        assert!(v.rediff_due.is_some());
+        v.settle_diff();
+        assert!(v.rediff_due.is_none());
+        assert_eq!(lines(&v, 1), ["axywz", "b"]);
+        // A new line always compares at once; the undo steps are those of typing as before:
+        // the new line, "w", then "xyz" typed in one go.
+        slow(&mut v);
+        frame(&mut v, &ctx, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(v.rediff_due.is_none());
+        v.undo();
+        v.undo();
+        assert_eq!(lines(&v, 1), ["axyz", "b"]);
+        v.undo();
+        assert_eq!(lines(&v, 1), ["a", "b"]);
+    }
+
+    /// Editing latency on large files, run by hand in a release build:
+    /// `cargo test --release --bin oxidemerge editing_latency -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn editing_latency() {
+        for (lines_n, every) in [(10_000, 20), (50_000, 20), (50_000, 2), (200_000, 50)] {
+            let a: String = (0..lines_n)
+                .map(|i| format!("    let value_{i} = compute({i}, \"text\");\n"))
+                .collect();
+            let b: String = (0..lines_n)
+                .map(|i| {
+                    if i % every == 0 {
+                        format!("    let value_{i} = changed({i});\n")
+                    } else {
+                        format!("    let value_{i} = compute({i}, \"text\");\n")
+                    }
+                })
+                .collect();
+            let ctx = egui::Context::default();
+            let mut v = two_way(&a, &b);
+            frame(&mut v, &ctx, vec![]);
+            let time = |v: &mut TextView, events: Vec<egui::Event>, n: usize| {
+                let mut ts = Vec::new();
+                for _ in 0..n {
+                    let t = std::time::Instant::now();
+                    frame(v, &ctx, events.clone());
+                    ts.push(t.elapsed().as_secs_f64() * 1000.0);
+                }
+                ts.sort_by(f64::total_cmp);
+                (ts[ts.len() / 2], ts[ts.len() - 1])
+            };
+            let idle = time(&mut v, vec![], 10);
+            let mid = lines_n / 2;
+            v.place_caret(1, (mid, 8), false);
+            frame(&mut v, &ctx, vec![]);
+            // The first keystroke takes an undo snapshot; the next ones join it.
+            let first = time(&mut v, vec![egui::Event::Text("x".into())], 1);
+            let typing = time(&mut v, vec![egui::Event::Text("x".into())], 20);
+            let enter = time(&mut v, vec![key(Key::Enter, Modifiers::NONE)], 5);
+            let select = time(&mut v, vec![key(Key::ArrowDown, Modifiers::SHIFT)], 20);
+            let t = std::time::Instant::now();
+            v.rediff();
+            let rediff = t.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "{lines_n} lines, 1 in {every} changed ({} blocks): idle frame {:.1} ms, first key {:.1}, typing {:.1} (max {:.1}), Enter {:.1} (max {:.1}), Shift+Down {:.1} (max {:.1}), rediff {rediff:.1}",
+                v.diff.blocks.len(), idle.0, first.0, typing.0, typing.1, enter.0, enter.1, select.0, select.1
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_or_drag_at_the_bottom_edge_never_jumps_the_view() {
+        let text: String = (0..300).map(|i| format!("line {i}\n")).collect();
+        let mut v = two_way(&text, &format!("x\n{text}"));
+        let ctx = egui::Context::default();
+        crate::ui::fonts::setup(&ctx, "en");
+        frame(&mut v, &ctx, vec![]);
+        frame(&mut v, &ctx, vec![]);
+        let button = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        // Clicking the lowest lines puts the caret there and leaves the view alone.
+        let mut lowest = None;
+        for y in (300..500).rev().step_by(4) {
+            let p = pos2(200.0, y as f32);
+            frame(
+                &mut v,
+                &ctx,
+                vec![egui::Event::PointerMoved(p), button(p, true)],
+            );
+            frame(&mut v, &ctx, vec![button(p, false)]);
+            for _ in 0..4 {
+                frame(&mut v, &ctx, vec![]);
+            }
+            if v.caret().is_some() {
+                lowest = Some(p);
+                break;
+            }
+        }
+        assert!(lowest.is_some(), "no line found to click");
+        assert_eq!(v.scroll, 0.0);
+        // Dragging past the bottom scrolls a little each frame, with the selection's end at
+        // the bottom edge.
+        frame(&mut v, &ctx, vec![]);
+        frame(&mut v, &ctx, vec![]);
+        let from = pos2(200.0, 120.0);
+        frame(
+            &mut v,
+            &ctx,
+            vec![egui::Event::PointerMoved(from), button(from, true)],
+        );
+        for y in [200.0, 300.0, 400.0, 495.0] {
+            frame(
+                &mut v,
+                &ctx,
+                vec![egui::Event::PointerMoved(pos2(200.0, y))],
+            );
+        }
+        let mut last = v.scroll;
+        for _ in 0..12 {
+            frame(&mut v, &ctx, vec![]);
+            let step = v.scroll - last;
+            assert!((0.0..2.0).contains(&step), "the view jumped {step} lines");
+            last = v.scroll;
+            let end = v.caret().map(|c| c.pos.0).unwrap_or(0) as f32;
+            assert!(
+                end >= v.scroll + 10.0,
+                "end {end} left the bottom (top {})",
+                v.scroll
+            );
+        }
+        assert!(v.scroll > 10.0);
+        frame(&mut v, &ctx, vec![button(pos2(200.0, 495.0), false)]);
+        for _ in 0..4 {
+            frame(&mut v, &ctx, vec![]);
+        }
+        assert_eq!(v.scroll, last, "the view moved after the drag");
     }
 
     /// Runs one frame of the side-by-side view with `events`.
@@ -10574,6 +13846,228 @@ mod tests {
             repeat: false,
             modifiers,
         }
+    }
+
+    /// The text of the line at the top of pane `p` as it is scrolled now.
+    fn top_text(v: &TextView, p: usize) -> Option<String> {
+        let VLine::Row(r, _) = *v.layout.lines.get(v.scroll as usize)? else {
+            return None;
+        };
+        let l = v.diff.rows[r].line(p)?;
+        Some(v.panes[p].doc.lines[l].clone())
+    }
+
+    #[test]
+    fn the_view_and_the_caret_keep_their_text_when_rows_above_them_change() {
+        let ctx = egui::Context::default();
+        let body: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let mut v = two_way(&format!("extra 1\nextra 2\nextra 3\n{body}"), &body);
+        frame(&mut v, &ctx, vec![]);
+        assert_eq!(v.diff.blocks.len(), 1, "the three extra lines");
+        v.scroll = 120.0;
+        frame(&mut v, &ctx, vec![]);
+        let top = top_text(&v, 1).unwrap();
+        // A caret with a selection in the right side, in view, below the copied lines.
+        v.place_caret(1, (125, 2), false);
+        v.place_caret(1, (126, 4), true);
+        v.scroll = 120.0;
+        frame(&mut v, &ctx, vec![]);
+        let selected = v.caret_text();
+
+        // Copying the block adds three rows of text to the right side above both.
+        v.copy_block(0, 0, 1);
+        frame(&mut v, &ctx, vec![]);
+        assert_eq!(lines(&v, 1)[..3], ["extra 1", "extra 2", "extra 3"]);
+        assert_eq!(
+            top_text(&v, 1).as_ref(),
+            Some(&top),
+            "the same text at the top"
+        );
+        let c = v.caret().unwrap();
+        assert_eq!(
+            (c.pos, c.anchor),
+            ((129, 4), (128, 2)),
+            "moved with its lines"
+        );
+        assert_eq!(v.caret_text(), selected);
+
+        // Undo takes them out again: the view, the caret and the selection go back with them.
+        v.undo();
+        frame(&mut v, &ctx, vec![]);
+        assert_eq!(top_text(&v, 1).as_ref(), Some(&top));
+        let c = v.caret().unwrap();
+        assert_eq!((c.pos, c.anchor), ((126, 4), (125, 2)));
+        assert_eq!(v.caret_text(), selected);
+        v.redo();
+        frame(&mut v, &ctx, vec![]);
+        assert_eq!(v.caret().unwrap().pos, (129, 4));
+
+        // Without a caret, the cursor row keeps to its line.
+        v.caret = None;
+        v.cursor_row = Some(v.diff.row_of_line(1, 160));
+        v.undo();
+        frame(&mut v, &ctx, vec![]);
+        let row = v.cursor_row.unwrap();
+        assert_eq!(v.diff.rows[row].line(1), Some(157));
+        assert_eq!(lines(&v, 1)[157], "line 157");
+    }
+
+    /// The display line where pane `p`'s line `l` starts.
+    fn display_line_of(v: &TextView, p: usize, l: usize) -> usize {
+        v.layout.row_line[v.diff.row_of_line(p, l)]
+    }
+
+    #[test]
+    fn the_view_keeps_its_text_with_folded_and_wrapped_lines() {
+        let ctx = egui::Context::default();
+        // Folded: unchanged lines between two differences are collapsed.
+        let body: String = (0..300).map(|i| format!("line {i}\n")).collect();
+        // A difference every 20 lines, so that the folded view is longer than the window.
+        let changed: String = (0..300)
+            .map(|i| match i % 20 {
+                10 => format!("line {i} changed\n"),
+                _ => format!("line {i}\n"),
+            })
+            .collect();
+        let mut v = two_way(&format!("extra 1\nextra 2\nextra 3\n{body}"), &changed);
+        v.set_collapse(true);
+        frame(&mut v, &ctx, vec![]);
+        assert!(v.layout.lines.iter().any(|l| matches!(l, VLine::Fold(..))));
+        v.scroll = display_line_of(&v, 1, 149) as f32;
+        frame(&mut v, &ctx, vec![]);
+        assert_eq!(top_text(&v, 1).as_deref(), Some("line 149"));
+        v.place_caret(1, (150, 4), false);
+        v.scroll = display_line_of(&v, 1, 149) as f32;
+        frame(&mut v, &ctx, vec![]);
+        v.copy_block(0, 0, 1);
+        frame(&mut v, &ctx, vec![]);
+        assert_eq!(lines(&v, 1)[..3], ["extra 1", "extra 2", "extra 3"]);
+        assert_eq!(top_text(&v, 1).as_deref(), Some("line 149"), "folded");
+        assert_eq!(v.caret().map(|c| c.pos), Some((153, 4)));
+        // Copying moves on to the next difference; back to where the test looks.
+        v.scroll_anim = None;
+        v.scroll = display_line_of(&v, 1, 152) as f32;
+        frame(&mut v, &ctx, vec![]);
+        v.undo();
+        for _ in 0..6 {
+            frame(&mut v, &ctx, vec![]);
+        }
+        assert_eq!(
+            top_text(&v, 1).as_deref(),
+            Some("line 149"),
+            "folded, undone"
+        );
+
+        // Wrapped: the view stays on the same display line of a long line.
+        let long = |i: usize| format!("{i:03} {}", "word ".repeat(60));
+        let body: String = (0..120).map(|i| long(i) + "\n").collect();
+        let mut v = two_way(&format!("extra 1\nextra 2\nextra 3\n{body}"), &body);
+        v.wrap = true;
+        frame(&mut v, &ctx, vec![]);
+        frame(&mut v, &ctx, vec![]);
+        let first = display_line_of(&v, 1, 80);
+        assert!(display_line_of(&v, 1, 81) > first + 1, "line 80 wraps");
+        v.scroll = (first + 1) as f32 + 0.25;
+        frame(&mut v, &ctx, vec![]);
+        v.copy_block(0, 0, 1);
+        frame(&mut v, &ctx, vec![]);
+        assert_eq!(
+            v.scroll,
+            (display_line_of(&v, 1, 83) + 1) as f32 + 0.25,
+            "wrapped"
+        );
+    }
+
+    #[test]
+    fn a_caret_moving_past_the_edge_scrolls_one_line_at_a_time() {
+        let ctx = egui::Context::default();
+        let body: String = (0..300).map(|i| format!("line {i}\n")).collect();
+        let mut v = two_way(&body, &body);
+        frame(&mut v, &ctx, vec![]);
+        v.place_caret(1, (0, 0), false);
+        frame(&mut v, &ctx, vec![]);
+        let mut last = v.scroll;
+        let mut moved = 0;
+        for _ in 0..80 {
+            frame(&mut v, &ctx, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+            let step = v.scroll - last;
+            assert!(
+                (0.0..=1.001).contains(&step),
+                "scrolled {step} lines at once"
+            );
+            moved += (step > 0.0) as usize;
+            last = v.scroll;
+        }
+        assert!(moved > 20, "the view followed the caret");
+        // Typing a new line at the bottom edge scrolls one line too.
+        let before = v.scroll;
+        frame(&mut v, &ctx, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(v.scroll - before <= 1.001, "{} -> {}", before, v.scroll);
+        // A jump far away still centres the caret's line a third of the way down.
+        frame(&mut v, &ctx, vec![key(Key::End, Modifiers::COMMAND)]);
+        for _ in 0..4 {
+            frame(&mut v, &ctx, vec![]);
+        }
+        assert!(v.scroll > 200.0, "{}", v.scroll);
+    }
+
+    #[test]
+    fn word_keys_move_select_and_delete_by_word() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("x\n", "let foo_bar = x.len();\nnext\n");
+        frame(&mut v, &ctx, vec![]);
+        // Option on macOS, Ctrl (which egui also reports as the command key) elsewhere.
+        let word = if MAC {
+            Modifiers::ALT
+        } else {
+            Modifiers::CTRL.plus(Modifiers::COMMAND)
+        };
+        let shift_word = word.plus(Modifiers::SHIFT);
+        let press = |v: &mut TextView, k: Key, m: Modifiers| frame(v, &ctx, vec![key(k, m)]);
+        v.place_caret(1, (0, 0), false);
+        press(&mut v, Key::ArrowRight, word);
+        assert_eq!(v.caret().unwrap().pos, (0, 3));
+        press(&mut v, Key::ArrowRight, word);
+        assert_eq!(v.caret().unwrap().pos, (0, 11));
+        press(&mut v, Key::ArrowLeft, word);
+        assert_eq!(v.caret().unwrap().pos, (0, 4));
+        // With Shift the selection grows by words, and shrinks back.
+        press(&mut v, Key::ArrowRight, shift_word);
+        press(&mut v, Key::ArrowRight, shift_word);
+        assert_eq!(v.caret_text().as_deref(), Some("foo_bar ="));
+        press(&mut v, Key::ArrowLeft, shift_word);
+        assert_eq!(v.caret_text().as_deref(), Some("foo_bar "));
+        // A word key deletes the selection first.
+        press(&mut v, Key::Backspace, word);
+        assert_eq!(lines(&v, 1)[0], "let = x.len();");
+        v.undo();
+        assert_eq!(lines(&v, 1)[0], "let foo_bar = x.len();");
+        // Backspace and Delete by word, each one undo step.
+        v.place_caret(1, (0, 15), false);
+        press(&mut v, Key::Backspace, word);
+        assert_eq!(lines(&v, 1)[0], "let foo_bar = .len();");
+        press(&mut v, Key::Delete, word);
+        assert_eq!(lines(&v, 1)[0], "let foo_bar = len();");
+        v.undo();
+        assert_eq!(lines(&v, 1)[0], "let foo_bar = .len();");
+        v.undo();
+        assert_eq!(lines(&v, 1)[0], "let foo_bar = x.len();");
+        // At a line end the word move goes to the next line, and Delete by word joins it.
+        v.place_caret(1, (0, 22), false);
+        press(&mut v, Key::ArrowRight, word);
+        assert_eq!(v.caret().unwrap().pos, (1, 0));
+        // The plain keys still move one character.
+        press(&mut v, Key::ArrowRight, Modifiers::NONE);
+        assert_eq!(v.caret().unwrap().pos, (1, 1));
+        assert_eq!(lines(&v, 0), ["x"], "the other side is untouched");
+
+        // A read-only side moves by word but does not change.
+        v.panes[0].doc.read_only = true;
+        v.place_caret(0, (0, 1), false);
+        press(&mut v, Key::Backspace, word);
+        assert_eq!(lines(&v, 0), ["x"]);
+        press(&mut v, Key::ArrowLeft, word);
+        assert_eq!(v.caret().unwrap().pos, (0, 0));
     }
 
     #[test]
@@ -10993,6 +14487,249 @@ mod tests {
         );
         v.redo();
         assert!(!v.panes[0].doc.modified, "back to the saved text");
+    }
+
+    /// The differences of `v`, as a fresh comparison of the same documents would find them.
+    fn diff_state(v: &TextView) -> String {
+        format!("{:?}{:?}", v.diff.rows, v.diff.blocks)
+    }
+
+    fn fresh_diff_state(v: &TextView) -> String {
+        let docs = v.panes.iter().map(|p| p.doc.clone()).collect();
+        diff_state(&TextView::new(docs, &Config::default()))
+    }
+
+    #[test]
+    fn typing_pastes_hunk_copies_and_merges_undo_and_redo_one_step_at_a_time() {
+        let docs = [
+            "a\nleft 1\nb\nleft 2\nc\nd\ne\n",
+            "a\nbase 1\nb\nbase 2\nc\nd\ne\n",
+            "a\nright 1\nb\nright 2\nc\nd\ne\n",
+        ]
+        .map(|t| TextDoc::from_text(None, t))
+        .to_vec();
+        let mut v = TextView::new(docs, &Config::default());
+        let sides = |v: &TextView| (lines(v, 0).join("|"), lines(v, 2).join("|"));
+        let outside = sides(&v);
+        let mut states = vec![lines(&v, 1).join("|")];
+        let mut step = |v: &mut TextView, f: &dyn Fn(&mut TextView)| {
+            f(v);
+            states.push(lines(v, 1).join("|"));
+        };
+        // typing in a line is one step, however many keys
+        step(&mut v, &|v| {
+            v.place_caret(1, (6, 1), false);
+            for ch in ["x", "y", "z"] {
+                v.caret_insert(ch);
+            }
+        });
+        // a paste right after typing is a step of its own
+        step(&mut v, &|v| v.caret_paste("P"));
+        step(&mut v, &|v| v.caret_insert("q"));
+        // a hunk copied from the left, then the next one taken from both sides
+        step(&mut v, &|v| {
+            let b = v.significant().next().unwrap();
+            v.copy_block(b, 0, 1)
+        });
+        step(&mut v, &|v| {
+            let b = v.diff.blocks.iter().position(|b| b.ranges[1].contains(&3));
+            v.select_block(b.unwrap());
+            v.take_both(true);
+        });
+        // typing again after the merge starts a new step
+        step(&mut v, &|v| {
+            v.place_caret(1, (0, 0), false);
+            v.caret_insert("!");
+            v.caret_insert("!");
+        });
+        assert_eq!(
+            states,
+            [
+                "a|base 1|b|base 2|c|d|e",
+                "a|base 1|b|base 2|c|d|exyz",
+                "a|base 1|b|base 2|c|d|exyzP",
+                "a|base 1|b|base 2|c|d|exyzPq",
+                "a|left 1|b|base 2|c|d|exyzPq",
+                "a|left 1|b|left 2|right 2|c|d|exyzPq",
+                "!!a|left 1|b|left 2|right 2|c|d|exyzPq",
+            ]
+        );
+        for want in states.iter().rev().skip(1) {
+            v.undo();
+            assert_eq!(lines(&v, 1).join("|"), *want);
+            assert_eq!(sides(&v), outside, "undo never touches the other panes");
+            assert_eq!(diff_state(&v), fresh_diff_state(&v));
+        }
+        assert!(!v.can_undo());
+        assert!(!v.panes[1].doc.modified, "back to the text as loaded");
+        for want in states.iter().skip(1) {
+            v.redo();
+            assert_eq!(lines(&v, 1).join("|"), *want);
+            assert_eq!(sides(&v), outside);
+            assert_eq!(diff_state(&v), fresh_diff_state(&v));
+            assert!(v.panes[1].doc.modified);
+        }
+        assert!(!v.can_redo());
+    }
+
+    #[test]
+    fn redo_is_dropped_only_by_a_new_edit() {
+        let mut v = two_way("one\n", "two\n");
+        v.copy_all(0, 1);
+        v.undo();
+        assert!(v.can_redo());
+        // no change: copying what is already there, a caret move, a delete at the start
+        v.copy_rows(0, 0, 1, 1);
+        v.place_caret(1, (0, 0), false);
+        v.caret_delete(false, false);
+        v.caret_paste("");
+        assert!(v.can_redo(), "nothing was edited");
+        v.panes[0].doc.read_only = true;
+        v.copy_all(1, 0);
+        v.place_caret(0, (0, 0), false);
+        v.caret_insert("x");
+        assert_eq!(lines(&v, 0), ["one"]);
+        assert!(v.can_redo(), "a read-only pane takes no edit");
+        v.place_caret(1, (0, 0), false);
+        v.caret_insert("x");
+        assert!(!v.can_redo());
+        assert_eq!(lines(&v, 1), ["xtwo"]);
+    }
+
+    #[test]
+    fn a_save_ends_the_typing_step_so_that_undo_stops_at_the_saved_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        touch(&a, "one\n", 100);
+        touch(&b, "two\n", 100);
+        let docs = [&a, &b].map(|p| text::load_doc(p, None).unwrap()).to_vec();
+        let mut v = TextView::new(docs, &Config::default());
+        v.place_caret(1, (0, 3), false);
+        v.caret_insert("a");
+        v.caret_insert("b");
+        v.save_pane(1).unwrap();
+        v.caret_insert("c");
+        assert!(v.panes[1].doc.modified);
+        v.undo();
+        assert_eq!(lines(&v, 1), ["twoab"]);
+        assert!(!v.panes[1].doc.modified, "the text is the saved one");
+        v.undo();
+        assert_eq!(lines(&v, 1), ["two"]);
+        assert!(v.panes[1].doc.modified, "the file has the typing");
+        v.redo();
+        assert!(!v.panes[1].doc.modified);
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "twoab\n");
+    }
+
+    #[test]
+    fn undo_leaves_read_only_panes_alone_and_older_text_counts_as_unsaved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        touch(&a, "one\n", 100);
+        touch(&b, "two\n", 100);
+        let docs = [&a, &b].map(|p| text::load_doc(p, None).unwrap()).to_vec();
+        let mut v = TextView::new(docs, &Config::default());
+
+        // A pane made read-only after its edit keeps it: undo refuses, and keeps the step.
+        v.place_caret(0, (0, 0), false);
+        v.caret_insert("x");
+        v.panes[0].doc.read_only = true;
+        v.undo();
+        assert_eq!(lines(&v, 0), ["xone"]);
+        assert!(v.can_undo());
+        assert_eq!(v.status, tr("msg.readonly"));
+        v.panes[0].doc.read_only = false;
+        v.undo();
+        assert_eq!(lines(&v, 0), ["one"]);
+
+        // A read-only pane reloaded from disk keeps the file's text through an undo of
+        // another pane's edit.
+        v.panes[0].doc.read_only = true;
+        v.place_caret(1, (0, 0), false);
+        v.caret_insert("y");
+        touch(&a, "ONE\n", 50);
+        v.check_disk();
+        assert_eq!(lines(&v, 0), ["ONE"]);
+        v.undo();
+        assert_eq!((lines(&v, 0), lines(&v, 1)), (vec!["ONE"], vec!["two"]));
+        assert!(!v.panes[0].doc.modified && !v.panes[1].doc.modified);
+        v.redo();
+        assert_eq!((lines(&v, 0), lines(&v, 1)), (vec!["ONE"], vec!["ytwo"]));
+
+        // A writable pane reloaded from disk gets its older text back as unsaved.
+        v.panes[0].doc.read_only = false;
+        v.place_caret(1, (0, 0), false);
+        v.caret_paste("z");
+        touch(&a, "uno\n", 20);
+        v.check_disk();
+        assert_eq!(lines(&v, 0), ["uno"]);
+        v.undo();
+        assert_eq!(lines(&v, 0), ["ONE"]);
+        assert!(v.panes[0].doc.modified, "the file holds another text now");
+        assert_eq!(diff_state(&v), fresh_diff_state(&v));
+    }
+
+    #[test]
+    fn an_edit_makes_stale_only_the_review_of_the_hunk_it_changed() {
+        use crate::core::review_state::{Decision, State};
+        let a: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        let b = a
+            .replace("line 5\n", "five\n")
+            .replace("line 20\n", "twenty\n");
+        let mut v = two_way(&a, &b);
+        assert_eq!(v.diff.blocks.len(), 2);
+        let ids: Vec<String> = v.diff.blocks.iter().map(|b| v.review_hunk_id(b)).collect();
+        let mut review = Decision::default();
+        for id in &ids {
+            let d = Decision {
+                id: id.clone(),
+                state: State::Accepted,
+                ..Default::default()
+            };
+            review.hunks.insert(id.clone(), Box::new(d));
+        }
+        v.review_decision = Some(Box::new(review));
+        v.review_dirty = false;
+        let stale = |v: &TextView| -> Vec<bool> {
+            let r = v.review_decision.as_ref().unwrap();
+            ids.iter().map(|id| r.hunks[id].stale).collect()
+        };
+        // Typing in the second hunk: the file and that hunk are stale, the first is not.
+        v.place_caret(1, (20, 6), false);
+        v.caret_insert("!");
+        assert_eq!(lines(&v, 1)[20], "twenty!");
+        assert!(v.review_decision.as_ref().unwrap().stale && v.review_dirty);
+        assert_eq!(stale(&v), [false, true]);
+        // Undo gives the hunk back as it was, but its decision stays stale.
+        v.undo();
+        assert_eq!(lines(&v, 1)[20], "twenty");
+        assert_eq!(stale(&v), [false, true]);
+        // A line next to the first hunk is part of its identity.
+        v.place_caret(1, (6, 0), false);
+        v.caret_insert("x");
+        assert_eq!(stale(&v), [true, true]);
+    }
+
+    #[test]
+    fn undo_marks_a_review_stale_and_keeps_the_review_out_of_the_saved_state() {
+        let mut v = two_way("one\n", "two\n");
+        v.copy_all(0, 1);
+        v.review_decision = Some(Box::default());
+        v.review_dirty = false;
+        let modified = v.panes[1].doc.modified;
+        v.undo();
+        let review = v.review_decision.as_ref().unwrap();
+        assert!(review.stale && v.review_dirty);
+        assert!(
+            !v.panes[1].doc.modified && modified,
+            "only the text says what is unsaved"
+        );
+        v.review_decision.as_mut().unwrap().stale = false;
+        v.undo();
+        assert!(
+            !v.review_decision.as_ref().unwrap().stale,
+            "nothing to undo, nothing changed"
+        );
     }
 
     #[test]

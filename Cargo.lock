@@ -2892,6 +2892,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "ttf-parser",
+ "unicode-segmentation",
  "ureq",
  "url",
  "walkdir",
