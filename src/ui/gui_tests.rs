@@ -179,7 +179,14 @@ impl Gui {
                 .app
                 .tabs
                 .iter()
-                .any(|t| matches!(t.content.view(), Content::Folder(v) if v.busy()))
+                .enumerate()
+                .any(|(i, t)| match t.content.view() {
+                    Content::Folder(v) => v.busy(),
+                    // "All differences" reads its files in the background, taking them in only
+                    // while it is shown.
+                    Content::Diffs(v) => i == self.app.active && v.outcome() == Outcome::Busy,
+                    _ => false,
+                })
     }
 
     /// The topmost widget named `label`, with or without the key that runs it ("Open  (⌘O)").
