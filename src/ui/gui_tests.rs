@@ -1876,7 +1876,8 @@ fn a_workspace_saves_the_open_tabs_by_name_and_reopens_them_later() {
     gui.app.run(Cmd::SaveWorkspace, &gui.ctx);
     gui.frames(2);
     gui.app.workspace_save_dlg.as_mut().unwrap().0 = "qa PASS".to_string();
-    gui.frame();
+    // The message that appears grows the dialog, which centers itself again a frame later.
+    gui.frames(2);
     assert!(gui.shows(&trf("msg.workspace_exists", &[("name", "QA pass".into())])));
     gui.click(tr("btn.replace"));
     assert_eq!(gui.app.cfg.workspaces.len(), 1);
