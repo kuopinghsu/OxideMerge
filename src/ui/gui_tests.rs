@@ -2175,6 +2175,39 @@ fn saving_a_remote_tab_again_while_it_uploads_is_not_taken_for_a_conflict() {
     remote::fake::uninstall();
 }
 
+/// A side that was saved is uploaded even when the other side could not be saved.
+#[cfg(unix)]
+#[test]
+fn a_remote_side_saved_is_uploaded_though_the_other_side_failed() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("b.txt", "one\n")]);
+    remote::fake::install(remote::fake::Server::new().file("/srv/a.txt", "one\n"));
+    let mut gui = Gui::start("sftp_partial_save", None);
+    let local = dir.path().join("b.txt");
+    compare_remote_with_local(&mut gui, &local);
+
+    for pane in [0, 1] {
+        text_view_mut(&mut gui).place_caret(pane, (0, 3), false);
+        gui.events.push(Event::Text("-edited".into()));
+        gui.frames(2);
+    }
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o444)).unwrap();
+    gui.app.run(Cmd::Save, &gui.ctx);
+    gui.frames(3);
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        gui.errors().iter().any(|e| e.contains("b.txt")),
+        "{:?}",
+        gui.errors()
+    );
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), "one\n");
+    assert_eq!(remote::fake::upload_count("/srv/a.txt"), 1);
+    let uploaded = remote::fake::uploaded("/srv/a.txt").unwrap();
+    assert_eq!(String::from_utf8(uploaded).unwrap(), "one-edited\n");
+    remote::fake::uninstall();
+}
+
 #[test]
 fn saving_a_remote_tab_while_closing_it_uploads_before_it_closes() {
     let dir = tempfile::tempdir().unwrap();

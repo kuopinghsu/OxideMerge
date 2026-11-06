@@ -4602,8 +4602,12 @@ impl TextView {
             anyhow::bail!("{}", self.read_only_message(p));
         }
         // Text read from a document, written over a file of a kind that is itself read by
-        // converting it, would replace that file's contents with something it cannot hold.
-        if doc.compare_only && crate::core::unpacker::find(&self.opts, path).is_some() {
+        // converting it, would replace that file's contents with something it cannot hold;
+        // whether such files are read as text now does not change that.
+        if doc.compare_only
+            && (crate::core::unpacker::find(&self.opts, path).is_some()
+                || crate::core::extract::Kind::of(path).is_some())
+        {
             anyhow::bail!(
                 "{}",
                 trf(
@@ -14935,6 +14939,10 @@ mod tests {
         let other = dir.path().join("c.ipynb");
         assert!(v.save_pane_to(0, &nb).is_err());
         assert!(v.save_pane_to(0, &other).is_err());
+        // Nor once documents are no longer read as text: the file still is one.
+        v.opts.extract_documents = false;
+        assert!(v.save_pane_to(0, &other).is_err());
+        v.opts.extract_documents = true;
         assert!(!other.exists());
         assert_eq!(std::fs::read_to_string(&nb).unwrap(), notebook);
 
