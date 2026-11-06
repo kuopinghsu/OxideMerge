@@ -1,4 +1,4 @@
-//! Context menu integration in the style of WinMerge's shell extension.
+//! Context menu integration with the system file manager.
 //!
 //! On Windows, `register` adds an "OxideMerge" submenu to Explorer for files, folders, drives and
 //! folder backgrounds, for the current user:

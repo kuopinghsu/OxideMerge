@@ -77,8 +77,10 @@ fn common_prefix(left: &[u8], right: &[u8]) -> usize {
     const CHUNK: usize = 64;
     let len = left.len().min(right.len());
     let prefix = left[..len]
-        .chunks_exact(CHUNK)
-        .zip(right[..len].chunks_exact(CHUNK))
+        .as_chunks::<CHUNK>()
+        .0
+        .iter()
+        .zip(right[..len].as_chunks::<CHUNK>().0)
         .take_while(|(a, b)| a == b)
         .count()
         * CHUNK;

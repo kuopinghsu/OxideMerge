@@ -67,6 +67,12 @@ fn writing(path: &Path) -> String {
     crate::i18n::trf("msg.cannot_write", &[("file", path.display().to_string())])
 }
 
+/// Whether a backup of `path` is made, with backups `on`: never inside an extracted archive,
+/// where the `.bak` would be packed into the archive with the rest.
+pub fn backs_up(path: &Path, on: bool) -> bool {
+    on && !super::archive::inside_extraction(path)
+}
+
 pub fn backup_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".bak");
@@ -120,7 +126,7 @@ pub fn write_atomic_with(path: &Path, bytes: &[u8], backup: bool) -> Result<()> 
         _ => path.to_path_buf(),
     };
     let mut old = std::fs::metadata(&target).ok();
-    if old.is_some() && backup {
+    if old.is_some() && backs_up(&target, backup) {
         keep_backup(&target)?;
     }
     let mut placeholder = false;
@@ -258,7 +264,7 @@ pub(crate) fn make_writable(path: &Path) -> bool {
 /// symbolic link there points to.
 pub fn copy_atomic(from: &Path, to: &Path, backup: bool) -> Result<()> {
     let copying = || format!("copy {} -> {}", from.display(), to.display());
-    if backup && to.is_file() {
+    if backs_up(to, backup) && to.is_file() {
         keep_backup(to)?;
     }
     let dir = match to.parent() {
@@ -302,7 +308,7 @@ pub fn remove(path: &Path) -> Result<()> {
 }
 
 fn remove_with(path: &Path, backup: bool) -> Result<()> {
-    if backup {
+    if backs_up(path, backup) {
         let bak = clear_backup(path)?;
         std::fs::rename(path, &bak).with_context(|| writing(&bak))
     } else {

@@ -6,20 +6,24 @@
 //! Git revision or an extracted archive is. Unlike those, a single file stays writable: saving
 //! it uploads the local copy back over a fresh connection made with the same credentials kept
 //! with its tab, since a connection is not worth holding open for as long as a tab might stay
-//! open (through sleep, a changed network, or a server that closes idle sessions). A folder is
+//! open (through sleep, a changed network, or a server that closes idle sessions). The upload
+//! goes to a temporary file beside the original, which then takes its place, and is refused
+//! when the file changed on the server since it was fetched (see [`upload`]). A folder is
 //! read-only, as a Git revision or a web page is: there is no equivalent here yet of the
 //! archive repacking a folder compare's own files use to save back what changed.
 //!
-//! The server's host key is checked against the ones this program has seen before (trust on
-//! first connection, kept in [`known_hosts_path`]), the same protection `ssh` itself gives:
-//! without it, a connection could be quietly handed to an attacker between the program and the
-//! real server before a password or a key ever reaches either end. See [`verify_host_key`].
+//! The server's host key is checked before a password or a key ever reaches it: against the
+//! user's own `~/.ssh/known_hosts`, then against the servers this program was told to trust
+//! (kept in [`known_hosts_path`]). A server in neither is not trusted silently: the fetch
+//! fails with [`UnknownHost`], carrying the key's fingerprint for the user to check and
+//! accept with [`trust_host`]. See [`verify_host_key`].
 //!
 //! A fetch is bounded: see [`Budget`]. The one real network path, [`RemoteFs`] for
 //! `ssh2::Sftp`, is a thin seam so the rest — walking a folder, the budget, cancelling midway —
 //! is tested without a real connection, the same way [`fake`] stands in for one entirely in
 //! GUI tests.
 
+use crate::i18n::{tr, trf};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -29,7 +33,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// How a connection is authenticated.
+/// How a connection is authenticated. The password or passphrase is overwritten in memory
+/// once it is dropped.
 #[derive(Clone)]
 pub enum Auth {
     Password(String),
@@ -38,6 +43,25 @@ pub enum Auth {
         path: PathBuf,
         passphrase: String,
     },
+}
+
+impl Drop for Auth {
+    fn drop(&mut self) {
+        match self {
+            Auth::Password(p) | Auth::Key { passphrase: p, .. } => wipe(p),
+        }
+    }
+}
+
+/// Overwrites `s` with zeros before emptying it, so a password does not linger in freed
+/// memory.
+pub fn wipe(s: &mut String) {
+    // SAFETY: zero bytes are valid UTF-8, and the string is emptied right after.
+    for b in unsafe { s.as_mut_vec() }.iter_mut() {
+        // SAFETY: `b` is a valid, aligned reference into the string's own buffer.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    s.clear();
 }
 
 /// Enough to open an SFTP connection again. Kept with a tab for as long as it is open so that
@@ -51,46 +75,103 @@ pub struct RemoteConnection {
     pub auth: Auth,
 }
 
+/// A remote file's size and modified time, to notice it changed on the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteStamp {
+    pub size: u64,
+    pub modified: u64,
+}
+
+impl RemoteStamp {
+    fn of(stat: &ssh2::FileStat) -> Self {
+        RemoteStamp {
+            size: stat.size.unwrap_or(0),
+            modified: stat.mtime.unwrap_or(0),
+        }
+    }
+}
+
+/// What [`fetch`] staged: the temporary folder holding it (deleted when dropped), the local
+/// copy in it, whether that is a folder, and for a file, how it was on the server.
+pub struct Fetched {
+    pub temp: tempfile::TempDir,
+    pub local: PathBuf,
+    pub is_dir: bool,
+    pub stamp: Option<RemoteStamp>,
+}
+
 /// How long connecting, looking up the address, and authenticating may each take before the
 /// server is treated as unreachable, and how long a single read or write of the connection may
 /// then take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// `host`'s address, looked up with its own bound on how long that may take: `ToSocketAddrs`
+/// `host:port` as shown to the user, with an IPv6 address in brackets.
+fn server(host: &str, port: u16) -> String {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// The name a server's host key is remembered under: [`server`], with the host in lowercase.
+fn host_id(host: &str, port: u16) -> String {
+    server(&host.to_ascii_lowercase(), port)
+}
+
+/// `host`'s addresses, looked up with its own bound on how long that may take: `ToSocketAddrs`
 /// gives the operating system's resolver no timeout of its own, so without this a lookup that
 /// hangs (an unreachable DNS server, say) would hang the fetch past `CONNECT_TIMEOUT` and past
-/// *Cancel*, which is only checked between the chunks of a transfer, not during this or the
-/// connection and authentication steps after it. The lookup itself still runs to completion on
-/// its own thread even after timing out here; that thread is harmless once nothing reads its
-/// result.
-fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
+/// *Cancel*. The lookup itself still runs to completion on its own thread even after timing
+/// out here; that thread is harmless once nothing reads its result.
+fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     let (tx, rx) = mpsc::channel();
-    let owned = host.to_string();
+    let owned = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
     std::thread::spawn(move || {
         let _ = tx.send(
             (owned.as_str(), port)
                 .to_socket_addrs()
-                .map(|mut a| a.next()),
+                .map(|a| a.collect::<Vec<_>>()),
         );
     });
+    let lookup = || trf("msg.sftp_lookup", &[("host", host.to_string())]);
     match rx.recv_timeout(CONNECT_TIMEOUT) {
-        Ok(Ok(Some(addr))) => Ok(addr),
-        Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-            bail!("{host}: cannot look up this address")
-        }
-        Ok(Err(e)) => Err(e).with_context(|| format!("{host}: cannot look up this address")),
+        Ok(Ok(addrs)) if !addrs.is_empty() => Ok(addrs),
+        Ok(Ok(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => bail!(lookup()),
+        Ok(Err(e)) => Err(e).context(lookup()),
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            bail!("{host}: looking up this address took too long")
+            bail!(trf("msg.sftp_lookup_slow", &[("host", host.to_string())]))
         }
     }
 }
 
-/// The file this program remembers server host keys in, to notice if one ever changes: one line
-/// per server, `host:port` and the key in hexadecimal, separated by one space. Blank lines and
-/// lines starting with `#` are ignored, so entries can be removed by hand (see
-/// [`verify_host_key`]) without disturbing the rest of the file.
-fn known_hosts_path() -> Option<PathBuf> {
-    crate::config::config_dir().map(|d| d.join("known_hosts"))
+/// The file this program remembers the host keys of servers it was told to trust in: one line
+/// per server, `host:port` and the key in hexadecimal, separated by one space. Lines it does not
+/// understand, blank ones, and ones starting with `#` are kept as they are, so entries can be
+/// removed by hand (see [`verify_host_key`]) without disturbing the rest of the file. Kept with
+/// the settings file, next to the program in portable use.
+pub fn known_hosts_path() -> Option<PathBuf> {
+    let settings = crate::config::config_path()?;
+    let name = if settings.file_name().is_some_and(|n| n == "oxidemerge.json") {
+        "oxidemerge-known_hosts"
+    } else {
+        "known_hosts"
+    };
+    Some(settings.with_file_name(name))
+}
+
+/// The user's own `ssh` known hosts file, checked first.
+fn user_known_hosts() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".ssh").join("known_hosts"))
+        .filter(|p| p.is_file())
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -107,43 +188,89 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-fn load_known_hosts(path: &Path) -> HashMap<String, Vec<u8>> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return HashMap::new();
+/// `bytes` in unpadded base64, the way `ssh` shows a key fingerprint.
+fn encode_base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+        for i in 0..=chunk.len() {
+            out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// The type a host key names itself with (`ssh-ed25519`, `ecdsa-sha2-nistp256`, ...), the
+/// first field of its wire form.
+fn key_type(key: &[u8]) -> Option<&str> {
+    let len = u32::from_be_bytes(key.get(..4)?.try_into().ok()?) as usize;
+    std::str::from_utf8(key.get(4..4 + len)?).ok()
+}
+
+/// The remembered host keys, by [`host_id`]. A missing file is none; one that cannot be read is
+/// an error, so that a server whose key changed is never mistaken for one never seen.
+fn load_known_hosts(path: &Path) -> Result<HashMap<String, Vec<u8>>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => {
+            return Err(e).context(trf(
+                "msg.sftp_known_hosts_unreadable",
+                &[("file", path.display().to_string())],
+            ))
+        }
     };
-    text.lines()
+    Ok(text
+        .lines()
         .filter_map(|line| {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 return None;
             }
             let (id, hex) = line.split_once(' ')?;
-            Some((id.to_string(), decode_hex(hex)?))
+            Some((id.to_string(), decode_hex(hex.trim())?))
         })
-        .collect()
+        .collect())
 }
 
-fn save_known_hosts(path: &Path, hosts: &HashMap<String, Vec<u8>>) -> std::io::Result<()> {
+/// Adds `id`'s `key` to the known hosts file at `path`, replacing a line for the same server
+/// and keeping every other line as it is now on disk (another window may have added one since
+/// this one read it). Written to a temporary file that then takes the file's place.
+fn remember_host(path: &Path, id: &str, key: &[u8]) -> Result<()> {
+    let old = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(e).context(trf(
+                "msg.sftp_known_hosts_unreadable",
+                &[("file", path.display().to_string())],
+            ))
+        }
+    };
+    let mut text: String = old
+        .lines()
+        .filter(|line| line.trim().split_once(' ').map(|(i, _)| i) != Some(id))
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    text.push_str(&format!("{id} {}\n", encode_hex(key)));
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut ids: Vec<&String> = hosts.keys().collect();
-    ids.sort();
-    let text: String = ids
-        .iter()
-        .map(|id| format!("{id} {}\n", encode_hex(&hosts[*id])))
-        .collect();
-    std::fs::write(path, text)
+    super::fsutil::write_atomic_with(path, text.as_bytes(), false)
 }
 
 /// What [`verify_host_key`] decided about a server's host key.
 #[derive(Debug, PartialEq, Eq)]
 enum HostKeyCheck {
-    /// Matches the key this program saw the last time it connected to this server.
+    /// Matches the key this program was told to trust for this server.
     Trusted,
-    /// The first time this program has connected to this server: trusted and remembered.
+    /// A server this program was never told to trust.
     New,
-    /// Does not match the key this program saw the last time: a changed host key, a different
+    /// Does not match the key this program was told to trust: a changed host key, a different
     /// server now answering at the same address, or someone between this program and the
     /// server.
     Changed,
@@ -157,81 +284,187 @@ fn check_host_key(known: &HashMap<String, Vec<u8>>, id: &str, key: &[u8]) -> Hos
     }
 }
 
-/// Checks `sess`'s host key against the ones this program has connected to before, trusting
-/// and remembering it the first time (see [`known_hosts_path`]), the same way `ssh` itself
-/// does with `~/.ssh/known_hosts`. Called right after the handshake and before a password or a
-/// key ever reaches the connection, so a server this fails for never sees them.
-///
-/// Unlike `ssh`, there is no prompt to trust a changed key anyway: that choice is easy to
-/// click past without reading it, which defeats the point of checking at all. A key that
-/// genuinely changed (a reinstalled server, a rotated key) is trusted again only by removing
-/// its line from the known hosts file by hand.
-fn verify_host_key(sess: &ssh2::Session, conn: &RemoteConnection) -> Result<()> {
-    let (key, _) = sess.host_key().context("the server sent no host key")?;
-    let id = format!("{}:{}", conn.host, conn.port);
-    let path = known_hosts_path();
-    let known = path.as_deref().map(load_known_hosts).unwrap_or_default();
-    match check_host_key(&known, &id, key) {
-        HostKeyCheck::Trusted => Ok(()),
-        HostKeyCheck::New => {
-            if let Some(path) = &path {
-                let mut known = known;
-                known.insert(id, key.to_vec());
-                // Not trusting the connection if this fails would make a read-only settings
-                // folder unable to connect at all; the key is still checked, just not
-                // remembered between runs.
-                let _ = save_known_hosts(path, &known);
-            }
-            Ok(())
-        }
-        HostKeyCheck::Changed => bail!(
-            "{id}'s key has changed since the last connection to it. This could mean someone \
-            is between this program and the server, or that the server was reinstalled or its \
-            key renewed. If you are sure the server is genuine, remove its line (starting with \
-            \"{id} \") from {}",
-            path.as_deref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "the known hosts file".to_string()),
-        ),
+/// A server neither the user's `~/.ssh/known_hosts` nor this program's own list knows: the
+/// error a fetch fails with, for the user to compare `fingerprint` with the server's real one
+/// and, if it matches, [`trust_host`] it and fetch again.
+#[derive(Debug, Clone)]
+pub struct UnknownHost {
+    /// `host:port`, as shown.
+    pub server: String,
+    id: String,
+    /// The key's type, such as `ssh-ed25519`.
+    pub key_type: String,
+    /// `SHA256:` and the key's hash in base64, as `ssh` shows it.
+    pub fingerprint: String,
+    key: Vec<u8>,
+    path: PathBuf,
+    /// The user's own known hosts file, when it records a different key for this server.
+    pub differs_from: Option<PathBuf>,
+}
+
+impl std::fmt::Display for UnknownHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}",
+            trf(
+                "msg.sftp_unknown_host",
+                &[
+                    ("server", self.server.clone()),
+                    ("type", self.key_type.clone())
+                ]
+            ),
+            self.fingerprint
+        )
     }
 }
 
-/// Opens an SFTP session authenticated as `conn` says.
-fn session(conn: &RemoteConnection) -> Result<ssh2::Sftp> {
-    let addr = resolve(&conn.host, conn.port)?;
-    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .with_context(|| format!("{}:{} is not reachable", conn.host, conn.port))?;
+impl std::error::Error for UnknownHost {}
+
+/// Trusts `host`'s key from now on, remembering it in [`known_hosts_path`].
+pub fn trust_host(host: &UnknownHost) -> Result<()> {
+    #[cfg(test)]
+    if fake::trust(host) {
+        return Ok(());
+    }
+    remember_host(&host.path, &host.id, &host.key)
+}
+
+/// Checks `sess`'s host key: against the user's own `~/.ssh/known_hosts` (a match is trusted),
+/// then against the keys this program was told to trust, `known` (see [`known_hosts_path`]).
+/// Called right after the handshake and before a password or a key ever reaches the
+/// connection, so a server this fails for never sees them. A server neither knows fails with
+/// [`UnknownHost`].
+///
+/// There is no prompt to trust a changed key anyway: that choice is easy to click past without
+/// reading it, which defeats the point of checking at all. A key that genuinely changed (a
+/// reinstalled server, a rotated key) is trusted again only by removing its line from the
+/// known hosts file by hand.
+fn verify_host_key(
+    sess: &ssh2::Session,
+    conn: &RemoteConnection,
+    known: &HashMap<String, Vec<u8>>,
+    path: &Path,
+) -> Result<()> {
+    let (key, _) = sess
+        .host_key()
+        .with_context(|| tr("msg.sftp_no_host_key"))?;
+    let mut differs_from = None;
+    if let Some(user_file) = user_known_hosts() {
+        if let Ok(mut hosts) = sess.known_hosts() {
+            if hosts
+                .read_file(&user_file, ssh2::KnownHostFileKind::OpenSSH)
+                .is_ok()
+            {
+                match hosts.check_port(&conn.host, conn.port, key) {
+                    ssh2::CheckResult::Match => return Ok(()),
+                    // The file may hold another type of key for this server than the one it
+                    // sent; this program's own list, or the user, decides.
+                    ssh2::CheckResult::Mismatch => differs_from = Some(user_file),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let id = host_id(&conn.host, conn.port);
+    match check_host_key(known, &id, key) {
+        HostKeyCheck::Trusted => Ok(()),
+        HostKeyCheck::Changed => bail!(trf(
+            "msg.sftp_key_changed",
+            &[
+                ("server", server(&conn.host, conn.port)),
+                ("id", id),
+                ("file", path.display().to_string()),
+            ],
+        )),
+        HostKeyCheck::New => {
+            let hash = sess
+                .host_key_hash(ssh2::HashType::Sha256)
+                .unwrap_or_default();
+            Err(UnknownHost {
+                server: server(&conn.host, conn.port),
+                id,
+                key_type: key_type(key).unwrap_or("?").to_string(),
+                fingerprint: format!("SHA256:{}", encode_base64(hash)),
+                key: key.to_vec(),
+                path: path.to_path_buf(),
+                differs_from,
+            }
+            .into())
+        }
+    }
+}
+
+/// The host key algorithms to ask a server for when this program already trusts its key of
+/// type `kind`, so that it presents that one rather than another the program never saw.
+fn host_key_methods(kind: &str) -> &str {
+    match kind {
+        "ssh-rsa" => "rsa-sha2-512,rsa-sha2-256,ssh-rsa",
+        other => other,
+    }
+}
+
+/// Opens an SFTP session authenticated as `conn` says. Setting `cancel` stops it between steps.
+fn session(conn: &RemoteConnection, cancel: &AtomicBool) -> Result<ssh2::Sftp> {
+    let shown = server(&conn.host, conn.port);
+    let path = known_hosts_path().with_context(|| {
+        trf(
+            "msg.sftp_known_hosts_unreadable",
+            &[("file", "known_hosts".to_string())],
+        )
+    })?;
+    let known = load_known_hosts(&path)?;
+    let addrs = resolve(&conn.host, conn.port)?;
+    check(cancel)?;
+    let mut tcp = Err(std::io::Error::other("no address"));
+    for addr in &addrs {
+        tcp = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT);
+        if tcp.is_ok() {
+            break;
+        }
+        check(cancel)?;
+    }
+    let tcp = tcp.with_context(|| trf("msg.sftp_unreachable", &[("server", shown.clone())]))?;
+    check(cancel)?;
     tcp.set_read_timeout(Some(CONNECT_TIMEOUT))?;
     tcp.set_write_timeout(Some(CONNECT_TIMEOUT))?;
-    let mut sess = ssh2::Session::new().context("cannot start an SSH session")?;
+    let mut sess = ssh2::Session::new().context("SSH")?;
     sess.set_timeout(CONNECT_TIMEOUT.as_millis() as u32);
     sess.set_tcp_stream(tcp);
-    sess.handshake().context("the SSH handshake failed")?;
-    verify_host_key(&sess, conn)?;
+    if let Some(kind) = known
+        .get(&host_id(&conn.host, conn.port))
+        .and_then(|k| key_type(k))
+    {
+        let _ = sess.method_pref(ssh2::MethodType::HostKey, host_key_methods(kind));
+    }
+    sess.handshake()
+        .with_context(|| trf("msg.sftp_handshake", &[("server", shown.clone())]))?;
+    verify_host_key(&sess, conn, &known, &path)?;
+    check(cancel)?;
     match &conn.auth {
         Auth::Password(password) => sess
             .userauth_password(&conn.user, password)
-            .context("the server refused this user name and password")?,
+            .with_context(|| trf("msg.sftp_password", &[("server", shown.clone())]))?,
         Auth::Key { path, passphrase } => {
             let passphrase = (!passphrase.is_empty()).then_some(passphrase.as_str());
             sess.userauth_pubkey_file(&conn.user, None, path, passphrase)
-                .context(
-                    "could not sign in with this key: check the key file, its passphrase, and \
-                    that the server accepts it",
-                )?
+                .with_context(|| trf("msg.sftp_key", &[("server", shown.clone())]))?
         }
     }
     if !sess.authenticated() {
-        bail!("authentication failed");
+        bail!(trf("msg.sftp_password", &[("server", shown)]));
     }
-    sess.sftp().context("the server has no SFTP subsystem")
+    check(cancel)?;
+    sess.sftp()
+        .with_context(|| trf("msg.sftp_no_sftp", &[("server", shown)]))
 }
 
-/// Cooperative cancellation, checked between chunks of a transfer: a network read or write
-/// itself cannot be interrupted, but a large file then stops within one chunk of it.
+/// Cooperative cancellation, checked between the steps of connecting and the chunks of a
+/// transfer: a network read or write itself cannot be interrupted, but a large file then stops
+/// within one chunk of it.
 fn check(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) {
-        bail!("cancelled");
+        bail!(tr("msg.sftp_cancelled"));
     }
     Ok(())
 }
@@ -245,54 +478,69 @@ const CHUNK: usize = 64 * 1024;
 /// hit them without actually downloading gigabytes or tens of thousands of files.
 struct Budget {
     bytes: u64,
-    files: usize,
+    entries: usize,
     max_bytes: u64,
-    max_files: usize,
+    max_entries: usize,
 }
 
 /// The most bytes a single fetch (one file, or a whole folder together) reads from the server.
 const MAX_REMOTE_BYTES: u64 = 4 << 30;
-/// The most files a single folder fetch reads from the server.
-const MAX_REMOTE_FILES: usize = 50_000;
+/// The most files and folders a single folder fetch reads from the server.
+const MAX_REMOTE_ENTRIES: usize = 50_000;
+/// The most folders deep a folder fetch goes.
+const MAX_REMOTE_DEPTH: usize = 64;
 
 impl Budget {
     fn new() -> Self {
         Self {
             bytes: 0,
-            files: 0,
+            entries: 0,
             max_bytes: MAX_REMOTE_BYTES,
-            max_files: MAX_REMOTE_FILES,
+            max_entries: MAX_REMOTE_ENTRIES,
         }
     }
 
     #[cfg(test)]
-    fn with_limits(max_bytes: u64, max_files: usize) -> Self {
+    fn with_limits(max_bytes: u64, max_entries: usize) -> Self {
         Self {
             bytes: 0,
-            files: 0,
+            entries: 0,
             max_bytes,
-            max_files,
+            max_entries,
         }
     }
 
-    fn take_file(&mut self) -> Result<()> {
-        self.files += 1;
-        if self.files > self.max_files {
-            bail!(
-                "stopped after {} files; fetch a smaller folder",
-                self.max_files
-            );
+    /// How many more files and folders may be read.
+    fn entries_left(&self) -> usize {
+        self.max_entries.saturating_sub(self.entries)
+    }
+
+    fn too_many(&self) -> anyhow::Error {
+        anyhow::anyhow!(trf(
+            "msg.sftp_too_many",
+            &[("count", self.max_entries.to_string())]
+        ))
+    }
+
+    fn take_entry(&mut self) -> Result<()> {
+        self.entries += 1;
+        if self.entries > self.max_entries {
+            return Err(self.too_many());
         }
         Ok(())
+    }
+
+    fn too_large(&self) -> anyhow::Error {
+        anyhow::anyhow!(trf(
+            "msg.sftp_too_large",
+            &[("size", format!("{} GiB", self.max_bytes >> 30))]
+        ))
     }
 
     fn take_bytes(&mut self, n: u64) -> Result<()> {
         self.bytes += n;
         if self.bytes > self.max_bytes {
-            bail!(
-                "stopped after {} GB; fetch a smaller file or folder",
-                self.max_bytes >> 30
-            );
+            return Err(self.too_large());
         }
         Ok(())
     }
@@ -305,32 +553,80 @@ impl Budget {
 /// implements this trait too, in memory.
 trait RemoteFs {
     fn open_read(&self, remote: &str) -> Result<Box<dyn Read + '_>>;
-    /// `(name, is_dir, is_file)` for each entry of `remote`, a folder.
-    fn list_dir(&self, remote: &str) -> Result<Vec<(String, bool, bool)>>;
+    /// `(name, is_dir, is_file)` for each entry of `remote`, a folder: no more than `limit + 1`
+    /// of them, so a caller sees there were too many without reading them all. Fails once
+    /// `cancel` is set.
+    fn list_dir(
+        &self,
+        remote: &str,
+        limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<(String, bool, bool)>>;
 }
 
 impl RemoteFs for ssh2::Sftp {
     fn open_read(&self, remote: &str) -> Result<Box<dyn Read + '_>> {
-        Ok(Box::new(
-            self.open(Path::new(remote))
-                .with_context(|| format!("{remote}: cannot open it"))?,
-        ))
+        Ok(Box::new(self.open(Path::new(remote)).with_context(
+            || trf("msg.sftp_cannot_read", &[("path", remote.to_string())]),
+        )?))
     }
 
     /// Entries without a name valid in UTF-8 are left out too, along with symbolic links and
     /// other special entries ([`RemoteFs::list_dir`]): this program's paths are UTF-8
     /// throughout, the same as a local folder compare already assumes of a file's name.
-    fn list_dir(&self, remote: &str) -> Result<Vec<(String, bool, bool)>> {
-        Ok(self
-            .readdir(Path::new(remote))
-            .with_context(|| format!("{remote}: cannot list it"))?
-            .into_iter()
-            .filter_map(|(path, stat)| {
-                let name = path.file_name()?.to_str()?.to_string();
-                Some((name, stat.is_dir(), stat.is_file()))
-            })
-            .collect())
+    fn list_dir(
+        &self,
+        remote: &str,
+        limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<(String, bool, bool)>> {
+        let cannot = || trf("msg.sftp_cannot_list", &[("path", remote.to_string())]);
+        let mut dir = self.opendir(Path::new(remote)).with_context(cannot)?;
+        let mut out = Vec::new();
+        loop {
+            check(cancel)?;
+            let (name, stat) = match dir.readdir() {
+                Ok(entry) => entry,
+                // libssh2's "no more files"
+                Err(e) if matches!(e.code(), ssh2::ErrorCode::Session(-16)) => break,
+                Err(e) => return Err(e).with_context(cannot),
+            };
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name == "." || name == ".." {
+                continue;
+            }
+            out.push((name.to_string(), stat.is_dir(), stat.is_file()));
+            if out.len() > limit {
+                break;
+            }
+        }
+        Ok(out)
     }
+}
+
+/// Whether `name`, a remote folder entry, can be a file name here: not a path of its own, and on
+/// Windows, none of the names or characters Windows refuses.
+fn local_name_ok(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        return false;
+    }
+    if cfg!(windows) {
+        const RESERVED: &[&str] = &[
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+            "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+        let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+        if name.contains(['\\', ':', '*', '?', '"', '<', '>', '|'])
+            || name.chars().any(|c| (c as u32) < 32)
+            || name.ends_with(['.', ' '])
+            || RESERVED.contains(&stem.trim_end())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn download_file(
@@ -340,10 +636,10 @@ fn download_file(
     cancel: &AtomicBool,
     budget: &mut Budget,
 ) -> Result<()> {
-    budget.take_file()?;
+    budget.take_entry()?;
     let mut from = fs.open_read(remote)?;
     let mut to = std::fs::File::create(local)
-        .with_context(|| format!("{}: cannot write it", local.display()))?;
+        .with_context(|| trf("msg.cannot_write", &[("file", local.display().to_string())]))?;
     let mut buf = [0u8; CHUNK];
     loop {
         check(cancel)?;
@@ -356,23 +652,42 @@ fn download_file(
     }
 }
 
-/// `remote`'s files and subfolders, downloaded into `local` (already created); symbolic links
-/// and other special entries are left out, the same as a folder compare leaves out what it does
-/// not understand on either side.
+/// `remote`'s files and subfolders, downloaded into `local`; symbolic links, other special
+/// entries, and names this machine cannot have are left out, the same as a folder compare
+/// leaves out what it does not understand on either side. `depth` is how many folders deep
+/// `remote` is in the fetch.
 fn download_dir(
     fs: &dyn RemoteFs,
     remote: &str,
     local: &Path,
+    depth: usize,
     cancel: &AtomicBool,
     budget: &mut Budget,
 ) -> Result<()> {
     check(cancel)?;
+    if depth > MAX_REMOTE_DEPTH {
+        bail!(trf(
+            "msg.sftp_too_deep",
+            &[
+                ("path", remote.to_string()),
+                ("count", MAX_REMOTE_DEPTH.to_string())
+            ]
+        ));
+    }
+    budget.take_entry()?;
     std::fs::create_dir_all(local)?;
-    for (name, is_dir, is_file) in fs.list_dir(remote)? {
+    let entries = fs.list_dir(remote, budget.entries_left(), cancel)?;
+    if entries.len() > budget.entries_left() {
+        return Err(budget.too_many());
+    }
+    for (name, is_dir, is_file) in entries {
+        if !local_name_ok(&name) {
+            continue;
+        }
         let child_remote = join(remote, &name);
         let child_local = local.join(&name);
         if is_dir {
-            download_dir(fs, &child_remote, &child_local, cancel, budget)?;
+            download_dir(fs, &child_remote, &child_local, depth + 1, cancel, budget)?;
         } else if is_file {
             download_file(fs, &child_remote, &child_local, cancel, budget)?;
         }
@@ -389,71 +704,193 @@ fn join(base: &str, name: &str) -> String {
 /// The last path segment of an SFTP path, trimming a trailing `/` first so a path to a folder
 /// given that way (`/srv/data/`) still names it `data`, not nothing.
 fn remote_file_name(remote_path: &str) -> std::ffi::OsString {
-    Path::new(remote_path.trim_end_matches('/'))
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_else(|| "remote".into())
+    let name = remote_path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    if local_name_ok(name) {
+        name.into()
+    } else {
+        "remote".into()
+    }
 }
 
 /// Fetches the file or folder `remote_path` into a new temporary folder (deleted when it is
-/// dropped), returning it together with the local copy and whether it was a folder. Setting
-/// `cancel` stops it, and it fails. Bounded by [`MAX_REMOTE_BYTES`] and [`MAX_REMOTE_FILES`].
-pub fn fetch(
-    conn: &RemoteConnection,
-    remote_path: &str,
-    cancel: &AtomicBool,
-) -> Result<(tempfile::TempDir, PathBuf, bool)> {
+/// dropped). Setting `cancel` stops it, and it fails. Bounded by [`MAX_REMOTE_BYTES`],
+/// [`MAX_REMOTE_ENTRIES`] and [`MAX_REMOTE_DEPTH`]. Fails with [`UnknownHost`] for a server
+/// not trusted yet.
+pub fn fetch(conn: &RemoteConnection, remote_path: &str, cancel: &AtomicBool) -> Result<Fetched> {
     #[cfg(test)]
     if let Some(result) = fake::fetch(remote_path, cancel) {
         return result;
     }
-    let sftp = session(conn)?;
+    let sftp = session(conn, cancel)?;
     let stat = sftp
         .stat(Path::new(remote_path))
-        .with_context(|| format!("{remote_path}: cannot read it"))?;
+        .with_context(|| trf("msg.sftp_cannot_read", &[("path", remote_path.to_string())]))?;
     let is_dir = stat.is_dir();
+    if !is_dir && !stat.is_file() {
+        bail!(trf(
+            "msg.sftp_not_regular",
+            &[("path", remote_path.to_string())]
+        ));
+    }
+    let mut budget = Budget::new();
+    if stat.size.is_some_and(|s| s > budget.max_bytes) {
+        return Err(budget.too_large());
+    }
     let temp = tempfile::Builder::new()
         .prefix("oxidemerge-sftp-")
         .tempdir()?;
     let local = temp.path().join(remote_file_name(remote_path));
-    let mut budget = Budget::new();
     if is_dir {
-        download_dir(&sftp, remote_path, &local, cancel, &mut budget)?;
+        download_dir(&sftp, remote_path, &local, 0, cancel, &mut budget)?;
     } else {
         download_file(&sftp, remote_path, &local, cancel, &mut budget)?;
     }
-    Ok((temp, local, is_dir))
+    Ok(Fetched {
+        temp,
+        local,
+        is_dir,
+        stamp: (!is_dir).then(|| RemoteStamp::of(&stat)),
+    })
 }
 
 /// Writes `local_path`'s bytes to `remote_path` on the server, for *Save* of a file opened
-/// with [`fetch`].
-pub fn upload(conn: &RemoteConnection, local_path: &Path, remote_path: &str) -> Result<()> {
+/// with [`fetch`], returning how the file is on the server now.
+///
+/// Refused when the file is not as `expected` (how it was fetched or last uploaded) any more:
+/// someone else changed it on the server meanwhile, and writing over it would lose their
+/// change. The bytes go to a temporary file beside it first, given the file's permissions,
+/// which then takes its place, so a failed or cancelled upload leaves the server's file as it
+/// was.
+pub fn upload(
+    conn: &RemoteConnection,
+    local_path: &Path,
+    remote_path: &str,
+    expected: Option<RemoteStamp>,
+    cancel: &AtomicBool,
+) -> Result<RemoteStamp> {
     #[cfg(test)]
-    if let Some(result) = fake::upload(local_path, remote_path) {
+    if let Some(result) = fake::upload(local_path, remote_path, expected) {
         return result;
     }
-    let sftp = session(conn)?;
-    let mut from = std::fs::File::open(local_path)
-        .with_context(|| format!("{}: cannot read it", local_path.display()))?;
-    let mut to = sftp
-        .create(Path::new(remote_path))
-        .with_context(|| format!("{remote_path}: cannot write it"))?;
-    let mut buf = [0u8; CHUNK];
-    loop {
-        let n = from.read(&mut buf)?;
-        if n == 0 {
-            return Ok(());
+    let target = Path::new(remote_path);
+    let cannot_write = || {
+        trf(
+            "msg.sftp_cannot_write",
+            &[("path", remote_path.to_string())],
+        )
+    };
+    let sftp = session(conn, cancel)?;
+    let now = sftp.stat(target).ok();
+    if let (Some(expected), Some(now)) = (expected, &now) {
+        if RemoteStamp::of(now) != expected {
+            bail!(trf(
+                "msg.sftp_changed_on_server",
+                &[("path", remote_path.to_string())]
+            ));
         }
-        to.write_all(&buf[..n])?;
+    }
+    let mut from = std::fs::File::open(local_path).with_context(|| {
+        trf(
+            "msg.sftp_cannot_read",
+            &[("path", local_path.display().to_string())],
+        )
+    })?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let name = remote_file_name(remote_path).to_string_lossy().into_owned();
+    let dir = remote_path.trim_end_matches('/');
+    let dir = &dir[..dir.rfind('/').map_or(0, |i| i + 1)];
+    let tmp_path = format!("{dir}.{name}.oxidemerge-{}-{unique}", std::process::id());
+    let tmp = Path::new(&tmp_path);
+    let perm = now
+        .as_ref()
+        .and_then(|s| s.perm)
+        .map_or(0o644, |p| p & 0o7777);
+    let mut to = sftp
+        .open_mode(
+            tmp,
+            ssh2::OpenFlags::WRITE | ssh2::OpenFlags::EXCLUSIVE,
+            perm as i32,
+            ssh2::OpenType::File,
+        )
+        .with_context(cannot_write)?;
+    let written = (|| -> Result<()> {
+        let mut buf = [0u8; CHUNK];
+        loop {
+            check(cancel)?;
+            let n = from.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            to.write_all(&buf[..n])?;
+        }
+        let _ = to.fsync();
+        to.close()?;
+        let _ = sftp.setstat(
+            tmp,
+            ssh2::FileStat {
+                size: None,
+                uid: None,
+                gid: None,
+                perm: Some(perm),
+                atime: None,
+                mtime: None,
+            },
+        );
+        replace(&sftp, tmp, target, now.is_some())
+    })();
+    if let Err(e) = written {
+        let _ = sftp.unlink(tmp);
+        return Err(e).with_context(cannot_write);
+    }
+    let stat = sftp.stat(target).with_context(cannot_write)?;
+    Ok(RemoteStamp::of(&stat))
+}
+
+/// Renames `tmp` over `target` on the server. A server speaking SFTP version 3 (OpenSSH, and
+/// most others) refuses to rename over an existing file, so then the old file is first moved
+/// aside, and moved back if the second rename fails too.
+fn replace(sftp: &ssh2::Sftp, tmp: &Path, target: &Path, exists: bool) -> Result<()> {
+    let flags =
+        ssh2::RenameFlags::OVERWRITE | ssh2::RenameFlags::ATOMIC | ssh2::RenameFlags::NATIVE;
+    let first = sftp.rename(tmp, target, Some(flags));
+    if first.is_ok() || !exists {
+        return Ok(first?);
+    }
+    let mut aside = tmp.as_os_str().to_owned();
+    aside.push(".old");
+    let aside = PathBuf::from(aside);
+    sftp.rename(target, &aside, None)?;
+    match sftp.rename(tmp, target, None) {
+        Ok(()) => {
+            let _ = sftp.unlink(&aside);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = sftp.rename(&aside, target, None);
+            Err(e.into())
+        }
     }
 }
 
 /// A connection's user and host, for showing what a tab is reading from or saving to, without
-/// its password or key.
+/// its password or key. A path not starting with `/` is relative to the user's home folder,
+/// shown as `/~/`.
 pub fn label(conn: &RemoteConnection, remote_path: &str) -> String {
+    let path = if remote_path.starts_with('/') {
+        remote_path.to_string()
+    } else {
+        format!("/~/{remote_path}")
+    };
     format!(
-        "sftp://{}@{}:{}{remote_path}",
-        conn.user, conn.host, conn.port
+        "sftp://{}@{}{path}",
+        conn.user,
+        server(&conn.host, conn.port)
     )
 }
 
@@ -472,8 +909,12 @@ pub mod fake {
     #[derive(Default)]
     pub struct Server {
         entries: BTreeMap<String, Option<Vec<u8>>>,
+        /// How many times each file was written, standing in for its modified time.
+        versions: BTreeMap<String, u64>,
         fail: Option<String>,
         uploaded: Vec<(String, Vec<u8>)>,
+        /// Whether the server's key is not trusted yet (see [`Server::unknown_host`]).
+        unknown: bool,
     }
 
     impl Server {
@@ -500,6 +941,21 @@ pub mod fake {
             self.fail = Some(message.to_string());
             self
         }
+
+        /// A server whose key is not trusted yet: fetching fails with [`UnknownHost`] until
+        /// [`trust_host`] is called with it.
+        pub fn unknown_host(mut self) -> Self {
+            self.unknown = true;
+            self
+        }
+
+        fn stamp(&self, path: &str) -> Option<RemoteStamp> {
+            let bytes = self.entries.get(path)?.as_ref()?;
+            Some(RemoteStamp {
+                size: bytes.len() as u64,
+                modified: self.versions.get(path).copied().unwrap_or(0),
+            })
+        }
     }
 
     impl RemoteFs for Server {
@@ -511,7 +967,13 @@ pub mod fake {
             }
         }
 
-        fn list_dir(&self, remote: &str) -> Result<Vec<(String, bool, bool)>> {
+        fn list_dir(
+            &self,
+            remote: &str,
+            limit: usize,
+            cancel: &AtomicBool,
+        ) -> Result<Vec<(String, bool, bool)>> {
+            check(cancel)?;
             let prefix = format!("{}/", remote.trim_end_matches('/'));
             Ok(self
                 .entries
@@ -521,6 +983,7 @@ pub mod fake {
                     (!rel.is_empty() && !rel.contains('/'))
                         .then(|| (rel.to_string(), contents.is_none(), contents.is_some()))
                 })
+                .take(limit.saturating_add(1))
                 .collect())
         }
     }
@@ -542,6 +1005,18 @@ pub mod fake {
     /// I/O, unlike the fake server, can be slow.
     pub fn installed() -> bool {
         SERVER.with(|s| s.borrow().is_some())
+    }
+
+    /// Someone else writing `contents` to the file at `path` on the server.
+    pub fn change(path: &str, contents: &str) {
+        SERVER.with(|s| {
+            if let Some(server) = s.borrow_mut().as_mut() {
+                server
+                    .entries
+                    .insert(path.to_string(), Some(contents.as_bytes().to_vec()));
+                *server.versions.entry(path.to_string()).or_default() += 1;
+            }
+        });
     }
 
     /// The bytes last uploaded to `path`, if any, for a test to check what *Save* wrote.
@@ -568,10 +1043,18 @@ pub mod fake {
         })
     }
 
-    pub(super) fn fetch(
-        remote_path: &str,
-        cancel: &AtomicBool,
-    ) -> Option<Result<(tempfile::TempDir, PathBuf, bool)>> {
+    /// Trusts the fake server's key, if one is installed.
+    pub(super) fn trust(_host: &UnknownHost) -> bool {
+        SERVER.with(|s| match s.borrow_mut().as_mut() {
+            Some(server) => {
+                server.unknown = false;
+                true
+            }
+            None => false,
+        })
+    }
+
+    pub(super) fn fetch(remote_path: &str, cancel: &AtomicBool) -> Option<Result<Fetched>> {
         // Trimmed once, up front, and used everywhere below: `is_dir`'s lookup and the actual
         // read must agree on the same path, or a file fetched with a trailing slash would
         // pass the first and fail the second with a confusing "no such file or folder".
@@ -581,6 +1064,18 @@ pub mod fake {
             let server = server.as_ref()?;
             if let Some(message) = &server.fail {
                 return Some(Err(anyhow::anyhow!("{message}")));
+            }
+            if server.unknown {
+                return Some(Err(UnknownHost {
+                    server: "example.com:22".into(),
+                    id: "example.com:22".into(),
+                    key_type: "ssh-ed25519".into(),
+                    fingerprint: "SHA256:fake".into(),
+                    key: b"fake".to_vec(),
+                    path: PathBuf::new(),
+                    differs_from: None,
+                }
+                .into()));
             }
             Some((|| {
                 check(cancel)?;
@@ -595,16 +1090,25 @@ pub mod fake {
                 };
                 let mut budget = Budget::new();
                 if is_dir {
-                    download_dir(server, remote_path, &local, cancel, &mut budget)?;
+                    download_dir(server, remote_path, &local, 0, cancel, &mut budget)?;
                 } else {
                     download_file(server, remote_path, &local, cancel, &mut budget)?;
                 }
-                Ok((temp, local, is_dir))
+                Ok(Fetched {
+                    temp,
+                    local,
+                    is_dir,
+                    stamp: server.stamp(remote_path),
+                })
             })())
         })
     }
 
-    pub(super) fn upload(local_path: &Path, remote_path: &str) -> Option<Result<()>> {
+    pub(super) fn upload(
+        local_path: &Path,
+        remote_path: &str,
+        expected: Option<RemoteStamp>,
+    ) -> Option<Result<RemoteStamp>> {
         SERVER.with(|s| {
             let mut server = s.borrow_mut();
             let server = server.as_mut()?;
@@ -612,12 +1116,21 @@ pub mod fake {
                 return Some(Err(anyhow::anyhow!("{message}")));
             }
             Some((|| {
+                if let (Some(expected), Some(now)) = (expected, server.stamp(remote_path)) {
+                    if now != expected {
+                        bail!(trf(
+                            "msg.sftp_changed_on_server",
+                            &[("path", remote_path.to_string())]
+                        ));
+                    }
+                }
                 let bytes = std::fs::read(local_path)?;
                 server
                     .entries
                     .insert(remote_path.to_string(), Some(bytes.clone()));
+                *server.versions.entry(remote_path.to_string()).or_default() += 1;
                 server.uploaded.push((remote_path.to_string(), bytes));
-                Ok(())
+                Ok(server.stamp(remote_path).unwrap())
             })())
         })
     }
@@ -645,21 +1158,21 @@ mod tests {
                 passphrase: String::new(),
             },
         };
-        let (_t, local, is_dir) = fetch(&conn, "/tmp/sshtest/data_file.txt", &never).unwrap();
-        assert!(!is_dir);
-        assert_eq!(std::fs::read_to_string(&local).unwrap(), "hello remote\n");
+        let f = fetch(&conn, "/tmp/sshtest/data_file.txt", &never).unwrap();
+        assert!(!f.is_dir);
+        assert_eq!(std::fs::read_to_string(&f.local).unwrap(), "hello remote\n");
 
-        let (_t, local, is_dir) = fetch(&conn, "/tmp/sshtest/data", &never).unwrap();
-        assert!(is_dir);
+        let f = fetch(&conn, "/tmp/sshtest/data", &never).unwrap();
+        assert!(f.is_dir);
         assert_eq!(
-            std::fs::read_to_string(local.join("sub/b.txt")).unwrap(),
+            std::fs::read_to_string(f.local.join("sub/b.txt")).unwrap(),
             "nested\n"
         );
 
         let up_dir = tempfile::tempdir().unwrap();
         let up_local = up_dir.path().join("out.txt");
         std::fs::write(&up_local, "uploaded by smoke test\n").unwrap();
-        upload(&conn, &up_local, "/tmp/sshtest/uploaded.txt").unwrap();
+        upload(&conn, &up_local, "/tmp/sshtest/uploaded.txt", None, &never).unwrap();
         assert_eq!(
             std::fs::read_to_string("/tmp/sshtest/uploaded.txt").unwrap(),
             "uploaded by smoke test\n"
@@ -691,6 +1204,10 @@ mod tests {
         let shown = label(&conn, "/srv/report.txt");
         assert_eq!(shown, "sftp://ann@example.com:22/srv/report.txt");
         assert!(!shown.contains("s3cret"));
+        assert_eq!(
+            label(&conn, "notes.txt"),
+            "sftp://ann@example.com:22/~/notes.txt"
+        );
     }
 
     #[test]
@@ -710,25 +1227,25 @@ mod tests {
                 .dir("/srv/data/sub")
                 .file("/srv/data/sub/b.txt", "b"),
         );
-        let (_t, path, is_dir) = fetch(&conn, "/srv/report.txt", &never).unwrap();
-        assert!(!is_dir);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
-        let (_t, path, is_dir) = fetch(&conn, "/srv/data", &never).unwrap();
-        assert!(is_dir);
-        assert_eq!(std::fs::read_to_string(path.join("a.txt")).unwrap(), "a");
+        let f = fetch(&conn, "/srv/report.txt", &never).unwrap();
+        assert!(!f.is_dir);
+        assert_eq!(std::fs::read_to_string(&f.local).unwrap(), "hello");
+        let f = fetch(&conn, "/srv/data", &never).unwrap();
+        assert!(f.is_dir);
+        assert_eq!(std::fs::read_to_string(f.local.join("a.txt")).unwrap(), "a");
         assert_eq!(
-            std::fs::read_to_string(path.join("sub/b.txt")).unwrap(),
+            std::fs::read_to_string(f.local.join("sub/b.txt")).unwrap(),
             "b"
         );
         // A trailing slash on the remote path still names the staged folder after it, not
         // the fallback name.
-        let (_t, path, _) = fetch(&conn, "/srv/data/", &never).unwrap();
-        assert_eq!(path.file_name().unwrap(), "data");
+        let f = fetch(&conn, "/srv/data/", &never).unwrap();
+        assert_eq!(f.local.file_name().unwrap(), "data");
         // A trailing slash on a *file*'s path does not make it look missing: whatever
         // decided it is a file is the same lookup that then reads it.
-        let (_t, path, is_dir) = fetch(&conn, "/srv/report.txt/", &never).unwrap();
-        assert!(!is_dir);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        let f = fetch(&conn, "/srv/report.txt/", &never).unwrap();
+        assert!(!f.is_dir);
+        assert_eq!(std::fs::read_to_string(&f.local).unwrap(), "hello");
         fake::uninstall();
     }
 
@@ -744,7 +1261,7 @@ mod tests {
         fake::install(fake::Server::new().file("/a.txt", "a"));
         assert!(fetch(&conn, "/missing.txt", &never).is_err());
         fake::install(fake::Server::new().failing("no route to host"));
-        let err = fetch(&conn, "/a.txt", &never).unwrap_err();
+        let err = fetch(&conn, "/a.txt", &never).err().unwrap();
         assert!(err.to_string().contains("no route to host"));
         fake::uninstall();
     }
@@ -759,8 +1276,8 @@ mod tests {
             auth: Auth::Password(String::new()),
         };
         fake::install(fake::Server::new().dir("/srv").file("/srv/a.txt", "a"));
-        let err = fetch(&conn, "/srv", &cancelled).unwrap_err();
-        assert!(err.to_string().contains("cancelled"));
+        let err = fetch(&conn, "/srv", &cancelled).err().unwrap();
+        assert_eq!(err.to_string(), tr("msg.sftp_cancelled"));
         fake::uninstall();
     }
 
@@ -776,11 +1293,50 @@ mod tests {
             user: "u".into(),
             auth: Auth::Password(String::new()),
         };
-        upload(&conn, &local, "/a.txt").unwrap();
+        let never = AtomicBool::new(false);
+        let first = upload(&conn, &local, "/a.txt", None, &never).unwrap();
         assert_eq!(fake::uploaded("/a.txt").unwrap(), b"new");
         assert_eq!(fake::upload_count("/a.txt"), 1);
-        upload(&conn, &local, "/a.txt").unwrap();
+        upload(&conn, &local, "/a.txt", Some(first), &never).unwrap();
         assert_eq!(fake::upload_count("/a.txt"), 2);
+        fake::uninstall();
+    }
+
+    /// A file someone else changed on the server since it was fetched is not written over.
+    #[test]
+    fn uploading_over_a_file_changed_on_the_server_is_refused() {
+        fake::install(fake::Server::new().file("/a.txt", "old"));
+        let conn = RemoteConnection {
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: Auth::Password(String::new()),
+        };
+        let never = AtomicBool::new(false);
+        let fetched = fetch(&conn, "/a.txt", &never).unwrap();
+        std::fs::write(&fetched.local, "mine").unwrap();
+        fake::change("/a.txt", "theirs");
+        let err = upload(&conn, &fetched.local, "/a.txt", fetched.stamp, &never).unwrap_err();
+        assert!(err.to_string().contains("/a.txt"), "{err}");
+        assert_eq!(fake::upload_count("/a.txt"), 0);
+        fake::uninstall();
+    }
+
+    #[test]
+    fn a_server_not_trusted_yet_fails_with_its_fingerprint_until_trusted() {
+        fake::install(fake::Server::new().file("/a.txt", "a").unknown_host());
+        let conn = RemoteConnection {
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: Auth::Password(String::new()),
+        };
+        let never = AtomicBool::new(false);
+        let err = fetch(&conn, "/a.txt", &never).err().unwrap();
+        let host = err.downcast_ref::<UnknownHost>().unwrap().clone();
+        assert!(err.to_string().contains(&host.fingerprint));
+        trust_host(&host).unwrap();
+        assert!(fetch(&conn, "/a.txt", &never).is_ok());
         fake::uninstall();
     }
 
@@ -822,7 +1378,12 @@ mod tests {
             }))
         }
 
-        fn list_dir(&self, _remote: &str) -> Result<Vec<(String, bool, bool)>> {
+        fn list_dir(
+            &self,
+            _remote: &str,
+            _limit: usize,
+            _cancel: &AtomicBool,
+        ) -> Result<Vec<(String, bool, bool)>> {
             unreachable!("not a folder")
         }
     }
@@ -840,7 +1401,7 @@ mod tests {
         let local = dir.path().join("big.bin");
         let mut budget = Budget::new();
         let err = download_file(&fs, "/big.bin", &local, &cancel, &mut budget).unwrap_err();
-        assert!(err.to_string().contains("cancelled"));
+        assert_eq!(err.to_string(), tr("msg.sftp_cancelled"));
         assert_eq!(std::fs::metadata(&local).unwrap().len(), CHUNK as u64);
     }
 
@@ -855,7 +1416,12 @@ mod tests {
             Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
         }
 
-        fn list_dir(&self, _remote: &str) -> Result<Vec<(String, bool, bool)>> {
+        fn list_dir(
+            &self,
+            _remote: &str,
+            _limit: usize,
+            _cancel: &AtomicBool,
+        ) -> Result<Vec<(String, bool, bool)>> {
             unreachable!("not a folder")
         }
     }
@@ -867,11 +1433,16 @@ mod tests {
             Ok(Box::new(std::io::Cursor::new(b"x".to_vec())))
         }
 
-        fn list_dir(&self, remote: &str) -> Result<Vec<(String, bool, bool)>> {
+        fn list_dir(
+            &self,
+            remote: &str,
+            limit: usize,
+            _cancel: &AtomicBool,
+        ) -> Result<Vec<(String, bool, bool)>> {
             if remote != "/many" {
                 return Ok(Vec::new());
             }
-            Ok((0..self.0)
+            Ok((0..self.0.min(limit + 1))
                 .map(|i| (format!("f{i}"), false, true))
                 .collect())
         }
@@ -885,12 +1456,15 @@ mod tests {
         let fs = ManyFiles(10);
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("many");
-        let mut budget = Budget::with_limits(u64::MAX, 3);
-        let err = download_dir(&fs, "/many", &local, &never, &mut budget).unwrap_err();
-        assert!(err.to_string().contains("files"));
-        // The files up to the limit were still written; the budget stops the next one, not
-        // the whole folder retroactively.
-        assert_eq!(std::fs::read_dir(&local).unwrap().count(), 3);
+        let mut budget = Budget::with_limits(u64::MAX, 4);
+        let err = download_dir(&fs, "/many", &local, 0, &never, &mut budget).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            trf("msg.sftp_too_many", &[("count", "4".to_string())])
+        );
+        // The folder itself counts as one entry; a listing longer than what is left stops
+        // the fetch before any of it is read.
+        assert_eq!(std::fs::read_dir(&local).unwrap().count(), 0);
     }
 
     #[test]
@@ -905,7 +1479,7 @@ mod tests {
         // not fit and is rejected before it is, so the file is left with just the first.
         let mut budget = Budget::with_limits(CHUNK as u64, usize::MAX);
         let err = download_file(&fs, "/big.bin", &local, &never, &mut budget).unwrap_err();
-        assert!(err.to_string().contains("GB"), "{err}");
+        assert_eq!(err.to_string(), budget.too_large().to_string());
         assert_eq!(std::fs::metadata(&local).unwrap().len(), CHUNK as u64);
     }
 
@@ -918,24 +1492,126 @@ mod tests {
     }
 
     #[test]
-    fn known_hosts_are_loaded_and_saved_as_one_line_per_server() {
+    fn known_hosts_are_remembered_one_line_per_server_keeping_the_other_lines() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("known_hosts");
-        let mut hosts = HashMap::new();
-        hosts.insert("example.com:22".to_string(), vec![1, 2, 3]);
-        save_known_hosts(&path, &hosts).unwrap();
-        let loaded = load_known_hosts(&path);
-        assert_eq!(loaded, hosts);
+        let path = dir.path().join("sub/known_hosts");
+        remember_host(&path, "example.com:22", &[1, 2, 3]).unwrap();
+        let loaded = load_known_hosts(&path).unwrap();
+        assert_eq!(loaded.get("example.com:22"), Some(&vec![1, 2, 3]));
+
+        // Another window added a server, and someone wrote a note: both are kept, and a
+        // server remembered again replaces its own line only.
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("# a note\nother:22 ff\nnot a host line\n");
+        std::fs::write(&path, text).unwrap();
+        remember_host(&path, "example.com:22", &[9]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "# a note\nother:22 ff\nnot a host line\nexample.com:22 09\n"
+        );
     }
 
     #[test]
     fn load_known_hosts_ignores_a_missing_file_blank_lines_and_comments() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("known_hosts");
-        assert!(load_known_hosts(&path).is_empty());
+        assert!(load_known_hosts(&path).unwrap().is_empty());
         std::fs::write(&path, "# a comment\n\nexample.com:22 0102ff\n").unwrap();
-        let loaded = load_known_hosts(&path);
+        let loaded = load_known_hosts(&path).unwrap();
         assert_eq!(loaded.get("example.com:22"), Some(&vec![1, 2, 0xff]));
+    }
+
+    /// A known hosts file that exists but cannot be read must not look like one listing no
+    /// servers: a server whose key changed would then look like one never seen.
+    #[test]
+    fn an_unreadable_known_hosts_file_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        std::fs::create_dir(&path).unwrap();
+        assert!(load_known_hosts(&path).is_err());
+        assert!(remember_host(&path, "h:22", &[1]).is_err());
+    }
+
+    #[test]
+    fn fingerprints_and_key_types_read_as_ssh_shows_them() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg");
+        assert_eq!(encode_base64(b"fo"), "Zm8");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"hello"), "aGVsbG8");
+        let mut key = 11u32.to_be_bytes().to_vec();
+        key.extend_from_slice(b"ssh-ed25519");
+        key.extend_from_slice(&[0, 0, 0, 1, 7]);
+        assert_eq!(key_type(&key), Some("ssh-ed25519"));
+        assert_eq!(key_type(&[0, 0]), None);
+        assert_eq!(
+            host_key_methods("ssh-rsa"),
+            "rsa-sha2-512,rsa-sha2-256,ssh-rsa"
+        );
+    }
+
+    #[test]
+    fn servers_are_named_with_ipv6_addresses_in_brackets() {
+        assert_eq!(host_id("Example.COM", 22), "example.com:22");
+        assert_eq!(host_id("::1", 2222), "[::1]:2222");
+        assert_eq!(host_id("[::1]", 22), "[::1]:22");
+    }
+
+    #[test]
+    fn remote_names_that_cannot_be_local_file_names_are_left_out() {
+        assert!(local_name_ok("a.txt"));
+        for bad in ["", ".", "..", "a/b", "a\0b"] {
+            assert!(!local_name_ok(bad), "{bad:?}");
+        }
+        if cfg!(windows) {
+            for bad in ["CON", "nul.txt", "a:b", "trailing.", "a?"] {
+                assert!(!local_name_ok(bad), "{bad:?}");
+            }
+        }
+    }
+
+    /// Folders nested deeper than any real tree (a server looping a folder into itself, say)
+    /// stop the fetch.
+    #[test]
+    fn a_folder_nested_too_deep_stops_the_fetch() {
+        struct Endless;
+        impl RemoteFs for Endless {
+            fn open_read(&self, _remote: &str) -> Result<Box<dyn Read + '_>> {
+                unreachable!("only folders")
+            }
+            fn list_dir(
+                &self,
+                _remote: &str,
+                _limit: usize,
+                _cancel: &AtomicBool,
+            ) -> Result<Vec<(String, bool, bool)>> {
+                Ok(vec![("d".to_string(), true, false)])
+            }
+        }
+        let never = AtomicBool::new(false);
+        let dir = tempfile::tempdir().unwrap();
+        let mut budget = Budget::new();
+        let err = download_dir(
+            &Endless,
+            "/d",
+            &dir.path().join("d"),
+            0,
+            &never,
+            &mut budget,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(&MAX_REMOTE_DEPTH.to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_password_is_overwritten_when_wiped() {
+        let mut s = String::from("s3cret");
+        wipe(&mut s);
+        assert!(s.is_empty());
     }
 
     #[test]

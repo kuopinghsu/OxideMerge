@@ -15,37 +15,57 @@ uses its section of this file as the release notes.
   starts from the host, port, user and key path of the last one that succeeded, so
   fetching the other side of a compare from the same server does not need them retyped;
   the password or passphrase is never remembered this way. A fetched file is
-  writable: *Save* re-uploads it to the server over a fresh connection. A fetched folder
-  opens read-only, and is bounded to 4 GiB and 50,000 files so a very large folder
-  cannot be fetched by mistake. The server's host key is checked against the ones seen
-  before (remembered in a `known_hosts` file under the settings folder, independent of
-  the system's own SSH `known_hosts`): a new server's key is trusted and remembered on
-  first connection, and a key that no longer matches a remembered one stops the
-  connection instead of silently trusting it. The connection, including the password or
-  passphrase, is kept only in memory for the tab's lifetime; it is never written to the
-  settings file, a saved workspace, or the restored session.
+  writable: *Save* re-uploads it to the server over a fresh connection, in the
+  background with a *Cancel* button, to a temporary file that then replaces the original,
+  so a failed upload leaves the server's file as it was. An upload is refused when the
+  file changed on the server since it was fetched, and the tab stays unsaved until an
+  upload succeeds; closing it or quitting asks first. A fetched folder opens read-only, and
+  is bounded to 4 GiB, 50,000 files and folders and 64 levels deep so a very large folder
+  cannot be fetched by mistake. The server's host key is checked before the password or
+  key is sent: a server whose key matches your `~/.ssh/known_hosts` is trusted, a new one
+  shows its fingerprint and is trusted only once you confirm it, and is then remembered in
+  OxideMerge's own `known_hosts` file next to its settings; a key that no longer matches a
+  remembered one stops the connection instead of silently trusting it. The connection,
+  including the password or passphrase, is kept only in memory for the tab's lifetime; it
+  is never written to the settings file, and fetched tabs are left out of saved
+  workspaces, the restored session and the recent paths.
 - **Workspaces:** *File → Workspaces → Save as workspace...* saves the open tabs under a
   name, kept until deleted; *File → Workspaces* then lists every saved workspace to reopen
   all of its tabs at once, alongside whatever is open already, and *Manage workspaces...*
   lists them to open or delete. Unlike the one, unnamed session the app already reopens on
   its own at startup, a workspace is kept and reopened only by name, whenever asked.
+  Saving over an existing name asks first, a workspace is never saved empty, a deleted
+  one can be brought back with *Undo*, tabs whose files are gone are counted rather than
+  reopened against an empty side, and tabs of temporary copies (SFTP, revisions, files
+  inside an archive compare) are left out. Another OxideMerge window running at the same
+  time no longer writes its older list of workspaces over one just saved.
 - **Compare clipboard:** *File → Compare clipboard* opens a new text compare with the
   clipboard's current text on the left and a blank, writable right side: paste a second
   text into it (`Ctrl+V`) to compare the two right away, with no files needed. Both sides
   edit normally; *Save* works like any other unsaved comparison and asks where to write
   the text, since there is no file to write back to.
 - **Jupyter notebooks (`.ipynb`) read as text:** a notebook is compared cell by cell, each
-  one labeled as a numbered code cell, a Markdown cell or a raw cell, with that cell's own
-  source and nothing else; outputs, execution counts and other metadata a notebook carries
-  from being run are left out, so re-running a notebook without changing it compares equal.
-  Read through the same `extract_documents` setting as the other built-in document readers,
-  and read-only, like them. Sample: `samples/*/docs/report.ipynb`.
+  one under a line naming it a code cell, a Markdown cell or a raw cell (unnumbered, so an
+  added cell doesn't relabel the ones after it), with that cell's own source and nothing
+  else; outputs, execution counts and other metadata a notebook carries from being run are
+  left out, so re-running a notebook without changing it compares equal. nbformat 3
+  notebooks are read too; one that can't be read is compared as its JSON text. Read through
+  the same `extract_documents` setting as the other built-in document readers, and
+  read-only, like them; `git mergetool` (`-o`) still merges notebooks as the files they are,
+  so the merged result stays valid. A saved review of a notebook shows it as changed once,
+  since what it shows is now the cells. Sample: `samples/*/docs/report.ipynb`.
 - **Archive sides are writable:** a file extracted from an archive compare (ZIP-based
-  formats, TAR plain or gzip/bzip2/xz-compressed, or 7z) can now be edited, copied to,
+  formats, TAR plain or gzip/bzip2-compressed, or 7z) can now be edited, copied to,
   merged into or deleted, like a plain folder. Saving a file, or *File → Save* / *Save
-  All* on the folder compare, repacks the archive in place, keeping every other entry as
-  it was. A review snapshot or a page tree compared from the web stays read-only, as
-  before, since there is nowhere for its changes to go back to.
+  All* on the folder compare, repacks the archive in place, keeping its permissions and
+  every entry you didn't change exactly as it was (date, compression, order); an archive
+  with no changes is not rewritten. Saving is refused when the archive was changed on
+  disk since it was extracted, or is read-only, and no `.bak` backups are made inside it.
+  An archive fetched over SFTP is uploaded again after it is saved. A review snapshot or
+  a page tree compared from the web stays read-only, as before, since there is nowhere
+  for its changes to go back to, and so do signed packages (`.apk`, `.ipa`, `.appx`,
+  `.msix`, `.crx`, `.xpi`, or a zip with a `META-INF` signature), `.tar.xz` and archives
+  inside another archive.
 - **Moved blocks in binary comparisons:** *Moved blocks* on the binary toolbar highlights
   identical bytes at different offsets, in the hexadecimal and text columns and in the
   location pane: data shifted up to 128 bytes by an insertion or deletion, and blocks of
@@ -423,8 +443,9 @@ uses its section of this file as the release notes.
   under their characters. Each column is labeled with its side, a difference continued on a
   new page names its file, the folder file list repeats its header on each page, and a cell
   too tall for a page is cut. Hebrew and Arabic text reads right to left, with its numbers
-  and brackets in place and Arabic letters joined, and Hebrew, Arabic and Thai print with an
-  installed font that allows embedding. Characters no font has are listed at the end of the
+  (dates, phone numbers, percentages and prices kept whole) and brackets in place and Arabic
+  and Persian letters joined, and Hebrew, Arabic and Thai print with an installed font whose
+  licence allows embedding a subset of it. Characters no font has are listed at the end of the
   report and on standard error. Color-blind colors show changes in purple and conflicts in yellow, as
   in the program. The temporary file for *Print* is readable only by you and deleted when
   OxideMerge closes. The review summary section and the font and page-size errors are
@@ -880,9 +901,9 @@ uses its section of this file as the release notes.
 ### Added
 
 - **Synchronization points** (*Merge → Set synchronization point*, Alt+S, or right-click a
-  line): line up lines the compare pairs wrongly, as in WinMerge. The text before and
-  after each point is compared separately. Points are marked in the gutter, follow edits
-  and are kept in saved comparisons.
+  line): line up lines the compare pairs wrongly. The text before and after each point is
+  compared separately. Points are marked in the gutter, follow edits and are kept in saved
+  comparisons.
 - **XML reports** of text and folder compares, for other programs to read: choose the
   `.xml` type in *Generate report...*, or `--report <name>.xml`. Text reports list every
   difference with its lines and the bookmarks; folder reports list every item with its
@@ -895,9 +916,8 @@ uses its section of this file as the release notes.
   bottom, instead of only the first screen (up to 16384 pixels tall).
 - **Web page compare, highlighted differences:** the screenshot modes compare the pages'
   text and highlight what differs on the pages themselves (changed blocks in yellow,
-  changed words in orange), like WinMerge's *View Differences*, so a change that moves the
-  page down no longer marks everything below it. *Highlight differences* in the toolbar
-  turns this off.
+  changed words in orange), so a change that moves the page down no longer marks
+  everything below it. *Highlight differences* in the toolbar turns this off.
 
 ### Changed
 
@@ -1312,7 +1332,7 @@ uses its section of this file as the release notes.
 - Recent comparisons on the start page can be edited or removed from their context menu.
 - Dropping files on the window shows what will happen; dropping onto the Open dialog fills
   in the empty paths.
-- **Windows Explorer context menu in the style of WinMerge:** an OxideMerge submenu with
+- **Windows Explorer context menu:** an OxideMerge submenu with
   Compare, Select Left, Select Middle and Compare As, also available from the command line
   as `--select-left`, `--select-middle` and `--compare-to`.
 - **Finder Quick Actions and Linux file manager entries:** Tools → Add Finder Quick
@@ -1400,7 +1420,7 @@ First release.
   a Clear filter option, zip-based archives compared as folders, and HTML, CSV and text
   reports.
 - **Text compare and merge:** 2-way and 3-way with Myers, Patience or LCS, inline word and
-  character differences, moved blocks, a location pane, WinMerge-style ignore options,
+  character differences, moved blocks, a location pane, ignore options,
   copy and auto merge, undo and redo, in-place editing, conflict file resolution, syntax
   highlighting, find, go to line, CSV/TSV table mode, patches, and unpacker plugins.
 - **Binary compare** in a side-by-side hex view.

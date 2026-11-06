@@ -252,6 +252,12 @@ pub fn load_doc(
                             &[("file", path.display().to_string())],
                         )))
                     });
+            // A notebook is JSON text to begin with: one this can't read (an older or broken
+            // one) is still worth comparing as it is.
+            let cancelled = cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+            if read.is_err() && kind == super::extract::Kind::Notebook && !cancelled {
+                return super::text::load_doc(path, None);
+            }
             (read?.into_bytes(), crate::i18n::tr(kind.label()))
         }
         None => return super::text::load_doc(path, None),

@@ -21,7 +21,7 @@ OxideMerge is a visual tool for comparing and merging files and folders.
 It runs on Windows, macOS and Linux.
 Use it to review changes, combine edits and resolve merge conflicts.
 It also compares binary files, images and web pages.
-OxideMerge is written in Rust and is inspired by WinMerge.
+OxideMerge is written in Rust.
 
 This guide is also available in xref:user-guide.zh-TW.adoc[繁體中文].
 
@@ -287,23 +287,40 @@ host, port, user and key path of the last connection that succeeded, for fetchin
 from the same server; the password or a key's passphrase is never filled in this way.
 
 A fetched *file* is writable: edit it and *Save* uploads it back to the server over a fresh
-connection. A fetched *folder* opens read-only, since OxideMerge does not yet upload new,
-renamed or deleted files inside a remote folder. A fetched folder is also limited to 4 GiB and
-50,000 files, so a very large folder cannot be fetched by mistake.
+connection, in the background, with a *Cancel* button. The upload is written to a temporary
+file beside the original, which then takes its place keeping its permissions, so a failed or
+stopped upload leaves the server's file as it was. If someone changed the file on the server
+after you fetched it, OxideMerge does not write over their change: the upload is refused, your
+edits stay in the tab, and you can compare them with the server's version. Until an upload
+succeeds the tab counts as unsaved, so closing it or quitting asks first, and *Save* tries
+again. Closing a tab with *Save* waits for its upload to finish before it closes.
+
+A fetched *folder* opens read-only, since OxideMerge does not yet upload new, renamed or deleted
+files inside a remote folder. A fetch is also limited to 4 GiB, 50,000 files and folders, and
+folders nested 64 deep, so a very large folder cannot be fetched by mistake. Names that can't be
+file names on this computer are left out.
 
 The connection, including the password or the key's passphrase, is kept only in memory for as
-long as the tab stays open. It is never written to the settings file, a saved workspace (see
-<<workspaces>>) or the session OxideMerge reopens on its own at startup — reopening a tab
-fetched over SFTP after restarting the app asks you to connect again.
+long as the tab stays open, and the password is overwritten in memory once it is no longer
+needed. It is never written to the settings file. Tabs showing a fetched file or folder are left
+out of saved workspaces (see <<workspaces>>), the session OxideMerge reopens on its own at
+startup, and the recent paths, since their temporary copies are gone after the app closes:
+connect again to compare the same remote path.
 
-The first time you connect to a server, OxideMerge remembers its host key in a `known_hosts`
-file of its own, under its settings folder (separate from your system's own SSH
-`known_hosts`). On every later connection to that server, the key is checked against the one
-remembered: if it no longer matches, OxideMerge refuses the connection rather than silently
-trusting a server that may not be the one you expect. This usually means the server was
-rebuilt or reinstalled; if you are sure that is what happened, remove that server's line from
-the `known_hosts` file (it is one line per server, `host:port` followed by its key) and
-connect again to trust and remember the new key.
+Before the password or key is sent, OxideMerge checks the server's host key. A server listed
+in your own SSH `~/.ssh/known_hosts` with the same key is trusted. Otherwise OxideMerge checks a
+`known_hosts` file of its own, next to its settings file. The first time you connect to a server
+found in neither, OxideMerge shows the key's type and fingerprint (`SHA256:...`, as `ssh` shows
+it) and asks whether to trust it: compare it with the fingerprint the server's administrator
+gives you before you click *Trust and connect*. A warning is shown when your `~/.ssh/known_hosts`
+lists a different key for that server.
+
+On every later connection, the key is checked against the one remembered: if it no longer
+matches, OxideMerge refuses the connection rather than trusting a server that may not be the
+one you expect. This usually means the server was rebuilt or reinstalled. If you are sure that
+is what happened, remove that server's line from OxideMerge's `known_hosts` file (it is one line
+per server, `host:port` followed by its key) and connect again. If that file exists but can't be
+read, OxideMerge connects to no server until it can.
 
 [[compare-types]]
 === Comparison types
@@ -1472,10 +1489,14 @@ mapping symbols ARM and RISC-V assemblers add (`$x`, `$d`, …) are left out and
 at most 100,000 symbols of a table are listed.
 
 |`.ipynb`
-|A Jupyter notebook, cell by cell: each cell labeled as a numbered code cell, a Markdown cell or
-a raw cell, with that cell's own source and nothing else. Outputs, execution counts and other
+|A Jupyter notebook, cell by cell: each cell under a line naming it a code cell, a Markdown cell
+or a raw cell, with that cell's own source and nothing else. Cells are not numbered, so adding
+one doesn't change the label of every cell after it. Outputs, execution counts and other
 metadata a notebook carries from being run are left out, so re-running a notebook without
-changing it compares equal.
+changing it compares equal. The older nbformat 3 notebooks are read too, their heading cells as
+Markdown headings. At most 20,000 cells are read; the end of the text says how many were left
+out. A notebook that can't be read this way, such as a broken one, is compared as the JSON text
+it is.
 |===
 
 A file read this way is *read-only*: the pane says what was read (for example
@@ -1564,9 +1585,21 @@ OxideMerge extracts archives and compares them as folders. It supports these for
 * `.7z`.
 
 Edits to the extracted files are saved back into the archive: copying, deleting, merging or
-editing a file and then saving writes a new archive in place of the original. An archive
-opened as a snapshot in a review, or a page tree compared from the web, stays read-only, as
-there is nowhere for its changes to go back to.
+editing a file and then saving writes a new archive in place of the original, keeping its
+permissions. Only an archive whose files changed is written, and the entries you didn't change
+are kept exactly as they were, with their dates, compression and order; changed entries get the
+current time. If the archive itself was changed on disk since it was extracted, or is
+read-only, saving into it is refused instead of losing those changes. No `.bak` backups are made
+inside an extracted archive. An archive fetched over SFTP is uploaded again after it is saved.
+
+These stay read-only, as there is nowhere for their changes to go back to, or writing them
+again would break them:
+
+* an archive opened as a snapshot in a review, or a page tree compared from the web;
+* signed packages (`.apk`, `.ipa`, `.appx`, `.msix`, `.crx`, `.xpi`, and any zip carrying a
+  `META-INF` signature or an `_xmlsignatures` folder), as rewriting them invalidates the signature;
+* `.tar.xz` / `.txz`, which OxideMerge reads but can't write;
+* an archive inside another extracted archive.
 It refuses archives that would extract to more than 8 GB or more than 500,000 files.
 RAR is not supported.
 
@@ -1957,7 +1990,7 @@ next to the program.
 An unpacker plugin converts a file to text before the comparison.
 OxideMerge compares the text that the program writes to its standard output.
 
-OxideMerge reads PDF, `.docx`, `.odt`, `.rtf`, `.xlsx` and `.ods` files, and ELF programs,
+OxideMerge reads PDF, `.docx`, `.odt`, `.rtf`, `.xlsx`, `.ods` and `.ipynb` files, and ELF programs,
 itself (see <<documents>>), so a plugin is needed only for a format it does not read — the older
 Word `.doc` and Excel `.xls` among them — or to read one of those formats better than it does.
 A plugin whose pattern matches is always used in preference.
@@ -2074,20 +2107,29 @@ To share the text as it is now, with your review notes, save a comparison instea
 [[workspaces]]
 === Workspaces
 
-*File → Workspaces → Save as workspace...* saves every open text, binary, image and web
-comparison tab that has files of its own under a name you choose. The name and the tabs' paths
-and settings are kept in your settings, not in a file of their own; folder, *All differences*
-and review tabs, which have nothing of their own to reopen from, are left out, the same as the
-session OxideMerge reopens automatically always leaves them out.
+*File → Workspaces → Save as workspace...* saves every open text, binary, image, web and folder
+comparison tab that has files of its own under a name you choose (up to 80 characters). The name
+and the tabs' paths and settings are kept in your settings, not in a file of their own. Tabs with
+nothing of their own to reopen from are left out, the same as the session OxideMerge reopens
+automatically leaves them out: *All differences* and review tabs, the clipboard, and tabs of
+temporary copies, such as a file or folder fetched over SFTP (see <<remote-sftp>>), a revision,
+or a file opened from inside an archive compare. A message says how many tabs were saved and how
+many were left out. When none of the open tabs can be saved, the dialog says so and nothing is
+saved.
 
-*File → Workspaces* then lists every saved workspace: choose one to reopen all of its tabs at
-once, alongside whatever is open already. *Manage workspaces...* lists the saved workspaces, to
-open or delete one.
+Names are told apart regardless of case. Saving under the name of a workspace that already exists
+says so, and replaces its tabs only once you click *Replace*.
+
+*File → Workspaces* then lists the saved workspaces (the first 15; *Manage workspaces...* lists
+them all): choose one to reopen all of its tabs at once, alongside whatever is open already. A tab
+whose files are gone is not reopened, and a message says how many could not be. *Manage
+workspaces...* lists the saved workspaces, to open or delete one; a deleted workspace can be
+brought back with *Undo* in the message that follows.
 
 A workspace is unlike the one, unnamed session OxideMerge reopens on its own when it starts: that
 session is kept and replaced automatically, while a workspace is kept, and reopened, only by the
-name you gave it. A tab fetched over SFTP (see <<remote-sftp>>) is never part of a workspace,
-since its password or key is not kept either.
+name you gave it. When two OxideMerge windows run at once, a workspace saved or deleted in one is
+kept when the other saves its settings.
 
 [[saved-comparisons]]
 === Saved comparisons
@@ -2285,10 +2327,11 @@ change, so the change itself is always shown, and a line such as *… 1,200 more
 is left out. The differences after the limit are only counted.
 
 Lines read left to right, and Hebrew and Arabic text in them right to left, with the numbers and
-brackets in it in their places and Arabic letters joined. This is simpler than a browser's
+brackets in it in their places (a date, phone number, percentage or price stays whole) and Arabic
+and Persian letters joined. This is simpler than a browser's
 layout, so a line mixing the two directions in unusual ways can differ from it. Code fonts do
-not join `!=` or `->` into one sign. Hebrew, Arabic and Thai print with an installed font that
-allows embedding, such as SF Hebrew, Geeza Pro, Tahoma, Segoe UI or Noto. A character none of
+not join `!=` or `->` into one sign. Hebrew, Arabic and Thai print with an installed font whose
+licence allows embedding a subset of it, such as SF Hebrew, Geeza Pro, Tahoma, Segoe UI or Noto. A character none of
 the fonts has
 prints as `?`; a note at the end of the report (and on the command line, on standard error)
 lists such characters by code point.
@@ -3396,6 +3439,8 @@ In a file, kbd:[Alt+↓] after the last difference opens the next changed file.
 `git mergetool`:: Opens a three-way merge with the base in the middle.
 Use *Auto merge*, or copy differences to the middle, then save.
 The middle pane is written to the merged file, never to the base.
+Files OxideMerge would otherwise read as text, such as Jupyter notebooks, are merged as the
+files they are here, so what is saved is still a valid file.
 +
 With `trustExitCode false`, Git checks whether the output file changed.
 If it looks unchanged, Git can ask you whether the merge was successful.
@@ -3860,7 +3905,9 @@ The pane is read-only for one of these reasons:
 * The lock in its header is closed.
 * It was opened with `--wl`, `--wm` or `--wr`.
 * It was extracted from a review snapshot or from a web page tree. A file extracted from an
-  archive compare (see <<archives>>) can be edited; saving it also saves the archive.
+  archive compare (see <<archives>>) can be edited; saving it also saves the archive, unless
+  the archive is one that stays read-only, such as a signed package or a `.tar.xz`.
+* It is a fetched folder from *Compare over SFTP* (see <<remote-sftp>>).
 * It is a JSON or XML file shown formatted.
   Turn off *Format JSON and XML before comparing* to edit and merge it.
 --

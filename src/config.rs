@@ -47,7 +47,7 @@ impl TextLayout {
 }
 
 /// A tab of the previous session: what was compared, and how.
-#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Default)]
 pub struct SessionTab {
     pub paths: Vec<String>,
     /// "text", "binary", "image" or "web"; none for folder compares.
@@ -61,9 +61,68 @@ pub struct SessionTab {
 /// unnamed set the app reopens on its own at startup), a workspace is kept until the user
 /// deletes it and is only reopened when asked to by name.
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
 pub struct Workspace {
     pub name: String,
     pub tabs: Vec<SessionTab>,
+}
+
+impl Workspace {
+    /// Whether `name` names this workspace: names are told apart regardless of case.
+    pub fn is_named(&self, name: &str) -> bool {
+        self.name.to_lowercase() == name.trim().to_lowercase()
+    }
+}
+
+/// The workspaces to save, when this instance changed `base` (what it read) into `ours` while
+/// another running OxideMerge may have saved `theirs` meanwhile: theirs stand, except for the
+/// workspaces changed here, which are replaced, added or deleted as they were here.
+pub fn merge_workspaces(
+    base: &[Workspace],
+    ours: &[Workspace],
+    theirs: &[Workspace],
+) -> Vec<Workspace> {
+    let find = |list: &[Workspace], name: &str| list.iter().find(|w| w.name == name).cloned();
+    let mut out = theirs.to_vec();
+    let mut names: Vec<&str> = Vec::new();
+    for w in base.iter().chain(ours) {
+        if !names.contains(&w.name.as_str()) {
+            names.push(&w.name);
+        }
+    }
+    for name in names {
+        let ours = find(ours, name);
+        if find(base, name) == ours {
+            continue;
+        }
+        match (ours, out.iter().position(|w| w.name == name)) {
+            (Some(w), Some(at)) => out[at] = w,
+            (Some(w), None) => out.push(w),
+            (None, Some(at)) => {
+                out.remove(at);
+            }
+            (None, None) => {}
+        }
+    }
+    out
+}
+
+/// The workspaces in the settings file now, as another running OxideMerge may have saved
+/// them; `None` when the file can't be read, so nothing is merged from it. Unit tests share
+/// one settings folder, so they never read it.
+pub fn saved_workspaces() -> Option<Vec<Workspace>> {
+    if cfg!(test) {
+        return None;
+    }
+    let p = config_path()?;
+    match std::fs::read(&p) {
+        Ok(bytes) => std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(Config::parse)
+            .map(|c| c.workspaces),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        Err(_) => None,
+    }
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
@@ -383,6 +442,35 @@ pub fn unreadable_message(file: &std::path::Path, kept: Option<&std::path::Path>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ws(name: &str, n: usize) -> Workspace {
+        Workspace {
+            name: name.into(),
+            tabs: vec![SessionTab::default(); n],
+        }
+    }
+
+    #[test]
+    fn workspaces_saved_by_another_instance_are_kept() {
+        let base = vec![ws("a", 1), ws("b", 1), ws("gone", 1)];
+        // Here: "b" replaced, "gone" deleted, "new" added.
+        let ours = vec![ws("a", 1), ws("b", 2), ws("new", 1)];
+        // Meanwhile, elsewhere: "a" replaced, "other" added.
+        let theirs = vec![ws("a", 3), ws("b", 1), ws("gone", 1), ws("other", 1)];
+        assert_eq!(
+            merge_workspaces(&base, &ours, &theirs),
+            vec![ws("a", 3), ws("b", 2), ws("other", 1), ws("new", 1)]
+        );
+        // Nothing changed here: whatever was saved elsewhere stands as it is.
+        assert_eq!(merge_workspaces(&base, &base, &theirs), theirs);
+    }
+
+    #[test]
+    fn a_hand_edited_workspace_missing_a_field_keeps_the_settings() {
+        let cfg = Config::parse(r#"{"language": "ja", "workspaces": [{"name": "x"}]}"#).unwrap();
+        assert_eq!(cfg.language, "ja");
+        assert_eq!(cfg.workspaces, vec![ws("x", 0)]);
+    }
 
     #[test]
     fn unreadable_settings_are_kept() {

@@ -706,7 +706,9 @@ impl FolderView {
     ) -> Self {
         // A side extracted from a real archive to compare it can be edited and repacked;
         // any other extracted copy (a review snapshot, a web page tree, ...) is read-only,
-        // as changes to it would otherwise be lost.
+        // as changes to it would otherwise be lost. So is an archive that can't be written
+        // back (see `archive::writable`) and one nested in another extracted archive, as
+        // repacking it would not reach the outer archive.
         let temp_backed: Vec<bool> = roots
             .iter()
             .map(|r| temps.iter().any(|t| r.starts_with(t.path())))
@@ -719,7 +721,10 @@ impl FolderView {
                     return None;
                 }
                 let p = PathBuf::from(disp);
-                (archive::is_archive(&p) && p.is_file()).then_some(p)
+                let editable = archive::is_archive(&p)
+                    && archive::writable(&p)
+                    && !archive::inside_extraction(&p);
+                editable.then_some(p)
             })
             .collect();
         let read_only: Vec<bool> = temp_backed
@@ -1138,13 +1143,27 @@ impl FolderView {
         }
     }
 
+    /// Marks every archive side as possibly edited, after a job that may have written into
+    /// any of them (an automatic merge, a synchronization): saving then repacks those whose
+    /// contents really changed.
+    fn mark_archives_dirty(&mut self) {
+        for s in 0..self.archive_sources.len() {
+            if self.is_archive_side(s) {
+                self.mark_archive_dirty(s);
+            }
+        }
+    }
+
     /// Whether any archive side has edits not yet written back into its archive file.
     pub fn has_archive_changes(&self) -> bool {
         self.archive_dirty.iter().any(|&d| d)
     }
 
-    /// Repacks every archive side with pending edits back into its archive file.
-    pub fn save_archives(&mut self) -> anyhow::Result<()> {
+    /// Repacks every archive side with pending edits back into its archive file, returning
+    /// the archive files that were written (an archive whose contents came out unchanged is
+    /// left alone).
+    pub fn save_archives(&mut self) -> anyhow::Result<Vec<PathBuf>> {
+        let mut written = Vec::new();
         for s in 0..self.archive_sources.len() {
             if !self.archive_dirty[s] {
                 continue;
@@ -1155,10 +1174,12 @@ impl FolderView {
                 self.archive_dirty[s] = false;
                 continue;
             };
-            archive::repack(src, &self.roots[s])?;
+            if archive::repack(src, &self.roots[s])? {
+                written.push(src.clone());
+            }
             self.archive_dirty[s] = false;
         }
-        Ok(())
+        Ok(written)
     }
 
     pub fn is_running(&self) -> bool {
@@ -2202,6 +2223,9 @@ impl FolderView {
             .join()
             .unwrap_or_else(|_| (0, vec![tr("status.error").to_string()]));
         if rescan {
+            if done > 0 {
+                self.mark_archives_dirty();
+            }
             self.start_compare();
         }
         self.status = trf("msg.op_done", &[("n", done.to_string())]);
@@ -4589,6 +4613,7 @@ impl FolderView {
         if let Some(rescan) = self.sync.as_mut().and_then(|d| d.show(ui)) {
             self.sync = None;
             if rescan {
+                self.mark_archives_dirty();
                 self.start_compare();
             }
         }
@@ -4860,6 +4885,44 @@ mod tests {
             std::fs::read_to_string(after.path().join("a.txt")).unwrap(),
             "edited\n"
         );
+    }
+
+    /// A signed package, a `.tar.xz`, and an archive inside another extracted archive can't be
+    /// written back, so their sides open read-only.
+    #[test]
+    fn archives_that_cannot_be_written_back_open_read_only() {
+        let cfg = Config::default();
+        let left = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let apk = work.path().join("app.apk");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&apk).unwrap());
+        zw.start_file("classes.dex", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.finish().unwrap();
+        let outer = work.path().join("outer.zip");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&outer).unwrap());
+        zw.start_file("inner.zip", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let mut inner = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        inner
+            .start_file("a.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zw, &inner.finish().unwrap().into_inner()).unwrap();
+        zw.finish().unwrap();
+        let outer_copy = archive::extract_to_temp(&outer).unwrap();
+        let nested = outer_copy.path().join("inner.zip");
+
+        for path in [apk, nested] {
+            let extracted = archive::extract_to_temp(&path).unwrap();
+            let roots = vec![left.path().to_path_buf(), extracted.path().to_path_buf()];
+            let display = vec![
+                left.path().display().to_string(),
+                path.display().to_string(),
+            ];
+            let v = FolderView::new(roots, display, vec![extracted], "", &[], &cfg);
+            assert_eq!(v.read_only, [false, true], "{}", path.display());
+            assert!(!v.is_archive_side(1));
+        }
     }
 
     #[test]
