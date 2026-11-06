@@ -451,23 +451,26 @@ fn load_document_fonts(lang: &str) -> crate::core::pdf_report::Fonts {
         data: Arc::new(bytes),
         index,
     };
-    let mut seen = std::collections::HashSet::new();
-    let mut first = |paths: &[&str]| {
-        let found = paths.iter().find_map(|&path| {
-            let bytes = std::fs::read(path).ok()?;
-            embeddable(&bytes, 0).then_some((path, bytes))
-        });
-        found.map(|(path, bytes)| {
-            seen.insert(path.to_string());
-            file(bytes, 0)
-        })
+    let read = |path: &str| {
+        let bytes = std::fs::read(path).ok()?;
+        embeddable(&bytes, 0).then(|| file(bytes, 0))
+    };
+    let first = |paths: &[&str]| {
+        paths
+            .iter()
+            .find_map(|&path| Some((path.to_string(), read(path)?)))
     };
     let mono = first(MONO_FONTS);
     let sans = first(UI_FONTS);
+    let primaries: Vec<(String, FontFile)> = mono.iter().chain(&sans).cloned().collect();
+    let mut seen = std::collections::HashSet::new();
     let mut rest: Vec<FontFile> = Vec::new();
     for f in fallbacks(lang) {
-        if embeddable(&f.bytes, f.index) && seen.insert(f.path) {
-            rest.push(file(f.bytes, f.index));
+        if embeddable(&f.bytes, f.index) {
+            let (bytes, index) = (f.bytes, f.index);
+            add_first(vec![f.path], &primaries, &mut seen, &mut rest, |_| {
+                Some(file(bytes.clone(), index))
+            });
         }
     }
     for &(win, unix, fc) in DOCUMENT_SCRIPTS {
@@ -476,36 +479,73 @@ fn load_document_fonts(lang: &str) -> crate::core::pdf_report::Fonts {
             unix.iter().copied().map(str::to_string).collect(),
             vec![fc],
         );
-        let found = paths.into_iter().find_map(|path| {
-            if seen.contains(&path) {
-                return Some(None);
-            }
-            let bytes = std::fs::read(&path).ok()?;
-            embeddable(&bytes, 0).then_some(Some((path, bytes)))
-        });
-        if let Some(Some((path, bytes))) = found {
-            seen.insert(path);
-            rest.push(file(bytes, 0));
-        }
+        add_first(paths, &primaries, &mut seen, &mut rest, read);
     }
     let built_in = FontDefinitions::default();
-    let builtin = |name: &str| {
-        built_in.font_data.get(name).map(|d| FontFile {
-            data: d.font.clone(),
-            index: d.index,
-        })
-    };
-    let chain = |primary: Option<FontFile>, last: &[&str]| -> Vec<FontFile> {
-        primary
-            .into_iter()
-            .chain(rest.iter().cloned())
-            .chain(last.iter().filter_map(|name| builtin(name)))
+    let builtin = |names: &[&str]| -> Vec<FontFile> {
+        names
+            .iter()
+            .filter_map(|name| {
+                built_in.font_data.get(*name).map(|d| FontFile {
+                    data: d.font.clone(),
+                    index: d.index,
+                })
+            })
             .collect()
     };
     crate::core::pdf_report::Fonts {
-        mono: chain(mono, &["Hack", "Ubuntu-Light", "NotoEmoji-Regular"]),
-        sans: chain(sans, &["Ubuntu-Light", "NotoEmoji-Regular"]),
+        mono: chain(
+            mono.map(|(_, f)| f),
+            &rest,
+            builtin(&["Hack", "Ubuntu-Light", "NotoEmoji-Regular"]),
+        ),
+        sans: chain(
+            sans.map(|(_, f)| f),
+            &rest,
+            builtin(&["Ubuntu-Light", "NotoEmoji-Regular"]),
+        ),
     }
+}
+
+/// Adds to `rest` the first of `paths` there is a font for, unless an earlier one of them is
+/// there already. A path that is one of the `primaries` (the code or UI font) is added too,
+/// sharing its bytes: the other primary may lack the script it was looked up for.
+fn add_first(
+    paths: impl IntoIterator<Item = String>,
+    primaries: &[(String, crate::core::pdf_report::FontFile)],
+    seen: &mut std::collections::HashSet<String>,
+    rest: &mut Vec<crate::core::pdf_report::FontFile>,
+    read: impl Fn(&str) -> Option<crate::core::pdf_report::FontFile>,
+) {
+    for path in paths {
+        if seen.contains(&path) {
+            return;
+        }
+        let shared = primaries.iter().find(|(p, _)| *p == path);
+        if let Some(font) = shared.map(|(_, f)| f.clone()).or_else(|| read(&path)) {
+            seen.insert(path);
+            rest.push(font);
+            return;
+        }
+    }
+}
+
+/// `primary`, then the fonts of `rest` other than `primary` itself, then `last`.
+fn chain(
+    primary: Option<crate::core::pdf_report::FontFile>,
+    rest: &[crate::core::pdf_report::FontFile],
+    last: Vec<crate::core::pdf_report::FontFile>,
+) -> Vec<crate::core::pdf_report::FontFile> {
+    let others = rest
+        .iter()
+        .filter(|f| {
+            !primary
+                .as_ref()
+                .is_some_and(|p| Arc::ptr_eq(&p.data, &f.data) && p.index == f.index)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    primary.into_iter().chain(others).chain(last).collect()
 }
 
 #[cfg(test)]
@@ -525,6 +565,44 @@ mod tests {
             }
         }
         panic!("no OS/2 table");
+    }
+
+    /// A font for Hebrew or Arabic that is also the UI font (Segoe UI on Windows) is still a
+    /// fallback for the code font, which lacks those scripts, and appears once in each list.
+    #[test]
+    fn a_ui_font_that_covers_a_script_is_a_fallback_for_the_code_font() {
+        use crate::core::pdf_report::FontFile;
+        let font = |byte: u8| FontFile {
+            data: Arc::new(vec![byte]),
+            index: 0,
+        };
+        let bytes = |list: &[FontFile]| {
+            list.iter()
+                .map(|f| (*f.data).as_ref()[0])
+                .collect::<Vec<_>>()
+        };
+        let (mono, sans) = (font(1), font(2));
+        let primaries = vec![
+            ("mono".to_string(), mono.clone()),
+            ("ui".to_string(), sans.clone()),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        let mut rest = Vec::new();
+        let read = |path: &str| (path == "thai").then(|| font(3));
+        for paths in [
+            vec!["ui".to_string()],
+            vec!["missing".to_string(), "ui".to_string()],
+            vec!["missing".to_string(), "thai".to_string()],
+        ] {
+            add_first(paths, &primaries, &mut seen, &mut rest, read);
+        }
+        assert_eq!(bytes(&rest), [2, 3]);
+        assert_eq!(
+            bytes(&chain(Some(mono), &rest, vec![font(9)])),
+            [1, 2, 3, 9]
+        );
+        assert_eq!(bytes(&chain(Some(sans), &rest, vec![font(9)])), [2, 3, 9]);
+        assert_eq!(bytes(&chain(None, &rest, Vec::new())), [2, 3]);
     }
 
     #[test]

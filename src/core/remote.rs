@@ -169,9 +169,7 @@ fn user_known_hosts() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
-    dirs::home_dir()
-        .map(|h| h.join(".ssh").join("known_hosts"))
-        .filter(|p| p.is_file())
+    dirs::home_dir().map(|h| h.join(".ssh").join("known_hosts"))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -224,17 +222,132 @@ fn load_known_hosts(path: &Path) -> Result<HashMap<String, Vec<u8>>> {
             ))
         }
     };
-    Ok(text
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
+    let mut known = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // A line that can't be read could be the one for the server being checked.
+        let Some((id, key)) = line
+            .split_once(' ')
+            .and_then(|(id, hex)| Some((id, decode_hex(hex.trim())?)))
+        else {
+            bail!(trf(
+                "msg.sftp_known_hosts_unreadable",
+                &[("file", path.display().to_string())],
+            ));
+        };
+        known.insert(id.to_string(), key);
+    }
+    Ok(known)
+}
+
+/// The key types libssh2 reads in a known hosts file. A line of another type (a security key,
+/// a certificate) can't be checked here, and no server key this program accepts has its type.
+const KEY_TYPES: &[&str] = &[
+    "ssh-rsa",
+    "ssh-dss",
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+];
+
+/// What the user's own `~/.ssh/known_hosts` says of a server's key.
+#[derive(Debug, PartialEq, Eq)]
+enum UserHosts {
+    /// It records this very key for the server.
+    Match,
+    /// It records another key of the same type for the server, or revokes this one.
+    Changed,
+    /// It records only keys of other types for the server.
+    OtherType,
+    /// It says nothing of the server.
+    Unknown,
+}
+
+/// The name `ssh` records a server under in a known hosts file: the host alone on port 22,
+/// `[host]:port` on any other.
+fn ssh_name(host: &str, port: u16) -> String {
+    let bare = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if port == 22 {
+        bare
+    } else {
+        format!("[{bare}]:{port}")
+    }
+}
+
+/// Checks `key`, the host key of `host` at `port`, against the known hosts file at `path`, as
+/// `ssh` would: by the host's name alone on port 22, as `[host]:port` on any other. A missing
+/// file knows no server; one that can't be read, or holding a line of a key type it checks
+/// that can't be read, is an error, since that line could be the one for this server.
+fn check_user_hosts(path: &Path, host: &str, port: u16, key: &[u8]) -> Result<UserHosts> {
+    let unreadable = || {
+        trf(
+            "msg.sftp_known_hosts_unreadable",
+            &[("file", path.display().to_string())],
+        )
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(UserHosts::Unknown),
+        Err(e) => return Err(e).context(unreadable()),
+    };
+    let sess = ssh2::Session::new().context(unreadable())?;
+    let lists = || sess.known_hosts().context(unreadable());
+    let (mut same, mut other, mut revoked) = (lists()?, lists()?, lists()?);
+    let kind = key_type(key);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (into, entry) = match line.split_once(char::is_whitespace) {
+            Some(("@revoked", rest)) => (&mut revoked, rest.trim_start()),
+            // Certificate authorities: host certificates are not used here.
+            Some((marker, _)) if marker.starts_with('@') => continue,
+            _ => {
+                let line_type = line.split_whitespace().nth(1);
+                if line_type.is_some() && line_type == kind {
+                    (&mut same, line)
+                } else {
+                    (&mut other, line)
+                }
             }
-            let (id, hex) = line.split_once(' ')?;
-            Some((id.to_string(), decode_hex(hex.trim())?))
-        })
-        .collect())
+        };
+        // Keys of types this program can't be sent are no concern of its.
+        let line_type = entry.split_whitespace().nth(1).unwrap_or("");
+        if !KEY_TYPES.contains(&line_type) {
+            continue;
+        }
+        if into
+            .read_str(entry, ssh2::KnownHostFileKind::OpenSSH)
+            .is_err()
+        {
+            bail!(unreadable());
+        }
+    }
+    let name = ssh_name(host, port);
+    let check = |list: &ssh2::KnownHosts| match list.check(&name, key) {
+        ssh2::CheckResult::Failure => Err(anyhow::anyhow!(unreadable())),
+        found => Ok(found),
+    };
+    if matches!(check(&revoked)?, ssh2::CheckResult::Match) {
+        return Ok(UserHosts::Changed);
+    }
+    match check(&same)? {
+        ssh2::CheckResult::Match => return Ok(UserHosts::Match),
+        ssh2::CheckResult::Mismatch => return Ok(UserHosts::Changed),
+        _ => {}
+    }
+    Ok(match check(&other)? {
+        ssh2::CheckResult::NotFound => UserHosts::Unknown,
+        _ => UserHosts::OtherType,
+    })
 }
 
 /// Adds `id`'s `key` to the known hosts file at `path`, replacing a line for the same server
@@ -330,11 +443,11 @@ pub fn trust_host(host: &UnknownHost) -> Result<()> {
     remember_host(&host.path, &host.id, &host.key)
 }
 
-/// Checks `sess`'s host key: against the user's own `~/.ssh/known_hosts` (a match is trusted),
-/// then against the keys this program was told to trust, `known` (see [`known_hosts_path`]).
-/// Called right after the handshake and before a password or a key ever reaches the
-/// connection, so a server this fails for never sees them. A server neither knows fails with
-/// [`UnknownHost`].
+/// Checks `sess`'s host key: against the user's own `~/.ssh/known_hosts` (a match is trusted,
+/// another key of the same type refuses the connection), then against the keys this program
+/// was told to trust, `known` (see [`known_hosts_path`]). Called right after the handshake and
+/// before a password or a key ever reaches the connection, so a server this fails for never
+/// sees them. A server neither knows fails with [`UnknownHost`].
 ///
 /// There is no prompt to trust a changed key anyway: that choice is easy to click past without
 /// reading it, which defeats the point of checking at all. A key that genuinely changed (a
@@ -351,19 +464,20 @@ fn verify_host_key(
         .with_context(|| tr("msg.sftp_no_host_key"))?;
     let mut differs_from = None;
     if let Some(user_file) = user_known_hosts() {
-        if let Ok(mut hosts) = sess.known_hosts() {
-            if hosts
-                .read_file(&user_file, ssh2::KnownHostFileKind::OpenSSH)
-                .is_ok()
-            {
-                match hosts.check_port(&conn.host, conn.port, key) {
-                    ssh2::CheckResult::Match => return Ok(()),
-                    // The file may hold another type of key for this server than the one it
-                    // sent; this program's own list, or the user, decides.
-                    ssh2::CheckResult::Mismatch => differs_from = Some(user_file),
-                    _ => {}
-                }
-            }
+        match check_user_hosts(&user_file, &conn.host, conn.port, key)? {
+            UserHosts::Match => return Ok(()),
+            UserHosts::Changed => bail!(trf(
+                "msg.sftp_key_changed_ssh",
+                &[
+                    ("server", server(&conn.host, conn.port)),
+                    ("host", ssh_name(&conn.host, conn.port)),
+                    ("file", user_file.display().to_string()),
+                ],
+            )),
+            // The server sent another type of key than the file records for it: this
+            // program's own list, or the user, decides.
+            UserHosts::OtherType => differs_from = Some(user_file),
+            UserHosts::Unknown => {}
         }
     }
     let id = host_id(&conn.host, conn.port);
@@ -758,13 +872,15 @@ pub fn fetch(conn: &RemoteConnection, remote_path: &str, cancel: &AtomicBool) ->
 }
 
 /// Writes `local_path`'s bytes to `remote_path` on the server, for *Save* of a file opened
-/// with [`fetch`], returning how the file is on the server now.
+/// with [`fetch`], returning how the file is on the server now. A link on the server is kept,
+/// and the file it names is written instead.
 ///
 /// Refused when the file is not as `expected` (how it was fetched or last uploaded) any more:
-/// someone else changed it on the server meanwhile, and writing over it would lose their
-/// change. The bytes go to a temporary file beside it first, given the file's permissions,
-/// which then takes its place, so a failed or cancelled upload leaves the server's file as it
-/// was.
+/// someone else changed or deleted it on the server meanwhile, and writing over it would lose
+/// their change. The bytes go to a temporary file beside it first, given the file's
+/// permissions, which then takes its place, so a failed or cancelled upload leaves the
+/// server's file as it was. A server that cannot rename over a file (OpenSSH cannot) has the
+/// old file moved aside for that moment, and moved back if the upload cannot finish.
 pub fn upload(
     conn: &RemoteConnection,
     local_path: &Path,
@@ -776,22 +892,43 @@ pub fn upload(
     if let Some(result) = fake::upload(local_path, remote_path, expected) {
         return result;
     }
-    let target = Path::new(remote_path);
     let cannot_write = || {
         trf(
             "msg.sftp_cannot_write",
             &[("path", remote_path.to_string())],
         )
     };
+    let changed = || {
+        anyhow::anyhow!(trf(
+            "msg.sftp_changed_on_server",
+            &[("path", remote_path.to_string())]
+        ))
+    };
     let sftp = session(conn, cancel)?;
-    let now = sftp.stat(target).ok();
-    if let (Some(expected), Some(now)) = (expected, &now) {
-        if RemoteStamp::of(now) != expected {
-            bail!(trf(
-                "msg.sftp_changed_on_server",
-                &[("path", remote_path.to_string())]
-            ));
+    let real = match sftp.lstat(Path::new(remote_path)) {
+        Ok(s) if s.file_type().is_symlink() => sftp
+            .realpath(Path::new(remote_path))
+            .with_context(cannot_write)?
+            .to_string_lossy()
+            .into_owned(),
+        _ => remote_path.to_string(),
+    };
+    let target = Path::new(&real);
+    let stat_now = || match sftp.stat(target) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) => {
+            let e = std::io::Error::from(e);
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(anyhow::Error::from(e).context(cannot_write()))
+            }
         }
+    };
+    let now = stat_now()?;
+    let stamp_now = now.as_ref().map(RemoteStamp::of);
+    if expected.is_some() && stamp_now != expected {
+        return Err(changed());
     }
     let mut from = std::fs::File::open(local_path).with_context(|| {
         trf(
@@ -802,10 +939,20 @@ pub fn upload(
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let name = remote_file_name(remote_path).to_string_lossy().into_owned();
-    let dir = remote_path.trim_end_matches('/');
+    let name = remote_file_name(&real).to_string_lossy().into_owned();
+    // Short enough that the temporary name, and the one the old file is moved aside to, still
+    // fit the 255 bytes most file systems allow a name.
+    let mut end = name.len().min(100);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dir = real.trim_end_matches('/');
     let dir = &dir[..dir.rfind('/').map_or(0, |i| i + 1)];
-    let tmp_path = format!("{dir}.{name}.oxidemerge-{}-{unique}", std::process::id());
+    let tmp_path = format!(
+        "{dir}.{}.oxidemerge-{}-{unique}",
+        &name[..end],
+        std::process::id()
+    );
     let tmp = Path::new(&tmp_path);
     let perm = now
         .as_ref()
@@ -842,6 +989,11 @@ pub fn upload(
                 mtime: None,
             },
         );
+        check(cancel)?;
+        // Someone may have changed the file while this one was being sent.
+        if stat_now()?.as_ref().map(RemoteStamp::of) != stamp_now {
+            return Err(changed());
+        }
         replace(&sftp, tmp, target, now.is_some())
     })();
     if let Err(e) = written {
@@ -854,7 +1006,8 @@ pub fn upload(
 
 /// Renames `tmp` over `target` on the server. A server speaking SFTP version 3 (OpenSSH, and
 /// most others) refuses to rename over an existing file, so then the old file is first moved
-/// aside, and moved back if the second rename fails too.
+/// aside, and moved back if the second rename fails too; failing that, the error names where
+/// the old file is now.
 fn replace(sftp: &ssh2::Sftp, tmp: &Path, target: &Path, exists: bool) -> Result<()> {
     let flags =
         ssh2::RenameFlags::OVERWRITE | ssh2::RenameFlags::ATOMIC | ssh2::RenameFlags::NATIVE;
@@ -872,7 +1025,12 @@ fn replace(sftp: &ssh2::Sftp, tmp: &Path, target: &Path, exists: bool) -> Result
             Ok(())
         }
         Err(e) => {
-            let _ = sftp.rename(&aside, target, None);
+            if sftp.rename(&aside, target, None).is_err() {
+                return Err(e).context(trf(
+                    "msg.sftp_original_moved",
+                    &[("path", aside.display().to_string())],
+                ));
+            }
             Err(e.into())
         }
     }
@@ -1019,6 +1177,15 @@ pub mod fake {
         });
     }
 
+    /// Deletes `path` on the installed server, as someone else working on it might.
+    pub fn remove(path: &str) {
+        SERVER.with(|s| {
+            if let Some(server) = s.borrow_mut().as_mut() {
+                server.entries.remove(path);
+            }
+        });
+    }
+
     /// The bytes last uploaded to `path`, if any, for a test to check what *Save* wrote.
     pub fn uploaded(path: &str) -> Option<Vec<u8>> {
         SERVER.with(|s| {
@@ -1116,13 +1283,11 @@ pub mod fake {
                 return Some(Err(anyhow::anyhow!("{message}")));
             }
             Some((|| {
-                if let (Some(expected), Some(now)) = (expected, server.stamp(remote_path)) {
-                    if now != expected {
-                        bail!(trf(
-                            "msg.sftp_changed_on_server",
-                            &[("path", remote_path.to_string())]
-                        ));
-                    }
+                if expected.is_some() && server.stamp(remote_path) != expected {
+                    bail!(trf(
+                        "msg.sftp_changed_on_server",
+                        &[("path", remote_path.to_string())]
+                    ));
                 }
                 let bytes = std::fs::read(local_path)?;
                 server
@@ -1316,6 +1481,9 @@ mod tests {
         let fetched = fetch(&conn, "/a.txt", &never).unwrap();
         std::fs::write(&fetched.local, "mine").unwrap();
         fake::change("/a.txt", "theirs");
+        let err = upload(&conn, &fetched.local, "/a.txt", fetched.stamp, &never).unwrap_err();
+        assert!(err.to_string().contains("/a.txt"), "{err}");
+        fake::remove("/a.txt");
         let err = upload(&conn, &fetched.local, "/a.txt", fetched.stamp, &never).unwrap_err();
         assert!(err.to_string().contains("/a.txt"), "{err}");
         assert_eq!(fake::upload_count("/a.txt"), 0);
@@ -1531,6 +1699,96 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         assert!(load_known_hosts(&path).is_err());
         assert!(remember_host(&path, "h:22", &[1]).is_err());
+        let path = dir.path().join("corrupt");
+        std::fs::write(&path, "h:22 0102\nh2:22 not-hex\n").unwrap();
+        assert!(load_known_hosts(&path).is_err());
+    }
+
+    /// An SSH key blob of type `kind` with `rest` after it.
+    fn blob(kind: &str, rest: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for part in std::iter::once(kind.as_bytes()).chain(rest.iter().copied()) {
+            out.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            out.extend_from_slice(part);
+        }
+        out
+    }
+
+    /// `key` in padded base64, as a known hosts file holds it.
+    fn padded(key: &[u8]) -> String {
+        let mut s = encode_base64(key);
+        while !s.len().is_multiple_of(4) {
+            s.push('=');
+        }
+        s
+    }
+
+    /// The user's own known hosts file is read as `ssh` reads it: a matching key is trusted, a
+    /// different key of the same type (or a revoked one) refuses the connection, a key of
+    /// another type is only a warning, and a line that can't be read fails closed.
+    #[test]
+    fn the_users_known_hosts_file_is_checked_as_ssh_checks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let ours = blob("ssh-ed25519", &[&[1; 32]]);
+        let theirs = blob("ssh-ed25519", &[&[2; 32]]);
+        let ecdsa = blob("ecdsa-sha2-nistp256", &[b"nistp256", &[4; 65]]);
+        let check = |text: &str, host: &str, port: u16, key: &[u8]| {
+            std::fs::write(&path, text).unwrap();
+            check_user_hosts(&path, host, port, key)
+        };
+        let line = |name: &str, kind: &str, key: &[u8]| format!("{name} {kind} {}\n", padded(key));
+
+        assert_eq!(
+            check_user_hosts(&dir.path().join("none"), "h", 22, &ours).unwrap(),
+            UserHosts::Unknown
+        );
+        let known = line("example.com", "ssh-ed25519", &ours);
+        assert_eq!(
+            check(&known, "Example.COM", 22, &ours).unwrap(),
+            UserHosts::Match
+        );
+        assert_eq!(
+            check(&known, "example.com", 22, &theirs).unwrap(),
+            UserHosts::Changed
+        );
+        // Another port is another server to `ssh`, recorded as `[host]:port`.
+        assert_eq!(
+            check(&known, "example.com", 2222, &theirs).unwrap(),
+            UserHosts::Unknown
+        );
+        let on_port = line("[example.com]:2222", "ssh-ed25519", &ours);
+        assert_eq!(
+            check(&on_port, "example.com", 2222, &ours).unwrap(),
+            UserHosts::Match
+        );
+
+        let other = line("example.com", "ecdsa-sha2-nistp256", &ecdsa);
+        assert_eq!(
+            check(&other, "example.com", 22, &ours).unwrap(),
+            UserHosts::OtherType
+        );
+
+        let revoked = format!("{known}@revoked {known}");
+        assert_eq!(
+            check(&revoked, "example.com", 22, &ours).unwrap(),
+            UserHosts::Changed
+        );
+        let authority = format!("@cert-authority {}", line("*.com", "ssh-ed25519", &theirs));
+        assert_eq!(
+            check(&authority, "example.com", 22, &ours).unwrap(),
+            UserHosts::Unknown
+        );
+        let unknown_type = "example.com sk-ssh-ed25519@openssh.com AAAA\n";
+        assert_eq!(
+            check(unknown_type, "example.com", 22, &ours).unwrap(),
+            UserHosts::Unknown
+        );
+
+        assert!(check("example.com ssh-ed25519 !!!\n", "example.com", 22, &ours).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(check_user_hosts(&path, "example.com", 22, &ours).is_err());
     }
 
     #[test]

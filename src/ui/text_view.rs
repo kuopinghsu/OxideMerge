@@ -4587,24 +4587,42 @@ impl TextView {
         let Some(path) = dlg.save_file() else {
             return Ok(false);
         };
+        self.save_pane_to(p, &path)?;
+        Ok(true)
+    }
+
+    /// Writes pane `p` to `path`, which it is then the file of, for *Save As*.
+    fn save_pane_to(&mut self, p: usize, path: &std::path::Path) -> anyhow::Result<()> {
         let doc = &self.panes[p].doc;
         let canonical = |p: &std::path::Path| std::fs::canonicalize(p).ok();
         if doc.compare_only
-            && canonical(&path).is_some()
-            && doc.path.as_deref().and_then(canonical) == canonical(&path)
+            && canonical(path).is_some()
+            && doc.path.as_deref().and_then(canonical) == canonical(path)
         {
             anyhow::bail!("{}", self.read_only_message(p));
         }
-        text::refuse_read_only(&path)?;
+        // Text read from a document, written over a file of a kind that is itself read by
+        // converting it, would replace that file's contents with something it cannot hold.
+        if doc.compare_only && crate::core::unpacker::find(&self.opts, path).is_some() {
+            anyhow::bail!(
+                "{}",
+                trf(
+                    "msg.extracted_over_document",
+                    &[("file", path.display().to_string())]
+                )
+            );
+        }
+        text::refuse_read_only(path)?;
         self.panes[p].original = None;
         let doc = &mut self.panes[p].doc;
-        doc.save_as(&path)?;
+        doc.save_as(path)?;
         doc.read_only = false;
+        doc.compare_only = false;
         doc.description = None;
         self.status = trf("msg.saved", &[("file", doc.title())]);
         self.mark_saved(p);
         self.rediff();
-        Ok(true)
+        Ok(())
     }
 
     pub fn save_modified(&mut self) -> anyhow::Result<()> {
@@ -14897,6 +14915,37 @@ mod tests {
         assert!(!v.saved);
         v.save_pane(1).unwrap();
         assert!(v.saved);
+    }
+
+    /// Text read from a notebook can be saved as a text file, which it can then be edited as,
+    /// but not over the notebook or any other file read by converting it.
+    #[test]
+    fn text_read_from_a_notebook_saves_as_a_text_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (nb, b) = (dir.path().join("a.ipynb"), dir.path().join("b.txt"));
+        let notebook = r#"{"cells":[{"cell_type":"code","source":["print(1)\n"],"metadata":{},"outputs":[],"execution_count":null}],"metadata":{},"nbformat":4,"nbformat_minor":5}"#;
+        std::fs::write(&nb, notebook).unwrap();
+        touch(&b, "two\n", 100);
+        let cfg = Config::default();
+        let read = crate::core::unpacker::load_doc(&nb, &cfg.comparison_options(), None).unwrap();
+        assert!(read.compare_only);
+        let docs = vec![read, text::load_doc(&b, None).unwrap()];
+        let mut v = TextView::new(docs, &cfg);
+
+        let other = dir.path().join("c.ipynb");
+        assert!(v.save_pane_to(0, &nb).is_err());
+        assert!(v.save_pane_to(0, &other).is_err());
+        assert!(!other.exists());
+        assert_eq!(std::fs::read_to_string(&nb).unwrap(), notebook);
+
+        let txt = dir.path().join("c.txt");
+        v.save_pane_to(0, &txt).unwrap();
+        assert!(!v.panes[0].doc.compare_only && !v.panes[0].doc.read_only);
+        assert!(std::fs::read_to_string(&txt).unwrap().contains("print(1)"));
+        v.place_caret(0, (0, 0), false);
+        v.caret_insert("x");
+        v.save_pane(0).unwrap();
+        assert!(std::fs::read_to_string(&txt).unwrap().starts_with('x'));
     }
 
     #[test]

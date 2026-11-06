@@ -2152,6 +2152,28 @@ fn a_file_changed_on_the_server_is_not_overwritten_and_its_tab_stays_unsaved() {
     remote::fake::uninstall();
 }
 
+/// A save made while an upload of the same file is still under way waits for it, then
+/// expects the server's file as that upload left it, not as it was fetched.
+#[test]
+fn saving_a_remote_tab_again_while_it_uploads_is_not_taken_for_a_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("b.txt", "one\n")]);
+    remote::fake::install(remote::fake::Server::new().file("/srv/a.txt", "one\n"));
+    let mut gui = Gui::start("sftp_save_twice", None);
+    compare_remote_with_local(&mut gui, &dir.path().join("b.txt"));
+
+    text_view_mut(&mut gui).place_caret(0, (0, 3), false);
+    gui.events.push(Event::Text("-mine".into()));
+    gui.frames(2);
+    gui.app.run(Cmd::Save, &gui.ctx);
+    gui.app.run(Cmd::Save, &gui.ctx);
+    gui.frames(3);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(remote::fake::upload_count("/srv/a.txt"), 2);
+    assert!(!gui.app.tabs[0].is_modified());
+    remote::fake::uninstall();
+}
+
 #[test]
 fn saving_a_remote_tab_while_closing_it_uploads_before_it_closes() {
     let dir = tempfile::tempdir().unwrap();

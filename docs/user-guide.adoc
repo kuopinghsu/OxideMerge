@@ -289,8 +289,12 @@ from the same server; the password or a key's passphrase is never filled in this
 A fetched *file* is writable: edit it and *Save* uploads it back to the server over a fresh
 connection, in the background, with a *Cancel* button. The upload is written to a temporary
 file beside the original, which then takes its place keeping its permissions, so a failed or
-stopped upload leaves the server's file as it was. If someone changed the file on the server
-after you fetched it, OxideMerge does not write over their change: the upload is refused, your
+stopped upload leaves the server's file as it was. If the server's path is a link, the file it
+points to is written and the link is kept. A server that cannot rename over a file (OpenSSH
+cannot) has the original moved aside for a moment while the new file takes its place; if that
+cannot finish, the original is moved back, or the error says where it is. If someone changed or
+deleted the file on the server after you fetched it, or while it was being uploaded, OxideMerge
+does not write over their change: the upload is refused, your
 edits stay in the tab, and you can compare them with the server's version. Until an upload
 succeeds the tab counts as unsaved, so closing it or quitting asks first, and *Save* tries
 again. Closing a tab with *Save* waits for its upload to finish before it closes.
@@ -307,20 +311,25 @@ out of saved workspaces (see <<workspaces>>), the session OxideMerge reopens on 
 startup, and the recent paths, since their temporary copies are gone after the app closes:
 connect again to compare the same remote path.
 
-Before the password or key is sent, OxideMerge checks the server's host key. A server listed
-in your own SSH `~/.ssh/known_hosts` with the same key is trusted. Otherwise OxideMerge checks a
-`known_hosts` file of its own, next to its settings file. The first time you connect to a server
-found in neither, OxideMerge shows the key's type and fingerprint (`SHA256:...`, as `ssh` shows
-it) and asks whether to trust it: compare it with the fingerprint the server's administrator
-gives you before you click *Trust and connect*. A warning is shown when your `~/.ssh/known_hosts`
-lists a different key for that server.
+Before the password or key is sent, OxideMerge checks the server's host key. It first reads
+your own SSH `~/.ssh/known_hosts` the way `ssh` does, finding a server on another port than 22
+under `[host]:port`. A server listed there with the same key is trusted. A server listed there
+with a different key of the same type, or whose key is marked `@revoked` there, is refused, as
+`ssh` refuses it: if the server was reinstalled, remove its old key with
+`ssh-keygen -R host` (or `ssh-keygen -R "[host]:port"`) and connect again. Otherwise OxideMerge
+checks a `known_hosts` file of its own, next to its settings file. The first time you connect to
+a server found in neither, OxideMerge shows the key's type and fingerprint (`SHA256:...`, as
+`ssh` shows it) and asks whether to trust it: compare it with the fingerprint the server's
+administrator gives you before you click *Trust and connect*. A warning is shown when your
+`~/.ssh/known_hosts` lists only keys of other types for that server.
 
 On every later connection, the key is checked against the one remembered: if it no longer
 matches, OxideMerge refuses the connection rather than trusting a server that may not be the
 one you expect. This usually means the server was rebuilt or reinstalled. If you are sure that
 is what happened, remove that server's line from OxideMerge's `known_hosts` file (it is one line
-per server, `host:port` followed by its key) and connect again. If that file exists but can't be
-read, OxideMerge connects to no server until it can.
+per server, `host:port` followed by its key) and connect again. If either `known_hosts` file
+exists but can't be read, or holds a line it can't make sense of, OxideMerge connects to no
+server until it can.
 
 [[compare-types]]
 === Comparison types

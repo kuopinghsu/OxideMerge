@@ -365,7 +365,10 @@ impl Tab {
     /// back into its archive file (see [`App::mark_origin_folder_dirty`]).
     fn save(&mut self) -> anyhow::Result<()> {
         match &mut self.content {
-            Content::Folder(v) => v.save_archives().map(drop),
+            Content::Folder(v) => match v.save_archives().1 {
+                errors if errors.is_empty() => Ok(()),
+                errors => anyhow::bail!("{}", errors.join("\n")),
+            },
             Content::Web(_) => Ok(()),
             Content::Text(v) => v.save_modified(),
             Content::Binary(v) => v.save(),
@@ -1692,7 +1695,8 @@ pub fn set_test_clipboard(text: Result<&str, &str>) {
     });
 }
 
-/// The most clipboard text compared, in MiB.
+/// The most clipboard text compared, in MiB. The clipboard hands over its text whole, so this
+/// bounds what is compared and kept, not what is read from it.
 const MAX_CLIPBOARD_MIB: usize = 64;
 
 /// What became of reading the clipboard: its text, or why there is none.
@@ -2645,6 +2649,9 @@ impl OxideMergeApp {
                 &self.cfg.workspaces,
                 &theirs,
             );
+            // What the file holds is what the next merge starts from, even if saving fails:
+            // a workspace deleted there afterwards then stays deleted.
+            self.saved_cfg.workspaces = theirs;
         }
     }
 
@@ -4757,8 +4764,9 @@ impl OxideMergeApp {
                     },
                     Content::Folder(v) => match cmd {
                         Cmd::Save => {
-                            if let Err(e) = v.save_archives() {
-                                err = Some(e.to_string());
+                            let errors = v.save_archives().1;
+                            if !errors.is_empty() {
+                                err = Some(errors.join("\n"));
                             }
                         }
                         Cmd::Refresh => v.refresh(&cfg, &named),
@@ -5184,11 +5192,11 @@ impl OxideMergeApp {
                         v.mark_archive_dirty(s);
                     }
                 }
-                match v.save_archives() {
-                    Ok(w) if !w.is_empty() => written.push(folder),
-                    Ok(_) => {}
-                    Err(e) => errors.push(e.to_string()),
+                let (w, failed) = v.save_archives();
+                if !w.is_empty() {
+                    written.push(folder);
                 }
+                errors.extend(failed);
             }
         }
         for (archive, root) in closed {
@@ -5341,6 +5349,13 @@ impl OxideMergeApp {
                         .and_then(Option::as_mut);
                     match done.result {
                         Ok(stamp) => {
+                            // A later upload of this side expects the server's file as this
+                            // one left it, not as it was before.
+                            for q in &mut self.upload_queue {
+                                if (q.tab, q.side) == (done.tab, done.side) {
+                                    q.expected = Some(stamp);
+                                }
+                            }
                             if let Some(file) = file {
                                 file.stamp = Some(stamp);
                                 file.sent = Some(done.hash);
@@ -5482,11 +5497,11 @@ impl OxideMergeApp {
                             f.mark_archive_dirty(s);
                         }
                     }
-                    match f.save_archives() {
-                        Ok(w) if !w.is_empty() => repacked.push(id),
-                        Ok(_) => {}
-                        Err(e) => errors.push(e.to_string()),
+                    let (w, failed) = f.save_archives();
+                    if !w.is_empty() {
+                        repacked.push(id);
                     }
+                    errors.extend(failed);
                     f.refresh(&cfg, &named);
                 }
                 Content::Text(v) => v.check_disk(),

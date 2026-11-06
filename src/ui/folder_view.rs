@@ -1161,9 +1161,11 @@ impl FolderView {
 
     /// Repacks every archive side with pending edits back into its archive file, returning
     /// the archive files that were written (an archive whose contents came out unchanged is
-    /// left alone).
-    pub fn save_archives(&mut self) -> anyhow::Result<Vec<PathBuf>> {
+    /// left alone) and the errors of those that could not be. A side that fails keeps its
+    /// edits pending and does not stop the others.
+    pub fn save_archives(&mut self) -> (Vec<PathBuf>, Vec<String>) {
         let mut written = Vec::new();
+        let mut errors = Vec::new();
         for s in 0..self.archive_sources.len() {
             if !self.archive_dirty[s] {
                 continue;
@@ -1174,12 +1176,17 @@ impl FolderView {
                 self.archive_dirty[s] = false;
                 continue;
             };
-            if archive::repack(src, &self.roots[s])? {
-                written.push(src.clone());
+            match archive::repack(src, &self.roots[s]) {
+                Ok(true) => written.push(src.clone()),
+                Ok(false) => {}
+                Err(e) => {
+                    errors.push(format!("{e:#}"));
+                    continue;
+                }
             }
             self.archive_dirty[s] = false;
         }
-        Ok(written)
+        (written, errors)
     }
 
     pub fn is_running(&self) -> bool {
@@ -4877,7 +4884,7 @@ mod tests {
         std::fs::write(v.roots[1].join("a.txt"), "edited\n").unwrap();
         v.mark_archive_dirty(1);
         assert!(v.has_archive_changes());
-        v.save_archives().unwrap();
+        assert_eq!(v.save_archives().1, Vec::<String>::new());
         assert!(!v.has_archive_changes());
 
         let after = archive::extract_to_temp(&zip_path).unwrap();
@@ -4911,8 +4918,17 @@ mod tests {
         zw.finish().unwrap();
         let outer_copy = archive::extract_to_temp(&outer).unwrap();
         let nested = outer_copy.path().join("inner.zip");
+        let txz = work.path().join("a.tar.xz");
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(3);
+        h.set_mode(0o644);
+        tar.append_data(&mut h, "a.txt", &b"abc"[..]).unwrap();
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut tar.into_inner().unwrap().as_slice(), &mut xz).unwrap();
+        std::fs::write(&txz, xz).unwrap();
 
-        for path in [apk, nested] {
+        for path in [apk, nested, txz] {
             let extracted = archive::extract_to_temp(&path).unwrap();
             let roots = vec![left.path().to_path_buf(), extracted.path().to_path_buf()];
             let display = vec![
