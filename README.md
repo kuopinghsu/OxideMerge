@@ -8,9 +8,8 @@ OxideMerge is a free and open-source tool that compares and merges files and fol
 runs on **Windows, macOS and Linux**. Use it to review changes, combine edits and resolve
 merge conflicts.
 
-OxideMerge is written in Rust and is inspired by
-[WinMerge](https://github.com/WinMerge/winmerge). It compares text, folders, binary files,
-images and web pages.
+OxideMerge is written in Rust. It compares text, folders, binary files, images and web
+pages.
 
 **[Download](https://github.com/kuopinghsu/OxideMerge/releases)** ·
 [User guide](docs/user-guide.adoc) ·
@@ -56,8 +55,9 @@ images and web pages.
 - Compare a file or folder with a Git, Subversion or Mercurial revision.
 - **Compare over SFTP:** connect to a server by host, port, user, and a password or a private
   key, and fetch a file or folder to compare — open it twice for two remote locations, or once
-  against a local path. A fetched file is writable: *Save* re-uploads it. A fetched folder opens
-  read-only. The connection, including the password or passphrase, is kept only in memory for
+  against a local path. A fetched file is writable: *Save* re-uploads it, unless it changed on the
+  server meanwhile. A fetched folder opens read-only. A new server's host key fingerprint is shown
+  for you to confirm before anything is sent. The connection, including the password or passphrase, is kept only in memory for
   the tab's lifetime.
 
 ### Text
@@ -104,8 +104,8 @@ images and web pages.
   install. A workbook of one sheet opens as a table comparison, with the columns and key
   matching that offers. These comparisons are read-only: the file itself is never written
   back.
-- **Jupyter notebooks (`.ipynb`):** compared cell by cell, each one labeled as a numbered code
-  cell, a Markdown cell or a raw cell, with that cell's own source and nothing else; outputs,
+- **Jupyter notebooks (`.ipynb`):** compared cell by cell, each one labeled as a code cell,
+  a Markdown cell or a raw cell, with that cell's own source and nothing else; outputs,
   execution counts and other run metadata are left out, so re-running a notebook without
   changing it compares equal.
 - **Formatted documents:** choose **Formatted** above the panes to see Word documents,
@@ -639,3 +639,7 @@ OxideMerge handles untrusted files and how the dependencies are checked.
 ## License
 
 OxideMerge is released under the [MIT License](LICENSE).
+
+Release builds also contain third-party code under its own permissive licenses, listed in
+[`deny.toml`](deny.toml): the Rust crates in `Cargo.lock`, and, for SFTP, the C libraries
+libssh2 (BSD 3-Clause) and OpenSSL (Apache 2.0), compiled in.

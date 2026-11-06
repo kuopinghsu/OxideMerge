@@ -507,7 +507,7 @@ impl Journal {
     /// Keeps `path` and its `<name>.bak` when one is made, the `.bak` first so that it is put
     /// back after the file.
     fn remember_with_backup(&mut self, path: &Path, backup: bool) -> std::io::Result<()> {
-        if backup {
+        if fsutil::backs_up(path, backup) {
             self.remember(&fsutil::backup_path(path))?;
         }
         self.remember(path)

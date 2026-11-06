@@ -644,7 +644,7 @@ mod tests {
 
     #[test]
     fn a_job_without_a_kind_compares_as_the_readme_example_shows() {
-        let readme = include_str!("../../README.md");
+        let readme = include_str!("../../README.md").replace("\r\n", "\n");
         let start = readme.find("```json\n{\n  \"version\": 1,").unwrap() + "```json\n".len();
         let end = start + readme[start..].find("```").unwrap();
         let file = JobFile::parse(&readme[start..end]).unwrap();

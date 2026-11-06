@@ -476,6 +476,20 @@ fn push_step(steps: &mut Vec<Snapshot>, s: Snapshot) {
     steps.push(s);
 }
 
+/// How many of the oldest undo steps go, given the lines each step holds, oldest first. Steps
+/// below the top keep only the lines they changed; past 200 steps, or once the steps that stay
+/// below the top hold more than five million lines, the oldest go, keeping at least ten.
+fn undo_overflow(sizes: &[usize]) -> usize {
+    let mut drop = sizes.len().saturating_sub(200);
+    let below_top = sizes.len().saturating_sub(1);
+    let mut held: usize = sizes[drop.min(below_top)..below_top].iter().sum();
+    while held > 5_000_000 && sizes.len() - drop > 10 {
+        held -= sizes[drop];
+        drop += 1;
+    }
+    drop
+}
+
 /// Takes the top step off `steps`, and makes the one below it whole again.
 fn pop_step(steps: &mut Vec<Snapshot>) -> Option<Snapshot> {
     let s = steps.pop()?;
@@ -723,7 +737,7 @@ pub fn redirect_output(docs: &mut [TextDoc], out: &std::path::Path) {
         d.modified = true;
     }
     d.path = Some(out.to_path_buf());
-    d.read_only = false;
+    d.read_only = d.compare_only;
 }
 
 /// Unchanged lines kept visible around each difference when folding.
@@ -2537,15 +2551,8 @@ impl TextView {
         self.typing_group = false;
         let s = self.snapshot();
         push_step(&mut self.undo, s);
-        // Steps below the top keep only the lines they changed; past 200 steps, or once
-        // those hold more than five million lines, the oldest go, keeping at least ten.
-        let mut held: usize = self.undo.iter().rev().skip(1).map(Snapshot::size).sum();
-        let mut drop = self.undo.len().saturating_sub(200);
-        while held > 5_000_000 && self.undo.len() - drop > 10 {
-            held -= self.undo[drop].size();
-            drop += 1;
-        }
-        self.undo.drain(..drop);
+        let sizes: Vec<usize> = self.undo.iter().map(Snapshot::size).collect();
+        self.undo.drain(..undo_overflow(&sizes));
         self.redo.clear();
     }
 
@@ -4447,6 +4454,9 @@ impl TextView {
 
     pub fn save_pane(&mut self, p: usize) -> anyhow::Result<bool> {
         self.commit_pending_edit();
+        if self.panes[p].doc.compare_only {
+            anyhow::bail!("{}", self.read_only_message(p));
+        }
         let doc = &mut self.panes[p].doc;
         if doc.read_only {
             anyhow::bail!("{}", tr("msg.readonly"));
@@ -4577,6 +4587,14 @@ impl TextView {
         let Some(path) = dlg.save_file() else {
             return Ok(false);
         };
+        let doc = &self.panes[p].doc;
+        let canonical = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+        if doc.compare_only
+            && canonical(&path).is_some()
+            && doc.path.as_deref().and_then(canonical) == canonical(&path)
+        {
+            anyhow::bail!("{}", self.read_only_message(p));
+        }
         text::refuse_read_only(&path)?;
         self.panes[p].original = None;
         let doc = &mut self.panes[p].doc;
@@ -13226,6 +13244,23 @@ mod tests {
         assert!(v.save_pane(1).unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "ab\n");
         assert!(!v.panes[1].doc.modified);
+    }
+
+    #[test]
+    fn a_large_oldest_undo_step_dropped_by_the_step_cap_drops_no_other() {
+        // 201 steps: the oldest, a whole large file, goes for the 200-step cap; the rest
+        // hold far less than the line budget and must all stay.
+        let mut sizes = vec![4_900_000];
+        sizes.extend(std::iter::repeat_n(1_500, 199));
+        sizes.push(10);
+        assert_eq!(undo_overflow(&sizes), 1);
+        // Over the line budget, the oldest go until it fits, but never the last ten.
+        let mut sizes = vec![3_000_000, 3_000_000];
+        sizes.extend([10; 11]);
+        assert_eq!(undo_overflow(&sizes), 1);
+        assert_eq!(undo_overflow(&[6_000_000; 12]), 2);
+        assert_eq!(undo_overflow(&[3_000_000, 3_000_000, 10]), 0);
+        assert_eq!(undo_overflow(&[]), 0);
     }
 
     #[test]

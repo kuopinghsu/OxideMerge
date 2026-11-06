@@ -2,7 +2,7 @@
 name = "oxidemerge"
 version = "0.9.8"
 edition = "2021"
-description = "OxideMerge - a cross-platform differencing and merging tool for Windows, macOS and Linux, modeled on WinMerge"
+description = "OxideMerge - a cross-platform differencing and merging tool for Windows, macOS and Linux"
 license = "MIT"
 repository = "https://github.com/kuopinghsu/OxideMerge"
 
@@ -60,7 +60,7 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-c = "0.24.2"
 tree-sitter-cpp = "0.23.4"
 arboard = "3"
-ssh2 = { version = "0.9", features = ["vendored-openssl"] }
+ssh2 = { version = "0.9", features = ["vendored-openssl", "openssl-on-win32"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

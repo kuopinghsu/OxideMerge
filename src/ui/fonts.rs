@@ -411,39 +411,81 @@ pub fn setup(ctx: &egui::Context, lang: &str) {
     ctx.set_fonts(fonts);
 }
 
+/// Whether the font's licence lets a PDF embed it as a report does: a subset of its outlines,
+/// in a document that can at least be viewed and printed. A font that doesn't say is left out.
+fn embeddable(bytes: &[u8], index: u32) -> bool {
+    use ttf_parser::Permissions::{Editable, Installable, PreviewAndPrint};
+    ttf_parser::Face::parse(bytes, index).is_ok_and(|face| {
+        matches!(
+            face.permissions(),
+            Some(Installable | Editable | PreviewAndPrint)
+        ) && face.is_subsetting_allowed()
+            && face.is_outline_embedding_allowed()
+    })
+}
+
 /// The fonts a PDF report embeds: the code and UI fonts, then the fallbacks of [`fallbacks`] and
-/// fonts for Hebrew, Arabic and Thai that allow embedding, and last the fonts built into the
-/// program, so that every report has a font for Latin text even where none is installed.
+/// fonts for Hebrew, Arabic and Thai, each only if it allows embedding, and last the fonts built
+/// into the program, so that every report has a font for Latin text even where none is
+/// installed. Read once per language.
 pub fn document_fonts(lang: &str) -> crate::core::pdf_report::Fonts {
+    use crate::core::pdf_report::Fonts;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, Fonts>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Mutex::default);
+    if let Some(fonts) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(lang) {
+        return fonts.clone();
+    }
+    let fonts = load_document_fonts(lang);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(lang.to_string(), fonts.clone());
+    fonts
+}
+
+fn load_document_fonts(lang: &str) -> crate::core::pdf_report::Fonts {
     use crate::core::pdf_report::FontFile;
     let file = |bytes: Vec<u8>, index: u32| FontFile {
         data: Arc::new(bytes),
         index,
     };
-    let first = |paths: &[&str]| {
-        first_font(paths.iter().map(|s| s.to_string())).map(|(_, bytes)| file(bytes, 0))
-    };
-    let mut rest: Vec<FontFile> = fallbacks(lang)
-        .into_iter()
-        .map(|f| file(f.bytes, f.index))
-        .collect();
     let mut seen = std::collections::HashSet::new();
+    let mut first = |paths: &[&str]| {
+        let found = paths.iter().find_map(|&path| {
+            let bytes = std::fs::read(path).ok()?;
+            embeddable(&bytes, 0).then_some((path, bytes))
+        });
+        found.map(|(path, bytes)| {
+            seen.insert(path.to_string());
+            file(bytes, 0)
+        })
+    };
+    let mono = first(MONO_FONTS);
+    let sans = first(UI_FONTS);
+    let mut rest: Vec<FontFile> = Vec::new();
+    for f in fallbacks(lang) {
+        if embeddable(&f.bytes, f.index) && seen.insert(f.path) {
+            rest.push(file(f.bytes, f.index));
+        }
+    }
     for &(win, unix, fc) in DOCUMENT_SCRIPTS {
         let paths = system_fonts(
             win.to_vec(),
             unix.iter().copied().map(str::to_string).collect(),
             vec![fc],
         );
-        let embeddable = paths.into_iter().find_map(|path| {
-            let bytes = std::fs::read(&path).ok()?;
-            let face = ttf_parser::Face::parse(&bytes, 0).ok()?;
-            (face.permissions() != Some(ttf_parser::Permissions::Restricted))
-                .then_some((path, bytes))
-        });
-        if let Some((path, bytes)) = embeddable {
-            if seen.insert(path) {
-                rest.push(file(bytes, 0));
+        let found = paths.into_iter().find_map(|path| {
+            if seen.contains(&path) {
+                return Some(None);
             }
+            let bytes = std::fs::read(&path).ok()?;
+            embeddable(&bytes, 0).then_some(Some((path, bytes)))
+        });
+        if let Some(Some((path, bytes))) = found {
+            seen.insert(path);
+            rest.push(file(bytes, 0));
         }
     }
     let built_in = FontDefinitions::default();
@@ -461,17 +503,75 @@ pub fn document_fonts(lang: &str) -> crate::core::pdf_report::Fonts {
             .collect()
     };
     crate::core::pdf_report::Fonts {
-        mono: chain(
-            first(MONO_FONTS),
-            &["Hack", "Ubuntu-Light", "NotoEmoji-Regular"],
-        ),
-        sans: chain(first(UI_FONTS), &["Ubuntu-Light", "NotoEmoji-Regular"]),
+        mono: chain(mono, &["Hack", "Ubuntu-Light", "NotoEmoji-Regular"]),
+        sans: chain(sans, &["Ubuntu-Light", "NotoEmoji-Regular"]),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `font` with the embedding flags of its OS/2 table set to `fs_type`.
+    fn with_fs_type(font: &[u8], fs_type: u16) -> Vec<u8> {
+        let mut out = font.to_vec();
+        let tables = u16::from_be_bytes([font[4], font[5]]) as usize;
+        for t in 0..tables {
+            let rec = 12 + 16 * t;
+            if &font[rec..rec + 4] == b"OS/2" {
+                let at = u32::from_be_bytes(font[rec + 8..rec + 12].try_into().unwrap()) as usize;
+                out[at + 8..at + 10].copy_from_slice(&fs_type.to_be_bytes());
+                return out;
+            }
+        }
+        panic!("no OS/2 table");
+    }
+
+    #[test]
+    fn only_fonts_that_allow_embedding_a_subset_of_outlines_are_embedded() {
+        let defs = FontDefinitions::default();
+        let hack = (*defs.font_data["Hack"].font).as_ref().to_vec();
+        for (fs_type, ok) in [
+            (0x0000, true),  // installable
+            (0x0004, true),  // preview and print
+            (0x0008, true),  // editable
+            (0x0002, false), // restricted
+            (0x0100, false), // no subsetting
+            (0x0200, false), // bitmaps only
+            (0x0104, false),
+        ] {
+            assert_eq!(
+                embeddable(&with_fs_type(&hack, fs_type), 0),
+                ok,
+                "fsType {fs_type:#06x}"
+            );
+        }
+        assert!(!embeddable(b"not a font", 0));
+    }
+
+    #[test]
+    fn report_fonts_are_read_once_and_not_twice() {
+        let a = document_fonts("en");
+        let b = document_fonts("en");
+        assert!(a
+            .sans
+            .iter()
+            .zip(&b.sans)
+            .all(|(x, y)| Arc::ptr_eq(&x.data, &y.data)));
+        let mut seen = std::collections::HashSet::new();
+        for f in &a.sans {
+            assert!(
+                seen.insert((Arc::as_ptr(&f.data) as *const () as usize, f.index)),
+                "a font is listed twice"
+            );
+            let same_bytes = a
+                .sans
+                .iter()
+                .filter(|g| g.index == f.index && (*g.data).as_ref() == (*f.data).as_ref())
+                .count();
+            assert_eq!(same_bytes, 1, "a font file is embedded twice");
+        }
+    }
 
     #[test]
     fn baseline_offset_shares_primary_baseline() {

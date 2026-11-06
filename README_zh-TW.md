@@ -8,8 +8,7 @@ OxideMerge 是免費、開放原始碼的檔案與資料夾比較及合併工具
 **Windows、macOS 與 Linux** 上執行。
 您可以用它檢視差異、整合修改內容，並解決合併衝突。
 
-OxideMerge 以 Rust 開發，設計上參考了 [WinMerge](https://github.com/WinMerge/winmerge)。
-它可以比較文字、資料夾、二進位檔、影像與網頁。
+OxideMerge 以 Rust 開發，可以比較文字、資料夾、二進位檔、影像與網頁。
 
 **[下載](https://github.com/kuopinghsu/OxideMerge/releases)** ·
 [使用者指南](docs/user-guide.zh-TW.adoc) ·
@@ -53,7 +52,8 @@ OxideMerge 以 Rust 開發，設計上參考了 [WinMerge](https://github.com/Wi
 - 將檔案或資料夾與 Git、Subversion 或 Mercurial 的修訂版本比較。
 - **透過 SFTP 比較：** 輸入伺服器的主機、埠號、使用者，以及密碼或私密金鑰，即可取得檔案或
   資料夾來比較——連線兩次可比較兩個遠端位置，連線一次則可與本機路徑比較。取得的檔案可編
-  輯：「儲存」會將它重新上傳；取得的資料夾為唯讀。連線資訊（包括密碼或密碼短語）只會保留在
+  輯：「儲存」會將它重新上傳，除非伺服器上的檔案在此期間已被修改；取得的資料夾為唯讀。新伺
+  服器的主機金鑰指紋會先顯示給您確認，才會送出任何資料。連線資訊（包括密碼或密碼短語）只會保留在
   記憶體中，直到分頁關閉為止。
 
 ### 文字
@@ -91,7 +91,7 @@ OxideMerge 以 Rust 開發，設計上參考了 [WinMerge](https://github.com/Wi
   的符號比較。
   只有一個工作表的活頁簿會以表格比較開啟，可使用欄位與索引鍵配對功能。這類比較均為唯讀：絕
   不會寫回原始檔案。
-- **Jupyter notebook（`.ipynb`）：** 逐一儲存格比較，每個儲存格標示為編號的程式碼儲存格、
+- **Jupyter notebook（`.ipynb`）：** 逐一儲存格比較，每個儲存格標示為程式碼儲存格、
   Markdown 儲存格或原始儲存格，只比較該儲存格本身的內容；執行後的輸出、執行次數等中繼資料
   都不會列入，因此未變更內容而重新執行的 notebook 會視為相同。
 - **格式化文件：** 選擇窗格上方的**格式化**，即可將 Word 文件、Excel 活頁簿與加上標籤的
@@ -599,3 +599,6 @@ cargo test --locked
 ## 授權條款
 
 OxideMerge 採用 [MIT 授權條款](LICENSE)發布。
+
+發行版本也包含採用各自寬鬆授權條款的第三方程式碼，列於 [`deny.toml`](deny.toml)：`Cargo.lock` 中的
+Rust crate，以及為 SFTP 編譯進來的 C 函式庫 libssh2（BSD 3-Clause）與 OpenSSL（Apache 2.0）。

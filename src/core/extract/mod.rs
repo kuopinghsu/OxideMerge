@@ -7,6 +7,7 @@
 //! user configured is used in preference, so a better converter can always be put in front.
 
 mod markdown;
+mod notebook;
 pub(crate) mod pdf;
 
 pub use markdown::{docx_blocks, pdf_blocks, xlsx_blocks};
@@ -47,10 +48,10 @@ pub enum Kind {
     Elf,
     /// A PDF file: the text of its pages.
     Pdf,
-    /// A Jupyter notebook (`.ipynb`): each cell's own text, numbering code cells, without their
-    /// outputs (execution counts, captured results and embedded images), which are rebuilt by
-    /// running the notebook rather than written by hand and would otherwise swamp the diff of
-    /// what the notebook's author actually wrote.
+    /// A Jupyter notebook (`.ipynb`): each cell's own text under a line naming its kind,
+    /// without its outputs (execution counts, captured results and embedded images), which
+    /// are rebuilt by running the notebook rather than written by hand and would otherwise
+    /// swamp the diff of what the notebook's author actually wrote.
     Notebook,
 }
 
@@ -101,7 +102,7 @@ impl Kind {
             Kind::Pdf => read_whole(path)
                 .and_then(|bytes| pdf::text(&bytes, cancel))
                 .map(tidy),
-            Kind::Notebook => notebook(path, cancel),
+            Kind::Notebook => notebook::read(path, cancel),
         }
         .with_context(|| {
             crate::i18n::trf(
@@ -1587,74 +1588,10 @@ fn section_flags(value: u64) -> String {
     out
 }
 
-// ---------- Jupyter notebooks ----------
-
-/// The most cells read of one notebook; the rest are left out rather than read, so that a
-/// crafted file cannot ask for unbounded memory one tiny cell at a time.
-const MAX_CELLS: usize = 20_000;
-
-/// A code cell's `source`, or a text output's `text`: either a single string, or (how Jupyter
-/// itself writes a notebook, one array entry per line kept) a list of strings to join as they
-/// are, since each one but the last already ends with its own line break.
-fn notebook_lines(v: Option<&serde_json::Value>) -> String {
-    match v {
-        Some(serde_json::Value::Array(lines)) => lines.iter().filter_map(|l| l.as_str()).collect(),
-        Some(serde_json::Value::String(s)) => s.clone(),
-        _ => String::new(),
-    }
-}
-
-/// The cells of the Jupyter notebook at `path`, each labeled by its kind, code cells numbered
-/// as the notebook shows them. Outputs are left out (see [`Kind::Notebook`]); so is anything
-/// else a cell carries beyond its own text, such as `metadata` or an `id` kept only to tell two
-/// otherwise identical cells apart.
-fn notebook(path: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
-    let bytes = read_whole(path)?;
-    let doc: serde_json::Value =
-        serde_json::from_slice(&bytes).context("not a valid notebook (invalid JSON)")?;
-    let cells = doc
-        .get("cells")
-        .and_then(|c| c.as_array())
-        .context("not a valid notebook (no cells)")?;
-    let mut out = String::new();
-    let mut code_n = 0usize;
-    for cell in cells.iter().take(MAX_CELLS) {
-        check(cancel)?;
-        let kind = cell
-            .get("cell_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("code");
-        let label = if kind == "markdown" {
-            crate::i18n::tr("label.notebook_markdown_cell").to_string()
-        } else if kind == "raw" {
-            crate::i18n::tr("label.notebook_raw_cell").to_string()
-        } else {
-            code_n += 1;
-            crate::i18n::trf("label.notebook_code_cell", &[("n", code_n.to_string())])
-        };
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&label);
-        out.push('\n');
-        let source = notebook_lines(cell.get("source"));
-        out.push_str(&source);
-        if !source.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    if cells.len() > MAX_CELLS {
-        out.push('\n');
-        out.push_str(crate::i18n::tr("msg.extract_truncated"));
-        out.push('\n');
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::i18n::{tr, trf};
+    use crate::i18n::trf;
 
     /// A zipped document built from its parts, as Word and OpenDocument write them.
     fn zipped(dir: &Path, name: &str, parts: &[(&str, &str)]) -> std::path::PathBuf {
@@ -2427,14 +2364,15 @@ mod tests {
         );
         assert_eq!(Kind::of(&path), Some(Kind::Notebook));
         let text = Kind::Notebook.read(&path, None).unwrap();
+        let (md, code, raw) = (
+            notebook::header("label.notebook_markdown_cell"),
+            notebook::header("label.notebook_code_cell"),
+            notebook::header("label.notebook_raw_cell"),
+        );
         assert_eq!(
             text,
             format!(
-                "{}\n# Title\nSome text.\n\n{}\nimport pandas as pd\nprint(1)\n\n{}\nprint(2)\n\n{}\nverbatim\n",
-                tr("label.notebook_markdown_cell"),
-                trf("label.notebook_code_cell", &[("n", "1".into())]),
-                trf("label.notebook_code_cell", &[("n", "2".into())]),
-                tr("label.notebook_raw_cell"),
+                "{md}\n# Title\nSome text.\n\n{code}\nimport pandas as pd\nprint(1)\n\n{code}\nprint(2)\n\n{raw}\nverbatim\n"
             )
         );
         // Outputs never show up, however they changed: the two notebooks below only differ in
@@ -2473,11 +2411,81 @@ mod tests {
         let text = Kind::Notebook.read(&path, None).unwrap();
         assert_eq!(
             text,
-            format!(
-                "{}\na\nb\n",
-                trf("label.notebook_code_cell", &[("n", "1".into())])
-            )
+            format!("{}\na\nb\n", notebook::header("label.notebook_code_cell"))
         );
+    }
+
+    #[test]
+    fn a_code_cell_added_at_the_top_changes_no_other_cell_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = notebook_file(dir.path(), "a.ipynb", &[("code", &["x = 1"], &[])]);
+        let after = notebook_file(
+            dir.path(),
+            "b.ipynb",
+            &[("code", &["import os"], &[]), ("code", &["x = 1"], &[])],
+        );
+        let before = Kind::Notebook.read(&before, None).unwrap();
+        let after = Kind::Notebook.read(&after, None).unwrap();
+        assert!(after.ends_with(&before), "{after:?} vs {before:?}");
+    }
+
+    #[test]
+    fn an_nbformat_3_notebook_reads_its_worksheets_and_headings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.ipynb");
+        let doc = serde_json::json!({
+            "nbformat": 3,
+            "worksheets": [{
+                "cells": [
+                    {"cell_type": "heading", "level": 2, "source": ["Results"]},
+                    {"cell_type": "code", "input": ["print(1)"], "outputs": [{"text": ["1"]}]},
+                    {"cell_type": "markdown", "source": "Done."},
+                ],
+            }],
+        });
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        let (md, code) = (
+            notebook::header("label.notebook_markdown_cell"),
+            notebook::header("label.notebook_code_cell"),
+        );
+        assert_eq!(
+            Kind::Notebook.read(&path, None).unwrap(),
+            format!("{md}\n## Results\n\n{code}\nprint(1)\n\n{md}\nDone.\n")
+        );
+    }
+
+    #[test]
+    fn a_notebook_with_a_bom_or_an_unknown_cell_type_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom.ipynb");
+        let json = br#"{"cells":[{"cell_type":"widget","source":"w"}],"nbformat":4}"#;
+        std::fs::write(&path, [b"\xEF\xBB\xBF".as_slice(), json].concat()).unwrap();
+        assert_eq!(
+            Kind::Notebook.read(&path, None).unwrap(),
+            format!("{}\nw\n", notebook::header("label.notebook_raw_cell"))
+        );
+    }
+
+    #[test]
+    fn cells_past_the_limit_are_counted_but_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.ipynb");
+        let n = notebook::MAX_CELLS + 5;
+        let cells = vec![r#"{"cell_type":"raw","source":"x","outputs":[{"data":"big"}]}"#; n];
+        std::fs::write(&path, format!(r#"{{"cells":[{}]}}"#, cells.join(","))).unwrap();
+        let text = Kind::Notebook.read(&path, None).unwrap();
+        let raw = notebook::header("label.notebook_raw_cell");
+        assert_eq!(text.matches(&raw).count(), notebook::MAX_CELLS);
+        assert!(text.ends_with(&format!(
+            "{}\n",
+            trf(
+                "msg.notebook_truncated",
+                &[
+                    ("max", notebook::MAX_CELLS.to_string()),
+                    ("n", n.to_string())
+                ]
+            )
+        )));
     }
 
     #[test]
@@ -2509,5 +2517,12 @@ mod tests {
         let no_cells = dir.path().join("no_cells.ipynb");
         std::fs::write(&no_cells, br#"{"nbformat": 4}"#).unwrap();
         assert!(Kind::Notebook.read(&no_cells, None).is_err());
+        // Opened for a compare, either one is still shown as the text it is, and can be edited.
+        let opts = crate::core::diff::DiffOptions::default();
+        for path in [&broken, &no_cells] {
+            let doc = crate::core::unpacker::load_doc(path, &opts, None).unwrap();
+            assert!(!doc.compare_only && !doc.read_only, "{}", path.display());
+            assert_eq!(doc.text(), std::fs::read_to_string(path).unwrap());
+        }
     }
 }

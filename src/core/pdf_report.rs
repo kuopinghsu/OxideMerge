@@ -287,7 +287,22 @@ impl<'a> Faces<'a> {
     }
 
     fn width(&self, family: Family, size: f32, text: &str) -> f32 {
-        text.chars().map(|c| self.glyph(family, c).1).sum::<f32>() * size
+        let chars: Vec<char> = text.chars().collect();
+        self.forms(family, &chars)
+            .into_iter()
+            .map(|c| self.glyph(family, c).1)
+            .sum::<f32>()
+            * size
+    }
+
+    /// `chars` as they are drawn, in reading order: Arabic letters in their joined forms
+    /// where a font has them, so they are measured as drawn.
+    fn forms(&self, family: Family, chars: &[char]) -> Vec<char> {
+        if chars.iter().any(|&c| is_rtl(c)) {
+            arabic_forms(chars, |c| self.has(family, c))
+        } else {
+            chars.to_vec()
+        }
     }
 
     /// Whether a font of `family` draws `c`.
@@ -314,10 +329,18 @@ impl<'a> Faces<'a> {
 // ---------- right-to-left text ----------
 
 /// Whether `c` is written right to left: Hebrew, Arabic, Syriac, Thaana and N'Ko letters and
-/// marks and their presentation forms.
+/// marks and their presentation forms, but not the digits and number separators among them.
 fn is_rtl(c: char) -> bool {
     matches!(c, '\u{0590}'..='\u{08FF}' | '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFC}')
         && !is_number(c)
+        && !matches!(c, '\u{060C}' | '\u{066A}'..='\u{066C}')
+}
+
+/// Whether `c` is an Arabic letter, after which digits read as Arabic numbers: separators and
+/// signs like `-` and `%` then stay apart from them.
+fn is_arabic(c: char) -> bool {
+    matches!(c, '\u{0600}'..='\u{07BF}' | '\u{0860}'..='\u{08FF}' | '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFC}')
+        && is_rtl(c)
 }
 
 fn is_number(c: char) -> bool {
@@ -326,6 +349,76 @@ fn is_number(c: char) -> bool {
 
 fn is_ltr(c: char) -> bool {
     c.is_alphabetic() && !is_rtl(c)
+}
+
+/// A separator kept inside a number when it stands alone between two digits.
+fn is_number_separator(c: char) -> bool {
+    matches!(
+        c,
+        '.' | ',' | ':' | '/' | '\u{060C}' | '\u{066B}' | '\u{066C}'
+    )
+}
+
+/// A sign kept with the digits it stands next to, unless they follow Arabic letters: `%`,
+/// `#`, `°`, currency signs and the like.
+fn is_number_terminator(c: char) -> bool {
+    matches!(
+        c,
+        '#' | '$'
+            | '%'
+            | '°'
+            | '±'
+            | '¢'
+            | '£'
+            | '¤'
+            | '¥'
+            | '‰'
+            | '‱'
+            | '′'
+            | '″'
+            | '‴'
+            | '\u{066A}'
+    ) || ('\u{20A0}'..='\u{20CF}').contains(&c)
+}
+
+/// Which characters of `chars` are drawn as part of a number, left to right even inside
+/// right-to-left text: digits, a separator standing alone between two of them and, unless
+/// the digits follow Arabic letters, a `+` or `-` between two of them and the signs like `%`
+/// next to them (the Unicode bidirectional algorithm's rules W2, W4 and W5).
+fn number_parts(chars: &[char]) -> Vec<bool> {
+    let mut num: Vec<bool> = chars.iter().map(|&c| is_number(c)).collect();
+    let mut arabic = vec![false; chars.len()];
+    let mut last = false;
+    for (k, &c) in chars.iter().enumerate() {
+        if is_rtl(c) || is_ltr(c) {
+            last = is_arabic(c);
+        }
+        arabic[k] = last;
+    }
+    let digit = |k: usize| is_number(chars[k]);
+    for k in 1..chars.len().saturating_sub(1) {
+        let c = chars[k];
+        let european = !arabic[k] && matches!(c, '+' | '-');
+        if (is_number_separator(c) || european) && digit(k - 1) && digit(k + 1) {
+            num[k] = true;
+        }
+    }
+    for (k, &after_arabic) in arabic.iter().enumerate() {
+        if !digit(k) || after_arabic {
+            continue;
+        }
+        let mut b = k;
+        while b > 0 && is_number_terminator(chars[b - 1]) {
+            b -= 1;
+            num[b] = true;
+        }
+        let mut a = k + 1;
+        while a < chars.len() && is_number_terminator(chars[a]) {
+            num[a] = true;
+            a += 1;
+        }
+    }
+    num
 }
 
 fn mirror(c: char) -> char {
@@ -344,12 +437,44 @@ fn mirror(c: char) -> char {
     }
 }
 
+/// For each character of `chars`, the bracket that pairs with it, if any: the first of
+/// `( [ {` that is closed later on the line, each closing bracket matching the nearest one
+/// still open of its kind.
+fn bracket_pairs(chars: &[char]) -> Vec<Option<usize>> {
+    let mut pairs = vec![None; chars.len()];
+    let mut open: Vec<usize> = Vec::new();
+    for (k, &c) in chars.iter().enumerate() {
+        match c {
+            '(' | '[' | '{' => {
+                if open.len() == 63 {
+                    break;
+                }
+                open.push(k);
+            }
+            ')' | ']' | '}' => {
+                if let Some(at) = open.iter().rposition(|&o| mirror(chars[o]) == c) {
+                    let o = open[at];
+                    open.truncate(at);
+                    pairs[o] = Some(k);
+                    pairs[k] = Some(o);
+                }
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
+
 /// The order in which the characters of a left-to-right line are drawn, each with whether it
 /// is mirrored: a simplified Unicode bidirectional algorithm. A run from a right-to-left
 /// character to the last right-to-left character or number before the next left-to-right
 /// letter is reversed, its brackets mirrored, and the numbers in it still read left to right.
+/// A bracket pair holding a left-to-right letter reads left to right, so a run ends before it.
 fn visual_order(chars: &[char]) -> Vec<(usize, bool)> {
     let mut order: Vec<(usize, bool)> = (0..chars.len()).map(|k| (k, false)).collect();
+    let num = number_parts(chars);
+    let pairs = bracket_pairs(chars);
+    let strong = |k: usize| is_rtl(chars[k]) || num[k];
     let mut i = 0;
     while i < chars.len() {
         if !is_rtl(chars[i]) {
@@ -359,49 +484,39 @@ fn visual_order(chars: &[char]) -> Vec<(usize, bool)> {
         let mut end = i + 1;
         let mut k = end;
         while k < chars.len() && !is_ltr(chars[k]) {
-            if is_rtl(chars[k]) || is_number(chars[k]) {
+            if let Some(close) = pairs[k].filter(|&p| p > k) {
+                if chars[k + 1..close].iter().any(|&c| is_ltr(c)) {
+                    break;
+                }
+            }
+            if strong(k) {
                 end = k + 1;
             }
             k += 1;
         }
         // A bracket opened in the run around right-to-left text or a number closes in it.
-        let mut open: Vec<usize> = Vec::new();
-        for p in i..k {
-            match chars[p] {
-                '(' | '[' | '{' => open.push(p),
-                ')' | ']' | '}' => {
-                    let Some(at) = open.iter().rposition(|&o| mirror(chars[o]) == chars[p]) else {
-                        continue;
-                    };
-                    let o = open[at];
-                    open.truncate(at);
-                    if p >= end && chars[o + 1..p].iter().any(|&c| is_rtl(c) || is_number(c)) {
-                        end = p + 1;
-                    }
+        let mut o = i;
+        while o < end {
+            if let Some(p) = pairs[o].filter(|&p| p > o && p >= end && p < k) {
+                if (o + 1..p).any(strong) {
+                    end = p + 1;
                 }
-                _ => {}
             }
+            o += 1;
         }
         order[i..end].reverse();
         let mut j = i;
         while j < end {
-            let c = chars[order[j].0];
-            if !is_number(c) {
+            let at = order[j].0;
+            if !num[at] {
+                let c = chars[at];
                 order[j].1 = c != mirror(c);
                 j += 1;
                 continue;
             }
-            // Reversed, a number's digits and the single separators between them run from
-            // its last digit back; they go back in reading order.
+            // Reversed, a number runs from its end back; it goes back in reading order.
             let mut e = j + 1;
-            while e < end {
-                let c = chars[order[e].0];
-                let joins = matches!(c, '.' | ',' | ':' | '/')
-                    && e + 1 < end
-                    && is_number(chars[order[e + 1].0]);
-                if !is_number(c) && !joins {
-                    break;
-                }
+            while e < end && num[order[e].0] && order[e].0 + 1 == order[e - 1].0 {
                 e += 1;
             }
             order[j..e].reverse();
@@ -416,6 +531,17 @@ fn visual_order(chars: &[char]) -> Vec<(usize, bool)> {
 /// else whether it joins the letter after it too, with its isolated presentation form; the
 /// final, initial and medial forms follow that one.
 fn arabic_joining(c: char) -> Option<(bool, u32)> {
+    // Letters Persian and Urdu add, with their forms in the U+FB50 block: peh, tcheh, jeh,
+    // keheh, gaf and farsi yeh.
+    match c {
+        '\u{067E}' => return Some((true, 0xFB56)),
+        '\u{0686}' => return Some((true, 0xFB7A)),
+        '\u{0698}' => return Some((false, 0xFB8A)),
+        '\u{06A9}' => return Some((true, 0xFB8E)),
+        '\u{06AF}' => return Some((true, 0xFB92)),
+        '\u{06CC}' => return Some((true, 0xFBFC)),
+        _ => {}
+    }
     // From U+0621: U for hamza (no joining), R for a letter joining only the one before it,
     // D for one joining both sides, and x for one not in the presentation forms.
     const TYPES: &[u8] = b"URRRRDRDRDDDDDRRRRDDDDDDDDxxxxxxDDDDDDDRRD";
@@ -440,10 +566,23 @@ fn arabic_joining(c: char) -> Option<(bool, u32)> {
 /// form, as it joins its neighbors, where `has` the form; marks between letters are passed
 /// over.
 fn arabic_forms(chars: &[char], has: impl Fn(char) -> bool) -> Vec<char> {
-    let transparent =
-        |c: char| matches!(c, '\u{064B}'..='\u{065F}' | '\u{0670}' | '\u{06D6}'..='\u{06ED}');
-    let joins_after = |c: char| c == '\u{0640}' || arabic_joining(c).is_some_and(|j| j.0);
-    let joins_before = |c: char| c == '\u{0640}' || arabic_joining(c).is_some();
+    let transparent = |c: char| {
+        matches!(
+            c,
+            '\u{0610}'..='\u{061A}'
+                | '\u{064B}'..='\u{065F}'
+                | '\u{0670}'
+                | '\u{06D6}'..='\u{06DC}'
+                | '\u{06DF}'..='\u{06E4}'
+                | '\u{06E7}'
+                | '\u{06E8}'
+                | '\u{06EA}'..='\u{06ED}'
+        )
+    };
+    // Tatweel and the zero width joiner join both sides.
+    let causes = |c: char| matches!(c, '\u{0640}' | '\u{200D}');
+    let joins_after = |c: char| causes(c) || arabic_joining(c).is_some_and(|j| j.0);
+    let joins_before = |c: char| causes(c) || arabic_joining(c).is_some();
     let mut out = chars.to_vec();
     for (k, &c) in chars.iter().enumerate() {
         let Some((dual, isolated)) = arabic_joining(c) else {
@@ -713,10 +852,12 @@ impl<'a> Writer<'a> {
             return text.to_owned();
         }
         let room = width - self.faces.width(family, size, "…");
+        let chars: Vec<char> = text.chars().collect();
+        let forms = self.faces.forms(family, &chars);
         let mut w = 0.0;
         let mut tail: Vec<char> = Vec::new();
-        for c in text.chars().rev() {
-            w += self.faces.glyph(family, c).1 * size;
+        for (&c, &form) in chars.iter().zip(&forms).rev() {
+            w += self.faces.glyph(family, form).1 * size;
             if w > room {
                 break;
             }
@@ -936,8 +1077,10 @@ impl<'a> Writer<'a> {
     fn wrap_cells(&self, chars: &[Cell], width: f32) -> Vec<Range<usize>> {
         let mut out = Vec::new();
         let (mut start, mut w) = (0, 0.0);
-        for (i, cell) in chars.iter().enumerate() {
-            let cw = self.faces.glyph(Family::Mono, cell.c).1 * CODE_SIZE;
+        let plain: Vec<char> = chars.iter().map(|cell| cell.c).collect();
+        let forms = self.faces.forms(Family::Mono, &plain);
+        for (i, &form) in forms.iter().enumerate() {
+            let cw = self.faces.glyph(Family::Mono, form).1 * CODE_SIZE;
             if w + cw > width && i > start {
                 out.push(start..i);
                 start = i;
@@ -2023,6 +2166,26 @@ mod tests {
         assert_eq!(shown("\"שלום (1)\";"), "\"(1) םולש\";");
         assert_eq!(shown("א () b"), "א () b");
         assert_eq!(shown("plain (text) 12"), "plain (text) 12");
+        // Dates, phone numbers, percentages and prices stay whole after Hebrew...
+        assert_eq!(shown("תאריך 2024-01-15"), "2024-01-15 ךיראת");
+        assert_eq!(shown("טל 050-1234567"), "050-1234567 לט");
+        assert_eq!(shown("הנחה 50%"), "50% החנה");
+        assert_eq!(shown("מחיר $5"), "$5 ריחמ");
+        // ...but after Arabic letters, digits are Arabic numbers the signs keep apart.
+        assert_eq!(shown("تاريخ 2024-01-15"), "15-01-2024 خيرات");
+        assert_eq!(shown("ع ٣٫١٤"), "٣٫١٤ ع");
+        // A bracket pair holding English reads left to right, around reversed Hebrew.
+        assert_eq!(shown("שלום (עולם foo)"), "םולש (םלוע foo)");
+        assert_eq!(shown("א [ב (ג) ד] e"), "[ד (ג) ב] א e");
+
+        // Persian letters join, and so does a letter before a zero width joiner.
+        let yek: Vec<char> = "یک".chars().collect();
+        assert_eq!(arabic_forms(&yek, |_| true), vec!['\u{FBFE}', '\u{FB8F}']);
+        let zwj: Vec<char> = "ب\u{200D}".chars().collect();
+        assert_eq!(arabic_forms(&zwj, |_| true)[0], '\u{FE91}');
+        // Quranic signs that are not marks don't let the letters around them join.
+        let sign: Vec<char> = "ب\u{06DE}ب".chars().collect();
+        assert_eq!(arabic_forms(&sign, |_| true)[0], '\u{FE8F}');
 
         let salam: Vec<char> = "سلام".chars().collect();
         let forms = arabic_forms(&salam, |_| true);

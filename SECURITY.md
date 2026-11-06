@@ -20,8 +20,18 @@ the following as **untrusted** and handles them without running anything they co
   every file before changing it (see the user guide).
 - **Archives** (zip, tar, 7z) are extracted to a private temporary folder. Entries that
   would land outside it are skipped, and so are links that point outside the archive. An
-  archive that unpacks to more than 8 GB or 500,000 files is refused. Extracted sides are
-  read-only.
+  archive that unpacks to more than 8 GB or 500,000 files is refused. Edits are written
+  back only into the archive they were extracted from, never next to it; signed packages,
+  `.tar.xz` and archives nested in another archive stay read-only.
+- **SFTP servers** you fetch from. The server's host key is checked before any password or
+  key is sent: against your `~/.ssh/known_hosts` and OxideMerge's own `known_hosts` file
+  next to its settings. A key that no longer matches stops the connection, a new server's
+  fingerprint must be confirmed before it is trusted, and an unreadable `known_hosts` file
+  stops every connection. Fetched names are checked to be plain file names before anything
+  is written, and a fetch is limited in size, file count and depth. Uploads go to a temporary
+  file that replaces the original, and are refused when the server's file changed since it
+  was fetched. Passwords and passphrases stay in memory only, and are overwritten when no
+  longer needed.
 - **Web pages.** OxideMerge downloads the pages itself and never hands them to a browser,
   so their scripts never run. Such a web page may not load local files, and only a page on
   this computer or a private network may load resources from one or redirect to one.

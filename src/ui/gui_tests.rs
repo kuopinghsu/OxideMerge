@@ -229,18 +229,21 @@ impl Gui {
     }
 
     /// Picks an item of the menu bar: `["File", "Export", "Generate patch..."]`. Items are told
-    /// from buttons of the same name by where they are: under their menu, or beside it.
+    /// from buttons of the same name by where they are: under their menu, or beside it. A menu
+    /// too tall for the window under its button opens beside it instead.
     fn menu(&mut self, path: &[&str]) {
         let mut anchor = self.click_menu(path[0]);
         for (depth, item) in path.iter().enumerate().skip(1) {
             let found = self.widgets.iter().rev().find(|w| {
                 let r = w.rect;
+                let beside = r.left() >= anchor.right() - 4.0 && r.left() <= anchor.right() + 24.0;
                 named(w, item)
                     && if depth == 1 {
-                        (anchor.left() - 2.0..=anchor.left() + 12.0).contains(&r.left())
-                            && r.top() >= anchor.bottom()
+                        ((anchor.left() - 2.0..=anchor.left() + 12.0).contains(&r.left())
+                            && r.top() >= anchor.bottom())
+                            || (beside && r.top() > anchor.top())
                     } else {
-                        r.left() >= anchor.right() - 4.0 && r.left() <= anchor.right() + 24.0
+                        beside
                     }
             });
             let Some(w) = found else {
@@ -965,6 +968,76 @@ fn git_mergetool_conflicts_are_resolved_into_the_merged_file() {
     let staged = git(&["show", ":file.txt"]);
     assert_eq!(String::from_utf8_lossy(&staged.stdout), expected);
     assert_eq!(read(&repo.join("file.txt")), expected);
+}
+
+#[test]
+fn a_notebook_merged_into_an_output_file_is_merged_as_the_file_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let cell = |src: &str| {
+        format!(
+            r#"{{"cells":[{{"cell_type":"code","source":["{src}"],"outputs":[]}}],"nbformat":4,"nbformat_minor":5}}"#
+        )
+    };
+    let (ours, base) = (cell("print(1)"), cell("print(0)"));
+    write(
+        dir.path(),
+        &[
+            ("local.ipynb", ours.as_str()),
+            ("base.ipynb", base.as_str()),
+            ("remote.ipynb", base.as_str()),
+        ],
+    );
+    let merged = dir.path().join("merged.ipynb");
+    std::fs::write(&merged, &base).unwrap();
+    let mut gui = Gui::start(
+        "notebook_mergetool",
+        Some(OpenRequest {
+            paths: ["local", "base", "remote"]
+                .map(|n| dir.path().join(format!("{n}.ipynb")))
+                .to_vec(),
+            read_only: vec![true, false, true],
+            output: Some(merged.clone()),
+            ..Default::default()
+        }),
+    );
+    let v = gui.text_view();
+    for p in 0..3 {
+        assert!(!v.panes[p].doc.compare_only, "pane {p} was read as cells");
+    }
+    assert!(!v.panes[1].doc.read_only);
+    gui.menu(&[tr("menu.merge"), tr("cmd.auto_merge")]);
+    gui.click(tr("merge.save_result"));
+    let saved: serde_json::Value = serde_json::from_str(&read(&merged)).unwrap();
+    assert_eq!(saved["cells"][0]["source"][0], "print(1)");
+}
+
+#[test]
+fn text_read_out_of_a_notebook_is_never_saved_over_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let nb = r#"{"cells":[{"cell_type":"code","source":["x"],"outputs":[]}],"nbformat":4}"#;
+    write(dir.path(), &[("a.ipynb", nb), ("b.ipynb", nb)]);
+    let mut docs: Vec<TextDoc> = ["a", "b"]
+        .iter()
+        .map(|n| {
+            crate::core::unpacker::load_doc(
+                &dir.path().join(format!("{n}.ipynb")),
+                &Default::default(),
+                None,
+            )
+            .unwrap()
+        })
+        .collect();
+    let out = dir.path().join("b.ipynb");
+    crate::ui::text_view::redirect_output(&mut docs, &out);
+    assert!(
+        docs[1].read_only,
+        "an output side read as cells became writable"
+    );
+    let mut v = TextView::new(docs, &crate::config::Config::default());
+    v.panes[1].doc.read_only = false;
+    v.panes[1].doc.modified = true;
+    assert!(v.save_pane(1).is_err());
+    assert_eq!(read(&out), nb);
 }
 
 fn merge_folders(d: &Path) -> [PathBuf; 3] {
@@ -1798,17 +1871,83 @@ fn a_workspace_saves_the_open_tabs_by_name_and_reopens_them_later() {
     assert_eq!(gui.app.tabs.len(), 2);
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
 
-    // Saving again under the same name replaces it rather than adding a second entry.
+    // Saving again under the same name, in any case, says so and replaces it once Replace is
+    // clicked, rather than adding a second entry.
     gui.app.run(Cmd::SaveWorkspace, &gui.ctx);
     gui.frames(2);
-    gui.app.workspace_save_dlg.as_mut().unwrap().0 = "QA pass".to_string();
+    gui.app.workspace_save_dlg.as_mut().unwrap().0 = "qa PASS".to_string();
     gui.frame();
-    gui.click(tr("btn.save"));
+    assert!(gui.shows(&trf("msg.workspace_exists", &[("name", "QA pass".into())])));
+    gui.click(tr("btn.replace"));
     assert_eq!(gui.app.cfg.workspaces.len(), 1);
+    assert_eq!(gui.app.cfg.workspaces[0].name, "qa PASS");
 
-    // The manage dialog can delete it.
+    // Deleting it can be undone from its message.
     gui.app.run(Cmd::DeleteWorkspace(0), &gui.ctx);
     assert!(gui.app.cfg.workspaces.is_empty());
+    gui.frames(3);
+    gui.click(tr("cmd.undo"));
+    assert_eq!(gui.app.cfg.workspaces.len(), 1);
+
+    // A tab whose file is gone is not reopened as a compare with an empty side, and is
+    // counted in a message.
+    std::fs::remove_file(d.join("b.txt")).unwrap();
+    gui.app.run(Cmd::CloseAllTabs, &gui.ctx);
+    gui.app.run(Cmd::OpenWorkspace(0), &gui.ctx);
+    gui.settle();
+    assert_eq!(gui.app.tabs.len(), 1);
+    let want = trf(
+        "msg.workspace_not_reopened",
+        &[("n", "1".into()), ("total", "2".into())],
+    );
+    assert!(gui.errors().contains(&want), "{:?}", gui.errors());
+}
+
+#[test]
+fn a_workspace_leaves_out_temporary_copies_and_is_not_saved_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let zip_path = d.join("a.zip");
+    {
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        zw.start_file("in.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zw, b"x\n").unwrap();
+        zw.finish().unwrap();
+    }
+    let mut gui = Gui::start(
+        "workspace_temporary_copies",
+        compare(&[zip_path.clone(), zip_path.clone()]),
+    );
+    gui.settle();
+    // A file tab opened from inside the extracted archive.
+    let inner = match &gui.app.tabs[0].content {
+        Content::Folder(v) => v.roots[0].join("in.txt"),
+        _ => panic!("not a folder compare"),
+    };
+    gui.app.open(OpenRequest {
+        paths: vec![inner.clone(), inner],
+        ..Default::default()
+    });
+    gui.settle();
+    assert_eq!(gui.app.tabs.len(), 2);
+    let saved = gui.app.session_tabs();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(saved[0].paths[0], zip_path.display().to_string());
+
+    // With nothing open that can be saved, the dialog says so and nothing is saved.
+    gui.app.run(Cmd::CloseAllTabs, &gui.ctx);
+    gui.app.run(Cmd::SaveWorkspace, &gui.ctx);
+    gui.frames(2);
+    gui.app.workspace_save_dlg.as_mut().unwrap().0 = "Empty".to_string();
+    gui.frame();
+    assert!(gui.shows(tr("msg.workspace_nothing")));
+    gui.app.workspace_save_dlg = None;
+    gui.app.save_workspace("Empty".into());
+    assert!(gui.app.cfg.workspaces.is_empty());
+    assert!(gui
+        .errors()
+        .contains(&tr("msg.workspace_nothing").to_string()));
 }
 
 #[test]
@@ -1856,6 +1995,15 @@ fn compare_clipboard_reports_an_empty_clipboard_instead_of_opening_a_tab() {
 
     assert!(gui.app.tabs.is_empty());
     assert!(gui.errors().iter().any(|e| e.contains("nope")));
+
+    // Text that is there but empty is said to be empty, the same as no text at all.
+    set_test_clipboard(Ok(""));
+    gui.app.run(Cmd::CompareClipboard, &gui.ctx);
+    gui.frames(2);
+    assert!(gui.app.tabs.is_empty());
+    assert!(gui
+        .errors()
+        .contains(&tr("msg.clipboard_empty").to_string()));
 }
 
 #[test]
@@ -1926,6 +2074,133 @@ fn compare_over_sftp_fetches_both_sides_edits_one_and_saves_it_back_to_the_serve
     assert_eq!(String::from_utf8(uploaded).unwrap(), "one\ntwo-edited\n");
     assert_eq!(remote::fake::upload_count("/srv/right.txt"), 0);
 
+    remote::fake::uninstall();
+}
+
+/// Fetches `remote_path` from the fake server into the start page's side `side`.
+fn fetch_to_start_page(gui: &mut Gui, side: usize, remote_path: &str) {
+    gui.app.start_remote_connect(RemoteTarget::Start(side));
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+        d.remote_path = remote_path.to_string();
+    }
+    gui.frame();
+    gui.click(tr("btn.connect"));
+    gui.settle();
+}
+
+/// Compares the remote file `/srv/a.txt` with a local one, from the start page.
+fn compare_remote_with_local(gui: &mut Gui, local: &Path) {
+    fetch_to_start_page(gui, 0, "/srv/a.txt");
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    gui.app.start_paths[2] = local.display().to_string();
+    gui.frame();
+    gui.click(tr("btn.compare"));
+    assert_eq!(gui.app.tabs.len(), 1);
+}
+
+#[test]
+fn an_unknown_server_asks_to_trust_its_fingerprint_before_fetching() {
+    remote::fake::install(
+        remote::fake::Server::new()
+            .file("/srv/a.txt", "a")
+            .unknown_host(),
+    );
+    let mut gui = Gui::start("sftp_unknown_host", None);
+    fetch_to_start_page(&mut gui, 0, "/srv/a.txt");
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert!(gui.app.start_paths[0].is_empty(), "nothing fetched yet");
+    assert!(gui.app.host_prompt.is_some());
+    gui.frame();
+    assert!(gui.shows_text("SHA256:fake"));
+
+    gui.click(tr("btn.trust_connect"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert!(gui.app.host_prompt.is_none());
+    assert!(Path::new(&gui.app.start_paths[0]).is_file());
+    remote::fake::uninstall();
+}
+
+#[test]
+fn a_file_changed_on_the_server_is_not_overwritten_and_its_tab_stays_unsaved() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("b.txt", "one\n")]);
+    remote::fake::install(remote::fake::Server::new().file("/srv/a.txt", "one\n"));
+    let mut gui = Gui::start("sftp_conflict", None);
+    compare_remote_with_local(&mut gui, &dir.path().join("b.txt"));
+
+    remote::fake::change("/srv/a.txt", "theirs\n");
+    text_view_mut(&mut gui).place_caret(0, (0, 3), false);
+    gui.events.push(Event::Text("-mine".into()));
+    gui.frames(2);
+    gui.app.run(Cmd::Save, &gui.ctx);
+    gui.frames(2);
+    assert_eq!(remote::fake::upload_count("/srv/a.txt"), 0);
+    assert!(
+        gui.errors().iter().any(|e| e.contains("/srv/a.txt")),
+        "{:?}",
+        gui.errors()
+    );
+    assert!(
+        gui.app.tabs[0].is_modified(),
+        "the edit is not on the server"
+    );
+    remote::fake::uninstall();
+}
+
+#[test]
+fn saving_a_remote_tab_while_closing_it_uploads_before_it_closes() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("b.txt", "one\n")]);
+    remote::fake::install(remote::fake::Server::new().file("/srv/a.txt", "one\n"));
+    let mut gui = Gui::start("sftp_save_on_close", None);
+    compare_remote_with_local(&mut gui, &dir.path().join("b.txt"));
+
+    text_view_mut(&mut gui).place_caret(0, (0, 3), false);
+    gui.events.push(Event::Text("-edited".into()));
+    gui.frames(2);
+    gui.key(CMD, Key::W);
+    assert!(gui.shows(tr("dlg.unsaved")));
+    gui.click(tr("btn.save"));
+    gui.frames(3);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(
+        remote::fake::uploaded("/srv/a.txt").as_deref(),
+        Some(&b"one-edited\n"[..])
+    );
+    assert!(gui.app.tabs.is_empty());
+    remote::fake::uninstall();
+}
+
+#[test]
+fn a_folder_fetched_from_the_start_page_opens_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("a.txt", "local")]);
+    remote::fake::install(
+        remote::fake::Server::new()
+            .dir("/srv/data")
+            .file("/srv/data/a.txt", "remote"),
+    );
+    let mut gui = Gui::start("sftp_start_page_folder", None);
+    fetch_to_start_page(&mut gui, 0, "/srv/data");
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    gui.app.start_paths[2] = dir.path().display().to_string();
+    gui.frame();
+    gui.click(tr("btn.compare"));
+    gui.settle();
+    let Content::Folder(v) = gui.app.tabs[0].content.view() else {
+        panic!("Expected a folder compare");
+    };
+    assert!(v.read_only[0], "the fetched folder is read-only");
+    assert!(!v.read_only[1]);
+    assert!(
+        gui.app.session_tabs().is_empty(),
+        "a staged folder is not saved in the session"
+    );
     remote::fake::uninstall();
 }
 

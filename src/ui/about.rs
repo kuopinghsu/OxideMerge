@@ -156,7 +156,6 @@ fn body(ui: &mut egui::Ui) {
 
     heading(ui, tr("about.credits"));
     text(ui, tr("about.built_with"));
-    link(ui, tr("about.winmerge"), "https://winmerge.org/");
     text(ui, tr("about.thanks"));
 
     heading(ui, tr("about.license"));
