@@ -109,20 +109,32 @@ fn close_button(ui: &mut egui::Ui) -> egui::Response {
     response
 }
 
+/// What the About dialog shows for the build: just `date` for a clean release of the matching
+/// version tag, where `build` (the crate's `OXIDEMERGE_BUILD_ID`) is then that same date and
+/// nothing more (see `build_info::identifier` in the build script); otherwise `date` and the
+/// commit `build` was built from together, so a bug report names exactly what was built, not
+/// just when.
+fn build_label(date: &str, build: &str) -> String {
+    if build == date {
+        date.to_string()
+    } else {
+        format!("{date}, {build}")
+    }
+}
+
 fn body(ui: &mut egui::Ui) {
     let p = widgets::pal(ui);
     let build = env!("OXIDEMERGE_BUILD_ID");
+    let date = env!("OXIDEMERGE_BUILD_DATE");
+    let shown = build_label(date, build);
     let mut title = egui::text::LayoutJob::default();
     let parts = [
         RichText::new(format!("OxideMerge {}  ", env!("CARGO_PKG_VERSION")))
             .font(theme::semibold(theme::size::DISPLAY))
             .color(p.text),
-        RichText::new(format!(
-            "({})",
-            trf("about.build", &[("date", build.to_string())])
-        ))
-        .size(theme::size::SUBTITLE)
-        .color(p.text_dim),
+        RichText::new(format!("({})", trf("about.build", &[("date", shown)])))
+            .size(theme::size::SUBTITLE)
+            .color(p.text_dim),
     ];
     for part in parts {
         part.append_to(
@@ -150,7 +162,6 @@ fn body(ui: &mut egui::Ui) {
     heading(ui, tr("about.license"));
     let repository = env!("CARGO_PKG_REPOSITORY");
     link(ui, repository.trim_start_matches("https://"), repository);
-    let date = env!("OXIDEMERGE_BUILD_DATE");
     let year = date.get(..4).unwrap_or(date);
     text(
         ui,
@@ -186,4 +197,24 @@ fn link(ui: &mut egui::Ui, label: &str, url: &str) {
         RichText::new(label).size(theme::size::CONTROL).color(color),
         url,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_release_build_shows_only_its_date() {
+        assert_eq!(build_label("2026.11.06", "2026.11.06"), "2026.11.06");
+    }
+
+    #[test]
+    fn any_other_build_shows_its_date_and_the_commit_together() {
+        assert_eq!(build_label("2026.11.06", "abc1234"), "2026.11.06, abc1234");
+        assert_eq!(
+            build_label("2026.11.06", "abc1234-dirty"),
+            "2026.11.06, abc1234-dirty"
+        );
+        assert_eq!(build_label("2026.11.06", "unknown"), "2026.11.06, unknown");
+    }
 }

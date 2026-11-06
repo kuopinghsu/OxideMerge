@@ -15,12 +15,18 @@ use std::ops::Range;
 
 /// The byte index in `line` where display column `col` starts, and how many columns the line
 /// falls short of it (0 when the column is inside the line). A column inside a tab is taken to
-/// start at the tab.
+/// start at the tab, and one on an accent or another code point joined to a character at that
+/// character, so a character is never split.
 pub fn byte_at(line: &str, col: usize, tab: usize) -> (usize, usize) {
+    use unicode_segmentation::UnicodeSegmentation;
     let tab = tab.max(1);
     let mut c = 0;
-    for (i, ch) in line.char_indices() {
-        let w = if ch == '\t' { tab - c % tab } else { 1 };
+    for (i, g) in line.grapheme_indices(true) {
+        let w = if g == "\t" {
+            tab - c % tab
+        } else {
+            g.chars().count()
+        };
         if col < c + w {
             return (i, 0);
         }
@@ -305,10 +311,11 @@ fn word_spans(line: &str) -> impl Iterator<Item = (usize, usize, bool)> + '_ {
     let segments = line.split_word_bound_indices().flat_map(|(i, seg)| {
         let mut parts = Vec::new();
         let mut from = 0;
-        for (j, c) in seg.char_indices() {
-            if split(c) {
-                parts.extend([(from, j), (j, j + c.len_utf8())]);
-                from = j + c.len_utf8();
+        // By grapheme, so an accent on the punctuation stays with it.
+        for (j, g) in seg.grapheme_indices(true) {
+            if g.chars().next().is_some_and(split) {
+                parts.extend([(from, j), (j, j + g.len())]);
+                from = j + g.len();
             }
         }
         parts.push((from, seg.len()));
@@ -335,37 +342,18 @@ fn word_starts(line: &str) -> impl Iterator<Item = (usize, bool)> + '_ {
     word_spans(line).map(|(a, _, blank)| (a, blank))
 }
 
-/// The word (letters, digits and `_`) or other run of characters around byte `at` of `line`.
+/// The word or other run of characters around byte `at` of `line`, as the word moves see
+/// them: the one starting at `at`, or the last one when `at` is the end of the line.
 pub fn word_at(line: &str, at: usize) -> Range<usize> {
-    let kind = |c: char| {
-        if c.is_alphanumeric() || c == '_' {
-            0
-        } else if c.is_whitespace() {
-            1
-        } else {
-            2
-        }
-    };
-    let Some(k) = line[at.min(line.len())..]
-        .chars()
-        .next()
-        .or_else(|| line[..at.min(line.len())].chars().next_back())
-        .map(kind)
-    else {
-        return at..at;
-    };
     let at = at.min(line.len());
-    let start = line[..at]
-        .char_indices()
-        .rev()
-        .take_while(|&(_, c)| kind(c) == k)
-        .last()
-        .map_or(at, |(i, _)| i);
-    let end = line[at..]
-        .char_indices()
-        .find(|&(_, c)| kind(c) != k)
-        .map_or(line.len(), |(i, _)| at + i);
-    start..end
+    let mut last = None;
+    for (a, b, _) in word_spans(line) {
+        if a <= at && at < b {
+            return a..b;
+        }
+        last = Some(a..b);
+    }
+    last.filter(|r| r.end == at).unwrap_or(at..at)
 }
 
 /// Puts a copy of lines `first..=last` right after them. Returns how many lines were copied
@@ -615,5 +603,45 @@ mod tests {
         assert_eq!(word_at("let foo_1 = 2;", 9), 9..10);
         assert_eq!(word_at("abc", 3), 0..3);
         assert_eq!(word_at("", 0), 0..0);
+        assert_eq!(
+            word_at("cafe\u{301} x", 1),
+            0..6,
+            "the accent is part of the word"
+        );
+        assert_eq!(word_at("中文", 0), 0..3, "each Chinese character is a word");
+    }
+
+    #[test]
+    fn a_column_on_an_accent_is_taken_at_its_letter() {
+        // "e" plus a combining accent is two columns as laid out, but one character.
+        assert_eq!(byte_at("ae\u{301}b", 2, 4), (1, 0));
+        assert_eq!(byte_at("ae\u{301}b", 3, 4), (4, 0));
+        let mut lines = v(&["ae\u{301}b"]);
+        replace(&mut lines, 0, 1, &(2..3), &["X".into()], 4);
+        assert_eq!(lines, ["aXb"], "the accent goes with its letter");
+    }
+
+    #[test]
+    fn word_moves_never_stop_inside_a_character() {
+        let lines = v(&["a.\u{301}b", "x\u{301}.\u{301}.y"]);
+        for (l, line) in lines.iter().enumerate() {
+            let mut at = (l, 0);
+            while at.1 < line.len() {
+                let next = word_right(&lines, at);
+                assert!(next > at && next.0 == l, "line {l}: stuck at {at:?}");
+                assert_eq!(
+                    clamp(&lines, next),
+                    next,
+                    "line {l}: {next:?} is inside a character"
+                );
+                at = next;
+            }
+            while at.1 > 0 {
+                let next = word_left(&lines, at);
+                assert!(next < at, "line {l}: stuck at {at:?}");
+                assert_eq!(clamp(&lines, next), next);
+                at = next;
+            }
+        }
     }
 }

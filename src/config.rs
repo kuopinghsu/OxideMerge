@@ -57,6 +57,15 @@ pub struct SessionTab {
     pub rules: Option<String>,
 }
 
+/// A named, saved set of tabs, for `File → Workspaces`: unlike [`Config::session`] (the one,
+/// unnamed set the app reopens on its own at startup), a workspace is kept until the user
+/// deletes it and is only reopened when asked to by name.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Default)]
+pub struct Workspace {
+    pub name: String,
+    pub tabs: Vec<SessionTab>,
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct Config {
@@ -105,6 +114,8 @@ pub struct Config {
     pub image_threshold: u8,
     pub image_block: u32,
     pub binary_bytes_per_line: usize,
+    /// Binary compares look for blocks of bytes that moved to another offset.
+    pub binary_moved_blocks: bool,
     pub unpackers: Vec<Unpacker>,
     pub web_mode: WebMode,
     pub restore_session: bool,
@@ -122,6 +133,9 @@ pub struct Config {
     pub folder_file_pane: bool,
     pub session: Vec<SessionTab>,
     pub session_active: usize,
+    /// Named, saved sets of tabs the user can reopen any time (see [`Workspace`]), not only
+    /// the single unnamed [`Config::session`] that is restored on its own at startup.
+    pub workspaces: Vec<Workspace>,
 }
 
 impl Default for Config {
@@ -167,6 +181,7 @@ impl Default for Config {
             image_threshold: 0,
             image_block: 8,
             binary_bytes_per_line: 16,
+            binary_moved_blocks: true,
             unpackers: vec![Unpacker {
                 enabled: false,
                 pattern: "*.docx;*.odt;*.rtf".into(),
@@ -182,6 +197,7 @@ impl Default for Config {
             folder_file_pane: false,
             session: Vec::new(),
             session_active: 0,
+            workspaces: Vec::new(),
         }
     }
 }

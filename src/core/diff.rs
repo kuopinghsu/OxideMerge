@@ -437,16 +437,36 @@ impl DiffResult {
 
     /// Row index displaying `line` of `pane` (or the nearest row).
     pub fn row_of_line(&self, pane: usize, line: usize) -> usize {
-        let mut best = 0;
-        for (i, r) in self.rows.iter().enumerate() {
-            if let Some(l) = r.line(pane) {
-                if l >= line {
-                    return i;
+        // The last row at or before row `i` that shows a line of `pane`, with that line. The
+        // lines of a pane go up row by row, so this goes up with `i`.
+        let shown_before = |mut i: usize| -> Option<(usize, usize)> {
+            loop {
+                let r = &self.rows[i];
+                if let Some(l) = r.line(pane) {
+                    return Some((i, l));
                 }
-                best = i;
+                let back = match r.block().and_then(|b| self.blocks.get(b)) {
+                    Some(b) if b.ranges[pane].is_empty() && b.first_row <= i => b.first_row,
+                    _ => i,
+                };
+                i = back.checked_sub(1)?;
+            }
+        };
+        let (mut lo, mut hi) = (0, self.rows.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if shown_before(mid).is_none_or(|(_, l)| l < line) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
         }
-        best
+        if lo < self.rows.len() {
+            return lo;
+        }
+        lo.checked_sub(1)
+            .and_then(shown_before)
+            .map_or(0, |(i, _)| i)
     }
 }
 
@@ -1959,6 +1979,43 @@ mod tests {
         assert!(r.moved[1].contains(&4));
         assert!(!r.moved[0].contains(&4));
         assert!(!r.moved[1].contains(&0));
+    }
+
+    #[test]
+    fn the_row_of_a_line_is_the_first_row_at_or_after_it() {
+        let linear = |r: &DiffResult, pane: usize, line: usize| {
+            let mut best = 0;
+            for (i, row) in r.rows.iter().enumerate() {
+                if let Some(l) = row.line(pane) {
+                    if l >= line {
+                        return i;
+                    }
+                    best = i;
+                }
+            }
+            best
+        };
+        let a = v(&["a", "b", "x1", "x2", "x3", "c", "d", "e", "f"]);
+        let b = v(&["a", "y1", "b", "c", "z1", "z2", "z3", "z4", "f", "g"]);
+        let empty: Vec<String> = Vec::new();
+        for (l, r) in [
+            (&a, &b),
+            (&b, &a),
+            (&a, &empty),
+            (&empty, &b),
+            (&empty, &empty),
+        ] {
+            let result = compute(&[l, r], &DiffOptions::default());
+            for pane in 0..2 {
+                for line in 0..12 {
+                    assert_eq!(
+                        result.row_of_line(pane, line),
+                        linear(&result, pane, line),
+                        "pane {pane} line {line}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

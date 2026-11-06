@@ -1956,12 +1956,17 @@ enum Mark {
     Other,
 }
 
+/// What a run kept apart from the one before it costs beyond its text, counted against what
+/// marked content may keep.
+const RUN_COST: usize = 80;
+
 /// What reading one page's marked content keeps track of.
 struct Marking<'m> {
     page: usize,
     marks: Vec<Mark>,
     out: &'m mut HashMap<(usize, i64), Marked>,
-    /// The bytes of text kept so far.
+    /// The bytes of text kept so far, on this page and the pages before it, with
+    /// [`RUN_COST`] for each run.
     size: usize,
 }
 
@@ -1970,7 +1975,7 @@ impl Marking<'_> {
     /// on along the same line in the same format.
     fn add(&mut self, mut run: Run) {
         let added = run.text.len();
-        if run.text.is_empty() || self.size + added > super::MAX_OUTPUT {
+        if run.text.is_empty() || self.size + added + RUN_COST > super::MAX_OUTPUT {
             return;
         }
         let Some(piece) = self.current() else { return };
@@ -1994,6 +1999,7 @@ impl Marking<'_> {
             _ => {
                 run.text.shrink_to_fit();
                 piece.runs.push(run);
+                self.size += RUN_COST;
             }
         }
         self.size += added;
@@ -2056,6 +2062,7 @@ impl Document<'_> {
             bail!("the file lists no pages");
         }
         let mut marked = HashMap::new();
+        let mut size = 0;
         for (i, (_, page)) in pages.iter().enumerate() {
             self.check()?;
             let resources = self.get(page, "Resources");
@@ -2064,9 +2071,10 @@ impl Document<'_> {
                 page: i,
                 marks: Vec::new(),
                 out: &mut marked,
-                size: 0,
+                size,
             };
             self.read_marked(&content, &resources, IDENTITY, 0, &mut marking);
+            size = marking.size;
         }
         self.check()?;
         let roles = match self.get(tree, "RoleMap") {
@@ -2127,7 +2135,13 @@ impl Document<'_> {
         let (mut ctm, mut saved, mut unsaved) = (ctm, Vec::new(), 0usize);
         let mut text = TextState::default();
         let marks_at_start = marking.marks.len();
+        let mut count = 0usize;
         while let Some(operator) = ops.next() {
+            count += 1;
+            // Stops once cancelled or out of budget; the caller then fails.
+            if count.is_multiple_of(4096) && self.check().is_err() {
+                break;
+            }
             let operands = &ops.operands;
             match operator.as_str() {
                 "q" if saved.len() < 64 => saved.push(ctm),
@@ -2278,14 +2292,20 @@ impl Document<'_> {
                     return;
                 };
                 let cached = number.and_then(|n| self.prints.borrow().get(&n).cloned());
-                let print = cached.unwrap_or_else(|| {
-                    let print =
-                        super::markdown::fingerprint(self.bytes.get(start..end).unwrap_or(&[]));
-                    if let Some(n) = number {
-                        self.prints.borrow_mut().insert(n, print.clone());
+                let print = match cached {
+                    Some(print) => print,
+                    None => {
+                        let raw = self.bytes.get(start..end).unwrap_or(&[]);
+                        if self.spend(raw.len()).is_err() {
+                            return;
+                        }
+                        let print = super::markdown::fingerprint(raw);
+                        if let Some(n) = number {
+                            self.prints.borrow_mut().insert(n, print.clone());
+                        }
+                        print
                     }
-                    print
-                });
+                };
                 if !piece.images.contains(&print) {
                     piece.images.push(print);
                 }

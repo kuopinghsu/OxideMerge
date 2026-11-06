@@ -2,11 +2,14 @@
 //! `--job`. A job file is JSON with a version number. Each job becomes the command-line options
 //! that do the same, so a job gives what the equivalent command gives.
 //!
-//! A job file runs no command and names no shell; paths in it are relative to its own folder and
-//! may use `${env:NAME}`. A job that changes a folder must say so (`"kind": "sync"` with
-//! `"apply": true`), and even then it runs only when `--yes` is given too: a job file alone never
-//! authorizes changing or deleting anything.
+//! A job file names no command and no shell; paths in it are relative to its own folder and may
+//! use `${env:NAME}`. Comparing a file that an unpacker of the settings reads still runs that
+//! unpacker, as any comparison does. A job that changes a folder must say so (`"kind": "sync"`
+//! with `"apply": true`), and even then it runs only when `--yes` is given too; so does a job
+//! whose report or patch lies outside the job file's folder. A job file alone never authorizes
+//! changing, deleting or overwriting anything outside its folder.
 
+use crate::i18n::{tr, trf};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -52,6 +55,7 @@ impl JobKind {
 pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default)]
     pub kind: JobKind,
     // Compare.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,23 +141,42 @@ pub struct Job {
 impl JobFile {
     /// Reads a job file, refusing a newer format, an unknown field or an empty list.
     pub fn parse(text: &str) -> Result<JobFile, String> {
-        let value: serde_json::Value =
-            serde_json::from_str(text).map_err(|e| format!("not a job file: {e}"))?;
+        let not_a_job = |e: serde_json::Error| trf("job.err_not_job", &[("error", e.to_string())]);
+        let value: serde_json::Value = serde_json::from_str(text).map_err(not_a_job)?;
         match value.get("version").and_then(serde_json::Value::as_u64) {
             Some(v) if v > u64::from(JOB_VERSION) => {
-                return Err(format!(
-                    "the job file is version {v}, newer than this OxideMerge reads ({JOB_VERSION})"
+                return Err(trf(
+                    "job.err_newer",
+                    &[("version", v.to_string()), ("max", JOB_VERSION.to_string())],
                 ))
             }
+            Some(0) => return Err(trf("job.err_bad_version", &[("version", "0".into())])),
             Some(_) => {}
-            None => return Err("not a job file: no \"version\"".into()),
+            None => return Err(tr("job.err_no_version").into()),
         }
-        let file: JobFile =
-            serde_json::from_value(value).map_err(|e| format!("not a job file: {e}"))?;
+        let file: JobFile = serde_json::from_value(value).map_err(not_a_job)?;
         if file.jobs.is_empty() {
-            return Err("the job file lists no jobs".into());
+            return Err(tr("job.err_no_jobs").into());
         }
         Ok(file)
+    }
+
+    /// Reads the job file at `path`.
+    pub fn read(path: &Path) -> Result<JobFile, String> {
+        let bytes = super::analysis::read(path).map_err(|e| format!("{e:#}"))?;
+        let text = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+        JobFile::parse(&text)
+    }
+
+    /// The reports and patches of its jobs that lie outside `dir`, the folder of the job file,
+    /// resolved as writing them would. Writing those needs the user's agreement.
+    pub fn outputs_outside(&self, dir: &Path) -> Vec<PathBuf> {
+        let base = resolved(dir);
+        self.jobs
+            .iter()
+            .flat_map(|j| j.outputs(dir))
+            .filter(|p| !resolved(p).starts_with(&base))
+            .collect()
     }
 }
 
@@ -193,7 +216,7 @@ impl Job {
     pub fn label(&self, index: usize) -> String {
         match &self.name {
             Some(n) if !n.trim().is_empty() => n.clone(),
-            _ => format!("job {}", index + 1),
+            _ => trf("job.unnamed", &[("n", (index + 1).to_string())]),
         }
     }
 
@@ -307,11 +330,22 @@ impl Job {
         })
     }
 
-    /// The report or patch the job writes, resolved against `dir`, the folder of the job file.
-    pub fn output(&self, dir: &Path) -> Option<PathBuf> {
-        let v = self.report.as_deref().or(self.patch.as_deref())?;
-        let p = PathBuf::from(expand(v).ok()?);
-        Some(if p.is_absolute() { p } else { dir.join(p) })
+    /// The report and patch the job writes, resolved against `dir`, the folder of the job file.
+    pub fn outputs(&self, dir: &Path) -> Vec<PathBuf> {
+        [&self.report, &self.patch]
+            .into_iter()
+            .flatten()
+            .filter_map(|v| expand(v).ok())
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| {
+                let p = PathBuf::from(t);
+                if p.is_absolute() {
+                    p
+                } else {
+                    dir.join(p)
+                }
+            })
+            .collect()
     }
 
     /// The paths the job names, resolved against `dir`: left, base and right of a compare, or
@@ -368,7 +402,10 @@ impl Job {
         let kind = self.kind.key();
         let given = |on: bool, field: &str| -> Result<(), String> {
             if on {
-                Err(format!("\"{field}\" does not apply to a {kind} job"))
+                Err(trf(
+                    "job.err_not_for_kind",
+                    &[("field", field.into()), ("kind", kind.into())],
+                ))
             } else {
                 Ok(())
             }
@@ -376,7 +413,10 @@ impl Job {
         let need = |v: &Option<String>, field: &str| -> Result<(), String> {
             match v {
                 Some(s) if !s.trim().is_empty() => Ok(()),
-                _ => Err(format!("a {kind} job needs \"{field}\"")),
+                _ => Err(trf(
+                    "job.err_needs",
+                    &[("kind", kind.into()), ("field", field.into())],
+                )),
             }
         };
         match self.kind {
@@ -420,11 +460,7 @@ impl Job {
                 } else {
                     given(self.report.is_some(), "report")?;
                     if !self.apply {
-                        return Err(
-                            "a sync job changes the destination only with \"apply\": true; \
-                             use a sync_plan job to plan without changing anything"
-                                .into(),
-                        );
+                        return Err(tr("job.err_apply").into());
                     }
                 }
             }
@@ -442,18 +478,48 @@ fn expand(text: &str) -> Result<String, String> {
         let after = &rest[at + 2..];
         let end = after
             .find('}')
-            .ok_or_else(|| format!("unclosed \"${{\" in {text:?}"))?;
+            .ok_or_else(|| trf("job.err_env_unclosed", &[("text", format!("{text:?}"))]))?;
         let name = after[..end]
             .strip_prefix("env:")
             .filter(|n| !n.is_empty())
-            .ok_or_else(|| format!("only ${{env:NAME}} may be used, not ${{{}}}", &after[..end]))?;
+            .ok_or_else(|| trf("job.err_env_only", &[("name", after[..end].to_string())]))?;
         let value = std::env::var(name)
-            .map_err(|_| format!("the environment variable {name} is not set"))?;
+            .map_err(|_| trf("job.err_env_unset", &[("name", name.to_string())]))?;
         out.push_str(&value);
         rest = &after[end + 1..];
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// `path` as writing to it reaches it: through the links of the part that exists, with `.` and
+/// `..` of the rest taken away.
+fn resolved(path: &Path) -> PathBuf {
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut rest = Vec::new();
+    let mut at = path.as_path();
+    loop {
+        if let Ok(real) = at.canonicalize() {
+            let mut out = real;
+            for part in rest.into_iter().rev() {
+                match part {
+                    std::path::Component::ParentDir => {
+                        out.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    other => out.push(other),
+                }
+            }
+            return out;
+        }
+        match (at.parent(), at.components().next_back()) {
+            (Some(parent), Some(last)) => {
+                rest.push(last);
+                at = parent;
+            }
+            _ => return path.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -571,5 +637,55 @@ mod tests {
         let json = serde_json::to_string_pretty(&file).unwrap();
         assert_eq!(JobFile::parse(&json).unwrap(), file);
         assert_eq!(file.jobs[0].label(0), "docs");
+        assert!(
+            JobFile::parse(r#"{"version": 0, "jobs": [{"left": "a", "right": "b"}]}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn a_job_without_a_kind_compares_as_the_readme_example_shows() {
+        let readme = include_str!("../../README.md");
+        let start = readme.find("```json\n{\n  \"version\": 1,").unwrap() + "```json\n".len();
+        let end = start + readme[start..].find("```").unwrap();
+        let file = JobFile::parse(&readme[start..end]).unwrap();
+        assert_eq!(file.jobs[0].kind, JobKind::Compare);
+        assert!(file.jobs[0].prepare(Path::new("/d")).is_ok());
+        assert_eq!(file.jobs[1].kind, JobKind::Sync);
+        assert_eq!(
+            file.jobs[1].label(1),
+            trf("job.unnamed", &[("n", "2".into())])
+        );
+    }
+
+    #[test]
+    fn outputs_outside_the_job_folder_are_found_also_through_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = dir.path().join("jobs");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(jobs.join("out")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let file = |report: &str, patch: Option<&str>| JobFile {
+            version: 1,
+            continue_on_error: false,
+            jobs: vec![Job {
+                left: Some("a".into()),
+                right: Some("b".into()),
+                report: Some(report.into()),
+                patch: patch.map(Into::into),
+                ..Default::default()
+            }],
+        };
+        assert!(file("out/r.html", Some("new/p.diff"))
+            .outputs_outside(&jobs)
+            .is_empty());
+        let outside = file("../elsewhere/r.html", None).outputs_outside(&jobs);
+        assert_eq!(outside, [jobs.join("../elsewhere/r.html")]);
+        let abs = elsewhere.join("r.html").display().to_string();
+        assert_eq!(file("r.html", Some(&abs)).outputs_outside(&jobs).len(), 1);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&elsewhere, jobs.join("link")).unwrap();
+            assert_eq!(file("link/r.html", None).outputs_outside(&jobs).len(), 1);
+        }
     }
 }

@@ -1441,7 +1441,12 @@ fn a_compare_job_writes_what_its_command_line_writes() {
                  "recursive": true, "report": "../job.csv"}]}"#,
         )],
     );
-    let job = oxidemerge(d, &["--job", "jobs/nightly.oxjob"]);
+    // A report outside the job file's folder is written only when allowed.
+    let refused = oxidemerge(d, &["--job", "jobs/nightly.oxjob"]);
+    assert_eq!(refused.code, 2, "{}{}", refused.stdout, refused.stderr);
+    assert!(refused.stderr.contains("--yes"), "{}", refused.stderr);
+    assert!(!d.join("job.csv").exists());
+    let job = oxidemerge(d, &["--job", "jobs/nightly.oxjob", "--yes"]);
     assert_eq!(job.code, 1, "{}{}", job.stdout, job.stderr);
     let summary: serde_json::Value = serde_json::from_str(&job.stdout).unwrap();
     assert_eq!(summary["exit_code"], 1);
@@ -1547,8 +1552,13 @@ fn jobs_go_on_after_a_failure_only_when_asked_and_large_deletions_need_leave() {
 
     let with_paths = oxidemerge(d, &["--job", "jobs.oxjob", "a.txt", "a.txt"]);
     assert_eq!(with_paths.code, 2);
+    for option in ["-r", "--ignore-case", "--filter=*.c", "--method=date"] {
+        let with_option = oxidemerge(d, &["--job", "jobs.oxjob", option]);
+        assert_eq!(with_option.code, 2, "{option}");
+        assert!(with_option.stdout.is_empty(), "{option}: no job runs");
+    }
     files(d, &[("future.oxjob", r#"{"version": 9, "jobs": []}"#)]);
-    let future = oxidemerge(d, &["--job", "future.oxjob"]);
+    let future = oxidemerge(d, &["--job", "future.oxjob", "--lang", "en"]);
     assert_eq!(future.code, 2);
     assert!(future.stderr.contains("version 9"), "{}", future.stderr);
 }
@@ -1678,6 +1688,23 @@ fn diff_style_labels_title_the_sides_and_descriptions_win_over_them() {
     let html = read(d.join("labels.html"));
     assert!(html.contains("f.txt\t(revision 1)"), "left label");
     assert!(html.contains("f.txt\t(working copy)"), "right label");
+
+    // A file named with a leading dash still has its title taken as one.
+    let run = oxidemerge(
+        d,
+        &[
+            "--report",
+            "dash.html",
+            "-L",
+            "-notes.txt\t(revision 1)",
+            "-L",
+            "-notes.txt\t(working copy)",
+            "old.txt",
+            "new.txt",
+        ],
+    );
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(read(d.join("dash.html")).contains("-notes.txt\t(revision 1)"));
 
     let run = oxidemerge(
         d,

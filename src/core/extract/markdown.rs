@@ -21,9 +21,10 @@ use super::{
 };
 use crate::core::web_markdown::{
     destination, escape_cell, escape_line_start, escapes, lay_out, Block, SpanCell, COVERED_ABOVE,
-    COVERED_LEFT,
+    COVERED_LEFT, MAX_TABLE_CELLS,
 };
 use anyhow::{bail, Result};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -60,22 +61,43 @@ pub fn docx_blocks(path: &Path, cancel: Option<&AtomicBool>) -> Result<Vec<Block
         links,
         counters: HashMap::new(),
         images: HashMap::new(),
+        prints: HashMap::new(),
         described: None,
         blocks: Vec::new(),
         size: 0,
+        cut: false,
     };
     if let Some(body) = body.child(W, "body") {
         reader.blocks_of(body, 0)?;
     }
-    Ok(reader.blocks)
+    Ok(with_cut_note(reader.blocks, reader.cut))
+}
+
+/// `blocks` with a last one saying that the rest was left out, when it was.
+fn with_cut_note(mut blocks: Vec<Block>, cut: bool) -> Vec<Block> {
+    if cut {
+        blocks.push(Block {
+            depth: 0,
+            text: format!(
+                "*{}*",
+                escape(crate::i18n::tr("msg.extract_truncated").trim())
+            ),
+        });
+    }
+    blocks
 }
 
 // ---------- the element tree ----------
 
+/// The most elements of a part read into a tree; a part with more is too large to show
+/// formatted.
+const MAX_ELEMENTS: usize = 3_000_000;
+
 /// An element of a part, with the namespace of its name and its attributes by local name.
 #[derive(Default)]
 struct Element {
-    ns: String,
+    /// Shared by the elements of the same namespace.
+    ns: std::rc::Rc<str>,
     name: String,
     attrs: Vec<(String, String)>,
     children: Vec<Node>,
@@ -88,7 +110,7 @@ enum Node {
 
 impl Element {
     fn is(&self, ns: &str, name: &str) -> bool {
-        self.ns == ns && self.name == name
+        &*self.ns == ns && self.name == name
     }
 
     fn elements(&self) -> impl Iterator<Item = &Element> {
@@ -150,6 +172,8 @@ fn parse(xml: &[u8], cancel: Option<&AtomicBool>) -> Result<Element> {
     // Elements left out, counted so that their ends are told from the ends of others.
     let mut skipping = 0usize;
     let mut buf = Vec::new();
+    let mut spaces: Vec<std::rc::Rc<str>> = Vec::new();
+    let mut elements = 0usize;
     for read in 0.. {
         if read % CHECK_EVERY == 0 {
             check(cancel)?;
@@ -167,15 +191,27 @@ fn parse(xml: &[u8], cancel: Option<&AtomicBool>) -> Result<Element> {
                     continue;
                 }
                 let (ns, name) = reader.resolver().resolve_element(e.name());
-                let ns = match ns {
-                    quick_xml::name::ResolveResult::Bound(n) => n.as_ref().to_owned(),
-                    _ => String::new(),
+                let ns: &str = match &ns {
+                    quick_xml::name::ResolveResult::Bound(n) => n.as_ref(),
+                    _ => "",
                 };
                 let name = name.as_ref().to_owned();
                 if (ns == MARKUP_COMPATIBILITY && name == "Fallback") || stack.len() > MAX_DEPTH {
                     skipping = usize::from(!empty);
                     continue;
                 }
+                elements += 1;
+                if elements > MAX_ELEMENTS {
+                    bail!("the part has more than {MAX_ELEMENTS} elements, too many to show");
+                }
+                let ns = match spaces.iter().find(|s| &***s == ns) {
+                    Some(s) => s.clone(),
+                    None => {
+                        let s: std::rc::Rc<str> = ns.into();
+                        spaces.push(s.clone());
+                        s
+                    }
+                };
                 let attrs = e
                     .attributes()
                     .flatten()
@@ -401,16 +437,24 @@ struct Reader<'a> {
     counters: HashMap<String, Vec<u64>>,
     /// How each image is shown, by relationship and description.
     images: HashMap<(String, Option<String>), String>,
+    /// The fingerprint of each picture read, by part.
+    prints: HashMap<String, Option<String>>,
     /// The description of the drawing being read.
     described: Option<String>,
     blocks: Vec<Block>,
     /// The length of the blocks so far, kept within what a text reading would read.
     size: usize,
+    /// Whether some of the document was left out to keep within that.
+    cut: bool,
 }
 
 impl Reader<'_> {
     fn emit(&mut self, depth: usize, text: String) {
-        if text.trim().is_empty() || self.size > MAX_OUTPUT {
+        if text.trim().is_empty() {
+            return;
+        }
+        if self.size > MAX_OUTPUT {
+            self.cut = true;
             return;
         }
         self.size += text.len();
@@ -419,15 +463,15 @@ impl Reader<'_> {
 
     /// The paragraphs and tables of `e`, such as the body, a content control or a text box.
     fn blocks_of(&mut self, e: &Element, depth: usize) -> Result<()> {
-        check(self.cancel)?;
         if depth > MAX_DEPTH {
             return Ok(());
         }
         for child in e.elements() {
-            match (child.ns.as_str(), child.name.as_str()) {
+            check(self.cancel)?;
+            match (&*child.ns, child.name.as_str()) {
                 (W, "p") => self.paragraph(child)?,
                 (W, "tbl") => {
-                    let text = self.table(child);
+                    let text = self.table(child)?;
                     self.emit(0, text);
                 }
                 (W, "sectPr" | "del" | "moveFrom") => {}
@@ -511,7 +555,7 @@ impl Reader<'_> {
             return;
         }
         for child in e.elements() {
-            if child.ns != W {
+            if &*child.ns != W {
                 if child.name == "docPr" {
                     // The description of the drawing whose picture follows.
                     self.described = child
@@ -572,7 +616,7 @@ impl Reader<'_> {
         depth: usize,
     ) {
         for child in r.elements() {
-            if child.ns != W {
+            if &*child.ns != W {
                 self.inline(child, format, out, boxes, depth + 1);
                 continue;
             }
@@ -615,9 +659,18 @@ impl Reader<'_> {
         let print = if target.contains("://") {
             None
         } else {
-            part_name("word", &target)
-                .and_then(|p| optional_part(self.path, &p).ok().flatten())
-                .map(|bytes| fingerprint(&bytes))
+            part_name("word", &target).and_then(|p| {
+                let path = self.path;
+                self.prints
+                    .entry(p)
+                    .or_insert_with_key(|p| {
+                        optional_part(path, p)
+                            .ok()
+                            .flatten()
+                            .map(|bytes| fingerprint(&bytes))
+                    })
+                    .clone()
+            })
         };
         let label = described.filter(|d| !d.trim().is_empty());
         let shown = image_markdown(label.as_deref(), print.as_deref().or(Some(&name)));
@@ -627,9 +680,16 @@ impl Reader<'_> {
 
     /// A table as a Markdown pipe table with a cell for every column of every row; see the
     /// module notes for how merged cells are written. Text in a cell is on one line.
-    fn table(&mut self, tbl: &Element) -> String {
+    fn table(&mut self, tbl: &Element) -> Result<String> {
         let mut rows: Vec<Vec<String>> = Vec::new();
+        let (mut cells, mut size) = (0usize, 0usize);
+        let room = MAX_OUTPUT.saturating_sub(self.size);
         for tr in rows_of(tbl) {
+            check(self.cancel)?;
+            if cells >= MAX_TABLE_CELLS || size > room {
+                self.cut = true;
+                break;
+            }
             let mut row = Vec::new();
             let trpr = tr.child(W, "trPr");
             for _ in 0..trpr
@@ -640,6 +700,9 @@ impl Reader<'_> {
                 row.push(String::new());
             }
             for tc in cells_of(tr) {
+                if row.len() >= MAX_SHEET_COLUMNS {
+                    break;
+                }
                 let tcpr = tc.child(W, "tcPr");
                 let span = tcpr
                     .and_then(|p| p.number("gridSpan"))
@@ -668,9 +731,12 @@ impl Reader<'_> {
             {
                 row.push(String::new());
             }
+            row.truncate(MAX_SHEET_COLUMNS);
+            cells += row.len();
+            size += row.iter().map(String::len).sum::<usize>();
             rows.push(row);
         }
-        pipe_table(&rows)
+        Ok(pipe_table(&rows))
     }
 
     /// The text of a cell on one line: its paragraphs, list items and tables one after another.
@@ -693,17 +759,24 @@ impl Reader<'_> {
     }
 }
 
-/// The rows of a table, also those inside content controls.
+/// The rows of a table, also those inside content controls; never those of a table in a cell.
 fn rows_of(tbl: &Element) -> Vec<&Element> {
     let mut out = Vec::new();
-    for e in tbl.elements() {
-        if e.is(W, "tr") {
-            out.push(e);
-        } else if e.is(W, "sdt") || e.is(W, "customXml") {
-            out.extend(e.descendants().into_iter().filter(|d| d.is(W, "tr")));
+    rows_into(tbl, &mut out, 0);
+    out
+}
+
+fn rows_into<'e>(e: &'e Element, out: &mut Vec<&'e Element>, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    for c in e.elements() {
+        if c.is(W, "tr") {
+            out.push(c);
+        } else if c.is(W, "sdt") || c.is(W, "sdtContent") || c.is(W, "customXml") {
+            rows_into(c, out, depth + 1);
         }
     }
-    out
 }
 
 /// The cells of a row, also those inside content controls.
@@ -800,14 +873,23 @@ fn markdown(pieces: &[Piece], breaks: bool) -> String {
         }
     }
     flush(&mut out, &mut run);
+    // A line break inside a piece of text, as some files keep in their words, is a space too
+    // where breaks are not kept, so that it cannot split a table row or a heading.
     let mut text = out
         .split('\n')
         .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect::<Vec<_>>()
-        .join("\n");
-    while text.ends_with("\\") || text.ends_with('\n') {
-        text.pop();
+        .join(if breaks { "\n" } else { " " });
+    // A break at the end: the `\` of a hard break, not one of an escaped `\\`.
+    loop {
+        let backslashes = text.len() - text.trim_end_matches('\\').len();
+        if text.ends_with('\n') || backslashes % 2 == 1 {
+            text.pop();
+        } else {
+            break;
+        }
     }
+    text.truncate(text.trim_end().len());
     text
 }
 
@@ -834,12 +916,13 @@ fn formatted(f: Format, text: &str) -> String {
 }
 
 /// Rows of Markdown cells as a pipe table, every row as wide as the widest, the first row the
-/// header.
+/// header; the rows past [`MAX_TABLE_CELLS`] cells are left out.
 fn pipe_table(rows: &[Vec<String>]) -> String {
     let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
     if cols == 0 {
         return String::new();
     }
+    let rows = &rows[..rows.len().min(MAX_TABLE_CELLS / cols).max(1)];
     let line = |cells: &mut dyn Iterator<Item = &str>| {
         let mut s = String::from("|");
         for c in cells {
@@ -869,6 +952,8 @@ const DRAWINGML: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 /// The most rows and columns of a sheet shown as a table; a sheet larger than this is cut off.
 const MAX_SHEET_ROWS: usize = 100_000;
 const MAX_SHEET_COLUMNS: usize = 1_024;
+/// The most decimals a number format shows; a spreadsheet shows at most 30.
+const MAX_DECIMALS: usize = 30;
 
 /// The blocks of the workbook at `path`: for each sheet a heading, its cells as a table, with
 /// merged cells written as markers and numbers shown in their number formats, and the pictures
@@ -893,12 +978,15 @@ pub fn xlsx_blocks(path: &Path, cancel: Option<&AtomicBool>) -> Result<Vec<Block
     };
     let book = Book {
         path,
+        cancel,
         shared,
         formats,
         date1904,
+        prints: RefCell::default(),
     };
     let mut blocks = Vec::new();
     let mut size = 0;
+    let mut cut = false;
     let sheets = workbook
         .child(SHEET_NS, "sheets")
         .map(|s| s.elements().filter(|e| e.is(SHEET_NS, "sheet")).collect())
@@ -908,6 +996,10 @@ pub fn xlsx_blocks(path: &Path, cancel: Option<&AtomicBool>) -> Result<Vec<Block
     }
     for sheet in sheets {
         check(cancel)?;
+        if size > MAX_OUTPUT {
+            cut = true;
+            break;
+        }
         let name = sheet.attr("name").unwrap_or("");
         let Some(target) = sheet
             .attr("id")
@@ -920,32 +1012,33 @@ pub fn xlsx_blocks(path: &Path, cancel: Option<&AtomicBool>) -> Result<Vec<Block
             continue;
         };
         let heading = crate::i18n::trf("label.sheet", &[("name", name.to_string())]);
+        let root = parse(&xml, cancel)?;
+        let (table, table_cut) = book.table(&root, MAX_OUTPUT.saturating_sub(size))?;
+        cut |= table_cut;
         let mut add = |text: String| {
             size += text.len();
             blocks.push(Block { depth: 0, text });
         };
         add(format!("## {}", escape(heading.trim())));
-        let root = parse(&xml, cancel)?;
-        let table = book.table(&root);
         if !table.is_empty() {
             add(table);
         }
-        for picture in book.pictures(&root, &target) {
+        for picture in book.pictures(&root, &target)? {
             add(picture);
         }
-        if size > MAX_OUTPUT {
-            break;
-        }
     }
-    Ok(blocks)
+    Ok(with_cut_note(blocks, cut))
 }
 
 /// What the cells of every sheet of a workbook are read with.
 struct Book<'a> {
     path: &'a Path,
+    cancel: Option<&'a AtomicBool>,
     shared: Vec<String>,
     formats: NumberFormats,
     date1904: bool,
+    /// The fingerprint of each picture read, by part.
+    prints: RefCell<HashMap<String, Option<String>>>,
 }
 
 /// A cell reference such as `B12` as a row and column, counting from zero.
@@ -970,12 +1063,20 @@ fn cell_name(row: usize, col: usize) -> String {
 
 impl Book<'_> {
     /// A sheet's cells as a pipe table: every row from the first to the last that holds a value
-    /// or a merged cell, and every column likewise.
-    fn table(&self, root: &Element) -> String {
+    /// or a merged cell, and every column likewise, within [`MAX_TABLE_CELLS`] cells and
+    /// `room` bytes of text. Also says whether some of the sheet was left out to keep within
+    /// them.
+    fn table(&self, root: &Element, room: usize) -> Result<(String, bool)> {
         let mut cells: Vec<(usize, usize, String)> = Vec::new();
+        let (mut used, mut cut) = (0usize, false);
         if let Some(data) = root.child(SHEET_NS, "sheetData") {
             let mut next_row = 0usize;
             for row in data.elements().filter(|e| e.is(SHEET_NS, "row")) {
+                check(self.cancel)?;
+                if used > room {
+                    cut = true;
+                    break;
+                }
                 let r = row
                     .attr("r")
                     .and_then(|r| r.trim().parse::<usize>().ok())
@@ -994,6 +1095,7 @@ impl Book<'_> {
                     }
                     let text = self.value(c);
                     if !text.is_empty() {
+                        used += text.len() + 4;
                         cells.push((r, k, text));
                     }
                 }
@@ -1027,14 +1129,35 @@ impl Book<'_> {
             .map(|c| c.1)
             .chain(merges.iter().map(|m| m.1 .1))
             .max();
-        let (Some(rows), Some(cols)) = (rows, cols) else {
-            return String::new();
+        let (Some(mut rows), Some(cols)) = (rows, cols) else {
+            return Ok((String::new(), cut));
         };
+        // The rows past the most cells a table may have are left out, merged areas too.
+        let most = (MAX_TABLE_CELLS / (cols + 1)).saturating_sub(1);
+        if rows > most {
+            rows = most;
+            cut = true;
+        }
         let mut grid = vec![vec![String::new(); cols + 1]; rows + 1];
         for (r, k, text) in cells {
-            grid[r][k] = escape_cell(&escape(&text).replace('\n', " "));
+            if r <= rows {
+                grid[r][k] = escape_cell(&escape(&text).replace('\n', " "));
+            }
         }
+        // Overlapping merges could mark the grid many times over; past twice its cells, the
+        // rest are left unmarked.
+        let mut marked = 0usize;
         for ((r0, c0), (r1, c1)) in merges {
+            check(self.cancel)?;
+            if r0 > rows {
+                continue;
+            }
+            let r1 = r1.min(rows);
+            marked += (r1 - r0 + 1) * (c1 - c0 + 1);
+            if marked > 2 * MAX_TABLE_CELLS {
+                cut = true;
+                break;
+            }
             for (r, row) in grid.iter_mut().enumerate().take(r1 + 1).skip(r0) {
                 for (k, cell) in row.iter_mut().enumerate().take(c1 + 1).skip(c0) {
                     if (r, k) == (r0, c0) {
@@ -1044,7 +1167,7 @@ impl Book<'_> {
                 }
             }
         }
-        pipe_table(&collapse_blank_rows(grid))
+        Ok((pipe_table(&collapse_blank_rows(grid)), cut))
     }
 
     /// What a cell shows: its value, a shared or inline string, a truth value, an error, or a
@@ -1060,14 +1183,7 @@ impl Book<'_> {
                 .unwrap_or_default(),
             "inlineStr" => c
                 .child(SHEET_NS, "is")
-                .map(|is| {
-                    is.descendants()
-                        .into_iter()
-                        .filter(|e| e.is(SHEET_NS, "t"))
-                        .filter(|t| !is_phonetic(is, t))
-                        .map(own_text)
-                        .collect()
-                })
+                .map(inline_string)
                 .unwrap_or_default(),
             "b" => if v.trim() == "1" { "TRUE" } else { "FALSE" }.to_string(),
             "n" => {
@@ -1080,9 +1196,9 @@ impl Book<'_> {
 
     /// The pictures placed on the sheet `root` of the part `target`, each as its description,
     /// the cell its top left corner is in and a fingerprint of the picture.
-    fn pictures(&self, root: &Element, target: &str) -> Vec<String> {
+    fn pictures(&self, root: &Element, target: &str) -> Result<Vec<String>> {
         let Some(id) = root.child(SHEET_NS, "drawing").and_then(|d| d.attr("id")) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let (folder, file) = target.rsplit_once('/').unwrap_or(("", target));
         let rels = |folder: &str, file: &str| -> HashMap<String, String> {
@@ -1096,13 +1212,15 @@ impl Book<'_> {
             .get(id)
             .and_then(|t| part_name(folder, t))
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(xml) = optional_part(self.path, &drawing).ok().flatten() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        let Ok(tree) = parse(&xml, None) else {
-            return Vec::new();
+        check(self.cancel)?;
+        let Ok(tree) = parse(&xml, self.cancel) else {
+            check(self.cancel)?;
+            return Ok(Vec::new());
         };
         let (dfolder, dfile) = drawing.rsplit_once('/').unwrap_or(("", &drawing));
         let media = rels(dfolder, dfile);
@@ -1111,7 +1229,7 @@ impl Book<'_> {
             if !matches!(
                 anchor.name.as_str(),
                 "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor"
-            ) || anchor.ns != DRAWING
+            ) || &*anchor.ns != DRAWING
             {
                 continue;
             }
@@ -1127,6 +1245,7 @@ impl Book<'_> {
                 .into_iter()
                 .filter(|e| e.is(DRAWING, "pic"))
             {
+                check(self.cancel)?;
                 let described = pic
                     .descendants()
                     .into_iter()
@@ -1144,8 +1263,18 @@ impl Book<'_> {
                     .and_then(|b| b.attr("embed"))
                     .and_then(|id| media.get(id))
                     .and_then(|t| part_name(dfolder, t))
-                    .and_then(|p| optional_part(self.path, &p).ok().flatten())
-                    .map(|bytes| fingerprint(&bytes));
+                    .and_then(|p| {
+                        self.prints
+                            .borrow_mut()
+                            .entry(p)
+                            .or_insert_with_key(|p| {
+                                optional_part(self.path, p)
+                                    .ok()
+                                    .flatten()
+                                    .map(|bytes| fingerprint(&bytes))
+                            })
+                            .clone()
+                    });
                 let mut text = String::from("Image");
                 if let Some(d) = described {
                     text.push_str(": ");
@@ -1161,7 +1290,7 @@ impl Book<'_> {
                 out.push(format!("*{}*", escape(&text)));
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -1198,11 +1327,20 @@ fn collapse_blank_rows(grid: Vec<Vec<String>>) -> Vec<Vec<String>> {
     out
 }
 
-/// Whether the text `t` of an inline string `is` is the reading of its words rather than words.
-fn is_phonetic(is: &Element, t: &Element) -> bool {
-    is.elements()
-        .filter(|e| e.is(SHEET_NS, "rPh"))
-        .any(|r| r.descendants().into_iter().any(|d| std::ptr::eq(d, t)))
+/// The words of an inline string `is`: its own text and that of its runs, not the readings of
+/// its words (`rPh`).
+fn inline_string(is: &Element) -> String {
+    let mut out = String::new();
+    for e in is.elements() {
+        if e.is(SHEET_NS, "t") {
+            out.push_str(&own_text(e));
+        } else if e.is(SHEET_NS, "r") {
+            for t in e.elements().filter(|t| t.is(SHEET_NS, "t")) {
+                out.push_str(&own_text(t));
+            }
+        }
+    }
+    out
 }
 
 /// The number formats of `xl/styles.xml`, by cell style.
@@ -1370,6 +1508,7 @@ fn number_format(n: f64, code: &str, date1904: bool) -> Option<String> {
         let decimals = body[..e].split_once('.').map_or(0, |(_, d)| {
             d.chars().filter(|c| matches!(c, '0' | '#')).count()
         });
+        let decimals = decimals.min(MAX_DECIMALS);
         let s = format!("{value:.decimals$E}");
         let (mantissa, exponent) = s.split_once('E').unwrap_or((&s, "0"));
         let exponent: i32 = exponent.parse().unwrap_or(0);
@@ -1382,6 +1521,7 @@ fn number_format(n: f64, code: &str, date1904: bool) -> Option<String> {
         let decimals = body.split_once('.').map_or(0, |(_, d)| {
             d.chars().filter(|c| matches!(c, '0' | '#' | '?')).count()
         });
+        let decimals = decimals.min(MAX_DECIMALS);
         let grouped = body.split('.').next().unwrap_or("").contains(',');
         // Halves are rounded away from zero, as a spreadsheet rounds them.
         let scale = 10f64.powi(decimals.min(15) as i32);
@@ -1499,13 +1639,14 @@ pub fn pdf_blocks(path: &Path, cancel: Option<&AtomicBool>) -> Result<Vec<Block>
         cancel,
         blocks: Vec::new(),
         size: 0,
+        cut: false,
         sections: 0,
     };
     writer.block(&tree, 0, 0)?;
     if writer.blocks.is_empty() {
         bail!("the PDF file is tagged, but its structure holds no text");
     }
-    Ok(writer.blocks)
+    Ok(with_cut_note(writer.blocks, writer.cut))
 }
 
 /// What an element of a tagged file is read as.
@@ -1574,6 +1715,8 @@ struct Tagged<'a> {
     cancel: Option<&'a AtomicBool>,
     blocks: Vec<Block>,
     size: usize,
+    /// Whether some of the file was left out to keep within [`MAX_OUTPUT`].
+    cut: bool,
     /// How many sections the element being written is in.
     sections: usize,
 }
@@ -1722,7 +1865,11 @@ fn images_of(e: &pdf::Element, out: &mut Vec<String>, depth: usize) {
 
 impl Tagged<'_> {
     fn emit(&mut self, depth: usize, text: String) {
-        if text.trim().is_empty() || self.size > MAX_OUTPUT {
+        if text.trim().is_empty() {
+            return;
+        }
+        if self.size > MAX_OUTPUT {
+            self.cut = true;
             return;
         }
         self.size += text.len();
@@ -2258,5 +2405,72 @@ mod tests {
             blocks[2].text,
             format!("*Image: A photo at H3 ({})*", fingerprint(b"pixels"))
         );
+    }
+
+    #[test]
+    fn a_merge_over_a_whole_sheet_or_a_wide_word_row_stays_within_the_cell_limit() {
+        let sheet = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><mergeCells><mergeCell ref="A1:AMJ100000"/><mergeCell ref="A1:AMJ100000"/></mergeCells>"#;
+        let blocks = xlsx_blocks(xlsx(sheet, &[]).path(), None).unwrap();
+        let rows = blocks[1].text.lines().count();
+        let cols = blocks[1].text.lines().next().unwrap().matches(" |").count();
+        assert!(rows * cols <= MAX_TABLE_CELLS + 2 * cols, "{rows} x {cols}");
+        let note = escape(crate::i18n::tr("msg.extract_truncated").trim());
+        assert!(blocks.iter().any(|b| b.text.contains(note.as_str())));
+
+        let wide = "<w:tc><w:p/></w:tc>".repeat(5_000);
+        let narrow = format!("<w:tr><w:tc>{}</w:tc></w:tr>", p("x"));
+        let body = format!("<w:tbl><w:tr>{wide}</w:tr>{}</w:tbl>", narrow.repeat(3_000));
+        let table = &blocks_of_doc(&body)[0];
+        let cols = table.lines().next().unwrap().matches(" |").count();
+        assert_eq!(cols, MAX_SHEET_COLUMNS);
+        assert!(table.lines().count() * cols <= MAX_TABLE_CELLS + 2 * cols);
+    }
+
+    fn blocks_of_doc(body: &str) -> Vec<String> {
+        blocks(body, &[]).into_iter().map(|(_, t)| t).collect()
+    }
+
+    #[test]
+    fn rows_of_a_table_in_a_content_controlled_row_are_not_its_own() {
+        let inner = format!("<w:tbl><w:tr><w:tc>{}</w:tc></w:tr></w:tbl>", p("inner"));
+        let body = format!(
+            "<w:tbl><w:sdt><w:sdtContent><w:tr><w:tc>{}{inner}</w:tc></w:tr></w:sdtContent></w:sdt></w:tbl>",
+            p("outer")
+        );
+        let table = &blocks_of_doc(&body)[0];
+        assert_eq!(table.lines().count(), 2, "{table}");
+        assert!(table.contains("outer inner"), "{table}");
+    }
+
+    #[test]
+    fn line_breaks_in_words_and_escaped_backslashes_at_the_end_are_kept_apart() {
+        let cell = |t: &str| format!("<w:tc><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>");
+        let body = format!(
+            "<w:tbl><w:tr>{}{}</w:tr><w:tr>{}{}</w:tr></w:tbl>{}",
+            cell("a"),
+            cell("b"),
+            cell("one\ntwo"),
+            cell(r"C:\temp\"),
+            p(r"ends in C:\temp\"),
+        );
+        let got = blocks_of_doc(&body);
+        let cells = crate::core::web_markdown::table_cells(&got[0]).expect("still a table");
+        assert_eq!(cells[1][0], "one two");
+        assert!(cells[1][1].ends_with(r"temp\\"), "{:?}", cells[1][1]);
+        assert!(got[1].ends_with(r"temp\\"), "{}", got[1]);
+    }
+
+    #[test]
+    fn text_moved_elsewhere_is_read_once_where_it_went() {
+        let body = format!(
+            "<w:moveFrom w:id=\"1\">{}</w:moveFrom>{}<w:moveTo w:id=\"2\">{}</w:moveTo>",
+            p("moved"),
+            p("stays"),
+            p("moved")
+        );
+        let xml = format!(r#"<w:document {NS}><w:body>{body}</w:body></w:document>"#);
+        let text = super::super::docx(xml.as_bytes(), None).unwrap();
+        assert_eq!(text.matches("moved").count(), 1, "{text}");
+        assert!(text.contains("stays"));
     }
 }

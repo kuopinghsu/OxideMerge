@@ -2,8 +2,10 @@
 //! (`.oxjob`), and a job file run as `--job` runs it, with its results listed.
 //!
 //! Running goes through the same code as `--job`, so a job gives in the program what it gives on
-//! the command line. A job file that synchronizes folders runs only after it says which folders
-//! it changes and the user agrees, each time; that agreement stands for `--yes`.
+//! the command line. A job file that synchronizes folders, or writes outside its own folder, runs
+//! only after it says which folders it changes and which files it writes and the user agrees,
+//! each time; that agreement stands for `--yes`. What runs is the file as it was when the user
+//! agreed.
 
 use crate::config::Config;
 use crate::core::job::{Job, JobFile, JobKind};
@@ -11,7 +13,9 @@ use crate::i18n::{tr, trf};
 use crate::ui::widgets;
 use egui::{Key, RichText};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
 
 /// What the job saved from a folder comparison does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,18 +263,28 @@ impl SaveJob {
 }
 
 enum RunState {
-    /// The file changes folders: waiting for the user to agree.
+    /// The file changes folders or writes outside its folder: waiting for the user to agree.
     Confirm,
-    Running(Receiver<Result<crate::JobsReport, String>>),
+    Running(Receiver<crate::JobsReport>),
     Done(crate::JobsReport),
     Failed(String),
 }
 
 pub struct RunJob {
     pub path: PathBuf,
+    /// The folder of the job file, which its relative paths are in.
+    dir: PathBuf,
     file: Option<JobFile>,
+    /// The reports and patches it writes outside `dir`.
+    outside: Vec<PathBuf>,
     state: RunState,
+    stop: Arc<AtomicBool>,
 }
+
+/// The kinds of report a finished job offers to open; anything else could be a program.
+const OPENABLE: &[&str] = &[
+    "html", "htm", "pdf", "csv", "txt", "xml", "json", "diff", "patch",
+];
 
 /// What the run dialog asks of the app.
 #[derive(Debug, PartialEq, Eq)]
@@ -285,48 +299,62 @@ pub enum RunStep {
 }
 
 impl RunJob {
-    /// Reads the job file at `path`. A file that changes no folder can be started at once.
+    /// Reads the job file at `path`. A file that changes no folder and writes only inside its
+    /// own folder can be started at once.
     pub fn new(path: PathBuf) -> RunJob {
-        let read = std::fs::read(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()))
-            .and_then(|t| JobFile::parse(&t));
+        let dir = crate::job_dir(&path).unwrap_or_default();
+        let read = JobFile::read(&path);
+        let mut run = RunJob {
+            path,
+            dir,
+            file: None,
+            outside: Vec::new(),
+            state: RunState::Confirm,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
         match read {
-            Ok(file) => RunJob {
-                path,
-                file: Some(file),
-                state: RunState::Confirm,
-            },
-            Err(e) => RunJob {
-                state: RunState::Failed(format!("{}: {e}", path.display())),
-                path,
-                file: None,
-            },
+            Ok(file) => {
+                run.outside = file.outputs_outside(&run.dir);
+                run.file = Some(file);
+            }
+            Err(e) => run.state = RunState::Failed(format!("{}: {e}", run.path.display())),
         }
+        run
     }
 
     /// Whether running the file needs the user's agreement first.
     pub fn needs_confirmation(&self) -> bool {
         matches!(self.state, RunState::Confirm)
-            && self.file.as_ref().is_some_and(JobFile::changes_folders)
+            && (self.changes_folders() || !self.outside.is_empty())
+    }
+
+    /// Whether the file holds a job that synchronizes folders.
+    pub fn changes_folders(&self) -> bool {
+        self.file.as_ref().is_some_and(JobFile::changes_folders)
     }
 
     pub fn is_running(&self) -> bool {
         matches!(self.state, RunState::Running(_))
     }
 
-    /// Runs the file on another thread, from the settings `cfg`.
+    /// Runs the file as it was read, on another thread, from the settings `cfg`.
     pub fn start(&mut self, cfg: Config, yes: bool) {
-        if self.file.is_none() {
+        let Some(file) = self.file.clone() else {
             return;
-        }
+        };
         let (tx, rx) = std::sync::mpsc::channel();
-        let path = self.path.clone();
+        let dir = self.dir.clone();
+        self.stop = Arc::new(AtomicBool::new(false));
+        let stop = self.stop.clone();
         std::thread::spawn(move || {
-            let r = crate::job_summary(&path, yes, &cfg).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(r);
+            let _ = tx.send(crate::job_summary(&file, &dir, yes, &cfg, &stop));
         });
         self.state = RunState::Running(rx);
+    }
+
+    /// Stops a synchronization being applied, and the jobs after the one running.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 
     /// Picks up the result of a run, once there is one. Returns whether it just ended.
@@ -335,8 +363,7 @@ impl RunJob {
             return false;
         };
         self.state = match rx.try_recv() {
-            Ok(Ok(summary)) => RunState::Done(summary),
-            Ok(Err(e)) => RunState::Failed(e),
+            Ok(summary) => RunState::Done(summary),
             Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => RunState::Failed(tr("status.error").into()),
         };
@@ -367,11 +394,12 @@ impl RunJob {
                 (r.name.clone(), text, bad)
             })
             .collect();
-        rows.extend(
-            s.not_run
-                .iter()
-                .map(|n| (n.clone(), tr("job.not_run").into(), true)),
-        );
+        let why = if s.stopped {
+            tr("job.not_run_stopped")
+        } else {
+            tr("job.not_run")
+        };
+        rows.extend(s.not_run.iter().map(|n| (n.clone(), why.into(), true)));
         rows
     }
 
@@ -381,12 +409,7 @@ impl RunJob {
         }
         let mut step = None;
         let mut again = false;
-        let dir = self
-            .path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        let dir = std::path::absolute(&dir).unwrap_or(dir);
+        let dir = self.dir.clone();
         let modal = egui::Modal::new(egui::Id::unique("run_job_dialog")).show(ctx, |ui| {
             ui.set_min_width(520.0);
             ui.set_max_width(760.0);
@@ -399,12 +422,16 @@ impl RunJob {
             ui.add_space(6.0);
             match &self.state {
                 RunState::Confirm => {
-                    let file = self.file.as_ref();
-                    let syncs: Vec<&Job> = file
-                        .map(|f| f.jobs.iter().filter(|j| j.kind == JobKind::Sync).collect())
-                        .unwrap_or_default();
-                    ui.label(RichText::new(tr("job.confirm")).color(pal.warning).strong());
-                    for j in syncs {
+                    let syncs: Vec<(usize, &Job)> = self
+                        .file
+                        .iter()
+                        .flat_map(|f| f.jobs.iter().enumerate())
+                        .filter(|(_, j)| j.kind == JobKind::Sync)
+                        .collect();
+                    if !syncs.is_empty() {
+                        ui.label(RichText::new(tr("job.confirm")).color(pal.warning).strong());
+                    }
+                    for (i, j) in syncs {
                         let p = j.paths(&dir);
                         let at = |i: usize| {
                             p.get(i)
@@ -416,11 +443,28 @@ impl RunJob {
                         } else {
                             tr("job.mirror")
                         };
-                        ui.label(format!("• {}", j.label(0)));
+                        ui.label(format!("• {}", j.label(i)));
                         ui.label(
                             RichText::new(format!("   {mode}\n   {} → {}", at(0), at(1)))
                                 .monospace(),
                         );
+                        if j.allow_large_deletion {
+                            ui.label(
+                                RichText::new(format!("   {}", tr("job.confirm_large")))
+                                    .color(pal.danger),
+                            );
+                        }
+                    }
+                    if !self.outside.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(tr("job.confirm_outside"))
+                                .color(pal.warning)
+                                .strong(),
+                        );
+                        for p in &self.outside {
+                            ui.label(RichText::new(format!("• {}", p.display())).monospace());
+                        }
                     }
                     widgets::dialog_footer(ui, |ui| {
                         if widgets::primary_button(ui, tr("job.run_changes")).clicked() {
@@ -434,9 +478,22 @@ impl RunJob {
                     });
                 }
                 RunState::Running(_) => {
+                    let stopping = self.stop.load(Ordering::Relaxed);
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(tr("job.running"));
+                        ui.label(if stopping {
+                            tr("job.stopping")
+                        } else {
+                            tr("job.running")
+                        });
+                    });
+                    widgets::dialog_footer(ui, |ui| {
+                        if ui
+                            .add_enabled(!stopping, egui::Button::new(tr("btn.stop")))
+                            .clicked()
+                        {
+                            self.stop();
+                        }
                     });
                     ctx.request_repaint_after(std::time::Duration::from_millis(150));
                 }
@@ -472,8 +529,17 @@ impl RunJob {
                                 ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
                                 ui.horizontal(|ui| {
                                     let Some(job) = jobs.get(i) else { return };
-                                    if let Some(out) = job.output(&dir).filter(|o| o.is_file()) {
-                                        if ui.small_button(tr("job.open_output")).clicked() {
+                                    for out in job.outputs(&dir).into_iter().filter(|o| openable(o))
+                                    {
+                                        let name = out
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_default();
+                                        if ui
+                                            .small_button(tr("job.open_output"))
+                                            .on_hover_text(name)
+                                            .clicked()
+                                        {
                                             step = Some(RunStep::Open(out));
                                         }
                                     }
@@ -502,10 +568,9 @@ impl RunJob {
             }
         });
         if again {
-            // A file that changes folders asks again before every run.
-            if self.file.as_ref().is_some_and(JobFile::changes_folders) {
-                self.state = RunState::Confirm;
-            } else {
+            // Read again, and ask again before every run of a file that needs agreement.
+            *self = RunJob::new(self.path.clone());
+            if matches!(self.state, RunState::Confirm) && !self.needs_confirmation() {
                 step = Some(RunStep::Start { yes: false });
             }
         }
@@ -514,6 +579,13 @@ impl RunJob {
         }
         step
     }
+}
+
+/// Whether a job's output is a report file to open: a plain file of a report type, not a link.
+fn openable(path: &Path) -> bool {
+    let ext = crate::core::text::extension(path);
+    OPENABLE.contains(&ext.as_str())
+        && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
 }
 
 /// How a job ended, in words, and whether that is a problem.
@@ -672,6 +744,60 @@ mod tests {
         assert!(!run.needs_confirmation());
         assert_eq!(run.exit_code(), Some(2));
         assert!(matches!(&run.state, RunState::Failed(e) if e.contains("newer")));
+    }
+
+    #[test]
+    fn a_job_writing_outside_its_folder_asks_and_runs_the_file_as_agreed() {
+        let (dir, l, r) = folders();
+        let jobs = dir.path().join("jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        let file = jobs.join("out.oxjob");
+        let text = |report: &str| {
+            format!(
+                r#"{{"version": 1, "jobs": [{{"left": {}, "right": {}, "report": "{report}"}}]}}"#,
+                serde_json::to_string(&l).unwrap(),
+                serde_json::to_string(&r).unwrap()
+            )
+        };
+        std::fs::write(&file, text("../outside.html")).unwrap();
+        let mut agreed = RunJob::new(file.clone());
+        assert!(agreed.needs_confirmation(), "it writes outside its folder");
+        assert!(!agreed.changes_folders());
+        // Changed after the user saw it: the run is of what was shown.
+        std::fs::write(&file, text("../elsewhere.html")).unwrap();
+        agreed.start(Config::default(), true);
+        while agreed.is_running() {
+            agreed.poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(agreed.exit_code(), Some(1), "{:?}", agreed.results());
+        assert!(dir.path().join("outside.html").is_file());
+        assert!(!dir.path().join("elsewhere.html").exists());
+
+        // Without agreement, nothing is written outside.
+        std::fs::remove_file(dir.path().join("outside.html")).unwrap();
+        std::fs::write(&file, text("../outside.html")).unwrap();
+        let refused = run(&file, false);
+        assert_eq!(refused.exit_code(), Some(2));
+        assert!(!dir.path().join("outside.html").exists());
+    }
+
+    #[test]
+    fn only_plain_report_files_are_offered_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["r.html", "r.command", "r.app"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        assert!(openable(&dir.path().join("r.html")));
+        assert!(!openable(&dir.path().join("r.command")));
+        assert!(!openable(&dir.path().join("r.app")));
+        assert!(!openable(&dir.path().join("missing.html")));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path().join("r.command"), dir.path().join("l.html"))
+                .unwrap();
+            assert!(!openable(&dir.path().join("l.html")));
+        }
     }
 
     #[test]

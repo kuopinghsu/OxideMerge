@@ -1,6 +1,7 @@
 //! Folder compare view.
 
 use crate::config::Config;
+use crate::core::archive;
 use crate::core::diff::DiffOptions;
 use crate::core::filter::{FileFilter, FltFilter};
 use crate::core::folder::{self, CmpStatus, DirItem, FolderOptions, Progress, Scanner};
@@ -385,6 +386,13 @@ pub struct FolderView {
     sync: Option<Box<SyncDialog>>,
     /// Sides nothing may be copied to or deleted from, such as an extracted Git revision.
     pub read_only: Vec<bool>,
+    /// For a side that is a genuine archive extracted to compare, its archive file; edits
+    /// made to it are repacked back into this file on save. `None` for every other side,
+    /// such as a plain folder or an archive shown read-only (a review snapshot, a web tree).
+    archive_sources: Vec<Option<PathBuf>>,
+    /// Whether each archive side in `archive_sources` has been edited since it was last
+    /// repacked (or opened, if never).
+    archive_dirty: Vec<bool>,
     /// Compare rules file used (a name or path, "" = none); read again on every refresh.
     pub rules: String,
     /// Whether `rules` named a file that could be read the last time it was applied.
@@ -696,11 +704,30 @@ impl FolderView {
         cfg: &Config,
         snapshot_options: Option<DiffOptions>,
     ) -> Self {
-        // Extracted archives are copies: changes to them would be lost.
-        let read_only = roots
+        // A side extracted from a real archive to compare it can be edited and repacked;
+        // any other extracted copy (a review snapshot, a web page tree, ...) is read-only,
+        // as changes to it would otherwise be lost.
+        let temp_backed: Vec<bool> = roots
             .iter()
             .map(|r| temps.iter().any(|t| r.starts_with(t.path())))
             .collect();
+        let archive_sources: Vec<Option<PathBuf>> = temp_backed
+            .iter()
+            .zip(&display_roots)
+            .map(|(&backed, disp)| {
+                if !backed {
+                    return None;
+                }
+                let p = PathBuf::from(disp);
+                (archive::is_archive(&p) && p.is_file()).then_some(p)
+            })
+            .collect();
+        let read_only: Vec<bool> = temp_backed
+            .iter()
+            .zip(&archive_sources)
+            .map(|(&backed, src)| backed && src.is_none())
+            .collect();
+        let archive_dirty = vec![false; archive_sources.len()];
         let mut v = FolderView {
             drawer_open: false,
             drawer_tab: FolderPanel::Review,
@@ -760,6 +787,8 @@ impl FolderView {
             merge_stop: None,
             sync: None,
             read_only: Vec::new(),
+            archive_sources: Vec::new(),
+            archive_dirty: Vec::new(),
             rules: cfg.rules.clone(),
             rules_found: false,
             rule_names: Vec::new(),
@@ -771,6 +800,8 @@ impl FolderView {
             id: egui::Id::unique(("folderview", std::time::Instant::now())),
         };
         v.read_only = read_only;
+        v.archive_sources = archive_sources;
+        v.archive_dirty = archive_dirty;
         v.set_rules(cfg, cfg.rules.clone());
         v.start_compare();
         v
@@ -799,6 +830,11 @@ impl FolderView {
         view.workspace = manifest.workspace;
         view.peek = false;
         view.read_only = vec![true; view.n()];
+        // A review is a frozen snapshot: never write edits back into an archive from here,
+        // even if its labels happen to match one (`archive_sources` is normally derived
+        // from a real extraction's display labels, see `with_snapshot`).
+        view.archive_sources = vec![None; view.n()];
+        view.archive_dirty = vec![false; view.n()];
         view
     }
 
@@ -933,13 +969,7 @@ impl FolderView {
     pub fn as_job(&self, cfg: &Config) -> crate::core::job::Job {
         use crate::core::diff::WhitespaceMode;
         use crate::core::folder::CompareMethod;
-        // An archive is compared through a copy; the job names the archive itself.
-        let path = |i: usize| -> String {
-            match self.display_roots.get(i) {
-                Some(d) if Path::new(d).exists() => d.clone(),
-                _ => self.roots[i].display().to_string(),
-            }
-        };
+        let path = |i: usize| self.roots[i].display().to_string();
         let n = self.roots.len();
         let d = cfg.comparison_options();
         let method = match self.fopts.method {
@@ -958,7 +988,8 @@ impl FolderView {
             filter: Some(self.filter_spec.trim().to_string()).filter(|f| !f.is_empty()),
             method: Some(method.into()),
             structured: self.fopts.structured,
-            rules: Some(self.rules.clone()).filter(|r| !r.trim().is_empty()),
+            // "" compares without rules, as this tab does, rather than with those selected later.
+            rules: Some(self.used_rules().to_string()),
             whitespace: match d.whitespace {
                 WhitespaceMode::Compare => None,
                 WhitespaceMode::IgnoreChange => Some("change".into()),
@@ -1087,6 +1118,47 @@ impl FolderView {
     /// Extracted archives the compared folders are in.
     pub fn temps(&self) -> &[std::sync::Arc<tempfile::TempDir>] {
         &self.temps
+    }
+
+    /// Whether a side is an archive extracted to compare, rather than a plain folder.
+    pub fn is_archive_side(&self, s: usize) -> bool {
+        self.archive_sources.get(s).is_some_and(Option::is_some)
+    }
+
+    /// The archive file side `s` is repacked into when saved, if it is an archive side.
+    pub fn archive_source(&self, s: usize) -> Option<&Path> {
+        self.archive_sources.get(s)?.as_deref()
+    }
+
+    /// Marks the archive side `s` as having unpacked edits pending, so a save repacks it.
+    /// Does nothing if `s` is not an archive side (see [`Self::is_archive_side`]).
+    pub fn mark_archive_dirty(&mut self, s: usize) {
+        if let Some(dirty) = self.archive_dirty.get_mut(s) {
+            *dirty = true;
+        }
+    }
+
+    /// Whether any archive side has edits not yet written back into its archive file.
+    pub fn has_archive_changes(&self) -> bool {
+        self.archive_dirty.iter().any(|&d| d)
+    }
+
+    /// Repacks every archive side with pending edits back into its archive file.
+    pub fn save_archives(&mut self) -> anyhow::Result<()> {
+        for s in 0..self.archive_sources.len() {
+            if !self.archive_dirty[s] {
+                continue;
+            }
+            let Some(src) = &self.archive_sources[s] else {
+                // Not an archive side (or it stopped being one on a later refresh): there is
+                // nothing to repack it into, so the flag was a mistake and is cleared here.
+                self.archive_dirty[s] = false;
+                continue;
+            };
+            archive::repack(src, &self.roots[s])?;
+            self.archive_dirty[s] = false;
+        }
+        Ok(())
     }
 
     pub fn is_running(&self) -> bool {
@@ -1845,6 +1917,18 @@ impl FolderView {
             match r {
                 Ok(()) => done += 1,
                 Err(e) => errors.push(format!("{}: {e}", it.rel_path())),
+            }
+        }
+        if done > 0 {
+            let touched: Vec<usize> = match op.kind {
+                OpKind::Copy { to, .. } => vec![to],
+                OpKind::Delete { side: Some(s) } => vec![s],
+                OpKind::Delete { side: None } => (0..self.n()).collect(),
+            };
+            for s in touched {
+                if self.archive_sources.get(s).is_some_and(Option::is_some) {
+                    self.archive_dirty[s] = true;
+                }
             }
         }
         self.status = trf("msg.op_done", &[("n", done.to_string())]);
@@ -2766,7 +2850,7 @@ impl FolderView {
                 .summary(items.iter().filter(|i| !i.is_dir).map(|i| i.rel_path()));
             let json = serde_json::to_string_pretty(&summary).unwrap_or_default();
             sections.push(Section {
-                title: "Review workspace".into(),
+                title: tr("workspace.title").into(),
                 lines: json.lines().map(str::to_owned).collect(),
                 mono: true,
             });
@@ -4725,6 +4809,57 @@ mod tests {
         assert_eq!(src.read_only, [false, true]);
         assert_eq!(src.items.len(), 1);
         assert!(!src.stopped);
+    }
+
+    #[test]
+    fn archive_sides_are_writable_and_save_repacks_them() {
+        use std::io::Write;
+        let cfg = Config::default();
+        let left = tempfile::tempdir().unwrap();
+        std::fs::write(left.path().join("a.txt"), "x\n").unwrap();
+
+        let work = tempfile::tempdir().unwrap();
+        let zip_path = work.path().join("right.zip");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        zw.start_file("a.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(b"y\n").unwrap();
+        zw.finish().unwrap();
+
+        let extracted = archive::extract_to_temp(&zip_path).unwrap();
+        let roots = vec![left.path().to_path_buf(), extracted.path().to_path_buf()];
+        let display = vec![
+            left.path().display().to_string(),
+            zip_path.display().to_string(),
+        ];
+        let mut v = FolderView::new(roots, display, vec![extracted], "", &[], &cfg);
+        let wait = |v: &mut FolderView| {
+            while v.running.is_some() {
+                std::thread::sleep(Duration::from_millis(10));
+                v.poll();
+            }
+        };
+        wait(&mut v);
+
+        // Unlike a non-archive extracted copy, this side is writable, and the real archive
+        // file is tracked as its save target.
+        assert_eq!(v.read_only, [false, false]);
+        assert!(!v.is_archive_side(0));
+        assert!(v.is_archive_side(1));
+        assert!(!v.has_archive_changes());
+
+        // Edit the extracted copy directly, as saving a file tab opened from it would.
+        std::fs::write(v.roots[1].join("a.txt"), "edited\n").unwrap();
+        v.mark_archive_dirty(1);
+        assert!(v.has_archive_changes());
+        v.save_archives().unwrap();
+        assert!(!v.has_archive_changes());
+
+        let after = archive::extract_to_temp(&zip_path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(after.path().join("a.txt")).unwrap(),
+            "edited\n"
+        );
     }
 
     #[test]

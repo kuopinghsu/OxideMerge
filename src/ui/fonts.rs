@@ -23,6 +23,43 @@ const UNIX_HANGUL: &[&str] = &[
     "/System/Library/Fonts/AppleSDGothicNeo.ttc",
 ];
 
+/// Fonts for the scripts a PDF report may need beyond the fallbacks of [`fallbacks`]: Windows
+/// files, Unix paths and a fontconfig language for Hebrew, Arabic (with its presentation forms)
+/// and Thai.
+const DOCUMENT_SCRIPTS: &[(&[&str], &[&str], &str)] = &[
+    (
+        &["segoeui.ttf", "tahoma.ttf"],
+        &[
+            "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSansHebrew-Regular.ttf",
+            "/System/Library/Fonts/SFHebrew.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ],
+        "he",
+    ),
+    (
+        &["segoeui.ttf", "tahoma.ttf"],
+        &[
+            "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/System/Library/Fonts/GeezaPro.ttc",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ],
+        "ar",
+    ),
+    (
+        &["leelawui.ttf", "tahoma.ttf"],
+        &[
+            "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSansThai-Regular.ttf",
+            "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
+            "/System/Library/Fonts/Supplemental/Tahoma.ttf",
+        ],
+        "th",
+    ),
+];
+
 const UI_FONTS: &[&str] = &[
     "C:\\Windows\\Fonts\\segoeui.ttf",
     "/System/Library/Fonts/SFNS.ttf",
@@ -374,9 +411,9 @@ pub fn setup(ctx: &egui::Context, lang: &str) {
     ctx.set_fonts(fonts);
 }
 
-/// The fonts a PDF report embeds: the code and UI fonts, then the fallbacks of [`fallbacks`], and
-/// last the fonts built into the program, so that every report has a font for Latin text even
-/// where none is installed.
+/// The fonts a PDF report embeds: the code and UI fonts, then the fallbacks of [`fallbacks`] and
+/// fonts for Hebrew, Arabic and Thai that allow embedding, and last the fonts built into the
+/// program, so that every report has a font for Latin text even where none is installed.
 pub fn document_fonts(lang: &str) -> crate::core::pdf_report::Fonts {
     use crate::core::pdf_report::FontFile;
     let file = |bytes: Vec<u8>, index: u32| FontFile {
@@ -386,10 +423,29 @@ pub fn document_fonts(lang: &str) -> crate::core::pdf_report::Fonts {
     let first = |paths: &[&str]| {
         first_font(paths.iter().map(|s| s.to_string())).map(|(_, bytes)| file(bytes, 0))
     };
-    let rest: Vec<FontFile> = fallbacks(lang)
+    let mut rest: Vec<FontFile> = fallbacks(lang)
         .into_iter()
         .map(|f| file(f.bytes, f.index))
         .collect();
+    let mut seen = std::collections::HashSet::new();
+    for &(win, unix, fc) in DOCUMENT_SCRIPTS {
+        let paths = system_fonts(
+            win.to_vec(),
+            unix.iter().copied().map(str::to_string).collect(),
+            vec![fc],
+        );
+        let embeddable = paths.into_iter().find_map(|path| {
+            let bytes = std::fs::read(&path).ok()?;
+            let face = ttf_parser::Face::parse(&bytes, 0).ok()?;
+            (face.permissions() != Some(ttf_parser::Permissions::Restricted))
+                .then_some((path, bytes))
+        });
+        if let Some((path, bytes)) = embeddable {
+            if seen.insert(path) {
+                rest.push(file(bytes, 0));
+            }
+        }
+    }
     let built_in = FontDefinitions::default();
     let builtin = |name: &str| {
         built_in.font_data.get(name).map(|d| FontFile {
@@ -397,16 +453,19 @@ pub fn document_fonts(lang: &str) -> crate::core::pdf_report::Fonts {
             index: d.index,
         })
     };
-    let chain = |primary: Option<FontFile>, last: &str| -> Vec<FontFile> {
+    let chain = |primary: Option<FontFile>, last: &[&str]| -> Vec<FontFile> {
         primary
             .into_iter()
             .chain(rest.iter().cloned())
-            .chain(builtin(last))
+            .chain(last.iter().filter_map(|name| builtin(name)))
             .collect()
     };
     crate::core::pdf_report::Fonts {
-        mono: chain(first(MONO_FONTS), "Hack"),
-        sans: chain(first(UI_FONTS), "Ubuntu-Light"),
+        mono: chain(
+            first(MONO_FONTS),
+            &["Hack", "Ubuntu-Light", "NotoEmoji-Regular"],
+        ),
+        sans: chain(first(UI_FONTS), &["Ubuntu-Light", "NotoEmoji-Regular"]),
     }
 }
 

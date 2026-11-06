@@ -27,7 +27,7 @@ use krilla::outline::{Outline, OutlineNode};
 use krilla::page::PageSettings;
 use krilla::paint::{Fill, FillRule, Stroke};
 use krilla::surface::Surface;
-use krilla::text::{Font, TextDirection};
+use krilla::text::{Font, GlyphId, KrillaGlyph};
 use krilla::Document;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -106,9 +106,27 @@ impl Default for PdfOptions {
     }
 }
 
-/// Rows of compared lines in one report, all files together; the differences after them are only
-/// counted. A page holds about 50 rows, so this is some 2,000 pages.
-const REPORT_ROWS: usize = 100_000;
+/// Drawn lines of compared text in one report, all files together, a wrapped line counting
+/// once for each line it takes; the differences after them are only counted. A page holds
+/// about 50, so this is some 400 pages.
+const REPORT_LINES: usize = 20_000;
+/// Unchanged rows kept above a change when its difference is cut: the rows above them are
+/// left out first, so the change itself is always drawn.
+const LEAD_ROWS: usize = 100;
+
+#[cfg(test)]
+thread_local! {
+    /// The lines of compared text the reports of a test may draw.
+    static LINES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn report_lines() -> usize {
+    #[cfg(test)]
+    if let Some(n) = LINES.with(|l| l.get()) {
+        return n;
+    }
+    REPORT_LINES
+}
 const MARGIN: f32 = 36.0;
 /// Where the footer's "OxideMerge" links to.
 pub const HOME_URL: &str = env!("CARGO_PKG_REPOSITORY");
@@ -152,22 +170,28 @@ struct Palette {
 
 impl Palette {
     fn new(color_blind: bool) -> Palette {
-        let (add, del) = if color_blind {
+        // Color-blind: blue and orange, changes in purple and conflicts in yellow, as the
+        // program's own color-blind colors.
+        let (add, del, chg, conf) = if color_blind {
             (
                 ((0xe3, 0xf0, 0xfa), (0xa8, 0xd0, 0xee), (0x00, 0x72, 0xb2)),
                 ((0xfd, 0xee, 0xdd), (0xf5, 0xc4, 0x8a), (0xd5, 0x5e, 0x00)),
+                ((0xeb, 0xdd, 0xf9), (0xd3, 0xc0, 0xf0), (0x7b, 0x5b, 0xc4)),
+                ((0xfa, 0xf5, 0xc4), (0xf0, 0xe4, 0x42), (0xa8, 0x92, 0x00)),
             )
         } else {
             (
                 ((0xe7, 0xf7, 0xed), (0xa9, 0xe5, 0xbf), (0x16, 0xa3, 0x4a)),
                 ((0xfd, 0xec, 0xee), (0xf5, 0xb8, 0xc1), (0xdc, 0x26, 0x26)),
+                ((0xff, 0xf5, 0xdc), (0xf6, 0xd9, 0x8a), (0xb4, 0x6a, 0x00)),
+                ((0xff, 0xe0, 0xe0), (0xf5, 0xa0, 0xa0), (0xb9, 0x1c, 0x1c)),
             )
         };
         Palette {
             add,
             del,
-            chg: ((0xff, 0xf5, 0xdc), (0xf6, 0xd9, 0x8a), (0xb4, 0x6a, 0x00)),
-            conf: ((0xff, 0xe0, 0xe0), (0xf5, 0xa0, 0xa0), (0xb9, 0x1c, 0x1c)),
+            chg,
+            conf,
             ign: ((0xee, 0xf0, 0xfb), (0xd8, 0xdc, 0xf5), (0x5b, 0x6c, 0xff)),
         }
     }
@@ -193,16 +217,19 @@ enum Family {
     Sans = 1,
 }
 
-/// The font drawing a character, its advance in ems and the character drawn.
-type Glyph = (usize, f32, char);
+/// The font drawing a character, its advance in ems, the character drawn and its glyph in
+/// that font.
+type Glyph = (usize, f32, char, u16);
 
 /// The fonts of a report, parsed, with the width of each character found once.
 struct Faces<'a> {
     parsed: [Vec<ttf_parser::Face<'a>>; 2],
     fonts: [Vec<Font>; 2],
-    /// For each family and character: the font drawing it, its advance in ems and the character
-    /// drawn, `?` for one no font has.
+    /// For each family and character: the font drawing it, its advance in ems, the character
+    /// drawn (`?` for one no font has) and its glyph.
     cache: RefCell<HashMap<(Family, char), Glyph>>,
+    /// The characters no font has, drawn as `?`.
+    missing: RefCell<std::collections::BTreeSet<char>>,
 }
 
 impl<'a> Faces<'a> {
@@ -226,12 +253,13 @@ impl<'a> Faces<'a> {
         let (mono, mono_fonts) = load(&fonts.mono);
         let (sans, sans_fonts) = load(&fonts.sans);
         if mono.is_empty() || sans.is_empty() {
-            return Err("no font could be read for the PDF report".into());
+            return Err(tr("report.err_no_font").to_string());
         }
         Ok(Faces {
             parsed: [mono, sans],
             fonts: [mono_fonts, sans_fonts],
             cache: RefCell::new(HashMap::new()),
+            missing: RefCell::default(),
         })
     }
 
@@ -246,10 +274,14 @@ impl<'a> Faces<'a> {
             faces.iter().enumerate().find_map(|(i, f)| {
                 let g = f.glyph_index(c)?;
                 let adv = f.glyph_hor_advance(g)? as f32 / f.units_per_em() as f32;
-                Some((i, adv, c))
+                Some((i, adv, c, g.0))
             })
         };
-        let found = find(c).or_else(|| find('?')).unwrap_or((0, 0.5, '?'));
+        let found = find(c).or_else(|| {
+            self.missing.borrow_mut().insert(c);
+            find('?')
+        });
+        let found = found.unwrap_or((0, 0.5, '?', 0));
         self.cache.borrow_mut().insert((family, c), found);
         found
     }
@@ -257,6 +289,181 @@ impl<'a> Faces<'a> {
     fn width(&self, family: Family, size: f32, text: &str) -> f32 {
         text.chars().map(|c| self.glyph(family, c).1).sum::<f32>() * size
     }
+
+    /// Whether a font of `family` draws `c`.
+    fn has(&self, family: Family, c: char) -> bool {
+        self.parsed[family as usize]
+            .iter()
+            .any(|f| f.glyph_index(c).is_some())
+    }
+
+    /// `chars` in the order they are drawn from left to right, Arabic letters in their joined
+    /// forms where a font has them.
+    fn shown(&self, family: Family, chars: &[char]) -> Vec<(usize, char)> {
+        if !chars.iter().any(|&c| is_rtl(c)) {
+            return chars.iter().copied().enumerate().collect();
+        }
+        let forms = arabic_forms(chars, |c| self.has(family, c));
+        visual_order(chars)
+            .into_iter()
+            .map(|(k, mirrored)| (k, if mirrored { mirror(forms[k]) } else { forms[k] }))
+            .collect()
+    }
+}
+
+// ---------- right-to-left text ----------
+
+/// Whether `c` is written right to left: Hebrew, Arabic, Syriac, Thaana and N'Ko letters and
+/// marks and their presentation forms.
+fn is_rtl(c: char) -> bool {
+    matches!(c, '\u{0590}'..='\u{08FF}' | '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFC}')
+        && !is_number(c)
+}
+
+fn is_number(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c, '\u{0660}'..='\u{0669}' | '\u{06F0}'..='\u{06F9}')
+}
+
+fn is_ltr(c: char) -> bool {
+    c.is_alphabetic() && !is_rtl(c)
+}
+
+fn mirror(c: char) -> char {
+    match c {
+        '(' => ')',
+        ')' => '(',
+        '[' => ']',
+        ']' => '[',
+        '{' => '}',
+        '}' => '{',
+        '<' => '>',
+        '>' => '<',
+        '«' => '»',
+        '»' => '«',
+        _ => c,
+    }
+}
+
+/// The order in which the characters of a left-to-right line are drawn, each with whether it
+/// is mirrored: a simplified Unicode bidirectional algorithm. A run from a right-to-left
+/// character to the last right-to-left character or number before the next left-to-right
+/// letter is reversed, its brackets mirrored, and the numbers in it still read left to right.
+fn visual_order(chars: &[char]) -> Vec<(usize, bool)> {
+    let mut order: Vec<(usize, bool)> = (0..chars.len()).map(|k| (k, false)).collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if !is_rtl(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let mut end = i + 1;
+        let mut k = end;
+        while k < chars.len() && !is_ltr(chars[k]) {
+            if is_rtl(chars[k]) || is_number(chars[k]) {
+                end = k + 1;
+            }
+            k += 1;
+        }
+        // A bracket opened in the run around right-to-left text or a number closes in it.
+        let mut open: Vec<usize> = Vec::new();
+        for p in i..k {
+            match chars[p] {
+                '(' | '[' | '{' => open.push(p),
+                ')' | ']' | '}' => {
+                    let Some(at) = open.iter().rposition(|&o| mirror(chars[o]) == chars[p]) else {
+                        continue;
+                    };
+                    let o = open[at];
+                    open.truncate(at);
+                    if p >= end && chars[o + 1..p].iter().any(|&c| is_rtl(c) || is_number(c)) {
+                        end = p + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        order[i..end].reverse();
+        let mut j = i;
+        while j < end {
+            let c = chars[order[j].0];
+            if !is_number(c) {
+                order[j].1 = c != mirror(c);
+                j += 1;
+                continue;
+            }
+            // Reversed, a number's digits and the single separators between them run from
+            // its last digit back; they go back in reading order.
+            let mut e = j + 1;
+            while e < end {
+                let c = chars[order[e].0];
+                let joins = matches!(c, '.' | ',' | ':' | '/')
+                    && e + 1 < end
+                    && is_number(chars[order[e + 1].0]);
+                if !is_number(c) && !joins {
+                    break;
+                }
+                e += 1;
+            }
+            order[j..e].reverse();
+            j = e;
+        }
+        i = end;
+    }
+    order
+}
+
+/// How an Arabic letter joins: `None` for one that is not in the Arabic presentation forms,
+/// else whether it joins the letter after it too, with its isolated presentation form; the
+/// final, initial and medial forms follow that one.
+fn arabic_joining(c: char) -> Option<(bool, u32)> {
+    // From U+0621: U for hamza (no joining), R for a letter joining only the one before it,
+    // D for one joining both sides, and x for one not in the presentation forms.
+    const TYPES: &[u8] = b"URRRRDRDRDDDDDRRRRDDDDDDDDxxxxxxDDDDDDDRRD";
+    let i = (c as u32).checked_sub(0x0621)? as usize;
+    let mut form = 0xFE80;
+    for (k, &t) in TYPES.iter().enumerate() {
+        let forms = match t {
+            b'U' => 1,
+            b'R' => 2,
+            b'D' => 4,
+            _ => 0,
+        };
+        if k == i {
+            return (forms > 1).then_some((t == b'D', form));
+        }
+        form += forms;
+    }
+    None
+}
+
+/// `chars` with each Arabic letter in its isolated, final, initial or medial presentation
+/// form, as it joins its neighbors, where `has` the form; marks between letters are passed
+/// over.
+fn arabic_forms(chars: &[char], has: impl Fn(char) -> bool) -> Vec<char> {
+    let transparent =
+        |c: char| matches!(c, '\u{064B}'..='\u{065F}' | '\u{0670}' | '\u{06D6}'..='\u{06ED}');
+    let joins_after = |c: char| c == '\u{0640}' || arabic_joining(c).is_some_and(|j| j.0);
+    let joins_before = |c: char| c == '\u{0640}' || arabic_joining(c).is_some();
+    let mut out = chars.to_vec();
+    for (k, &c) in chars.iter().enumerate() {
+        let Some((dual, isolated)) = arabic_joining(c) else {
+            continue;
+        };
+        let before = chars[..k].iter().rev().find(|&&p| !transparent(p));
+        let after = chars[k + 1..].iter().find(|&&n| !transparent(n));
+        let prev = before.is_some_and(|&p| joins_after(p));
+        let next = dual && after.is_some_and(|&n| joins_before(n));
+        let offset = match (prev, next) {
+            (false, false) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (true, true) => 3,
+        };
+        if let Some(form) = char::from_u32(isolated + offset).filter(|&f| has(f)) {
+            out[k] = form;
+        }
+    }
+    out
 }
 
 /// A character of a compared line and whether it is part of a change.
@@ -336,6 +543,12 @@ struct Writer<'a> {
     /// The bookmark level of a difference: 0 in a text report, 1 under its file in a folder
     /// report.
     diff_level: u8,
+    /// Lines of compared text still to draw; see [`REPORT_LINES`].
+    lines_left: usize,
+    /// Whether the differences are drawn in one column.
+    unified: bool,
+    /// The page the column names of the difference being drawn were last drawn on.
+    labeled: usize,
 }
 
 impl<'a> Writer<'a> {
@@ -359,6 +572,9 @@ impl<'a> Writer<'a> {
             palette: Palette::new(opts.color_blind),
             title: title.to_owned(),
             diff_level: 0,
+            lines_left: report_lines(),
+            unified: false,
+            labeled: 0,
         };
         wr.new_page();
         Ok(wr)
@@ -410,13 +626,29 @@ impl<'a> Writer<'a> {
     }
 
     fn text(&mut self, x: f32, y: f32, size: f32, family: Family, text: &str, color: Color) {
+        let text = self.shown_text(family, text);
+        self.put_text(x, y, size, family, text, color);
+    }
+
+    /// `text` in the order its characters are drawn.
+    fn shown_text(&self, family: Family, text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        self.faces
+            .shown(family, &chars)
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect()
+    }
+
+    /// `text`, already in the order it is drawn.
+    fn put_text(&mut self, x: f32, y: f32, size: f32, family: Family, text: String, color: Color) {
         if !text.is_empty() {
             self.op(Op::Text {
                 x,
                 y,
                 size,
                 family,
-                text: text.to_owned(),
+                text,
                 color,
             });
         }
@@ -473,6 +705,65 @@ impl<'a> Writer<'a> {
 
     fn gap(&mut self, h: f32) {
         self.y += h;
+    }
+
+    /// `text`, its start cut with `…` when it is wider than `width`.
+    fn fit(&self, family: Family, size: f32, text: &str, width: f32) -> String {
+        if self.faces.width(family, size, text) <= width {
+            return text.to_owned();
+        }
+        let room = width - self.faces.width(family, size, "…");
+        let mut w = 0.0;
+        let mut tail: Vec<char> = Vec::new();
+        for c in text.chars().rev() {
+            w += self.faces.glyph(family, c).1 * size;
+            if w > room {
+                break;
+            }
+            tail.push(c);
+        }
+        std::iter::once('…').chain(tail.into_iter().rev()).collect()
+    }
+
+    /// Makes room for a line of compared text; on a new page the column names come first.
+    fn code_need(&mut self, doc: &Doc) {
+        self.need(CODE_LEAD);
+        if self.page() != self.labeled {
+            self.columns(doc, true);
+        }
+    }
+
+    /// The names of the sides over their columns, and on a page a difference continues on,
+    /// the name of its file.
+    fn columns(&mut self, doc: &Doc, continued: bool) {
+        let n = doc.panes.len();
+        let labels = !self.unified && n > 1;
+        let name = if continued { doc.name } else { "" };
+        if labels || !name.is_empty() {
+            self.need(CODE_LEAD);
+            let y = self.y + CODE_LEAD * 0.78;
+            if labels {
+                let col_w = self.content_w() / n as f32;
+                for p in 0..n {
+                    let x = self.left() + p as f32 * col_w + 2.0;
+                    self.text(x, y, SMALL_SIZE, Family::Sans, side_name(p, n), DIM);
+                }
+            }
+            if !name.is_empty() {
+                let name = self.fit(Family::Sans, SMALL_SIZE, name, self.content_w() / 2.0);
+                let w = self.faces.width(Family::Sans, SMALL_SIZE, &name);
+                self.text(
+                    self.right() - w - 2.0,
+                    y,
+                    SMALL_SIZE,
+                    Family::Sans,
+                    &name,
+                    DIM,
+                );
+            }
+            self.y += CODE_LEAD;
+        }
+        self.labeled = self.page();
     }
 
     fn heading(&mut self, text: &str) {
@@ -593,6 +884,13 @@ impl<'a> Writer<'a> {
             self.text(tx, base, CODE_SIZE, Family::Mono, sign, sign_color);
         }
         tx += self.faces.width(Family::Mono, CODE_SIZE, "+ ");
+        let logical: Vec<char> = chars.iter().map(|cell| cell.c).collect();
+        let chars: Vec<Cell> = self
+            .faces
+            .shown(Family::Mono, &logical)
+            .into_iter()
+            .map(|(k, c)| Cell { c, ..chars[k] })
+            .collect();
         // The changed words: a darker background and a line under them.
         let mark = colors.map(|c| c.1);
         let mut run_start: Option<f32> = None;
@@ -600,7 +898,7 @@ impl<'a> Writer<'a> {
         let mut text = String::new();
         let mut ends = Vec::new();
         for (k, cell) in chars.iter().enumerate() {
-            let (_, adv, c) = self.faces.glyph(Family::Mono, cell.c);
+            let (_, adv, c, _) = self.faces.glyph(Family::Mono, cell.c);
             let cw = adv * CODE_SIZE;
             match (cell.marked, run_start) {
                 (true, None) => run_start = Some(cx),
@@ -631,7 +929,7 @@ impl<'a> Writer<'a> {
                 ));
             }
         }
-        self.text(tx, base, CODE_SIZE, Family::Mono, &text, BLACK);
+        self.put_text(tx, base, CODE_SIZE, Family::Mono, text, BLACK);
     }
 
     /// Splits `chars` into lines that fit `width`.
@@ -663,14 +961,18 @@ impl<'a> Writer<'a> {
             .width(Family::Mono, CODE_SIZE, &"0".repeat(digits + 1))
     }
 
-    /// The rows of one difference side by side, a column for each side.
-    fn rows_side_by_side(&mut self, doc: &Doc, rows: Range<usize>) {
+    /// The rows of one difference side by side, a column for each side, until the lines left
+    /// run out. Returns the number of rows drawn.
+    fn rows_side_by_side(&mut self, doc: &Doc, rows: Range<usize>) -> usize {
         let n = doc.panes.len();
         let col_w = self.content_w() / n as f32;
         let num_w = self.num_width(doc.panes);
         let sign_w = self.faces.width(Family::Mono, CODE_SIZE, "+ ");
         let text_w = col_w - num_w - sign_w - 6.0;
-        for r in rows {
+        for r in rows.clone() {
+            if self.lines_left == 0 {
+                return r - rows.start;
+            }
             let row = &doc.result.rows[r];
             let cellv = row_cells(doc.result, doc.panes, doc.opts, r);
             let laid: Vec<(Vec<Cell>, Vec<Range<usize>>)> = (0..n)
@@ -685,7 +987,8 @@ impl<'a> Writer<'a> {
                 .collect();
             let lines = laid.iter().map(|(_, w)| w.len()).max().unwrap_or(1);
             for k in 0..lines {
-                self.need(CODE_LEAD);
+                self.code_need(doc);
+                self.lines_left = self.lines_left.saturating_sub(1);
                 for (p, (chars, wrapped)) in laid.iter().enumerate() {
                     let x = self.left() + p as f32 * col_w;
                     let part = wrapped.get(k).map_or(&[][..], |r| &chars[r.clone()]);
@@ -703,17 +1006,22 @@ impl<'a> Writer<'a> {
             }
             self.notes(doc, r);
         }
+        rows.len()
     }
 
     /// The rows of one difference of two sides in one column: unchanged lines once, and the
-    /// lines of each change with the left side's above the right side's.
-    fn rows_unified(&mut self, doc: &Doc, rows: Range<usize>) {
+    /// lines of each change with the left side's above the right side's, until the lines left
+    /// run out. Returns the number of rows drawn.
+    fn rows_unified(&mut self, doc: &Doc, rows: Range<usize>) -> usize {
         let num_w = self.num_width(doc.panes);
         let sign_w = self.faces.width(Family::Mono, CODE_SIZE, "+ ");
         let w = self.content_w();
         let text_w = w - 2.0 * num_w - sign_w - 6.0;
         let mut r = rows.start;
         while r < rows.end {
+            if self.lines_left == 0 {
+                return r - rows.start;
+            }
             let cellv = row_cells(doc.result, doc.panes, doc.opts, r);
             if cellv.iter().all(|c| c.0 == "ctx") {
                 let row = &doc.result.rows[r];
@@ -721,16 +1029,17 @@ impl<'a> Writer<'a> {
                 let chars = row
                     .line(p)
                     .map_or_else(Vec::new, |l| cells(&doc.panes[p][l], &[]));
-                self.unified_line(&chars, text_w, num_w, [row.line(0), row.line(1)], "ctx");
+                let nums = [row.line(0), row.line(1)];
+                self.unified_line(doc, &chars, text_w, num_w, nums, "ctx");
                 self.notes(doc, r);
                 r += 1;
                 continue;
             }
-            // A run of changed rows of one block.
+            // A run of changed rows of one block, each drawing up to two lines.
             let block = doc.result.rows[r].block();
             let mut end = r;
             let mut all = Vec::new();
-            while end < rows.end {
+            while end < rows.end && (end - r) * 2 < self.lines_left.max(2) {
                 let c = row_cells(doc.result, doc.panes, doc.opts, end);
                 if doc.result.rows[end].block() != block || c.iter().all(|c| c.0 == "ctx") {
                     break;
@@ -746,7 +1055,7 @@ impl<'a> Writer<'a> {
                     let chars = cells(&doc.panes[p][l], marks);
                     let mut nums = [None, None];
                     nums[p] = Some(l);
-                    self.unified_line(&chars, text_w, num_w, nums, class);
+                    self.unified_line(doc, &chars, text_w, num_w, nums, class);
                 }
             }
             for row_r in r..end {
@@ -754,10 +1063,12 @@ impl<'a> Writer<'a> {
             }
             r = end;
         }
+        rows.len()
     }
 
     fn unified_line(
         &mut self,
+        doc: &Doc,
         chars: &[Cell],
         text_w: f32,
         num_w: f32,
@@ -766,7 +1077,8 @@ impl<'a> Writer<'a> {
     ) {
         let w = self.content_w();
         for (k, part) in self.wrap_cells(chars, text_w).into_iter().enumerate() {
-            self.need(CODE_LEAD);
+            self.code_need(doc);
+            self.lines_left = self.lines_left.saturating_sub(1);
             let x = self.left();
             self.code_line(x, w, num_w, &nums, class, &chars[part], k == 0);
             self.y += CODE_LEAD;
@@ -801,39 +1113,47 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// Every difference of one compared text, within `budget` rows. Returns the rows drawn and
-    /// the number of differences.
-    fn diffs(&mut self, doc: &Doc, opts: &PdfOptions, budget: usize) -> (usize, usize) {
+    /// Every difference of one compared text, while lines are left to draw: each is cut to
+    /// [`HUNK_MAX_ROWS`] rows (unless the whole file is shown) and to the lines left, with the
+    /// rows above its change left out first.
+    fn diffs(&mut self, doc: &Doc, opts: &PdfOptions) {
         let list = match opts.context {
             Some(c) => hunks_with(doc.result, c),
             None => whole_file(doc.result),
         };
         let total = list.len();
-        let unified = opts.layout == Layout::Unified && doc.panes.len() == 2;
-        let mut used = 0;
+        self.unified = opts.layout == Layout::Unified && doc.panes.len() == 2;
         let mut shown = 0;
         for (k, (b, rows)) in list.into_iter().enumerate() {
-            let cap = if opts.context.is_some() {
-                HUNK_MAX_ROWS
-            } else {
-                usize::MAX
-            };
-            let drawn = rows.start..rows.end.min(rows.start.saturating_add(cap));
-            if used + drawn.len() > budget && shown > 0 {
+            if self.lines_left == 0 {
                 break;
             }
-            used += drawn.len();
             shown += 1;
-            self.hunk_bar(doc.result, b, doc.panes.len(), (k, total));
-            let hidden = rows.len() - drawn.len();
-            if unified {
-                self.rows_unified(doc, drawn);
+            let cap = match opts.context {
+                Some(_) => HUNK_MAX_ROWS.min(self.lines_left),
+                None => self.lines_left,
+            };
+            let start = if rows.len() > cap {
+                let change = doc.result.blocks[b].first_row.clamp(rows.start, rows.end);
+                change - (change - rows.start).min(LEAD_ROWS.min(cap / 4))
             } else {
-                self.rows_side_by_side(doc, drawn);
+                rows.start
+            };
+            self.hunk_bar(doc.result, b, doc.panes.len(), (k, total));
+            let more = |n: usize| trf("report.more_lines", &[("n", n.to_string())]);
+            if start > rows.start {
+                self.para(SMALL_SIZE, Family::Sans, &more(start - rows.start), DIM);
             }
+            self.columns(doc, false);
+            let drawn = start..rows.end.min(start + cap);
+            let done = if self.unified {
+                self.rows_unified(doc, drawn)
+            } else {
+                self.rows_side_by_side(doc, drawn)
+            };
+            let hidden = rows.end - (start + done);
             if hidden > 0 {
-                let more = trf("report.more_lines", &[("n", hidden.to_string())]);
-                self.para(SMALL_SIZE, Family::Sans, &more, DIM);
+                self.para(SMALL_SIZE, Family::Sans, &more(hidden), DIM);
             }
             self.gap(8.0);
         }
@@ -841,7 +1161,30 @@ impl<'a> Writer<'a> {
             let more = trf("report.more_diffs", &[("n", (total - shown).to_string())]);
             self.para(TEXT_SIZE, Family::Sans, &more, DIM);
         }
-        (used, total)
+    }
+
+    /// A note naming the characters no font has, which are drawn as `?`; also written to
+    /// standard error.
+    fn missing_note(&mut self) {
+        let missing = self.faces.missing.borrow().clone();
+        if missing.is_empty() {
+            return;
+        }
+        let mut chars: Vec<String> = missing
+            .iter()
+            .take(20)
+            .map(|c| format!("U+{:04X}", *c as u32))
+            .collect();
+        if missing.len() > 20 {
+            chars.push("…".into());
+        }
+        let note = trf(
+            "report.missing_glyphs",
+            &[("n", missing.len().to_string()), ("chars", chars.join(" "))],
+        );
+        eprintln!("{note}");
+        self.gap(8.0);
+        self.para(TEXT_SIZE, Family::Sans, &note, DIM);
     }
 
     /// The parts added at the end, each with a bookmark.
@@ -867,7 +1210,8 @@ impl<'a> Writer<'a> {
         let mut document = Document::new();
         let count = self.pages.len();
         for (i, ops) in self.pages.iter().enumerate() {
-            let settings = PageSettings::from_wh(self.w, self.h).ok_or("bad page size")?;
+            let settings = PageSettings::from_wh(self.w, self.h)
+                .ok_or_else(|| tr("report.err_page_size").to_string())?;
             let mut page = document.start_page_with(settings);
             let mut s = page.surface();
             for op in ops {
@@ -886,7 +1230,7 @@ impl<'a> Writer<'a> {
                 y: MARGIN,
                 size: SMALL_SIZE,
                 family: Family::Sans,
-                text: self.title.clone(),
+                text: self.shown_text(Family::Sans, &self.title),
                 color: DIM,
             };
             self.draw(&mut s, &header);
@@ -1041,41 +1385,57 @@ impl<'a> Writer<'a> {
                     paint: color(*c).into(),
                     ..Default::default()
                 }));
-                // Runs of the characters each font draws, placed one after another.
+                // Runs of the characters each font draws, placed one after another. The
+                // glyphs are placed as they are, not shaped: shaping would turn `!=` or `->`
+                // into ligatures in some code fonts and move glyphs off their marks.
                 let fonts = &self.faces.fonts[*family as usize];
                 let mut cx = *x;
                 let mut run = String::new();
+                let mut glyphs: Vec<KrillaGlyph> = Vec::new();
                 let mut run_font = usize::MAX;
                 let mut run_x = cx;
-                for ch in text.chars() {
-                    let (f, adv, ch) = self.faces.glyph(*family, ch);
-                    if f != run_font && !run.is_empty() {
-                        s.draw_text(
-                            Point::from_xy(run_x, *y),
-                            fonts[run_font].clone(),
+                let flush = |s: &mut Surface,
+                             run: &mut String,
+                             glyphs: &mut Vec<KrillaGlyph>,
+                             f: usize,
+                             at: f32| {
+                    if !run.trim().is_empty() {
+                        s.draw_glyphs(
+                            Point::from_xy(at, *y),
+                            glyphs.as_slice(),
+                            fonts[f].clone(),
+                            run,
                             *size,
-                            &run,
                             false,
-                            TextDirection::LeftToRight,
                         );
-                        run.clear();
+                    }
+                    run.clear();
+                    glyphs.clear();
+                };
+                for ch in text.chars() {
+                    let (f, adv, ch, id) = self.faces.glyph(*family, ch);
+                    if f != run_font && !run.is_empty() {
+                        flush(s, &mut run, &mut glyphs, run_font, run_x);
                     }
                     if run.is_empty() {
                         run_font = f;
                         run_x = cx;
                     }
+                    let start = run.len();
                     run.push(ch);
+                    glyphs.push(KrillaGlyph {
+                        glyph_id: GlyphId::new(id.into()),
+                        text_range: start..run.len(),
+                        x_advance: adv,
+                        x_offset: 0.0,
+                        y_offset: 0.0,
+                        y_advance: 0.0,
+                        location: None,
+                    });
                     cx += adv * size;
                 }
-                if !run.is_empty() && run.trim() != "" {
-                    s.draw_text(
-                        Point::from_xy(run_x, *y),
-                        fonts[run_font].clone(),
-                        *size,
-                        &run,
-                        false,
-                        TextDirection::LeftToRight,
-                    );
+                if !run.is_empty() {
+                    flush(s, &mut run, &mut glyphs, run_font, run_x);
                 }
             }
         }
@@ -1108,6 +1468,8 @@ fn whole_file(result: &DiffResult) -> Vec<(usize, Range<usize>)> {
 /// A compared text: the lines of each side, their differences, the options they were found
 /// with, and bookmark comments.
 struct Doc<'a> {
+    /// The file in a folder report, empty in a text report.
+    name: &'a str,
     panes: &'a [&'a [String]],
     result: &'a DiffResult,
     opts: &'a DiffOptions,
@@ -1169,14 +1531,16 @@ pub fn text_pdf(
         w.para(TEXT_SIZE, Family::Sans, tr("report.no_diffs"), BLACK);
     } else {
         let doc = Doc {
+            name: "",
             panes,
             result,
             opts,
             notes,
         };
-        w.diffs(&doc, pdf, REPORT_ROWS);
+        w.diffs(&doc, pdf);
     }
     w.sections(sections);
+    w.missing_note();
     w.finish()
 }
 
@@ -1234,9 +1598,9 @@ pub fn folder_pdf(
 
     let Some(dopts) = diffs else {
         w.sections(sections);
+        w.missing_note();
         return w.finish();
     };
-    let mut budget = REPORT_ROWS;
     let mut first = true;
     for it in &listed {
         let found = file_diffs(it, roots, dopts);
@@ -1258,19 +1622,19 @@ pub fn folder_pdf(
             FileDiffs::Diffs(docs, result) => {
                 let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
                 let doc = Doc {
+                    name: &rel,
                     panes: &refs,
                     result: &result,
                     opts: dopts,
                     notes: &[],
                 };
-                if budget == 0 {
+                if w.lines_left == 0 {
                     let total = hunks_with(&result, 0).len();
                     let more = trf("report.more_diffs", &[("n", total.to_string())]);
                     w.para(TEXT_SIZE, Family::Sans, &more, DIM);
                     continue;
                 }
-                let (used, _) = w.diffs(&doc, pdf, budget);
-                budget = budget.saturating_sub(used);
+                w.diffs(&doc, pdf);
             }
             FileDiffs::Note(note) => w.para(TEXT_SIZE, Family::Sans, &note, DIM),
             FileDiffs::None => {}
@@ -1278,6 +1642,7 @@ pub fn folder_pdf(
         w.gap(6.0);
     }
     w.sections(sections);
+    w.missing_note();
     w.finish()
 }
 
@@ -1294,35 +1659,10 @@ fn file_table(w: &mut Writer, listed: &[&DirItem], n: usize) {
     for s in 0..n {
         header.push(side_name(s, n).to_string());
     }
-    let col_w = |i: usize| if i < 3 { widths[i] } else { side_w };
-    let row = |w: &mut Writer, cells: &[String], color: Option<Color>, bold_bg: bool| {
-        let wrapped: Vec<Vec<String>> = cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| w.wrap(Family::Sans, SMALL_SIZE, c, col_w(i) - 6.0))
-            .collect();
-        let lines = wrapped.iter().map(Vec::len).max().unwrap_or(1);
-        let h = lines as f32 * CODE_LEAD + 3.0;
-        w.need(h);
-        let (x0, y) = (w.left(), w.y);
-        if bold_bg {
-            w.fill(x0, y, w.content_w(), h, SURFACE);
-        }
-        if let Some(c) = color {
-            w.fill(x0 + 2.0, y + 3.5, 4.0, 4.0, c);
-        }
-        let mut x = x0 + 10.0;
-        for (i, lines) in wrapped.iter().enumerate() {
-            for (k, l) in lines.iter().enumerate() {
-                let base = y + 1.5 + CODE_LEAD * (k as f32 + 0.78);
-                w.text(x, base, SMALL_SIZE, Family::Sans, l, BLACK);
-            }
-            x += col_w(i);
-        }
-        w.y += h;
-        w.op(Op::Line(x0, w.y, w.right(), w.y, 0.4, RULE));
-    };
-    row(w, &header, None, true);
+    let widths: Vec<f32> = (0..header.len())
+        .map(|i| if i < 3 { widths[i] } else { side_w })
+        .collect();
+    table_row(w, &header, &widths, None, None);
     for it in listed {
         let mut cells = vec![it.name.clone(), it.rel_dir.clone(), status_text(it, n)];
         for s in 0..n {
@@ -1344,11 +1684,62 @@ fn file_table(w: &mut Writer, listed: &[&DirItem], n: usize) {
             "error" => (0xdc, 0x26, 0x26),
             _ => DIM,
         };
-        row(w, &cells, Some(color), false);
+        table_row(w, &cells, &widths, Some(color), Some(&header));
     }
     if listed.is_empty() {
         w.para(TEXT_SIZE, Family::Sans, tr("report.no_match"), DIM);
     }
+}
+
+/// One row of the file table, each cell wrapped to its column and cut with `…` where it would
+/// not fit on a page. `header` is the table's header row, drawn again first when this row
+/// starts a new page; `None` for the header row itself.
+fn table_row(
+    w: &mut Writer,
+    cells: &[String],
+    widths: &[f32],
+    color: Option<Color>,
+    header: Option<&[String]>,
+) {
+    let max_lines = (((w.bottom() - w.top()) / CODE_LEAD) as usize)
+        .saturating_sub(4)
+        .max(1);
+    let wrapped: Vec<Vec<String>> = cells
+        .iter()
+        .zip(widths)
+        .map(|(c, &cw)| {
+            let mut lines = w.wrap(Family::Sans, SMALL_SIZE, c, cw - 6.0);
+            if lines.len() > max_lines {
+                lines.truncate(max_lines);
+                lines[max_lines - 1].push('…');
+            }
+            lines
+        })
+        .collect();
+    let lines = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+    let h = lines as f32 * CODE_LEAD + 3.0;
+    let page = w.page();
+    w.need(h);
+    if let (true, Some(head)) = (w.page() != page, header) {
+        table_row(w, head, widths, None, None);
+    }
+    let (x0, y) = (w.left(), w.y);
+    if header.is_none() {
+        w.fill(x0, y, w.content_w(), h, SURFACE);
+    }
+    if let Some(c) = color {
+        w.fill(x0 + 2.0, y + 3.5, 4.0, 4.0, c);
+    }
+    let mut x = x0 + 10.0;
+    for (lines, cw) in wrapped.iter().zip(widths) {
+        for (k, l) in lines.iter().enumerate() {
+            let base = y + 1.5 + CODE_LEAD * (k as f32 + 0.78);
+            w.text(x, base, SMALL_SIZE, Family::Sans, l, BLACK);
+        }
+        x += cw;
+    }
+    w.y += h;
+    w.op(Op::Line(x0, w.y, w.right(), w.y, 0.4, RULE));
 }
 
 #[cfg(test)]
@@ -1534,6 +1925,210 @@ mod tests {
         assert!(took.as_secs() < 30, "took {took:?}");
         assert!(pdf.len() < 40 << 20, "{} bytes", pdf.len());
         assert!(read(&pdf).contains("row 9990 of the file changed"));
+    }
+
+    fn pages(pdf: &[u8]) -> usize {
+        String::from_utf8_lossy(pdf).matches("/Type/Page/").count()
+    }
+
+    #[test]
+    fn a_whole_file_or_wide_context_report_is_cut_but_still_shows_the_change() {
+        LINES.with(|l| l.set(Some(300)));
+        let a: Vec<String> = (0..6000).map(|i| format!("line {i}")).collect();
+        let mut b = a.clone();
+        b[5000] = "the change".into();
+        for context in [None, Some(500)] {
+            let opts = PdfOptions {
+                context,
+                ..Default::default()
+            };
+            let pdf = report(&a, &b, &opts);
+            let text = read(&pdf);
+            assert!(text.contains("the change"), "{context:?}");
+            assert!(text.contains("line 4999") && !text.contains("line 4500"));
+            assert!(pages(&pdf) <= 10, "{context:?}: {} pages", pages(&pdf));
+            let skipped = trf("report.more_lines", &[("n", "".into())]);
+            let word = skipped.split_whitespace().nth(1).unwrap().to_owned();
+            assert!(text.contains(&word), "the rows left out are noted: {text}");
+        }
+        LINES.with(|l| l.set(None));
+    }
+
+    #[test]
+    fn wrapped_lines_count_against_the_lines_a_report_draws() {
+        LINES.with(|l| l.set(Some(200)));
+        let a: Vec<String> = (0..300)
+            .map(|i| format!("{i} {}", "x ".repeat(900)))
+            .collect();
+        let b: Vec<String> = (0..300)
+            .map(|i| format!("{i} {}", "y ".repeat(900)))
+            .collect();
+        let pdf = report(&a, &b, &PdfOptions::default());
+        assert!(pages(&pdf) <= 8, "{} pages", pages(&pdf));
+        LINES.with(|l| l.set(None));
+    }
+
+    #[test]
+    fn characters_no_font_has_are_noted_and_code_is_not_made_into_ligatures() {
+        let built_in = egui::FontDefinitions::default();
+        let hack = built_in.font_data.get("Hack").unwrap();
+        let only_hack = Fonts {
+            mono: vec![FontFile {
+                data: hack.font.clone(),
+                index: hack.index,
+            }],
+            sans: vec![FontFile {
+                data: hack.font.clone(),
+                index: hack.index,
+            }],
+        };
+        let panes: Vec<Vec<String>> = vec![v(&["a != b -> c", "x"]), v(&["a != b -> c", "測"])];
+        let refs: Vec<&[String]> = panes.iter().map(Vec::as_slice).collect();
+        let opts = DiffOptions::default();
+        let result = compute(&refs, &opts);
+        let titles = v(&["l", "r"]);
+        let pdf = text_pdf(
+            &titles,
+            &refs,
+            &result,
+            &opts,
+            &[],
+            "",
+            &[],
+            &only_hack,
+            &PdfOptions {
+                context: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let text = read(&pdf);
+        assert!(text.contains("U+6E2C"), "{text}");
+        assert!(text.contains("!=") && text.contains("->"), "{text}");
+    }
+
+    #[test]
+    fn right_to_left_text_is_drawn_in_reading_order_with_numbers_and_brackets() {
+        let shown = |s: &str| -> String {
+            let chars: Vec<char> = s.chars().collect();
+            visual_order(&chars)
+                .into_iter()
+                .map(|(k, m)| if m { mirror(chars[k]) } else { chars[k] })
+                .collect()
+        };
+        assert_eq!(shown("abc שלום 123 def"), "abc 123 םולש def");
+        assert_eq!(shown("x = \"אב 1,000.5\";"), "x = \"1,000.5 בא\";");
+        assert_eq!(shown("(שלום)"), "(םולש)");
+        assert_eq!(shown("א(ב)ג"), "ג(ב)א");
+        assert_eq!(shown("\"שלום (1)\";"), "\"(1) םולש\";");
+        assert_eq!(shown("א () b"), "א () b");
+        assert_eq!(shown("plain (text) 12"), "plain (text) 12");
+
+        let salam: Vec<char> = "سلام".chars().collect();
+        let forms = arabic_forms(&salam, |_| true);
+        let expected: Vec<char> = [0xFEB3, 0xFEE0, 0xFE8E, 0xFEE1]
+            .into_iter()
+            .filter_map(char::from_u32)
+            .collect();
+        assert_eq!(forms, expected, "initial, medial, final and isolated");
+        assert_eq!(
+            arabic_forms(&salam, |_| false),
+            salam,
+            "kept without the forms"
+        );
+        let marked: Vec<char> = "بَب".chars().collect();
+        let forms = arabic_forms(&marked, |_| true);
+        assert_eq!(
+            (forms[0], forms[1]),
+            ('\u{FE91}', '\u{064E}'),
+            "a mark is passed over"
+        );
+
+        let panes: Vec<Vec<String>> =
+            vec![v(&["שלום עולם (1)", "سلام"]), v(&["שלום עולם (2)", "سلام x"])];
+        let refs: Vec<&[String]> = panes.iter().map(Vec::as_slice).collect();
+        let opts = DiffOptions::default();
+        let result = compute(&refs, &opts);
+        let titles = v(&["ימין", "שמאל"]);
+        let pdf = text_pdf(
+            &titles,
+            &refs,
+            &result,
+            &opts,
+            &[],
+            "",
+            &[],
+            &fonts(),
+            &PdfOptions::default(),
+        )
+        .unwrap();
+        assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn the_file_table_header_is_repeated_on_each_page() {
+        use crate::core::folder::CmpStatus;
+        let items: Vec<DirItem> = (0..400)
+            .map(|i| DirItem {
+                rel_dir: String::new(),
+                name: format!("file{i}.txt"),
+                is_dir: false,
+                exists: [true, true, false],
+                size: [Some(1), Some(2), None],
+                mtime: [None; 3],
+                status: CmpStatus::Different,
+                diff_side: None,
+                binary: false,
+                error: None,
+                depth: 0,
+                parent: None,
+                children: Vec::new(),
+            })
+            .collect();
+        let refs: Vec<&DirItem> = items.iter().collect();
+        let roots = vec![PathBuf::from("a"), PathBuf::from("b")];
+        let pdf = folder_pdf(
+            &refs,
+            &roots,
+            &roots,
+            None,
+            "",
+            &[],
+            &fonts(),
+            &Default::default(),
+        )
+        .unwrap();
+        let text = read(&pdf);
+        let header = tr("col.result");
+        assert!(pages(&pdf) > 2);
+        assert!(text.matches(header).count() >= pages(&pdf) - 1, "{text}");
+    }
+
+    #[test]
+    fn a_three_way_report_has_every_side() {
+        let base = v(&["one", "two", "three"]);
+        let ours = v(&["one", "deux", "three"]);
+        let theirs = v(&["one", "zwei", "three"]);
+        let panes: Vec<&[String]> = vec![&base, &ours, &theirs];
+        let opts = DiffOptions::default();
+        let result = compute(&panes, &opts);
+        let titles = v(&["base.txt", "ours.txt", "theirs.txt"]);
+        let pdf = text_pdf(
+            &titles,
+            &panes,
+            &result,
+            &opts,
+            &[],
+            "",
+            &[],
+            &fonts(),
+            &Default::default(),
+        )
+        .unwrap();
+        let text = read(&pdf);
+        for want in ["base.txt", "theirs.txt", "deux", "zwei"] {
+            assert!(text.contains(want), "{want} missing in {text}");
+        }
     }
 
     #[test]
