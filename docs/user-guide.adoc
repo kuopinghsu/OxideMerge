@@ -312,8 +312,10 @@ startup, and the recent paths, since their temporary copies are gone after the a
 connect again to compare the same remote path.
 
 Before the password or key is sent, OxideMerge checks the server's host key. It first reads
-your own SSH `~/.ssh/known_hosts` the way `ssh` does, finding a server on another port than 22
-under `[host]:port`. A server listed there with the same key is trusted. A server listed there
+your own SSH `~/.ssh/known_hosts` the way `ssh` does: host patterns such as `*.example.com`
+or `!host.example.com`, in any letter case, and names hashed by `ssh-keygen -H` all match, and
+a server on another port than 22 is found under `[host]:port`. A server listed there with the
+same key is trusted. A server listed there
 with a different key of the same type, or whose key is marked `@revoked` there, is refused, as
 `ssh` refuses it: if the server was reinstalled, remove its old key with
 `ssh-keygen -R host` (or `ssh-keygen -R "[host]:port"`) and connect again. Otherwise OxideMerge
@@ -321,15 +323,17 @@ checks a `known_hosts` file of its own, next to its settings file. The first tim
 a server found in neither, OxideMerge shows the key's type and fingerprint (`SHA256:...`, as
 `ssh` shows it) and asks whether to trust it: compare it with the fingerprint the server's
 administrator gives you before you click *Trust and connect*. A warning is shown when your
-`~/.ssh/known_hosts` lists only keys of other types for that server.
+`~/.ssh/known_hosts` lists only keys of other types for that server. OxideMerge asks servers
+for plain host keys only, never a host certificate, so `@cert-authority` lines are not used.
 
 On every later connection, the key is checked against the one remembered: if it no longer
 matches, OxideMerge refuses the connection rather than trusting a server that may not be the
 one you expect. This usually means the server was rebuilt or reinstalled. If you are sure that
 is what happened, remove that server's line from OxideMerge's `known_hosts` file (it is one line
 per server, `host:port` followed by its key) and connect again. If either `known_hosts` file
-exists but can't be read, or holds a line it can't make sense of, OxideMerge connects to no
-server until it can.
+exists but can't be read, or holds a line OxideMerge can't read (any line of its own file, or
+a line of `~/.ssh/known_hosts` for a key type it checks), OxideMerge connects to no server
+until it can.
 
 [[compare-types]]
 === Comparison types
@@ -693,7 +697,9 @@ The bar under each pane shows whether you can edit it:
   save again.
 * *Compare only*: the pane shows text that OxideMerge read from the file, not the file itself:
   a document, spreadsheet, PDF or program, a web page, or a formatted copy of JSON or XML.
-  It cannot be unlocked, edited or saved back.
+  It cannot be unlocked, edited or saved back. To edit the text itself, save it with
+  *File → Save as* to a plain file, such as a `.txt` file, which the pane then edits; it is
+  never saved over a file that is itself read this way, whatever the options say.
 * *Modified* appears while the file has changes that are not saved.
 
 The status bar at the bottom of the window shows the same for the active pane.

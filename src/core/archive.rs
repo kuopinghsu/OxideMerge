@@ -6,7 +6,7 @@
 use super::fsutil;
 use anyhow::{Context, Result};
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -370,6 +370,11 @@ fn extract_tar(
     for entry in ar.entries()? {
         budget.entry()?;
         let mut entry = entry?;
+        if entry.header().entry_type() == tar::EntryType::GNUSparse {
+            // Its holes take no room in the archive but are written out as zeros.
+            let stored = entry.header().entry_size().unwrap_or(0);
+            Budget::take(&budget.bytes, entry.size().saturating_sub(stored))?;
+        }
         let Ok(rel) = entry.path().map(|p| p.into_owned()) else {
             continue;
         };
@@ -590,7 +595,11 @@ fn append_entry<W: Write>(
 ) -> std::io::Result<()> {
     let kind = h.entry_type();
     match link {
-        Some(target) if kind.is_symlink() || kind.is_hard_link() => b.append_link(h, rel, target),
+        Some(target) if kind.is_symlink() || kind.is_hard_link() => {
+            // A link holds no data, whatever size its header gave.
+            h.set_size(0);
+            b.append_link(h, rel, target)
+        }
         _ => b.append_data(h, rel, data),
     }
 }
@@ -621,7 +630,9 @@ fn pax_records<R: Read>(entry: &mut tar::Entry<R>) -> std::io::Result<Pax> {
 fn rewritten(pax: &Pax, changed: bool) -> Pax {
     pax.iter()
         .filter(|(k, _)| {
-            !matches!(k.as_slice(), b"path" | b"linkpath" | b"size") && !(changed && k == b"mtime")
+            !matches!(k.as_slice(), b"path" | b"linkpath" | b"size")
+                && !(changed
+                    && (k == b"mtime" || k == b"SCHILY.realsize" || k.starts_with(b"GNU.sparse.")))
         })
         .cloned()
         .collect()
@@ -744,15 +755,29 @@ fn same_contents(a: &Path, b: &Path) -> Result<bool> {
     Ok(same_file(&mut std::fs::File::open(b)?, len, a)? == Some(true))
 }
 
-/// Copies the tar stream `input` into `w`, taking the edits made to `dir` (see [`repack`]),
-/// and returns `w` with whether anything changed.
+/// For each place a tar stream unpacks to, the index of the last entry unpacked there: the
+/// one left on disk, as `tar` writes an entry over an earlier one of the same name.
+fn last_entries(input: impl Read) -> Result<HashMap<PathBuf, usize>> {
+    let mut last = HashMap::new();
+    for (i, entry) in tar::Archive::new(input).entries()?.enumerate() {
+        if let Some(rel) = entry?.path().ok().and_then(|p| unpacked_at(&p)) {
+            last.insert(rel, i);
+        }
+    }
+    Ok(last)
+}
+
+/// Copies the tar stream `open` reads into `w`, taking the edits made to `dir` (see
+/// [`repack`]), and returns `w` with whether anything changed. Of entries unpacked to the same
+/// place, only the last is kept, as only that one was extracted.
 fn copy_tar<W: Write>(
-    input: impl Read,
+    open: &dyn Fn() -> Result<Box<dyn Read>>,
     dir: &Path,
     ours: &dyn Fn(&Path) -> bool,
     w: W,
 ) -> Result<(W, bool)> {
-    let mut ar = tar::Archive::new(input);
+    let last = last_entries(open()?)?;
+    let mut ar = tar::Archive::new(open()?);
     let mut b = tar::Builder::new(w);
     b.follow_symlinks(false);
     let mut seen = HashSet::new();
@@ -764,13 +789,15 @@ fn copy_tar<W: Write>(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    for entry in ar.entries()? {
+    for (i, entry) in ar.entries()?.enumerate() {
         let mut entry = entry?;
         let mut h = entry.header().clone();
         let kind = h.entry_type();
         let pax = pax_records(&mut entry)?;
         let link = entry.link_name().ok().flatten().map(|l| l.into_owned());
         let stored = entry.path_bytes().into_owned();
+        // Unpacked as a folder, as old tars wrote one.
+        let old_dir = h.as_ustar().is_none() && stored.ends_with(b"/");
         let rel = entry.path().ok().and_then(|p| unpacked_at(&p));
         // Left alone, an entry the builder would name differently keeps its stored name.
         let raw = rel
@@ -790,11 +817,15 @@ fn copy_tar<W: Write>(
             }
             continue;
         };
+        if last.get(&rel) != Some(&i) {
+            continue;
+        }
         add_parents(&mut implied, &rel);
+        seen.insert(rel.clone());
         let abs = dir.join(&rel);
-        let keep = if !(seen.insert(rel.clone()) && !apple_metadata(&rel) && ours(&rel)) {
+        let keep = if apple_metadata(&rel) || !ours(&rel) {
             true
-        } else if kind.is_dir() {
+        } else if kind.is_dir() || old_dir {
             abs.is_dir()
         } else if kind.is_symlink() {
             std::fs::read_link(&abs).ok() == link
@@ -1013,12 +1044,12 @@ pub fn repack(path: &Path, dir: &Path) -> Result<bool> {
     let Some(tmp) = staged else {
         return Ok(false);
     };
+    tmp.as_file().set_permissions(md.permissions())?;
+    tmp.as_file().sync_all()?;
     // Writing it can take a while: checked again just before it takes the archive's place.
     if then.is_some() && stamp(&target) != then {
         anyhow::bail!(trf("msg.archive_changed", &[file()]));
     }
-    tmp.as_file().set_permissions(md.permissions())?;
-    tmp.as_file().sync_all()?;
     fsutil::persist(tmp, &target)
         .map_err(|e| anyhow::anyhow!("{}\n{e:#}", tr("msg.archive_replace_failed")))?;
     rerecord(dir, &target);
@@ -1038,17 +1069,23 @@ fn repack_into(
     };
     let (tmp, changed) = match kind(path) {
         Some(Kind::Zip) => repack_zip(path, dir, out_dir, ours)?,
-        Some(Kind::Tar) => copy_tar(open()?, dir, ours, staging(out_dir)?)?,
+        Some(Kind::Tar) => copy_tar(
+            &|| Ok(Box::new(open()?) as Box<dyn Read>),
+            dir,
+            ours,
+            staging(out_dir)?,
+        )?,
         Some(Kind::TarGz) => {
-            let input = flate2::read::MultiGzDecoder::new(open()?);
+            let input =
+                || Ok(Box::new(flate2::read::MultiGzDecoder::new(open()?)) as Box<dyn Read>);
             let enc = flate2::write::GzEncoder::new(staging(out_dir)?, Default::default());
-            let (enc, changed) = copy_tar(input, dir, ours, enc)?;
+            let (enc, changed) = copy_tar(&input, dir, ours, enc)?;
             (enc.finish().context("finish gzip")?, changed)
         }
         Some(Kind::TarBz2) => {
-            let input = bzip2::read::MultiBzDecoder::new(open()?);
+            let input = || Ok(Box::new(bzip2::read::MultiBzDecoder::new(open()?)) as Box<dyn Read>);
             let enc = bzip2::write::BzEncoder::new(staging(out_dir)?, Default::default());
-            let (enc, changed) = copy_tar(input, dir, ours, enc)?;
+            let (enc, changed) = copy_tar(&input, dir, ours, enc)?;
             (enc.finish().context("finish bzip2")?, changed)
         }
         Some(Kind::SevenZ) => {
@@ -1597,7 +1634,11 @@ mod tests {
 
         let extracted = extract_to_temp(&path).unwrap();
         assert!(!repack(&path, extracted.path()).unwrap());
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // Copied unchanged, it comes out byte for byte as it was.
+        let open = || Ok(Box::new(std::fs::File::open(&path)?) as Box<dyn Read>);
+        let (copy, changed) = copy_tar(&open, extracted.path(), &|_| true, Vec::new()).unwrap();
+        assert!(!changed);
+        assert_eq!(copy, before);
 
         std::fs::write(extracted.path().join("a.txt"), "new\n").unwrap();
         assert!(repack(&path, extracted.path()).unwrap());
@@ -1680,22 +1721,28 @@ mod tests {
         );
     }
 
-    /// A GNU sparse file is written out whole (its holes as zeros) rather than with a header
-    /// that no longer fits its data, which would leave every entry after it unreadable.
-    #[test]
-    fn repack_keeps_a_tar_readable_past_a_sparse_file() {
+    /// The header of a GNU sparse file `name` holding 3 bytes of data at `offset`, after a hole.
+    fn sparse_header(name: &str, offset: u64) -> tar::Header {
         fn octal(field: &mut [u8], value: u64) {
             let digits = format!("{value:0w$o}", w = field.len() - 1);
             field[..digits.len()].copy_from_slice(digits.as_bytes());
         }
+        let mut h = named_header(name, tar::EntryType::GNUSparse, 3);
+        let gnu = h.as_gnu_mut().unwrap();
+        octal(&mut gnu.sparse[0].offset, offset);
+        octal(&mut gnu.sparse[0].numbytes, 3);
+        octal(&mut gnu.realsize, offset + 3);
+        h.set_cksum();
+        h
+    }
+
+    /// A GNU sparse file is written out whole (its holes as zeros) rather than with a header
+    /// that no longer fits its data, which would leave every entry after it unreadable.
+    #[test]
+    fn repack_keeps_a_tar_readable_past_a_sparse_file() {
         let work = tempfile::tempdir().unwrap();
         let path = work.path().join("a.tar");
-        let mut h = named_header("hole.bin", tar::EntryType::GNUSparse, 3);
-        let gnu = h.as_gnu_mut().unwrap();
-        octal(&mut gnu.sparse[0].offset, 1024);
-        octal(&mut gnu.sparse[0].numbytes, 3);
-        octal(&mut gnu.realsize, 1027);
-        h.set_cksum();
+        let h = sparse_header("hole.bin", 1024);
         let mut b = tar::Builder::new(Vec::new());
         b.append(&h, &b"abc"[..]).unwrap();
         b.append(
@@ -1719,8 +1766,134 @@ mod tests {
         );
     }
 
+    /// The holes of a sparse file count against the limit on what an archive unpacks to, as
+    /// they are written out.
+    #[test]
+    fn a_sparse_file_counts_whole_against_the_limit() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("a.tar");
+        let mut b = tar::Builder::new(Vec::new());
+        b.append(&sparse_header("hole.bin", 2 << 20), &b"abc"[..])
+            .unwrap();
+        std::fs::write(&path, b.into_inner().unwrap()).unwrap();
+        let limits = |bytes| Limits {
+            bytes,
+            entries: 100,
+        };
+        let err = format!("{:#}", extract_with(&path, limits(1 << 20)).unwrap_err());
+        assert!(err.contains("unpacks to more than"), "{err}");
+        let roomy = extract_with(&path, limits(4 << 20)).unwrap();
+        let len = std::fs::metadata(roomy.path().join("hole.bin"))
+            .unwrap()
+            .len();
+        assert_eq!(len, (2 << 20) + 3);
+    }
+
+    /// `tar` unpacks an entry over an earlier one of the same name, so only the last one is
+    /// compared with the extracted copy and kept; earlier ones would bring an old version back.
+    #[test]
+    fn repack_keeps_only_the_last_tar_entry_of_a_name() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("a.tar");
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, data) in [("a.txt", "v1\n"), ("b.txt", "b\n"), ("./a.txt", "v2\n")] {
+            let h = named_header(name, tar::EntryType::Regular, data.len() as u64);
+            b.append(&h, data.as_bytes()).unwrap();
+        }
+        std::fs::write(&path, b.into_inner().unwrap()).unwrap();
+        let read = |dir: &Path, name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+
+        let extracted = extract_to_temp(&path).unwrap();
+        assert_eq!(read(extracted.path(), "a.txt"), "v2\n");
+        assert!(!repack(&path, extracted.path()).unwrap());
+        std::fs::write(extracted.path().join("b.txt"), "B\n").unwrap();
+        assert!(repack(&path, extracted.path()).unwrap());
+        assert_eq!(tar_names(&path), ["b.txt", "./a.txt"]);
+        let after = extract_to_temp(&path).unwrap();
+        assert_eq!(read(after.path(), "a.txt"), "v2\n");
+
+        std::fs::write(after.path().join("a.txt"), "new\n").unwrap();
+        assert!(repack(&path, after.path()).unwrap());
+        let again = extract_to_temp(&path).unwrap();
+        assert_eq!(read(again.path(), "a.txt"), "new\n");
+        assert_eq!(read(again.path(), "b.txt"), "B\n");
+    }
+
+    /// An old tar marks a folder only by the `/` ending its name, as `tar` unpacks it.
+    #[test]
+    fn repack_leaves_a_folder_of_an_old_tar_alone() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("a.tar");
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, data, mode) in [("d/", "", 0o755), ("d/x.txt", "x\n", 0o644)] {
+            let mut h = tar::Header::new_old();
+            h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+            h.set_size(data.len() as u64);
+            h.set_mode(mode);
+            h.set_cksum();
+            b.append(&h, data.as_bytes()).unwrap();
+        }
+        std::fs::write(&path, b.into_inner().unwrap()).unwrap();
+
+        let extracted = extract_to_temp(&path).unwrap();
+        assert!(extracted.path().join("d").is_dir());
+        assert!(!repack(&path, extracted.path()).unwrap());
+        std::fs::write(extracted.path().join("d/x.txt"), "new\n").unwrap();
+        assert!(repack(&path, extracted.path()).unwrap());
+        assert_eq!(tar_names(&path), ["d/", "d/x.txt"]);
+    }
+
+    /// A link whose header gave it a size, written again by name, is written with none: it
+    /// holds no data, and a size would leave every entry after it unreadable.
+    #[cfg(unix)]
+    #[test]
+    fn repack_writes_a_tar_link_without_data() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("a.tar");
+        let mut b = tar::Builder::new(Vec::new());
+        let file = named_header("a.txt", tar::EntryType::Regular, 2);
+        b.append(&file, &b"a\n"[..]).unwrap();
+        let mut link = named_header("link", tar::EntryType::Symlink, 4);
+        link.set_link_name("a.txt").unwrap();
+        link.set_cksum();
+        b.append(&link, &b"junk"[..]).unwrap();
+        let edit = named_header("edit.txt", tar::EntryType::Regular, 4);
+        b.append(&edit, &b"old\n"[..]).unwrap();
+        std::fs::write(&path, b.into_inner().unwrap()).unwrap();
+
+        let extracted = extract_to_temp(&path).unwrap();
+        std::fs::write(extracted.path().join("edit.txt"), "new\n").unwrap();
+        assert!(repack(&path, extracted.path()).unwrap());
+        let after = extract_to_temp(&path).unwrap();
+        assert_eq!(
+            std::fs::read_link(after.path().join("link")).unwrap(),
+            PathBuf::from("a.txt")
+        );
+        assert_eq!(
+            std::fs::read_to_string(after.path().join("edit.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
+    /// The sparse map of a pax sparse file describes the data it was stored with: dropped,
+    /// with its time, once that data changed.
+    #[test]
+    fn pax_records_of_a_changed_entry_drop_what_no_longer_holds() {
+        let record = |k: &str| (k.as_bytes().to_vec(), b"1".to_vec());
+        let pax = vec![
+            record("GNU.sparse.map"),
+            record("SCHILY.realsize"),
+            record("mtime"),
+            record("SCHILY.xattr.user.k"),
+            record("size"),
+        ];
+        assert_eq!(rewritten(&pax, true), vec![record("SCHILY.xattr.user.k")]);
+        assert_eq!(rewritten(&pax, false), pax[..4].to_vec());
+    }
+
     /// Entries left alone keep their pax records (extended attributes, say), and one stored
-    /// from the root, never extracted, is kept rather than failing the whole repack.
+    /// from the root or going up with `..`, never extracted, is kept rather than failing the
+    /// whole repack.
     #[test]
     fn repack_keeps_pax_records_and_entries_it_never_extracted() {
         let work = tempfile::tempdir().unwrap();
@@ -1739,6 +1912,11 @@ mod tests {
         )
         .unwrap();
         b.append(
+            &named_header("../up.txt", tar::EntryType::Regular, 3),
+            &b"up\n"[..],
+        )
+        .unwrap();
+        b.append(
             &named_header("edit.txt", tar::EntryType::Regular, 4),
             &b"old\n"[..],
         )
@@ -1746,10 +1924,14 @@ mod tests {
         std::fs::write(&path, b.into_inner().unwrap()).unwrap();
 
         let extracted = extract_to_temp(&path).unwrap();
+        assert!(!work.path().join("up.txt").exists());
         std::fs::write(extracted.path().join("edit.txt"), "new\n").unwrap();
         assert!(repack(&path, extracted.path()).unwrap());
 
-        assert_eq!(tar_names(&path), ["keep.txt", "/abs.txt", "edit.txt"]);
+        assert_eq!(
+            tar_names(&path),
+            ["keep.txt", "/abs.txt", "../up.txt", "edit.txt"]
+        );
         let mut ar = tar::Archive::new(std::fs::File::open(&path).unwrap());
         let mut first = ar.entries().unwrap().next().unwrap().unwrap();
         let records = pax_records(&mut first).unwrap();

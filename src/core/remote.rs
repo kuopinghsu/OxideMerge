@@ -243,8 +243,32 @@ fn load_known_hosts(path: &Path) -> Result<HashMap<String, Vec<u8>>> {
     Ok(known)
 }
 
-/// The key types libssh2 reads in a known hosts file. A line of another type (a security key,
-/// a certificate) can't be checked here, and no server key this program accepts has its type.
+/// `s` decoded from base64, padded or not; `None` if it is not base64.
+fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut n, mut bits) = (0u32, 0);
+    for c in s.trim_end_matches('=').bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        n = n << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((n >> bits) as u8);
+            n &= (1 << bits) - 1;
+        }
+    }
+    (bits < 6).then_some(out)
+}
+
+/// The key types checked in a known hosts file: those of the host key algorithms this program
+/// asks a server for (see [`host_key_methods`]), and DSA, so that a line for one is reported.
 const KEY_TYPES: &[&str] = &[
     "ssh-rsa",
     "ssh-dss",
@@ -259,8 +283,10 @@ const KEY_TYPES: &[&str] = &[
 enum UserHosts {
     /// It records this very key for the server.
     Match,
-    /// It records another key of the same type for the server, or revokes this one.
+    /// It records another key of the same type for the server.
     Changed,
+    /// It marks this key `@revoked`.
+    Revoked,
     /// It records only keys of other types for the server.
     OtherType,
     /// It says nothing of the server.
@@ -281,72 +307,179 @@ fn ssh_name(host: &str, port: u16) -> String {
     }
 }
 
-/// Checks `key`, the host key of `host` at `port`, against the known hosts file at `path`, as
-/// `ssh` would: by the host's name alone on port 22, as `[host]:port` on any other. A missing
-/// file knows no server; one that can't be read, or holding a line of a key type it checks
-/// that can't be read, is an error, since that line could be the one for this server.
-fn check_user_hosts(path: &Path, host: &str, port: u16, key: &[u8]) -> Result<UserHosts> {
+/// A line of an OpenSSH known hosts file for a key type in [`KEY_TYPES`].
+struct KnownLine {
+    revoked: bool,
+    /// The host patterns, or a hashed name (`|1|salt|hash`).
+    hosts: String,
+    kind: String,
+    key: Vec<u8>,
+}
+
+/// The lines of the known hosts file at `path` for the key types it checks; `None` when there
+/// is no such file. Lines of other types, and `@cert-authority` lines (host certificates are
+/// never asked for), are passed over; a line of a checked type whose key can't be read is an
+/// error, since it could be the one for the server being checked.
+fn read_known_lines(path: &Path) -> Result<Option<Vec<KnownLine>>> {
     let unreadable = || {
         trf(
             "msg.sftp_known_hosts_unreadable",
             &[("file", path.display().to_string())],
         )
     };
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(UserHosts::Unknown),
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).context(unreadable()),
     };
-    let sess = ssh2::Session::new().context(unreadable())?;
-    let lists = || sess.known_hosts().context(unreadable());
-    let (mut same, mut other, mut revoked) = (lists()?, lists()?, lists()?);
-    let kind = key_type(key);
-    for line in text.lines() {
+    let mut lines = Vec::new();
+    for line in String::from_utf8_lossy(&bytes).lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (into, entry) = match line.split_once(char::is_whitespace) {
-            Some(("@revoked", rest)) => (&mut revoked, rest.trim_start()),
-            // Certificate authorities: host certificates are not used here.
-            Some((marker, _)) if marker.starts_with('@') => continue,
-            _ => {
-                let line_type = line.split_whitespace().nth(1);
-                if line_type.is_some() && line_type == kind {
-                    (&mut same, line)
-                } else {
-                    (&mut other, line)
-                }
+        let mut fields = line.split_whitespace();
+        let mut hosts = fields.next();
+        let revoked = match hosts {
+            Some("@revoked") => {
+                hosts = fields.next();
+                true
             }
+            Some(marker) if marker.starts_with('@') => continue,
+            _ => false,
         };
-        // Keys of types this program can't be sent are no concern of its.
-        let line_type = entry.split_whitespace().nth(1).unwrap_or("");
-        if !KEY_TYPES.contains(&line_type) {
+        let (Some(hosts), Some(kind)) = (hosts, fields.next()) else {
+            continue;
+        };
+        if !KEY_TYPES.contains(&kind) {
             continue;
         }
-        if into
-            .read_str(entry, ssh2::KnownHostFileKind::OpenSSH)
-            .is_err()
-        {
+        let key = fields.next().and_then(decode_base64);
+        let Some(key) = key.filter(|k| key_type(k) == Some(kind)) else {
             bail!(unreadable());
+        };
+        lines.push(KnownLine {
+            revoked,
+            hosts: hosts.to_string(),
+            kind: kind.to_string(),
+            key,
+        });
+    }
+    Ok(Some(lines))
+}
+
+/// Whether `name` matches the glob `pattern`, where `*` stands for any run of characters and
+/// `?` for any one, as OpenSSH matches host patterns.
+fn glob_match(name: &[u8], pattern: &[u8]) -> bool {
+    let (mut n, mut p) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == name[n]) {
+            n += 1;
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some((p, n));
+            p += 1;
+        } else if let Some((sp, sn)) = star {
+            p = sp + 1;
+            n = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
         }
     }
-    let name = ssh_name(host, port);
-    let check = |list: &ssh2::KnownHosts| match list.check(&name, key) {
-        ssh2::CheckResult::Failure => Err(anyhow::anyhow!(unreadable())),
-        found => Ok(found),
+    pattern[p..].iter().all(|&c| c == b'*')
+}
+
+/// Whether the host field of `line` names `name` (lowercase): a hashed name, checked by
+/// libssh2 with the help of `sess`, or comma-separated patterns, ignoring case, any of them
+/// matching and none negated with `!` matching, as OpenSSH reads them.
+fn names_host(line: &KnownLine, name: &str, sess: &ssh2::Session) -> Result<bool> {
+    if line.hosts.starts_with('|') {
+        let mut hosts = sess.known_hosts()?;
+        let text = format!("{} {} {}", line.hosts, line.kind, encode_base64(&line.key));
+        hosts.read_str(&text, ssh2::KnownHostFileKind::OpenSSH)?;
+        return match hosts.check(name, &line.key) {
+            ssh2::CheckResult::Failure => bail!("known hosts"),
+            found => Ok(matches!(found, ssh2::CheckResult::Match)),
+        };
+    }
+    let mut named = false;
+    for pattern in line.hosts.split(',') {
+        let (negated, pattern) = match pattern.strip_prefix('!') {
+            Some(p) => (true, p),
+            None => (false, pattern),
+        };
+        if glob_match(name.as_bytes(), pattern.to_ascii_lowercase().as_bytes()) {
+            if negated {
+                return Ok(false);
+            }
+            named = true;
+        }
+    }
+    Ok(named)
+}
+
+/// The lines of the known hosts file at `path` naming `host` at `port` (see [`ssh_name`]), or
+/// `None` when there is no such file.
+fn lines_for(path: &Path, host: &str, port: u16) -> Result<Option<Vec<KnownLine>>> {
+    let Some(lines) = read_known_lines(path)? else {
+        return Ok(None);
     };
-    if matches!(check(&revoked)?, ssh2::CheckResult::Match) {
-        return Ok(UserHosts::Changed);
+    let unreadable = || {
+        trf(
+            "msg.sftp_known_hosts_unreadable",
+            &[("file", path.display().to_string())],
+        )
+    };
+    let sess = ssh2::Session::new().context(unreadable())?;
+    let name = ssh_name(host, port);
+    let mut out = Vec::new();
+    for line in lines {
+        if names_host(&line, &name, &sess).context(unreadable())? {
+            out.push(line);
+        }
     }
-    match check(&same)? {
-        ssh2::CheckResult::Match => return Ok(UserHosts::Match),
-        ssh2::CheckResult::Mismatch => return Ok(UserHosts::Changed),
-        _ => {}
+    Ok(Some(out))
+}
+
+/// The key types the known hosts file at `path` records for `host` at `port`, to ask the
+/// server for those first. Nothing when the file can't be read: checking the key says why.
+fn user_host_types(path: &Path, host: &str, port: u16) -> Vec<String> {
+    let lines = lines_for(path, host, port)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    lines
+        .into_iter()
+        .filter(|l| !l.revoked)
+        .map(|l| l.kind)
+        .collect()
+}
+
+/// Checks `key`, the host key of `host` at `port`, against the known hosts file at `path`, as
+/// `ssh` would: by the host's name alone on port 22, as `[host]:port` on any other, against
+/// host patterns and hashed names. A missing file knows no server; one that can't be read, or
+/// holding a line of a key type it checks whose key can't be read, is an error.
+fn check_user_hosts(path: &Path, host: &str, port: u16, key: &[u8]) -> Result<UserHosts> {
+    let Some(lines) = lines_for(path, host, port)? else {
+        return Ok(UserHosts::Unknown);
+    };
+    if lines.iter().any(|l| l.revoked && l.key == key) {
+        return Ok(UserHosts::Revoked);
     }
-    Ok(match check(&other)? {
-        ssh2::CheckResult::NotFound => UserHosts::Unknown,
-        _ => UserHosts::OtherType,
+    let listed: Vec<&KnownLine> = lines.iter().filter(|l| !l.revoked).collect();
+    Ok(if listed.iter().any(|l| l.key == key) {
+        UserHosts::Match
+    } else if listed
+        .iter()
+        .any(|l| Some(l.kind.as_str()) == key_type(key))
+    {
+        UserHosts::Changed
+    } else if !listed.is_empty() {
+        UserHosts::OtherType
+    } else {
+        UserHosts::Unknown
     })
 }
 
@@ -411,7 +544,8 @@ pub struct UnknownHost {
     pub fingerprint: String,
     key: Vec<u8>,
     path: PathBuf,
-    /// The user's own known hosts file, when it records a different key for this server.
+    /// The user's own known hosts file, when it records only keys of other types for this
+    /// server.
     pub differs_from: Option<PathBuf>,
 }
 
@@ -474,6 +608,13 @@ fn verify_host_key(
                     ("file", user_file.display().to_string()),
                 ],
             )),
+            UserHosts::Revoked => bail!(trf(
+                "msg.sftp_key_revoked",
+                &[
+                    ("server", server(&conn.host, conn.port)),
+                    ("file", user_file.display().to_string()),
+                ],
+            )),
             // The server sent another type of key than the file records for it: this
             // program's own list, or the user, decides.
             UserHosts::OtherType => differs_from = Some(user_file),
@@ -509,13 +650,37 @@ fn verify_host_key(
     }
 }
 
-/// The host key algorithms to ask a server for when this program already trusts its key of
-/// type `kind`, so that it presents that one rather than another the program never saw.
-fn host_key_methods(kind: &str) -> &str {
-    match kind {
-        "ssh-rsa" => "rsa-sha2-512,rsa-sha2-256,ssh-rsa",
-        other => other,
+/// The host key algorithms asked for, most wanted first: plain keys only, never a
+/// certificate, whose key no known hosts file here records.
+const HOST_KEY_METHODS: &[&str] = &[
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "rsa-sha2-512",
+    "rsa-sha2-256",
+    "ssh-rsa",
+];
+
+/// The host key algorithms to ask a server for: first those for the key `types` a known hosts
+/// file records for it, so that it presents a key that can be checked, then the others.
+fn host_key_methods(types: &[String]) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let wanted = types.iter().flat_map(|kind| -> &[&str] {
+        match kind.as_str() {
+            "ssh-rsa" => &["rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"],
+            other => HOST_KEY_METHODS
+                .iter()
+                .find(|m| **m == other)
+                .map_or(&[], std::slice::from_ref),
+        }
+    });
+    for m in wanted.chain(HOST_KEY_METHODS) {
+        if !out.contains(m) {
+            out.push(m);
+        }
     }
+    out.join(",")
 }
 
 /// Opens an SFTP session authenticated as `conn` says. Setting `cancel` stops it between steps.
@@ -545,12 +710,17 @@ fn session(conn: &RemoteConnection, cancel: &AtomicBool) -> Result<ssh2::Sftp> {
     let mut sess = ssh2::Session::new().context("SSH")?;
     sess.set_timeout(CONNECT_TIMEOUT.as_millis() as u32);
     sess.set_tcp_stream(tcp);
-    if let Some(kind) = known
+    let mut types: Vec<String> = known
         .get(&host_id(&conn.host, conn.port))
         .and_then(|k| key_type(k))
-    {
-        let _ = sess.method_pref(ssh2::MethodType::HostKey, host_key_methods(kind));
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+    if let Some(user_file) = user_known_hosts() {
+        types.extend(user_host_types(&user_file, &conn.host, conn.port));
     }
+    sess.method_pref(ssh2::MethodType::HostKey, &host_key_methods(&types))
+        .context("SSH")?;
     sess.handshake()
         .with_context(|| trf("msg.sftp_handshake", &[("server", shown.clone())]))?;
     verify_host_key(&sess, conn, &known, &path)?;
@@ -1000,7 +1170,12 @@ pub fn upload(
         let _ = sftp.unlink(tmp);
         return Err(e).with_context(cannot_write);
     }
-    let stat = sftp.stat(target).with_context(cannot_write)?;
+    let stat = sftp.stat(target).with_context(|| {
+        trf(
+            "msg.sftp_saved_unchecked",
+            &[("path", remote_path.to_string())],
+        )
+    })?;
     Ok(RemoteStamp::of(&stat))
 }
 
@@ -1725,7 +1900,8 @@ mod tests {
 
     /// The user's own known hosts file is read as `ssh` reads it: a matching key is trusted, a
     /// different key of the same type (or a revoked one) refuses the connection, a key of
-    /// another type is only a warning, and a line that can't be read fails closed.
+    /// another type is only a warning, and a line for a key type it checks that can't be read
+    /// fails closed.
     #[test]
     fn the_users_known_hosts_file_is_checked_as_ssh_checks_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -1772,7 +1948,7 @@ mod tests {
         let revoked = format!("{known}@revoked {known}");
         assert_eq!(
             check(&revoked, "example.com", 22, &ours).unwrap(),
-            UserHosts::Changed
+            UserHosts::Revoked
         );
         let authority = format!("@cert-authority {}", line("*.com", "ssh-ed25519", &theirs));
         assert_eq!(
@@ -1786,6 +1962,72 @@ mod tests {
         );
 
         assert!(check("example.com ssh-ed25519 !!!\n", "example.com", 22, &ours).is_err());
+        // A key that is base64 but not of the type its line names can't be read either.
+        let wrong = format!("example.com ssh-ed25519 {}\n", padded(&ecdsa));
+        assert!(check(&wrong, "example.com", 22, &ours).is_err());
+
+        // Patterns, lists and negations, whatever their case.
+        let wild = line("*.COM", "ssh-ed25519", &theirs);
+        assert_eq!(
+            check(&wild, "example.com", 22, &ours).unwrap(),
+            UserHosts::Changed
+        );
+        let list = line("other.org,EXAMPLE.com", "ssh-ed25519", &ours);
+        assert_eq!(
+            check(&list, "example.com", 22, &ours).unwrap(),
+            UserHosts::Match
+        );
+        let negated = line("!example.com,*.com", "ssh-ed25519", &theirs);
+        assert_eq!(
+            check(&negated, "example.com", 22, &ours).unwrap(),
+            UserHosts::Unknown
+        );
+        assert_eq!(
+            check(&negated, "other.com", 22, &ours).unwrap(),
+            UserHosts::Changed
+        );
+        // Hashed names, as `ssh-keygen -H` writes them.
+        let salt = "|1|AAECAwQFBgcICQoLDA0ODxAREhM=";
+        let hashed = line(
+            &format!("{salt}|nnUK16ANsXd3hL31YfAkGOluSjU="),
+            "ssh-ed25519",
+            &ours,
+        );
+        assert_eq!(
+            check(&hashed, "example.com", 22, &ours).unwrap(),
+            UserHosts::Match
+        );
+        assert_eq!(
+            check(&hashed, "example.com", 22, &theirs).unwrap(),
+            UserHosts::Changed
+        );
+        assert_eq!(
+            check(&hashed, "example.org", 22, &theirs).unwrap(),
+            UserHosts::Unknown
+        );
+        let hashed_port = line(
+            &format!("{salt}|Wgcx+Fm+LmaWwC7rQ80eIf2uHe0="),
+            "ssh-ed25519",
+            &ours,
+        );
+        assert_eq!(
+            check(&hashed_port, "example.com", 2222, &ours).unwrap(),
+            UserHosts::Match
+        );
+        // A key revoked for every host is refused even where another line records it.
+        let everywhere = format!("{known}@revoked {}", line("*", "ssh-ed25519", &ours));
+        assert_eq!(
+            check(&everywhere, "example.com", 22, &ours).unwrap(),
+            UserHosts::Revoked
+        );
+        // A file that is not UTF-8 throughout is still read.
+        let mut latin1 = b"# caf\xe9\n".to_vec();
+        latin1.extend_from_slice(known.as_bytes());
+        std::fs::write(&path, latin1).unwrap();
+        assert_eq!(
+            check_user_hosts(&path, "example.com", 22, &ours).unwrap(),
+            UserHosts::Match
+        );
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(check_user_hosts(&path, "example.com", 22, &ours).is_err());
@@ -1803,10 +2045,49 @@ mod tests {
         key.extend_from_slice(&[0, 0, 0, 1, 7]);
         assert_eq!(key_type(&key), Some("ssh-ed25519"));
         assert_eq!(key_type(&[0, 0]), None);
+        // Plain keys only, those a known hosts file records for the server first.
+        let all = "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,\
+                   rsa-sha2-512,rsa-sha2-256,ssh-rsa";
+        assert_eq!(host_key_methods(&[]), all);
         assert_eq!(
-            host_key_methods("ssh-rsa"),
-            "rsa-sha2-512,rsa-sha2-256,ssh-rsa"
+            host_key_methods(&["ssh-rsa".into(), "ssh-dss".into(), "ssh-rsa".into()]),
+            "rsa-sha2-512,rsa-sha2-256,ssh-rsa,ssh-ed25519,ecdsa-sha2-nistp256,\
+             ecdsa-sha2-nistp384,ecdsa-sha2-nistp521"
         );
+        assert!(!host_key_methods(&["ssh-ed25519-cert-v01@openssh.com".into()]).contains("cert"));
+        for (text, bytes) in [
+            ("", &b""[..]),
+            ("Zg==", b"f"),
+            ("Zm8", b"fo"),
+            ("aGVsbG8=", b"hello"),
+        ] {
+            assert_eq!(decode_base64(text).as_deref(), Some(bytes));
+        }
+        assert_eq!(decode_base64("Z"), None);
+        assert_eq!(decode_base64("Zm9v!"), None);
+    }
+
+    /// Host patterns match as OpenSSH matches them.
+    #[test]
+    fn known_host_patterns_match_as_ssh_matches_them() {
+        for (name, pattern, matches) in [
+            ("a.example.com", "*.example.com", true),
+            ("example.com", "*.example.com", false),
+            ("a.b.example.com", "*.example.com", true),
+            ("host1", "host?", true),
+            ("host10", "host?", false),
+            ("anything", "*", true),
+            ("[a.example.com]:2222", "[*.example.com]:2222", true),
+            ("[a.example.com]:2222", "*.example.com", false),
+            ("abc", "a*b*c", true),
+            ("abd", "a*b*c", false),
+        ] {
+            assert_eq!(
+                glob_match(name.as_bytes(), pattern.as_bytes()),
+                matches,
+                "{name} {pattern}"
+            );
+        }
     }
 
     #[test]

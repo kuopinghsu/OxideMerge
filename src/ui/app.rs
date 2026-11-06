@@ -4573,10 +4573,11 @@ impl OxideMergeApp {
                     if !self.tabs[i].is_modified() {
                         continue;
                     }
-                    match self.tabs[i].save() {
-                        Ok(()) => saved.push(self.tabs[i].id),
-                        Err(e) => errors.push(e.to_string()),
+                    if let Err(e) = self.tabs[i].save() {
+                        errors.push(e.to_string());
                     }
+                    // What was written is uploaded even when another side failed to save.
+                    saved.push(self.tabs[i].id);
                 }
                 errors.extend(self.after_save(&saved));
                 if !errors.is_empty() {
@@ -4813,15 +4814,15 @@ impl OxideMergeApp {
                         }
                     }
                 }
-                if let Some(e) = err {
-                    self.error(e);
-                } else if cmd == Cmd::Save {
+                let mut errors: Vec<String> = err.into_iter().collect();
+                if cmd == Cmd::Save {
+                    // What was written is uploaded even when another side failed to save.
                     if let Some(id) = self.tabs.get(self.active).map(|t| t.id) {
-                        let errors = self.after_save(&[id]);
-                        if !errors.is_empty() {
-                            self.error(errors.join("\n"));
-                        }
+                        errors.extend(self.after_save(&[id]));
                     }
+                }
+                if !errors.is_empty() {
+                    self.error(errors.join("\n"));
                 }
                 self.take_step_file();
             }
@@ -5213,7 +5214,12 @@ impl OxideMergeApp {
     fn queue_uploads(&mut self, ids: &[u64]) -> Vec<String> {
         let mut errors = Vec::new();
         let mut jobs = Vec::new();
+        let mut queued = std::collections::HashSet::new();
         for &id in ids {
+            // A tab saved and also holding an archive written back is uploaded once.
+            if !queued.insert(id) {
+                continue;
+            }
             let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
                 continue;
             };
@@ -8316,7 +8322,10 @@ impl OxideMergeApp {
                             }
                             Err(e) => {
                                 self.close_queue.clear();
-                                self.error(e.to_string());
+                                // What was written is uploaded even so.
+                                let mut errors = vec![e.to_string()];
+                                errors.extend(self.after_save(&[id]));
+                                self.error(errors.join("\n"));
                             }
                         }
                     }
@@ -8361,10 +8370,11 @@ impl OxideMergeApp {
                         let mut err = None;
                         let mut saved = Vec::new();
                         for i in 0..self.tabs.len() {
-                            match self.tabs[i].save() {
-                                Ok(()) => saved.push(self.tabs[i].id),
-                                Err(e) => err = Some(e.to_string()),
+                            if let Err(e) = self.tabs[i].save() {
+                                err = Some(e.to_string());
                             }
+                            // What was written is uploaded even when another side failed.
+                            saved.push(self.tabs[i].id);
                         }
                         if let Some(e) = self.after_save(&saved).into_iter().next() {
                             err = Some(e);

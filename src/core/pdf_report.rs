@@ -295,22 +295,19 @@ impl<'a> Faces<'a> {
             * size
     }
 
-    /// How far `c`, a character of [`Faces::forms`], moves the pen at size 1.
-    fn advance(&self, family: Family, c: char) -> f32 {
-        if c == LIGATED {
-            0.0
-        } else {
-            self.glyph(family, c).1
-        }
+    /// How far `form`, a character of [`Faces::forms`], moves the pen at size 1: not at all for
+    /// an alef drawn as part of a ligature.
+    fn advance(&self, family: Family, form: Option<char>) -> f32 {
+        form.map_or(0.0, |c| self.glyph(family, c).1)
     }
 
     /// `chars` as they are drawn, in reading order: Arabic letters in their joined forms
-    /// where a font has them, so they are measured as drawn.
-    fn forms(&self, family: Family, chars: &[char]) -> Vec<char> {
-        if chars.iter().any(|&c| is_rtl(c)) {
+    /// where a font has them, so they are measured as drawn (see [`arabic_forms`]).
+    fn forms(&self, family: Family, chars: &[char]) -> Vec<Option<char>> {
+        if needs_bidi(chars) {
             arabic_forms(chars, |c| self.has(family, c))
         } else {
-            chars.to_vec()
+            chars.iter().copied().map(Some).collect()
         }
     }
 
@@ -322,16 +319,26 @@ impl<'a> Faces<'a> {
     }
 
     /// `chars` in the order they are drawn from left to right, Arabic letters in their joined
-    /// forms where a font has them.
-    fn shown(&self, family: Family, chars: &[char]) -> Vec<(usize, char)> {
-        if !chars.iter().any(|&c| is_rtl(c)) {
-            return chars.iter().copied().enumerate().collect();
+    /// forms where a font has them, each with the characters of `chars` it stands for: one, or
+    /// a lam through the alef of their ligature.
+    fn shown(&self, family: Family, chars: &[char]) -> Vec<(Range<usize>, char)> {
+        if !needs_bidi(chars) {
+            return chars
+                .iter()
+                .enumerate()
+                .map(|(k, &c)| (k..k + 1, c))
+                .collect();
         }
         let forms = arabic_forms(chars, |c| self.has(family, c));
         visual_order(chars)
             .into_iter()
-            .filter(|&(k, _)| forms[k] != LIGATED)
-            .map(|(k, mirrored)| (k, if mirrored { mirror(forms[k]) } else { forms[k] }))
+            .filter_map(|(k, mirrored)| {
+                let c = forms[k]?;
+                Some((
+                    ligature_span(&forms, k),
+                    if mirrored { mirror(c) } else { c },
+                ))
+            })
             .collect()
     }
 }
@@ -344,6 +351,11 @@ fn is_rtl(c: char) -> bool {
     matches!(c, '\u{0590}'..='\u{08FF}' | '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFC}')
         && !is_number(c)
         && !matches!(c, '\u{060C}' | '\u{066A}'..='\u{066C}')
+}
+
+/// Whether a line holds text read right to left: letters, or Arabic numbers.
+fn needs_bidi(chars: &[char]) -> bool {
+    chars.iter().any(|&c| is_rtl(c) || is_arabic_number(c))
 }
 
 /// Whether `c` is an Arabic letter, after which digits read as Arabic numbers: separators and
@@ -484,12 +496,14 @@ fn bracket_pairs(chars: &[char]) -> Vec<Option<usize>> {
     pairs
 }
 
-/// For each bracket of a pair, the direction it takes, as the Unicode bidirectional
-/// algorithm's rule N0 gives it: left to right when the pair holds a left-to-right letter (or a
-/// number after one); right to left when it holds right-to-left text or a number after it, and
-/// the text before the pair is right to left too; left to right when only the inside is; and
-/// none when it holds neither, for the brackets to take the direction around them.
-fn bracket_directions(chars: &[char], pairs: &[Option<usize>], num: &[bool]) -> Vec<Option<bool>> {
+/// For each character, whether it reads right to left (`Some(true)`), left to right
+/// (`Some(false)`) or as the text around it (`None`). Letters read their own way, Arabic
+/// numbers right to left, other numbers the way of the letter before them (rule W7). Paired
+/// brackets read as rule N0 gives it: left to right when the pair holds a left-to-right letter
+/// (or a number after one); right to left when it holds right-to-left text or a number after
+/// it, and the text before the pair is right to left too; left to right when only the inside
+/// is; and as the text around them when the pair holds neither.
+fn directions(chars: &[char], pairs: &[Option<usize>], num: &[bool]) -> Vec<Option<bool>> {
     // Whether each character with a direction reads right to left: letters, Arabic numbers,
     // and other numbers taking that of the letter before them (rule W7).
     let mut strong = vec![None; chars.len()];
@@ -504,7 +518,6 @@ fn bracket_directions(chars: &[char], pairs: &[Option<usize>], num: &[bool]) -> 
             strong[k] = Some(last);
         }
     }
-    let mut dir = vec![None; chars.len()];
     for o in 0..chars.len() {
         let Some(close) = pairs[o].filter(|&p| p > o) else {
             continue;
@@ -518,37 +531,32 @@ fn bracket_directions(chars: &[char], pairs: &[Option<usize>], num: &[bool]) -> 
             continue;
         };
         // A pair resolved counts as the text before the pairs after it.
-        for k in [o, close] {
-            dir[k] = Some(d);
-            strong[k] = Some(d);
-        }
+        strong[o] = Some(d);
+        strong[close] = Some(d);
     }
-    dir
+    strong
 }
 
 /// The order in which the characters of a left-to-right line are drawn, each with whether it
 /// is mirrored: a simplified Unicode bidirectional algorithm. A run from a right-to-left
 /// character or Arabic number to the last right-to-left character or number before the next
-/// left-to-right letter is reversed, its brackets mirrored, and the numbers in it still read
-/// left to right. Brackets read in the direction [`bracket_directions`] gives them.
+/// left-to-right one is reversed, its brackets mirrored, and the numbers in it still read
+/// left to right. Characters read in the direction [`directions`] gives them.
 fn visual_order(chars: &[char]) -> Vec<(usize, bool)> {
     let mut order: Vec<(usize, bool)> = (0..chars.len()).map(|k| (k, false)).collect();
     let num = number_parts(chars);
     let pairs = bracket_pairs(chars);
-    let dir = bracket_directions(chars, &pairs, &num);
-    let rtl = |k: usize| is_rtl(chars[k]) || dir[k] == Some(true);
-    let ltr = |k: usize| is_ltr(chars[k]) || dir[k] == Some(false);
-    let strong = |k: usize| rtl(k) || num[k];
+    let dir = directions(chars, &pairs, &num);
     let mut i = 0;
     while i < chars.len() {
-        if !rtl(i) && !is_arabic_number(chars[i]) {
+        if dir[i] != Some(true) {
             i += 1;
             continue;
         }
         let mut end = i + 1;
         let mut k = end;
-        while k < chars.len() && !ltr(k) {
-            if strong(k) {
+        while k < chars.len() && dir[k] != Some(false) {
+            if dir[k] == Some(true) {
                 end = k + 1;
             }
             k += 1;
@@ -611,27 +619,46 @@ fn arabic_joining(c: char) -> Option<(bool, u32)> {
     None
 }
 
-/// Stands in [`arabic_forms`] for an alef drawn as part of the lam before it: nothing is drawn
-/// for it.
-const LIGATED: char = '\u{FFFF}';
+/// An Arabic mark, passed over when letters join.
+fn transparent(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0610}'..='\u{061A}'
+            | '\u{064B}'..='\u{065F}'
+            | '\u{0670}'
+            | '\u{06D6}'..='\u{06DC}'
+            | '\u{06DF}'..='\u{06E4}'
+            | '\u{06E7}'
+            | '\u{06E8}'
+            | '\u{06EA}'..='\u{06ED}'
+    )
+}
+
+/// The characters the form at `k` of [`arabic_forms`] stands for: `k` alone, or a lam through
+/// the alef drawn with it, the first `None` past the marks after it.
+fn ligature_span(forms: &[Option<char>], k: usize) -> Range<usize> {
+    if !matches!(forms[k], Some('\u{FEF5}'..='\u{FEFC}')) {
+        return k..k + 1;
+    }
+    let mut n = k + 1;
+    while let Some(Some(c)) = forms.get(n) {
+        if !transparent(*c) {
+            return k..k + 1;
+        }
+        n += 1;
+    }
+    if n < forms.len() {
+        k..n + 1
+    } else {
+        k..k + 1
+    }
+}
 
 /// `chars` with each Arabic letter in its isolated, final, initial or medial presentation
 /// form, as it joins its neighbors, where `has` the form; marks between letters are passed
-/// over. A lam right before an alef becomes the two letters' ligature, the alef [`LIGATED`].
-fn arabic_forms(chars: &[char], has: impl Fn(char) -> bool) -> Vec<char> {
-    let transparent = |c: char| {
-        matches!(
-            c,
-            '\u{0610}'..='\u{061A}'
-                | '\u{064B}'..='\u{065F}'
-                | '\u{0670}'
-                | '\u{06D6}'..='\u{06DC}'
-                | '\u{06DF}'..='\u{06E4}'
-                | '\u{06E7}'
-                | '\u{06E8}'
-                | '\u{06EA}'..='\u{06ED}'
-        )
-    };
+/// over. A lam and the alef after it become the two letters' ligature, where `has` it: the
+/// lam's place holds it, and the alef's is `None`.
+fn arabic_forms(chars: &[char], has: impl Fn(char) -> bool) -> Vec<Option<char>> {
     // Tatweel and the zero width joiner join both sides.
     let causes = |c: char| matches!(c, '\u{0640}' | '\u{200D}');
     let joins_after = |c: char| causes(c) || arabic_joining(c).is_some_and(|j| j.0);
@@ -655,19 +682,26 @@ fn arabic_forms(chars: &[char], has: impl Fn(char) -> bool) -> Vec<char> {
             out[k] = form;
         }
     }
-    for k in 0..chars.len().saturating_sub(1) {
-        let isolated = match (chars[k], chars[k + 1]) {
-            ('\u{0644}', '\u{0622}') => 0xFEF5,
-            ('\u{0644}', '\u{0623}') => 0xFEF7,
-            ('\u{0644}', '\u{0625}') => 0xFEF9,
-            ('\u{0644}', '\u{0627}') => 0xFEFB,
+    let mut out: Vec<Option<char>> = out.into_iter().map(Some).collect();
+    for (k, &c) in chars.iter().enumerate() {
+        if c != '\u{0644}' {
+            continue;
+        }
+        let Some(a) = (k + 1..chars.len()).find(|&n| !transparent(chars[n])) else {
+            continue;
+        };
+        let isolated = match chars[a] {
+            '\u{0622}' => 0xFEF5,
+            '\u{0623}' => 0xFEF7,
+            '\u{0625}' => 0xFEF9,
+            '\u{0627}' => 0xFEFB,
             _ => continue,
         };
         let before = chars[..k].iter().rev().find(|&&p| !transparent(p));
         let prev = before.is_some_and(|&p| joins_after(p));
         if let Some(form) = char::from_u32(isolated + u32::from(prev)).filter(|&f| has(f)) {
-            out[k] = form;
-            out[k + 1] = LIGATED;
+            out[k] = Some(form);
+            out[a] = None;
         }
     }
     out
@@ -926,12 +960,18 @@ impl<'a> Writer<'a> {
         let forms = self.faces.forms(family, &chars);
         let mut w = 0.0;
         let mut tail: Vec<char> = Vec::new();
+        let mut part_of_ligature = false;
         for (&c, &form) in chars.iter().zip(&forms).rev() {
             w += self.faces.advance(family, form) * size;
             if w > room {
+                // An alef without the lam it was drawn with would be drawn on its own, wider.
+                if part_of_ligature {
+                    tail.pop();
+                }
                 break;
             }
             tail.push(c);
+            part_of_ligature = form.is_none();
         }
         std::iter::once('…').chain(tail.into_iter().rev()).collect()
     }
@@ -1100,7 +1140,10 @@ impl<'a> Writer<'a> {
             .faces
             .shown(Family::Mono, &logical)
             .into_iter()
-            .map(|(k, c)| Cell { c, ..chars[k] })
+            .map(|(span, c)| Cell {
+                c,
+                marked: chars[span].iter().any(|cell| cell.marked),
+            })
             .collect();
         // The changed words: a darker background and a line under them.
         let mark = colors.map(|c| c.1);
@@ -2256,44 +2299,70 @@ mod tests {
         assert_eq!(shown("a ١٢ ٣٤"), "a ٣٤ ١٢");
         assert_eq!(shown("ב 12%"), "12% ב");
         assert_eq!(shown("ב ١٢%"), "١٢ ב%");
+        // A number after English reads left to right, even after an Arabic number.
+        assert_eq!(
+            shown("\"ar\": [\"٠\", 0, \"صفر\"]"),
+            "\"ar\": [\"٠\", 0, \"رفص\"]"
+        );
+        assert_eq!(shown("a ١٢ 34"), "a ١٢ 34");
+        // As drawn, too, on a line with no right-to-left letter.
+        let drawn_fonts = fonts();
+        let faces = Faces::new(&drawn_fonts).unwrap();
+        let drawn = |s: &str| -> String {
+            let chars: Vec<char> = s.chars().collect();
+            faces
+                .shown(Family::Mono, &chars)
+                .into_iter()
+                .map(|(_, c)| c)
+                .collect()
+        };
+        assert_eq!(drawn("a ١٢ ٣٤"), "a ٣٤ ١٢");
+        assert_eq!(drawn("x \u{FFFF} y"), "x \u{FFFF} y");
+        // A name cut to fit keeps a lam with its alef, so it is no wider than it was cut to.
+        let writer = Writer::new(&drawn_fonts, &PdfOptions::default(), "").unwrap();
+        let name = "سلام سلام سلام.txt";
+        for room in (10..120).step_by(3) {
+            let room = room as f32;
+            let cut = writer.fit(Family::Sans, 9.0, name, room);
+            assert!(
+                writer.faces.width(Family::Sans, 9.0, &cut) <= room + 0.01,
+                "{cut}"
+            );
+        }
 
+        let forms = |s: &str| -> Vec<Option<char>> {
+            arabic_forms(&s.chars().collect::<Vec<_>>(), |_| true)
+        };
+        let joined = |s: &str| -> Vec<char> { forms(s).into_iter().flatten().collect() };
         // Persian letters join, and so does a letter before a zero width joiner.
-        let yek: Vec<char> = "یک".chars().collect();
-        assert_eq!(arabic_forms(&yek, |_| true), vec!['\u{FBFE}', '\u{FB8F}']);
-        let zwj: Vec<char> = "ب\u{200D}".chars().collect();
-        assert_eq!(arabic_forms(&zwj, |_| true)[0], '\u{FE91}');
+        assert_eq!(joined("یک"), ['\u{FBFE}', '\u{FB8F}']);
+        assert_eq!(joined("ب\u{200D}")[0], '\u{FE91}');
         // Quranic signs that are not marks don't let the letters around them join.
-        let sign: Vec<char> = "ب\u{06DE}ب".chars().collect();
-        assert_eq!(arabic_forms(&sign, |_| true)[0], '\u{FE8F}');
+        assert_eq!(joined("ب\u{06DE}ب")[0], '\u{FE8F}');
 
+        assert_eq!(
+            forms("سلام"),
+            [Some('\u{FEB3}'), Some('\u{FEFC}'), None, Some('\u{FEE1}')],
+            "initial, lam-alef final, isolated"
+        );
+        assert_eq!(
+            forms("لا لأ"),
+            [Some('\u{FEFB}'), None, Some(' '), Some('\u{FEF7}'), None]
+        );
+        // A mark between lam and alef is drawn after their ligature.
+        assert_eq!(forms("لَا"), [Some('\u{FEFB}'), Some('\u{064E}'), None]);
+        assert_eq!(ligature_span(&forms("لَا x"), 0), 0..3);
+        assert_eq!(ligature_span(&forms("لَا x"), 1), 1..2);
+        assert_eq!(joined("سل"), ['\u{FEB3}', '\u{FEDE}'], "initial and final");
         let salam: Vec<char> = "سلام".chars().collect();
-        let forms = arabic_forms(&salam, |_| true);
-        let expected: Vec<char> = [0xFEB3, 0xFEFC, 0xFFFF, 0xFEE1]
-            .into_iter()
-            .filter_map(char::from_u32)
-            .collect();
-        assert_eq!(forms, expected, "initial, lam-alef final, isolated");
-        let la: Vec<char> = "لا لأ".chars().collect();
-        assert_eq!(
-            arabic_forms(&la, |_| true),
-            ['\u{FEFB}', LIGATED, ' ', '\u{FEF7}', LIGATED]
-        );
-        let without: Vec<char> = "سل".chars().collect();
-        assert_eq!(
-            arabic_forms(&without, |_| true),
-            ['\u{FEB3}', '\u{FEDE}'],
-            "initial and final"
-        );
         assert_eq!(
             arabic_forms(&salam, |_| false),
-            salam,
+            salam.iter().copied().map(Some).collect::<Vec<_>>(),
             "kept without the forms"
         );
-        let marked: Vec<char> = "بَب".chars().collect();
-        let forms = arabic_forms(&marked, |_| true);
         assert_eq!(
-            (forms[0], forms[1]),
-            ('\u{FE91}', '\u{064E}'),
+            joined("بَب")[..2],
+            ['\u{FE91}', '\u{064E}'],
             "a mark is passed over"
         );
 
