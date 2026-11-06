@@ -55,13 +55,10 @@ This guide uses these conventions:
   If it is not, use the full path of the program.
 * Replace example paths, such as `old-folder`, with your own paths.
 
-[NOTE]
-====
-*Keyboard shortcuts on macOS.* This guide uses the key names of Windows and Linux.
+NOTE: *Keyboard shortcuts on macOS.* This guide uses the key names of Windows and Linux.
 On macOS, press Command (kbd:[⌘]) instead of kbd:[Ctrl], and Option (kbd:[⌥]) instead of kbd:[Alt].
 The one exception is kbd:[Ctrl+Tab], which uses the Control key on macOS too.
 Menus and tooltips always show the shortcuts for your system.
-====
 
 === Key terms
 
@@ -242,6 +239,9 @@ You can start a comparison in several ways:
 * Choose a recent comparison on the start page, in *File → Open recent* or in the command palette.
 * Start OxideMerge from the command line (see <<command-line>>) or from your file manager
   (see <<file-manager>>).
+* Choose *File → Compare over SFTP...*, or click the globe button beside a path on the start
+  page or in the *Select files or folders* dialog, to fetch a file or folder from a server first.
+  See <<remote-sftp>>.
 
 To use the *Select files or folders* dialog:
 
@@ -261,6 +261,49 @@ image::dialog.png[Select files or folders dialog]
 TIP: To compare text that is not in a file, choose *File → New text compare* (kbd:[Ctrl+N]).
 This opens two empty sides.
 Paste text with kbd:[Ctrl+V], or double-click a line to type.
+
+TIP: To compare the clipboard's text against something you are about to paste, choose
+*File → Compare clipboard*.
+This opens a text compare with the clipboard's current text on the left and a blank, writable
+right side; paste the second text with kbd:[Ctrl+V].
+*Save* works like any other unsaved comparison, since there is no file to write back to.
+
+[[remote-sftp]]
+=== Comparing over SFTP
+
+*File → Compare over SFTP...*, and the globe button beside a path on the start page or in the
+*Select files or folders* dialog, connect to a server to fetch a file or folder to compare,
+instead of browsing the local disk.
+
+. Enter the server's *Host*, *Port* and *User*.
+. Choose *Password* or *Private key* and enter it; a private key can have a *Passphrase*.
+. Enter the *Remote path* of the file or folder to fetch.
+. Click *Connect*.
+
+The fetched path then fills in the *Left*, *Middle* or *Right* path, the same as a local one.
+Connect again, for the other side, to compare two remote locations with each other, or leave
+the other side local to compare a remote path against a local one. The dialog starts from the
+host, port, user and key path of the last connection that succeeded, for fetching a second path
+from the same server; the password or a key's passphrase is never filled in this way.
+
+A fetched *file* is writable: edit it and *Save* uploads it back to the server over a fresh
+connection. A fetched *folder* opens read-only, since OxideMerge does not yet upload new,
+renamed or deleted files inside a remote folder. A fetched folder is also limited to 4 GiB and
+50,000 files, so a very large folder cannot be fetched by mistake.
+
+The connection, including the password or the key's passphrase, is kept only in memory for as
+long as the tab stays open. It is never written to the settings file, a saved workspace (see
+<<workspaces>>) or the session OxideMerge reopens on its own at startup — reopening a tab
+fetched over SFTP after restarting the app asks you to connect again.
+
+The first time you connect to a server, OxideMerge remembers its host key in a `known_hosts`
+file of its own, under its settings folder (separate from your system's own SSH
+`known_hosts`). On every later connection to that server, the key is checked against the one
+remembered: if it no longer matches, OxideMerge refuses the connection rather than silently
+trusting a server that may not be the one you expect. This usually means the server was
+rebuilt or reinstalled; if you are sure that is what happened, remove that server's line from
+the `known_hosts` file (it is one line per server, `host:port` followed by its key) and
+connect again to trust and remember the new key.
 
 [[compare-types]]
 === Comparison types
@@ -367,6 +410,9 @@ To keep the text and your review notes as they are now, save the comparison inst
 
 [[text-comparison]]
 == Comparing text files
+
+This chapter covers plain text. For PDFs, documents, spreadsheets, Jupyter notebooks and ELF
+programs, which OxideMerge also reads as text, see <<documents>>.
 
 .A two-way text comparison
 image::text.png[Text comparison]
@@ -489,6 +535,7 @@ Before you copy, check which pane is active and which way the arrow points.
   it from the left or the right to the middle, or from the middle to the left or the right.
 * kbd:[Ctrl+Z] undoes a change. kbd:[Ctrl+Y] or kbd:[Ctrl+Shift+Z] redoes it.
 
+[[saving-files]]
 === Saving files
 
 * kbd:[Ctrl+S] saves all changed panes in the current tab.
@@ -555,10 +602,14 @@ Click in the text to place the cursor there, and type, as in any text editor.
   kbd:[Option] with a letter, a digit or a sign types its character (kbd:[Option+S] types ß), so
   kbd:[Alt+C], kbd:[Alt+Z], kbd:[Alt+P] and kbd:[Alt+S] wait until the cursor leaves the text;
   their commands stay in the menus.
-* Each kbd:[Esc] does one thing, the first that applies: it closes an open menu, then a dialog
-  or a field you are typing in, then the search bar, then goes back from several cursors to one, then ends the selection (the cursor stays
-  where it was), then removes the cursor, so the arrow keys move from row to row again.
-  Only then does kbd:[Esc] close the tab.
+* Each kbd:[Esc] does one thing, the first of these that applies:
+. Closes an open menu.
+. Closes a dialog, or a field you are typing in.
+. Closes the search bar.
+. Goes back from several cursors to one.
+. Ends the selection (the cursor stays where it was).
+. Removes the cursor, so the arrow keys move from row to row again.
+. Closes the tab.
 * Input methods work at the cursor, so you can type Chinese, Japanese or Korean.
 * In very large files, typing within a line stays fast: OxideMerge compares the files again once
   you pause for a moment, or before any other key, click or command, so the colors of the line
@@ -784,7 +835,8 @@ In a two-way comparison, the bar above the table has these settings:
 *Match rows by*:: *Position* (the default) or *Key columns*.
 *Keys*:: The columns that identify a record, such as `id`. Choose one or more.
 *First row is header*:: Use the first row for column names. It is not compared.
-*Columns by*:: Pair columns by *Position* or by *Header name*, so that reordered columns still match.
+*Columns by*:: Pair columns by *Position* or by *Header name*, so that reordered columns still
+match.
 *Ignore row order*:: A record that only moved is not a difference: next and previous difference
 skip it, but it keeps its `↕` mark.
 *Numeric tolerance*:: Numbers this close count as equal. `0.01` is a difference, `1%` a
@@ -820,7 +872,7 @@ The settings are saved in projects. Older projects open with matching by positio
 Subversion or Mercurial. The nearest working copy above the path decides which one.
 The dialog lists the recent revisions that changed the path.
 
-NOTE: Comparing with a Subversion or Mercurial revision is experimental and not fully tested:
+WARNING: Comparing with a Subversion or Mercurial revision is experimental and not fully tested:
 it was tried on macOS only, with local repositories.
 
 In Git, the version can be `HEAD`, a branch, a tag or a commit; left empty, it is `HEAD`.
@@ -836,8 +888,15 @@ Git and Mercurial read their revisions from the local repository.
 Subversion reads `BASE` from the working copy; other revisions, and the list of recent ones,
 come from the repository server, which may ask for a sign-in that OxideMerge cannot give.
 Sign in with `svn` itself first.
+The revision is read in the background; *Cancel* stops a server that is slow or does not answer,
+and the dialog comes back.
+Clicking *Compare* lets Mercurial read the repository's own `.hg/hgrc`, as Git's filters are
+honored; the list of recent revisions, read while you type, skips it (Mercurial 5.4 or later).
 When you compare the top folder of a working copy, the `.git`, `.svn` or `.hg` folder is listed
 on the right only; the *Exclude Source Control* filter hides it.
+Exporting a revision's folder is refused if it would come to more than 8 GB or 500,000 files,
+the same limit <<archives,archive extraction>> already has, so a mistaken or huge revision
+cannot fill the disk.
 
 On the command line, use `--rev` (or `--git-rev`, the same option):
 
@@ -847,6 +906,10 @@ oxidemerge --rev HEAD~1 src/main.rs
 oxidemerge --rev PREV src/main.c
 oxidemerge --rev .^ docs
 ----
+
+See also <<integration>>: OxideMerge can also be set up as Git, Subversion, Mercurial or
+Perforce's own diff and merge tool, invoked by them rather than opened on a revision from
+within OxideMerge.
 
 [[merging]]
 == Merging files and resolving conflicts
@@ -1333,8 +1396,9 @@ folder paths, so a plan is applied only to the folders it was made for.
 deleted, you must also tick a box that states their number.
 
 OxideMerge then works in this order: it creates folders, copies and replaces files, deletes files
-and finally removes empty folders. The dialog shows the count and the item being changed. For each item it first checks that the source and the
-destination are still as in the preview. Every file is copied to a temporary file next to its
+and finally removes empty folders. The dialog shows the count and the item being changed. For each
+item it first checks that the source and the destination are still as in the preview. Every file is
+copied to a temporary file next to its
 destination, checked against the planned SHA-256 and then renamed into place; a renamed file is
 moved instead. At the end, all copied and moved files are checked again.
 
@@ -1349,8 +1413,9 @@ On Windows, paths longer than the old 260-character limit are copied and deleted
 
 Nothing is applied either when the new and replacing files, or the journal copies of the files
 that are replaced and deleted, do not fit in the free space of their drive. The message names
-the drive, the space needed and the space free. If a drive still fills up part way, the write
-fails and the changes are undone.
+the drive, the space needed and the space free. Files that are only moved within the
+destination do not count. This check is made on macOS and Linux; on Windows the free space is
+not measured. If a drive still fills up part way, the write fails and the changes are undone.
 
 ==== If something goes wrong
 
@@ -1395,16 +1460,22 @@ all apply. A workbook of more than one sheet names each one before its rows and 
 text, since its sheets are not one table.
 
 |ELF programs, shared objects and object files
-|The header — class, byte order, kind, machine, ABI, entry point and the counts of the
-headers — then the program headers, a line to a segment with its type, offset, virtual and
-physical address, sizes in the file and in memory, alignment and `R`, `W`, `E` flags (and the
-interpreter a dynamically linked program asks for), then the section table, a line to a section
-with its name, type, address, offset, size, alignment and flags. Last come the symbols of each
-symbol table (`.symtab`, `.dynsym`), sorted by name, a line to a symbol with its address, size,
-type, binding, visibility and section (`UND` when it is undefined, `ABS` for an absolute value).
-So two builds line up function by function: a function that grew or moved shows as a changed
-line. The mapping symbols ARM and RISC-V assemblers add (`$x`, `$d`, …) are left out and only
-counted, and at most 100,000 symbols of a table are listed.
+|The header: class, byte order, kind, machine, ABI, entry point and the counts of the headers.
+Then the program headers, a line to a segment with its type, offset, virtual and physical
+address, sizes in the file and in memory, alignment and `R`, `W`, `E` flags (and the interpreter
+a dynamically linked program asks for). Then the section table, a line to a section with its
+name, type, address, offset, size, alignment and flags. Last, the symbols of each symbol table
+(`.symtab`, `.dynsym`), sorted by name: a line to a symbol with its address, size, type, binding,
+visibility and section (`UND` when it is undefined, `ABS` for an absolute value), so two builds
+line up function by function and a function that grew or moved shows as a changed line. The
+mapping symbols ARM and RISC-V assemblers add (`$x`, `$d`, …) are left out and only counted, and
+at most 100,000 symbols of a table are listed.
+
+|`.ipynb`
+|A Jupyter notebook, cell by cell: each cell labeled as a numbered code cell, a Markdown cell or
+a raw cell, with that cell's own source and nothing else. Outputs, execution counts and other
+metadata a notebook carries from being run are left out, so re-running a notebook without
+changing it compares equal.
 |===
 
 A file read this way is *read-only*: the pane says what was read (for example
@@ -1449,8 +1520,8 @@ not offered for `.odt`, `.rtf` or `.ods` files. The Formatted view reads the fil
 when a converter under *Options → Plugins* is set up for them. Whether a block differs depends
 on its text alone; the comparison options decide only which words of a changed block are
 highlighted. The view is made again when a file or an option changes. While it is shown, the
-difference counter on the toolbar still counts the differences of the text comparison; *Next difference* and *Previous difference* step
-through the changed blocks of the Formatted view.
+difference counter on the toolbar still counts the differences of the text comparison;
+*Next difference* and *Previous difference* step through the changed blocks of the Formatted view.
 
 Some limits and rules:
 
@@ -1463,8 +1534,11 @@ Some limits and rules:
   *Full contents* compares programs by their bytes.
 * A PDF file can ask for at most 1 GiB of decoded content in all; a file that needs more is
   reported rather than read.
-* The text read from one file can be at most 16 MiB. The rest is left out, and a line at the end
-  says so.
+* The text read from one file can be at most 16 MiB, in the *Text* and the *Formatted* modes
+  alike. The rest is left out, and a line at the end says so.
+* In the *Formatted* mode a table shows at most 1,048,576 cells and 1,024 columns; the rows past
+  that are left out, with the same line at the end. A part of more than 3 million elements is
+  too large to show formatted and is reported; the *Text* mode still reads it.
 * A workbook none of whose listed sheets can be found in the file is reported rather than
   compared as empty.
 
@@ -1489,7 +1563,10 @@ OxideMerge extracts archives and compares them as folders. It supports these for
 * `.tar`, `.tar.gz` / `.tgz`, `.tar.bz2` / `.tbz2` and `.tar.xz` / `.txz`.
 * `.7z`.
 
-The extracted files are read-only. OxideMerge never writes changes back into an archive.
+Edits to the extracted files are saved back into the archive: copying, deleting, merging or
+editing a file and then saving writes a new archive in place of the original. An archive
+opened as a snapshot in a review, or a page tree compared from the web, stays read-only, as
+there is nowhere for its changes to go back to.
 It refuses archives that would extract to more than 8 GB or more than 500,000 files.
 RAR is not supported.
 
@@ -1509,6 +1586,33 @@ Bytes that are different are highlighted, and the sides scroll together.
 
 To change the number of bytes on each line, use *Bytes per line (binary)* in
 *Options → Image / Binary*.
+
+=== Moved blocks
+
+*Moved blocks* on the binary toolbar highlights identical blocks found at different offsets
+in the hex and text columns and in the location pane. Select a highlighted byte and use
+*Go to matching block* to visit its counterpart, keeping your position within the block. You can tab
+to the button and press Enter. Focus returns to the byte grid so you can continue with the arrow
+keys.
+Two-way and three-way comparisons are supported; in three-way comparisons the button uses
+the first matching side shown beside it. Turn the checkbox off to see only ordinary differences.
+OxideMerge remembers the checkbox for the next binary comparison.
+
+Detection finds two kinds of identical bytes:
+
+* _Bytes shifted by an insertion or a deletion_: data near an edit that moved up to 128 bytes
+  forward or back, including short runs between two edits.
+* _Blocks moved farther or swapped_: data of at least 16 bytes that occurs only once in the
+  file. Repeated data, such as a run of padding bytes, is not matched this way.
+
+The highlights only add information: the differences, copying a difference, the file contents
+and the saved bytes stay the same.
+
+Detection runs in the background: once when the comparison opens, and after edits, undo, redo
+or copying a difference, when you stop typing for a moment. An edit, or closing the comparison,
+stops a scan at once, so detection does not slow down editing or use extra memory. Large files
+are sampled, so some short matches can be missed; up to 1,024 blocks are shown for each pair of
+files.
 
 === Editing bytes
 
@@ -1905,6 +2009,11 @@ OxideMerge can save your work in several formats. Choose the format by what you 
 |Open the same comparison again later. It stores paths and settings, not file contents.
 See <<projects>>.
 
+|Workspace
+|(kept in your settings)
+|Reopen a named set of open tabs at once, alongside whatever is open already.
+See <<workspaces>>.
+
 |Saved comparison
 |`.oxmcmp`
 |Keep the text of a text comparison, with bookmarks and comments.
@@ -1961,6 +2070,24 @@ those paths now.
 To move a project to another computer, copy its files and the external rules files that it uses
 too.
 To share the text as it is now, with your review notes, save a comparison instead.
+
+[[workspaces]]
+=== Workspaces
+
+*File → Workspaces → Save as workspace...* saves every open text, binary, image and web
+comparison tab that has files of its own under a name you choose. The name and the tabs' paths
+and settings are kept in your settings, not in a file of their own; folder, *All differences*
+and review tabs, which have nothing of their own to reopen from, are left out, the same as the
+session OxideMerge reopens automatically always leaves them out.
+
+*File → Workspaces* then lists every saved workspace: choose one to reopen all of its tabs at
+once, alongside whatever is open already. *Manage workspaces...* lists the saved workspaces, to
+open or delete one.
+
+A workspace is unlike the one, unnamed session OxideMerge reopens on its own when it starts: that
+session is kept and replaced automatically, while a workspace is kept, and reopened, only by the
+name you gave it. A tab fetched over SFTP (see <<remote-sftp>>) is never part of a workspace,
+since its password or key is not kept either.
 
 [[saved-comparisons]]
 === Saved comparisons
@@ -2068,8 +2195,8 @@ dialog.
 
 XML reports are for other programs, such as scripts, review tools or a build that checks what
 changed.
-Choose the XML type in the save dialog of *File → Export → HTML report...*, or use `--report <name>.xml` on the command
-line.
+Choose the XML type in the save dialog of *File → Export → HTML report...*, or use
+`--report <name>.xml` on the command line.
 
 * A text comparison report lists each difference.
   For each one, it gives the kind, whether it is ignored, and the lines of each side with their
@@ -2128,8 +2255,9 @@ In the browser:
 === PDF reports and printing
 
 *File → Export → PDF report...* saves the report of a text or folder comparison as a PDF
-file. *File → Print...* (kbd:[Ctrl+P]) writes the same PDF to a temporary file and opens it in
-your system's PDF viewer, where you print it. No browser is used.
+file. *File → Print...* (kbd:[Ctrl+P]) writes the same PDF to a temporary file that only you
+can read and opens it in your system's PDF viewer, where you print it. The temporary file is
+deleted when OxideMerge closes. No browser is used.
 
 A PDF report holds what the HTML report holds:
 
@@ -2146,7 +2274,24 @@ Each page has a header with the OxideMerge icon and the report title, and a foot
 m* and *OxideMerge*, which links to the project page
 (https://github.com/kuopinghsu/OxideMerge). The PDF has a bookmark for each file and each
 difference. The fonts OxideMerge uses are embedded, only with the characters the report needs,
-so Chinese, Japanese and Korean text prints as it shows on screen.
+so Chinese, Japanese and Korean text prints as it shows on screen. Each column is labeled with
+its side, and on a page a difference continues on, with its file as well. In a folder report,
+the header of the file list is repeated on each page.
+
+A report draws at most 20,000 lines of compared text (about 400 pages), all files together; a
+long line that wraps counts once for each line it takes. A difference shows at most 400 rows,
+unless the whole file is shown. When one is cut, at most 100 unchanged lines are kept above the
+change, so the change itself is always shown, and a line such as *… 1,200 more lines* says what
+is left out. The differences after the limit are only counted.
+
+Lines read left to right, and Hebrew and Arabic text in them right to left, with the numbers and
+brackets in it in their places and Arabic letters joined. This is simpler than a browser's
+layout, so a line mixing the two directions in unusual ways can differ from it. Code fonts do
+not join `!=` or `->` into one sign. Hebrew, Arabic and Thai print with an installed font that
+allows embedding, such as SF Hebrew, Geeza Pro, Tahoma, Segoe UI or Noto. A character none of
+the fonts has
+prints as `?`; a note at the end of the report (and on the command line, on standard error)
+lists such characters by code point.
 
 Color is never the only cue, so a report printed in black and white still shows what changed:
 
@@ -2155,7 +2300,7 @@ Color is never the only cue, so a report printed in black and white still shows 
 * Changed words are underlined as well as highlighted.
 * The place of a line missing on one side is hatched.
 * With *Color-blind friendly diff colors* on in *Options → General*, blue and orange take the
-  place of green and red.
+  place of green and red, changes are purple and conflicts yellow.
 
 Pages are A4 and landscape. Select *File → Export → US Letter pages for PDF reports* for Letter
 pages. On the command line, `--page-size`, `--portrait`, `--unified`, `--whole-file` and
@@ -2512,7 +2657,7 @@ longer match.
   items, or that a newer version of OxideMerge saved.
 
 [[baselines]]
-=== Release baselines
+=== Release summary / Compare baselines
 
 The *Release summary / Compare baselines* panel compares two releases.
 It is on the start page, and in the side drawer of a folder comparison.
@@ -2591,7 +2736,7 @@ NOTE: Important paths only help you choose what to review first.
 They do not guarantee compatibility.
 
 [[impact]]
-=== Impact analysis
+=== Potential impact
 
 Turn on *Potential impact* to list the places where the changed files may be used.
 Each finding shows the file, the line, a digest of the content and an excerpt.
@@ -2933,7 +3078,8 @@ Linux). The plan records it, so `--sync-apply` needs no flag. Without it, links 
 
 |`--yes`
 |Confirm that `--sync-apply`, or the sync jobs of `--job`, may replace and delete files in the
-destination.
+destination, and that the jobs of `--job` may write reports and patches outside the job file's
+folder.
 
 |`--sync-recover`
 |Undo the folder synchronizations that did not finish.
@@ -3128,7 +3274,8 @@ oxidemerge --job nightly.oxjob --yes    # runs all three
 
 Each job is turned into the options of a command line and run as that command line would be, so
 a job and its command line give the same result. Your saved options apply, as they do on the
-command line.
+command line. `--job` takes no paths and no other options except `--yes` and `--lang`; the
+options of each job are in the file.
 
 `version`:: Required; `1`. A file of a newer version is refused.
 `continue_on_error`:: When `false` (the default), the jobs after one that ends with an error
@@ -3150,18 +3297,26 @@ refused unless the job has `"allow_large_deletion": true`. Both kinds take
 
 All kinds also take `filter`, `method`, `rules`, `whitespace`, `ignore_case`, `ignore_blank`,
 `ignore_eol`, `ignore_numbers`, `ignore_comments`, `prettify`, `structured` and
-`numeric_tolerance`, and the compare and sync plan kinds `page_size`, `portrait`, `unified` and
-`whole_file` for a `.pdf` report, with the meanings of the command-line options of the same names.
-A field that does not fit the kind, such as `apply` in a compare, is an error.
+`numeric_tolerance`, and the compare kind `page_size`, `portrait`, `unified` and `whole_file` for
+a `.pdf` report, with the meanings of the command-line options of the same names. A field that
+does not fit the kind, such as `apply` in a compare, is an error.
 
 Paths, including `rules`, are relative to the folder of the job file, unless they are absolute or
 URLs. In paths and `rules`, `${env:NAME}` is replaced by the environment variable `NAME`; an unset
-variable is an error. Nothing else is expanded, and no job runs a shell or another program.
+variable is an error. Nothing else is expanded, and a job file names no command and no shell.
+Comparing a file that one of your unpackers reads (see <<unpackers>>) runs that unpacker, as any
+comparison does.
+
+A job writes its report or patch as a new file or over a plain file, never through a symbolic
+link. A report or patch outside the job file's folder, such as `../report.html` or a path under
+`${env:HOME}`, is written only with `--yes`, so a job file received from someone else cannot
+replace your files.
 
 `--job` prints a JSON summary. Its `exit_code` is the worst of the jobs' codes, which is also the
 exit code of the run. Each entry of `jobs` has the `name`, the `kind`, the `exit_code`, an `error`
 when the job failed, and for a sync job the same `sync` result that `--sync-apply` prints.
-`not_run` lists the jobs skipped after a failure:
+`not_run` lists the jobs skipped after a failure, and `stopped` is `true` when the run was stopped
+in the program:
 
 [source,json]
 ----
@@ -3171,7 +3326,7 @@ when the job failed, and for a sync job the same `sync` result that `--sync-appl
     { "name": "nightly report", "kind": "compare", "exit_code": 1 },
     { "name": "plan", "kind": "sync_plan", "exit_code": 1 },
     { "name": "backup", "kind": "sync", "exit_code": 2,
-      "error": "this job changes … and runs only with --yes" }
+      "error": "This job changes … and runs only when allowed: --yes on the command line" }
   ]
 }
 ----
@@ -3191,15 +3346,28 @@ options that are on, so it compares as the tab does. Choose what the job does:
   `"allow_large_deletion": true`.
 
 Select *Store paths relative to the job file* to move the job and its folders together. Only a
-comparison of two folders can be saved as a sync job.
+comparison of two folders can be saved as a sync job. A comparison of a revision, a web page or an
+archive goes through temporary copies, so it cannot be saved as a job.
 
 *File → Run job...* runs a job file and lists how each job ended, with *Open* for the report or
-plan it wrote and *Compare* to open its folders in a tab. The jobs run as `--job` runs them, from
-your saved options. A file that holds a sync job first lists the folders it changes and runs only
-after you click *Run and allow changes*; that stands for `--yes`, for this run only.
+plan it wrote and *Compare* to open its folders in a tab. *Open* is offered only for report files
+(`.html`, `.pdf`, `.csv`, `.txt`, `.xml`, `.json`, `.diff` or `.patch`). The jobs run as `--job`
+runs them, from your saved options, not the options OxideMerge was started with.
+
+A file that holds a sync job, or writes a report or patch outside its folder, first lists the
+folders it changes and the files it writes. A sync job allowed to delete many files says so. The
+file runs only after you click *Run and allow changes*; that stands for `--yes`, for this run
+only. What runs is the file as it was listed, even if it changes on disk meanwhile; *Run again*
+reads it again and asks again. *Stop* stops a synchronization being applied, undoing what it
+changed, and skips the jobs after it. While a job is synchronizing, OxideMerge waits for it
+before it quits.
 
 [[integration]]
 == Integrating with other tools
+
+This chapter sets OxideMerge up as the diff and merge tool that Git, Subversion, Mercurial
+or Perforce run on their own. To instead open a revision from within OxideMerge, see
+<<git-revision>>.
 
 [[git]]
 === Git
@@ -3691,7 +3859,8 @@ The pane is read-only for one of these reasons:
 --
 * The lock in its header is closed.
 * It was opened with `--wl`, `--wm` or `--wr`.
-* It was extracted from an archive.
+* It was extracted from a review snapshot or from a web page tree. A file extracted from an
+  archive compare (see <<archives>>) can be edited; saving it also saves the archive.
 * It is a JSON or XML file shown formatted.
   Turn off *Format JSON and XML before comparing* to edit and merge it.
 --
@@ -3703,10 +3872,9 @@ If you choose another encoding, OxideMerge reads the file again, so copy your ed
 place first.
 
 A save or copy fails, but the file is writable::
-To replace a file, OxideMerge must also be able to create a temporary file in its folder and
-replace files there.
-Check the folder permissions, the free space, and programs that lock the file.
-OxideMerge reports the failure. It never writes directly over the original.
+OxideMerge must also be able to create and replace a temporary file in the same folder (see
+<<saving-files>>). Check the folder permissions, the free space, and programs that lock the
+file. OxideMerge reports the failure rather than writing over the original.
 Keep the comparison open until you have saved your edits successfully.
 
 === Comparison results
@@ -3765,9 +3933,9 @@ content (see <<compare-methods>>).
 == Known limitations
 
 * Archives: ZIP-based formats, TAR (plain, gzip, bzip2 and xz) and 7z are supported.
-  RAR is not supported. Extracted archive contents are read-only.
+  RAR is not supported.
 * The text panes are meant for reviewing and merging changes, not as a full editor.
-  There are no multiple cursors except a column selection, and the inline view does not edit.
+  The inline view does not edit.
 * Unpacker plugins use external commands. WinMerge plugin DLLs and scripts are not supported.
 * Web page comparison does not support cookies or logins. A page that needs a login shows its login
   page.

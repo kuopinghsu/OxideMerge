@@ -777,8 +777,13 @@ fn table(
         let body = egui::TextStyle::Body.resolve(ui.style());
         let mono = egui::TextStyle::Monospace.resolve(ui.style());
         let mut wide = Vec::new();
+        // A large table is measured from its first rows and rows spread over the rest.
+        let step = (rows.len() * cols).div_ceil(MEASURED_CELLS).max(1);
         ui.ctx().fonts_mut(|fonts| {
             for (r, row) in rows.iter().enumerate() {
+                if r >= FIRST_MEASURED && r % step != 0 {
+                    continue;
+                }
                 for (k, (text, _)) in row.iter().enumerate() {
                     match slot(layout, r, k) {
                         Slot::Anchor { cols: 1, .. } => {
@@ -981,6 +986,11 @@ fn fit(natural: &[f32], room: f32) -> Vec<f32> {
     }
     widths
 }
+
+/// The most cells of a table measured for the widths of its columns, and the rows at its top
+/// always measured.
+const MEASURED_CELLS: usize = 50_000;
+const FIRST_MEASURED: usize = 50;
 
 /// About how wide Markdown `text` is shown on one line in `body`, with its code in `mono`.
 fn natural_width(

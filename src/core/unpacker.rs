@@ -336,7 +336,12 @@ mod tests {
     fn documents_read_as_text_are_compare_only() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/left");
         let opts = super::super::diff::DiffOptions::default();
-        for name in ["docs/report.docx", "docs/budget.xlsx", "docs/report.pdf"] {
+        for name in [
+            "docs/report.docx",
+            "docs/budget.xlsx",
+            "docs/report.pdf",
+            "docs/report.ipynb",
+        ] {
             let doc = load_doc(&root.join(name), &opts, None).unwrap();
             assert!(doc.read_only && doc.compare_only, "{name}");
         }

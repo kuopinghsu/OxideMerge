@@ -1,10 +1,12 @@
 //! Archive support: archives are extracted to a temporary folder and compared as folders.
 //! Zip based formats, tar (plain or compressed with gzip, bzip2 or xz) and 7z are supported.
+//! Edits saved into the extracted copy are written back with [`repack`].
 
+use super::fsutil;
 use anyhow::{Context, Result};
 use std::cell::Cell;
 use std::io::{Read, Seek, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 pub const ZIP_EXTS: &[&str] = &[
     "zip", "jar", "war", "ear", "apk", "aar", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub",
@@ -180,7 +182,7 @@ fn extract(path: &Path, dir: &Path, budget: &Budget) -> Result<()> {
 
 /// Removes the symbolic links under `root` that lead outside it, or nowhere. Each link is
 /// resolved as the system resolves it, through the other links on the way.
-fn remove_links_outside(root: &Path) -> Result<()> {
+pub(super) fn remove_links_outside(root: &Path) -> Result<()> {
     let real_root = std::fs::canonicalize(root)?;
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
@@ -295,9 +297,433 @@ fn extract_tar(input: impl Read, dir: &Path, budget: &Budget) -> Result<()> {
     Ok(())
 }
 
+/// One entry found while walking an extracted archive for [`repack`], relative to its root.
+enum Entry {
+    Dir(PathBuf),
+    File(PathBuf),
+    /// A symbolic link kept as a link (tar only): its target, as stored in the link itself.
+    Symlink(PathBuf, PathBuf),
+}
+
+impl Entry {
+    fn rel(&self) -> &Path {
+        match self {
+            Entry::Dir(p) | Entry::File(p) => p,
+            Entry::Symlink(p, _) => p,
+        }
+    }
+}
+
+/// Lists every entry under `dir`, relative to it, in a stable (sorted) order. With
+/// `follow_symlinks`, a symbolic link is read as whatever it points to (as zip has no
+/// portable way to store one), but only when that real path stays inside `dir`: a symlink
+/// added to the extracted copy by hand, pointing elsewhere (say, at `/etc/passwd`), is left
+/// out rather than having its outside content embedded into the repacked archive. Without
+/// `follow_symlinks`, a link is instead kept as an [`Entry::Symlink`] (tar supports these
+/// directly), but only when it stays inside `dir` by name, as [`extract`] would have let it
+/// through. Following a symlink never descends into the same real directory twice, so a
+/// cycle made of symlinks cannot loop forever.
+fn list_dir(dir: &Path, follow_symlinks: bool) -> Result<Vec<Entry>> {
+    let mut out = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    let mut visited = std::collections::HashSet::new();
+    let real_root = follow_symlinks
+        .then(|| std::fs::canonicalize(dir).ok())
+        .flatten();
+    if let Some(root) = &real_root {
+        visited.insert(root.clone());
+    }
+    while let Some(rel) = stack.pop() {
+        let abs = dir.join(&rel);
+        for entry in std::fs::read_dir(&abs).with_context(|| format!("read {}", abs.display()))? {
+            let entry = entry?;
+            let rel_child = rel.join(entry.file_name());
+            let abs_child = dir.join(&rel_child);
+            let ft = entry.file_type()?;
+            if ft.is_symlink() {
+                if !follow_symlinks {
+                    if let Ok(target) = std::fs::read_link(&abs_child) {
+                        if link_inside(&rel_child, &target, false) {
+                            out.push(Entry::Symlink(rel_child, target));
+                        }
+                    }
+                    continue;
+                }
+                // Resolve where the link really leads before trusting it with anything
+                // else: not inside `dir` at all, or (for a directory) a real path already
+                // on the way down, which would otherwise recurse forever.
+                let Ok(real) = std::fs::canonicalize(&abs_child) else {
+                    continue;
+                };
+                if real_root
+                    .as_ref()
+                    .is_some_and(|root| !real.starts_with(root))
+                {
+                    continue;
+                }
+                if abs_child.is_dir() {
+                    out.push(Entry::Dir(rel_child.clone()));
+                    if visited.insert(real) {
+                        stack.push(rel_child);
+                    }
+                } else {
+                    out.push(Entry::File(rel_child));
+                }
+                continue;
+            }
+            if ft.is_dir() {
+                out.push(Entry::Dir(rel_child.clone()));
+                stack.push(rel_child);
+            } else {
+                out.push(Entry::File(rel_child));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.rel().cmp(b.rel()));
+    Ok(out)
+}
+
+/// The folder a replacement for `path` is staged in before it takes its place, so the
+/// rename stays on the same file system.
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// Writes every entry of `dir` into `w` as a tar stream, returning it once finished.
+fn write_tar<W: Write>(entries: &[Entry], dir: &Path, w: W) -> Result<W> {
+    let mut b = tar::Builder::new(w);
+    for e in entries {
+        match e {
+            Entry::Dir(rel) => {
+                b.append_dir(rel, dir.join(rel))
+                    .with_context(|| format!("archive dir {}", rel.display()))?;
+            }
+            Entry::File(rel) => {
+                b.append_path_with_name(dir.join(rel), rel)
+                    .with_context(|| format!("archive file {}", rel.display()))?;
+            }
+            Entry::Symlink(rel, target) => {
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(tar::EntryType::Symlink);
+                h.set_size(0);
+                h.set_mode(0o777);
+                b.append_link(&mut h, rel, target)
+                    .with_context(|| format!("archive link {}", rel.display()))?;
+            }
+        }
+    }
+    b.into_inner().context("finish tar")
+}
+
+/// Rewrites the archive at `path` from the current contents of `dir`, an extraction of it
+/// that may have been edited. The write goes to a temporary file in the same folder as
+/// `path`, which then takes its place, so a failure or a crash leaves the original archive
+/// untouched. Called after saving a change made to a file opened from an archive compare.
+pub fn repack(path: &Path, dir: &Path) -> Result<()> {
+    let out_dir = parent_dir(path);
+    let writing = || format!("write {}", path.display());
+    let Some(k) = kind(path) else {
+        anyhow::bail!("{}: not a recognized archive", path.display());
+    };
+    match k {
+        Kind::Zip => repack_zip(path, dir, out_dir).with_context(writing),
+        Kind::Tar => {
+            let entries = list_dir(dir, false)?;
+            let tmp = tempfile::Builder::new()
+                .prefix(".oxidemerge-")
+                .tempfile_in(out_dir)?;
+            let tmp = write_tar(&entries, dir, tmp)?;
+            finish(tmp, path)
+        }
+        Kind::TarGz => {
+            let entries = list_dir(dir, false)?;
+            let tmp = tempfile::Builder::new()
+                .prefix(".oxidemerge-")
+                .tempfile_in(out_dir)?;
+            let enc = flate2::write::GzEncoder::new(tmp, flate2::Compression::default());
+            let enc = write_tar(&entries, dir, enc)?;
+            finish(enc.finish().context("finish gzip")?, path)
+        }
+        Kind::TarBz2 => {
+            let entries = list_dir(dir, false)?;
+            let tmp = tempfile::Builder::new()
+                .prefix(".oxidemerge-")
+                .tempfile_in(out_dir)?;
+            let enc = bzip2::write::BzEncoder::new(tmp, bzip2::Compression::default());
+            let enc = write_tar(&entries, dir, enc)?;
+            finish(enc.finish().context("finish bzip2")?, path)
+        }
+        Kind::TarXz => {
+            let entries = list_dir(dir, false)?;
+            // Built uncompressed first, as `lzma_rs` compresses a whole stream at once.
+            let mut inner = tempfile::tempfile()?;
+            write_tar(&entries, dir, &mut inner)?;
+            inner.rewind()?;
+            let tmp = tempfile::Builder::new()
+                .prefix(".oxidemerge-")
+                .tempfile_in(out_dir)?;
+            let mut tmp = tmp;
+            lzma_rs::xz_compress(&mut std::io::BufReader::new(inner), tmp.as_file_mut())
+                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            finish(tmp, path)
+        }
+        Kind::SevenZ => repack_7z(path, dir, out_dir).with_context(writing),
+    }
+}
+
+/// Syncs and persists the staged replacement `tmp` over `path`.
+fn finish(tmp: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    tmp.as_file().sync_all()?;
+    fsutil::persist(tmp, path).with_context(|| format!("write {}", path.display()))
+}
+
+fn repack_zip(path: &Path, dir: &Path, out_dir: &Path) -> Result<()> {
+    let entries = list_dir(dir, true)?;
+    let tmp = tempfile::Builder::new()
+        .prefix(".oxidemerge-")
+        .tempfile_in(out_dir)?;
+    let mut tmp = tmp;
+    {
+        let mut w = zip::ZipWriter::new(tmp.as_file_mut());
+        for e in &entries {
+            match e {
+                Entry::Dir(rel) => {
+                    w.add_directory_from_path(rel, zip::write::SimpleFileOptions::default())?;
+                }
+                Entry::File(rel) => {
+                    w.start_file_from_path(rel, zip::write::SimpleFileOptions::default())?;
+                    let mut f = std::fs::File::open(dir.join(rel))
+                        .with_context(|| format!("open {}", rel.display()))?;
+                    std::io::copy(&mut f, &mut w)?;
+                }
+                Entry::Symlink(..) => unreachable!("zip entries follow symlinks"),
+            }
+        }
+        w.finish().context("finish zip")?;
+    }
+    finish(tmp, path)
+}
+
+fn repack_7z(path: &Path, dir: &Path, out_dir: &Path) -> Result<()> {
+    let entries = list_dir(dir, true)?;
+    let tmp = tempfile::Builder::new()
+        .prefix(".oxidemerge-")
+        .tempfile_in(out_dir)?;
+    let mut tmp = tmp;
+    {
+        let mut w = sevenz_rust2::ArchiveWriter::new(tmp.as_file_mut())
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        // DEFLATE rather than the default LZMA2, as this build only enables the codecs it
+        // reads archives with (see the `sevenz-rust2` dependency features).
+        w.set_content_methods(vec![sevenz_rust2::EncoderMethod::DEFLATE.into()]);
+        for e in &entries {
+            let rel = e.rel();
+            let name = rel.to_string_lossy().replace('\\', "/");
+            match e {
+                Entry::Dir(_) => {
+                    let entry = sevenz_rust2::ArchiveEntry::from_path(dir.join(rel), name);
+                    w.push_archive_entry::<&[u8]>(entry, None)
+                        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+                }
+                Entry::File(_) => {
+                    let entry = sevenz_rust2::ArchiveEntry::from_path(dir.join(rel), name);
+                    let f = std::fs::File::open(dir.join(rel))
+                        .with_context(|| format!("open {}", rel.display()))?;
+                    w.push_archive_entry(entry, Some(f))
+                        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+                }
+                Entry::Symlink(..) => unreachable!("7z entries follow symlinks"),
+            }
+        }
+        w.finish()
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    }
+    finish(tmp, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Extracts `archive`, edits the files as a user might, repacks it, then extracts the
+    /// result again and checks the edits came through, for every supported format.
+    #[test]
+    fn repack_round_trips_every_format() {
+        let work = tempfile::tempdir().unwrap();
+
+        let zip_path = work.path().join("a.zip");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        zw.start_file("keep.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(b"keep\n").unwrap();
+        zw.start_file("change.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(b"old\n").unwrap();
+        zw.start_file("remove.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(b"gone\n").unwrap();
+        zw.add_directory("sub/", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.finish().unwrap();
+
+        let tar_path = work.path().join("a.tar");
+        std::fs::write(&tar_path, tar_bytes()).unwrap();
+
+        let tgz_path = work.path().join("a.tar.gz");
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar_bytes()).unwrap();
+        std::fs::write(&tgz_path, gz.finish().unwrap()).unwrap();
+
+        let tbz_path = work.path().join("a.tar.bz2");
+        let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        bz.write_all(&tar_bytes()).unwrap();
+        std::fs::write(&tbz_path, bz.finish().unwrap()).unwrap();
+
+        let txz_path = work.path().join("a.tar.xz");
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut tar_bytes().as_slice(), &mut xz).unwrap();
+        std::fs::write(&txz_path, xz).unwrap();
+
+        // `tar_bytes` makes a `dir/a.txt`; build the same tree on disk for the 7z source.
+        let sevenz_path = work.path().join("a.7z");
+        let src = work.path().join("sevenz_src");
+        std::fs::create_dir_all(src.join("dir")).unwrap();
+        std::fs::write(src.join("dir/a.txt"), "hello\n").unwrap();
+        sevenz_rust2::compress_to_path(&src, &sevenz_path).unwrap();
+
+        for (archive, rel) in [
+            (&zip_path, "change.txt"),
+            (&tar_path, "dir/a.txt"),
+            (&tgz_path, "dir/a.txt"),
+            (&tbz_path, "dir/a.txt"),
+            (&txz_path, "dir/a.txt"),
+            (&sevenz_path, "dir/a.txt"),
+        ] {
+            let extracted = extract_to_temp(archive).unwrap();
+            let target = extracted.path().join(rel);
+            std::fs::write(&target, "new\n").unwrap();
+            std::fs::write(extracted.path().join("added.txt"), "added\n").unwrap();
+
+            super::repack(archive, extracted.path())
+                .unwrap_or_else(|e| panic!("{}: {e}", archive.display()));
+
+            let after = extract_to_temp(archive).unwrap();
+            let changed = std::fs::read_to_string(after.path().join(rel)).unwrap();
+            assert_eq!(changed, "new\n", "{}", archive.display());
+            let added = std::fs::read_to_string(after.path().join("added.txt")).unwrap();
+            assert_eq!(added, "added\n", "{}", archive.display());
+        }
+
+        // Zip alone was given an unrelated file and an empty directory to drop and keep.
+        let extracted = extract_to_temp(&zip_path).unwrap();
+        assert!(extracted.path().join("keep.txt").exists());
+        std::fs::remove_file(extracted.path().join("remove.txt")).unwrap();
+        super::repack(&zip_path, extracted.path()).unwrap();
+        let after = extract_to_temp(&zip_path).unwrap();
+        assert!(after.path().join("keep.txt").exists());
+        assert!(!after.path().join("remove.txt").exists());
+        assert!(after.path().join("sub").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repack_keeps_symlinks_in_tar_but_not_zip() {
+        let work = tempfile::tempdir().unwrap();
+        let tar_path = work.path().join("a.tar");
+        std::fs::write(&tar_path, tar_bytes()).unwrap();
+        let extracted = extract_to_temp(&tar_path).unwrap();
+        std::os::unix::fs::symlink("a.txt", extracted.path().join("dir/link.txt")).unwrap();
+        super::repack(&tar_path, extracted.path()).unwrap();
+        let after = extract_to_temp(&tar_path).unwrap();
+        let link = after.path().join("dir/link.txt");
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "tar should keep the symbolic link"
+        );
+
+        let zip_path = work.path().join("a.zip");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        zw.start_file("a.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(b"hi\n").unwrap();
+        zw.finish().unwrap();
+        let extracted = extract_to_temp(&zip_path).unwrap();
+        std::os::unix::fs::symlink("a.txt", extracted.path().join("link.txt")).unwrap();
+        super::repack(&zip_path, extracted.path()).unwrap();
+        let after = extract_to_temp(&zip_path).unwrap();
+        let link = after.path().join("link.txt");
+        // Zip has no portable symbolic link of its own here, so the link was followed and
+        // stored as the regular file it points to.
+        assert!(!std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "hi\n");
+    }
+
+    /// A symlink added to the extracted copy by hand, pointing outside it, is left out of
+    /// the repacked tar rather than written into the archive: `extract` would never have let
+    /// such a link through in the first place (see `link_inside`, `remove_links_outside`).
+    #[cfg(unix)]
+    #[test]
+    fn repack_drops_a_tar_symlink_pointing_outside_the_archive() {
+        let work = tempfile::tempdir().unwrap();
+        let tar_path = work.path().join("a.tar");
+        std::fs::write(&tar_path, tar_bytes()).unwrap();
+        let extracted = extract_to_temp(&tar_path).unwrap();
+        std::os::unix::fs::symlink("../../../etc/passwd", extracted.path().join("escape.txt"))
+            .unwrap();
+        super::repack(&tar_path, extracted.path()).unwrap();
+        let after = extract_to_temp(&tar_path).unwrap();
+        assert!(!after.path().join("escape.txt").exists());
+    }
+
+    /// Following symlinks to repack a zip or 7z must not loop forever on a cycle of
+    /// directory symlinks (`a` -> `b`, `b` -> `a`).
+    #[cfg(unix)]
+    #[test]
+    fn repack_follows_symlinks_without_looping_on_a_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("real")).unwrap();
+        std::fs::write(dir.path().join("real/a.txt"), "hi\n").unwrap();
+        // "." inside `real` resolves to `real` itself: following `real/loop` walks back
+        // into `real`, then into `real/loop` again, forever, unless that is detected.
+        std::os::unix::fs::symlink(".", dir.path().join("real/loop")).unwrap();
+        let entries = list_dir(dir.path(), true).unwrap();
+        // The cycle is cut off rather than walked forever; the real file is still found.
+        assert!(entries.iter().any(|e| e.rel() == Path::new("real/a.txt")));
+    }
+
+    /// Following symlinks to repack a zip or 7z must not read through one pointing outside
+    /// the extracted copy: that would embed a file (or a whole directory) from elsewhere on
+    /// disk into the archive, under the attacker's chosen name.
+    #[cfg(unix)]
+    #[test]
+    fn repack_does_not_follow_a_symlink_outside_the_extracted_copy() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+        std::fs::create_dir_all(outside.path().join("secret_dir")).unwrap();
+        std::fs::write(outside.path().join("secret_dir/x.txt"), "x\n").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hi\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("escape_file.txt"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret_dir"),
+            dir.path().join("escape_dir"),
+        )
+        .unwrap();
+
+        let entries = list_dir(dir.path(), true).unwrap();
+        assert!(entries.iter().any(|e| e.rel() == Path::new("a.txt")));
+        assert!(!entries
+            .iter()
+            .any(|e| e.rel().starts_with("escape_file.txt")));
+        assert!(!entries.iter().any(|e| e.rel().starts_with("escape_dir")));
+    }
 
     fn tar_bytes() -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());

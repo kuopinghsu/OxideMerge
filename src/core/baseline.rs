@@ -165,7 +165,7 @@ pub fn capture(
         BaselineSpec::Folder { path } => path.clone(),
         BaselineSpec::GitRef { path, revision } => {
             let id = super::git::resolve_commit(path, revision)?;
-            let (temp, copy) = super::git::export_folder(path, &id)?;
+            let (temp, copy) = super::git::export_folder(path, &id, cancel)?;
             resolved_commit = Some(id);
             git_temp = Some(temp);
             copy

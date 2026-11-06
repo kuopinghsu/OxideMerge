@@ -1,16 +1,18 @@
 # Sample comparisons
 
-Files for trying OxideMerge's features without your own data. Run the commands from the project
-folder: `cargo run --` runs the debug build; with OxideMerge installed, use `oxidemerge` instead.
+Files for trying OxideMerge's features without your own data. Run the commands from the
+project folder: `cargo run --` runs the debug build; with OxideMerge installed, use
+`oxidemerge` instead.
 
 ## Folder compare: `left` and `right`
 
     cargo run -- -r samples/left samples/right      # or: make demo
 
 The two folders differ in every way a folder compare shows: changed text and binary files,
-identical files (`same.txt`, `src/util/strings.rs`), and files and folders on one side only
-(`only_left/`, `docs/README.md`). Select files by name with patterns such as `*.log; *.py`, open the
-**All differences** view, or write a report or slideshow from the **File** menu.
+identical files (`same.txt`, `src/util/strings.rs`), and files and folders on one side
+only (`only_left/`, `docs/README.md`). Select files by name with patterns such as
+`*.log; *.py`, open the **All differences** view, or write a report or slideshow from the
+**File** menu.
 
 Each pair below can also be opened on its own, for example
 `cargo run -- samples/left/src/inventory.py samples/right/src/inventory.py`.
@@ -33,8 +35,9 @@ Each pair below can also be opened on its own, for example
 | `text/encoding.txt` | The same text in ISO-8859-1 and in UTF-8 with a byte order mark. It compares equal by default; turn off **Ignore code page differences** to see the difference. |
 | `images/chart.png` | A bar chart where one bar grew and two changed color. Try the side by side, overlay, swipe, blink and difference views. |
 | `images/gradient.ppm`, `images/stamp.pbm` | Netpbm images (binary PPM and plain-text PBM) with a few changed areas. Zoom in on the small stamp. |
-| `bin/firmware.img` | A 4 KiB binary with a changed header field, changed bytes and 16 inserted bytes, in the hexadecimal view. |
+| `bin/firmware.bin` | A mixed binary edit fixture. The left side has bytes inserted, deleted and overwritten throughout, so its copy of the right side's bytes is from 1 byte behind to 21 bytes ahead. Enable **Moved blocks** to see 18 unchanged runs at shifted offsets. |
 | `docs/report.docx`, `docs/report.pdf`, `docs/budget.xlsx` | Word, Excel and PDF files read by the built-in readers, with no converter installed. **The report:** edited and added paragraphs, bullet lists, a header with a logo, a changed chart and an added map image (as text, image changes show through the captions; choose **Formatted** above the panes to see the tables drawn with their merged cells and each image's fingerprint), and tables with merged cells: header cells spanning columns and rows, areas merged down over their regions, with an added region inside a merge, and total and notes rows spanning several columns. `report.pdf` is the report as LibreOffice prints it, tagged, for comparing the same changes as a PDF; **Formatted** reads it from its tags, with the same headings, lists, merged table cells and figures as the Word file. **The budget:** six sheets with merged titles and headers, group cells merged down over their rows (with a row added inside a merge and one removed), formulas whose stored results change, dates, percentages, booleans, an error value, rich and inline text, text that needs quoting (commas, quotes, line breaks), rows that swap places, cells far apart on a sparse sheet, a hidden sheet, a sheet removed and one added with a Chinese name, and pictures placed over cells. As text, only values are compared, dates as serial numbers. Choose **Formatted** above the panes to see each sheet as a table with its merged cells, dates, amounts and percentages as their formats show them, and each picture with its cell and fingerprint, so the photo changed on its own (the first staff row) shows as a change. A fill changed on its own (Utilities Q2) compares as equal either way: open the workbook as an archive to see it in `xl/worksheets/sheet2.xml` (the cell's style). |
+| `docs/report.ipynb` | A Jupyter notebook read cell by cell: the second code cell has the same source on each side but a different execution count and output, so it compares equal; the third has a line added, and the closing note's wording changed. Outputs, execution counts and other run metadata never show up in the comparison. |
 | `prog/prog.elf` | Two 32-bit RISC-V programs for the same board, CoreMark on the left and Dhrystone on the right, read by the built-in ELF reader: the header, the program headers (segments with their addresses, sizes and flags), the section table, and the symbols sorted by name with their address, size, type, binding, visibility and section. The start-up code and memory map they share line up, the benchmark functions show as added and removed, and the shared functions show as moved to new addresses. |
 | `web/handbook.html` | A long web page compared as a web page, in the **Formatted** mode by default: headings at three levels, edited paragraphs with bold, italic and code words, nested and numbered lists with items added, a quote, a definition list, a code block, a figure whose alt text and picture changed, an added section and a changed email link. Two tables have merged cells (`rowspan`, `colspan`): header cells spanning rows and columns, regions merged down over their areas with a row added inside a merge and a region replaced, and footer rows spanning several columns; they are drawn with their merged cells. A note hidden with an inline `display: none` changes too, and is left out of the Formatted and Text modes (HTML source still shows it). |
 | `archives/bundle.zip` | Open it from the folder compare to compare the archives as folders: changed files and one added file. |
@@ -50,30 +53,32 @@ Each pair below can also be opened on its own, for example
     cargo run -- samples/three/conflict.txt                                              # make demo-conflict
     cargo run -- samples/three/diff3-conflict.py
 
-- `settings/*.ini`, `settings/*.toml`, `settings/*.yaml`: the same settings in three formats, with
-  changes made on the left only, on the right only, the same change on both sides, and
-  conflicting changes. **Auto merge** takes the first three kinds and leaves the conflicts for
-  you to resolve. `--merge-plan` lists the same actions and warnings for each format.
-- `folders/`: a 3-way folder compare with a file changed on one side, on the other, the same on
-  both, in conflict, added on the left, and removed on the right. Use **Auto merge** on the folder
-  compare too. **Next conflict** (Alt+PgDn) goes through the open conflicts of `conflict.txt`
-  and `docs/install.md`, passing over `docs/guide.md`, which both sides changed but which merges
-  cleanly. Turn on **View → File compare below the folder list** to step through them without
-  opening tabs.
-- `conflict.txt` and `diff3-conflict.py`: files with version-control conflict markers. The second
-  has two conflicts in Git's diff3 style, with the base version between `|||||||` and `=======`,
-  so it opens as a 3-way merge.
+- `settings/*.ini`, `settings/*.toml`, `settings/*.yaml`: the same settings in three
+  formats, with changes made on the left only, on the right only, the same change on both
+  sides, and conflicting changes. **Auto merge** takes the first three kinds and leaves
+  the conflicts for you to resolve. `--merge-plan` lists the same actions and warnings for
+  each format.
+- `folders/`: a 3-way folder compare with a file changed on one side, on the other, the
+  same on both, in conflict, added on the left, and removed on the right. Use
+  **Auto merge** on the folder compare too. **Next conflict** (Alt+PgDn) goes through the
+  open conflicts of `conflict.txt` and `docs/install.md`, passing over `docs/guide.md`,
+  which both sides changed but which merges cleanly. Turn on
+  **View → File compare below the folder list** to step through them without opening tabs.
+- `conflict.txt` and `diff3-conflict.py`: files with version-control conflict markers. The
+  second has two conflicts in Git's diff3 style, with the base version between `|||||||`
+  and `=======`, so it opens as a 3-way merge.
 
 ## Tables matched by key: `tables`
 
     cargo run -- samples/tables/orders.oxmproj
 
-The project opens two order lists matched by `order_id`, their columns paired by header name and
-the rows shown in key order. The right list is in another order with `status` before `amount`:
-order 1003 was returned, 1004 is gone, 1007 is new, and 1006 is listed twice, which is reported
-as a duplicate key and left unmatched. Grace's amount of 75.505 equals 75.50 within the tolerance
-of 0.01. Change the key, the column pairing, the row order or the tolerance above the table, and
-write a report from the **File** menu to record how the records were matched.
+The project opens two order lists matched by `order_id`, their columns paired by header
+name and the rows shown in key order. The right list is in another order with `status`
+before `amount`: order 1003 was returned, 1004 is gone, 1007 is new, and 1006 is listed
+twice, which is reported as a duplicate key and left unmatched. Grace's amount of 75.505
+equals 75.50 within the tolerance of 0.01. Change the key, the column pairing, the row
+order or the tolerance above the table, and write a report from the **File** menu to
+record how the records were matched.
 
 ## Folder synchronization: `sync`
 
@@ -83,23 +88,25 @@ Synchronizing changes the files, so copy the folders first:
     cargo run -- -r /tmp/sync-demo/source /tmp/sync-demo/destination
 
 Choose **Synchronize folders...** in the folder compare, then **Mirror left → right**. The
-preview lists a folder to create, a replaced `README.txt`, a copied `new.txt` and a deleted
-`obsolete.txt`; `q3-report.txt` moved to `reports/2026-q3.txt` in the source, so it shows under
-**Rename** too. **Update right from left** keeps `obsolete.txt` and `q3-report.txt`. Nothing
-changes until you choose **Apply changes**, and **Stop** undoes what was done.
+preview lists a folder to create, a replaced `README.txt`, a copied `new.txt` and a
+deleted `obsolete.txt`; `q3-report.txt` moved to `reports/2026-q3.txt` in the source, so
+it shows under **Rename** too. **Update right from left** keeps `obsolete.txt` and
+`q3-report.txt`. Nothing changes until you choose **Apply changes**, and **Stop** undoes
+what was done.
 
 ## XML tree compare: `xml`
 
     cargo run -- samples/xml/catalog-left.xml samples/xml/catalog-right.xml
 
-Choose **Tree**. The right catalog writes its namespace with another prefix (`c:` for `cat:`) and an
-attribute of `b101` in another order, which do not count; it adds `b100` at the top, moves `b103`
-up, changes its price and changes the title of `b102`. Without a key rule the reordered books pair
-by name in order; type `book@id` in **Key rules** to pair them by `id`: one addition, one move and
-two edits remain. Search `//book[@id='b102']/title`, or select the catalog and choose **View as
-collection** to see the books as a table.
+Choose **Tree**. The right catalog writes its namespace with another prefix (`c:` for
+`cat:`) and an attribute of `b101` in another order, which do not count; it adds `b100` at
+the top, moves `b103` up, changes its price and changes the title of `b102`. Without a key
+rule the reordered books pair by name in order; type `book@id` in **Key rules** to pair
+them by `id`: one addition, one move and two edits remain. Search
+`//book[@id='b102']/title`, or select the catalog and choose **View as collection** to see
+the books as a table.
 
 ## Web page compare: `web`
 
-See [web/README.md](web/README.md): a release notes page in three versions, and pairs of pages
-in `web/formatted` with complex text, headings and tables for the *Formatted* mode.
+See [web/README.md](web/README.md): a release notes page in three versions, and pairs of
+pages in `web/formatted` with complex text, headings and tables for the *Formatted* mode.

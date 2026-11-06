@@ -276,6 +276,9 @@ struct Table {
     caption: String,
     /// Tables inside this one, whose cells run together.
     nested: usize,
+    /// Whether a `thead` is open, and whether the first row has a data (`td`) cell outside one.
+    in_head: bool,
+    data_first: bool,
 }
 
 struct Converter {
@@ -286,6 +289,9 @@ struct Converter {
     /// Inline text of the block being read.
     line: String,
     ctx: Vec<Ctx>,
+    /// Quotes and lists opened past [`MAX_NESTING`], which are read as their text only.
+    deep_quotes: usize,
+    deep_lists: usize,
     open: Vec<Open>,
     heading: Option<usize>,
     /// Text of a `pre` element being read, with the language of its code.
@@ -309,6 +315,28 @@ impl Converter {
         match &self.base {
             Some(b) => b.join(&href).map_or(href, |u| u.to_string()),
             None => href,
+        }
+    }
+
+    /// Where a link to `href` goes, when it is one a click may open: a web or mail address, a
+    /// file on this computer from a page on it, or an address relative to a page without one.
+    /// Decided after entities are decoded and the address is made absolute, so `&#106;avascript:`
+    /// is caught; what is kept is the address as parsed, with no line break left in it.
+    fn link_to(&self, href: &str) -> Option<String> {
+        let url = self.resolve(href);
+        let local_page = self.base.as_ref().is_none_or(|b| b.scheme() == "file");
+        match Url::parse(&url) {
+            Ok(u) => match u.scheme() {
+                "http" | "https" | "mailto" => Some(u.to_string()),
+                "file" if local_page && u.host_str().is_none_or(|h| h == "localhost") => {
+                    Some(u.to_string())
+                }
+                _ => None,
+            },
+            Err(url::ParseError::RelativeUrlWithoutBase) if !url.contains(char::is_control) => {
+                Some(url)
+            }
+            Err(_) => None,
         }
     }
 
@@ -514,20 +542,29 @@ impl Converter {
         // Each row group is laid out on its own, so that no cell spans into the next one. An
         // empty row still counts, as a row a cell above may span, and is left out only when
         // nothing covers it.
+        let data_first = t.data_first;
         let mut rows = Vec::new();
         let mut cells = t.rows.into_iter();
         let mut at = 0;
         let mut ends = t.groups;
         ends.push(usize::MAX);
+        // One budget for the whole table, so that many row groups cannot add up past it.
+        let mut budget = MAX_TABLE_CELLS;
         for end in ends {
             if end <= at {
                 continue;
             }
             let group: Vec<_> = cells.by_ref().take(end - at).collect();
             at += group.len();
-            rows.extend(lay_out(group).into_iter().filter(|r| !r.is_empty()));
+            rows.extend(
+                lay_out_within(group, &mut budget)
+                    .into_iter()
+                    .filter(|r| !r.is_empty()),
+            );
         }
         let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        // Every row is written out to the widest one: past the budget, the rest is left out.
+        rows.truncate(MAX_TABLE_CELLS / cols.max(1));
         if cols == 0
             || rows.iter().all(|r| {
                 r.iter()
@@ -535,6 +572,15 @@ impl Converter {
             })
         {
             return;
+        }
+        // A Markdown table's first row is its header, and a merged cell in it makes the rows it
+        // reaches header rows too. When those are data rows, an empty header goes above them.
+        if data_first
+            && rows
+                .get(1)
+                .is_some_and(|r| r.iter().any(|c| c == COVERED_ABOVE))
+        {
+            rows.insert(0, Vec::new());
         }
         let line = |cells: &mut dyn Iterator<Item = &str>| {
             let mut s = String::from("|");
@@ -595,6 +641,10 @@ impl Converter {
             }
             "ul" | "ol" if !in_table => {
                 self.flush();
+                if self.ctx.len() >= MAX_NESTING {
+                    self.deep_lists += 1;
+                    return;
+                }
                 let next = attr(attrs, "start")
                     .and_then(|s| s.trim().parse().ok())
                     .unwrap_or(1);
@@ -605,6 +655,9 @@ impl Converter {
             }
             "li" if !in_table => {
                 self.flush();
+                if self.deep_lists > 0 || self.ctx.len() >= MAX_NESTING {
+                    return;
+                }
                 // An item left open ends where the next one starts.
                 if matches!(self.ctx.last(), Some(Ctx::Item(_))) {
                     self.ctx.pop();
@@ -627,7 +680,11 @@ impl Converter {
             }
             "blockquote" if !in_table => {
                 self.flush();
-                self.ctx.push(Ctx::Quote);
+                if self.ctx.len() >= MAX_NESTING {
+                    self.deep_quotes += 1;
+                } else {
+                    self.ctx.push(Ctx::Quote);
+                }
             }
             "pre" if !in_table => {
                 self.flush();
@@ -651,6 +708,7 @@ impl Converter {
                 self.end_cell();
                 if let Some(t) = &mut self.table {
                     t.groups.push(t.rows.len());
+                    t.in_head = name == "thead";
                 }
             }
             "tr" if in_table => {
@@ -672,6 +730,9 @@ impl Converter {
                         span("rowspan", usize::MAX, 65_534),
                         span("colspan", 1, 1_000),
                     );
+                    if name == "td" && t.rows.len() == 1 && !t.in_head {
+                        t.data_first = true;
+                    }
                 }
             }
             "br" => {
@@ -685,13 +746,11 @@ impl Converter {
             }
             "img" => self.image(attrs),
             "a" => {
-                let href = attr(attrs, "href").filter(|h| {
-                    let h = h.trim_start().to_ascii_lowercase();
-                    !h.is_empty() && !h.starts_with("javascript:")
-                });
+                let href = attr(attrs, "href").filter(|h| !h.trim().is_empty());
                 if let (Some(href), false) = (href, self.in_link()) {
-                    let url = self.resolve(href);
-                    self.open_mark(name, Mark::Link(url));
+                    if let Some(url) = self.link_to(href) {
+                        self.open_mark(name, Mark::Link(url));
+                    }
                 }
             }
             "strong" | "b" => self.open_mark(name, Mark::Strong),
@@ -730,15 +789,28 @@ impl Converter {
             }
             "ul" | "ol" if !in_table => {
                 self.flush();
-                self.pop_to(|c| matches!(c, Ctx::List { .. }));
+                if self.deep_lists > 0 {
+                    self.deep_lists -= 1;
+                } else {
+                    self.pop_to(|c| matches!(c, Ctx::List { .. }));
+                }
             }
             "li" if !in_table => {
                 self.flush();
-                self.pop_to(|c| matches!(c, Ctx::Item(_)));
+                // Only an item of the innermost list ends: one past the depth was never opened.
+                let item = self.ctx.iter().rposition(|c| matches!(c, Ctx::Item(_)));
+                let list = self.ctx.iter().rposition(|c| matches!(c, Ctx::List { .. }));
+                if let Some(i) = item.filter(|&i| self.deep_lists == 0 && list < Some(i)) {
+                    self.ctx.truncate(i);
+                }
             }
             "blockquote" if !in_table => {
                 self.flush();
-                self.pop_to(|c| matches!(c, Ctx::Quote));
+                if self.deep_quotes > 0 {
+                    self.deep_quotes -= 1;
+                } else {
+                    self.pop_to(|c| matches!(c, Ctx::Quote));
+                }
             }
             "table" => self.end_table(),
             "td" | "th" | "caption" if in_table => self.end_cell(),
@@ -747,6 +819,7 @@ impl Converter {
                 self.end_cell();
                 if let Some(t) = &mut self.table {
                     t.groups.push(t.rows.len());
+                    t.in_head = false;
                 }
             }
             "dt" | "summary" => {
@@ -779,11 +852,13 @@ impl Converter {
         let alt = attr(attrs, "alt").map(decode).unwrap_or_default();
         let alt = alt.split_whitespace().collect::<Vec<_>>().join(" ");
         let src = attr(attrs, "src").map(str::trim).unwrap_or_default();
-        if src.is_empty() || src.starts_with("data:") || self.in_link() || self.in_code() {
+        let url = (!self.in_link() && !self.in_code())
+            .then(|| self.link_to(src))
+            .flatten();
+        let Some(url) = url.filter(|_| !src.is_empty()) else {
             self.text(&alt);
             return;
-        }
-        let url = self.resolve(src);
+        };
         let name = if alt.is_empty() {
             Url::parse(&url)
                 .ok()
@@ -822,12 +897,23 @@ fn code_language(attrs: &str) -> String {
 /// The page `html` as Markdown blocks, in the order they appear. Links and images are made
 /// absolute against `base`, the page's address. Hidden elements are left out.
 pub fn html_to_blocks(html: &str, base: Option<&Url>) -> Vec<Block> {
+    html_to_blocks_until(html, base, &std::sync::atomic::AtomicBool::new(false)).unwrap_or_default()
+}
+
+/// [`html_to_blocks`], given up (`None`) soon after `abort` is set.
+pub fn html_to_blocks_until(
+    html: &str,
+    base: Option<&Url>,
+    abort: &std::sync::atomic::AtomicBool,
+) -> Option<Vec<Block>> {
     let mut c = Converter {
         base: base.cloned(),
         based: false,
         blocks: Vec::new(),
         line: String::new(),
         ctx: Vec::new(),
+        deep_quotes: 0,
+        deep_lists: 0,
         open: Vec::new(),
         heading: None,
         pre: None,
@@ -836,7 +922,10 @@ pub fn html_to_blocks(html: &str, base: Option<&Url>) -> Vec<Block> {
     };
     // The elements open outside the elements left out, outermost first.
     let mut opened = OpenElements::default();
-    for tok in tokens(html) {
+    for (n, tok) in tokens(html).into_iter().enumerate() {
+        if n % 4096 == 0 && abort.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
         if !c.skip.is_empty() && skipped(&mut c.skip, &tok, |name| opened.contains(name)) {
             // the page's `<base>` is in its `<head>`, which is otherwise left out
             if let Token::Tag(name, attrs, false) = &tok {
@@ -867,7 +956,7 @@ pub fn html_to_blocks(html: &str, base: Option<&Url>) -> Vec<Block> {
     c.end_pre();
     c.end_table();
     c.flush();
-    c.blocks
+    Some(c.blocks)
 }
 
 /// The tokens of the text and elements a page shows: hidden elements and elements without text
@@ -909,6 +998,11 @@ struct OpenElements {
 
 /// Elements nested deeper than this are not followed; a page cannot make each tag cost more.
 const MAX_OPEN_DEPTH: usize = 1024;
+
+/// The most quotes, lists and list items one block is shown inside: each adds to the start of
+/// every line of the blocks in it, so a page of many unclosed ones would otherwise grow with
+/// their number squared.
+const MAX_NESTING: usize = 32;
 
 impl OpenElements {
     fn contains(&self, name: &str) -> bool {
@@ -1185,9 +1279,14 @@ pub struct SpanCell {
 /// the last row, or past [`MAX_TABLE_COLUMNS`], stops there; once the table holds
 /// [`MAX_TABLE_CELLS`], cells no longer span, and past that the rest is left out.
 pub fn lay_out(rows: Vec<Vec<SpanCell>>) -> Vec<Vec<String>> {
+    lay_out_within(rows, &mut MAX_TABLE_CELLS.clone())
+}
+
+/// [`lay_out`] with `budget` cells left, for the row groups of one table to share; the cells
+/// laid out are taken from it.
+pub fn lay_out_within(rows: Vec<Vec<SpanCell>>, budget: &mut usize) -> Vec<Vec<String>> {
     let count = rows.len();
     let mut grid: Vec<Vec<Option<String>>> = vec![Vec::new(); count];
-    let mut slots = 0usize;
     'rows: for (r, row) in rows.into_iter().enumerate() {
         let mut c = 0;
         for cell in row {
@@ -1205,15 +1304,22 @@ pub fn lay_out(rows: Vec<Vec<SpanCell>>) -> Vec<Vec<String>> {
                     .map(|line| (c + cols).saturating_sub(line.len()))
                     .sum()
             };
-            let mut more = grow(span_rows, span_cols);
-            if slots + more > MAX_TABLE_CELLS {
+            // A span whose area alone is past the budget does not span, without measuring it:
+            // measuring every such span again would take time growing with rows times rows.
+            let fits = span_rows.saturating_mul(span_cols) <= *budget;
+            let mut more = if fits {
+                grow(span_rows, span_cols)
+            } else {
+                usize::MAX
+            };
+            if more > *budget {
                 (span_rows, span_cols) = (1, 1);
                 more = grow(1, 1);
-                if slots + more > MAX_TABLE_CELLS {
+                if more > *budget {
                     break 'rows;
                 }
             }
-            slots += more;
+            *budget -= more;
             let mut text = Some(cell.text);
             for (dr, line) in grid[r..r + span_rows].iter_mut().enumerate() {
                 if line.len() < c + span_cols {
@@ -1550,7 +1656,7 @@ mod tests {
             <tr><td>2</td></tr><tr><td>x</td><td>y</td></tr></table>";
         assert_eq!(
             md(html),
-            "| A | 1 |\n| --- | --- |\n| ^ |  |\n| ^ | 2 |\n| x | y |"
+            "|  |  |\n| --- | --- |\n| A | 1 |\n| ^ |  |\n| ^ | 2 |\n| x | y |"
         );
         // A row nothing covers is left out.
         assert_eq!(
@@ -1580,6 +1686,93 @@ mod tests {
         assert_eq!(grid.len(), 20_001);
         assert_eq!(grid[0], ["x"]);
         assert!(grid[1..].iter().all(|r| r == &["a"]));
+    }
+
+    #[test]
+    fn a_table_of_many_groups_or_padded_rows_stays_within_its_budget() {
+        // Many row groups each full of spanned cells share one budget.
+        let group = format!(
+            "<tbody><tr><td rowspan=0 colspan=1000>x</td></tr>{}</tbody>",
+            "<tr></tr>".repeat(999)
+        );
+        let page = format!("<table>{}</table>", group.repeat(20));
+        let text = md(&page);
+        let cells: usize = text.lines().map(|l| l.matches(" |").count()).sum();
+        assert!(cells <= 2 * MAX_TABLE_CELLS, "{cells}");
+        // A wide first row and many narrow ones: every row is written as wide as the widest.
+        let page = format!(
+            "<table><tr><td colspan=1000>w</td></tr>{}</table>",
+            "<tr><td>a</td></tr>".repeat(20_000)
+        );
+        let text = md(&page);
+        assert!(text.len() < 8 * MAX_TABLE_CELLS, "{}", text.len());
+        // Row spans to the end of a long group are not measured again for every row.
+        let page = format!(
+            "<table>{}</table>",
+            "<tr><td rowspan=0>a</td></tr>".repeat(100_000)
+        );
+        let start = std::time::Instant::now();
+        md(&page);
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn deeply_nested_quotes_and_lists_stop_adding_to_each_line() {
+        let page = "<blockquote>x".repeat(10_000);
+        let text = md(&page);
+        let widest = text.lines().map(str::len).max().unwrap_or(0);
+        assert!(widest <= 2 * MAX_NESTING + 1, "{widest}");
+        let page = "<ul><li>x".repeat(10_000);
+        let blocks = html_to_blocks(&page, None);
+        assert!(blocks.iter().all(|b| b.depth <= MAX_NESTING));
+        // Lists past the depth do not end the ones around them.
+        let page = format!(
+            "<ul><li>a{}<li>b</li></ul>",
+            "<ul><li>deep".repeat(40) + &"</li></ul>".repeat(40)
+        );
+        assert!(md(&page).ends_with("- b"), "{}", md(&page));
+    }
+
+    #[test]
+    fn only_web_mail_and_local_file_links_are_kept() {
+        let base = Url::parse("https://example.com/a/").unwrap();
+        let link = |html: &str| html_to_blocks(html, Some(&base))[0].text.clone();
+        assert_eq!(link("<a href='&#106;avascript:alert(1)'>x</a>"), "x");
+        assert_eq!(link("<a href='java&#9;script:alert(1)'>x</a>"), "x");
+        assert_eq!(link("<a href='file://host/share/x'>x</a>"), "x");
+        assert_eq!(link("<a href='vbscript:x'>x</a>"), "x");
+        assert_eq!(link("<img src='javascript:x' alt='pic'>"), "pic");
+        assert_eq!(
+            link("<a href='b.html'>x</a>"),
+            "[x](https://example.com/a/b.html)"
+        );
+        assert_eq!(
+            link("<a href='mailto:me@example.com'>x</a>"),
+            "[x](mailto:me@example.com)"
+        );
+        // A line break in an address cannot start Markdown of its own.
+        let text = link("<a href='https://exa mple.com/&#10;[y](https://evil)'>x</a>");
+        assert!(
+            !text.contains('\n') && !text.contains("](https://evil)"),
+            "{text}"
+        );
+        // A page on this computer may link to its files.
+        let local = Url::parse("file:///tmp/page.html").unwrap();
+        let blocks = html_to_blocks("<a href='notes.txt'>n</a>", Some(&local));
+        assert_eq!(blocks[0].text, "[n](file:///tmp/notes.txt)");
+    }
+
+    #[test]
+    fn a_merged_data_cell_in_the_first_row_does_not_make_header_rows() {
+        let text =
+            md("<table><tr><td rowspan=2>2024</td><td>Jan</td></tr><tr><td>Feb</td></tr></table>");
+        assert_eq!(text, "|  |  |\n| --- | --- |\n| 2024 | Jan |\n| ^ | Feb |");
+        // Header cells keep their rows as the header.
+        let text = md(
+            "<table><thead><tr><th rowspan=2>Name</th><th>Q</th></tr><tr><th>Q1</th></tr>\
+             </thead><tr><td>a</td><td>1</td></tr></table>",
+        );
+        assert!(text.starts_with("| Name | Q |"), "{text}");
     }
 
     #[test]

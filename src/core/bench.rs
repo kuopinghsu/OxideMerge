@@ -158,6 +158,76 @@ const WORKLOADS: &[Workload] = &[
         run: diff_binary,
     },
     Workload {
+        name: "binary-moved-unrelated",
+        what: "3 unrelated 5 MiB panes",
+        level: 0,
+        make: |d| {
+            for (name, seed) in [("a.bin", 1), ("b.bin", 2), ("c.bin", 3)] {
+                write(&d.join(name), &moved_data(5 * MB, seed));
+            }
+        },
+        run: |d| moved_binary(d, &["a.bin", "b.bin", "c.bin"]),
+    },
+    Workload {
+        name: "binary-moved-swap",
+        what: "2 files of 4 MiB with two swapped 64 KiB blocks",
+        level: 0,
+        make: |d| {
+            let mut data = moved_data(4 * MB, 4);
+            write(&d.join("a.bin"), &data);
+            data[MB..MB + 128 * 1024].rotate_left(64 * 1024);
+            write(&d.join("b.bin"), &data);
+        },
+        run: |d| moved_binary(d, &["a.bin", "b.bin"]),
+    },
+    Workload {
+        name: "binary-moved-large",
+        what: "2 files of 64 MiB with two swapped 1 MiB blocks",
+        level: 0,
+        make: |d| {
+            let mut data = moved_data(64 * MB, 4);
+            write(&d.join("a.bin"), &data);
+            data[8 * MB..10 * MB].rotate_left(MB);
+            write(&d.join("b.bin"), &data);
+        },
+        run: |d| moved_binary(d, &["a.bin", "b.bin"]),
+    },
+    Workload {
+        name: "binary-moved-short-shift",
+        what: "2 files of 4 MiB with a 15-byte shifted region",
+        level: 0,
+        make: |d| {
+            let mut data = moved_data(4 * MB, 4);
+            write(&d.join("b.bin"), &data);
+            data.insert(2 * MB, 0xa6);
+            data.remove(2 * MB + 16);
+            write(&d.join("a.bin"), &data);
+        },
+        run: |d| moved_binary(d, &["a.bin", "b.bin"]),
+    },
+    Workload {
+        name: "binary-moved-wide-shift",
+        what: "1 MiB repeated payload shifted by a 96-byte insertion",
+        level: 0,
+        make: |d| {
+            let mut data: Vec<_> = (0..251u8).cycle().take(MB).collect();
+            write(&d.join("b.bin"), &data);
+            data.splice(MB / 2..MB / 2, [255; 96]);
+            write(&d.join("a.bin"), &data);
+        },
+        run: |d| moved_binary(d, &["a.bin", "b.bin"]),
+    },
+    Workload {
+        name: "binary-moved-firmware",
+        what: "2 firmware samples with mixed insertions, deletions and overwrites",
+        level: 0,
+        make: |d| {
+            write(&d.join("a.bin"), include_bytes!("../../samples/left/bin/firmware.bin"));
+            write(&d.join("b.bin"), include_bytes!("../../samples/right/bin/firmware.bin"));
+        },
+        run: |d| moved_binary(d, &["a.bin", "b.bin"]),
+    },
+    Workload {
         name: "image-4k",
         what: "2 PNG images of 3840 x 2160, 1% of the pixels changed",
         level: 0,
@@ -420,6 +490,28 @@ fn binary_pair(dir: &Path, size: usize) {
         a[at] = !a[at];
     }
     write(&dir.join("b.bin"), &a);
+}
+
+fn moved_data(size: usize, mut state: u32) -> Vec<u8> {
+    (0..size)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect()
+}
+
+fn moved_binary(dir: &Path, names: &[&str]) -> String {
+    let files: Vec<_> = names
+        .iter()
+        .map(|name| std::fs::read(dir.join(name)).unwrap())
+        .collect();
+    let inputs: Vec<_> = files.iter().map(Vec::as_slice).collect();
+    let blocks = super::binary::moved_blocks(&inputs);
+    let matched: usize = blocks.iter().map(|m| m.source.len()).sum();
+    format!("{} moved blocks, {matched} matched bytes", blocks.len())
 }
 
 fn image_pair(dir: &Path) {

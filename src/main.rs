@@ -16,6 +16,7 @@ use core::report::ReportFormat;
 use core::text::FileKind;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use ui::app::{OpenRequest, OxideMergeApp};
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -105,7 +106,12 @@ struct Cli {
     dr: Option<String>,
     /// Title of a side, given once per path in the same order (as diff -L, which Subversion and
     /// other version control systems pass); --dl, --dm and --dr take precedence
-    #[arg(short = 'L', long = "label", value_name = "TITLE")]
+    #[arg(
+        short = 'L',
+        long = "label",
+        value_name = "TITLE",
+        allow_hyphen_values = true
+    )]
     labels: Vec<String>,
     /// Accepted for diff compatibility (Subversion passes -u) and ignored
     #[allow(dead_code)]
@@ -164,7 +170,7 @@ struct Cli {
     /// Show the whole files in a .pdf report, not only the differences with --context lines
     #[arg(long)]
     whole_file: bool,
-    /// Add the differences of every changed text file to an HTML folder report
+    /// Add the differences of every changed text file to an HTML or PDF folder report
     #[arg(long)]
     report_diffs: bool,
     /// Write the .html report as a slideshow, one difference per slide
@@ -206,12 +212,12 @@ struct Cli {
     #[arg(long, value_name = "PLAN", requires = "yes")]
     sync_apply: Option<PathBuf>,
     /// Confirm that --sync-apply, or the sync jobs of --job, may change and delete files in the
-    /// destination folder
+    /// destination folder, and that the jobs of --job may write outside the job file's folder
     #[arg(long)]
     yes: bool,
     /// Run the jobs of a .oxjob file (JSON: compares, reports, sync plans and syncs) in order,
-    /// stopping at the first that fails; prints a JSON summary. Sync jobs that apply changes need
-    /// --yes. Exit code: the worst of the jobs (0 identical or applied, 1 different, 2 error,
+    /// stopping at the first that fails; prints a JSON summary. Sync jobs that apply changes, and
+    /// reports or patches outside the job file's folder, need --yes. Exit code: the worst of the jobs (0 identical or applied, 1 different, 2 error,
     /// 4 undone, 5 recovery required)
     #[arg(long, value_name = "FILE")]
     job: Option<PathBuf>,
@@ -383,14 +389,7 @@ fn patch_style(p: PatchArg) -> PatchStyle {
 /// `path` as it was in revision `rev` of its Git repository, Subversion working copy or
 /// Mercurial repository, in a temporary folder that lives as long as the returned guard.
 fn git_copy(path: &std::path::Path, rev: &str) -> anyhow::Result<(tempfile::TempDir, PathBuf)> {
-    if path.is_dir() {
-        return core::vcs::export_folder(path, rev);
-    }
-    let bytes = core::vcs::show_file(path, rev)?;
-    let dir = tempfile::tempdir()?;
-    let copy = dir.path().join(path.file_name().unwrap_or_default());
-    std::fs::write(&copy, bytes)?;
-    Ok((dir, copy))
+    core::vcs::copy_of(path, rev, &AtomicBool::new(false))
 }
 
 /// Tells about the patterns of the rules that are not valid regular expressions: the compare
@@ -429,9 +428,22 @@ fn finite_number(s: &str) -> Result<f64, String> {
     }
 }
 
+thread_local! {
+    /// Set while a job runs: its reports and patches never replace a link or special file.
+    static JOB_OUTPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Writes a report or patch whole or not at all, so a failed run leaves no file that looks done.
 fn export(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
-    core::fsutil::write_atomic_with(path, text.as_bytes(), false)
+    write_output(path, text.as_bytes())
+}
+
+fn write_output(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if JOB_OUTPUT.get() {
+        core::fsutil::write_atomic_report(path, bytes)
+    } else {
+        core::fsutil::write_atomic_with(path, bytes, false)
+    }
 }
 
 /// Whether a report file is a PDF.
@@ -572,7 +584,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
                 &pdf_options(cli, cfg),
             )
             .map_err(anyhow::Error::msg)?;
-            core::fsutil::write_atomic_with(r, &pdf, false)?;
+            write_output(r, &pdf)?;
         } else if let Some(r) = &cli.report {
             let format = report_format(r);
             if cli.report_diffs {
@@ -717,7 +729,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             &pdf_options(cli, cfg),
         )
         .map_err(anyhow::Error::msg)?;
-        core::fsutil::write_atomic_with(r, &pdf, false)?;
+        write_output(r, &pdf)?;
     } else if let Some(r) = &cli.report {
         // One note per problem: another type is written as HTML, a slideshow if asked for.
         let format = match ReportFormat::from_path(r) {
@@ -1309,42 +1321,62 @@ pub(crate) struct JobReport {
 pub(crate) struct JobsReport {
     pub(crate) exit_code: u8,
     pub(crate) jobs: Vec<JobReport>,
-    /// Jobs not run because one before failed.
+    /// Jobs not run because one before failed, or because the run was stopped.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) not_run: Vec<String>,
+    /// Whether the run was stopped before its last job.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) stopped: bool,
 }
 
 /// Runs the jobs of `file` one after another, as their command lines would, and prints a JSON
 /// summary. The exit code is the worst of the jobs'.
 fn run_jobs(file: &std::path::Path, yes: bool, base: &Config) -> anyhow::Result<u8> {
-    let summary = job_summary(file, yes, base)?;
+    let jobs = core::job::JobFile::read(file).map_err(anyhow::Error::msg)?;
+    let summary = job_summary(&jobs, &job_dir(file)?, yes, base, &AtomicBool::new(false));
     println!("{}", core::analysis::json(&summary)?);
     Ok(summary.exit_code)
 }
 
-/// Runs the jobs of `file` one after another, as their command lines would, and says how each
-/// ended. Sync jobs change folders only when `yes` is given. Used by `--job` and by
-/// *File → Run job…*.
-pub(crate) fn job_summary(
-    file: &std::path::Path,
-    yes: bool,
-    base: &Config,
-) -> anyhow::Result<JobsReport> {
-    use core::job::{JobFile, JobKind};
-    let text = String::from_utf8(core::analysis::read(file)?)?;
-    let jobs = JobFile::parse(&text).map_err(anyhow::Error::msg)?;
-    let dir = std::path::absolute(file)?
+/// The folder of a job file, which its relative paths are in.
+pub(crate) fn job_dir(file: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    Ok(std::path::absolute(file)?
         .parent()
         .map(std::path::Path::to_path_buf)
-        .unwrap_or_default();
+        .unwrap_or_default())
+}
+
+/// Runs `jobs`, read from a job file in `dir`, one after another, as their command lines would,
+/// and says how each ended. Sync jobs, and jobs writing outside `dir`, run only when `yes` is
+/// given. `stop` stops a synchronization being applied and the jobs after it. Used by `--job` and
+/// by *File → Run job…*.
+pub(crate) fn job_summary(
+    jobs: &core::job::JobFile,
+    dir: &std::path::Path,
+    yes: bool,
+    base: &Config,
+    stop: &AtomicBool,
+) -> JobsReport {
+    use core::job::{JobFile, JobKind};
+    struct Strict(bool);
+    impl Drop for Strict {
+        fn drop(&mut self) {
+            JOB_OUTPUT.set(self.0);
+        }
+    }
+    let _strict = Strict(JOB_OUTPUT.replace(true));
     let mut summary = JobsReport {
         exit_code: 0,
         jobs: Vec::new(),
         not_run: Vec::new(),
+        stopped: false,
     };
     for (i, job) in jobs.jobs.iter().enumerate() {
         let name = job.label(i);
-        if summary.exit_code >= 2 && !jobs.continue_on_error {
+        if stop.load(Ordering::Relaxed) {
+            summary.stopped = true;
+        }
+        if summary.stopped || (summary.exit_code >= 2 && !jobs.continue_on_error) {
             summary.not_run.push(name);
             continue;
         }
@@ -1356,7 +1388,14 @@ pub(crate) fn job_summary(
             sync: None,
         };
         let run = || -> anyhow::Result<(u8, Option<SyncReport>)> {
-            let prepared = job.prepare(&dir).map_err(anyhow::Error::msg)?;
+            let prepared = job.prepare(dir).map_err(anyhow::Error::msg)?;
+            let alone = JobFile::single(job.clone());
+            if let (Some(out), false) = (alone.outputs_outside(dir).first(), yes) {
+                anyhow::bail!(
+                    "{}",
+                    i18n::trf("job.err_outside", &[("path", out.display().to_string())])
+                );
+            }
             let argv = std::iter::once(std::ffi::OsString::from("oxidemerge")).chain(prepared.args);
             let cli = Cli::try_parse_from(argv).map_err(|e| {
                 let text = e.to_string();
@@ -1364,17 +1403,20 @@ pub(crate) fn job_summary(
             })?;
             let mut cfg = base.clone();
             apply_cli_options(&cli, &mut cfg);
-            let (spec, rules) = resolve_rules(&cli, &dir).map_err(anyhow::Error::msg)?;
+            let (spec, rules) = resolve_rules(&cli, dir).map_err(anyhow::Error::msg)?;
             use_rules(&mut cfg, &spec, &rules);
             if job.kind != JobKind::Sync {
                 return Ok((run_batch(&cli, &cfg)?, None));
             }
             anyhow::ensure!(
                 yes,
-                "this job changes {} and runs only with --yes",
-                cli.paths[1].display()
+                "{}",
+                i18n::trf(
+                    "job.err_needs_yes",
+                    &[("path", cli.paths[1].display().to_string())]
+                )
             );
-            let (code, report) = sync_now(&cli, &cfg, prepared.allow_large_deletion)?;
+            let (code, report) = sync_now(&cli, &cfg, prepared.allow_large_deletion, stop)?;
             Ok((code, Some(report)))
         };
         match run() {
@@ -1390,14 +1432,19 @@ pub(crate) fn job_summary(
         summary.exit_code = summary.exit_code.max(report.exit_code);
         summary.jobs.push(report);
     }
-    Ok(summary)
+    summary
 }
 
 /// Plans the synchronization of the two folders of `cli` and applies it at once, as a sync job
 /// does: refused when it would delete many files unless the job allows it.
-fn sync_now(cli: &Cli, cfg: &Config, allow_large: bool) -> anyhow::Result<(u8, SyncReport)> {
+fn sync_now(
+    cli: &Cli,
+    cfg: &Config,
+    allow_large: bool,
+    stop: &AtomicBool,
+) -> anyhow::Result<(u8, SyncReport)> {
     use core::folder_sync::{self, Side, SyncMode, SyncPolicy};
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::AtomicUsize;
     let mode = match cli.sync_plan {
         Some(SyncArg::Update) => SyncMode::Update,
         _ => SyncMode::Mirror,
@@ -1413,13 +1460,16 @@ fn sync_now(cli: &Cli, cfg: &Config, allow_large: bool) -> anyhow::Result<(u8, S
     )?;
     anyhow::ensure!(
         allow_large || !plan.large_deletion(),
-        "this synchronization would delete {} items; set \"allow_large_deletion\": true in the job to allow it",
-        plan.deletions()
+        "{}",
+        i18n::trf(
+            "job.err_large_deletion",
+            &[("n", plan.deletions().to_string())]
+        )
     );
     let journal_root =
         folder_sync::journal_root().ok_or_else(|| anyhow::anyhow!("No settings folder"))?;
-    let (stop, done) = (AtomicBool::new(false), AtomicUsize::new(0));
-    let outcome = folder_sync::apply(&plan, &cli.paths, &journal_root, &stop, &done);
+    let done = AtomicUsize::new(0);
+    let outcome = folder_sync::apply(&plan, &cli.paths, &journal_root, stop, &done);
     Ok(sync_report(outcome))
 }
 
@@ -1479,7 +1529,9 @@ fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
     wsl_gl_defaults();
     attach_console();
-    let cli = Cli::parse_from(winmerge_args());
+    let matches = <Cli as clap::CommandFactory>::command().get_matches_from(winmerge_args());
+    let cli =
+        <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let mut cfg = Config::load();
     cfg.diff = cfg.comparison_options();
     if core::rules::load_selected(&mut cfg) {
@@ -1538,6 +1590,28 @@ fn main() -> ExitCode {
     // What each job of --job starts from: the settings, without this command line's options.
     let base_cfg = cfg.clone();
     apply_cli_options(&cli, &mut cfg);
+    if let Some(file) = &cli.job {
+        let command = <Cli as clap::CommandFactory>::command();
+        let others = command.get_arguments().any(|arg| {
+            let id = arg.get_id().as_str();
+            !matches!(id, "job" | "yes" | "lang")
+                && matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
+        });
+        if others {
+            eprintln!(
+                "error: --job takes no paths and no options but --yes and --lang; the options of \
+                 each job are in the file"
+            );
+            return ExitCode::from(2);
+        }
+        return match run_jobs(file, cli.yes, &base_cfg) {
+            Ok(code) => ExitCode::from(code),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ExitCode::from(2)
+            }
+        };
+    }
     if cli.git_rev.is_some() && paths.len() != 1 {
         eprintln!("error: --git-rev compares exactly one file or folder with a revision");
         return ExitCode::from(2);
@@ -1552,24 +1626,6 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Some(file) = &cli.job {
-        let others = !cli.paths.is_empty()
-            || cli.cli
-            || cli.report.is_some()
-            || cli.patch.is_some()
-            || analysis_mode(&cli);
-        if others {
-            eprintln!("error: --job takes no paths, and the options of each job are in the file");
-            return ExitCode::from(2);
-        }
-        return match run_jobs(file, cli.yes, &base_cfg) {
-            Ok(code) => ExitCode::from(code),
-            Err(e) => {
-                eprintln!("error: {e:#}");
-                ExitCode::from(2)
-            }
-        };
-    }
     if cli.yes && cli.sync_apply.is_none() {
         eprintln!("error: --yes only confirms --sync-apply or --job");
         return ExitCode::from(2);

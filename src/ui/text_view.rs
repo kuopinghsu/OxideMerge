@@ -154,7 +154,11 @@ fn edited_lines(old: &[u64], new: &[String]) -> HashSet<usize> {
 /// each as the line that took its place.
 fn line_map(old: &[String], new: &[String], edited: bool) -> Vec<(usize, bool)> {
     let mut map = vec![(0, false); old.len()];
-    for op in similar::capture_diff_slices(similar::Algorithm::Myers, old, new) {
+    // Bounded in time: past the deadline the map is coarser but still valid.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    for op in
+        similar::capture_diff_slices_deadline(similar::Algorithm::Myers, old, new, Some(deadline))
+    {
         let (tag, o, n) = op.as_tag_tuple();
         let kept = tag == similar::DiffTag::Equal
             || (edited && tag == similar::DiffTag::Replace && o.len() == n.len());
@@ -399,7 +403,12 @@ pub fn replace_all(lines: &mut [String], re: &Regex, with: &str, expand: bool) -
 }
 
 struct Snapshot {
+    /// The lines of each pane. Below the top of its stack, a step keeps only the lines between
+    /// the ones it shares with the step above, which `kept` counts.
     lines: Vec<Vec<String>>,
+    /// For each pane, how many of the first and the last lines of the step above this step
+    /// has too, and were left out of `lines`.
+    kept: Vec<(usize, usize)>,
     modified: Vec<bool>,
     saves: Vec<u64>,
     /// The format of each pane before this step, where the step changed it.
@@ -409,6 +418,71 @@ struct Snapshot {
     sync_points: Vec<SyncPoint>,
     /// The carets, the primary one first, when there were several: undo and redo put them back.
     carets: Vec<Caret>,
+}
+
+impl Snapshot {
+    /// Leaves out of each pane the first and last lines `above`, all of whose lines are kept,
+    /// has too.
+    fn share_with(&mut self, above: &Snapshot) {
+        for (i, lines) in self.lines.iter_mut().enumerate() {
+            let Some(other) = above.lines.get(i) else {
+                continue;
+            };
+            let head = lines.iter().zip(other).take_while(|(a, b)| a == b).count();
+            let room = lines.len().min(other.len()) - head;
+            let tail = lines
+                .iter()
+                .rev()
+                .zip(other.iter().rev())
+                .take(room)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let len = lines.len();
+            lines.truncate(len - tail);
+            lines.drain(..head);
+            lines.shrink_to_fit();
+            self.kept[i] = (head, tail);
+        }
+    }
+
+    /// Puts back the lines [`share_with`](Self::share_with) left out, from `above`.
+    fn unshare(&mut self, above: &Snapshot) {
+        for (i, lines) in self.lines.iter_mut().enumerate() {
+            let (head, tail) = std::mem::take(&mut self.kept[i]);
+            if head + tail == 0 {
+                continue;
+            }
+            let other = &above.lines[i];
+            let mut whole = Vec::with_capacity(head + lines.len() + tail);
+            whole.extend_from_slice(&other[..head]);
+            whole.append(lines);
+            whole.extend_from_slice(&other[other.len() - tail..]);
+            *lines = whole;
+        }
+    }
+
+    /// The lines this step holds.
+    fn size(&self) -> usize {
+        self.lines.iter().map(Vec::len).sum()
+    }
+}
+
+/// Puts `s` on top of `steps`; the step below then keeps only the lines it does not share
+/// with `s`.
+fn push_step(steps: &mut Vec<Snapshot>, s: Snapshot) {
+    if let Some(below) = steps.last_mut() {
+        below.share_with(&s);
+    }
+    steps.push(s);
+}
+
+/// Takes the top step off `steps`, and makes the one below it whole again.
+fn pop_step(steps: &mut Vec<Snapshot>) -> Option<Snapshot> {
+    let s = steps.pop()?;
+    if let Some(below) = steps.last_mut() {
+        below.unshare(&s);
+    }
+    Some(s)
 }
 
 /// Save-format state shared by merge operations and their undo snapshots.
@@ -1269,6 +1343,11 @@ pub struct TextView {
     /// Set when difference navigation ran past the last (true) or first (false) difference,
     /// so the app can move on to the next or previous file of the folder compare.
     pub step_file: Option<bool>,
+    /// Set whenever a pane was written to disk by [`Self::save_pane`], however that was
+    /// triggered (the `Cmd::Save` command, but also the merge view's own "Save result"
+    /// button, which calls it directly). The app checks this every frame to repack the
+    /// archive this tab was opened from, if any, even when that bypassed `Cmd::Save`.
+    pub saved: bool,
     /// Set when next (true) or previous conflict ran past the last or first open conflict.
     pub step_conflict: Option<bool>,
     /// Bookmarked lines of each pane, with their comments (empty when there is none).
@@ -1385,6 +1464,7 @@ impl TextView {
             wrap: cfg.word_wrap,
             scroll_anim: None,
             step_file: None,
+            saved: false,
             step_conflict: None,
             sync_pending: vec![None; bookmarks.len()],
             bookmarks,
@@ -1799,14 +1879,19 @@ impl TextView {
         self.invalidate_review();
         // the rows and layout are still those of the text before the change
         self.hold_view();
+        // Taken out for the remapping rather than copied: a pane can have millions of lines.
+        let last = self.undo.pop();
         for &p in panes {
             self.panes[p].doc.modified = true;
             self.panes[p].hl_dirty = true;
-            if let Some(before) = self.undo.last().map(|s| s.lines[p].clone()) {
-                self.remap_bookmarks(p, &before);
-                self.remap_sync_points(p, &before);
-                self.remap_view(p, &before);
+            if let Some(before) = last.as_ref().map(|s| &s.lines[p]) {
+                self.remap_bookmarks(p, before);
+                self.remap_sync_points(p, before);
+                self.remap_view(p, before);
             }
+        }
+        if let Some(s) = last {
+            self.undo.push(s);
         }
         self.rediff();
     }
@@ -2435,6 +2520,7 @@ impl TextView {
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             lines: self.panes.iter().map(|p| p.doc.lines.clone()).collect(),
+            kept: vec![(0, 0); self.panes.len()],
             modified: self.panes.iter().map(|p| p.doc.modified).collect(),
             saves: self.panes.iter().map(|p| p.saves).collect(),
             formats: vec![None; self.panes.len()],
@@ -2450,13 +2536,16 @@ impl TextView {
     fn push_undo(&mut self) {
         self.typing_group = false;
         let s = self.snapshot();
-        // Each snapshot copies every pane, so keep fewer levels for large files.
-        let lines: usize = s.lines.iter().map(Vec::len).sum();
-        let max = (5_000_000 / lines.max(1)).clamp(10, 200);
-        self.undo.push(s);
-        if self.undo.len() > max {
-            self.undo.drain(..self.undo.len() - max);
+        push_step(&mut self.undo, s);
+        // Steps below the top keep only the lines they changed; past 200 steps, or once
+        // those hold more than five million lines, the oldest go, keeping at least ten.
+        let mut held: usize = self.undo.iter().rev().skip(1).map(Snapshot::size).sum();
+        let mut drop = self.undo.len().saturating_sub(200);
+        while held > 5_000_000 && self.undo.len() - drop > 10 {
+            held -= self.undo[drop].size();
+            drop += 1;
         }
+        self.undo.drain(..drop);
         self.redo.clear();
     }
 
@@ -2529,9 +2618,9 @@ impl TextView {
             self.status = tr("msg.readonly").to_string();
             return;
         }
-        if let Some(s) = self.undo.pop() {
+        if let Some(s) = pop_step(&mut self.undo) {
             let cur = self.snapshot_for(&s);
-            self.redo.push(cur);
+            push_step(&mut self.redo, cur);
             self.restore(s);
         }
     }
@@ -2545,9 +2634,9 @@ impl TextView {
             self.status = tr("msg.readonly").to_string();
             return;
         }
-        if let Some(s) = self.redo.pop() {
+        if let Some(s) = pop_step(&mut self.redo) {
             let cur = self.snapshot_for(&s);
-            self.undo.push(cur);
+            push_step(&mut self.undo, cur);
             self.restore(s);
         }
     }
@@ -3240,12 +3329,19 @@ impl TextView {
         if let Some(s) = &mut self.caret {
             s.others.clear();
         }
+        self.typing_group = false;
     }
 
     /// Applies `op`, written for one caret, at each caret in turn, from the last in the text to
     /// the first, as one undo step: carets already done move with the text each edit changes
     /// before them. `op` gets the caret's index in text order and the number of carets.
-    fn at_each_caret(&mut self, mut op: impl FnMut(&mut Self, usize, usize)) {
+    fn at_each_caret(&mut self, op: impl FnMut(&mut Self, usize, usize)) {
+        self.at_each_caret_with(true, op);
+    }
+
+    /// [`Self::at_each_caret`]; without `edits`, `op` only moves carets, so no text is kept
+    /// for an undo step.
+    fn at_each_caret_with(&mut self, edits: bool, mut op: impl FnMut(&mut Self, usize, usize)) {
         if !self.multi_caret() {
             op(self, 0, 1);
             return;
@@ -3274,7 +3370,11 @@ impl TextView {
             .unwrap_or(0)
             .saturating_add(2)
             .clamp(lo, old_len);
-        let kept: Vec<String> = self.panes[pane].doc.lines[lo..hi].to_vec();
+        let kept: Vec<String> = if edits {
+            self.panes[pane].doc.lines[lo..hi].to_vec()
+        } else {
+            Vec::new()
+        };
         #[cfg(debug_assertions)]
         let whole = self.panes[pane].doc.lines.clone();
         let count = carets.len();
@@ -3324,6 +3424,7 @@ impl TextView {
             }
             done.push((after.at, primary));
         }
+        debug_assert!(edits || !batch.changed, "a caret move changed the text");
         if batch.changed {
             // One undo step for all of them, taken from the text before the first edit: the
             // kept lines go back in for the snapshot, and the edited ones after it.
@@ -3444,6 +3545,16 @@ impl TextView {
     /// inline view only shows the files: a caret kept from the side-by-side view waits there.
     pub fn takes_text(&self) -> bool {
         self.caret.is_some() && !self.table_mode && !self.shows_inline()
+    }
+
+    /// Whether typed characters would go into the caret's pane, which is not read-only, so
+    /// shortcuts that type a character (Option+letter on macOS) must leave it alone.
+    pub fn types_into_pane(&self) -> bool {
+        self.takes_text()
+            && self
+                .caret
+                .as_ref()
+                .is_some_and(|s| !self.panes[s.at.pane].doc.read_only)
     }
 
     /// Whether the inline view is the one shown, which shows the files without editing them.
@@ -3941,11 +4052,8 @@ impl TextView {
         let lines = &self.panes[c.pane].doc.lines;
         let tab = self.tab_size;
         let want = c.want.unwrap_or_else(|| {
-            edit::col_at(
-                &lines[c.pos.0.min(lines.len().saturating_sub(1))],
-                c.pos.1,
-                tab,
-            )
+            let line = lines.get(c.pos.0.min(lines.len().saturating_sub(1)));
+            edit::col_at(line.map_or("", String::as_str), c.pos.1, tab)
         });
         let last = lines.len().saturating_sub(1);
         let target = c.pos.0.saturating_add_signed(delta).min(last);
@@ -4037,7 +4145,9 @@ impl TextView {
             return true;
         }
         if m.alt {
+            // `command` rather than `mac_cmd`: shortcut bindings set only `command`.
             return mac
+                && !m.command
                 && !m.mac_cmd
                 && !m.ctrl
                 && matches!(
@@ -4080,7 +4190,21 @@ impl TextView {
                 Key::Tab if self.carets().iter().any(|c| self.tab_indents(c)) => {
                     return self.caret_indent(false)
                 }
-                _ => return self.at_each_caret(|v, _, _| v.caret_key_one(mac, key, m)),
+                _ => {
+                    use Key::*;
+                    let moves = matches!(
+                        key,
+                        ArrowLeft
+                            | ArrowRight
+                            | ArrowUp
+                            | ArrowDown
+                            | Home
+                            | End
+                            | PageUp
+                            | PageDown
+                    );
+                    return self.at_each_caret_with(!moves, |v, _, _| v.caret_key_one(mac, key, m));
+                }
             }
         }
         self.caret_key_one(mac, key, m);
@@ -4190,13 +4314,19 @@ impl TextView {
             return;
         }
         let tab = self.tab_size;
-        let mut lines = self.panes[s.pane].doc.lines.clone();
-        edit::replace(&mut lines, range.start, range.len(), &cols, with, tab);
-        if lines == self.panes[s.pane].doc.lines {
+        // Only the lines the text goes into are copied and compared, not the whole pane.
+        let doc = &self.panes[s.pane].doc.lines;
+        let reach = range
+            .len()
+            .max(if with.len() == 1 { 0 } else { with.len() });
+        let end = (range.start + reach).min(doc.len());
+        let mut part = doc[range.start..end].to_vec();
+        edit::replace(&mut part, 0, range.len(), &cols, with, tab);
+        if part == doc[range.start..end] {
             return;
         }
         self.push_undo();
-        self.panes[s.pane].doc.lines = lines;
+        self.panes[s.pane].doc.lines.splice(range.start..end, part);
         self.mark_changed(&[s.pane]);
         // The caret goes after the text put in, on the rows the selection covered.
         let width = with.iter().map(|w| edit::col_at(w, w.len(), tab)).max();
@@ -4338,12 +4468,13 @@ impl TextView {
         doc.path = Some(path);
         doc.save()?;
         self.status = trf("msg.saved", &[("file", doc.title())]);
-        self.saved(p);
+        self.mark_saved(p);
+        self.saved = true;
         self.rediff();
         Ok(true)
     }
 
-    fn saved(&mut self, p: usize) {
+    fn mark_saved(&mut self, p: usize) {
         let pane = &mut self.panes[p];
         pane.saves += 1;
         pane.disk_time = disk_time(&pane.doc);
@@ -4453,7 +4584,7 @@ impl TextView {
         doc.read_only = false;
         doc.description = None;
         self.status = trf("msg.saved", &[("file", doc.title())]);
-        self.saved(p);
+        self.mark_saved(p);
         self.rediff();
         Ok(true)
     }
@@ -9725,9 +9856,39 @@ impl TextView {
 
         // dragging selects rows of the pane where the drag started; Alt+dragging selects columns
         let hscroll = self.hscroll;
-        let col_at_x = |p: usize, x: f32| {
+        let col_galley = |ui: &Ui, line: &str| {
+            let job = Self::line_job(
+                line,
+                None,
+                &[],
+                &[],
+                Color32::TRANSPARENT,
+                Color32::TRANSPARENT,
+                Color32::WHITE,
+                &font,
+                tab,
+                show_ws,
+            );
+            ui.fonts_mut(|f| f.layout_job(job))
+        };
+        // Columns are characters as laid out, so a wide character is one column however wide
+        // it is drawn; past the end of a line they are `char_w` wide.
+        let col_at_x = |this: &Self, p: usize, r: usize, x: f32| {
             let left = content_left + p as f32 * pane_step + gutter_w + 4.0;
-            ((x - left + hscroll) / char_w.max(1.0)).round().max(0.0) as usize
+            let gx = (x - left + hscroll).max(0.0);
+            let cells = |w: f32| (w / char_w.max(1.0)).round().max(0.0) as usize;
+            let Some(line) = this.diff.rows[r]
+                .line(p)
+                .map(|l| &this.panes[p].doc.lines[l])
+            else {
+                return cells(gx);
+            };
+            let galley = col_galley(ui, line);
+            if gx > galley.rect.width() {
+                galley.text().chars().count() + cells(gx - galley.rect.width())
+            } else {
+                galley.cursor_from_pos(vec2(gx, 1.0)).index.0
+            }
         };
         if resp.dragged_by(egui::PointerButton::Primary) {
             if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
@@ -9740,7 +9901,7 @@ impl TextView {
                         .map(|v| self.layout.lines[v])
                         .filter(|_| columns)
                     {
-                        let at = (r, col_at_x(self.active_pane, origin.x));
+                        let at = (r, col_at_x(self, self.active_pane, r, origin.x));
                         self.drop_carets();
                         self.col_sel = Some(Box::new(ColSel {
                             pane: self.active_pane,
@@ -9775,8 +9936,14 @@ impl TextView {
                 let row = line_at(self.active_pane, y).map(|v| self.layout.lines[v]);
                 let at = line_at(self.active_pane, y)
                     .and_then(|v| caret_hit(self, self.active_pane, v, pos.x));
-                if let (Some(s), Some(VLine::Row(r, _))) = (self.col_sel.as_deref_mut(), row) {
-                    s.head = (r, col_at_x(s.pane, pos.x));
+                let head = match (self.col_sel.as_deref(), row) {
+                    (Some(s), Some(VLine::Row(r, _))) => {
+                        Some((r, col_at_x(self, s.pane, r, pos.x)))
+                    }
+                    _ => None,
+                };
+                if let (Some(s), Some((r, col))) = (self.col_sel.as_deref_mut(), head) {
+                    s.head = (r, col);
                     self.sel_anchor = None;
                     self.cursor_row = Some(r);
                 } else if let (Some(at), Some(c)) = (at, self.caret()) {
@@ -9858,8 +10025,24 @@ impl TextView {
                     if (a..=b).contains(&r) {
                         let cols = s.cols();
                         let x = text_rect.left() + 4.0 - self.hscroll;
-                        let x0 = x + cols.start as f32 * char_w;
-                        let x1 = (x + cols.end as f32 * char_w).max(x0 + 1.5);
+                        // Over the characters the columns are, as laid out.
+                        let line = self.diff.rows[r]
+                            .line(p)
+                            .map(|l| &self.panes[p].doc.lines[l]);
+                        let galley = line.map(|t| col_galley(ui, t));
+                        let col_x = |col: usize| match &galley {
+                            Some(g) => {
+                                let n = g.text().chars().count();
+                                if col <= n {
+                                    g.pos_from_cursor(egui::text::CCursor::new(col)).min.x
+                                } else {
+                                    g.rect.width() + (col - n) as f32 * char_w
+                                }
+                            }
+                            None => col as f32 * char_w,
+                        };
+                        let x0 = x + col_x(cols.start);
+                        let x1 = (x + col_x(cols.end)).max(x0 + 1.5);
                         tp.rect_filled(
                             Rect::from_min_max(pos2(x0, y), pos2(x1, y + row_h)),
                             0.0,
@@ -12055,6 +12238,10 @@ mod tests {
                 );
             }
         }
+        // A shortcut binding sets `command` only, without `mac_cmd`: ⌘⌥→ stays Copy All.
+        let binding = Modifiers::COMMAND | Modifiers::ALT;
+        assert!(!TextView::caret_key_on(true, ArrowRight, binding));
+        assert!(!TextView::caret_key_on(true, ArrowLeft, binding));
         // Only Option (macOS) or Ctrl (elsewhere) is the word key.
         assert!(word_key_on(true, mods(true, "alt+shift")));
         assert!(!word_key_on(true, mods(true, "ctrl")));
@@ -13068,9 +13255,26 @@ mod tests {
         v.panes[0].doc.read_only = true;
         frame(&mut v, &ctx, vec![]);
         v.place_caret(0, (0, 1), false);
+        // The caret still moves, but shortcuts that type a character are free to run.
+        assert!(v.takes_text() && !v.types_into_pane());
         frame(&mut v, &ctx, vec![egui::Event::Text("x".into())]);
         assert_eq!(lines(&v, 0), ["a"]);
         assert!(!v.status.is_empty());
+        v.place_caret(1, (0, 1), false);
+        assert!(v.types_into_pane());
+    }
+
+    #[test]
+    fn the_arrow_keys_in_an_empty_pane_keep_the_caret_at_its_start() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("a\nb\n", "");
+        frame(&mut v, &ctx, vec![]);
+        assert!(v.panes[1].doc.lines.is_empty());
+        v.place_caret(1, (0, 0), false);
+        for key in [Key::ArrowDown, Key::ArrowUp, Key::PageDown, Key::PageUp] {
+            v.caret_key_pressed(key, Modifiers::NONE);
+            assert_eq!(v.caret().map(|c| c.pos), Some((0, 0)), "{key:?}");
+        }
     }
 
     #[test]
@@ -13262,6 +13466,23 @@ mod tests {
         let mut c: Vec<_> = v.carets().iter().map(|c| (c.anchor, c.pos)).collect();
         c.sort();
         c
+    }
+
+    #[test]
+    fn typing_after_escape_from_several_carets_is_its_own_undo_step() {
+        let ctx = egui::Context::default();
+        let mut v = two_way("x\n", "a\nb\n");
+        frame(&mut v, &ctx, vec![]);
+        put_carets(&mut v, 1, &[((0, 1), (0, 1)), ((1, 1), (1, 1))]);
+        let text = |t: &str| egui::Event::Text(t.into());
+        frame(&mut v, &ctx, vec![text("x"), text("y")]);
+        assert_eq!(lines(&v, 1), ["axy", "bxy"]);
+        v.caret_key_pressed(Key::Escape, Modifiers::NONE);
+        assert_eq!(v.carets().len(), 1);
+        frame(&mut v, &ctx, vec![text("z")]);
+        assert_eq!(lines(&v, 1), ["axy", "bxyz"]);
+        v.undo();
+        assert_eq!(lines(&v, 1), ["axy", "bxy"]);
     }
 
     #[test]
@@ -14622,6 +14843,28 @@ mod tests {
     }
 
     #[test]
+    fn save_pane_flags_saved_so_the_app_can_repack_its_archive_but_save_pane_as_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        touch(&a, "one\n", 100);
+        touch(&b, "two\n", 100);
+        let docs = [&a, &b].map(|p| text::load_doc(p, None).unwrap()).to_vec();
+        let mut v = TextView::new(docs, &Config::default());
+        v.place_caret(1, (0, 3), false);
+        v.caret_insert("a");
+
+        // However it is called (`Cmd::Save`, or a button like the merge view's own "Save
+        // result", which calls it directly), `save_pane` must flag that a save happened, so
+        // the app can repack the archive this tab was opened from, if any (see
+        // `App::refresh_saved_folders`). `save_pane_as` writes to a path the user picked
+        // instead, unrelated to any extraction this tab may have come from, so it does not
+        // set the flag (it needs a file dialog, so it is not exercised here).
+        assert!(!v.saved);
+        v.save_pane(1).unwrap();
+        assert!(v.saved);
+    }
+
+    #[test]
     fn undo_leaves_read_only_panes_alone_and_older_text_counts_as_unsaved() {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
@@ -14844,5 +15087,43 @@ mod tests {
         v.auto_merge();
         assert_eq!(v.panes[1].doc.lines, vec!["a".to_string()]);
         assert_eq!(v.panes[1].doc.eol, Eol::CrLf);
+    }
+
+    #[test]
+    fn undo_steps_below_the_top_keep_only_the_lines_they_changed() {
+        let text: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+        let mut v = two_way(&text, &text);
+        let mut states = vec![v.panes[1].doc.lines.clone()];
+        for step in 0..30usize {
+            v.push_undo();
+            let lines = &mut v.panes[1].doc.lines;
+            match step % 3 {
+                0 => lines[step * 600] = format!("changed {step}"),
+                1 => lines.insert(step * 600, format!("inserted {step}")),
+                _ => drop(lines.remove(step * 600)),
+            }
+            v.mark_changed(&[1]);
+            states.push(v.panes[1].doc.lines.clone());
+        }
+        let below =
+            |steps: &[Snapshot]| -> usize { steps.iter().rev().skip(1).map(Snapshot::size).sum() };
+        assert_eq!(v.undo.len(), 30);
+        assert!(below(&v.undo) <= 2 * 30, "{} lines held", below(&v.undo));
+        for state in states.iter().rev().skip(1) {
+            v.undo();
+            assert!(v.panes[1].doc.lines == *state);
+            assert_eq!(v.panes[0].doc.lines, states[0]);
+        }
+        assert!(!v.can_undo());
+        assert!(below(&v.redo) <= 2 * 30, "{} lines held", below(&v.redo));
+        for state in states.iter().skip(1) {
+            v.redo();
+            assert!(v.panes[1].doc.lines == *state);
+        }
+        assert!(!v.can_redo());
+        for state in states.iter().rev().skip(1).take(5) {
+            v.undo();
+            assert!(v.panes[1].doc.lines == *state);
+        }
     }
 }

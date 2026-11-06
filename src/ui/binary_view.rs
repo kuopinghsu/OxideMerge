@@ -13,6 +13,7 @@ use egui::{
 };
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// One undo or redo step: the bytes it puts back in place of the `len` bytes at `at` of side
 /// `side`, and the contents that leaves, to tell them from those saved.
@@ -24,12 +25,46 @@ struct Step {
     state: u64,
 }
 
+/// The moved blocks being found on another thread, from buffers it shares with the view.
+struct MovedScan {
+    rx: std::sync::mpsc::Receiver<Option<Vec<binary::MovedBlock>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl MovedScan {
+    /// Stops the scan and waits the moment it takes, so the buffers are the view's alone again.
+    fn finish(self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.thread.join();
+    }
+}
+
+impl Drop for BinaryView {
+    /// A closed view stops its scan, which lets go of the buffers it shares soon after.
+    fn drop(&mut self) {
+        if let Some(job) = &self.moved_job {
+            job.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 pub struct BinaryView {
     pub paths: Vec<PathBuf>,
-    pub data: Vec<Vec<u8>>,
+    pub data: Vec<Arc<Vec<u8>>>,
     pub modified: Vec<bool>,
     pub read_only: Vec<bool>,
     pub diffs: Vec<Range<usize>>,
+    pub moved: Vec<binary::MovedBlock>,
+    detect_moved: bool,
+    /// The moved-block setting last read from the settings.
+    moved_setting: Option<bool>,
+    /// Set when the moved-block checkbox was turned on or off, for the settings.
+    pub moved_choice: Option<bool>,
+    moved_dirty: bool,
+    moved_due: Option<f64>,
+    moved_job: Option<MovedScan>,
+    moved_ranges: Vec<Vec<Range<usize>>>,
     pub cur: Option<usize>,
     pub cursor: Option<usize>,
     scroll: f32,
@@ -79,10 +114,18 @@ impl BinaryView {
         let n = paths.len();
         let mut v = BinaryView {
             paths,
-            data,
+            data: data.into_iter().map(Arc::new).collect(),
             modified: vec![false; n],
             read_only: vec![false; n],
             diffs: Vec::new(),
+            moved: Vec::new(),
+            detect_moved: true,
+            moved_setting: None,
+            moved_choice: None,
+            moved_dirty: true,
+            moved_due: None,
+            moved_job: None,
+            moved_ranges: vec![Vec::new(); n],
             cur: None,
             cursor: None,
             scroll: 0.0,
@@ -108,6 +151,7 @@ impl BinaryView {
             bpl: 16,
         };
         v.recompute();
+        v.moved_due = Some(0.0);
         if !v.diffs.is_empty() {
             v.select(0);
         }
@@ -142,6 +186,7 @@ impl BinaryView {
     }
 
     fn recompute(&mut self) {
+        self.invalidate_moved();
         let refs: Vec<&[u8]> = self.data.iter().map(|d| d.as_slice()).collect();
         self.diffs = binary::diff_ranges(&refs);
         if let Some(c) = self.cur {
@@ -154,6 +199,7 @@ impl BinaryView {
     /// The differences again after bytes `lo..hi` of a side changed and its length did not:
     /// only there and in the differences touching them.
     fn recompute_bytes(&mut self, lo: usize, hi: usize) {
+        self.invalidate_moved();
         let first = self.diffs.partition_point(|r| r.end < lo);
         let last = self.diffs.partition_point(|r| r.start <= hi);
         let touching = &self.diffs[first..last];
@@ -177,9 +223,144 @@ impl BinaryView {
         }
     }
 
+    fn invalidate_moved(&mut self) {
+        self.stop_moved_scan();
+        self.moved.clear();
+        for ranges in &mut self.moved_ranges {
+            ranges.clear();
+        }
+        self.moved_dirty = true;
+        self.moved_due = None;
+    }
+
+    fn start_moved_scan(&mut self, ctx: &egui::Context) {
+        self.moved_dirty = false;
+        self.moved_due = None;
+        if !self.detect_moved || self.diffs.is_empty() {
+            return;
+        }
+        // The worker shares the buffers; an edit stops it first (see `stop_moved_scan`), so no
+        // buffer is ever copied for it.
+        let data = self.data.clone();
+        let ctx = ctx.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let refs: Vec<_> = data.iter().map(|d| d.as_slice()).collect();
+            let found = binary::moved_blocks_until(&refs, &flag);
+            drop(refs);
+            drop(data);
+            if tx.send(found).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+        self.moved_job = Some(MovedScan { rx, stop, thread });
+    }
+
+    /// Stops a scan sharing the buffers, before they change.
+    fn stop_moved_scan(&mut self) {
+        if let Some(job) = self.moved_job.take() {
+            job.finish();
+        }
+    }
+
+    fn poll_moved_scan(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(job) = &self.moved_job else { return };
+        let result = job.rx.try_recv();
+        if matches!(result, Err(TryRecvError::Empty)) {
+            return;
+        }
+        self.moved_job = None;
+        // Any edit or toggle since launch invalidates the snapshot.
+        if self.moved_dirty {
+            return;
+        }
+        if let Ok(Some(moved)) = result {
+            self.apply_moved(moved);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_for_moved_scan(&mut self) {
+        if let Some(job) = self.moved_job.take() {
+            let moved = job
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            if let (false, Some(moved)) = (self.moved_dirty, moved) {
+                self.apply_moved(moved);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn refresh_moved(&mut self) {
+        self.moved_dirty = false;
+        self.moved_due = None;
+        let refs: Vec<_> = self.data.iter().map(|d| d.as_slice()).collect();
+        let moved = if self.detect_moved {
+            binary::moved_blocks(&refs)
+        } else {
+            Vec::new()
+        };
+        self.apply_moved(moved);
+    }
+
+    fn apply_moved(&mut self, moved: Vec<binary::MovedBlock>) {
+        self.moved = moved;
+        for ranges in &mut self.moved_ranges {
+            ranges.clear();
+        }
+        for m in &self.moved {
+            self.moved_ranges[m.from].push(m.source.clone());
+            self.moved_ranges[m.to].push(m.target.clone());
+        }
+        for ranges in &mut self.moved_ranges {
+            ranges.sort_unstable_by_key(|r| (r.start, r.end));
+            let mut merged: Vec<Range<usize>> = Vec::new();
+            for r in ranges.drain(..) {
+                match merged.last_mut() {
+                    Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                    _ => merged.push(r),
+                }
+            }
+            *ranges = merged;
+        }
+    }
+
+    fn is_moved(&self, pane: usize, offset: usize) -> bool {
+        let ranges = &self.moved_ranges[pane];
+        let i = ranges.partition_point(|r| r.end <= offset);
+        ranges.get(i).is_some_and(|r| r.contains(&offset))
+    }
+
+    /// The corresponding byte in another pane, preserving the offset within the block.
+    pub fn moved_partner(&self) -> Option<(usize, usize)> {
+        let (pane, offset) = (self.pane?, self.cursor?);
+        self.moved.iter().find_map(|m| {
+            if pane == m.from && m.source.contains(&offset) {
+                Some((m.to, m.target.start + offset - m.source.start))
+            } else if pane == m.to && m.target.contains(&offset) {
+                Some((m.from, m.source.start + offset - m.target.start))
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn go_to_moved_partner(&mut self) {
+        if let Some((pane, offset)) = self.moved_partner() {
+            self.pane = Some(pane);
+            self.move_cursor(offset);
+        }
+    }
+
     /// Replaces bytes `range` of side `p` with `bytes`, as part of the last undo step.
     fn splice(&mut self, p: usize, range: Range<usize>, bytes: &[u8]) {
-        let data = &mut self.data[p];
+        self.stop_moved_scan();
+        let data = Arc::make_mut(&mut self.data[p]);
         if let Some(step) = self.undo.last_mut().filter(|s| s.side == p) {
             if step.len == 0 && step.bytes.is_empty() {
                 step.at = range.start;
@@ -445,7 +626,10 @@ impl BinaryView {
     fn swap_step(&mut self, step: Step) -> Step {
         let (s, at, len) = (step.side, step.at, step.bytes.len());
         let same = len == step.len;
-        let removed = self.data[s].splice(at..at + step.len, step.bytes).collect();
+        self.stop_moved_scan();
+        let removed = Arc::make_mut(&mut self.data[s])
+            .splice(at..at + step.len, step.bytes)
+            .collect();
         let back = Step {
             side: s,
             at,
@@ -587,8 +771,44 @@ impl BinaryView {
         if self.bpl != cfg.binary_bytes_per_line.clamp(4, 64) {
             self.bpl = cfg.binary_bytes_per_line.clamp(4, 64);
         }
+        if self.moved_setting != Some(cfg.binary_moved_blocks) {
+            self.moved_setting = Some(cfg.binary_moved_blocks);
+            if self.detect_moved != cfg.binary_moved_blocks {
+                self.detect_moved = cfg.binary_moved_blocks;
+                self.invalidate_moved();
+            }
+        }
         let bpl = self.bpl;
+        let active = ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Text(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Cut
+                        | egui::Event::Key { pressed: true, .. }
+                )
+            })
+        });
         self.handle_keys(ui);
+        // Edits clear old annotations immediately. Wait briefly before finding new matches,
+        // so typing does not scan the complete buffers at every keystroke.
+        self.poll_moved_scan();
+        if self.moved_dirty {
+            let now = ui.input(|i| i.time);
+            let due = *self.moved_due.get_or_insert(now + 0.15);
+            if active {
+                self.moved_due = Some(now + 0.15);
+            } else if now >= due && self.moved_job.is_none() {
+                self.start_moved_scan(ui.ctx());
+            }
+            if let Some(due) = self.moved_due.filter(|&due| due > now) {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(
+                        (due - now).max(0.0),
+                    ));
+            }
+        }
         widgets::toolbar(ui, |ui| {
             let pal = widgets::pal(ui);
             let key = widgets::with_key;
@@ -655,6 +875,47 @@ impl BinaryView {
             .clicked()
             {
                 self.goto = Some(String::new());
+            }
+        });
+        widgets::toolbar(ui, |ui| {
+            if ui
+                .checkbox(&mut self.detect_moved, tr("binary.moved_blocks"))
+                .on_hover_text(tr("binary.moved_hint"))
+                .changed()
+            {
+                self.moved_choice = Some(self.detect_moved);
+                self.invalidate_moved();
+                self.moved_due = Some(0.0);
+                ui.ctx().request_repaint();
+            }
+            if self.detect_moved {
+                ui.add_space(6.0);
+                let pal = widgets::pal(ui);
+                widgets::chip(ui, &self.moved.len().to_string(), pal.text, pal.control)
+                    .on_hover_text(trf(
+                        "binary.moved_count",
+                        &[("n", self.moved.len().to_string())],
+                    ));
+                widgets::toolbar_sep(ui);
+                if ui
+                    .add_enabled(
+                        self.moved_partner().is_some(),
+                        egui::Button::new(tr("binary.moved_partner")),
+                    )
+                    .clicked()
+                {
+                    self.go_to_moved_partner();
+                    ui.memory_mut(|m| m.request_focus(self.id.with("body")));
+                }
+                if let Some((p, at)) = self.moved_partner() {
+                    ui.label(trf(
+                        "binary.moved_at",
+                        &[
+                            ("side", crate::core::report::side_name(p, self.n()).into()),
+                            ("offset", format!("{at:08X}")),
+                        ],
+                    ));
+                }
             }
         });
         if self.find.open {
@@ -765,6 +1026,7 @@ impl BinaryView {
         let text_col = hex_col + 3.0 * bpl as f32 + 1.0;
 
         if resp.clicked() {
+            resp.request_focus();
             if let Some(pos) = resp.interact_pointer_pos() {
                 let line = (self.scroll + (pos.y - top) / row_h).floor() as usize;
                 let p = (((pos.x - left) / pane_w).floor() as usize).min(n - 1);
@@ -813,6 +1075,7 @@ impl BinaryView {
                     let sel = cur_range.as_ref().is_some_and(|r| r.contains(&off));
                     let bg = match (byte, differs, sel) {
                         (None, _, _) if off < max_len => c.missing,
+                        (Some(_), _, _) if self.is_moved(p, off) => c.moved,
                         (_, true, true) => c.inline_sel,
                         (_, true, false) => c.inline,
                         _ => Color32::TRANSPARENT,
@@ -878,7 +1141,7 @@ impl BinaryView {
 
         if cfg.show_location_pane {
             let loc = Rect::from_min_max(pos2(right, top), pos2(right + loc_w - 2.0, bottom));
-            let marks: Vec<Mark> = self
+            let mut marks: Vec<Mark> = self
                 .diffs
                 .iter()
                 .enumerate()
@@ -897,6 +1160,17 @@ impl BinaryView {
                     }
                 })
                 .collect();
+            for (p, ranges) in self.moved_ranges.iter().enumerate() {
+                for r in ranges {
+                    let mut columns = [None; 3];
+                    columns[p] = Some(c.moved);
+                    marks.push(Mark {
+                        start: r.start / bpl,
+                        len: (r.end - 1) / bpl - r.start / bpl + 1,
+                        columns,
+                    });
+                }
+            }
             if let Some(t) = widgets::location_pane(
                 ui,
                 self.id.with("loc"),
@@ -929,6 +1203,9 @@ impl BinaryView {
     fn handle_keys(&mut self, ui: &Ui) {
         let ctx = ui.ctx();
         if widgets::typing(ctx)
+            // Toolbar controls own their keyboard input: Space on the moved-block checkbox
+            // must never also overwrite a byte in the ASCII column.
+            || ctx.memory(|m| m.focused()).is_some_and(|id| id != self.id.with("body"))
             || self.goto.is_some()
             || widgets::modal_open(ctx)
             || egui::Popup::is_any_open(ctx)
@@ -1093,6 +1370,418 @@ impl BinaryView {
 mod tests {
     use super::*;
 
+    fn moved_view() -> (tempfile::TempDir, BinaryView) {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c): (Vec<u8>, Vec<u8>, Vec<u8>) =
+            ((0..64).collect(), (64..128).collect(), (128..192).collect());
+        let paths = vec![dir.path().join("a.bin"), dir.path().join("b.bin")];
+        std::fs::write(&paths[0], [a.clone(), b.clone(), c.clone()].concat()).unwrap();
+        std::fs::write(&paths[1], [a, c, b].concat()).unwrap();
+        let mut view = BinaryView::load(paths).unwrap();
+        view.refresh_moved();
+        (dir, view)
+    }
+
+    #[test]
+    fn moved_blocks_navigate_without_editing_and_refresh_after_edits_and_undo() {
+        let (_dir, mut v) = moved_view();
+        let original = v.data.clone();
+        let differences = v.diffs.clone();
+        assert_eq!(v.moved.len(), 2);
+        v.pane = Some(0);
+        v.move_cursor(69);
+        assert!(v.is_moved(0, 69));
+        assert_eq!(v.moved_partner(), Some((1, 133)));
+        v.read_only[1] = true;
+        v.go_to_moved_partner();
+        assert_eq!((v.pane, v.cursor), (Some(1), Some(133)));
+        v.go_to_moved_partner();
+        assert_eq!((v.pane, v.cursor), (Some(0), Some(69)));
+        assert_eq!(v.data, original);
+        assert_eq!(v.diffs, differences);
+        assert!(v.undo.is_empty() && !v.is_modified());
+        v.move_cursor(64);
+        v.write_bytes(&[250; 64]);
+        assert!(
+            v.moved.is_empty(),
+            "an old correspondence is never shown after an edit"
+        );
+        v.refresh_moved();
+        assert!(!v.is_moved(0, 69));
+        v.move_cursor(69);
+        assert_eq!(v.moved_partner(), None);
+        v.undo();
+        v.refresh_moved();
+        assert_eq!(v.data, original);
+        assert_eq!(v.moved.len(), 2);
+        v.redo();
+        v.refresh_moved();
+        assert!(!v.is_moved(0, 69));
+        v.undo();
+        v.refresh_moved();
+        v.detect_moved = false;
+        v.invalidate_moved();
+        v.refresh_moved();
+        assert!(v.moved.is_empty());
+        assert!(!v.is_moved(0, 69));
+        assert_eq!(v.diffs, differences);
+        v.detect_moved = true;
+        v.invalidate_moved();
+        v.refresh_moved();
+        v.pane = Some(1);
+        v.move_cursor(133);
+        let moves = v.moved.clone();
+        v.write_bytes(&[0]);
+        assert_eq!(v.data, original, "read-only side refuses writes");
+        assert_eq!(v.moved, moves);
+        v.read_only[1] = false;
+        v.copy_all(true);
+        v.refresh_moved();
+        assert!(v.diffs.is_empty() && v.moved.is_empty());
+        v.undo();
+        v.refresh_moved();
+        assert_eq!(v.data, original);
+        assert_eq!(v.moved.len(), 2);
+    }
+
+    /// The runs of `samples/*/bin/firmware.bin` the two sides share: the right side's range
+    /// and how far the left side's copy is from it.
+    const FIRMWARE_RUNS: [(Range<usize>, isize); 18] = [
+        (0x20..0x3f, 1),
+        (0x41..0x100, -1),
+        (0x105..0x200, -1),
+        (0x200..0x380, 4),
+        (0x383..0x3b5, 1),
+        (0x3b7..0x3e8, 2),
+        (0x3e9..0x4fd, 4),
+        (0x4fd..0x5fd, 8),
+        (0x604..0x66f, 1),
+        (0x66f..0x692, 3),
+        (0x697..0x6b5, 2),
+        (0x6b5..0x800, 4),
+        (0x805..0x822, 5),
+        (0x823..0x838, 5),
+        (0x838..0xef0, 7),
+        (0xef0..0xf48, 17),
+        (0xf49..0xf76, 17),
+        (0xf78..0xff0, 21),
+    ];
+
+    fn firmware_paths() -> [std::path::PathBuf; 2] {
+        ["left", "right"].map(|side| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("samples/{side}/bin/firmware.bin"))
+        })
+    }
+
+    /// A view of `left` and `right` written to a temporary folder.
+    fn view_of(left: &[u8], right: &[u8]) -> (tempfile::TempDir, BinaryView) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = vec![dir.path().join("left.bin"), dir.path().join("right.bin")];
+        std::fs::write(&paths[0], left).unwrap();
+        std::fs::write(&paths[1], right).unwrap();
+        (dir, BinaryView::load(paths).unwrap())
+    }
+
+    /// Checks that each left byte of the runs, `extra` bytes further on, has its right byte as
+    /// its moved partner; runs that line up again are only compared.
+    fn assert_runs(v: &mut BinaryView, runs: &[(Range<usize>, isize)], extra: isize) {
+        v.pane = Some(0);
+        for (right_range, shift) in runs {
+            for right in right_range.clone() {
+                let left = right.checked_add_signed(shift + extra).unwrap();
+                assert_eq!(v.data[0][left], v.data[1][right]);
+                if shift + extra != 0 {
+                    v.move_cursor(left);
+                    assert_eq!(v.moved_partner(), Some((1, right)), "left {left:#x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn firmware_sample_leading_insertion_recovers_header_and_repeated_runs() {
+        let mut v = BinaryView::load(firmware_paths().into()).unwrap();
+        v.refresh_moved();
+        let baseline_moves = v.moved.clone();
+        v.pane = Some(0);
+        v.move_cursor(0);
+        v.insert = true;
+        v.write_bytes(&[0xa5]);
+        v.refresh_moved();
+        assert_eq!(v.data[0][0], 0xa5);
+        assert_ne!(v.data[0][0], v.data[1][0]);
+        assert!(!v.is_moved(0, 0));
+        assert_eq!(&v.data[0][1..0x21], &v.data[1][..0x20]);
+        for offset in 1..0x21 {
+            assert!(v.is_moved(0, offset));
+            assert!(v.is_moved(1, offset - 1));
+            v.move_cursor(offset);
+            assert_eq!(v.moved_partner(), Some((1, offset - 1)));
+        }
+        assert!(!v.is_moved(0, 0x21), "the byte only the left side has");
+        assert_runs(&mut v, &FIRMWARE_RUNS, 1);
+        v.undo();
+        v.refresh_moved();
+        assert_eq!(v.moved, baseline_moves);
+    }
+
+    #[test]
+    fn firmware_sample_balanced_edits_detect_local_shift() {
+        let base = include_bytes!("../../samples/right/bin/firmware.bin");
+        for deleted in [1, 2] {
+            let (_dir, mut v) = view_of(base, base);
+            v.pane = Some(0);
+            v.insert = true;
+            v.move_cursor(0x20);
+            v.write_bytes(&[0xa5]);
+            v.move_cursor(0x40);
+            for _ in 0..deleted {
+                v.delete(false);
+            }
+            assert_eq!(v.data[0].len() + deleted - 1, v.data[1].len());
+            v.refresh_moved();
+            for left in 0x21..0x40 {
+                assert_eq!(v.data[0][left], v.data[1][left - 1]);
+                assert!(v.is_moved(0, left));
+                v.move_cursor(left);
+                assert_eq!(v.moved_partner(), Some((1, left - 1)));
+            }
+            assert!(!v.is_moved(0, 0x20));
+            for removed in 0x3f..0x3f + deleted {
+                assert!(!v.is_moved(1, removed));
+            }
+            v.move_cursor(0x40);
+            assert_eq!(v.moved_partner(), (deleted == 2).then_some((1, 0x41)));
+        }
+    }
+
+    #[test]
+    fn firmware_opposite_pane_edits_keep_short_match() {
+        let shift = 2;
+        let mut v = BinaryView::load(firmware_paths().into()).unwrap();
+        let removed = v.data[1][0x2f];
+        v.pane = Some(0);
+        v.insert = true;
+        v.move_cursor(0x20);
+        v.write_bytes(&[0xa6]);
+        v.pane = Some(1);
+        v.move_cursor(0x2f);
+        v.delete(false);
+        v.refresh_moved();
+        for right in 0x20..0x2f {
+            let left = right + shift;
+            assert_eq!(v.data[0][left], v.data[1][right]);
+            v.move_cursor(right);
+            assert_eq!(v.moved_partner(), Some((0, left)), "{right:#x}");
+        }
+        assert!(!v.is_moved(0, 0x20));
+        assert_eq!(v.data[0][0x2f + shift], removed);
+        assert!(!v.is_moved(0, 0x2f + shift));
+    }
+
+    #[test]
+    fn firmware_sample_deletion_keeps_later_runs_aligned() {
+        for prepend in [false, true] {
+            let mut v = BinaryView::load(firmware_paths().into()).unwrap();
+            v.pane = Some(0);
+            if prepend {
+                v.insert = true;
+                v.move_cursor(0);
+                v.write_bytes(&[0xa5]);
+            }
+            v.move_cursor(0x120);
+            v.delete(false);
+            v.delete(false);
+            let removed = 2 - isize::from(prepend);
+            assert_eq!(v.data[0].len() as isize, 4101 - removed);
+            v.refresh_moved();
+            assert_runs(&mut v, &FIRMWARE_RUNS[3..], -removed);
+            // The ten bytes only the left side has stay unmatched.
+            let only_left = 0xef7 - removed as usize..0xf01 - removed as usize;
+            assert!(only_left.into_iter().all(|at| !v.is_moved(0, at)));
+        }
+    }
+
+    #[test]
+    fn firmware_sample_insertion_detects_shifted_bytes() {
+        let left = include_bytes!("../../samples/left/bin/firmware.bin");
+        let right = include_bytes!("../../samples/right/bin/firmware.bin");
+        // Inside the header both sides have at the same offsets.
+        let at = 0x10;
+        for baseline in [&left[..], &right[..]] {
+            let (_dir, mut v) = view_of(baseline, right);
+            v.refresh_moved();
+            let baseline_moves = v.moved.clone();
+            v.pane = Some(1);
+            v.move_cursor(at);
+            v.insert = true;
+            v.write_bytes(&[0xa5]);
+            assert_eq!(v.data[1].len(), right.len() + 1);
+            assert_eq!(v.data[1][at], 0xa5);
+            assert_eq!(&v.data[1][at + 1..], &right[at..]);
+            v.refresh_moved();
+            let m = v.moved.iter().find(|m| m.source.contains(&at)).unwrap();
+            assert_eq!(m.target.start, m.source.start + 1);
+            assert_eq!(v.data[0][m.source.clone()], v.data[1][m.target.clone()]);
+            v.move_cursor(at + 1);
+            assert_eq!(v.moved_partner(), Some((0, at)));
+            v.go_to_moved_partner();
+            assert_eq!((v.pane, v.cursor), (Some(0), Some(at)));
+            v.undo();
+            v.refresh_moved();
+            assert_eq!(v.data[1].as_slice(), right);
+            assert_eq!(v.moved, baseline_moves);
+            assert_eq!(std::fs::read(&v.paths[1]).unwrap(), right);
+        }
+    }
+
+    #[test]
+    fn complex_firmware_fixture_tracks_each_shift_and_leaves_edits_unmatched() {
+        let mut v = BinaryView::load(firmware_paths().into()).unwrap();
+        v.refresh_moved();
+        let found: Vec<_> = v
+            .moved
+            .iter()
+            .map(|m| (m.source.clone(), m.target.clone()))
+            .collect();
+        let expected: Vec<_> = FIRMWARE_RUNS
+            .iter()
+            .map(|(right, shift)| {
+                let left = right.start.checked_add_signed(*shift).unwrap()
+                    ..right.end.checked_add_signed(*shift).unwrap();
+                (left, right.clone())
+            })
+            .collect();
+        assert_eq!(found, expected);
+        assert_runs(&mut v, &FIRMWARE_RUNS, 0);
+        for unmatched in [
+            0x20..0x21,
+            0xff..0x104,
+            0x1ff..0x204,
+            0x501..0x505,
+            0xef7..0xf01,
+            0xf87..0xf8d,
+        ] {
+            assert!(unmatched.into_iter().all(|at| !v.is_moved(0, at)));
+        }
+    }
+
+    #[test]
+    fn an_edit_stops_the_moved_scan_and_changes_the_bytes_in_place() {
+        let (_dir, mut v) = moved_view();
+        let ctx = egui::Context::default();
+        let before = Arc::as_ptr(&v.data[0]);
+        v.invalidate_moved();
+        v.start_moved_scan(&ctx);
+        assert!(v.moved_job.is_some());
+        v.pane = Some(0);
+        v.move_cursor(64);
+        v.write_bytes(&[250]);
+        assert_eq!(v.data[0][64], 250);
+        assert!(v.moved_job.is_none(), "the scan is stopped");
+        assert_eq!(Arc::as_ptr(&v.data[0]), before, "the side was not copied");
+        assert_eq!(Arc::strong_count(&v.data[0]), 1);
+        assert!(v.moved_dirty && v.moved.is_empty());
+    }
+
+    #[test]
+    fn a_stopped_scan_gives_nothing_and_a_closed_view_stops_its_scan() {
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let a: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut b = a.clone();
+        b.rotate_left(4096);
+        assert!(binary::moved_blocks_until(&[&a, &b], &stop).is_none());
+
+        let (_dir, mut v) = moved_view();
+        v.invalidate_moved();
+        v.start_moved_scan(&egui::Context::default());
+        let flag = v.moved_job.as_ref().unwrap().stop.clone();
+        drop(v);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn moved_blocks_wait_for_idle_after_binary_typing() {
+        let (_dir, mut v) = moved_view();
+        let ctx = egui::Context::default();
+        let cfg = Config::default();
+        let colors = crate::ui::theme::colors(false);
+        let frame = |v: &mut BinaryView, time, events| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 820.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| v.ui(ui, &cfg, &colors));
+                },
+            );
+            out.textures_delta.clear();
+        };
+        v.pane = Some(0);
+        v.move_cursor(64);
+        v.write_bytes(&[250]);
+        frame(&mut v, 0.0, vec![]);
+        assert!(v.moved_dirty && v.moved.is_empty());
+        frame(
+            &mut v,
+            0.1,
+            vec![egui::Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        frame(&mut v, 0.2, vec![]);
+        assert!(v.moved_dirty && v.moved.is_empty());
+        frame(&mut v, 0.3, vec![]);
+        v.wait_for_moved_scan();
+        assert!(!v.moved_dirty && !v.moved.is_empty());
+        for m in &v.moved {
+            assert_eq!(
+                v.data[m.from][m.source.clone()],
+                v.data[m.to][m.target.clone()]
+            );
+        }
+    }
+
+    #[test]
+    fn the_moved_block_setting_is_followed_when_it_changes() {
+        let (_dir, mut v) = moved_view();
+        let ctx = egui::Context::default();
+        let mut cfg = Config {
+            binary_moved_blocks: false,
+            ..Config::default()
+        };
+        let colors = crate::ui::theme::colors(false);
+        let frame = |v: &mut BinaryView, cfg: &Config, time| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| v.ui(ui, cfg, &colors));
+                },
+            );
+            out.textures_delta.clear();
+        };
+        frame(&mut v, &cfg, 0.0);
+        frame(&mut v, &cfg, 1.0);
+        assert!(v.moved_job.is_none() && v.moved.is_empty());
+        assert_eq!(v.moved_choice, None);
+        cfg.binary_moved_blocks = true;
+        frame(&mut v, &cfg, 2.0);
+        frame(&mut v, &cfg, 3.0);
+        v.wait_for_moved_scan();
+        assert!(!v.moved.is_empty());
+    }
+
     #[test]
     fn edits_keep_the_differences_of_a_full_compare_and_undo_to_the_same_bytes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1169,7 +1858,7 @@ mod tests {
         v.save().unwrap();
         v.undo();
         assert!(v.is_modified());
-        assert_eq!(v.data[1], b"bbb");
+        assert_eq!(v.data[1].as_slice(), b"bbb");
         v.redo();
         assert!(!v.is_modified());
         v.undo();
@@ -1200,20 +1889,20 @@ mod tests {
         for ch in "abc".chars() {
             v.type_char(ch);
         }
-        assert_eq!(v.data[1], [0x00, 0xAB, 0xC2]);
+        assert_eq!(v.data[1].as_slice(), [0x00, 0xAB, 0xC2]);
         assert_eq!(v.cursor, Some(2), "half a byte typed keeps the cursor");
         for ch in "dxef".chars() {
             v.type_char(ch);
         }
         assert_eq!(
-            v.data[1],
+            v.data[1].as_slice(),
             [0x00, 0xAB, 0xCD, 0xEF],
             "typed past the end adds bytes"
         );
         assert_eq!(v.diffs, [Range { start: 1, end: 4 }]);
         v.undo();
         assert_eq!(
-            v.data[1],
+            v.data[1].as_slice(),
             [0x00, 0x11, 0x22],
             "one typing run is one undo step"
         );
@@ -1226,26 +1915,26 @@ mod tests {
         for ch in "OKé".chars() {
             v.type_char(ch);
         }
-        assert_eq!(v.data[1], [b'O', b'K', 0x00, 0xAB, 0xCD, 0xEF]);
+        assert_eq!(v.data[1].as_slice(), [b'O', b'K', 0x00, 0xAB, 0xCD, 0xEF]);
         v.delete(true);
         v.delete(false);
-        assert_eq!(v.data[1], [b'O', 0xAB, 0xCD, 0xEF]);
+        assert_eq!(v.data[1].as_slice(), [b'O', 0xAB, 0xCD, 0xEF]);
 
         v.insert = false;
         v.ascii = false;
         v.move_cursor(1);
         v.paste("DE AD BE EF");
-        assert_eq!(v.data[1], [b'O', 0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(v.data[1].as_slice(), [b'O', 0xDE, 0xAD, 0xBE, 0xEF]);
         v.undo();
         assert_eq!(
-            v.data[1],
+            v.data[1].as_slice(),
             [b'O', 0xAB, 0xCD, 0xEF],
             "a paste is its own undo step"
         );
 
         v.paste("123");
         v.paste("hello");
-        assert_eq!(v.data[1], [b'O', 0xAB, 0xCD, 0xEF]);
+        assert_eq!(v.data[1].as_slice(), [b'O', 0xAB, 0xCD, 0xEF]);
         assert_eq!(v.status, tr("msg.paste_not_hex"));
 
         v.move_cursor(1);
@@ -1255,10 +1944,10 @@ mod tests {
         v.move_cursor(2);
         v.type_char('3');
         v.type_char('4');
-        assert_eq!(v.data[1], [b'O', 0x12, 0x34, 0xEF]);
+        assert_eq!(v.data[1].as_slice(), [b'O', 0x12, 0x34, 0xEF]);
         v.undo();
         assert_eq!(
-            v.data[1],
+            v.data[1].as_slice(),
             [b'O', 0x12, 0xCD, 0xEF],
             "typing after moving the cursor is a new undo step"
         );
@@ -1272,20 +1961,20 @@ mod tests {
         v.undo();
         v.undo();
         assert_eq!(
-            v.data[1],
+            v.data[1].as_slice(),
             [b'O', 0x92, 0xCD, 0xEF],
             "undoing a change of one side leaves the other"
         );
-        assert_eq!(v.data[0], [0x00, 0x11, 0x22]);
+        assert_eq!(v.data[0].as_slice(), [0x00, 0x11, 0x22]);
         assert!(!v.modified[0]);
         v.undo();
-        assert_eq!(v.data[1], [b'O', 0x12, 0xCD, 0xEF]);
+        assert_eq!(v.data[1].as_slice(), [b'O', 0x12, 0xCD, 0xEF]);
 
         v.read_only[0] = true;
         v.pane = Some(0);
         v.move_cursor(0);
         v.type_char('f');
-        assert_eq!(v.data[0], [0x00, 0x11, 0x22]);
+        assert_eq!(v.data[0].as_slice(), [0x00, 0x11, 0x22]);
         assert_eq!(v.status, tr("msg.readonly"));
         v.save().unwrap();
         assert_eq!(std::fs::read(&paths[1]).unwrap(), [b'O', 0x12, 0xCD, 0xEF]);

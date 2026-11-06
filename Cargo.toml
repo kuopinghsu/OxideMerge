@@ -30,7 +30,7 @@ tar = { version = "0.4", default-features = false }
 flate2 = "1"
 bzip2 = "0.6"
 lzma-rs = "0.3"
-sevenz-rust2 = { version = "0.24", default-features = false, features = ["util", "bzip2", "deflate", "ppmd"] }
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["util", "compress", "bzip2", "deflate", "ppmd"] }
 quick-xml = "0.42"
 toml = { version = "1.1", default-features = false, features = ["std", "parse"] }
 yaml-rust = "0.4"
@@ -59,6 +59,8 @@ tree-sitter-javascript = "0.25.0"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-c = "0.24.2"
 tree-sitter-cpp = "0.23.4"
+arboard = "3"
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

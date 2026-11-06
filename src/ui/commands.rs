@@ -10,12 +10,25 @@ use egui::{Key, KeyboardShortcut, Modifiers};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cmd {
     New,
+    /// A new text compare with the clipboard's current text on the left, to paste a second
+    /// text into the right side and compare it right away.
+    CompareClipboard,
     Open,
+    /// Opens the connection dialog of *Compare over SFTP*, to stage a remote file or folder
+    /// locally and compare it like any other path.
+    OpenRemote,
     OpenConflict,
     OpenProject,
     SaveProject,
     SaveJob,
     RunJob,
+    /// Saves the open tabs as a named workspace, to reopen with [`Cmd::OpenWorkspace`].
+    SaveWorkspace,
+    /// Opens every tab of the workspace at this index of [`crate::config::Config::workspaces`].
+    OpenWorkspace(usize),
+    ManageWorkspaces,
+    /// Deletes the workspace at this index, from the "Manage workspaces" dialog.
+    DeleteWorkspace(usize),
     ApplyPatch,
     ToggleBookmark,
     NextBookmark,
@@ -101,12 +114,18 @@ impl Cmd {
         use Cmd::*;
         match self {
             New => "menu.new",
+            CompareClipboard => "menu.compare_clipboard",
             Open => "menu.open",
+            OpenRemote => "menu.open_remote",
             OpenConflict => "menu.open_conflict",
             OpenProject => "menu.open_project",
             SaveProject => "menu.save_project",
             SaveJob => "menu.save_job",
             RunJob => "menu.run_job",
+            SaveWorkspace => "menu.save_workspace",
+            OpenWorkspace(_) => "menu.open_workspace",
+            ManageWorkspaces => "menu.manage_workspaces",
+            DeleteWorkspace(_) => "cmd.delete",
             ApplyPatch => "menu.apply_patch",
             ToggleBookmark => "cmd.toggle_bookmark",
             NextBookmark => "cmd.next_bookmark",
@@ -182,10 +201,15 @@ impl Cmd {
     pub fn icon(self) -> Icon {
         use Cmd::*;
         match self {
-            New => Icon::Plus,
+            New | CompareClipboard => Icon::Plus,
             Open | OpenProject | RunJob => Icon::Folder,
+            OpenRemote => Icon::Globe,
             OpenConflict => Icon::Warning,
-            Save | SaveAll | SaveAs(_) | SaveProject | SaveJob | SaveComparison => Icon::File,
+            Save | SaveAll | SaveAs(_) | SaveProject | SaveJob | SaveComparison | SaveWorkspace => {
+                Icon::File
+            }
+            OpenWorkspace(_) | ManageWorkspaces => Icon::Folder,
+            DeleteWorkspace(_) => Icon::Close,
             Patch | ApplyPatch | BookmarkComment => Icon::Text,
             Slideshow | ExportPdf | Print => Icon::Export,
             HtmlReport => Icon::Export,
@@ -455,12 +479,16 @@ pub const PALETTE: &[Cmd] = {
     use Cmd::*;
     &[
         New,
+        CompareClipboard,
         Open,
+        OpenRemote,
         OpenConflict,
         OpenProject,
         SaveProject,
         SaveJob,
         RunJob,
+        SaveWorkspace,
+        ManageWorkspaces,
         Save,
         SaveAll,
         Patch,

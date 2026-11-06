@@ -23,6 +23,7 @@ pub mod problem;
 pub mod project;
 #[cfg(test)]
 mod regress;
+pub mod remote;
 pub mod report;
 pub mod review;
 pub mod rules;

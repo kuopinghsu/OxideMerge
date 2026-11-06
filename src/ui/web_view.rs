@@ -150,13 +150,21 @@ impl WebView {
             WebMode::Markdown => {
                 // The downloaded HTML as Markdown.
                 let opts = cfg.comparison_options();
+                let converting = progress.clone();
                 std::thread::spawn(move || {
-                    let r = pages().map(|pages| {
+                    let r = pages().and_then(|pages| {
+                        let abort = &converting.abort;
                         let blocks = pages
                             .iter()
-                            .map(|p| web_markdown::html_to_blocks(&p.html, Some(&p.url)))
-                            .collect();
-                        Loaded::Formatted(pages, Box::new(Prepared::new(blocks, &opts)))
+                            .map(|p| {
+                                web_markdown::html_to_blocks_until(&p.html, Some(&p.url), abort)
+                            })
+                            .collect::<Option<Vec<_>>>()
+                            .ok_or_else(|| anyhow::anyhow!(tr("msg.aborted")))?;
+                        Ok(Loaded::Formatted(
+                            pages,
+                            Box::new(Prepared::new(blocks, &opts)),
+                        ))
                     });
                     let _ = tx.send(r);
                 });

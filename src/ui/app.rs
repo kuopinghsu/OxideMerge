@@ -1,6 +1,6 @@
 //! Main application window: menus, tabs, dialogs and command dispatch.
 
-use crate::config::{Config, SessionTab, TextLayout, ThemeMode};
+use crate::config::{Config, SessionTab, TextLayout, ThemeMode, Workspace};
 use crate::core::archive;
 use crate::core::conflict;
 use crate::core::diff::{DiffAlgorithm, DiffOptions, InlineMode, WhitespaceMode};
@@ -8,6 +8,7 @@ use crate::core::filter::{self, FltFilter, FLT_PREFIX};
 use crate::core::folder::CompareMethod;
 use crate::core::patch::{self, PatchStyle};
 use crate::core::project::{self, Project};
+use crate::core::remote;
 use crate::core::report::{self, side_name, ReportFormat};
 use crate::core::rules::{self, RuleDraft, RuleKind, RuleSet};
 use crate::core::saved::{self, SavedCompare};
@@ -123,9 +124,37 @@ pub struct Tab {
     descriptions: Vec<Option<String>>,
     /// The folder compare this tab was opened from, for moving on to its next or previous file.
     origin: Option<Origin>,
-    /// Temporary copies of sides (a Git revision, extracted archives), deleted with the last
-    /// tab showing them: the folder compare and the files opened from it.
+    /// Temporary copies of sides (a Git revision, extracted archives, a file or folder fetched
+    /// over SFTP), deleted with the last tab showing them: the folder compare and the files
+    /// opened from it.
     temps: Vec<std::sync::Arc<tempfile::TempDir>>,
+    /// The connection and remote path of a side staged from [`remote::fetch`], one slot per
+    /// `source`, for *Save* to write a file side back to; `None` for a side opened any other
+    /// way, and for a folder side, which stays read-only (see [`remote`] for why).
+    remote: Vec<Option<RemoteFile>>,
+}
+
+/// A tab's side backed by a file fetched over SFTP: enough to write it back on *Save*, kept
+/// only in memory, for as long as its tab is open.
+#[derive(Clone)]
+struct RemoteFile {
+    conn: remote::RemoteConnection,
+    /// The file's path on the server.
+    remote_path: String,
+    /// The local file's modified time right after it was last written to the server (by the
+    /// fetch, or by an upload), so a save that touches another side of the same tab, or a
+    /// second hook of the same save (see [`OxideMergeApp::upload_remote_sides`]), does not
+    /// upload this one again with nothing new to send.
+    uploaded: Option<std::time::SystemTime>,
+}
+
+/// A fetch staged by the remote connection dialog, waiting to be claimed by the tab it ends up
+/// opening in (matched on the local path it was staged to, by [`OxideMergeApp::push_tab`]).
+struct PendingRemote {
+    local: PathBuf,
+    temp: std::sync::Arc<tempfile::TempDir>,
+    /// `None` for a folder: it opens read-only, with nothing to write back.
+    file: Option<RemoteFile>,
 }
 
 #[derive(Clone)]
@@ -134,6 +163,12 @@ struct Origin {
     folder: u64,
     /// Relative path of the item in that folder compare.
     rel: String,
+    /// Each side's root as it was in the folder compare when this tab was opened from it,
+    /// and the archive file to repack it into, for a side that was an archive side. Used to
+    /// save this tab's archive even after the folder tab it came from was closed, when there
+    /// is no live `FolderView` left to ask; `archives[s]` is `None` for a plain folder side.
+    roots: Vec<PathBuf>,
+    archives: Vec<Option<PathBuf>>,
 }
 
 impl Tab {
@@ -244,7 +279,8 @@ impl Tab {
 
     fn is_modified(&self) -> bool {
         match &self.content {
-            Content::Folder(_) | Content::Web(_) => false,
+            Content::Folder(v) => v.has_archive_changes(),
+            Content::Web(_) => false,
             Content::Text(v) => v.is_modified(),
             Content::Binary(v) => v.is_modified(),
             Content::Image(v) => v.is_modified(),
@@ -256,9 +292,12 @@ impl Tab {
         self.content.status_line()
     }
 
+    /// Saves changes; for a folder compare, repacks every archive side with pending edits
+    /// back into its archive file (see [`App::mark_origin_folder_dirty`]).
     fn save(&mut self) -> anyhow::Result<()> {
         match &mut self.content {
-            Content::Folder(_) | Content::Web(_) => Ok(()),
+            Content::Folder(v) => v.save_archives(),
+            Content::Web(_) => Ok(()),
             Content::Text(v) => v.save_modified(),
             Content::Binary(v) => v.save(),
             Content::Image(v) => v.save(),
@@ -1233,6 +1272,81 @@ struct GitDialog {
     hint_job: Option<(String, std::sync::mpsc::Receiver<&'static str>)>,
 }
 
+/// Which path field a remote connection dialog started from, and so which one its fetch fills
+/// in once it is done.
+#[derive(Clone, Copy)]
+enum RemoteTarget {
+    /// A side of the start page's compare form.
+    Start(usize),
+    /// A side of the Open dialog.
+    Open(usize),
+}
+
+/// *File → Compare over SFTP*: a server, a user name, a password or a private key, and the
+/// file or folder to fetch from it.
+struct RemoteDialog {
+    target: RemoteTarget,
+    host: String,
+    port: String,
+    user: String,
+    /// A private key and its passphrase (true), or a password (false).
+    key_auth: bool,
+    password: String,
+    key_path: String,
+    passphrase: String,
+    remote_path: String,
+}
+
+/// Everything but the password or passphrase of the last connection the remote connect
+/// dialog succeeded with, to fill in a later one with: fetching a second path from the same
+/// server, most often the other side of a compare, should not need host, port, user and key
+/// path retyped. The password or a key's passphrase is never kept here, consistent with
+/// [`RemoteConnection`] itself never outliving the tab it was used for.
+struct LastRemote {
+    host: String,
+    port: String,
+    user: String,
+    key_auth: bool,
+    key_path: String,
+}
+
+impl LastRemote {
+    fn from_conn(conn: &remote::RemoteConnection) -> Self {
+        let (key_auth, key_path) = match &conn.auth {
+            remote::Auth::Password(_) => (false, String::new()),
+            remote::Auth::Key { path, .. } => (true, path.display().to_string()),
+        };
+        Self {
+            host: conn.host.clone(),
+            port: conn.port.to_string(),
+            user: conn.user.clone(),
+            key_auth,
+            key_path,
+        }
+    }
+}
+
+/// A file or folder being fetched over SFTP, on another thread, for [`RemoteDialog`].
+struct RemoteLoad {
+    target: RemoteTarget,
+    conn: remote::RemoteConnection,
+    remote_path: String,
+    rx: std::sync::mpsc::Receiver<anyhow::Result<(tempfile::TempDir, PathBuf, bool)>>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The dialog it was started from, shown again when fetching fails or is stopped.
+    dialog: Option<RemoteDialog>,
+}
+
+/// A revision being read for *Compare with revision*, on another thread.
+struct RevLoad {
+    path: PathBuf,
+    rev: String,
+    rx: std::sync::mpsc::Receiver<anyhow::Result<(tempfile::TempDir, PathBuf)>>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The dialog it was started from, shown again when reading fails or is stopped.
+    dialog: Option<GitDialog>,
+}
+
 /// How long the Git dialog's path must stay unchanged before its commits are read.
 const GIT_LOG_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 /// How long a log read for an earlier path may run before a new path's starts anyway, so a
@@ -1299,13 +1413,29 @@ pub struct OxideMergeApp {
     save_job: Option<crate::ui::job_dialog::SaveJob>,
     run_job: Option<crate::ui::job_dialog::RunJob>,
     git_dlg: Option<GitDialog>,
+    rev_load: Option<RevLoad>,
+    remote_dlg: Option<RemoteDialog>,
+    remote_load: Option<RemoteLoad>,
+    /// Fetches staged by the remote connection dialog, waiting for the tab they end up
+    /// opening in to claim them (see [`PendingRemote`]).
+    pending_remote: Vec<PendingRemote>,
+    /// Host, port, user and key path of the last successful connection, to fill in a new
+    /// connect dialog with (see [`LastRemote`]). Kept only for this run; never saved.
+    last_remote: Option<LastRemote>,
     /// A folder report with file differences being written on another thread: its file.
     report_job: Option<(PathBuf, std::sync::mpsc::Receiver<Result<(), String>>)>,
     /// Whether the report being written opens in the system's viewer once done, to be printed.
     report_opens: bool,
+    /// The PDF files written to be printed, readable only by the user; deleted when the
+    /// program ends.
+    prints: Vec<tempfile::TempPath>,
     /// Ctrl+Tab presses taken from the input before egui saw them.
     tab_keys: Vec<Cmd>,
     filters_dlg: bool,
+    /// The name being typed into the "Save as workspace..." dialog, while open, and whether
+    /// its field still needs focus (only true the first frame it shows).
+    workspace_save_dlg: Option<(String, bool)>,
+    manage_workspaces: bool,
     about: bool,
     help: bool,
     named_filters: Vec<FltFilter>,
@@ -1442,8 +1572,6 @@ where
 
 /// Save dialog filters of report types: name and extensions.
 const HTML: (&str, &[&str]) = ("HTML", &["html", "htm"]);
-/// PDF files written to be printed, numbered so that each has a name of its own.
-static PRINTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const XML: (&str, &[&str]) = ("XML", &["xml"]);
 
 /// `path` with ".html" added to its name.
@@ -1459,6 +1587,47 @@ fn blank_doc() -> TextDoc {
     d.lines.push(String::new());
     d.final_newline = false;
     d
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the real clipboard in tests, so they don't depend on one being available
+    /// (or on what happens to be in it) in a CI sandbox. `None` means "use the real clipboard".
+    static TEST_CLIPBOARD: std::cell::RefCell<Option<Result<String, String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub fn set_test_clipboard(text: Result<&str, &str>) {
+    TEST_CLIPBOARD.with(|c| {
+        *c.borrow_mut() = Some(text.map(String::from).map_err(String::from));
+    });
+}
+
+/// The system clipboard's current text, kept apart from [`clipboard_doc`] so tests can stand
+/// in for the real clipboard (see [`TEST_CLIPBOARD`]) instead of depending on one.
+fn read_clipboard_text() -> anyhow::Result<String> {
+    #[cfg(test)]
+    if let Some(r) = TEST_CLIPBOARD.with(|c| c.borrow().clone()) {
+        return r.map_err(|e| anyhow::anyhow!(e));
+    }
+    let mut cb = arboard::Clipboard::new()
+        .map_err(|_| anyhow::anyhow!("{}", tr("msg.clipboard_unavailable")))?;
+    let text = cb
+        .get_text()
+        .map_err(|_| anyhow::anyhow!("{}", tr("msg.clipboard_empty")))?;
+    if text.is_empty() {
+        anyhow::bail!("{}", tr("msg.clipboard_empty"));
+    }
+    Ok(text)
+}
+
+/// A new unsaved document holding the clipboard's current text, for [`Cmd::CompareClipboard`].
+fn clipboard_doc() -> anyhow::Result<TextDoc> {
+    let text = read_clipboard_text()?;
+    let mut doc = TextDoc::from_text(None, &text);
+    doc.description = Some(tr("label.clipboard").to_string());
+    Ok(doc)
 }
 
 fn kind_label(k: Option<FileKind>) -> &'static str {
@@ -1522,6 +1691,8 @@ struct Menus {
     rules: Option<String>,
     recent: Option<Vec<String>>,
     clear_recent: bool,
+    /// Whether any workspace is saved, for [`Cmd::ManageWorkspaces`] and [`Cmd::OpenWorkspace`].
+    has_workspaces: bool,
 }
 
 impl Menus {
@@ -1576,12 +1747,14 @@ impl Menus {
                 Diffs,
             ) => true,
             (
-                New | Open | OpenConflict | OpenProject | GitCompare | ApplyPatch | Options
-                | CompareOptions | Filters | EditRules | Help | Palette | Exit | ZoomIn | ZoomOut
-                | ZoomReset | ToggleCollapse | ToggleWrap | CloseTabAt(_) | CloseOtherTabs(_)
-                | CloseTabsToRight(_),
+                New | CompareClipboard | Open | OpenRemote | OpenConflict | OpenProject
+                | GitCompare | ApplyPatch | Options | CompareOptions | Filters | EditRules | Help
+                | Palette | Exit | ZoomIn | ZoomOut | ZoomReset | ToggleCollapse | ToggleWrap
+                | CloseTabAt(_) | CloseOtherTabs(_) | CloseTabsToRight(_) | SaveWorkspace,
                 _,
             ) => true,
+            (ManageWorkspaces | OpenWorkspace(_), _) => self.has_workspaces,
+            (DeleteWorkspace(_), _) => true,
             _ => false,
         }
     }
@@ -2073,10 +2246,18 @@ impl OxideMergeApp {
             save_job: None,
             run_job: None,
             git_dlg: None,
+            remote_dlg: None,
+            remote_load: None,
+            pending_remote: Vec::new(),
+            last_remote: None,
+            rev_load: None,
             report_job: None,
             report_opens: false,
+            prints: Vec::new(),
             tab_keys: Vec::new(),
             filters_dlg: false,
+            workspace_save_dlg: None,
+            manage_workspaces: false,
             rule_dlg: None,
             about: false,
             help: false,
@@ -2139,9 +2320,19 @@ impl OxideMergeApp {
     /// Reopens the tabs of the previous session; those that can't be opened are left out.
     fn restore_session(&mut self) {
         let session = self.cfg.session.clone();
+        if let Some(a) = self.open_saved_tabs(&session, self.cfg.session_active) {
+            self.active = a;
+        }
+    }
+
+    /// Opens every tab of `tabs` (the previous session, or a named workspace), skipping ones
+    /// that can no longer be opened, alongside whatever is open already. Returns the app tab
+    /// index to focus afterwards: the one that came from index `focus` of `tabs` if it opened,
+    /// else the last one of `tabs` that did; `None` if none opened.
+    fn open_saved_tabs(&mut self, tabs: &[SessionTab], focus: usize) -> Option<usize> {
         let recent_paths = self.cfg.recent_paths.clone();
         let mut active = None;
-        for (i, s) in session.iter().enumerate() {
+        for (i, s) in tabs.iter().enumerate() {
             let kind = match s.kind.as_deref() {
                 Some("text") => Some(FileKind::Text),
                 Some("binary") => Some(FileKind::Binary),
@@ -2157,27 +2348,27 @@ impl OxideMergeApp {
                 rules: s.rules.clone(),
                 ..Default::default()
             };
-            if self.try_open(req).is_ok()
-                && self.tabs.len() > before
-                && i <= self.cfg.session_active
-            {
+            if self.try_open(req).is_ok() && self.tabs.len() > before && i <= focus {
                 active = Some(self.tabs.len() - 1);
             }
         }
         // a single file without conflicts opens the Open dialog instead of a tab
         self.open_dlg = None;
         self.cfg.recent_paths = recent_paths;
-        if let Some(a) = active {
-            self.active = a;
-        }
+        active
     }
 
-    fn save_session(&mut self) {
-        if !self.track_session {
-            return;
-        }
+    /// The open tabs right now, as a list to save (the auto-saved session, or a named
+    /// workspace): folder and "All differences" or review tabs with nothing of their own to
+    /// reopen from are left out, the same as the auto-saved session always was.
+    fn session_tabs(&self) -> Vec<SessionTab> {
         let tab = |t: &Tab| -> Option<SessionTab> {
             if t.source.is_empty() {
+                return None;
+            }
+            // A side fetched over SFTP is staged in a temporary folder gone by the next
+            // start, and reopening it would need its password or key again in any case.
+            if t.remote.iter().any(Option::is_some) {
                 return None;
             }
             let kind = match &t.content {
@@ -2199,8 +2390,15 @@ impl OxideMergeApp {
                 rules,
             })
         };
-        let session: Vec<SessionTab> = if self.cfg.restore_session {
-            self.tabs.iter().filter_map(tab).collect()
+        self.tabs.iter().filter_map(tab).collect()
+    }
+
+    fn save_session(&mut self) {
+        if !self.track_session {
+            return;
+        }
+        let session = if self.cfg.restore_session {
+            self.session_tabs()
         } else {
             Vec::new()
         };
@@ -2212,6 +2410,27 @@ impl OxideMergeApp {
             self.cfg.session = session;
         }
         self.cfg.session_active = active;
+    }
+
+    /// Saves the open tabs as a named workspace (see [`Config::workspaces`]): a workspace of
+    /// the same name is replaced, otherwise a new one is added.
+    fn save_workspace(&mut self, name: String) {
+        let tabs = self.session_tabs();
+        match self.cfg.workspaces.iter_mut().find(|w| w.name == name) {
+            Some(w) => w.tabs = tabs,
+            None => self.cfg.workspaces.push(Workspace { name, tabs }),
+        }
+    }
+
+    /// Opens every tab of the workspace at `idx` of [`Config::workspaces`], alongside whatever
+    /// is open already, and focuses its last tab.
+    fn open_workspace(&mut self, idx: usize) {
+        let Some(tabs) = self.cfg.workspaces.get(idx).map(|w| w.tabs.clone()) else {
+            return;
+        };
+        if let Some(a) = self.open_saved_tabs(&tabs, usize::MAX) {
+            self.active = a;
+        }
     }
 
     fn error(&mut self, msg: impl Into<String>) {
@@ -2306,7 +2525,8 @@ impl OxideMergeApp {
             return self.try_open(opened);
         }
         if let (Some(rev), [path]) = (&req.git_rev, &paths[..]) {
-            return self.open_git_revision(path, rev);
+            self.open_git_revision(path, rev, None);
+            return Ok(());
         }
         if paths.len() == 1 && text::extension(&paths[0]) == crate::core::review::EXT {
             let review = crate::core::review::load(&paths[0])?;
@@ -2532,12 +2752,454 @@ impl OxideMergeApp {
     }
 
     /// Compares `path` with how it was in revision `rev` of its Git repository, Subversion
-    /// working copy or Mercurial repository (the left side, read-only).
-    fn open_git_revision(&mut self, path: &Path, rev: &str) -> anyhow::Result<()> {
-        let rev = vcs::rev_or_default(path, rev);
+    /// working copy or Mercurial repository (the left side, read-only). The revision is read on
+    /// another thread, as a server may be slow or not answer; `dialog` comes back if it fails.
+    fn open_git_revision(&mut self, path: &Path, rev: &str, dialog: Option<GitDialog>) {
+        if let Some(old) = self.rev_load.take() {
+            old.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let rev = vcs::rev_or_default(path, rev).to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (p, r, stop) = (path.to_path_buf(), rev.clone(), cancel.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(vcs::copy_of(&p, &r, &stop));
+        });
+        self.rev_load = Some(RevLoad {
+            path: path.to_path_buf(),
+            rev,
+            rx,
+            cancel,
+            dialog,
+        });
+    }
+
+    /// Opens the connection dialog of *Compare over SFTP* for `target`'s path field.
+    fn start_remote_connect(&mut self, target: RemoteTarget) {
+        let last = self.last_remote.as_ref();
+        self.remote_dlg = Some(RemoteDialog {
+            target,
+            host: last.map_or_else(String::new, |l| l.host.clone()),
+            port: last.map_or_else(|| "22".to_string(), |l| l.port.clone()),
+            user: last.map_or_else(String::new, |l| l.user.clone()),
+            key_auth: last.is_some_and(|l| l.key_auth),
+            password: String::new(),
+            key_path: last.map_or_else(String::new, |l| l.key_path.clone()),
+            passphrase: String::new(),
+            remote_path: String::new(),
+        });
+    }
+
+    /// *File → Compare over SFTP*: a server, a user name, a password or a private key, and the
+    /// file or folder to fetch from it, for one path field.
+    fn remote_connect_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.remote_dlg.take() else {
+            return;
+        };
+        let (mut connect, mut cancel) = (false, false);
+        let ready = !d.host.trim().is_empty()
+            && !d.user.trim().is_empty()
+            && !d.remote_path.trim().is_empty()
+            && d.port.trim().parse::<u16>().is_ok()
+            && (!d.key_auth || !d.key_path.trim().is_empty());
+        let modal = egui::Modal::new(egui::Id::unique("remote_connect_dialog")).show(ctx, |ui| {
+            ui.set_min_width(440.0);
+            if widgets::dialog_title(ui, &plain(tr("menu.open_remote"))) {
+                cancel = true;
+            }
+            egui::Grid::new("remote_grid")
+                .num_columns(2)
+                .spacing([12.0, 10.0])
+                .show(ui, |ui| {
+                    ui.label(tr("label.remote_host"));
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.host)
+                                .hint_text("example.com")
+                                .desired_width(220.0),
+                        );
+                        ui.label(tr("label.remote_port"));
+                        ui.add(egui::TextEdit::singleline(&mut d.port).desired_width(50.0));
+                    });
+                    ui.end_row();
+                    ui.label(tr("label.remote_user"));
+                    ui.add(egui::TextEdit::singleline(&mut d.user).desired_width(220.0));
+                    ui.end_row();
+                    ui.label(tr("label.remote_auth"));
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut d.key_auth, false, tr("label.remote_password"));
+                        ui.selectable_value(&mut d.key_auth, true, tr("label.remote_key"));
+                    });
+                    ui.end_row();
+                    if d.key_auth {
+                        ui.label(tr("label.remote_key_path"));
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.key_path).desired_width(260.0),
+                            );
+                            if widgets::icon_button(ui, Icon::File, tr("btn.browse_file")).clicked()
+                            {
+                                if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                    d.key_path = p.display().to_string();
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        ui.label(tr("label.remote_passphrase"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.passphrase)
+                                .password(true)
+                                .desired_width(220.0),
+                        );
+                        ui.end_row();
+                    } else {
+                        ui.label(tr("label.remote_password"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.password)
+                                .password(true)
+                                .desired_width(220.0),
+                        );
+                        ui.end_row();
+                    }
+                    ui.label(tr("label.remote_path"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.remote_path)
+                            .hint_text(tr("msg.remote_path_hint"))
+                            .desired_width(300.0),
+                    );
+                    ui.end_row();
+                });
+            widgets::dialog_footer(ui, |ui| {
+                ui.add_enabled_ui(ready, |ui| {
+                    if widgets::primary_button(ui, tr("btn.connect")).clicked()
+                        || (ready && ui.input(|i| i.key_pressed(Key::Enter)))
+                    {
+                        connect = true;
+                    }
+                });
+                if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
+                    || ui.input(|i| i.key_pressed(Key::Escape))
+                {
+                    cancel = true;
+                }
+            });
+        });
+        if modal.should_close() {
+            cancel = true;
+        }
+        if connect {
+            // `ready` (gating the *Connect* button above) already requires this to parse;
+            // the fallback is just a defensive backstop against the two checks ever drifting
+            // apart, not a path expected to run.
+            let port = d.port.trim().parse().unwrap_or(22);
+            let auth = if d.key_auth {
+                remote::Auth::Key {
+                    path: PathBuf::from(d.key_path.trim()),
+                    passphrase: d.passphrase.clone(),
+                }
+            } else {
+                remote::Auth::Password(d.password.clone())
+            };
+            let conn = remote::RemoteConnection {
+                host: d.host.trim().to_string(),
+                port,
+                user: d.user.trim().to_string(),
+                auth,
+            };
+            let remote_path = d.remote_path.trim().to_string();
+            let target = d.target;
+            self.open_remote(target, conn, remote_path, Some(d));
+        } else if !cancel {
+            self.remote_dlg = Some(d);
+        }
+    }
+
+    /// Fetches `remote_path` over SFTP for `target`'s path field, authenticated as `conn`
+    /// says. Read on another thread, as a server may be slow or not answer; `dialog` comes
+    /// back if it fails or is stopped.
+    fn open_remote(
+        &mut self,
+        target: RemoteTarget,
+        conn: remote::RemoteConnection,
+        remote_path: String,
+        dialog: Option<RemoteDialog>,
+    ) {
+        if let Some(old) = self.remote_load.take() {
+            old.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (c, p, stop) = (conn.clone(), remote_path.clone(), cancel.clone());
+        // Tests stand in for the network with a thread-local fake server (see
+        // `remote::fake`), so a fetch for one runs on this thread rather than a spawned one,
+        // which would not see it.
+        #[cfg(test)]
+        let on_this_thread = remote::fake::installed();
+        #[cfg(not(test))]
+        let on_this_thread = false;
+        if on_this_thread {
+            let _ = tx.send(remote::fetch(&c, &p, &stop));
+        } else {
+            std::thread::spawn(move || {
+                let _ = tx.send(remote::fetch(&c, &p, &stop));
+            });
+        }
+        self.remote_load = Some(RemoteLoad {
+            target,
+            conn,
+            remote_path,
+            rx,
+            cancel,
+            dialog,
+        });
+    }
+
+    /// Shows that a file or folder is being fetched over SFTP, with a button to stop, and
+    /// fills in its path field once it is done.
+    fn remote_load_dialog(&mut self, ctx: &egui::Context) {
+        let Some(load) = self.remote_load.take() else {
+            return;
+        };
+        let result = match load.rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Some(Err(anyhow::anyhow!("{}", tr("status.error"))))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        };
+        let Some(result) = result else {
+            let label = remote::label(&load.conn, &load.remote_path);
+            let mut stop = false;
+            egui::Modal::new(egui::Id::unique("remote_load_dialog")).show(ctx, |ui| {
+                ui.set_width(480.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(trf("msg.fetching_remote", &[("name", label)]));
+                });
+                widgets::dialog_footer(ui, |ui| {
+                    if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
+                        || ui.input(|i| i.key_pressed(Key::Escape))
+                    {
+                        stop = true;
+                    }
+                });
+            });
+            if stop {
+                load.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            self.remote_load = Some(load);
+            return;
+        };
+        let stopped = load.cancel.load(std::sync::atomic::Ordering::Relaxed);
+        match result {
+            Ok((temp, local, is_dir)) => {
+                self.last_remote = Some(LastRemote::from_conn(&load.conn));
+                self.use_remote_fetch(
+                    load.target,
+                    load.conn,
+                    load.remote_path,
+                    temp,
+                    local,
+                    is_dir,
+                );
+            }
+            Err(e) => {
+                if !stopped {
+                    self.error(e.to_string());
+                }
+                self.remote_dlg = load.dialog;
+            }
+        }
+    }
+
+    /// Fills in the path field a fetch over SFTP was started for, and remembers the fetch to
+    /// claim once a tab opens with that path (see [`PendingRemote`]).
+    fn use_remote_fetch(
+        &mut self,
+        target: RemoteTarget,
+        conn: remote::RemoteConnection,
+        remote_path: String,
+        temp: tempfile::TempDir,
+        local: PathBuf,
+        is_dir: bool,
+    ) {
+        let shown = local.display().to_string();
+        match target {
+            RemoteTarget::Start(s) => self.start_paths[s] = shown,
+            RemoteTarget::Open(s) => {
+                let mut d = self
+                    .open_dlg
+                    .take()
+                    .unwrap_or_else(|| self.new_open_dialog(None));
+                d.paths[s] = shown;
+                d.read_only[s] = is_dir;
+                self.open_dlg = Some(d);
+            }
+        }
+        let uploaded = std::fs::metadata(&local).and_then(|m| m.modified()).ok();
+        self.pending_remote.push(PendingRemote {
+            local,
+            temp: std::sync::Arc::new(temp),
+            file: (!is_dir).then_some(RemoteFile {
+                conn,
+                remote_path,
+                uploaded,
+            }),
+        });
+    }
+
+    /// Shows that a revision is being read, with a button to stop, and opens its tab once read.
+    fn rev_load_dialog(&mut self, ctx: &egui::Context) {
+        let Some(load) = self.rev_load.take() else {
+            return;
+        };
+        let result = match load.rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Some(Err(anyhow::anyhow!("{}", tr("status.error"))))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        };
+        let Some(result) = result else {
+            let label = format!("{} @ {}", load.path.display(), load.rev);
+            let mut stop = false;
+            egui::Modal::new(egui::Id::unique("rev_load_dialog")).show(ctx, |ui| {
+                ui.set_width(480.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(trf("msg.reading_revision", &[("name", label)]));
+                });
+                widgets::dialog_footer(ui, |ui| {
+                    if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
+                        || ui.input(|i| i.key_pressed(Key::Escape))
+                    {
+                        stop = true;
+                    }
+                });
+            });
+            if stop {
+                load.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            self.rev_load = Some(load);
+            return;
+        };
+        let stopped = load.cancel.load(std::sync::atomic::Ordering::Relaxed);
+        let shown =
+            result.and_then(|(temp, copy)| self.show_revision(&load.path, &load.rev, temp, copy));
+        if let Err(e) = shown {
+            if !stopped {
+                self.error(e.to_string());
+            }
+            self.git_dlg = load.dialog;
+        }
+    }
+
+    /// The "Save as workspace..." dialog: a name for the open tabs, saved under
+    /// [`Config::workspaces`] on confirm (see [`App::save_workspace`]).
+    fn workspace_save_dialog(&mut self, ctx: &egui::Context) {
+        let Some((name, focus)) = &mut self.workspace_save_dlg else {
+            return;
+        };
+        let mut save = false;
+        let mut cancel = false;
+        let empty = name.trim().is_empty();
+        egui::Modal::new(egui::Id::unique("workspace_save_dialog")).show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            ui.heading(tr("menu.save_workspace"));
+            let field =
+                ui.add(egui::TextEdit::singleline(name).hint_text(tr("msg.workspace_name_hint")));
+            if *focus {
+                field.request_focus();
+                *focus = false;
+            }
+            if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !empty {
+                save = true;
+            }
+            widgets::dialog_footer(ui, |ui| {
+                ui.add_enabled_ui(!empty, |ui| {
+                    if widgets::primary_button(ui, tr("btn.save")).clicked() {
+                        save = true;
+                    }
+                });
+                if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
+                    || ui.input(|i| i.key_pressed(Key::Escape))
+                {
+                    cancel = true;
+                }
+            });
+        });
+        if save {
+            if let Some((name, _)) = self.workspace_save_dlg.take() {
+                self.save_workspace(name.trim().to_string());
+            }
+        } else if cancel {
+            self.workspace_save_dlg = None;
+        }
+    }
+
+    /// The "Manage workspaces..." dialog: every saved workspace, each with a button to open or
+    /// delete it.
+    fn manage_workspaces_dialog(&mut self, ctx: &egui::Context) {
+        if !self.manage_workspaces {
+            return;
+        }
+        let mut open = None;
+        let mut delete = None;
+        let mut close = false;
+        egui::Modal::new(egui::Id::unique("manage_workspaces_dialog")).show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            ui.heading(tr("menu.manage_workspaces"));
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    for (i, w) in self.cfg.workspaces.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(&w.name);
+                            if widgets::secondary_button(ui, tr("job.open_output")).clicked() {
+                                open = Some(i);
+                            }
+                            if widgets::secondary_button(ui, tr(Cmd::DeleteWorkspace(i).label()))
+                                .clicked()
+                            {
+                                delete = Some(i);
+                            }
+                        });
+                    }
+                });
+            widgets::dialog_footer(ui, |ui| {
+                if widgets::primary_button(ui, tr("btn.close")).clicked()
+                    || ui.input(|i| i.key_pressed(Key::Escape))
+                {
+                    close = true;
+                }
+            });
+        });
+        if let Some(i) = delete {
+            self.cfg.workspaces.remove(i);
+        }
+        if let Some(i) = open {
+            self.open_workspace(i);
+            self.manage_workspaces = false;
+        }
+        if close {
+            self.manage_workspaces = false;
+        }
+    }
+
+    /// Opens the tab comparing `path` with `copy`, its copy as of revision `rev` in `temp`.
+    fn show_revision(
+        &mut self,
+        path: &Path,
+        rev: &str,
+        temp: tempfile::TempDir,
+        copy: PathBuf,
+    ) -> anyhow::Result<()> {
         let label = format!("{} @ {rev}", path.display());
-        let (temp, content) = if path.is_dir() {
-            let (temp, copy) = vcs::export_folder(path, rev)?;
+        let content = if path.is_dir() {
             let display = vec![label, path.display().to_string()];
             let mut v = FolderView::new(
                 vec![copy, path.to_path_buf()],
@@ -2548,14 +3210,10 @@ impl OxideMergeApp {
                 &self.cfg,
             );
             v.read_only[0] = true;
-            (temp, Content::Folder(v))
+            Content::Folder(v)
         } else {
-            let bytes = vcs::show_file(path, rev)?;
-            let temp = tempfile::tempdir()?;
-            let copy = temp.path().join(path.file_name().unwrap_or_default());
-            std::fs::write(&copy, bytes)?;
             let paths = vec![copy.clone(), path.to_path_buf()];
-            let content = if text::is_image_path(path) {
+            if text::is_image_path(path) {
                 let mut v = ImageView::load(paths, &self.cfg)?;
                 v.read_only[0] = true;
                 Content::Image(v)
@@ -2571,8 +3229,7 @@ impl OxideMergeApp {
                 left.read_only = true;
                 let right = self.load_text(path, !path.exists())?;
                 Content::Text(TextView::new(vec![left, right], &self.cfg))
-            };
-            (temp, content)
+            }
         };
         self.cfg.add_recent_path(&path.display().to_string());
         self.push_tab(content, Vec::new());
@@ -2692,22 +3349,67 @@ impl OxideMergeApp {
 
     fn push_tab(&mut self, content: Content, source: Vec<PathBuf>) {
         self.next_tab_id += 1;
+        let (temps, remote) = self.take_pending_remote(&source);
         self.tabs.push(Tab {
             id: self.next_tab_id,
             content,
             source,
             descriptions: Vec::new(),
             origin: None,
-            temps: Vec::new(),
+            temps,
+            remote,
         });
         self.active = self.tabs.len() - 1;
+    }
+
+    /// Claims the fetches of [`Self::pending_remote`] that `source` was staged from (by the
+    /// local path each was staged to): the temporary folders to keep as long as the new tab
+    /// does, and, for a file side, the connection *Save* writes it back to.
+    fn take_pending_remote(
+        &mut self,
+        source: &[PathBuf],
+    ) -> (
+        Vec<std::sync::Arc<tempfile::TempDir>>,
+        Vec<Option<RemoteFile>>,
+    ) {
+        let mut temps = Vec::new();
+        let mut remote = vec![None; source.len()];
+        self.pending_remote.retain(|p| {
+            let Some(i) = source.iter().position(|s| s == &p.local) else {
+                return true;
+            };
+            temps.push(p.temp.clone());
+            remote[i] = p.file.clone();
+            false
+        });
+        (temps, remote)
+    }
+
+    /// Drops a fetch of [`Self::pending_remote`] that no longer sits in any path field it
+    /// could still be claimed from: the Open dialog it staged a path for was cancelled (or
+    /// closed without comparing), or that path field was overwritten by a later fetch or a
+    /// browsed path before a tab ever opened from it. Without this, its temporary folder (and
+    /// the disk space it uses) would sit unclaimed for the rest of the session, since nothing
+    /// else ever revisits [`Self::pending_remote`] once [`Self::use_remote_fetch`] adds to it.
+    /// Run once a frame, alongside the dialogs that can add to or replace it.
+    fn gc_pending_remote(&mut self) {
+        if self.pending_remote.is_empty() {
+            return;
+        }
+        let mut live: Vec<&Path> = self.start_paths.iter().map(Path::new).collect();
+        if let Some(d) = &self.open_dlg {
+            live.extend(d.paths.iter().map(Path::new));
+        }
+        self.pending_remote
+            .retain(|p| live.iter().any(|l| *l == p.local));
     }
 
     /// Moves on from the active tab to the next or previous file with differences in the folder
     /// compare it was opened from, or with `conflicts`, that both sides changed.
     fn step_file(&mut self, forward: bool, conflicts: bool) {
         let ti = self.active;
-        let Some(Origin { folder, rel }) = self.tabs.get(ti).and_then(|t| t.origin.clone()) else {
+        let Some(Origin { folder, rel, .. }) = self.tabs.get(ti).and_then(|t| t.origin.clone())
+        else {
             return;
         };
         let Some(Content::Folder(f)) = self
@@ -2729,7 +3431,8 @@ impl OxideMergeApp {
     }
 
     fn switch_file(&mut self, ti: usize, forward: bool, conflicts: bool) {
-        let Some(Origin { folder, rel }) = self.tabs.get(ti).and_then(|t| t.origin.clone()) else {
+        let Some(Origin { folder, rel, .. }) = self.tabs.get(ti).and_then(|t| t.origin.clone())
+        else {
             return;
         };
         let temps = self.tabs[ti].temps.clone();
@@ -2742,6 +3445,12 @@ impl OxideMergeApp {
         else {
             return;
         };
+        let (origin_roots, origin_archives) = (
+            f.roots.clone(),
+            (0..f.n())
+                .map(|s| f.archive_source(s).map(Path::to_path_buf))
+                .collect(),
+        );
         let Some(FolderAction::OpenFiles {
             paths,
             missing,
@@ -2822,7 +3531,12 @@ impl OxideMergeApp {
             }
             None => self.notify(trf("msg.file_switched", &[("file", rel.clone())])),
         }
-        tab.origin = Some(Origin { folder, rel });
+        tab.origin = Some(Origin {
+            folder,
+            rel,
+            roots: origin_roots,
+            archives: origin_archives,
+        });
         tab.temps = temps;
         self.tabs[ti] = tab;
         self.active = ti;
@@ -3420,6 +4134,22 @@ impl OxideMergeApp {
                 v.status = tr("msg.new_hint").to_string();
                 self.push_tab(Content::Text(v), Vec::new());
             }
+            Cmd::CompareClipboard => match clipboard_doc() {
+                Ok(left) => {
+                    let mut v = TextView::new(vec![left, blank_doc()], &self.cfg);
+                    v.status = tr("msg.clipboard_hint").to_string();
+                    self.push_tab(Content::Text(v), Vec::new());
+                }
+                Err(e) => self.error(e.to_string()),
+            },
+            Cmd::SaveWorkspace => self.workspace_save_dlg = Some((String::new(), true)),
+            Cmd::OpenWorkspace(i) => self.open_workspace(i),
+            Cmd::ManageWorkspaces => self.manage_workspaces = true,
+            Cmd::DeleteWorkspace(i) => {
+                if i < self.cfg.workspaces.len() {
+                    self.cfg.workspaces.remove(i);
+                }
+            }
             Cmd::OpenProject => {
                 if let Some(p) = rfd::FileDialog::new()
                     .set_title(tr("menu.open_project"))
@@ -3497,12 +4227,19 @@ impl OxideMergeApp {
             Cmd::CloseTabsToRight(keep) => self.close_tabs(|i| i > keep),
             Cmd::CloseAllTabs => self.close_tabs(|_| true),
             Cmd::SaveAll => {
-                let errors: Vec<String> = self
-                    .tabs
-                    .iter_mut()
-                    .filter(|t| t.is_modified())
-                    .filter_map(|t| t.save().err().map(|e| e.to_string()))
-                    .collect();
+                let mut errors = Vec::new();
+                let mut saved = Vec::new();
+                for i in 0..self.tabs.len() {
+                    if !self.tabs[i].is_modified() {
+                        continue;
+                    }
+                    match self.tabs[i].save() {
+                        Ok(()) => saved.push(self.tabs[i].id),
+                        Err(e) => errors.push(e.to_string()),
+                    }
+                }
+                errors.extend(self.save_origin_folder_archives(&saved));
+                errors.extend(self.upload_remote_sides(&saved));
                 if !errors.is_empty() {
                     self.error(errors.join("\n"));
                 }
@@ -3527,6 +4264,15 @@ impl OxideMergeApp {
             Cmd::Print => self.save_pdf(true),
             Cmd::SaveComparison => self.save_comparison(),
             Cmd::Statistics => self.show_statistics(),
+            Cmd::OpenRemote => {
+                if self.open_dlg.is_none() {
+                    let mut d = self.new_open_dialog(None);
+                    d.paths = self.start_paths.clone();
+                    d.three_way = self.start_three_way;
+                    self.open_dlg = Some(d);
+                }
+                self.start_remote_connect(RemoteTarget::Open(0));
+            }
             Cmd::GitCompare => {
                 let path = self
                     .tabs
@@ -3664,6 +4410,11 @@ impl OxideMergeApp {
                         _ => {}
                     },
                     Content::Folder(v) => match cmd {
+                        Cmd::Save => {
+                            if let Err(e) = v.save_archives() {
+                                err = Some(e.to_string());
+                            }
+                        }
                         Cmd::Refresh => v.refresh(&cfg, &named),
                         Cmd::Find => v.focus_search(),
                         Cmd::CopyRight => v.copy_selected(true, &cfg),
@@ -3710,6 +4461,16 @@ impl OxideMergeApp {
                 }
                 if let Some(e) = err {
                     self.error(e);
+                } else if cmd == Cmd::Save {
+                    if let Err(e) = self.save_origin_folder_archive(self.active) {
+                        self.error(e.to_string());
+                    }
+                    if let Some(id) = self.tabs.get(self.active).map(|t| t.id) {
+                        let errors = self.upload_remote_sides(&[id]);
+                        if !errors.is_empty() {
+                            self.error(errors.join("\n"));
+                        }
+                    }
                 }
                 self.take_step_file();
             }
@@ -3837,12 +4598,23 @@ impl OxideMergeApp {
                 }
             };
         let stem = name.strip_suffix(".html").unwrap_or(&name).to_string();
+        let mut print_file = None;
         let path = if print {
-            let n = PRINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            std::env::temp_dir().join(format!(
-                "oxidemerge-print-{}-{n}-{stem}.pdf",
-                std::process::id()
-            ))
+            let made = tempfile::Builder::new()
+                .prefix("oxidemerge-print-")
+                .suffix(&format!("-{stem}.pdf"))
+                .tempfile();
+            let (file, temp) = match made {
+                Ok(f) => f.into_parts(),
+                Err(e) => {
+                    self.error(format!("{}: {e}", std::env::temp_dir().display()));
+                    return;
+                }
+            };
+            let path = temp.to_path_buf();
+            self.prints.push(temp);
+            print_file = Some(file);
+            path
         } else {
             let title = tr("menu.export_pdf");
             let Some(path) = rfd::FileDialog::new()
@@ -3864,9 +4636,11 @@ impl OxideMergeApp {
         let (tx, rx) = std::sync::mpsc::channel();
         let file = path.clone();
         std::thread::spawn(move || {
-            let written = job().and_then(|bytes| {
-                crate::core::fsutil::write_atomic_with(&file, &bytes, false)
-                    .map_err(|e| format!("{e:#}"))
+            let written = job().and_then(|bytes| match print_file {
+                Some(mut f) => std::io::Write::write_all(&mut f, &bytes)
+                    .map_err(|e| format!("{}: {e}", file.display())),
+                None => crate::core::fsutil::write_atomic_with(&file, &bytes, false)
+                    .map_err(|e| format!("{e:#}")),
             });
             let _ = tx.send(written);
         });
@@ -3997,31 +4771,178 @@ impl OxideMergeApp {
         }
     }
 
-    fn refresh_saved_folders(&mut self) {
-        let mut folders = Vec::new();
-        let mut errors = Vec::new();
-        for t in &mut self.tabs {
-            if let Content::Diffs(v) = &mut t.content {
-                if std::mem::take(&mut v.saved) {
-                    folders.push(v.folder);
+    /// If the tab at `idx` was opened from an archive-backed folder compare, repacks every
+    /// archive side of that folder right away, so saving the tab also saves the archive it
+    /// came from in the same step — not only once the folder tab is itself saved later, by
+    /// `SaveAll`, say. Call after successfully saving a tab (this does not track which side
+    /// exactly changed, only that the tab it came from did, so every archive side of the
+    /// folder is repacked, not only the one the tab's file is on).
+    fn save_origin_folder_archive(&mut self, idx: usize) -> anyhow::Result<()> {
+        let Some(id) = self.tabs.get(idx).map(|t| t.id) else {
+            return Ok(());
+        };
+        match self.save_origin_folder_archives(&[id]).into_iter().next() {
+            Some(e) => Err(anyhow::anyhow!(e)),
+            None => Ok(()),
+        }
+    }
+
+    /// Repacks every archive touched while saving the tabs in `ids`, each archive written at
+    /// most once even when several of its tabs were saved together (`SaveAll`, or saving every
+    /// tab before exit, with several files open from the same archive): the repack itself is
+    /// the expensive part (it walks and recompresses the whole archive on the UI thread), so
+    /// doing it once per archive instead of once per tab avoids redoing that work needlessly
+    /// within a single save operation.
+    fn save_origin_folder_archives(&mut self, ids: &[u64]) -> Vec<String> {
+        let mut folders = std::collections::HashSet::new();
+        let mut closed = std::collections::HashSet::new();
+        for &id in ids {
+            let Some(origin) = self
+                .tabs
+                .iter()
+                .find(|t| t.id == id)
+                .and_then(|t| t.origin.clone())
+            else {
+                continue;
+            };
+            if self.tabs.iter().any(|t| t.id == origin.folder) {
+                folders.insert(origin.folder);
+            } else {
+                // The folder tab this file was opened from was closed meanwhile, so there is
+                // no live `FolderView` left to mark dirty and save: repack straight from how
+                // its sides looked when this tab was opened, recorded in `origin` for exactly
+                // this case. Dedupe by archive path too, in case several sibling tabs from the
+                // same now-closed folder are saved together.
+                for (root, archive) in origin.roots.iter().zip(&origin.archives) {
+                    if let Some(archive) = archive {
+                        closed.insert((archive.clone(), root.clone()));
+                    }
                 }
-                errors.extend(v.error.take());
             }
         }
-        for e in errors {
-            self.error(e);
+        let mut errors = Vec::new();
+        for folder in folders {
+            if let Some(Content::Folder(v)) = self
+                .tabs
+                .iter_mut()
+                .find(|t| t.id == folder)
+                .map(|t| t.content.view_mut())
+            {
+                for s in 0..v.n() {
+                    if v.is_archive_side(s) {
+                        v.mark_archive_dirty(s);
+                    }
+                }
+                if let Err(e) = v.save_archives() {
+                    errors.push(e.to_string());
+                }
+            }
         }
+        for (archive, root) in closed {
+            if let Err(e) = archive::repack(&archive, &root) {
+                errors.push(e.to_string());
+            }
+        }
+        errors
+    }
+
+    /// Re-uploads the remote sides of the tabs in `ids` that changed on disk since they were
+    /// last sent, each over its own, fresh SFTP connection; a side still exactly as it was
+    /// (unmodified, or already uploaded by an earlier call for the same save: a tab's own
+    /// *Save* and `refresh_saved_folders`'s catch-all both call this) is skipped, by its local
+    /// file's modified time.
+    fn upload_remote_sides(&mut self, ids: &[u64]) -> Vec<String> {
+        let mut errors = Vec::new();
+        for &id in ids {
+            let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+                continue;
+            };
+            if tab.remote.iter().all(Option::is_none) {
+                continue;
+            }
+            let paths = tab.paths();
+            let source = tab.source.clone();
+            for (i, local) in paths.iter().enumerate() {
+                if source.get(i) != Some(local) {
+                    // Save As moved this side to a local path of its own; it is no longer
+                    // read from or written to the server.
+                    continue;
+                }
+                let modified = std::fs::metadata(local).and_then(|m| m.modified()).ok();
+                let Some(file) = tab.remote.get_mut(i).and_then(Option::as_mut) else {
+                    continue;
+                };
+                if modified.is_some() && modified == file.uploaded {
+                    continue;
+                }
+                match remote::upload(&file.conn, local, &file.remote_path) {
+                    Ok(()) => file.uploaded = modified,
+                    Err(e) => errors.push(e.to_string()),
+                }
+            }
+        }
+        errors
+    }
+
+    fn refresh_saved_folders(&mut self) {
+        let mut folders = Vec::new();
+        let mut text_saved = Vec::new();
+        let mut errors = Vec::new();
+        for t in &mut self.tabs {
+            match &mut t.content {
+                Content::Diffs(v) => {
+                    if std::mem::take(&mut v.saved) {
+                        folders.push(v.folder);
+                    }
+                    errors.extend(v.error.take());
+                }
+                Content::Text(v) => {
+                    if std::mem::take(&mut v.saved) {
+                        text_saved.push(t.id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A text tab's own buttons (the 3-way merge view's "Save result", say) can write a
+        // pane straight to disk without going through `Cmd::Save`; repack the archive this
+        // tab was opened from here too, the same as the `Cmd::Save` dispatch itself does.
+        // Batched (not one `save_origin_folder_archive` call per tab) so saving several panes
+        // from the same archive in one frame repacks it only once.
+        errors.extend(self.save_origin_folder_archives(&text_saved));
+        errors.extend(self.upload_remote_sides(&text_saved));
         if folders.is_empty() {
+            for e in errors {
+                self.error(e);
+            }
             return;
         }
         let (cfg, named) = (self.cfg.clone(), self.named_filters.clone());
         for t in &mut self.tabs {
             let id = t.id;
             match t.content.view_mut() {
-                Content::Folder(f) if folders.contains(&id) => f.refresh(&cfg, &named),
+                Content::Folder(f) if folders.contains(&id) => {
+                    // "All differences" writes straight into the extracted copy, the same
+                    // way a child file tab's own save does; repack any archive side it
+                    // touched before refreshing the listing (see `save_origin_folder_archive`
+                    // for the same pattern keyed by a tab's `Origin` instead of `DiffsView`'s
+                    // `folder`).
+                    for s in 0..f.n() {
+                        if f.is_archive_side(s) {
+                            f.mark_archive_dirty(s);
+                        }
+                    }
+                    if let Err(e) = f.save_archives() {
+                        errors.push(e.to_string());
+                    }
+                    f.refresh(&cfg, &named);
+                }
                 Content::Text(v) => v.check_disk(),
                 _ => {}
             }
+        }
+        for e in errors {
+            self.error(e);
         }
     }
 
@@ -4219,10 +5140,23 @@ impl OxideMergeApp {
 
     /// Offers the active folder comparison to save as a job file.
     fn begin_save_job(&mut self) {
-        let Some(Content::Folder(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Content::Folder(v) = tab.content.view() else {
             self.error(tr("msg.job_folder_only"));
             return;
         };
+        // A revision, web page or archive is compared through temporary copies, which a job
+        // run later would not find.
+        let temps = tab.shown_temps();
+        if v.roots
+            .iter()
+            .any(|r| temps.iter().any(|t| r.starts_with(t.path())))
+        {
+            self.error(tr("msg.job_temp_folders"));
+            return;
+        }
         let name = report::html_file_name(&v.display_roots);
         let stem = name.strip_suffix(".html").unwrap_or(&name).to_string();
         self.save_job = Some(crate::ui::job_dialog::SaveJob::new(
@@ -4264,19 +5198,20 @@ impl OxideMergeApp {
     pub fn start_run_job(&mut self, path: PathBuf) {
         let mut run = crate::ui::job_dialog::RunJob::new(path);
         if !run.needs_confirmation() {
-            run.start(self.cfg.clone(), false);
+            run.start(self.stored_cfg(), false);
         }
         self.run_job = Some(run);
     }
 
     fn run_job_dialog(&mut self, ctx: &egui::Context) {
         use crate::ui::job_dialog::RunStep;
+        let cfg = self.stored_cfg();
         let Some(d) = self.run_job.as_mut() else {
             return;
         };
         match d.show(ctx) {
             Some(RunStep::Close) => self.run_job = None,
-            Some(RunStep::Start { yes }) => d.start(self.cfg.clone(), yes),
+            Some(RunStep::Start { yes }) => d.start(cfg, yes),
             Some(RunStep::Open(path)) => {
                 if let Err(e) = crate::ui::folder_view::system_open(&path) {
                     self.error(e);
@@ -4502,10 +5437,7 @@ impl OxideMergeApp {
         }
         if go && !d.path.trim().is_empty() {
             let rev = d.rev.clone();
-            if let Err(e) = self.open_git_revision(&path, &rev) {
-                self.error(e.to_string());
-                self.git_dlg = Some(d);
-            }
+            self.open_git_revision(&path, &rev, Some(d));
         } else if keep {
             self.git_dlg = Some(d);
         }
@@ -4684,6 +5616,10 @@ impl OxideMergeApp {
             self.tabs.get(self.active).map(|t| t.content.view()),
             Some(Content::Text(v)) if v.takes_text()
         );
+        let types_into_pane = match self.tabs.get(self.active).map(|t| t.content.view()) {
+            Some(Content::Text(v)) => v.types_into_pane(),
+            _ => text_typed,
+        };
         let caret = match self.tabs.get(self.active).map(|t| t.content.view()) {
             Some(Content::Text(v)) => Some(v),
             _ => None,
@@ -4699,7 +5635,7 @@ impl OxideMergeApp {
             for (b, &reserved) in BINDINGS.iter().zip(&reserved) {
                 if b.key.logical_key == Key::Escape && escape_reserved
                     || b.key.logical_key == Key::Questionmark && text_typed
-                    || text_typed && commands::types_text(b)
+                    || types_into_pane && commands::types_text(b)
                     || reserved
                 {
                     continue;
@@ -4759,6 +5695,7 @@ impl OxideMergeApp {
             rules: None,
             recent: None,
             clear_recent: false,
+            has_workspaces: !self.cfg.workspaces.is_empty(),
         }
     }
 
@@ -4941,7 +5878,9 @@ impl OxideMergeApp {
 
     fn file_menu(&mut self, ui: &mut egui::Ui, m: &mut Menus) {
         m.item(ui, Cmd::New);
+        m.item(ui, Cmd::CompareClipboard);
         m.item(ui, Cmd::Open);
+        m.item(ui, Cmd::OpenRemote);
         let recent = &self.cfg.recent_compares;
         ui.add_enabled_ui(!recent.is_empty(), |ui| {
             submenu_list(ui, tr("menu.open_recent"), |ui| {
@@ -4965,6 +5904,19 @@ impl OxideMergeApp {
         m.item(ui, Cmd::SaveProject);
         m.item(ui, Cmd::SaveJob);
         m.item(ui, Cmd::RunJob);
+        ui.separator();
+        let workspaces = &self.cfg.workspaces;
+        submenu_list(ui, tr("menu.workspaces"), |ui| {
+            m.item(ui, Cmd::SaveWorkspace);
+            if !workspaces.is_empty() {
+                ui.separator();
+                for (i, w) in workspaces.iter().enumerate() {
+                    m.item_as(ui, &w.name, Cmd::OpenWorkspace(i));
+                }
+                ui.separator();
+                m.item(ui, Cmd::ManageWorkspaces);
+            }
+        });
         ui.separator();
         m.item(ui, Cmd::Save);
         m.item(ui, Cmd::SaveAll);
@@ -5830,8 +6782,8 @@ impl OxideMergeApp {
                 let three = self.start_three_way;
                 let slots: &[usize] = if three { &[0, 1, 2] } else { &[0, 2] };
                 let sides = slots.len();
-                // Side chip, gaps and the two browse buttons around the path field.
-                let field_w = ui.available_width() - 60.0 - 4.0 - 8.0 - 2.0 * 30.0 - 16.0 - 40.0;
+                // Side chip, gaps and the three browse buttons around the path field.
+                let field_w = ui.available_width() - 60.0 - 4.0 - 8.0 - 3.0 * 30.0 - 16.0 - 40.0;
                 for (k, &s) in slots.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
@@ -5864,6 +6816,10 @@ impl OxideMergeApp {
                             if let Some(f) = rfd::FileDialog::new().pick_folder() {
                                 self.start_paths[s] = f.display().to_string();
                             }
+                        }
+                        if widgets::icon_button(ui, Icon::Globe, tr("btn.browse_remote")).clicked()
+                        {
+                            self.start_remote_connect(RemoteTarget::Start(s));
                         }
                     });
                 }
@@ -5898,11 +6854,18 @@ impl OxideMergeApp {
     // ---------- dialogs ----------
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
+        // Paused (not drawn) while its own remote connection dialog is in front of it, rather
+        // than showing two modals at once: `self.open_dlg` stays as it was meanwhile, and
+        // `use_remote_fetch` fills in its path field directly once the fetch is done.
+        if self.remote_dlg.is_some() || self.remote_load.is_some() {
+            return;
+        }
         let Some(mut d) = self.open_dlg.take() else {
             return;
         };
         let mut keep = true;
         let mut go = false;
+        let mut remote_for: Option<usize> = None;
         let recent = self.cfg.recent_paths.clone();
         let mut filters: Vec<String> = self.cfg.recent_filters.clone();
         for f in &self.named_filters {
@@ -5974,6 +6937,11 @@ impl OxideMergeApp {
                                 if let Some(p) = rfd::FileDialog::new().pick_folder() {
                                     d.paths[s] = p.display().to_string();
                                 }
+                            }
+                            if widgets::icon_button(ui, Icon::Globe, tr("btn.browse_remote"))
+                                .clicked()
+                            {
+                                remote_for = Some(s);
                             }
                             let lock = if d.read_only[s] {
                                 Icon::Lock
@@ -6078,7 +7046,10 @@ impl OxideMergeApp {
         if modal.should_close() {
             keep = false;
         }
-        if go {
+        if let Some(s) = remote_for {
+            self.open_dlg = Some(d);
+            self.start_remote_connect(RemoteTarget::Open(s));
+        } else if go {
             self.submit_open(d);
         } else if keep {
             self.open_dlg = Some(d);
@@ -6759,12 +7730,26 @@ impl OxideMergeApp {
                         keep = false;
                         match self.tabs[i].save() {
                             Ok(()) if !self.tabs[i].is_modified() => {
+                                if let Err(e) = self.save_origin_folder_archive(i) {
+                                    self.error(e.to_string());
+                                }
                                 finish(self);
                                 if queued {
                                     self.ask_next_close();
                                 }
                             }
-                            Ok(()) => self.close_queue.clear(),
+                            Ok(()) => {
+                                if let Err(e) = self.save_origin_folder_archive(i) {
+                                    self.error(e.to_string());
+                                }
+                                if let Some(id) = self.tabs.get(i).map(|t| t.id) {
+                                    let errors = self.upload_remote_sides(&[id]);
+                                    if !errors.is_empty() {
+                                        self.error(errors.join("\n"));
+                                    }
+                                }
+                                self.close_queue.clear();
+                            }
                             Err(e) => {
                                 self.close_queue.clear();
                                 self.error(e.to_string());
@@ -6810,10 +7795,19 @@ impl OxideMergeApp {
                     1 => {
                         keep = false;
                         let mut err = None;
-                        for t in &mut self.tabs {
-                            if let Err(e) = t.save() {
-                                err = Some(e.to_string());
+                        let mut saved = Vec::new();
+                        for i in 0..self.tabs.len() {
+                            match self.tabs[i].save() {
+                                Ok(()) => saved.push(self.tabs[i].id),
+                                Err(e) => err = Some(e.to_string()),
                             }
+                        }
+                        if let Some(e) = self.save_origin_folder_archives(&saved).into_iter().next()
+                        {
+                            err = Some(e);
+                        }
+                        if let Some(e) = self.upload_remote_sides(&saved).into_iter().next() {
+                            err = Some(e);
                         }
                         match err {
                             Some(e) => self.error(e),
@@ -7092,6 +8086,10 @@ impl eframe::App for OxideMergeApp {
         // Ending the program part way would leave a synchronization to recover next time.
         let syncing = self.sync_recovery.as_ref().is_some_and(|r| r.busy())
             || self
+                .run_job
+                .as_ref()
+                .is_some_and(|r| r.is_running() && r.changes_folders())
+            || self
                 .tabs
                 .iter()
                 .any(|t| matches!(t.content.view(), Content::Folder(f) if f.syncing()));
@@ -7216,6 +8214,18 @@ impl eframe::App for OxideMergeApp {
                         _ => t.id,
                     });
                     let temps = self.tabs.get(self.active).map(Tab::shown_temps);
+                    let (origin_roots, origin_archives) = folder
+                        .and_then(|id| self.tabs.iter().find(|t| t.id == id))
+                        .and_then(|t| match t.content.view() {
+                            Content::Folder(v) => Some((
+                                v.roots.clone(),
+                                (0..v.n())
+                                    .map(|s| v.archive_source(s).map(Path::to_path_buf))
+                                    .collect(),
+                            )),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
                     let count = self.tabs.len();
                     self.open(OpenRequest {
                         paths,
@@ -7243,7 +8253,12 @@ impl eframe::App for OxideMergeApp {
                                 view.review_decision = Some(Box::new(review));
                                 view.restore_review_cursor();
                             }
-                            t.origin = Some(Origin { folder, rel });
+                            t.origin = Some(Origin {
+                                folder,
+                                rel,
+                                roots: origin_roots,
+                                archives: origin_archives,
+                            });
                             t.temps = temps.unwrap_or_default();
                         }
                     }
@@ -7310,6 +8325,12 @@ impl eframe::App for OxideMergeApp {
         self.stats_dialog(ctx);
         self.save_job_dialog(ctx);
         self.run_job_dialog(ctx);
+        self.rev_load_dialog(ctx);
+        self.remote_connect_dialog(ctx);
+        self.remote_load_dialog(ctx);
+        self.gc_pending_remote();
+        self.workspace_save_dialog(ctx);
+        self.manage_workspaces_dialog(ctx);
         self.git_dialog(ctx);
         if let Some(r) = &mut self.sync_recovery {
             if !r.show(ctx) {
@@ -7332,7 +8353,12 @@ impl eframe::App for OxideMergeApp {
         for t in &mut self.tabs {
             let msg = match t.content.view_mut() {
                 Content::Text(v) => v.bulk_edit.take(),
-                Content::Binary(v) => v.bulk_edit.take(),
+                Content::Binary(v) => {
+                    if let Some(on) = v.moved_choice.take() {
+                        self.cfg.binary_moved_blocks = on;
+                    }
+                    v.bulk_edit.take()
+                }
                 _ => None,
             };
             if let Some(m) = msg {

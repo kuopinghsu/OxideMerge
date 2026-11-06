@@ -333,7 +333,13 @@ fn planned_link(path: &Path, expected: &str) -> std::io::Result<PathBuf> {
 fn make_link(target: &Path, at: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(target, at)?;
+        std::os::unix::fs::symlink(target, at).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                changed_since_preview()
+            } else {
+                e
+            }
+        })?;
         if let Some(dir) = at.parent() {
             let _ = sync_dir(dir);
         }
@@ -1018,6 +1024,10 @@ pub fn plan(
             Some(Reason::Link)
         } else if ks == Kind::Other || kd == Kind::Other {
             Some(Reason::Special)
+        } else if link && it.is_dir {
+            // The compare, which does not follow links, saw a folder here: what it listed
+            // inside would now be reached through the link.
+            Some(Reason::ChangedSinceCompare)
         } else if !link && ((in_s && ks != expected) || (in_d && kd != expected)) {
             Some(Reason::TypeDiffers)
         } else if (in_s && !it.exists[s])
@@ -1053,6 +1063,10 @@ pub fn plan(
             continue;
         }
         let fingerprint = |p: &Path| Precondition::read_until(p, true, stop);
+        if link {
+            // Nothing is ever planned under a link.
+            cut.insert(i);
+        }
         let planned = if link {
             match (in_s, in_d) {
                 (true, false) => Some((
@@ -1161,6 +1175,14 @@ pub fn plan(
         };
         operations.push(op(action, reason, bytes, source, destination));
     }
+    // The other spelling of a name planned as a rename above is the same file to the
+    // destination: deleting it as well would count it twice, or delete the file left alone.
+    operations.retain(|o| {
+        let (dir, name) = o.path.rsplit_once('/').unwrap_or(("", &o.path));
+        o.renamed.is_some()
+            || o.action != Action::Delete
+            || !respelt.contains(&(dir.to_string(), fold(name)))
+    });
     operations.sort_by(|a, b| {
         let phase = |o: &SyncOperation| match o.action {
             Action::CreateDir => 0,
@@ -1572,12 +1594,32 @@ pub fn apply(
 /// deletes, do not fit in the free space of their file systems. When the journal is on the
 /// destination's file system, each file it keeps a copy of is replaced or deleted straight
 /// after, so only the largest of them is there twice at once.
-fn check_space(plan: &SyncPlan, destination: &Path, journal_root: &Path) -> Result<(), String> {
-    // A rename moves the file it deletes into the copy's place: nothing is written or kept.
+fn check_space(plan: &SyncPlan, roots: &[PathBuf], journal_root: &Path) -> Result<(), String> {
+    let (s, d) = (plan.policy.source(), plan.policy.destination());
+    let destination = roots[d].as_path();
+    // A rename that moves the file it deletes into the copy's place writes and keeps nothing;
+    // one that is copied and deleted instead counts as both.
+    let renames: HashMap<&str, &SyncOperation> = plan
+        .operations
+        .iter()
+        .filter(|o| o.action == Action::Copy)
+        .filter_map(|o| Some((o.renamed.as_deref()?, o)))
+        .collect();
+    let moved = |o: &SyncOperation| match (o.action, o.renamed.as_deref()) {
+        (Action::Copy, Some(old)) => plan
+            .operations
+            .iter()
+            .find(|p| p.action == Action::Delete && p.path == old)
+            .is_some_and(|old| moves(o, old, roots, s, d)),
+        (Action::Delete, Some(_)) => renames
+            .get(o.path.as_str())
+            .is_some_and(|copy| moves(copy, o, roots, s, d)),
+        _ => false,
+    };
     let changes = || {
         plan.operations
             .iter()
-            .filter(|o| o.action.changes() && o.renamed.is_none())
+            .filter(move |o| o.action.changes() && !moved(o))
     };
     let written: u64 = changes()
         .filter(|o| matches!(o.action, Action::Copy | Action::Replace))
@@ -1613,6 +1655,36 @@ fn check_space(plan: &SyncPlan, destination: &Path, journal_root: &Path) -> Resu
 
 fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// Whether the rename made of `copy` and `old`, its deletion, moves the file rather than
+/// copying and deleting it: only within one file system, and since a move keeps the file's
+/// time and permissions, only when the source has the same ones, unless only the spelling of
+/// the name changed.
+fn moves(copy: &SyncOperation, old: &SyncOperation, roots: &[PathBuf], s: usize, d: usize) -> bool {
+    let (sp, dp) = (under(&roots[s], &copy.path), under(&roots[d], &copy.path));
+    let odp = under(&roots[d], &old.path);
+    let one_volume = match (odp.parent(), dp.parent()) {
+        (Some(a), Some(b)) => same_volume(a, b),
+        _ => false,
+    };
+    one_volume && (respelled(copy) || same_time_and_mode(&sp, &odp))
+}
+
+/// Whether files `a` and `b` have the same modification time and permissions. Times
+/// within 2 seconds count as the same: FAT and some network shares round them.
+fn same_time_and_mode(a: &Path, b: &Path) -> bool {
+    let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    let close = match (a.modified(), b.modified()) {
+        (Ok(x), Ok(y)) => {
+            let gap = x.duration_since(y).or_else(|_| y.duration_since(x));
+            gap.is_ok_and(|g| g <= std::time::Duration::from_secs(2))
+        }
+        _ => false,
+    };
+    close && a.permissions() == b.permissions()
 }
 
 #[cfg(unix)]
@@ -1698,8 +1770,7 @@ fn preflight(
         }
     }
     std::fs::create_dir_all(journal_root).map_err(|e| one(Problem::WriteFailure)(e.to_string()))?;
-    check_space(plan, &roots[plan.policy.destination()], journal_root)
-        .map_err(one(Problem::WriteFailure))?;
+    check_space(plan, roots, journal_root).map_err(one(Problem::WriteFailure))?;
     let pending = journals(journal_root);
     let same = |a: &Path, b: &Path| {
         std::fs::canonicalize(a)
@@ -1854,20 +1925,23 @@ fn apply_with(
             )));
             break;
         }
-        // A file is moved only within one file system; across two it is copied and deleted.
         let from = (o.action == Action::Copy)
             .then(|| o.renamed.as_deref().and_then(|r| sources.get(r)))
             .flatten()
-            .filter(|old| {
-                let odp = under(&roots[d], &old.path);
-                match (odp.parent(), dp.parent()) {
-                    (Some(a), Some(b)) => same_volume(a, b),
-                    _ => false,
-                }
-            });
+            .filter(|old| moves(o, old, roots, s, d));
         let result = match from {
             Some(old) => {
                 let (osp, odp) = (under(&roots[s], &old.path), under(&roots[d], &old.path));
+                // The old name is checked now too: a folder above it may have become a link
+                // since the plan was checked.
+                if escapes(&roots[d], &old.path, &odp) {
+                    problem = Some(Problem::Unsupported);
+                    failure = Some(Some(trf(
+                        "folder_sync.err_outside",
+                        &[("path", old.path.clone())],
+                    )));
+                    break;
+                }
                 let r = step_move(&mut journal, o, old, (&sp, &dp, &osp, &odp), fault, stop);
                 if r.is_ok() {
                     moved.insert(old.path.as_str());
@@ -2090,8 +2164,9 @@ fn move_name(dir: &Path, plan_id: &str, n: usize) -> PathBuf {
 /// Renames `from` to `to`, refusing when `to` names anything, also under another case or
 /// Unicode form.
 fn move_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    // Something put there after the checks: changed since the preview.
     if std::fs::symlink_metadata(to).is_ok() {
-        return Err(std::io::ErrorKind::AlreadyExists.into());
+        return Err(changed_since_preview());
     }
     std::fs::rename(fsutil::long_path(from), fsutil::long_path(to))?;
     for dir in [from.parent(), to.parent()].into_iter().flatten() {
@@ -2755,6 +2830,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_renamed_file_with_another_time_is_copied_so_it_gets_the_sources_time() {
+        let f = folders();
+        let (l, r) = (&f.roots[0], &f.roots[1]);
+        write(l, "new.txt", "moved\n");
+        write(r, "old.txt", "moved\n");
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(r.join("old.txt"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let p = make(&f, MIRROR);
+        assert_eq!(p.estimate.renames, 1);
+        let find = |a| p.operations.iter().find(|o| o.action == a).unwrap();
+        let (copy, delete) = (find(Action::Copy), find(Action::Delete));
+        let (s, d) = (p.policy.source(), p.policy.destination());
+        assert!(!moves(copy, delete, &f.roots, s, d));
+        assert!(matches!(
+            run(&f, &p, &|_, _| Fault::None),
+            SyncOutcome::Applied { .. }
+        ));
+        assert!(!r.join("old.txt").exists());
+        let time = |p: PathBuf| std::fs::metadata(p).unwrap().modified().unwrap();
+        assert_eq!(time(r.join("new.txt")), time(l.join("new.txt")));
+    }
+
     /// The names under `root` that a synchronization leaves only while it runs.
     fn leftovers(root: &Path) -> Vec<String> {
         tree(root)
@@ -2924,6 +3027,8 @@ mod tests {
             "{:?}",
             ops(&p)
         );
+        assert_eq!(p.operations.len(), 2, "{:?}", ops(&p));
+        assert_eq!(p.estimate.deletes, 1);
         // Undone when it fails after the move.
         let outcome = run(&f, &p, &|at, _| {
             if at == Point::Written {
@@ -3174,9 +3279,9 @@ mod tests {
         assert!(kept.len() > 1, "{kept:?}");
         let need = written + kept.iter().max().unwrap();
         FREE_SPACE.with(|s| s.set(Some(need)));
-        let fits = check_space(&plan, destination, &f.journal);
+        let fits = check_space(&plan, &f.roots, &f.journal);
         FREE_SPACE.with(|s| s.set(Some(need - 1)));
-        let short = check_space(&plan, destination, &f.journal);
+        let short = check_space(&plan, &f.roots, &f.journal);
         FREE_SPACE.with(|s| s.set(None));
         assert!(fits.is_ok(), "{fits:?}");
         assert!(short.is_err());
@@ -3696,6 +3801,42 @@ mod tests {
         link(&outside.join("secret.txt"), &r.join("extra.lnk"));
         write(r, "clash", "a file");
         f
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_became_a_link_has_nothing_planned_through_it() {
+        let f = folders();
+        let r = &f.roots[1];
+        write(r, "current/app.js", "app\n");
+        let items = scan(&f.roots);
+        // After the compare, the folder is replaced by a link to a folder with the same file.
+        write(r, ".releases/v3/app.js", "app\n");
+        std::fs::remove_dir_all(r.join("current")).unwrap();
+        std::os::unix::fs::symlink(".releases/v3", r.join("current")).unwrap();
+        let scope = Scope {
+            copy_links: true,
+            ..ALL
+        };
+        let plan = plan(&items, &f.roots, MIRROR, scope, &AtomicBool::new(false)).unwrap();
+        assert!(
+            plan.operations
+                .iter()
+                .all(|o| !o.path.starts_with("current/")),
+            "{:?}",
+            ops(&plan)
+        );
+        let current = plan
+            .operations
+            .iter()
+            .find(|o| o.path == "current")
+            .unwrap();
+        assert_eq!(
+            (current.action, current.reason),
+            (Action::Conflict, Reason::ChangedSinceCompare)
+        );
+        run(&f, &plan, &|_, _| Fault::None);
+        assert_eq!(read_to(r.join(".releases/v3/app.js")), "app\n");
     }
 
     #[cfg(unix)]

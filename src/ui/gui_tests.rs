@@ -173,6 +173,8 @@ impl Gui {
 
     fn busy(&self) -> bool {
         self.app.report_job.is_some()
+            || self.app.rev_load.is_some()
+            || self.app.remote_load.is_some()
             || self
                 .app
                 .tabs
@@ -1608,6 +1610,528 @@ fn next_conflict_in_a_tab_opened_from_a_folder_goes_on_to_files_with_open_confli
     gui.key(ALT, Key::PageUp);
     gui.frames(2);
     assert_eq!(shown(&gui), ("a.txt".into(), (Some(1), 2)));
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn saving_a_file_opened_from_an_archive_compare_repacks_the_archive_right_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let make_zip = |path: &Path, content: &str| {
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        zw.start_file("a.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zw, content.as_bytes()).unwrap();
+        zw.finish().unwrap();
+    };
+    let left_zip = d.join("left.zip");
+    let right_zip = d.join("right.zip");
+    make_zip(&left_zip, "left\n");
+    make_zip(&right_zip, "right\n");
+
+    let mut gui = Gui::start(
+        "archive_save_repacks",
+        compare(&[left_zip.clone(), right_zip.clone()]),
+    );
+    gui.settle();
+    gui.click("a.txt");
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.frames(3);
+    assert_eq!(
+        gui.text_view().titles()[0].rsplit(['/', '\\']).next(),
+        Some("a.txt")
+    );
+
+    // Make the right pane match the left, then save only this file tab — never the folder
+    // tab itself. Saving the file alone must still repack `right.zip` right away, not only
+    // once the folder tab is saved separately (see `App::save_origin_folder_archive`).
+    gui.app.run(Cmd::CopyRight, &gui.ctx);
+    gui.app.run(Cmd::Save, &gui.ctx);
+    gui.settle();
+
+    let repacked = archive::extract_to_temp(&right_zip).unwrap();
+    assert_eq!(read(&repacked.path().join("a.txt")), "left\n");
+    // The left archive was not touched by this edit.
+    let left_after = archive::extract_to_temp(&left_zip).unwrap();
+    assert_eq!(read(&left_after.path().join("a.txt")), "left\n");
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn saving_a_file_still_repacks_its_archive_after_the_folder_tab_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let make_zip = |path: &Path, content: &str| {
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        zw.start_file("a.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zw, content.as_bytes()).unwrap();
+        zw.finish().unwrap();
+    };
+    let left_zip = d.join("left.zip");
+    let right_zip = d.join("right.zip");
+    make_zip(&left_zip, "left\n");
+    make_zip(&right_zip, "right\n");
+
+    let mut gui = Gui::start(
+        "archive_save_after_folder_closed",
+        compare(&[left_zip.clone(), right_zip.clone()]),
+    );
+    gui.settle();
+    gui.click("a.txt");
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.frames(3);
+    assert_eq!(
+        gui.text_view().titles()[0].rsplit(['/', '\\']).next(),
+        Some("a.txt")
+    );
+    assert_eq!(gui.app.tabs.len(), 2);
+
+    // Close the folder tab the file was opened from, keeping only the file tab open.
+    gui.app.close_tab(0, true);
+    assert_eq!(gui.app.tabs.len(), 1);
+    assert!(matches!(gui.app.tabs[0].content, Content::Text(_)));
+
+    // Saving the file must still repack `right.zip`: there is no folder tab left to ask,
+    // so this relies on the root and archive path `Origin` recorded when it was opened.
+    gui.app.run(Cmd::CopyRight, &gui.ctx);
+    gui.app.run(Cmd::Save, &gui.ctx);
+    gui.settle();
+
+    let repacked = archive::extract_to_temp(&right_zip).unwrap();
+    assert_eq!(read(&repacked.path().join("a.txt")), "left\n");
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn save_all_with_several_files_from_the_same_archive_repacks_it_once_with_every_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let make_zip = |path: &Path, files: &[(&str, &str)]| {
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (name, content) in files {
+            zw.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zw, content.as_bytes()).unwrap();
+        }
+        zw.finish().unwrap();
+    };
+    let left_zip = d.join("left.zip");
+    let right_zip = d.join("right.zip");
+    make_zip(&left_zip, &[("a.txt", "left a\n"), ("b.txt", "left b\n")]);
+    make_zip(
+        &right_zip,
+        &[("a.txt", "right a\n"), ("b.txt", "right b\n")],
+    );
+
+    let mut gui = Gui::start(
+        "archive_save_all_once",
+        compare(&[left_zip.clone(), right_zip.clone()]),
+    );
+    gui.settle();
+
+    // Open both files from the same folder compare (so both tabs share one `Origin::folder`
+    // and one archive side each), make each tab's right pane match its left, then save both
+    // at once with `SaveAll` rather than one at a time. This exercises the dedup in
+    // `App::save_origin_folder_archives`: the archive must be repacked with both edits, not
+    // only the one from whichever tab happened to run last.
+    gui.click("a.txt");
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.frames(3);
+    gui.app.run(Cmd::CopyRight, &gui.ctx);
+
+    // Back to the folder tab to open the second file (clicking a row only works on the
+    // currently active tab's own widgets).
+    gui.app.active = 0;
+    gui.frame();
+    gui.click("b.txt");
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.frames(3);
+    gui.app.run(Cmd::CopyRight, &gui.ctx);
+
+    assert_eq!(gui.app.tabs.len(), 3);
+    gui.app.run(Cmd::SaveAll, &gui.ctx);
+    gui.settle();
+
+    let repacked = archive::extract_to_temp(&right_zip).unwrap();
+    assert_eq!(read(&repacked.path().join("a.txt")), "left a\n");
+    assert_eq!(read(&repacked.path().join("b.txt")), "left b\n");
+    let left_after = archive::extract_to_temp(&left_zip).unwrap();
+    assert_eq!(read(&left_after.path().join("a.txt")), "left a\n");
+    assert_eq!(read(&left_after.path().join("b.txt")), "left b\n");
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn a_workspace_saves_the_open_tabs_by_name_and_reopens_them_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "one\n"), ("b.txt", "two\n")]);
+    let mut gui = Gui::start(
+        "workspace_save_and_open",
+        compare(&[d.join("a.txt"), d.join("a.txt")]),
+    );
+    gui.settle();
+    gui.app.open(OpenRequest {
+        paths: vec![d.join("b.txt"), d.join("b.txt")],
+        ..Default::default()
+    });
+    gui.settle();
+    assert_eq!(gui.app.tabs.len(), 2);
+
+    // Save the two open tabs as a named workspace, through the dialog.
+    gui.app.run(Cmd::SaveWorkspace, &gui.ctx);
+    gui.frames(2);
+    gui.app.workspace_save_dlg.as_mut().unwrap().0 = "QA pass".to_string();
+    gui.frame();
+    gui.click(tr("btn.save"));
+    assert!(gui.app.workspace_save_dlg.is_none());
+    assert_eq!(gui.app.cfg.workspaces.len(), 1);
+    assert_eq!(gui.app.cfg.workspaces[0].name, "QA pass");
+    assert_eq!(gui.app.cfg.workspaces[0].tabs.len(), 2);
+
+    // Close everything, then reopen the workspace by name: both tabs come back.
+    gui.app.run(Cmd::CloseAllTabs, &gui.ctx);
+    assert!(gui.app.tabs.is_empty());
+    gui.app.run(Cmd::OpenWorkspace(0), &gui.ctx);
+    gui.settle();
+    assert_eq!(gui.app.tabs.len(), 2);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+
+    // Saving again under the same name replaces it rather than adding a second entry.
+    gui.app.run(Cmd::SaveWorkspace, &gui.ctx);
+    gui.frames(2);
+    gui.app.workspace_save_dlg.as_mut().unwrap().0 = "QA pass".to_string();
+    gui.frame();
+    gui.click(tr("btn.save"));
+    assert_eq!(gui.app.cfg.workspaces.len(), 1);
+
+    // The manage dialog can delete it.
+    gui.app.run(Cmd::DeleteWorkspace(0), &gui.ctx);
+    assert!(gui.app.cfg.workspaces.is_empty());
+}
+
+#[test]
+fn compare_clipboard_opens_the_clipboard_text_on_the_left_and_a_blank_right_side() {
+    set_test_clipboard(Ok("one\ntwo\n"));
+    let mut gui = Gui::start("compare_clipboard", None);
+    gui.app.run(Cmd::CompareClipboard, &gui.ctx);
+    gui.settle();
+
+    let Content::Text(v) = &gui.app.tabs[0].content else {
+        panic!("Expected a text compare");
+    };
+    assert_eq!(
+        v.panes[0].doc.lines,
+        vec!["one".to_string(), "two".to_string()]
+    );
+    assert_eq!(v.panes[1].doc.lines, vec![String::new()]);
+    assert!(!v.panes[0].doc.modified && !v.panes[1].doc.modified);
+    assert_eq!(v.panes[0].doc.path, None);
+    assert!(gui.shows_text(tr("label.clipboard")));
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+
+    // The right side is fully editable, so a second text can be pasted in to compare it.
+    let Content::Text(v) = &mut gui.app.tabs[0].content else {
+        panic!("Expected a text compare");
+    };
+    v.active_pane = 1;
+    gui.events.push(Event::Paste("one\nTWO\n".into()));
+    gui.frames(2);
+    let Content::Text(v) = &gui.app.tabs[0].content else {
+        panic!("Expected a text compare");
+    };
+    assert_eq!(
+        v.panes[1].doc.lines,
+        vec!["one".to_string(), "TWO".to_string()]
+    );
+}
+
+#[test]
+fn compare_clipboard_reports_an_empty_clipboard_instead_of_opening_a_tab() {
+    set_test_clipboard(Err("nope"));
+    let mut gui = Gui::start("compare_clipboard_empty", None);
+    gui.app.run(Cmd::CompareClipboard, &gui.ctx);
+    gui.frames(2);
+
+    assert!(gui.app.tabs.is_empty());
+    assert!(gui.errors().iter().any(|e| e.contains("nope")));
+}
+
+#[test]
+fn compare_over_sftp_fetches_both_sides_edits_one_and_saves_it_back_to_the_server() {
+    remote::fake::install(
+        remote::fake::Server::new()
+            .file("/srv/left.txt", "one\ntwo\n")
+            .file("/srv/right.txt", "one\nTWO\n"),
+    );
+    let mut gui = Gui::start("compare_over_sftp", None);
+
+    // File → Compare over SFTP opens the Open dialog and a connection dialog for its left side.
+    gui.app.run(Cmd::OpenRemote, &gui.ctx);
+    assert!(gui.app.open_dlg.is_some());
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+        d.remote_path = "/srv/left.txt".to_string();
+    }
+    gui.frame();
+    gui.click(tr("btn.connect"));
+    assert!(gui.app.remote_dlg.is_none());
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let left_staged = gui.app.open_dlg.as_ref().unwrap().paths[0].clone();
+    assert!(!left_staged.is_empty());
+    assert!(!gui.app.open_dlg.as_ref().unwrap().read_only[0]);
+
+    // A second connection, straight on the dialog (as the per-side "Browse a server over
+    // SFTP" button would start it), fills in the right side the same way. (Side 2, not 1:
+    // slot 1 is the hidden middle path of a 3-way compare, which this dialog is not.)
+    gui.app.start_remote_connect(RemoteTarget::Open(2));
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+        d.remote_path = "/srv/right.txt".to_string();
+    }
+    gui.frame();
+    gui.click(tr("btn.connect"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+
+    gui.click(tr("btn.compare"));
+    gui.settle();
+    assert_eq!(gui.app.tabs.len(), 1);
+    let Content::Text(v) = &gui.app.tabs[0].content else {
+        panic!("Expected a text compare");
+    };
+    assert_eq!(v.panes[0].doc.lines, vec!["one", "two"]);
+    assert_eq!(v.panes[1].doc.lines, vec!["one", "TWO"]);
+    assert!(!v.panes[0].doc.read_only);
+
+    // Editing the left (remote) side and saving uploads it back to the server, over a fresh
+    // connection, leaving the unchanged right side alone.
+    assert_eq!(remote::fake::upload_count("/srv/left.txt"), 0);
+    text_view_mut(&mut gui).place_caret(0, (1, 3), false);
+    gui.events.push(Event::Text("-edited".into()));
+    gui.frames(2);
+    gui.app.run(Cmd::Save, &gui.ctx);
+    gui.frame();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(remote::fake::upload_count("/srv/left.txt"), 1);
+    let uploaded = remote::fake::uploaded("/srv/left.txt").unwrap();
+    assert_eq!(String::from_utf8(uploaded).unwrap(), "one\ntwo-edited\n");
+    assert_eq!(remote::fake::upload_count("/srv/right.txt"), 0);
+
+    remote::fake::uninstall();
+}
+
+#[test]
+fn compare_over_sftp_fetches_a_folder_read_only_and_a_failure_reopens_the_dialog() {
+    remote::fake::install(
+        remote::fake::Server::new()
+            .dir("/srv/data")
+            .file("/srv/data/a.txt", "a")
+            .file("/srv/data/b.txt", "b"),
+    );
+    let mut gui = Gui::start("compare_over_sftp_folder", None);
+    gui.app.run(Cmd::OpenRemote, &gui.ctx);
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+        d.remote_path = "/srv/data".to_string();
+    }
+    gui.frame();
+    gui.click(tr("btn.connect"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let d = gui.app.open_dlg.as_ref().unwrap();
+    assert!(d.read_only[0], "a fetched folder opens read-only");
+    assert!(std::path::Path::new(&d.paths[0]).join("a.txt").exists());
+
+    // A connection that fails reopens the connection dialog with its fields kept, instead of
+    // silently dropping what was typed. The slot index below is incidental to this scenario
+    // (any would do); `0` just matches the Open dialog's left side, used above too.
+    remote::fake::install(remote::fake::Server::new().failing("connection refused"));
+    gui.app.start_remote_connect(RemoteTarget::Open(0));
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "unreachable.example".to_string();
+        d.user = "ann".to_string();
+        d.remote_path = "/srv/anything".to_string();
+    }
+    gui.frame();
+    gui.click(tr("btn.connect"));
+    gui.settle();
+    assert!(gui
+        .errors()
+        .iter()
+        .any(|e| e.contains("connection refused")));
+    assert_eq!(
+        gui.app.remote_dlg.as_ref().unwrap().host,
+        "unreachable.example"
+    );
+
+    remote::fake::uninstall();
+}
+
+#[test]
+fn compare_over_sftp_from_the_start_page_fills_in_its_path_field_and_compares() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("b.txt", "one\ntwo\n")]);
+    remote::fake::install(remote::fake::Server::new().file("/srv/a.txt", "one\ntwo\n"));
+    let mut gui = Gui::start("compare_over_sftp_start_page", None);
+
+    // The start page's own "Browse a server over SFTP" button, not the Open dialog's: fills
+    // in the start page's own path field (`start_paths`), not `open_dlg`.
+    gui.app.start_remote_connect(RemoteTarget::Start(0));
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+        d.remote_path = "/srv/a.txt".to_string();
+    }
+    gui.frame();
+    gui.click(tr("btn.connect"));
+    assert!(gui.app.remote_dlg.is_none());
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert!(gui.app.open_dlg.is_none(), "stayed on the start page");
+    let staged = gui.app.start_paths[0].clone();
+    assert!(Path::new(&staged).is_file());
+
+    // Comparing from the start page claims the fetch the same way the Open dialog does.
+    gui.app.start_paths[2] = dir.path().join("b.txt").display().to_string();
+    gui.frame();
+    gui.click(tr("btn.compare"));
+    assert_eq!(gui.app.tabs.len(), 1);
+    assert_eq!(gui.text_view().panes[0].doc.lines, ["one", "two"]);
+    assert!(gui.app.pending_remote.is_empty(), "the fetch was claimed");
+
+    remote::fake::uninstall();
+}
+
+#[test]
+fn cancelling_the_open_dialog_after_a_fetch_drops_its_staged_copy() {
+    remote::fake::install(remote::fake::Server::new().file("/srv/a.txt", "a"));
+    let mut gui = Gui::start("compare_over_sftp_cancel_drops_fetch", None);
+
+    gui.app.run(Cmd::OpenRemote, &gui.ctx);
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+        d.remote_path = "/srv/a.txt".to_string();
+    }
+    gui.frame();
+    gui.click(tr("btn.connect"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(gui.app.pending_remote.len(), 1, "the fetch is staged");
+
+    // Cancelling the Open dialog, instead of comparing, leaves the staged copy unclaimed: a
+    // frame of normal upkeep (where `gc_pending_remote` runs) reaps it rather than leaking
+    // its temporary folder for the rest of the session.
+    gui.click(tr("btn.cancel"));
+    assert!(gui.app.open_dlg.is_none());
+    gui.frame();
+    assert!(
+        gui.app.pending_remote.is_empty(),
+        "an unclaimed fetch is not kept once its dialog is gone"
+    );
+
+    remote::fake::uninstall();
+}
+
+#[test]
+fn a_second_connection_starts_from_the_last_ones_server_but_not_its_password() {
+    remote::fake::install(
+        remote::fake::Server::new()
+            .file("/srv/a.txt", "a")
+            .file("/srv/b.txt", "b"),
+    );
+    let mut gui = Gui::start("compare_over_sftp_remembers_server", None);
+
+    gui.app.start_remote_connect(RemoteTarget::Start(0));
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.port = "2222".to_string();
+        d.user = "ann".to_string();
+        d.key_auth = true;
+        d.key_path = "/home/ann/.ssh/id_ed25519".to_string();
+        d.passphrase = "s3cret".to_string();
+        d.remote_path = "/srv/a.txt".to_string();
+    }
+    gui.frames(2);
+    gui.click(tr("btn.connect"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert!(
+        gui.app.last_remote.is_some(),
+        "last_remote should be set after a successful connect"
+    );
+
+    // A second connection, for the other side, starts from the same server and key instead
+    // of blank fields, but never from the passphrase just typed: that is kept only for the
+    // tab the first fetch is in, the same as any other `RemoteConnection`.
+    gui.app.start_remote_connect(RemoteTarget::Start(2));
+    gui.frame();
+    let d = gui.app.remote_dlg.as_ref().unwrap();
+    assert_eq!(d.host, "example.com");
+    assert_eq!(d.port, "2222");
+    assert_eq!(d.user, "ann");
+    assert!(d.key_auth);
+    assert_eq!(d.key_path, "/home/ann/.ssh/id_ed25519");
+    assert_eq!(d.passphrase, "", "a passphrase is never remembered");
+    assert_eq!(d.remote_path, "", "the remote path is always blank");
+
+    remote::fake::uninstall();
+}
+
+#[test]
+fn saving_in_all_differences_repacks_the_archives_it_touched() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let make_zip = |path: &Path, content: &str| {
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        zw.start_file("a.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zw, content.as_bytes()).unwrap();
+        zw.finish().unwrap();
+    };
+    let left_zip = d.join("left.zip");
+    let right_zip = d.join("right.zip");
+    make_zip(&left_zip, "left\n");
+    make_zip(&right_zip, "right\n");
+
+    let mut gui = Gui::start(
+        "archive_all_diffs_repacks",
+        compare(&[left_zip.clone(), right_zip.clone()]),
+    );
+    gui.settle();
+    gui.app.run(Cmd::AllDiffs, &gui.ctx);
+    gui.settle();
+    assert!(matches!(gui.app.tabs[1].content, Content::Diffs(_)));
+
+    // Edit and save from "All differences" rather than a file tab opened from the folder;
+    // this must repack `right.zip` too (see `App::refresh_saved_folders`).
+    gui.app.run(Cmd::FirstDiff, &gui.ctx);
+    gui.app.run(Cmd::CopyRight, &gui.ctx);
+    gui.app.run(Cmd::Save, &gui.ctx);
+    gui.settle();
+
+    let repacked = archive::extract_to_temp(&right_zip).unwrap();
+    assert_eq!(read(&repacked.path().join("a.txt")), "left\n");
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
 }
 
@@ -3087,7 +3611,13 @@ fn start_page_baselines_open_frozen_binary_bytes_without_original_inputs() {
     let Content::Binary(view) = gui.app.tabs[gui.app.active].content.view() else {
         panic!("captured binary compare expected")
     };
-    assert_eq!(view.data, [b"\0A".to_vec(), b"\0B".to_vec()]);
+    assert_eq!(
+        view.data
+            .iter()
+            .map(|data| data.as_slice())
+            .collect::<Vec<_>>(),
+        [b"\0A", b"\0B"]
+    );
     assert!(view.read_only.iter().all(|r| *r));
 }
 
@@ -3360,11 +3890,19 @@ fn scrolling_reaches_a_row_the_list_has_not_drawn() {
 fn about_displays_the_build_identifier_and_keeps_the_calendar_copyright_year() {
     let mut gui = Gui::start("about_build", None);
     gui.menu(&[tr("menu.help"), tr("menu.about")]);
-    assert!(gui.shows_text(env!("OXIDEMERGE_BUILD_ID")));
+    let build = env!("OXIDEMERGE_BUILD_ID");
+    let date = env!("OXIDEMERGE_BUILD_DATE");
+    assert!(gui.shows_text(build));
+    // A release build's id is its date and nothing more; this test binary is never that (see
+    // `build_info::identifier`), so it must show the date *and* the commit it was built from
+    // together, not the commit alone.
+    assert_ne!(build, date, "this test assumes a non-release build");
+    assert!(gui.shows_text(date));
+    assert!(gui.shows_text(&format!("{date}, {build}")));
     let copyright = trf(
         "about.copyright",
         &[
-            ("year", env!("OXIDEMERGE_BUILD_DATE")[..4].to_owned()),
+            ("year", date[..4].to_owned()),
             ("license", env!("CARGO_PKG_LICENSE").to_owned()),
         ],
     );
@@ -3844,7 +4382,7 @@ fn clicked_bytes_take_typed_digits_and_text_and_save() {
         )
     };
     let binary = |gui: &Gui| match gui.app.tabs[gui.app.active].content.view() {
-        Content::Binary(v) => (v.data[1].clone(), v.pane, v.is_modified()),
+        Content::Binary(v) => (v.data[1].to_vec(), v.pane, v.is_modified()),
         _ => panic!("binary compare expected"),
     };
 
@@ -4104,6 +4642,26 @@ fn compare_with_revision_lists_and_opens_mercurial_revisions() {
     gui.wait_until("the second tab", |g| g.app.tabs.len() == 2 && !g.busy());
     assert_eq!(gui.text_view().panes[0].doc.text(), "one\n");
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn a_revision_is_read_on_another_thread_and_its_error_brings_the_dialog_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("loose.txt");
+    std::fs::write(&file, "text\n").unwrap();
+    let mut gui = Gui::start("rev_thread", None);
+    gui.menu(&[tr("menu.file"), tr("menu.git_compare")]);
+    let dialog = gui.app.git_dlg.take();
+    gui.app.open_git_revision(&file, "HEAD", dialog);
+    assert!(
+        gui.app.rev_load.is_some(),
+        "reading goes on without the window"
+    );
+    assert!(gui.app.git_dlg.is_none());
+    gui.wait_until("the error", |g| g.app.rev_load.is_none());
+    assert!(!gui.errors().is_empty());
+    assert!(gui.app.git_dlg.is_some(), "the dialog is back to try again");
+    assert!(gui.app.tabs.is_empty());
 }
 
 #[test]
@@ -4580,4 +5138,85 @@ fn ime_selection_commit_cancel_and_save_keep_unicode_and_format_in_both_themes()
             assert!(gui.errors().is_empty(), "{:?}", gui.errors());
         }
     }
+}
+
+#[test]
+fn binary_moved_blocks_toggle_and_navigate_without_changing_merge_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let (a, b, c): (Vec<u8>, Vec<u8>, Vec<u8>) =
+        ((0..64).collect(), (64..128).collect(), (128..192).collect());
+    let left = [a.clone(), b.clone(), c.clone()].concat();
+    let right = [a, c, b].concat();
+    std::fs::write(d.join("left.bin"), &left).unwrap();
+    std::fs::write(d.join("right.bin"), &right).unwrap();
+    let mut gui = Gui::start(
+        "binary_moved_blocks",
+        compare(&[d.join("left.bin"), d.join("right.bin")]),
+    );
+    let binary = |g: &Gui| match g.app.tabs[g.app.active].content.view() {
+        Content::Binary(v) => (
+            v.data.clone(),
+            v.diffs.clone(),
+            v.moved.clone(),
+            v.pane,
+            v.cursor,
+        ),
+        _ => panic!("expected a binary comparison"),
+    };
+    let wait_for_moves = |g: &mut Gui| {
+        g.frame();
+        if let Content::Binary(v) = g.app.tabs[g.app.active].content.view_mut() {
+            v.wait_for_moved_scan();
+        }
+        g.frame();
+    };
+    wait_for_moves(&mut gui);
+    let original = binary(&gui);
+    assert_eq!(original.2.len(), 2);
+    match gui.app.tabs[gui.app.active].content.view_mut() {
+        Content::Binary(v) => {
+            v.pane = Some(0);
+            v.move_cursor(69);
+        }
+        _ => unreachable!(),
+    }
+    gui.frames(2);
+    gui.tab_to("go to matching block", |w| {
+        w.role == accesskit::Role::Button && w.label == tr("binary.moved_partner")
+    });
+    gui.key(Modifiers::NONE, Key::Enter);
+    let after = binary(&gui);
+    assert_eq!((after.3, after.4), (Some(1), Some(133)));
+    assert_eq!(after.0, original.0);
+    assert_eq!(after.1, original.1);
+    gui.key(Modifiers::NONE, Key::ArrowRight);
+    assert_eq!((binary(&gui).3, binary(&gui).4), (Some(1), Some(134)));
+    gui.click(tr("binary.moved_blocks"));
+    assert!(binary(&gui).2.is_empty());
+    assert!(!gui.app.cfg.binary_moved_blocks);
+    gui.click(tr("binary.moved_blocks"));
+    assert!(gui.app.cfg.binary_moved_blocks);
+    wait_for_moves(&mut gui);
+    assert_eq!(binary(&gui).2, original.2);
+    if let Content::Binary(v) = gui.app.tabs[gui.app.active].content.view_mut() {
+        v.ascii = true;
+    }
+    gui.tab_to("moved-block checkbox", |w| {
+        w.role == accesskit::Role::CheckBox && w.label == tr("binary.moved_blocks")
+    });
+    gui.events.push(Event::Text(" ".into()));
+    gui.key(Modifiers::NONE, Key::Space);
+    assert_eq!(
+        binary(&gui).0,
+        original.0,
+        "Space on a toolbar control must not type into the byte pane"
+    );
+    assert!(binary(&gui).2.is_empty());
+    gui.click(tr("binary.moved_blocks"));
+    wait_for_moves(&mut gui);
+    assert_eq!(binary(&gui).2, original.2);
+    assert_eq!(std::fs::read(d.join("left.bin")).unwrap(), left);
+    assert_eq!(std::fs::read(d.join("right.bin")).unwrap(), right);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
 }

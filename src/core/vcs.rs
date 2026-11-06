@@ -5,9 +5,13 @@
 //! entry. Git and Mercurial revisions are read from the local repository. Subversion reads
 //! `BASE` from the working copy; other revisions, and the list of recent ones, come from the
 //! repository server the working copy names, as `svn` itself would.
+//!
+//! Reading a revision honors the repository's own configuration, as Git's filters are honored.
+//! The list of recent revisions, read while a path is being typed, does not: Mercurial is told
+//! to skip the repository's `.hg/hgrc`, whose hooks and extensions could run commands.
 
-use super::git;
-use anyhow::{Context, Result};
+use super::{archive, git};
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -74,13 +78,17 @@ impl Vcs {
     }
 }
 
-fn svn(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    git::run(svn_command(dir, args), None)
+fn svn(dir: &Path, args: &[&str], cancel: &AtomicBool) -> Result<Vec<u8>> {
+    git::run_cancellable(svn_command(dir, args), cancel)
 }
 
 fn svn_command(dir: &Path, args: &[&str]) -> std::process::Command {
     let mut cmd = git::tool("svn", dir);
     utf8_locale(&mut cmd);
+    // ssh would ask for a password on the terminal the program was started from, if any
+    if std::env::var_os("SVN_SSH").is_none() {
+        cmd.env("SVN_SSH", "ssh -o BatchMode=yes");
+    }
     cmd.arg("--non-interactive").args(args);
     cmd
 }
@@ -177,38 +185,111 @@ fn svn_rev(rev: &str) -> Result<String> {
 fn svn_target(path: &Path) -> Result<(PathBuf, String)> {
     let abs = git::dunce_canonical(path)?;
     let dir = abs.parent().context("no parent folder")?.to_path_buf();
-    let target = format!("{}@", abs.display());
-    Ok((dir, target))
+    let name = abs
+        .to_str()
+        .with_context(|| format!("{}: the name is not valid UTF-8", abs.display()))?;
+    Ok((dir, format!("{name}@")))
 }
 
-/// The contents of file `path` in revision `rev`, or in the default revision when `rev` is
-/// empty.
-pub fn show_file(path: &Path, rev: &str) -> Result<Vec<u8>> {
+/// File or folder `path` as it was in revision `rev` (the default revision when `rev` is
+/// empty), in a temporary folder. Returns the temporary folder (deleted when dropped) and the
+/// copy of `path` inside it. Setting `cancel` stops the command reading it, one waiting on a
+/// server for example, and fails.
+pub fn copy_of(
+    path: &Path,
+    rev: &str,
+    cancel: &AtomicBool,
+) -> Result<(tempfile::TempDir, PathBuf)> {
+    if path.is_dir() {
+        return export_folder(path, rev, cancel);
+    }
+    let temp = tempfile::Builder::new()
+        .prefix("oxidemerge-rev-")
+        .tempdir()?;
+    let copy = temp.path().join(path.file_name().unwrap_or_default());
+    save_file(path, rev, &copy, cancel)?;
+    Ok((temp, copy))
+}
+
+/// Writes file `path` as it was in revision `rev` to the new file `dest`.
+fn save_file(path: &Path, rev: &str, dest: &Path, cancel: &AtomicBool) -> Result<()> {
     let vcs = Vcs::of(path);
     let rev = vcs.rev_or_default(rev);
     match vcs {
-        Vcs::Git => no_working_copy(path, git::show_file(path, rev)),
+        Vcs::Git => no_working_copy(path, git::save_file(path, rev, dest, cancel)),
         Vcs::Subversion => {
             let rev = svn_rev(rev)?;
             let (dir, target) = svn_target(path)?;
-            svn(&dir, &["cat", "-r", &rev, "--", &target])
+            let cmd = svn_command(&dir, &["cat", "-r", &rev, "--", &target]);
+            git::run_to_file(cmd, dest, cancel)
         }
         Vcs::Mercurial => {
             let rev = hg_rev(rev)?;
-            let (root, rel) = hg_locate(path)?;
+            let (root, rel) = hg_locate(path, Repo::Trusted)?;
             let pattern = format!("path:{rel}");
-            hg(&root, &["cat", "--decode", &rev, "--", &pattern])
+            let cmd = hg_command(
+                &root,
+                &["cat", "--decode", &rev, "--", &pattern],
+                Repo::Trusted,
+            );
+            git::run_to_file(cmd, dest, cancel)
         }
     }
 }
 
+/// The most a Subversion or Mercurial revision export may contain. See
+/// [`bound_exported_folder`]; Git's own export is bounded as it is written instead (see
+/// `git::MAX_EXPORT_BYTES`).
+const MAX_EXPORTED_BYTES: u64 = 8 << 30;
+/// The most files a Subversion or Mercurial revision export may contain. See
+/// [`MAX_EXPORTED_BYTES`].
+const MAX_EXPORTED_FILES: u64 = 500_000;
+
+/// Refuses an export that turned out larger than [`MAX_EXPORTED_BYTES`] or
+/// [`MAX_EXPORTED_FILES`], once `svn export` or `hg archive` has already written `dir`: unlike
+/// Git's own tree, neither command reports what a revision contains before writing it, so this
+/// is a backstop rather than a preventive check. The caller's temporary folder is still deleted
+/// as usual once this returns an error, so a revision that got this large does not linger on
+/// disk, even though - unlike the SFTP fetch or an archive extraction - it was briefly written
+/// in full first. Call this after [`archive::remove_links_outside`], so a link escaping `dir`
+/// is not read, and not counted, either.
+fn bound_exported_folder(dir: &Path) -> Result<()> {
+    bound_with_limits(dir, MAX_EXPORTED_BYTES, MAX_EXPORTED_FILES)
+}
+
+/// What [`bound_exported_folder`] checks `dir` against, with the limits as arguments so a test
+/// can pass small ones without actually writing gigabytes or hundreds of thousands of files.
+fn bound_with_limits(dir: &Path, max_bytes: u64, max_files: u64) -> Result<()> {
+    let (mut bytes, mut files) = (0u64, 0u64);
+    for entry in walkdir::WalkDir::new(dir) {
+        let entry = entry.context("reading the exported folder")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        files += 1;
+        bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if bytes > max_bytes || files > max_files {
+            bail!(
+                "stopped after {} GB or {} files; export a smaller revision or folder",
+                max_bytes >> 30,
+                max_files
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Folder `path` as it was in revision `rev`, in a temporary folder. Returns the temporary
 /// folder (deleted when dropped) and the copy of `path` inside it.
-pub fn export_folder(path: &Path, rev: &str) -> Result<(tempfile::TempDir, PathBuf)> {
+fn export_folder(
+    path: &Path,
+    rev: &str,
+    cancel: &AtomicBool,
+) -> Result<(tempfile::TempDir, PathBuf)> {
     let vcs = Vcs::of(path);
     let rev = vcs.rev_or_default(rev);
     match vcs {
-        Vcs::Git => no_working_copy(path, git::export_folder(path, rev)),
+        Vcs::Git => no_working_copy(path, git::export_folder(path, rev, cancel)),
         Vcs::Subversion => {
             let rev = svn_rev(rev)?;
             let (dir, target) = svn_target(path)?;
@@ -223,19 +304,36 @@ pub fn export_folder(path: &Path, rev: &str) -> Result<(tempfile::TempDir, PathB
             let copy = temp.path().join(name);
             // the destination is read for a peg revision too
             let dest = format!("{}@", copy.display());
-            match svn(&dir, &["export", "-q", "-r", &rev, "--", &target, &dest]) {
+            let export = &["export", "-q", "-r", &rev, "--", &target, &dest];
+            match svn(&dir, export, cancel) {
                 Ok(_) => {}
                 // the folder was not there in that revision: it compares as empty, as in Git
                 // and Mercurial (the codes are the same in every language)
                 Err(e) if SVN_NOT_THERE.iter().any(|c| e.to_string().contains(c)) => {}
+                // also a repository the server no longer has: the folder is missing only if
+                // the folder holding it is there
+                Err(e) if e.to_string().contains(SVN_NO_URL) => {
+                    let (_, parent) = svn_target(&dir).map_err(|_| anyhow::anyhow!("{e}"))?;
+                    let info = &["info", "-r", &rev, "--depth", "empty", "--", &parent];
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed)
+                        || svn(&dir, info, cancel).is_err()
+                    {
+                        return Err(e);
+                    }
+                }
                 Err(e) => return Err(e),
             }
             std::fs::create_dir_all(&copy)?;
+            // Subversion's svn:special property checks a symlink out as a real one; one
+            // crafted to point outside `copy` could otherwise be opened and shown as if it
+            // were part of the revision.
+            archive::remove_links_outside(&copy)?;
+            bound_exported_folder(&copy)?;
             Ok((temp, copy))
         }
         Vcs::Mercurial => {
             let rev = hg_rev(rev)?;
-            let (root, rel) = hg_locate(path)?;
+            let (root, rel) = hg_locate(path, Repo::Trusted)?;
             let temp = tempfile::Builder::new()
                 .prefix("oxidemerge-hg-")
                 .tempdir()?;
@@ -254,7 +352,7 @@ pub fn export_folder(path: &Path, rev: &str) -> Result<(tempfile::TempDir, PathB
             }
             let dest_arg = dest.display().to_string();
             args.extend(["--", dest_arg.as_str()]);
-            match hg(&root, &args) {
+            match git::run_cancellable(hg_command(&root, &args, Repo::Trusted), cancel) {
                 Ok(_) => {}
                 // the folder had no files in that revision: it compares as empty
                 Err(e) if e.to_string().contains("no files match") => {}
@@ -262,14 +360,19 @@ pub fn export_folder(path: &Path, rev: &str) -> Result<(tempfile::TempDir, PathB
             }
             let copy = dest.join(&rel);
             std::fs::create_dir_all(&copy)?;
+            // Mercurial checks a tracked symlink out as a real one; one crafted to point
+            // outside `dest` (the whole archive, of which `copy` may be only a subfolder)
+            // could otherwise be opened and shown as if it were part of the revision.
+            archive::remove_links_outside(&dest)?;
+            bound_exported_folder(&dest)?;
             Ok((temp, copy))
         }
     }
 }
 
 /// Recent revisions that changed `path`, newest first: (revision, first line of the message).
-/// Setting `cancel` stops a Subversion or Mercurial log that is still running (one waiting on a
-/// server), and the list comes back empty.
+/// Setting `cancel` stops a log that is still running (one waiting on a server, or walking a
+/// long history), and the list comes back empty.
 pub fn recent_revisions(path: &Path, n: usize, cancel: &AtomicBool) -> Vec<(String, String)> {
     match Vcs::detect(path) {
         Some(Vcs::Subversion) => {
@@ -285,7 +388,7 @@ pub fn recent_revisions(path: &Path, n: usize, cancel: &AtomicBool) -> Vec<(Stri
             .unwrap_or_default()
         }
         Some(Vcs::Mercurial) => {
-            let Ok((root, rel)) = hg_locate(path) else {
+            let Ok((root, rel)) = hg_locate(path, Repo::Untrusted) else {
                 return Vec::new();
             };
             let limit = n.to_string();
@@ -300,7 +403,7 @@ pub fn recent_revisions(path: &Path, n: usize, cancel: &AtomicBool) -> Vec<(Stri
             if !rel.is_empty() {
                 args.extend(["--", pattern.as_str()]);
             }
-            git::run_cancellable(hg_command(&root, &args), cancel)
+            git::run_cancellable(hg_command(&root, &args, Repo::Untrusted), cancel)
                 .map(|out| {
                     String::from_utf8_lossy(&out)
                         .lines()
@@ -310,29 +413,34 @@ pub fn recent_revisions(path: &Path, n: usize, cancel: &AtomicBool) -> Vec<(Stri
                 })
                 .unwrap_or_default()
         }
-        _ => git::recent_commits(path, n),
+        _ => git::recent_commits(path, n, cancel),
     }
+}
+
+/// Whether Mercurial may read the repository's own `.hg/hgrc`: only when the user asked for a
+/// revision, never for what is read on its own while a path is typed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Repo {
+    Trusted,
+    Untrusted,
 }
 
 /// `hg` with the plain, untranslated behavior meant for scripts, UTF-8 file names and no
 /// prompts.
-fn hg(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    git::run(hg_command(dir, args), None)
-}
-
-fn hg_command(dir: &Path, args: &[&str]) -> std::process::Command {
+fn hg_command(dir: &Path, args: &[&str], repo: Repo) -> std::process::Command {
     let mut cmd = git::tool("hg", dir);
-    cmd.env("HGPLAIN", "1")
-        .env("HGENCODING", "utf-8")
-        .arg("-y")
-        .args(args);
+    cmd.env("HGPLAIN", "1").env("HGENCODING", "utf-8");
+    if repo == Repo::Untrusted {
+        cmd.env("HGRCSKIPREPO", "1");
+    }
+    cmd.arg("-y").args(args);
     cmd
 }
 
 /// The repository holding `path` and the path relative to its top folder, with `/`
 /// separators (empty for the top folder itself).
-fn hg_locate(path: &Path) -> Result<(PathBuf, String)> {
-    git::locate_with(path, |dir| hg(dir, &["root"]))
+fn hg_locate(path: &Path, repo: Repo) -> Result<(PathBuf, String)> {
+    git::locate_with(path, |dir| git::run(hg_command(dir, &["root"], repo), None))
 }
 
 /// A Mercurial revision as one `--rev=` argument. Mercurial takes negative numbers (`-1` is
@@ -346,7 +454,10 @@ fn hg_rev(rev: &str) -> Result<String> {
 }
 
 /// Error codes of `svn` for a path that is not in the revision asked for.
-const SVN_NOT_THERE: &[&str] = &["E195012", "E160013", "E170000"];
+const SVN_NOT_THERE: &[&str] = &["E195012", "E160013"];
+/// The error code of `svn` for a URL that does not exist: a path not in the revision, or a
+/// repository the server no longer has.
+const SVN_NO_URL: &str = "E170000";
 
 /// A Git error for a path that no working copy was found for names every system looked for.
 fn no_working_copy<T>(path: &Path, result: Result<T>) -> Result<T> {
@@ -445,6 +556,21 @@ First | with a bar
     }
 
     #[test]
+    fn a_folder_past_the_byte_or_file_budget_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "0123456789").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "0123456789").unwrap();
+
+        let err = bound_with_limits(dir.path(), 5, u64::MAX).unwrap_err();
+        assert!(err.to_string().contains("GB"), "{err}");
+
+        let err = bound_with_limits(dir.path(), u64::MAX, 1).unwrap_err();
+        assert!(err.to_string().contains("1 files"), "{err}");
+
+        bound_with_limits(dir.path(), u64::MAX, u64::MAX).unwrap();
+    }
+
+    #[test]
     fn svn_gets_a_utf8_character_set_and_keeps_its_language() {
         let s = |v: &str| Some(v.to_string());
         assert!(utf8_locale_env(s("de_DE.UTF-8"), None, None, "UTF-8").is_empty());
@@ -499,6 +625,130 @@ First | with a bar
         assert_eq!(svn_rev("{2026-11-01}").unwrap(), "{2026-11-01}");
         assert!(svn_rev("-r5").is_err());
         assert!(svn_rev("").is_err());
+    }
+
+    #[test]
+    fn the_revision_list_runs_no_hook_of_a_mercurial_repository() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let init = std::process::Command::new("hg")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .env("HGRCPATH", "")
+            .output();
+        if !init.is_ok_and(|o| o.status.success()) {
+            eprintln!("Mercurial is not installed; skipped");
+            return;
+        }
+        let marker = d.path().join("ran");
+        let hook = if cfg!(windows) {
+            format!("type nul > \"{}\"", marker.display())
+        } else {
+            format!("touch '{}'", marker.display())
+        };
+        std::fs::write(
+            repo.join(".hg/hgrc"),
+            format!("[hooks]\npre-root = {hook}\npre-log = {hook}\n"),
+        )
+        .unwrap();
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        let never = AtomicBool::new(false);
+        assert!(recent_revisions(&repo.join("a.txt"), 5, &never).is_empty());
+        assert!(!marker.exists(), "a hook of the repository ran");
+    }
+
+    /// Mercurial checks a tracked symlink out as a real one when archiving a revision: left
+    /// alone, one pointing outside the exported copy would be opened and read as if it were
+    /// part of the revision. `export_folder` must drop it (see `archive::remove_links_outside`).
+    #[cfg(unix)]
+    #[test]
+    fn mercurial_export_drops_a_symlink_pointing_outside_it() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let hg = |args: &[&str]| {
+            std::process::Command::new("hg")
+                .args(args)
+                .current_dir(&repo)
+                .env("HGRCPATH", "")
+                .output()
+        };
+        if !hg(&["init", "-q"]).is_ok_and(|o| o.status.success()) {
+            eprintln!("Mercurial is not installed; skipped");
+            return;
+        }
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), repo.join("escape.txt"))
+            .unwrap();
+        hg(&["add", "a.txt", "escape.txt"]).unwrap();
+        hg(&["commit", "-q", "-m", "first", "-u", "T <t@example.com>"]).unwrap();
+
+        let never = AtomicBool::new(false);
+        let (_tmp, copy) = export_folder(&repo, "0", &never).unwrap();
+        assert!(copy.join("a.txt").is_file());
+        assert!(
+            !copy.join("escape.txt").exists(),
+            "the escaping link should have been dropped"
+        );
+    }
+
+    /// Subversion checks a symlink out as a real one (`svn:special`) when exporting a
+    /// revision: left alone, one pointing outside the exported copy would be opened and read
+    /// as if it were part of the revision. `export_folder` must drop it (see
+    /// `archive::remove_links_outside`).
+    #[cfg(unix)]
+    #[test]
+    fn svn_export_drops_a_symlink_pointing_outside_it() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+
+        let d = tempfile::tempdir().unwrap();
+        let run = |cwd: &Path, program: &str, args: &[&str]| {
+            std::process::Command::new(program)
+                .args(args)
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::null())
+                .output()
+        };
+        let repo = d.path().join("repo");
+        if run(d.path(), "svnadmin", &["create", repo.to_str().unwrap()]).is_err() {
+            eprintln!("Subversion is not installed; skipped");
+            return;
+        }
+        let url = format!(
+            "file:///{}",
+            repo.to_str()
+                .unwrap()
+                .replace('\\', "/")
+                .trim_start_matches('/')
+        );
+        let wc = d.path().join("wc");
+        let ok = |cwd: &Path, args: &[&str]| {
+            let out = run(cwd, "svn", args).unwrap();
+            assert!(
+                out.status.success(),
+                "svn {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        ok(d.path(), &["checkout", "-q", &url, wc.to_str().unwrap()]);
+        std::fs::write(wc.join("a.txt"), "a\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), wc.join("escape.txt"))
+            .unwrap();
+        ok(&wc, &["add", "-q", "a.txt", "escape.txt"]);
+        ok(&wc, &["commit", "-q", "-m", "first"]);
+
+        let never = AtomicBool::new(false);
+        let (_tmp, copy) = export_folder(&wc, "1", &never).unwrap();
+        assert!(copy.join("a.txt").is_file());
+        assert!(
+            !copy.join("escape.txt").exists(),
+            "the escaping link should have been dropped"
+        );
     }
 
     #[test]
