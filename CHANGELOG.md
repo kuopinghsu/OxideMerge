@@ -24,8 +24,9 @@ uses its section of this file as the release notes.
   cannot be fetched by mistake. The server's host key is checked before the password or
   key is sent: a server whose key matches your `~/.ssh/known_hosts` is trusted, a new one
   shows its fingerprint and is trusted only once you confirm it, and is then remembered in
-  OxideMerge's own `known_hosts` file next to its settings; a key that no longer matches a
-  remembered one stops the connection instead of silently trusting it. The connection,
+  OxideMerge's own `known_hosts` file next to its settings; a key that differs from one of
+  the same type recorded in either file stops the connection instead of silently trusting
+  it, and so does a `known_hosts` file that can't be read. The connection,
   including the password or passphrase, is kept only in memory for the tab's lifetime; it
   is never written to the settings file, and fetched tabs are left out of saved
   workspaces, the restored session and the recent paths.

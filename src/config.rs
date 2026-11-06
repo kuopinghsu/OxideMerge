@@ -76,17 +76,18 @@ impl Workspace {
 
 /// The workspaces to save, when this instance changed `base` (what it read) into `ours` while
 /// another running OxideMerge may have saved `theirs` meanwhile: theirs stand, except for the
-/// workspaces changed here, which are replaced, added or deleted as they were here.
+/// workspaces changed here, which are replaced, added or deleted as they were here. Names
+/// match whatever their case, as [`Workspace::is_named`] does.
 pub fn merge_workspaces(
     base: &[Workspace],
     ours: &[Workspace],
     theirs: &[Workspace],
 ) -> Vec<Workspace> {
-    let find = |list: &[Workspace], name: &str| list.iter().find(|w| w.name == name).cloned();
+    let find = |list: &[Workspace], name: &str| list.iter().find(|w| w.is_named(name)).cloned();
     let mut out = theirs.to_vec();
     let mut names: Vec<&str> = Vec::new();
     for w in base.iter().chain(ours) {
-        if !names.contains(&w.name.as_str()) {
+        if !names.iter().any(|&n| w.is_named(n)) {
             names.push(&w.name);
         }
     }
@@ -95,7 +96,7 @@ pub fn merge_workspaces(
         if find(base, name) == ours {
             continue;
         }
-        match (ours, out.iter().position(|w| w.name == name)) {
+        match (ours, out.iter().position(|w| w.is_named(name))) {
             (Some(w), Some(at)) => out[at] = w,
             (Some(w), None) => out.push(w),
             (None, Some(at)) => {
@@ -463,6 +464,12 @@ mod tests {
         );
         // Nothing changed here: whatever was saved elsewhere stands as it is.
         assert_eq!(merge_workspaces(&base, &base, &theirs), theirs);
+        // Names match whatever their case: renaming "a" to "A" here replaces it, once.
+        let ours = vec![ws("A", 1), ws("b", 1), ws("gone", 1)];
+        assert_eq!(
+            merge_workspaces(&base, &ours, &theirs),
+            vec![ws("A", 1), ws("b", 1), ws("gone", 1), ws("other", 1)]
+        );
     }
 
     #[test]

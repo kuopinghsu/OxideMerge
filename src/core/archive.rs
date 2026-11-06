@@ -256,7 +256,7 @@ fn extract(
             budget.entry()?;
             let mut r = Counted { inner: r, budget };
             let done = sevenz_rust2::default_entry_extract_fn(e, &mut r, dest)?;
-            written.borrow_mut().insert(PathBuf::from(e.name()));
+            written.borrow_mut().insert(clean(Path::new(e.name())));
             Ok(done)
         })
         .map_err(|e| anyhow::anyhow!("{}: {e}", path.display())),
@@ -323,7 +323,7 @@ fn extract_zip(
             let mut w = std::fs::File::create(&out)?;
             std::io::copy(&mut Counted { inner: f, budget }, &mut w)?;
         }
-        written.borrow_mut().insert(rel);
+        written.borrow_mut().insert(clean(&rel));
     }
     Ok(())
 }
@@ -388,7 +388,9 @@ fn extract_tar(
             }
         }
         if entry.unpack_in(dir).unwrap_or(false) {
-            written.borrow_mut().insert(rel);
+            if let Some(rel) = unpacked_at(&rel) {
+                written.borrow_mut().insert(rel);
+            }
         }
     }
     // A limit passed inside an entry fails only that entry.
@@ -493,7 +495,7 @@ fn parent_dir(path: &Path) -> &Path {
 }
 
 /// Drops the `.` parts of a path stored in an archive, so it compares equal to the same path
-/// found on disk.
+/// found on disk: `./dir/a.txt`, as `tar -C dir .` names it, is `dir/a.txt`.
 fn clean(rel: &Path) -> PathBuf {
     rel.components()
         .filter(|c| !matches!(c, Component::CurDir))
@@ -593,6 +595,155 @@ fn append_entry<W: Write>(
     }
 }
 
+/// Extended (pax) header records of a tar entry, as key and value.
+type Pax = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// The pax records `entry` came with: attributes a plain header has no room for, such as
+/// extended attributes, times finer than a second and long owner names.
+fn pax_records<R: Read>(entry: &mut tar::Entry<R>) -> std::io::Result<Pax> {
+    if entry.header().entry_type().is_pax_global_extensions() {
+        // Its records are its own data, copied with it.
+        return Ok(Vec::new());
+    }
+    Ok(entry
+        .pax_extensions()?
+        .map(|records| {
+            records
+                .filter_map(Result::ok)
+                .map(|r| (r.key_bytes().to_vec(), r.value_bytes().to_vec()))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// The records of `pax` still true of an entry written again by name: its path and size are
+/// written anew, and so is its time when its contents `changed`.
+fn rewritten(pax: &Pax, changed: bool) -> Pax {
+    pax.iter()
+        .filter(|(k, _)| {
+            !matches!(k.as_slice(), b"path" | b"linkpath" | b"size") && !(changed && k == b"mtime")
+        })
+        .cloned()
+        .collect()
+}
+
+/// Writes `records` as an extended header for the entry written next; nothing when empty.
+fn append_pax<W: Write>(b: &mut tar::Builder<W>, records: &Pax) -> std::io::Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut data = Vec::new();
+    for (k, v) in records {
+        // `<length> <key>=<value>\n`, the length counting its own digits too.
+        let rest = k.len() + v.len() + 3;
+        let mut len = rest + 1;
+        while rest + len.to_string().len() != len {
+            len = rest + len.to_string().len();
+        }
+        data.extend_from_slice(format!("{len} ").as_bytes());
+        data.extend_from_slice(k);
+        data.push(b'=');
+        data.extend_from_slice(v);
+        data.push(b'\n');
+    }
+    let mut h = tar::Header::new_ustar();
+    h.set_entry_type(tar::EntryType::XHeader);
+    h.set_path("PaxHeader")?;
+    h.set_mode(0o644);
+    h.set_size(data.len() as u64);
+    h.set_cksum();
+    b.append(&h, data.as_slice())
+}
+
+/// `h` as the header of a plain file: a GNU sparse file is written out whole, as its holes
+/// were read back as zeros.
+fn as_regular(h: &tar::Header) -> tar::Header {
+    let mut out = tar::Header::new_gnu();
+    // Name, mode, owner, size, time, type, link name, magic and owner names: what every tar
+    // header holds, without the sparse map a GNU one adds after them.
+    out.as_mut_bytes()[..345].copy_from_slice(&h.as_bytes()[..345]);
+    out.set_entry_type(tar::EntryType::Regular);
+    out
+}
+
+/// Where `tar` unpacks an entry named `name`, relative to the folder it unpacks to: without
+/// its `.` parts or a leading `/`. `None` for a name going up with `..`, never unpacked, and
+/// for the archive's own root (`./`).
+fn unpacked_at(name: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in name.components() {
+        match c {
+            Component::Normal(part) => out.push(part),
+            Component::ParentDir => return None,
+            Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
+        }
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
+/// The name and link target of a tar entry exactly as stored, for one that can't be written
+/// again by name (`tar::Builder` tidies `./a` and refuses `/a`).
+struct RawName {
+    path: Vec<u8>,
+    link: Option<Vec<u8>>,
+}
+
+/// Writes an entry with header `h` and its pax records as it was, under the name it had.
+fn append_raw<W: Write>(
+    b: &mut tar::Builder<W>,
+    h: &tar::Header,
+    pax: &Pax,
+    name: &RawName,
+    data: impl Read,
+) -> std::io::Result<()> {
+    let mut records = pax.clone();
+    let has = |key: &[u8]| pax.iter().any(|(k, _)| k == key);
+    // A name too long for the header itself came in a GNU record, written here as pax.
+    if name.path.len() > 100 && !has(b"path") {
+        records.push((b"path".to_vec(), name.path.clone()));
+    }
+    if let Some(link) = name.link.as_ref().filter(|l| l.len() > 100) {
+        if !has(b"linkpath") {
+            records.push((b"linkpath".to_vec(), link.clone()));
+        }
+    }
+    let mut h = h.clone();
+    h.set_cksum();
+    append_pax(b, &records)?;
+    b.append(&h, data)
+}
+
+/// Writes an entry with header `h` at `rel` into `b`, with what still holds of its pax records:
+/// under its stored `raw` name when it has one and its contents did not change.
+#[allow(clippy::too_many_arguments)]
+fn put<W: Write>(
+    b: &mut tar::Builder<W>,
+    h: &mut tar::Header,
+    rel: &Path,
+    link: Option<&Path>,
+    pax: &Pax,
+    changed: bool,
+    raw: Option<&RawName>,
+    data: impl Read,
+) -> std::io::Result<()> {
+    match raw {
+        Some(raw) if !changed => append_raw(b, h, pax, raw, data),
+        _ => {
+            append_pax(b, &rewritten(pax, changed))?;
+            append_entry(b, h, rel, link, data)
+        }
+    }
+}
+
+/// Whether the files at `a` and `b` hold the same bytes; false when either is not a file.
+fn same_contents(a: &Path, b: &Path) -> Result<bool> {
+    let len = match std::fs::symlink_metadata(b) {
+        Ok(md) if md.is_file() => md.len(),
+        _ => return Ok(false),
+    };
+    Ok(same_file(&mut std::fs::File::open(b)?, len, a)? == Some(true))
+}
+
 /// Copies the tar stream `input` into `w`, taking the edits made to `dir` (see [`repack`]),
 /// and returns `w` with whether anything changed.
 fn copy_tar<W: Write>(
@@ -606,6 +757,9 @@ fn copy_tar<W: Write>(
     b.follow_symlinks(false);
     let mut seen = HashSet::new();
     let mut implied = HashSet::new();
+    // Entries whose place on disk now holds something else (a link to elsewhere, a link
+    // where a file was): written from disk at the end, as new ones are.
+    let mut replaced = HashSet::new();
     let mut changed = false;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -614,9 +768,26 @@ fn copy_tar<W: Write>(
         let mut entry = entry?;
         let mut h = entry.header().clone();
         let kind = h.entry_type();
+        let pax = pax_records(&mut entry)?;
         let link = entry.link_name().ok().flatten().map(|l| l.into_owned());
-        let Ok(rel) = entry.path().map(|p| clean(&p)) else {
-            b.append(&h, &mut entry)?;
+        let stored = entry.path_bytes().into_owned();
+        let rel = entry.path().ok().and_then(|p| unpacked_at(&p));
+        // Left alone, an entry the builder would name differently keeps its stored name.
+        let raw = rel
+            .as_deref()
+            .is_none_or(|r| r.as_os_str().as_encoded_bytes() != stored.as_slice())
+            .then(|| RawName {
+                path: stored,
+                link: entry.link_name_bytes().map(|l| l.into_owned()),
+            });
+        if kind == tar::EntryType::GNUSparse {
+            h = as_regular(&h);
+            h.set_size(entry.size());
+        }
+        let Some(rel) = rel else {
+            if let Some(raw) = &raw {
+                append_raw(&mut b, &h, &pax, raw, &mut entry)?;
+            }
             continue;
         };
         add_parents(&mut implied, &rel);
@@ -628,8 +799,31 @@ fn copy_tar<W: Write>(
         } else if kind.is_symlink() {
             std::fs::read_link(&abs).ok() == link
         } else if kind.is_hard_link() {
-            std::fs::symlink_metadata(&abs).is_ok()
-        } else if kind.is_file() || kind == tar::EntryType::Continuous {
+            // Kept as a link while it still holds what its target holds; an edit saved to
+            // either one gave it a file of its own.
+            let target = link.as_deref().map(|l| dir.join(clean(l)));
+            match std::fs::symlink_metadata(&abs) {
+                Ok(md) if md.is_file() => {
+                    if target.is_some_and(|t| same_contents(&abs, &t).unwrap_or(false)) {
+                        true
+                    } else {
+                        changed = true;
+                        let mut h = as_regular(&h);
+                        h.set_size(md.len());
+                        h.set_mtime(now);
+                        let f = std::fs::File::open(&abs)
+                            .with_context(|| format!("open {}", rel.display()))?;
+                        put(&mut b, &mut h, &rel, None, &pax, true, None, f)
+                            .with_context(|| format!("archive file {}", rel.display()))?;
+                        continue;
+                    }
+                }
+                _ => false,
+            }
+        } else if kind.is_file()
+            || kind == tar::EntryType::Continuous
+            || kind == tar::EntryType::GNUSparse
+        {
             let len = entry.size();
             match same_file(&mut entry, len, &abs)? {
                 Some(same) => {
@@ -640,7 +834,7 @@ fn copy_tar<W: Write>(
                         h.set_size(f.metadata()?.len());
                         h.set_mtime(now);
                     }
-                    append_entry(&mut b, &mut h, &rel, None, f)
+                    put(&mut b, &mut h, &rel, None, &pax, !same, raw.as_ref(), f)
                         .with_context(|| format!("archive file {}", rel.display()))?;
                     continue;
                 }
@@ -650,14 +844,27 @@ fn copy_tar<W: Write>(
             true
         };
         if keep {
-            append_entry(&mut b, &mut h, &rel, link.as_deref(), &mut entry)
-                .with_context(|| format!("archive {}", rel.display()))?;
+            let link = link.as_deref();
+            put(
+                &mut b,
+                &mut h,
+                &rel,
+                link,
+                &pax,
+                false,
+                raw.as_ref(),
+                &mut entry,
+            )
+            .with_context(|| format!("archive {}", rel.display()))?;
         } else {
             changed = true;
+            if std::fs::symlink_metadata(&abs).is_ok() {
+                replaced.insert(rel);
+            }
         }
     }
     for e in list_dir(dir, false)? {
-        if is_new(&e, &seen, &implied) {
+        if is_new(&e, &seen, &implied) || replaced.contains(e.rel()) {
             changed = true;
             append_new(&mut b, dir, &e)?;
         }
@@ -689,7 +896,8 @@ pub fn writable(path: &Path) -> bool {
 }
 
 /// Whether the zip at `path` carries a signature: a signed jar (`META-INF/*.SF` and its key
-/// block), a signed OpenDocument or EPUB file, or a signed Office document.
+/// block), a signed OpenDocument or EPUB file, a signed Office document or other Open
+/// Packaging Conventions package (a VSIX), a signed NuGet package, or a signed wheel.
 fn zip_signed(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return false;
@@ -701,6 +909,10 @@ fn zip_signed(path: &Path) -> bool {
         let n = n.to_ascii_lowercase();
         let meta = n.strip_prefix("meta-inf/").unwrap_or("");
         n.starts_with("_xmlsignatures/")
+            || n.starts_with("package/services/digital-signature/")
+            || n == ".signature.p7s"
+            || n.ends_with(".dist-info/record.jws")
+            || n.ends_with(".dist-info/record.p7s")
             || [".sf", ".rsa", ".dsa", ".ec", "signatures.xml"]
                 .iter()
                 .any(|end| meta.ends_with(end))
@@ -801,6 +1013,10 @@ pub fn repack(path: &Path, dir: &Path) -> Result<bool> {
     let Some(tmp) = staged else {
         return Ok(false);
     };
+    // Writing it can take a while: checked again just before it takes the archive's place.
+    if then.is_some() && stamp(&target) != then {
+        anyhow::bail!(trf("msg.archive_changed", &[file()]));
+    }
     tmp.as_file().set_permissions(md.permissions())?;
     tmp.as_file().sync_all()?;
     fsutil::persist(tmp, &target)
@@ -1334,8 +1550,210 @@ mod tests {
         std::os::unix::fs::symlink("../../../etc/passwd", extracted.path().join("escape.txt"))
             .unwrap();
         super::repack(&tar_path, extracted.path()).unwrap();
-        let after = extract_to_temp(&tar_path).unwrap();
-        assert!(!after.path().join("escape.txt").exists());
+        assert!(!tar_names(&tar_path).contains(&"escape.txt".to_string()));
+    }
+
+    /// The names of the entries of the tar at `path`, as stored.
+    fn tar_names(path: &Path) -> Vec<String> {
+        let mut ar = tar::Archive::new(std::fs::File::open(path).unwrap());
+        ar.entries()
+            .unwrap()
+            .map(|e| String::from_utf8_lossy(&e.unwrap().path_bytes()).into_owned())
+            .collect()
+    }
+
+    /// A header for `name` stored as it is, which `tar::Builder` would tidy (`./a`) or refuse
+    /// (`/a`).
+    fn named_header(name: &str, kind: tar::EntryType, size: u64) -> tar::Header {
+        let mut h = tar::Header::new_gnu();
+        h.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name.as_bytes());
+        h.set_entry_type(kind);
+        h.set_size(size);
+        h.set_mode(0o644);
+        h.set_cksum();
+        h
+    }
+
+    /// `tar -C dir -cf x.tar .` names every entry `./...`, starting with `./` itself.
+    #[test]
+    fn repack_takes_edits_to_a_tar_naming_its_entries_from_dot() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("a.tar");
+        let mut b = tar::Builder::new(Vec::new());
+        b.append(&named_header("./", tar::EntryType::Directory, 0), &[][..])
+            .unwrap();
+        b.append(
+            &named_header("./a.txt", tar::EntryType::Regular, 4),
+            &b"old\n"[..],
+        )
+        .unwrap();
+        b.append(
+            &named_header("./keep.txt", tar::EntryType::Regular, 5),
+            &b"keep\n"[..],
+        )
+        .unwrap();
+        std::fs::write(&path, b.into_inner().unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let extracted = extract_to_temp(&path).unwrap();
+        assert!(!repack(&path, extracted.path()).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        std::fs::write(extracted.path().join("a.txt"), "new\n").unwrap();
+        assert!(repack(&path, extracted.path()).unwrap());
+        let after = extract_to_temp(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(after.path().join("a.txt")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(after.path().join("keep.txt")).unwrap(),
+            "keep\n"
+        );
+        assert_eq!(tar_names(&path), ["./", "a.txt", "./keep.txt"]);
+    }
+
+    /// A link pointed elsewhere, or put where a file was, is written as it now is.
+    #[cfg(unix)]
+    #[test]
+    fn repack_writes_a_tar_link_that_changed() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("a.tar");
+        let mut b = tar::Builder::new(Vec::new());
+        for name in ["v2/x", "v3/x", "file.txt"] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(1);
+            h.set_mode(0o644);
+            b.append_data(&mut h, name, &b"x"[..]).unwrap();
+        }
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        b.append_link(&mut h, "current", "v2").unwrap();
+        std::fs::write(&path, b.into_inner().unwrap()).unwrap();
+
+        let extracted = extract_to_temp(&path).unwrap();
+        let current = extracted.path().join("current");
+        std::fs::remove_file(&current).unwrap();
+        std::os::unix::fs::symlink("v3", &current).unwrap();
+        let file = extracted.path().join("file.txt");
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink("v2/x", &file).unwrap();
+        assert!(repack(&path, extracted.path()).unwrap());
+
+        let after = extract_to_temp(&path).unwrap();
+        let target = |name: &str| std::fs::read_link(after.path().join(name)).ok();
+        assert_eq!(target("current"), Some(PathBuf::from("v3")));
+        assert_eq!(target("file.txt"), Some(PathBuf::from("v2/x")));
+    }
+
+    /// A hard link stays one while it holds what its target does; an edit saved to it (as a
+    /// new file, the way files are saved) is written as a file of its own.
+    #[cfg(unix)]
+    #[test]
+    fn repack_takes_an_edit_to_a_tar_hard_link() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("a.tar");
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(4);
+        h.set_mode(0o644);
+        b.append_data(&mut h, "a.txt", &b"old\n"[..]).unwrap();
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Link);
+        h.set_size(0);
+        b.append_link(&mut h, "b.txt", "a.txt").unwrap();
+        std::fs::write(&path, b.into_inner().unwrap()).unwrap();
+
+        let extracted = extract_to_temp(&path).unwrap();
+        assert!(!repack(&path, extracted.path()).unwrap());
+        let linked = extracted.path().join("b.txt");
+        std::fs::remove_file(&linked).unwrap();
+        std::fs::write(&linked, "new\n").unwrap();
+        assert!(repack(&path, extracted.path()).unwrap());
+
+        let after = extract_to_temp(&path).unwrap();
+        let read = |name: &str| std::fs::read_to_string(after.path().join(name)).unwrap();
+        assert_eq!(
+            (read("a.txt"), read("b.txt")),
+            ("old\n".into(), "new\n".into())
+        );
+    }
+
+    /// A GNU sparse file is written out whole (its holes as zeros) rather than with a header
+    /// that no longer fits its data, which would leave every entry after it unreadable.
+    #[test]
+    fn repack_keeps_a_tar_readable_past_a_sparse_file() {
+        fn octal(field: &mut [u8], value: u64) {
+            let digits = format!("{value:0w$o}", w = field.len() - 1);
+            field[..digits.len()].copy_from_slice(digits.as_bytes());
+        }
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("a.tar");
+        let mut h = named_header("hole.bin", tar::EntryType::GNUSparse, 3);
+        let gnu = h.as_gnu_mut().unwrap();
+        octal(&mut gnu.sparse[0].offset, 1024);
+        octal(&mut gnu.sparse[0].numbytes, 3);
+        octal(&mut gnu.realsize, 1027);
+        h.set_cksum();
+        let mut b = tar::Builder::new(Vec::new());
+        b.append(&h, &b"abc"[..]).unwrap();
+        b.append(
+            &named_header("edit.txt", tar::EntryType::Regular, 4),
+            &b"old\n"[..],
+        )
+        .unwrap();
+        std::fs::write(&path, b.into_inner().unwrap()).unwrap();
+
+        let extracted = extract_to_temp(&path).unwrap();
+        std::fs::write(extracted.path().join("edit.txt"), "new\n").unwrap();
+        assert!(repack(&path, extracted.path()).unwrap());
+
+        let after = extract_to_temp(&path).unwrap();
+        let mut hole = vec![0u8; 1024];
+        hole.extend_from_slice(b"abc");
+        assert_eq!(std::fs::read(after.path().join("hole.bin")).unwrap(), hole);
+        assert_eq!(
+            std::fs::read_to_string(after.path().join("edit.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
+    /// Entries left alone keep their pax records (extended attributes, say), and one stored
+    /// from the root, never extracted, is kept rather than failing the whole repack.
+    #[test]
+    fn repack_keeps_pax_records_and_entries_it_never_extracted() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("a.tar");
+        let mut b = tar::Builder::new(Vec::new());
+        let xattr = (b"SCHILY.xattr.user.k".to_vec(), b"v".to_vec());
+        append_pax(&mut b, &vec![xattr.clone()]).unwrap();
+        b.append(
+            &named_header("keep.txt", tar::EntryType::Regular, 5),
+            &b"keep\n"[..],
+        )
+        .unwrap();
+        b.append(
+            &named_header("/abs.txt", tar::EntryType::Regular, 4),
+            &b"abs\n"[..],
+        )
+        .unwrap();
+        b.append(
+            &named_header("edit.txt", tar::EntryType::Regular, 4),
+            &b"old\n"[..],
+        )
+        .unwrap();
+        std::fs::write(&path, b.into_inner().unwrap()).unwrap();
+
+        let extracted = extract_to_temp(&path).unwrap();
+        std::fs::write(extracted.path().join("edit.txt"), "new\n").unwrap();
+        assert!(repack(&path, extracted.path()).unwrap());
+
+        assert_eq!(tar_names(&path), ["keep.txt", "/abs.txt", "edit.txt"]);
+        let mut ar = tar::Archive::new(std::fs::File::open(&path).unwrap());
+        let mut first = ar.entries().unwrap().next().unwrap().unwrap();
+        let records = pax_records(&mut first).unwrap();
+        assert_eq!(records, vec![xattr]);
     }
 
     /// Following symlinks to repack a zip or 7z must not loop forever on a cycle of

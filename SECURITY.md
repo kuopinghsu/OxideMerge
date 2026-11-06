@@ -25,9 +25,10 @@ the following as **untrusted** and handles them without running anything they co
   `.tar.xz` and archives nested in another archive stay read-only.
 - **SFTP servers** you fetch from. The server's host key is checked before any password or
   key is sent: against your `~/.ssh/known_hosts` and OxideMerge's own `known_hosts` file
-  next to its settings. A key that no longer matches stops the connection, a new server's
-  fingerprint must be confirmed before it is trusted, and an unreadable `known_hosts` file
-  stops every connection. Fetched names are checked to be plain file names before anything
+  next to its settings. A key that differs from one of the same type recorded in either
+  file, or that `~/.ssh/known_hosts` revokes, stops the connection; a new server's
+  fingerprint must be confirmed before it is trusted; and a `known_hosts` file, or a line in
+  it, that can't be read stops every connection. Fetched names are checked to be plain file names before anything
   is written, and a fetch is limited in size, file count and depth. Uploads go to a temporary
   file that replaces the original, and are refused when the server's file changed since it
   was fetched. Passwords and passphrases stay in memory only, and are overwritten when no
