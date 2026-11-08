@@ -4447,8 +4447,9 @@ p4 set P4MERGE=oxidemerge
 +
 If `oxidemerge` is not on your `PATH`, give its full path, for example
 `/Applications/OxideMerge.app/Contents/MacOS/oxidemerge` on macOS.
-Do not add `--cli` to `P4DIFF`: with it, OxideMerge exits with 1 when the files differ, which
-p4 reports as *Execution Failed*.
+Do not add `--cli` to `P4DIFF`: with it, OxideMerge prints the differences instead of opening
+a window, and exits with 1 when the files differ, which p4 on macOS reports as
+*Execution Failed*.
 +
 `p4 set` stores the values in `~/.p4enviro` on macOS and Linux, and in the registry on
 Windows.
@@ -4508,9 +4509,9 @@ p4 then reports, for example, `//ws/f.txt - edit from //depot/main/f.txt`.
 .A conflict opened by `p4 resolve`
 image::p4-merge.png[Three-way merge opened by p4 resolve]
 
-If you close the window without saving, OxideMerge exits with code 1. p4 reports
-*Execution Failed* and the file stays unresolved; typing *ae* then warns that the file
-still has change markers.
+If you close the window without saving, OxideMerge exits with code 1 and the file stays
+unresolved: p4 suggests *e* rather than *ae* (on macOS it also reports *Execution Failed*),
+and typing *ae* warns that the file still has change markers.
 Run `p4 resolve` again to start over.
 
 ===== P4V
@@ -4593,11 +4594,10 @@ without saving, the result still contains P4V's markers.
 To take theirs or yours whole, use *Accept Source* or *Accept Target* instead.
 
 NOTE: Checked on Windows with SlikSVN 1.14.2, Mercurial 7.1.2 and p4/p4d 2026.1, using local
-Subversion and Mercurial repositories: *Compare with revision*, including a Subversion file
-whose name is not ASCII, and Mercurial with a name the ANSI code page can spell.
-p4d 2026.1 starts, and then requires a password before the first user can be created, so a
-resolve was not run against that server.
-The four-file merge and the exit code of an unchanged result are covered by tests.
+repositories and a local Perforce server: *Compare with revision*, including a Subversion file
+whose name is not ASCII, and Mercurial with a name the ANSI code page can spell; and merges
+from `svn update --accept launch`, `hg merge` and `p4 resolve` with the settings above, both
+saved (the conflict is resolved) and closed without saving (it stays unresolved).
 P4V keeps the argument string above.
 Its diff setting, and accepting a merge in P4V after saving, were tried earlier on macOS with
 P4V 2026.3 and were not repeated on Windows.
