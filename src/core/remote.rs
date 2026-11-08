@@ -37,7 +37,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How a connection is authenticated. The password or passphrase is overwritten in memory
 /// once it is dropped.
@@ -152,6 +152,9 @@ pub struct ConnOptions {
     pub client_cert: Option<PathBuf>,
     /// The certificate's private key (PEM), when it is not in the certificate's file.
     pub client_key: Option<PathBuf>,
+    /// SFTP only: whether the port was written out, so that it wins over the `Port` of
+    /// `~/.ssh/config` even when it is 22. Otherwise only another port does.
+    pub port_given: bool,
 }
 
 /// One question of a [`Challenge`].
@@ -195,25 +198,50 @@ fn ask(challenge: &Challenge, cancel: &AtomicBool) -> Option<Vec<String>> {
     asker(challenge, cancel).filter(|a| a.len() == challenge.prompts.len())
 }
 
-/// A remote file's size and modified time, to notice it changed on the server.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// A remote file's size and modified time, to notice it changed on the server. Two stamps are
+/// the same when their sizes and times are.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct RemoteStamp {
     pub size: u64,
     pub modified: u64,
+    /// Whether `modified` was within [`RECENT`] seconds of this machine's clock when the stamp
+    /// was read: another change in the same second would keep it, size and all.
+    pub recent: bool,
 }
 
+impl PartialEq for RemoteStamp {
+    fn eq(&self, other: &Self) -> bool {
+        (self.size, self.modified) == (other.size, other.modified)
+    }
+}
+
+impl Eq for RemoteStamp {}
+
+/// How many seconds old a modified time read is still too new to tell a change by, allowing
+/// for the server's clock being a little ahead.
+const RECENT: u64 = 5;
+
 impl RemoteStamp {
-    fn of(stat: &ssh2::FileStat) -> Self {
+    pub(crate) fn new(size: u64, modified: u64) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
         RemoteStamp {
-            size: stat.size.unwrap_or(0),
-            modified: stat.mtime.unwrap_or(0),
+            size,
+            modified,
+            recent: modified != 0 && modified + RECENT >= now,
         }
     }
 
-    /// Whether the server gave no modified time (an FTP server without `MDTM` or `MLST`), so
-    /// a change that kept the size cannot be told from the stamp alone.
+    fn of(stat: &ssh2::FileStat) -> Self {
+        Self::new(stat.size.unwrap_or(0), stat.mtime.unwrap_or(0))
+    }
+
+    /// Whether a change that kept the size cannot be told from the stamp alone: the server
+    /// gave no modified time (an FTP server without `MDTM` or `MLST`), or it was
+    /// [`RemoteStamp::recent`].
     pub fn is_weak(self) -> bool {
-        self.modified == 0
+        self.modified == 0 || self.recent
     }
 }
 
@@ -1106,7 +1134,8 @@ const MAX_JUMPS: usize = 8;
 fn session(conn: &RemoteConnection, cancel: &AtomicBool) -> Result<ssh2::Sftp> {
     let target = super::ssh_config::lookup(
         &conn.host,
-        (conn.port != Protocol::Sftp.default_port()).then_some(conn.port),
+        (conn.options.port_given || conn.port != Protocol::Sftp.default_port())
+            .then_some(conn.port),
         Some(conn.user.as_str()).filter(|u| !u.is_empty()),
     )?;
     let sess = open_ssh(&target, &conn.auth, conn.options.proxy.as_ref(), 0, cancel)?;
@@ -1237,7 +1266,9 @@ const RELAY_BUFFER: usize = 256 << 10;
 /// Copies between `socket` and `channel`, both ways, until both are done or either fails. The
 /// session is non-blocking so one thread serves both directions, waiting while nothing moves
 /// for either side to be ready (see [`relay_wait`]). Once `socket` is closed, what it sent is
-/// still passed on, then the end of it, and the channel is read to its end.
+/// still passed on, then the end of it, and the channel is read to its end, or given up on
+/// once nothing came for [`CONNECT_TIMEOUT`], so a jump host that never ends it does not keep
+/// the session open for good.
 fn relay(sess: ssh2::Session, mut channel: ssh2::Channel, mut socket: TcpStream) {
     use std::io::ErrorKind::{Interrupted, WouldBlock};
     sess.set_blocking(false);
@@ -1248,6 +1279,7 @@ fn relay(sess: ssh2::Session, mut channel: ssh2::Channel, mut socket: TcpStream)
     let mut buf = vec![0u8; 32 << 10];
     let (mut closed, mut eof_sent) = (false, false);
     let mut idle = 0;
+    let mut last_moved = Instant::now();
     loop {
         let mut moved = false;
         if !closed && up.len() < RELAY_BUFFER {
@@ -1306,6 +1338,11 @@ fn relay(sess: ssh2::Session, mut channel: ssh2::Channel, mut socket: TcpStream)
             }
         }
         if channel.eof() && down.is_empty() {
+            break;
+        }
+        if moved {
+            last_moved = Instant::now();
+        } else if eof_sent && last_moved.elapsed() > CONNECT_TIMEOUT {
             break;
         }
         idle = if moved { 0 } else { (idle + 1).min(10) };
@@ -1488,22 +1525,33 @@ fn ask_secret(shown: &str, text: String, cancel: &AtomicBool) -> Option<String> 
 /// Whether the private key file at `path` needs a passphrase: an OpenSSH key with a cipher, or
 /// an encrypted PEM key. Unreadable files are left for signing in to report.
 fn key_encrypted(path: &Path) -> bool {
-    let Ok(mut text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let encrypted = text.contains("ENCRYPTED") || {
-        let body = text
-            .split("-----BEGIN OPENSSH PRIVATE KEY-----")
-            .nth(1)
-            .and_then(|rest| rest.split("-----END").next());
-        let bytes = body.and_then(|b| decode_base64(&b.split_whitespace().collect::<String>()));
-        let cipher = bytes.as_deref().and_then(|b| {
-            let b = b.strip_prefix(b"openssh-key-v1\0")?;
-            let len = u32::from_be_bytes(b.get(..4)?.try_into().ok()?) as usize;
-            b.get(4..4 + len).map(<[u8]>::to_vec)
+    let mut text = String::new();
+    let read = std::fs::File::open(path).and_then(|mut f| {
+        // Room for all of it at once: growing the buffer would leave copies of the key behind.
+        text.reserve(f.metadata()?.len() as usize + 1);
+        f.read_to_string(&mut text)
+    });
+    let encrypted = read.is_ok()
+        && (text.contains("ENCRYPTED") || {
+            // Only the start, which names the cipher: the key itself is never decoded here.
+            let head: String = text
+                .split("-----BEGIN OPENSSH PRIVATE KEY-----")
+                .nth(1)
+                .map(|rest| {
+                    rest.chars()
+                        .filter(|c| !c.is_whitespace())
+                        .take_while(|&c| c != '-')
+                        .take(64)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let cipher = decode_base64(&head).and_then(|b| {
+                let b = b.strip_prefix(b"openssh-key-v1\0")?;
+                let len = u32::from_be_bytes(b.get(..4)?.try_into().ok()?) as usize;
+                b.get(4..4 + len).map(<[u8]>::to_vec)
+            });
+            cipher.is_some_and(|c| c != b"none")
         });
-        cipher.is_some_and(|c| c != b"none")
-    };
     wipe(&mut text);
     encrypted
 }
@@ -2062,7 +2110,7 @@ fn local_name_ok(name: &str) -> bool {
         const RESERVED: &[&str] = &[
             "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
             "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-            "CONIN$", "CONOUT$",
+            "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³", "CONIN$", "CONOUT$",
         ];
         let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
         if name.contains(['\\', ':', '*', '?', '"', '<', '>', '|'])
@@ -2696,10 +2744,13 @@ fn browse_in(fs: &dyn RemoteFs, path: &str, cancel: &AtomicBool) -> Result<Listi
 /// would take seconds every time. The connection is made on the first [`Browser::list`], and
 /// again on the next one after it failed; it is closed when the browser is dropped.
 pub struct Browser {
-    requests: Option<mpsc::Sender<String>>,
+    requests: Option<mpsc::Sender<(u64, String)>>,
     #[cfg(test)]
-    done: mpsc::Sender<Result<Listing>>,
-    results: mpsc::Receiver<Result<Listing>>,
+    done: mpsc::Sender<(u64, Result<Listing>)>,
+    results: mpsc::Receiver<(u64, Result<Listing>)>,
+    /// How many folders were asked for: each listing comes back with its number, and only
+    /// the last one asked for is shown.
+    asked: std::cell::Cell<u64>,
     cancel: std::sync::Arc<AtomicBool>,
 }
 
@@ -2713,17 +2764,18 @@ impl Browser {
                 requests: None,
                 done,
                 results,
+                asked: Default::default(),
                 cancel,
             };
         }
-        let (requests, asked) = mpsc::channel::<String>();
+        let (requests, asked) = mpsc::channel::<(u64, String)>();
         let (tx, stop) = (done.clone(), cancel.clone());
         std::thread::spawn(move || {
             let mut open: Option<Box<dyn Remote>> = None;
-            while let Ok(mut path) = asked.recv() {
+            while let Ok((mut n, mut path)) = asked.recv() {
                 // Only the folder asked for last matters once the user has moved on.
                 while let Ok(newer) = asked.try_recv() {
-                    path = newer;
+                    (n, path) = newer;
                 }
                 let listed = match &open {
                     Some(r) => browse_in(&**r, &path, &stop),
@@ -2738,7 +2790,7 @@ impl Browser {
                 if listed.is_err() {
                     open = None;
                 }
-                if tx.send(listed).is_err() {
+                if tx.send((n, listed)).is_err() {
                     break;
                 }
             }
@@ -2748,6 +2800,7 @@ impl Browser {
             #[cfg(test)]
             done,
             results,
+            asked: Default::default(),
             cancel,
         }
     }
@@ -2755,23 +2808,30 @@ impl Browser {
     /// Asks for the folder `path` names to be listed (see [`browse_in`]); [`Browser::poll`]
     /// returns it once it is. Fails with [`UnknownHost`] for a server not trusted yet.
     pub fn list(&self, path: &str) {
+        let n = self.asked.get() + 1;
+        self.asked.set(n);
         #[cfg(test)]
         if self.requests.is_none() {
             if let Some(remote) = fake::connect() {
-                let _ = self
-                    .done
-                    .send(remote.and_then(|r| browse_in(&*r, path, &self.cancel)));
+                let listed = remote.and_then(|r| browse_in(&*r, path, &self.cancel));
+                let _ = self.done.send((n, listed));
             }
             return;
         }
         if let Some(requests) = &self.requests {
-            let _ = requests.send(path.to_string());
+            let _ = requests.send((n, path.to_string()));
         }
     }
 
-    /// The next listing done since the last call, if any.
+    /// The listing of the folder asked for last, once it is done; those of folders asked for
+    /// before it are dropped.
     pub fn poll(&self) -> Option<Result<Listing>> {
-        self.results.try_recv().ok()
+        while let Ok((n, listed)) = self.results.try_recv() {
+            if n == self.asked.get() {
+                return Some(listed);
+            }
+        }
+        None
     }
 }
 
@@ -2872,13 +2932,13 @@ pub mod fake {
 
         fn stamp(&self, path: &str) -> Option<RemoteStamp> {
             let bytes = self.entries.get(path)?.as_ref()?;
-            Some(RemoteStamp {
-                size: bytes.len() as u64,
-                modified: match self.weak {
+            Some(RemoteStamp::new(
+                bytes.len() as u64,
+                match self.weak {
                     true => 0,
                     false => self.versions.get(path).copied().unwrap_or(0) + 1,
                 },
-            })
+            ))
         }
     }
 

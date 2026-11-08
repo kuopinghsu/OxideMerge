@@ -2490,30 +2490,60 @@ fn journals(journal_root: &Path) -> Vec<Header> {
 
 /// Opens and locks the journal file of `dir`; `None` while a synchronization uses it.
 fn claim(dir: &Path) -> std::io::Result<Option<std::fs::File>> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .append(true)
-        .open(dir.join(JOURNAL_FILE))?;
+    claim_all(&[dir]).pop().unwrap_or(Ok(None))
+}
+
+/// [`claim`]s the journal files of `dirs` together, so the tries for those in use take no
+/// longer than for one.
+fn claim_all(dirs: &[&Path]) -> Vec<std::io::Result<Option<std::fs::File>>> {
+    let open = |dir: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(dir.join(JOURNAL_FILE))
+    };
+    let mut files: Vec<std::io::Result<(std::fs::File, bool)>> =
+        dirs.iter().map(|d| open(d).map(|f| (f, false))).collect();
     // A process being started copies every open file until it runs its program, and with it
     // the lock of a synchronization that has just let it go: a few short tries outlast that.
-    for _ in 0..10 {
-        match file.try_lock() {
-            Ok(()) => return Ok(Some(file)),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                std::thread::sleep(std::time::Duration::from_millis(10))
+    for tries in 1..=10 {
+        let mut waiting = false;
+        for f in &mut files {
+            let Ok((file, locked)) = f else {
+                continue;
+            };
+            if *locked {
+                continue;
             }
-            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            match file.try_lock() {
+                Ok(()) => *locked = true,
+                Err(std::fs::TryLockError::WouldBlock) => waiting = true,
+                Err(std::fs::TryLockError::Error(e)) => *f = Err(e),
+            }
+        }
+        if !waiting {
+            break;
+        }
+        if tries < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
-    Ok(None)
+    files
+        .into_iter()
+        .map(|f| f.map(|(file, locked)| locked.then_some(file)))
+        .collect()
 }
 
 /// The unfinished synchronizations recorded under `journal_root`, oldest first.
 pub fn unfinished(journal_root: &Path) -> Vec<Unfinished> {
-    journals(journal_root)
+    let found = journals(journal_root);
+    let dirs: Vec<&Path> = found.iter().map(|h| h.dir.as_path()).collect();
+    let files = claim_all(&dirs);
+    found
         .into_iter()
-        .filter_map(|h| {
-            let file = claim(&h.dir).ok()??;
+        .zip(files)
+        .filter_map(|(h, file)| {
+            let file = file.ok()??;
             // The header was read before the lock was taken. A synchronization that finishes in
             // between removes its header and only then lets the lock go, so the header is read
             // again now that it is held: without this, one that has just succeeded would be

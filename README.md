@@ -51,13 +51,22 @@ pages.
   only brought up to date from it, then apply the changes after you confirm. If applying
   fails or you stop it, the changes made so far are undone.
 - Open ZIP, TAR, 7z and other supported archives as folders. Edit, copy, merge or delete
-  their files and save to write the changes back into the archive.
+  their files and save to write the changes back into the archive; a slow-to-compress
+  `.tar.xz` or 7z is written in the background.
 - Compare a file or folder with a Git, Subversion or Mercurial revision.
-- **Compare over SFTP:** connect to a server by host, port, user, and a password or a private
-  key, and fetch a file or folder to compare — open it twice for two remote locations, or once
-  against a local path. A fetched file is writable: *Save* re-uploads it, unless it changed on the
-  server meanwhile. A fetched folder opens read-only. A new server's host key fingerprint is shown
-  for you to confirm before anything is sent. The connection, including the password or passphrase, is kept only in memory for
+- **Compare over SFTP and FTP:** connect to a server over SFTP, FTPS or plain FTP by host,
+  port, user, and a password, a private key or `ssh-agent`, and fetch a file or folder to
+  compare — open it twice for two remote locations, or once against a local path. Type the
+  remote path, or pick it from a list of the server's folders and files. Fetched files and
+  folders are writable: *Save* uploads what changed and deletes what was removed, except
+  what changed on the server meanwhile, and *Reload from server* fetches again. A new
+  server's host key or self-signed certificate fingerprint is shown for you to confirm before
+  anything is sent. On the command line and in jobs, a path can be `sftp://`, `ftp://`,
+  `ftpes://` or `ftps://`, with the password from `OXIDEMERGE_REMOTE_PASSWORD`. SFTP follows
+  `~/.ssh/config` (aliases, keys, `ProxyJump` and `ProxyCommand`), asks the server's sign-in
+  questions such as one-time codes, and accepts host certificates from a `@cert-authority`;
+  SFTP and FTP can go through a SOCKS5 or HTTP proxy, FTP can use active mode, and FTPS can
+  present a client certificate. The connection, including the password or passphrase, is kept only in memory for
   the tab's lifetime.
 
 ### Text

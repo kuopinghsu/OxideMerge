@@ -28,11 +28,34 @@ pub struct Saved {
     pub errors: Vec<String>,
 }
 
-/// The files and folders of `local`, by their `/`-separated paths relative to it: regular files
-/// and folders only, without following links, as a fetch wrote them. Fails when `local` is gone
-/// or any of it cannot be read: what could not be read would otherwise look deleted, and be
-/// deleted on the server.
-fn local_tree(local: &Path) -> Result<(BTreeMap<String, PathBuf>, BTreeSet<String>)> {
+/// The files and folders of a local copy, by their `/`-separated paths relative to it.
+#[derive(Default)]
+struct Tree {
+    files: BTreeMap<String, PathBuf>,
+    dirs: BTreeSet<String>,
+    /// Links and special files, which are not saved.
+    skipped: BTreeSet<String>,
+    /// What has a name that is not Unicode, which cannot be saved (shown as near as can be).
+    unnamed: BTreeSet<String>,
+}
+
+impl Tree {
+    /// Whether `rel`, or a folder it is in, is [`Tree::skipped`]: what the server has there
+    /// is not to be deleted, as though it were gone here.
+    fn shadowed(&self, rel: &str) -> bool {
+        self.skipped.iter().any(|s| {
+            rel == s
+                || rel
+                    .strip_prefix(s.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+        })
+    }
+}
+
+/// The files and folders of `local`: regular files and folders only, without following links,
+/// as a fetch wrote them. Fails when `local` is gone or any of it cannot be read: what could not
+/// be read would otherwise look deleted, and be deleted on the server.
+fn local_tree(local: &Path) -> Result<Tree> {
     let unreadable = || {
         trf(
             "msg.remote_local_unreadable",
@@ -42,36 +65,45 @@ fn local_tree(local: &Path) -> Result<(BTreeMap<String, PathBuf>, BTreeSet<Strin
     if !std::fs::symlink_metadata(local).is_ok_and(|m| m.is_dir()) {
         bail!(unreadable());
     }
-    let (mut files, mut dirs) = (BTreeMap::new(), BTreeSet::new());
-    for e in walkdir::WalkDir::new(local)
+    let mut tree = Tree::default();
+    let mut walk = walkdir::WalkDir::new(local)
         .min_depth(1)
         .follow_links(false)
-    {
+        .into_iter();
+    while let Some(e) = walk.next() {
         let e = e.with_context(unreadable)?;
         let Ok(rel) = e.path().strip_prefix(local) else {
             continue;
         };
-        let Some(rel) = rel
+        let named = rel
             .components()
             .map(|c| c.as_os_str().to_str())
-            .collect::<Option<Vec<_>>>()
-        else {
+            .collect::<Option<Vec<_>>>();
+        let Some(rel) = named.map(|parts| parts.join("/")) else {
+            tree.unnamed.insert(
+                rel.to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+            );
+            if e.file_type().is_dir() {
+                walk.skip_current_dir();
+            }
             continue;
         };
-        let rel = rel.join("/");
         if e.file_type().is_dir() {
-            dirs.insert(rel);
+            tree.dirs.insert(rel);
         } else if e.file_type().is_file() {
-            files.insert(rel, e.into_path());
+            tree.files.insert(rel, e.into_path());
+        } else {
+            tree.skipped.insert(rel);
         }
     }
-    Ok((files, dirs))
+    Ok(tree)
 }
 
 /// Whether `local` differs from what `manifest` says was fetched into it (or last saved). One
 /// that cannot be read counts as changed, so saving it tells why it cannot be saved.
 pub fn changed(local: &Path, manifest: &Manifest) -> bool {
-    let Ok((files, dirs)) = local_tree(local) else {
+    let Ok(Tree { files, dirs, .. }) = local_tree(local) else {
         return true;
     };
     dirs != manifest.dirs
@@ -114,7 +146,7 @@ fn save_with(
         manifest: manifest.clone(),
         ..Saved::default()
     };
-    let (files, dirs) = match local_tree(local) {
+    let tree = match local_tree(local) {
         Ok(tree) => tree,
         Err(e) => {
             out.errors.push(format!("{e:#}"));
@@ -128,35 +160,46 @@ fn save_with(
         }
         stop
     };
+    // What is here but cannot be saved, where it would otherwise be lost: a name that is not
+    // Unicode, or a link or special file where the server has a file or folder.
+    for s in &tree.skipped {
+        let in_manifest = |rel: &String| rel == s || rel.starts_with(&format!("{s}/"));
+        if manifest.files.keys().any(in_manifest) || manifest.dirs.iter().any(in_manifest) {
+            out.errors
+                .push(trf("msg.remote_local_skipped", &[("path", at(s))]));
+        }
+    }
+    for s in &tree.unnamed {
+        out.errors
+            .push(trf("msg.remote_local_skipped", &[("path", at(s))]));
+    }
+    let gone_files: Vec<(&String, &(super::remote::RemoteStamp, u64))> = manifest
+        .files
+        .iter()
+        .filter(|(rel, _)| !tree.files.contains_key(*rel) && !tree.shadowed(rel))
+        .collect();
+    let gone_dirs: Vec<&String> = manifest
+        .dirs
+        .difference(&tree.dirs)
+        .filter(|rel| !tree.shadowed(rel))
+        .collect();
 
-    // Files deleted here, while each is still on the server as fetched.
-    for (rel, (stamp, hash)) in &manifest.files {
-        if files.contains_key(rel) || stopped(&mut out) {
-            continue;
+    // Files a folder made here takes the place of go first, so the folder can be made; every
+    // other deletion waits until all that is new is written, so that a file renamed here is
+    // never only deleted on the server.
+    let (in_the_way, gone_files): (Vec<_>, Vec<_>) = gone_files
+        .into_iter()
+        .partition(|(rel, _)| tree.dirs.contains(*rel));
+    for (rel, (stamp, hash)) in in_the_way {
+        if stopped(&mut out) {
+            break;
         }
-        let path = at(rel);
-        if r.stamp(&path).is_ok_and(|now| now.is_none()) {
-            out.manifest.files.remove(rel);
-            continue;
-        }
-        match still_as(r, &path, *stamp, *hash, cancel) {
-            Ok(true) => match r.remove_file(&path) {
-                Ok(()) => {
-                    out.manifest.files.remove(rel);
-                    out.deleted += 1;
-                }
-                Err(e) => out.errors.push(format!("{e:#}")),
-            },
-            Ok(false) => out
-                .errors
-                .push(trf("msg.remote_not_deleted", &[("path", path)])),
-            Err(e) => out.errors.push(format!("{e:#}")),
-        }
+        delete_file(r, &at(rel), rel, *stamp, *hash, cancel, &mut out);
     }
 
     // Folders made here, each before what is in it.
     let mut failed_dirs: Vec<String> = Vec::new();
-    for rel in dirs.difference(&manifest.dirs) {
+    for rel in tree.dirs.difference(&manifest.dirs) {
         if stopped(&mut out) {
             break;
         }
@@ -182,69 +225,46 @@ fn save_with(
         }
     }
 
-    // Files edited or made here.
-    for (rel, local_path) in &files {
+    // Files edited or made here; those where a folder deleted here still is, once it is gone.
+    // What could not be written is remembered by its bytes: it may be a file moved here, whose
+    // old place then must not be deleted on the server yet.
+    let mut unsaved = std::collections::HashSet::new();
+    let (failed, files): (Vec<_>, Vec<_>) = tree.files.iter().partition(|(rel, _)| {
+        failed_dirs
+            .iter()
+            .any(|d| rel.starts_with(&format!("{d}/")))
+    });
+    unsaved.extend(failed.into_iter().filter_map(|(_, p)| file_hash(p)));
+    let (later, now): (Vec<_>, Vec<_>) = files
+        .into_iter()
+        .partition(|(rel, _)| gone_dirs.contains(rel));
+    for (rel, local_path) in now {
         if stopped(&mut out) {
             break;
         }
-        if failed_dirs
-            .iter()
-            .any(|d| rel.starts_with(&format!("{d}/")))
-        {
-            continue;
+        unsaved.extend(upload_file(
+            r,
+            &at(rel),
+            rel,
+            local_path,
+            manifest,
+            cancel,
+            &mut out,
+        ));
+    }
+
+    // Files deleted here, while each is still on the server as fetched.
+    for (rel, (stamp, hash)) in gone_files {
+        if stopped(&mut out) {
+            break;
         }
-        let Some(hash) = file_hash(local_path) else {
-            out.errors.push(trf(
-                "msg.sftp_cannot_read",
-                &[("path", local_path.display().to_string())],
-            ));
-            continue;
-        };
-        let path = at(rel);
-        // A new file is refused by `put` if someone made one there meanwhile.
-        let expected = match manifest.files.get(rel) {
-            Some((_, fetched)) if *fetched == hash => continue,
-            Some((stamp, fetched)) => {
-                // The stamp alone may not tell a change (`put` checks that much).
-                if stamp.is_weak() {
-                    match still_as(r, &path, *stamp, *fetched, cancel) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            out.errors
-                                .push(trf("msg.sftp_changed_on_server", &[("path", path)]));
-                            continue;
-                        }
-                        Err(e) => {
-                            out.errors.push(format!("{e:#}"));
-                            continue;
-                        }
-                    }
-                }
-                Some(*stamp)
-            }
-            None => None,
-        };
-        match r.put(local_path, &path, expected, cancel) {
-            Ok(stamp) => {
-                out.manifest.files.insert(rel.clone(), (stamp, hash));
-                out.uploaded += 1;
-            }
-            Err(e) => {
-                // Expected as this upload left it, so saving again finishes it rather than
-                // being refused; what it holds now is read back, as its stamp may not tell.
-                if let Some(stamp) = e.downcast_ref::<PartlyWritten>().and_then(|p| p.stamp) {
-                    if let Ok(now) = r.open_read(&path).and_then(|f| hash_of(f, cancel)) {
-                        out.manifest.files.insert(rel.clone(), (stamp, now));
-                    }
-                }
-                out.errors.push(format!("{e:#}"));
-            }
+        if !unsaved.contains(hash) {
+            delete_file(r, &at(rel), rel, *stamp, *hash, cancel, &mut out);
         }
     }
 
     // Folders deleted here, each after what was in it.
-    let gone: Vec<&String> = manifest.dirs.difference(&dirs).collect();
-    for rel in gone.into_iter().rev() {
+    for rel in gone_dirs.into_iter().rev() {
         if stopped(&mut out) {
             break;
         }
@@ -256,7 +276,108 @@ fn save_with(
             Err(e) => out.errors.push(format!("{e:#}")),
         }
     }
+
+    for (rel, local_path) in later {
+        if stopped(&mut out) {
+            break;
+        }
+        let _ = upload_file(r, &at(rel), rel, local_path, manifest, cancel, &mut out);
+    }
     out
+}
+
+/// Deletes the file `path` (`rel` in the manifest) deleted here, if it is still on the server
+/// as fetched (`stamp`, its bytes hashing to `hash`).
+fn delete_file(
+    r: &dyn Remote,
+    path: &str,
+    rel: &str,
+    stamp: super::remote::RemoteStamp,
+    hash: u64,
+    cancel: &AtomicBool,
+    out: &mut Saved,
+) {
+    if r.stamp(path).is_ok_and(|now| now.is_none()) {
+        out.manifest.files.remove(rel);
+        return;
+    }
+    match still_as(r, path, stamp, hash, cancel) {
+        Ok(true) => match r.remove_file(path) {
+            Ok(()) => {
+                out.manifest.files.remove(rel);
+                out.deleted += 1;
+            }
+            Err(e) => out.errors.push(format!("{e:#}")),
+        },
+        Ok(false) => out
+            .errors
+            .push(trf("msg.remote_not_deleted", &[("path", path.to_string())])),
+        Err(e) => out.errors.push(format!("{e:#}")),
+    }
+}
+
+/// Uploads `local_path`, the file `rel` here, to `path` if it is new or changed since
+/// `manifest` was made, and the server's copy did not change meanwhile. Returns the hash of
+/// its bytes when it was not written.
+fn upload_file(
+    r: &dyn Remote,
+    path: &str,
+    rel: &str,
+    local_path: &Path,
+    manifest: &Manifest,
+    cancel: &AtomicBool,
+    out: &mut Saved,
+) -> Option<u64> {
+    let Some(hash) = file_hash(local_path) else {
+        out.errors.push(trf(
+            "msg.sftp_cannot_read",
+            &[("path", local_path.display().to_string())],
+        ));
+        return None;
+    };
+    // A new file is refused by `put` if someone made one there meanwhile.
+    let expected = match manifest.files.get(rel) {
+        Some((_, fetched)) if *fetched == hash => return None,
+        Some((stamp, fetched)) => {
+            // The stamp alone may not tell a change (`put` checks that much).
+            if stamp.is_weak() {
+                match still_as(r, path, *stamp, *fetched, cancel) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        out.errors.push(trf(
+                            "msg.sftp_changed_on_server",
+                            &[("path", path.to_string())],
+                        ));
+                        return Some(hash);
+                    }
+                    Err(e) => {
+                        out.errors.push(format!("{e:#}"));
+                        return Some(hash);
+                    }
+                }
+            }
+            Some(*stamp)
+        }
+        None => None,
+    };
+    match r.put(local_path, path, expected, cancel) {
+        Ok(stamp) => {
+            out.manifest.files.insert(rel.to_string(), (stamp, hash));
+            out.uploaded += 1;
+            None
+        }
+        Err(e) => {
+            // Expected as this upload left it, so saving again finishes it rather than
+            // being refused; what it holds now is read back, as its stamp may not tell.
+            if let Some(stamp) = e.downcast_ref::<PartlyWritten>().and_then(|p| p.stamp) {
+                if let Ok(now) = r.open_read(path).and_then(|f| hash_of(f, cancel)) {
+                    out.manifest.files.insert(rel.to_string(), (stamp, now));
+                }
+            }
+            out.errors.push(format!("{e:#}"));
+            Some(hash)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -561,6 +682,48 @@ mod tests {
             fake::entry("/srv/data/a.txt"),
             Some(Some(b"lower".to_vec()))
         );
+        fake::uninstall();
+    }
+
+    #[test]
+    fn moves_folders_turned_files_and_links_here_lose_nothing_on_the_server() {
+        let never = AtomicBool::new(false);
+        fake::install(server().write_fails("/srv/data/moved.txt"));
+        let f = remote::fetch(&conn(), "/srv/data", &never).unwrap();
+        let manifest = f.manifest.clone().unwrap();
+        let l = &f.local;
+        std::fs::remove_dir_all(l.join("old")).unwrap();
+        std::fs::write(l.join("old"), "now a file").unwrap();
+        // Moved, but the new place cannot be written: the old one is kept.
+        std::fs::rename(l.join("a.txt"), l.join("moved.txt")).unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir_all(l.join("keep")).unwrap();
+            std::os::unix::fs::symlink("/nowhere", l.join("keep")).unwrap();
+        }
+
+        let saved = save_folder(&conn(), l, "/srv/data", &manifest, &never).unwrap();
+        assert_eq!(
+            fake::entry("/srv/data/old"),
+            Some(Some(b"now a file".to_vec()))
+        );
+        assert!(fake::was_removed("/srv/data/old/c.txt"));
+        assert_eq!(fake::entry("/srv/data/a.txt"), Some(Some(b"a".to_vec())));
+        let all = saved.errors.join("\n");
+        assert!(all.contains("/srv/data/moved.txt"), "{all}");
+        #[cfg(unix)]
+        {
+            assert_eq!(saved.errors.len(), 2, "{all}");
+            assert!(all.contains(&trf(
+                "msg.remote_local_skipped",
+                &[("path", "/srv/data/keep".to_string())]
+            )));
+            assert_eq!(
+                fake::entry("/srv/data/keep/d.txt"),
+                Some(Some(b"d".to_vec()))
+            );
+        }
+        assert!(changed(l, &saved.manifest));
         fake::uninstall();
     }
 

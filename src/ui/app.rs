@@ -210,6 +210,37 @@ struct UploadRun {
     errors: Vec<String>,
 }
 
+/// An archive slow to compress to write back with [`archive::repack_all`] on another thread:
+/// the folder tab and side it is extracted on (`None` for one from a closed tab), the
+/// archive file, and the folder it was extracted to.
+struct Repack {
+    side: Option<(u64, usize)>,
+    archive: PathBuf,
+    root: PathBuf,
+}
+
+/// How writing back a [`Repack`] went: its side, and the archive files written or why not.
+type Repacked = (Option<(u64, usize)>, Result<Vec<PathBuf>, String>);
+
+/// Archives slow to compress being written back on another thread, one after the other,
+/// before the sides that saving them touched are uploaded.
+struct RepackRun {
+    rx: std::sync::mpsc::Receiver<Repacked>,
+    /// What is being written, as shown.
+    names: String,
+    done: Vec<Repacked>,
+    /// Asked for while these were under way, started once they are done.
+    later: Vec<Repack>,
+    /// The tabs to upload once done (see [`OxideMergeApp::queue_uploads`]).
+    up: Vec<u64>,
+    /// What to do once every archive was written and uploaded (see [`UploadRun::then`]).
+    then: Option<Prompt>,
+    queued: bool,
+    /// The temporary folders the archives were extracted to, kept until they are written
+    /// even if their tabs close meanwhile.
+    _keep: Vec<std::sync::Arc<tempfile::TempDir>>,
+}
+
 /// *Reload from server* under way on another thread: each side fetched again, and how.
 struct ReloadRun {
     tab: u64,
@@ -398,7 +429,8 @@ impl Tab {
     }
 
     /// Saves changes; for a folder compare, repacks every archive side with pending edits
-    /// back into its archive file (see [`App::mark_origin_folder_dirty`]).
+    /// back into its archive file (see [`App::mark_origin_folder_dirty`]), but for those slow
+    /// to repack, which [`OxideMergeApp::after_save`] writes on another thread.
     fn save(&mut self) -> anyhow::Result<()> {
         match &mut self.content {
             Content::Folder(v) => match v.save_archives().1 {
@@ -1438,6 +1470,24 @@ impl RemoteDialog {
         Ok(Some(proxy))
     }
 
+    /// Moves a password typed into the proxy URL to its own field, where it is not shown and is
+    /// wiped with the dialog.
+    fn hide_proxy_password(&mut self) {
+        let Ok(mut proxy) = crate::core::net::Proxy::parse(&self.proxy) else {
+            return;
+        };
+        let Some(mut password) = proxy.password.take() else {
+            return;
+        };
+        if self.proxy_password.is_empty() {
+            self.proxy_password = password;
+        } else {
+            remote::wipe(&mut password);
+        }
+        let mut typed = std::mem::replace(&mut self.proxy, proxy.url());
+        remote::wipe(&mut typed);
+    }
+
     /// The connection the fields describe, once every one it needs is filled in. A user name
     /// is optional over SFTP, where `~/.ssh/config` or the local user's name stands in.
     fn conn(&self) -> Option<remote::RemoteConnection> {
@@ -1460,6 +1510,7 @@ impl RemoteDialog {
             active: self.protocol.is_ftp() && self.active,
             client_cert: file(&self.client_cert),
             client_key: file(&self.client_key).filter(|_| !self.client_cert.trim().is_empty()),
+            port_given: false,
         };
         let auth = match sign_in {
             SignIn::Key => remote::Auth::Key {
@@ -1503,6 +1554,7 @@ impl Drop for RemoteDialog {
         remote::wipe(&mut self.password);
         remote::wipe(&mut self.passphrase);
         remote::wipe(&mut self.proxy_password);
+        remote::wipe(&mut self.proxy);
     }
 }
 
@@ -1519,11 +1571,14 @@ fn remote_advanced(ui: &mut egui::Ui, d: &mut RemoteDialog) {
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
                     ui.label(tr("label.remote_proxy"));
-                    ui.add(
+                    let field = ui.add(
                         egui::TextEdit::singleline(&mut d.proxy)
                             .hint_text("socks5://host:1080")
                             .desired_width(260.0),
                     );
+                    if field.lost_focus() {
+                        d.hide_proxy_password();
+                    }
                     ui.end_row();
                     if !d.proxy.trim().is_empty() {
                         ui.label(tr("label.remote_proxy_password"));
@@ -1535,7 +1590,13 @@ fn remote_advanced(ui: &mut egui::Ui, d: &mut RemoteDialog) {
                         ui.end_row();
                         if let Err(e) = d.proxy() {
                             ui.label("");
-                            ui.colored_label(ui.visuals().error_fg_color, format!("{e:#}"));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{e:#}"))
+                                        .color(ui.visuals().error_fg_color),
+                                )
+                                .wrap(),
+                            );
                             ui.end_row();
                         }
                     }
@@ -1621,6 +1682,9 @@ struct RemoteBrowse {
     /// Whether `asked` is being listed.
     loading: bool,
     error: Option<String>,
+    /// The path field when `asked` was asked for: its listing fills the field in only if the
+    /// user did not change it meanwhile (picking a file, say).
+    field: String,
 }
 
 impl RemoteBrowse {
@@ -1632,13 +1696,15 @@ impl RemoteBrowse {
             listing: None,
             loading: false,
             error: None,
+            field: String::new(),
         };
-        b.list(path);
+        b.list(path, path);
         b
     }
 
-    fn list(&mut self, path: &str) {
+    fn list(&mut self, path: &str, field: &str) {
         self.asked = path.to_string();
+        self.field = field.to_string();
         self.loading = true;
         self.browser.list(path);
     }
@@ -1868,6 +1934,7 @@ pub struct OxideMergeApp {
     upload: Option<UploadRun>,
     /// Uploads asked for while others were under way, started once they are done.
     upload_queue: Vec<UploadJob>,
+    repack: Option<RepackRun>,
     /// The tab whose *Reload from server* waits for the user to agree to lose its changes.
     reload_prompt: Option<u64>,
     reload: Option<ReloadRun>,
@@ -2744,6 +2811,7 @@ impl OxideMergeApp {
             host_prompt: None,
             upload: None,
             upload_queue: Vec::new(),
+            repack: None,
             reload_prompt: None,
             reload: None,
             pending_remote: Vec::new(),
@@ -3448,12 +3516,15 @@ impl OxideMergeApp {
         if let Some(b) = &mut d.browse {
             if let Some(listed) = b.browser.poll() {
                 b.loading = false;
+                ctx.request_repaint();
                 match listed {
                     Ok(l) => {
-                        d.remote_path = match &l.file {
-                            Some(file) => remote::join(&l.path, file),
-                            None => l.path.clone(),
-                        };
+                        if d.remote_path == b.field {
+                            d.remote_path = match &l.file {
+                                Some(file) => remote::join(&l.path, file),
+                                None => l.path.clone(),
+                            };
+                        }
                         b.error = None;
                         b.listing = Some(l);
                     }
@@ -3484,6 +3555,7 @@ impl OxideMergeApp {
         let (mut toggle_browse, mut go, mut pick, mut fetch_now) = (false, None, None, None);
         let modal = egui::Modal::new(egui::Id::unique("remote_connect_dialog")).show(ctx, |ui| {
             ui.set_min_width(440.0);
+            ui.set_max_width(600.0);
             if widgets::dialog_title(ui, &plain(tr("menu.open_remote"))) {
                 cancel = true;
             }
@@ -3542,7 +3614,12 @@ impl OxideMergeApp {
                     }
                     if d.sign_in() == SignIn::Agent {
                         ui.label("");
-                        ui.weak(tr("msg.remote_agent_hint"));
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(tr("msg.remote_agent_hint")).weak(),
+                            )
+                            .wrap(),
+                        );
                         ui.end_row();
                     } else if d.sign_in() == SignIn::Key {
                         ui.label(tr("label.remote_key_path"));
@@ -3660,10 +3737,35 @@ impl OxideMergeApp {
                                             remote::EntryKind::Link => Icon::ChevronRight,
                                         };
                                         widgets::small_icon(ui, icon, ui.visuals().text_color());
-                                        let row =
-                                            ui.selectable_label(d.remote_path == full, &e.name);
-                                        if e.kind == remote::EntryKind::File {
-                                            ui.weak(report::fmt_size(Some(e.size)));
+                                        let size = (e.kind == remote::EntryKind::File)
+                                            .then(|| report::fmt_size(Some(e.size)));
+                                        let size_width = size.as_ref().map_or(0.0, |s| {
+                                            ui.painter()
+                                                .layout_no_wrap(
+                                                    s.clone(),
+                                                    egui::TextStyle::Body.resolve(ui.style()),
+                                                    egui::Color32::PLACEHOLDER,
+                                                )
+                                                .size()
+                                                .x
+                                                + ui.spacing().item_spacing.x
+                                        });
+                                        let row = ui
+                                            .scope(|ui| {
+                                                ui.set_max_width(
+                                                    (ui.available_width() - size_width).max(40.0),
+                                                );
+                                                ui.add(
+                                                    egui::Button::selectable(
+                                                        d.remote_path == full,
+                                                        &e.name,
+                                                    )
+                                                    .truncate(),
+                                                )
+                                            })
+                                            .inner;
+                                        if let Some(size) = size {
+                                            ui.weak(size);
                                         }
                                         if e.kind != remote::EntryKind::File {
                                             if row.clicked() {
@@ -3712,7 +3814,7 @@ impl OxideMergeApp {
             };
         }
         if let (Some(path), Some(b)) = (go, &mut d.browse) {
-            b.list(&path);
+            b.list(&path, &d.remote_path);
         }
         if let Some(path) = pick {
             d.remote_path = path;
@@ -3970,7 +4072,9 @@ impl OxideMergeApp {
             match remote::trust_host(&p.host) {
                 Ok(()) if p.browse => {
                     self.remote_dlg = p.dialog.map(|mut d| {
-                        d.browse = Some(RemoteBrowse::start(p.conn, &p.remote_path));
+                        let mut b = RemoteBrowse::start(p.conn, &p.remote_path);
+                        b.field = d.remote_path.clone();
+                        d.browse = Some(b);
                         d
                     });
                 }
@@ -5867,7 +5971,7 @@ impl OxideMergeApp {
     /// uploads their sides fetched over SFTP (and the archives just repacked, for an archive
     /// fetched that way) on another thread. Returns the errors to show.
     fn after_save(&mut self, ids: &[u64]) -> Vec<String> {
-        let (mut errors, folders) = self.save_origin_folder_archives(ids);
+        let (mut errors, folders, slow) = self.save_origin_folder_archives(ids);
         for t in &mut self.tabs {
             if ids.contains(&t.id) {
                 if let Content::Text(v) = t.content.view_mut() {
@@ -5879,8 +5983,142 @@ impl OxideMergeApp {
         let mut up = ids.to_vec();
         up.extend(folders);
         up.extend(self.mark_origin_remote_folders(ids));
-        errors.extend(self.queue_uploads(&up));
+        if slow.is_empty() && self.repack.is_none() {
+            errors.extend(self.queue_uploads(&up));
+        } else {
+            self.start_repacks(slow, up);
+        }
         errors
+    }
+
+    /// The archive sides of the folder tabs in `folders` that saving left as slow to repack
+    /// (see [`FolderView::slow_archives`]).
+    fn slow_archives(&self, folders: &[u64]) -> Vec<Repack> {
+        let mut slow = Vec::new();
+        for t in self.tabs.iter().filter(|t| folders.contains(&t.id)) {
+            if let Content::Folder(v) = t.content.view() {
+                slow.extend(
+                    v.slow_archives()
+                        .into_iter()
+                        .map(|(s, archive, root)| Repack {
+                            side: Some((t.id, s)),
+                            archive,
+                            root,
+                        }),
+                );
+            }
+        }
+        slow
+    }
+
+    /// Writes the archives `slow` back on another thread (after those already under way),
+    /// then uploads the tabs in `up`.
+    fn start_repacks(&mut self, slow: Vec<Repack>, up: Vec<u64>) {
+        if let Some(run) = &mut self.repack {
+            for r in slow {
+                if !run.later.iter().any(|l| l.archive == r.archive) {
+                    run.later.push(r);
+                }
+            }
+            run.up.extend(up);
+            return;
+        }
+        let names = slow
+            .iter()
+            .map(|r| match r.archive.file_name() {
+                Some(n) => n.to_string_lossy().into_owned(),
+                None => r.archive.display().to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let keep = self.tabs.iter().flat_map(Tab::shown_temps).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for r in slow {
+                let result = archive::repack_all(&r.archive, &r.root).map_err(|e| format!("{e:#}"));
+                if tx.send((r.side, result)).is_err() {
+                    return;
+                }
+            }
+        });
+        self.repack = Some(RepackRun {
+            rx,
+            names,
+            done: Vec::new(),
+            later: Vec::new(),
+            up,
+            then: None,
+            queued: false,
+            _keep: keep,
+        });
+    }
+
+    /// Shows the archives being written back, and once they are, takes in how each went and
+    /// uploads what they touched.
+    fn repack_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut run) = self.repack.take() else {
+            return;
+        };
+        let finished = loop {
+            match run.rx.try_recv() {
+                Ok(done) => run.done.push(done),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break true,
+            }
+        };
+        if !finished {
+            egui::Modal::new(egui::Id::unique("repack_dialog")).show(ctx, |ui| {
+                ui.set_width(480.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(trf("msg.archive_writing", &[("name", run.names.clone())]));
+                });
+            });
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            self.repack = Some(run);
+            return;
+        }
+        let mut errors = Vec::new();
+        let mut up = std::mem::take(&mut run.up);
+        let mut closed = Vec::new();
+        for (side, result) in std::mem::take(&mut run.done) {
+            if let Err(e) = &result {
+                errors.push(e.clone());
+            }
+            match side {
+                Some((id, s)) => {
+                    let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) else {
+                        continue;
+                    };
+                    if let Content::Folder(v) = t.content.view_mut() {
+                        if result.as_ref().is_ok_and(|w| !w.is_empty()) {
+                            up.push(id);
+                        }
+                        v.archive_repacked(s, result);
+                    }
+                }
+                None => closed.extend(result.unwrap_or_default()),
+            }
+        }
+        up.extend(self.outer_archive_tabs(&closed));
+        let later = std::mem::take(&mut run.later);
+        if !later.is_empty() {
+            self.start_repacks(later, up);
+        } else {
+            errors.extend(self.queue_uploads(&up));
+        }
+        let failed = !errors.is_empty();
+        if failed {
+            self.error(errors.join("\n"));
+        }
+        let Some(then) = run.then else {
+            return;
+        };
+        if failed {
+            self.close_queue.clear();
+        } else if !self.after_uploads(then, run.queued) {
+            self.after_written(then, run.queued, ctx);
+        }
     }
 
     /// Marks the sides fetched from a server of the folder compares the tabs in `ids` were
@@ -5915,8 +6153,9 @@ impl OxideMergeApp {
     /// Repacks every archive touched while saving the tabs in `ids`, each archive written at
     /// most once even when several of its tabs were saved together (`SaveAll`, or saving every
     /// tab before exit, with several files open from the same archive). Returns the errors,
-    /// and the folder tabs whose archives were written.
-    fn save_origin_folder_archives(&mut self, ids: &[u64]) -> (Vec<String>, Vec<u64>) {
+    /// the folder tabs whose archives were written, and the archives slow to repack left to
+    /// write on another thread (those of the folder tabs in `ids` too).
+    fn save_origin_folder_archives(&mut self, ids: &[u64]) -> (Vec<String>, Vec<u64>, Vec<Repack>) {
         let mut folders = std::collections::HashSet::new();
         let mut closed = std::collections::HashSet::new();
         for &id in ids {
@@ -5945,6 +6184,8 @@ impl OxideMergeApp {
         }
         let mut errors = Vec::new();
         let mut written = Vec::new();
+        let mut slow_from: Vec<u64> = ids.to_vec();
+        slow_from.extend(&folders);
         for folder in folders {
             if let Some(Content::Folder(v)) = self
                 .tabs
@@ -5964,21 +6205,31 @@ impl OxideMergeApp {
                 errors.extend(failed);
             }
         }
+        let mut slow = self.slow_archives(&slow_from);
         let mut closed_written = Vec::new();
         for (archive, root) in closed {
+            if archive::slow_to_repack(&archive) {
+                slow.push(Repack {
+                    side: None,
+                    archive,
+                    root,
+                });
+                continue;
+            }
             match archive::repack_all(&archive, &root) {
                 Ok(w) => closed_written.extend(w),
                 Err(e) => errors.push(e.to_string()),
             }
         }
         written.extend(self.outer_archive_tabs(&closed_written));
-        (errors, written)
+        (errors, written, slow)
     }
 
     /// The folder tabs with a side extracted from an archive file that saving just wrote
     /// from another tab, an archive nested in it having been saved there (or from a closed
     /// tab, the archives in `also`): each is compared again, and returned to be uploaded
-    /// if it came over SFTP.
+    /// if it came over SFTP. So is a folder tab with a side fetched from a server that such
+    /// an archive is in, that side marked edited.
     fn outer_archive_tabs(&mut self, also: &[PathBuf]) -> Vec<u64> {
         let mut written: Vec<(Option<u64>, PathBuf)> =
             also.iter().map(|p| (None, p.clone())).collect();
@@ -6001,7 +6252,20 @@ impl OxideMergeApp {
             let holds = (0..v.n())
                 .filter_map(|s| v.archive_source(s))
                 .any(|a| written.iter().any(|(by, p)| *by != Some(id) && p == a));
-            if holds {
+            let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            let remote: Vec<usize> = (0..v.n())
+                .filter(|&s| v.is_remote_side(s))
+                .filter(|&s| {
+                    let root = real(&v.roots[s]);
+                    written
+                        .iter()
+                        .any(|(by, p)| *by != Some(id) && real(p).starts_with(&root))
+                })
+                .collect();
+            for &s in &remote {
+                v.mark_remote_dirty(s);
+            }
+            if holds || !remote.is_empty() {
                 v.refresh(&cfg, &named);
                 tabs.push(id);
             }
@@ -6364,9 +6628,15 @@ impl OxideMergeApp {
         }
     }
 
-    /// After the uploads now under way succeed, does what `then` asked for (closing a tab or
-    /// the program); returns false, doing nothing, when there are none.
+    /// After the archives being written back and the uploads now under way succeed, does what
+    /// `then` asked for (closing a tab or the program); returns false, doing nothing, when
+    /// there are none.
     fn after_uploads(&mut self, then: Prompt, queued: bool) -> bool {
+        if let Some(run) = &mut self.repack {
+            run.then = Some(then);
+            run.queued = queued;
+            return true;
+        }
         match &mut self.upload {
             Some(run) => {
                 run.then = Some(then);
@@ -6503,6 +6773,13 @@ impl OxideMergeApp {
             self.close_queue.clear();
             return;
         }
+        self.after_written(then, run.queued, ctx);
+    }
+
+    /// Does what `then` asked for once what it saved was written back and uploaded: closes the
+    /// tab, or the program, unless something is still not saved. `queued`: whether more tabs
+    /// wait to be asked about closing.
+    fn after_written(&mut self, then: Prompt, queued: bool, ctx: &egui::Context) {
         match then {
             Prompt::Exit => {
                 if !self.tabs.iter().any(|t| t.is_modified()) {
@@ -6524,7 +6801,7 @@ impl OxideMergeApp {
                     }
                     _ => self.close_tab(i, true),
                 }
-                if run.queued {
+                if queued {
                     self.ask_next_close();
                 }
             }
@@ -6592,7 +6869,12 @@ impl OxideMergeApp {
             }
         }
         repacked.extend(self.outer_archive_tabs(&[]));
-        errors.extend(self.queue_uploads(&repacked));
+        let slow = self.slow_archives(&folders);
+        if slow.is_empty() && self.repack.is_none() {
+            errors.extend(self.queue_uploads(&repacked));
+        } else {
+            self.start_repacks(slow, repacked);
+        }
         for e in errors {
             self.error(e);
         }
@@ -9787,6 +10069,19 @@ impl eframe::App for OxideMergeApp {
             || self.stats_dlg.is_some()
             || self.git_dlg.is_some()
             || self.rule_dlg.is_some()
+            || self.save_job.is_some()
+            || self.run_job.is_some()
+            || self.rev_load.is_some()
+            || self.remote_dlg.is_some()
+            || self.remote_load.is_some()
+            || self.host_prompt.is_some()
+            || self.ask.is_some()
+            || self.repack.is_some()
+            || self.upload.is_some()
+            || self.reload_prompt.is_some()
+            || self.reload.is_some()
+            || self.workspace_save_dlg.is_some()
+            || self.manage_workspaces
             || self.help
             || self.about
             || self.palette.is_some()
@@ -9990,6 +10285,7 @@ impl eframe::App for OxideMergeApp {
         self.ask_dialog(ctx);
         self.remote_load_dialog(ctx);
         self.host_prompt_dialog(ctx);
+        self.repack_dialog(ctx);
         self.upload_dialog(ctx);
         self.reload_prompt_dialog(ctx);
         self.reload_dialog(ctx);

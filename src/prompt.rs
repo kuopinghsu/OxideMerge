@@ -94,23 +94,44 @@ fn read_line(input: &mut std::fs::File) -> Option<String> {
 /// time, so that no buffer is left holding what was typed.
 #[cfg_attr(windows, allow(dead_code))]
 fn read_line_from(input: &mut impl std::io::Read) -> Option<String> {
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
     let ended = loop {
         match input.read(&mut byte) {
             Ok(0) => break bytes.is_empty(),
             Ok(_) if byte[0] == b'\n' => break false,
-            Ok(_) => bytes.push(byte[0]),
+            Ok(_) => push_wiping(&mut bytes, byte[0]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break true,
         }
     };
+    wipe_all(&mut byte);
     if bytes.last() == Some(&b'\r') {
         bytes.pop();
     }
     let line = String::from_utf8_lossy(&bytes).into_owned();
-    bytes.iter_mut().for_each(|b| *b = 0);
+    wipe_all(&mut bytes);
     finish(line, ended)
+}
+
+/// Pushes `x` onto `v`, wiping what `v` held when it has to move to make room, so that no copy
+/// of what was typed is left in freed memory.
+fn push_wiping<T: Copy + Default>(v: &mut Vec<T>, x: T) {
+    if v.len() == v.capacity() {
+        let mut bigger = Vec::with_capacity((v.capacity() * 2).max(256));
+        bigger.extend_from_slice(v);
+        wipe_all(v);
+        *v = bigger;
+    }
+    v.push(x);
+}
+
+/// Overwrites every element of `v`, in a way that is not left out as having no effect.
+fn wipe_all<T: Copy + Default>(v: &mut [T]) {
+    for x in v.iter_mut() {
+        // SAFETY: `x` is a valid, aligned reference into `v`.
+        unsafe { std::ptr::write_volatile(x, T::default()) };
+    }
 }
 
 /// One line typed on the console, read as UTF-16 so that an answer outside the console's
@@ -120,7 +141,7 @@ fn read_line(input: &mut std::fs::File) -> Option<String> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::Console::ReadConsoleW;
     let handle = input.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-    let mut units: Vec<u16> = Vec::new();
+    let mut units: Vec<u16> = Vec::with_capacity(256);
     let mut unit = [0u16; 1];
     let ended = loop {
         let mut read = 0u32;
@@ -144,13 +165,18 @@ fn read_line(input: &mut std::fs::File) -> Option<String> {
         if unit[0] == u16::from(b'\n') {
             break false;
         }
-        units.push(unit[0]);
+        push_wiping(&mut units, unit[0]);
     };
+    wipe_all(&mut unit);
     if units.last() == Some(&u16::from(b'\r')) {
         units.pop();
     }
-    let line = String::from_utf16_lossy(&units);
-    units.iter_mut().for_each(|u| *u = 0);
+    // Sized for the longest it can come out, so that it never moves while being filled.
+    let mut line = String::with_capacity(units.len() * 3);
+    for c in char::decode_utf16(units.iter().copied()) {
+        line.push(c.unwrap_or(char::REPLACEMENT_CHARACTER));
+    }
+    wipe_all(&mut units);
     finish(line, ended)
 }
 
@@ -361,19 +387,62 @@ impl Hidden {
     #[cfg(windows)]
     fn new(console: &std::fs::File) -> Self {
         use std::os::windows::io::AsRawHandle;
+        use std::sync::atomic::Ordering;
         use windows_sys::Win32::System::Console::{
-            GetConsoleMode, SetConsoleMode, ENABLE_ECHO_INPUT,
+            GetConsoleMode, SetConsoleCtrlHandler, SetConsoleMode, ENABLE_ECHO_INPUT,
         };
         let handle = console.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
         let mut old = 0u32;
-        // SAFETY: `handle` is the open console input for the calls, and `old` a valid place
-        // for the mode.
+        // SAFETY: `handle` is the open console input for the calls, `old` a valid place for
+        // the mode, and what the handler reads is stored before it is added.
         let restore = unsafe {
-            (GetConsoleMode(handle, &mut old) != 0
-                && SetConsoleMode(handle, old & !ENABLE_ECHO_INPUT) != 0)
-                .then_some((handle, old))
+            if GetConsoleMode(handle, &mut old) == 0 {
+                return Hidden { restore: None };
+            }
+            on_ctrl::MODE.store(old, Ordering::SeqCst);
+            on_ctrl::HANDLE.store(handle, Ordering::SeqCst);
+            let added = SetConsoleCtrlHandler(Some(on_ctrl::handle), 1) != 0;
+            if SetConsoleMode(handle, old & !ENABLE_ECHO_INPUT) != 0 {
+                Some((handle, old))
+            } else {
+                if added {
+                    SetConsoleCtrlHandler(Some(on_ctrl::handle), 0);
+                }
+                on_ctrl::HANDLE.store(std::ptr::null_mut(), Ordering::SeqCst);
+                None
+            }
         };
         Hidden { restore }
+    }
+}
+
+/// What turns the console's echo back on when `Ctrl+C`, `Ctrl+Break` or closing the console
+/// ends the program while it is off, which would otherwise leave it off.
+#[cfg(windows)]
+mod on_ctrl {
+    use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+
+    /// The console input to restore, or null.
+    pub(super) static HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+    /// Its mode with echo.
+    pub(super) static MODE: AtomicU32 = AtomicU32::new(0);
+
+    /// Restores the console's mode, then leaves the event to the handlers there were before,
+    /// which end the program.
+    pub(super) unsafe extern "system" fn handle(
+        _event: u32,
+    ) -> windows_sys::Win32::Foundation::BOOL {
+        let handle = HANDLE.load(Ordering::SeqCst);
+        if !handle.is_null() {
+            // SAFETY: the console input stays open for as long as the handle is set.
+            unsafe {
+                windows_sys::Win32::System::Console::SetConsoleMode(
+                    handle,
+                    MODE.load(Ordering::SeqCst),
+                )
+            };
+        }
+        0
     }
 }
 
@@ -387,8 +456,14 @@ impl Drop for Hidden {
         }
         #[cfg(windows)]
         if let Some((handle, old)) = self.restore {
-            // SAFETY: restores the mode read from the same, still open, console.
-            unsafe { windows_sys::Win32::System::Console::SetConsoleMode(handle, old) };
+            use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, SetConsoleMode};
+            // SAFETY: removes the handler added with this, then restores the mode read from
+            // the same, still open, console.
+            unsafe {
+                SetConsoleCtrlHandler(Some(on_ctrl::handle), 0);
+                on_ctrl::HANDLE.store(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
+                SetConsoleMode(handle, old);
+            }
         }
     }
 }
@@ -404,6 +479,11 @@ mod tests {
         assert_eq!(read_line_from(&mut input).as_deref(), Some("second"));
         assert_eq!(read_line_from(&mut input).as_deref(), Some("last"));
         assert_eq!(read_line_from(&mut input), None);
+
+        let long = "x".repeat(1000);
+        let mut input = format!("{long}\n").into_bytes();
+        assert_eq!(read_line_from(&mut input.as_slice()), Some(long));
+        input.clear();
     }
 
     #[test]

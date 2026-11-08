@@ -34,7 +34,7 @@ DIST_DIR    := dist/$(DIST_NAME)
 
 .PHONY: all help build release run run-release demo demo-text demo-3way demo-3way-merge demo-3way-folder demo-conflict \
         demo-web demo-web-text demo-web-headings demo-web-tables \
-        test gui-smoke check check-platforms lint fmt fmt-check ci install uninstall shell-register shell-unregister \
+        test gui-smoke docker-test check check-platforms lint fmt fmt-check ci install uninstall shell-register shell-unregister \
         languages dist appimage user-guide clean
 
 help:
@@ -56,6 +56,7 @@ help:
 	@echo '  demo-web-tables   Web page compare of tables: changed cells, rows and columns'
 	@echo '  test              Run the unit, window and command line tests'
 	@echo '  gui-smoke         Open real windows with the release build and check what they show'
+	@echo '  docker-test       Check Linux in a Docker container, with real test servers'
 	@echo '  check             Type-check all targets'
 	@echo '  check-platforms   Type-check for Windows, macOS and Linux'
 	@echo '  lint              Clippy with warnings treated as errors'
@@ -115,6 +116,9 @@ test:
 
 gui-smoke: release
 	bash scripts/gui-smoke.sh $(RELEASE_BIN)
+
+docker-test:
+	bash scripts/docker-test.sh
 
 check:
 	$(CARGO) check --all-targets

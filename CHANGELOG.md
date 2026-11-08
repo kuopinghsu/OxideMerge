@@ -7,31 +7,91 @@ uses its section of this file as the release notes.
 
 ### Added
 
-- **Compare over SFTP:** *File → Compare over SFTP...*, and a "Browse a server over
-  SFTP" button beside every path on the start page and the *Open* dialog, connect to a
-  server by host, port, user, and a password or a private key (with an optional
-  passphrase), then fetch a file or folder to compare like any local path - open it
-  twice to compare two remote locations, or once against a local one. A later connection
+- **Compare over SFTP and FTP:** *File → Compare over SFTP/FTP...*, and a "Browse a server
+  over SFTP/FTP" button beside every path on the start page and the *Open* dialog, connect
+  to a server over SFTP, FTPS (explicit or implicit TLS) or plain FTP by host, port, user,
+  and a password, a private key (with an optional passphrase) or, for SFTP, the keys
+  `ssh-agent` holds, then fetch a file or folder to compare like any local path - open it
+  twice to compare two remote locations, or once against a local one. The remote path can
+  be typed or chosen from a list of the server's folders and files, opened from a button
+  beside it: click a folder to open it or a file to choose it, or double-click a file to
+  fetch it. The list keeps one connection open while it is shown. A later connection
   starts from the host, port, user and key path of the last one that succeeded, so
   fetching the other side of a compare from the same server does not need them retyped;
   the password or passphrase is never remembered this way. A fetched file is
   writable: *Save* re-uploads it to the server over a fresh connection, in the
-  background with a *Cancel* button, to a temporary file that then replaces the original,
-  so a failed upload leaves the server's file as it was. An upload is refused when the
-  file changed on the server since it was fetched, and the tab stays unsaved until an
-  upload succeeds; closing it or quitting asks first. A fetched folder opens read-only, and
-  is bounded to 4 GiB, 50,000 files and folders and 64 levels deep so a very large folder
-  cannot be fetched by mistake. The server's host key is checked before the password or
+  background with a *Cancel* button. It updates the existing file in place to preserve its
+  owner, group and access controls. You can cancel before writing starts. An upload is refused
+  when the file changed on the server since it was fetched, and the tab stays unsaved until an
+  upload succeeds; closing it or quitting asks first. A fetched folder is writable too: *Save*
+  uploads the files that are new or changed, creates new folders and deletes what was
+  removed, but leaves alone and reports any file that changed on the server since the
+  fetch; where the server gives no modified times (FTP without `MDTM`), a file's contents
+  tell. An upload that stopped part way says so, and saving again finishes it. A local copy
+  that is gone or cannot be read in full saves nothing, rather than deleting on the server
+  what could not be read. Of names on the server this computer cannot keep apart (differing
+  only in case, say), only the first is fetched, and no `.bak` backups are made inside a
+  fetched copy. New files are created with the usual permissions (644, less the server's
+  umask). *File → Reload from server* fetches the server's copy again, replacing the tab's
+  unsaved edits of it once confirmed. A fetch is bounded to
+  4 GiB, 50,000 files and folders and 64 levels deep so a very large folder cannot be
+  fetched by mistake. Plain FTP is marked in the dialog as sending the password and files
+  unencrypted. An FTPS server's certificate must be vouched for by a certificate authority,
+  or else its fingerprint is shown to confirm, as for an SSH host key, and the certificate is
+  then pinned in a `known_certs` file next to the settings. The server's host key is checked before the password or
   key is sent: a server whose key matches your `~/.ssh/known_hosts` (host patterns and
-  hashed names included) is trusted, a new one shows its fingerprint and is trusted only
-  once you confirm it, and is then remembered in OxideMerge's own `known_hosts` file next to
-  its settings; a key that differs from the one remembered there, or from one of the same
+  hashed names included) is trusted if it also matches any OxideMerge pin. A new server shows
+  its fingerprint and is trusted only once you confirm it, and is then remembered in
+  OxideMerge's own `known_hosts` file next to
+  its settings (two windows trusting servers at once both keep theirs); a key that differs from the one remembered there, or from one of the same
   type in `~/.ssh/known_hosts`, or that is marked `@revoked`, stops the connection instead
-  of silently trusting it, and so does a `known_hosts` file that can't be read. Only plain
-  host keys are asked for, never host certificates. The connection,
+  of silently trusting it, and so does a `known_hosts` file that can't be read. A host
+  certificate is accepted from a server a `@cert-authority` line names an authority for (see
+  below). The connection,
   including the password or passphrase, is kept only in memory for the tab's lifetime; it
   is never written to the settings file, and fetched tabs are left out of saved
   workspaces, the restored session and the recent paths.
+- **Server paths on the command line and in jobs:** a path can be
+  `sftp://[user@]host[:port]/path`, `ftp://`, `ftpes://` (explicit FTPS) or `ftps://`
+  (implicit FTPS), with `/~/` for the home folder. SFTP signs in with `--ssh-key FILE`,
+  a password, `ssh-agent`, or the keys `~/.ssh/config` names; the password or passphrase comes from the
+  `OXIDEMERGE_REMOTE_PASSWORD` environment variable (removed at startup, so programs
+  OxideMerge starts do not inherit it), and one written in the address is
+  refused. A server not trusted yet is trusted with `--trust-fingerprint SHA256:...`. What
+  a run changes in a fetched copy, such as a `sync` job's destination, is written back to
+  the server afterwards, with the same checks as *Save*; a synchronization that stopped
+  part way (exit code 5) is undone in the copy instead, and nothing is written back. A `--sync-plan` made for a folder
+  on a server names it by its address, so `--sync-apply` applies it to the copy fetched
+  then. Job files take `ssh_key` and `trust_fingerprint`.
+- **SSH configuration, jump hosts, proxies and more ways to sign in:** an SFTP server is
+  reached as `~/.ssh/config` (and `/etc/ssh/ssh_config`) says, the way `ssh` reaches it:
+  a `Host` alias, with its `HostName`, `User`, `Port`, `IdentityFile`, `IdentitiesOnly`,
+  `HostKeyAlias` and `UserKnownHostsFile`, `Include`, and `Match` blocks on `host`,
+  `originalhost`, `user`, `localuser` or `all` (never `exec`, which would run a command). The user name is optional, as with `ssh`. A server behind `ProxyJump` jump hosts
+  (up to 8, each signing in with the SSH agent's and the configuration's keys) or a
+  `ProxyCommand` is reached through them; each jump host's key is checked like the server's.
+  A server that asks questions while signing in (keyboard-interactive: a one-time code, a
+  second factor, a password change) has them put to you in a window, or on the terminal for
+  the command line, and an encrypted private key's passphrase is asked for when none was
+  given; when the key's `.pub` file is beside it, only once the server has said it would
+  take that key. A password the server
+  refused is not sent again, what a server writes is shown without terminal control
+  characters, and a hidden answer's terminal echo comes back if the command line is
+  interrupted or stopped (Ctrl+C, Ctrl+Z, a closed terminal). A host or user name with
+  characters a shell would act on (`` ` ``, `$`, `;`, `|`, quotes, spaces and the like), or
+  starting with `-`, is refused before any `ProxyCommand` runs. A host certificate is checked against the `@cert-authority` lines of the
+  known hosts files for the server: signed by that authority (Ed25519, ECDSA P-256/P-384 or
+  RSA with SHA-2), naming the server, valid now, and with no critical options; an authority
+  or key marked `@revoked` stops the connection. Under the connection dialog's *Advanced*
+  settings, and with `--proxy URL` on the command line or `proxy` in a job, SFTP and FTP
+  both connect through a SOCKS5 (`socks5://[user@]host:port`) or HTTP CONNECT
+  (`http://[user@]host:port`) proxy, every FTP data connection included; a proxy password
+  comes from the dialog or the `OXIDEMERGE_PROXY_PASSWORD` environment variable, never from
+  the address on the command line. FTP can use active mode (*Active mode*, `--ftp-active`,
+  `ftp_active`): `EPRT`, or `PORT` for a server without it, accepting the data connection only
+  from the server's address; it cannot be used through a proxy or from behind NAT. FTPS can
+  present a client certificate (`--client-cert FILE` and `--client-key FILE`, or
+  `client_cert` and `client_key`) in PEM, key and certificate in one file or two.
 - **Workspaces:** *File → Workspaces → Save as workspace...* saves the open tabs under a
   name, kept until deleted; *File → Workspaces* then lists every saved workspace to reopen
   all of its tabs at once, alongside whatever is open already, and *Manage workspaces...*
@@ -58,17 +118,23 @@ uses its section of this file as the release notes.
   so the merged result stays valid. A saved review of a notebook shows it as changed once,
   since what it shows is now the cells. Sample: `samples/*/docs/report.ipynb`.
 - **Archive sides are writable:** a file extracted from an archive compare (ZIP-based
-  formats, TAR plain or gzip/bzip2-compressed, or 7z) can now be edited, copied to,
-  merged into or deleted, like a plain folder. Saving a file, or *File → Save* / *Save
+  formats, TAR plain or compressed with gzip, bzip2 or xz, or 7z) can now be edited, copied
+  to, merged into or deleted, like a plain folder. Saving a file, or *File → Save* / *Save
   All* on the folder compare, repacks the archive in place, keeping its permissions and
-  every entry you didn't change exactly as it was (date, compression, order); an archive
-  with no changes is not rewritten. Saving is refused when the archive was changed on
-  disk since it was extracted, or is read-only, and no `.bak` backups are made inside it.
-  An archive fetched over SFTP is uploaded again after it is saved. A review snapshot or
-  a page tree compared from the web stays read-only, as before, since there is nowhere
-  for its changes to go back to, and so do signed packages (`.apk`, `.ipa`, `.appx`,
-  `.msix`, `.crx`, `.xpi`, or a zip with a `META-INF` signature), `.tar.xz` and archives
-  inside another archive.
+  every entry you didn't change exactly as it was (date, compression, order; in a 7z, every
+  compressed block holding only such entries is copied as it was, and other blocks are
+  compressed again with LZMA2, keeping their entries' dates and attributes); an archive
+  with no changes is not rewritten. An archive inside another extracted archive can be
+  edited too: saving it also writes the archive it came from, out to the outermost one,
+  and an open compare of that archive is refreshed. A `.tar.xz` or 7z archive, slow to
+  compress, is written in the background while a window shows it is being written; closing
+  or quitting waits for it. Saving is refused when the archive was
+  changed on disk since it was extracted, or is read-only, and no `.bak` backups are made
+  inside it. An archive fetched over SFTP is uploaded again after it is saved. A review
+  snapshot or a page tree compared from the web stays read-only, as before, since there is
+  nowhere for its changes to go back to, and so do signed packages (`.apk`, `.ipa`,
+  `.appx`, `.msix`, `.crx`, `.xpi`, or a zip with a `META-INF` signature) and archives
+  inside them.
 - **Moved blocks in binary comparisons:** *Moved blocks* on the binary toolbar highlights
   identical bytes at different offsets, in the hexadecimal and text columns and in the
   location pane: data shifted up to 128 bytes by an insertion or deletion, and blocks of
@@ -334,6 +400,13 @@ uses its section of this file as the release notes.
   ask for a password fails instead of waiting for an answer that cannot come. With Git and
   Mercurial, a file whose name is not valid UTF-8 is refused rather than read under a
   changed name.
+- **Docker test environment for Linux:** `scripts/docker-test.sh` (`make docker-test`)
+  checks Linux from any computer with Docker. It runs Clippy, the tests, a release build and
+  the command-line and window checks. It also runs tests against real servers: OpenSSH (keys,
+  passphrases, host certificates, jump hosts and keyboard-interactive sign-in through PAM),
+  vsftpd and ProFTPD (FTP, FTPS, active mode and client certificates), and Dante and
+  tinyproxy (SOCKS5 and HTTP CONNECT proxies). The tests are built for release, as
+  continuous integration builds them. See the development guide.
 
 ### Changed
 
@@ -412,6 +485,22 @@ uses its section of this file as the release notes.
 
 ### Fixed
 
+- **An FTP upload no longer risks losing its end:** the data connection was closed while
+  the server might still send on it (a TLS session ticket, say). That reset the connection,
+  and the server could throw away the end of the file before reading it. OxideMerge now
+  waits for the server to close its side first.
+- **PDF reports keep code in one font on a system without the code fonts they look for:**
+  a font found for Hebrew, Arabic or Thai came before the built-in code font, so it drew
+  the digits and spaces between letters in the built-in font. The built-in font now comes
+  first.
+- **An interrupted synchronization is no longer missed while another program starts:** the
+  check of whether a synchronization journal is still in use could see it as in use for a
+  moment after the synchronization had let it go, when a process (`git`, say) was being
+  started at the same time, and leave it out of the list to undo. It now tries again briefly.
+- **In-line highlighting now follows the rules' substitutions and *Ignore numbers*:** a
+  changed line no longer highlights text that a substitution replaces (a timestamp, an
+  address) or digits ignored by *Ignore numbers*, in the text view and in reports; only the
+  parts that still differ are marked.
 - **Comparing with a revision no longer follows a symbolic link out of it:** a tracked
   symbolic link pointing outside the exported copy (in Git, Subversion or Mercurial) is
   dropped rather than checked out, the same protection an archive extraction already had.

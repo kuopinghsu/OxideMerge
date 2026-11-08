@@ -31,6 +31,9 @@ pub struct Options {
     pub port_only: bool,
     /// Whether a TLS client must present a certificate signed by [`CLIENT_CA`].
     pub client_ca: bool,
+    /// Ends each download and listing after this many bytes, without a TLS `close_notify`,
+    /// as someone in between could, yet still says it all went.
+    pub cut: Option<usize>,
 }
 
 pub struct Server {
@@ -136,6 +139,21 @@ fn close(stream: Stream) -> std::io::Result<()> {
             }
             s.sock.shutdown(Shutdown::Both)
         }
+        Stream::Gone => Ok(()),
+    }
+}
+
+/// Sends `bytes` over `data` and closes it, or only their first `cut` without a `close_notify`.
+fn send_data(mut data: Stream, bytes: &[u8], cut: Option<usize>) -> std::io::Result<()> {
+    let Some(cut) = cut else {
+        data.write_all(bytes)?;
+        return close(data);
+    };
+    data.write_all(&bytes[..cut.min(bytes.len())])?;
+    data.flush()?;
+    match data {
+        Stream::Plain(s) => s.shutdown(Shutdown::Both),
+        Stream::Tls(s) => s.sock.shutdown(Shutdown::Both),
         Stream::Gone => Ok(()),
     }
 }
@@ -411,12 +429,9 @@ impl Session {
                     })
                     .collect();
                 self.send("150 Here it comes")?;
-                let mut data = self.data()?;
-                for line in lines {
-                    data.write_all(line.as_bytes())?;
-                    data.write_all(b"\r\n")?;
-                }
-                close(data)?;
+                let data = self.data()?;
+                let text: String = lines.iter().map(|l| format!("{l}\r\n")).collect();
+                send_data(data, text.as_bytes(), self.options.cut)?;
                 self.send("226 Done")?;
             }
             "SIZE" => match self.path(arg).filter(|p| p.is_file()) {
@@ -441,9 +456,8 @@ impl Session {
                 Some(p) => {
                     let bytes = std::fs::read(p)?;
                     self.send("150 Here it comes")?;
-                    let mut data = self.data()?;
-                    data.write_all(&bytes)?;
-                    close(data)?;
+                    let data = self.data()?;
+                    send_data(data, &bytes, self.options.cut)?;
                     self.send("226 Done")?;
                 }
                 None => self.send("550 Not a file")?,

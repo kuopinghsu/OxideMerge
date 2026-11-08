@@ -72,7 +72,7 @@ impl Proxy {
                     Some((u, p)) => (u, Some(p)),
                     None => (auth, None),
                 };
-                let decode = |s: &str| super::remote_url::decode(s, &shown);
+                let decode = |s: &str| super::remote_url::decode(s, bad);
                 (
                     Some(decode(user)?).filter(|u| !u.is_empty()),
                     password.map(decode).transpose()?,
@@ -434,15 +434,21 @@ pub(crate) fn command_stream(command: &str) -> Result<TcpStream> {
     #[cfg(windows)]
     let mut shell = {
         use std::os::windows::process::CommandExt;
-        // As written: `cmd` reads its own quotes, not the escaped ones `arg` would add.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // As written: `cmd` reads its own quotes, not the escaped ones `arg` would add. With
+        // `/S` it takes off only the outer pair added here, so a command starting with a
+        // quoted program path keeps its quotes.
         let mut c = std::process::Command::new("cmd");
-        c.arg("/C").raw_arg(command);
+        c.args(["/D", "/S", "/C"])
+            .raw_arg(format!("\"{command}\""))
+            .creation_flags(CREATE_NO_WINDOW);
         c
     };
     #[cfg(not(windows))]
     let mut shell = {
+        // `exec`, as `ssh` does: stopping the shell then stops the program itself.
         let mut c = std::process::Command::new("/bin/sh");
-        c.arg("-c").arg(command);
+        c.arg("-c").arg(format!("exec {command}"));
         c
     };
     let mut child = shell
@@ -807,7 +813,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_command_carries_the_connection_as_a_proxy_command_does() {
-        let tcp = command_stream("printf 'hello\\n'; cat").unwrap();
+        let tcp = command_stream("sh -c \"printf 'hello\\n'; exec cat\"").unwrap();
         tcp.set_read_timeout(Some(CONNECT_TIMEOUT)).unwrap();
         greeted(tcp);
     }
@@ -823,5 +829,11 @@ mod tests {
         let mut out = String::new();
         tcp.read_to_string(&mut out).unwrap();
         assert_eq!(out, "\"hello there\"\r\nproxied=ping\r\n");
+        // A program path in quotes, as one under `C:\Program Files` needs.
+        let mut tcp = command_stream(r#""cmd.exe" /D /C echo quoted"#).unwrap();
+        tcp.set_read_timeout(Some(CONNECT_TIMEOUT)).unwrap();
+        let mut out = String::new();
+        tcp.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "quoted\r\n");
     }
 }

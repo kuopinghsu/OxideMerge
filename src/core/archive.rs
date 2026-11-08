@@ -1025,6 +1025,21 @@ fn rerecord(dir: &Path, archive: &Path) {
     }
 }
 
+/// Whether [`repack_all`] of `path` may take long: it, or an archive it sits in an extraction
+/// of, is compressed with xz or 7z's LZMA, which can take minutes for a large one.
+pub fn slow_to_repack(path: &Path) -> bool {
+    let mut path = path.to_path_buf();
+    loop {
+        if matches!(kind(&path), Some(Kind::TarXz | Kind::SevenZ)) {
+            return true;
+        }
+        match extraction_of(&path) {
+            Some((outer, _)) => path = outer,
+            None => return false,
+        }
+    }
+}
+
 /// [`repack`]s `path` from `dir`, then each archive it sits in an extraction of, from the
 /// inside out, so that an edit saved into an archive nested in another reaches the outermost
 /// one. Returns the archives written. The outer ones are repacked even when `path` came out

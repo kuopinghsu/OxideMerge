@@ -80,6 +80,8 @@ pub struct RemoteUrl {
     /// Without the brackets of an IPv6 address.
     pub host: String,
     pub port: u16,
+    /// Whether the URL names the port, rather than the protocol's usual one being taken.
+    pub port_given: bool,
     pub user: Option<String>,
     /// The path on the server: absolute, or relative to the user's home folder for a URL whose
     /// path starts with `/~`.
@@ -92,9 +94,8 @@ pub fn is_remote_url(text: &str) -> bool {
         .is_some_and(|(scheme, _)| Protocol::from_scheme(scheme).is_some())
 }
 
-/// `text` with its `%XX` escapes decoded.
-pub(crate) fn decode(text: &str, url: &str) -> Result<String> {
-    let bad = || trf("msg.remote_url_bad", &[("url", url.to_string())]);
+/// `text` with its `%XX` escapes decoded; `bad` is the error when one is not valid.
+pub(crate) fn decode(text: &str, bad: impl Fn() -> String + Copy) -> Result<String> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -111,9 +112,22 @@ pub(crate) fn decode(text: &str, url: &str) -> Result<String> {
     String::from_utf8(out).ok().with_context(bad)
 }
 
+/// `url` to show in a message, without what may be a password in it: all between the scheme
+/// and the last `@`, when that holds a `:`.
+pub fn shown(url: &str) -> String {
+    if let Some((scheme, rest)) = url.split_once("://") {
+        if let Some((user, host)) = rest.rsplit_once('@') {
+            if user.contains(':') {
+                return format!("{scheme}://…@{host}");
+            }
+        }
+    }
+    url.to_string()
+}
+
 /// Reads `scheme://[user@]host[:port][/path]`.
 pub fn parse(url: &str) -> Result<RemoteUrl> {
-    let bad = || trf("msg.remote_url_bad", &[("url", url.to_string())]);
+    let bad = || trf("msg.remote_url_bad", &[("url", shown(url))]);
     let (scheme, rest) = url.split_once("://").with_context(bad)?;
     let protocol = Protocol::from_scheme(scheme).with_context(bad)?;
     let (authority, path) = match rest.find('/') {
@@ -124,11 +138,19 @@ pub fn parse(url: &str) -> Result<RemoteUrl> {
         Some((user, host_port)) => (Some(user), host_port),
         None => (None, authority),
     };
-    if user.is_some_and(|u| u.contains(':')) {
+    // A password with a `/` in it ends the authority early, leaving its rest and the host in
+    // the path's first name: `sftp://ann:12/34@h/x` is not port 12 of a host `ann`.
+    let cut_password = user.is_none()
+        && authority.contains(':')
+        && path
+            .get(1..)
+            .and_then(|p| p.split('/').next())
+            .is_some_and(|first| first.contains('@'));
+    if cut_password || user.is_some_and(|u| u.contains(':')) {
         bail!(tr("msg.remote_url_password"));
     }
     let user = user
-        .map(|u| decode(u, url))
+        .map(|u| decode(u, bad))
         .transpose()?
         .filter(|u| !u.is_empty());
     // A line break would end a command to the server or proxy early, and start another.
@@ -147,6 +169,8 @@ pub fn parse(url: &str) -> Result<RemoteUrl> {
             }
         }
         None => match host_port.rsplit_once(':') {
+            // An IPv6 address needs its brackets, or its last group would read as the port.
+            Some((host, _)) if host.contains(':') => bail!(bad()),
             Some((host, port)) => (host, Some(port)),
             None => (host_port, None),
         },
@@ -157,11 +181,12 @@ pub fn parse(url: &str) -> Result<RemoteUrl> {
     {
         bail!(bad());
     }
+    let port_given = port.is_some();
     let port = match port {
         Some(p) => p.parse().ok().filter(|&p: &u16| p > 0).with_context(bad)?,
         None => protocol.default_port(),
     };
-    let path = decode(path, url)?;
+    let path = decode(path, bad)?;
     let path = match path.strip_prefix("/~") {
         Some(rest) if rest.is_empty() || rest == "/" => ".".to_string(),
         Some(rest) if rest.starts_with('/') => rest[1..].to_string(),
@@ -172,6 +197,7 @@ pub fn parse(url: &str) -> Result<RemoteUrl> {
         protocol,
         host: host.to_string(),
         port,
+        port_given,
         user,
         path,
     })
@@ -214,7 +240,7 @@ impl Drop for Credentials {
 /// The connection `url` names, signed in as `creds` say: a key, or ssh-agent's and
 /// `~/.ssh/config`'s keys, for SFTP (or a password, when one is given), and a password for FTP.
 /// Without a user name, SFTP signs in as `~/.ssh/config` says or as the local user, and FTP
-/// anonymously.
+/// anonymously, never with the password, which is for a user named.
 pub fn connection(url: &RemoteUrl, creds: &Credentials) -> Result<RemoteConnection> {
     let user = match &url.user {
         Some(user) => user.clone(),
@@ -226,6 +252,7 @@ pub fn connection(url: &RemoteUrl, creds: &Credentials) -> Result<RemoteConnecti
             bail!(tr("msg.ftp_password_only"));
         }
         match &creds.secret {
+            _ if url.user.is_none() => Auth::Password("anonymous@".to_string()),
             Some(p) => Auth::Password(p.clone()),
             None if user == "anonymous" => Auth::Password("anonymous@".to_string()),
             None => bail!(trf(
@@ -249,7 +276,10 @@ pub fn connection(url: &RemoteUrl, creds: &Credentials) -> Result<RemoteConnecti
         port: url.port,
         user,
         auth,
-        options: creds.options.clone(),
+        options: remote::ConnOptions {
+            port_given: url.port_given,
+            ..creds.options.clone()
+        },
     })
 }
 
@@ -433,6 +463,7 @@ mod tests {
                 protocol: Protocol::Sftp,
                 host: "example.com".into(),
                 port: 22,
+                port_given: false,
                 user: Some("ann".into()),
                 path: "/srv/data".into(),
             }
@@ -462,13 +493,26 @@ mod tests {
             "ftp://a%0D%0AUSER%20x@h/x",
             "ftp://h\r\nX/x",
             "sftp://h\tx/x",
+            "sftp://::1/x",
+            "sftp://fe80::1:22/x",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
-        let e = parse("sftp://ann:secret@example.com/x")
-            .unwrap_err()
-            .to_string();
-        assert!(!e.contains("secret"), "{e}");
+        for leaky in [
+            "sftp://ann:secret@example.com/x",
+            "sftp://ann:sec/ret@example.com/x",
+            "sftp://ann:12/34@example.com/x",
+            "sftp://ann:s/e/cret@example.com/x",
+        ] {
+            let e = parse(leaky).unwrap_err().to_string();
+            assert!(!e.contains("ret") && !e.contains("34"), "{e}");
+        }
+        assert_eq!(
+            parse("sftp://h:2222/etc/getty@tty1.service").unwrap().path,
+            "/etc/getty@tty1.service"
+        );
+        assert_eq!(shown("sftp://ann:pw@h/x"), "sftp://…@h/x");
+        assert_eq!(shown("sftp://ann@h/x"), "sftp://ann@h/x");
     }
 
     #[test]
@@ -491,10 +535,25 @@ mod tests {
 
         let c = connection(&url("ftp://h/x"), &creds(None, None)).unwrap();
         assert_eq!(c.user, "anonymous");
+        let c = connection(&url("ftp://h/x"), &creds(None, Some("pw"))).unwrap();
+        assert!(matches!(&c.auth, Auth::Password(p) if p == "anonymous@"));
         assert!(connection(&url("ftp://ann@h/x"), &creds(None, None)).is_err());
         assert!(connection(&url("ftpes://ann@h/x"), &creds(Some("/k"), Some("pw"))).is_err());
         let c = connection(&url("ftpes://ann@h:2121/x"), &creds(None, Some("pw"))).unwrap();
         assert_eq!((c.protocol, c.port), (Protocol::Ftps, 2121));
+        // Port 22 written out wins over `~/.ssh/config`'s, as with `ssh -p 22`.
+        assert!(
+            connection(&url("sftp://h:22/x"), &creds(None, None))
+                .unwrap()
+                .options
+                .port_given
+        );
+        assert!(
+            !connection(&url("sftp://h/x"), &creds(None, None))
+                .unwrap()
+                .options
+                .port_given
+        );
 
         // Without a user name, SFTP leaves it to `~/.ssh/config` or the local user.
         let c = connection(&url("sftp://prod/x"), &creds(None, None)).unwrap();

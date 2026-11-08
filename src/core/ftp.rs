@@ -82,27 +82,33 @@ impl Stream {
     /// Ends the TLS session, if any, and closes the sending side, as the end of an upload is
     /// marked; then waits for the server to close its side.
     fn finish_upload(&mut self) -> std::io::Result<()> {
-        let sock = match self {
-            Stream::Plain(s) => s,
+        match self {
+            Stream::Plain(s) => {
+                s.shutdown(Shutdown::Write)?;
+                drain(s);
+            }
             Stream::Tls(s) => {
                 s.conn.send_close_notify();
                 while s.conn.wants_write() {
                     s.conn.write_tls(&mut s.sock)?;
                 }
-                &mut s.sock
+                s.sock.shutdown(Shutdown::Write)?;
+                drain_tls(s);
             }
-            Stream::Gone => return Ok(()),
-        };
-        sock.shutdown(Shutdown::Write)?;
-        drain(sock);
+            Stream::Gone => {}
+        }
         Ok(())
     }
 
     /// Reads a data connection: a TLS one closed without a `close_notify` (as many servers do)
-    /// ends there, since the reply on the control connection then says whether all of it came.
-    fn read_data(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    /// ends there too, setting `unclean`. Anyone in between can end a connection that way, so
+    /// what came is then checked another way (its size, say).
+    fn read_data(&mut self, buf: &mut [u8], unclean: &mut bool) -> std::io::Result<usize> {
         match self.read(buf) {
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                *unclean = true;
+                Ok(0)
+            }
             other => other,
         }
     }
@@ -124,6 +130,26 @@ fn drain(sock: &mut TcpStream) {
     }
 }
 
+/// [`drain`] for a TLS data connection, taking in what comes through the session on the way:
+/// the server's session tickets, each good for resuming the session once, which the next data
+/// connections need when the server requires them to resume the control connection's session.
+/// An upload reads nothing else, so without this its ticket would be lost.
+fn drain_tls(s: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>) {
+    let mut buf = [0u8; 4096];
+    let mut left = 1usize << 20;
+    loop {
+        match s.conn.read_tls(&mut s.sock) {
+            Ok(n) if n > 0 && n < left => left -= n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            _ => return,
+        }
+        if s.conn.process_new_packets().is_err() {
+            return;
+        }
+        while matches!(s.conn.reader().read(&mut buf), Ok(n) if n > 0) {}
+    }
+}
+
 /// A server's reply: its code and text.
 #[derive(Debug)]
 struct Reply {
@@ -139,13 +165,95 @@ impl std::fmt::Display for Reply {
 
 /// What a TLS connection to the server needs: the configuration (shared by the control and
 /// the data connections, so that a data connection resumes the control connection's TLS
-/// session, as many servers require), the name to check the certificate for, and why the
-/// certificate was refused, when it was.
+/// session, as many servers require), the name to check the certificate for, why the
+/// certificate was refused, when it was, and the session tickets at hand.
 #[derive(Clone)]
 struct Tls {
     config: Arc<rustls::ClientConfig>,
     name: ServerName<'static>,
     refused: Arc<Mutex<Option<anyhow::Error>>>,
+    tickets: Arc<Tickets>,
+}
+
+/// The TLS sessions kept to resume, counting the TLS 1.3 tickets: each is good for one data
+/// connection, and a server gives only a few (some none on a data connection the client only
+/// sends on), so that a server that requires data connections to resume the session refuses
+/// one once they are used up, until the control connection is made again.
+#[derive(Debug)]
+struct Tickets {
+    store: rustls::client::ClientSessionMemoryCache,
+    /// Whether the server gave any, and how many are left.
+    count: Mutex<(bool, usize)>,
+}
+
+/// The most TLS 1.3 tickets [`rustls::client::ClientSessionMemoryCache`] keeps for a server.
+const MAX_TICKETS: usize = 8;
+
+impl Tickets {
+    fn new() -> Self {
+        Tickets {
+            store: rustls::client::ClientSessionMemoryCache::new(4),
+            count: Mutex::new((false, 0)),
+        }
+    }
+
+    /// Whether the server gives tickets, and all were used.
+    fn used_up(&self) -> bool {
+        self.count.lock().is_ok_and(|c| c.0 && c.1 == 0)
+    }
+}
+
+impl rustls::client::ClientSessionStore for Tickets {
+    fn set_kx_hint(&self, name: ServerName<'static>, group: rustls::NamedGroup) {
+        self.store.set_kx_hint(name, group)
+    }
+
+    fn kx_hint(&self, name: &ServerName<'_>) -> Option<rustls::NamedGroup> {
+        self.store.kx_hint(name)
+    }
+
+    fn set_tls12_session(
+        &self,
+        name: ServerName<'static>,
+        value: rustls::client::Tls12ClientSessionValue,
+    ) {
+        self.store.set_tls12_session(name, value)
+    }
+
+    fn tls12_session(
+        &self,
+        name: &ServerName<'_>,
+    ) -> Option<rustls::client::Tls12ClientSessionValue> {
+        self.store.tls12_session(name)
+    }
+
+    fn remove_tls12_session(&self, name: &ServerName<'static>) {
+        self.store.remove_tls12_session(name)
+    }
+
+    fn insert_tls13_ticket(
+        &self,
+        name: ServerName<'static>,
+        value: rustls::client::Tls13ClientSessionValue,
+    ) {
+        self.store.insert_tls13_ticket(name, value);
+        if let Ok(mut c) = self.count.lock() {
+            *c = (true, (c.1 + 1).min(MAX_TICKETS));
+        }
+    }
+
+    fn take_tls13_ticket(
+        &self,
+        name: &ServerName<'static>,
+    ) -> Option<rustls::client::Tls13ClientSessionValue> {
+        let ticket = self.store.take_tls13_ticket(name);
+        if ticket.is_some() {
+            if let Ok(mut c) = self.count.lock() {
+                c.1 = c.1.saturating_sub(1);
+            }
+        }
+        ticket
+    }
 }
 
 /// Accepts a certificate a certificate authority vouches for, or else the one the user pinned
@@ -229,7 +337,7 @@ fn tls_for(conn: &RemoteConnection) -> Result<Tls> {
         .with_safe_default_protocol_versions()?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier));
-    let config = match &conn.options.client_cert {
+    let mut config = match &conn.options.client_cert {
         None => builder.with_no_client_auth(),
         Some(cert) => {
             let (certs, key) = client_identity(cert, conn.options.client_key.as_deref())?;
@@ -243,10 +351,13 @@ fn tls_for(conn: &RemoteConnection) -> Result<Tls> {
     };
     let name = ServerName::try_from(conn.host.clone())
         .with_context(|| trf("msg.sftp_lookup", &[("host", conn.host.clone())]))?;
+    let tickets = Arc::new(Tickets::new());
+    config.resumption = rustls::client::Resumption::store(tickets.clone());
     Ok(Tls {
         config: Arc::new(config),
         name,
         refused,
+        tickets,
     })
 }
 
@@ -315,6 +426,9 @@ struct Control {
     /// Replies still owed for transfers given up before they ended, read before the next
     /// command's.
     owed: usize,
+    /// Whether a reply could not be read whole (it timed out, say), so that the next one read
+    /// might be the late end of it rather than the answer to the next command.
+    broken: bool,
 }
 
 impl Control {
@@ -326,12 +440,21 @@ impl Control {
         if n == 0 {
             bail!(tr("msg.ftp_closed"));
         }
+        if !buf.ends_with(b"\n") {
+            bail!(tr("msg.ftp_bad_reply"));
+        }
         Ok(String::from_utf8_lossy(&buf)
             .trim_end_matches(['\r', '\n'])
             .to_string())
     }
 
     fn reply(&mut self) -> Result<Reply> {
+        let reply = self.read_reply();
+        self.broken |= reply.is_err();
+        reply
+    }
+
+    fn read_reply(&mut self) -> Result<Reply> {
         let first = self.line()?;
         let code: u16 = first
             .get(..3)
@@ -358,14 +481,23 @@ impl Control {
         if line.contains(['\r', '\n']) {
             bail!(tr("msg.ftp_bad_name"));
         }
+        if self.broken {
+            bail!(tr("msg.ftp_out_of_step"));
+        }
         while self.owed > 0 {
             self.owed -= 1;
             self.reply()?;
         }
         let out = self.stream.get_mut();
-        out.write_all(line.as_bytes())?;
-        out.write_all(b"\r\n")?;
-        out.flush()?;
+        let sent = (|| {
+            out.write_all(line.as_bytes())?;
+            out.write_all(b"\r\n")?;
+            out.flush()
+        })();
+        if let Err(e) = sent {
+            self.broken = true;
+            return Err(e.into());
+        }
         self.reply()
     }
 
@@ -391,7 +523,7 @@ impl Control {
 
     /// Opens a passive data connection, to the control connection's own address, or through
     /// the proxy to the server's name.
-    fn open_data(&mut self) -> Result<TcpStream> {
+    fn open_data(&mut self, cancel: &AtomicBool) -> Result<TcpStream> {
         let epsv = self.cmd("EPSV")?;
         let port = if epsv.code == 229 {
             epsv_port(&epsv.text).with_context(|| epsv.to_string())?
@@ -400,7 +532,7 @@ impl Control {
             pasv_port(&pasv.text).with_context(|| pasv.to_string())?
         };
         if let Some(proxy) = &self.proxy {
-            return super::net::connect(&self.host, port, Some(proxy), &AtomicBool::new(false));
+            return super::net::connect(&self.host, port, Some(proxy), cancel);
         }
         let tcp = TcpStream::connect_timeout(&SocketAddr::new(self.peer, port), CONNECT_TIMEOUT)?;
         tcp.set_read_timeout(Some(CONNECT_TIMEOUT))?;
@@ -432,10 +564,11 @@ impl Control {
 
     /// The server's connection to `listener`, in active mode: only one from the address the
     /// control connection reached is taken, so another machine cannot send or take a file.
-    fn accept(&self, listener: TcpListener) -> Result<TcpStream> {
+    fn accept(&self, listener: TcpListener, cancel: &AtomicBool) -> Result<TcpStream> {
         listener.set_nonblocking(true)?;
         let until = Instant::now() + CONNECT_TIMEOUT;
         loop {
+            check(cancel)?;
             match listener.accept() {
                 Ok((tcp, from)) if from.ip() == self.peer => {
                     tcp.set_nonblocking(false)?;
@@ -457,10 +590,10 @@ impl Control {
 
     /// Starts the transfer `line` asks for over a new data connection, secured once the server
     /// has said it is ready (it starts its side of the TLS handshake only then).
-    fn transfer(&mut self, line: &str) -> Result<Stream> {
+    fn transfer(&mut self, line: &str, cancel: &AtomicBool) -> Result<Stream> {
         let (tcp, listener) = match self.active {
             true => (None, Some(self.listen()?)),
-            false => (Some(self.open_data()?), None),
+            false => (Some(self.open_data(cancel)?), None),
         };
         let reply = self.cmd(line)?;
         if reply.code != 125 && reply.code != 150 {
@@ -468,7 +601,7 @@ impl Control {
         }
         let tcp = match (tcp, listener) {
             (Some(tcp), _) => tcp,
-            (None, Some(listener)) => match self.accept(listener) {
+            (None, Some(listener)) => match self.accept(listener, cancel) {
                 Ok(tcp) => tcp,
                 Err(e) => {
                     self.owed += 1;
@@ -498,15 +631,21 @@ impl Control {
         Ok(())
     }
 
-    /// `remote` described by `MLST`: `None` when the server says there is nothing there.
+    /// `remote` described by `MLST`: `None` when the server says there is nothing there. A
+    /// description not understood is an error, not "nothing there", which would let a file
+    /// be written over.
     fn mlst(&mut self, remote: &str) -> Result<Option<Entry>> {
         let reply = self.cmd(&format!("MLST {remote}"))?;
         match reply.code {
-            250 => Ok(reply
+            250 => match reply
                 .text
                 .lines()
                 .find(|l| l.starts_with(' '))
-                .and_then(|l| parse_mlsd(l.trim_start()))),
+                .and_then(|l| parse_mlst(l.trim_start()))
+            {
+                Some(entry) => Ok(Some(entry)),
+                None => bail!("{}: {reply}", tr("msg.ftp_bad_reply")),
+            },
             550 => Ok(None),
             _ => bail!("{reply}"),
         }
@@ -544,6 +683,8 @@ enum Kind {
 /// An open, signed-in FTP or FTPS connection.
 pub(crate) struct Client {
     control: RefCell<Control>,
+    /// To sign in again with, for fresh TLS session tickets (see [`Tickets`]).
+    conn: RemoteConnection,
 }
 
 impl Client {
@@ -551,6 +692,31 @@ impl Client {
     /// with [`super::remote::UnknownHost`] for an FTPS server whose certificate no certificate
     /// authority vouches for and that was not trusted yet.
     pub fn connect(conn: &RemoteConnection, cancel: &AtomicBool) -> Result<Self> {
+        Ok(Client {
+            control: RefCell::new(Self::open(conn, cancel)?),
+            conn: conn.clone(),
+        })
+    }
+
+    /// Makes the control connection again before a transfer when the TLS session tickets the
+    /// server gave are used up, so that the data connection can resume the session.
+    fn fresh(&self, cancel: &AtomicBool) -> Result<()> {
+        let used_up = self
+            .control
+            .borrow()
+            .tls
+            .as_ref()
+            .is_some_and(|t| t.tickets.used_up());
+        if used_up {
+            let fresh = Self::open(&self.conn, cancel)?;
+            let mut old = self.control.replace(fresh);
+            let _ = old.stream.get_mut().write_all(b"QUIT\r\n");
+        }
+        Ok(())
+    }
+
+    /// A control connection signed in as `conn` says (see [`Self::connect`]).
+    fn open(conn: &RemoteConnection, cancel: &AtomicBool) -> Result<Control> {
         let shown = server(&conn.host, conn.port);
         let Auth::Password(password) = &conn.auth else {
             bail!(tr("msg.ftp_password_only"));
@@ -576,6 +742,7 @@ impl Client {
             mlst: false,
             home: "/".to_string(),
             owed: 0,
+            broken: false,
         };
         if conn.protocol == Protocol::FtpsImplicit {
             c.start_tls()?;
@@ -635,13 +802,12 @@ impl Client {
                 c.home = home;
             }
         }
-        Ok(Client {
-            control: RefCell::new(c),
-        })
+        Ok(c)
     }
 
     fn listing(&self, remote: &str, cancel: &AtomicBool) -> Result<Vec<Entry>> {
         let cannot = || trf("msg.sftp_cannot_list", &[("path", remote.to_string())]);
+        self.fresh(cancel).with_context(cannot)?;
         let mut c = self.control.borrow_mut();
         let mlsd = c.mlst;
         let line = if mlsd {
@@ -649,13 +815,14 @@ impl Client {
         } else {
             format!("LIST {remote}")
         };
-        let mut data = c.transfer(&line).with_context(cannot)?;
+        let mut data = c.transfer(&line, cancel).with_context(cannot)?;
         let mut text = Vec::new();
         let mut buf = vec![0u8; CHUNK];
+        let mut unclean = false;
         let read = (|| -> Result<()> {
             loop {
                 check(cancel)?;
-                let n = data.read_data(&mut buf)?;
+                let n = data.read_data(&mut buf, &mut unclean)?;
                 if n == 0 {
                     return Ok(());
                 }
@@ -672,6 +839,10 @@ impl Client {
             c.finish().with_context(cannot)?;
         }
         read.with_context(cannot)?;
+        if unclean {
+            // A line cut short could name another file: `notes` for `notes.txt`.
+            text.truncate(text.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1));
+        }
         Ok(String::from_utf8_lossy(&text)
             .lines()
             .filter_map(|line| {
@@ -704,7 +875,7 @@ impl Client {
         } else {
             0
         };
-        Ok(Some(RemoteStamp { size, modified }))
+        Ok(Some(RemoteStamp::new(size, modified)))
     }
 }
 
@@ -721,6 +892,21 @@ struct Download<'a> {
     data: Stream,
     control: RefMut<'a, Control>,
     done: bool,
+    remote: String,
+    read: u64,
+    unclean: bool,
+}
+
+impl Download<'_> {
+    /// After a TLS data connection that ended without a `close_notify`: fails unless the
+    /// server, asked, gives the size that came (or cannot say).
+    fn check_size(&mut self) -> Result<()> {
+        let size = self.control.cmd(&format!("SIZE {}", self.remote))?;
+        match size.text.trim().parse::<u64>() {
+            Ok(n) if size.code == 213 && n != self.read => bail!(tr("msg.ftp_truncated")),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl Read for Download<'_> {
@@ -728,12 +914,16 @@ impl Read for Download<'_> {
         if self.done {
             return Ok(0);
         }
-        let n = self.data.read_data(buf)?;
+        let n = self.data.read_data(buf, &mut self.unclean)?;
         if n == 0 {
             self.done = true;
             self.data = Stream::Gone;
             self.control.finish().map_err(std::io::Error::other)?;
+            if self.unclean {
+                self.check_size().map_err(std::io::Error::other)?;
+            }
         }
+        self.read += n as u64;
         Ok(n)
     }
 }
@@ -749,14 +939,20 @@ impl Drop for Download<'_> {
 
 impl RemoteFs for Client {
     fn open_read(&self, remote: &str) -> Result<Box<dyn Read + '_>> {
+        let cannot = || trf("msg.sftp_cannot_read", &[("path", remote.to_string())]);
+        let never = AtomicBool::new(false);
+        self.fresh(&never).with_context(cannot)?;
         let mut control = self.control.borrow_mut();
         let data = control
-            .transfer(&format!("RETR {remote}"))
-            .with_context(|| trf("msg.sftp_cannot_read", &[("path", remote.to_string())]))?;
+            .transfer(&format!("RETR {remote}"), &never)
+            .with_context(cannot)?;
         Ok(Box::new(Download {
             data,
             control,
             done: false,
+            remote: remote.to_string(),
+            read: 0,
+            unclean: false,
         }))
     }
 
@@ -892,9 +1088,28 @@ impl RemoteWrite for Client {
             )
         })?;
         check(cancel)?;
+        self.fresh(cancel).with_context(cannot)?;
+        let started = self
+            .control
+            .borrow_mut()
+            .transfer(&format!("STOR {remote}"), cancel);
+        let mut data = match started {
+            Ok(data) => data,
+            // The server may have emptied the file before the data connection failed.
+            Err(e) => {
+                let stamp = self.stamp(remote).ok().flatten();
+                let e = e.context(cannot());
+                return Err(match stamp == now {
+                    true => e,
+                    false => e.context(PartlyWritten {
+                        path: remote.to_string(),
+                        stamp,
+                    }),
+                });
+            }
+        };
         let written = {
             let mut c = self.control.borrow_mut();
-            let mut data = c.transfer(&format!("STOR {remote}")).with_context(cannot)?;
             let mut buf = vec![0u8; CHUNK];
             let sent = (|| -> Result<()> {
                 loop {
@@ -1024,10 +1239,24 @@ fn parse_mlsd(line: &str) -> Option<Entry> {
     Some(Entry {
         name,
         kind,
-        stamp: (kind == Kind::File).then(|| RemoteStamp {
-            size: size.unwrap_or(0),
-            modified: modified.unwrap_or(0),
-        }),
+        stamp: (kind == Kind::File)
+            .then(|| RemoteStamp::new(size.unwrap_or(0), modified.unwrap_or(0))),
+    })
+}
+
+/// The line of an `MLST` reply describing the path asked about: as a line of an `MLSD`
+/// listing, but where a folder may be `type=cdir`.
+fn parse_mlst(line: &str) -> Option<Entry> {
+    parse_mlsd(line).or_else(|| {
+        let (facts, name) = line.split_once(' ')?;
+        facts
+            .split(';')
+            .any(|f| f.eq_ignore_ascii_case("type=cdir") || f.eq_ignore_ascii_case("type=pdir"))
+            .then(|| Entry {
+                name: name.rsplit('/').next().unwrap_or(name).to_string(),
+                kind: Kind::Dir,
+                stamp: None,
+            })
     })
 }
 
@@ -1109,13 +1338,7 @@ mod tests {
         let e = parse_mlsd("type=file;size=12;modify=19700101000002;perm=r; a b.txt").unwrap();
         assert_eq!(e.name, "a b.txt");
         assert_eq!(e.kind, Kind::File);
-        assert_eq!(
-            e.stamp,
-            Some(RemoteStamp {
-                size: 12,
-                modified: 2
-            })
-        );
+        assert_eq!(e.stamp, Some(RemoteStamp::new(12, 2)));
         assert_eq!(
             parse_mlsd("Type=dir;Modify=20260101000000; sub")
                 .unwrap()
@@ -1123,6 +1346,8 @@ mod tests {
             Kind::Dir
         );
         assert!(parse_mlsd("type=cdir; .").is_none());
+        assert_eq!(parse_mlst("type=cdir; /srv/x").unwrap().kind, Kind::Dir);
+        assert!(parse_mlst("size=3; /srv/x").is_none());
         assert_eq!(
             parse_mlsd("type=OS.unix=slink:/x;size=1; ln").unwrap().kind,
             Kind::Link
@@ -1387,6 +1612,41 @@ mod tests {
                 "{err:#}"
             );
             std::fs::write(&file, "").unwrap();
+        }
+        *remote::CERTS_PATH.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn tls_data_cut_short_without_close_notify_is_caught() {
+        let _one = CERTS_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let certs = tempfile::tempdir().unwrap();
+        let file = certs.path().join("known_certs");
+        *remote::CERTS_PATH.lock().unwrap() = Some(file.clone());
+        let never = AtomicBool::new(false);
+        let hex: String = ts::CERT.iter().map(|b| format!("{b:02x}")).collect();
+        for (cut, whole) in [(3, false), (10_000, true)] {
+            let server = ts::start(Options {
+                security: Security::Explicit,
+                mlst: true,
+                epsv: true,
+                cut: Some(cut),
+                ..Default::default()
+            });
+            seed(server.root.path());
+            std::fs::write(&file, format!("127.0.0.1:{} {hex}\n", server.port)).unwrap();
+            let c = conn(Protocol::Ftps, server.port);
+            let fetched = remote::fetch(&c, "/data/a.txt", &never);
+            match whole {
+                true => assert_eq!(read(fetched.unwrap().local), "alpha"),
+                false => {
+                    let err = format!("{:#}", fetched.err().unwrap());
+                    assert!(err.contains(tr("msg.ftp_truncated")), "{err}");
+                }
+            }
+            // A listing has no size to check by, but its line cut short is left out.
+            let f = remote::fetch(&c, "/data", &never).unwrap();
+            let names = std::fs::read_dir(&f.local).unwrap().count();
+            assert_eq!(names, if whole { 2 } else { 0 });
         }
         *remote::CERTS_PATH.lock().unwrap() = None;
     }

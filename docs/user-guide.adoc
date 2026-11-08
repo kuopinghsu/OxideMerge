@@ -239,9 +239,9 @@ You can start a comparison in several ways:
 * Choose a recent comparison on the start page, in *File → Open recent* or in the command palette.
 * Start OxideMerge from the command line (see <<command-line>>) or from your file manager
   (see <<file-manager>>).
-* Choose *File → Compare over SFTP...*, or click the globe button beside a path on the start
-  page or in the *Select files or folders* dialog, to fetch a file or folder from a server first.
-  See <<remote-sftp>>.
+* Choose *File → Compare over SFTP/FTP...*, or click the globe button beside a path on the start
+  page or in the *Select files or folders* dialog, to fetch a file or folder from a server over
+  SFTP, FTPS or FTP first. See <<remote-sftp>>.
 
 To use the *Select files or folders* dialog:
 
@@ -269,16 +269,38 @@ right side; paste the second text with kbd:[Ctrl+V].
 *Save* works like any other unsaved comparison, since there is no file to write back to.
 
 [[remote-sftp]]
-=== Comparing over SFTP
+=== Comparing over SFTP or FTP
 
-*File → Compare over SFTP...*, and the globe button beside a path on the start page or in the
-*Select files or folders* dialog, connect to a server to fetch a file or folder to compare,
+*File → Compare over SFTP/FTP...*, and the globe button beside a path on the start page or in
+the *Select files or folders* dialog, connect to a server to fetch a file or folder to compare,
 instead of browsing the local disk.
 
-. Enter the server's *Host*, *Port* and *User*.
-. Choose *Password* or *Private key* and enter it; a private key can have a *Passphrase*.
-. Enter the *Remote path* of the file or folder to fetch.
+. Choose the *Protocol*:
+  *SFTP (over SSH)*; *FTPS (explicit TLS)*, which connects to the FTP port (21) and switches
+  to TLS before signing in; *FTPS (implicit TLS, port 990)*, for servers that expect TLS from
+  the start; or *FTP (not encrypted)*. Changing the protocol changes the *Port* to that
+  protocol's usual one, unless you typed another.
+. Enter the server's *Host*, *Port* and *User*. For SFTP, the host can be a `Host` alias of
+  your `~/.ssh/config`, and the user can be left empty, as with `ssh` (see <<remote-ssh-config>>).
+. For SFTP, choose how to sign in: *Password*, *Private key* (which can have a *Passphrase*),
+  or *SSH agent*, which uses the keys `ssh-agent` holds (Pageant on Windows) and those
+  `~/.ssh/config` names, so nothing is typed here. FTP and FTPS sign in with a password.
+. If needed, open *Advanced* for a proxy, FTP's active mode or an FTPS client certificate (see
+  <<remote-advanced>>).
+. Enter the *Remote path* of the file or folder to fetch, or click the folder button beside it
+  to choose it from a list of the server's folders and files.
 . Click *Connect*.
+
+The folder button connects and lists the folder of the *Remote path*, or your home folder on
+the server if it is empty. Folders come first, then files with their sizes; hidden entries,
+whose names start with a dot, come last in each group. Click a folder to open it, or a file to
+choose it: the *Remote path* follows what you click, so *Connect* fetches the folder you are in
+or the file you chose. Double-click a file to fetch it straight away. The up-arrow button opens
+the folder above, and the refresh button lists the *Remote path* again, including one you typed.
+A path that does not exist lists the nearest folder above it. The list stays connected while it
+is shown, so going through folders does not sign in again each time. It closes when the dialog
+closes, or when you change the host, port, user, password or key. A folder shows its first
+10,000 entries.
 
 The fetched path then fills in the *Left*, *Middle* or *Right* path, the same as a local one.
 Connect again, for the other side, to compare two remote locations with each other, or leave
@@ -287,22 +309,63 @@ host, port, user and key path of the last connection that succeeded, for fetchin
 from the same server; the password or a key's passphrase is never filled in this way.
 
 A fetched *file* is writable: edit it and *Save* uploads it back to the server over a fresh
-connection, in the background, with a *Cancel* button. The upload is written to a temporary
-file beside the original, which then takes its place keeping its permissions, so a failed or
-stopped upload leaves the server's file as it was. If the server's path is a link, the file it
-points to is written and the link is kept. A server that cannot rename over a file (OpenSSH
-cannot) has the original moved aside for a moment while the new file takes its place; if that
-cannot finish, the original is moved back, or the error says where it is. If someone changed or
-deleted the file on the server after you fetched it, or while it was being uploaded, OxideMerge
-does not write over their change: the upload is refused, your
-edits stay in the tab, and you can compare them with the server's version. Until an upload
+connection in the background. The upload updates the file in place to preserve its owner,
+group and access controls. If the server's path is a link, the file it points to is updated.
+*Cancel* can stop an upload before it starts writing. A connection failure during the write
+can leave partial contents on the server; the message says so, and *Save* again finishes
+writing the file. If the server's file changed or disappeared after
+you fetched it, the upload is refused before writing. Your edits stay in the tab, and you
+can compare them with the server's version. Until an upload
 succeeds the tab counts as unsaved, so closing it or quitting asks first, and *Save* tries
 again. Closing a tab with *Save* waits for its upload to finish before it closes.
 
-A fetched *folder* opens read-only, since OxideMerge does not yet upload new, renamed or deleted
-files inside a remote folder. A fetch is also limited to 4 GiB, 50,000 files and folders, and
-folders nested 64 deep, so a very large folder cannot be fetched by mistake. Names that can't be
-file names on this computer are left out.
+A fetched *folder* is writable too. Copy or delete files in the folder comparison, or
+open a file from it and edit it, and *Save* writes what changed back to the server: files that
+are new or whose contents changed are uploaded, folders that are new are created, and files
+and folders that were removed are deleted on the server. Files you did not change are not sent
+again. Before each upload or deletion OxideMerge checks that the server's file is still the one
+it fetched: a file changed on the server meanwhile is neither overwritten nor deleted, and a
+new file whose name was created on the server meanwhile is not overwritten. A file changed
+within a few seconds before it was fetched is also checked by its contents, since a second
+change in the same second would leave its size and time unchanged. The message after
+the save lists those files; your copies stay in the tab, so you can compare them with the
+server's and save again. The rest is written as usual. Until every change is written, the tab
+counts as unsaved. If the folder's local copy is gone, or part of it can't be read, nothing is
+written, so a file that couldn't be read is never deleted on the server.
+
+Files are uploaded before the removed ones are deleted, so a file you moved to another folder
+is deleted from its old place only once its new copy is on the server: if that upload fails,
+the old copy stays. A symbolic link or special file in the fetched copy, or a name that isn't
+valid Unicode, is never uploaded and never counts as removed; the server's file stays as it
+is, and the message after the save names it.
+
+A fetch is limited to 4 GiB, 50,000 files and folders, and folders nested 64 deep, so a very
+large folder cannot be fetched by mistake. Names that can't be file names on this computer are
+left out, and so is the second of two names this computer can't keep apart, such as `A.txt`
+and `a.txt` where letter case doesn't count. No `.bak` backups are made inside a fetched
+copy, since saving would upload them.
+
+*File → Reload from server* fetches the server's copy of the current tab's remote file or
+folder again, over a fresh connection, and shows it in place of the copy fetched before. It
+asks first when that would replace changes not saved to the server yet; edits of a remote
+file are then replaced (*Undo* brings them back), and edits of a local side are kept.
+
+On FTP and FTPS, OxideMerge tells whether a file changed on the server by its size and the
+modification time the server reports; for a server that reports no modification time, it
+reads the file and compares its contents instead. Servers that can't list folders in the standard
+machine-readable way (`MLSD`) are read from their plain listing instead, and links are followed
+to the file or folder they point to. Transfers use passive mode unless *Active mode* is set (see
+<<remote-advanced>>), and always connect to the server the sign-in went to.
+
+Over FTPS, a download whose connection ended without TLS's closing message, which anyone in
+between could cause, is checked against the size the server reports, and refused if it came
+short. Many FTPS servers, such as ProFTPD and vsftpd, require each transfer to resume the TLS
+session of the sign-in; each of the session tickets a server gives for that is good for one
+transfer, so when they run out OxideMerge signs in again before the next transfer.
+
+IMPORTANT: Plain FTP sends your password and your files unencrypted: anyone on the network
+between you and the server can read them, and the dialog says so. Use FTPS or SFTP whenever the
+server offers them.
 
 The connection, including the password or the key's passphrase, is kept only in memory for as
 long as the tab stays open, and the password is overwritten in memory once it is no longer
@@ -315,25 +378,155 @@ Before the password or key is sent, OxideMerge checks the server's host key. It 
 your own SSH `~/.ssh/known_hosts` the way `ssh` does: host patterns such as `*.example.com`
 or `!host.example.com`, in any letter case, and names hashed by `ssh-keygen -H` all match, and
 a server on another port than 22 is found under `[host]:port`. A server listed there with the
-same key is trusted. A server listed there
+same key is trusted if it also matches any key saved by OxideMerge. A server listed there
 with a different key of the same type, or whose key is marked `@revoked` there, is refused, as
 `ssh` refuses it: if the server was reinstalled, remove its old key with
-`ssh-keygen -R host` (or `ssh-keygen -R "[host]:port"`) and connect again. Otherwise OxideMerge
-checks a `known_hosts` file of its own, next to its settings file. The first time you connect to
+`ssh-keygen -R host` (or `ssh-keygen -R "[host]:port"`) and connect again. OxideMerge also
+checks its own `known_hosts` file next to its settings file. The first time you connect to
 a server found in neither, OxideMerge shows the key's type and fingerprint (`SHA256:...`, as
 `ssh` shows it) and asks whether to trust it: compare it with the fingerprint the server's
 administrator gives you before you click *Trust and connect*. A warning is shown when your
-`~/.ssh/known_hosts` lists only keys of other types for that server. OxideMerge asks servers
-for plain host keys only, never a host certificate, so `@cert-authority` lines are not used.
+`~/.ssh/known_hosts` lists only keys of other types for that server.
+
+A server can also prove who it is with a host certificate, signed by an authority your
+`~/.ssh/known_hosts` names in a `@cert-authority` line, such as
+`@cert-authority *.example.com ssh-ed25519 AAAA...`. OxideMerge asks for a certificate only
+from a server such a line names; it trusts the certificate when that authority signed it, it
+names the server (or its `HostKeyAlias`) among its principals, it is valid now, and it has no
+critical options, without asking you first. A certificate that fails any of these is
+refused, and so is one whose authority or key is marked `@revoked`. Certificates signed with
+Ed25519, ECDSA (P-256 or P-384) or RSA with SHA-2 are checked; an authority using another
+algorithm, such as RSA with SHA-1 or ECDSA P-521, is refused. A certificate from a server no
+authority is named for is checked like its plain key.
 
 On every later connection, the key is checked against the one remembered: if it no longer
 matches, OxideMerge refuses the connection rather than trusting a server that may not be the
 one you expect. This usually means the server was rebuilt or reinstalled. If you are sure that
-is what happened, remove that server's line from OxideMerge's `known_hosts` file (it is one line
-per server, `host:port` followed by its key) and connect again. If either `known_hosts` file
+is what happened, remove that server's old entries from OxideMerge's `known_hosts` file
+(`host:port` followed by its key) and connect again. If either `known_hosts` file
 exists but can't be read, or holds a line OxideMerge can't read (any line of its own file, or
 a line of `~/.ssh/known_hosts` for a key type it checks), OxideMerge connects to no server
 until it can.
+
+FTPS servers are checked the way a web browser checks a website: their certificate must be
+valid for the host name and vouched for by a well-known certificate authority. Many FTP servers
+have a self-signed certificate instead. The first time you connect to one, OxideMerge shows the
+certificate's fingerprint and asks whether to trust it, as for an unknown SSH host key; once
+trusted, the certificate is remembered in the `known_certs` file next to the settings file
+(`oxidemerge-known_certs` in portable use), and a later connection that shows another
+certificate is refused. Remove the server's line (`host:port` followed by the certificate) from
+that file if the server's certificate was renewed. In both cases the certificate is checked
+before the password is sent, and a server that does not offer TLS is refused for FTPS rather
+than signed in to without it.
+
+[[remote-ssh-config]]
+==== SSH configuration, jump hosts and sign-in questions
+
+An SFTP server is reached the way `ssh` reaches it, as your `~/.ssh/config` (and the system's
+`/etc/ssh/ssh_config`) says. A *Host* such as `prod` can be an alias there, and its block can
+set the `HostName`, `User`, `Port`, `IdentityFile` (with `IdentitiesOnly`), `HostKeyAlias`
+(the name its key is looked up and certified under) and `UserKnownHostsFile`. A `#` starting a
+word begins a comment. `Include` is read in place, skipping files whose names start with a dot
+unless the pattern's file name does too, and `Match` blocks on `host` (the `HostName` set so far, as
+in `ssh`), `originalhost`, `user`, `localuser` or `all` apply; `Match exec` is never run. As in
+`ssh`, the first value found wins, and a user, or a port other than 22, typed in the dialog wins
+over the file; in an address on the command line, any port written wins, `:22` included.
+Without a user, the file's `User` or your own user name is used.
+
+A server reached through jump hosts (`ProxyJump bastion` or `ProxyJump user@hop1,hop2:2222`)
+is connected to through each in turn, up to 8, as `ssh -J` does; a jump host signs in with the
+SSH agent's keys and the keys its own block names, and its key is checked like the server's,
+before anything is sent to it. A `ProxyCommand` is run as `ssh` runs it, by the shell, with
+`%h`, `%p`, `%r` and `%n` filled in, and the connection goes through it. As in OpenSSH, a
+host or user name with characters the shell would act on (quotes, `$`, `;`, `|`, spaces and
+the like), or starting with `-`, is refused before any command runs.
+
+A server can ask questions while signing in (*keyboard-interactive* sign-in): a one-time code,
+a second factor, a new password. OxideMerge shows them in a *Sign-in question* window naming the server, the
+answers hidden unless the server says they may be shown; *Cancel* declines. The password you
+gave answers a server's single password question by itself. A private key that is encrypted
+and was given without a passphrase has its passphrase asked for the same way; when its `.pub`
+file is beside it, only after the server has said it would take the key. A password the
+server refused is not sent again. Ways of signing
+in are tried in turn, starting with the one chosen, for servers that need more than one.
+
+[[remote-advanced]]
+==== Proxies, active mode and client certificates
+
+*Advanced* in the connection dialog holds settings most servers don't need:
+
+* *Proxy*: connect through a SOCKS5 proxy (`socks5://host:1080`, or `socks5://user@host:1080`
+  with a *Proxy password*) or an HTTP proxy that allows `CONNECT` (`http://host:8080`). A
+  password typed into the address moves to *Proxy password*, where it is hidden, once you leave
+  the field. Both
+  SFTP and FTP use it, every FTP data connection included. A jump host or a `ProxyCommand` from
+  `~/.ssh/config` is used instead of it for the servers it applies to; the first jump host is
+  reached through it.
+* *Active mode* (FTP): the server connects back to this computer for each transfer
+  (`EPRT`, or `PORT` for a server without it), for servers that refuse passive mode. A data
+  connection is accepted only from the server's address. Active mode can't go through a proxy,
+  and usually not from behind a router that translates addresses (NAT) or a firewall that blocks
+  incoming connections.
+* *Client certificate* and *Certificate key* (FTPS): a certificate to present to a server that asks
+  for one, in PEM, with its private key in the same file or in the key file. The key must not
+  be encrypted.
+
+The dialog remembers the proxy's address, active mode and the certificate's files with the last
+connection that succeeded, never the proxy password.
+
+[[remote-command-line]]
+==== Server paths on the command line and in jobs
+
+On the command line and in job files (see <<jobs>>), a path can also be a file or folder on a
+server, written as an address:
+
+[source,sh]
+----
+oxidemerge sftp://ann@build.example.com/var/www/site ./site     # SFTP, port 22
+oxidemerge ftpes://ann@ftp.example.com/public/index.html index.html  # explicit FTPS, port 21
+oxidemerge ftps://ann@ftp.example.com:990/public ./public -r    # implicit FTPS
+oxidemerge --cli ftp://ftp.example.com/pub/README README         # anonymous plain FTP
+oxidemerge sftp://ann@host/~/notes.txt notes.txt                # in ann's home folder
+----
+
+The address is `scheme://[user@]host[:port]/path`. An IPv6 address goes in brackets, as in
+`sftp://ann@[2001:db8::1]/srv`. A path starting with `/~/` is in the user's
+home folder on the server, and other characters can be written as `%XX`. For SFTP, the host
+can be an alias of `~/.ssh/config` (see <<remote-ssh-config>>), and without a user name, its
+`User` or your own user name is used; FTP without one signs in as `anonymous`, with
+`anonymous@` as the password, never the one in `OXIDEMERGE_REMOTE_PASSWORD`.
+
+A password never goes in the address, where anyone who can see the command line or the job
+file could read it; one there is refused. Put it in the `OXIDEMERGE_REMOTE_PASSWORD`
+environment variable instead. SFTP signs in with `--ssh-key FILE` when given (the variable then
+holds the key's passphrase, if it has one), else with the password in the variable, else with
+`ssh-agent` and the keys `~/.ssh/config` names. FTP and FTPS need the password, unless they
+sign in as `anonymous`. OxideMerge removes the variable when it starts, so the programs it runs,
+such as an external tool, don't inherit it. Questions a server asks while signing in, and the
+passphrase of an encrypted key given without one, are asked on the terminal, without echoing
+the answer (*Ctrl+C* there turns the echo back on as it stops the program); without a terminal
+they are declined.
+
+`--proxy URL` connects through a proxy, as *Proxy* does in the dialog; a proxy password is read
+from the `OXIDEMERGE_PROXY_PASSWORD` environment variable, also removed at startup, and one in
+the address is refused. `--ftp-active` uses FTP's active mode. `--client-cert FILE` presents an
+FTPS client certificate, with its key from `--client-key FILE` when not in the same file.
+
+Servers are checked as in the program, against the same `known_hosts` and `known_certs`
+files. A server not trusted yet is refused, and the error shows its fingerprint. Compare it
+with the one its administrator gives you, then run again with
+`--trust-fingerprint SHA256:...` to trust it; it is then remembered, as when you click *Trust
+and connect*. A server whose key or certificate changed is refused.
+
+Each server path is fetched to a temporary copy before the comparison and opened like a local
+path. In the window, *Save* writes changes back to the server as described above. Without a
+window, what the run changed in a fetched copy, as a `sync` job does in its destination, is
+written back to the server after the run, with the same checks; a file the server changed
+meanwhile is reported as an error (exit code 2). A synchronization that stopped part way
+without undoing all it changed (exit code 5) is undone in the fetched copy instead, and nothing
+is written back. A sync plan made with `--sync-plan` names a server folder by its address, so
+`--sync-apply` applies it to the copy that run fetches; as for local folders, it is refused if
+the files it plans to change are no longer as planned.
 
 [[compare-types]]
 === Comparison types
@@ -1603,9 +1796,18 @@ Edits to the extracted files are saved back into the archive: copying, deleting,
 editing a file and then saving writes a new archive in place of the original, keeping its
 permissions. Only an archive whose files changed is written, and the entries you didn't change
 are kept exactly as they were, with their dates, compression and order; changed entries get the
-current time. If the archive itself was changed on disk since it was extracted, or is
+current time. A 7z packs entries together into compressed blocks: a block holding only entries
+you didn't change is copied as it was, and any other block is compressed again with LZMA2,
+its entries keeping their dates and attributes. A `.tar.xz` is compressed again as `xz` does by
+default. Compressing a `.tar.xz` or a 7z can take a while for a large archive, so it is written
+in the background while a window shows which archive is being written; uploads, closing a tab
+and quitting wait for it. If the archive itself was changed on disk since it was extracted, or is
 read-only, saving into it is refused instead of losing those changes. No `.bak` backups are made
-inside an extracted archive. An archive fetched over SFTP is uploaded again after it is saved.
+inside an extracted archive. An archive fetched over SFTP or FTP is uploaded again after it is saved.
+
+An archive inside an extracted archive can be edited too: saving it also writes the archive it
+came from, and so on out to the outermost one, and an open compare of that archive is
+compared again.
 
 These stay read-only, as there is nowhere for their changes to go back to, or writing them
 again would break them:
@@ -1613,8 +1815,7 @@ again would break them:
 * an archive opened as a snapshot in a review, or a page tree compared from the web;
 * signed packages (`.apk`, `.ipa`, `.appx`, `.msix`, `.crx`, `.xpi`, and any zip carrying a
   `META-INF` signature or an `_xmlsignatures` folder), as rewriting them invalidates the signature;
-* `.tar.xz` / `.txz`, which OxideMerge reads but can't write;
-* an archive inside another extracted archive.
+* an archive inside one of these.
 It refuses archives that would extract to more than 8 GB or more than 500,000 files.
 RAR is not supported.
 
@@ -1901,7 +2102,9 @@ A compare rules file (`.oxrules`) contains rules of three kinds:
 Ignore lines matching:: One regular expression on each line.
 A difference that contains only matching lines is ignored.
 Substitutions:: One rule on each line, written as `+regex => replacement+`.
-OxideMerge applies the substitutions to both sides before it compares them.
+OxideMerge applies the substitutions to both sides before it compares them, in order, each
+rule to the text the rules before it left; the changed words within a line are highlighted the
+same way.
 Use them for text that is different in an expected way.
 Ignore blocks between start and end lines:: One block on each line, written as
 `+start regex => end regex+`.
@@ -2127,7 +2330,7 @@ comparison tab that has files of its own under a name you choose (up to 80 chara
 and the tabs' paths and settings are kept in your settings, not in a file of their own. Tabs with
 nothing of their own to reopen from are left out, the same as the session OxideMerge reopens
 automatically leaves them out: *All differences* and review tabs, the clipboard, and tabs of
-temporary copies, such as a file or folder fetched over SFTP (see <<remote-sftp>>), a revision,
+temporary copies, such as a file or folder fetched over SFTP or FTP (see <<remote-sftp>>), a revision,
 or a file opened from inside an archive compare. A message says how many tabs were saved and how
 many were left out. When none of the open tabs can be saved, the dialog says so and nothing is
 saved.
@@ -2972,8 +3175,8 @@ oxidemerge review.oxmcmp                        # open a saved comparison
 |Option |Description
 
 |`PATHS...`
-|Two or three files, folders or web addresses; or one conflict file, project file or saved
-comparison.
+|Two or three files, folders, web addresses or server paths (`sftp://`, `ftp://`, `ftpes://`,
+`ftps://`; see <<remote-command-line>>); or one conflict file, project file or saved comparison.
 
 |`-t`, `--compare-as <T>`
 |The comparison type: `text`, `binary`, `image` or `web`.
@@ -2991,6 +3194,25 @@ three-way comparison.
 
 |`--wl`, `--wm`, `--wr`
 |Open the left, middle or right side read-only.
+
+|`--ssh-key <FILE>`
+|The private key to sign in to `sftp://` paths with (see <<remote-command-line>>).
+
+|`--trust-fingerprint <FINGERPRINT>`
+|Trust a server path's server not trusted yet when its key or certificate has this fingerprint,
+and remember it (see <<remote-command-line>>).
+
+|`--proxy <URL>`
+|Reach server paths through a SOCKS5 (`socks5://[user@]host:port`) or HTTP CONNECT
+(`http://[user@]host:port`) proxy, its password from `OXIDEMERGE_PROXY_PASSWORD` (see
+<<remote-advanced>>).
+
+|`--ftp-active`
+|Use active mode for `ftp://`, `ftpes://` and `ftps://` paths (see <<remote-advanced>>).
+
+|`--client-cert <FILE>`, `--client-key <FILE>`
+|The client certificate (PEM) to present to FTPS servers, and its private key when not in the
+same file (see <<remote-advanced>>).
 
 |`--rev`, `--git-rev <REV>`
 |Compare the one path given with its version in a Git, Subversion or Mercurial revision
@@ -3357,10 +3579,14 @@ All kinds also take `filter`, `method`, `rules`, `whitespace`, `ignore_case`, `i
 `ignore_eol`, `ignore_numbers`, `ignore_comments`, `prettify`, `structured` and
 `numeric_tolerance`, and the compare kind `page_size`, `portrait`, `unified` and `whole_file` for
 a `.pdf` report, with the meanings of the command-line options of the same names. A field that
-does not fit the kind, such as `apply` in a compare, is an error.
+does not fit the kind, such as `apply` in a compare, is an error. For server paths, all kinds
+take `ssh_key`, `trust_fingerprint`, `proxy`, `ftp_active`, `client_cert` and `client_key`,
+as `--ssh-key`, `--trust-fingerprint`, `--proxy`, `--ftp-active`, `--client-cert` and
+`--client-key` (see <<remote-command-line>>); a `sync` job whose `destination` is a server path
+writes the changes back to the server.
 
-Paths, including `rules`, are relative to the folder of the job file, unless they are absolute or
-URLs. In paths and `rules`, `${env:NAME}` is replaced by the environment variable `NAME`; an unset
+Paths, including `rules`, are relative to the folder of the job file, unless they are absolute,
+URLs or server paths. In paths and `rules`, `${env:NAME}` is replaced by the environment variable `NAME`; an unset
 variable is an error. Nothing else is expanded, and a job file names no command and no shell.
 Comparing a file that one of your unpackers reads (see <<unpackers>>) runs that unpacker, as any
 comparison does.
@@ -3921,8 +4147,7 @@ The pane is read-only for one of these reasons:
 * It was opened with `--wl`, `--wm` or `--wr`.
 * It was extracted from a review snapshot or from a web page tree. A file extracted from an
   archive compare (see <<archives>>) can be edited; saving it also saves the archive, unless
-  the archive is one that stays read-only, such as a signed package or a `.tar.xz`.
-* It is a fetched folder from *Compare over SFTP* (see <<remote-sftp>>).
+  the archive is one that stays read-only, such as a signed package.
 * It is a JSON or XML file shown formatted.
   Turn off *Format JSON and XML before comparing* to edit and merge it.
 --
@@ -4007,5 +4232,9 @@ content (see <<compare-methods>>).
   reading the file again. It does not move array elements or merge all changes at once.
 * Folder synchronization works on local folders only, and only when you start it.
   A renamed file appears as a deletion and a copy.
+* SFTP and FTP: FTP's active mode does not go through a proxy, and rarely works from behind
+  NAT. SSH host certificates signed with RSA SHA-1 or ECDSA P-521 are refused. `Match exec`
+  and `Match canonical` in `~/.ssh/config` never match. A question on the terminal can be
+  stopped only with `Ctrl+C`.
 * The translations were made with the help of machines and have not been reviewed by native
   speakers.

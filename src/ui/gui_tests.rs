@@ -175,6 +175,7 @@ impl Gui {
         self.app.report_job.is_some()
             || self.app.rev_load.is_some()
             || self.app.remote_load.is_some()
+            || self.app.repack.is_some()
             || self
                 .app
                 .tabs
@@ -1784,6 +1785,45 @@ fn saving_a_file_still_repacks_its_archive_after_the_folder_tab_closed() {
 }
 
 #[test]
+fn saving_a_file_from_a_tar_xz_writes_it_back_on_another_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let make_txz = |path: &Path, content: &str| {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(content.len() as u64);
+        h.set_mode(0o644);
+        tar.append_data(&mut h, "a.txt", content.as_bytes())
+            .unwrap();
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut tar.into_inner().unwrap().as_slice(), &mut xz).unwrap();
+        std::fs::write(path, xz).unwrap();
+    };
+    let left = d.join("left.tar.xz");
+    let right = d.join("right.tar.xz");
+    make_txz(&left, "left\n");
+    make_txz(&right, "right\n");
+
+    let mut gui = Gui::start("archive_save_slow", compare(&[left.clone(), right.clone()]));
+    gui.settle();
+    gui.click("a.txt");
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.frames(3);
+    gui.app.run(Cmd::CopyRight, &gui.ctx);
+    gui.app.run(Cmd::Save, &gui.ctx);
+    // Left to another thread, the folder tab still has it to write meanwhile.
+    assert!(gui.app.repack.is_some());
+    assert!(gui.app.tabs[0].is_modified());
+    gui.settle();
+
+    assert!(gui.app.repack.is_none());
+    assert!(!gui.app.tabs[0].is_modified());
+    let repacked = archive::extract_to_temp(&right).unwrap();
+    assert_eq!(read(&repacked.path().join("a.txt")), "left\n");
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
 fn save_all_with_several_files_from_the_same_archive_repacks_it_once_with_every_edit() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
@@ -2493,6 +2533,14 @@ fn the_connection_dialog_offers_ftp_with_a_warning_and_sftp_with_ssh_agent() {
     d.set_protocol(remote::Protocol::Sftp);
     assert_eq!(d.port, "22");
     assert_eq!(d.sign_in(), SignIn::Agent, "the SFTP sign-in is kept");
+
+    // A password typed into the proxy URL moves to the field that hides it.
+    d.proxy = "socks5://bob:s%40cret@proxy.example:1080".to_string();
+    d.hide_proxy_password();
+    assert_eq!(d.proxy, "socks5://bob@proxy.example:1080");
+    assert_eq!(d.proxy_password, "s@cret");
+    let proxy = d.proxy().unwrap().unwrap();
+    assert_eq!(proxy.password.as_deref(), Some("s@cret"));
 }
 
 #[test]
@@ -2672,6 +2720,7 @@ fn the_connection_dialog_lists_the_servers_folders_to_pick_the_remote_path_from(
             .dir("/home")
             .dir("/home/ann")
             .file("/home/ann/notes.txt", "notes\n")
+            .file(&format!("/home/ann/{}.txt", "long-name-".repeat(20)), "")
             .dir("/home/ann/srv")
             .file("/home/ann/srv/a.txt", "one\n")
             .file("/home/ann/srv/b.txt", "two\n"),
@@ -2689,8 +2738,16 @@ fn the_connection_dialog_lists_the_servers_folders_to_pick_the_remote_path_from(
         let d = gui.app.remote_dlg.as_mut().unwrap();
         d.host = "example.com".to_string();
         d.user = "ann".to_string();
+        d.sign_in = SignIn::Agent;
     }
     gui.frame();
+    let width = |gui: &Gui| {
+        gui.widget(tr("btn.connect")).rect.right()
+            - gui.widget(tr("label.remote_protocol")).rect.left()
+    };
+    // Long hints wrap, and long names are cut short, rather than stretching the dialog across
+    // the window.
+    assert!(width(&gui) <= 610.0, "{} wide", width(&gui));
 
     // With no path typed, the list starts at the home folder, and the path field follows the
     // folder shown.
@@ -2698,6 +2755,8 @@ fn the_connection_dialog_lists_the_servers_folders_to_pick_the_remote_path_from(
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
     assert_eq!(remote_path(&gui), "/home/ann");
     assert!(gui.shows("srv") && gui.shows("notes.txt"));
+    gui.frames(2);
+    assert!(width(&gui) <= 610.0, "{} wide with the list", width(&gui));
 
     // Clicking a folder opens it; clicking a file picks it; *Up* goes back.
     gui.click("srv");
