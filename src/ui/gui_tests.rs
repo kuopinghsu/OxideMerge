@@ -2792,7 +2792,9 @@ fn the_connection_dialog_lists_the_servers_folders_to_pick_the_remote_path_from(
         d.user = "ann".to_string();
         d.sign_in = SignIn::Agent;
     }
-    gui.frame();
+    // The agent hint makes the dialog taller, and a centered dialog moves to its new place a
+    // frame later; clicking before then misses where the fonts wrap the hint to more lines.
+    gui.frames(3);
     let width = |gui: &Gui| {
         gui.widget(tr("btn.connect")).rect.right()
             - gui.widget(tr("label.remote_protocol")).rect.left()
