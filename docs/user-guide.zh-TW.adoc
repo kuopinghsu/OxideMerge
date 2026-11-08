@@ -1908,18 +1908,87 @@ image::rules.png[比較規則選項]
 規則檔存放在設定檔旁的 `Rules` 資料夾中（請參閱 <<configuration>>）。
 OxideMerge 也會讀取程式旁的 `Rules` 資料夾。
 
-規則檔是 JSON 檔案，規則的名稱就是去掉 `.oxrules` 的檔名：
+規則檔是 JSON 檔案，規則的名稱就是去掉 `.oxrules` 的檔名。
+以下是 `samples/rules/Build logs.oxrules`：
 
 .Build logs.oxrules
 [source,json]
 ----
 {
-  "description": "忽略建置紀錄中的時間戳記與自動產生的標頭",
-  "ignore_lines": ["^\\[\\d{2}:\\d{2}:\\d{2}\\]", "^// Generated on .*$"],
-  "substitutions": [{ "find": "\\b0x[0-9a-fA-F]{8,}\\b", "replace": "0xADDR" }],
+  "description": "Timestamps, generated headers and load addresses in samples/*/logs/build.log",
+  "ignore_lines": ["^// Generated on .*$"],
+  "substitutions": [
+    { "find": "^\\[\\d{2}:\\d{2}:\\d{2}\\] ", "replace": "[time] " },
+    { "find": "\\b0x[0-9a-fA-F]{8,}\\b", "replace": "0xADDR" }
+  ],
   "ignore_blocks": [{ "start": "^/\\* BEGIN LICENSE", "end": "END LICENSE \\*/$" }]
 }
 ----
+
+每個欄位都可以省略：
+
+`description`:: 顯示在「選項 → 比較規則」中名稱的旁邊。
+`ignore_lines`:: 規則運算式的清單。
+若某個差異的每一行都符合其中之一，該差異就會被忽略。
+`substitutions`:: `find` 與 `replace` 的配對清單。
+比較前，兩個檔案中每個符合 `find` 的地方都會依清單順序換成 `replace`。
+取代文字可以使用符合內容的群組：`$1` 是第一個群組。
+窗格中顯示的仍是檔案中原本的文字。
+`ignore_blocks`:: `start` 與 `end` 的配對清單。
+區塊從符合 `start` 的行開始，到下一個符合 `end` 的行結束；這兩行都屬於區塊，區塊內的差異會被忽略。
+結束也可以出現在起始行中較後面的位置。
+只有起始而沒有結束行的不算區塊，因此不會忽略任何內容。
+
+每個規則運算式一次只比對一行，因此 `^` 與 `$` 代表行首與行尾。
+在 JSON 中，規則運算式的每個反斜線都要寫兩次：檔案中的 `\\d` 就是規則運算式中的 `\d`。
+「選項 → 比較規則」中的規則編輯器顯示的是未重複反斜線的規則運算式。
+
+==== 範例：建置紀錄
+
+`samples/left/logs/build.log` 與 `samples/right/logs/build.log` 是同一個建置的兩次執行紀錄。
+不使用規則時，幾乎每一行都不同：建置主機、日期、每個時間戳記與載入位址每次都不一樣。
+
+.不使用規則的兩份建置紀錄
+image::rules-off.png[不使用規則比較兩份建置紀錄]
+
+要以 *Build logs* 規則比較它們，請匯入 `samples/rules/Build logs.oxrules`
+（「選項 → 比較規則 → 匯入...」）、選取它，再開啟這兩個檔案。
+也可以在命令列上為單次比較指定規則：
+
+[source,sh]
+----
+oxidemerge --rules "Build logs" samples/left/logs/build.log samples/right/logs/build.log
+----
+
+`--rules` 也接受檔案路徑，因此不必匯入也能使用這些規則：
+`--rules "samples/rules/Build logs.oxrules"`。
+
+每條規則各處理紀錄中的一種雜訊：
+
+* 從 `^/\* BEGIN LICENSE` 到 `END LICENSE \*/$` 的忽略區塊涵蓋第 1 到 4 行的授權標頭，
+  因此 `Build host: build-01` 與 `build-07` 不再算作差異。
+* 忽略的行 `^// Generated on .*$` 涵蓋記錄執行日期的第 5 行。
+* 第一條取代規則將每行開頭的時間戳記（例如 `[09:12:05]`）換成 `[time]`。
+  規則運算式結尾包含時間戳記後的空格，因此取代文字也以空格結尾。
+* 第二條取代規則將 8 位以上十六進位數字的載入位址（例如 `0x7FF6A1B20000`）換成 `0xADDR`，
+  因此第 8 行兩側相同。
+
+剩下的就是唯一真正的差異：第 10 行，有一項測試失敗。
+被忽略的行以灰色顯示，差異計數顯示 *1/1*。
+第 10 行的時間戳記沒有標示，因為取代規則讓它們變得相同。
+
+.使用 Build logs 規則的同一組建置紀錄
+image::rules-on.png[使用 Build logs 規則比較兩份建置紀錄]
+
+在「選項 → 比較規則」中按一下 *Build logs* 旁的「編輯」，即可在規則編輯器中看到同樣的規則，每行一條。
+取代規則寫成 `+find => replace+`；第一條取代規則的 `=>` 前有兩個空格，因為規則運算式以空格結尾。
+
+.規則編輯器中的 Build logs 規則
+image::rules-editor.png[顯示 Build logs 規則的規則編輯器]
+
+在指令碼中，同樣的規則也決定結束代碼。
+對這兩份紀錄執行 `oxidemerge --cli --rules "samples/rules/Build logs.oxrules" ...` 會因第 10 行而以 `1` 結束。
+若只剩規則忽略的差異，它不會輸出任何內容，並以 `0` 結束。
 
 [[add-rule]]
 === 從文字比較建立規則
@@ -3387,6 +3456,12 @@ oxidemerge.checkchanged = true
 Perforce 可從 p4 命令列、P4V 或兩者使用 OxideMerge。
 兩者需分別設定：p4 讀取 `P4DIFF` 與 `P4MERGE`，P4V 則使用自己的偏好設定。
 
+兩者都需要先能連線。
+請在工作區中執行 `p4 info`：應顯示您的 *User name*、作為 *Client name* 的工作區，
+以及作為 *Server address* 的伺服器。
+若顯示 *Client unknown* 或無法連線，請先設定 `P4PORT`、`P4USER` 與 `P4CLIENT`，
+或團隊使用的 `P4CONFIG` 檔案。
+
 ===== p4 命令列
 
 p4 會以兩個檔案執行 `P4DIFF` 指定的程式：depot 修訂版本（暫存檔）與您工作區中的檔案。
@@ -3425,19 +3500,57 @@ p4 set P4MERGE=$HOME/bin/oxidemerge-p4-merge
 若 `oxidemerge` 不在 `PATH` 中，請使用完整路徑，例如 macOS 上的
 `/Applications/OxideMerge.app/Contents/MacOS/oxidemerge`。
 請勿在 `P4DIFF` 加上 `--cli`：檔案不同時它會以 1 結束，p4 會回報 *Execution Failed*。
-. 執行 `p4 set` 檢查設定；兩行都應指向 OxideMerge。
++
+`p4 set` 在 macOS 與 Linux 上會將設定存於 `~/.p4enviro`，在 Windows 上則存於登錄檔。
+. 執行 `p4 set` 檢查設定；兩行都應指向 OxideMerge：
++
+----
+P4DIFF=oxidemerge (enviro)
+P4MERGE=/Users/you/bin/oxidemerge-p4-merge (enviro)
+----
++
+括號中的文字表示 p4 從何處取得該值：`(enviro)` 為 macOS 與 Linux 上的 `p4 set`，
+`(set)` 為 Windows 上的 `p4 set`，`(config '...')` 為 `P4CONFIG` 檔案。
+後面沒有括號的值來自環境變數，其優先順序高於 `p4 set`；
+若某一行指向其他工具，請在設定它的地方修改。
 
 要將檔案與 depot 比較，請執行 `p4 diff f.txt`；OxideMerge 會在左側顯示 depot 修訂版本，
 右側顯示您工作區中的檔案。
+depot 修訂版本是暫存檔，名稱類似 `tmp.63484.0x20d2d0f40.90`，只有工作區中的檔案可以編輯。
+p4 會將 `P4DIFF` 中的字詞傳給 OxideMerge，因此您可以改為替窗格命名：
+
+[source,sh]
+----
+p4 set P4DIFF="oxidemerge --dl Depot --dr Workspace"
+----
+
+p4 會以空格切分 `P4DIFF`，因此每個標題請只用一個字詞。
+
+.窗格命名為 Depot 與 Workspace 的 `p4 diff`
+image::p4-diff.png[由 p4 diff 開啟的 OxideMerge]
 
 合併衝突的步驟：
 
 . 執行 `p4 resolve f.txt`。
+p4 會顯示找到的變更，並建議一個動作：
++
+----
+/home/you/ws/f.txt - merging //depot/main/f.txt#2
+Diff chunks: 0 yours + 1 theirs + 0 both + 1 conflicting
+Accept(a) Edit(e) Diff(d) Merge (m) Skip(s) Help(?) e:
+----
 . 在提示時輸入 *m*（merge）。
 OxideMerge 會開啟，左側為 *Yours*、中間為 *Base*、右側為 *Theirs*。
+中間窗格一開始是基底內容，「儲存結果」會將它寫入 p4 傳入的結果檔案，絕不會寫入基底。
 . 以「下一個衝突」搭配「採用左側」、「採用右側」或「採用兩側」，或直接編輯中間窗格，解決每個衝突。
+請確認工具列顯示「沒有剩餘衝突」：仍有衝突時「儲存結果」也會儲存，衝突處會保留基底的文字。
 . 按一下「儲存結果」並關閉視窗。
-. 回到提示後，p4 會建議 *ae*（accept edit）；輸入 *ae* 接受合併後的檔案。
+. 回到提示後，p4 會建議 *ae*（accept edit），若結果與對方版本相同則建議 *at*（accept theirs）。
+輸入 *ae* 以接受您儲存的合併檔案。
+接著 p4 會回報，例如 `//ws/f.txt - edit from //depot/main/f.txt`。
+
+.由 `p4 resolve` 開啟的衝突
+image::p4-merge.png[由 p4 resolve 開啟的三方合併]
 
 若未儲存就關閉視窗，p4 會回報 *Execution Failed*，檔案仍維持未解決；
 此時輸入 *ae* 會警告檔案仍含有變更標記。
@@ -3464,6 +3577,9 @@ P4V 不會讀取 `P4DIFF` 或 `P4MERGE`，而是使用自己的比較與合併�
 |Linux |`command -v oxidemerge` 的輸出，例如 `/usr/bin/oxidemerge`
 |===
 . 在 *Arguments* 中輸入 `%1 %2`。
++
+.P4V Preferences → Diff
+image::p4v-diff-prefs.png[將 OxideMerge 設為其他應用程式的 P4V 比較偏好設定]
 . 在左側清單中選取 *Merge*，同樣選取 *Other application*，並填入相同的 *Location*。
 . 在 *Arguments* 中輸入：
 +
@@ -3472,7 +3588,22 @@ P4V 不會讀取 `P4DIFF` 或 `P4MERGE`，而是使用自己的比較與合併�
 ----
 +
 在 P4V 的合併參數中，`%1` 是對方版本，`%2` 是您的版本，`%b` 是基底，`%r` 是結果。
++
+.P4V Preferences → Merge
+image::p4v-merge-prefs.png[將 OxideMerge 設為其他應用程式的 P4V 合併偏好設定]
 . 按一下 *OK*。
+
+*Specify diff application by extension* 與 *Specify merge application by extension*
+下方的清單會覆寫其中副檔名的預設工具。
+保持空白即可讓所有檔案都使用 OxideMerge；若某類檔案仍開啟 P4Merge，請在其中尋找它的副檔名。
+
+將檔案與 depot 比較的步驟：
+
+. 在 *Workspace* 或 *Depot* 分頁中選取檔案，按一下工具列的 *Diff*。
+. 在 Diff Files 對話方塊中，第一個路徑是最新修訂版本，第二個是您工作區中的檔案；
+按一下 *Diff*。
+OxideMerge 會開啟，左側為 depot 修訂版本（名稱類似 `server#head.conf` 的暫存檔），
+右側為您工作區中的檔案。
 
 合併衝突的步驟：
 
@@ -3481,9 +3612,15 @@ P4V 不會讀取 `P4DIFF` 或 `P4MERGE`，而是使用自己的比較與合併�
 . 在 Resolve 對話方塊中按一下 *Run Merge Tool*。
 OxideMerge 會開啟，左側為 *Yours*、中間為 *Base*、右側為 *Theirs*。
 若開啟的是 P4Merge，請回到 *Preferences → Merge*，確認已選取 *Other application*。
++
+.P4V 的 Resolve 對話方塊
+image::p4v-resolve.png[含 Run Merge Tool 的 P4V Resolve 對話方塊]
 . 解決每個衝突，按一下「儲存結果」並關閉視窗。
 P4V 傳入的結果檔案已含有 P4V 自己的衝突標記；儲存後會取代這些標記。
-. 在 Resolve 對話方塊中按一下 *Accept Merged*。
+*Yours* 就是您工作區中的檔案本身，而非複本，因此請在中間窗格修改：
+在左側窗格儲存的內容會立即寫入您的工作區檔案。
+. 在 Resolve 對話方塊中按一下 *Accept Merged*，P4V 詢問是否以合併結果取代檔案時按 *Yes*。
+對話方塊仍會顯示合併前的衝突數；在您接受之前，P4V 不會重新讀取結果。
 請先檢查結果：OxideMerge 只在您儲存時寫入結果，若未儲存就關閉，結果仍會保留 P4V 的標記。
 若要整個採用對方版本或您的版本，請改用 *Accept Source* 或 *Accept Target*。
 
@@ -3494,11 +3631,10 @@ P4V 傳入的結果檔案已含有 P4V 自己的衝突標記；儲存後會取�
 
 NOTE: 已試過：在 macOS 上，以 Subversion 1.15 試過 Subversion 的命令與包裝指令碼，
 以 Mercurial 7.2 試過 Mercurial 的設定，且僅使用本機儲存庫。
-Perforce：以 p4 2026.1 試過 `P4DIFF` 與 `oxidemerge-p4-merge` 包裝指令碼，
-並試過由 P4V 的 Resolve 對話方塊開啟 OxideMerge，皆使用本機個人伺服器。
+Perforce：以 p4 2026.1 試過 `P4DIFF`（含與不含窗格標題）與 `oxidemerge-p4-merge` 包裝指令碼，
+並以 P4V 2026.3 試過比較與合併設定，從 *Diff* 到 *Accept Merged*，皆使用本機個人伺服器。
 尚未試過：Windows 與 Linux、Windows 的 `.cmd` 包裝指令碼、透過網路連線的 Subversion 伺服器
-（`svn://`、`https://`）及其登入、透過網路連線的 Perforce 伺服器、P4V 的比較設定，
-以及在 OxideMerge 中儲存後於 P4V 接受合併。
+（`svn://`、`https://`）及其登入，以及透過網路連線的 Perforce 伺服器。
 
 [[file-manager]]
 === 檔案管理員
