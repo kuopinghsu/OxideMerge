@@ -1359,6 +1359,7 @@ pub(crate) struct JobsReport {
 /// summary. The exit code is the worst of the jobs'.
 fn run_jobs(file: &std::path::Path, yes: bool, base: &Config) -> anyhow::Result<u8> {
     let jobs = core::job::JobFile::read(file).map_err(anyhow::Error::msg)?;
+    core::remote::set_asker(Some(std::sync::Arc::new(prompt::ask)));
     let summary = job_summary(&jobs, &job_dir(file)?, yes, base, &AtomicBool::new(false));
     println!("{}", core::analysis::json(&summary)?);
     Ok(summary.exit_code)
@@ -1384,8 +1385,8 @@ fn stage_remote(
         active: cli.ftp_active,
         client_cert: cli.client_cert.clone(),
         client_key: cli.client_key.clone(),
+        port_given: false,
     };
-    core::remote::set_asker(Some(std::sync::Arc::new(prompt::ask)));
     let staged = core::remote_url::stage(&mut cli.paths, &creds, cancel)?;
     // A side is described by its address on the server, not by its temporary copy.
     for (&i, s) in sides.iter().zip(&staged) {
@@ -1453,7 +1454,9 @@ pub(crate) fn job_summary(
             error: None,
             sync: None,
         };
-        let run = || -> anyhow::Result<(u8, Option<SyncReport>)> {
+        type Ran = anyhow::Result<(u8, Option<SyncReport>)>;
+        // What the job did, and what could not be written back to its servers afterwards.
+        let run = || -> anyhow::Result<(Ran, Vec<String>)> {
             let prepared = job.prepare(dir).map_err(anyhow::Error::msg)?;
             let alone = JobFile::single(job.clone());
             if let (Some(out), false) = (alone.outputs_outside(dir).first(), yes) {
@@ -1476,7 +1479,10 @@ pub(crate) fn job_summary(
                 "{}",
                 i18n::trf(
                     "job.err_needs_yes",
-                    &[("path", cli.paths[1].display().to_string())]
+                    &[(
+                        "path",
+                        core::remote_url::shown(&cli.paths[1].display().to_string())
+                    )]
                 )
             );
             let staged = stage_remote(&mut cli, stop)?;
@@ -1489,18 +1495,29 @@ pub(crate) fn job_summary(
             let code = result.as_ref().map_or(2, |(code, _)| *code);
             let journals = core::folder_sync::journal_root();
             let failed = core::remote_url::finish(&staged, code, journals.as_deref(), stop);
-            anyhow::ensure!(failed.is_empty(), "{}", failed.join("\n"));
-            result
+            Ok((result, failed))
         };
+        let mut errors = Vec::new();
         match run() {
-            Ok((code, sync)) => {
-                report.exit_code = code;
-                report.sync = sync;
+            Ok((result, failed)) => {
+                match result {
+                    Ok((code, sync)) => {
+                        report.exit_code = code;
+                        report.sync = sync;
+                    }
+                    Err(e) => errors.push(format!("{e:#}")),
+                }
+                if !failed.is_empty() {
+                    report.exit_code = 2;
+                    errors.extend(failed);
+                }
             }
-            Err(e) => {
-                eprintln!("error: {}: {e:#}", report.name);
-                report.error = Some(format!("{e:#}"));
-            }
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+        if !errors.is_empty() {
+            let text = errors.join("\n");
+            eprintln!("error: {}: {text}", report.name);
+            report.error = Some(text);
         }
         summary.exit_code = summary.exit_code.max(report.exit_code);
         summary.jobs.push(report);
@@ -1693,6 +1710,7 @@ fn main() -> ExitCode {
 
     let never = AtomicBool::new(false);
     cli.paths = paths;
+    core::remote::set_asker(Some(std::sync::Arc::new(prompt::ask)));
     let staged = match stage_remote(&mut cli, &never) {
         Ok(staged) => staged,
         Err(e) => {

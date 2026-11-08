@@ -73,6 +73,7 @@ shows. For the web page samples, see [samples/web/README.md](../samples/web/READ
 | `make test` | Runs the unit, interface and command-line tests. |
 | `make ci` | Runs `check`, `lint` and `test`. |
 | `make gui-smoke` | Builds a release, opens real windows and checks their comparison results. |
+| `make docker-test` | Runs the Linux checks in a Docker container, with real test servers. See [Docker test environment](#docker-test-environment). |
 | `make check-platforms` | Type-checks the Windows, macOS and Linux targets that the Makefile lists. First install their standard libraries with `rustup target add`. |
 
 ### Build packages
@@ -181,6 +182,27 @@ program draws it, without a screen grab, once the comparison is done, and then c
 `OXIDEMERGE_SCREENSHOT_COMMAND` to a command's label key, such as `cmd.sync_folders`, to
 run it first. Use `OXIDEMERGE_CONFIG_DIR` with a `config.json` that sets `language` to
 take a picture in another language.
+
+### Docker test environment
+
+To check Linux from any computer with Docker, including a Mac, run `scripts/docker-test.sh`
+(or `make docker-test`). [docker/Dockerfile](../docker/Dockerfile) defines the container. It
+runs Clippy, the full test suite, a release build, and the command-line and window checks on
+Xvfb, building the tests for release as continuous integration does. The tests run as an
+ordinary user. The container also starts real servers ([docker/servers.sh](../docker/servers.sh))
+and runs the tests that a normal `cargo test` run skips:
+
+- OpenSSH: sign-in with keys, passphrases, host certificates, jump hosts and a
+  `ProxyCommand`, and keyboard-interactive sign-in through PAM.
+- vsftpd and ProFTPD: FTP, explicit and implicit FTPS, active mode, and a client certificate.
+- Dante and tinyproxy: SFTP, FTP and FTPS through SOCKS5 and HTTP CONNECT proxies, with and
+  without sign-in.
+
+Cargo runs offline. It uses the crates already downloaded to `~/.cargo/registry`, so on a
+new computer, run `cargo fetch --locked` first. Building the container the first time needs
+the network. Build output stays in Docker volumes (`oxidemerge-test-*`), so later runs are
+faster. Each check writes its log to `out/docker/linux`. If Docker has little memory, set
+`CARGO_BUILD_JOBS` to a small number.
 
 ### Benchmarks
 

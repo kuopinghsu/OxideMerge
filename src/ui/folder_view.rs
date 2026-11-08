@@ -1210,6 +1210,8 @@ impl FolderView {
     /// archive that one is nested in, returning the archive files that were written (an
     /// archive whose contents came out unchanged is left alone) and the errors of those that
     /// could not be. A side that fails keeps its edits pending and does not stop the others.
+    /// Sides slow to repack are left pending, for the app to write on another thread (see
+    /// [`Self::slow_archives`]).
     pub fn save_archives(&mut self) -> (Vec<PathBuf>, Vec<String>) {
         let mut written = Vec::new();
         let mut errors = Vec::new();
@@ -1223,6 +1225,9 @@ impl FolderView {
                 self.archive_dirty[s] = false;
                 continue;
             };
+            if archive::slow_to_repack(src) {
+                continue;
+            }
             match archive::repack_all(src, &self.roots[s]) {
                 Ok(w) => written.extend(w),
                 Err(e) => {
@@ -1234,6 +1239,30 @@ impl FolderView {
         }
         self.written.extend(written.iter().cloned());
         (written, errors)
+    }
+
+    /// The archive sides with pending edits that [`Self::save_archives`] left, as slow to
+    /// repack: each side, its archive file, and the folder it was extracted to.
+    pub fn slow_archives(&self) -> Vec<(usize, PathBuf, PathBuf)> {
+        (0..self.archive_sources.len())
+            .filter(|&s| self.archive_dirty[s])
+            .filter_map(|s| {
+                let src = self.archive_sources[s].as_ref()?;
+                archive::slow_to_repack(src).then(|| (s, src.clone(), self.roots[s].clone()))
+            })
+            .collect()
+    }
+
+    /// Takes in how repacking the archive side `s` on another thread went (see
+    /// [`Self::slow_archives`]): the archive files written, its edits no longer pending, or why
+    /// not, keeping them pending.
+    pub fn archive_repacked(&mut self, s: usize, result: Result<Vec<PathBuf>, String>) {
+        if let Ok(written) = result {
+            if let Some(dirty) = self.archive_dirty.get_mut(s) {
+                *dirty = false;
+            }
+            self.written.extend(written);
+        }
     }
 
     /// The archive files saving has written since this was last called.
@@ -5019,9 +5048,20 @@ mod tests {
         let mut xz = Vec::new();
         lzma_rs::xz_compress(&mut tar.into_inner().unwrap().as_slice(), &mut xz).unwrap();
         std::fs::write(&txz, xz).unwrap();
-        let v = archive_side(&txz, left.path(), &cfg);
+        let mut v = archive_side(&txz, left.path(), &cfg);
         assert_eq!(v.read_only, [false, false]);
         assert!(v.is_archive_side(1));
+        // Slow to compress, it is left for the app to write on another thread.
+        std::fs::write(v.roots[1].join("a.txt"), "xz\n").unwrap();
+        v.mark_archive_dirty(1);
+        assert_eq!(v.save_archives(), (Vec::new(), Vec::new()));
+        let slow = v.slow_archives();
+        assert_eq!(slow.len(), 1);
+        let (s, src, root) = slow.into_iter().next().unwrap();
+        let written = archive::repack_all(&src, &root).map_err(|e| e.to_string());
+        v.archive_repacked(s, written);
+        assert!(!v.has_archive_changes());
+        assert_eq!(v.take_written(), std::slice::from_ref(&txz));
 
         let (nested, _outer) = nested_zip(work.path(), "outer.zip", "inner.zip");
         let mut v = archive_side(&nested, left.path(), &cfg);

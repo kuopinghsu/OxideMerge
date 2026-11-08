@@ -114,7 +114,7 @@ pub fn local_user() -> String {
 }
 
 /// How a connection to `alias` goes. A `port` or `user` given wins over the configuration's,
-/// as one given to `ssh` on its command line does; port 22 counts as not given.
+/// as one given to `ssh` on its command line does.
 pub fn lookup(alias: &str, port: Option<u16>, user: Option<&str>) -> Result<Resolved> {
     for name in std::iter::once(alias).chain(user) {
         if !valid_name(name) {
@@ -150,13 +150,15 @@ pub fn lookup(alias: &str, port: Option<u16>, user: Option<&str>) -> Result<Reso
 
 /// Whether `name`, a server or a user name given to connect with, is safe to put into a
 /// `ProxyCommand`, which the shell runs: as OpenSSH requires of the names given to it, nothing
-/// the shell treats specially, no spaces or control characters, and no leading `-`.
+/// the shell treats specially (nor, on Windows, what `cmd` does), no spaces or control
+/// characters, and no leading `-`.
 fn valid_name(name: &str) -> bool {
+    let special = |c: char| "'`\"$\\;&<>|(){}".contains(c) || cfg!(windows) && "%^!".contains(c);
     !name.is_empty()
         && !name.starts_with('-')
         && !name
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || "'`\"$\\;&<>|()".contains(c))
+            .any(|c| c.is_whitespace() || c.is_control() || special(c))
 }
 
 /// What a line is read against.
@@ -184,13 +186,15 @@ fn split(line: &str) -> Option<(String, String)> {
     Some((keyword.to_ascii_lowercase(), rest.to_string()))
 }
 
-/// The arguments of `rest`, split at spaces outside double quotes.
+/// The arguments of `rest`, split at spaces outside double quotes, up to one starting with an
+/// unquoted `#`: the rest of the line is a comment, as for OpenSSH 8.7 and later.
 fn args(rest: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
     let (mut quoted, mut any) = (false, false);
     for c in rest.chars() {
         match c {
+            '#' if !quoted && !any => break,
             '"' => {
                 quoted = !quoted;
                 any = true;
@@ -253,7 +257,11 @@ fn match_holds(criteria: &[String], at: &Reading, found: &Found) -> bool {
                 };
                 i += 1;
                 let value = match name.as_str() {
-                    "host" => found.host_name.as_deref().unwrap_or(at.alias).to_string(),
+                    "host" => found
+                        .host_name
+                        .as_deref()
+                        .filter(|n| !n.is_empty())
+                        .map_or_else(|| at.alias.to_string(), |n| host_name(n, at.alias)),
                     "originalhost" => at.alias.to_string(),
                     "user" => at
                         .user
@@ -368,7 +376,8 @@ fn set(slot: &mut Option<String>, value: Option<String>) {
 }
 
 /// The files an `Include` of `pattern` names, relative to `dir` unless absolute, a `*` or `?`
-/// in any part of the path matching any name there, in order of name.
+/// in any part of the path matching any name there, in order of name. As for `glob`, a name
+/// starting with `.` matches only a part starting with `.` too.
 fn include_files(pattern: &str, dir: &Path) -> Vec<PathBuf> {
     let path = tilde(pattern);
     let path = if path.is_absolute() {
@@ -393,10 +402,9 @@ fn include_files(pattern: &str, dir: &Path) -> Vec<PathBuf> {
                 .flatten()
                 .flatten()
                 .filter(|e| {
-                    super::remote::glob_match(
-                        e.file_name().to_string_lossy().as_bytes(),
-                        name.as_bytes(),
-                    )
+                    let file = e.file_name().to_string_lossy().into_owned();
+                    (!file.starts_with('.') || name.starts_with('.'))
+                        && super::remote::glob_match(file.as_bytes(), name.as_bytes())
                 })
                 .map(|e| e.path())
                 .collect();
@@ -658,6 +666,32 @@ Match all
         assert!(read_str(text, "db.corp", Some("bob")).jumps.is_empty());
         assert_eq!(read_str(text, "box", Some("ann")).host, "box.internal");
         assert_eq!(read_str(text, "box", Some("root")).host, "box");
+
+        // `Match host` sees a `HostName` found before it with its `%h` expanded.
+        let text = "\
+Host db
+    HostName %h.corp
+Match host db.corp
+    Port 2200
+";
+        assert_eq!(read_str(text, "db", None).port, 2200);
+    }
+
+    #[test]
+    fn a_hash_starting_an_argument_ends_the_line() {
+        let text = "\
+Host prod # main db
+    User deploy # the release user
+    ProxyCommand nc %h %p # kept as written
+";
+        assert!(read_str(text, "main", None).user != "deploy");
+        let r = read_str(text, "prod", None);
+        assert_eq!(r.user, "deploy");
+        assert_eq!(
+            r.proxy_command.as_deref(),
+            Some("nc prod 22 # kept as written")
+        );
+        assert_eq!(args("a \"#b\" c#d # e"), ["a", "#b", "c#d"]);
     }
 
     #[test]
@@ -736,6 +770,7 @@ Match !canonical
             "h|nc",
             "-oProxyCommand=x",
             "a b",
+            "a{b,c}",
         ] {
             assert!(lookup(name, None, None).is_err(), "{name}");
             assert!(lookup("h", None, Some(name)).is_err(), "{name}");
@@ -757,6 +792,10 @@ Match !canonical
         );
         assert_eq!(include_files("b/*", dir.path()).len(), 2);
         assert!(include_files("c*/config", dir.path()).is_empty());
+        // As for `glob`, hidden files (an editor's swap file, say) only by name.
+        std::fs::write(dir.path().join("b/.config.swp"), "4").unwrap();
+        assert_eq!(include_files("b/*", dir.path()).len(), 2);
+        assert_eq!(include_files("b/.*", dir.path()).len(), 1);
     }
 
     #[test]

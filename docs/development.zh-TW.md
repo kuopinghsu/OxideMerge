@@ -70,6 +70,7 @@ macOS 與 Linux 的程式位於 `target/release/oxidemerge`，Windows 則為
 | `make test` | 執行單元測試、介面測試與指令列測試。 |
 | `make ci` | 依序執行 `check`、`lint` 與 `test`。 |
 | `make gui-smoke` | 建置發行版本、開啟實際視窗，並檢查比較結果。 |
+| `make docker-test` | 在 Docker 容器中執行 Linux 檢查，並使用實際的測試伺服器。請參閱 [Docker 測試環境](#docker-測試環境)。 |
 | `make check-platforms` | 對 Makefile 列出的 Windows、macOS 與 Linux 目標執行型別檢查。請先以 `rustup target add` 安裝各目標的標準函式庫。 |
 
 ### 產生套件
@@ -167,6 +168,25 @@ Linux 沒有顯示環境時，會自動啟動 Xvfb。設定 `OXIDEMERGE_SMOKE_RE
 直接儲存它所繪製的視窗畫面（不需擷取螢幕），然後關閉。將 `OXIDEMERGE_SCREENSHOT_COMMAND`
 設為命令的標籤鍵（例如 `cmd.sync_folders`），會先執行該命令。搭配 `OXIDEMERGE_CONFIG_DIR`
 與設定 `language` 的 `config.json`，即可擷取其他語言的畫面。
+
+### Docker 測試環境
+
+在任何裝有 Docker 的電腦上（包括 Mac），都可以執行 `scripts/docker-test.sh`（或
+`make docker-test`）來檢查 Linux。容器定義於 [docker/Dockerfile](../docker/Dockerfile)，會執行
+Clippy、完整測試、發行版本建置，以及在 Xvfb 上的指令列與視窗檢查；測試與持續整合相同，以發行模式
+建置。測試以一般使用者身分執行。容器也會啟動實際的伺服器（[docker/servers.sh](../docker/servers.sh)），
+執行一般 `cargo test` 會略過的測試：
+
+- OpenSSH：以金鑰登入、金鑰密碼、主機憑證、跳板主機與 `ProxyCommand`，以及透過 PAM 的鍵盤互動式
+  登入。
+- vsftpd 與 ProFTPD：FTP、明確與隱含 FTPS、主動模式，以及用戶端憑證。
+- Dante 與 tinyproxy：透過 SOCKS5 與 HTTP CONNECT 代理伺服器（需登入與不需登入）使用 SFTP、FTP
+  與 FTPS。
+
+Cargo 以離線方式執行，使用已下載到 `~/.cargo/registry` 的套件；在新電腦上，請先執行
+`cargo fetch --locked`。第一次建置容器時需要網路。建置結果保存在 Docker volume
+（`oxidemerge-test-*`）中，之後的執行會比較快。每項檢查的記錄寫在 `out/docker/linux`。若 Docker
+可用的記憶體不多，請將 `CARGO_BUILD_JOBS` 設為較小的數字。
 
 ### 效能測試
 

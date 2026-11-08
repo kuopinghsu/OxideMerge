@@ -1469,11 +1469,13 @@ fn inline_subs(opts: &DiffOptions) -> std::rc::Rc<Vec<(Regex, String)>> {
     })
 }
 
-/// Where the substitutions match in `s`, in order, each with what it is replaced by. Matches
-/// do not overlap: an earlier rule, then an earlier match, wins.
+/// Where the substitutions match in `s`, in order, each with what it is replaced by: as in
+/// [`Normalizer::key`], which applies each rule to what the ones before it left, the later
+/// rules are applied to the replacement. Matches do not overlap: an earlier rule, then an
+/// earlier match, wins.
 fn sub_spans(s: &str, subs: &[(Regex, String)]) -> Vec<(Range<usize>, String)> {
     let mut spans: Vec<(Range<usize>, String)> = Vec::new();
-    for (re, rep) in subs {
+    for (k, (re, rep)) in subs.iter().enumerate() {
         for caps in re.captures_iter(s) {
             let Some(m) = caps.get(0).filter(|m| !m.is_empty()) else {
                 continue;
@@ -1486,6 +1488,9 @@ fn sub_spans(s: &str, subs: &[(Regex, String)]) -> Vec<(Range<usize>, String)> {
             }
             let mut to = String::new();
             caps.expand(rep, &mut to);
+            for (later, rep) in &subs[k + 1..] {
+                to = later.replace_all(&to, rep.as_str()).into_owned();
+            }
             spans.push((m.range(), to));
         }
     }
@@ -2080,6 +2085,12 @@ mod tests {
         let (ra, rb) = inline_diff("mail ann@a.example", "mail bob@a.example", &o);
         assert_eq!(text("mail ann@a.example", &ra), ["ann@a.example"]);
         assert_eq!(rb.len(), 1);
+
+        // Each rule applies to what the ones before it left, as when comparing lines.
+        o.substitutions = vec![("foo".into(), "bar".into()), ("bar".into(), "baz".into())];
+        let n = Normalizer::new(&o);
+        assert_eq!(n.key("x foo"), n.key("x bar"));
+        assert_eq!(inline_diff("x foo", "x bar", &o), (Vec::new(), Vec::new()));
 
         let o = DiffOptions {
             ignore_numbers: true,
