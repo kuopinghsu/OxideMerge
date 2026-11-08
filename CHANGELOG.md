@@ -387,29 +387,37 @@ uses its section of this file as the release notes.
   same structure as identical* in *Options → Folder* (or `--structured`) counts such files
   as identical in the *Full contents* method when only key order, layout or comments
   differ.
-- **Subversion, Mercurial and Perforce (experimental, not fully tested):** `-L <title>`
-  (`--label`) titles the sides in order, as `diff -L` does, and `-u` is accepted and
-  ignored, so `svn diff --diff-cmd oxidemerge` shows revision names in the pane headers;
-  `--dl`, `--dm` and `--dr` take precedence. The user guide sets up diffs and merges for
-  Subversion, Mercurial and Perforce, with wrapper scripts that leave a conflict
-  unresolved when the merge was not saved, and the P4V *Diff* and *Merge* arguments. Tried
-  with Subversion 1.15, Mercurial 7.2 and p4 2026.1 (with P4V) on macOS.
-- **Compare with revision in Subversion and Mercurial (experimental, not fully tested;
-  macOS and local repositories only):**
+- **Subversion, Mercurial and Perforce:** `-L <title>` (`--label`) titles the sides in
+  order, as `diff -L` does, and `-u` is accepted and ignored, so
+  `svn diff --diff-cmd oxidemerge` shows revision names in the pane headers; `--dl`,
+  `--dm` and `--dr` take precedence. Subversion's `merge-tool-cmd` and Perforce's
+  `P4MERGE` can be `oxidemerge` itself. Five existing files are read as Subversion's order
+  (base, theirs, mine, merged, working copy) and four as Perforce's (base, theirs, yours,
+  result). The left pane is mine or yours, the middle is the base and the right is theirs,
+  and the middle pane is saved to the result. If that file is unchanged when the window
+  closes, the program exits with code 1 and the conflict stays unresolved. Any other
+  option, including `-o`, uses the arguments as written, so an existing wrapper still
+  works. Checked on Windows with SlikSVN 1.14.2, Mercurial 7.1.2 and p4/p4d 2026.1.
+  A fresh p4d 2026.1 requires a password before the first user exists, so a resolve was
+  not run against that server. P4V keeps its own argument string.
+- **Compare with revision in Subversion and Mercurial:**
   *File → Compare with revision...* (formerly *Compare with Git revision...*) and `--rev`
   (`--git-rev` still works) also take Subversion and Mercurial working copies: the nearest
   `.git`, `.svn` or `.hg` above the path decides. Subversion revisions are `BASE` (the
   default), `PREV`, `HEAD`, a number, `r1234` as `svn log` prints it, or a date; the
-  dialog lists the recent revisions with their messages. Names with `@` or letters outside
-  ASCII work when the program starts without a UTF-8 locale. Revisions other than `BASE`
-  are read from the repository server, as `svn` does. Mercurial revisions are `.` (the
-  default), `.^`, `tip`, a number, a hash, a tag or another revset, read from the local
-  repository. The list of recent revisions, read while you type a path, skips the
+  dialog lists the recent revisions from `svn log --xml`. On Windows, a path that is not
+  ASCII is read by its repository URL, because that `svn` keeps only ASCII arguments, and
+  `BASE` of such a file is the pristine copy in the working copy. Mercurial revisions are
+  `.` (the default), `.^`, `tip`, a number, a hash, a tag or another revset, read from the
+  local repository. On Windows, Mercurial is left on the ANSI code page: forcing UTF-8
+  makes every name that code page can spell fail, and a name it cannot spell is one `hg`
+  itself cannot open. The list of recent revisions, read while you type a path, skips the
   repository's own `.hg/hgrc`, so browsing to a downloaded repository runs none of its
   hooks; only *Compare* reads it. A Subversion server reached over `svn+ssh` that would
   ask for a password fails instead of waiting for an answer that cannot come. With Git and
   Mercurial, a file whose name is not valid UTF-8 is refused rather than read under a
-  changed name.
+  changed name. Checked on Windows with the same SlikSVN and Mercurial versions, including
+  a Subversion file whose name is not ASCII.
 - **Docker test environment for Linux:** `scripts/docker-test.sh` (`make docker-test`)
   checks Linux from any computer with Docker. It runs Clippy, the tests, a release build and
   the command-line and window checks. It also runs tests against real servers: OpenSSH (keys,

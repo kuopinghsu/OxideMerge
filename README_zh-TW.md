@@ -441,17 +441,15 @@ git config --global mergetool.oxidemerge.trustExitCode false
 若程式不在 `PATH` 中，請在上述指令中使用完整路徑。詳情請參閱
 [使用者指南](docs/user-guide.zh-TW.adoc)。
 
-### Subversion、Mercurial 與 Perforce（實驗性）
-
-> 對 Subversion、Mercurial 與 Perforce 的支援屬於實驗性功能，尚未完整測試；
-> 詳情請見[已知限制](#已知限制)。
+### Subversion、Mercurial 與 Perforce
 
 `svn diff --diff-cmd oxidemerge` 可直接使用：OxideMerge 接受 Subversion 傳入的 `-u` 與
-`-L` 標題，
-因此窗格會顯示修訂版本名稱。
+`-L` 標題，因此窗格會顯示修訂版本名稱。
 Mercurial（`extdiff` 與 `merge-tools`）與 Perforce
 （`P4DIFF`、`P4MERGE`，或 P4V 的 Diff 與 Merge 偏好設定）
-需在各自的設定中設定；Subversion 與 p4 命令列的合併要透過一個簡短的包裝指令碼。
+需在各自的設定中設定。
+Subversion 的 `merge-tool-cmd` 與 Perforce 的 `P4MERGE` 可以直接設為 `oxidemerge`：
+檔案會重新排列，結果未變更時以結束代碼 1 離開，衝突維持未解決。
 請參閱使用者指南中的
 [Subversion、Mercurial 與 Perforce](docs/user-guide.zh-TW.adoc#other-vcs)。
 
@@ -571,11 +569,10 @@ Mercurial（`extdiff` 與 `merge-tools`）與 Perforce
 ### 介面與整合
 
 - 支援 WinMerge 專案檔與篩選器檔案，但不支援 WinMerge 的外掛程式動態連結程式庫與指令碼。
-- 對 Subversion、Mercurial 與 Perforce 的支援（比較與合併設定，以及 Subversion 與
-  Mercurial 的「與修訂版本比較」；
-  Perforce 沒有「與修訂版本比較」）屬於實驗性功能，尚未完整測試：
-  僅在 macOS 上以本機儲存庫與本機 Perforce 伺服器試過。Windows、Linux，以及透過網路連線的
-  Subversion 與 Perforce 伺服器皆尚未試過。
+- Perforce 沒有「與修訂版本比較」。在 Windows 上，Mercurial 只能開啟 ANSI 字碼頁拼得出來的
+  檔名，這與 `hg` 本身的限制相同。Subversion 或 Perforce 伺服器仍可能要求 OxideMerge
+  無法提供的登入，請先使用 `svn` 或 `p4` 登入。P4V 使用自己的參數字串，因此未儲存就關閉
+  並不會讓衝突維持未解決。
 - 各語言翻譯由機器輔助完成，尚未經母語人士審閱。
 
 ## 開發
