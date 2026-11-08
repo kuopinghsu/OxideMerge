@@ -1856,85 +1856,83 @@ fn mercurial_letter() -> &'static str {
     "x"
 }
 
+#[cfg(not(windows))]
+fn ansi_round_trips(_text: &str) -> bool {
+    true
+}
+
+#[cfg(windows)]
 fn ansi_round_trips(text: &str) -> bool {
-    #[cfg(not(windows))]
-    {
-        let _ = text;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetACP() -> u32;
+        fn WideCharToMultiByte(
+            code_page: u32,
+            flags: u32,
+            wide: *const u16,
+            wide_len: i32,
+            multi: *mut u8,
+            multi_len: i32,
+            default_char: *const u8,
+            used_default: *mut i32,
+        ) -> i32;
+        fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            multi: *const u8,
+            multi_len: i32,
+            wide: *mut u16,
+            wide_len: i32,
+        ) -> i32;
+    }
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    wide.push(0);
+    let cp = unsafe { GetACP() };
+    if cp == 65001 {
         return true;
     }
-    #[cfg(windows)]
-    {
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn GetACP() -> u32;
-            fn WideCharToMultiByte(
-                code_page: u32,
-                flags: u32,
-                wide: *const u16,
-                wide_len: i32,
-                multi: *mut u8,
-                multi_len: i32,
-                default_char: *const u8,
-                used_default: *mut i32,
-            ) -> i32;
-            fn MultiByteToWideChar(
-                code_page: u32,
-                flags: u32,
-                multi: *const u8,
-                multi_len: i32,
-                wide: *mut u16,
-                wide_len: i32,
-            ) -> i32;
-        }
-        let mut wide: Vec<u16> = text.encode_utf16().collect();
-        wide.push(0);
-        let cp = unsafe { GetACP() };
-        if cp == 65001 {
-            return true;
-        }
-        let bytes_len = unsafe {
-            WideCharToMultiByte(
-                cp,
-                0,
-                wide.as_ptr(),
-                -1,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-            )
-        };
-        if bytes_len <= 1 {
-            return false;
-        }
-        let mut bytes = vec![0u8; bytes_len as usize];
-        let wrote = unsafe {
-            WideCharToMultiByte(
-                cp,
-                0,
-                wide.as_ptr(),
-                -1,
-                bytes.as_mut_ptr(),
-                bytes_len,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-            )
-        };
-        if wrote <= 1 {
-            return false;
-        }
-        let wide_len =
-            unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), -1, std::ptr::null_mut(), 0) };
-        if wide_len <= 1 {
-            return false;
-        }
-        let mut back = vec![0u16; wide_len as usize];
-        unsafe {
-            MultiByteToWideChar(cp, 0, bytes.as_ptr(), -1, back.as_mut_ptr(), wide_len);
-        }
-        back.pop();
-        String::from_utf16(&back).ok().as_deref() == Some(text)
+    let bytes_len = unsafe {
+        WideCharToMultiByte(
+            cp,
+            0,
+            wide.as_ptr(),
+            -1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    if bytes_len <= 1 {
+        return false;
     }
+    let mut bytes = vec![0u8; bytes_len as usize];
+    let wrote = unsafe {
+        WideCharToMultiByte(
+            cp,
+            0,
+            wide.as_ptr(),
+            -1,
+            bytes.as_mut_ptr(),
+            bytes_len,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    if wrote <= 1 {
+        return false;
+    }
+    let wide_len =
+        unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), -1, std::ptr::null_mut(), 0) };
+    if wide_len <= 1 {
+        return false;
+    }
+    let mut back = vec![0u16; wide_len as usize];
+    unsafe {
+        MultiByteToWideChar(cp, 0, bytes.as_ptr(), -1, back.as_mut_ptr(), wide_len);
+    }
+    back.pop();
+    String::from_utf16(&back).ok().as_deref() == Some(text)
 }
 
 #[test]
