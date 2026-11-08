@@ -12,7 +12,7 @@ OxideMerge is written in Rust. It compares text, folders, binary files, images a
 pages.
 
 **[Download](https://github.com/kuopinghsu/OxideMerge/releases)** ·
-[User guide](docs/user-guide.adoc) ·
+[User guide](docs/user-guide.adoc) ([PDF](docs/dist/oxidemerge-user-guide.pdf)) ·
 [Changelog](CHANGELOG.md)
 
 ![OxideMerge start page](images/start.png)
@@ -553,6 +553,10 @@ Missing messages, and translations with wrong placeholders, are shown in English
 - [User guide](docs/user-guide.adoc): how to compare and merge, comparison options,
   keyboard shortcuts, Git integration and troubleshooting.
 - [User guide in Traditional Chinese](docs/user-guide.zh-TW.adoc).
+- The user guide as PDF files, for the latest version on `main`:
+  [English](docs/dist/oxidemerge-user-guide.pdf) and
+  [Traditional Chinese](docs/dist/oxidemerge-user-guide.zh-TW.pdf).
+  Each release also has the guides for that version.
 - [Analysis guide](docs/analysis-guide.md): merge verification, semantic comparison,
   review workspaces, release summaries and potential impact.
 - [Benchmarks](docs/benchmarks.md): performance results and how to measure them.
