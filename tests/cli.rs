@@ -1960,3 +1960,94 @@ fn a_path_in_no_working_copy_names_every_system_looked_for() {
         run.stderr
     );
 }
+
+#[test]
+fn paths_on_a_server_are_checked_before_anything_connects() {
+    let t = tmp();
+    let d = t.path();
+    files(d, &[("a.txt", "a\n")]);
+    let no_password = [
+        ("OXIDEMERGE_REMOTE_PASSWORD", ""),
+        ("OXIDEMERGE_PROXY_PASSWORD", ""),
+    ];
+    let run = |args: &[&str]| {
+        let mut all = vec!["--cli", "--lang", "en"];
+        all.extend(args);
+        oxidemerge_with_env(d, &all, &no_password)
+    };
+
+    let bad = run(&["sftp://", "a.txt"]);
+    assert_eq!(bad.code, 2);
+    assert!(bad.stderr.contains("Not a server path"), "{}", bad.stderr);
+
+    // A password in the address is refused, and not repeated where others may see it.
+    let password = run(&["sftp://ann:hunter2@127.0.0.1/x", "a.txt"]);
+    assert_eq!(password.code, 2);
+    assert!(
+        password.stderr.contains("OXIDEMERGE_REMOTE_PASSWORD"),
+        "{}",
+        password.stderr
+    );
+    assert!(!password.stderr.contains("hunter2"), "{}", password.stderr);
+
+    let ftp = run(&["ftp://ann@127.0.0.1:1/x", "a.txt"]);
+    assert_eq!(ftp.code, 2);
+    assert!(
+        ftp.stderr.contains("OXIDEMERGE_REMOTE_PASSWORD"),
+        "{}",
+        ftp.stderr
+    );
+
+    let key = run(&["--ssh-key", "a.txt", "ftps://ann@127.0.0.1:1/x", "a.txt"]);
+    assert_eq!(key.code, 2);
+    assert!(!key.stderr.is_empty());
+
+    // So is a password in a proxy's address, and an address that is not a proxy's.
+    let proxy = |url: &str| run(&["--proxy", url, "ftp://127.0.0.1:1/x", "a.txt"]);
+    let password = proxy("socks5://bob:hunter2@127.0.0.1:1");
+    assert_eq!(password.code, 2);
+    assert!(
+        password.stderr.contains("OXIDEMERGE_PROXY_PASSWORD"),
+        "{}",
+        password.stderr
+    );
+    assert!(!password.stderr.contains("hunter2"), "{}", password.stderr);
+    let bad = proxy("ftp://127.0.0.1:1");
+    assert_eq!(bad.code, 2);
+    assert!(bad.stderr.contains("Not a proxy address"), "{}", bad.stderr);
+
+    // A client certificate is read before anything connects.
+    let cert = run(&["--client-cert", "a.txt", "ftps://127.0.0.1:1/x", "a.txt"]);
+    assert_eq!(cert.code, 2);
+    assert!(
+        cert.stderr.contains("Cannot read a certificate"),
+        "{}",
+        cert.stderr
+    );
+
+    // Nothing listens on port 1: the error names the server.
+    let anonymous = run(&["ftp://127.0.0.1:1/x", "a.txt"]);
+    assert_eq!(anonymous.code, 2);
+    assert!(
+        anonymous.stderr.contains("127.0.0.1"),
+        "{}",
+        anonymous.stderr
+    );
+
+    files(
+        d,
+        &[(
+            "remote.oxjob",
+            r#"{"version": 1, "jobs": [
+                {"name": "site", "kind": "compare", "left": "a.txt",
+                 "right": "ftp://ann@127.0.0.1:1/a.txt"}]}"#,
+        )],
+    );
+    let job = oxidemerge_with_env(d, &["--job", "remote.oxjob", "--lang", "en"], &no_password);
+    assert_eq!(job.code, 2, "{}{}", job.stdout, job.stderr);
+    let summary: serde_json::Value = serde_json::from_str(&job.stdout).unwrap();
+    assert!(summary["jobs"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("OXIDEMERGE_REMOTE_PASSWORD"));
+}

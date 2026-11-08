@@ -9,6 +9,7 @@ use crate::core::folder::CompareMethod;
 use crate::core::patch::{self, PatchStyle};
 use crate::core::project::{self, Project};
 use crate::core::remote;
+use crate::core::remote_sync;
 use crate::core::report::{self, side_name, ReportFormat};
 use crate::core::rules::{self, RuleDraft, RuleKind, RuleSet};
 use crate::core::saved::{self, SavedCompare};
@@ -129,18 +130,20 @@ pub struct Tab {
     /// opened from it.
     temps: Vec<std::sync::Arc<tempfile::TempDir>>,
     /// The connection and remote path of a side staged from [`remote::fetch`], one slot per
-    /// `source`, for *Save* to write a file side back to; `None` for a side opened any other
-    /// way, and for a folder side, which stays read-only (see [`remote`] for why).
+    /// `source`, for *Save* to write it back to; `None` for a side opened any other way.
     remote: Vec<Option<RemoteFile>>,
 }
 
-/// A tab's side backed by a file fetched over SFTP: enough to write it back on *Save*, kept
-/// only in memory, for as long as its tab is open.
+/// A tab's side backed by a file or folder fetched over SFTP or FTP: enough to write it back
+/// on *Save*, kept only in memory, for as long as its tab is open.
 #[derive(Clone)]
 struct RemoteFile {
     conn: remote::RemoteConnection,
-    /// The file's path on the server.
+    /// The file's or folder's path on the server.
     remote_path: String,
+    /// For a folder, what it held as fetched or last saved, to write back only what changed
+    /// since (see [`remote_sync`]); `None` for a file.
+    manifest: Option<remote::Manifest>,
     /// How the file was on the server when fetched or last uploaded, so an upload does not
     /// write over a change someone else made there meanwhile.
     stamp: Option<remote::RemoteStamp>,
@@ -154,20 +157,10 @@ struct RemoteFile {
 
 /// A hash of the file at `path`'s bytes, to tell whether it changed since it was last sent.
 fn file_hash(path: &Path) -> Option<u64> {
-    use std::hash::Hasher;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    let mut buf = vec![0u8; 64 << 10];
-    loop {
-        let n = std::io::Read::read(&mut f, &mut buf).ok()?;
-        if n == 0 {
-            return Some(h.finish());
-        }
-        h.write(&buf[..n]);
-    }
+    remote::file_hash(path)
 }
 
-/// A file side to upload to the server it was fetched from.
+/// A file or folder side to upload to the server it was fetched from.
 struct UploadJob {
     tab: u64,
     side: usize,
@@ -175,6 +168,11 @@ struct UploadJob {
     local: PathBuf,
     remote_path: String,
     expected: Option<remote::RemoteStamp>,
+    /// For a file, the hash of what the server had as fetched or last uploaded (see
+    /// [`remote::upload`]).
+    sent: Option<u64>,
+    /// For a folder, what the server's folder held as fetched or last saved.
+    manifest: Option<remote::Manifest>,
     hash: u64,
     /// The temporary folder `local` is in, kept until the upload is done even if its tab
     /// closes meanwhile.
@@ -187,7 +185,15 @@ struct UploadDone {
     side: usize,
     hash: u64,
     label: String,
-    result: anyhow::Result<remote::RemoteStamp>,
+    result: anyhow::Result<Uploaded>,
+}
+
+/// What an [`UploadJob`] wrote.
+enum Uploaded {
+    /// A file, now as this stamp says on the server.
+    File(remote::RemoteStamp),
+    /// What changed in a folder, as far as it could be written.
+    Folder(remote_sync::Saved),
 }
 
 /// Uploads under way on another thread, one after the other.
@@ -204,6 +210,34 @@ struct UploadRun {
     errors: Vec<String>,
 }
 
+/// *Reload from server* under way on another thread: each side fetched again, and how.
+struct ReloadRun {
+    tab: u64,
+    rx: std::sync::mpsc::Receiver<(usize, anyhow::Result<remote::Staged>)>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// What is being fetched, as shown.
+    names: String,
+    done: Vec<(usize, anyhow::Result<remote::Staged>)>,
+    /// The temporary folders the sides are in, kept until the fetch is done even if the tab
+    /// closes meanwhile.
+    _keep: Vec<std::sync::Arc<tempfile::TempDir>>,
+}
+
+/// The sides of `tab` that came from a server and are still read from it (not moved to a local
+/// path of their own by *Save As*): side, connection, path on the server, and local copy.
+fn reload_sides(tab: &Tab) -> Vec<(usize, remote::RemoteConnection, String, PathBuf)> {
+    let paths = tab.paths();
+    tab.remote
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            let r = r.as_ref()?;
+            let local = paths.get(i).filter(|p| tab.source.get(i) == Some(*p))?;
+            Some((i, r.conn.clone(), r.remote_path.clone(), local.clone()))
+        })
+        .collect()
+}
+
 /// A fetch that stopped at a server whose key is not trusted yet, waiting for the user to check
 /// its fingerprint.
 struct HostPrompt {
@@ -212,6 +246,9 @@ struct HostPrompt {
     conn: remote::RemoteConnection,
     remote_path: String,
     dialog: Option<RemoteDialog>,
+    /// Stopped listing the server's folders for `dialog` (see [`RemoteBrowse`]), not fetching:
+    /// trusting the server lists `remote_path` again instead.
+    browse: bool,
 }
 
 /// A fetch staged by the remote connection dialog, waiting to be claimed by the tab it ends up
@@ -219,8 +256,7 @@ struct HostPrompt {
 struct PendingRemote {
     local: PathBuf,
     temp: std::sync::Arc<tempfile::TempDir>,
-    /// `None` for a folder: it opens read-only, with nothing to write back.
-    file: Option<RemoteFile>,
+    file: RemoteFile,
 }
 
 #[derive(Clone)]
@@ -348,7 +384,7 @@ impl Tab {
             return true;
         }
         match &self.content {
-            Content::Folder(v) => v.has_archive_changes(),
+            Content::Folder(v) => v.has_archive_changes() || v.has_remote_changes(),
             Content::Web(_) => false,
             Content::Text(v) => v.is_modified(),
             Content::Binary(v) => v.is_modified(),
@@ -1354,25 +1390,257 @@ enum RemoteTarget {
     Open(usize),
 }
 
-/// *File → Compare over SFTP*: a server, a user name, a password or a private key, and the
-/// file or folder to fetch from it.
+/// How the remote connection dialog signs in. FTP has only a password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignIn {
+    Password,
+    /// A private key file and its passphrase.
+    Key,
+    /// The keys `ssh-agent` holds, and those of `~/.ssh/config` or `~/.ssh/id_*`.
+    Agent,
+}
+
+/// *File → Compare over SFTP or FTP*: a protocol, a server, a user name, how to sign in, and
+/// the file or folder to fetch from it.
 struct RemoteDialog {
     target: RemoteTarget,
+    protocol: remote::Protocol,
     host: String,
     port: String,
     user: String,
-    /// A private key and its passphrase (true), or a password (false).
-    key_auth: bool,
+    sign_in: SignIn,
     password: String,
     key_path: String,
     passphrase: String,
     remote_path: String,
+    /// The server's folders and files, shown to pick `remote_path` from.
+    browse: Option<RemoteBrowse>,
+    /// A proxy to connect through, and its password when the URL has a user.
+    proxy: String,
+    proxy_password: String,
+    /// FTP in active mode.
+    active: bool,
+    /// FTPS: a client certificate, and its key when not in the same file.
+    client_cert: String,
+    client_key: String,
+}
+
+impl RemoteDialog {
+    /// The proxy the field names, if any.
+    fn proxy(&self) -> anyhow::Result<Option<crate::core::net::Proxy>> {
+        if self.proxy.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut proxy = crate::core::net::Proxy::parse(&self.proxy)?;
+        if !self.proxy_password.is_empty() {
+            proxy.password = Some(self.proxy_password.clone());
+        }
+        Ok(Some(proxy))
+    }
+
+    /// The connection the fields describe, once every one it needs is filled in. A user name
+    /// is optional over SFTP, where `~/.ssh/config` or the local user's name stands in.
+    fn conn(&self) -> Option<remote::RemoteConnection> {
+        let port = self.port.trim().parse().ok()?;
+        let sign_in = self.sign_in();
+        if self.host.trim().is_empty()
+            || (self.user.trim().is_empty() && self.protocol.is_ftp())
+            || (sign_in == SignIn::Key && self.key_path.trim().is_empty())
+        {
+            return None;
+        }
+        let tls = matches!(
+            self.protocol,
+            remote::Protocol::Ftps | remote::Protocol::FtpsImplicit
+        );
+        let file =
+            |text: &str| (tls && !text.trim().is_empty()).then(|| PathBuf::from(text.trim()));
+        let options = remote::ConnOptions {
+            proxy: self.proxy().ok()?,
+            active: self.protocol.is_ftp() && self.active,
+            client_cert: file(&self.client_cert),
+            client_key: file(&self.client_key).filter(|_| !self.client_cert.trim().is_empty()),
+        };
+        let auth = match sign_in {
+            SignIn::Key => remote::Auth::Key {
+                path: PathBuf::from(self.key_path.trim()),
+                passphrase: self.passphrase.clone(),
+            },
+            SignIn::Agent => remote::Auth::Agent,
+            SignIn::Password => remote::Auth::Password(self.password.clone()),
+        };
+        Some(remote::RemoteConnection {
+            protocol: self.protocol,
+            host: self.host.trim().to_string(),
+            port,
+            user: self.user.trim().to_string(),
+            auth,
+            options,
+        })
+    }
+
+    /// How the dialog signs in: as chosen over SFTP, and always with a password over FTP.
+    fn sign_in(&self) -> SignIn {
+        if self.protocol.is_ftp() {
+            SignIn::Password
+        } else {
+            self.sign_in
+        }
+    }
+
+    /// Switches to `protocol`, and to its usual port unless another was typed.
+    fn set_protocol(&mut self, protocol: remote::Protocol) {
+        let port = self.port.trim();
+        if port.is_empty() || port == self.protocol.default_port().to_string() {
+            self.port = protocol.default_port().to_string();
+        }
+        self.protocol = protocol;
+    }
 }
 
 impl Drop for RemoteDialog {
     fn drop(&mut self) {
         remote::wipe(&mut self.password);
         remote::wipe(&mut self.passphrase);
+        remote::wipe(&mut self.proxy_password);
+    }
+}
+
+/// The remote connection dialog's less common settings, folded away until opened: a proxy,
+/// FTP's active mode, an FTPS client certificate, and a word on `~/.ssh/config` for SFTP.
+fn remote_advanced(ui: &mut egui::Ui, d: &mut RemoteDialog) {
+    let set = !d.proxy.trim().is_empty() || d.active || !d.client_cert.trim().is_empty();
+    egui::CollapsingHeader::new(tr("label.remote_advanced"))
+        .id_salt("remote_advanced")
+        .default_open(set)
+        .show(ui, |ui| {
+            egui::Grid::new("remote_advanced_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label(tr("label.remote_proxy"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.proxy)
+                            .hint_text("socks5://host:1080")
+                            .desired_width(260.0),
+                    );
+                    ui.end_row();
+                    if !d.proxy.trim().is_empty() {
+                        ui.label(tr("label.remote_proxy_password"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.proxy_password)
+                                .password(true)
+                                .desired_width(220.0),
+                        );
+                        ui.end_row();
+                        if let Err(e) = d.proxy() {
+                            ui.label("");
+                            ui.colored_label(ui.visuals().error_fg_color, format!("{e:#}"));
+                            ui.end_row();
+                        }
+                    }
+                    if d.protocol.is_ftp() {
+                        ui.label("");
+                        ui.checkbox(&mut d.active, tr("label.remote_active"))
+                            .on_hover_text(tr("msg.remote_active_hint"));
+                        ui.end_row();
+                    }
+                    if matches!(
+                        d.protocol,
+                        remote::Protocol::Ftps | remote::Protocol::FtpsImplicit
+                    ) {
+                        for (label, path) in [
+                            ("label.remote_client_cert", &mut d.client_cert),
+                            ("label.remote_client_key", &mut d.client_key),
+                        ] {
+                            ui.label(tr(label));
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(path).desired_width(260.0));
+                                if widgets::icon_button(ui, Icon::File, tr("btn.browse_file"))
+                                    .clicked()
+                                {
+                                    if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                        *path = p.display().to_string();
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    }
+                });
+            if !d.protocol.is_ftp() {
+                ui.weak(tr("msg.remote_ssh_config_hint"));
+            }
+        });
+}
+
+/// `protocol` as the remote connection dialog lists it.
+fn protocol_name(protocol: remote::Protocol) -> &'static str {
+    tr(match protocol {
+        remote::Protocol::Sftp => "label.protocol_sftp",
+        remote::Protocol::Ftps => "label.protocol_ftps",
+        remote::Protocol::FtpsImplicit => "label.protocol_ftps_implicit",
+        remote::Protocol::Ftp => "label.protocol_ftp",
+    })
+}
+
+/// Whether `a` and `b` connect to the same server the same way, as the same user, signed in
+/// the same way.
+fn same_conn(a: &remote::RemoteConnection, b: &remote::RemoteConnection) -> bool {
+    a.protocol == b.protocol
+        && a.host == b.host
+        && a.port == b.port
+        && a.user == b.user
+        && a.options == b.options
+        && match (&a.auth, &b.auth) {
+            (remote::Auth::Password(x), remote::Auth::Password(y)) => x == y,
+            (remote::Auth::Agent, remote::Auth::Agent) => true,
+            (
+                remote::Auth::Key {
+                    path: p,
+                    passphrase: x,
+                },
+                remote::Auth::Key {
+                    path: q,
+                    passphrase: y,
+                },
+            ) => p == q && x == y,
+            _ => false,
+        }
+}
+
+/// The remote connection dialog's list of a folder on the server, to pick the remote path from
+/// instead of typing it. Its connection stays open while the list is shown.
+struct RemoteBrowse {
+    browser: remote::Browser,
+    /// What `browser` connects with: changing any of the dialog's fields closes the list.
+    conn: remote::RemoteConnection,
+    /// The path last asked for.
+    asked: String,
+    listing: Option<remote::Listing>,
+    /// Whether `asked` is being listed.
+    loading: bool,
+    error: Option<String>,
+}
+
+impl RemoteBrowse {
+    fn start(conn: remote::RemoteConnection, path: &str) -> Self {
+        let mut b = Self {
+            browser: remote::Browser::start(conn.clone()),
+            conn,
+            asked: String::new(),
+            listing: None,
+            loading: false,
+            error: None,
+        };
+        b.list(path);
+        b
+    }
+
+    fn list(&mut self, path: &str) {
+        self.asked = path.to_string();
+        self.loading = true;
+        self.browser.list(path);
     }
 }
 
@@ -1382,27 +1650,122 @@ impl Drop for RemoteDialog {
 /// path retyped. The password or a key's passphrase is never kept here, consistent with
 /// [`RemoteConnection`] itself never outliving the tab it was used for.
 struct LastRemote {
+    protocol: remote::Protocol,
     host: String,
     port: String,
     user: String,
-    key_auth: bool,
+    sign_in: SignIn,
     key_path: String,
+    /// The proxy, without its password.
+    proxy: String,
+    active: bool,
+    client_cert: String,
+    client_key: String,
 }
 
 impl LastRemote {
     fn from_conn(conn: &remote::RemoteConnection) -> Self {
-        let (key_auth, key_path) = match &conn.auth {
-            remote::Auth::Password(_) => (false, String::new()),
-            remote::Auth::Key { path, .. } => (true, path.display().to_string()),
+        let (sign_in, key_path) = match &conn.auth {
+            remote::Auth::Password(_) => (SignIn::Password, String::new()),
+            remote::Auth::Key { path, .. } => (SignIn::Key, path.display().to_string()),
+            remote::Auth::Agent => (SignIn::Agent, String::new()),
+        };
+        let shown = |p: &Option<PathBuf>| {
+            p.as_ref()
+                .map_or_else(String::new, |p| p.display().to_string())
         };
         Self {
+            protocol: conn.protocol,
             host: conn.host.clone(),
             port: conn.port.to_string(),
             user: conn.user.clone(),
-            key_auth,
+            sign_in,
             key_path,
+            proxy: conn
+                .options
+                .proxy
+                .as_ref()
+                .map_or_else(String::new, |p| p.url()),
+            active: conn.options.active,
+            client_cert: shown(&conn.options.client_cert),
+            client_key: shown(&conn.options.client_key),
         }
     }
+}
+
+/// A server's questions while signing in, put to the user in a window of their own (see
+/// [`install_asker`]).
+struct AskRequest {
+    challenge: remote::Challenge,
+    answers: Vec<String>,
+    reply: std::sync::mpsc::Sender<Option<Vec<String>>>,
+    /// Set once the connection stopped waiting (it was cancelled), closing the window.
+    gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the first answer's field still needs focus (only the first frame it shows).
+    focus: bool,
+}
+
+impl Drop for AskRequest {
+    fn drop(&mut self) {
+        for a in &mut self.answers {
+            remote::wipe(a);
+        }
+    }
+}
+
+/// Puts a server's questions while signing in to the user, in a window, for connections made
+/// on other threads (see [`remote::set_asker`]); the window shows once the receiver returned is
+/// read.
+fn install_asker(ctx: &egui::Context) -> std::sync::mpsc::Receiver<AskRequest> {
+    let (ask, rx) = asker(ctx);
+    remote::set_asker(Some(ask));
+    rx
+}
+
+/// What [`install_asker`] installs, and the receiver its questions come through. Asked on the
+/// window's own thread, which must not wait for itself, a question is declined.
+fn asker(
+    ctx: &egui::Context,
+) -> (
+    std::sync::Arc<remote::Asker>,
+    std::sync::mpsc::Receiver<AskRequest>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel::<AskRequest>();
+    let ctx = ctx.clone();
+    let ui_thread = std::thread::current().id();
+    let tx = std::sync::Mutex::new(tx);
+    let ask = std::sync::Arc::new(
+        move |challenge: &remote::Challenge, cancel: &std::sync::atomic::AtomicBool| {
+            if std::thread::current().id() == ui_thread {
+                return None;
+            }
+            let (reply, answered) = std::sync::mpsc::channel();
+            let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            tx.lock()
+                .ok()?
+                .send(AskRequest {
+                    answers: vec![String::new(); challenge.prompts.len()],
+                    challenge: challenge.clone(),
+                    reply,
+                    gone: gone.clone(),
+                    focus: true,
+                })
+                .ok()?;
+            ctx.request_repaint();
+            let answers = loop {
+                match answered.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(answers) => break answers,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if !cancel.load(std::sync::atomic::Ordering::Relaxed) => {}
+                    Err(_) => break None,
+                }
+            };
+            gone.store(true, std::sync::atomic::Ordering::Relaxed);
+            ctx.request_repaint();
+            answers
+        },
+    );
+    (ask, rx)
 }
 
 /// A file or folder being fetched over SFTP, on another thread, for [`RemoteDialog`].
@@ -1505,12 +1868,19 @@ pub struct OxideMergeApp {
     upload: Option<UploadRun>,
     /// Uploads asked for while others were under way, started once they are done.
     upload_queue: Vec<UploadJob>,
+    /// The tab whose *Reload from server* waits for the user to agree to lose its changes.
+    reload_prompt: Option<u64>,
+    reload: Option<ReloadRun>,
     /// Fetches staged by the remote connection dialog, waiting for the tab they end up
     /// opening in to claim them (see [`PendingRemote`]).
     pending_remote: Vec<PendingRemote>,
     /// Host, port, user and key path of the last successful connection, to fill in a new
     /// connect dialog with (see [`LastRemote`]). Kept only for this run; never saved.
     last_remote: Option<LastRemote>,
+    /// A server's questions while signing in (see [`remote::set_asker`]), from connections on
+    /// other threads, and the one being answered.
+    asks: Option<std::sync::mpsc::Receiver<AskRequest>>,
+    ask: Option<AskRequest>,
     /// A folder report with file differences being written on another thread: its file.
     report_job: Option<(PathBuf, std::sync::mpsc::Receiver<Result<(), String>>)>,
     /// Whether the report being written opens in the system's viewer once done, to be printed.
@@ -1799,6 +2169,9 @@ struct Menus {
     clear_recent: bool,
     /// Whether any workspace is saved, for [`Cmd::ManageWorkspaces`] and [`Cmd::OpenWorkspace`].
     has_workspaces: bool,
+    /// Whether the tab has a side fetched from a server, and nothing is being sent to or
+    /// fetched from one, for [`Cmd::ReloadRemote`].
+    can_reload: bool,
 }
 
 impl Menus {
@@ -1860,6 +2233,7 @@ impl Menus {
                 _,
             ) => true,
             (ManageWorkspaces | OpenWorkspace(_), _) => self.has_workspaces,
+            (ReloadRemote, _) => self.can_reload,
             (DeleteWorkspace(_), _) => true,
             _ => false,
         }
@@ -2324,11 +2698,24 @@ fn drop_overlay(ctx: &egui::Context, filling_dialog: bool) {
 
 impl OxideMergeApp {
     /// `stored` is the config as loaded, before the options of the command line went into `cfg`.
+    #[cfg(test)]
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         cfg: Config,
         stored: Config,
         initial: Option<OpenRequest>,
+    ) -> Self {
+        Self::with_fetched(cc, cfg, stored, initial, Vec::new())
+    }
+
+    /// [`Self::new`], with paths of `initial` fetched from servers on the command line: each
+    /// connection, path on the server and fetch, for *Save* to write the side back.
+    pub fn with_fetched(
+        cc: &eframe::CreationContext<'_>,
+        cfg: Config,
+        stored: Config,
+        initial: Option<OpenRequest>,
+        fetched: Vec<(remote::RemoteConnection, String, remote::Fetched)>,
     ) -> Self {
         let lang = i18n::current_language().to_string();
         fonts::setup(&cc.egui_ctx, &lang);
@@ -2357,8 +2744,12 @@ impl OxideMergeApp {
             host_prompt: None,
             upload: None,
             upload_queue: Vec::new(),
+            reload_prompt: None,
+            reload: None,
             pending_remote: Vec::new(),
             last_remote: None,
+            asks: Some(install_asker(&cc.egui_ctx)),
+            ask: None,
             rev_load: None,
             report_job: None,
             report_opens: false,
@@ -2409,6 +2800,9 @@ impl OxideMergeApp {
         };
         app.text_layout = (app.cfg.collapse_unchanged, app.cfg.word_wrap);
         crate::core::fsutil::set_backup(app.cfg.backup_on_save);
+        for (conn, remote_path, fetched) in fetched {
+            app.stage_fetch(conn, remote_path, fetched);
+        }
         if let Some(req) = initial {
             app.open(req);
         } else if app.cfg.restore_session {
@@ -3020,14 +3414,21 @@ impl OxideMergeApp {
         let last = self.last_remote.as_ref();
         self.remote_dlg = Some(RemoteDialog {
             target,
+            protocol: last.map_or(remote::Protocol::Sftp, |l| l.protocol),
             host: last.map_or_else(String::new, |l| l.host.clone()),
             port: last.map_or_else(|| "22".to_string(), |l| l.port.clone()),
             user: last.map_or_else(String::new, |l| l.user.clone()),
-            key_auth: last.is_some_and(|l| l.key_auth),
+            sign_in: last.map_or(SignIn::Password, |l| l.sign_in),
             password: String::new(),
             key_path: last.map_or_else(String::new, |l| l.key_path.clone()),
             passphrase: String::new(),
             remote_path: String::new(),
+            browse: None,
+            proxy: last.map_or_else(String::new, |l| l.proxy.clone()),
+            proxy_password: String::new(),
+            active: last.is_some_and(|l| l.active),
+            client_cert: last.map_or_else(String::new, |l| l.client_cert.clone()),
+            client_key: last.map_or_else(String::new, |l| l.client_key.clone()),
         });
     }
 
@@ -3038,11 +3439,49 @@ impl OxideMergeApp {
             return;
         };
         let (mut connect, mut cancel) = (false, false);
-        let ready = !d.host.trim().is_empty()
-            && !d.user.trim().is_empty()
-            && !d.remote_path.trim().is_empty()
-            && d.port.trim().parse::<u16>().is_ok()
-            && (!d.key_auth || !d.key_path.trim().is_empty());
+        let conn = d.conn();
+        if let Some(b) = &d.browse {
+            if !conn.as_ref().is_some_and(|c| same_conn(c, &b.conn)) {
+                d.browse = None;
+            }
+        }
+        if let Some(b) = &mut d.browse {
+            if let Some(listed) = b.browser.poll() {
+                b.loading = false;
+                match listed {
+                    Ok(l) => {
+                        d.remote_path = match &l.file {
+                            Some(file) => remote::join(&l.path, file),
+                            None => l.path.clone(),
+                        };
+                        b.error = None;
+                        b.listing = Some(l);
+                    }
+                    Err(e) => match e.downcast::<remote::UnknownHost>() {
+                        Ok(host) => {
+                            let Some(b) = d.browse.take() else {
+                                return;
+                            };
+                            self.host_prompt = Some(HostPrompt {
+                                host,
+                                target: d.target,
+                                conn: b.conn.clone(),
+                                remote_path: b.asked.clone(),
+                                dialog: Some(d),
+                                browse: true,
+                            });
+                            return;
+                        }
+                        Err(e) => b.error = Some(format!("{e:#}")),
+                    },
+                }
+            }
+        }
+        if d.browse.as_ref().is_some_and(|b| b.loading) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        let ready = conn.is_some() && !d.remote_path.trim().is_empty();
+        let (mut toggle_browse, mut go, mut pick, mut fetch_now) = (false, None, None, None);
         let modal = egui::Modal::new(egui::Id::unique("remote_connect_dialog")).show(ctx, |ui| {
             ui.set_min_width(440.0);
             if widgets::dialog_title(ui, &plain(tr("menu.open_remote"))) {
@@ -3052,6 +3491,20 @@ impl OxideMergeApp {
                 .num_columns(2)
                 .spacing([12.0, 10.0])
                 .show(ui, |ui| {
+                    ui.label(tr("label.remote_protocol"));
+                    let mut protocol = d.protocol;
+                    egui::ComboBox::from_id_salt("remote_protocol")
+                        .selected_text(protocol_name(protocol))
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            for p in remote::Protocol::ALL {
+                                ui.selectable_value(&mut protocol, p, protocol_name(p));
+                            }
+                        });
+                    if protocol != d.protocol {
+                        d.set_protocol(protocol);
+                    }
+                    ui.end_row();
                     ui.label(tr("label.remote_host"));
                     ui.horizontal(|ui| {
                         ui.add(
@@ -3066,13 +3519,32 @@ impl OxideMergeApp {
                     ui.label(tr("label.remote_user"));
                     ui.add(egui::TextEdit::singleline(&mut d.user).desired_width(220.0));
                     ui.end_row();
-                    ui.label(tr("label.remote_auth"));
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut d.key_auth, false, tr("label.remote_password"));
-                        ui.selectable_value(&mut d.key_auth, true, tr("label.remote_key"));
-                    });
-                    ui.end_row();
-                    if d.key_auth {
+                    if !d.protocol.is_ftp() {
+                        ui.label(tr("label.remote_auth"));
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut d.sign_in,
+                                SignIn::Password,
+                                tr("label.remote_password"),
+                            );
+                            ui.selectable_value(
+                                &mut d.sign_in,
+                                SignIn::Key,
+                                tr("label.remote_key"),
+                            );
+                            ui.selectable_value(
+                                &mut d.sign_in,
+                                SignIn::Agent,
+                                tr("label.remote_agent"),
+                            );
+                        });
+                        ui.end_row();
+                    }
+                    if d.sign_in() == SignIn::Agent {
+                        ui.label("");
+                        ui.weak(tr("msg.remote_agent_hint"));
+                        ui.end_row();
+                    } else if d.sign_in() == SignIn::Key {
                         ui.label(tr("label.remote_key_path"));
                         ui.horizontal(|ui| {
                             ui.add(
@@ -3103,13 +3575,118 @@ impl OxideMergeApp {
                         ui.end_row();
                     }
                     ui.label(tr("label.remote_path"));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut d.remote_path)
-                            .hint_text(tr("msg.remote_path_hint"))
-                            .desired_width(300.0),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.remote_path)
+                                .hint_text(tr("msg.remote_path_hint"))
+                                .desired_width(260.0),
+                        );
+                        if widgets::icon_button_enabled(
+                            ui,
+                            conn.is_some(),
+                            Icon::Folder,
+                            tr("btn.list_remote"),
+                        )
+                        .clicked()
+                        {
+                            toggle_browse = true;
+                        }
+                    });
                     ui.end_row();
                 });
+            if d.protocol == remote::Protocol::Ftp {
+                ui.add_space(4.0);
+                ui.colored_label(ui.visuals().warn_fg_color, tr("msg.ftp_plain_warning"));
+            }
+            ui.add_space(4.0);
+            remote_advanced(ui, &mut d);
+            if let Some(b) = &d.browse {
+                ui.add_space(6.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let up = b
+                            .listing
+                            .as_ref()
+                            .and_then(|l| remote::parent_path(&l.path));
+                        if widgets::icon_button_enabled(
+                            ui,
+                            up.is_some(),
+                            Icon::Prev,
+                            tr("btn.remote_up"),
+                        )
+                        .clicked()
+                        {
+                            go = up;
+                        }
+                        if widgets::icon_button(ui, Icon::Refresh, tr("cmd.refresh")).clicked() {
+                            go = Some(d.remote_path.clone());
+                        }
+                        if b.loading {
+                            ui.spinner();
+                        }
+                        if let Some(l) = &b.listing {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&l.path).monospace())
+                                    .truncate(),
+                            );
+                        }
+                    });
+                    if let Some(e) = &b.error {
+                        ui.colored_label(ui.visuals().error_fg_color, e);
+                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| match &b.listing {
+                            None => {
+                                if b.loading {
+                                    ui.weak(trf(
+                                        "msg.remote_listing",
+                                        &[("path", b.asked.clone())],
+                                    ));
+                                }
+                            }
+                            Some(l) => {
+                                if l.entries.is_empty() {
+                                    ui.weak(tr("msg.remote_empty"));
+                                }
+                                for e in &l.entries {
+                                    let full = remote::join(&l.path, &e.name);
+                                    ui.horizontal(|ui| {
+                                        let icon = match e.kind {
+                                            remote::EntryKind::Dir => Icon::Folder,
+                                            remote::EntryKind::File => Icon::File,
+                                            remote::EntryKind::Link => Icon::ChevronRight,
+                                        };
+                                        widgets::small_icon(ui, icon, ui.visuals().text_color());
+                                        let row =
+                                            ui.selectable_label(d.remote_path == full, &e.name);
+                                        if e.kind == remote::EntryKind::File {
+                                            ui.weak(report::fmt_size(Some(e.size)));
+                                        }
+                                        if e.kind != remote::EntryKind::File {
+                                            if row.clicked() {
+                                                go = Some(full);
+                                            }
+                                        } else if row.double_clicked() {
+                                            fetch_now = Some(full);
+                                        } else if row.clicked() {
+                                            pick = Some(full);
+                                        }
+                                    });
+                                }
+                                if l.truncated {
+                                    ui.weak(trf(
+                                        "msg.remote_truncated",
+                                        &[("count", remote::MAX_BROWSE_ENTRIES.to_string())],
+                                    ));
+                                }
+                            }
+                        });
+                    ui.weak(tr("msg.remote_browse_hint"));
+                });
+            }
             widgets::dialog_footer(ui, |ui| {
                 ui.add_enabled_ui(ready, |ui| {
                     if widgets::primary_button(ui, tr("btn.connect")).clicked()
@@ -3128,30 +3705,108 @@ impl OxideMergeApp {
         if modal.should_close() {
             cancel = true;
         }
-        if connect {
-            // `ready` (gating the *Connect* button above) already requires this to parse;
-            // the fallback is just a defensive backstop against the two checks ever drifting
-            // apart, not a path expected to run.
-            let port = d.port.trim().parse().unwrap_or(22);
-            let auth = if d.key_auth {
-                remote::Auth::Key {
-                    path: PathBuf::from(d.key_path.trim()),
-                    passphrase: d.passphrase.clone(),
+        if toggle_browse {
+            d.browse = match (d.browse.take(), &conn) {
+                (None, Some(c)) => Some(RemoteBrowse::start(c.clone(), &d.remote_path)),
+                _ => None,
+            };
+        }
+        if let (Some(path), Some(b)) = (go, &mut d.browse) {
+            b.list(&path);
+        }
+        if let Some(path) = pick {
+            d.remote_path = path;
+        }
+        if let Some(path) = fetch_now {
+            d.remote_path = path;
+            connect = true;
+        }
+        match conn {
+            Some(conn) if connect && !cancel && !d.remote_path.trim().is_empty() => {
+                let remote_path = d.remote_path.trim().to_string();
+                let target = d.target;
+                self.open_remote(target, conn, remote_path, Some(d));
+            }
+            _ if cancel => {}
+            _ => self.remote_dlg = Some(d),
+        }
+    }
+
+    /// A server's questions while signing in (see [`install_asker`]), one window at a time,
+    /// in the order they came.
+    fn ask_dialog(&mut self, ctx: &egui::Context) {
+        let gone = |a: &AskRequest| a.gone.load(std::sync::atomic::Ordering::Relaxed);
+        if self.ask.as_ref().is_some_and(gone) {
+            self.ask = None;
+        }
+        while self.ask.is_none() {
+            match self.asks.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                Some(a) if !gone(&a) => self.ask = Some(a),
+                Some(_) => {}
+                None => return,
+            }
+        }
+        let Some(a) = &mut self.ask else {
+            return;
+        };
+        let (mut ok, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::unique("remote_ask_dialog")).show(ctx, |ui| {
+            ui.set_min_width(380.0);
+            if widgets::dialog_title(ui, &plain(tr("label.remote_ask_title"))) {
+                cancel = true;
+            }
+            ui.label(trf(
+                "msg.remote_ask_server",
+                &[("server", a.challenge.server.clone())],
+            ));
+            if !a.challenge.name.trim().is_empty() {
+                ui.strong(a.challenge.name.trim());
+            }
+            if !a.challenge.instructions.trim().is_empty() {
+                ui.label(a.challenge.instructions.trim());
+            }
+            ui.add_space(4.0);
+            egui::Grid::new("remote_ask_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    let focus = std::mem::take(&mut a.focus);
+                    for (i, (p, answer)) in
+                        a.challenge.prompts.iter().zip(&mut a.answers).enumerate()
+                    {
+                        ui.label(p.text.trim());
+                        let field = ui.add(
+                            egui::TextEdit::singleline(answer)
+                                .password(!p.echo)
+                                .desired_width(220.0),
+                        );
+                        if focus && i == 0 {
+                            field.request_focus();
+                        }
+                        ui.end_row();
+                    }
+                });
+            widgets::dialog_footer(ui, |ui| {
+                if widgets::primary_button(ui, tr("btn.ok")).clicked()
+                    || ui.input(|i| i.key_pressed(Key::Enter))
+                {
+                    ok = true;
                 }
-            } else {
-                remote::Auth::Password(d.password.clone())
-            };
-            let conn = remote::RemoteConnection {
-                host: d.host.trim().to_string(),
-                port,
-                user: d.user.trim().to_string(),
-                auth,
-            };
-            let remote_path = d.remote_path.trim().to_string();
-            let target = d.target;
-            self.open_remote(target, conn, remote_path, Some(d));
-        } else if !cancel {
-            self.remote_dlg = Some(d);
+                if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
+                    || ui.input(|i| i.key_pressed(Key::Escape))
+                {
+                    cancel = true;
+                }
+            });
+        });
+        if modal.should_close() {
+            cancel = true;
+        }
+        if ok || cancel {
+            if let Some(mut a) = self.ask.take() {
+                let answers = ok.then(|| std::mem::take(&mut a.answers));
+                let _ = a.reply.send(answers);
+            }
         }
     }
 
@@ -3247,6 +3902,7 @@ impl OxideMergeApp {
                         conn: load.conn,
                         remote_path: load.remote_path,
                         dialog: load.dialog,
+                        browse: false,
                     });
                 }
                 Ok(_) => self.remote_dlg = load.dialog,
@@ -3270,13 +3926,20 @@ impl OxideMergeApp {
         let modal = egui::Modal::new(egui::Id::unique("host_prompt")).show(ctx, |ui| {
             ui.set_width(520.0);
             ui.heading(tr("dlg.unknown_host"));
-            ui.label(trf(
-                "msg.sftp_unknown_host",
-                &[
-                    ("server", p.host.server.clone()),
-                    ("type", p.host.key_type.clone()),
-                ],
-            ));
+            ui.label(if p.host.key_type == tr("label.tls_certificate") {
+                trf(
+                    "msg.ftps_unknown_cert",
+                    &[("server", p.host.server.clone())],
+                )
+            } else {
+                trf(
+                    "msg.sftp_unknown_host",
+                    &[
+                        ("server", p.host.server.clone()),
+                        ("type", p.host.key_type.clone()),
+                    ],
+                )
+            });
             ui.add(egui::Label::new(
                 egui::RichText::new(&p.host.fingerprint).monospace(),
             ));
@@ -3305,6 +3968,12 @@ impl OxideMergeApp {
         }
         if trust {
             match remote::trust_host(&p.host) {
+                Ok(()) if p.browse => {
+                    self.remote_dlg = p.dialog.map(|mut d| {
+                        d.browse = Some(RemoteBrowse::start(p.conn, &p.remote_path));
+                        d
+                    });
+                }
                 Ok(()) => self.open_remote(p.target, p.conn, p.remote_path, p.dialog),
                 Err(e) => {
                     self.error(format!("{e:#}"));
@@ -3327,13 +3996,7 @@ impl OxideMergeApp {
         remote_path: String,
         fetched: remote::Fetched,
     ) {
-        let remote::Fetched {
-            temp,
-            local,
-            is_dir,
-            stamp,
-        } = fetched;
-        let shown = local.display().to_string();
+        let shown = fetched.local.display().to_string();
         match target {
             RemoteTarget::Start(s) => self.start_paths[s] = shown,
             RemoteTarget::Open(s) => {
@@ -3342,21 +4005,39 @@ impl OxideMergeApp {
                     .take()
                     .unwrap_or_else(|| self.new_open_dialog(None));
                 d.paths[s] = shown;
-                d.read_only[s] = is_dir;
                 self.open_dlg = Some(d);
             }
         }
+        self.stage_fetch(conn, remote_path, fetched);
+    }
+
+    /// Remembers `fetched`, from `remote_path` over `conn`, to claim once a tab opens with its
+    /// local copy (see [`PendingRemote`]).
+    fn stage_fetch(
+        &mut self,
+        conn: remote::RemoteConnection,
+        remote_path: String,
+        fetched: remote::Fetched,
+    ) {
+        let remote::Fetched {
+            temp,
+            local,
+            is_dir,
+            stamp,
+            manifest,
+        } = fetched;
         let sent = if is_dir { None } else { file_hash(&local) };
         self.pending_remote.push(PendingRemote {
             local,
             temp: std::sync::Arc::new(temp),
-            file: (!is_dir).then_some(RemoteFile {
+            file: RemoteFile {
                 conn,
                 remote_path,
+                manifest,
                 stamp,
                 sent,
                 pending: false,
-            }),
+            },
         });
     }
 
@@ -3687,11 +4368,11 @@ impl OxideMergeApp {
 
     fn push_tab(&mut self, mut content: Content, source: Vec<PathBuf>) {
         self.next_tab_id += 1;
-        let (temps, remote, staged_dirs) = self.take_pending_remote(&source);
+        let (temps, remote) = self.take_pending_remote(&source);
         if let Content::Folder(v) = &mut content {
-            for i in staged_dirs {
-                if let Some(ro) = v.read_only.get_mut(i) {
-                    *ro = true;
+            for (i, r) in remote.iter().enumerate() {
+                if r.as_ref().is_some_and(|r| r.manifest.is_some()) {
+                    v.set_remote_side(i);
                 }
             }
         }
@@ -3709,31 +4390,25 @@ impl OxideMergeApp {
 
     /// Claims the fetches of [`Self::pending_remote`] that `source` was staged from (by the
     /// local path each was staged to): the temporary folders to keep as long as the new tab
-    /// does, for a file side, the connection *Save* writes it back to, and the sides that are
-    /// fetched folders, which stay read-only.
+    /// does, and for each side the connection *Save* writes it back to.
     fn take_pending_remote(
         &mut self,
         source: &[PathBuf],
     ) -> (
         Vec<std::sync::Arc<tempfile::TempDir>>,
         Vec<Option<RemoteFile>>,
-        Vec<usize>,
     ) {
         let mut temps = Vec::new();
         let mut remote = vec![None; source.len()];
-        let mut dirs = Vec::new();
         self.pending_remote.retain(|p| {
             let Some(i) = source.iter().position(|s| s == &p.local) else {
                 return true;
             };
             temps.push(p.temp.clone());
-            remote[i] = p.file.clone();
-            if p.file.is_none() {
-                dirs.push(i);
-            }
+            remote[i] = Some(p.file.clone());
             false
         });
-        (temps, remote, dirs)
+        (temps, remote)
     }
 
     /// Drops a fetch of [`Self::pending_remote`] that no longer sits in any path field it
@@ -3916,7 +4591,8 @@ impl OxideMergeApp {
         }
         self.take_review_updates();
         self.refresh_saved_folders();
-        self.tabs.remove(i);
+        let closed = self.tabs.remove(i);
+        self.hand_down_remote(&closed);
         self.shown_active = None;
         if i < self.active {
             self.active -= 1;
@@ -3926,15 +4602,69 @@ impl OxideMergeApp {
         }
     }
 
+    /// After the folder compare `closed` closed: gives each tab still open from it, for its
+    /// files on a side fetched from a server, that file's own place on the server, so saving
+    /// one still uploads it, as the folder's write-back did while it was open.
+    fn hand_down_remote(&mut self, closed: &Tab) {
+        if !matches!(closed.content.view(), Content::Folder(_)) {
+            return;
+        }
+        for (s, r) in closed.remote.iter().enumerate() {
+            let Some(RemoteFile {
+                conn,
+                remote_path,
+                manifest: Some(manifest),
+                ..
+            }) = r
+            else {
+                continue;
+            };
+            let Some(root) = closed.source.get(s) else {
+                continue;
+            };
+            for t in &mut self.tabs {
+                if t.origin.as_ref().map(|o| o.folder) != Some(closed.id) {
+                    continue;
+                }
+                let paths = t.paths();
+                t.remote.resize(paths.len(), None);
+                for (slot, p) in t.remote.iter_mut().zip(&paths) {
+                    let Some(rel) = p.strip_prefix(root).ok().and_then(|r| {
+                        r.components()
+                            .map(|c| c.as_os_str().to_str())
+                            .collect::<Option<Vec<_>>>()
+                    }) else {
+                        continue;
+                    };
+                    if slot.is_some() || rel.is_empty() {
+                        continue;
+                    }
+                    let rel = rel.join("/");
+                    let fetched = manifest.files.get(&rel);
+                    *slot = Some(RemoteFile {
+                        conn: conn.clone(),
+                        remote_path: remote::join(remote_path, &rel),
+                        manifest: None,
+                        stamp: fetched.map(|(stamp, _)| *stamp),
+                        sent: fetched.map(|(_, hash)| *hash),
+                        pending: false,
+                    });
+                }
+            }
+        }
+    }
+
     /// Closes the tabs selected by `close`. Tabs with unsaved changes stay open and ask, one after
     /// the other, whether to save.
     fn close_tabs(&mut self, close: impl Fn(usize) -> bool) {
         let mut kept = Vec::new();
         let mut active = 0;
         let mut ask = Vec::new();
+        let mut closed = Vec::new();
         for (i, t) in std::mem::take(&mut self.tabs).into_iter().enumerate() {
             if close(i) {
                 if !t.is_modified() {
+                    closed.push(t);
                     continue;
                 }
                 ask.push(t.id);
@@ -3945,6 +4675,9 @@ impl OxideMergeApp {
             kept.push(t);
         }
         self.tabs = kept;
+        for t in &closed {
+            self.hand_down_remote(t);
+        }
         self.active = active;
         self.shown_active = None;
         self.close_queue = ask;
@@ -4613,6 +5346,7 @@ impl OxideMergeApp {
                 }
                 self.start_remote_connect(RemoteTarget::Open(0));
             }
+            Cmd::ReloadRemote => self.reload_remote(false),
             Cmd::GitCompare => {
                 let path = self
                     .tabs
@@ -5144,8 +5878,38 @@ impl OxideMergeApp {
         }
         let mut up = ids.to_vec();
         up.extend(folders);
+        up.extend(self.mark_origin_remote_folders(ids));
         errors.extend(self.queue_uploads(&up));
         errors
+    }
+
+    /// Marks the sides fetched from a server of the folder compares the tabs in `ids` were
+    /// opened from, those the tabs' files are in, as edited; returns those folder tabs, for
+    /// their write-back to upload the files just saved.
+    fn mark_origin_remote_folders(&mut self, ids: &[u64]) -> Vec<u64> {
+        let mut marked = Vec::new();
+        for &id in ids {
+            let Some(tab) = self.tabs.iter().find(|t| t.id == id) else {
+                continue;
+            };
+            let Some(origin) = tab.origin.clone() else {
+                continue;
+            };
+            let paths = tab.paths();
+            let Some(folder) = self.tabs.iter_mut().find(|t| t.id == origin.folder) else {
+                continue;
+            };
+            let Content::Folder(v) = folder.content.view_mut() else {
+                continue;
+            };
+            for (s, root) in origin.roots.iter().enumerate() {
+                if v.is_remote_side(s) && paths.iter().any(|p| p.starts_with(root)) {
+                    v.mark_remote_dirty(s);
+                    marked.push(origin.folder);
+                }
+            }
+        }
+        marked
     }
 
     /// Repacks every archive touched while saving the tabs in `ids`, each archive written at
@@ -5200,12 +5964,49 @@ impl OxideMergeApp {
                 errors.extend(failed);
             }
         }
+        let mut closed_written = Vec::new();
         for (archive, root) in closed {
-            if let Err(e) = archive::repack(&archive, &root) {
-                errors.push(e.to_string());
+            match archive::repack_all(&archive, &root) {
+                Ok(w) => closed_written.extend(w),
+                Err(e) => errors.push(e.to_string()),
             }
         }
+        written.extend(self.outer_archive_tabs(&closed_written));
         (errors, written)
+    }
+
+    /// The folder tabs with a side extracted from an archive file that saving just wrote
+    /// from another tab, an archive nested in it having been saved there (or from a closed
+    /// tab, the archives in `also`): each is compared again, and returned to be uploaded
+    /// if it came over SFTP.
+    fn outer_archive_tabs(&mut self, also: &[PathBuf]) -> Vec<u64> {
+        let mut written: Vec<(Option<u64>, PathBuf)> =
+            also.iter().map(|p| (None, p.clone())).collect();
+        for t in &mut self.tabs {
+            let id = t.id;
+            if let Content::Folder(v) = t.content.view_mut() {
+                written.extend(v.take_written().into_iter().map(|p| (Some(id), p)));
+            }
+        }
+        if written.is_empty() {
+            return Vec::new();
+        }
+        let (cfg, named) = (self.cfg.clone(), self.named_filters.clone());
+        let mut tabs = Vec::new();
+        for t in &mut self.tabs {
+            let id = t.id;
+            let Content::Folder(v) = t.content.view_mut() else {
+                continue;
+            };
+            let holds = (0..v.n())
+                .filter_map(|s| v.archive_source(s))
+                .any(|a| written.iter().any(|(by, p)| *by != Some(id) && p == a));
+            if holds {
+                v.refresh(&cfg, &named);
+                tabs.push(id);
+            }
+        }
+        tabs
     }
 
     /// Uploads the sides of the tabs in `ids` fetched over SFTP whose local copy changed since
@@ -5238,6 +6039,29 @@ impl OxideMergeApp {
                 let Some(file) = tab.remote.get_mut(i).and_then(Option::as_mut) else {
                     continue;
                 };
+                if let Some(manifest) = &file.manifest {
+                    let edited = match tab.content.view_mut() {
+                        Content::Folder(v) => v.take_remote_dirty(i),
+                        _ => false,
+                    };
+                    if !edited && !file.pending {
+                        continue;
+                    }
+                    file.pending = true;
+                    jobs.push(UploadJob {
+                        tab: id,
+                        side: i,
+                        conn: file.conn.clone(),
+                        local: local.clone(),
+                        remote_path: file.remote_path.clone(),
+                        expected: None,
+                        sent: None,
+                        manifest: Some(manifest.clone()),
+                        hash: 0,
+                        _keep: keep.clone(),
+                    });
+                    continue;
+                }
                 let Some(hash) = file_hash(local) else {
                     errors.push(trf(
                         "msg.sftp_cannot_read",
@@ -5256,6 +6080,8 @@ impl OxideMergeApp {
                     local: local.clone(),
                     remote_path: file.remote_path.clone(),
                     expected: file.stamp,
+                    sent: file.sent,
+                    manifest: None,
                     hash,
                     _keep: keep.clone(),
                 });
@@ -5287,8 +6113,25 @@ impl OxideMergeApp {
         let stop = cancel.clone();
         let run = move || {
             for job in jobs {
-                let result =
-                    remote::upload(&job.conn, &job.local, &job.remote_path, job.expected, &stop);
+                let result = match &job.manifest {
+                    Some(manifest) => remote_sync::save_folder(
+                        &job.conn,
+                        &job.local,
+                        &job.remote_path,
+                        manifest,
+                        &stop,
+                    )
+                    .map(Uploaded::Folder),
+                    None => remote::upload(
+                        &job.conn,
+                        &job.local,
+                        &job.remote_path,
+                        job.expected,
+                        job.sent,
+                        &stop,
+                    )
+                    .map(Uploaded::File),
+                };
                 let done = UploadDone {
                     tab: job.tab,
                     side: job.side,
@@ -5320,6 +6163,205 @@ impl OxideMergeApp {
             queued: false,
             errors: Vec::new(),
         });
+    }
+
+    /// *Reload from server*: fetches the active tab's sides that came from a server again,
+    /// on another thread, once the user agreed (`confirmed`) to lose its changes, if it has any.
+    fn reload_remote(&mut self, confirmed: bool) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let sides = reload_sides(tab);
+        if sides.is_empty() || self.upload.is_some() || self.reload.is_some() {
+            return;
+        }
+        if !confirmed && tab.is_modified() {
+            self.reload_prompt = Some(tab.id);
+            return;
+        }
+        let names = sides
+            .iter()
+            .map(|(_, conn, path, _)| remote::label(conn, path))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (tab_id, keep) = (tab.id, tab.shown_temps());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = cancel.clone();
+        let run = move || {
+            for (side, conn, path, local) in sides {
+                if tx
+                    .send((side, remote::refetch(&conn, &path, &local, &stop)))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        };
+        // Tests stand in for the network with a thread-local fake server, which a spawned
+        // thread would not see (see `open_remote`).
+        #[cfg(test)]
+        let on_this_thread = remote::fake::installed();
+        #[cfg(not(test))]
+        let on_this_thread = false;
+        if on_this_thread {
+            run();
+        } else {
+            std::thread::spawn(run);
+        }
+        self.reload = Some(ReloadRun {
+            tab: tab_id,
+            rx,
+            cancel,
+            names,
+            done: Vec::new(),
+            _keep: keep,
+        });
+    }
+
+    /// Asks whether to replace a tab's changes with the server's copy, for *Reload from server*.
+    fn reload_prompt_dialog(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.reload_prompt else {
+            return;
+        };
+        let Some(i) = self.tabs.iter().position(|t| t.id == id) else {
+            self.reload_prompt = None;
+            return;
+        };
+        let (mut go, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::unique("reload_prompt")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.heading(tr("menu.reload_remote"));
+            ui.label(tr("msg.reload_remote_discards"));
+            widgets::dialog_footer(ui, |ui| {
+                if widgets::primary_button(ui, tr("btn.reload_remote")).clicked() {
+                    go = true;
+                }
+                if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
+                    || ui.input(|i| i.key_pressed(Key::Escape))
+                {
+                    cancel = true;
+                }
+            });
+        });
+        if go {
+            self.reload_prompt = None;
+            self.active = i;
+            self.reload_remote(true);
+        } else if cancel || modal.should_close() {
+            self.reload_prompt = None;
+        }
+    }
+
+    /// Shows *Reload from server* under way, with a button to stop it, and once it is done
+    /// shows the tab's sides as the server now has them.
+    fn reload_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut run) = self.reload.take() else {
+            return;
+        };
+        let finished = loop {
+            match run.rx.try_recv() {
+                Ok(done) => run.done.push(done),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break true,
+            }
+        };
+        if !finished {
+            let mut stop = false;
+            egui::Modal::new(egui::Id::unique("reload_dialog")).show(ctx, |ui| {
+                ui.set_width(480.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(trf("msg.fetching_remote", &[("name", run.names.clone())]));
+                });
+                widgets::dialog_footer(ui, |ui| {
+                    if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
+                        || ui.input(|i| i.key_pressed(Key::Escape))
+                    {
+                        stop = true;
+                    }
+                });
+            });
+            if stop {
+                run.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            self.reload = Some(run);
+            return;
+        }
+        let stopped = run.cancel.load(std::sync::atomic::Ordering::Relaxed);
+        let (cfg, named) = (self.cfg.clone(), self.named_filters.clone());
+        let mut errors = Vec::new();
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == run.tab) {
+            let paths = tab.paths();
+            let mut reloaded = Vec::new();
+            for (side, result) in run.done {
+                match result {
+                    Ok(staged) => {
+                        if let Some(Some(r)) = tab.remote.get_mut(side) {
+                            r.stamp = staged.stamp;
+                            r.manifest = staged.manifest;
+                            r.sent = if staged.is_dir {
+                                None
+                            } else {
+                                paths.get(side).and_then(|p| file_hash(p))
+                            };
+                            r.pending = false;
+                        }
+                        reloaded.push(side);
+                    }
+                    Err(e) if stopped => drop(e),
+                    Err(e) => errors.push(format!("{e:#}")),
+                }
+            }
+            if !reloaded.is_empty() {
+                match tab.content.view_mut() {
+                    Content::Folder(v) => {
+                        for &s in &reloaded {
+                            v.take_remote_dirty(s);
+                        }
+                        v.refresh(&cfg, &named);
+                    }
+                    Content::Text(v) => {
+                        let files: Vec<PathBuf> = reloaded
+                            .iter()
+                            .filter_map(|&s| paths.get(s).map(|p| p.to_path_buf()))
+                            .collect();
+                        v.reload_from_disk(&files);
+                    }
+                    Content::Binary(v) => {
+                        let read_only = v.read_only.clone();
+                        match BinaryView::load(tab.source.clone()) {
+                            Ok(mut new) => {
+                                new.read_only = read_only;
+                                *v = new;
+                            }
+                            Err(e) => errors.push(format!("{e:#}")),
+                        }
+                    }
+                    Content::Image(v) => {
+                        let read_only = v.read_only.clone();
+                        match ImageView::load(tab.source.clone(), &cfg) {
+                            Ok(mut new) => {
+                                new.read_only = read_only;
+                                *v = new;
+                            }
+                            Err(e) => errors.push(format!("{e:#}")),
+                        }
+                    }
+                    Content::Web(_) | Content::Diffs(_) => {}
+                }
+            }
+        }
+        // Files opened from a folder fetched again notice theirs changed.
+        for t in &mut self.tabs {
+            if let Content::Text(v) = t.content.view_mut() {
+                v.check_disk();
+            }
+        }
+        if !errors.is_empty() {
+            self.error(errors.join("\n"));
+        }
     }
 
     /// After the uploads now under way succeed, does what `then` asked for (closing a tab or
@@ -5354,12 +6396,13 @@ impl OxideMergeApp {
                         .and_then(|t| t.remote.get_mut(done.side))
                         .and_then(Option::as_mut);
                     match done.result {
-                        Ok(stamp) => {
+                        Ok(Uploaded::File(stamp)) => {
                             // A later upload of this side expects the server's file as this
                             // one left it, not as it was before.
                             for q in &mut self.upload_queue {
                                 if (q.tab, q.side) == (done.tab, done.side) {
                                     q.expected = Some(stamp);
+                                    q.sent = Some(done.hash);
                                 }
                             }
                             if let Some(file) = file {
@@ -5368,7 +6411,40 @@ impl OxideMergeApp {
                                 file.pending = queued;
                             }
                         }
+                        Ok(Uploaded::Folder(saved)) => {
+                            for q in &mut self.upload_queue {
+                                if (q.tab, q.side) == (done.tab, done.side) {
+                                    q.manifest = Some(saved.manifest.clone());
+                                }
+                            }
+                            let failed = !saved.errors.is_empty();
+                            if failed && !run.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                run.errors.push(trf(
+                                    "msg.sftp_upload_failed",
+                                    &[("name", done.label), ("error", saved.errors.join("\n"))],
+                                ));
+                            }
+                            if let Some(file) = file {
+                                file.manifest = Some(saved.manifest);
+                                file.pending = queued || failed;
+                            }
+                        }
                         Err(e) => {
+                            // Half written by this upload, the file is expected as it left
+                            // it, so saving again finishes it rather than being refused.
+                            let partly = e.downcast_ref::<remote::PartlyWritten>();
+                            if let Some(stamp) = partly.and_then(|p| p.stamp) {
+                                for q in &mut self.upload_queue {
+                                    if (q.tab, q.side) == (done.tab, done.side) {
+                                        q.expected = Some(stamp);
+                                        q.sent = None;
+                                    }
+                                }
+                                if let Some(file) = file {
+                                    file.stamp = Some(stamp);
+                                    file.sent = None;
+                                }
+                            }
                             if !run.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                                 run.errors.push(trf(
                                     "msg.sftp_upload_failed",
@@ -5502,9 +6578,10 @@ impl OxideMergeApp {
                         if f.is_archive_side(s) {
                             f.mark_archive_dirty(s);
                         }
+                        f.mark_remote_dirty(s);
                     }
                     let (w, failed) = f.save_archives();
-                    if !w.is_empty() {
+                    if !w.is_empty() || f.has_remote_changes() {
                         repacked.push(id);
                     }
                     errors.extend(failed);
@@ -5514,6 +6591,7 @@ impl OxideMergeApp {
                 _ => {}
             }
         }
+        repacked.extend(self.outer_archive_tabs(&[]));
         errors.extend(self.queue_uploads(&repacked));
         for e in errors {
             self.error(e);
@@ -6270,6 +7348,9 @@ impl OxideMergeApp {
             recent: None,
             clear_recent: false,
             has_workspaces: !self.cfg.workspaces.is_empty(),
+            can_reload: tab.is_some_and(|t| !reload_sides(t).is_empty())
+                && self.upload.is_none()
+                && self.reload.is_none(),
         }
     }
 
@@ -6455,6 +7536,7 @@ impl OxideMergeApp {
         m.item(ui, Cmd::CompareClipboard);
         m.item(ui, Cmd::Open);
         m.item(ui, Cmd::OpenRemote);
+        m.item(ui, Cmd::ReloadRemote);
         let recent = &self.cfg.recent_compares;
         ui.add_enabled_ui(!recent.is_empty(), |ui| {
             submenu_list(ui, tr("menu.open_recent"), |ui| {
@@ -8905,9 +9987,12 @@ impl eframe::App for OxideMergeApp {
         self.run_job_dialog(ctx);
         self.rev_load_dialog(ctx);
         self.remote_connect_dialog(ctx);
+        self.ask_dialog(ctx);
         self.remote_load_dialog(ctx);
         self.host_prompt_dialog(ctx);
         self.upload_dialog(ctx);
+        self.reload_prompt_dialog(ctx);
+        self.reload_dialog(ctx);
         self.gc_pending_remote();
         self.workspace_save_dialog(ctx);
         self.manage_workspaces_dialog(ctx);

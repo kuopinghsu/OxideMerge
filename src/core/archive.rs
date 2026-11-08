@@ -159,6 +159,7 @@ type Written = std::sync::Arc<HashSet<PathBuf>>;
 /// wrote, so that [`repack`] keeps every other entry as it was and refuses to write over an
 /// archive changed since.
 struct Extraction {
+    archive: PathBuf,
     dir: PathBuf,
     /// `dir` with every symbolic link on the way resolved.
     real: Option<PathBuf>,
@@ -175,18 +176,23 @@ fn extractions() -> std::sync::MutexGuard<'static, Vec<Extraction>> {
 /// Whether `path` is in a folder an archive was extracted to, where a backup copy of a saved
 /// file would end up packed into the archive.
 pub fn inside_extraction(path: &Path) -> bool {
+    extraction_of(path).is_some()
+}
+
+/// The archive, and the folder it was extracted to, of the extraction `path` is in.
+fn extraction_of(path: &Path) -> Option<(PathBuf, PathBuf)> {
     let all = extractions();
-    if all.iter().any(|e| path.starts_with(&e.dir)) {
-        return true;
+    let found = |e: &Extraction| (e.archive.clone(), e.dir.clone());
+    if let Some(e) = all.iter().find(|e| path.starts_with(&e.dir)) {
+        return Some(found(e));
     }
     let real = path
         .parent()
         .and_then(|p| std::fs::canonicalize(p).ok())
-        .map(|p| p.join(path.file_name().unwrap_or_default()));
-    real.is_some_and(|real| {
-        all.iter()
-            .any(|e| e.real.as_ref().is_some_and(|d| real.starts_with(d)))
-    })
+        .map(|p| p.join(path.file_name().unwrap_or_default()))?;
+    all.iter()
+        .find(|e| e.real.as_ref().is_some_and(|d| real.starts_with(d)))
+        .map(found)
 }
 
 /// The extraction recorded for the folder `dir`, if any.
@@ -213,6 +219,7 @@ fn extract_with(path: &Path, limits: Limits) -> Result<tempfile::TempDir> {
     let mut all = extractions();
     all.retain(|e| e.dir.exists());
     all.push(Extraction {
+        archive: path.to_path_buf(),
         dir: dir.path().to_path_buf(),
         real: std::fs::canonicalize(dir.path()).ok(),
         stamp,
@@ -914,16 +921,21 @@ fn staging(dir: &Path) -> Result<tempfile::NamedTempFile> {
 const SIGNED_EXTS: &[&str] = &["apk", "ipa", "appx", "msix", "crx", "xpi"];
 
 /// Whether edits to an extraction of `path` can be written back with [`repack`]. Not for a
-/// signed package, whose signature a change would break, nor for `.tar.xz`, which could only
-/// be written back uncompressed here.
+/// signed package, whose signature a change would break.
 pub fn writable(path: &Path) -> bool {
     match kind(path) {
-        None | Some(Kind::TarXz) => false,
+        None => false,
         Some(Kind::Zip) => {
             !SIGNED_EXTS.contains(&super::text::extension(path).as_str()) && !zip_signed(path)
         }
         Some(_) => true,
     }
+}
+
+/// Whether edits to an extraction of `path` reach a file of the user's with [`repack_all`]:
+/// `path` is [`writable`], and so is every extracted archive it is nested in.
+pub fn editable(path: &Path) -> bool {
+    writable(path) && extraction_of(path).is_none_or(|(outer, _)| editable(&outer))
 }
 
 /// Whether the zip at `path` carries a signature: a signed jar (`META-INF/*.SF` and its key
@@ -1013,11 +1025,30 @@ fn rerecord(dir: &Path, archive: &Path) {
     }
 }
 
+/// [`repack`]s `path` from `dir`, then each archive it sits in an extraction of, from the
+/// inside out, so that an edit saved into an archive nested in another reaches the outermost
+/// one. Returns the archives written. The outer ones are repacked even when `path` came out
+/// the same, as an earlier save may have failed before reaching them.
+pub fn repack_all(path: &Path, dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut written = Vec::new();
+    let (mut path, mut dir) = (path.to_path_buf(), dir.to_path_buf());
+    loop {
+        if repack(&path, &dir)? {
+            written.push(path.clone());
+        }
+        match extraction_of(&path) {
+            Some((outer, outer_dir)) => (path, dir) = (outer, outer_dir),
+            None => return Ok(written),
+        }
+    }
+}
+
 /// Writes the edits made to `dir`, an extraction of the archive at `path`, back into it.
 /// Entries left alone keep their bytes, times and order (in a zip, their compressed data
-/// too), as do entries never extracted; changed files get the current time; removed entries
-/// are left out, and new ones are added at the end. Nothing is written when nothing changed;
-/// returns whether the archive was written.
+/// too, and in a 7z, the compressed blocks holding only such entries), as do entries never
+/// extracted; changed files get the current time; removed entries are left out, and new ones
+/// are added at the end. Nothing is written when nothing changed; returns whether the
+/// archive was written.
 ///
 /// The archive is written to a temporary file beside it, which then takes its place keeping
 /// its permissions (through a symbolic link, to the file it leads to), so a failure or a
@@ -1088,13 +1119,34 @@ fn repack_into(
             let (enc, changed) = copy_tar(&input, dir, ours, enc)?;
             (enc.finish().context("finish bzip2")?, changed)
         }
-        Some(Kind::SevenZ) => {
-            if !sevenz_changed(path, dir)? {
+        Some(Kind::TarXz) => {
+            // Unpacked to a file, as when it was extracted, and packed again into another,
+            // so that the slow xz compression only runs when something changed.
+            let mut tar = tempfile::tempfile()?;
+            {
+                let mut out = std::io::BufWriter::new(&mut tar);
+                lzma_rs::xz_decompress(&mut open()?, &mut out)
+                    .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+                out.flush()?;
+            }
+            let input = || -> Result<Box<dyn Read>> {
+                let mut f = tar.try_clone()?;
+                f.rewind()?;
+                Ok(Box::new(std::io::BufReader::new(f)))
+            };
+            let out = std::io::BufWriter::new(tempfile::tempfile()?);
+            let (out, changed) = copy_tar(&input, dir, ours, out)?;
+            if !changed {
                 return Ok(None);
             }
-            (repack_7z(path, dir, out_dir)?, true)
+            let mut plain = out.into_inner().map_err(|e| e.into_error())?;
+            plain.rewind()?;
+            let mut enc = XzWriter::new(staging(out_dir)?, XZ_PRESET)?;
+            std::io::copy(&mut plain, &mut enc)?;
+            (enc.finish().context("finish xz")?, true)
         }
-        Some(Kind::TarXz) | None => anyhow::bail!("{}: cannot be written", path.display()),
+        Some(Kind::SevenZ) => return repack_7z(path, dir, out_dir, ours),
+        None => anyhow::bail!("{}: cannot be written", path.display()),
     };
     Ok(changed.then_some(tmp))
 }
@@ -1204,64 +1256,419 @@ fn repack_zip(
     Ok((tmp, changed))
 }
 
-/// Whether `dir`, an extraction of the 7z archive at `path`, differs from it.
-fn sevenz_changed(path: &Path, dir: &Path) -> Result<bool> {
-    let mut seen = HashSet::new();
-    let mut implied = HashSet::new();
-    let mut changed = false;
-    sevenz_rust2::decompress_file_with_extract_fn(path, dir, |e, r, _| {
-        let rel = clean(Path::new(e.name()));
-        add_parents(&mut implied, &rel);
-        let abs = dir.join(&rel);
-        if e.is_directory() {
-            changed |= !abs.is_dir();
-        } else {
-            let same = same_file(r, e.size(), &abs)
-                .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
-            changed |= same != Some(true);
-        }
-        seen.insert(rel);
-        Ok(true)
-    })
-    .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-    Ok(changed
-        || list_dir(dir, true)?
-            .iter()
-            .any(|e| is_new(e, &seen, &implied)))
+/// What became of an entry of a 7z archive in its extracted copy.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    Same,
+    /// Its file now holds something else.
+    Changed,
+    /// Removed, or written over in the copy by a later entry of the same name.
+    Gone,
 }
 
-fn repack_7z(path: &Path, dir: &Path, out_dir: &Path) -> Result<tempfile::NamedTempFile> {
-    let entries = list_dir(dir, true)?;
+/// The data of an entry packed into a 7z block: a file, opened only once it is read, so that
+/// a block of many entries keeps one open at a time.
+enum Source {
+    Path(PathBuf),
+    Open(std::fs::File),
+    Done,
+}
+
+impl Read for Source {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Source::Path(path) = self {
+            let f = std::fs::File::open(&*path)?;
+            *self = Source::Open(f);
+        }
+        let Source::Open(f) = self else {
+            return Ok(0);
+        };
+        let n = f.read(buf)?;
+        if n == 0 && !buf.is_empty() {
+            *self = Source::Done;
+        }
+        Ok(n)
+    }
+}
+
+/// A 7z entry for the file or folder at `abs`, added as `name`, with its times and its
+/// attributes: its Unix permissions too, above the Windows attributes, as 7-Zip stores them.
+fn new_7z_entry(abs: &Path, name: String) -> sevenz_rust2::ArchiveEntry {
+    const READ_ONLY: u32 = 0x1;
+    const DIRECTORY: u32 = 0x10;
+    const ARCHIVE: u32 = 0x20;
+    let mut e = sevenz_rust2::ArchiveEntry::from_path(abs, name);
+    if let Ok(md) = std::fs::metadata(abs) {
+        let mut attrs = if md.is_dir() { DIRECTORY } else { ARCHIVE };
+        if md.permissions().readonly() {
+            attrs |= READ_ONLY;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            const UNIX_EXTENSION: u32 = 0x8000;
+            attrs |= UNIX_EXTENSION | ((md.mode() & 0xFFFF) << 16);
+        }
+        e.windows_attributes = attrs;
+        e.has_windows_attributes = true;
+    }
+    e
+}
+
+/// Writes the replacement for the 7z archive at `path` (see [`repack`]), or `None` when it
+/// would be the same. A block whose entries are all as they were is copied without decoding
+/// it; any other is compressed again from what is left of it, with LZMA2 unless it was
+/// stored. Entries keep their times and attributes, but a changed file gets the current time.
+fn repack_7z(
+    path: &Path,
+    dir: &Path,
+    out_dir: &Path,
+    ours: &dyn Fn(&Path) -> bool,
+) -> Result<Option<tempfile::NamedTempFile>> {
+    use sevenz_rust2::{
+        Archive, ArchiveWriter, BlockDecoder, EncoderConfiguration, EncoderMethod, NtTime,
+        Password, SourceReader,
+    };
+    let fail = |e: sevenz_rust2::Error| anyhow::anyhow!("{}: {e}", path.display());
+    let password = Password::empty();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    let mut src = std::io::BufReader::new(std::fs::File::open(path)?);
+    let ar = Archive::read(&mut src, &password).map_err(fail)?;
+    let rels: Vec<PathBuf> = ar
+        .files
+        .iter()
+        .map(|e| clean(Path::new(e.name())))
+        .collect();
+    let last: HashMap<&PathBuf, usize> = rels.iter().enumerate().map(|(i, r)| (r, i)).collect();
+    let seen: HashSet<PathBuf> = rels.iter().cloned().collect();
+    let mut implied = HashSet::new();
+    for rel in &rels {
+        add_parents(&mut implied, rel);
+    }
+    // Whether the extraction wrote the entry, so that it can be told from what is there now.
+    let compared = |i: usize| !ar.files[i].is_anti_item() && ours(&rels[i]);
+    let mut fate: Vec<Fate> = (0..ar.files.len())
+        .map(|i| {
+            let e = &ar.files[i];
+            let abs = dir.join(&rels[i]);
+            if !compared(i) {
+                Fate::Same
+            } else if last[&rels[i]] != i {
+                Fate::Gone
+            } else if e.is_directory() {
+                if abs.is_dir() {
+                    Fate::Same
+                } else {
+                    Fate::Gone
+                }
+            } else if e.has_stream() {
+                // Told by its data, below.
+                Fate::Same
+            } else {
+                match std::fs::symlink_metadata(&abs) {
+                    Ok(md) if md.is_file() && md.len() == 0 => Fate::Same,
+                    Ok(md) if md.is_file() => Fate::Changed,
+                    _ => Fate::Gone,
+                }
+            }
+        })
+        .collect();
+
+    // The entries with data in each block, in the order they were packed.
+    let mut blocks: Vec<Vec<usize>> = vec![Vec::new(); ar.blocks.len()];
+    for (i, b) in ar.stream_map.file_block_index.iter().enumerate() {
+        if let Some(members) = b.and_then(|b| blocks.get_mut(b)) {
+            if ar.files[i].has_stream() {
+                members.push(i);
+            }
+        }
+    }
+    for (b, members) in blocks.iter().enumerate() {
+        let decoder = BlockDecoder::new(threads, b, &ar, &password, &mut src);
+        // `BlockDecoder` reads a block's entries as a run of the files, from its first one.
+        let start = ar.stream_map.block_first_file_index[b];
+        if decoder.entry_count() != members.len()
+            || members.iter().enumerate().any(|(k, &i)| i != start + k)
+        {
+            anyhow::bail!(
+                "{}: a block's entries are not stored together",
+                path.display()
+            );
+        }
+        if !members
+            .iter()
+            .any(|&i| compared(i) && fate[i] == Fate::Same)
+        {
+            continue;
+        }
+        let mut next = start;
+        decoder
+            .for_each_entries(&mut |e, r| {
+                let i = next;
+                next += 1;
+                if compared(i) && fate[i] == Fate::Same {
+                    let same = same_file(r, e.size(), &dir.join(&rels[i]))
+                        .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+                    fate[i] = match same {
+                        Some(true) => Fate::Same,
+                        Some(false) => Fate::Changed,
+                        None => Fate::Gone,
+                    };
+                } else {
+                    std::io::copy(r, &mut std::io::sink())?;
+                }
+                Ok(true)
+            })
+            .map_err(fail)?;
+    }
+
+    // Whatever is now where a removed entry was (a folder where a file was, say) is added.
+    let replaced: HashSet<PathBuf> = (0..ar.files.len())
+        .filter(|&i| fate[i] == Fate::Gone && last[&rels[i]] == i)
+        .filter(|&i| std::fs::symlink_metadata(dir.join(&rels[i])).is_ok())
+        .map(|i| rels[i].clone())
+        .collect();
+    let added: Vec<Entry> = list_dir(dir, true)?
+        .into_iter()
+        .filter(|e| is_new(e, &seen, &implied) || replaced.contains(e.rel()))
+        .collect();
+    if added.is_empty() && fate.iter().all(|f| *f == Fate::Same) {
+        return Ok(None);
+    }
+
+    let now = NtTime::now();
+    let entry = |i: usize| {
+        let mut e = ar.files[i].clone();
+        if fate[i] == Fate::Changed {
+            e.last_modified_date = now;
+            e.has_last_modified_date = true;
+        }
+        e
+    };
+    let methods = |stored: bool| {
+        let method = if stored {
+            EncoderMethod::COPY
+        } else {
+            EncoderMethod::LZMA2
+        };
+        vec![EncoderConfiguration::new(method)]
+    };
     let mut tmp = staging(out_dir)?;
     {
-        let mut w = sevenz_rust2::ArchiveWriter::new(tmp.as_file_mut())
-            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-        // DEFLATE rather than the default LZMA2, as this build only enables the codecs it
-        // reads archives with (see the `sevenz-rust2` dependency features).
-        w.set_content_methods(vec![sevenz_rust2::EncoderMethod::DEFLATE.into()]);
-        for e in &entries {
-            let rel = e.rel();
-            let name = rel.to_string_lossy().replace('\\', "/");
-            match e {
-                Entry::Dir(_) => {
-                    let entry = sevenz_rust2::ArchiveEntry::from_path(dir.join(rel), name);
-                    w.push_archive_entry::<&[u8]>(entry, None)
-                        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-                }
-                Entry::File(_) => {
-                    let entry = sevenz_rust2::ArchiveEntry::from_path(dir.join(rel), name);
-                    let f = std::fs::File::open(dir.join(rel))
-                        .with_context(|| format!("open {}", rel.display()))?;
-                    w.push_archive_entry(entry, Some(f))
-                        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-                }
-                Entry::Symlink(..) => unreachable!("7z entries follow symlinks"),
+        let mut w = ArchiveWriter::new(tmp.as_file_mut()).map_err(fail)?;
+        // Entries without data, written after the blocks.
+        let mut empty = Vec::new();
+        // Files to pack together into a new block, with where to read them from.
+        let mut fresh = Vec::new();
+        for (b, members) in blocks.iter().enumerate() {
+            if members.iter().all(|&i| fate[i] == Fate::Same) {
+                w.push_raw_block(&ar, b, &mut src, |e| e.name().to_owned())
+                    .map_err(fail)?;
+                continue;
             }
+            // An entry never extracted is not in the copy: it is taken from the block.
+            let mut copies = HashMap::new();
+            if members.iter().any(|&i| !compared(i)) {
+                let mut next = ar.stream_map.block_first_file_index[b];
+                BlockDecoder::new(threads, b, &ar, &password, &mut src)
+                    .for_each_entries(&mut |_, r| {
+                        let i = next;
+                        next += 1;
+                        if compared(i) {
+                            std::io::copy(r, &mut std::io::sink())?;
+                        } else {
+                            let mut f = tempfile::tempfile()?;
+                            std::io::copy(r, &mut f)?;
+                            f.rewind()?;
+                            copies.insert(i, f);
+                        }
+                        Ok(true)
+                    })
+                    .map_err(fail)?;
+            }
+            let mut entries = Vec::new();
+            let mut sources = Vec::new();
+            for &i in members {
+                let source = match copies.remove(&i) {
+                    Some(f) => Source::Open(f),
+                    None if fate[i] == Fate::Gone => continue,
+                    None => {
+                        let abs = dir.join(&rels[i]);
+                        if std::fs::metadata(&abs)?.len() == 0 {
+                            empty.push(entry(i));
+                            continue;
+                        }
+                        Source::Path(abs)
+                    }
+                };
+                entries.push(entry(i));
+                sources.push(SourceReader::new(source));
+            }
+            if !entries.is_empty() {
+                let stored = ar.blocks[b]
+                    .coders
+                    .iter()
+                    .all(|c| c.encoder_method_id() == EncoderMethod::ID_COPY);
+                w.set_content_methods(methods(stored));
+                w.push_archive_entries(entries, sources).map_err(fail)?;
+            }
+        }
+        for (i, e) in ar.files.iter().enumerate() {
+            match fate[i] {
+                _ if e.has_stream() => {}
+                Fate::Gone => {}
+                Fate::Same => empty.push(entry(i)),
+                // An empty file that was given contents.
+                Fate::Changed => fresh.push((entry(i), dir.join(&rels[i]))),
+            }
+        }
+        for e in &added {
+            let abs = dir.join(e.rel());
+            let new = new_7z_entry(&abs, zip_name(e.rel()));
+            match e {
+                Entry::File(_) if std::fs::metadata(&abs)?.len() > 0 => fresh.push((new, abs)),
+                _ => empty.push(new),
+            }
+        }
+        for e in empty {
+            w.push_archive_entry::<&[u8]>(e, None).map_err(fail)?;
+        }
+        if !fresh.is_empty() {
+            let (entries, sources): (Vec<_>, Vec<_>) = fresh
+                .into_iter()
+                .map(|(mut e, abs)| {
+                    // Packing entries together does not mark them as having data itself.
+                    e.has_stream = true;
+                    (e, SourceReader::new(Source::Path(abs)))
+                })
+                .unzip();
+            w.set_content_methods(methods(false));
+            w.push_archive_entries(entries, sources).map_err(fail)?;
         }
         w.finish()
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     }
-    Ok(tmp)
+    Ok(Some(tmp))
+}
+
+/// The preset `.tar.xz` files are written with: `xz`'s own default.
+const XZ_PRESET: u32 = 6;
+const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0];
+/// Stream flags: a CRC32 check.
+const XZ_FLAGS: [u8; 2] = [0, 1];
+/// The size of the block header [`XzWriter`] writes.
+const XZ_BLOCK_HEADER: u64 = 12;
+
+/// Writes an xz file holding one block of LZMA2 data, checked with CRC32.
+struct XzWriter<W: Write> {
+    lzma2: lzma_rust2::Lzma2Writer<ByteCount<W>>,
+    crc: flate2::Crc,
+    len: u64,
+}
+
+/// Counts the bytes written through it.
+struct ByteCount<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: Write> Write for ByteCount<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn crc32(data: &[u8]) -> [u8; 4] {
+    let mut crc = flate2::Crc::new();
+    crc.update(data);
+    crc.sum().to_le_bytes()
+}
+
+/// Appends `n` to `out` as an xz variable-length integer.
+fn xz_varint(out: &mut Vec<u8>, mut n: u64) {
+    while n >= 0x80 {
+        out.push(n as u8 | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+}
+
+impl<W: Write> XzWriter<W> {
+    fn new(mut inner: W, preset: u32) -> std::io::Result<Self> {
+        let options = lzma_rust2::Lzma2Options::with_preset(preset);
+        // The LZMA2 property: the smallest dictionary size it can name that is big enough.
+        let dict = u64::from(options.lzma_options.dict_size);
+        let dict_prop = (0..40u8)
+            .find(|&p| (2 | u64::from(p & 1)) << (p / 2 + 11) >= dict)
+            .unwrap_or(40);
+        let mut head = XZ_MAGIC.to_vec();
+        head.extend(XZ_FLAGS);
+        head.extend(crc32(&XZ_FLAGS));
+        // The block header: its size in fours less one, no flags, the LZMA2 filter with its
+        // one property byte, padding to a multiple of four, and its CRC32.
+        let block = [
+            (XZ_BLOCK_HEADER / 4 - 1) as u8,
+            0,
+            0x21,
+            1,
+            dict_prop,
+            0,
+            0,
+            0,
+        ];
+        head.extend(block);
+        head.extend(crc32(&block));
+        inner.write_all(&head)?;
+        Ok(XzWriter {
+            lzma2: lzma_rust2::Lzma2Writer::new(ByteCount { inner, written: 0 }, options),
+            crc: flate2::Crc::new(),
+            len: 0,
+        })
+    }
+
+    fn finish(self) -> std::io::Result<W> {
+        let ByteCount { mut inner, written } = self.lzma2.finish()?;
+        // The block's padding to a multiple of four, and its check.
+        let mut tail = vec![0; ((4 - written % 4) % 4) as usize];
+        tail.extend(self.crc.sum().to_le_bytes());
+        // The index of the one block: its size less the padding, and the size of its data.
+        let mut index = vec![0];
+        xz_varint(&mut index, 1);
+        xz_varint(&mut index, XZ_BLOCK_HEADER + written + 4);
+        xz_varint(&mut index, self.len);
+        index.resize(index.len().next_multiple_of(4), 0);
+        let index_crc = crc32(&index);
+        // The footer: the size of the index in fours less one, and the stream flags again.
+        let mut footer = ((index.len() as u32 + 4) / 4 - 1).to_le_bytes().to_vec();
+        footer.extend(XZ_FLAGS);
+        tail.extend(index);
+        tail.extend(index_crc);
+        tail.extend(crc32(&footer));
+        tail.extend(footer);
+        tail.extend(b"YZ");
+        inner.write_all(&tail)?;
+        Ok(inner)
+    }
+}
+
+impl<W: Write> Write for XzWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.lzma2.write(buf)?;
+        self.crc.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Not the encoder's own flush, which would end its chunk early.
+        self.lzma2.inner_mut().flush()
+    }
 }
 
 #[cfg(test)]
@@ -1319,6 +1726,7 @@ mod tests {
             (&tar_path, "dir/a.txt"),
             (&tgz_path, "dir/a.txt"),
             (&tbz_path, "dir/a.txt"),
+            (&txz_path, "dir/a.txt"),
             (&sevenz_path, "dir/a.txt"),
         ] {
             let extracted = extract_to_temp(archive).unwrap();
@@ -1336,12 +1744,6 @@ mod tests {
             let added = std::fs::read_to_string(after.path().join("added.txt")).unwrap();
             assert_eq!(added, "added\n", "{}", archive.display());
         }
-
-        // A .tar.xz could only be written back uncompressed, so it is left read-only.
-        assert!(!writable(&txz_path));
-        let extracted = extract_to_temp(&txz_path).unwrap();
-        std::fs::write(extracted.path().join("dir/a.txt"), "new\n").unwrap();
-        assert!(super::repack(&txz_path, extracted.path()).is_err());
 
         // Zip alone was given an unrelated file and an empty directory to drop and keep.
         let extracted = extract_to_temp(&zip_path).unwrap();
@@ -1466,6 +1868,194 @@ mod tests {
         let extracted = extract_to_temp(&path).unwrap();
         assert!(!repack(&path, extracted.path()).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A 7z block whose entries were left alone is copied as it was, compression and all;
+    /// any other is packed again from what is left of it. Entries keep their times and
+    /// attributes, but a changed file gets the current time.
+    #[test]
+    fn repack_copies_untouched_7z_blocks_as_they_were() {
+        use sevenz_rust2::{
+            Archive, ArchiveEntry, ArchiveWriter, EncoderMethod, NtTime, SourceReader,
+        };
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("a.7z");
+        let old = NtTime::from(130_000_000_000_000_000u64);
+        let attrs = 0x8000 | (0o100640 << 16);
+        let entry = |name: &str| {
+            let mut e = ArchiveEntry::new_file(name);
+            e.last_modified_date = old;
+            e.has_last_modified_date = true;
+            e.windows_attributes = attrs;
+            e.has_windows_attributes = true;
+            e
+        };
+        let mut w = ArchiveWriter::create(&path).unwrap();
+        w.set_content_methods(vec![EncoderMethod::DEFLATE.into()]);
+        w.push_archive_entry(entry("keep.txt"), Some(&b"keep\n"[..]))
+            .unwrap();
+        w.push_archive_entry(entry("edit.txt"), Some(&b"old\n"[..]))
+            .unwrap();
+        let solid = ["s/a.txt", "s/b.txt", "s/c.txt"];
+        w.push_archive_entries(
+            solid.iter().map(|n| entry(n)).collect(),
+            solid
+                .iter()
+                .map(|n| SourceReader::new(n.as_bytes()))
+                .collect(),
+        )
+        .unwrap();
+        w.push_archive_entry::<&[u8]>(entry("empty.txt"), None)
+            .unwrap();
+        w.push_archive_entry::<&[u8]>(ArchiveEntry::new_directory("d"), None)
+            .unwrap();
+        w.finish().unwrap();
+
+        let extracted = extract_to_temp(&path).unwrap();
+        let x = extracted.path();
+        assert!(!repack(&path, x).unwrap());
+        std::fs::write(x.join("edit.txt"), "new\n").unwrap();
+        std::fs::remove_file(x.join("s/b.txt")).unwrap();
+        std::fs::write(x.join("empty.txt"), "grown\n").unwrap();
+        std::fs::write(x.join("added.txt"), "added\n").unwrap();
+        assert!(repack(&path, x).unwrap());
+
+        let ar = Archive::open(&path).unwrap();
+        let find = |name: &str| {
+            let i = ar.files.iter().position(|e| e.name() == name);
+            i.unwrap_or_else(|| panic!("{name} is missing"))
+        };
+        let method = |name: &str| {
+            let b = ar.stream_map.file_block_index[find(name)].unwrap();
+            ar.blocks[b].coders[0].encoder_method_id().to_vec()
+        };
+        let time = |name: &str| u64::from(ar.files[find(name)].last_modified_date());
+        assert_eq!(method("keep.txt"), EncoderMethod::ID_DEFLATE);
+        assert_eq!(method("edit.txt"), EncoderMethod::ID_LZMA2);
+        assert_eq!(method("s/a.txt"), EncoderMethod::ID_LZMA2);
+        assert_eq!(
+            ar.stream_map.file_block_index[find("s/a.txt")],
+            ar.stream_map.file_block_index[find("s/c.txt")]
+        );
+        assert!(!ar.files.iter().any(|e| e.name() == "s/b.txt"));
+        assert_eq!(time("keep.txt"), u64::from(old));
+        assert_eq!(time("s/a.txt"), u64::from(old));
+        assert_ne!(time("edit.txt"), u64::from(old));
+        assert_ne!(time("empty.txt"), u64::from(old));
+        for name in ["keep.txt", "edit.txt", "s/c.txt", "empty.txt"] {
+            assert_eq!(ar.files[find(name)].windows_attributes(), attrs, "{name}");
+        }
+        assert!(ar.files[find("d")].is_directory());
+        find("added.txt");
+
+        let after = extract_to_temp(&path).unwrap();
+        let read = |rel: &str| std::fs::read_to_string(after.path().join(rel)).unwrap();
+        assert_eq!(read("keep.txt"), "keep\n");
+        assert_eq!(read("edit.txt"), "new\n");
+        assert_eq!(read("s/a.txt"), "s/a.txt");
+        assert_eq!(read("s/c.txt"), "s/c.txt");
+        assert_eq!(read("empty.txt"), "grown\n");
+        assert_eq!(read("added.txt"), "added\n");
+        assert!(!after.path().join("s/b.txt").exists());
+    }
+
+    /// A `.tar.xz` is written back compressed, as one xz stream another decoder reads.
+    #[test]
+    fn repack_writes_a_compressed_tar_xz() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("a.tar.xz");
+        let text = "the same line again\n".repeat(20_000);
+        let mut b = tar::Builder::new(Vec::new());
+        for name in ["one.txt", "two.txt"] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(text.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, name, text.as_bytes()).unwrap();
+        }
+        let tar = b.into_inner().unwrap();
+        // lzma-rs writes the data as it is, uncompressed.
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut tar.as_slice(), &mut xz).unwrap();
+        std::fs::write(&path, &xz).unwrap();
+
+        let extracted = extract_to_temp(&path).unwrap();
+        assert!(!repack(&path, extracted.path()).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), xz);
+        std::fs::write(extracted.path().join("two.txt"), "edited\n").unwrap();
+        assert!(repack(&path, extracted.path()).unwrap());
+
+        let written = std::fs::read(&path).unwrap();
+        assert!(written.len() < tar.len() / 50, "{} bytes", written.len());
+        let mut out = Vec::new();
+        lzma_rs::xz_decompress(&mut written.as_slice(), &mut out).unwrap();
+        let mut got = Vec::new();
+        for e in tar::Archive::new(out.as_slice()).entries().unwrap() {
+            let mut e = e.unwrap();
+            let mut s = String::new();
+            e.read_to_string(&mut s).unwrap();
+            got.push((e.path().unwrap().display().to_string(), s));
+        }
+        assert_eq!(
+            got,
+            [
+                ("one.txt".to_string(), text.clone()),
+                ("two.txt".to_string(), "edited\n".to_string())
+            ]
+        );
+    }
+
+    /// Saving an archive nested in an extracted one writes the outer archive too; one nested
+    /// in an archive that can't be written is not editable.
+    #[test]
+    fn repack_all_writes_the_archives_a_nested_one_is_in() {
+        let work = tempfile::tempdir().unwrap();
+        let mut inner = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        inner
+            .start_file("a.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        inner.write_all(b"old\n").unwrap();
+        let inner = inner.finish().unwrap().into_inner();
+        let outer = work.path().join("outer.tar.gz");
+        let mut b = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut h = tar::Header::new_gnu();
+        h.set_size(inner.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, "inner.zip", inner.as_slice())
+            .unwrap();
+        std::fs::write(&outer, b.into_inner().unwrap().finish().unwrap()).unwrap();
+
+        let outer_copy = extract_to_temp(&outer).unwrap();
+        let nested = outer_copy.path().join("inner.zip");
+        assert!(editable(&nested));
+        let inner_copy = extract_to_temp(&nested).unwrap();
+        std::fs::write(inner_copy.path().join("a.txt"), "new\n").unwrap();
+        assert_eq!(
+            repack_all(&nested, inner_copy.path()).unwrap(),
+            [nested.clone(), outer.clone()]
+        );
+        assert!(repack_all(&nested, inner_copy.path()).unwrap().is_empty());
+        let outer_after = extract_to_temp(&outer).unwrap();
+        let inner_after = extract_to_temp(&outer_after.path().join("inner.zip")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(inner_after.path().join("a.txt")).unwrap(),
+            "new\n"
+        );
+
+        let apk = work.path().join("app.apk");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&apk).unwrap());
+        zw.start_file("inner.zip", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(&inner).unwrap();
+        zw.finish().unwrap();
+        let apk_copy = extract_to_temp(&apk).unwrap();
+        let nested = apk_copy.path().join("inner.zip");
+        assert!(writable(&nested));
+        assert!(!editable(&nested));
     }
 
     /// Edits are not written over an archive that changed on disk since it was extracted,

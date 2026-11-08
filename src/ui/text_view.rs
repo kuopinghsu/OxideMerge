@@ -4543,6 +4543,27 @@ impl TextView {
         }
     }
 
+    /// Reloads the panes showing `files` from disk, discarding their unsaved edits (undoable), as
+    /// *Reload from server* asked the user to agree to; the other panes as [`Self::check_disk`]
+    /// does. Reloaded whether or not their files' modified times tell they changed.
+    pub fn reload_from_disk(&mut self, files: &[std::path::PathBuf]) {
+        self.check_disk();
+        let shows = |p: &Pane| p.doc.path.as_ref().is_some_and(|path| files.contains(path));
+        let others = self
+            .disk_changed
+            .iter()
+            .copied()
+            .filter(|&i| !shows(&self.panes[i]))
+            .collect();
+        self.disk_changed = (0..self.panes.len())
+            .filter(|&i| shows(&self.panes[i]))
+            .collect();
+        if !self.disk_changed.is_empty() {
+            self.reload_changed();
+        }
+        self.disk_changed = others;
+    }
+
     /// Replaces the listed panes with the file contents on disk, discarding their edits (undoable).
     fn reload_changed(&mut self) {
         let panes = std::mem::take(&mut self.disk_changed);

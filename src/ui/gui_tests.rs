@@ -2160,6 +2160,76 @@ fn a_file_changed_on_the_server_is_not_overwritten_and_its_tab_stays_unsaved() {
     remote::fake::uninstall();
 }
 
+#[test]
+fn a_remote_file_written_half_way_is_finished_by_saving_again() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("b.txt", "one\n")]);
+    remote::fake::install(
+        remote::fake::Server::new()
+            .file("/srv/a.txt", "one\n")
+            .partly_fails("/srv/a.txt"),
+    );
+    let mut gui = Gui::start("sftp_partly_written", None);
+    compare_remote_with_local(&mut gui, &dir.path().join("b.txt"));
+
+    text_view_mut(&mut gui).place_caret(0, (0, 3), false);
+    gui.events.push(Event::Text("-mine".into()));
+    gui.frames(2);
+    gui.app.run(Cmd::Save, &gui.ctx);
+    gui.frames(3);
+    let partly = trf(
+        "msg.remote_partly_written",
+        &[("path", "/srv/a.txt".into())],
+    );
+    assert!(
+        gui.errors().iter().any(|e| e.contains(&partly)),
+        "{:?}",
+        gui.errors()
+    );
+    assert_eq!(
+        remote::fake::entry("/srv/a.txt"),
+        Some(Some(b"one-".to_vec()))
+    );
+    assert!(gui.app.tabs[0].is_modified());
+
+    gui.app.run(Cmd::Save, &gui.ctx);
+    gui.frames(3);
+    assert_eq!(
+        remote::fake::entry("/srv/a.txt"),
+        Some(Some(b"one-mine\n".to_vec()))
+    );
+    assert!(!gui.app.tabs[0].is_modified());
+    remote::fake::uninstall();
+}
+
+#[test]
+fn reload_from_server_replaces_the_unsaved_edits_of_a_remote_file_only() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("b.txt", "one\n")]);
+    remote::fake::install(remote::fake::Server::new().file("/srv/a.txt", "one\n"));
+    let mut gui = Gui::start("sftp_reload_text", None);
+    compare_remote_with_local(&mut gui, &dir.path().join("b.txt"));
+
+    for pane in [0, 1] {
+        text_view_mut(&mut gui).place_caret(pane, (0, 3), false);
+        gui.events.push(Event::Text("-mine".into()));
+        gui.frames(2);
+    }
+    remote::fake::change("/srv/a.txt", "theirs\n");
+    gui.app.run(Cmd::ReloadRemote, &gui.ctx);
+    gui.frames(2);
+    assert!(gui.shows(tr("msg.reload_remote_discards")));
+    gui.click(tr("btn.reload_remote"));
+    gui.frames(3);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let v = text_view_mut(&mut gui);
+    assert_eq!(v.panes[0].doc.lines, vec!["theirs"]);
+    assert!(!v.panes[0].doc.modified);
+    assert_eq!(v.panes[1].doc.lines, vec!["one-mine"], "not the server's");
+    assert!(v.panes[1].doc.modified);
+    remote::fake::uninstall();
+}
+
 /// A save made while an upload of the same file is still under way waits for it, then
 /// expects the server's file as that upload left it, not as it was fetched.
 #[test]
@@ -2239,14 +2309,30 @@ fn saving_a_remote_tab_while_closing_it_uploads_before_it_closes() {
     remote::fake::uninstall();
 }
 
+fn active_text_view_mut(gui: &mut Gui) -> &mut TextView {
+    let active = gui.app.active;
+    match gui.app.tabs[active].content.view_mut() {
+        Content::Text(v) => v,
+        _ => panic!("Expected a text compare"),
+    }
+}
+
+fn remote_folder_view(gui: &mut Gui) -> &mut FolderView {
+    match gui.app.tabs[0].content.view_mut() {
+        Content::Folder(v) => v,
+        _ => panic!("Expected a folder compare"),
+    }
+}
+
 #[test]
-fn a_folder_fetched_from_the_start_page_opens_read_only() {
+fn a_folder_fetched_from_the_start_page_is_written_back_on_save_and_reloads_from_the_server() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), &[("a.txt", "local")]);
     remote::fake::install(
         remote::fake::Server::new()
             .dir("/srv/data")
-            .file("/srv/data/a.txt", "remote"),
+            .file("/srv/data/a.txt", "remote")
+            .file("/srv/data/old.txt", "old"),
     );
     let mut gui = Gui::start("sftp_start_page_folder", None);
     fetch_to_start_page(&mut gui, 0, "/srv/data");
@@ -2255,20 +2341,162 @@ fn a_folder_fetched_from_the_start_page_opens_read_only() {
     gui.frame();
     gui.click(tr("btn.compare"));
     gui.settle();
-    let Content::Folder(v) = gui.app.tabs[0].content.view() else {
-        panic!("Expected a folder compare");
-    };
-    assert!(v.read_only[0], "the fetched folder is read-only");
-    assert!(!v.read_only[1]);
+    let v = remote_folder_view(&mut gui);
+    assert!(!v.read_only[0], "the fetched folder can be written back");
+    assert!(v.is_remote_side(0) && !v.is_remote_side(1));
     assert!(
         gui.app.session_tabs().is_empty(),
         "a staged folder is not saved in the session"
+    );
+    assert!(!gui.app.tabs[0].is_modified());
+
+    // Changes made here are written back by Save, and only those.
+    let root = gui.app.tabs[0].source[0].clone();
+    std::fs::write(root.join("a.txt"), "edited here").unwrap();
+    std::fs::write(root.join("new.txt"), "new").unwrap();
+    std::fs::remove_file(root.join("old.txt")).unwrap();
+    remote_folder_view(&mut gui).mark_remote_dirty(0);
+    assert!(gui.app.tabs[0].is_modified());
+    gui.app.run(Cmd::Save, &gui.ctx);
+    gui.frames(3);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(
+        remote::fake::entry("/srv/data/a.txt"),
+        Some(Some(b"edited here".to_vec()))
+    );
+    assert_eq!(
+        remote::fake::entry("/srv/data/new.txt"),
+        Some(Some(b"new".to_vec()))
+    );
+    assert!(remote::fake::was_removed("/srv/data/old.txt"));
+    assert!(!gui.app.tabs[0].is_modified());
+
+    // Reload from server shows what changed there since.
+    remote::fake::change("/srv/data/a.txt", "theirs");
+    gui.app.run(Cmd::ReloadRemote, &gui.ctx);
+    gui.frames(3);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "theirs"
+    );
+
+    // Changes not saved to the server yet are replaced only once agreed to.
+    std::fs::write(root.join("a.txt"), "mine").unwrap();
+    remote_folder_view(&mut gui).mark_remote_dirty(0);
+    gui.app.run(Cmd::ReloadRemote, &gui.ctx);
+    gui.frames(2);
+    assert!(gui.shows(tr("msg.reload_remote_discards")));
+    gui.click(tr("btn.cancel"));
+    gui.frames(2);
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "mine");
+    gui.app.run(Cmd::ReloadRemote, &gui.ctx);
+    gui.frames(2);
+    gui.click(tr("btn.reload_remote"));
+    gui.frames(3);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "theirs"
+    );
+    assert!(!gui.app.tabs[0].is_modified());
+    remote::fake::uninstall();
+}
+
+#[test]
+fn a_file_opened_from_a_remote_folder_is_uploaded_when_saved_also_once_the_folder_is_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("a.txt", "local\n")]);
+    remote::fake::install(
+        remote::fake::Server::new()
+            .dir("/srv/data")
+            .file("/srv/data/a.txt", "remote\n"),
+    );
+    let mut gui = Gui::start("remote_folder_child_save", None);
+    fetch_to_start_page(&mut gui, 0, "/srv/data");
+    gui.app.start_paths[2] = dir.path().display().to_string();
+    gui.frame();
+    gui.click(tr("btn.compare"));
+    gui.settle();
+    gui.click("a.txt");
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.frames(3);
+    assert_eq!(gui.app.tabs.len(), 2);
+
+    let Content::Text(v) = gui.app.tabs[1].content.view_mut() else {
+        panic!("Expected the file in a text compare");
+    };
+    v.place_caret(0, (0, 6), false);
+    gui.events.push(Event::Text("-edited".into()));
+    gui.frames(2);
+    gui.key(CMD, Key::S);
+    gui.frames(3);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(
+        remote::fake::entry("/srv/data/a.txt"),
+        Some(Some(b"remote-edited\n".to_vec()))
+    );
+    assert!(!gui.app.tabs.iter().any(Tab::is_modified));
+
+    gui.app.close_tab(0, false);
+    gui.frames(2);
+    assert_eq!(gui.app.tabs.len(), 1);
+    active_text_view_mut(&mut gui).place_caret(0, (0, 13), false);
+    gui.events.push(Event::Text("!".into()));
+    gui.frames(2);
+    gui.key(CMD, Key::S);
+    gui.frames(3);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(
+        remote::fake::entry("/srv/data/a.txt"),
+        Some(Some(b"remote-edited!\n".to_vec()))
     );
     remote::fake::uninstall();
 }
 
 #[test]
-fn compare_over_sftp_fetches_a_folder_read_only_and_a_failure_reopens_the_dialog() {
+fn the_connection_dialog_offers_ftp_with_a_warning_and_sftp_with_ssh_agent() {
+    let mut gui = Gui::start("remote_protocols", None);
+    gui.app.start_remote_connect(RemoteTarget::Start(0));
+    gui.frames(2);
+    assert!(gui.shows(tr("label.remote_agent")));
+    assert!(!gui.shows(tr("msg.ftp_plain_warning")));
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+        d.sign_in = SignIn::Agent;
+    }
+    gui.frames(2);
+    assert!(gui.shows(tr("msg.remote_agent_hint")));
+    let d = gui.app.remote_dlg.as_ref().unwrap();
+    assert!(matches!(d.conn().unwrap().auth, remote::Auth::Agent));
+
+    // FTP signs in with a password only, on its own port, and warns it is not encrypted.
+    gui.click(protocol_name(remote::Protocol::Sftp));
+    gui.frames(2);
+    gui.click(protocol_name(remote::Protocol::Ftp));
+    gui.frames(2);
+    assert!(gui.shows(tr("msg.ftp_plain_warning")));
+    assert!(!gui.shows(tr("label.remote_agent")));
+    let d = gui.app.remote_dlg.as_mut().unwrap();
+    assert_eq!(d.port, "21");
+    let c = d.conn().unwrap();
+    assert_eq!(c.protocol, remote::Protocol::Ftp);
+    assert!(matches!(c.auth, remote::Auth::Password(_)));
+    // A port typed in is kept; the usual one follows the protocol.
+    d.port = "2121".to_string();
+    d.set_protocol(remote::Protocol::FtpsImplicit);
+    assert_eq!(d.port, "2121");
+    d.port = "990".to_string();
+    d.set_protocol(remote::Protocol::Ftps);
+    assert_eq!(d.port, "21");
+    d.set_protocol(remote::Protocol::Sftp);
+    assert_eq!(d.port, "22");
+    assert_eq!(d.sign_in(), SignIn::Agent, "the SFTP sign-in is kept");
+}
+
+#[test]
+fn compare_over_sftp_fetches_a_writable_folder_and_a_failure_reopens_the_dialog() {
     remote::fake::install(
         remote::fake::Server::new()
             .dir("/srv/data")
@@ -2289,7 +2517,7 @@ fn compare_over_sftp_fetches_a_folder_read_only_and_a_failure_reopens_the_dialog
     gui.settle();
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
     let d = gui.app.open_dlg.as_ref().unwrap();
-    assert!(d.read_only[0], "a fetched folder opens read-only");
+    assert!(!d.read_only[0], "a fetched folder can be written back");
     assert!(std::path::Path::new(&d.paths[0]).join("a.txt").exists());
 
     // A connection that fails reopens the connection dialog with its fields kept, instead of
@@ -2405,7 +2633,7 @@ fn a_second_connection_starts_from_the_last_ones_server_but_not_its_password() {
         d.host = "example.com".to_string();
         d.port = "2222".to_string();
         d.user = "ann".to_string();
-        d.key_auth = true;
+        d.sign_in = SignIn::Key;
         d.key_path = "/home/ann/.ssh/id_ed25519".to_string();
         d.passphrase = "s3cret".to_string();
         d.remote_path = "/srv/a.txt".to_string();
@@ -2428,10 +2656,258 @@ fn a_second_connection_starts_from_the_last_ones_server_but_not_its_password() {
     assert_eq!(d.host, "example.com");
     assert_eq!(d.port, "2222");
     assert_eq!(d.user, "ann");
-    assert!(d.key_auth);
+    assert_eq!(d.sign_in, SignIn::Key);
     assert_eq!(d.key_path, "/home/ann/.ssh/id_ed25519");
     assert_eq!(d.passphrase, "", "a passphrase is never remembered");
     assert_eq!(d.remote_path, "", "the remote path is always blank");
+
+    remote::fake::uninstall();
+}
+
+#[test]
+fn the_connection_dialog_lists_the_servers_folders_to_pick_the_remote_path_from() {
+    remote::fake::install(
+        remote::fake::Server::new()
+            .home("/home/ann")
+            .dir("/home")
+            .dir("/home/ann")
+            .file("/home/ann/notes.txt", "notes\n")
+            .dir("/home/ann/srv")
+            .file("/home/ann/srv/a.txt", "one\n")
+            .file("/home/ann/srv/b.txt", "two\n"),
+    );
+    let mut gui = Gui::start("sftp_browse", None);
+    let remote_path = |gui: &Gui| gui.app.remote_dlg.as_ref().unwrap().remote_path.clone();
+
+    gui.app.start_remote_connect(RemoteTarget::Start(0));
+    gui.frames(2);
+    assert!(
+        !gui.widget(tr("btn.list_remote")).enabled,
+        "nothing to list until the server and user are filled in"
+    );
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+    }
+    gui.frame();
+
+    // With no path typed, the list starts at the home folder, and the path field follows the
+    // folder shown.
+    gui.click(tr("btn.list_remote"));
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(remote_path(&gui), "/home/ann");
+    assert!(gui.shows("srv") && gui.shows("notes.txt"));
+
+    // Clicking a folder opens it; clicking a file picks it; *Up* goes back.
+    gui.click("srv");
+    assert_eq!(remote_path(&gui), "/home/ann/srv");
+    assert!(gui.shows("a.txt") && !gui.shows("notes.txt"));
+    gui.click("b.txt");
+    assert_eq!(remote_path(&gui), "/home/ann/srv/b.txt");
+    gui.click(tr("btn.remote_up"));
+    assert_eq!(remote_path(&gui), "/home/ann");
+    gui.click("srv");
+    gui.click("a.txt");
+    gui.click(tr("btn.connect"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(
+        std::fs::read_to_string(&gui.app.start_paths[0]).unwrap(),
+        "one\n"
+    );
+
+    // A typed path opens the list at its folder, with the file picked; double-clicking a file
+    // fetches it straight away.
+    gui.app.start_remote_connect(RemoteTarget::Start(2));
+    gui.frames(2);
+    gui.app.remote_dlg.as_mut().unwrap().remote_path = "/home/ann/srv/b.txt".to_string();
+    gui.frame();
+    gui.click(tr("btn.list_remote"));
+    assert_eq!(remote_path(&gui), "/home/ann/srv/b.txt");
+    assert!(gui.shows("a.txt"));
+    gui.click(tr("btn.remote_up"));
+    // Long enough after the last click for the next two not to count as a triple-click.
+    gui.time += 1.0;
+    gui.click("notes.txt");
+    gui.click("notes.txt");
+    assert!(gui.app.remote_dlg.is_none());
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(
+        std::fs::read_to_string(&gui.app.start_paths[2]).unwrap(),
+        "notes\n"
+    );
+
+    remote::fake::uninstall();
+}
+
+#[test]
+fn the_connection_dialogs_advanced_settings_reach_the_connection() {
+    let mut gui = Gui::start("remote_advanced", None);
+    gui.app.start_remote_connect(RemoteTarget::Start(0));
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+    }
+    gui.frame();
+    assert!(!gui.shows(tr("label.remote_proxy")), "folded away at first");
+    gui.click(tr("label.remote_advanced"));
+    gui.frames(2);
+    assert!(gui.shows(tr("label.remote_proxy")));
+    assert!(!gui.shows(tr("label.remote_active")), "not over SFTP");
+    assert!(
+        !gui.shows(tr("label.remote_proxy_password")),
+        "no proxy yet"
+    );
+
+    let conn = |gui: &Gui| gui.app.remote_dlg.as_ref().unwrap().conn();
+    gui.app.remote_dlg.as_mut().unwrap().proxy = "ftp://proxy:21".to_string();
+    gui.frame();
+    assert!(conn(&gui).is_none(), "not a proxy");
+    assert!(gui.shows_text("Not a proxy address"));
+    gui.app.remote_dlg.as_mut().unwrap().proxy = "socks5://bob:pw@proxy:1080".to_string();
+    gui.frame();
+    let proxy = conn(&gui).unwrap().options.proxy.unwrap();
+    assert_eq!(proxy.password.as_deref(), Some("pw"));
+    assert_eq!(proxy.url(), "socks5://bob@proxy:1080", "shown without it");
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.proxy = "socks5://bob@proxy:1080".to_string();
+        d.proxy_password = "pw".to_string();
+        d.active = true;
+        d.client_cert = "/keys/me.pem".to_string();
+    }
+    gui.frame();
+    assert!(gui.shows(tr("label.remote_proxy_password")));
+    let options = conn(&gui).unwrap().options;
+    let proxy = options.proxy.unwrap();
+    assert_eq!(proxy.password.as_deref(), Some("pw"));
+    assert_eq!(proxy.url(), "socks5://bob@proxy:1080");
+    assert!(
+        !options.active && options.client_cert.is_none(),
+        "neither over SFTP"
+    );
+
+    gui.app
+        .remote_dlg
+        .as_mut()
+        .unwrap()
+        .set_protocol(remote::Protocol::Ftps);
+    gui.frames(2);
+    assert!(gui.shows(tr("label.remote_active")) && gui.shows(tr("label.remote_client_cert")));
+    let options = conn(&gui).unwrap().options;
+    assert!(options.active);
+    assert_eq!(options.client_cert, Some(PathBuf::from("/keys/me.pem")));
+}
+
+#[test]
+fn a_servers_sign_in_questions_are_asked_in_a_window_until_answered_declined_or_stopped() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let mut gui = Gui::start("ssh_ask", None);
+    let (ask, rx) = asker(&gui.ctx);
+    gui.app.asks = Some(rx);
+    let challenge = remote::Challenge {
+        server: "example.com:22".into(),
+        name: "Two-step sign-in".into(),
+        instructions: "Open your authenticator.".into(),
+        prompts: vec![
+            remote::Prompt {
+                text: "Code: ".into(),
+                echo: false,
+            },
+            remote::Prompt {
+                text: "Device: ".into(),
+                echo: true,
+            },
+        ],
+    };
+    let asking = |cancel: Arc<AtomicBool>| {
+        let (ask, challenge) = (ask.clone(), challenge.clone());
+        std::thread::spawn(move || ask(&challenge, &cancel))
+    };
+    let shown = |gui: &Gui| gui.shows_text("Open your authenticator.");
+
+    // The window's own thread is never kept waiting for itself.
+    assert_eq!(ask(&challenge, &AtomicBool::new(false)), None);
+    gui.frames(2);
+    assert!(!shown(&gui));
+
+    // The first field has the keyboard, and the answers come back in order.
+    let answered = asking(Arc::default());
+    gui.wait_until("the questions", shown);
+    assert!(gui.shows_text("example.com:22") && gui.shows_text("Two-step sign-in"));
+    gui.type_text("123456");
+    gui.tab(false);
+    gui.type_text("phone");
+    gui.click(tr("btn.ok"));
+    assert_eq!(
+        answered.join().unwrap(),
+        Some(vec!["123456".to_string(), "phone".to_string()])
+    );
+    gui.frames(2);
+    assert!(!shown(&gui));
+
+    let declined = asking(Arc::default());
+    gui.wait_until("the questions", shown);
+    gui.click(tr("btn.cancel"));
+    assert_eq!(declined.join().unwrap(), None);
+
+    // A connection stopped while asking takes its window with it.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let stopped = asking(cancel.clone());
+    gui.wait_until("the questions", shown);
+    cancel.store(true, Ordering::Relaxed);
+    assert_eq!(stopped.join().unwrap(), None);
+    gui.wait_until("the window closed", |g| !shown(g));
+}
+
+#[test]
+fn listing_an_untrusted_server_asks_to_trust_it_and_a_changed_field_closes_the_list() {
+    remote::fake::install(
+        remote::fake::Server::new()
+            .home("/srv")
+            .dir("/srv")
+            .file("/srv/a.txt", "a")
+            .unknown_host(),
+    );
+    let mut gui = Gui::start("sftp_browse_unknown_host", None);
+    gui.app.start_remote_connect(RemoteTarget::Start(0));
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+    }
+    gui.frame();
+
+    // A server not trusted yet asks first, then lists once trusted, back in the dialog.
+    gui.click(tr("btn.list_remote"));
+    assert!(gui.app.host_prompt.is_some());
+    assert!(gui.app.remote_dlg.is_none());
+    gui.click(tr("btn.trust_connect"));
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let d = gui.app.remote_dlg.as_ref().unwrap();
+    assert!(d.browse.is_some());
+    assert_eq!(d.remote_path, "/srv");
+    assert!(gui.shows("a.txt"));
+
+    // Signing in as someone else closes the list made with the old connection.
+    gui.app.remote_dlg.as_mut().unwrap().user = "bob".to_string();
+    // A frame to close the list, and one for the dialog, now shorter, to center again.
+    gui.frames(2);
+    assert!(gui.app.remote_dlg.as_ref().unwrap().browse.is_none());
+    assert!(!gui.shows("a.txt"));
+
+    // A connection that fails says so in the list, leaving the dialog as it was.
+    remote::fake::install(remote::fake::Server::new().failing("connection refused"));
+    gui.click(tr("btn.list_remote"));
+    assert!(gui.shows_text("connection refused"));
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(gui.app.remote_dlg.as_ref().unwrap().user, "bob");
 
     remote::fake::uninstall();
 }

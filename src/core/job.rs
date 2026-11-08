@@ -136,6 +136,25 @@ pub struct Job {
     pub unified: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub whole_file: bool,
+    // Paths on a server (`sftp://`, `ftp://`, `ftpes://`, `ftps://`).
+    /// A private key file to sign in to SFTP servers with (`--ssh-key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_key: Option<String>,
+    /// The fingerprint of a server's key or certificate to trust (`--trust-fingerprint`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_fingerprint: Option<String>,
+    /// A SOCKS5 or HTTP proxy to connect through, without a password (`--proxy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// FTP in active mode (`--ftp-active`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ftp_active: bool,
+    /// A client certificate for FTPS servers that ask for one, and its key (`--client-cert`,
+    /// `--client-key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
 }
 
 impl JobFile {
@@ -231,7 +250,7 @@ impl Job {
         self.check()?;
         let path = |field: &str, v: &str| -> Result<OsString, String> {
             let text = expand(v).map_err(|e| format!("{field}: {e}"))?;
-            if super::web::is_url(&text) {
+            if super::web::is_url(&text) || super::remote_url::is_remote_url(&text) {
                 return Ok(text.into());
             }
             let p = PathBuf::from(&text);
@@ -321,6 +340,24 @@ impl Job {
         if let Some(p) = &self.page_size {
             opt("page-size", text(p));
         }
+        if let Some(k) = &self.ssh_key {
+            opt("ssh-key", Some(path("ssh_key", k)?));
+        }
+        if let Some(f) = &self.trust_fingerprint {
+            opt("trust-fingerprint", text(f));
+        }
+        if let Some(p) = &self.proxy {
+            opt("proxy", text(p));
+        }
+        if self.ftp_active {
+            opt("ftp-active", None);
+        }
+        if let Some(c) = &self.client_cert {
+            opt("client-cert", Some(path("client_cert", c)?));
+        }
+        if let Some(k) = &self.client_key {
+            opt("client-key", Some(path("client_key", k)?));
+        }
         // Paths after `--`, so one starting with `-` is not read as an option.
         args.push("--".into());
         args.extend(paths);
@@ -360,8 +397,9 @@ impl Job {
             .flatten()
             .filter_map(|v| expand(v).ok())
             .map(|t| {
-                let p = PathBuf::from(t);
-                if p.is_absolute() {
+                let p = PathBuf::from(&t);
+                if p.is_absolute() || super::web::is_url(&t) || super::remote_url::is_remote_url(&t)
+                {
                     p
                 } else {
                     dir.join(p)
@@ -574,6 +612,49 @@ mod tests {
             .prepare(Path::new("/d"))
             .unwrap();
         assert!(args(&p).contains(&"https://example.com/a".to_string()));
+    }
+
+    #[test]
+    fn paths_on_a_server_keep_their_address_and_sign_in_options_follow() {
+        let j = job(
+            r#"{"kind": "sync", "source": "src", "destination": "sftp://ann@host/~/site",
+                "mode": "update", "apply": true, "ssh_key": "keys/id",
+                "trust_fingerprint": "SHA256:abc"}"#,
+        )
+        .unwrap();
+        let p = j.prepare(Path::new("/d")).unwrap();
+        let a = args(&p);
+        assert!(a.contains(&"sftp://ann@host/~/site".to_string()), "{a:?}");
+        let under = |p: &str| Path::new("/d").join(p).display().to_string();
+        assert!(
+            a.contains(&format!("--ssh-key={}", under("keys/id"))),
+            "{a:?}"
+        );
+        assert!(a.contains(&"--trust-fingerprint=SHA256:abc".to_string()));
+        assert!(j
+            .paths(Path::new("/d"))
+            .contains(&PathBuf::from("sftp://ann@host/~/site")));
+
+        let j = job(
+            r#"{"kind": "sync", "source": "src", "destination": "ftpes://ann@host/site",
+                "mode": "update", "apply": true, "proxy": "socks5://bob@proxy:1080", "ftp_active": true,
+                "client_cert": "keys/me.pem", "client_key": "keys/me.key"}"#,
+        )
+        .unwrap();
+        let a = args(&j.prepare(Path::new("/d")).unwrap());
+        assert!(
+            a.contains(&"--proxy=socks5://bob@proxy:1080".to_string()),
+            "{a:?}"
+        );
+        assert!(a.contains(&"--ftp-active".to_string()), "{a:?}");
+        assert!(
+            a.contains(&format!("--client-cert={}", under("keys/me.pem"))),
+            "{a:?}"
+        );
+        assert!(
+            a.contains(&format!("--client-key={}", under("keys/me.key"))),
+            "{a:?}"
+        );
     }
 
     #[test]
