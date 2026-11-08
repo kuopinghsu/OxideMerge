@@ -80,8 +80,12 @@ macOS 與 Linux 的程式位於 `target/release/oxidemerge`，Windows 則為
 | `make dist` | 在 `dist/` 產生套件：Windows 為 ZIP 檔，macOS 與 Linux 為 TAR.GZ 檔。 |
 | `make appimage` | 依本機處理器架構（x86_64 或 aarch64）產生 Linux AppImage。需要 X11、Wayland 與鍵盤函式庫，並會下載 `appimagetool`。 |
 | `make user-guide` | 在 `dist/` 產生英文與繁體中文 PDF 指南。 |
+| `make user-guide-docs` | 在 `docs/dist/` 產生相同的指南，檔名為 `oxidemerge-user-guide.pdf` 與 `oxidemerge-user-guide.zh-TW.pdf`。這些檔案會提交到儲存庫，每次建置都會取代它們。 |
 
-`make user-guide` 需要 Asciidoctor PDF、`curl`、`shasum`、含 `fontTools` 的 Python 3、
+變更使用者指南或其圖片後，請執行 `make user-guide-docs`，並將 PDF 檔案與變更一起提交，
+讓 `docs/dist/` 始終保有最新的指南。
+
+`make user-guide` 與 `make user-guide-docs` 需要 Asciidoctor PDF、`curl`、`shasum`、含 `fontTools` 的 Python 3、
 fontconfig 與 DejaVu Sans 字型。建置指令碼會自動下載所需的 Noto Sans CJK 字型。
 
 ## 結果的命名方式
@@ -265,6 +269,7 @@ oxidemerge-0.9.8-windows-x64.zip
 2. 檢查 `CHANGELOG.md` 中 `0.9.8` 的段落，將標題中的 `Unreleased` 改為 `YYYY-MM-DD` 格式的
    發行日期。
 3. 執行 `make fmt-check ci`，並以 `scripts/release-notes.sh 0.9.8` 檢查發行說明。
+   執行 `make user-guide-docs`，讓 `docs/dist/` 中的指南顯示新版本。
 4. 提交並推送到 `main`，等待所有平台的必要持續整合檢查都通過。
 5. 為通過檢查的提交加上標籤，並推送標籤。加上標籤前，請先以 `git log -1 --oneline`
    確認 `HEAD` 就是通過檢查的提交。

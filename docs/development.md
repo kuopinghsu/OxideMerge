@@ -83,8 +83,12 @@ shows. For the web page samples, see [samples/web/README.md](../samples/web/READ
 | `make dist` | Creates a package in `dist/`: a ZIP file on Windows, or a TAR.GZ file on macOS and Linux. |
 | `make appimage` | Creates a Linux AppImage for this computer's processor (x86_64 or aarch64). It needs the X11, Wayland and keyboard libraries, and it downloads `appimagetool`. |
 | `make user-guide` | Creates the English and Traditional Chinese PDF guides in `dist/`. |
+| `make user-guide-docs` | Creates the same guides in `docs/dist/`, as `oxidemerge-user-guide.pdf` and `oxidemerge-user-guide.zh-TW.pdf`. These files are committed, and each build replaces them. |
 
-`make user-guide` needs Asciidoctor PDF, `curl`, `shasum`, Python 3 with `fontTools`,
+After you change a user guide or its images, run `make user-guide-docs` and commit the PDF
+files with the change, so that `docs/dist/` always has the latest guides.
+
+`make user-guide` and `make user-guide-docs` need Asciidoctor PDF, `curl`, `shasum`, Python 3 with `fontTools`,
 fontconfig and the DejaVu Sans font. The build script downloads the Noto Sans CJK fonts
 that it needs.
 
@@ -285,6 +289,7 @@ These steps use version `0.9.8` as an example. Use the version that you want to 
 2. Check the `0.9.8` section in `CHANGELOG.md`. In its heading, replace `Unreleased` with
    the release date in the form `YYYY-MM-DD`.
 3. Run `make fmt-check ci`. Check the release notes with `scripts/release-notes.sh 0.9.8`.
+   Run `make user-guide-docs`, so that the guides in `docs/dist/` show the new version.
 4. Commit, and push to `main`. Wait until the required CI checks pass on all platforms.
 5. Tag the checked commit and push the tag. First make sure with `git log -1 --oneline`
    that `HEAD` is the commit that passed the checks.

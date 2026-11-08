@@ -35,7 +35,7 @@ DIST_DIR    := dist/$(DIST_NAME)
 .PHONY: all help build release run run-release demo demo-text demo-3way demo-3way-merge demo-3way-folder demo-conflict \
         demo-web demo-web-text demo-web-headings demo-web-tables \
         test gui-smoke docker-test check check-platforms lint fmt fmt-check ci install uninstall shell-register shell-unregister \
-        languages dist appimage user-guide clean
+        languages dist appimage user-guide user-guide-docs clean
 
 help:
 	@echo 'OxideMerge $(VERSION) - make targets'
@@ -70,6 +70,7 @@ help:
 	@echo '  dist              Release build packaged into dist/$(DIST_NAME)'
 	@echo '  appimage          Linux AppImage (x86_64 or aarch64) in dist/'
 	@echo '  user-guide        User guide PDF files (English, Traditional Chinese) in dist/'
+	@echo '  user-guide-docs   The latest user guide PDF files in docs/dist, to commit'
 	@echo '  clean             Remove build output and dist/'
 
 all: release
@@ -182,6 +183,10 @@ endif
 # Same PDF files as the CI user-guide job; scripts/build-user-guide.sh lists what it needs.
 user-guide:
 	VERSION='$(VERSION)' bash scripts/build-user-guide.sh dist
+
+# The guides kept in the repository, under names that stay the same from one version to the next.
+user-guide-docs:
+	UNVERSIONED=1 VERSION='$(VERSION)' bash scripts/build-user-guide.sh docs/dist
 
 clean:
 	$(CARGO) clean

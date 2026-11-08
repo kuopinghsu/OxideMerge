@@ -11,7 +11,7 @@ OxideMerge 是免費、開放原始碼的檔案與資料夾比較及合併工具
 OxideMerge 以 Rust 開發，可以比較文字、資料夾、二進位檔、影像與網頁。
 
 **[下載](https://github.com/kuopinghsu/OxideMerge/releases)** ·
-[使用者指南](docs/user-guide.zh-TW.adoc) ·
+[使用者指南](docs/user-guide.zh-TW.adoc)（[PDF](docs/dist/oxidemerge-user-guide.zh-TW.pdf)） ·
 [變更紀錄](CHANGELOG.md)（英文）
 
 ![OxideMerge 起始頁](images/start.png)
@@ -517,6 +517,10 @@ Mercurial（`extdiff` 與 `merge-tools`）與 Perforce
 - [使用者指南](docs/user-guide.zh-TW.adoc)：比較與合併的操作方式、比較選項、快速鍵、Git 整
   合與疑難排解。
 - [英文使用者指南](docs/user-guide.adoc)。
+- `main` 上最新版本的 PDF 使用者指南：
+  [繁體中文](docs/dist/oxidemerge-user-guide.zh-TW.pdf)與
+  [英文](docs/dist/oxidemerge-user-guide.pdf)。
+  每個發行版本也附有該版本的指南。
 - [分析指南](docs/analysis-guide.md)：合併驗證、語意比較、審閱工作區、版本摘要與潛在影響
   （英文）。
 - [效能測試](docs/benchmarks.md)：效能量測結果與量測方式（英文）。
