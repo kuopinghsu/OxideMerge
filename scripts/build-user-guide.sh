@@ -6,7 +6,8 @@
 # writes oxidemerge-<version>-user-guide.pdf and oxidemerge-<version>-user-guide.zh-TW.pdf,
 # where <version> is $VERSION or else the version in Cargo.toml. With UNVERSIONED=1 the files
 # are oxidemerge-user-guide.pdf and oxidemerge-user-guide.zh-TW.pdf, for docs/dist, where each
-# build replaces the last; the version is still printed in them. Needs asciidoctor-pdf, curl,
+# build replaces the last; the version is still printed in them. The title page also shows the
+# month of the build, in the language of the guide. Needs asciidoctor-pdf, curl,
 # shasum, Python 3 with fontTools ($PYTHON, default python3), and the DejaVu Sans fonts,
 # found with fc-match (fontconfig). Noto Sans TC (the Chinese text), SC and KR (the names of
 # the Simplified Chinese and Korean languages) are downloaded once into target/guide-fonts,
@@ -74,8 +75,14 @@ done
 
 for doc in user-guide user-guide.zh-TW; do
   case $doc in
-    *.zh-TW) theme=oxidemerge-zh-TW ;;
-    *) theme=oxidemerge ;;
+    *.zh-TW)
+      theme=oxidemerge-zh-TW
+      revdate=$(date +'%Y 年 %-m 月')
+      ;;
+    *)
+      theme=oxidemerge
+      revdate=$(LC_ALL=C date +'%B %Y')
+      ;;
   esac
   pdf=$out/$prefix$doc.pdf
   # A character missing from every font is a warning, which fails the build; asciidoctor-pdf
@@ -83,7 +90,7 @@ for doc in user-guide user-guide.zh-TW; do
   asciidoctor-pdf --verbose --failure-level WARN \
     -a pdf-themesdir="$PWD/docs/pdf" -a pdf-theme="$theme" \
     -a pdf-fontsdir="$fonts;GEM_FONTS_DIR" \
-    -a revnumber="$version" -a relfileprefix="$prefix" \
+    -a revnumber="$version" -a revdate="$revdate" -a relfileprefix="$prefix" \
     -o "$pdf" "docs/$doc.adoc"
   echo "Built $pdf"
 done
