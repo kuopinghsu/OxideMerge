@@ -1738,6 +1738,58 @@ fn saving_a_file_opened_from_an_archive_compare_repacks_the_archive_right_away()
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
 }
 
+/// An encrypted archive asks for its password, again when it was wrong, opens with the right
+/// one, and is written back still encrypted.
+#[test]
+fn a_password_protected_archive_asks_for_its_password_and_saves_encrypted() {
+    use zip::{write::SimpleFileOptions, AesMode};
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let make_zip = |path: &Path, content: &str, o: SimpleFileOptions| {
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        zw.start_file("a.txt", o).unwrap();
+        std::io::Write::write_all(&mut zw, content.as_bytes()).unwrap();
+        zw.finish().unwrap();
+    };
+    let left_zip = d.join("left.zip");
+    let right_zip = d.join("right.zip");
+    make_zip(&left_zip, "left\n", SimpleFileOptions::default());
+    let locked = SimpleFileOptions::default().with_aes_encryption(AesMode::Aes256, "sesame");
+    make_zip(&right_zip, "right\n", locked);
+
+    let mut gui = Gui::start(
+        "archive_password",
+        compare(&[left_zip.clone(), right_zip.clone()]),
+    );
+    let file = || ("file", right_zip.display().to_string());
+    assert!(gui.shows(tr("label.archive_password_title")));
+    assert!(gui.shows_text(&trf("msg.archive_password_needed", &[file()])));
+    assert!(!gui.widget(tr("btn.ok")).enabled);
+    gui.type_text("open");
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.settle();
+    assert!(gui.shows_text(&trf("msg.archive_password_wrong", &[file()])));
+    gui.type_text("sesame");
+    gui.click(tr("btn.ok"));
+    gui.settle();
+    assert!(!gui.shows(tr("label.archive_password_title")));
+
+    gui.click("a.txt");
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.frames(3);
+    gui.app.run(Cmd::CopyRight, &gui.ctx);
+    gui.app.run(Cmd::Save, &gui.ctx);
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+
+    let mut ar = zip::ZipArchive::new(std::fs::File::open(&right_zip).unwrap()).unwrap();
+    assert!(ar.by_index_raw(0).unwrap().encrypted());
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut ar.by_index_decrypt(0, b"sesame").unwrap(), &mut text)
+        .unwrap();
+    assert_eq!(text, "left\n");
+}
+
 #[test]
 fn saving_a_file_still_repacks_its_archive_after_the_folder_tab_closed() {
     let dir = tempfile::tempdir().unwrap();

@@ -341,7 +341,7 @@ pub fn load(path: &Path) -> Result<Review> {
     let mut names = HashSet::new();
     for i in 0..zip.len() {
         let entry = zip.by_index(i)?;
-        if !names.insert(entry.name().to_string()) {
+        if !names.insert(entry.name()?.into_owned()) {
             bail!("Duplicate ZIP entry");
         }
     }
@@ -643,7 +643,7 @@ mod tests {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i).unwrap();
-            let name = entry.name().to_owned();
+            let name = entry.name().unwrap().into_owned();
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes).unwrap();
             if name == "data/0/a.txt" {
