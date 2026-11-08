@@ -344,7 +344,7 @@ To see the version, click the app logo or choose *Help → About OxideMerge*.
 The dialog also shows a build identifier:
 
 * A development build shows a short Git hash.
-  `-dirty` is added when tracked source files had uncommitted changes.
+  `-dirty` is added when tracked files or the Git index had uncommitted changes.
 * A clean optimized build of a release tag shows its build date (UTC).
 
 `oxidemerge --version` prints the same identifier.
@@ -540,8 +540,8 @@ Before the password or key is sent, OxideMerge checks the server's host key.
 It first reads your own SSH `~/.ssh/known_hosts` the way `ssh` does: host patterns such as
 `*.example.com` or `!host.example.com`, in any letter case, and names hashed by `ssh-keygen -H`
 all match, and a server on a port other than 22 is found under `[host]:port`.
-A server listed there with the same key is trusted if it also matches any key saved by
-OxideMerge.
+A server listed there with the same key is trusted, provided that the key also matches the one
+that OxideMerge saved for that server, if there is one.
 A server listed there with a different key of the same type, or whose key is marked `@revoked`
 there, is refused, as `ssh` refuses it.
 If the server was reinstalled, remove its old key with `ssh-keygen -R host`
@@ -1273,8 +1273,8 @@ image::csv.png[Table view of two CSV files]
   *Copy cell*.
   Both records must have that column.
 * The arrow keys move between records and columns.
-  kbd:[PgUp] and kbd:[PgDn] move through the records, and kbd:[Ctrl+Home] and kbd:[Ctrl+End]
-  select the first and the last record.
+  kbd:[PgUp] and kbd:[PgDn] move through the records a page at a time, and kbd:[Ctrl+Home] and
+  kbd:[Ctrl+End] select the first and the last record.
 * *Go to line* uses the line numbers of the file.
 
 When you edit a cell, OxideMerge preserves the quotes and line endings outside that field, and you
@@ -1362,8 +1362,9 @@ Sign in with `svn` itself first.
 The revision is read in the background; *Cancel* stops a server that is slow or does not respond,
 and the dialog returns.
 Clicking *Compare* lets Mercurial read the repository's own `.hg/hgrc`, just as Git's filters are
-honored; the list of recent revisions, which is read while you type, skips that file (Mercurial
-5.4 or later).
+honored.
+The list of recent revisions, which is read while you type, skips that file; skipping it needs
+Mercurial 5.4 or later.
 When you compare the top folder of a working copy, the `.git`, `.svn` or `.hg` folder is listed on
 the right only; the *Exclude Source Control* filter hides it.
 Exporting a revision's folder is refused if it would exceed 8 GB or 500,000 files, the same limit
@@ -1565,7 +1566,8 @@ When this pane is shown, the navigation keys behave differently:
 
 |kbd:[Alt+↓], kbd:[Alt+↑]
 |Go to the next or previous difference in the file.
-After the last difference, continue to the next file that has differences.
+After the last or before the first difference, continue to the next or previous file that has
+differences.
 |Select the next or previous file that has differences.
 
 |kbd:[Alt+Home], kbd:[Alt+End]
@@ -2037,7 +2039,7 @@ tracked changes as accepted.
 Workbooks (`.xlsx`, `.xlsm`) can also be compared *Formatted*, whether they have one sheet or
 several.
 Each sheet appears as a heading and a table.
-Sheets are matched by name, so a sheet that was added or removed shows up as such.
+Sheets are matched by name, so a sheet that was added or removed shows as one whole difference.
 Merged cells are drawn across the cells they cover.
 Numbers are shown in their number formats: dates and times in ISO form (`2026-09-30 18:00`),
 whatever order the format puts them in, and amounts with their decimals, thousands separators,
