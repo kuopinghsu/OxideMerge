@@ -2167,18 +2167,95 @@ When OxideMerge imports a rules file:
 Rules files are in the `Rules` folder next to the settings file (see <<configuration>>).
 OxideMerge also reads a `Rules` folder next to the program.
 
-A rules file is a JSON file. The name of the rules is the file name without `.oxrules`:
+A rules file is a JSON file. The name of the rules is the file name without `.oxrules`.
+This is `samples/rules/Build logs.oxrules`:
 
 .Build logs.oxrules
 [source,json]
 ----
 {
-  "description": "Timestamps and generated headers in build logs",
-  "ignore_lines": ["^\\[\\d{2}:\\d{2}:\\d{2}\\]", "^// Generated on .*$"],
-  "substitutions": [{ "find": "\\b0x[0-9a-fA-F]{8,}\\b", "replace": "0xADDR" }],
+  "description": "Timestamps, generated headers and load addresses in samples/*/logs/build.log",
+  "ignore_lines": ["^// Generated on .*$"],
+  "substitutions": [
+    { "find": "^\\[\\d{2}:\\d{2}:\\d{2}\\] ", "replace": "[time] " },
+    { "find": "\\b0x[0-9a-fA-F]{8,}\\b", "replace": "0xADDR" }
+  ],
   "ignore_blocks": [{ "start": "^/\\* BEGIN LICENSE", "end": "END LICENSE \\*/$" }]
 }
 ----
+
+Every field can be left out:
+
+`description`:: Shown next to the name in *Options → Compare rules*.
+`ignore_lines`:: A list of regular expressions.
+A difference whose lines all match one of them is ignored.
+`substitutions`:: A list of `find` and `replace` pairs.
+Each match of `find` is replaced by `replace` in both files before they are compared, in the
+order of the list.
+The replacement can use the groups of the match: `$1` is the first group.
+The panes still show the text as it is in the files.
+`ignore_blocks`:: A list of `start` and `end` pairs.
+A block starts at a line that matches `start` and ends at the next line that matches `end`; both
+of those lines belong to the block, and differences inside it are ignored.
+The end can also be later on the start line.
+A start without an end line is not a block, so nothing is ignored.
+
+Each pattern is matched against one line at a time, so `^` and `$` are the start and the end of
+the line.
+In JSON, each backslash of a pattern is written twice: `\\d` in the file is `\d` in the pattern.
+The rules editor in *Options → Compare rules* shows the patterns without that doubling.
+
+==== Example: build logs
+
+`samples/left/logs/build.log` and `samples/right/logs/build.log` are two runs of the same build.
+Without rules, nearly every line differs: the build host, the date and every timestamp, and the
+load address are different each time.
+
+.The two build logs without rules
+image::rules-off.png[Two build logs compared without rules]
+
+To compare them with the *Build logs* rules, import `samples/rules/Build logs.oxrules`
+(*Options → Compare rules → Import...*), select it, and open the two files.
+Or choose the rules for one comparison on the command line:
+
+[source,sh]
+----
+oxidemerge --rules "Build logs" samples/left/logs/build.log samples/right/logs/build.log
+----
+
+`--rules` also takes the path of the file, so the rules work without importing them:
+`--rules "samples/rules/Build logs.oxrules"`.
+
+Each rule handles one kind of noise in the logs:
+
+* The ignore block from `^/\* BEGIN LICENSE` to `END LICENSE \*/$` covers lines 1 to 4, the
+  license header, so `Build host: build-01` and `build-07` no longer count.
+* The ignored line `^// Generated on .*$` covers line 5, which holds the date of the run.
+* The first substitution replaces the timestamp at the start of each line, such as
+  `[09:12:05]`, with `[time]`.
+  The pattern ends with the space after the timestamp, so the replacement does too.
+* The second substitution replaces load addresses of 8 or more hexadecimal digits, such as
+  `0x7FF6A1B20000`, with `0xADDR`, so line 8 is the same on both sides.
+
+What is left is the one real difference: line 10, where one test failed.
+The ignored lines are shown in grey, and the difference counter shows *1/1*.
+The timestamps on line 10 are not highlighted, because the substitution makes them the same.
+
+.The same build logs with the Build logs rules
+image::rules-on.png[Two build logs compared with the Build logs rules]
+
+Click *Edit* next to *Build logs* in *Options → Compare rules* to see the same rules in the rules
+editor, one on each line.
+A substitution is written as `+find => replace+`; there are two spaces before `=>` in the first
+substitution, because the pattern ends with a space.
+
+.The Build logs rules in the rules editor
+image::rules-editor.png[The rules editor showing the Build logs rules]
+
+In scripts, the same rules decide the exit code.
+`oxidemerge --cli --rules "samples/rules/Build logs.oxrules" ...` exits with `1` for these logs,
+because of line 10.
+When the only differences are those the rules ignore, it prints nothing and exits with `0`.
 
 [[add-rule]]
 === Creating a rule from a text comparison
@@ -3793,6 +3870,12 @@ Perforce can use OxideMerge from the p4 command line, from P4V, or from both.
 The two are set up separately: p4 reads `P4DIFF` and `P4MERGE`, while P4V keeps its own
 preferences.
 
+Both need a working connection first.
+Run `p4 info` in your workspace: it should show your *User name*, your workspace as
+*Client name* and your server as *Server address*.
+If it reports *Client unknown* or cannot connect, set `P4PORT`, `P4USER` and `P4CLIENT`
+first, or the `P4CONFIG` file your team uses.
+
 ===== The p4 command line
 
 p4 runs the program named by `P4DIFF` with two files: the depot revision (in a temporary file)
@@ -3834,20 +3917,63 @@ If `oxidemerge` is not on your `PATH`, give its full path, for example
 `/Applications/OxideMerge.app/Contents/MacOS/oxidemerge` on macOS.
 Do not add `--cli` to `P4DIFF`: it exits with 1 when the files differ, which p4 reports as
 *Execution Failed*.
-. Check the settings with `p4 set`; both lines should name OxideMerge.
++
+`p4 set` stores the values in `~/.p4enviro` on macOS and Linux, and in the registry on
+Windows.
+. Check the settings with `p4 set`; both lines should name OxideMerge:
++
+----
+P4DIFF=oxidemerge (enviro)
+P4MERGE=/Users/you/bin/oxidemerge-p4-merge (enviro)
+----
++
+The text in parentheses tells where p4 found each value: `(enviro)` for `p4 set` on macOS and
+Linux, `(set)` for `p4 set` on Windows, `(config '...')` for a `P4CONFIG` file.
+A value with nothing after it comes from an environment variable, which takes precedence over
+`p4 set`; if a line names another tool, change it where it is set.
 
 To compare a file with the depot, run `p4 diff f.txt`; OxideMerge opens with the depot revision
 on the left and your workspace file on the right.
+The depot revision is a temporary file with a name such as `tmp.63484.0x20d2d0f40.90`, and only
+your workspace file can be edited.
+p4 passes the words in `P4DIFF` on to OxideMerge, so you can name the panes instead:
+
+[source,sh]
+----
+p4 set P4DIFF="oxidemerge --dl Depot --dr Workspace"
+----
+
+p4 splits `P4DIFF` at spaces, so keep each title to one word.
+
+.`p4 diff` with the panes named Depot and Workspace
+image::p4-diff.png[OxideMerge opened by p4 diff]
 
 To merge a conflict:
 
 . Run `p4 resolve f.txt`.
+p4 shows what it found, and suggests an action:
++
+----
+/home/you/ws/f.txt - merging //depot/main/f.txt#2
+Diff chunks: 0 yours + 1 theirs + 0 both + 1 conflicting
+Accept(a) Edit(e) Diff(d) Merge (m) Skip(s) Help(?) e:
+----
 . At the prompt, type *m* (merge).
 OxideMerge opens with *Yours* on the left, *Base* in the middle and *Theirs* on the right.
+The middle pane starts as the base, and *Save result* writes it to the result file p4 passed,
+never to the base.
 . Resolve each conflict, with *Next conflict* and then *Take left*, *Take right* or *Take both*,
 or by editing the middle pane.
+Check that the toolbar says *No conflicts left*: *Save result* also saves a result that still
+has conflicts, with the base text in their place.
 . Click *Save result* and close the window.
-. Back at the prompt, p4 suggests *ae* (accept edit); type *ae* to accept the merged file.
+. Back at the prompt, p4 suggests *ae* (accept edit), or *at* (accept theirs) when the result is
+the same as theirs.
+Type *ae* to accept the merged file as you saved it.
+p4 then reports, for example, `//ws/f.txt - edit from //depot/main/f.txt`.
+
+.A conflict opened by `p4 resolve`
+image::p4-merge.png[Three-way merge opened by p4 resolve]
 
 If you close the window without saving, p4 reports *Execution Failed* and the file stays
 unresolved; typing *ae* then warns that the file still has change markers.
@@ -3875,6 +4001,9 @@ P4Merge.
 |Linux |the output of `command -v oxidemerge`, for example `/usr/bin/oxidemerge`
 |===
 . In *Arguments*, type `%1 %2`.
++
+.P4V Preferences → Diff
+image::p4v-diff-prefs.png[P4V diff preferences with OxideMerge as the other application]
 . Select *Merge* in the list on the left, select *Other application* there too, and give the
 same *Location*.
 . In *Arguments*, type:
@@ -3884,7 +4013,23 @@ same *Location*.
 ----
 +
 In P4V's merge arguments, `%1` is theirs, `%2` is yours, `%b` the base and `%r` the result.
++
+.P4V Preferences → Merge
+image::p4v-merge-prefs.png[P4V merge preferences with OxideMerge as the other application]
 . Click *OK*.
+
+The list under *Specify diff application by extension* and *Specify merge application by
+extension* overrides the default for the extensions in it.
+Leave it empty to use OxideMerge for every file; if one kind of file still opens P4Merge, look
+for its extension there.
+
+To compare a file with the depot:
+
+. Select the file in the *Workspace* or *Depot* tab and click *Diff* in the toolbar.
+. In the Diff Files dialog, the first path is the latest revision and the second is your
+workspace file; click *Diff*.
+OxideMerge opens with the depot revision on the left, in a temporary file with a name such as
+`server#head.conf`, and your workspace file on the right.
 
 To merge a conflict:
 
@@ -3895,9 +4040,17 @@ question mark.
 OxideMerge opens with *Yours* on the left, *Base* in the middle and *Theirs* on the right.
 If P4Merge opens instead, go back to *Preferences → Merge* and check that *Other application*
 is selected.
++
+.The P4V Resolve dialog
+image::p4v-resolve.png[P4V Resolve dialog with Run Merge Tool]
 . Resolve each conflict, click *Save result* and close the window.
 The result file P4V passes already holds P4V's own conflict markers; saving replaces them.
-. In the Resolve dialog, click *Accept Merged*.
+*Yours* is your workspace file itself rather than a copy, so make your changes in the middle
+pane: what you save in the left pane is written to your workspace file at once.
+. In the Resolve dialog, click *Accept Merged*, and *Yes* when P4V asks whether to replace the
+file with the merged result.
+The dialog still shows the conflict count from before the merge; P4V does not read the result
+again until you accept it.
 Check the result first: OxideMerge writes the result only when you save, so if you closed it
 without saving, the result still holds P4V's markers.
 Use *Accept Source* or *Accept Target* instead to take theirs or yours whole.
@@ -3909,11 +4062,12 @@ It cannot tell whether you saved, so check the result before you accept it.
 
 NOTE: What was tried: the Subversion commands and wrapper with Subversion 1.15, and the
 Mercurial settings with Mercurial 7.2, on macOS, with local repositories only.
-Perforce: `P4DIFF` and the `oxidemerge-p4-merge` wrapper with p4 2026.1, and P4V opening
-OxideMerge from its Resolve dialog, against a local personal server.
+Perforce: `P4DIFF`, with and without pane titles, and the `oxidemerge-p4-merge` wrapper with
+p4 2026.1, and P4V 2026.3's diff and merge settings, from *Diff* to *Accept Merged*, against a
+local personal server.
 Not tried: Windows and Linux, the Windows `.cmd` wrappers, Subversion servers reached over the
-network (`svn://`, `https://`) and their sign-in, Perforce servers reached over the network,
-P4V's diff setting, and accepting a merge in P4V after saving in OxideMerge.
+network (`svn://`, `https://`) and their sign-in, and Perforce servers reached over the
+network.
 
 [[file-manager]]
 === File manager
