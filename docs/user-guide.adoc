@@ -1338,9 +1338,6 @@ Subversion or Mercurial.
 The nearest working copy above the path determines which system is used.
 The dialog lists the recent revisions that changed the path.
 
-WARNING: Comparing with a Subversion or Mercurial revision is experimental and not fully tested:
-it was tried on macOS only, with local repositories.
-
 The revision you can enter depends on the version control system:
 
 * In Git, the version can be `HEAD`, a branch, a tag or a commit; if you leave it empty, `HEAD` is
@@ -1355,9 +1352,16 @@ The older version is shown read-only on the left, and the current file or folder
 
 Git, Subversion or Mercurial must be installed and on your `PATH`.
 Git and Mercurial read their revisions from the local repository.
-Subversion reads `BASE` from the working copy; other revisions, and the list of recent revisions,
-come from the repository server, which may ask for a sign-in that OxideMerge cannot provide.
+Subversion reads `BASE` of an ASCII path from the working copy.
+On Windows, a path that is not ASCII is read by its repository URL, because that build of
+`svn` keeps only ASCII arguments.
+`BASE` of such a file is the pristine copy stored in the working copy, and other revisions
+come from the server.
+The list of recent revisions also comes from the server, which may ask for a sign-in that
+OxideMerge cannot provide.
 Sign in with `svn` itself first.
+On Windows, Mercurial reads names in the ANSI code page, as `hg` itself does: a name that
+code page cannot spell cannot be compared.
 
 The revision is read in the background; *Cancel* stops a server that is slow or does not respond,
 and the dialog returns.
@@ -4335,12 +4339,7 @@ Answer yes only after you have saved and checked the result.
 Closing the window alone does not mean that the merge was successful.
 
 [[other-vcs]]
-=== Subversion, Mercurial and Perforce (experimental)
-
-WARNING: Support for Subversion, Mercurial and Perforce is experimental and not fully tested.
-The settings below were tried on macOS only, with local repositories and a local Perforce
-server.
-Check the result of every merge before you accept it, and report what does not work.
+=== Subversion, Mercurial and Perforce
 
 The settings in this section let Subversion, Mercurial and Perforce open OxideMerge for diffs
 and merges.
@@ -4350,10 +4349,18 @@ OxideMerge accepts the title arguments that `diff` takes: `-u` is ignored, and e
 As a result, the pane headers show revision names rather than the paths of temporary files.
 `--dl`, `--dm` and `--dr` take precedence over `-L`.
 
-Subversion and Perforce pass the files of a merge in an order that OxideMerge cannot take
-directly, so merges go through a small wrapper script.
-The wrapper fails when the merged file was not saved; if you close the window without saving,
-the conflict therefore stays unresolved.
+A merge can name OxideMerge itself, with no wrapper.
+Subversion's `merge-tool-cmd` passes five existing files: the base, theirs, mine, the merged
+file and the working copy.
+Perforce's `P4MERGE` passes four: the base, theirs, yours and the result, which may not exist
+yet.
+When the command line contains only those files, OxideMerge opens mine or yours on the left,
+the base in the middle and theirs on the right, and saves the middle pane to the result.
+If that file is unchanged when the window closes, OxideMerge exits with code 1 and the
+conflict stays unresolved.
+Any other option, including `-o`, turns this recognition off, and the arguments are used as
+they were written.
+A wrapper that reorders the files and passes `-o` still works.
 
 ==== Subversion
 
@@ -4367,28 +4374,16 @@ To use OxideMerge for every `svn diff`, set it in `~/.subversion/config`
 ----
 [helpers]
 diff-cmd = oxidemerge
-merge-tool-cmd = /path/to/oxidemerge-svn-merge
+merge-tool-cmd = oxidemerge
 ----
 
 Do not pass `-x` options to `svn diff`, because Subversion then passes them instead of `-u`.
-
-For merges, Subversion passes five paths: the base, theirs, mine, the merged file and the
-working file.
-Save the following wrapper as `oxidemerge-svn-merge`, make it executable, and name it in
-`merge-tool-cmd`:
-
-[source,sh]
-----
-#!/bin/sh
-# Subversion passes: base, theirs, mine, merged, working file.
-before=$(cksum < "$4")
-oxidemerge "$3" "$1" "$2" -o "$4" --dl Mine --dm Base --dr Theirs --wl --wr
-[ "$(cksum < "$4")" != "$before" ]
-----
+Give the full path of `oxidemerge` when it is not on your `PATH`.
 
 At Subversion's conflict prompt, choose *l* (launch), or run `svn update --accept launch`.
-Subversion marks the conflict as resolved as soon as the wrapper succeeds, that is, as soon as
-you have saved.
+Subversion marks the conflict as resolved when OxideMerge exits with code 0, that is, when the
+merged file changed.
+Closing the window without saving leaves it unresolved.
 
 ==== Mercurial
 
@@ -4438,37 +4433,16 @@ or the `P4CONFIG` file that your team uses.
 p4 runs the program named by `P4DIFF` with two files: the depot revision (in a temporary file)
 and your workspace file.
 It runs the program named by `P4MERGE` with four: base, theirs, yours and the result.
-Because OxideMerge takes the merge files in a different order, the merge goes through a
-wrapper.
+OxideMerge takes that order when those are the only arguments.
 
 To set up the p4 command line:
 
-. Save this script as `oxidemerge-p4-merge` in a folder on your `PATH`, for example
-`~/bin/oxidemerge-p4-merge`:
-+
-[source,sh]
-----
-#!/bin/sh
-# Perforce passes: base, theirs, yours, result.
-before=$(cksum < "$4")
-oxidemerge "$3" "$1" "$2" -o "$4" --dl Yours --dm Base --dr Theirs --wl --wr
-[ "$(cksum < "$4")" != "$before" ]
-----
-+
-The last line makes the wrapper fail when the result was not saved, so that the file stays
-unresolved.
-. Make the script executable:
-+
-[source,sh]
-----
-chmod +x ~/bin/oxidemerge-p4-merge
-----
 . Tell p4 to use OxideMerge with `p4 set` (or with environment variables of the same names):
 +
 [source,sh]
 ----
 p4 set P4DIFF=oxidemerge
-p4 set P4MERGE=$HOME/bin/oxidemerge-p4-merge
+p4 set P4MERGE=oxidemerge
 ----
 +
 If `oxidemerge` is not on your `PATH`, give its full path, for example
@@ -4482,7 +4456,7 @@ Windows.
 +
 ----
 P4DIFF=oxidemerge (enviro)
-P4MERGE=/Users/you/bin/oxidemerge-p4-merge (enviro)
+P4MERGE=oxidemerge (enviro)
 ----
 +
 The text in parentheses shows where p4 found each value: `(enviro)` for `p4 set` on macOS and
@@ -4534,8 +4508,9 @@ p4 then reports, for example, `//ws/f.txt - edit from //depot/main/f.txt`.
 .A conflict opened by `p4 resolve`
 image::p4-merge.png[Three-way merge opened by p4 resolve]
 
-If you close the window without saving, p4 reports *Execution Failed* and the file stays
-unresolved; typing *ae* then warns that the file still has change markers.
+If you close the window without saving, OxideMerge exits with code 1. p4 reports
+*Execution Failed* and the file stays unresolved; typing *ae* then warns that the file
+still has change markers.
 Run `p4 resolve` again to start over.
 
 ===== P4V
@@ -4617,19 +4592,19 @@ Check the result first: OxideMerge writes the result only when you save, so if y
 without saving, the result still contains P4V's markers.
 To take theirs or yours whole, use *Accept Source* or *Accept Target* instead.
 
-On Windows, write a wrapper as a `.cmd` file that contains the line
-`oxidemerge.exe "%3" "%1" "%2" -o "%4" --dl Yours --dm Base --dr Theirs --wl --wr`
-(with *Mine* rather than *Yours* for Subversion).
-Such a wrapper cannot tell whether you saved, so check the result before you accept it.
-
-NOTE: What was tried: the Subversion commands and wrapper with Subversion 1.15, and the
-Mercurial settings with Mercurial 7.2, on macOS, with local repositories only.
-Perforce: `P4DIFF`, with and without pane titles, and the `oxidemerge-p4-merge` wrapper with
-p4 2026.1, and P4V 2026.3's diff and merge settings, from *Diff* to *Accept Merged*, against a
-local personal server.
-Not tried: Windows and Linux, the Windows `.cmd` wrappers, Subversion servers reached over the
-network (`svn://`, `https://`) and their sign-in, and Perforce servers reached over the
-network.
+NOTE: Checked on Windows with SlikSVN 1.14.2, Mercurial 7.1.2 and p4/p4d 2026.1, using local
+Subversion and Mercurial repositories: *Compare with revision*, including a Subversion file
+whose name is not ASCII, and Mercurial with a name the ANSI code page can spell.
+p4d 2026.1 starts, and then requires a password before the first user can be created, so a
+resolve was not run against that server.
+The four-file merge and the exit code of an unchanged result are covered by tests.
+P4V keeps the argument string above.
+Its diff setting, and accepting a merge in P4V after saving, were tried earlier on macOS with
+P4V 2026.3 and were not repeated on Windows.
+A Subversion or Perforce server reached over the network can still ask for a sign-in that
+OxideMerge cannot give.
+Sign in with `svn` or `p4` first.
+Subversion and Mercurial tests also run on Linux in the Docker test environment.
 
 [[file-manager]]
 === File manager

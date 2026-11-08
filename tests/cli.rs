@@ -1738,18 +1738,21 @@ fn subversion_working_copies_compare_with_their_revisions() {
     let d = tmp();
     let d = d.path();
     let svn = |dir: &Path, program: &str, args: &[&str]| {
-        Command::new(program)
-            .args(args)
-            .current_dir(dir)
-            .env(
+        let mut cmd = Command::new(program);
+        cmd.args(args).current_dir(dir);
+        // A UTF-8 locale is how `svn` is given names on Unix. Windows uses the
+        // ANSI code page instead, and a UTF-8 locale does not change that.
+        if !cfg!(windows) {
+            cmd.env(
                 "LC_CTYPE",
                 if cfg!(target_os = "macos") {
                     "UTF-8"
                 } else {
                     "C.UTF-8"
                 },
-            )
-            .output()
+            );
+        }
+        cmd.output()
     };
     let repo = d.join("repo");
     if svn(d, "svnadmin", &["create", repo.to_str().unwrap()]).is_err() {
@@ -1842,6 +1845,99 @@ fn subversion_working_copies_compare_with_their_revisions() {
     assert!(run.stderr.contains("invalid revision"), "{}", run.stderr);
 }
 
+/// A letter Mercurial can store here. On Windows it has to survive the ANSI code page:
+/// `é` does on 1252, and `中` does on 950. A page that has neither still runs the ASCII cases.
+fn mercurial_letter() -> &'static str {
+    for letter in ["é", "中", "я", "ä"] {
+        if ansi_round_trips(letter) {
+            return letter;
+        }
+    }
+    "x"
+}
+
+fn ansi_round_trips(text: &str) -> bool {
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetACP() -> u32;
+            fn WideCharToMultiByte(
+                code_page: u32,
+                flags: u32,
+                wide: *const u16,
+                wide_len: i32,
+                multi: *mut u8,
+                multi_len: i32,
+                default_char: *const u8,
+                used_default: *mut i32,
+            ) -> i32;
+            fn MultiByteToWideChar(
+                code_page: u32,
+                flags: u32,
+                multi: *const u8,
+                multi_len: i32,
+                wide: *mut u16,
+                wide_len: i32,
+            ) -> i32;
+        }
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        wide.push(0);
+        let cp = unsafe { GetACP() };
+        if cp == 65001 {
+            return true;
+        }
+        let bytes_len = unsafe {
+            WideCharToMultiByte(
+                cp,
+                0,
+                wide.as_ptr(),
+                -1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        if bytes_len <= 1 {
+            return false;
+        }
+        let mut bytes = vec![0u8; bytes_len as usize];
+        let wrote = unsafe {
+            WideCharToMultiByte(
+                cp,
+                0,
+                wide.as_ptr(),
+                -1,
+                bytes.as_mut_ptr(),
+                bytes_len,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        if wrote <= 1 {
+            return false;
+        }
+        let wide_len = unsafe {
+            MultiByteToWideChar(cp, 0, bytes.as_ptr(), -1, std::ptr::null_mut(), 0)
+        };
+        if wide_len <= 1 {
+            return false;
+        }
+        let mut back = vec![0u16; wide_len as usize];
+        unsafe {
+            MultiByteToWideChar(cp, 0, bytes.as_ptr(), -1, back.as_mut_ptr(), wide_len);
+        }
+        back.pop();
+        String::from_utf16(&back).ok().as_deref() == Some(text)
+    }
+}
+
 #[test]
 fn mercurial_repositories_compare_with_their_revisions() {
     let d = tmp();
@@ -1850,15 +1946,19 @@ fn mercurial_repositories_compare_with_their_revisions() {
     std::fs::create_dir(&repo).unwrap();
     let hgrc = d.join("hgrc");
     std::fs::write(&hgrc, "").unwrap();
+    // Windows Mercurial reads names in the ANSI code page. Forcing UTF-8 makes a name
+    // that code page can spell fail to add. Unix builds already use UTF-8.
     let hg = |args: &[&str]| {
-        Command::new("hg")
-            .args(args)
+        let mut cmd = Command::new("hg");
+        cmd.args(args)
             .current_dir(&repo)
             .env("HGRCPATH", &hgrc)
             .env("HGUSER", "test")
-            .env("HGPLAIN", "1")
-            .env("HGENCODING", "utf-8")
-            .output()
+            .env("HGPLAIN", "1");
+        if !cfg!(windows) {
+            cmd.env("HGENCODING", "utf-8");
+        }
+        cmd.output()
     };
     if hg(&["init"]).is_err() {
         eprintln!("Mercurial is not installed; skipped");
@@ -1872,8 +1972,11 @@ fn mercurial_repositories_compare_with_their_revisions() {
             String::from_utf8_lossy(&out.stderr)
         );
     };
-    // Brackets would be a pattern to hg, and letters that are not ASCII.
-    files(&repo, &[("f.txt", "one\n"), ("a b[x]/é.txt", "x\n")]);
+    // Brackets would be a pattern to hg. The letter is one this system's ANSI code page
+    // can spell: Mercurial on Windows cannot open a name outside that page.
+    let extra = mercurial_letter();
+    let nested = format!("a b[x]/{extra}.txt");
+    files(&repo, &[("f.txt", "one\n"), (nested.as_str(), "x\n")]);
     ok(&["add", "-q"]);
     ok(&["commit", "-q", "-m", "first"]);
     files(&repo, &[("f.txt", "two\n"), ("later.txt", "new\n")]);
@@ -1883,7 +1986,7 @@ fn mercurial_repositories_compare_with_their_revisions() {
 
     let run = oxidemerge_with_env(&repo, &["--cli", "--rev", ".", "f.txt"], &env);
     assert_eq!(run.code, 0, "unchanged since the parent: {}", run.stderr);
-    files(&repo, &[("f.txt", "three\n"), ("a b[x]/é.txt", "y\n")]);
+    files(&repo, &[("f.txt", "three\n"), (nested.as_str(), "y\n")]);
     // No revision is the working copy's parent, and the title says which.
     let run = oxidemerge_with_env(&repo, &["--cli", "--rev", "", "f.txt"], &env);
     assert_eq!(run.code, 1, "{}", run.stderr);
@@ -1896,7 +1999,7 @@ fn mercurial_repositories_compare_with_their_revisions() {
     let run = oxidemerge_with_env(&repo, &["--cli", "--rev", "0", "f.txt"], &env);
     assert_eq!(run.code, 1, "{}", run.stderr);
     assert!(run.stdout.contains("-one"), "{}", run.stdout);
-    let run = oxidemerge_with_env(&repo, &["--cli", "--rev", ".", "a b[x]/é.txt"], &env);
+    let run = oxidemerge_with_env(&repo, &["--cli", "--rev", ".", &nested], &env);
     assert_eq!(run.code, 1, "{}", run.stderr);
     assert!(
         run.stdout.contains("-x") && run.stdout.contains("+y"),

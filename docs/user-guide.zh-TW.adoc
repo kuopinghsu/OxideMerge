@@ -1146,9 +1146,6 @@ XML 報告將這些資訊放在 `<table-match>` 元素中。
 路徑上方最近的工作複本，決定使用哪一種版本控制系統。
 對話方塊會列出最近變更過該路徑的修訂版本供您選擇。
 
-WARNING: 與 Subversion 或 Mercurial 修訂版本比較屬於實驗性功能，尚未完整測試：
-僅在 macOS 上以本機儲存庫試用過。
-
 可以輸入的版本取決於版本控制系統：
 
 * 在 Git 中，版本可以是 `HEAD`、分支、標籤或某次提交；留空即為 `HEAD`。
@@ -1161,8 +1158,13 @@ WARNING: 與 Subversion 或 Mercurial 修訂版本比較屬於實驗性功能，
 
 必須先安裝 Git、Subversion 或 Mercurial，並將其加入 `PATH`。
 Git 與 Mercurial 會從本機儲存庫讀取修訂版本。
-Subversion 會從工作複本讀取 `BASE`；其他修訂版本與最近修訂版本清單則來自儲存庫伺服器，
-而伺服器可能要求 OxideMerge 無法提供的登入，請先使用 `svn` 本身登入。
+路徑為 ASCII 時，Subversion 會從工作複本讀取 `BASE`。
+在 Windows 上，不是 ASCII 的路徑會改以儲存庫 URL 讀取，因為該版 `svn` 只保留 ASCII 參數；
+這類檔案的 `BASE` 是工作複本裡的原始複本，其他修訂版本則來自伺服器。
+最近修訂版本清單也來自伺服器，而伺服器可能要求 OxideMerge 無法提供的登入，
+請先使用 `svn` 本身登入。
+在 Windows 上，Mercurial 以 ANSI 字碼頁讀取名稱，這與 `hg` 本身相同：
+字碼頁拼不出來的名稱無法比較。
 
 修訂版本會在背景讀取；伺服器緩慢或沒有回應時，按「取消」即可停止，並回到對話方塊。
 按下「比較」時，Mercurial 會讀取儲存庫本身的 `.hg/hgrc`，如同會套用 Git 的篩選器；
@@ -3754,11 +3756,7 @@ Jupyter notebook 等 OxideMerge 平時會讀成文字的檔案，在這裡會以
 只是關閉視窗，並不代表合併成功。
 
 [[other-vcs]]
-=== Subversion、Mercurial 與 Perforce（實驗性）
-
-WARNING: 對 Subversion、Mercurial 與 Perforce 的支援屬於實驗性功能，尚未完整測試。
-下列設定僅在 macOS 上以本機儲存庫與本機 Perforce 伺服器試過。
-接受任何合併結果前請先檢查，若有無法運作之處請回報。
+=== Subversion、Mercurial 與 Perforce
 
 本節的設定可讓 Subversion、Mercurial 與 Perforce 在比較與合併時開啟 OxideMerge。
 
@@ -3767,10 +3765,14 @@ OxideMerge 接受 `diff` 用來指定標題的參數：`-u` 會被忽略，
 因此窗格標題會顯示修訂版本名稱，而不是暫存檔的路徑。
 `--dl`、`--dm` 與 `--dr` 的優先順序高於 `-L`。
 
-Subversion 與 Perforce 傳入合併檔案的順序，OxideMerge 無法直接使用，
-因此合併需要透過一個小型包裝指令碼。
-若合併結果檔沒有儲存，包裝指令碼會回報失敗；
-因此未儲存就關閉視窗時，衝突仍會保持未解決。
+合併可以直接指定 OxideMerge 本身，不必再寫包裝指令碼。
+Subversion 的 `merge-tool-cmd` 會傳入五個已存在的檔案：基底、對方版本、我的版本、合併結果檔與工作檔。
+Perforce 的 `P4MERGE` 會傳入四個：基底、對方版本、您的版本與結果，結果當時可以還不存在。
+命令列只有這些檔案時，OxideMerge 會在左側開啟我的版本或您的版本、中間開啟基底、右側開啟對方版本，
+並將中間窗格存到結果檔。
+關閉視窗時若該檔案沒有變更，OxideMerge 會以結束代碼 1 離開，衝突維持未解決。
+只要還有其他選項（包括 `-o`），就不會採用這個辨識方式，參數會照原樣使用。
+會重新排列檔案並傳入 `-o` 的包裝指令碼仍然可用。
 
 ==== Subversion
 
@@ -3784,26 +3786,15 @@ Subversion 會傳入 `-u -L <舊標題> -L <新標題> <舊檔> <新檔>`，
 ----
 [helpers]
 diff-cmd = oxidemerge
-merge-tool-cmd = /path/to/oxidemerge-svn-merge
+merge-tool-cmd = oxidemerge
 ----
 
 請勿對 `svn diff` 傳入 `-x` 選項，否則 Subversion 會改傳這些選項，而不傳 `-u`。
-
-合併時，Subversion 會傳入五個路徑：基底、對方版本、我的版本、合併結果檔與工作檔。
-請將下列包裝指令碼存為 `oxidemerge-svn-merge`，設為可執行，
-並在 `merge-tool-cmd` 中指定它：
-
-[source,sh]
-----
-#!/bin/sh
-# Subversion passes: base, theirs, mine, merged, working file.
-before=$(cksum < "$4")
-oxidemerge "$3" "$1" "$2" -o "$4" --dl Mine --dm Base --dr Theirs --wl --wr
-[ "$(cksum < "$4")" != "$before" ]
-----
+若 `oxidemerge` 不在 `PATH` 中，請使用完整路徑。
 
 在 Subversion 的衝突提示中選擇 *l*（launch），或執行 `svn update --accept launch`。
-包裝指令碼一旦成功（也就是您已儲存），Subversion 就會將衝突標示為已解決。
+OxideMerge 以結束代碼 0 離開（也就是合併結果檔有變更）時，Subversion 會將衝突標示為已解決。
+未儲存就關閉視窗，衝突會維持未解決。
 
 ==== Mercurial
 
@@ -3850,35 +3841,16 @@ oxidemerge.checkchanged = true
 
 p4 會以兩個檔案執行 `P4DIFF` 指定的程式：depot 修訂版本（暫存檔）與您工作區中的檔案；
 並以四個檔案執行 `P4MERGE` 指定的程式：基底、對方版本、您的版本與結果。
-由於 OxideMerge 接受合併檔案的順序不同，合併需要透過包裝指令碼。
+命令列只有這些檔案時，OxideMerge 會接受這個順序。
 
 設定 p4 命令列的步驟如下：
 
-. 將下列指令碼存成 `PATH` 中某個資料夾內的 `oxidemerge-p4-merge`，例如
-`~/bin/oxidemerge-p4-merge`：
-+
-[source,sh]
-----
-#!/bin/sh
-# Perforce passes: base, theirs, yours, result.
-before=$(cksum < "$4")
-oxidemerge "$3" "$1" "$2" -o "$4" --dl Yours --dm Base --dr Theirs --wl --wr
-[ "$(cksum < "$4")" != "$before" ]
-----
-+
-最後一行會在結果未儲存時讓包裝指令碼失敗，使檔案維持未解決。
-. 將指令碼設為可執行：
-+
-[source,sh]
-----
-chmod +x ~/bin/oxidemerge-p4-merge
-----
 . 以 `p4 set`（或同名的環境變數）讓 p4 使用 OxideMerge：
 +
 [source,sh]
 ----
 p4 set P4DIFF=oxidemerge
-p4 set P4MERGE=$HOME/bin/oxidemerge-p4-merge
+p4 set P4MERGE=oxidemerge
 ----
 +
 若 `oxidemerge` 不在 `PATH` 中，請使用完整路徑，例如 macOS 上的
@@ -3891,7 +3863,7 @@ p4 會將此回報為 *Execution Failed*。
 +
 ----
 P4DIFF=oxidemerge (enviro)
-P4MERGE=/Users/you/bin/oxidemerge-p4-merge (enviro)
+P4MERGE=oxidemerge (enviro)
 ----
 +
 括號中的文字表示 p4 從何處取得該值：`(enviro)` 代表 macOS 與 Linux 上的 `p4 set`，
@@ -3939,7 +3911,7 @@ OxideMerge 會開啟，左側為 *Yours*、中間為 *Base*、右側為 *Theirs*
 .由 `p4 resolve` 開啟的衝突
 image::p4-merge.png[由 p4 resolve 開啟的三方合併]
 
-若未儲存就關閉視窗，p4 會回報 *Execution Failed*，檔案仍維持未解決；
+若未儲存就關閉視窗，OxideMerge 會以結束代碼 1 離開，p4 會回報 *Execution Failed*，檔案仍維持未解決；
 此時輸入 *ae* 會警告檔案仍含有變更標記。
 請再次執行 `p4 resolve` 重新開始。
 
@@ -4013,17 +3985,17 @@ P4V 傳入的結果檔案已含有 P4V 自己的衝突標記；儲存後會取�
 請先檢查結果：OxideMerge 只在您儲存時寫入結果，若未儲存就關閉，結果仍會保留 P4V 的標記。
 若要整個採用對方版本或您的版本，請改用 *Accept Source* 或 *Accept Target*。
 
-在 Windows 上，請將包裝指令碼寫成 `.cmd` 檔，內容為
-`oxidemerge.exe "%3" "%1" "%2" -o "%4" --dl Yours --dm Base --dr Theirs --wl --wr`
-（Subversion 請用 *Mine* 取代 *Yours*）。
-這種包裝指令碼無法判斷您是否已儲存，因此接受結果前請先檢查。
-
-NOTE: 已試過：在 macOS 上，以 Subversion 1.15 試過 Subversion 的命令與包裝指令碼，
-以 Mercurial 7.2 試過 Mercurial 的設定，且僅使用本機儲存庫。
-Perforce：以 p4 2026.1 試過 `P4DIFF`（含與不含窗格標題）與 `oxidemerge-p4-merge` 包裝指令碼，
-並以 P4V 2026.3 試過比較與合併設定，從 *Diff* 到 *Accept Merged*，皆使用本機個人伺服器。
-尚未試過：Windows 與 Linux、Windows 的 `.cmd` 包裝指令碼、透過網路連線的 Subversion 伺服器
-（`svn://`、`https://`）及其登入，以及透過網路連線的 Perforce 伺服器。
+NOTE: 已在 Windows 上以 SlikSVN 1.14.2、Mercurial 7.1.2 與 p4/p4d 2026.1 檢查，
+使用本機的 Subversion 與 Mercurial 儲存庫：包含「與修訂版本比較」、
+名稱不是 ASCII 的 Subversion 檔案，以及 ANSI 字碼頁拼得出來的 Mercurial 名稱。
+p4d 2026.1 可以啟動，但在建立第一個使用者之前就要求密碼，因此沒有對該伺服器執行 resolve。
+四個檔案的合併，以及結果未變更時的結束代碼，由測試涵蓋。
+P4V 仍使用上面的參數字串。
+它的比較設定，以及在 P4V 中於儲存後接受合併，先前曾在 macOS 上以 P4V 2026.3 試過，
+這次沒有在 Windows 上重做。
+透過網路連線的 Subversion 或 Perforce 伺服器仍可能要求 OxideMerge 無法提供的登入，
+請先使用 `svn` 或 `p4` 登入。
+Subversion 與 Mercurial 的測試也會在 Linux 的 Docker 測試環境中執行。
 
 [[file-manager]]
 === 檔案管理員

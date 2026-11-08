@@ -474,16 +474,14 @@ git config --global mergetool.oxidemerge.trustExitCode false
 If the program is not in your `PATH`, use its full path in these commands. For more
 details, see the [user guide](docs/user-guide.adoc).
 
-### Subversion, Mercurial and Perforce (experimental)
-
-> Support for Subversion, Mercurial and Perforce is experimental and not fully tested; see
-> [Known limitations](#known-limitations) for details.
+### Subversion, Mercurial and Perforce
 
 `svn diff --diff-cmd oxidemerge` works as it is: OxideMerge accepts the `-u` and `-L`
 titles that Subversion passes, so the panes show revision names. Mercurial (`extdiff` and
 `merge-tools`) and Perforce (`P4DIFF`, `P4MERGE`, or P4V's *Diff* and *Merge* preferences)
-are set up in their own configuration; merges in Subversion and the p4 command line go
-through a short wrapper script. See
+are set up in their own configuration. Subversion's `merge-tool-cmd` and Perforce's
+`P4MERGE` can be `oxidemerge` itself: the files are reordered, and an unchanged result
+exits with code 1 so the conflict stays unresolved. See
 [Subversion, Mercurial and Perforce](docs/user-guide.adoc#other-vcs) in the user guide.
 
 ### File managers
@@ -614,11 +612,11 @@ shortcuts use Command instead of Ctrl. The app shows the right keys for your sys
 
 - WinMerge project files and filter files work. WinMerge plugin DLLs and scripts do not
   work.
-- Support for Subversion, Mercurial and Perforce (diff and merge setup, and *Compare with
-  revision* for Subversion and Mercurial; Perforce has no *Compare with revision*) is
-  experimental and not fully tested: it was tried on macOS only, with local repositories
-  and a local Perforce server. Windows, Linux, and Subversion and Perforce servers over
-  the network have not been tried.
+- Perforce has no *Compare with revision*. On Windows, Mercurial can only open a file name
+  the ANSI code page can spell, which is the same limit `hg` has. A Subversion or Perforce
+  server can still ask for a sign-in that OxideMerge cannot give; sign in with `svn` or
+  `p4` first. P4V uses its own argument string, so closing it without saving does not by
+  itself leave the conflict unresolved.
 - The translations were made with machine help. Native speakers have not reviewed them
   yet.
 

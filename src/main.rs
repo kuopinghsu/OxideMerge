@@ -1240,6 +1240,18 @@ fn run_analysis(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     )
 }
 
+/// True when the command line named paths and no option. Defaults such as the page size do
+/// not count: only an option the user typed does.
+fn command_line_only_paths(matches: &clap::ArgMatches) -> bool {
+    <Cli as clap::CommandFactory>::command()
+        .get_arguments()
+        .all(|arg| {
+            let id = arg.get_id().as_str();
+            id == "paths"
+                || matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine)
+        })
+}
+
 fn cli_desc(cli: &Cli, i: usize) -> Option<String> {
     let desc = match (cli.paths.len(), i) {
         (_, 0) => cli.dl.clone(),
@@ -1678,6 +1690,23 @@ fn main() -> ExitCode {
         paths = shell::compare_paths(paths);
     }
 
+    // Subversion's merge-tool-cmd and Perforce's P4MERGE pass only files, in their own order.
+    // Any other option means the arguments were written out, and stay as they are.
+    let mut merge_result = None;
+    if command_line_only_paths(&matches) {
+        if let Some(merge) = core::vcs::external_merge(&paths) {
+            cli.dl = Some(merge.labels[0].clone());
+            cli.dm = Some(merge.labels[1].clone());
+            cli.dr = Some(merge.labels[2].clone());
+            cli.wl = merge.read_only[0];
+            cli.wm = merge.read_only[1];
+            cli.wr = merge.read_only[2];
+            cli.output = Some(merge.output.clone());
+            merge_result = Some(merge.output);
+            paths = merge.paths;
+        }
+    }
+
     // What each job of --job starts from: the settings, without this command line's options.
     let base_cfg = cfg.clone();
     apply_cli_options(&cli, &mut cfg);
@@ -1815,6 +1844,11 @@ fn main() -> ExitCode {
             .map(|d| d.join("app.ron")),
         ..Default::default()
     };
+    // An unchanged result leaves the conflict unresolved. Subversion and Perforce treat an
+    // exit code of 1 that way; saving the merge changes the file, and creating it does too.
+    let merge_digest = merge_result
+        .as_ref()
+        .map(|path| core::vcs::file_digest(path));
     let result = eframe::run_native(
         "OxideMerge",
         options,
@@ -1826,10 +1860,43 @@ fn main() -> ExitCode {
     );
     match result {
         Ok(()) if ui::app::screenshot_failed() => ExitCode::from(2),
+        Ok(())
+            if merge_result.as_ref().is_some_and(|path| {
+                core::vcs::file_digest(path) == merge_digest.unwrap_or(None)
+            }) =>
+        {
+            ExitCode::from(1)
+        }
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn files_alone_are_the_only_command_a_merge_tool_is_recognized_in() {
+        let plain = <Cli as clap::CommandFactory>::command().get_matches_from([
+            "oxidemerge",
+            "base",
+            "theirs",
+            "mine",
+            "merged",
+        ]);
+        assert!(command_line_only_paths(&plain));
+        let flagged = <Cli as clap::CommandFactory>::command().get_matches_from([
+            "oxidemerge",
+            "--wl",
+            "base",
+            "theirs",
+            "mine",
+            "merged",
+        ]);
+        assert!(!command_line_only_paths(&flagged));
     }
 }
