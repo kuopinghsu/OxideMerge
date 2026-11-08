@@ -930,9 +930,10 @@ fn xml_attr(e: &quick_xml::events::BytesStart<'_>, name: &str) -> Option<String>
     })
 }
 
-/// What `svn` or `hg` printed. UTF-8 is kept (Subversion's XML is UTF-8 even on Windows).
-/// Anything else is the ANSI code page, which is how Windows Mercurial prints a name.
-fn tool_text(bytes: &[u8]) -> String {
+/// What `svn`, `hg` or `git` printed. UTF-8 is kept (Subversion's XML is UTF-8 even on
+/// Windows). Anything else is the ANSI code page, which is how Windows Mercurial prints a name
+/// and Windows Subversion its messages.
+pub(super) fn tool_text(bytes: &[u8]) -> String {
     #[cfg(windows)]
     let ansi = ansi_encoding();
     #[cfg(not(windows))]

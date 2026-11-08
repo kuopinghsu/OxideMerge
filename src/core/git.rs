@@ -137,7 +137,7 @@ fn finish(
     stderr: &[u8],
 ) -> Result<Vec<u8>> {
     if !status.success() {
-        let err = String::from_utf8_lossy(stderr);
+        let err = super::vcs::tool_text(stderr);
         let first = err.lines().find(|l| !l.trim().is_empty());
         bail!(
             "{}",
