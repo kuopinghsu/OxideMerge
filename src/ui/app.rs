@@ -1759,6 +1759,18 @@ impl LastRemote {
     }
 }
 
+/// An archive being opened that is encrypted: its password is asked for, then what was being
+/// opened is opened again.
+struct ArchivePrompt {
+    req: OpenRequest,
+    archive: PathBuf,
+    /// Whether the password given before was wrong.
+    wrong: bool,
+    password: zeroize::Zeroizing<String>,
+    /// Whether the field still needs focus (only the first frame it shows).
+    focus: bool,
+}
+
 /// A server's questions while signing in, put to the user in a window of their own (see
 /// [`install_asker`]).
 struct AskRequest {
@@ -1948,6 +1960,10 @@ pub struct OxideMergeApp {
     /// other threads, and the one being answered.
     asks: Option<std::sync::mpsc::Receiver<AskRequest>>,
     ask: Option<AskRequest>,
+    archive_password: Option<ArchivePrompt>,
+    /// The archives given a password while opening, whose passwords are forgotten once it
+    /// opened or was given up on (extractions keep their own).
+    archive_passwords: Vec<PathBuf>,
     /// A folder report with file differences being written on another thread: its file.
     report_job: Option<(PathBuf, std::sync::mpsc::Receiver<Result<(), String>>)>,
     /// Whether the report being written opens in the system's viewer once done, to be printed.
@@ -2818,6 +2834,8 @@ impl OxideMergeApp {
             last_remote: None,
             asks: Some(install_asker(&cc.egui_ctx)),
             ask: None,
+            archive_password: None,
+            archive_passwords: Vec::new(),
             rev_load: None,
             report_job: None,
             report_opens: false,
@@ -3179,13 +3197,101 @@ impl OxideMergeApp {
         let staged = req.paths.iter().any(|p| self.is_staged(p));
         let recent: Option<Vec<String>> = (!req.skip_recent && !staged && req.paths.len() >= 2)
             .then(|| req.paths.iter().map(|p| p.display().to_string()).collect());
-        match self.try_open(req) {
+        let retry = req.clone();
+        let result = self.try_open(req);
+        if let Some(n) = result
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<archive::NeedsPassword>())
+        {
+            self.archive_password = Some(ArchivePrompt {
+                archive: n.archive.clone(),
+                wrong: n.wrong,
+                req: retry,
+                password: Default::default(),
+                focus: true,
+            });
+            return;
+        }
+        self.forget_archive_passwords();
+        match result {
             Ok(()) => {
                 if let Some(r) = recent {
                     self.cfg.add_recent_compare(&r);
                 }
             }
             Err(e) => self.error(format!("{e:#}")),
+        }
+    }
+
+    /// The password of an encrypted archive being opened (see [`ArchivePrompt`]).
+    fn archive_password_dialog(&mut self, ctx: &egui::Context) {
+        let Some(p) = &mut self.archive_password else {
+            return;
+        };
+        let (mut ok, mut cancel) = (false, false);
+        // The Enter that opened the archive is not taken as an answer.
+        let first = std::mem::take(&mut p.focus);
+        let modal = egui::Modal::new(egui::Id::unique("archive_password_dialog")).show(ctx, |ui| {
+            ui.set_min_width(380.0);
+            ui.set_max_width(520.0);
+            if widgets::dialog_title(ui, &plain(tr("label.archive_password_title"))) {
+                cancel = true;
+            }
+            let key = if p.wrong {
+                "msg.archive_password_wrong"
+            } else {
+                "msg.archive_password_needed"
+            };
+            let file = p.archive.display().to_string();
+            ui.add(egui::Label::new(trf(key, &[("file", file)])).wrap());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(tr("label.archive_password"));
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut *p.password)
+                        .password(true)
+                        .desired_width(240.0),
+                );
+                if first {
+                    field.request_focus();
+                }
+            });
+            let ready = !p.password.is_empty();
+            widgets::dialog_footer(ui, |ui| {
+                ui.add_enabled_ui(ready, |ui| {
+                    if widgets::primary_button(ui, tr("btn.ok")).clicked()
+                        || (ready && !first && ui.input(|i| i.key_pressed(Key::Enter)))
+                    {
+                        ok = true;
+                    }
+                });
+                if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
+                    || ui.input(|i| i.key_pressed(Key::Escape))
+                {
+                    cancel = true;
+                }
+            });
+        });
+        if modal.should_close() {
+            cancel = true;
+        }
+        if cancel {
+            self.archive_password = None;
+            self.forget_archive_passwords();
+        } else if ok {
+            if let Some(mut p) = self.archive_password.take() {
+                let password = std::mem::take(&mut p.password);
+                archive::give_password(&p.archive, password);
+                self.archive_passwords.push(p.archive.clone());
+                self.open(p.req);
+            }
+        }
+    }
+
+    fn forget_archive_passwords(&mut self) {
+        for p in self.archive_passwords.drain(..) {
+            archive::forget_password(&p);
         }
     }
 
@@ -4697,6 +4803,8 @@ impl OxideMergeApp {
         self.refresh_saved_folders();
         let closed = self.tabs.remove(i);
         self.hand_down_remote(&closed);
+        drop(closed);
+        archive::forget_removed();
         self.shown_active = None;
         if i < self.active {
             self.active -= 1;
@@ -4782,6 +4890,8 @@ impl OxideMergeApp {
         for t in &closed {
             self.hand_down_remote(t);
         }
+        drop(closed);
+        archive::forget_removed();
         self.active = active;
         self.shown_active = None;
         self.close_queue = ask;
@@ -10076,6 +10186,7 @@ impl eframe::App for OxideMergeApp {
             || self.remote_load.is_some()
             || self.host_prompt.is_some()
             || self.ask.is_some()
+            || self.archive_password.is_some()
             || self.repack.is_some()
             || self.upload.is_some()
             || self.reload_prompt.is_some()
@@ -10283,6 +10394,7 @@ impl eframe::App for OxideMergeApp {
         self.rev_load_dialog(ctx);
         self.remote_connect_dialog(ctx);
         self.ask_dialog(ctx);
+        self.archive_password_dialog(ctx);
         self.remote_load_dialog(ctx);
         self.host_prompt_dialog(ctx);
         self.repack_dialog(ctx);

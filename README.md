@@ -50,9 +50,11 @@ pages.
 - **Synchronize two folders:** preview how one folder would be made to match the other, or
   only brought up to date from it, then apply the changes after you confirm. If applying
   fails or you stop it, the changes made so far are undone.
-- Open ZIP, TAR, 7z and other supported archives as folders. Edit, copy, merge or delete
-  their files and save to write the changes back into the archive; a slow-to-compress
-  `.tar.xz` or 7z is written in the background.
+- Open ZIP, TAR, 7z and other supported archives as folders, including password-protected
+  ZIP and 7z archives and ZIP entries compressed with any common method. Edit, copy, merge or
+  delete their files and save to write the changes back into the archive, which stays
+  encrypted with the same password; a slow-to-compress `.tar.xz` or 7z is written in the
+  background.
 - Compare a file or folder with a Git, Subversion or Mercurial revision.
 - **Compare over SFTP and FTP:** connect to a server over SFTP, FTPS or plain FTP by host,
   port, user, and a password, a private key or `ssh-agent`, and fetch a file or folder to
@@ -566,8 +568,8 @@ shortcuts use Command instead of Ctrl. The app shows the right keys for your sys
 ### Files and folders
 
 - Saving an edited archive writes a new archive file in place of the original. A review
-  snapshot or a web page tree kept as a folder stays read-only. RAR files are not
-  supported.
+  snapshot or a web page tree kept as a folder stays read-only, and so does a signed
+  package. RAR files and archives split into parts are not supported.
 - Unpacker plugins run external commands. They work the same way in file comparisons,
   folder comparisons of full contents, the command line and reports, and a plugin is
   always used in preference to what OxideMerge reads itself. The presets need conversion

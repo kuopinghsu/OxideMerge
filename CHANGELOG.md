@@ -135,6 +135,16 @@ uses its section of this file as the release notes.
   nowhere for its changes to go back to, and so do signed packages (`.apk`, `.ipa`,
   `.appx`, `.msix`, `.crx`, `.xpi`, or a zip with a `META-INF` signature) and archives
   inside them.
+- **Password-protected archives, every ZIP compression method and `.tar.zst`:** a ZIP
+  encrypted with ZipCrypto or WinZip AES, or a 7z encrypted with AES (its file names too or
+  not), asks for its password in an *Archive password* window when it is opened, again if
+  the password was wrong. Saving keeps it encrypted: changed and new entries are encrypted
+  with the same password the way the archive was, unchanged AES entries and 7z blocks are
+  copied as they were, and a 7z with encrypted names keeps them encrypted. The password is
+  kept only in memory while the compare is open and is overwritten there afterwards. ZIP
+  entries compressed with bzip2, LZMA, xz, Zstandard, PPMd or Deflate64 are now read, and a
+  changed one keeps its method (Deflate for LZMA and Deflate64, which can only be read).
+  `.tar.zst` / `.tzst` archives open and save like the other TAR formats.
 - **Moved blocks in binary comparisons:** *Moved blocks* on the binary toolbar highlights
   identical bytes at different offsets, in the hexadecimal and text columns and in the
   location pane: data shifted up to 128 bytes by an insertion or deletion, and blocks of

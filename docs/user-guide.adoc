@@ -1788,18 +1788,36 @@ columns, tables and ligatures may not come out as they look; a converter such as
 OxideMerge extracts archives and compares them as folders. It supports these formats:
 
 * ZIP-based formats: `.zip`, `.jar`, `.apk`, `.docx`, `.xlsx`, `.odt`, `.epub`, `.nupkg` and
-  more.
-* `.tar`, `.tar.gz` / `.tgz`, `.tar.bz2` / `.tbz2` and `.tar.xz` / `.txz`.
+  more, with entries stored or compressed with Deflate, Deflate64, bzip2, LZMA, xz, Zstandard
+  or PPMd.
+* `.tar`, `.tar.gz` / `.tgz`, `.tar.bz2` / `.tbz2`, `.tar.xz` / `.txz` and `.tar.zst` /
+  `.tzst`.
 * `.7z`.
+
+A password-protected ZIP (with either the original ZIP encryption, "ZipCrypto", or WinZip AES)
+or 7z (including one whose file names are encrypted too) asks for its password in an *Archive
+password* window when it is opened; a wrong password asks again, and *Cancel* gives up opening
+it. The password is kept only in memory, only while the compare is open, and is overwritten
+there once it is no longer needed.
 
 Edits to the extracted files are saved back into the archive: copying, deleting, merging or
 editing a file and then saving writes a new archive in place of the original, keeping its
 permissions. Only an archive whose files changed is written, and the entries you didn't change
 are kept exactly as they were, with their dates, compression and order; changed entries get the
-current time. A 7z packs entries together into compressed blocks: a block holding only entries
-you didn't change is copied as it was, and any other block is compressed again with LZMA2,
-its entries keeping their dates and attributes. A `.tar.xz` is compressed again as `xz` does by
-default. Compressing a `.tar.xz` or a 7z can take a while for a large archive, so it is written
+current time. A changed ZIP entry keeps its compression method; one compressed with Deflate64 or
+LZMA, which can only be read, is compressed with Deflate instead, and so is an unchanged LZMA
+entry, as other tools refuse a copied one. A 7z packs entries together into compressed blocks:
+a block holding only entries you didn't change is copied as it was, and any other block is
+compressed again with LZMA2, its entries keeping their dates and attributes.
+
+An encrypted archive stays encrypted: changed and new entries are encrypted with the password it
+was opened with, the way the archive already was (AES with the same key strength, or ZipCrypto;
+a 7z's file names stay encrypted if they were). Unchanged AES-encrypted ZIP entries and 7z
+blocks are copied as they were; unchanged ZipCrypto entries are encrypted again, as a copy would
+lose the mark that says they are encrypted.
+
+A `.tar.xz` is compressed again as `xz` does by default, and a `.tar.zst` as `zstd` does.
+Compressing a `.tar.xz` or a 7z can take a while for a large archive, so it is written
 in the background while a window shows which archive is being written; uploads, closing a tab
 and quitting wait for it. If the archive itself was changed on disk since it was extracted, or is
 read-only, saving into it is refused instead of losing those changes. No `.bak` backups are made
@@ -4219,8 +4237,9 @@ content (see <<compare-methods>>).
 [[limitations]]
 == Known limitations
 
-* Archives: ZIP-based formats, TAR (plain, gzip, bzip2 and xz) and 7z are supported.
-  RAR is not supported.
+* Archives: ZIP-based formats, TAR (plain, gzip, bzip2, xz and Zstandard) and 7z are
+  supported, password-protected ZIP and 7z included. RAR and archives split into parts
+  (`.zip.001`, `.7z.001`) are not supported.
 * The text panes are meant for reviewing and merging changes, not as a full editor.
   The inline view does not edit.
 * Unpacker plugins use external commands. WinMerge plugin DLLs and scripts are not supported.

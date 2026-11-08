@@ -1,7 +1,7 @@
 //! Archive support: archives are extracted to a temporary folder and compared as folders.
-//! Zip based formats, tar (plain or compressed with gzip, bzip2 or xz) and 7z are supported.
-//! Edits saved into the extracted copy are written back with [`repack`], which keeps every
-//! entry left alone as it was.
+//! Zip based formats, tar (plain or compressed with gzip, bzip2, xz or Zstandard) and 7z are
+//! supported, password-protected zip and 7z archives included. Edits saved into the extracted
+//! copy are written back with [`repack`], which keeps every entry left alone as it was.
 
 use super::fsutil;
 use anyhow::{Context, Result};
@@ -9,6 +9,8 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use zeroize::Zeroizing;
 
 pub const ZIP_EXTS: &[&str] = &[
     "zip", "jar", "war", "ear", "apk", "aar", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub",
@@ -22,6 +24,7 @@ enum Kind {
     TarGz,
     TarBz2,
     TarXz,
+    TarZst,
     SevenZ,
 }
 
@@ -34,9 +37,72 @@ const SUFFIXES: &[(&str, Kind)] = &[
     (".tbz", Kind::TarBz2),
     (".tar.xz", Kind::TarXz),
     (".txz", Kind::TarXz),
+    (".tar.zst", Kind::TarZst),
+    (".tzst", Kind::TarZst),
     (".tar", Kind::Tar),
     (".7z", Kind::SevenZ),
 ];
+
+/// The password of an encrypted archive, wiped from memory once dropped.
+type Secret = Arc<Zeroizing<String>>;
+
+/// An archive that can't be read without its password: none was given, or the one given is
+/// wrong. Ask for it, [`give_password`], and try again.
+#[derive(Debug)]
+pub struct NeedsPassword {
+    pub archive: PathBuf,
+    pub wrong: bool,
+}
+
+impl std::fmt::Display for NeedsPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key = if self.wrong {
+            "msg.archive_password_wrong"
+        } else {
+            "msg.archive_password_needed"
+        };
+        let file = ("file", self.archive.display().to_string());
+        f.write_str(&crate::i18n::trf(key, &[file]))
+    }
+}
+
+impl std::error::Error for NeedsPassword {}
+
+/// Passwords given for archives about to be extracted, kept until [`forget_password`]. An
+/// extraction keeps its own, to write the archive back encrypted.
+static PASSWORDS: std::sync::Mutex<Vec<(PathBuf, Secret)>> = std::sync::Mutex::new(Vec::new());
+
+fn passwords() -> std::sync::MutexGuard<'static, Vec<(PathBuf, Secret)>> {
+    PASSWORDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Gives the password to open the archive at `path` with, replacing any given before.
+pub fn give_password(path: &Path, password: Zeroizing<String>) {
+    let mut all = passwords();
+    all.retain(|(p, _)| p != path);
+    all.push((path.to_path_buf(), Arc::new(password)));
+}
+
+/// Drops the password given with [`give_password`] for `path`; extractions keep theirs.
+pub fn forget_password(path: &Path) {
+    passwords().retain(|(p, _)| p != path);
+}
+
+fn password_for(path: &Path) -> Option<Secret> {
+    passwords()
+        .iter()
+        .find(|(p, _)| p == path)
+        .map(|(_, s)| s.clone())
+}
+
+/// The error for the archive at `path` when it needs a password: `wrong` when one was tried.
+fn needs_password(path: &Path, tried: Option<&Secret>) -> anyhow::Error {
+    NeedsPassword {
+        archive: path.to_path_buf(),
+        wrong: tried.is_some(),
+    }
+    .into()
+}
 
 fn kind(path: &Path) -> Option<Kind> {
     let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
@@ -165,12 +231,19 @@ struct Extraction {
     real: Option<PathBuf>,
     stamp: Option<Stamp>,
     written: Written,
+    /// What the archive was opened with, if it is encrypted.
+    password: Option<Secret>,
 }
 
 static EXTRACTIONS: std::sync::Mutex<Vec<Extraction>> = std::sync::Mutex::new(Vec::new());
 
 fn extractions() -> std::sync::MutexGuard<'static, Vec<Extraction>> {
     EXTRACTIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Drops what was kept of the extractions whose folder was removed, passwords included.
+pub fn forget_removed() {
+    extractions().retain(|e| e.dir.exists());
 }
 
 /// Whether `path` is in a folder an archive was extracted to, where a backup copy of a saved
@@ -202,6 +275,9 @@ fn find_extraction<'a>(all: &'a mut [Extraction], dir: &Path) -> Option<&'a mut 
         .find(|e| e.dir == dir || real.is_some() && e.real == real)
 }
 
+/// Extracts the archive at `path` to a new temporary folder. An encrypted zip or 7z is read
+/// with the password [`give_password`] gave for it, failing with [`NeedsPassword`] without
+/// one or with a wrong one.
 pub fn extract_to_temp(path: &Path) -> Result<tempfile::TempDir> {
     extract_with(path, LIMITS)
 }
@@ -211,19 +287,21 @@ fn extract_with(path: &Path, limits: Limits) -> Result<tempfile::TempDir> {
     let budget = Budget::new(limits);
     let stamp = stamp(path);
     let written = std::cell::RefCell::new(HashSet::new());
-    extract(path, dir.path(), &budget, &written).map_err(|e| budget.error(path, e))?;
+    let password = password_for(path);
+    extract(path, dir.path(), &budget, &written, password.as_ref())
+        .map_err(|e| budget.error(path, e))?;
     let mut written = written.into_inner();
     for gone in remove_links_outside(dir.path())? {
         written.remove(&gone);
     }
-    let mut all = extractions();
-    all.retain(|e| e.dir.exists());
-    all.push(Extraction {
+    forget_removed();
+    extractions().push(Extraction {
         archive: path.to_path_buf(),
         dir: dir.path().to_path_buf(),
         real: std::fs::canonicalize(dir.path()).ok(),
         stamp,
         written: std::sync::Arc::new(written),
+        password,
     });
     Ok(dir)
 }
@@ -233,12 +311,13 @@ fn extract(
     dir: &Path,
     budget: &Budget,
     written: &std::cell::RefCell<HashSet<PathBuf>>,
+    password: Option<&Secret>,
 ) -> Result<()> {
     let open = || std::fs::File::open(path).with_context(|| format!("open {}", path.display()));
     let extract_tar = |input: &mut dyn Read| extract_tar(input, dir, budget, written);
     match kind(path).unwrap_or(Kind::Zip) {
-        Kind::Zip => extract_zip(open()?, dir, budget, written)
-            .with_context(|| format!("{} is not a zip archive", path.display())),
+        Kind::Zip => extract_zip(path, open()?, dir, budget, written, password)
+            .with_context(|| path.display().to_string()),
         Kind::Tar => extract_tar(&mut open()?),
         Kind::TarGz => extract_tar(&mut flate2::read::MultiGzDecoder::new(open()?)),
         Kind::TarBz2 => extract_tar(&mut bzip2::read::MultiBzDecoder::new(open()?)),
@@ -259,14 +338,55 @@ fn extract(
             budget.bytes.set(Some(budget.limits.bytes));
             extract_tar(&mut std::io::BufReader::new(tar))
         }
-        Kind::SevenZ => sevenz_rust2::decompress_file_with_extract_fn(path, dir, |e, r, dest| {
-            budget.entry()?;
-            let mut r = Counted { inner: r, budget };
-            let done = sevenz_rust2::default_entry_extract_fn(e, &mut r, dest)?;
-            written.borrow_mut().insert(clean(Path::new(e.name())));
-            Ok(done)
-        })
-        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display())),
+        Kind::TarZst => extract_tar(&mut zstd::stream::read::Decoder::new(open()?)?),
+        Kind::SevenZ => sevenz_rust2::decompress_with_extract_fn_and_password(
+            std::io::BufReader::new(open()?),
+            dir,
+            sevenz_password(password),
+            |e, r, dest| {
+                budget.entry()?;
+                let mut r = Counted { inner: r, budget };
+                let done = sevenz_rust2::default_entry_extract_fn(e, &mut r, dest)?;
+                written.borrow_mut().insert(clean(Path::new(e.name())));
+                Ok(done)
+            },
+        )
+        .map_err(|e| sevenz_error(path, password, e)),
+    }
+}
+
+fn sevenz_password(password: Option<&Secret>) -> sevenz_rust2::Password {
+    password.map_or_else(sevenz_rust2::Password::empty, |p| p.as_str().into())
+}
+
+/// The error for a 7z archive that could not be read: [`NeedsPassword`] when a password was
+/// missing or, judging by encrypted data that would not decode, wrong.
+fn sevenz_error(path: &Path, password: Option<&Secret>, e: sevenz_rust2::Error) -> anyhow::Error {
+    use sevenz_rust2::Error as E;
+    match e {
+        E::PasswordRequired => needs_password(path, password),
+        E::MaybeBadPassword(_) => needs_password(path, password),
+        // A wrong key decrypts to garbage, which fails however it happens to.
+        E::FileOpen(..) | E::MaxMemLimited { .. } => anyhow::anyhow!("{}: {e}", path.display()),
+        _ if password.is_some() && sevenz_encrypted(path) => needs_password(path, password),
+        e => anyhow::anyhow!("{}: {e}", path.display()),
+    }
+}
+
+/// Whether the 7z archive at `path` holds encrypted data, or encrypted names.
+fn sevenz_encrypted(path: &Path) -> bool {
+    use sevenz_rust2::{Archive, EncoderMethod, Password};
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    match Archive::read(&mut std::io::BufReader::new(file), &Password::empty()) {
+        Err(sevenz_rust2::Error::PasswordRequired) => true,
+        Err(_) => false,
+        Ok(ar) => ar.blocks.iter().any(|b| {
+            b.coders
+                .iter()
+                .any(|c| c.encoder_method_id() == EncoderMethod::ID_AES256_SHA256)
+        }),
     }
 }
 
@@ -308,31 +428,75 @@ fn apple_metadata(rel: &Path) -> bool {
 }
 
 fn extract_zip(
+    path: &Path,
     file: std::fs::File,
     dir: &Path,
     budget: &Budget,
     written: &std::cell::RefCell<HashSet<PathBuf>>,
+    password: Option<&Secret>,
 ) -> Result<()> {
-    let mut ar = zip::ZipArchive::new(file)?;
+    let mut ar = zip::ZipArchive::new(std::io::BufReader::new(file))?;
     for i in 0..ar.len() {
         budget.entry()?;
-        let f = ar.by_index(i)?;
-        let Some(rel) = f.enclosed_name().filter(|r| !apple_metadata(r)) else {
+        let (rel, is_dir, encrypted) = {
+            let f = ar.by_index_raw(i)?;
+            (f.enclosed_name(), f.is_dir(), f.encrypted())
+        };
+        let Some(rel) = rel.filter(|r| !apple_metadata(r)) else {
             continue;
         };
         let out = dir.join(&rel);
-        if f.is_dir() {
+        if is_dir {
             std::fs::create_dir_all(&out)?;
         } else {
             if let Some(p) = out.parent() {
                 std::fs::create_dir_all(p)?;
             }
+            let f = zip_entry(&mut ar, i, path, password)?;
             let mut w = std::fs::File::create(&out)?;
-            std::io::copy(&mut Counted { inner: f, budget }, &mut w)?;
+            std::io::copy(&mut Counted { inner: f, budget }, &mut w)
+                .map_err(|e| zip_read_error(path, password, encrypted, e))?;
         }
         written.borrow_mut().insert(clean(&rel));
     }
     Ok(())
+}
+
+/// Entry `i` of `ar` (in the archive at `path`), decompressed and, when it is encrypted,
+/// decrypted with `password`.
+fn zip_entry<'a, R: Read + Seek>(
+    ar: &'a mut zip::ZipArchive<R>,
+    i: usize,
+    path: &Path,
+    password: Option<&Secret>,
+) -> Result<zip::read::ZipFile<'a, R>> {
+    if !ar.by_index_raw(i)?.encrypted() {
+        return Ok(ar.by_index(i)?);
+    }
+    let Some(p) = password else {
+        return Err(needs_password(path, None));
+    };
+    match ar.by_index_decrypt(i, p.as_bytes()) {
+        Ok(f) => Ok(f),
+        Err(zip::result::ZipError::InvalidPassword) => Err(needs_password(path, password)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The error for reading an entry of the zip at `path` that failed: for an encrypted one,
+/// data that does not check out means the password was wrong (a wrong one passes the first
+/// check one time in 256 for the old zip encryption).
+fn zip_read_error(
+    path: &Path,
+    password: Option<&Secret>,
+    encrypted: bool,
+    e: std::io::Error,
+) -> anyhow::Error {
+    if encrypted && e.kind() == std::io::ErrorKind::InvalidData {
+        needs_password(path, password)
+    } else {
+        e.into()
+    }
 }
 
 /// Whether a link at `rel` (a path in the archive) pointing to `target` stays in the archive,
@@ -948,7 +1112,7 @@ fn zip_signed(path: &Path) -> bool {
     let Ok(ar) = zip::ZipArchive::new(std::io::BufReader::new(file)) else {
         return false;
     };
-    let signed = ar.file_names().any(|n| {
+    let signed = ar.file_names().filter_map(Result::ok).any(|n| {
         let n = n.to_ascii_lowercase();
         let meta = n.strip_prefix("meta-inf/").unwrap_or("");
         n.starts_with("_xmlsignatures/")
@@ -1002,12 +1166,12 @@ fn mode_of(md: &std::fs::Metadata) -> u32 {
     }
 }
 
-/// Finds the extraction recorded for `dir`: how its archive was then, and which entries it
-/// wrote (`None`, all of them, for a folder not extracted here).
-fn recorded(dir: &Path) -> (Option<Stamp>, Option<Written>) {
+/// Finds the extraction recorded for `dir`: how its archive was then, which entries it wrote
+/// (`None`, all of them, for a folder not extracted here), and the archive's password.
+fn recorded(dir: &Path) -> (Option<Stamp>, Option<Written>, Option<Secret>) {
     match find_extraction(&mut extractions(), dir) {
-        Some(e) => (e.stamp, Some(e.written.clone())),
-        None => (None, None),
+        Some(e) => (e.stamp, Some(e.written.clone()), e.password.clone()),
+        None => (None, None, None),
     }
 }
 
@@ -1060,10 +1224,11 @@ pub fn repack_all(path: &Path, dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// Writes the edits made to `dir`, an extraction of the archive at `path`, back into it.
 /// Entries left alone keep their bytes, times and order (in a zip, their compressed data
-/// too, and in a 7z, the compressed blocks holding only such entries), as do entries never
-/// extracted; changed files get the current time; removed entries are left out, and new ones
-/// are added at the end. Nothing is written when nothing changed; returns whether the
-/// archive was written.
+/// too, unless encrypted with ZipCrypto or compressed with LZMA; in a 7z, the compressed
+/// blocks holding only such entries), as do entries never extracted; changed files get the
+/// current time; removed entries are left out, and new ones are added at the end. An
+/// encrypted archive stays encrypted, with the password it was extracted with. Nothing is
+/// written when nothing changed; returns whether the archive was written.
 ///
 /// The archive is written to a temporary file beside it, which then takes its place keeping
 /// its permissions (through a symbolic link, to the file it leads to), so a failure or a
@@ -1080,13 +1245,18 @@ pub fn repack(path: &Path, dir: &Path) -> Result<bool> {
     if md.permissions().readonly() {
         anyhow::bail!(trf("msg.archive_read_only", &[file()]));
     }
-    let (then, written) = recorded(dir);
+    let (then, written, password) = recorded(dir);
     if then.is_some() && stamp(&target) != then {
         anyhow::bail!(trf("msg.archive_changed", &[file()]));
     }
+    let password = password.or_else(|| password_for(path));
     let ours = |rel: &Path| written.as_ref().is_none_or(|w| w.contains(rel));
-    let staged = repack_into(&target, dir, &ours)
-        .map_err(|e| anyhow::anyhow!("{}\n{e:#}", trf("msg.archive_write_failed", &[file()])))?;
+    let staged = repack_into(&target, dir, &ours, password.as_ref()).map_err(|e| {
+        if e.is::<NeedsPassword>() {
+            return e;
+        }
+        anyhow::anyhow!("{}\n{e:#}", trf("msg.archive_write_failed", &[file()]))
+    })?;
     let Some(tmp) = staged else {
         return Ok(false);
     };
@@ -1108,13 +1278,14 @@ fn repack_into(
     path: &Path,
     dir: &Path,
     ours: &dyn Fn(&Path) -> bool,
+    password: Option<&Secret>,
 ) -> Result<Option<tempfile::NamedTempFile>> {
     let out_dir = parent_dir(path);
     let open = || -> Result<std::io::BufReader<std::fs::File>> {
         Ok(std::io::BufReader::new(std::fs::File::open(path)?))
     };
     let (tmp, changed) = match kind(path) {
-        Some(Kind::Zip) => repack_zip(path, dir, out_dir, ours)?,
+        Some(Kind::Zip) => repack_zip(path, dir, out_dir, ours, password)?,
         Some(Kind::Tar) => copy_tar(
             &|| Ok(Box::new(open()?) as Box<dyn Read>),
             dir,
@@ -1160,10 +1331,62 @@ fn repack_into(
             std::io::copy(&mut plain, &mut enc)?;
             (enc.finish().context("finish xz")?, true)
         }
-        Some(Kind::SevenZ) => return repack_7z(path, dir, out_dir, ours),
+        Some(Kind::TarZst) => {
+            let input =
+                || Ok(Box::new(zstd::stream::read::Decoder::new(open()?)?) as Box<dyn Read>);
+            let enc = zstd::stream::write::Encoder::new(staging(out_dir)?, 0)?;
+            let (enc, changed) = copy_tar(&input, dir, ours, enc)?;
+            (enc.finish().context("finish zstd")?, changed)
+        }
+        Some(Kind::SevenZ) => return repack_7z(path, dir, out_dir, ours, password),
         None => anyhow::bail!("{}: cannot be written", path.display()),
     };
     Ok(changed.then_some(tmp))
+}
+
+/// How an entry of a zip is encrypted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ZipLock {
+    Aes(zip::AesMode),
+    /// The original zip encryption ("ZipCrypto"), weak but read by every unzip tool.
+    Classic,
+}
+
+/// How entry `f` is encrypted, if it is.
+fn zip_lock<R: Read>(f: &zip::read::ZipFile<'_, R>) -> Option<ZipLock> {
+    use zip::HasZipMetadata;
+    f.encrypted().then(|| {
+        f.get_metadata()
+            .aes_settings()
+            .map_or(ZipLock::Classic, |(mode, _)| ZipLock::Aes(mode))
+    })
+}
+
+/// `o`, encrypting with `password` as `lock` says, if it says to.
+fn locked<'k>(
+    o: zip::write::SimpleFileOptions,
+    lock: Option<ZipLock>,
+    password: Option<&'k Secret>,
+) -> Result<zip::write::FileOptions<'k, 'static, ()>> {
+    use zip::unstable::write::FileOptionsExt;
+    let Some(lock) = lock else {
+        return Ok(o);
+    };
+    let password = password.context("no password for an encrypted entry")?;
+    Ok(match lock {
+        ZipLock::Aes(mode) => o.with_aes_encryption(mode, password.as_str()),
+        ZipLock::Classic => o.with_deprecated_encryption(password.as_bytes())?,
+    })
+}
+
+/// The method a changed entry compressed with `method` is written with: the same, unless
+/// it can only be read (Deflate64, LZMA and older ones), when it is compressed with Deflate.
+fn rewritten_method(method: zip::CompressionMethod) -> zip::CompressionMethod {
+    use zip::CompressionMethod as M;
+    match method {
+        M::Stored | M::Deflated | M::Bzip2 | M::Zstd | M::Xz | M::Ppmd => method,
+        _ => M::Deflated,
+    }
 }
 
 fn repack_zip(
@@ -1171,9 +1394,21 @@ fn repack_zip(
     dir: &Path,
     out_dir: &Path,
     ours: &dyn Fn(&Path) -> bool,
+    password: Option<&Secret>,
 ) -> Result<(tempfile::NamedTempFile, bool)> {
-    use zip::{write::SimpleFileOptions, CompressionMethod};
+    use zip::write::SimpleFileOptions;
     let mut ar = zip::ZipArchive::new(std::io::BufReader::new(std::fs::File::open(path)?))?;
+    // New files are encrypted as the archive's first encrypted entry is.
+    let mut new_lock = None;
+    for i in 0..ar.len() {
+        new_lock = zip_lock(&ar.by_index_raw(i)?);
+        if new_lock.is_some() {
+            break;
+        }
+    }
+    if new_lock.is_some() && password.is_none() {
+        return Err(needs_password(path, None));
+    }
     let mut tmp = staging(out_dir)?;
     let mut seen = HashSet::new();
     let mut implied = HashSet::new();
@@ -1181,18 +1416,19 @@ fn repack_zip(
     let now = zip_now();
     {
         let mut w = zip::ZipWriter::new(std::io::BufWriter::new(tmp.as_file_mut()));
-        w.set_raw_comment(ar.comment().into());
+        w.set_raw_comment(ar.comment().into())?;
         for i in 0..ar.len() {
-            let (name, rel, is_dir, method, mode, len) = {
+            let (name, rel, is_dir, method, mode, len, lock) = {
                 let f = ar.by_index_raw(i)?;
                 let rel = f.enclosed_name().map(|r| clean(&r));
                 (
-                    f.name().to_owned(),
+                    f.name().map(|n| n.into_owned()).unwrap_or_default(),
                     rel,
                     f.is_dir(),
                     f.compression(),
                     f.unix_mode(),
                     f.size(),
+                    zip_lock(&f),
                 )
             };
             if let Some(rel) = &rel {
@@ -1204,22 +1440,23 @@ fn repack_zip(
                 Some(rel) if is_dir => dir.join(rel).is_dir(),
                 Some(rel) => {
                     let abs = dir.join(&rel);
-                    match same_file(&mut ar.by_index(i)?, len, &abs)? {
+                    let same = {
+                        let mut f = zip_entry(&mut ar, i, path, password)?;
+                        same_file(&mut f, len, &abs)?
+                    };
+                    match same {
                         Some(true) => true,
                         Some(false) => {
                             changed = true;
                             let size = std::fs::metadata(&abs)?.len();
-                            let method = match method {
-                                CompressionMethod::Stored => CompressionMethod::Stored,
-                                _ => CompressionMethod::Deflated,
-                            };
                             let mut o = SimpleFileOptions::default()
-                                .compression_method(method)
+                                .compression_method(rewritten_method(method))
                                 .last_modified_time(now)
                                 .large_file(size > u32::MAX as u64);
                             if let Some(m) = mode {
                                 o = o.unix_permissions(m & 0o777);
                             }
+                            let o = locked(o, lock, password)?;
                             if mode.is_some_and(|m| m & 0o170000 == 0o120000) {
                                 let target = std::fs::read_to_string(&abs)?;
                                 w.add_symlink(name, target, o)?;
@@ -1235,7 +1472,16 @@ fn repack_zip(
                     }
                 }
             };
-            if keep {
+            let classic = lock == Some(ZipLock::Classic);
+            if keep && (classic || method == zip::CompressionMethod::Lzma) && !is_dir {
+                // A raw copy would drop the flag saying its data is encrypted, or for LZMA
+                // that it ends with a marker, which other tools then refuse.
+                let mut f = zip_entry(&mut ar, i, path, password)?;
+                let o = f.options().compression_method(rewritten_method(method));
+                w.start_file(name, locked(o, lock, password)?)?;
+                std::io::copy(&mut f, &mut w)
+                    .map_err(|e| zip_read_error(path, password, true, e))?;
+            } else if keep {
                 w.raw_copy_file(ar.by_index_raw(i)?)?;
             } else {
                 changed = true;
@@ -1257,6 +1503,7 @@ fn repack_zip(
                     let o = o
                         .unix_permissions(mode_of(&md))
                         .large_file(md.len() > u32::MAX as u64);
+                    let o = locked(o, new_lock, password)?;
                     w.start_file(zip_name(rel), o)?;
                     std::io::copy(&mut f, &mut w)?;
                 }
@@ -1339,16 +1586,38 @@ fn repack_7z(
     dir: &Path,
     out_dir: &Path,
     ours: &dyn Fn(&Path) -> bool,
+    secret: Option<&Secret>,
 ) -> Result<Option<tempfile::NamedTempFile>> {
+    use sevenz_rust2::encoder_options::AesEncoderOptions;
     use sevenz_rust2::{
         Archive, ArchiveWriter, BlockDecoder, EncoderConfiguration, EncoderMethod, NtTime,
         Password, SourceReader,
     };
-    let fail = |e: sevenz_rust2::Error| anyhow::anyhow!("{}: {e}", path.display());
-    let password = Password::empty();
+    let fail = |e: sevenz_rust2::Error| sevenz_error(path, secret, e);
+    let write_fail = |e: sevenz_rust2::Error| anyhow::anyhow!("{}: {e}", path.display());
+    let password = sevenz_password(secret);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    // Names that were encrypted stay so.
+    let header_locked = matches!(
+        Archive::read(
+            &mut std::io::BufReader::new(std::fs::File::open(path)?),
+            &Password::empty()
+        ),
+        Err(sevenz_rust2::Error::PasswordRequired)
+    );
     let mut src = std::io::BufReader::new(std::fs::File::open(path)?);
     let ar = Archive::read(&mut src, &password).map_err(fail)?;
+    let block_locked = |b: usize| {
+        ar.blocks[b]
+            .coders
+            .iter()
+            .any(|c| c.encoder_method_id() == EncoderMethod::ID_AES256_SHA256)
+    };
+    // New entries are encrypted when anything in the archive is.
+    let any_locked = header_locked || (0..ar.blocks.len()).any(block_locked);
+    if any_locked && secret.is_none() {
+        return Err(needs_password(path, None));
+    }
     let rels: Vec<PathBuf> = ar
         .files
         .iter()
@@ -1460,17 +1729,23 @@ fn repack_7z(
         }
         e
     };
-    let methods = |stored: bool| {
+    let methods = |stored: bool, lock: bool| {
         let method = if stored {
             EncoderMethod::COPY
         } else {
             EncoderMethod::LZMA2
         };
-        vec![EncoderConfiguration::new(method)]
+        let mut methods = Vec::new();
+        if lock {
+            methods.push(AesEncoderOptions::new(password.clone()).into());
+        }
+        methods.push(EncoderConfiguration::new(method));
+        methods
     };
     let mut tmp = staging(out_dir)?;
     {
-        let mut w = ArchiveWriter::new(tmp.as_file_mut()).map_err(fail)?;
+        let mut w = ArchiveWriter::new(tmp.as_file_mut()).map_err(write_fail)?;
+        w.set_encrypt_header(header_locked);
         // Entries without data, written after the blocks.
         let mut empty = Vec::new();
         // Files to pack together into a new block, with where to read them from.
@@ -1478,7 +1753,7 @@ fn repack_7z(
         for (b, members) in blocks.iter().enumerate() {
             if members.iter().all(|&i| fate[i] == Fate::Same) {
                 w.push_raw_block(&ar, b, &mut src, |e| e.name().to_owned())
-                    .map_err(fail)?;
+                    .map_err(write_fail)?;
                 continue;
             }
             // An entry never extracted is not in the copy: it is taken from the block.
@@ -1520,12 +1795,13 @@ fn repack_7z(
                 sources.push(SourceReader::new(source));
             }
             if !entries.is_empty() {
-                let stored = ar.blocks[b]
-                    .coders
-                    .iter()
-                    .all(|c| c.encoder_method_id() == EncoderMethod::ID_COPY);
-                w.set_content_methods(methods(stored));
-                w.push_archive_entries(entries, sources).map_err(fail)?;
+                let stored = ar.blocks[b].coders.iter().all(|c| {
+                    let id = c.encoder_method_id();
+                    id == EncoderMethod::ID_COPY || id == EncoderMethod::ID_AES256_SHA256
+                });
+                w.set_content_methods(methods(stored, block_locked(b)));
+                w.push_archive_entries(entries, sources)
+                    .map_err(write_fail)?;
             }
         }
         for (i, e) in ar.files.iter().enumerate() {
@@ -1546,7 +1822,7 @@ fn repack_7z(
             }
         }
         for e in empty {
-            w.push_archive_entry::<&[u8]>(e, None).map_err(fail)?;
+            w.push_archive_entry::<&[u8]>(e, None).map_err(write_fail)?;
         }
         if !fresh.is_empty() {
             let (entries, sources): (Vec<_>, Vec<_>) = fresh
@@ -1557,8 +1833,13 @@ fn repack_7z(
                     (e, SourceReader::new(Source::Path(abs)))
                 })
                 .unzip();
-            w.set_content_methods(methods(false));
-            w.push_archive_entries(entries, sources).map_err(fail)?;
+            w.set_content_methods(methods(false, any_locked));
+            w.push_archive_entries(entries, sources)
+                .map_err(write_fail)?;
+        }
+        // The header is encrypted with the methods set last.
+        if header_locked {
+            w.set_content_methods(methods(false, true));
         }
         w.finish()
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
@@ -1729,6 +2010,9 @@ mod tests {
         lzma_rs::xz_compress(&mut tar_bytes().as_slice(), &mut xz).unwrap();
         std::fs::write(&txz_path, xz).unwrap();
 
+        let tzst_path = work.path().join("a.tar.zst");
+        std::fs::write(&tzst_path, zstd::encode_all(&tar_bytes()[..], 0).unwrap()).unwrap();
+
         // `tar_bytes` makes a `dir/a.txt`; build the same tree on disk for the 7z source.
         let sevenz_path = work.path().join("a.7z");
         let src = work.path().join("sevenz_src");
@@ -1742,6 +2026,7 @@ mod tests {
             (&tgz_path, "dir/a.txt"),
             (&tbz_path, "dir/a.txt"),
             (&txz_path, "dir/a.txt"),
+            (&tzst_path, "dir/a.txt"),
             (&sevenz_path, "dir/a.txt"),
         ] {
             let extracted = extract_to_temp(archive).unwrap();
@@ -1791,7 +2076,7 @@ mod tests {
         w.write_all(b"<p>last letter first</p>").unwrap();
         w.start_file("a.css", stored).unwrap();
         w.write_all(b"p {}").unwrap();
-        w.set_comment("kept");
+        w.set_comment("kept").unwrap();
         w.finish().unwrap();
         let before = std::fs::read(&path).unwrap();
 
@@ -1804,12 +2089,15 @@ mod tests {
         assert!(repack(&path, extracted.path()).unwrap());
 
         let mut ar = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
-        let names: Vec<&str> = ar.file_names().collect();
-        assert_eq!(names.len(), 4);
+        assert_eq!(ar.len(), 4);
         assert_eq!(ar.comment(), b"kept");
         let entry = |ar: &mut zip::ZipArchive<std::fs::File>, i: usize| {
             let f = ar.by_index(i).unwrap();
-            (f.name().to_owned(), f.compression(), f.last_modified())
+            (
+                f.name().unwrap().into_owned(),
+                f.compression(),
+                f.last_modified(),
+            )
         };
         let (name, method, time) = entry(&mut ar, 0);
         assert_eq!(
@@ -1828,6 +2116,203 @@ mod tests {
         );
         assert_ne!(time, Some(old));
         assert_eq!(entry(&mut ar, 3).0, "new.txt");
+    }
+
+    /// Zip entries compressed with any method are read, and an edited one is written back
+    /// with its method, or with Deflate when that method can only be read.
+    #[test]
+    fn repack_keeps_the_compression_method_of_every_zip_entry() {
+        use zip::{write::SimpleFileOptions, CompressionMethod as M};
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("a.zip");
+        let methods = [M::Stored, M::Deflated, M::Bzip2, M::Zstd, M::Xz, M::Ppmd];
+        let name = |m: M| format!("{m:?}.txt");
+        let text = |m: M| format!("{m:?} ").repeat(100);
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        for m in methods {
+            let o = SimpleFileOptions::default().compression_method(m);
+            w.start_file(name(m), o).unwrap();
+            w.write_all(text(m).as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+
+        let extracted = extract_to_temp(&path).unwrap();
+        for m in methods {
+            let file = extracted.path().join(name(m));
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), text(m));
+            std::fs::write(&file, format!("{m:?} edited")).unwrap();
+        }
+        assert!(repack(&path, extracted.path()).unwrap());
+
+        let mut ar = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        for m in methods {
+            let mut f = ar.by_name(&name(m)).unwrap();
+            assert_eq!(f.compression(), m);
+            let mut got = String::new();
+            f.read_to_string(&mut got).unwrap();
+            assert_eq!(got, format!("{m:?} edited"));
+        }
+        assert_eq!(rewritten_method(M::Lzma), M::Deflated);
+        assert_eq!(rewritten_method(M::Deflate64), M::Deflated);
+    }
+
+    /// Whether `e` asks for the password of `archive`, and if so whether one was tried.
+    fn asks_password(e: anyhow::Error, archive: &Path) -> bool {
+        let e = e
+            .downcast::<NeedsPassword>()
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(e.archive, archive);
+        e.wrong
+    }
+
+    /// A password-protected zip asks for its password, telling a wrong one apart, and is
+    /// written back encrypted as it was: edited and new entries with the password it was
+    /// opened with, untouched AES ones copied as they were.
+    #[test]
+    fn password_protected_zips_open_with_their_password_and_stay_encrypted() {
+        use zip::{write::SimpleFileOptions, AesMode};
+        type Zip = zip::ZipArchive<std::fs::File>;
+        for lock in [
+            ZipLock::Aes(AesMode::Aes256),
+            ZipLock::Aes(AesMode::Aes128),
+            ZipLock::Classic,
+        ] {
+            let work = tempfile::tempdir().unwrap();
+            let path = work.path().join("secret.zip");
+            let secret: Secret = Arc::new(Zeroizing::new("open sesame".to_string()));
+            let o = SimpleFileOptions::default();
+            let mut w = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            for name in ["keep.txt", "edit.txt"] {
+                w.start_file(name, locked(o, Some(lock), Some(&secret)).unwrap())
+                    .unwrap();
+                w.write_all(format!("{name} before").as_bytes()).unwrap();
+            }
+            w.start_file("plain.txt", o).unwrap();
+            w.write_all(b"plain").unwrap();
+            w.finish().unwrap();
+
+            let err = extract_to_temp(&path).unwrap_err();
+            assert!(!asks_password(err, &path), "{lock:?}");
+            give_password(&path, Zeroizing::new("open says me".into()));
+            let err = extract_to_temp(&path).unwrap_err();
+            assert!(asks_password(err, &path), "{lock:?}");
+            give_password(&path, Zeroizing::new(secret.as_str().into()));
+            let extracted = extract_to_temp(&path).unwrap();
+            let x = extracted.path();
+            let read = |name: &str| std::fs::read_to_string(x.join(name)).unwrap();
+            assert_eq!(read("keep.txt"), "keep.txt before");
+            assert_eq!(read("plain.txt"), "plain");
+            std::fs::write(x.join("edit.txt"), "edit.txt after").unwrap();
+            std::fs::write(x.join("new.txt"), "new").unwrap();
+
+            let open = || Zip::new(std::fs::File::open(&path).unwrap()).unwrap();
+            let raw = |ar: &mut Zip, name: &str| {
+                let mut f = ar.by_index_raw(ar.index_for_name(name).unwrap()).unwrap();
+                let lock = zip_lock(&f);
+                let mut bytes = Vec::new();
+                f.read_to_end(&mut bytes).unwrap();
+                (lock, bytes)
+            };
+            let kept = raw(&mut open(), "keep.txt");
+            assert!(repack(&path, x).unwrap());
+
+            let mut ar = open();
+            if lock != ZipLock::Classic {
+                assert_eq!(raw(&mut ar, "keep.txt"), kept, "{lock:?}");
+            }
+            assert_eq!(raw(&mut ar, "plain.txt").0, None);
+            for (name, want) in [
+                ("keep.txt", "keep.txt before"),
+                ("edit.txt", "edit.txt after"),
+                ("new.txt", "new"),
+            ] {
+                assert_eq!(raw(&mut ar, name).0, Some(lock), "{name}");
+                let i = ar.index_for_name(name).unwrap();
+                let mut got = String::new();
+                ar.by_index_decrypt(i, secret.as_bytes())
+                    .unwrap()
+                    .read_to_string(&mut got)
+                    .unwrap();
+                assert_eq!(got, want, "{lock:?}");
+            }
+        }
+    }
+
+    /// An encrypted 7z, with its names encrypted too or not, asks for its password and is
+    /// written back encrypted as it was, the block left alone copied as it was.
+    #[test]
+    fn password_protected_7z_opens_with_its_password_and_stays_encrypted() {
+        use sevenz_rust2::encoder_options::AesEncoderOptions;
+        use sevenz_rust2::{
+            Archive, ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod,
+        };
+        let password = "open sesame";
+        for names_locked in [false, true] {
+            let work = tempfile::tempdir().unwrap();
+            let path = work.path().join("secret.7z");
+            let mut w = ArchiveWriter::create(&path).unwrap();
+            w.set_content_methods(vec![
+                AesEncoderOptions::new(password.into()).into(),
+                EncoderConfiguration::new(EncoderMethod::LZMA2),
+            ]);
+            w.set_encrypt_header(names_locked);
+            for name in ["keep.txt", "edit.txt"] {
+                let text = format!("{name} before");
+                w.push_archive_entry(ArchiveEntry::new_file(name), Some(text.as_bytes()))
+                    .unwrap();
+            }
+            w.finish().unwrap();
+            let read =
+                |pw: &str| Archive::read(&mut std::fs::File::open(&path).unwrap(), &pw.into());
+            let kept_block = |ar: &Archive| {
+                let i = ar
+                    .files
+                    .iter()
+                    .position(|e| e.name() == "keep.txt")
+                    .unwrap();
+                let b = ar.stream_map.file_block_index[i].unwrap();
+                // The coders hold the AES salt and IV, new each time data is encrypted.
+                (ar.blocks[b].coders.clone(), ar.blocks[b].crc)
+            };
+            let kept = kept_block(&read(password).unwrap());
+
+            let err = extract_to_temp(&path).unwrap_err();
+            assert!(!asks_password(err, &path), "{names_locked}");
+            give_password(&path, Zeroizing::new("open says me".into()));
+            let err = extract_to_temp(&path).unwrap_err();
+            assert!(asks_password(err, &path), "{names_locked}");
+            give_password(&path, Zeroizing::new(password.into()));
+            let extracted = extract_to_temp(&path).unwrap();
+            let x = extracted.path();
+            assert_eq!(
+                std::fs::read_to_string(x.join("keep.txt")).unwrap(),
+                "keep.txt before"
+            );
+            std::fs::write(x.join("edit.txt"), "edit.txt after").unwrap();
+            std::fs::write(x.join("new.txt"), "new").unwrap();
+            assert!(repack(&path, x).unwrap());
+
+            match read("") {
+                Err(sevenz_rust2::Error::PasswordRequired) => assert!(names_locked),
+                Ok(_) => assert!(!names_locked),
+                Err(e) => panic!("{e}"),
+            }
+            let ar = read(password).unwrap();
+            assert_eq!(ar.blocks.len(), 3);
+            for b in &ar.blocks {
+                let ids: Vec<_> = b.coders.iter().map(|c| c.encoder_method_id()).collect();
+                assert!(
+                    ids.contains(&EncoderMethod::ID_AES256_SHA256),
+                    "{names_locked}"
+                );
+            }
+            assert_eq!(kept_block(&ar), kept);
+            let after = extract_to_temp(&path).unwrap();
+            let read = |name: &str| std::fs::read_to_string(after.path().join(name)).unwrap();
+            assert_eq!(read("keep.txt"), "keep.txt before");
+            assert_eq!(read("edit.txt"), "edit.txt after");
+            assert_eq!(read("new.txt"), "new");
+        }
     }
 
     /// A tar entry left alone keeps its time; an edited one gets the current time.
