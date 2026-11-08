@@ -392,7 +392,7 @@ fn save_file(path: &Path, rev: &str, dest: &Path, cancel: &AtomicBool) -> Result
     let rev = vcs.rev_or_default(rev);
     match vcs {
         Vcs::Git => no_working_copy(path, git::save_file(path, rev, dest, cancel)),
-        Vcs::Subversion => svn_save(path, &rev, dest, cancel),
+        Vcs::Subversion => svn_save(path, rev, dest, cancel),
         Vcs::Mercurial => {
             let rev = hg_rev(rev)?;
             let (root, rel) = hg_locate(path, Repo::Trusted)?;
@@ -460,7 +460,7 @@ fn export_folder(
     let rev = vcs.rev_or_default(rev);
     match vcs {
         Vcs::Git => no_working_copy(path, git::export_folder(path, rev, cancel)),
-        Vcs::Subversion => svn_export(path, &rev, cancel),
+        Vcs::Subversion => svn_export(path, rev, cancel),
         Vcs::Mercurial => {
             let rev = hg_rev(rev)?;
             let (root, rel) = hg_locate(path, Repo::Trusted)?;

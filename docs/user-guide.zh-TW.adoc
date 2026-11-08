@@ -3856,7 +3856,8 @@ p4 set P4MERGE=oxidemerge
 若 `oxidemerge` 不在 `PATH` 中，請使用完整路徑，例如 macOS 上的
 `/Applications/OxideMerge.app/Contents/MacOS/oxidemerge`。
 請勿在 `P4DIFF` 加上 `--cli`：加上後，檔案不同時程式會以 1 結束，
-p4 會將此回報為 *Execution Failed*。
+OxideMerge 會改為列出差異而不開啟視窗，且在檔案不同時以 1 結束，
+macOS 上的 p4 會將此回報為 *Execution Failed*。
 +
 `p4 set` 在 macOS 與 Linux 上會將設定存於 `~/.p4enviro`，在 Windows 上則存於登錄檔。
 . 執行 `p4 set` 檢查設定；兩行都應指向 OxideMerge：
@@ -3911,7 +3912,8 @@ OxideMerge 會開啟，左側為 *Yours*、中間為 *Base*、右側為 *Theirs*
 .由 `p4 resolve` 開啟的衝突
 image::p4-merge.png[由 p4 resolve 開啟的三方合併]
 
-若未儲存就關閉視窗，OxideMerge 會以結束代碼 1 離開，p4 會回報 *Execution Failed*，檔案仍維持未解決；
+若未儲存就關閉視窗，OxideMerge 會以結束代碼 1 離開，檔案仍維持未解決：
+p4 會建議 *e* 而非 *ae*（在 macOS 上還會回報 *Execution Failed*），
 此時輸入 *ae* 會警告檔案仍含有變更標記。
 請再次執行 `p4 resolve` 重新開始。
 
@@ -3986,10 +3988,10 @@ P4V 傳入的結果檔案已含有 P4V 自己的衝突標記；儲存後會取�
 若要整個採用對方版本或您的版本，請改用 *Accept Source* 或 *Accept Target*。
 
 NOTE: 已在 Windows 上以 SlikSVN 1.14.2、Mercurial 7.1.2 與 p4/p4d 2026.1 檢查，
-使用本機的 Subversion 與 Mercurial 儲存庫：包含「與修訂版本比較」、
-名稱不是 ASCII 的 Subversion 檔案，以及 ANSI 字碼頁拼得出來的 Mercurial 名稱。
-p4d 2026.1 可以啟動，但在建立第一個使用者之前就要求密碼，因此沒有對該伺服器執行 resolve。
-四個檔案的合併，以及結果未變更時的結束代碼，由測試涵蓋。
+使用本機儲存庫與本機 Perforce 伺服器：包含「與修訂版本比較」、
+名稱不是 ASCII 的 Subversion 檔案，以及 ANSI 字碼頁拼得出來的 Mercurial 名稱；
+並以上面的設定，從 `svn update --accept launch`、`hg merge` 與 `p4 resolve` 進行合併，
+儲存後衝突即解決，未儲存就關閉則維持未解決。
 P4V 仍使用上面的參數字串。
 它的比較設定，以及在 P4V 中於儲存後接受合併，先前曾在 macOS 上以 P4V 2026.3 試過，
 這次沒有在 Windows 上重做。

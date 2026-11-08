@@ -397,9 +397,9 @@ uses its section of this file as the release notes.
   and the middle pane is saved to the result. If that file is unchanged when the window
   closes, the program exits with code 1 and the conflict stays unresolved. Any other
   option, including `-o`, uses the arguments as written, so an existing wrapper still
-  works. Checked on Windows with SlikSVN 1.14.2, Mercurial 7.1.2 and p4/p4d 2026.1.
-  A fresh p4d 2026.1 requires a password before the first user exists, so a resolve was
-  not run against that server. P4V keeps its own argument string.
+  works. Checked on Windows with SlikSVN 1.14.2, Mercurial 7.1.2 and p4/p4d 2026.1:
+  `svn update --accept launch`, `hg merge` and `p4 resolve` against a local server, both
+  saved and closed without saving. P4V keeps its own argument string.
 - **Compare with revision in Subversion and Mercurial:**
   *File → Compare with revision...* (formerly *Compare with Git revision...*) and `--rev`
   (`--git-rev` still works) also take Subversion and Mercurial working copies: the nearest
