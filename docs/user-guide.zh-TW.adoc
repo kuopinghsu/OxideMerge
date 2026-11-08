@@ -1159,8 +1159,13 @@ XML 報告將這些資訊放在 `<table-match>` 元素中。
 必須先安裝 Git、Subversion 或 Mercurial，並將其加入 `PATH`。
 Git 與 Mercurial 會從本機儲存庫讀取修訂版本。
 路徑為 ASCII 時，Subversion 會從工作複本讀取 `BASE`。
-在 Windows 上，不是 ASCII 的路徑會改以儲存庫 URL 讀取，因為該版 `svn` 只保留 ASCII 參數；
-這類檔案的 `BASE` 是工作複本裡的原始複本，其他修訂版本則來自伺服器。
+在 Windows 上，該版 `svn` 只保留 ASCII 參數，因此路徑不是 ASCII 時，
+OxideMerge 會在所在資料夾中啟動 `svn`，資料夾名稱會完整傳給它。
+資料夾會在該處從工作複本讀取。
+檔案則以儲存庫 URL 在工作複本所在的修訂版本讀取，因此之後改名的檔案仍找得到。
+這類檔案的 `BASE` 是工作複本裡的原始複本，行尾與 `svn cat` 給出的相同；
+設有 `svn:keywords` 的檔案則從伺服器讀取 `BASE`，由伺服器填入關鍵字。
+其他修訂版本來自伺服器。
 最近修訂版本清單也來自伺服器，而伺服器可能要求 OxideMerge 無法提供的登入，
 請先使用 `svn` 本身登入。
 在 Windows 上，Mercurial 以 ANSI 字碼頁讀取名稱，這與 `hg` 本身相同：

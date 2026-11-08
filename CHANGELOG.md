@@ -393,10 +393,11 @@ uses its section of this file as the release notes.
   `--dm` and `--dr` take precedence. Subversion's `merge-tool-cmd` and Perforce's
   `P4MERGE` can be `oxidemerge` itself. Five files whose merged file is the working copy are
   read as Subversion's order (base, theirs, mine, merged, working copy), and four whose base,
-  theirs and result are p4's temporary files as Perforce's (base, theirs, yours, result).
-  Any other four or five files are still refused as too many paths, so a pattern such as
-  `*.txt` never starts a merge that would save over one of them. The left pane is mine or yours, the middle is the base and the right is theirs,
-  and the middle pane is saved to the result. If that file is unchanged when the window
+  theirs and result carry the names p4 gives its temporary files (`t1234t5678t90.tmp` on
+  Windows) as Perforce's (base, theirs, yours, result). Any other four or five files are
+  still refused as too many paths, so a pattern such as `*.txt` never starts a merge that
+  would save over one of them. The left pane is mine or yours, the middle is the base and
+  the right is theirs, and the middle pane is saved to the result. If that file is unchanged when the window
   closes, the program exits with code 1 and the conflict stays unresolved. Any other
   option, including `-o`, uses the arguments as written, so an existing wrapper still
   works. Checked on Windows with SlikSVN 1.14.2, Mercurial 7.1.2 and p4/p4d 2026.1:
@@ -407,9 +408,12 @@ uses its section of this file as the release notes.
   (`--git-rev` still works) also take Subversion and Mercurial working copies: the nearest
   `.git`, `.svn` or `.hg` above the path decides. Subversion revisions are `BASE` (the
   default), `PREV`, `HEAD`, a number, `r1234` as `svn log` prints it, or a date; the
-  dialog lists the recent revisions from `svn log --xml`. On Windows, a path that is not
-  ASCII is read by its repository URL, because that `svn` keeps only ASCII arguments, and
-  `BASE` of such a file is the pristine copy in the working copy. Mercurial revisions are
+  dialog lists the recent revisions from `svn log --xml`. On Windows, that `svn` keeps
+  only ASCII arguments, so for a path that is not ASCII it is started in the folder, whose
+  name it receives whole: a folder is read there from the working copy, and a file by its
+  repository URL at the working copy's revision, so a file renamed since then is still
+  found. `BASE` of such a file is the pristine copy with the line endings `svn cat` gives
+  it, or comes from the server when the file has `svn:keywords`. Mercurial revisions are
   `.` (the default), `.^`, `tip`, a number, a hash, a tag or another revset, read from the
   local repository. On Windows, Mercurial is left on the ANSI code page: forcing UTF-8
   makes every name that code page can spell fail, and a name it cannot spell is one `hg`

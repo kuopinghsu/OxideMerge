@@ -1353,10 +1353,15 @@ The older version is shown read-only on the left, and the current file or folder
 Git, Subversion or Mercurial must be installed and on your `PATH`.
 Git and Mercurial read their revisions from the local repository.
 Subversion reads `BASE` of an ASCII path from the working copy.
-On Windows, a path that is not ASCII is read by its repository URL, because that build of
-`svn` keeps only ASCII arguments.
-`BASE` of such a file is the pristine copy stored in the working copy, and other revisions
-come from the server.
+On Windows, that build of `svn` keeps only ASCII arguments, so for a path that is not ASCII
+OxideMerge starts `svn` in the folder, whose name it receives whole.
+A folder is read there from the working copy.
+A file is read by its repository URL at the revision the working copy has, so a file renamed
+since then is still found.
+`BASE` of such a file is the pristine copy stored in the working copy, with the line endings
+`svn cat` gives it; a file with `svn:keywords` gets `BASE` from the server, which fills the
+keywords in.
+Other revisions come from the server.
 The list of recent revisions also comes from the server, which may ask for a sign-in that
 OxideMerge cannot provide.
 Sign in with `svn` itself first.
