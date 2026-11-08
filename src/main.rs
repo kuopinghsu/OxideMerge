@@ -3,6 +3,7 @@
 mod config;
 mod core;
 mod i18n;
+mod prompt;
 mod shell;
 mod ui;
 
@@ -78,8 +79,33 @@ enum PatchArg {
     long_about = None
 )]
 struct Cli {
-    /// Files, folders or http(s) URLs to compare (2 or 3; a single conflict file is opened for resolution)
+    /// Files, folders or http(s) URLs to compare (2 or 3; a single conflict file is opened for
+    /// resolution). A file or folder on a server is written sftp://[user@]host[:port]/path,
+    /// ftp://, ftpes:// (explicit FTPS) or ftps:// (implicit FTPS); /~/path is in the user's
+    /// home folder. The password, or the --ssh-key passphrase, is read from
+    /// OXIDEMERGE_REMOTE_PASSWORD; SFTP signs in with ssh-agent's and ~/.ssh/config's keys
+    /// without either, and follows ~/.ssh/config for host aliases, users, ports and jump hosts
     paths: Vec<PathBuf>,
+    /// Private key file to sign in to SFTP servers with
+    #[arg(long, value_name = "FILE")]
+    ssh_key: Option<PathBuf>,
+    /// Trust a server not trusted yet when its key or certificate has this fingerprint
+    /// (SHA256:…, as an unknown server's error shows it), and remember it
+    #[arg(long, value_name = "FINGERPRINT")]
+    trust_fingerprint: Option<String>,
+    /// Connect to servers through this proxy: socks5://[user@]host[:port] or
+    /// http://[user@]host[:port]; its password is read from OXIDEMERGE_PROXY_PASSWORD
+    #[arg(long, value_name = "URL")]
+    proxy: Option<String>,
+    /// Use active-mode FTP, where the server connects back for each transfer
+    #[arg(long)]
+    ftp_active: bool,
+    /// Client certificate (PEM) for FTPS servers that ask for one
+    #[arg(long, value_name = "FILE")]
+    client_cert: Option<PathBuf>,
+    /// Private key (PEM) of --client-cert, when not in the same file
+    #[arg(long, value_name = "FILE", requires = "client_cert")]
+    client_key: Option<PathBuf>,
     /// Compare folders recursively
     #[arg(short = 'r', long)]
     recursive: bool,
@@ -1338,6 +1364,46 @@ fn run_jobs(file: &std::path::Path, yes: bool, base: &Config) -> anyhow::Result<
     Ok(summary.exit_code)
 }
 
+/// Fetches the paths of `cli` that are on a server (see [`core::remote_url`]) to temporary
+/// copies, which it then compares instead.
+fn stage_remote(
+    cli: &mut Cli,
+    cancel: &AtomicBool,
+) -> anyhow::Result<Vec<core::remote_url::Staged>> {
+    let remote = |p: &PathBuf| p.to_str().is_some_and(core::remote_url::is_remote_url);
+    let sides: Vec<usize> = (0..cli.paths.len())
+        .filter(|&i| remote(&cli.paths[i]))
+        .collect();
+    if sides.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut creds =
+        core::remote_url::Credentials::from_env(cli.ssh_key.clone(), cli.trust_fingerprint.clone());
+    creds.options = core::remote::ConnOptions {
+        proxy: core::remote_url::proxy(cli.proxy.as_deref())?,
+        active: cli.ftp_active,
+        client_cert: cli.client_cert.clone(),
+        client_key: cli.client_key.clone(),
+    };
+    core::remote::set_asker(Some(std::sync::Arc::new(prompt::ask)));
+    let staged = core::remote_url::stage(&mut cli.paths, &creds, cancel)?;
+    // A side is described by its address on the server, not by its temporary copy.
+    for (&i, s) in sides.iter().zip(&staged) {
+        if s.fetched.is_dir {
+            core::folder_sync::name_folder(&s.fetched.local, &s.label());
+        }
+        if cli_desc(cli, i).is_none() {
+            let desc = Some(s.label());
+            match (cli.paths.len(), i) {
+                (_, 0) => cli.dl = desc,
+                (3, 1) => cli.dm = desc,
+                _ => cli.dr = desc,
+            }
+        }
+    }
+    Ok(staged)
+}
+
 /// The folder of a job file, which its relative paths are in.
 pub(crate) fn job_dir(file: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     Ok(std::path::absolute(file)?
@@ -1397,7 +1463,7 @@ pub(crate) fn job_summary(
                 );
             }
             let argv = std::iter::once(std::ffi::OsString::from("oxidemerge")).chain(prepared.args);
-            let cli = Cli::try_parse_from(argv).map_err(|e| {
+            let mut cli = Cli::try_parse_from(argv).map_err(|e| {
                 let text = e.to_string();
                 anyhow::anyhow!("{}", text.lines().next().unwrap_or_default())
             })?;
@@ -1405,19 +1471,26 @@ pub(crate) fn job_summary(
             apply_cli_options(&cli, &mut cfg);
             let (spec, rules) = resolve_rules(&cli, dir).map_err(anyhow::Error::msg)?;
             use_rules(&mut cfg, &spec, &rules);
-            if job.kind != JobKind::Sync {
-                return Ok((run_batch(&cli, &cfg)?, None));
-            }
             anyhow::ensure!(
-                yes,
+                yes || job.kind != JobKind::Sync,
                 "{}",
                 i18n::trf(
                     "job.err_needs_yes",
                     &[("path", cli.paths[1].display().to_string())]
                 )
             );
-            let (code, report) = sync_now(&cli, &cfg, prepared.allow_large_deletion, stop)?;
-            Ok((code, Some(report)))
+            let staged = stage_remote(&mut cli, stop)?;
+            let result = if job.kind == JobKind::Sync {
+                sync_now(&cli, &cfg, prepared.allow_large_deletion, stop)
+                    .map(|(code, report)| (code, Some(report)))
+            } else {
+                run_batch(&cli, &cfg).map(|code| (code, None))
+            };
+            let code = result.as_ref().map_or(2, |(code, _)| *code);
+            let journals = core::folder_sync::journal_root();
+            let failed = core::remote_url::finish(&staged, code, journals.as_deref(), stop);
+            anyhow::ensure!(failed.is_empty(), "{}", failed.join("\n"));
+            result
         };
         match run() {
             Ok((code, sync)) => {
@@ -1526,11 +1599,12 @@ fn sync_report(outcome: core::folder_sync::SyncOutcome) -> (u8, SyncReport) {
 }
 
 fn main() -> ExitCode {
+    core::remote_url::take_password_env();
     #[cfg(target_os = "linux")]
     wsl_gl_defaults();
     attach_console();
     let matches = <Cli as clap::CommandFactory>::command().get_matches_from(winmerge_args());
-    let cli =
+    let mut cli =
         <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let mut cfg = Config::load();
     cfg.diff = cfg.comparison_options();
@@ -1617,6 +1691,17 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    let never = AtomicBool::new(false);
+    cli.paths = paths;
+    let staged = match stage_remote(&mut cli, &never) {
+        Ok(staged) => staged,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            return ExitCode::from(2);
+        }
+    };
+    let paths = cli.paths.clone();
+
     let cwd = std::env::current_dir().unwrap_or_default();
     let (cli_rules, rules) = match resolve_rules(&cli, &cwd) {
         Ok(r) => r,
@@ -1633,14 +1718,25 @@ fn main() -> ExitCode {
 
     if cli.cli || cli.report.is_some() || cli.patch.is_some() || analysis_mode(&cli) {
         use_rules(&mut cfg, &cli_rules, &rules);
-        return match run_batch(&cli, &cfg) {
-            Ok(code) => ExitCode::from(code),
+        let mut code = match run_batch(&cli, &cfg) {
+            Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e:#}");
-                ExitCode::from(2)
+                2
             }
         };
+        // What the command changed in a copy of a path on a server goes back to the server.
+        let journals = core::folder_sync::journal_root();
+        for e in core::remote_url::finish(&staged, code, journals.as_deref(), &never) {
+            eprintln!("error: {e}");
+            code = code.max(2);
+        }
+        return ExitCode::from(code);
     }
+    let fetched: Vec<_> = staged
+        .into_iter()
+        .map(core::remote_url::Staged::into_parts)
+        .collect();
 
     let initial = if let (Some(rev), [_]) = (&cli.git_rev, &paths[..]) {
         Some(OpenRequest {
@@ -1704,7 +1800,11 @@ fn main() -> ExitCode {
     let result = eframe::run_native(
         "OxideMerge",
         options,
-        Box::new(move |cc| Ok(Box::new(OxideMergeApp::new(cc, cfg, stored, initial)))),
+        Box::new(move |cc| {
+            Ok(Box::new(OxideMergeApp::with_fetched(
+                cc, cfg, stored, initial, fetched,
+            )))
+        }),
     );
     match result {
         Ok(()) if ui::app::screenshot_failed() => ExitCode::from(2),

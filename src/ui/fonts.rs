@@ -530,12 +530,15 @@ fn add_first(
     }
 }
 
-/// `primary`, then the fonts of `rest` other than `primary` itself, then `last`.
+/// `primary`, then the fonts of `rest` other than `primary` itself, then `last`. Without a
+/// `primary`, the first of `last` takes its place: a font found for another script would
+/// otherwise draw the digits and spaces it also has, between letters in the built-in font.
 fn chain(
     primary: Option<crate::core::pdf_report::FontFile>,
     rest: &[crate::core::pdf_report::FontFile],
-    last: Vec<crate::core::pdf_report::FontFile>,
+    mut last: Vec<crate::core::pdf_report::FontFile>,
 ) -> Vec<crate::core::pdf_report::FontFile> {
+    let primary = primary.or_else(|| (!last.is_empty()).then(|| last.remove(0)));
     let others = rest
         .iter()
         .filter(|f| {
@@ -603,6 +606,12 @@ mod tests {
         );
         assert_eq!(bytes(&chain(Some(sans), &rest, vec![font(9)])), [2, 3, 9]);
         assert_eq!(bytes(&chain(None, &rest, Vec::new())), [2, 3]);
+        // With no code font installed, the built-in one comes before the fonts for other
+        // scripts.
+        assert_eq!(
+            bytes(&chain(None, &rest, vec![font(8), font(9)])),
+            [8, 2, 3, 9]
+        );
     }
 
     #[test]

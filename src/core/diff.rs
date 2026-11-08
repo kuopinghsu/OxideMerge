@@ -152,6 +152,37 @@ fn numbers_close(a: &str, b: &str, tol: f64) -> bool {
     }
 }
 
+/// `s` with each run of whitespace before other text made one space, and any at its end
+/// dropped.
+fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            in_ws = true;
+        } else {
+            if in_ws {
+                out.push(' ');
+            }
+            in_ws = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The substitutions of `opts` that are on and compile, in order.
+fn compile_subs(opts: &DiffOptions) -> Vec<(Regex, String)> {
+    if !opts.substitutions_enabled {
+        return Vec::new();
+    }
+    opts.substitutions
+        .iter()
+        .filter(|(s, _)| !s.is_empty())
+        .filter_map(|(s, r)| Regex::new(s).ok().map(|re| (re, r.clone())))
+        .collect()
+}
+
 impl Normalizer {
     pub fn new(opts: &DiffOptions) -> Self {
         let line_res = if opts.line_filters_enabled {
@@ -163,15 +194,7 @@ impl Normalizer {
         } else {
             Vec::new()
         };
-        let subs = if opts.substitutions_enabled {
-            opts.substitutions
-                .iter()
-                .filter(|(s, _)| !s.is_empty())
-                .filter_map(|(s, r)| Regex::new(s).ok().map(|re| (re, r.clone())))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let subs = compile_subs(opts);
         let blocks = if opts.block_filters_enabled {
             opts.block_filters
                 .iter()
@@ -279,22 +302,7 @@ impl Normalizer {
         match self.opts.whitespace {
             WhitespaceMode::Compare => {}
             WhitespaceMode::IgnoreAll => s.retain(|c| !c.is_whitespace()),
-            WhitespaceMode::IgnoreChange => {
-                let mut out = String::with_capacity(s.len());
-                let mut in_ws = false;
-                for c in s.chars() {
-                    if c.is_whitespace() {
-                        in_ws = true;
-                    } else {
-                        if in_ws {
-                            out.push(' ');
-                        }
-                        in_ws = false;
-                        out.push(c);
-                    }
-                }
-                s = out;
-            }
+            WhitespaceMode::IgnoreChange => s = collapse_whitespace(&s),
         }
         if self.opts.ignore_case {
             s = s.to_lowercase();
@@ -1399,8 +1407,9 @@ pub fn inline_diff(a: &str, b: &str, opts: &DiffOptions) -> (Vec<Range<usize>>, 
             std::iter::once(0..b.len()).collect(),
         );
     }
-    let ta = tokenize(a, opts);
-    let tb = tokenize(b, opts);
+    let subs = inline_subs(opts);
+    let ta = tokenize(a, opts, &sub_spans(a, &subs));
+    let tb = tokenize(b, opts, &sub_spans(b, &subs));
     let ka: Vec<&str> = ta.iter().map(|t| t.1.as_str()).collect();
     let kb: Vec<&str> = tb.iter().map(|t| t.1.as_str()).collect();
     // Long lines of many tokens could take long; past the deadline the result is coarser.
@@ -1436,27 +1445,104 @@ fn push_merge(v: &mut Vec<Range<usize>>, r: Range<usize>) {
     v.push(r);
 }
 
-fn tokenize(s: &str, opts: &DiffOptions) -> Vec<(Range<usize>, String)> {
+/// The substitutions of `opts` compiled, kept for the lines that follow, which in-line
+/// differences are worked out for one at a time with the same options.
+fn inline_subs(opts: &DiffOptions) -> std::rc::Rc<Vec<(Regex, String)>> {
+    type Compiled = (Vec<(String, String)>, std::rc::Rc<Vec<(Regex, String)>>);
+    thread_local! {
+        static SUBS: std::cell::RefCell<Option<Compiled>> = const { std::cell::RefCell::new(None) };
+    }
+    if !opts.substitutions_enabled || opts.substitutions.is_empty() {
+        return Default::default();
+    }
+    SUBS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((_, subs)) = cache
+            .as_ref()
+            .filter(|(from, _)| *from == opts.substitutions)
+        {
+            return subs.clone();
+        }
+        let subs = std::rc::Rc::new(compile_subs(opts));
+        *cache = Some((opts.substitutions.clone(), subs.clone()));
+        subs
+    })
+}
+
+/// Where the substitutions match in `s`, in order, each with what it is replaced by. Matches
+/// do not overlap: an earlier rule, then an earlier match, wins.
+fn sub_spans(s: &str, subs: &[(Regex, String)]) -> Vec<(Range<usize>, String)> {
+    let mut spans: Vec<(Range<usize>, String)> = Vec::new();
+    for (re, rep) in subs {
+        for caps in re.captures_iter(s) {
+            let Some(m) = caps.get(0).filter(|m| !m.is_empty()) else {
+                continue;
+            };
+            if spans
+                .iter()
+                .any(|(r, _)| r.start < m.end() && m.start() < r.end)
+            {
+                continue;
+            }
+            let mut to = String::new();
+            caps.expand(rep, &mut to);
+            spans.push((m.range(), to));
+        }
+    }
+    spans.sort_by_key(|(r, _)| r.start);
+    spans
+}
+
+/// Splits `s` into the tokens in-line differences are found between, each with the text it
+/// is compared by, as [`Normalizer::key`] compares lines: a match of a substitution in `spans`
+/// is one token, compared by its replacement.
+fn tokenize(
+    s: &str,
+    opts: &DiffOptions,
+    spans: &[(Range<usize>, String)],
+) -> Vec<(Range<usize>, String)> {
     let mut out = Vec::new();
     let chars: Vec<(usize, char)> = s.char_indices().collect();
     let mut i = 0;
     let norm = |t: &str| -> String {
-        if opts.ignore_case {
+        let mut t = if opts.ignore_case {
             t.to_lowercase()
         } else {
             t.to_string()
+        };
+        if opts.ignore_numbers {
+            t.retain(|c| !c.is_ascii_digit());
         }
+        t
     };
+    let mut spans = spans.iter().peekable();
     while i < chars.len() {
         let (start, c) = chars[i];
+        if let Some((r, to)) = spans.next_if(|(r, _)| r.start == start) {
+            let to = match opts.whitespace {
+                WhitespaceMode::Compare => to.clone(),
+                WhitespaceMode::IgnoreChange => collapse_whitespace(to),
+                WhitespaceMode::IgnoreAll => to.chars().filter(|c| !c.is_whitespace()).collect(),
+            };
+            out.push((r.clone(), norm(&to)));
+            while i < chars.len() && chars[i].0 < r.end {
+                i += 1;
+            }
+            continue;
+        }
+        // A word stops where a substitution starts.
+        let stop = spans.peek().map_or(s.len(), |(r, _)| r.start);
         let mut j = i + 1;
         if opts.inline == InlineMode::Word {
+            let more = |j: usize, f: fn(char) -> bool| {
+                j < chars.len() && chars[j].0 < stop && f(chars[j].1)
+            };
             if c.is_alphanumeric() || c == '_' {
-                while j < chars.len() && (chars[j].1.is_alphanumeric() || chars[j].1 == '_') {
+                while more(j, |c| c.is_alphanumeric() || c == '_') {
                     j += 1;
                 }
             } else if c.is_whitespace() {
-                while j < chars.len() && chars[j].1.is_whitespace() {
+                while more(j, char::is_whitespace) {
                     j += 1;
                 }
             }
@@ -1960,6 +2046,47 @@ mod tests {
         let right2 = v(&["1", "X", "3", "4"]);
         let r = compute(&[&left, &base, &right2], &DiffOptions::default());
         assert_eq!(r.blocks[0].kind, BlockKind::Conflict);
+    }
+
+    /// In-line differences leave out what the rules ignore: a substitution's matches compare
+    /// by what they are replaced by, and digits by nothing under *Ignore numbers*.
+    #[test]
+    fn inline_differences_follow_substitutions_and_ignored_numbers() {
+        let text = |s: &str, ranges: &[Range<usize>]| -> Vec<String> {
+            ranges.iter().map(|r| s[r.clone()].to_string()).collect()
+        };
+        let (a, b) = ("[09:12:33] 214 passed", "[14:41:19] 213 passed, 1 failed");
+        let mut o = DiffOptions {
+            substitutions_enabled: true,
+            substitutions: vec![(r"^\[\d{2}:\d{2}:\d{2}\] ".into(), "[time] ".into())],
+            ..DiffOptions::default()
+        };
+        let (ra, rb) = inline_diff(a, b, &o);
+        assert_eq!(text(a, &ra), ["214"]);
+        assert_eq!(text(b, &rb), ["213", ", 1 failed"]);
+
+        o.substitutions_enabled = false;
+        let (ra, _) = inline_diff(a, b, &o);
+        assert_eq!(text(a, &ra), ["09", "12", "33", "214"]);
+
+        // A match is one token, compared by its replacement with the groups filled in.
+        o.substitutions_enabled = true;
+        o.substitutions = vec![(r"(\w+)@[\w.]+".into(), "$1@host".into())];
+        let (ra, rb) = inline_diff("mail ann@a.example now", "mail ann@b.example later", &o);
+        assert_eq!(
+            (text("mail ann@a.example now", &ra), rb.len()),
+            (vec!["now".to_string()], 1)
+        );
+        let (ra, rb) = inline_diff("mail ann@a.example", "mail bob@a.example", &o);
+        assert_eq!(text("mail ann@a.example", &ra), ["ann@a.example"]);
+        assert_eq!(rb.len(), 1);
+
+        let o = DiffOptions {
+            ignore_numbers: true,
+            ..DiffOptions::default()
+        };
+        let (ra, rb) = inline_diff("took 12 ms on v2", "took 15 ms on v3", &o);
+        assert!(ra.is_empty() && rb.is_empty(), "{ra:?} {rb:?}");
     }
 
     #[test]

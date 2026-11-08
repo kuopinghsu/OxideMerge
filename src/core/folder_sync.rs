@@ -673,15 +673,32 @@ pub struct Scope {
     pub copy_links: bool,
 }
 
-/// The SHA-256 of the two folders' full paths, as recorded in a plan.
+/// Folders known in plans by a name rather than by where they are: copies of folders on a
+/// server, fetched afresh to a new place each time, by their address there.
+static FOLDER_NAMES: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Has plans know the folder at `local` as `name`, so one made against a copy of a folder on a
+/// server applies to the next copy of it.
+pub fn name_folder(local: &Path, name: &str) {
+    let real = std::fs::canonicalize(local).unwrap_or_else(|_| local.to_path_buf());
+    if let Ok(mut names) = FOLDER_NAMES.lock() {
+        names.retain(|(p, _)| *p != real);
+        names.push((real, name.to_string()));
+    }
+}
+
+/// The SHA-256 of the two folders' full paths (or names, see [`name_folder`]), as recorded in
+/// a plan.
 fn folders_digest(roots: &[PathBuf]) -> String {
+    let names = FOLDER_NAMES.lock().map(|n| n.clone()).unwrap_or_default();
     let real: Vec<String> = roots
         .iter()
         .map(|r| {
-            std::fs::canonicalize(r)
-                .unwrap_or_else(|_| r.clone())
-                .to_string_lossy()
-                .into_owned()
+            let real = std::fs::canonicalize(r).unwrap_or_else(|_| r.clone());
+            match names.iter().find(|(p, _)| *p == real) {
+                Some((_, name)) => name.clone(),
+                None => real.to_string_lossy().into_owned(),
+            }
         })
         .collect();
     analysis::identity(&real)
@@ -2477,11 +2494,18 @@ fn claim(dir: &Path) -> std::io::Result<Option<std::fs::File>> {
         .read(true)
         .append(true)
         .open(dir.join(JOURNAL_FILE))?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    // A process being started copies every open file until it runs its program, and with it
+    // the lock of a synchronization that has just let it go: a few short tries outlast that.
+    for _ in 0..10 {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
     }
+    Ok(None)
 }
 
 /// The unfinished synchronizations recorded under `journal_root`, oldest first.
@@ -2571,6 +2595,41 @@ pub fn discard(u: &Unfinished) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Mirrors `roots[0]` to `roots[1]` until the first file is written, then ends as if the
+/// program had, leaving its journal under `journal_root`: for tests elsewhere of what finds
+/// and undoes such a journal.
+#[cfg(test)]
+pub(crate) fn mirror_then_crash(roots: &[PathBuf], journal_root: &Path) -> SyncOutcome {
+    use crate::core::diff::DiffOptions;
+    use crate::core::filter::FileFilter;
+    use crate::core::folder::{FolderOptions, Progress, Scanner};
+    let items = Scanner {
+        roots,
+        filter: &FileFilter::parse_mask("*.*"),
+        fopts: &FolderOptions::default(),
+        dopts: &DiffOptions::default(),
+        progress: &Progress::default(),
+    }
+    .run();
+    let policy = SyncPolicy {
+        mode: SyncMode::Mirror,
+        source: Side::Left,
+    };
+    let scope = Scope {
+        complete: true,
+        excluded: false,
+        filter: String::new(),
+        skip_hidden: false,
+        copy_links: false,
+    };
+    let (stop, done) = (AtomicBool::new(false), AtomicUsize::new(0));
+    let plan = plan(&items, roots, policy, scope, &stop).unwrap();
+    apply_with(&plan, roots, journal_root, &stop, &done, &|p, _| match p {
+        Point::Written => Fault::Crash,
+        _ => Fault::None,
+    })
 }
 
 #[cfg(test)]
@@ -3162,6 +3221,40 @@ mod tests {
             panic!("applied without its folders");
         };
         assert_eq!(errors, [tr("folder_sync.err_other_folders")]);
+    }
+
+    #[test]
+    fn a_plan_for_folders_on_a_server_applies_to_a_new_copy_of_them() {
+        let names = [
+            "sftp://ann@example.com/srv/src",
+            "sftp://ann@example.com/srv/dst",
+        ];
+        let named = |f: &Folders, which: &[usize]| {
+            for &i in which {
+                name_folder(&f.roots[i], names[i]);
+            }
+        };
+        let f = sample();
+        named(&f, &[0, 1]);
+        let p = make(&f, MIRROR);
+        let half = sample();
+        named(&half, &[1]);
+        let SyncOutcome::NotApplied(_, errors) = run(&half, &p, &|_, _| Fault::None) else {
+            panic!("applied to a folder of another name");
+        };
+        assert_eq!(errors, [tr("folder_sync.err_other_folders")]);
+        let copy = sample();
+        named(&copy, &[0, 1]);
+        assert!(matches!(
+            run(&copy, &p, &|_, _| Fault::None),
+            SyncOutcome::Applied { .. }
+        ));
+        let dst = &copy.roots[1];
+        assert_eq!(
+            std::fs::read_to_string(dst.join("a.txt")).unwrap(),
+            "new a\n"
+        );
+        assert!(!dst.join("old.txt").exists());
     }
 
     #[test]

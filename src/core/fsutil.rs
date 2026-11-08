@@ -68,9 +68,10 @@ fn writing(path: &Path) -> String {
 }
 
 /// Whether a backup of `path` is made, with backups `on`: never inside an extracted archive,
-/// where the `.bak` would be packed into the archive with the rest.
+/// where the `.bak` would be packed into the archive with the rest, nor inside a folder fetched
+/// from a server, where saving the folder would upload it.
 pub fn backs_up(path: &Path, on: bool) -> bool {
-    on && !super::archive::inside_extraction(path)
+    on && !super::archive::inside_extraction(path) && !super::remote::inside_fetch(path)
 }
 
 pub fn backup_path(path: &Path) -> PathBuf {

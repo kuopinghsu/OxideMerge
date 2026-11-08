@@ -393,6 +393,13 @@ pub struct FolderView {
     /// Whether each archive side in `archive_sources` has been edited since it was last
     /// repacked (or opened, if never).
     archive_dirty: Vec<bool>,
+    /// Whether each side is a folder fetched over SFTP or FTP, written back to its server on
+    /// save by the app (which holds the connection), and whether it was edited since.
+    remote_sides: Vec<bool>,
+    remote_dirty: Vec<bool>,
+    /// Archive files written by saving the archive sides, outer archives they are nested in
+    /// included, not yet taken by [`Self::take_written`].
+    written: Vec<PathBuf>,
     /// Compare rules file used (a name or path, "" = none); read again on every refresh.
     pub rules: String,
     /// Whether `rules` named a file that could be read the last time it was applied.
@@ -707,8 +714,7 @@ impl FolderView {
         // A side extracted from a real archive to compare it can be edited and repacked;
         // any other extracted copy (a review snapshot, a web page tree, ...) is read-only,
         // as changes to it would otherwise be lost. So is an archive that can't be written
-        // back (see `archive::writable`) and one nested in another extracted archive, as
-        // repacking it would not reach the outer archive.
+        // back, or is nested in an extracted archive that can't (see `archive::editable`).
         let temp_backed: Vec<bool> = roots
             .iter()
             .map(|r| temps.iter().any(|t| r.starts_with(t.path())))
@@ -721,9 +727,7 @@ impl FolderView {
                     return None;
                 }
                 let p = PathBuf::from(disp);
-                let editable = archive::is_archive(&p)
-                    && archive::writable(&p)
-                    && !archive::inside_extraction(&p);
+                let editable = archive::is_archive(&p) && archive::editable(&p);
                 editable.then_some(p)
             })
             .collect();
@@ -794,6 +798,9 @@ impl FolderView {
             read_only: Vec::new(),
             archive_sources: Vec::new(),
             archive_dirty: Vec::new(),
+            remote_sides: Vec::new(),
+            remote_dirty: Vec::new(),
+            written: Vec::new(),
             rules: cfg.rules.clone(),
             rules_found: false,
             rule_names: Vec::new(),
@@ -1147,11 +1154,18 @@ impl FolderView {
     /// any of them (an automatic merge, a synchronization): saving then repacks those whose
     /// contents really changed.
     fn mark_archives_dirty(&mut self) {
-        for s in 0..self.archive_sources.len() {
-            if self.is_archive_side(s) {
-                self.mark_archive_dirty(s);
-            }
+        for s in 0..self.n() {
+            self.mark_written(s);
         }
+    }
+
+    /// Marks side `s` as written into, for saving to write it back into its archive file or
+    /// to its server (see [`Self::mark_archive_dirty`] and [`Self::mark_remote_dirty`]).
+    fn mark_written(&mut self, s: usize) {
+        if self.is_archive_side(s) {
+            self.mark_archive_dirty(s);
+        }
+        self.mark_remote_dirty(s);
     }
 
     /// Whether any archive side has edits not yet written back into its archive file.
@@ -1159,10 +1173,43 @@ impl FolderView {
         self.archive_dirty.iter().any(|&d| d)
     }
 
-    /// Repacks every archive side with pending edits back into its archive file, returning
-    /// the archive files that were written (an archive whose contents came out unchanged is
-    /// left alone) and the errors of those that could not be. A side that fails keeps its
-    /// edits pending and does not stop the others.
+    /// Makes side `s` a folder fetched from a server, for saving to write back to it.
+    pub fn set_remote_side(&mut self, s: usize) {
+        let n = self.n();
+        self.remote_sides.resize(n, false);
+        self.remote_dirty.resize(n, false);
+        if let Some(r) = self.remote_sides.get_mut(s) {
+            *r = true;
+        }
+    }
+
+    pub fn is_remote_side(&self, s: usize) -> bool {
+        self.remote_sides.get(s).copied().unwrap_or(false)
+    }
+
+    /// Marks the remote side `s` as possibly edited here, so saving writes it back to its
+    /// server. Does nothing if `s` is not a remote side (see [`Self::set_remote_side`]).
+    pub fn mark_remote_dirty(&mut self, s: usize) {
+        if self.is_remote_side(s) {
+            self.remote_dirty[s] = true;
+        }
+    }
+
+    /// Whether the remote side `s` was marked edited, clearing the mark: the app then tracks
+    /// the side until its upload is done.
+    pub fn take_remote_dirty(&mut self, s: usize) -> bool {
+        self.remote_dirty.get_mut(s).is_some_and(std::mem::take)
+    }
+
+    /// Whether any remote side has edits not yet written back to its server.
+    pub fn has_remote_changes(&self) -> bool {
+        self.remote_dirty.iter().any(|&d| d)
+    }
+
+    /// Repacks every archive side with pending edits back into its archive file, and each
+    /// archive that one is nested in, returning the archive files that were written (an
+    /// archive whose contents came out unchanged is left alone) and the errors of those that
+    /// could not be. A side that fails keeps its edits pending and does not stop the others.
     pub fn save_archives(&mut self) -> (Vec<PathBuf>, Vec<String>) {
         let mut written = Vec::new();
         let mut errors = Vec::new();
@@ -1176,9 +1223,8 @@ impl FolderView {
                 self.archive_dirty[s] = false;
                 continue;
             };
-            match archive::repack(src, &self.roots[s]) {
-                Ok(true) => written.push(src.clone()),
-                Ok(false) => {}
+            match archive::repack_all(src, &self.roots[s]) {
+                Ok(w) => written.extend(w),
                 Err(e) => {
                     errors.push(format!("{e:#}"));
                     continue;
@@ -1186,7 +1232,13 @@ impl FolderView {
             }
             self.archive_dirty[s] = false;
         }
+        self.written.extend(written.iter().cloned());
         (written, errors)
+    }
+
+    /// The archive files saving has written since this was last called.
+    pub fn take_written(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.written)
     }
 
     pub fn is_running(&self) -> bool {
@@ -1954,9 +2006,7 @@ impl FolderView {
                 OpKind::Delete { side: None } => (0..self.n()).collect(),
             };
             for s in touched {
-                if self.archive_sources.get(s).is_some_and(Option::is_some) {
-                    self.archive_dirty[s] = true;
-                }
+                self.mark_written(s);
             }
         }
         self.status = trf("msg.op_done", &[("n", done.to_string())]);
@@ -4892,9 +4942,47 @@ mod tests {
             std::fs::read_to_string(after.path().join("a.txt")).unwrap(),
             "edited\n"
         );
+
+        // A side fetched from a server is marked edited by what writes into it, and only it.
+        v.set_remote_side(0);
+        assert!(v.is_remote_side(0) && !v.is_remote_side(1));
+        assert!(!v.has_remote_changes());
+        v.mark_remote_dirty(1);
+        assert!(!v.has_remote_changes());
+        v.mark_archives_dirty();
+        assert!(v.has_remote_changes());
+        assert!(v.take_remote_dirty(0));
+        assert!(!v.take_remote_dirty(0));
+        assert!(!v.has_remote_changes());
     }
 
-    /// A signed package, a `.tar.xz`, and an archive inside another extracted archive can't be
+    /// A zip holding one `a.txt`, under `name` in `dir`, inside a zip of that name when
+    /// `inside` is given, extracted.
+    fn nested_zip(dir: &Path, name: &str, inside: &str) -> (PathBuf, tempfile::TempDir) {
+        let mut inner = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        inner
+            .start_file("a.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut inner, b"old\n").unwrap();
+        let outer = dir.join(name);
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&outer).unwrap());
+        zw.start_file(inside, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zw, &inner.finish().unwrap().into_inner()).unwrap();
+        zw.finish().unwrap();
+        let outer_copy = archive::extract_to_temp(&outer).unwrap();
+        (outer_copy.path().join(inside), outer_copy)
+    }
+
+    /// The archive side of a folder compare of `path` with an empty folder.
+    fn archive_side(path: &Path, left: &Path, cfg: &Config) -> FolderView {
+        let extracted = archive::extract_to_temp(path).unwrap();
+        let roots = vec![left.to_path_buf(), extracted.path().to_path_buf()];
+        let display = vec![left.display().to_string(), path.display().to_string()];
+        FolderView::new(roots, display, vec![extracted], "", &[], cfg)
+    }
+
+    /// A signed package, and an archive inside an extracted signed package, can't be
     /// written back, so their sides open read-only.
     #[test]
     fn archives_that_cannot_be_written_back_open_read_only() {
@@ -4906,18 +4994,22 @@ mod tests {
         zw.start_file("classes.dex", zip::write::SimpleFileOptions::default())
             .unwrap();
         zw.finish().unwrap();
-        let outer = work.path().join("outer.zip");
-        let mut zw = zip::ZipWriter::new(std::fs::File::create(&outer).unwrap());
-        zw.start_file("inner.zip", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        let mut inner = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        inner
-            .start_file("a.txt", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        std::io::Write::write_all(&mut zw, &inner.finish().unwrap().into_inner()).unwrap();
-        zw.finish().unwrap();
-        let outer_copy = archive::extract_to_temp(&outer).unwrap();
-        let nested = outer_copy.path().join("inner.zip");
+        let (nested, _outer) = nested_zip(work.path(), "outer.apk", "inner.zip");
+
+        for path in [apk, nested] {
+            let v = archive_side(&path, left.path(), &cfg);
+            assert_eq!(v.read_only, [false, true], "{}", path.display());
+            assert!(!v.is_archive_side(1));
+        }
+    }
+
+    /// A `.tar.xz` side and a side of a zip inside an extracted zip can be edited; saving
+    /// the nested one writes the outer zip too.
+    #[test]
+    fn a_tar_xz_and_a_nested_archive_open_editable() {
+        let cfg = Config::default();
+        let left = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
         let txz = work.path().join("a.tar.xz");
         let mut tar = tar::Builder::new(Vec::new());
         let mut h = tar::Header::new_gnu();
@@ -4927,18 +5019,25 @@ mod tests {
         let mut xz = Vec::new();
         lzma_rs::xz_compress(&mut tar.into_inner().unwrap().as_slice(), &mut xz).unwrap();
         std::fs::write(&txz, xz).unwrap();
+        let v = archive_side(&txz, left.path(), &cfg);
+        assert_eq!(v.read_only, [false, false]);
+        assert!(v.is_archive_side(1));
 
-        for path in [apk, nested, txz] {
-            let extracted = archive::extract_to_temp(&path).unwrap();
-            let roots = vec![left.path().to_path_buf(), extracted.path().to_path_buf()];
-            let display = vec![
-                left.path().display().to_string(),
-                path.display().to_string(),
-            ];
-            let v = FolderView::new(roots, display, vec![extracted], "", &[], &cfg);
-            assert_eq!(v.read_only, [false, true], "{}", path.display());
-            assert!(!v.is_archive_side(1));
-        }
+        let (nested, _outer) = nested_zip(work.path(), "outer.zip", "inner.zip");
+        let mut v = archive_side(&nested, left.path(), &cfg);
+        assert_eq!(v.read_only, [false, false]);
+        assert!(v.is_archive_side(1));
+        std::fs::write(v.roots[1].join("a.txt"), "new\n").unwrap();
+        v.mark_archive_dirty(1);
+        let outer = work.path().join("outer.zip");
+        assert_eq!(v.save_archives(), (vec![nested, outer.clone()], Vec::new()));
+        assert_eq!(v.take_written().len(), 2);
+        let outer_after = archive::extract_to_temp(&outer).unwrap();
+        let inner_after = archive::extract_to_temp(&outer_after.path().join("inner.zip")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(inner_after.path().join("a.txt")).unwrap(),
+            "new\n"
+        );
     }
 
     #[test]

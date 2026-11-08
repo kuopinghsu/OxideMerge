@@ -17,6 +17,9 @@ pub enum Cmd {
     /// Opens the connection dialog of *Compare over SFTP*, to stage a remote file or folder
     /// locally and compare it like any other path.
     OpenRemote,
+    /// Fetches the active tab's sides that came from a server again, replacing their local
+    /// copies with the server's.
+    ReloadRemote,
     OpenConflict,
     OpenProject,
     SaveProject,
@@ -117,6 +120,7 @@ impl Cmd {
             CompareClipboard => "menu.compare_clipboard",
             Open => "menu.open",
             OpenRemote => "menu.open_remote",
+            ReloadRemote => "menu.reload_remote",
             OpenConflict => "menu.open_conflict",
             OpenProject => "menu.open_project",
             SaveProject => "menu.save_project",
@@ -204,6 +208,7 @@ impl Cmd {
             New | CompareClipboard => Icon::Plus,
             Open | OpenProject | RunJob => Icon::Folder,
             OpenRemote => Icon::Globe,
+            ReloadRemote => Icon::Refresh,
             OpenConflict => Icon::Warning,
             Save | SaveAll | SaveAs(_) | SaveProject | SaveJob | SaveComparison | SaveWorkspace => {
                 Icon::File
@@ -482,6 +487,7 @@ pub const PALETTE: &[Cmd] = {
         CompareClipboard,
         Open,
         OpenRemote,
+        ReloadRemote,
         OpenConflict,
         OpenProject,
         SaveProject,
