@@ -1166,7 +1166,7 @@ Subversion 會從工作複本讀取 `BASE`；其他修訂版本與最近修訂�
 
 修訂版本會在背景讀取；伺服器緩慢或沒有回應時，按「取消」即可停止，並回到對話方塊。
 按下「比較」時，Mercurial 會讀取儲存庫本身的 `.hg/hgrc`，如同會套用 Git 的篩選器；
-輸入路徑時讀取的最近修訂版本清單則會略過它（Mercurial 5.4 或更新版本）。
+輸入路徑時讀取的最近修訂版本清單則會略過它；略過此檔案需要 Mercurial 5.4 或更新版本。
 比較工作複本的最上層資料夾時，`.git`、`.svn` 或 `.hg` 資料夾只會列在右側；
 「Exclude Source Control」篩選器可將其隱藏。
 匯出修訂版本的資料夾時，若會超過 8 GB 或 500,000 個檔案，就會被拒絕，
@@ -2314,14 +2314,13 @@ OxideMerge 也會列出 WinMerge 的 `.flt` 篩選器檔案，
 [[unpackers]]
 === 解譯器外掛程式
 
+解譯器外掛程式可讓 OxideMerge 比較它本身無法以文字讀取的檔案格式。
+外掛程式會在比較前將檔案轉換為文字，OxideMerge 再比較轉換程式寫到標準輸出的文字。
+
 OxideMerge 本身即可讀取 PDF、`.docx`、`.odt`、`.rtf`、`.xlsx`、`.ods`、`.ipynb` 與 ELF 程式
 （請參閱 <<documents>>），因此只有在遇到它尚未支援的格式（例如舊版 Word `.doc` 與 Excel `.xls`），
 或想以更好的方式讀取上述格式時，才需要外掛程式。
 只要外掛程式的檔案樣式符合，就一律優先使用。
-
-解譯器外掛程式會在比較前將檔案轉換為文字，
-適合 PDF 或 Office 文件等需要外部轉換程式的格式。
-OxideMerge 會比較轉換程式寫到標準輸出的文字。
 
 若要新增外掛程式：
 
@@ -4204,7 +4203,7 @@ NOTE: 在 macOS 上，請以 kbd:[⌘] 取代 kbd:[Ctrl]，以 kbd:[⌥] 取代 
 |kbd:[←]、kbd:[→] |切換為左側或右側窗格
 |kbd:[F2]、kbd:[Enter] |沒有游標時，將游標放在目前這一行的結尾
 |kbd:[Ctrl+A] |選取整個檔案
-|kbd:[Shift+↑]、kbd:[Shift+↓]、kbd:[Shift+PgUp]、kbd:[Shift+PgDn] |選取多行
+|kbd:[Shift+←]、kbd:[Shift+→]、kbd:[Shift+↑]、kbd:[Shift+↓]、kbd:[Shift+PgUp]、kbd:[Shift+PgDn] |選取文字
 |kbd:[Ctrl+C]、kbd:[Ctrl+X] |複製或剪下選取的文字或欄，或整行
 |kbd:[Ctrl+V] |在游標處貼上，或取代選取的文字或欄
 |kbd:[Delete]、kbd:[Backspace] |刪除一個字元、選取的文字或欄
