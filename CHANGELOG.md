@@ -391,9 +391,11 @@ uses its section of this file as the release notes.
   order, as `diff -L` does, and `-u` is accepted and ignored, so
   `svn diff --diff-cmd oxidemerge` shows revision names in the pane headers; `--dl`,
   `--dm` and `--dr` take precedence. Subversion's `merge-tool-cmd` and Perforce's
-  `P4MERGE` can be `oxidemerge` itself. Five existing files are read as Subversion's order
-  (base, theirs, mine, merged, working copy) and four as Perforce's (base, theirs, yours,
-  result). The left pane is mine or yours, the middle is the base and the right is theirs,
+  `P4MERGE` can be `oxidemerge` itself. Five files whose merged file is the working copy are
+  read as Subversion's order (base, theirs, mine, merged, working copy), and four whose base,
+  theirs and result are p4's temporary files as Perforce's (base, theirs, yours, result).
+  Any other four or five files are still refused as too many paths, so a pattern such as
+  `*.txt` never starts a merge that would save over one of them. The left pane is mine or yours, the middle is the base and the right is theirs,
   and the middle pane is saved to the result. If that file is unchanged when the window
   closes, the program exits with code 1 and the conflict stays unresolved. Any other
   option, including `-o`, uses the arguments as written, so an existing wrapper still

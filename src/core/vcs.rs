@@ -11,9 +11,10 @@
 //! to skip the repository's `.hg/hgrc`, whose hooks and extensions could run commands.
 //!
 //! On Windows the `svn` and `hg` programs take arguments in the system ANSI code page, so a
-//! name they cannot spell is never put on their command line. Subversion is given a repository
-//! URL instead (ASCII, with the name percent-encoded). Mercurial is left on that code page,
-//! which is as far as its own Windows build can see file names.
+//! name they cannot spell is never put on their command line. Subversion is started in the
+//! folder instead, which it is told whole: a folder is `.` there, and a file is read through
+//! its repository URL (ASCII, with the name percent-encoded). Mercurial is left on that code
+//! page, which is as far as its own Windows build can see file names.
 
 use super::{archive, git};
 use anyhow::{bail, Context, Result};
@@ -194,18 +195,21 @@ fn svn_rev(rev: &str) -> Result<String> {
     })
 }
 
-/// Where `svn` is asked to read `path`. An ASCII path is given to `svn` as a working-copy
-/// path. Anything else is not: the Windows build of `svn` keeps only ASCII arguments, so the
-/// repository URL (percent-encoded, from `svn info` of an ASCII folder above the path) is
-/// used instead.
+/// Where `svn` is asked to read `path`. The Windows build of `svn` keeps only ASCII arguments,
+/// but its working folder is passed whole. An ASCII path is given as it is. A folder that is
+/// not ASCII is `.` from inside it. A file that is not ASCII is read through its repository
+/// URL, which `svn info` of its folder gives.
 enum SvnTarget {
     Local { cwd: PathBuf, path: String },
     Remote(SvnNode),
 }
 
-/// A working-copy path `svn` cannot be given, read through its repository URL.
+/// A working-copy file `svn` cannot be given, read through its repository URL.
 struct SvnNode {
+    /// The folder holding the file.
     cwd: PathBuf,
+    /// The file's name, as `svn` lists it in `cwd`.
+    name: String,
     /// Peg-safe: a literal `@` in the path is `%40`.
     url: String,
     /// The revision the working copy has for this path (`BASE`).
@@ -229,8 +233,8 @@ fn svn_path_is_ascii(path: &Path) -> bool {
 }
 
 fn svn_open(path: &Path, cancel: &AtomicBool) -> Result<SvnTarget> {
-    if svn_path_is_ascii(path) {
-        let abs = git::dunce_canonical(path)?;
+    let abs = git::dunce_canonical(path)?;
+    if svn_path_is_ascii(&abs) {
         let cwd = abs.parent().context("no parent folder")?.to_path_buf();
         let local = abs
             .to_str()
@@ -240,84 +244,34 @@ fn svn_open(path: &Path, cancel: &AtomicBool) -> Result<SvnTarget> {
             path: local.to_string(),
         });
     }
-    Ok(SvnTarget::Remote(svn_node(path, cancel)?))
+    if abs.is_dir() {
+        return Ok(SvnTarget::Local {
+            cwd: abs,
+            path: ".".to_string(),
+        });
+    }
+    Ok(SvnTarget::Remote(svn_node(&abs, cancel)?))
 }
 
-/// The node of a non-ASCII `path`: its URL and the revisions recorded in the working copy.
-fn svn_node(path: &Path, cancel: &AtomicBool) -> Result<SvnNode> {
-    let abs = git::dunce_canonical(path)?;
-    let (ancestor, rel) = ascii_ancestor(&abs)?;
-    let arg = ancestor.to_str().with_context(|| {
-        format!(
-            "{}: Subversion on Windows cannot be given this path",
-            abs.display()
-        )
-    })?;
-    let cwd = ancestor
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| ancestor.clone());
-    let depth = if rel.is_empty() {
-        "empty"
-    } else if rel.contains('/') {
-        "infinity"
-    } else {
-        "immediates"
-    };
-    let target = format!("{arg}@");
+/// The node of a non-ASCII file `abs`: its URL and the revisions recorded in the working copy,
+/// from `svn info` of `.` in the folder holding it.
+fn svn_node(abs: &Path, cancel: &AtomicBool) -> Result<SvnNode> {
+    let cwd = abs.parent().context("no parent folder")?.to_path_buf();
+    let name = abs
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| format!("{}: the name is not valid UTF-8", abs.display()))?
+        .to_string();
     let xml = svn(
         &cwd,
-        &["info", "--xml", "--depth", depth, "--", &target],
+        &["info", "--xml", "--depth", "immediates", "--", ".@"],
         cancel,
     )?;
     let mut node =
-        parse_svn_info(&tool_text(&xml), &rel).with_context(|| abs.display().to_string())?;
+        parse_svn_info(&tool_text(&xml), &name).with_context(|| abs.display().to_string())?;
     node.cwd = cwd;
+    node.name = name;
     Ok(node)
-}
-
-/// The nearest folder at or above `abs` that is still inside the working copy and whose path
-/// is ASCII, and the rest of `abs` relative to it (`/` separators). When the working copy
-/// itself is not ASCII, its 8.3 short name is used if Windows still has one.
-fn ascii_ancestor(abs: &Path) -> Result<(PathBuf, String)> {
-    let wc = abs
-        .ancestors()
-        .find(|dir| dir.join(".svn").is_dir())
-        .with_context(|| format!("{} is not in a Subversion working copy", abs.display()))?;
-    let mut cursor = abs;
-    while let Some(parent) = cursor.parent() {
-        if parent != wc && !parent.starts_with(wc) {
-            break;
-        }
-        if parent.to_str().is_some_and(|text| text.is_ascii()) {
-            return Ok((parent.to_path_buf(), relative_posix(abs, parent)?));
-        }
-        if parent == wc {
-            break;
-        }
-        cursor = parent;
-    }
-    let short = short_ascii_path(wc).with_context(|| {
-        format!(
-            "{}: Subversion on Windows cannot be given this path, and it has no 8.3 short name",
-            wc.display()
-        )
-    })?;
-    Ok((short, relative_posix(abs, wc)?))
-}
-
-fn relative_posix(path: &Path, ancestor: &Path) -> Result<String> {
-    let rel = path
-        .strip_prefix(ancestor)
-        .with_context(|| format!("{} is not in {}", path.display(), ancestor.display()))?;
-    rel.components()
-        .map(|c| {
-            c.as_os_str()
-                .to_str()
-                .with_context(|| format!("{}: the name is not valid UTF-8", path.display()))
-        })
-        .collect::<Result<Vec<_>>>()
-        .map(|parts| parts.join("/"))
 }
 
 /// `rev` as `svn cat` and `svn export` take it. `BASE`, `COMMITTED` and `PREV` are working-copy
@@ -511,7 +465,9 @@ pub fn recent_revisions(path: &Path, n: usize, cancel: &AtomicBool) -> Vec<(Stri
             };
             let (cwd, pegged) = match &target {
                 SvnTarget::Local { cwd, path } => (cwd.as_path(), format!("{path}@")),
-                SvnTarget::Remote(node) => (node.cwd.as_path(), format!("{}@", node.url)),
+                SvnTarget::Remote(node) => {
+                    (node.cwd.as_path(), format!("{}@{}", node.url, node.base))
+                }
             };
             let limit = n.to_string();
             git::run_cancellable(
@@ -564,11 +520,14 @@ enum Repo {
 /// On Windows Mercurial decodes the command line in the ANSI code page and then as
 /// `HGENCODING`. Forcing UTF-8 there rejects every name the code page can spell, and a name
 /// the code page cannot spell is one Mercurial itself cannot open. The system encoding is
-/// left in place; what `hg` prints is decoded from it when it is not UTF-8.
+/// used, even when the environment sets another; what `hg` prints is decoded from it when it
+/// is not UTF-8.
 fn hg_command(dir: &Path, args: &[&str], repo: Repo) -> std::process::Command {
     let mut cmd = git::tool("hg", dir);
     cmd.env("HGPLAIN", "1");
-    if !cfg!(windows) {
+    if cfg!(windows) {
+        cmd.env_remove("HGENCODING");
+    } else {
         cmd.env("HGENCODING", "utf-8");
     }
     if repo == Repo::Untrusted {
@@ -634,23 +593,119 @@ fn svn_save(path: &Path, rev: &str, dest: &Path, cancel: &AtomicBool) -> Result<
         SvnTarget::Remote(node) => {
             let rev = svn_number(rev, &node)?;
             // BASE is the pristine file in the working copy, so it is read with the server
-            // unreachable. A later revision is the repository's.
+            // unreachable, translated as `svn cat` would. Keywords need the repository.
             if rev == node.base {
                 if let Some(src) = &node.pristine {
-                    std::fs::copy(src, dest).with_context(|| dest.display().to_string())?;
-                    return Ok(());
+                    let props = svn_props(&node, cancel).unwrap_or_default();
+                    if props.keywords.is_none() {
+                        let bytes =
+                            std::fs::read(src).with_context(|| src.display().to_string())?;
+                        let bytes = translate_eol(bytes, props.eol_style.as_deref());
+                        std::fs::write(dest, bytes).with_context(|| dest.display().to_string())?;
+                        return Ok(());
+                    }
                 }
             }
-            let target = format!("{}@{rev}", node.url);
+            // Pegged at BASE, as a working-copy path is, so the file is followed across renames.
+            let target = format!("{}@{}", node.url, node.base);
             let cmd = svn_command(&node.cwd, &["cat", "-r", &rev, "--", &target]);
             git::run_to_file(cmd, dest, cancel)
         }
     }
 }
 
+/// The properties of a file that change what `svn cat` prints.
+#[derive(Default, Debug, PartialEq)]
+struct SvnProps {
+    keywords: Option<String>,
+    eol_style: Option<String>,
+}
+
+fn svn_props(node: &SvnNode, cancel: &AtomicBool) -> Result<SvnProps> {
+    let xml = svn(
+        &node.cwd,
+        &[
+            "proplist",
+            "--xml",
+            "-v",
+            "--depth",
+            "immediates",
+            "--",
+            ".@",
+        ],
+        cancel,
+    )?;
+    Ok(parse_svn_props(&tool_text(&xml), &node.name))
+}
+
+/// `svn:keywords` and `svn:eol-style` of `name` in `svn proplist --xml -v` output.
+fn parse_svn_props(xml: &str, name: &str) -> SvnProps {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml.trim_start_matches('\u{feff}'));
+    reader.config_mut().expand_empty_elements = true;
+    let mut props = SvnProps::default();
+    let mut in_target = false;
+    let mut property: Option<String> = None;
+    let mut value = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => match e.name().as_ref() {
+                "target" => {
+                    in_target = svn_entry_matches(&xml_attr(&e, "path").unwrap_or_default(), name)
+                }
+                "property" if in_target => {
+                    property = xml_attr(&e, "name");
+                    value.clear();
+                }
+                _ => {}
+            },
+            Ok(Event::Text(t)) if property.is_some() => value.push_str(&t.xml10_content()),
+            Ok(Event::GeneralRef(r)) if property.is_some() => {
+                if let Some(s) = quick_xml::escape::resolve_xml_entity(&r) {
+                    value.push_str(s);
+                }
+            }
+            Ok(Event::End(e)) => match e.name().as_ref() {
+                "property" => match property.take().as_deref() {
+                    Some("svn:keywords") => props.keywords = Some(value.trim().to_string()),
+                    Some("svn:eol-style") => props.eol_style = Some(value.trim().to_string()),
+                    _ => {}
+                },
+                "target" => in_target = false,
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    props
+}
+
+/// A pristine file, stored with `\n` line ends when it has `svn:eol-style`, with the line ends
+/// `svn cat` gives it.
+fn translate_eol(bytes: Vec<u8>, eol_style: Option<&str>) -> Vec<u8> {
+    let eol: &[u8] = match eol_style {
+        Some("native") if cfg!(windows) => b"\r\n",
+        Some("CRLF") => b"\r\n",
+        Some("CR") => b"\r",
+        _ => return bytes,
+    };
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 16);
+    for &b in &bytes {
+        if b == b'\n' {
+            out.extend_from_slice(eol);
+        } else {
+            out.push(b);
+        }
+    }
+    out
+}
+
 /// Folder `path` as Subversion has it in `rev`, in a temporary folder.
 fn svn_export(path: &Path, rev: &str, cancel: &AtomicBool) -> Result<(tempfile::TempDir, PathBuf)> {
-    let target = svn_open(path, cancel)?;
+    let SvnTarget::Local { cwd, path: source } = svn_open(path, cancel)? else {
+        bail!("{} is not a folder", path.display());
+    };
     let temp = tempfile::Builder::new()
         .prefix("oxidemerge-svn-")
         .tempdir()?;
@@ -667,17 +722,9 @@ fn svn_export(path: &Path, rev: &str, cancel: &AtomicBool) -> Result<(tempfile::
         temp.path().join("export")
     };
     let dest = format!("{}@", argv_path(&staging).display());
-    let (cwd, source, rev) = match &target {
-        SvnTarget::Local { cwd, path } => {
-            let rev = svn_rev(rev)?;
-            (cwd.clone(), format!("{path}@"), rev)
-        }
-        SvnTarget::Remote(node) => {
-            let rev = svn_number(rev, node)?;
-            (node.cwd.clone(), format!("{}@{rev}", node.url), rev)
-        }
-    };
-    let export = &["export", "-q", "-r", &rev, "--", &source, &dest];
+    let rev = svn_rev(rev)?;
+    let pegged = format!("{source}@");
+    let export = &["export", "-q", "-r", &rev, "--", &pegged, &dest];
     match svn(&cwd, export, cancel) {
         Ok(_) => {}
         // the folder was not there in that revision: it compares as empty, as in Git
@@ -686,7 +733,7 @@ fn svn_export(path: &Path, rev: &str, cancel: &AtomicBool) -> Result<(tempfile::
         // also a repository the server no longer has: the folder is missing only if
         // the folder holding it is there
         Err(e) if e.to_string().contains(SVN_NO_URL) => {
-            let parent = svn_parent(&target, &rev).map_err(|_| anyhow::anyhow!("{e}"))?;
+            let parent = svn_parent(&source).map_err(|_| anyhow::anyhow!("{e}"))?;
             let info = &["info", "-r", &rev, "--depth", "empty", "--", &parent];
             if cancel.load(std::sync::atomic::Ordering::Relaxed) || svn(&cwd, info, cancel).is_err()
             {
@@ -709,25 +756,16 @@ fn svn_export(path: &Path, rev: &str, cancel: &AtomicBool) -> Result<(tempfile::
 
 /// The folder that holds the exported path, as an `svn info` target, so a missing path can be
 /// told from a repository the server no longer has.
-fn svn_parent(target: &SvnTarget, rev: &str) -> Result<String> {
-    match target {
-        SvnTarget::Local { path, .. } => {
-            let parent = Path::new(path).parent().context("no parent folder")?;
-            Ok(format!("{}@", parent.display()))
-        }
-        SvnTarget::Remote(node) => {
-            let mut url =
-                url::Url::parse(&node.url).with_context(|| format!("svn url {}", node.url))?;
-            url.path_segments_mut()
-                .map_err(|_| anyhow::anyhow!("svn url {}", node.url))?
-                .pop();
-            Ok(format!("{url}@{rev}"))
-        }
+fn svn_parent(source: &str) -> Result<String> {
+    if source == "." {
+        return Ok("..@".to_string());
     }
+    let parent = Path::new(source).parent().context("no parent folder")?;
+    Ok(format!("{}@", parent.display()))
 }
 
-/// The entry of `svn info --xml` whose path is `rel` under the folder that was asked about.
-fn parse_svn_info(xml: &str, rel: &str) -> Result<SvnNode> {
+/// The entry of `svn info --xml .` whose path is `name`, a file in that folder.
+fn parse_svn_info(xml: &str, name: &str) -> Result<SvnNode> {
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_str(xml.trim_start_matches('\u{feff}'));
     reader.config_mut().trim_text(true);
@@ -745,10 +783,10 @@ fn parse_svn_info(xml: &str, rel: &str) -> Result<SvnNode> {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
                 text.clear();
-                let name = e.name().as_ref().to_string();
-                if name == "entry" {
+                let element = e.name().as_ref().to_string();
+                if element == "entry" {
                     let path = xml_attr(&e, "path").unwrap_or_default();
-                    matched = svn_entry_matches(&path, rel);
+                    matched = svn_entry_matches(&path, name);
                     if matched {
                         found = true;
                         base = xml_attr(&e, "revision").unwrap_or_default();
@@ -758,7 +796,7 @@ fn parse_svn_info(xml: &str, rel: &str) -> Result<SvnNode> {
                         checksum.clear();
                         wcroot.clear();
                     }
-                } else if matched && name == "commit" {
+                } else if matched && element == "commit" {
                     if let Some(rev) = xml_attr(&e, "revision") {
                         committed = rev;
                     }
@@ -771,11 +809,11 @@ fn parse_svn_info(xml: &str, rel: &str) -> Result<SvnNode> {
                 }
             }
             Ok(Event::End(e)) => {
-                let name = e.name().as_ref().to_string();
+                let element = e.name().as_ref().to_string();
                 if matched {
                     let value = std::mem::take(&mut text);
                     let value = value.trim();
-                    match name.as_str() {
+                    match element.as_str() {
                         "url" => url = value.to_string(),
                         "checksum" => checksum = value.to_string(),
                         "wcroot-abspath" => wcroot = value.to_string(),
@@ -800,6 +838,7 @@ fn parse_svn_info(xml: &str, rel: &str) -> Result<SvnNode> {
         .flatten();
     Ok(SvnNode {
         cwd: PathBuf::new(),
+        name: String::new(),
         url: peg_safe_url(&url)?,
         base,
         committed,
@@ -807,12 +846,10 @@ fn parse_svn_info(xml: &str, rel: &str) -> Result<SvnNode> {
     })
 }
 
-fn svn_entry_matches(entry: &str, rel: &str) -> bool {
-    if rel.is_empty() {
-        return true;
-    }
-    let entry = entry.replace('\\', "/");
-    entry == rel || entry.ends_with(&format!("/{rel}"))
+/// `svn` lists the children of `.` by their names alone, so only the file itself matches, never
+/// one of the same name in a folder below.
+fn svn_entry_matches(entry: &str, name: &str) -> bool {
+    entry == name
 }
 
 /// `.svn/pristine/ab/<checksum>.svn-base` for a file's base, when that file is in the working
@@ -977,14 +1014,20 @@ pub struct ExternalMerge {
 }
 
 /// Subversion's `merge-tool-cmd` passes base, theirs, mine, the merged result and the working
-/// copy. Perforce's `P4MERGE` passes base, theirs, yours and the result, which may not exist
-/// yet. Four directories are not a merge. Recognized only when the command line has no other
-/// option, so a compare that sets one is left as it was written.
+/// copy, the last two being the same file. Perforce's `P4MERGE` passes base, theirs, yours and
+/// the result, which may not exist yet; all but yours are p4's temporary files. Recognized only
+/// when the command line has no other option, so a compare that sets one is left as it was
+/// written. Other files, such as a shell pattern that matched four or five, are not a merge:
+/// saving would overwrite the last of them.
 pub fn external_merge(paths: &[PathBuf]) -> Option<ExternalMerge> {
     let file = |p: &Path| p.is_file();
     match paths {
-        [base, theirs, mine, merged, _wc]
-            if file(base) && file(theirs) && file(mine) && file(merged) && file(_wc) =>
+        [base, theirs, mine, merged, wc]
+            if file(base)
+                && file(theirs)
+                && file(mine)
+                && same_file(merged, wc)
+                && distinct(&[base, theirs, mine, merged]) =>
         {
             Some(ExternalMerge {
                 paths: vec![mine.clone(), base.clone(), theirs.clone()],
@@ -994,7 +1037,12 @@ pub fn external_merge(paths: &[PathBuf]) -> Option<ExternalMerge> {
             })
         }
         [base, theirs, yours, result]
-            if file(base) && file(theirs) && file(yours) && !result.is_dir() =>
+            if file(base)
+                && file(theirs)
+                && file(yours)
+                && !result.is_dir()
+                && [base, theirs, result].iter().all(|p| p4_temp_name(p))
+                && distinct(&[base, theirs, yours, result]) =>
         {
             Some(ExternalMerge {
                 paths: vec![yours.clone(), base.clone(), theirs.clone()],
@@ -1005,6 +1053,40 @@ pub fn external_merge(paths: &[PathBuf]) -> Option<ExternalMerge> {
         }
         _ => None,
     }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (git::dunce_canonical(a), git::dunce_canonical(b)) {
+        (Ok(a), Ok(b)) => a.is_file() && a == b,
+        _ => false,
+    }
+}
+
+/// No two of `paths` name the same file. A path that does not exist yet is taken as written.
+fn distinct(paths: &[&PathBuf]) -> bool {
+    let keys: Vec<PathBuf> = paths
+        .iter()
+        .map(|p| git::dunce_canonical(p).unwrap_or_else(|_| p.to_path_buf()))
+        .collect();
+    keys.iter()
+        .enumerate()
+        .all(|(i, a)| keys[i + 1..].iter().all(|b| a != b))
+}
+
+/// A name p4 gives the files of a merge: `t1234t5678t90.tmp` on Windows, `tmp.1234.…` on
+/// macOS and Linux.
+fn p4_temp_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(stem) = name.strip_suffix(".tmp") {
+        let mut parts = stem.split('t');
+        return parts.next() == Some("") && parts.clone().count() == 3 && parts.all(digits);
+    }
+    name.strip_prefix("tmp.")
+        .and_then(|rest| rest.split('.').next())
+        .is_some_and(digits)
 }
 
 /// SHA-256 of a file, or `None` when it is not there. A missing result is distinct from an
@@ -1082,11 +1164,11 @@ r9 | not | a | header</msg>
         let xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <info>
-<entry path="a @b" revision="0" kind="dir">
+<entry path="." revision="0" kind="dir">
 <url>file:///C:/repo/a%20@b</url>
 <commit revision="0"/>
 </entry>
-<entry path="a @b\é.txt" revision="1" kind="file">
+<entry path="é.txt" revision="1" kind="file">
 <url>file:///C:/repo/a%20@b/é.txt</url>
 <wc-info>
 <wcroot-abspath>{}</wcroot-abspath>
@@ -1094,9 +1176,14 @@ r9 | not | a | header</msg>
 </wc-info>
 <commit revision="1"/>
 </entry>
+<entry path="sub\é.txt" revision="7" kind="file">
+<url>file:///C:/repo/a%20@b/sub/é.txt</url>
+<commit revision="7"/>
+</entry>
 </info>"#,
             wc.display()
         );
+        // Only the file itself, never one of the same name in a folder below.
         let node = parse_svn_info(&xml, "é.txt").unwrap();
         assert_eq!(node.base, "1");
         assert_eq!(node.committed, "1");
@@ -1104,6 +1191,62 @@ r9 | not | a | header</msg>
         assert_eq!(node.pristine.as_deref(), Some(pristine.as_path()));
         assert_eq!(previous_rev("1").unwrap(), "0");
         assert!(previous_rev("0").is_err());
+    }
+
+    #[test]
+    fn a_pristine_base_gets_the_line_ends_svn_cat_gives_it_and_keywords_are_seen() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<properties>
+<target path="other.txt">
+<property name="svn:keywords">Id</property>
+</target>
+<target path="é.txt">
+<property name="svn:eol-style">CRLF</property>
+<property name="svn:mime-type">text/plain</property>
+</target>
+</properties>"#;
+        let props = parse_svn_props(xml, "é.txt");
+        assert_eq!(props.keywords, None);
+        assert_eq!(props.eol_style.as_deref(), Some("CRLF"));
+        assert_eq!(
+            parse_svn_props(xml, "other.txt").keywords.as_deref(),
+            Some("Id")
+        );
+        assert_eq!(parse_svn_props(xml, "missing.txt"), SvnProps::default());
+
+        let lf = b"a\nb\n".to_vec();
+        assert_eq!(translate_eol(lf.clone(), None), lf);
+        assert_eq!(translate_eol(lf.clone(), Some("LF")), lf);
+        assert_eq!(translate_eol(lf.clone(), Some("CRLF")), b"a\r\nb\r\n");
+        assert_eq!(translate_eol(lf.clone(), Some("CR")), b"a\rb\r");
+        let native: &[u8] = if cfg!(windows) {
+            b"a\r\nb\r\n"
+        } else {
+            b"a\nb\n"
+        };
+        assert_eq!(translate_eol(lf, Some("native")), native);
+    }
+
+    #[test]
+    fn only_the_names_p4_gives_merge_files_count_as_p4_temporary_files() {
+        for name in [
+            "t11292t37660t86.tmp",
+            "t1t2t3.tmp",
+            "tmp.63484.0x20d2d0f40.90",
+        ] {
+            assert!(p4_temp_name(Path::new(name)), "{name}");
+        }
+        for name in [
+            "report.tmp",
+            "t1t2.tmp",
+            "t1t2t3t4.tmp",
+            "tat2t3.tmp",
+            "T1T2T3.TMP",
+            "tmp.txt",
+            "tmp..1",
+        ] {
+            assert!(!p4_temp_name(Path::new(name)), "{name}");
+        }
     }
 
     #[test]
@@ -1125,33 +1268,54 @@ r9 | not | a | header</msg>
             std::fs::write(&path, name).unwrap();
             path
         };
-        let base = file("base");
-        let theirs = file("theirs");
-        let mine = file("mine");
-        let merged = file("merged");
-        let wc = file("wc");
+        // As `svn update --accept launch` passes them: the merged file is the working file.
+        let base = file("g.txt.r1");
+        let theirs = file("g.txt.r2");
+        let mine = file("g.txt.mine");
+        let merged = file("g.txt");
         let merge = external_merge(&[
             base.clone(),
             theirs.clone(),
             mine.clone(),
             merged.clone(),
-            wc,
+            merged.clone(),
         ])
         .unwrap();
-        assert_eq!(merge.paths, vec![mine, base.clone(), theirs.clone()]);
+        assert_eq!(
+            merge.paths,
+            vec![mine.clone(), base.clone(), theirs.clone()]
+        );
         assert_eq!(merge.labels, ["Mine", "Base", "Theirs"]);
         assert_eq!(merge.read_only, [true, false, true]);
         assert_eq!(merge.output, merged);
+        // Five different files, as `oxidemerge *.txt` could pass, are not a merge.
+        let other = file("other.txt");
+        assert!(external_merge(&[base, theirs, mine, merged.clone(), other.clone()]).is_none());
 
-        let yours = file("yours");
-        let result = dir.path().join("result");
-        let merge = external_merge(&[base, theirs, yours.clone(), result.clone()]).unwrap();
-        assert_eq!(merge.paths[0], yours);
+        // As `p4 resolve` passes them: p4's temporary files around the workspace file.
+        let p4_base = file("t11292t37660t86.tmp");
+        let p4_theirs = file("tmp.63484.0x20d2d0f40.90");
+        let yours = file("f.txt");
+        let result = dir.path().join("t11292t37660t158.tmp");
+        let merge = external_merge(&[
+            p4_base.clone(),
+            p4_theirs.clone(),
+            yours.clone(),
+            result.clone(),
+        ])
+        .unwrap();
+        assert_eq!(merge.paths, vec![yours.clone(), p4_base.clone(), p4_theirs]);
         assert_eq!(merge.labels, ["Yours", "Base", "Theirs"]);
         assert_eq!(merge.output, result);
         assert!(file_digest(&merge.output).is_none());
         std::fs::write(&merge.output, b"").unwrap();
         assert!(file_digest(&merge.output).is_some());
+        // Four ordinary files are not, and neither is a result that is one of the inputs.
+        assert!(
+            external_merge(&[merged.clone(), other.clone(), yours.clone(), file("x.txt")])
+                .is_none()
+        );
+        assert!(external_merge(&[p4_base.clone(), result.clone(), yours, p4_base]).is_none());
 
         let dirs: Vec<_> = (0..4)
             .map(|i| {

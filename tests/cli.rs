@@ -1923,9 +1923,8 @@ fn ansi_round_trips(text: &str) -> bool {
         if wrote <= 1 {
             return false;
         }
-        let wide_len = unsafe {
-            MultiByteToWideChar(cp, 0, bytes.as_ptr(), -1, std::ptr::null_mut(), 0)
-        };
+        let wide_len =
+            unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), -1, std::ptr::null_mut(), 0) };
         if wide_len <= 1 {
             return false;
         }
@@ -1955,7 +1954,9 @@ fn mercurial_repositories_compare_with_their_revisions() {
             .env("HGRCPATH", &hgrc)
             .env("HGUSER", "test")
             .env("HGPLAIN", "1");
-        if !cfg!(windows) {
+        if cfg!(windows) {
+            cmd.env_remove("HGENCODING");
+        } else {
             cmd.env("HGENCODING", "utf-8");
         }
         cmd.output()
