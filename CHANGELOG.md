@@ -372,10 +372,11 @@ uses its section of this file as the release notes.
   `"allow_large_deletion": true`. A report or patch written outside the job file's folder
   also needs `--yes`, and a report never replaces a link or a special file. The jobs after
   a failure are skipped unless `"continue_on_error": true`; unknown fields and newer
-  versions are refused. *File → Save as job...* saves a folder comparison as a compare,
-  sync plan or sync job, with its folders, filter, method, rules and options, and paths
-  absolute or relative to the job file; a comparison of a revision, an archive or a web
-  page, whose folders are temporary, cannot be saved. *File → Run job...* runs a job file
+  versions are refused. *File → Projects and jobs → Save as job...* saves a folder
+  comparison as a compare, sync plan or sync job, with its folders, filter, method, rules
+  and options, and paths absolute or relative to the job file; a comparison of a revision,
+  an archive or a web page, whose folders are temporary, cannot be saved.
+  *File → Projects and jobs → Run job...* runs a job file
   as `--job` does, with your saved settings rather than this window's changes, and lists
   each job's result, with the report and the compare a click away. Before it runs, it
   lists the folders a sync job changes, the files written outside the job file's folder
@@ -466,8 +467,9 @@ uses its section of this file as the release notes.
 - **Menus in short windows:** a menu too tall for the window scrolls within it instead of
   being cut off. A menu of the menu bar stays under its button. Arrows at its top and bottom
   scroll it while the pointer rests on them, and the mouse wheel and the arrow keys scroll it
-  too. *Open project*, *Save as project*, *Save as job* and *Run job* moved to a new
-  *File → Projects and jobs* submenu, so the File menu fits more windows whole.
+  too. *Open project* and *Save as project* moved to a new *File → Projects and jobs*
+  submenu, with the new *Save as job* and *Run job*, so the File menu fits more windows
+  whole.
 - **HTML reports** are easier to read, search and share:
   - A folder report counts the files with different contents, the files on one side only and
     the differences exported apart. Its index lists every changed or one-sided file, and a file

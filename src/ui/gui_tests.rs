@@ -504,6 +504,24 @@ fn named(w: &Widget, label: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with("  ("))
 }
 
+/// Where the popups shown are, menus and their submenus among them.
+fn popups(gui: &Gui) -> Vec<Rect> {
+    gui.ctx.memory(|m| {
+        m.layer_ids()
+            .filter(|l| l.order == egui::Order::Foreground && m.areas().visible_last_frame(l))
+            .filter_map(|l| m.area_rect(l.id))
+            .collect()
+    })
+}
+
+/// Whether one of the File menu's submenus is at `at`, in sight or not.
+fn file_submenu_at(gui: &Gui, at: Pos2) -> bool {
+    let submenus = ["menu.projects_jobs", "menu.workspaces", "menu.export"];
+    gui.widgets
+        .iter()
+        .any(|w| w.rect.contains(at) && submenus.iter().any(|k| named(w, tr(k))))
+}
+
 /// The named widgets of an accessibility tree, in drawing order.
 fn widgets_of(tree: &accesskit::TreeUpdate) -> Vec<Widget> {
     let nodes: std::collections::HashMap<accesskit::NodeId, &accesskit::Node> =
@@ -3389,13 +3407,7 @@ fn menu_widths(gui: &mut Gui) -> Vec<(&'static str, f32)> {
     for key in MENUS {
         gui.click_menu(tr(key));
         gui.frames(3);
-        let open: Vec<f32> = gui.ctx.memory(|m| {
-            m.layer_ids()
-                .filter(|l| l.order == egui::Order::Foreground && m.areas().visible_last_frame(l))
-                .filter_map(|l| m.area_rect(l.id))
-                .map(|r| r.width())
-                .collect()
-        });
+        let open: Vec<f32> = popups(gui).iter().map(|r| r.width()).collect();
         assert_eq!(open.len(), 1, "{key}: {open:?}");
         widths.push((key, open[0]));
         gui.click_menu(tr(key));
@@ -3499,12 +3511,7 @@ fn menus_scroll_under_their_button_in_short_windows() {
     for key in MENUS {
         let button = gui.click_menu(tr(key));
         gui.frames(3);
-        let open: Vec<Rect> = gui.ctx.memory(|m| {
-            m.layer_ids()
-                .filter(|l| l.order == egui::Order::Foreground && m.areas().visible_last_frame(l))
-                .filter_map(|l| m.area_rect(l.id))
-                .collect()
-        });
+        let open = popups(&gui);
         assert_eq!(open.len(), 1, "{key}: {open:?}");
         let menu = open[0];
         assert!(
@@ -3547,12 +3554,7 @@ fn menus_too_tall_for_the_window_scroll_while_the_pointer_rests_on_their_arrows(
     gui.frames(3);
     gui.click_menu(tr(MENUS[0]));
     gui.frames(3);
-    let menu = gui.ctx.memory(|m| {
-        m.layer_ids()
-            .filter(|l| l.order == egui::Order::Foreground && m.areas().visible_last_frame(l))
-            .find_map(|l| m.area_rect(l.id))
-            .expect("the File menu is open")
-    });
+    let menu = *popups(&gui).first().expect("the File menu is open");
     // Where the first item is, if it is still in view.
     let first = |gui: &Gui| {
         gui.widgets
@@ -3562,23 +3564,19 @@ fn menus_too_tall_for_the_window_scroll_while_the_pointer_rests_on_their_arrows(
     };
     let top = first(&gui).expect("the first item shows");
     // A click on an arrow neither closes the menu nor picks the item under it.
-    let shown = |gui: &Gui| {
-        gui.ctx.memory(|m| {
-            m.layer_ids()
-                .filter(|l| l.order == egui::Order::Foreground && m.areas().visible_last_frame(l))
-                .count()
-        })
+    let shown = |gui: &Gui| popups(gui).len();
+    let rest = |gui: &mut Gui, y: f32, frames: usize| {
+        gui.events
+            .push(Event::PointerMoved(egui::pos2(menu.center().x, y)));
+        gui.frames(frames);
     };
     gui.click_at(egui::pos2(menu.center().x, menu.bottom() - 12.0));
     assert_eq!(shown(&gui), 1, "the menu stays open");
+    // Scrolled a little, it has an arrow at the top too.
+    rest(&mut gui, menu.bottom() - 12.0, 10);
     gui.click_at(egui::pos2(menu.center().x, menu.top() + 12.0));
     assert_eq!(shown(&gui), 1, "the menu stays open");
-    let rest = |gui: &mut Gui, y: f32| {
-        gui.events
-            .push(Event::PointerMoved(egui::pos2(menu.center().x, y)));
-        gui.frames(60);
-    };
-    rest(&mut gui, menu.bottom() - 12.0);
+    rest(&mut gui, menu.bottom() - 12.0, 60);
     assert!(
         first(&gui).is_none_or(|y| y < top - 40.0),
         "{:?} from {top}",
@@ -3588,10 +3586,10 @@ fn menus_too_tall_for_the_window_scroll_while_the_pointer_rests_on_their_arrows(
         gui.app.open_dlg.is_none(),
         "resting on the arrow picks nothing"
     );
-    rest(&mut gui, menu.top() + 12.0);
+    rest(&mut gui, menu.top() + 12.0, 60);
     assert_eq!(first(&gui), Some(top));
     // Opened again, it starts at the top, however far down it was left.
-    rest(&mut gui, menu.bottom() - 12.0);
+    rest(&mut gui, menu.bottom() - 12.0, 60);
     assert_ne!(first(&gui), Some(top));
     gui.click_menu(tr(MENUS[0]));
     gui.frames(3);
@@ -3603,6 +3601,74 @@ fn menus_too_tall_for_the_window_scroll_while_the_pointer_rests_on_their_arrows(
     gui.click_at(egui::pos2(menu.center().x, top + 8.0));
     assert_eq!(shown(&gui), 0, "an item closes the menu");
     assert_eq!(gui.app.tabs.len(), tabs + 1, "New opened a tab");
+}
+
+#[test]
+fn submenus_out_of_sight_or_under_an_arrow_do_not_open() {
+    let mut gui = Gui::start("hidden_submenus", None);
+    gui.screen = egui::vec2(640.0, 400.0);
+    gui.frames(3);
+    let file = gui.click_menu(tr(MENUS[0]));
+    gui.frames(3);
+    let menu = *popups(&gui).first().expect("the File menu is open");
+    // Resting on the bottom arrow, the File menu scrolls its submenus under it.
+    let at = egui::pos2(menu.center().x, menu.bottom() - 12.0);
+    let mut under = false;
+    for _ in 0..60 {
+        gui.events.push(Event::PointerMoved(at));
+        gui.frame();
+        under |= file_submenu_at(&gui, at);
+        assert_eq!(popups(&gui).len(), 1, "a submenu opened under the arrow");
+    }
+    assert!(under, "no submenu went under the arrow");
+    // Scrolled down, the submenus near its top are out of sight, over the menu bar.
+    assert!(
+        file_submenu_at(&gui, file.center()),
+        "no submenu went out of sight under the File button"
+    );
+    gui.events.push(Event::PointerMoved(file.center()));
+    gui.frames(10);
+    assert_eq!(popups(&gui).len(), 1, "a submenu out of sight opened");
+    // One in sight opens as ever.
+    let export = gui
+        .widgets
+        .iter()
+        .find(|w| named(w, tr("menu.export")) && menu.contains(w.rect.center()))
+        .expect("Export is in sight")
+        .rect;
+    gui.events.push(Event::PointerMoved(export.center()));
+    gui.frames(10);
+    assert_eq!(popups(&gui).len(), 2, "Export opened");
+}
+
+#[test]
+fn submenus_kept_from_opening_under_the_pointer_still_take_the_keyboard() {
+    let mut gui = Gui::start("hidden_submenus_keyboard", None);
+    gui.screen = egui::vec2(640.0, 400.0);
+    gui.frames(3);
+    let file = gui.click_menu(tr(MENUS[0]));
+    gui.frames(3);
+    let menu = *popups(&gui).first().expect("the File menu is open");
+    let at = egui::pos2(menu.center().x, menu.bottom() - 12.0);
+    gui.events.push(Event::PointerMoved(at));
+    gui.frames(60);
+    // The pointer left where the submenus near the top went out of sight.
+    gui.events.push(Event::PointerMoved(file.center()));
+    gui.frames(3);
+    assert!(
+        file_submenu_at(&gui, file.center()),
+        "no submenu went out of sight under the File button"
+    );
+    let mut reached = Vec::new();
+    for _ in 0..40 {
+        gui.key(Modifiers::NONE, Key::ArrowUp);
+        gui.frames(2);
+        reached.extend(gui.focus.as_ref().map(|w| w.label.clone()));
+    }
+    assert!(
+        reached.iter().any(|l| l == tr("menu.projects_jobs")),
+        "{reached:?}"
+    );
 }
 
 #[test]
