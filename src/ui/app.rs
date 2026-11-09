@@ -7457,7 +7457,9 @@ impl OxideMergeApp {
                             Icon::Next,
                             tr("label.recent_commits"),
                         );
-                        egui::Popup::menu(&commits).show(|ui| {
+                        let close = egui::PopupCloseBehavior::CloseOnClickOutside;
+                        let popup = egui::Popup::menu(&commits).close_behavior(close);
+                        popup.show(|ui| {
                             widgets::menu_scroll(ui, |ui| {
                                 ui.set_min_width(420.0);
                                 for (hash, subject) in &d.commits {
@@ -8976,13 +8978,14 @@ impl OxideMergeApp {
                             );
                             egui::Popup::from_toggle_button_response(&r)
                                 .id(recent_id)
-                                .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                                 .show(|ui| {
                                     widgets::menu_scroll(ui, |ui| {
                                         ui.set_min_width(320.0);
                                         for r in &recent {
                                             if ui.selectable_label(false, r).clicked() {
                                                 d.paths[s] = r.clone();
+                                                ui.close();
                                             }
                                         }
                                     });

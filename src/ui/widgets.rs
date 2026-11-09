@@ -1187,6 +1187,8 @@ pub fn menu_setup(ui: &mut Ui) {
 
 /// Room kept between a menu and the edges of the window.
 const MENU_EDGE: f32 = 4.0;
+/// Shortest a menu scrolls in, however short the window: a few rows.
+const MENU_MIN_HEIGHT: f32 = 80.0;
 
 /// The contents of a menu, styled by [`menu_setup`], scrolling when the window is too short to
 /// show them whole. Menus that open anywhere (submenus, context menus, drop-downs) move up to
@@ -1207,7 +1209,7 @@ pub fn menu_scroll<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 
 /// [`menu`] for a menu of the menu bar, which stays under its button: it scrolls in the room
 /// left below the menu bar, whose bottom is at `bar_bottom`. The menu cannot tell where it is
-/// itself, as the frame it opens it is laid out elsewhere.
+/// itself, as the frame it opens in is laid out elsewhere.
 pub fn bar_menu<R>(ui: &mut Ui, bar_bottom: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let window = ui.ctx().content_rect();
     let room = window.bottom() - bar_bottom - ui.spacing().menu_margin.sum().y - 2.0 * MENU_EDGE;
@@ -1219,8 +1221,11 @@ pub fn bar_menu<R>(ui: &mut Ui, bar_bottom: f32, add: impl FnOnce(&mut Ui) -> R)
 
 fn scrolling<R>(ui: &mut Ui, room: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let room = room.max(MENU_MIN_HEIGHT);
-    // A bar over the contents keeps a scrolling menu as wide as the others.
-    ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
+    // A bar over the contents keeps a scrolling menu as wide as the others. Even at its widest,
+    // under the pointer, it stays within the rows' padding, clear of the shortcuts at their ends.
+    let mut scroll = egui::style::ScrollStyle::floating();
+    scroll.bar_width = MENU_ITEM_PADDING.x - 2.0;
+    ui.spacing_mut().scroll = scroll;
     // A popup's room is the size it had the frame before, so a scroll area held to that would
     // never grow: the minimum lets it take all of `room` when the contents need it.
     egui::ScrollArea::vertical()
@@ -1245,9 +1250,6 @@ fn scrolling<R>(ui: &mut Ui, room: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
         })
         .inner
 }
-
-/// Shortest a menu scrolls in, however short the window: a few rows.
-const MENU_MIN_HEIGHT: f32 = 80.0;
 
 /// Room between a menu item's label and its shortcut.
 const MENU_SHORTCUT_GAP: f32 = 24.0;

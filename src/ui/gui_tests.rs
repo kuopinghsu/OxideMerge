@@ -612,6 +612,26 @@ const ALT: Modifiers = Modifiers::ALT;
 const CMD: Modifiers = Modifiers::COMMAND;
 
 #[test]
+fn a_recent_path_picked_in_the_open_dialog_fills_its_field_and_closes_the_list() {
+    let mut gui = Gui::start("open_dialog_recent", None);
+    gui.app.cfg.recent_paths = vec!["/tmp/one.txt".into(), "/tmp/two.txt".into()];
+    gui.key(CMD, Key::O);
+    let open = |gui: &Gui| {
+        [0, 2]
+            .into_iter()
+            .any(|s| egui::Popup::is_id_open(&gui.ctx, egui::Id::unique(("open_recent", s))))
+    };
+    gui.click(tr("label.recent"));
+    gui.frames(2);
+    assert!(open(&gui));
+    gui.click("/tmp/two.txt");
+    gui.frames(2);
+    assert!(!open(&gui));
+    let d = gui.app.open_dlg.as_ref().unwrap();
+    assert!(d.paths.iter().any(|p| p == "/tmp/two.txt"), "{:?}", d.paths);
+}
+
+#[test]
 fn files_dropped_on_the_open_dialog_are_compared_and_merged() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
