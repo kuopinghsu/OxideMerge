@@ -92,6 +92,13 @@ uses its section of this file as the release notes.
   from the server's address; it cannot be used through a proxy or from behind NAT. FTPS can
   present a client certificate (`--client-cert FILE` and `--client-key FILE`, or
   `client_cert` and `client_key`) in PEM, key and certificate in one file or two.
+  Checked on Linux with OpenSSH 10.5p1 and vsftpd 3.0.5: SFTP with a private key refuses an
+  untrusted server until `--trust-fingerprint` confirms the fingerprint `ssh-keygen -lf` prints,
+  then an identical file exits 0 and a different one exits 1, a folder compare names the changed
+  file, and the window opens the file as writable. A sync job uploads a new file, a shorter
+  upload replaces it in place, and an upload is refused when the server file has changed since
+  the fetch. Anonymous FTP does the same for a file, including with `--ftp-active`, and a second
+  sync updates the uploaded file. An address that contains a password is refused.
 - **Workspaces:** *File → Workspaces → Save as workspace...* saves the open tabs under a
   name, kept until deleted; *File → Workspaces* then lists every saved workspace to reopen
   all of its tabs at once, alongside whatever is open already, and *Manage workspaces...*
