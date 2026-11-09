@@ -236,14 +236,14 @@ const WORKLOADS: &[Workload] = &[
     },
     Workload {
         name: "folder-small-files",
-        what: "2 folders of 20,000 files of 1 KB, 8 levels deep, 1% changed",
+        what: "2 folders of 20,000 files of about 400 bytes, 8 levels deep, 1% changed",
         level: 0,
         make: small_files,
         run: compare_folders,
     },
     Workload {
         name: "sync-preview-20k",
-        what: "a mirror plan for 2 folders of 20,000 files of 1 KB, 1% changed: scan, then plan",
+        what: "a mirror plan for 2 folders of 20,000 files of about 400 bytes, 1% changed: scan, then plan",
         level: 0,
         make: small_files,
         run: preview_sync,

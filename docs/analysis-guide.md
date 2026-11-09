@@ -271,8 +271,9 @@ scope.
 Semantic source navigation supports LF, CRLF and CR physical lines. Changes are paginated
 in the GUI and displayed values are abbreviated; exports retain bounded full values. XML
 expanded names are capped at 1 KiB and semantic paths at 4 KiB, with a 32 MiB change
-budget. The impact cache bounds indexed lines to 100,000 per file and 1,000,000 total,
-with a 256 MiB estimated footprint; lines longer than 4 KiB are explicitly omitted.
+budget. The impact cache indexes at most 1,000,000 lines in total, with a 256 MiB
+estimated footprint; a file of more than 100,000 lines or 16 MiB of text is not indexed
+at all, and lines longer than 4 KiB are explicitly omitted.
 Multi-pattern matching has a 1 MiB pattern budget, 32 MiB matcher budget and 10 million
 match-step limit. Cancellation/error clears partial caches.
 

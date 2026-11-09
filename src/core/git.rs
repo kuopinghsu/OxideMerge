@@ -137,7 +137,11 @@ fn finish(
     stderr: &[u8],
 ) -> Result<Vec<u8>> {
     if !status.success() {
-        let err = super::vcs::tool_text(stderr);
+        let err = match program {
+            // their messages are in the ANSI code page on Windows; Git's are UTF-8
+            "svn" | "hg" => super::vcs::tool_text(stderr),
+            _ => String::from_utf8_lossy(stderr).into_owned(),
+        };
         let first = err.lines().find(|l| !l.trim().is_empty());
         bail!(
             "{}",

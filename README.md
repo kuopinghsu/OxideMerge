@@ -13,6 +13,7 @@ pages.
 
 **[Download](https://github.com/kuopinghsu/OxideMerge/releases)** ·
 [User guide](docs/user-guide.adoc) ([PDF](docs/dist/oxidemerge-user-guide.pdf)) ·
+[Feature comparison](docs/OxideMerge_Feature_Comparison.md) ·
 [Changelog](CHANGELOG.md)
 
 ![OxideMerge start page](images/start.png)
@@ -558,6 +559,8 @@ Missing messages, and translations with wrong placeholders, are shown in English
 - [Analysis guide](docs/analysis-guide.md): merge verification, semantic comparison,
   review workspaces, release summaries and potential impact.
 - [Benchmarks](docs/benchmarks.md): performance results and how to measure them.
+- [Feature comparison](docs/OxideMerge_Feature_Comparison.md): OxideMerge's features
+  next to those documented for WinMerge, Meld, Beyond Compare and Araxis Merge.
 - [Changelog](CHANGELOG.md): the changes in each version.
 - [Development guide](docs/development.md): how to build, test and release OxideMerge.
 
@@ -623,8 +626,9 @@ shortcuts use Command instead of Ctrl. The app shows the right keys for your sys
 ## Development
 
 To build OxideMerge from source, install a Rust toolchain with
-[rustup](https://rustup.rs/). Linux also needs a C compiler. Then run these commands in
-the repository folder:
+[rustup](https://rustup.rs/). Linux also needs a C compiler, and Windows and Linux need
+Perl to build OpenSSL (see the [development guide](docs/development.md#build-from-source)).
+Then run these commands in the repository folder:
 
 ```sh
 cargo build --release --locked

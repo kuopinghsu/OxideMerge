@@ -593,10 +593,10 @@ fn svn_save(path: &Path, rev: &str, dest: &Path, cancel: &AtomicBool) -> Result<
         SvnTarget::Remote(node) => {
             let rev = svn_number(rev, &node)?;
             // BASE is the pristine file in the working copy, so it is read with the server
-            // unreachable, translated as `svn cat` would. Keywords need the repository.
-            if rev == node.base {
-                if let Some(src) = &node.pristine {
-                    let props = svn_props(&node, cancel).unwrap_or_default();
+            // unreachable, translated as `svn cat` would. Keywords need the repository, and so
+            // does a file whose properties cannot be read.
+            if let (true, Some(src)) = (rev == node.base, &node.pristine) {
+                if let Ok(props) = svn_props(&node, cancel) {
                     if props.keywords.is_none() {
                         let bytes =
                             std::fs::read(src).with_context(|| src.display().to_string())?;
@@ -621,6 +621,7 @@ struct SvnProps {
     eol_style: Option<String>,
 }
 
+/// The properties `BASE` of `node` was committed with, not those changed in the working copy.
 fn svn_props(node: &SvnNode, cancel: &AtomicBool) -> Result<SvnProps> {
     let xml = svn(
         &node.cwd,
@@ -628,6 +629,8 @@ fn svn_props(node: &SvnNode, cancel: &AtomicBool) -> Result<SvnProps> {
             "proplist",
             "--xml",
             "-v",
+            "-r",
+            "BASE",
             "--depth",
             "immediates",
             "--",
@@ -930,9 +933,9 @@ fn xml_attr(e: &quick_xml::events::BytesStart<'_>, name: &str) -> Option<String>
     })
 }
 
-/// What `svn`, `hg` or `git` printed. UTF-8 is kept (Subversion's XML is UTF-8 even on
-/// Windows). Anything else is the ANSI code page, which is how Windows Mercurial prints a name
-/// and Windows Subversion its messages.
+/// What `svn` or `hg` printed. UTF-8 is kept (Subversion's XML is UTF-8 even on Windows).
+/// Anything else is the ANSI code page, which is how Windows Mercurial prints a name and
+/// Windows Subversion its messages.
 pub(super) fn tool_text(bytes: &[u8]) -> String {
     #[cfg(windows)]
     let ansi = ansi_encoding();
@@ -1522,6 +1525,92 @@ r9 | not | a | header</msg>
             !copy.join("escape.txt").exists(),
             "the escaping link should have been dropped"
         );
+    }
+
+    /// `BASE` of a file is what `svn cat -r BASE` gives, line ends and keywords included, even
+    /// with properties changed in the working copy and not committed, and for a name that is
+    /// not ASCII, which the Windows `svn` is never given.
+    #[test]
+    fn svn_base_has_the_committed_line_ends_and_keywords() {
+        let d = tempfile::tempdir().unwrap();
+        let run = |cwd: &Path, program: &str, args: &[&str]| {
+            std::process::Command::new(program)
+                .args(args)
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::null())
+                .output()
+        };
+        let repo = d.path().join("repo");
+        if run(d.path(), "svnadmin", &["create", repo.to_str().unwrap()]).is_err() {
+            eprintln!("Subversion is not installed; skipped");
+            return;
+        }
+        let url = format!(
+            "file:///{}",
+            repo.to_str()
+                .unwrap()
+                .replace('\\', "/")
+                .trim_start_matches('/')
+        );
+        let wc = d.path().join("wc");
+        let ok = |cwd: &Path, args: &[&str]| {
+            let out = run(cwd, "svn", args).unwrap();
+            assert!(
+                out.status.success(),
+                "svn {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        ok(d.path(), &["checkout", "-q", &url, wc.to_str().unwrap()]);
+        let sub = wc.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("é.txt"), "a\nb\n").unwrap();
+        std::fs::write(sub.join("é.kw"), "$Rev$\n").unwrap();
+        // the names reach `svn` only from the folder, as no argument can carry them on Windows
+        ok(
+            &wc,
+            &[
+                "add",
+                "-q",
+                "--force",
+                "--config-option",
+                "config:miscellany:enable-auto-props=yes",
+                "--config-option",
+                "config:auto-props:*.txt=svn:eol-style=native",
+                "--config-option",
+                "config:auto-props:*.kw=svn:keywords=Rev",
+                "sub",
+            ],
+        );
+        ok(&wc, &["commit", "-q", "-m", "first"]);
+
+        let native: &[u8] = if cfg!(windows) {
+            b"a\r\nb\r\n"
+        } else {
+            b"a\nb\n"
+        };
+        let base = |name: &str| {
+            let never = AtomicBool::new(false);
+            let (_tmp, copy) = copy_of(&sub.join(name), "BASE", &never).unwrap();
+            std::fs::read(copy).unwrap()
+        };
+        assert_eq!(base("é.txt"), native);
+        assert_eq!(base("é.kw"), b"$Rev: 1 $\n");
+
+        ok(&sub, &["propdel", "-q", "svn:eol-style", "-R", "."]);
+        ok(&sub, &["propdel", "-q", "svn:keywords", "-R", "."]);
+        assert_eq!(base("é.kw"), b"$Rev: 1 $\n", "uncommitted svn:keywords");
+
+        // with the repository gone, BASE can only be the pristine copy in the working copy
+        std::fs::rename(&repo, d.path().join("gone")).unwrap();
+        if cfg!(windows) {
+            let never = AtomicBool::new(false);
+            assert!(
+                copy_of(&sub.join("é.kw"), "BASE", &never).is_err(),
+                "a file with keywords is read from the repository"
+            );
+        }
+        assert_eq!(base("é.txt"), native, "uncommitted svn:eol-style");
     }
 
     #[test]

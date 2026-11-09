@@ -17,8 +17,17 @@
 ## 從原始碼建置
 
 請先透過 [rustup](https://rustup.rs/) 安裝 Rust 工具鏈。Linux 另需要 C 編譯器。
-X11、Wayland、鍵盤與 OpenGL 函式庫會在程式啟動時才載入，因此建置時不需要安裝這些函式庫的開
-發套件。
+X11、Wayland、鍵盤與 OpenGL 函式庫會在程式啟動時才載入，
+因此建置時不需要安裝這些函式庫的開發套件。
+
+SFTP 功能會從原始碼建置 OpenSSL，因此需要 Perl：
+
+- **Windows：** 安裝 [Strawberry Perl](https://strawberryperl.com/)，例如執行
+  `winget install StrawberryPerl.StrawberryPerl`，然後開啟新的終端機。若要使用不在 `PATH`
+  中的 Perl，請將 `OPENSSL_SRC_PERL` 設為其 `perl.exe`。Git for Windows 附帶的 Perl 無法
+  使用。
+- **Linux：** `perl` 及其 `IPC::Cmd` 模組（Fedora 為 `perl-IPC-Cmd`）。
+- **macOS：** 系統內建的 Perl 即可。
 
 在儲存庫資料夾中執行：
 
@@ -117,17 +126,20 @@ fontconfig 與 DejaVu Sans 字型。建置指令碼會自動下載所需的 Noto
 
 `cargo test` 涵蓋三個部分：
 
-- **核心功能：** 比較、合併、修補檔、資料夾與檔案操作。`src/core/regress.rs` 中的隨機測試
-  也會產生差異、合併與修補案例進行驗證。
-- **介面操作：** 在沒有顯示器的情況下操作實際的檢視畫面，涵蓋選單、編輯、拖放檔案與儲存結
-  果。
+- **核心功能：** 比較、合併、修補檔、資料夾與檔案操作。
+  `src/core/regress.rs` 中的隨機測試也會產生差異、合併與修補案例進行驗證。
+- **介面操作：** 在沒有顯示器的情況下操作實際的檢視畫面，涵蓋選單、編輯、拖放檔案與儲存結果。
   視窗測試失敗時，會將詳細資訊寫入 `target/gui-tests/<test>.txt`。
-- **指令列行為：** `tests/cli.rs` 中的測試會執行程式，檢查結束代碼、報告、修補檔與錯誤訊
-  息。
+- **指令列行為：** `tests/cli.rs` 中的測試會執行程式，檢查結束代碼、報告、修補檔與錯誤訊息。
 
 測試使用獨立的設定資料夾，不會變更您的設定。其他不應影響設定的測試，
 也可以將 `OXIDEMERGE_CONFIG_DIR` 指向另一個資料夾。
 部分網頁測試會啟動本機 HTTP 伺服器，因此測試環境必須允許程式監聽本機網路連接埠。
+
+版本控制的測試會使用實際的程式：Git、Subversion 的 `svn` 與 `svnadmin`，以及 Mercurial 的 `hg`。
+找不到 Subversion 或 Mercurial 時，相關測試會印出已略過並視為通過，因此請先安裝它們再執行這些測試。
+持續整合工作流程不會安裝 Subversion 或 Mercurial，只有執行環境本身已有時才會執行；
+[Docker 測試環境](#docker-測試環境)則兩者都會安裝。Perforce 沒有自動化測試。
 
 ### 已保存的報告
 
@@ -177,15 +189,17 @@ Linux 沒有顯示環境時，會自動啟動 Xvfb。設定 `OXIDEMERGE_SMOKE_RE
 
 在任何裝有 Docker 的電腦上（包括 Mac），都可以執行 `scripts/docker-test.sh`（或
 `make docker-test`）來檢查 Linux。容器定義於 [docker/Dockerfile](../docker/Dockerfile)，會執行
-Clippy、完整測試、發行版本建置，以及在 Xvfb 上的指令列與視窗檢查；測試與持續整合相同，以發行模式
-建置。測試以一般使用者身分執行。容器也會啟動實際的伺服器（[docker/servers.sh](../docker/servers.sh)），
-執行一般 `cargo test` 會略過的測試：
+Clippy、完整測試、發行版本建置，以及在 Xvfb 上的指令列與視窗檢查；
+測試與持續整合相同，以發行模式建置。測試以一般使用者身分執行。
+容器也會啟動實際的伺服器（[docker/servers.sh](../docker/servers.sh)），
+並安裝 Subversion 與 Mercurial，執行一般 `cargo test` 會略過的測試：
 
-- OpenSSH：以金鑰登入、金鑰密碼、主機憑證、跳板主機與 `ProxyCommand`，以及透過 PAM 的鍵盤互動式
-  登入。
+- OpenSSH：以金鑰登入、金鑰密碼、主機憑證、跳板主機與 `ProxyCommand`，
+  以及透過 PAM 的鍵盤互動式登入。
 - vsftpd 與 ProFTPD：FTP、明確與隱含 FTPS、主動模式，以及用戶端憑證。
-- Dante 與 tinyproxy：透過 SOCKS5 與 HTTP CONNECT 代理伺服器（需登入與不需登入）使用 SFTP、FTP
-  與 FTPS。
+- Dante 與 tinyproxy：透過 SOCKS5 與 HTTP CONNECT 代理伺服器（需登入與不需登入）
+  使用 SFTP、FTP 與 FTPS。
+- Subversion 與 Mercurial：以實際的工作複本與修訂版本比較。
 
 Cargo 以離線方式執行，使用已下載到 `~/.cargo/registry` 的套件；在新電腦上，請先執行
 `cargo fetch --locked`。第一次建置容器時需要網路。建置結果保存在 Docker volume
@@ -219,17 +233,15 @@ Cargo 以離線方式執行，使用已下載到 `~/.cargo/registry` 的套件�
 
 推送到 `main`、推送發行標籤，以及開啟 `packages` 的手動執行，都會產生並驗證下列套件：
 
-- **Windows x64 與 Arm64：** 只包含 `oxidemerge.exe` 的 ZIP 套件。會檢查每個程式的處理器架
-  構，並實際啟動。
-- **Linux x64 與 Arm64：** 在 Ubuntu 22.04 上建置的 TAR.GZ 套件。會實際啟動程式，並確認不
-  會變更設定。
-- **Linux AppImage：** 在使用 glibc 2.28 的 AlmaLinux 8 上建置。套件內含 X11、Wayland 與鍵
-  盤函式庫，
-  系統缺少這些函式庫時才會使用。兩種處理器架構都會在 Ubuntu 22.04 與 AlmaLinux 8 上，
-  檢查函式庫載入、指令列行為與視窗啟動。
-- **macOS：** 採用臨時簽署的通用應用程式，以 DMG 套件提供。會驗證 Apple 晶片與 Intel 兩種
-  程式碼，
-  並透過 Rosetta 測試 Intel 程式。
+- **Windows x64 與 Arm64：** 只包含 `oxidemerge.exe` 的 ZIP 套件。
+  會檢查每個程式的處理器架構，並實際啟動。
+- **Linux x64 與 Arm64：** 在 Ubuntu 22.04 上建置的 TAR.GZ 套件。
+  會實際啟動程式，並確認不會變更設定。
+- **Linux AppImage：** 在使用 glibc 2.28 的 AlmaLinux 8 上建置。
+  套件內含 X11、Wayland 與鍵盤函式庫，系統缺少這些函式庫時才會使用。
+  兩種處理器架構都會在 Ubuntu 22.04 與 AlmaLinux 8 上，檢查函式庫載入、指令列行為與視窗啟動。
+- **macOS：** 採用臨時簽署的通用應用程式，以 DMG 套件提供。
+  會驗證 Apple 晶片與 Intel 兩種程式碼，並透過 Rosetta 測試 Intel 程式。
 - **說明文件：** 英文與繁體中文 PDF 指南。若字型缺少所需字元，文件建置會失敗。
 
 Windows 與 Linux 的 Arm64 套件會在實體 Arm 架構電腦上建置與測試，而非使用模擬環境。
@@ -266,8 +278,8 @@ oxidemerge-0.9.8-windows-x64.zip
 以下以 `0.9.8` 版為例，請改為您要發布的版本號。
 
 1. 修改 `Cargo.toml` 中的 `version`，再執行 `cargo build` 更新 `Cargo.lock`。
-2. 檢查 `CHANGELOG.md` 中 `0.9.8` 的段落，將標題中的 `Unreleased` 改為 `YYYY-MM-DD` 格式的
-   發行日期。
+2. 檢查 `CHANGELOG.md` 中 `0.9.8` 的段落，
+   將標題中的 `Unreleased` 改為 `YYYY-MM-DD` 格式的發行日期。
 3. 執行 `make fmt-check ci`，並以 `scripts/release-notes.sh 0.9.8` 檢查發行說明。
    執行 `make user-guide-docs`，讓 `docs/dist/` 中的指南顯示新版本。
 4. 提交並推送到 `main`，等待所有平台的必要持續整合檢查都通過。
@@ -284,10 +296,9 @@ oxidemerge-0.9.8-windows-x64.zip
 
 ### 修正建置失敗的版本
 
-工作流程只會在所有建置與測試工作都通過後才發布版本。因此，若發行標籤的其中一項建置或測試工
-作失敗，
-就不會發布任何內容，您可以從修正後的提交，重新發布同一個版本。以下以 `v0.9.8` 為例，請改為
-建置失敗的版本號。
+工作流程只會在所有建置與測試工作都通過後才發布版本。
+因此，若發行標籤的其中一項建置或測試工作失敗，就不會發布任何內容，
+您可以從修正後的提交，重新發布同一個版本。以下以 `v0.9.8` 為例，請改為建置失敗的版本號。
 
 1. 確認 GitHub 上沒有 `v0.9.8` 的發行版本：
 
@@ -318,9 +329,8 @@ oxidemerge-0.9.8-windows-x64.zip
 
    `git log` 顯示的必須是通過檢查的提交。推送標籤後，會為修正後的提交重新執行工作流程。
 
-   請勿對舊標籤失敗的執行結果使用「**Re-run jobs**」（重新執行工作）。該次執行會建置舊的提
-   交，
-   可能以移動後的標籤發布舊的套件。
+   請勿對舊標籤失敗的執行結果使用「**Re-run jobs**」（重新執行工作）。
+   該次執行會建置舊的提交，可能以移動後的標籤發布舊的套件。
 
 4. 工作流程完成後，檢查 GitHub 上的新發行版本，確認所有套件與 PDF 指南都已提供。
 
@@ -333,8 +343,7 @@ oxidemerge-0.9.8-windows-x64.zip
 工作流程也會拒絕發布已存在的版本。請改為發布新的修補版本：
 
 1. 在 `main` 上修正問題。
-2. 以下一個修補版本號（例如 `0.9.8` 之後使用 `0.9.9`）依照[發布新版本](#發布新版本)的步驟
-   操作，
+2. 以下一個修補版本號（例如 `0.9.8` 之後使用 `0.9.9`）依照[發布新版本](#發布新版本)的步驟操作，
    並在新版本的變更紀錄段落中說明修正內容。
 
 請保留舊標籤與舊版本已發布的檔案。

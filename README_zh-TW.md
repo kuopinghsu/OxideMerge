@@ -12,6 +12,7 @@ OxideMerge 以 Rust 開發，可以比較文字、資料夾、二進位檔、影
 
 **[下載](https://github.com/kuopinghsu/OxideMerge/releases)** ·
 [使用者指南](docs/user-guide.zh-TW.adoc)（[PDF](docs/dist/oxidemerge-user-guide.zh-TW.pdf)） ·
+[功能比較](docs/OxideMerge_Feature_Comparison.md)（英文） ·
 [變更紀錄](CHANGELOG.md)（英文）
 
 ![OxideMerge 起始頁](images/start.png)
@@ -522,6 +523,8 @@ Subversion 的 `merge-tool-cmd` 與 Perforce 的 `P4MERGE` 可以直接設為 `o
 - [分析指南](docs/analysis-guide.md)：合併驗證、語意比較、審閱工作區、版本摘要與潛在影響
   （英文）。
 - [效能測試](docs/benchmarks.md)：效能量測結果與量測方式（英文）。
+- [功能比較](docs/OxideMerge_Feature_Comparison.md)：OxideMerge 與 WinMerge、Meld、Beyond
+  Compare、Araxis Merge 文件所列功能的對照（英文）。
 - [變更紀錄](CHANGELOG.md)：各版本的變更內容（英文）。
 - [開發指南](docs/development.zh-TW.md)：如何建置、測試與發布 OxideMerge。
 
@@ -578,7 +581,8 @@ Subversion 的 `merge-tool-cmd` 與 Perforce 的 `P4MERGE` 可以直接設為 `o
 ## 開發
 
 若要從原始碼建置 OxideMerge，請先透過 [rustup](https://rustup.rs/) 安裝 Rust 工具鏈。
-Linux 另需要 C 編譯器。接著在儲存庫資料夾中執行：
+Linux 另需要 C 編譯器；Windows 與 Linux 也需要 Perl 來建置 OpenSSL（請參閱
+[開發指南](docs/development.zh-TW.md#從原始碼建置)）。接著在儲存庫資料夾中執行：
 
 ```sh
 cargo build --release --locked

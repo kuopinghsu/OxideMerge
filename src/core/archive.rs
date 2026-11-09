@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 
 pub const ZIP_EXTS: &[&str] = &[
     "zip", "jar", "war", "ear", "apk", "aar", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub",
-    "nupkg", "vsix", "whl", "xpi", "crx", "ipa", "appx", "msix",
+    "nupkg", "vsix", "whl", "xpi", "crx", "ipa", "appx", "msix", "xws",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
