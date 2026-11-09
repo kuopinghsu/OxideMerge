@@ -55,6 +55,9 @@ jobs:
     env:
       ARCH: ${{ matrix.arch }}
       TARGET: ${{ matrix.target }}
+      MESA_VERSION: "26.2.5"
+      # Pinned with the archive so a changed build is downloaded again, not reused.
+      MESA_SHA256: ${{ matrix.arch == 'arm64' && 'e7df75398d50e07a68bbffa5cff2ece4c85e5f8ef8bda497f560dd04fe60cbbd' || 'd1b713ca2a7fba47a50c058099f13c435ddb76a16a422c334e4d787f9755a31d' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -116,28 +119,54 @@ jobs:
 
       # Hosted Windows runners have no OpenGL beyond 1.1, so Mesa's llvmpipe
       # renders in software. Its opengl32.dll goes next to a copy of the
-      # program, never into the package.
+      # program, never into the package. The release CDN often answers 504
+      # for a short while, so a verified archive is reused and a miss retries.
+      - name: Cache Mesa llvmpipe
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/mesa-llvmpipe
+          key: mesa-llvmpipe-${{ matrix.arch }}-${{ env.MESA_VERSION }}-${{ env.MESA_SHA256 }}
+
       - name: Window smoke test
         shell: bash
         env:
-          MESA_VERSION: 26.2.5
-          MESA_SHA256_x64: d1b713ca2a7fba47a50c058099f13c435ddb76a16a422c334e4d787f9755a31d
-          MESA_SHA256_arm64: e7df75398d50e07a68bbffa5cff2ece4c85e5f8ef8bda497f560dd04fe60cbbd
           GALLIUM_DRIVER: llvmpipe
           GUI_SMOKE_STRICT: "1"
         run: |
           set -euo pipefail
           archive=mesa-llvmpipe-$ARCH-$MESA_VERSION.7z
-          sum=MESA_SHA256_$ARCH
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
-            "https://github.com/mmozeiko/build-mesa/releases/download/$MESA_VERSION/$archive"
-          echo "${!sum}  $RUNNER_TEMP/$archive" | sha256sum -c -
+          cached=target/mesa-llvmpipe/$archive
+          url="https://github.com/mmozeiko/build-mesa/releases/download/$MESA_VERSION/$archive"
+          mkdir -p target/mesa-llvmpipe
+          if [ -f "$cached" ] && echo "$MESA_SHA256  $cached" | sha256sum -c -; then
+            echo "Using cached $archive"
+          else
+            rm -f "$cached"
+            ok=0
+            for attempt in 1 2 3 4 5; do
+              echo "Downloading $archive (attempt $attempt)"
+              # The release CDN often answers 504 over HTTP/2; force HTTP/1.1 and
+              # wait it out. The file is about 16 MB, so a hung transfer is cut off.
+              if curl -fL --http1.1 --retry 2 --retry-all-errors --retry-delay 5 \
+                   --connect-timeout 20 --max-time 90 \
+                   -o "$RUNNER_TEMP/$archive" "$url" \
+                 && echo "$MESA_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -; then
+                mv "$RUNNER_TEMP/$archive" "$cached"
+                ok=1
+                break
+              fi
+              rm -f "$RUNNER_TEMP/$archive"
+              echo "::warning::Mesa download attempt $attempt failed"
+              sleep $((attempt * 15))
+            done
+            [ "$ok" = 1 ] || { echo "::error::Could not download $url"; exit 1; }
+          fi
           dir=target/gui-smoke-bin
           mkdir -p "$dir"
           if command -v 7z >/dev/null; then
-            7z e -y -o"$dir" "$RUNNER_TEMP/$archive" opengl32.dll >/dev/null
+            7z e -y -o"$dir" "$cached" opengl32.dll >/dev/null
           else
-            "$SYSTEMROOT/System32/tar.exe" -xf "$(cygpath -w "$RUNNER_TEMP/$archive")" -C "$dir" opengl32.dll
+            "$SYSTEMROOT/System32/tar.exe" -xf "$(cygpath -w "$cached")" -C "$dir" opengl32.dll
           fi
           cp "target/$TARGET/release/oxidemerge.exe" "$dir/"
           bash scripts/gui-smoke.sh "$dir/oxidemerge.exe" target/gui-smoke
