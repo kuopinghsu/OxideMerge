@@ -199,6 +199,9 @@ struct Cli {
     /// Add the differences of every changed text file to an HTML or PDF folder report
     #[arg(long)]
     report_diffs: bool,
+    /// Name the compared folders Left, Middle and Right in a folder report, not by their paths
+    #[arg(long)]
+    report_hide_paths: bool,
     /// Write the .html report as a slideshow, one difference per slide
     #[arg(long)]
     slideshow: bool,
@@ -545,6 +548,9 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     if cli.report_diffs && cli.report.is_none() {
         eprintln!("note: --report-diffs needs --report");
     }
+    if cli.report_hide_paths && cli.report.is_none() {
+        eprintln!("note: --report-hide-paths needs --report");
+    }
     if cli.slideshow && cli.report.is_none() {
         eprintln!("note: --slideshow needs --report");
     }
@@ -594,6 +600,14 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             i.status != CmpStatus::Identical && !(i.is_dir && i.status == CmpStatus::NotCompared)
         });
         let failed = files.iter().any(|i| i.status == CmpStatus::Error);
+        // The names reports give the folders.
+        let named = core::report::shown_roots(&shown, cli.report_hide_paths);
+        let info = core::report::FolderReportInfo {
+            method: Some(fopts.method),
+            filter: filter_spec.clone(),
+            scope: None,
+            hide_paths: cli.report_hide_paths,
+        };
         if let Some(r) = cli.report.as_deref().filter(|r| is_pdf(r)) {
             if cli.slideshow {
                 eprintln!("note: --slideshow only applies to .html reports");
@@ -605,6 +619,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
                 &shown,
                 cli.report_diffs.then_some(&cfg.diff),
                 &cfg.rules,
+                &info,
                 &[],
                 &fonts,
                 &pdf_options(cli, cfg),
@@ -624,12 +639,19 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             }
             let text = match format {
                 ReportFormat::Slideshow => {
-                    core::report::folder_slideshow(&files, paths, &shown, &cfg.diff, &cfg.rules)
+                    core::report::folder_slideshow(
+                        &files, paths, &shown, &cfg.diff, &cfg.rules, &info,
+                    )
                 }
-                ReportFormat::Html if cli.report_diffs => core::report::folder_html_with_diffs(
-                    &files, paths, &shown, &cfg.diff, &cfg.rules,
+                ReportFormat::Html => core::report::folder_html(
+                    &files,
+                    paths,
+                    &shown,
+                    cli.report_diffs.then_some(&cfg.diff),
+                    &cfg.rules,
+                    &info,
                 ),
-                f => core::report::generate(&files, &shown, f, &cfg.rules),
+                f => core::report::generate(&files, &named, f, &cfg.rules),
             };
             export(r, &text)?;
         }
@@ -663,6 +685,9 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     }
     if cli.report_diffs && cli.report.is_some() {
         eprintln!("note: --report-diffs only applies to folder compares");
+    }
+    if cli.report_hide_paths && cli.report.is_some() {
+        eprintln!("note: --report-hide-paths only applies to folder compares");
     }
     let kind = match cli.kind {
         Some(k) => file_kind(k),

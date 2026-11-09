@@ -950,22 +950,49 @@ impl FolderView {
         }
     }
 
-    fn report_notes(&self, content: String, format: ReportFormat) -> String {
-        let content = crate::core::review::annotate_report(content, format, &self.notes);
-        if self.workspace.entries.is_empty() {
-            content
-        } else {
-            crate::core::review_state::annotate_report(
-                content,
-                format,
-                &self.workspace.summary(
-                    self.items
-                        .iter()
-                        .filter(|i| !i.is_dir)
-                        .map(|i| i.rel_path()),
-                ),
-            )
+    fn report_notes(&self, content: String, format: ReportFormat, cfg: &Config) -> String {
+        let (notes, summary) = self.report_review(cfg, self.items.iter());
+        let content = crate::core::review::annotate_report(content, format, &notes);
+        match summary {
+            Some(summary) => crate::core::review_state::annotate_report(content, format, &summary),
+            None => content,
         }
+    }
+
+    /// The review notes and the review summary of `items` that a report carries, with the
+    /// compared folders' paths in their text replaced by the names of their sides when reports
+    /// hide them.
+    fn report_review<'a>(
+        &self,
+        cfg: &Config,
+        items: impl Iterator<Item = &'a DirItem>,
+    ) -> (
+        BTreeMap<String, String>,
+        Option<crate::core::review_state::Summary>,
+    ) {
+        let display: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
+        let redact =
+            crate::core::html_report::Redact::new(cfg.report_hide_paths, &self.roots, &display);
+        let notes = self
+            .notes
+            .iter()
+            .map(|(path, note)| (redact.apply(path), redact.apply(note)))
+            .collect();
+        // A summary whose paths cannot be hidden is left out rather than shown with them.
+        let summary = (!self.workspace.entries.is_empty())
+            .then(|| {
+                let summary = self
+                    .workspace
+                    .summary(items.filter(|i| !i.is_dir).map(|i| i.rel_path()));
+                if !cfg.report_hide_paths {
+                    return Some(summary);
+                }
+                let mut value = serde_json::to_value(&summary).ok()?;
+                redact_strings(&mut value, &redact);
+                serde_json::from_value(value).ok()
+            })
+            .flatten();
+        (notes, summary)
     }
 
     pub fn set_recursive(&mut self, recursive: bool) {
@@ -2881,11 +2908,59 @@ impl FolderView {
     pub fn report(&self, format: ReportFormat, cfg: &Config) -> String {
         let list = self.flat_list(cfg);
         let items: Vec<&DirItem> = list.iter().map(|&i| &self.items[i]).collect();
-        let roots: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
-        self.report_notes(
-            report::generate(&items, &roots, format, self.used_rules()),
-            format,
-        )
+        let text = if format == ReportFormat::Html {
+            let display: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
+            report::folder_html(
+                &items,
+                &self.roots,
+                &display,
+                None,
+                self.used_rules(),
+                &self.report_info(cfg),
+            )
+        } else {
+            report::generate(&items, &self.report_roots(cfg), format, self.used_rules())
+        };
+        self.report_notes(text, format, cfg)
+    }
+
+    /// The names reports give the compared folders.
+    fn report_roots(&self, cfg: &Config) -> Vec<PathBuf> {
+        let display: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
+        report::shown_roots(&display, cfg.report_hide_paths)
+    }
+
+    /// How a report of the listed items was made: the method, the filter, and which items the
+    /// list shows when not all of them.
+    fn report_info(&self, cfg: &Config) -> report::FolderReportInfo {
+        let n = self.n();
+        let unique_slot = |s: usize| if n == 2 && s == 1 { 2 } else { s };
+        let mut kinds = Vec::new();
+        if cfg.show_different {
+            kinds.push(tr("view.different").to_string());
+        }
+        for s in 0..n {
+            if cfg.show_unique[unique_slot(s)] {
+                kinds.push(trf("stats.only_in", &[("side", side_name(s, n).into())]));
+            }
+        }
+        if cfg.show_identical {
+            kinds.push(tr("view.identical").to_string());
+        }
+        let mut scope = Vec::new();
+        if kinds.len() < n + 2 {
+            scope.push(trf("report.scope_shown", &[("kinds", kinds.join(", "))]));
+        }
+        let query = self.search.trim();
+        if !query.is_empty() {
+            scope.push(trf("report.scope_search", &[("q", query.to_string())]));
+        }
+        report::FolderReportInfo {
+            method: Some(self.fopts.method),
+            filter: self.filter_spec.clone(),
+            scope: (!scope.is_empty()).then(|| scope.join(" · ")),
+            hide_paths: cfg.report_hide_paths,
+        }
     }
 
     /// Writes the HTML report of the listed items followed by the differences of every changed
@@ -2899,17 +2974,14 @@ impl FolderView {
         let display: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
         let (roots, dopts) = (self.roots.clone(), self.dopts.clone());
         let rules = self.used_rules().to_string();
-        let notes = self.notes.clone();
-        let review_summary = (!self.workspace.entries.is_empty()).then(|| {
-            self.workspace
-                .summary(items.iter().filter(|i| !i.is_dir).map(|i| i.rel_path()))
-        });
+        let info = self.report_info(cfg);
+        let (notes, review_summary) = self.report_review(cfg, items.iter());
         let temps = self.temps.clone();
         move || {
             let _keep_alive = temps;
             let refs: Vec<&DirItem> = items.iter().collect();
             let content = crate::core::review::annotate_report(
-                report::folder_html_with_diffs(&refs, &roots, &display, &dopts, &rules),
+                report::folder_html_with_diffs(&refs, &roots, &display, &dopts, &rules, &info),
                 ReportFormat::Html,
                 &notes,
             );
@@ -2942,22 +3014,20 @@ impl FolderView {
         let display: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
         let (roots, dopts) = (self.roots.clone(), self.dopts.clone());
         let rules = self.used_rules().to_string();
+        let info = self.report_info(cfg);
+        let (notes, review_summary) = self.report_review(cfg, items.iter());
         let mut sections = Vec::new();
-        if !self.notes.is_empty() {
+        if !notes.is_empty() {
             sections.push(Section {
                 title: crate::i18n::tr("review.notes").to_string(),
-                lines: self
-                    .notes
+                lines: notes
                     .iter()
                     .map(|(path, note)| format!("{path}: {note}"))
                     .collect(),
                 mono: false,
             });
         }
-        if !self.workspace.entries.is_empty() {
-            let summary = self
-                .workspace
-                .summary(items.iter().filter(|i| !i.is_dir).map(|i| i.rel_path()));
+        if let Some(summary) = review_summary {
             let json = serde_json::to_string_pretty(&summary).unwrap_or_default();
             sections.push(Section {
                 title: tr("workspace.title").into(),
@@ -2976,6 +3046,7 @@ impl FolderView {
                 &display,
                 Some(&dopts),
                 &rules,
+                &info,
                 &sections,
                 &fonts,
                 &pdf,
@@ -2994,17 +3065,14 @@ impl FolderView {
         let display: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
         let (roots, dopts) = (self.roots.clone(), self.dopts.clone());
         let rules = self.used_rules().to_string();
-        let notes = self.notes.clone();
-        let review_summary = (!self.workspace.entries.is_empty()).then(|| {
-            self.workspace
-                .summary(items.iter().filter(|i| !i.is_dir).map(|i| i.rel_path()))
-        });
+        let info = self.report_info(cfg);
+        let (notes, review_summary) = self.report_review(cfg, items.iter());
         let temps = self.temps.clone();
         move || {
             let _keep_alive = temps;
             let refs: Vec<&DirItem> = items.iter().collect();
             let content = crate::core::review::annotate_report(
-                report::folder_slideshow(&refs, &roots, &display, &dopts, &rules),
+                report::folder_slideshow(&refs, &roots, &display, &dopts, &rules, &info),
                 ReportFormat::Html,
                 &notes,
             );
@@ -4712,6 +4780,23 @@ impl FolderView {
     }
 }
 
+/// Applies `redact` to every string of `value`, the keys of its objects included.
+fn redact_strings(value: &mut serde_json::Value, redact: &crate::core::html_report::Redact) {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => *s = redact.apply(s),
+        Value::Array(items) => items.iter_mut().for_each(|v| redact_strings(v, redact)),
+        Value::Object(map) => {
+            let old = std::mem::take(map);
+            for (k, mut v) in old {
+                redact_strings(&mut v, redact);
+                map.insert(redact.apply(&k), v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Compares `roots`, then steps from the first file with differences to the last as Next
 /// Difference does without the docked compare, reading the status bar position at each.
 #[cfg(test)]
@@ -5078,6 +5163,30 @@ mod tests {
             std::fs::read_to_string(inner_after.path().join("a.txt")).unwrap(),
             "new\n"
         );
+    }
+
+    #[test]
+    fn reports_that_hide_folder_paths_hide_them_in_review_notes_too() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(a.path().join("a.txt"), "old\n").unwrap();
+        std::fs::write(b.path().join("a.txt"), "new\n").unwrap();
+        let mut cfg = Config::default();
+        let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        let display = roots.iter().map(|r| r.display().to_string()).collect();
+        let mut v = FolderView::new(roots, display, Vec::new(), "", &[], &cfg);
+        while v.running.is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+            v.poll();
+        }
+        let right = b.path().display().to_string();
+        v.notes
+            .insert("a.txt".into(), format!("checked against {right}"));
+        cfg.report_hide_paths = true;
+        let slides = v.slideshow_job(&cfg)();
+        assert!(slides.contains("checked against"), "no note in {slides}");
+        assert!(!slides.contains(&right), "{right} shows in {slides}");
+        cfg.report_hide_paths = false;
+        assert!(v.slideshow_job(&cfg)().contains(&crate::core::report::esc(&right)));
     }
 
     #[test]

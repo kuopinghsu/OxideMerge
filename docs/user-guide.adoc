@@ -2975,13 +2975,48 @@ Recipients can open it in any browser, without OxideMerge.
 * Each difference appears as a card with line numbers, three lines of context and the changed
   words highlighted.
 * The report includes summary cards, an index, a side-by-side or unified view, light and dark
-  themes, a file filter and search.
-* Press kbd:[N] and kbd:[P] to go to the next and the previous difference, which pulses briefly.
+  themes, a status filter and search.
+* *Previous* and *Next* in the header, or kbd:[P] and kbd:[N], go to the previous and the next
+  difference across files; a counter shows where you are, and the difference pulses briefly.
+  A link to a difference, such as `report.html#f7d0`, opens its file and scrolls it into view
+  below the header.
+  The view you switch to keeps the difference you were reading in place.
+* The search box searches file names and paths, or, with *Search diff content*, the text of the
+  differences shown, whether their files are expanded or not. It shows how many files or
+  differences match, and *Clear* empties it.
 * The header carries the OxideMerge icon, and the page animates as it opens: the sections fade in
   and the counts in the summary cards count up.
   A browser set to reduce motion shows a still page, and so does printing.
 * The report names the compare rules file and counts the ignored differences.
-* A folder report includes the differences of each changed text file.
+* On a narrow window or a phone, the index folds into a heading you tap to open, and the page fits
+  the screen width.
+* Without JavaScript, the report still shows every file, difference and link; only the buttons
+  that need it are hidden.
+
+A folder report includes the differences of each changed text file, and also:
+
+* separate counts of the files with different contents, the files on one side only, and the
+  differences exported or left out;
+* an index of every changed or one-sided file; a file shown without its differences says
+  *Summary only* and why, for example because it is binary or too long;
+* how each file was compared, such as *Text*, *Spreadsheet cells*, *Document text* or the
+  converter program, with the sheet and rows, the PDF pages, or the notebook cell, of each
+  difference where the file has them, and with the fields that changed in each changed CSV,
+  TSV or spreadsheet row, as in `Alice · score · 90 → 95`. A spreadsheet value reads as the
+  sheet shows it, followed by the value it stores when that differs, as in `741,700 (741700)`;
+* the differences of what OxideMerge or a converter reads from a changed binary file, such as the
+  header and sections of an ELF program; when that text is the same, the report says the files
+  differ in bytes it leaves out;
+* a *Comparison settings* section with the compare method, file filter, options, line filters,
+  substitutions and report limits, and which files the folder view showed;
+* a note of what the report leaves out or shortens.
+
+To share a folder report without the paths of your folders, turn on
+*File → Export → Hide folder paths in reports* (`--report-hide-paths` on the command line).
+The report then names the folders by their sides, and their paths appear nowhere in it, review
+notes and the review summary included.
+File names and the differences shown can still be sensitive, so check the report before you
+share it.
 
 To save reports without opening them, turn off
 *File → Export → Open reports in the browser after saving*.
@@ -3054,8 +3089,15 @@ Use it to walk through a change in a meeting or a review.
 * Each difference then has its own slide, with its lines, the lines around it, the changed words
   and any bookmark comments.
 * For a folder comparison, there is a slide for each difference of each changed text file.
-  The last slide lists the files that are different in other ways, such as binary files or files
-  on one side only.
+  Each slide says how the file was compared, such as *Text* or *Spreadsheet cells*, gives the
+  sheet and rows, the PDF pages or the notebook cell of the difference, and lists the fields of
+  a changed CSV, TSV or spreadsheet row.
+* The title slide of a folder comparison counts the files as the HTML report does (see
+  <<html-reports>>), with the exported diff blocks, and says what the slideshow leaves out.
+* The last slide of a folder comparison lists every changed or one-sided file. Click a file to go
+  to its first slide; a file without slides says *Summary only* and why, such as a binary file.
+  Below the list, *Comparison settings* shows the method, filter, options and limits.
+* With *Hide folder paths in reports* on, the sides are named Left, Middle and Right.
 * Ignored differences are not included.
 
 In the browser:
@@ -3087,9 +3129,28 @@ A PDF report contains what the HTML report contains:
 * Every difference, side by side, with three lines of context, line numbers and the changed words
   marked. With the inline view switched on, a two-way report has a single column on portrait
   pages, with the removed lines above the added ones.
-* For a folder comparison, the list of files with their status, sizes and dates, followed by the
-  differences of every changed text file, the review notes and the review summary.
+* For a folder comparison, the summary, the note of what the report leaves out, the comparison
+  settings, the index of changed files and the list of all files with their status, sizes and
+  dates, followed by a part for each changed file, the review notes and the review summary.
 * For a table compared by key, what matching by key found.
+
+A PDF folder report has the folder report extras of the HTML report (see <<html-reports>>):
+
+* The summary counts the files with different contents, the files present on one side only, the
+  exported diff blocks and any blocks left out.
+* *Not everything is in this report* lists the files shown without their differences, the blocks
+  left out by the size limit and the blocks shortened.
+* *Comparison settings* gives the files in the report, the compare method, the file filter, the
+  whitespace and ignore options, the filters and converters, the unchanged lines around each block
+  (or *The whole file*) and the report limits.
+* *File differences* lists every changed or one-sided file with the number of blocks drawn, or
+  *Summary only* and why, and how the file was compared, such as *Text*, *Spreadsheet cells* or
+  *ELF header and sections*. Click an entry to go to the part of its file.
+* The part of each file starts with its status and how it was compared. Each difference names
+  its sheet and rows, its PDF pages or its notebook cell, and a changed CSV, TSV or spreadsheet
+  row lists the fields that changed, as in `Alice · score · 90 → 95`.
+* With *Hide folder paths in reports* on, the sides are named Left, Middle and Right, and the
+  report keeps the folder paths out of its notes and settings.
 
 Each page has a header with the OxideMerge icon and the report title, and a footer with *Page n of
 m* and *OxideMerge*, which links to the project page
@@ -3106,7 +3167,8 @@ long line that wraps counts once for each line it occupies.
 A difference shows at most 400 rows, unless the whole file is shown.
 When a difference is cut, at most 100 unchanged lines are kept above the change, so the change
 itself is always shown, and a line such as *… 1,200 more lines* states what was left out.
-Differences after the limit are only counted.
+Differences after the limit are only counted; a folder report gives their number as *Diff blocks
+left out*.
 
 Lines read left to right, and Hebrew and Arabic text within them reads right to left, with the
 numbers and brackets in it kept in place (a date, phone number, percentage or price stays whole)
@@ -3915,6 +3977,9 @@ See <<pdf-reports>>.
 |`--report-diffs`
 |Adds the differences of each changed text file to an HTML or PDF folder report.
 
+|`--report-hide-paths`
+|Names the compared folders Left, Middle and Right in a folder report, rather than by their paths.
+
 |`--slideshow`
 |Writes the `.html` report as a slideshow, with one difference per slide.
 
@@ -4222,8 +4287,8 @@ Every job has an optional `name`, which appears in the summary and in error mess
 `kind`:
 
 `compare` (the default):: Requires `left` and `right` (and `base` for a three-way comparison).
-Options: `recursive`, `report`, `report_diffs`, `slideshow`, `patch`, `patch_style`, `context`,
-`compare_as`.
+Options: `recursive`, `report`, `report_diffs`, `report_hide_paths`, `slideshow`, `patch`,
+`patch_style`, `context`, `compare_as`.
 `sync_plan`:: Writes a sync plan. Requires `source`, `destination`, `mode` (`mirror` or `update`)
 and `report` (the plan file).
 `sync`:: Plans and applies a synchronization in one step. Requires `source`, `destination`,

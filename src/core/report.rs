@@ -3,6 +3,7 @@
 
 use super::diff::{DiffOptions, DiffResult};
 use super::folder::{CmpStatus, DirItem};
+pub use super::html_report::FolderReportInfo;
 use crate::i18n::{tr, trf};
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -195,28 +196,56 @@ pub fn text_report(
 }
 
 /// HTML slideshow of a folder compare: a slide for each difference of every changed text file.
-/// `roots` are the compared folders and `display` the names to show for them.
+/// `roots` are the compared folders, `display` their paths to show and `info` how the report was
+/// made and whether those paths are hidden.
 pub fn folder_slideshow(
     items: &[&DirItem],
     roots: &[PathBuf],
     display: &[PathBuf],
     opts: &DiffOptions,
     rules: &str,
+    info: &FolderReportInfo,
 ) -> String {
-    super::slideshow::folder_slideshow(items, roots, display, opts, rules)
+    super::slideshow::folder_slideshow(items, roots, display, opts, rules, info)
 }
 
 /// HTML folder report followed by the differences of every changed text file, including files
 /// missing on some side. `roots` are the compared folders and `display` the names to show for
-/// them, and `rules` the compare rules file used ("" = none).
+/// them, `rules` the compare rules file used ("" = none), and `info` how the report was made.
 pub fn folder_html_with_diffs(
     items: &[&DirItem],
     roots: &[PathBuf],
     display: &[PathBuf],
     opts: &DiffOptions,
     rules: &str,
+    info: &FolderReportInfo,
 ) -> String {
-    super::html_report::folder_report(items, roots, display, Some(opts), rules)
+    super::html_report::folder_report(items, roots, display, Some(opts), rules, info)
+}
+
+/// HTML folder report, with the differences of every changed text file when `opts` is given;
+/// see [`folder_html_with_diffs`].
+pub fn folder_html(
+    items: &[&DirItem],
+    roots: &[PathBuf],
+    display: &[PathBuf],
+    opts: Option<&DiffOptions>,
+    rules: &str,
+    info: &FolderReportInfo,
+) -> String {
+    super::html_report::folder_report(items, roots, display, opts, rules, info)
+}
+
+/// The names reports give the compared folders: `display`, or with `hide_paths` the names of
+/// their sides.
+pub fn shown_roots(display: &[PathBuf], hide_paths: bool) -> Vec<PathBuf> {
+    if hide_paths {
+        (0..display.len())
+            .map(|s| PathBuf::from(side_name(s, display.len())))
+            .collect()
+    } else {
+        display.to_vec()
+    }
 }
 
 /// Makes a report; it may run on another thread.
@@ -420,7 +449,14 @@ pub fn generate(
         }
         // XML returned above; a slideshow without the files' differences is the HTML report.
         ReportFormat::Html | ReportFormat::Xml | ReportFormat::Slideshow => {
-            return super::html_report::folder_report(items, roots, roots, None, rules);
+            return super::html_report::folder_report(
+                items,
+                roots,
+                roots,
+                None,
+                rules,
+                &FolderReportInfo::default(),
+            );
         }
     }
     out

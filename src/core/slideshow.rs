@@ -7,10 +7,11 @@
 use super::diff::{DiffOptions, DiffResult};
 use super::folder::{CmpStatus, DirItem};
 use super::html_report::{
-    file_diffs, has_text_diffs, hunks, kind, line_range, row_cells, status_class, too_big,
-    FileDiffs, DARK, HUNK_MAX_ROWS, LIGHT,
+    block_extra, file_diffs, file_read, has_text_diffs, hunks, ignored_blocks, kind, line_range,
+    row_cells, settings_dl, settings_rows, status_class, summary_reason, too_big, Extra, FileDiffs,
+    FolderReportInfo, ReadAs, Redact, CONTEXT, DARK, HUNK_MAX_ROWS, LIGHT, MAX_BYTES, MAX_LINES,
 };
-use super::report::{esc, esc_marked, side_name, status_text};
+use super::report::{esc, esc_marked, fmt_size, side_name};
 use crate::i18n::{tr, trf};
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -30,6 +31,7 @@ html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans","PingFang TC","Microsoft JhengHei",sans-serif;display:flex;flex-direction:column;overflow:hidden}
 :root{--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
 header{display:flex;align-items:center;gap:14px;padding:10px 22px;background:var(--surface);border-bottom:1px solid var(--border)}
+header nav{display:flex;align-items:center;gap:10px;flex:none}
 .brand{display:flex;align-items:center;gap:10px;font-weight:650;margin-right:auto;min-width:0}
 .brand span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .home{display:flex;flex:none;border-radius:7px}.home:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
@@ -39,13 +41,15 @@ header{display:flex;align-items:center;gap:14px;padding:10px 22px;background:var
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 button{font:inherit;font-size:14px;padding:5px 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer}
 button:hover{border-color:var(--accent)}button:disabled{opacity:.4;cursor:default}
+button:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .count{font-variant-numeric:tabular-nums;color:var(--dim);min-width:5.5em;text-align:center}
 .bar{height:3px;background:var(--surface2)}.bar div{height:100%;background:var(--accent);transition:width .2s}
 main{flex:1;position:relative;overflow:hidden}
 section{position:absolute;inset:0;padding:28px 40px 24px;overflow:auto;display:none}
 section.on{display:block}
-section.title,section.end{display:none;place-content:center;text-align:center}
+section.title,section.end{display:none;text-align:center}
 section.title.on,section.end.on{display:grid}
+section.title>div,section.end>div{margin-block:auto;width:100%}
 h1{font-size:34px;margin:0 0 6px}h2{font-size:22px;margin:0 0 4px}
 .sub{color:var(--dim);margin-bottom:22px}
 .sides{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin:0 auto 22px;max-width:1100px;text-align:left}
@@ -76,8 +80,23 @@ tr.more td{text-align:center;color:var(--dim);font-family:system-ui,sans-serif;p
 .notes li{margin:2px 0}
 .list{max-width:900px;margin:0 auto;text-align:left;columns:2;column-gap:24px;font-size:14px}
 .list div{break-inside:avoid;padding:2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.list div.why{white-space:normal;overflow-wrap:anywhere}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;background:var(--dim)}
 .st-different .dot{background:var(--warn)}.st-unique .dot{background:var(--uniq)}.st-error .dot{background:var(--bad)}
+.list a{color:inherit;text-decoration:none}.list a:hover .nm{text-decoration:underline}
+.list .c{color:var(--accent);font-variant-numeric:tabular-nums;margin-left:6px}.list .so{color:var(--dim)}
+.meth{font-size:13px;padding:2px 10px;border-radius:99px;background:var(--accent-bg);color:var(--accent)}
+.loc{color:var(--dim);font-size:14px}
+.fields{margin:12px 0 0;padding:10px 14px 10px 30px;border-radius:10px;background:var(--surface);border:1px solid var(--border);font-size:14px}
+.note,.paths{color:var(--dim);font-size:13px;margin:10px 0 0}.paths{margin:-12px 0 18px}
+.omit{max-width:760px;margin:0 auto 20px;text-align:left;padding:10px 16px;border-radius:12px;border:1px solid var(--border);background:var(--surface);font-size:14px}
+.omit b{display:block;margin-bottom:2px}.omit ul{margin:0;padding-left:20px}
+.settings{max-width:760px;margin:18px auto 0;text-align:left;font-size:14px}
+.settings summary{cursor:pointer;color:var(--dim)}.settings dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:10px 0 0}
+.settings dt{color:var(--dim)}.settings dd{margin:0}.settings ul{margin:0;padding-left:18px}
+.settings code{font-family:var(--mono);font-size:13px}
+@media (max-width:600px){header{padding:8px 10px;gap:6px}section{padding:16px 12px}h1{font-size:26px}
+.stat{min-width:0;flex:1 1 40%;padding:10px 12px}.list{columns:1}.settings dl{grid-template-columns:1fr}table{font-size:13px}}
 @media print{body{display:block;overflow:visible;height:auto}header,.bar{display:none}main{overflow:visible}section,section.title,section.end{position:static;display:block!important;break-after:page;text-align:left}}
 "#;
 
@@ -90,11 +109,13 @@ s[i].scrollTop=0;if(push!==false)history.replaceState(null,'','#'+(i+1))}
 pv.onclick=()=>go(i-1);nx.onclick=()=>go(i+1);
 document.getElementById('full').onclick=()=>document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen();
 document.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey||e.altKey)return;const k=e.key;
+if((k===' '||k==='Enter')&&e.target.closest&&e.target.closest('summary,a'))return;
 if(k==='ArrowRight'||k==='PageDown'||k===' '||k==='j'||k==='n'){e.preventDefault();go(i+1)}
 else if(k==='ArrowLeft'||k==='PageUp'||k==='k'||k==='p'){e.preventDefault();go(i-1)}
 else if(k==='Home'){e.preventDefault();go(0)}else if(k==='End'){e.preventDefault();go(n-1)}
 else if(k==='f'||k==='F'){document.getElementById('full').click()}});
 window.addEventListener('hashchange',()=>go(parseInt(location.hash.slice(1),10)-1||0,false));
+window.addEventListener('beforeprint',()=>document.querySelectorAll('details').forEach(d=>d.open=true));
 go(parseInt(location.hash.slice(1),10)-1||0,false)})();
 "#;
 
@@ -103,14 +124,18 @@ fn page_start(out: &mut String, title: &str) {
         out,
         "<!DOCTYPE html>\n<html lang=\"{}\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"generator\" content=\"OxideMerge {}\"><title>{}</title><style>:root{{{LIGHT}}}@media (prefers-color-scheme:dark){{:root{{{DARK}}}}}{CSS}</style></head><body>\
 <header><div class=\"brand\"><a class=\"home\" href=\"{}\" title=\"OxideMerge\" target=\"_blank\" rel=\"noopener\"><img class=\"logo\" alt=\"OxideMerge\" src=\"{}\"></a><span>{}</span></div>\
-<button id=\"prev\" title=\"←\">‹</button><span class=\"count\" id=\"count\"></span><button id=\"next\" title=\"→\">›</button>\
-<button id=\"full\" title=\"F\">⛶</button></header><div class=\"bar\"><div></div></div><main>\n",
+<nav aria-label=\"{nav}\"><button id=\"prev\" title=\"{prev} (←)\" aria-label=\"{prev}\">‹</button><span class=\"count\" id=\"count\" role=\"status\" aria-live=\"polite\"></span><button id=\"next\" title=\"{next} (→)\" aria-label=\"{next}\">›</button>\
+<button id=\"full\" title=\"{full} (F)\" aria-label=\"{full}\">⛶</button></nav></header><div class=\"bar\" aria-hidden=\"true\"><div></div></div><main>\n",
         crate::i18n::current_language(),
         env!("CARGO_PKG_VERSION"),
         esc(title),
         env!("CARGO_PKG_REPOSITORY"),
         super::html_report::icon_data_uri(),
-        esc(title)
+        esc(title),
+        nav = esc(tr("slides.nav")),
+        prev = esc(tr("slides.prev")),
+        next = esc(tr("slides.next")),
+        full = esc(tr("slides.full_screen")),
     );
 }
 
@@ -145,12 +170,15 @@ fn stats_html(out: &mut String, cards: &[(&str, String, &str)]) {
     out.push_str("</div>");
 }
 
+/// The title slide; `notes` go under its counts: whether folder paths are hidden, and what the
+/// slideshow leaves out.
 fn title_slide(
     out: &mut String,
     title: &str,
     names: &[String],
     rules: &str,
     cards: &[(&str, String, &str)],
+    notes: &str,
 ) {
     let _ = write!(out, "<section class=\"title\"><div><h1>{}</h1>", esc(title));
     let created = chrono::Local::now().format("%Y-%m-%d %H:%M");
@@ -165,6 +193,7 @@ fn title_slide(
     let _ = write!(out, "<div class=\"sub\">{}</div>", esc(&sub));
     sides_html(out, names);
     stats_html(out, cards);
+    out.push_str(notes);
     let _ = writeln!(
         out,
         "<div class=\"hint\">{}</div></div></section>",
@@ -181,31 +210,48 @@ struct Doc<'a> {
     names: &'a [String],
 }
 
-/// The slide of difference `b`, showing `rows` (it and the lines around it). `file` names the
-/// file in a folder compare.
+/// The file of a slide in a folder compare: its path and how it was read.
+struct SlideFile<'a> {
+    path: &'a str,
+    read: Option<&'a ReadAs>,
+}
+
+/// The slide of difference `b`, showing `rows` (it and the lines around it), with where it is in
+/// the file and its field changes. `file` names the file in a folder compare. Returns whether
+/// rows were left out.
 fn diff_slide(
     out: &mut String,
     doc: &Doc,
-    file: Option<&str>,
+    file: Option<&SlideFile>,
     (index, total): (usize, usize),
     (b, rows): (usize, Range<usize>),
-) {
+    extra: &Extra,
+) -> bool {
     let n = doc.panes.len();
     let blk = &doc.result.blocks[b];
     let (kclass, klabel) = kind(doc.result, b);
     out.push_str("<section><div class=\"sh\">");
     if let Some(f) = file {
-        let _ = write!(out, "<div class=\"file\">{}</div>", esc(f));
+        let _ = write!(out, "<div class=\"file\">{}</div>", esc(f.path));
     }
     let _ = write!(
         out,
-        "<h2>{}</h2><span class=\"kind k-{kclass}\">{}</span><span class=\"pos\">",
+        "<h2>{}</h2><span class=\"kind k-{kclass}\">{}</span>",
         esc(&trf(
             "slides.difference",
             &[("n", (index + 1).to_string()), ("total", total.to_string())]
         )),
         esc(klabel)
     );
+    if let Some(read) = file.and_then(|f| f.read) {
+        let _ = write!(
+            out,
+            "<span class=\"meth\" title=\"{}\">{}</span>",
+            esc(tr("report.read_as")),
+            esc(&read.label())
+        );
+    }
+    out.push_str("<span class=\"pos\">");
     for p in 0..n {
         let _ = write!(
             out,
@@ -214,7 +260,11 @@ fn diff_slide(
             esc(&line_range(&blk.ranges[p]))
         );
     }
-    out.push_str("</span></div><div class=\"d\"><table><colgroup>");
+    out.push_str("</span>");
+    if let Some(at) = &extra.location {
+        let _ = write!(out, "<span class=\"loc\">{}</span>", esc(at));
+    }
+    out.push_str("</div><div class=\"d\"><table><colgroup>");
     for _ in 0..n {
         out.push_str("<col style=\"width:4.2em\"><col>");
     }
@@ -263,6 +313,20 @@ fn diff_slide(
         );
     }
     out.push_str("</table></div>");
+    if !extra.fields.is_empty() {
+        out.push_str("<ul class=\"fields\">");
+        for field in &extra.fields {
+            let _ = write!(out, "<li>{}</li>", esc(field));
+        }
+        out.push_str("</ul>");
+    }
+    if file.and_then(|f| f.read).is_some_and(ReadAs::extracted) {
+        let _ = write!(
+            out,
+            "<p class=\"note\">{}</p>",
+            esc(tr("report.extracted_lines"))
+        );
+    }
     if !notes.is_empty() {
         out.push_str("<ul class=\"notes\">");
         for (p, l, note) in notes {
@@ -277,6 +341,7 @@ fn diff_slide(
         out.push_str("</ul>");
     }
     out.push_str("</section>\n");
+    shown.end < rows.end
 }
 
 fn end_slide(out: &mut String, text: &str, extra: &str) {
@@ -316,7 +381,7 @@ pub fn text_slideshow(
             tr("report.kind_conflict"),
         ));
     }
-    title_slide(&mut out, title, titles, rules, &cards);
+    title_slide(&mut out, title, titles, rules, &cards, "");
     let doc = Doc {
         panes,
         result,
@@ -325,7 +390,7 @@ pub fn text_slideshow(
         names: titles,
     };
     for (i, h) in list.into_iter().take(MAX_SLIDES).enumerate() {
-        diff_slide(&mut out, &doc, None, (i, total), h);
+        diff_slide(&mut out, &doc, None, (i, total), h, &Extra::default());
     }
     let end = if total == 0 {
         tr("slides.no_diffs").to_string()
@@ -348,66 +413,120 @@ pub fn text_slideshow(
     out
 }
 
-/// Slideshow of a folder compare: a slide for each difference of every changed text file
-/// (reading the files from `roots`), then a closing slide listing the files that differ in
-/// other ways, such as binary files or files on one side only. `display` names the folders.
+/// A changed file in the index of a folder slideshow.
+struct Entry<'a> {
+    item: &'a DirItem,
+    /// The number of its first slide, when it has one.
+    first: Option<usize>,
+    /// Its slides, and all its differences.
+    shown: usize,
+    total: usize,
+    read: Option<ReadAs>,
+    /// Why it has no slides.
+    why: Option<String>,
+}
+
+/// Slideshow of a folder compare, with the content of the HTML folder report: a title slide with
+/// the counts and what the slideshow leaves out, a slide for each difference of every changed
+/// text file (reading the files from `roots`), then a closing slide with the index of the changed
+/// files, each linked to its first slide or saying why it has none, and the comparison settings.
+/// `display` names the folders; `info` says how the report was made and whether their paths are
+/// hidden.
 pub fn folder_slideshow(
     items: &[&DirItem],
     roots: &[PathBuf],
     display: &[PathBuf],
     opts: &DiffOptions,
     rules: &str,
+    info: &FolderReportInfo,
 ) -> String {
     let n = display.len();
-    let names: Vec<String> = display.iter().map(|d| d.display().to_string()).collect();
+    let redact = Redact::new(info.hide_paths, roots, display);
+    let names: Vec<String> = if info.hide_paths {
+        (0..n).map(|s| side_name(s, n).to_string()).collect()
+    } else {
+        display.iter().map(|d| d.display().to_string()).collect()
+    };
     let files: Vec<&DirItem> = items
         .iter()
         .copied()
         .filter(|it| !it.is_dir || it.status == CmpStatus::Unique)
         .collect();
     let mut slides = String::new();
-    let mut others: Vec<(&DirItem, String)> = Vec::new();
+    let mut index: Vec<Entry> = Vec::new();
     let mut total = 0;
-    let mut skipped = 0;
+    // Differences without a slide once the slideshow is full, and those with rows left out.
+    let (mut skipped, mut cut) = (0, 0);
+    let mut ignored = 0;
     // Changed text files not read at all, once there are slides enough; ones known to be too
     // large are still listed, with why.
     let mut skipped_files = 0;
+    let file_names: Vec<String> = (0..n).map(|s| side_name(s, n).to_string()).collect();
     for it in &files {
-        if total >= MAX_SLIDES && has_text_diffs(it) {
+        if !matches!(status_class(it.status), "different" | "unique" | "error") {
+            continue;
+        }
+        if total >= MAX_SLIDES && has_text_diffs(it, roots, opts) {
             match too_big(it, n) {
-                Some(note) => others.push((it, note)),
+                Some(note) => index.push(Entry {
+                    item: it,
+                    first: None,
+                    shown: 0,
+                    total: 0,
+                    read: None,
+                    why: Some(redact.apply(&note)),
+                }),
                 None => skipped_files += 1,
             }
             continue;
         }
-        match file_diffs(it, roots, opts) {
-            FileDiffs::Diffs(docs, result) => {
-                let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
-                let file_names: Vec<String> = (0..n).map(|s| side_name(s, n).to_string()).collect();
-                let doc = Doc {
-                    panes: &refs,
-                    result: &result,
-                    opts,
-                    notes: &[],
-                    names: &file_names,
-                };
-                let list = hunks(&result);
-                let count = list.len();
-                for (j, h) in list.into_iter().enumerate() {
-                    if total >= MAX_SLIDES {
-                        skipped += 1;
-                        continue;
-                    }
-                    total += 1;
-                    diff_slide(&mut slides, &doc, Some(&it.rel_path()), (j, count), h);
+        let diffs = file_diffs(it, roots, opts);
+        let reads: Vec<ReadAs> = match &diffs {
+            FileDiffs::Diffs(docs, _) => docs.iter().map(|d| ReadAs::of(d, opts)).collect(),
+            _ => Vec::new(),
+        };
+        let read = file_read(it, &diffs, &reads);
+        // The title slide is the first.
+        let first = total + 2;
+        let (mut shown, mut count) = (0, 0);
+        if let FileDiffs::Diffs(docs, result) = &diffs {
+            ignored += ignored_blocks(result);
+            let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
+            let doc = Doc {
+                panes: &refs,
+                result,
+                opts,
+                notes: &[],
+                names: &file_names,
+            };
+            let rel = it.rel_path();
+            let file = SlideFile {
+                path: &rel,
+                read: read.as_ref(),
+            };
+            let list = hunks(result);
+            count = list.len();
+            for (j, h) in list.into_iter().enumerate() {
+                if total >= MAX_SLIDES {
+                    skipped += 1;
+                    continue;
+                }
+                total += 1;
+                shown += 1;
+                let extra = block_extra(&reads, docs, result, h.0);
+                if diff_slide(&mut slides, &doc, Some(&file), (j, count), h, &extra) {
+                    cut += 1;
                 }
             }
-            FileDiffs::Note(note) => others.push((it, note)),
-            FileDiffs::None if it.status != CmpStatus::Identical => {
-                others.push((it, status_text(it, n)))
-            }
-            FileDiffs::None => {}
         }
+        index.push(Entry {
+            item: it,
+            first: (shown > 0).then_some(first),
+            shown,
+            total: count,
+            read,
+            why: summary_reason(it, n, &diffs, true, &redact),
+        });
     }
     let count = |st: &str| {
         files
@@ -418,69 +537,156 @@ pub fn folder_slideshow(
     let title = tr("slides.title");
     let mut out = String::new();
     page_start(&mut out, title);
-    let cards = vec![
-        (
-            "acc",
-            (total + skipped).to_string(),
-            tr("report.differences"),
-        ),
+    let mut cards = vec![
+        ("", files.len().to_string(), tr("report.files")),
+        ("ok", count("identical").to_string(), tr("report.identical")),
         (
             "warn",
             count("different").to_string(),
-            tr("report.different"),
+            tr("report.files_different"),
         ),
-        ("uniq", count("unique").to_string(), tr("report.unique")),
-        ("ok", count("identical").to_string(), tr("report.identical")),
+        (
+            "uniq",
+            count("unique").to_string(),
+            tr("report.files_unique"),
+        ),
     ];
-    title_slide(&mut out, title, &names, rules, &cards);
-    out.push_str(&slides);
-    let mut extra = String::new();
+    if count("error") > 0 {
+        cards.push(("bad", count("error").to_string(), tr("report.errors")));
+    }
+    if count("other") > 0 {
+        cards.push(("", count("other").to_string(), tr("report.not_compared")));
+    }
+    cards.push(("acc", total.to_string(), tr("report.blocks_exported")));
     if skipped > 0 {
-        let _ = write!(
-            extra,
-            "<div class=\"sub\">{}</div>",
-            esc(&trf("report.more_diffs", &[("n", skipped.to_string())]))
-        );
+        cards.push(("", skipped.to_string(), tr("report.blocks_left_out")));
+    }
+    if ignored > 0 {
+        cards.push(("", ignored.to_string(), tr("report.ignored")));
+    }
+    let summary_only = index.iter().filter(|e| e.total == 0).count();
+    let mut omissions = Vec::new();
+    if summary_only > 0 {
+        omissions.push(trf(
+            "report.omit_summary",
+            &[("n", summary_only.to_string())],
+        ));
+    }
+    if skipped > 0 {
+        omissions.push(trf(
+            "slides.omit_limit",
+            &[
+                ("n", skipped.to_string()),
+                ("slides", fmt_size(Some(MAX_SLIDES as u64))),
+            ],
+        ));
     }
     if skipped_files > 0 {
+        omissions.push(trf(
+            "slides.more_files",
+            &[("n", skipped_files.to_string())],
+        ));
+    }
+    if cut > 0 {
+        omissions.push(trf(
+            "slides.omit_cut",
+            &[("n", cut.to_string()), ("rows", HUNK_MAX_ROWS.to_string())],
+        ));
+    }
+    let mut notes = String::new();
+    if info.hide_paths {
         let _ = write!(
-            extra,
-            "<div class=\"sub\">{}</div>",
-            esc(&trf(
-                "slides.more_files",
-                &[("n", skipped_files.to_string())]
-            ))
+            notes,
+            "<p class=\"paths\">{}</p>",
+            esc(tr("report.paths_hidden"))
         );
     }
-    if !others.is_empty() {
+    if !omissions.is_empty() {
+        let _ = write!(
+            notes,
+            "<div class=\"omit\" role=\"note\"><b>{}</b><ul>",
+            esc(tr("report.omissions"))
+        );
+        for o in &omissions {
+            let _ = write!(notes, "<li>{}</li>", esc(o));
+        }
+        notes.push_str("</ul></div>");
+    }
+    title_slide(&mut out, title, &names, rules, &cards, &notes);
+    out.push_str(&slides);
+
+    let mut extra = String::new();
+    if !index.is_empty() {
         let _ = write!(
             extra,
-            "<div class=\"sub\">{}</div><div class=\"list\">",
-            esc(tr("slides.other_files"))
+            "<div class=\"sub\">{} ({})</div><div class=\"list\">",
+            esc(tr("report.file_diffs")),
+            index.len()
         );
-        for (it, why) in others.iter().take(MAX_LISTED) {
-            let _ = write!(
-                extra,
-                "<div class=\"st-{}\" title=\"{}\"><span class=\"dot\"></span>{} — {}</div>",
-                status_class(it.status),
-                esc(&it.rel_path()),
-                esc(&it.rel_path()),
-                esc(why)
-            );
+        for e in index.iter().take(MAX_LISTED) {
+            let rel = e.item.rel_path();
+            let st = status_class(e.item.status);
+            let read = e.read.as_ref().map(ReadAs::label).unwrap_or_default();
+            match e.first {
+                Some(first) => {
+                    let mut count = e.shown.to_string();
+                    if e.shown < e.total {
+                        count = format!("{count}/{}", e.total);
+                    }
+                    let _ = write!(
+                        extra,
+                        "<div class=\"st-{st}\"><a href=\"#{first}\" title=\"{}\"><span class=\"dot\"></span><span class=\"nm\">{}</span><span class=\"c\">{count}</span> <span class=\"so\">{}</span></a></div>",
+                        esc(&format!("{rel} · {read}")),
+                        esc(&rel),
+                        esc(&read)
+                    );
+                }
+                None => {
+                    let why = e.why.clone().unwrap_or_default();
+                    let _ = write!(
+                        extra,
+                        "<div class=\"st-{st} why\" title=\"{}\"><span class=\"dot\"></span>{} — <span class=\"so\">{}{}</span></div>",
+                        esc(&format!("{rel} — {why}")),
+                        esc(&rel),
+                        esc(tr("report.summary_only")),
+                        if why.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", esc(&why))
+                        }
+                    );
+                }
+            }
         }
         extra.push_str("</div>");
-        if others.len() > MAX_LISTED {
+        if index.len() > MAX_LISTED {
             let _ = write!(
                 extra,
                 "<div class=\"sub\">{}</div>",
                 esc(&trf(
                     "slides.more_files",
-                    &[("n", (others.len() - MAX_LISTED).to_string())]
+                    &[("n", (index.len() - MAX_LISTED).to_string())]
                 ))
             );
         }
     }
-    let end = if total + skipped + skipped_files == 0 {
+    let limits = trf(
+        "slides.limits",
+        &[
+            ("slides", fmt_size(Some(MAX_SLIDES as u64))),
+            ("hunk", HUNK_MAX_ROWS.to_string()),
+            ("size", format!("{} MiB", MAX_BYTES >> 20)),
+            ("lines", fmt_size(Some(MAX_LINES as u64))),
+        ],
+    );
+    let rows = settings_rows(Some(opts), info, &redact, CONTEXT.to_string(), limits);
+    let _ = write!(
+        extra,
+        "<details class=\"settings\"><summary>{}</summary>{}</details>",
+        esc(tr("report.settings")),
+        settings_dl(&rows)
+    );
+    let end = if index.is_empty() && skipped_files == 0 {
         tr("slides.no_diffs")
     } else {
         tr("slides.end")
@@ -593,11 +799,94 @@ mod tests {
             children: Vec::new(),
         };
         let (a, b) = (item("a.txt"), item("b.txt"));
-        let html = folder_slideshow(&[&a, &b], &roots, &roots, &DiffOptions::default(), "");
+        let html = folder_slideshow(
+            &[&a, &b],
+            &roots,
+            &roots,
+            &DiffOptions::default(),
+            "",
+            &FolderReportInfo::default(),
+        );
         // Title, the slides it holds, end; b.txt is not read and is counted instead.
         assert_eq!(html.matches("<section").count(), MAX_SLIDES + 2);
         assert!(!html.contains(">B<"), "b.txt was not shown");
-        assert!(html.contains(&esc(&trf("report.more_diffs", &[("n", "1".into())]))));
+        let left_out = trf(
+            "slides.omit_limit",
+            &[
+                ("n", "1".into()),
+                ("slides", fmt_size(Some(MAX_SLIDES as u64))),
+            ],
+        );
+        assert!(html.contains(&esc(&left_out)), "{left_out}");
         assert!(html.contains(&esc(&trf("slides.more_files", &[("n", "1".into())]))));
+    }
+
+    #[test]
+    fn folder_slideshows_have_the_summary_index_and_settings_of_the_html_report() {
+        use crate::core::filter::FileFilter;
+        use crate::core::folder::{CompareMethod, FolderOptions, Progress, Scanner};
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(a.path().join("prices.csv"), "item,price\napple,1\n").unwrap();
+        std::fs::write(b.path().join("prices.csv"), "item,price\napple,2\n").unwrap();
+        std::fs::write(a.path().join("blob.bin"), [0u8, 1, 2, 3, 0, 9]).unwrap();
+        std::fs::write(b.path().join("blob.bin"), [0u8, 1, 2, 4, 0, 9]).unwrap();
+        std::fs::write(a.path().join("same.txt"), "same\n").unwrap();
+        std::fs::write(b.path().join("same.txt"), "same\n").unwrap();
+        let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        let opts = DiffOptions::default();
+        let items = Scanner {
+            roots: &roots,
+            filter: &FileFilter::default(),
+            fopts: &FolderOptions::default(),
+            dopts: &opts,
+            progress: &Progress::default(),
+        }
+        .run();
+        let refs: Vec<&DirItem> = items.iter().filter(|i| !i.is_dir).collect();
+        let info = FolderReportInfo {
+            method: Some(CompareMethod::FullContents),
+            filter: roots[0].join("*.csv").display().to_string(),
+            scope: None,
+            hide_paths: true,
+        };
+        let html = folder_slideshow(&refs, &roots, &roots, &opts, "", &info);
+        // Title, the one difference of prices.csv, end.
+        assert_eq!(html.matches("<section").count(), 3);
+        for want in [
+            tr("report.files_different"),
+            tr("report.files_unique"),
+            tr("report.blocks_exported"),
+            tr("report.paths_hidden"),
+            tr("report.omissions"),
+            tr("report.file_diffs"),
+            tr("report.summary_only"),
+            tr("report.binary"),
+            tr("report.settings"),
+            tr("report.set_filter"),
+            tr("slides.next"),
+        ] {
+            assert!(html.contains(&esc(want)), "{want} missing");
+        }
+        assert!(
+            html.contains("apple · price · 1 → 2"),
+            "the fields that changed"
+        );
+        assert!(
+            html.contains("<span class=\"meth\""),
+            "how the file was read"
+        );
+        assert!(
+            html.contains("<a href=\"#2\""),
+            "the index links to the first slide of prices.csv"
+        );
+        assert!(html.contains("role=\"status\""));
+        for root in &roots {
+            let path = esc(&root.display().to_string());
+            assert!(!html.contains(&path), "{path} shows");
+        }
+        assert!(
+            !html.contains("same.txt"),
+            "identical files are not indexed"
+        );
     }
 }

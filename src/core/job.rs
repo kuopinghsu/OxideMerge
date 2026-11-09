@@ -119,6 +119,8 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub report_diffs: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub report_hide_paths: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub slideshow: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch: Option<String>,
@@ -312,6 +314,7 @@ impl Job {
             (self.prettify, "prettify"),
             (self.structured, "structured"),
             (self.report_diffs, "report-diffs"),
+            (self.report_hide_paths, "report-hide-paths"),
             (self.copy_links, "sync-links"),
             (self.slideshow, "slideshow"),
             (self.portrait, "portrait"),
@@ -481,6 +484,7 @@ impl Job {
                     (self.patch_style.is_some(), "patch_style"),
                     (self.context.is_some(), "context"),
                     (self.report_diffs, "report_diffs"),
+                    (self.report_hide_paths, "report_hide_paths"),
                     (self.slideshow, "slideshow"),
                     (self.page_size.is_some(), "page_size"),
                     (self.portrait, "portrait"),

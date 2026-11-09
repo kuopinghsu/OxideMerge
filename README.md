@@ -354,6 +354,7 @@ oxidemerge -r old-folder new-folder --report report.html --report-diffs
 | `-L <title>` | Title the next side, as `diff -L` does (Subversion passes these). |
 | `--report <file>` | Export a report as `.html`, `.pdf` or `.xml`. Folder comparisons can also use `.csv` or `.txt`. |
 | `--report-diffs` | Add text differences to a folder HTML or PDF report. |
+| `--report-hide-paths` | Name the folders Left, Middle and Right in a folder report, not by their paths. |
 | `--page-size a4\|letter`, `--portrait`, `--unified`, `--whole-file` | Lay out a `.pdf` report: page size, portrait pages, one column for two files, or the whole files instead of the differences with `--context` lines. |
 | `--slideshow` | Export an HTML slideshow with one difference per slide. |
 | `--patch <file>` | Export a patch from a two-way file or folder comparison. |

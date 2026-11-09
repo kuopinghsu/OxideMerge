@@ -944,18 +944,21 @@ impl<'a> Document<'a> {
         out
     }
 
-    /// The text of the whole document, a line to a line of the page.
-    pub fn text(&self) -> Result<String> {
+    /// The text of the whole document, a line to a line of the page, with the byte each page's
+    /// text starts at.
+    pub fn text_pages(&self) -> Result<(String, Vec<usize>)> {
         let pages = self.pages();
         if pages.is_empty() {
             bail!("the file lists no pages");
         }
         let mut out = String::new();
+        let mut starts = Vec::with_capacity(pages.len());
         for (i, page) in pages.iter().enumerate() {
             self.check()?;
             if i > 0 {
                 out.push('\n');
             }
+            starts.push(out.len());
             let resources = self.get(page, "Resources");
             let content = self.page_content(page);
             out.push_str(&self.page_text(&content, &resources, 0));
@@ -975,7 +978,7 @@ impl<'a> Document<'a> {
             ));
             out.push('\n');
         }
-        Ok(out)
+        Ok((out, starts))
     }
 
     /// The content streams of a page, one after another.
@@ -1794,8 +1797,9 @@ fn undo_predictor(body: Vec<u8>, parms: &HashMap<String, Object>, doc: &Document
 }
 
 /// The text of the PDF file `bytes`, given up on once `cancel` is set.
+#[cfg(test)]
 pub fn text(bytes: &[u8], cancel: Option<&AtomicBool>) -> Result<String> {
-    Document::read(bytes, cancel)?.text()
+    Ok(Document::read(bytes, cancel)?.text_pages()?.0)
 }
 
 // ---------- the structure of a tagged file ----------
@@ -2932,6 +2936,23 @@ mod tests {
 second page
 "
         );
+        // Where each page starts, as found by the read that compares the file, is kept while
+        // the file is unchanged: a report asks for it without reading the file again.
+        use crate::core::extract::{pdf_pages, Kind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two.pdf");
+        std::fs::write(&path, &file).unwrap();
+        Kind::Pdf.read(&path, None).unwrap();
+        assert_eq!(pdf_pages(&path, None).unwrap(), (vec![0, 2], 3));
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, vec![b'x'; file.len()]).unwrap();
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_modified(written).unwrap();
+        drop(f);
+        assert_eq!(pdf_pages(&path, None).unwrap(), (vec![0, 2], 3));
+        // A file written since is read again.
+        std::fs::write(&path, b"not a pdf").unwrap();
+        assert!(pdf_pages(&path, None).is_err());
     }
 
     /// Where a file says its tables are may be nonsense; reading it must not end the program.

@@ -11,11 +11,13 @@
 use super::diff::{DiffOptions, DiffResult};
 use super::folder::DirItem;
 use super::html_report::{
-    file_diffs, hunks_with, ignored_blocks, kind, line_range, row_cells, status_class, FileDiffs,
-    HUNK_MAX_ROWS, LINE_CHARS,
+    block_extra, file_diffs, file_read, hunks_with, ignored_blocks, kind, line_range, row_cells,
+    settings_rows, status_class, summary_reason, FileDiffs, FolderReportInfo, ReadAs, Redact,
+    Setting, HUNK_MAX_ROWS, LINE_CHARS, MAX_BYTES, MAX_LINES,
 };
 use super::report::{fmt_size, fmt_time, side_name, status_text};
-use crate::i18n::{tr, trf};
+use super::text::TextDoc;
+use crate::i18n::{current_language, tr, trf};
 use krilla::action::LinkAction;
 use krilla::annotation::{LinkAnnotation, Target};
 use krilla::color::rgb;
@@ -790,6 +792,14 @@ struct Writer<'a> {
     unified: bool,
     /// The page the column names of the difference being drawn were last drawn on.
     labeled: usize,
+    links: Vec<Link>,
+}
+
+/// A link from an area of a page to a place in the report.
+struct Link {
+    page: usize,
+    rect: Rect,
+    to: (usize, f32),
 }
 
 impl<'a> Writer<'a> {
@@ -816,6 +826,7 @@ impl<'a> Writer<'a> {
             lines_left: report_lines(),
             unified: false,
             labeled: 0,
+            links: Vec::new(),
         };
         wr.new_page();
         Ok(wr)
@@ -1063,16 +1074,27 @@ impl<'a> Writer<'a> {
         self.gap(6.0);
     }
 
-    /// The bar above a difference: its kind, where it is on each side, and its number.
-    fn hunk_bar(&mut self, result: &DiffResult, b: usize, n: usize, (i, total): (usize, usize)) {
+    /// The bar above a difference: its kind, where it is on each side and in the file, and its
+    /// number.
+    fn hunk_bar(
+        &mut self,
+        result: &DiffResult,
+        b: usize,
+        n: usize,
+        (i, total): (usize, usize),
+        location: Option<&str>,
+    ) {
         let h = TEXT_SIZE * 1.9;
         self.need(h + 3.0 * CODE_LEAD);
         let (class, label) = kind(result, b);
         let blk = &result.blocks[b];
-        let pos = (0..n)
+        let mut pos = (0..n)
             .map(|p| format!("{} {}", side_name(p, n), line_range(&blk.ranges[p])))
             .collect::<Vec<_>>()
             .join("    ");
+        if let Some(at) = location {
+            pos = format!("{pos}    ·  {at}");
+        }
         self.mark(format!("{}. {label}  {pos}", i + 1), self.diff_level);
         let (x, y, w) = (self.left(), self.y, self.content_w());
         self.fill(x, y, w, h, SURFACE);
@@ -1080,12 +1102,13 @@ impl<'a> Writer<'a> {
         let base = y + h * 0.68;
         self.text(x + 5.0, base, TEXT_SIZE, Family::Sans, label, sign_color);
         let lw = self.faces.width(Family::Sans, TEXT_SIZE, label);
-        self.text(x + 14.0 + lw, base, TEXT_SIZE, Family::Sans, &pos, DIM);
         let num = trf(
             "report.diff_n",
             &[("i", (i + 1).to_string()), ("n", total.to_string())],
         );
         let nw = self.faces.width(Family::Sans, SMALL_SIZE, &num);
+        let pos = self.fit(Family::Sans, TEXT_SIZE, &pos, w - lw - nw - 30.0);
+        self.text(x + 14.0 + lw, base, TEXT_SIZE, Family::Sans, &pos, DIM);
         self.text(x + w - nw - 5.0, base, SMALL_SIZE, Family::Sans, &num, DIM);
         self.y += h;
     }
@@ -1371,20 +1394,26 @@ impl<'a> Writer<'a> {
 
     /// Every difference of one compared text, while lines are left to draw: each is cut to
     /// [`HUNK_MAX_ROWS`] rows (unless the whole file is shown) and to the lines left, with the
-    /// rows above its change left out first.
-    fn diffs(&mut self, doc: &Doc, opts: &PdfOptions) {
+    /// rows above its change left out first. Returns the differences drawn and all of them,
+    /// and of those drawn the ones cut to [`HUNK_MAX_ROWS`] rows and the ones cut where the
+    /// lines left ran out.
+    fn diffs(&mut self, doc: &Doc, opts: &PdfOptions) -> (usize, usize, usize, usize) {
         let list = match opts.context {
             Some(c) => hunks_with(doc.result, c),
             None => whole_file(doc.result),
         };
         let total = list.len();
         self.unified = opts.layout == Layout::Unified && doc.panes.len() == 2;
-        let mut shown = 0;
+        let (mut shown, mut cut, mut cut_short) = (0, 0, 0);
         for (k, (b, rows)) in list.into_iter().enumerate() {
             if self.lines_left == 0 {
                 break;
             }
             shown += 1;
+            let extra = doc
+                .read
+                .map(|(reads, docs)| block_extra(reads, docs, doc.result, b))
+                .unwrap_or_default();
             let cap = match opts.context {
                 Some(_) => HUNK_MAX_ROWS.min(self.lines_left),
                 None => self.lines_left,
@@ -1395,7 +1424,16 @@ impl<'a> Writer<'a> {
             } else {
                 rows.start
             };
-            self.hunk_bar(doc.result, b, doc.panes.len(), (k, total));
+            self.hunk_bar(
+                doc.result,
+                b,
+                doc.panes.len(),
+                (k, total),
+                extra.location.as_deref(),
+            );
+            for field in &extra.fields {
+                self.para(SMALL_SIZE, Family::Sans, &format!("•  {field}"), BLACK);
+            }
             let more = |n: usize| trf("report.more_lines", &[("n", n.to_string())]);
             if start > rows.start {
                 self.para(SMALL_SIZE, Family::Sans, &more(start - rows.start), DIM);
@@ -1411,12 +1449,20 @@ impl<'a> Writer<'a> {
             if hidden > 0 {
                 self.para(SMALL_SIZE, Family::Sans, &more(hidden), DIM);
             }
+            if start > rows.start || hidden > 0 {
+                if opts.context.is_some() && rows.len() > HUNK_MAX_ROWS {
+                    cut += 1;
+                } else {
+                    cut_short += 1;
+                }
+            }
             self.gap(8.0);
         }
         if shown < total {
             let more = trf("report.more_diffs", &[("n", (total - shown).to_string())]);
             self.para(TEXT_SIZE, Family::Sans, &more, DIM);
         }
+        (shown, total, cut, cut_short)
     }
 
     /// A note naming the characters no font has, which are drawn as `?`; also written to
@@ -1459,6 +1505,39 @@ impl<'a> Writer<'a> {
                 }
             }
         }
+    }
+
+    /// A titled list, as the omissions of a folder report.
+    fn list(&mut self, title: &str, items: &[String]) {
+        self.need(TEXT_SIZE * 5.0);
+        self.para(TEXT_SIZE + 1.0, Family::Sans, title, BLACK);
+        for item in items {
+            self.para(TEXT_SIZE, Family::Sans, &format!("•  {item}"), BLACK);
+        }
+        self.gap(6.0);
+    }
+
+    /// The settings of a folder report, each with its label.
+    fn settings(&mut self, rows: &[(&str, Setting)]) {
+        self.need(TEXT_SIZE * 5.0);
+        self.para(TEXT_SIZE + 1.0, Family::Sans, tr("report.settings"), BLACK);
+        for (term, value) in rows {
+            if value.list {
+                self.para(TEXT_SIZE, Family::Sans, &format!("{term}:"), DIM);
+                let family = if value.code {
+                    Family::Mono
+                } else {
+                    Family::Sans
+                };
+                for item in &value.items {
+                    self.para(SMALL_SIZE, family, &format!("    •  {item}"), BLACK);
+                }
+            } else {
+                let text = format!("{term}: {}", value.items.join(" "));
+                self.para(TEXT_SIZE, Family::Sans, &text, BLACK);
+            }
+        }
+        self.gap(6.0);
     }
 
     /// Draws the pages laid out, with a header and page numbers on each, and the bookmarks.
@@ -1536,6 +1615,12 @@ impl<'a> Writer<'a> {
                     .into(),
                 );
             }
+            for link in self.links.iter().filter(|l| l.page == i && l.to.0 < count) {
+                let to = XyzDestination::new(link.to.0, Point::from_xy(0.0, link.to.1));
+                page.add_annotation(
+                    LinkAnnotation::new(link.rect, Target::Destination(to.into())).into(),
+                );
+            }
             page.finish();
         }
         let mut outline = Outline::new();
@@ -1564,6 +1649,7 @@ impl<'a> Writer<'a> {
         document.set_metadata(
             Metadata::new()
                 .title(self.title.clone())
+                .language(current_language().to_string())
                 .creator(format!("OxideMerge {}", env!("CARGO_PKG_VERSION"))),
         );
         document.finish().map_err(|e| format!("{e:?}"))
@@ -1730,6 +1816,9 @@ struct Doc<'a> {
     result: &'a DiffResult,
     opts: &'a DiffOptions,
     notes: &'a [BTreeMap<usize, String>],
+    /// In a folder report, how each side was read and its text, for the location and the
+    /// field changes of each difference.
+    read: Option<(&'a [ReadAs], &'a [TextDoc])>,
 }
 
 /// The PDF report of a two- or three-way text compare, with the same content as its HTML report.
@@ -1792,6 +1881,7 @@ pub fn text_pdf(
             result,
             opts,
             notes,
+            read: None,
         };
         w.diffs(&doc, pdf);
     }
@@ -1800,9 +1890,11 @@ pub fn text_pdf(
     w.finish()
 }
 
-/// The PDF report of a folder compare: the files listed with their status, sizes and dates, and
-/// when `diffs` is given the differences of every changed text file, read from `roots`, as the
-/// HTML report with `--report-diffs`. `display` names the compared folders.
+/// The PDF report of a folder compare, with the content of its HTML report: a summary, what the
+/// report leaves out, the settings, the files listed with their status, sizes and dates, and
+/// when `diffs` is given an index of the changed files and the differences of each, read from
+/// `roots`, or why it shows none. `display` names the compared folders; `info` says how the
+/// report was made and whether their paths are hidden.
 #[allow(clippy::too_many_arguments)]
 pub fn folder_pdf(
     items: &[&DirItem],
@@ -1810,6 +1902,7 @@ pub fn folder_pdf(
     display: &[PathBuf],
     diffs: Option<&DiffOptions>,
     rules: &str,
+    info: &FolderReportInfo,
     sections: &[Section],
     fonts: &Fonts,
     pdf: &PdfOptions,
@@ -1829,17 +1922,132 @@ pub fn folder_pdf(
             .filter(|it| status_class(it.status) == st)
             .count()
     };
+    let redact = Redact::new(info.hide_paths, roots, display);
     let title = tr("report.title");
     let mut w = Writer::new(fonts, pdf, title)?;
+
+    // The part of each changed file is laid out first, so that the summary above it can count
+    // what it shows; the summary's pages then go in front of it.
+    w.diff_level = 1;
+    let mut index: Vec<IndexRow> = Vec::new();
+    let (mut shown_blocks, mut left_out, mut cut_blocks, mut cut_short) = (0, 0, 0, 0);
+    let (mut summary_only, mut total_ignored) = (0, 0);
+    for it in &listed {
+        if !matches!(status_class(it.status), "different" | "unique" | "error") {
+            continue;
+        }
+        let Some(dopts) = diffs else {
+            summary_only += 1;
+            continue;
+        };
+        let found = file_diffs(it, roots, dopts);
+        let reads: Vec<ReadAs> = match &found {
+            FileDiffs::Diffs(docs, _) => docs.iter().map(|d| ReadAs::of(d, dopts)).collect(),
+            _ => Vec::new(),
+        };
+        let read = file_read(it, &found, &reads);
+        let rel = it.rel_path();
+        if !index.is_empty() {
+            w.gap(6.0);
+        }
+        w.need(TEXT_SIZE * 6.0);
+        let at = (w.page(), w.y);
+        w.mark(rel.clone(), 0);
+        w.gap(4.0);
+        w.para(TEXT_SIZE + 2.0, Family::Sans, &rel, BLACK);
+        let mut meta = vec![redact.apply(&status_text(it, n))];
+        if let Some(r) = &read {
+            meta.push(format!("{}: {}", tr("report.read_as"), r.label()));
+        }
+        let (mut shown, mut total, mut cut, mut short) = (0, 0, 0, 0);
+        if let FileDiffs::Diffs(docs, result) = &found {
+            let ignored = ignored_blocks(result);
+            total_ignored += ignored;
+            if ignored > 0 {
+                meta.push(trf("report.n_ignored", &[("n", ignored.to_string())]));
+            }
+            w.para(SMALL_SIZE, Family::Sans, &meta.join("   ·   "), DIM);
+            w.gap(3.0);
+            if read.as_ref().is_some_and(ReadAs::extracted) {
+                w.para(SMALL_SIZE, Family::Sans, tr("report.extracted_lines"), DIM);
+                w.gap(3.0);
+            }
+            let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
+            let doc = Doc {
+                name: &rel,
+                panes: &refs,
+                result,
+                opts: dopts,
+                notes: &[],
+                read: Some((&reads, docs)),
+            };
+            (shown, total, cut, short) = if w.lines_left == 0 {
+                let total = hunks_with(result, 0).len();
+                let more = trf("report.more_diffs", &[("n", total.to_string())]);
+                w.para(TEXT_SIZE, Family::Sans, &more, DIM);
+                (0, total, 0, 0)
+            } else {
+                w.diffs(&doc, pdf)
+            };
+        }
+        shown_blocks += shown;
+        left_out += total - shown;
+        cut_blocks += cut;
+        cut_short += short;
+        let mut blocks = Vec::new();
+        if total == 0 {
+            summary_only += 1;
+            blocks.push(tr("report.summary_only").to_string());
+            if !matches!(found, FileDiffs::Diffs(..)) {
+                meta.push(tr("report.summary_only").to_string());
+                w.para(SMALL_SIZE, Family::Sans, &meta.join("   ·   "), DIM);
+                w.gap(3.0);
+            }
+            if let Some(why) = summary_reason(it, n, &found, true, &redact) {
+                w.para(TEXT_SIZE, Family::Sans, &why, DIM);
+                blocks.push(why);
+            }
+        } else {
+            blocks.push(shown.to_string());
+            if shown < total {
+                blocks.push(trf(
+                    "report.n_left_out",
+                    &[("n", (total - shown).to_string())],
+                ));
+            }
+            if cut + short > 0 {
+                blocks.push(tr("report.shortened").to_string());
+            }
+        }
+        index.push(IndexRow {
+            item: it,
+            at,
+            blocks: blocks.join("\n"),
+            read: read.map(|r| r.label()).unwrap_or_default(),
+        });
+    }
+    let body_pages = std::mem::take(&mut w.pages);
+    let body_marks = std::mem::take(&mut w.marks);
+    let body_y = w.y;
+    w.diff_level = 0;
+    w.new_page();
+
     w.heading(title);
-    let names: Vec<String> = display.iter().map(|d| d.display().to_string()).collect();
+    let names: Vec<String> = if info.hide_paths {
+        (0..n).map(|s| side_name(s, n).to_string()).collect()
+    } else {
+        display.iter().map(|d| d.display().to_string()).collect()
+    };
     w.sides(&names);
+    if info.hide_paths {
+        w.para(SMALL_SIZE, Family::Sans, tr("report.paths_hidden"), DIM);
+    }
     w.rules(rules);
     let mut cards = vec![
         (tr("report.files"), listed.len().to_string()),
         (tr("report.identical"), count("identical").to_string()),
-        (tr("report.different"), count("different").to_string()),
-        (tr("report.unique"), count("unique").to_string()),
+        (tr("report.files_different"), count("different").to_string()),
+        (tr("report.files_unique"), count("unique").to_string()),
     ];
     if count("error") > 0 {
         cards.push((tr("report.errors"), count("error").to_string()));
@@ -1847,63 +2055,168 @@ pub fn folder_pdf(
     if count("other") > 0 {
         cards.push((tr("report.not_compared"), count("other").to_string()));
     }
+    if diffs.is_some() {
+        cards.push((tr("report.blocks_exported"), shown_blocks.to_string()));
+    }
+    if left_out > 0 {
+        cards.push((tr("report.blocks_left_out"), left_out.to_string()));
+    }
+    if total_ignored > 0 {
+        cards.push((tr("report.ignored"), total_ignored.to_string()));
+    }
     w.counts(&cards);
-    w.mark(tr("report.files").into(), 0);
-    file_table(&mut w, &listed, n);
-    w.diff_level = 1;
 
-    let Some(dopts) = diffs else {
-        w.sections(sections);
-        w.missing_note();
-        return w.finish();
+    let mut omissions = Vec::new();
+    if summary_only > 0 {
+        omissions.push(if diffs.is_some() {
+            trf("report.omit_summary", &[("n", summary_only.to_string())])
+        } else {
+            tr("report.why_scope").to_string()
+        });
+    }
+    if left_out > 0 {
+        omissions.push(trf(
+            "report.omit_limit_pdf",
+            &[
+                ("n", left_out.to_string()),
+                ("rows", fmt_size(Some(report_lines() as u64))),
+            ],
+        ));
+    }
+    if cut_blocks > 0 {
+        omissions.push(trf(
+            "report.omit_cut",
+            &[
+                ("n", cut_blocks.to_string()),
+                ("rows", HUNK_MAX_ROWS.to_string()),
+                ("chars", fmt_size(Some(LINE_CHARS as u64))),
+            ],
+        ));
+    }
+    // Drawing stops at the limit, so only the difference it reached is cut short.
+    if cut_short > 0 {
+        omissions.push(trf(
+            "report.omit_cut_short_pdf",
+            &[("rows", fmt_size(Some(report_lines() as u64)))],
+        ));
+    }
+    if !omissions.is_empty() {
+        w.list(tr("report.omissions"), &omissions);
+    }
+    let context = match pdf.context {
+        Some(c) => c.to_string(),
+        None => tr("report.whole_file").to_string(),
     };
-    let mut first = true;
-    for it in &listed {
-        let found = file_diffs(it, roots, dopts);
-        if matches!(found, FileDiffs::None) {
-            continue;
-        }
-        if first {
-            w.new_page();
-            first = false;
-        }
-        let rel = it.rel_path();
-        w.need(TEXT_SIZE * 6.0);
-        w.mark(rel.clone(), 0);
-        w.gap(4.0);
-        w.para(TEXT_SIZE + 2.0, Family::Sans, &rel, BLACK);
-        w.para(SMALL_SIZE, Family::Sans, &status_text(it, n), DIM);
-        w.gap(3.0);
-        match found {
-            FileDiffs::Diffs(docs, result) => {
-                let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
-                let doc = Doc {
-                    name: &rel,
-                    panes: &refs,
-                    result: &result,
-                    opts: dopts,
-                    notes: &[],
-                };
-                if w.lines_left == 0 {
-                    let total = hunks_with(&result, 0).len();
-                    let more = trf("report.more_diffs", &[("n", total.to_string())]);
-                    w.para(TEXT_SIZE, Family::Sans, &more, DIM);
-                    continue;
-                }
-                w.diffs(&doc, pdf);
-            }
-            FileDiffs::Note(note) => w.para(TEXT_SIZE, Family::Sans, &note, DIM),
-            FileDiffs::None => {}
-        }
-        w.gap(6.0);
+    let mut limits = trf(
+        "report.pdf_limits",
+        &[
+            ("rows", fmt_size(Some(report_lines() as u64))),
+            ("size", format!("{} MiB", MAX_BYTES >> 20)),
+            ("lines", fmt_size(Some(MAX_LINES as u64))),
+        ],
+    );
+    if pdf.context.is_some() {
+        let cut = trf(
+            "report.cut_note",
+            &[
+                ("rows", HUNK_MAX_ROWS.to_string()),
+                ("chars", fmt_size(Some(LINE_CHARS as u64))),
+            ],
+        );
+        limits = format!("{limits} {cut}");
+    }
+    w.settings(&settings_rows(diffs, info, &redact, context, limits));
+
+    // Links to the parts laid out above, once the pages in front of them are known.
+    let mut to_body = Vec::new();
+    if !index.is_empty() {
+        let heading = format!("{} ({})", tr("report.file_diffs"), index.len());
+        w.need(TEXT_SIZE * 5.0);
+        w.mark(heading.clone(), 0);
+        w.para(TEXT_SIZE + 1.0, Family::Sans, &heading, BLACK);
+        to_body = index_table(&mut w, &index, &redact);
+        w.gap(8.0);
+    }
+    let heading = format!("{} ({})", tr("report.files"), listed.len());
+    w.need(TEXT_SIZE * 5.0);
+    w.mark(heading.clone(), 0);
+    w.para(TEXT_SIZE + 1.0, Family::Sans, &heading, BLACK);
+    file_table(&mut w, &listed, n, &redact);
+
+    if !index.is_empty() {
+        let front = w.pages.len();
+        w.pages.extend(body_pages);
+        w.marks.extend(body_marks.into_iter().map(|mut m| {
+            m.page += front;
+            m
+        }));
+        w.links
+            .extend(to_body.into_iter().map(|(page, rect, (to, y))| Link {
+                page,
+                rect,
+                to: (to + front, y),
+            }));
+        w.y = body_y;
     }
     w.sections(sections);
     w.missing_note();
     w.finish()
 }
 
+/// A changed file in the index of a folder report: where its part starts, its differences
+/// drawn or why it has none, and how it was read.
+struct IndexRow<'a> {
+    item: &'a DirItem,
+    at: (usize, f32),
+    blocks: String,
+    read: String,
+}
+
+/// The index of the changed files of a folder report. Returns the area of each row with the
+/// place its link goes to in the pages of the files' parts.
+fn index_table(
+    w: &mut Writer,
+    index: &[IndexRow],
+    redact: &Redact,
+) -> Vec<(usize, Rect, (usize, f32))> {
+    let total = w.content_w() - 10.0;
+    let widths = [total * 0.30, total * 0.22, total * 0.30, total * 0.18];
+    let header: Vec<String> = vec![
+        tr("col.name").into(),
+        tr("col.folder").into(),
+        tr("report.blocks_exported").into(),
+        tr("report.read_as").into(),
+    ];
+    table_row(w, &header, &widths, None, None);
+    let mut links = Vec::new();
+    for row in index {
+        let it = row.item;
+        let cells = vec![
+            it.name.clone(),
+            it.rel_dir.clone(),
+            redact.apply(&row.blocks),
+            row.read.clone(),
+        ];
+        let (page, y, h) = table_row(w, &cells, &widths, Some(status_color(it)), Some(&header));
+        if let Some(rect) = Rect::from_xywh(w.left(), y, w.content_w(), h) {
+            links.push((page, rect, row.at));
+        }
+    }
+    links
+}
+
+fn status_color(it: &DirItem) -> Color {
+    match status_class(it.status) {
+        "identical" => (0x16, 0xa3, 0x4a),
+        "different" => (0xd9, 0x77, 0x06),
+        "unique" => (0x7c, 0x3a, 0xed),
+        "error" => (0xdc, 0x26, 0x26),
+        _ => DIM,
+    }
+}
+
 /// The table of the files of a folder report.
-fn file_table(w: &mut Writer, listed: &[&DirItem], n: usize) {
+fn file_table(w: &mut Writer, listed: &[&DirItem], n: usize, redact: &Redact) {
     let total = w.content_w() - 10.0;
     let side_w = total * 0.40 / n as f32;
     let widths = [total * 0.26, total * 0.18, total * 0.16];
@@ -1920,7 +2233,11 @@ fn file_table(w: &mut Writer, listed: &[&DirItem], n: usize) {
         .collect();
     table_row(w, &header, &widths, None, None);
     for it in listed {
-        let mut cells = vec![it.name.clone(), it.rel_dir.clone(), status_text(it, n)];
+        let mut cells = vec![
+            it.name.clone(),
+            it.rel_dir.clone(),
+            redact.apply(&status_text(it, n)),
+        ];
         for s in 0..n {
             let size = match it.size[s] {
                 Some(_) => fmt_size(it.size[s]),
@@ -1933,14 +2250,7 @@ fn file_table(w: &mut Writer, listed: &[&DirItem], n: usize) {
                 format!("{size}\n{time}")
             });
         }
-        let color = match status_class(it.status) {
-            "identical" => (0x16, 0xa3, 0x4a),
-            "different" => (0xd9, 0x77, 0x06),
-            "unique" => (0x7c, 0x3a, 0xed),
-            "error" => (0xdc, 0x26, 0x26),
-            _ => DIM,
-        };
-        table_row(w, &cells, &widths, Some(color), Some(&header));
+        table_row(w, &cells, &widths, Some(status_color(it)), Some(&header));
     }
     if listed.is_empty() {
         w.para(TEXT_SIZE, Family::Sans, tr("report.no_match"), DIM);
@@ -1949,14 +2259,15 @@ fn file_table(w: &mut Writer, listed: &[&DirItem], n: usize) {
 
 /// One row of the file table, each cell wrapped to its column and cut with `…` where it would
 /// not fit on a page. `header` is the table's header row, drawn again first when this row
-/// starts a new page; `None` for the header row itself.
+/// starts a new page; `None` for the header row itself. Returns the page, top and height of the
+/// row.
 fn table_row(
     w: &mut Writer,
     cells: &[String],
     widths: &[f32],
     color: Option<Color>,
     header: Option<&[String]>,
-) {
+) -> (usize, f32, f32) {
     let max_lines = (((w.bottom() - w.top()) / CODE_LEAD) as usize)
         .saturating_sub(4)
         .max(1);
@@ -1996,6 +2307,7 @@ fn table_row(
     }
     w.y += h;
     w.op(Op::Line(x0, w.y, w.right(), w.y, 0.4, RULE));
+    (w.page(), y, h)
 }
 
 #[cfg(test)]
@@ -2136,6 +2448,7 @@ mod tests {
             &roots,
             None,
             "",
+            &FolderReportInfo::default(),
             &[],
             &fonts(),
             &Default::default(),
@@ -2149,6 +2462,7 @@ mod tests {
             &roots,
             Some(&opts),
             "",
+            &FolderReportInfo::default(),
             &sections,
             &fonts(),
             &Default::default(),
@@ -2157,6 +2471,141 @@ mod tests {
         for want in ["zwei", "new file", "checked", "same.txt"] {
             assert!(text.contains(want), "{want} missing in {text}");
         }
+    }
+
+    #[test]
+    fn a_folder_report_has_the_summary_index_settings_and_omissions_of_the_html_report() {
+        use crate::core::filter::FileFilter;
+        use crate::core::folder::{CompareMethod, FolderOptions, Progress, Scanner};
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(a.path().join("prices.csv"), "item,price\napple,1\n").unwrap();
+        std::fs::write(b.path().join("prices.csv"), "item,price\napple,2\n").unwrap();
+        std::fs::write(a.path().join("blob.bin"), [0u8, 1, 2, 3, 0, 9]).unwrap();
+        std::fs::write(b.path().join("blob.bin"), [0u8, 1, 2, 4, 0, 9]).unwrap();
+        let many =
+            |c: &str| -> String { (0..60).map(|i| format!("{c}{i}\n\n\n\n\n\n\n\n")).collect() };
+        std::fs::write(a.path().join("rows.txt"), many("a")).unwrap();
+        std::fs::write(b.path().join("rows.txt"), many("b")).unwrap();
+        let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        let opts = DiffOptions::default();
+        let items = Scanner {
+            roots: &roots,
+            filter: &FileFilter::default(),
+            fopts: &FolderOptions::default(),
+            dopts: &opts,
+            progress: &Progress::default(),
+        }
+        .run();
+        let refs: Vec<&DirItem> = items.iter().filter(|i| !i.is_dir).collect();
+        let info = FolderReportInfo {
+            method: Some(CompareMethod::FullContents),
+            filter: "*.csv;*.bin;*.txt".into(),
+            scope: None,
+            hide_paths: true,
+        };
+        LINES.with(|l| l.set(Some(40)));
+        let pdf = folder_pdf(
+            &refs,
+            &roots,
+            &roots,
+            Some(&opts),
+            "",
+            &info,
+            &[],
+            &fonts(),
+            &Default::default(),
+        )
+        .unwrap();
+        LINES.with(|l| l.set(None));
+        let text = read(&pdf);
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for want in [
+            tr("report.files_different"),
+            tr("report.blocks_exported"),
+            tr("report.blocks_left_out"),
+            tr("report.omissions"),
+            tr("report.settings"),
+            tr("report.set_filter"),
+            tr("report.file_diffs"),
+            tr("report.summary_only"),
+            tr("report.read_as"),
+            tr("report.paths_hidden"),
+            "apple · price · 1 → 2",
+        ] {
+            let want = want.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains(&want), "{want} missing in {flat}");
+        }
+        for root in &roots {
+            let path = root.display().to_string();
+            assert!(!text.contains(&path), "{path} shows in {text}");
+        }
+        assert!(
+            String::from_utf8_lossy(&pdf).contains("/Lang"),
+            "no language"
+        );
+        assert!(
+            String::from_utf8_lossy(&pdf).contains("/Dest"),
+            "the index links to the files"
+        );
+    }
+
+    #[test]
+    fn a_whole_file_folder_report_says_blocks_are_cut_at_the_report_limit() {
+        use crate::core::filter::FileFilter;
+        use crate::core::folder::{FolderOptions, Progress, Scanner};
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let file = |c: &str| -> String {
+            (0..100)
+                .map(|i| match i {
+                    50 => format!("{c}\n"),
+                    _ => format!("row {i}\n"),
+                })
+                .collect()
+        };
+        std::fs::write(a.path().join("rows.txt"), file("left")).unwrap();
+        std::fs::write(b.path().join("rows.txt"), file("right")).unwrap();
+        let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        let opts = DiffOptions::default();
+        let items = Scanner {
+            roots: &roots,
+            filter: &FileFilter::default(),
+            fopts: &FolderOptions::default(),
+            dopts: &opts,
+            progress: &Progress::default(),
+        }
+        .run();
+        let refs: Vec<&DirItem> = items.iter().filter(|i| !i.is_dir).collect();
+        LINES.with(|l| l.set(Some(20)));
+        let pdf = folder_pdf(
+            &refs,
+            &roots,
+            &roots,
+            Some(&opts),
+            "",
+            &FolderReportInfo::default(),
+            &[],
+            &fonts(),
+            &PdfOptions {
+                context: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        LINES.with(|l| l.set(None));
+        let flat = read(&pdf).split_whitespace().collect::<Vec<_>>().join(" ");
+        let short = trf("report.omit_cut_short_pdf", &[("rows", "20".into())]);
+        let short = short.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains(&short), "{short} missing in {flat}");
+        let block = trf(
+            "report.omit_cut",
+            &[
+                ("n", "1".into()),
+                ("rows", HUNK_MAX_ROWS.to_string()),
+                ("chars", fmt_size(Some(LINE_CHARS as u64))),
+            ],
+        );
+        let block = block.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(!flat.contains(&block), "{block} shows in {flat}");
     }
 
     #[test]
@@ -2415,6 +2864,7 @@ mod tests {
             &roots,
             None,
             "",
+            &FolderReportInfo::default(),
             &[],
             &fonts(),
             &Default::default(),
