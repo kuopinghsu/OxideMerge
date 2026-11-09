@@ -394,16 +394,24 @@ uses its section of this file as the release notes.
   `--dm` and `--dr` take precedence. Subversion's `merge-tool-cmd` and Perforce's
   `P4MERGE` can be `oxidemerge` itself. Five files whose merged file is the working copy are
   read as Subversion's order (base, theirs, mine, merged, working copy), and four whose base,
-  theirs and result carry the names p4 gives its temporary files (`t1234t5678t90.tmp` on
-  Windows) as Perforce's (base, theirs, yours, result). Any other four or five files are
-  still refused as too many paths, so a pattern such as `*.txt` never starts a merge that
-  would save over one of them. The left pane is mine or yours, the middle is the base and
-  the right is theirs, and the middle pane is saved to the result. If that file is
-  unchanged when the window closes, the program exits with code 1 and the conflict stays
-  unresolved. Any other option, including `-o`, uses the arguments as written, so an
-  existing wrapper still works. Checked on Windows with SlikSVN 1.14.2, Mercurial 7.1.2 and
-  p4/p4d 2026.1: `svn update --accept launch`, `hg merge` and `p4 resolve` against a local
-  server, both saved and closed without saving. P4V keeps its own argument string.
+  theirs and result carry the names p4 gives its temporary files (`t1t2t3.tmp` on Windows,
+  `tmp.1.2.3` on macOS and Linux) as Perforce's (base, theirs, yours, result). Any other four
+  or five files are still refused as too many paths, so a pattern such as `*.txt` never
+  starts a merge that would save over one of them. The left pane is mine or yours, the
+  middle is the base and the right is theirs, and the middle pane is saved to the result. If
+  that file is unchanged when the window closes, the program exits with code 1 and the
+  conflict stays unresolved. Any other option, including `-o`, uses the arguments as written,
+  so an existing wrapper still works. Checked on Windows with SlikSVN 1.14.2, Mercurial
+  7.1.2 and p4/p4d 2026.1, and on Linux with Git 2.55.0, Subversion 1.14.5, Mercurial 7.2.4
+  and p4/p4d 2026.1 (3089746): `git mergetool`, `svn update --accept launch`, `hg merge` and
+  `p4 resolve` against local repositories and a local server, both saved and closed without
+  saving. On Linux, closing a `p4 resolve` without saving is reported as *Execution Failed*
+  and *No such file or directory*; that is exit code 1. P4V keeps its own argument string.
+  On Linux, P4V 2026.1 (2933292) was checked with it: diff opens the depot revision on the
+  left and the workspace file on the right, saving then Accept Merged resolves the file, and
+  closing without saving leaves P4V's markers and the file unresolved. The same P4V diff,
+  and accepting a merge after saving, were tried earlier on macOS with P4V 2026.3 and were
+  not repeated on Windows.
 - **Compare with revision in Subversion and Mercurial:**
   *File → Compare with revision...* (formerly *Compare with Git revision...*) and `--rev`
   (`--git-rev` still works) also take Subversion and Mercurial working copies: the nearest
@@ -426,7 +434,10 @@ uses its section of this file as the release notes.
   Subversion server reached over `svn+ssh` that would ask for a password fails instead of
   waiting for an answer that cannot come. With Git and Mercurial, a file whose name is not
   valid UTF-8 is refused rather than read under a changed name. Checked on Windows with the
-  same SlikSVN and Mercurial versions, including a Subversion file whose name is not ASCII.
+  same SlikSVN and Mercurial versions, including a Subversion file whose name is not ASCII,
+  and on Linux with Git 2.55.0, Subversion 1.14.5 and Mercurial 7.2.4, including a
+  Subversion path that is not ASCII (passed to `svn` as itself) and a Mercurial path with
+  brackets.
 - **Docker test environment for Linux:** `scripts/docker-test.sh` (`make docker-test`)
   checks Linux from any computer with Docker. It runs Clippy, the tests, a release build and
   the command-line and window checks. It also runs tests against real servers: OpenSSH (keys,
