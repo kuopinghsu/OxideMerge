@@ -3779,7 +3779,7 @@ OxideMerge 接受 `diff` 用來指定標題的參數：`-u` 會被忽略，
 Subversion 的 `merge-tool-cmd` 會傳入五個檔案：基底、對方版本、我的版本、合併結果檔與工作檔，
 最後兩個是同一個檔案。
 Perforce 的 `P4MERGE` 會傳入四個：基底、對方版本、您的版本與結果，結果當時可以還不存在；
-除了您的版本，其餘都是 p4 的暫存檔，例如 `t1234t5678t90.tmp`。
+除了您的版本，其餘都是 p4 的暫存檔，名稱在 Windows 上類似 `t1t2t3.tmp`，在 macOS 與 Linux 上類似 `tmp.1.2.3`。
 其他四個或五個檔案（例如 `*.txt` 這類樣式比對到的檔案）會因路徑太多而被拒絕，
 因此儲存時絕不會覆寫其中某個檔案。
 命令列只有這些檔案時，OxideMerge 會在左側開啟我的版本或您的版本、中間開啟基底、右側開啟對方版本，
@@ -3888,7 +3888,7 @@ P4MERGE=oxidemerge (enviro)
 
 要將檔案與 depot 比較，請執行 `p4 diff f.txt`。
 OxideMerge 會在左側顯示 depot 修訂版本，右側顯示您工作區中的檔案。
-depot 修訂版本是暫存檔，名稱在 macOS 上類似 `tmp.63484.0x20d2d0f40.90`，
+depot 修訂版本是暫存檔，名稱類似 `tmp.1.2.3`。
 只有工作區中的檔案可以編輯。
 由於 p4 會將 `P4DIFF` 中的字詞傳給 OxideMerge，您也可以改為替窗格命名：
 
@@ -3928,7 +3928,7 @@ OxideMerge 會開啟，左側為 *Yours*、中間為 *Base*、右側為 *Theirs*
 image::p4-merge.png[由 p4 resolve 開啟的三方合併]
 
 若未儲存就關閉視窗，OxideMerge 會以結束代碼 1 離開，檔案仍維持未解決：
-p4 會建議 *e* 而非 *ae*（在 macOS 上還會回報 *Execution Failed*），
+p4 會建議 *e* 而非 *ae*（在 macOS 與 Linux 上還會回報 *Execution Failed*；Linux 接著顯示 *No such file or directory*，那是它回報這個結束代碼的方式），
 此時輸入 *ae* 會警告檔案仍含有變更標記。
 請再次執行 `p4 resolve` 重新開始。
 
@@ -4003,12 +4003,16 @@ P4V 傳入的結果檔案已含有 P4V 自己的衝突標記；儲存後會取�
 若要整個採用對方版本或您的版本，請改用 *Accept Source* 或 *Accept Target*。
 
 NOTE: 已在 Windows 上以 SlikSVN 1.14.2、Mercurial 7.1.2 與 p4/p4d 2026.1 檢查，
-使用本機儲存庫與本機 Perforce 伺服器：包含「與修訂版本比較」、
-名稱不是 ASCII 的 Subversion 檔案，以及 ANSI 字碼頁拼得出來的 Mercurial 名稱；
-並以上面的設定，從 `svn update --accept launch`、`hg merge` 與 `p4 resolve` 進行合併，
+並在 Linux 上以 Git 2.55.0、Subversion 1.14.5、Mercurial 7.2.4 與 p4/p4d 2026.1（3089746）檢查，
+使用本機儲存庫與本機 Perforce 伺服器。
+「與修訂版本比較」涵蓋 Git、Subversion 與 Mercurial，包含名稱不是 ASCII 的 Subversion 檔案
+（在 Linux 上該路徑會直接傳給 `svn`），以及在 Windows 上 ANSI 字碼頁拼得出來的 Mercurial 名稱。
+並以上面的設定，從 `git mergetool`、`svn update --accept launch`、`hg merge` 與 `p4 resolve` 進行合併，
 儲存後衝突即解決，未儲存就關閉則維持未解決。
 P4V 仍使用上面的參數字串。
-它的比較設定，以及在 P4V 中於儲存後接受合併，先前曾在 macOS 上以 P4V 2026.3 試過，
+在 Linux 上已以 P4V 2026.1（2933292）檢查：比較時左側為 depot 修訂版本、右側為工作區檔案；
+儲存合併後按 *Accept Merged* 即解決檔案；未儲存就關閉則結果仍保留 P4V 的標記，檔案維持未解決。
+它的比較設定，以及在儲存後接受合併，先前曾在 macOS 上以 P4V 2026.3 試過，
 這次沒有在 Windows 上重做。
 透過網路連線的 Subversion 或 Perforce 伺服器仍可能要求 OxideMerge 無法提供的登入，
 請先使用 `svn` 或 `p4` 登入。

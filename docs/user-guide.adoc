@@ -4363,7 +4363,7 @@ A merge can name OxideMerge itself, with no wrapper.
 Subversion's `merge-tool-cmd` passes five files: the base, theirs, mine, the merged file and
 the working copy, the last two being the same file.
 Perforce's `P4MERGE` passes four: the base, theirs, yours and the result, which may not exist
-yet; all but yours are p4's temporary files, such as `t1234t5678t90.tmp`.
+yet; all but yours are p4's temporary files, named like `t1t2t3.tmp` on Windows and `tmp.1.2.3` on macOS and Linux.
 Four or five other files, such as a pattern like `*.txt` that matched them, are refused as
 too many paths, so a save never overwrites one of them.
 When the command line contains only those files, OxideMerge opens mine or yours on the left,
@@ -4480,8 +4480,8 @@ If a line names another tool, change the value where it is set.
 
 To compare a file with the depot, run `p4 diff f.txt`.
 OxideMerge opens with the depot revision on the left and your workspace file on the right.
-The depot revision is a temporary file, with a name such as `tmp.63484.0x20d2d0f40.90` on
-macOS; only your workspace file can be edited.
+The depot revision is a temporary file named like `tmp.1.2.3`.
+Only your workspace file can be edited.
 Because p4 passes the words in `P4DIFF` on to OxideMerge, you can give the panes names instead:
 
 [source,sh]
@@ -4522,8 +4522,9 @@ p4 then reports, for example, `//ws/f.txt - edit from //depot/main/f.txt`.
 image::p4-merge.png[Three-way merge opened by p4 resolve]
 
 If you close the window without saving, OxideMerge exits with code 1 and the file stays
-unresolved: p4 suggests *e* rather than *ae* (on macOS it also reports *Execution Failed*),
-and typing *ae* warns that the file still has change markers.
+unresolved: p4 suggests *e* rather than *ae* (on macOS and Linux it also reports
+*Execution Failed*; Linux then says *No such file or directory*, which is how it reports
+that exit code), and typing *ae* warns that the file still has change markers.
 Run `p4 resolve` again to start over.
 
 ===== P4V
@@ -4605,13 +4606,20 @@ Check the result first: OxideMerge writes the result only when you save, so if y
 without saving, the result still contains P4V's markers.
 To take theirs or yours whole, use *Accept Source* or *Accept Target* instead.
 
-NOTE: Checked on Windows with SlikSVN 1.14.2, Mercurial 7.1.2 and p4/p4d 2026.1, using local
-repositories and a local Perforce server: *Compare with revision*, including a Subversion file
-whose name is not ASCII, and Mercurial with a name the ANSI code page can spell; and merges
-from `svn update --accept launch`, `hg merge` and `p4 resolve` with the settings above, both
-saved (the conflict is resolved) and closed without saving (it stays unresolved).
+NOTE: Checked on Windows with SlikSVN 1.14.2, Mercurial 7.1.2 and p4/p4d 2026.1, and on Linux
+with Git 2.55.0, Subversion 1.14.5, Mercurial 7.2.4 and p4/p4d 2026.1 (3089746), using local
+repositories and a local Perforce server.
+*Compare with revision* covers Git, Subversion and Mercurial, including a Subversion file
+whose name is not ASCII (on Linux that path is passed to `svn` directly) and, on Windows, a
+Mercurial name the ANSI code page can spell.
+Merges from `git mergetool`, `svn update --accept launch`, `hg merge` and `p4 resolve` were
+tried with the settings above, both saved (the conflict is resolved) and closed without saving
+(it stays unresolved).
 P4V keeps the argument string above.
-Its diff setting, and accepting a merge in P4V after saving, were tried earlier on macOS with
+On Linux this was checked with P4V 2026.1 (2933292): diff opens the depot revision on the left
+and the workspace file on the right, saving the merge and then *Accept Merged* resolves the file,
+and closing without saving leaves P4V's markers so the file stays unresolved.
+The same diff setting, and accepting a merge after saving, were tried earlier on macOS with
 P4V 2026.3 and were not repeated on Windows.
 A Subversion or Perforce server reached over the network can still ask for a sign-in that
 OxideMerge cannot give.
