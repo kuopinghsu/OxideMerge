@@ -499,16 +499,19 @@ impl ReadAs {
     }
 }
 
-/// The file name of the program a converter's command line runs, without its folder.
+/// The file name of the program a converter's command line runs, without its folder. Settings
+/// may come from another system, so both `/` and `\` end a folder.
 fn program(command: &str) -> String {
     let command = command.trim_start();
     let first = match command.strip_prefix('"') {
         Some(rest) => rest.split('"').next().unwrap_or(rest),
         None => command.split_whitespace().next().unwrap_or(""),
     };
-    Path::new(first)
-        .file_name()
-        .map_or_else(|| first.to_string(), |f| f.to_string_lossy().into_owned())
+    first
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(first)
+        .to_string()
 }
 
 /// Where line `at` of `lines`, read as `read`, is in the file, when the reading says so: the

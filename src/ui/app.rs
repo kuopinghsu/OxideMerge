@@ -931,17 +931,19 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
         }
         ui.add_enabled_ui(!d.rule_sets.is_empty(), |ui| {
             ui.menu_button(tr("rules.export"), |ui| {
-                for set in &d.rule_sets {
-                    if ui.button(&set.name).clicked() {
-                        export = Some(Some(set.clone()));
+                widgets::menu_scroll(ui, |ui| {
+                    for set in &d.rule_sets {
+                        if ui.button(&set.name).clicked() {
+                            export = Some(Some(set.clone()));
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button(tr("rules.export_all")).clicked() {
+                        export = Some(None);
                         ui.close();
                     }
-                }
-                ui.separator();
-                if ui.button(tr("rules.export_all")).clicked() {
-                    export = Some(None);
-                    ui.close();
-                }
+                });
             });
         });
     });
@@ -7456,14 +7458,16 @@ impl OxideMergeApp {
                             tr("label.recent_commits"),
                         );
                         egui::Popup::menu(&commits).show(|ui| {
-                            ui.set_min_width(420.0);
-                            for (hash, subject) in &d.commits {
-                                let text = egui::RichText::new(format!("{hash}  {subject}"));
-                                if ui.button(text).clicked() {
-                                    d.rev = hash.clone();
-                                    ui.close();
+                            widgets::menu_scroll(ui, |ui| {
+                                ui.set_min_width(420.0);
+                                for (hash, subject) in &d.commits {
+                                    let text = egui::RichText::new(format!("{hash}  {subject}"));
+                                    if ui.button(text).clicked() {
+                                        d.rev = hash.clone();
+                                        ui.close();
+                                    }
                                 }
-                            }
+                            });
                         });
                     });
                     ui.end_row();
@@ -7790,10 +7794,10 @@ impl OxideMergeApp {
                 );
             }
             ui.add_space(12.0);
+            let bar_bottom = ui.max_rect().bottom();
             for (i, key) in MENUS.into_iter().enumerate() {
                 ui.menu_button(tr(key), |ui| {
-                    widgets::menu_setup(ui);
-                    self.menu(ui, &mut m, i);
+                    widgets::bar_menu(ui, bar_bottom, |ui| self.menu(ui, &mut m, i));
                 });
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -8974,12 +8978,14 @@ impl OxideMergeApp {
                                 .id(recent_id)
                                 .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
                                 .show(|ui| {
-                                    ui.set_min_width(320.0);
-                                    for r in &recent {
-                                        if ui.selectable_label(false, r).clicked() {
-                                            d.paths[s] = r.clone();
+                                    widgets::menu_scroll(ui, |ui| {
+                                        ui.set_min_width(320.0);
+                                        for r in &recent {
+                                            if ui.selectable_label(false, r).clicked() {
+                                                d.paths[s] = r.clone();
+                                            }
                                         }
-                                    }
+                                    });
                                 });
                             if widgets::icon_button(ui, Icon::File, tr("btn.browse_file")).clicked()
                             {

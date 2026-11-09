@@ -1,0 +1,4 @@
+# The vendored OpenSSL (built for libssh2) names a debug database, ossl_static.pdb, that its
+# build never writes, so the MSVC linker warns LNK4099 for each of its objects on every link.
+[target.'cfg(target_env = "msvc")']
+rustflags = ["-C", "link-arg=/IGNORE:4099"]

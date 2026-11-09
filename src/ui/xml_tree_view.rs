@@ -1225,16 +1225,18 @@ impl XmlTreeView {
                 ui.selectable_value(&mut self.collection_filter, Some(f), tr(key));
             }
             ui.menu_button(tr("analysis.tree_columns"), |ui| {
-                for column in &table.columns {
-                    let mut on = !self.collection_hidden.contains(column);
-                    if ui.checkbox(&mut on, column).changed() {
-                        if on {
-                            self.collection_hidden.remove(column);
-                        } else {
-                            self.collection_hidden.insert(column.clone());
+                widgets::menu_scroll(ui, |ui| {
+                    for column in &table.columns {
+                        let mut on = !self.collection_hidden.contains(column);
+                        if ui.checkbox(&mut on, column).changed() {
+                            if on {
+                                self.collection_hidden.remove(column);
+                            } else {
+                                self.collection_hidden.insert(column.clone());
+                            }
                         }
                     }
-                }
+                });
             });
         });
         if table.nested {

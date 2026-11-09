@@ -3470,6 +3470,57 @@ fn submenus_are_measured_with_their_arrow() {
 }
 
 #[test]
+fn menus_scroll_under_their_button_in_short_windows() {
+    let mut gui = Gui::start("short_menus", None);
+    // The smallest window the app allows.
+    gui.screen = egui::vec2(640.0, 400.0);
+    gui.frames(3);
+    let mut tallest = 0.0_f32;
+    for key in MENUS {
+        let button = gui.click_menu(tr(key));
+        gui.frames(3);
+        let open: Vec<Rect> = gui.ctx.memory(|m| {
+            m.layer_ids()
+                .filter(|l| l.order == egui::Order::Foreground && m.areas().visible_last_frame(l))
+                .filter_map(|l| m.area_rect(l.id))
+                .collect()
+        });
+        assert_eq!(open.len(), 1, "{key}: {open:?}");
+        let menu = open[0];
+        assert!(
+            menu.top() >= button.bottom() - 1.0,
+            "{key} at {menu:?} under {button:?}"
+        );
+        assert!(
+            menu.bottom() <= gui.screen.y,
+            "{key} at {menu:?} is cut off"
+        );
+        tallest = tallest.max(menu.bottom());
+        gui.click_menu(tr(key));
+        gui.frames(3);
+    }
+    // The File menu is longer than the window is tall, so it takes all the room there is.
+    assert!(tallest > gui.screen.y - 20.0, "{tallest}");
+    // Its items further down come into view as the arrow keys reach them.
+    gui.click_menu(tr(MENUS[0]));
+    gui.frames(3);
+    let mut lowest = 0.0_f32;
+    for _ in 0..40 {
+        gui.key(Modifiers::NONE, Key::ArrowDown);
+        gui.frames(2);
+        let item = gui.focus.clone().expect("an item has the keyboard");
+        assert!(
+            item.rect.bottom() <= gui.screen.y,
+            "{:?} at {:?} is out of view",
+            item.label,
+            item.rect
+        );
+        lowest = lowest.max(item.rect.bottom());
+    }
+    assert!(lowest > gui.screen.y - 60.0, "{lowest}");
+}
+
+#[test]
 fn menus_open_equally_wide() {
     let same = |widths: &[(&str, f32)]| widths.iter().all(|(_, w)| (w - widths[0].1).abs() < 0.01);
     let mut fresh = Vec::new();

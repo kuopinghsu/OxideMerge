@@ -1185,6 +1185,70 @@ pub fn menu_setup(ui: &mut Ui) {
     ui.set_min_width(menu_width(ui.ctx()));
 }
 
+/// Room kept between a menu and the edges of the window.
+const MENU_EDGE: f32 = 4.0;
+
+/// The contents of a menu, styled by [`menu_setup`], scrolling when the window is too short to
+/// show them whole. Menus that open anywhere (submenus, context menus, drop-downs) move up to
+/// fit, so they may be as tall as the window.
+pub fn menu<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    menu_scroll(ui, |ui| {
+        menu_setup(ui);
+        add(ui)
+    })
+}
+
+/// The contents of a popup list styled its own way, scrolling like those of a [`menu`].
+pub fn menu_scroll<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let window = ui.ctx().content_rect();
+    let room = window.height() - ui.spacing().menu_margin.sum().y - 2.0 * MENU_EDGE;
+    scrolling(ui, room, add)
+}
+
+/// [`menu`] for a menu of the menu bar, which stays under its button: it scrolls in the room
+/// left below the menu bar, whose bottom is at `bar_bottom`. The menu cannot tell where it is
+/// itself, as the frame it opens it is laid out elsewhere.
+pub fn bar_menu<R>(ui: &mut Ui, bar_bottom: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let window = ui.ctx().content_rect();
+    let room = window.bottom() - bar_bottom - ui.spacing().menu_margin.sum().y - 2.0 * MENU_EDGE;
+    scrolling(ui, room, |ui| {
+        menu_setup(ui);
+        add(ui)
+    })
+}
+
+fn scrolling<R>(ui: &mut Ui, room: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let room = room.max(MENU_MIN_HEIGHT);
+    // A bar over the contents keeps a scrolling menu as wide as the others.
+    ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
+    // A popup's room is the size it had the frame before, so a scroll area held to that would
+    // never grow: the minimum lets it take all of `room` when the contents need it.
+    egui::ScrollArea::vertical()
+        .id_salt("menu")
+        .min_scrolled_height(room)
+        .max_height(room)
+        .auto_shrink([true; 2])
+        .animated(false)
+        .show(ui, |ui| {
+            let inner = add(ui);
+            // The item the arrow keys move to is scrolled into view.
+            let focused = ui.memory(|m| m.focused());
+            let seen = ui.scope_id().with("menu_focus");
+            if ui.data(|d| d.get_temp::<Option<egui::Id>>(seen)) != Some(focused) {
+                ui.data_mut(|d| d.insert_temp(seen, focused));
+                let item = focused.and_then(|id| ui.ctx().read_response(id));
+                if let Some(item) = item.filter(|r| r.layer_id == ui.layer_id()) {
+                    item.scroll_to_me(None);
+                }
+            }
+            inner
+        })
+        .inner
+}
+
+/// Shortest a menu scrolls in, however short the window: a few rows.
+const MENU_MIN_HEIGHT: f32 = 80.0;
+
 /// Room between a menu item's label and its shortcut.
 const MENU_SHORTCUT_GAP: f32 = 24.0;
 /// Room before a check item's label, where its check mark goes.
@@ -1223,10 +1287,7 @@ pub fn submenu<R>(
     title: &str,
     add: impl FnOnce(&mut Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
-    ui.menu_button(title, |ui| {
-        menu_setup(ui);
-        add(ui)
-    })
+    ui.menu_button(title, |ui| menu(ui, add))
 }
 
 /// A menu item that turns something on or off, or picks one of a few options: a check mark in a
