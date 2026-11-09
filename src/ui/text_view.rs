@@ -7997,27 +7997,29 @@ impl TextView {
             ui.menu_button(
                 format!("{}: {}", tr("table.choose_keys"), chosen.join(" + ")),
                 |ui| {
-                    let listed: Vec<KeyColumn> = (0..width)
-                        .map(|column| key_column(&names, column, self.table_match.header))
-                        .collect();
-                    // Saved keys no column has, such as from a project, can be unticked too.
-                    let missing: Vec<KeyColumn> = self
-                        .table_match
-                        .keys
-                        .iter()
-                        .filter(|k| !listed.contains(k))
-                        .cloned()
-                        .collect();
-                    for key in listed.into_iter().chain(missing) {
-                        let mut on = self.table_match.keys.contains(&key);
-                        if ui.checkbox(&mut on, key_label(&key, &names)).changed() {
-                            if on {
-                                self.table_match.keys.push(key);
-                            } else if self.table_match.keys.len() > 1 {
-                                self.table_match.keys.retain(|k| *k != key);
+                    widgets::menu_scroll(ui, |ui| {
+                        let listed: Vec<KeyColumn> = (0..width)
+                            .map(|column| key_column(&names, column, self.table_match.header))
+                            .collect();
+                        // Saved keys no column has, such as from a project, can be unticked too.
+                        let missing: Vec<KeyColumn> = self
+                            .table_match
+                            .keys
+                            .iter()
+                            .filter(|k| !listed.contains(k))
+                            .cloned()
+                            .collect();
+                        for key in listed.into_iter().chain(missing) {
+                            let mut on = self.table_match.keys.contains(&key);
+                            if ui.checkbox(&mut on, key_label(&key, &names)).changed() {
+                                if on {
+                                    self.table_match.keys.push(key);
+                                } else if self.table_match.keys.len() > 1 {
+                                    self.table_match.keys.retain(|k| *k != key);
+                                }
                             }
                         }
-                    }
+                    })
                 },
             );
             ui.label(tr("table.columns_by"));
@@ -10615,103 +10617,104 @@ impl TextView {
             let block = self.diff.rows.get(r).and_then(|row| row.block());
             let lines = selection.filter(|&(a, b)| (a..=b).contains(&r));
             resp.context_menu(|ui| {
-                widgets::menu_setup(ui);
-                let copy = |from, to| match (lines, block) {
-                    (Some(_), _) => Some(MenuAction::CopyLines(from, to)),
-                    (None, Some(b)) => Some(MenuAction::Copy(b, from, to)),
-                    _ => None,
-                };
-                if lines.is_some() || block.is_some() {
-                    let items: &[(String, usize, usize)] = if n == 2 {
-                        &[
-                            (format!("→  {}", tr("cmd.copy_right")), 0, 1),
-                            (format!("←  {}", tr("cmd.copy_left")), 1, 0),
-                        ]
-                    } else {
-                        &[
-                            (tr("cmd.copy_from_left").to_string(), 0, 1),
-                            (tr("cmd.copy_from_right").to_string(), 2, 1),
-                            (tr("cmd.copy_middle_left").to_string(), 1, 0),
-                            (tr("cmd.copy_middle_right").to_string(), 1, 2),
-                        ]
+                widgets::menu(ui, |ui| {
+                    let copy = |from, to| match (lines, block) {
+                        (Some(_), _) => Some(MenuAction::CopyLines(from, to)),
+                        (None, Some(b)) => Some(MenuAction::Copy(b, from, to)),
+                        _ => None,
                     };
-                    for (label, from, to) in items {
-                        if ui.button(label).clicked() {
-                            action = copy(*from, *to);
+                    if lines.is_some() || block.is_some() {
+                        let items: &[(String, usize, usize)] = if n == 2 {
+                            &[
+                                (format!("→  {}", tr("cmd.copy_right")), 0, 1),
+                                (format!("←  {}", tr("cmd.copy_left")), 1, 0),
+                            ]
+                        } else {
+                            &[
+                                (tr("cmd.copy_from_left").to_string(), 0, 1),
+                                (tr("cmd.copy_from_right").to_string(), 2, 1),
+                                (tr("cmd.copy_middle_left").to_string(), 1, 0),
+                                (tr("cmd.copy_middle_right").to_string(), 1, 2),
+                            ]
+                        };
+                        for (label, from, to) in items {
+                            if ui.button(label).clicked() {
+                                action = copy(*from, *to);
+                            }
                         }
+                        ui.separator();
+                    }
+                    if ui.button(tr("cmd.edit_line")).clicked() {
+                        action = Some(MenuAction::Edit(r, p));
+                    }
+                    if ui.button(tr("cmd.insert_line")).clicked() {
+                        action = Some(MenuAction::InsertBelow(r, p));
+                    }
+                    if ui.button(tr("cmd.delete_line")).clicked() {
+                        action = Some(MenuAction::DeleteLine(r, p));
                     }
                     ui.separator();
-                }
-                if ui.button(tr("cmd.edit_line")).clicked() {
-                    action = Some(MenuAction::Edit(r, p));
-                }
-                if ui.button(tr("cmd.insert_line")).clicked() {
-                    action = Some(MenuAction::InsertBelow(r, p));
-                }
-                if ui.button(tr("cmd.delete_line")).clicked() {
-                    action = Some(MenuAction::DeleteLine(r, p));
-                }
-                ui.separator();
-                if ui.button(tr("cmd.copy_text")).clicked() {
-                    action = Some(MenuAction::CopyText(r, p));
-                }
-                let mark = if self
-                    .bookmark_target(r, p)
-                    .is_some_and(|(bp, _)| self.row_bookmarked(r, bp))
-                {
-                    "cmd.remove_bookmark"
-                } else {
-                    "cmd.add_bookmark"
-                };
-                if ui.button(tr(mark)).clicked() {
-                    action = Some(MenuAction::ToggleBookmark(r, p));
-                }
-                if ui.button(tr("cmd.bookmark_comment")).clicked() {
-                    action = Some(MenuAction::EditNote(r, p));
-                }
-                ui.separator();
-                let synced = self.diff.rows[r]
-                    .line(p)
-                    .is_some_and(|l| self.sync_points.iter().any(|s| s[p] == l));
-                let picked = self.diff.rows[r].line(p).is_some()
-                    && self.sync_pending.get(p).copied().flatten() == self.diff.rows[r].line(p);
-                let sync_label = if synced {
-                    "cmd.remove_sync_point"
-                } else if picked {
-                    "cmd.unpick_sync_point"
-                } else {
-                    "cmd.sync_point"
-                };
-                let enabled = self.diff.rows[r].line(p).is_some();
-                if widgets::menu_item(ui, enabled, tr(sync_label), &Cmd::SyncPoint.shown_key())
-                    .clicked()
-                {
-                    action = Some(MenuAction::SyncPoint(r, p));
-                }
-                if self.has_sync_points() && ui.button(tr("cmd.clear_sync_points")).clicked() {
-                    action = Some(MenuAction::ClearSyncPoints);
-                }
-                widgets::submenu(ui, tr("cmd.add_rule"), |ui| {
-                    for kind in RuleKind::ALL {
-                        if ui.button(tr(kind.key())).clicked() {
-                            action = Some(MenuAction::AddRule(kind, r, p));
+                    if ui.button(tr("cmd.copy_text")).clicked() {
+                        action = Some(MenuAction::CopyText(r, p));
+                    }
+                    let mark = if self
+                        .bookmark_target(r, p)
+                        .is_some_and(|(bp, _)| self.row_bookmarked(r, bp))
+                    {
+                        "cmd.remove_bookmark"
+                    } else {
+                        "cmd.add_bookmark"
+                    };
+                    if ui.button(tr(mark)).clicked() {
+                        action = Some(MenuAction::ToggleBookmark(r, p));
+                    }
+                    if ui.button(tr("cmd.bookmark_comment")).clicked() {
+                        action = Some(MenuAction::EditNote(r, p));
+                    }
+                    ui.separator();
+                    let synced = self.diff.rows[r]
+                        .line(p)
+                        .is_some_and(|l| self.sync_points.iter().any(|s| s[p] == l));
+                    let picked = self.diff.rows[r].line(p).is_some()
+                        && self.sync_pending.get(p).copied().flatten() == self.diff.rows[r].line(p);
+                    let sync_label = if synced {
+                        "cmd.remove_sync_point"
+                    } else if picked {
+                        "cmd.unpick_sync_point"
+                    } else {
+                        "cmd.sync_point"
+                    };
+                    let enabled = self.diff.rows[r].line(p).is_some();
+                    if widgets::menu_item(ui, enabled, tr(sync_label), &Cmd::SyncPoint.shown_key())
+                        .clicked()
+                    {
+                        action = Some(MenuAction::SyncPoint(r, p));
+                    }
+                    if self.has_sync_points() && ui.button(tr("cmd.clear_sync_points")).clicked() {
+                        action = Some(MenuAction::ClearSyncPoints);
+                    }
+                    widgets::submenu(ui, tr("cmd.add_rule"), |ui| {
+                        for kind in RuleKind::ALL {
+                            if ui.button(tr(kind.key())).clicked() {
+                                action = Some(MenuAction::AddRule(kind, r, p));
+                            }
+                        }
+                    });
+                    if n == 3 {
+                        if let Some(b) = block.filter(|_| !self.panes[1].doc.read_only) {
+                            ui.separator();
+                            if ui.button(tr("cmd.take_left_right")).clicked() {
+                                action = Some(MenuAction::TakeBoth(b, true));
+                            }
+                            if ui.button(tr("cmd.take_right_left")).clicked() {
+                                action = Some(MenuAction::TakeBoth(b, false));
+                            }
                         }
                     }
-                });
-                if n == 3 {
-                    if let Some(b) = block.filter(|_| !self.panes[1].doc.read_only) {
-                        ui.separator();
-                        if ui.button(tr("cmd.take_left_right")).clicked() {
-                            action = Some(MenuAction::TakeBoth(b, true));
-                        }
-                        if ui.button(tr("cmd.take_right_left")).clicked() {
-                            action = Some(MenuAction::TakeBoth(b, false));
-                        }
+                    if action.is_some() {
+                        ui.close();
                     }
-                }
-                if action.is_some() {
-                    ui.close();
-                }
+                })
             });
         }
         if let Some(a) = action {

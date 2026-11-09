@@ -3406,18 +3406,19 @@ impl FolderView {
                 )
                 .on_hover_text(tr("tip.click_change"));
                 popup_below(&r, method_id, close).show(|ui| {
-                    widgets::menu_setup(ui);
-                    for m in folder::CompareMethod::ALL {
-                        let on = self.fopts.method == m;
-                        if widgets::menu_check(ui, on, tr(m.key()), "").clicked() && !on {
-                            new_options = Some((m, self.fopts.recursive));
+                    widgets::menu(ui, |ui| {
+                        for m in folder::CompareMethod::ALL {
+                            let on = self.fopts.method == m;
+                            if widgets::menu_check(ui, on, tr(m.key()), "").clicked() && !on {
+                                new_options = Some((m, self.fopts.recursive));
+                            }
                         }
-                    }
-                    ui.separator();
-                    let recursive = self.fopts.recursive;
-                    if widgets::menu_check(ui, recursive, tr("label.recursive"), "").clicked() {
-                        new_options = Some((self.fopts.method, !recursive));
-                    }
+                        ui.separator();
+                        let recursive = self.fopts.recursive;
+                        if widgets::menu_check(ui, recursive, tr("label.recursive"), "").clicked() {
+                            new_options = Some((self.fopts.method, !recursive));
+                        }
+                    })
                 });
 
                 let rules_id = self.id.with("rules_popup");
@@ -3433,25 +3434,26 @@ impl FolderView {
                     self.rule_names = rules::list().into_iter().map(|s| s.name).collect();
                 }
                 popup_below(&r, rules_id, close).show(|ui| {
-                    widgets::menu_setup(ui);
-                    if widgets::menu_check(ui, self.rules.is_empty(), tr("rules.none"), "")
-                        .clicked()
-                    {
-                        new_rules = Some(String::new());
-                    }
-                    let refs: Vec<&str> = self.rule_names.iter().map(String::as_str).collect();
-                    let picked = rules::chosen(&self.rules, &refs);
-                    for name in &self.rule_names {
-                        let on = picked == Some(name.as_str());
-                        if widgets::menu_check(ui, on, name, "").clicked() {
-                            new_rules = Some(name.clone());
+                    widgets::menu(ui, |ui| {
+                        if widgets::menu_check(ui, self.rules.is_empty(), tr("rules.none"), "")
+                            .clicked()
+                        {
+                            new_rules = Some(String::new());
                         }
-                    }
-                    ui.separator();
-                    if ui.button(tr("cmd.edit_rules")).clicked() {
-                        ui.close();
-                        action = Some(FolderAction::EditRules);
-                    }
+                        let refs: Vec<&str> = self.rule_names.iter().map(String::as_str).collect();
+                        let picked = rules::chosen(&self.rules, &refs);
+                        for name in &self.rule_names {
+                            let on = picked == Some(name.as_str());
+                            if widgets::menu_check(ui, on, name, "").clicked() {
+                                new_rules = Some(name.clone());
+                            }
+                        }
+                        ui.separator();
+                        if ui.button(tr("cmd.edit_rules")).clicked() {
+                            ui.close();
+                            action = Some(FolderAction::EditRules);
+                        }
+                    })
                 });
 
                 let filter_id = self.id.with("filter_popup");
@@ -3468,32 +3470,34 @@ impl FolderView {
                     self.filter_edit = Some(self.filter_spec.clone());
                 }
                 popup_below(&r, filter_id, close).show(|ui| {
-                    ui.set_min_width(widgets::menu_width(ui.ctx()).max(300.0));
-                    let edit = self
-                        .filter_edit
-                        .get_or_insert_with(|| self.filter_spec.clone());
-                    let field = ui.add(
-                        egui::TextEdit::singleline(edit)
-                            .margin(vec2(8.0, 4.0))
-                            .desired_width(f32::INFINITY),
-                    );
-                    if opened {
-                        field.request_focus();
-                    }
-                    if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        new_filter = Some(edit.clone());
-                    }
-                    ui.separator();
-                    let listed = cfg.recent_filters.iter().cloned().chain(
-                        named
-                            .iter()
-                            .map(|f| format!("{}{}", crate::core::filter::FLT_PREFIX, f.name)),
-                    );
-                    for f in listed {
-                        if ui.selectable_label(f == self.filter_spec, &f).clicked() {
-                            new_filter = Some(f);
+                    widgets::menu_scroll(ui, |ui| {
+                        ui.set_min_width(widgets::menu_width(ui.ctx()).max(300.0));
+                        let edit = self
+                            .filter_edit
+                            .get_or_insert_with(|| self.filter_spec.clone());
+                        let field = ui.add(
+                            egui::TextEdit::singleline(edit)
+                                .margin(vec2(8.0, 4.0))
+                                .desired_width(f32::INFINITY),
+                        );
+                        if opened {
+                            field.request_focus();
                         }
-                    }
+                        if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            new_filter = Some(edit.clone());
+                        }
+                        ui.separator();
+                        let listed = cfg.recent_filters.iter().cloned().chain(
+                            named
+                                .iter()
+                                .map(|f| format!("{}{}", crate::core::filter::FLT_PREFIX, f.name)),
+                        );
+                        for f in listed {
+                            if ui.selectable_label(f == self.filter_spec, &f).clicked() {
+                                new_filter = Some(f);
+                            }
+                        }
+                    })
                 });
             });
             if !wrap {
@@ -4483,123 +4487,133 @@ impl FolderView {
                         click = Some((vi, Modifiers::NONE));
                     }
                     resp.context_menu(|ui| {
-                        widgets::menu_setup(ui);
-                        if ui.button(tr("cmd.compare")).clicked() {
-                            menu = Some(MenuCmd::Open(idx, None));
-                        }
-                        if !it.is_dir {
-                            widgets::submenu(ui, tr("cmd.compare_as"), |ui| {
-                                for (kind, key) in [
-                                    (FileKind::Text, "kind.text"),
-                                    (FileKind::Binary, "kind.binary"),
-                                    (FileKind::Image, "kind.image"),
-                                    (FileKind::Web, "kind.web"),
-                                ] {
-                                    if ui.button(tr(key)).clicked() {
-                                        menu = Some(MenuCmd::Open(idx, Some(kind)));
+                        widgets::menu(ui, |ui| {
+                            if ui.button(tr("cmd.compare")).clicked() {
+                                menu = Some(MenuCmd::Open(idx, None));
+                            }
+                            if !it.is_dir {
+                                widgets::submenu(ui, tr("cmd.compare_as"), |ui| {
+                                    for (kind, key) in [
+                                        (FileKind::Text, "kind.text"),
+                                        (FileKind::Binary, "kind.binary"),
+                                        (FileKind::Image, "kind.image"),
+                                        (FileKind::Web, "kind.web"),
+                                    ] {
+                                        if ui.button(tr(key)).clicked() {
+                                            menu = Some(MenuCmd::Open(idx, Some(kind)));
+                                        }
+                                    }
+                                });
+                            }
+                            ui.separator();
+                            for from in 0..n {
+                                for to in 0..n {
+                                    if from != to && (n == 2 || from == 1 || to == 1) {
+                                        let label = trf(
+                                            "cmd.copy_from_to",
+                                            &[
+                                                ("from", side_name(from, n).into()),
+                                                ("to", side_name(to, n).into()),
+                                            ],
+                                        );
+                                        if ui
+                                            .add_enabled(
+                                                it.exists[from] && self.writable(to),
+                                                egui::Button::new(label),
+                                            )
+                                            .clicked()
+                                        {
+                                            menu = Some(MenuCmd::Op(OpKind::Copy { from, to }));
+                                        }
                                     }
                                 }
-                            });
-                        }
-                        ui.separator();
-                        for from in 0..n {
-                            for to in 0..n {
-                                if from != to && (n == 2 || from == 1 || to == 1) {
-                                    let label = trf(
-                                        "cmd.copy_from_to",
-                                        &[
-                                            ("from", side_name(from, n).into()),
-                                            ("to", side_name(to, n).into()),
-                                        ],
-                                    );
+                            }
+                            widgets::submenu(ui, tr("cmd.copy_to_folder"), |ui| {
+                                for s in 0..n {
                                     if ui
                                         .add_enabled(
-                                            it.exists[from] && self.writable(to),
-                                            egui::Button::new(label),
+                                            it.exists[s],
+                                            egui::Button::new(side_name(s, n)),
                                         )
                                         .clicked()
                                     {
-                                        menu = Some(MenuCmd::Op(OpKind::Copy { from, to }));
+                                        menu = Some(MenuCmd::CopyTo(s));
                                     }
                                 }
-                            }
-                        }
-                        widgets::submenu(ui, tr("cmd.copy_to_folder"), |ui| {
-                            for s in 0..n {
-                                if ui
-                                    .add_enabled(it.exists[s], egui::Button::new(side_name(s, n)))
-                                    .clicked()
-                                {
-                                    menu = Some(MenuCmd::CopyTo(s));
+                            });
+                            widgets::submenu(ui, tr("cmd.delete"), |ui| {
+                                for s in 0..n {
+                                    if ui
+                                        .add_enabled(
+                                            it.exists[s] && self.writable(s),
+                                            egui::Button::new(side_name(s, n)),
+                                        )
+                                        .clicked()
+                                    {
+                                        menu = Some(MenuCmd::Op(OpKind::Delete { side: Some(s) }));
+                                    }
                                 }
-                            }
-                        });
-                        widgets::submenu(ui, tr("cmd.delete"), |ui| {
-                            for s in 0..n {
-                                if ui
-                                    .add_enabled(
-                                        it.exists[s] && self.writable(s),
-                                        egui::Button::new(side_name(s, n)),
-                                    )
-                                    .clicked()
-                                {
-                                    menu = Some(MenuCmd::Op(OpKind::Delete { side: Some(s) }));
+                                if ui.button(tr("side.all")).clicked() {
+                                    menu = Some(MenuCmd::Op(OpKind::Delete { side: None }));
                                 }
-                            }
-                            if ui.button(tr("side.all")).clicked() {
-                                menu = Some(MenuCmd::Op(OpKind::Delete { side: None }));
-                            }
-                        });
-                        ui.separator();
-                        widgets::submenu(ui, tr("cmd.open_with_app"), |ui| {
-                            for s in 0..n {
-                                if ui
-                                    .add_enabled(it.exists[s], egui::Button::new(side_name(s, n)))
-                                    .clicked()
-                                {
-                                    menu = Some(MenuCmd::SystemOpen(idx, s));
+                            });
+                            ui.separator();
+                            widgets::submenu(ui, tr("cmd.open_with_app"), |ui| {
+                                for s in 0..n {
+                                    if ui
+                                        .add_enabled(
+                                            it.exists[s],
+                                            egui::Button::new(side_name(s, n)),
+                                        )
+                                        .clicked()
+                                    {
+                                        menu = Some(MenuCmd::SystemOpen(idx, s));
+                                    }
                                 }
-                            }
-                        });
-                        widgets::submenu(ui, tr("cmd.reveal"), |ui| {
-                            for s in 0..n {
-                                if ui
-                                    .add_enabled(it.exists[s], egui::Button::new(side_name(s, n)))
-                                    .clicked()
-                                {
-                                    menu = Some(MenuCmd::Reveal(idx, s));
+                            });
+                            widgets::submenu(ui, tr("cmd.reveal"), |ui| {
+                                for s in 0..n {
+                                    if ui
+                                        .add_enabled(
+                                            it.exists[s],
+                                            egui::Button::new(side_name(s, n)),
+                                        )
+                                        .clicked()
+                                    {
+                                        menu = Some(MenuCmd::Reveal(idx, s));
+                                    }
                                 }
-                            }
-                        });
-                        widgets::submenu(ui, tr("cmd.copy_path"), |ui| {
-                            for s in 0..n {
-                                if ui.button(side_name(s, n)).clicked() {
-                                    menu = Some(MenuCmd::CopyPath(idx, s));
+                            });
+                            widgets::submenu(ui, tr("cmd.copy_path"), |ui| {
+                                for s in 0..n {
+                                    if ui.button(side_name(s, n)).clicked() {
+                                        menu = Some(MenuCmd::CopyPath(idx, s));
+                                    }
                                 }
+                            });
+                            ui.separator();
+                            if ui.button(tr("cmd.toggle_bookmark")).clicked() {
+                                menu = Some(MenuCmd::Bookmark(idx));
                             }
-                        });
-                        ui.separator();
-                        if ui.button(tr("cmd.toggle_bookmark")).clicked() {
-                            menu = Some(MenuCmd::Bookmark(idx));
-                        }
-                        if ui.button(tr("dlg.bookmark_comment")).clicked() {
-                            menu = Some(MenuCmd::Comment(idx));
-                        }
-                        if ui
-                            .add_enabled(
-                                self.running.is_none(),
-                                egui::Button::new(tr("review.save_selected")),
-                            )
-                            .clicked()
-                        {
-                            menu = Some(MenuCmd::SaveReview);
-                        }
-                        if ui.button(tr("cmd.select_pattern")).clicked() {
-                            menu = Some(MenuCmd::SelectPattern);
-                        }
-                        if menu.is_some() {
-                            ui.close();
-                        }
+                            if ui.button(tr("dlg.bookmark_comment")).clicked() {
+                                menu = Some(MenuCmd::Comment(idx));
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.running.is_none(),
+                                    egui::Button::new(tr("review.save_selected")),
+                                )
+                                .clicked()
+                            {
+                                menu = Some(MenuCmd::SaveReview);
+                            }
+                            if ui.button(tr("cmd.select_pattern")).clicked() {
+                                menu = Some(MenuCmd::SelectPattern);
+                            }
+                            if menu.is_some() {
+                                ui.close();
+                            }
+                        })
                     });
                 });
             });
