@@ -463,6 +463,11 @@ uses its section of this file as the release notes.
 
 ### Changed
 
+- **Menus in short windows:** a menu too tall for the window scrolls within it instead of
+  being cut off. A menu of the menu bar stays under its button. Arrows at its top and bottom
+  scroll it while the pointer rests on them, and the mouse wheel and the arrow keys scroll it
+  too. *Open project*, *Save as project*, *Save as job* and *Run job* moved to a new
+  *File → Projects and jobs* submenu, so the File menu fits more windows whole.
 - **HTML reports** are easier to read, search and share:
   - A folder report counts the files with different contents, the files on one side only and
     the differences exported apart. Its index lists every changed or one-sided file, and a file

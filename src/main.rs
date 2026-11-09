@@ -1453,7 +1453,7 @@ pub(crate) fn job_dir(file: &std::path::Path) -> anyhow::Result<std::path::PathB
 /// Runs `jobs`, read from a job file in `dir`, one after another, as their command lines would,
 /// and says how each ended. Sync jobs, and jobs writing outside `dir`, run only when `yes` is
 /// given. `stop` stops a synchronization being applied and the jobs after it. Used by `--job` and
-/// by *File → Run job…*.
+/// by *File → Projects and jobs → Run job…*.
 pub(crate) fn job_summary(
     jobs: &core::job::JobFile,
     dir: &std::path::Path,

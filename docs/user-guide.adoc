@@ -2828,14 +2828,14 @@ Check these files for confidential content before you share them.
 A project lets you return to the same comparison later without selecting the files and options
 again.
 
-*File → Save as project...* saves what the current tab compares in an `.oxmproj` file.
+*File → Projects and jobs → Save as project...* saves what the current tab compares in an `.oxmproj` file.
 A project stores:
 
 * the paths, the descriptions and the read-only sides;
 * the comparison type, the filter, *Include subfolders* and the compare method;
 * the compare rules file.
 
-To reopen a project, choose *File → Open project...*.
+To reopen a project, choose *File → Projects and jobs → Open project...*.
 OxideMerge can also open WinMerge projects (`.WinMerge`).
 
 Paths are stored relative to the project file, so you can move a project together with its files.
@@ -2935,7 +2935,7 @@ To open a bundle, use any of these methods:
 
 * on the command line, run `oxidemerge review.oxmreview`;
 * drop the file on the window;
-* choose *File → Open project...*.
+* choose *File → Projects and jobs → Open project...*.
 
 The bundle opens as a read-only snapshot that uses the comparison options it was saved with.
 It does not need the original files, named filters or external rules files.
@@ -4346,7 +4346,7 @@ in the program:
 
 You can also create and run job files from the OxideMerge window.
 
-*File → Save as job...* saves the active folder comparison as a job file.
+*File → Projects and jobs → Save as job...* saves the active folder comparison as a job file.
 The job records the compared folders, the filter, the compare method, the compare rules file and
 the comparison options that are turned on, so it compares exactly as the tab does.
 Choose what the job does:
@@ -4364,7 +4364,7 @@ Only a comparison of two folders can be saved as a sync job.
 A comparison of a revision, a web page or an archive works on temporary copies, so it cannot be
 saved as a job.
 
-*File → Run job...* runs a job file and lists how each job ended.
+*File → Projects and jobs → Run job...* runs a job file and lists how each job ended.
 Click *Open* to open the report or plan that a job wrote, or *Compare* to open its folders in a
 tab.
 *Open* is offered only for report files (`.html`, `.pdf`, `.csv`, `.txt`, `.xml`, `.json`,

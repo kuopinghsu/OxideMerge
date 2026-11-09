@@ -7955,11 +7955,13 @@ impl OxideMergeApp {
         m.item(ui, Cmd::OpenConflict);
         m.item(ui, Cmd::GitCompare);
         ui.separator();
-        m.item(ui, Cmd::OpenProject);
-        m.item(ui, Cmd::SaveProject);
-        m.item(ui, Cmd::SaveJob);
-        m.item(ui, Cmd::RunJob);
-        ui.separator();
+        submenu(ui, tr("menu.projects_jobs"), |ui| {
+            m.item(ui, Cmd::OpenProject);
+            m.item(ui, Cmd::SaveProject);
+            ui.separator();
+            m.item(ui, Cmd::SaveJob);
+            m.item(ui, Cmd::RunJob);
+        });
         let workspaces = &self.cfg.workspaces;
         submenu_list(ui, tr("menu.workspaces"), |ui| {
             m.item(ui, Cmd::SaveWorkspace);

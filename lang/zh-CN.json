@@ -124,6 +124,7 @@
   "label.notebook_markdown_cell": "Markdown 单元格",
   "label.notebook_raw_cell": "原始单元格",
   "menu.workspaces": "工作区",
+  "menu.projects_jobs": "项目与任务",
   "menu.save_workspace": "另存为工作区…",
   "menu.open_workspace": "打开工作区",
   "menu.manage_workspaces": "管理工作区…",

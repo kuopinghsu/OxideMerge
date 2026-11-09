@@ -124,6 +124,7 @@
   "label.notebook_markdown_cell": "Markdown-Zelle",
   "label.notebook_raw_cell": "Rohzelle",
   "menu.workspaces": "Arbeitsbereiche",
+  "menu.projects_jobs": "Projekte und Aufträge",
   "menu.save_workspace": "Als Arbeitsbereich speichern...",
   "menu.open_workspace": "Arbeitsbereich öffnen",
   "menu.manage_workspaces": "Arbeitsbereiche verwalten...",

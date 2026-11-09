@@ -124,6 +124,7 @@
   "label.notebook_markdown_cell": "마크다운 셀",
   "label.notebook_raw_cell": "원본 셀",
   "menu.workspaces": "작업 공간",
+  "menu.projects_jobs": "프로젝트 및 작업",
   "menu.save_workspace": "작업 공간으로 저장...",
   "menu.open_workspace": "작업 공간 열기",
   "menu.manage_workspaces": "작업 공간 관리...",
