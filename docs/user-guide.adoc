@@ -715,6 +715,20 @@ A sync plan made with `--sync-plan` names a server folder by its address, so `--
 applies it to the copy that its run fetches; as for local folders, the plan is refused if the
 files it plans to change are no longer as planned.
 
+NOTE: Checked on Linux with OpenSSH 10.5p1 and vsftpd 3.0.5.
+With a private key, SFTP refuses a server it has not been told to trust and shows that server's
+fingerprint, the same one `ssh-keygen -lf` prints; `--trust-fingerprint` then connects and the
+key is remembered.
+An identical file exits 0, a different file exits 1, and a folder compare names the file that
+differs.
+The window opens the fetched file as writable and shows the difference.
+A sync job uploads a new file, a shorter upload replaces that file in place, and an upload is
+refused when the file on the server has changed since it was fetched.
+Anonymous FTP does the same for a file: identical exits 0, different exits 1, the window shows
+it as writable, a sync job uploads a file and a second run updates it, and `--ftp-active`
+compared an identical file (exit 0).
+An address that contains a password is refused for both.
+
 [[compare-types]]
 === Comparison types
 
