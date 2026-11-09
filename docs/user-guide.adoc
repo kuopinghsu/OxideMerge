@@ -317,6 +317,9 @@ Every comparison you open appears in the main window, which has these parts:
 
 Menu bar:: *File*, *Edit*, *View*, *Compare*, *Merge*, *Tools* and *Help*.
 Commands that do not apply to the current tab are unavailable.
+A menu that is too tall for the window scrolls, and so does a context menu.
+To scroll it, rest the pointer on the arrow at its top or bottom, or use the mouse wheel or the
+arrow keys.
 Title bar:: At the right end: *Search commands*, which opens the command palette, *Open*, a
 switch for the light and dark themes, *Options* and *Help & Shortcuts*.
 In a narrow window, the search field becomes an icon, and buttons that do not fit are hidden.

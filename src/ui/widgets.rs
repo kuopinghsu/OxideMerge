@@ -1224,15 +1224,43 @@ const MENU_ARROW_HEIGHT: f32 = 18.0;
 /// How far a menu scrolls in a second while the pointer rests on one of its arrows.
 const MENU_ARROW_SPEED: f32 = 360.0;
 
-/// What a scrolling menu keeps from one frame to the next while it is open.
-#[derive(Clone, Copy, Default)]
+/// What the open menus keep from one frame to the next. Kept for as long as they are shown, so
+/// the context menus of rows, each a menu of its own, leave nothing behind.
+#[derive(Clone, Default)]
+struct MenuMemory {
+    /// Scrolling menus, by their [`scrolling`] key.
+    scrolls: std::collections::HashMap<egui::Id, MenuScroll>,
+}
+
+#[derive(Clone)]
 struct MenuScroll {
     /// The pass it was last shown in.
-    pass: Option<u64>,
+    pass: u64,
+    layer: egui::LayerId,
     /// Where its arrows scroll it to next.
     to: Option<f32>,
     /// Whether the pointer has moved since it opened.
     moved: bool,
+    /// The pointer as it was before its buttons last went down, to take back a click on an arrow.
+    idle: Option<egui::PointerState>,
+    /// The item the arrow keys moved to, once it is scrolled into view.
+    seen: Option<Option<egui::Id>>,
+    /// Its arrows, which hide the rows under them.
+    arrows: [Option<Rect>; 2],
+}
+
+fn menu_memory_id() -> egui::Id {
+    egui::Id::unique("oxidemerge_menu_memory")
+}
+
+/// [`MenuMemory`], without what the menus not shown the pass before left.
+fn menu_memory<T>(ctx: &egui::Context, f: impl FnOnce(&mut MenuMemory, u64) -> T) -> T {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| {
+        let m = d.get_temp_mut_or_default::<MenuMemory>(menu_memory_id());
+        m.scrolls.retain(|_, s| s.pass + 1 >= pass);
+        f(m, pass)
+    })
 }
 
 fn scrolling<R>(ui: &mut Ui, room: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
@@ -1249,32 +1277,41 @@ fn scrolling<R>(ui: &mut Ui, room: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
         .animated(false)
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
     let key = ui.scope_id().with("menu_scroll");
-    let pass = ui.ctx().cumulative_pass_nr();
-    let mut kept = ui
-        .data(|d| d.get_temp::<MenuScroll>(key))
-        .unwrap_or_default();
-    if kept.pass.is_none_or(|p| p + 1 < pass) {
-        // Just opened: at the top, as egui keeps (and saves) where a scroll area was scrolled.
-        kept = MenuScroll::default();
-        area = area.vertical_scroll_offset(0.0);
-    } else if let Some(y) = kept.to.take() {
-        area = area.vertical_scroll_offset(y);
-    }
-    kept.pass = Some(pass);
+    let layer = ui.layer_id();
+    let (kept, pass) = menu_memory(ui.ctx(), |m, pass| (m.scrolls.get(&key).cloned(), pass));
+    let mut kept = match kept {
+        Some(mut kept) => {
+            if let Some(y) = kept.to.take() {
+                area = area.vertical_scroll_offset(y);
+            }
+            kept.pass = pass;
+            kept
+        }
+        None => {
+            // Just opened: at the top, as egui keeps (and saves) where a scroll area was scrolled.
+            area = area.vertical_scroll_offset(0.0);
+            MenuScroll {
+                pass,
+                layer,
+                to: None,
+                moved: false,
+                idle: None,
+                seen: None,
+                arrows: [None; 2],
+            }
+        }
+    };
     kept.moved |= ui.input(|i| i.pointer.delta() != Vec2::ZERO);
-    // The pointer as it was before its buttons last went down, to take back a click on an arrow.
-    let idle = key.with("idle_pointer");
     let pointer = ui.input(|i| i.pointer.clone());
     if !pointer.any_down() && !pointer.any_released() {
-        ui.data_mut(|d| d.insert_temp(idle, pointer));
+        kept.idle = Some(pointer);
     }
     let out = area.show(ui, |ui| {
         let inner = add(ui);
         // The item the arrow keys move to is scrolled into view, clear of the arrows.
         let focused = ui.memory(|m| m.focused());
-        let seen = ui.scope_id().with("menu_focus");
-        if ui.data(|d| d.get_temp::<Option<egui::Id>>(seen)) != Some(focused) {
-            ui.data_mut(|d| d.insert_temp(seen, focused));
+        if kept.seen != Some(focused) {
+            kept.seen = Some(focused);
             let item = focused.and_then(|id| ui.ctx().read_response(id));
             if let Some(item) = item.filter(|r| r.layer_id == ui.layer_id()) {
                 let clear = item.rect.expand2(egui::vec2(0.0, MENU_ARROW_HEIGHT));
@@ -1287,7 +1324,8 @@ fn scrolling<R>(ui: &mut Ui, room: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let end = (out.content_size.y - view.height()).max(0.0);
     let offset = out.state.clamped_offset().y;
     let mut to = offset;
-    for up in [true, false] {
+    kept.arrows = [None; 2];
+    for (i, up) in [true, false].into_iter().enumerate() {
         if (up && offset <= 0.5) || (!up && offset >= end - 0.5) {
             continue;
         }
@@ -1299,13 +1337,15 @@ fn scrolling<R>(ui: &mut Ui, room: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
                 view.max,
             )
         };
+        kept.arrows[i] = Some(strip);
         // Clicks on an arrow do not reach the item under it, and the arrow keys pass it by.
         let r = ui.interact(strip, out.id.with(up), Sense::CLICK);
         menu_arrow(ui, strip, up, r.hovered());
         // A menu, and the menus it opened from, close on any click in them, read from the
-        // pointer after their contents: the pointer from before the click makes it never was.
+        // pointer after their contents: the pointer from before the click on an arrow takes it
+        // back, as if it never happened.
         if r.hovered() && ui.input(|i| i.pointer.any_click()) {
-            if let Some(before) = ui.data(|d| d.get_temp::<egui::PointerState>(idle)) {
+            if let Some(before) = kept.idle.clone() {
                 ui.ctx().input_mut(|i| i.pointer = before);
             }
         }
@@ -1320,7 +1360,7 @@ fn scrolling<R>(ui: &mut Ui, room: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
         kept.to = Some(to);
         ui.ctx().request_repaint();
     }
-    ui.data_mut(|d| d.insert_temp(key, kept));
+    menu_memory(ui.ctx(), |m, _| m.scrolls.insert(key, kept));
     out.inner
 }
 
@@ -1393,7 +1433,41 @@ pub fn submenu<R>(
     title: &str,
     add: impl FnOnce(&mut Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
-    ui.menu_button(title, |ui| menu(ui, add))
+    use egui::containers::menu::{MenuState, SubMenu, SubMenuButton};
+    if !egui::containers::menu::is_in_menu(ui) {
+        return ui.menu_button(title, |ui| menu(ui, add));
+    }
+    // As egui 0.37's `SubMenuButton::ui` does, but for what egui takes for the pointer over the
+    // button: to be checked against egui's own on each upgrade.
+    let id = SubMenu::id_from_widget_id(ui.next_auto_id());
+    let open = MenuState::from_ui(ui, |state, _| state.open_item == Some(id));
+    let inactive = ui.visuals().widgets.inactive;
+    if open {
+        ui.visuals_mut().widgets.inactive = ui.visuals().widgets.open;
+    }
+    let button = egui::Button::new(title).right_text(SubMenuButton::arrow_atom(None));
+    let response = ui.add(button);
+    ui.visuals_mut().widgets.inactive = inactive;
+    // egui opens a submenu wherever the pointer is over its button, seen or not: scrolled out
+    // of its menu's sight or under one of its arrows too. There it is kept from opening.
+    let mut hover = response.clone();
+    let at = ui.ctx().pointer_hover_pos();
+    let over = response.rect.expand2(ui.spacing().item_spacing / 2.0);
+    if let Some(at) = at.filter(|&at| !open && over.contains(at)) {
+        let layer = ui.layer_id();
+        let arrow = menu_memory(ui.ctx(), |m, _| {
+            m.scrolls
+                .values()
+                .filter(|s| s.layer == layer)
+                .flat_map(|s| s.arrows.iter().flatten())
+                .any(|r| r.contains(at))
+        });
+        if arrow || !ui.clip_rect().contains(at) {
+            hover.rect = Rect::NOTHING;
+        }
+    }
+    let inner = SubMenu::new().show(ui, &hover, |ui| menu(ui, add));
+    egui::InnerResponse::new(inner.map(|i| i.inner), response)
 }
 
 /// A menu item that turns something on or off, or picks one of a few options: a check mark in a
