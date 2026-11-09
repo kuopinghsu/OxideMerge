@@ -16,7 +16,8 @@ this are:
 - **Control-click → Open:** works up to macOS 14. From macOS 15 on, it no longer bypasses
   Gatekeeper, so use System Settings instead.
 - **Terminal:** `xattr -dr com.apple.quarantine /Applications/OxideMerge.app` clears the
-  flag. Packages built from source, or copied without a browser, never get it.
+  flag. An app built from source, or a package fetched with a tool such as `curl`, never
+  gets it.
 
 The release page lists each download's SHA-256 digest, so the downloaded package can be
 checked before it is allowed to run (`shasum -a 256 oxidemerge-*-macos-universal.dmg`).
@@ -27,16 +28,19 @@ is independent of signing; `Info.plist` explains why OxideMerge asks.
 
 ## What CI does today
 
-The macOS job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
+The macOS job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) builds and
+tests `aarch64-apple-darwin` on every run, and opens real windows with
+`scripts/gui-smoke.sh` using that build. On pushes, and on manual runs with `packages`, it
+then:
 
-1. builds `aarch64-apple-darwin` and `x86_64-apple-darwin` and joins them with `lipo`;
+1. builds `x86_64-apple-darwin` and joins the two with `lipo`;
 2. fails unless `lipo -verify_arch arm64 x86_64` passes;
 3. signs the app ad hoc (`codesign --force --deep --sign -`), since Apple silicon refuses
    to run unsigned code, and checks it with `codesign --verify --deep --strict`;
 4. runs the packaged binary from the command line, and its Intel half again through
-   Rosetta;
-5. opens real windows with `scripts/gui-smoke.sh`, using the Apple silicon build before it
-   is joined and packaged.
+   Rosetta (only a warning when the runner has no Rosetta).
+
+Pull requests build no app.
 
 ## What notarization would take
 
@@ -47,17 +51,20 @@ The macOS job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
 - **Hardened runtime:** sign with `codesign --options runtime --timestamp`. OxideMerge
   loads no plug-ins and needs no JIT, so it should need no extra entitlements; the `.app`
   must be signed from the inside out rather than with `--deep`.
-- **Notarization:** submit the `.dmg` (holding the signed app) with
-  `xcrun notarytool submit --wait`, using an App Store Connect API key (key ID, issuer ID
-  and `.p8` file as CI secrets).
-- **Stapling:** `xcrun stapler staple` on the app and the `.dmg`, so Gatekeeper accepts
-  them offline.
+- **Notarization:** sign the `.dmg` (holding the signed app) with the same certificate
+  (`codesign --timestamp`), then submit it with `xcrun notarytool submit --wait`, using an
+  App Store Connect API key (key ID, issuer ID and `.p8` file as CI secrets).
+- **Stapling:** `xcrun stapler staple` on the `.dmg`, so Gatekeeper accepts it offline.
+  The app inside is covered by the same notarization; stapling the app itself as well
+  means notarizing it before it goes into the `.dmg`, then building, signing and
+  notarizing the `.dmg`.
 - **Verification in CI:** `spctl --assess --type execute -vv OxideMerge.app` and
   `spctl --assess --type open --context context:primary-signature -vv` on the `.dmg` must
-  report `source=Notarized Developer ID`; the release job would fail otherwise.
+  report `source=Notarized Developer ID`. This belongs in the macOS job, which would fail
+  otherwise: the release job runs on Linux, which has no `spctl`.
 
-Pull requests from forks get no secrets, so they would keep ad-hoc signing, and only
-builds of `main` and of tags would be notarized.
+Pull requests build no app, and those from forks get no secrets anyway, so only pushes to
+`main`, tags and manual runs with `packages` would be notarized.
 
 ## Decision
 

@@ -144,7 +144,8 @@ uses its section of this file as the release notes.
   kept only in memory while the compare is open and is overwritten there afterwards. ZIP
   entries compressed with bzip2, LZMA, xz, Zstandard, PPMd or Deflate64 are now read, and a
   changed one keeps its method (Deflate for LZMA and Deflate64, which can only be read).
-  `.tar.zst` / `.tzst` archives open and save like the other TAR formats.
+  `.tar.zst` / `.tzst` archives open and save like the other TAR formats, and `.xws` files
+  open as ZIP archives.
 - **Moved blocks in binary comparisons:** *Moved blocks* on the binary toolbar highlights
   identical bytes at different offsets, in the hexadecimal and text columns and in the
   location pane: data shifted up to 128 bytes by an insertion or deletion, and blocks of
@@ -397,12 +398,12 @@ uses its section of this file as the release notes.
   Windows) as Perforce's (base, theirs, yours, result). Any other four or five files are
   still refused as too many paths, so a pattern such as `*.txt` never starts a merge that
   would save over one of them. The left pane is mine or yours, the middle is the base and
-  the right is theirs, and the middle pane is saved to the result. If that file is unchanged when the window
-  closes, the program exits with code 1 and the conflict stays unresolved. Any other
-  option, including `-o`, uses the arguments as written, so an existing wrapper still
-  works. Checked on Windows with SlikSVN 1.14.2, Mercurial 7.1.2 and p4/p4d 2026.1:
-  `svn update --accept launch`, `hg merge` and `p4 resolve` against a local server, both
-  saved and closed without saving. P4V keeps its own argument string.
+  the right is theirs, and the middle pane is saved to the result. If that file is
+  unchanged when the window closes, the program exits with code 1 and the conflict stays
+  unresolved. Any other option, including `-o`, uses the arguments as written, so an
+  existing wrapper still works. Checked on Windows with SlikSVN 1.14.2, Mercurial 7.1.2 and
+  p4/p4d 2026.1: `svn update --accept launch`, `hg merge` and `p4 resolve` against a local
+  server, both saved and closed without saving. P4V keeps its own argument string.
 - **Compare with revision in Subversion and Mercurial:**
   *File → Compare with revision...* (formerly *Compare with Git revision...*) and `--rev`
   (`--git-rev` still works) also take Subversion and Mercurial working copies: the nearest
@@ -410,20 +411,22 @@ uses its section of this file as the release notes.
   default), `PREV`, `HEAD`, a number, `r1234` as `svn log` prints it, or a date; the
   dialog lists the recent revisions from `svn log --xml`. On Windows, that `svn` keeps
   only ASCII arguments, so for a path that is not ASCII it is started in the folder, whose
-  name it receives whole: a folder is read there from the working copy, and a file by its
-  repository URL at the working copy's revision, so a file renamed since then is still
-  found. `BASE` of such a file is the pristine copy with the line endings `svn cat` gives
-  it, or comes from the server when the file has `svn:keywords`. Mercurial revisions are
-  `.` (the default), `.^`, `tip`, a number, a hash, a tag or another revset, read from the
-  local repository. On Windows, Mercurial is left on the ANSI code page: forcing UTF-8
-  makes every name that code page can spell fail, and a name it cannot spell is one `hg`
-  itself cannot open. The list of recent revisions, read while you type a path, skips the
-  repository's own `.hg/hgrc`, so browsing to a downloaded repository runs none of its
-  hooks; only *Compare* reads it. A Subversion server reached over `svn+ssh` that would
-  ask for a password fails instead of waiting for an answer that cannot come. With Git and
-  Mercurial, a file whose name is not valid UTF-8 is refused rather than read under a
-  changed name. Checked on Windows with the same SlikSVN and Mercurial versions, including
-  a Subversion file whose name is not ASCII.
+  name it receives whole: a folder is given to it there as `.`, and a file by its
+  repository URL pinned at the working copy's revision, so an older revision is found even
+  when the file had another name then, as for an ASCII path. `BASE` of such a file is the
+  pristine copy with the line endings its committed `svn:eol-style` gives it, as `svn cat`
+  does, or comes from the server when it was committed with `svn:keywords`. Mercurial
+  revisions are `.` (the default), `.^`, `tip`, a number, a hash, a tag or another revset,
+  read from the local repository. On Windows, Mercurial is left on the ANSI code page:
+  forcing UTF-8 makes every name that code page can spell fail, and a name it cannot spell
+  is one `hg` itself cannot open. The error messages that `svn` and `hg` print in that code
+  page, in the language of Windows, are shown readably instead of garbled. The list of
+  recent revisions, read while you type a path, skips the repository's own `.hg/hgrc`, so
+  browsing to a downloaded repository runs none of its hooks; only *Compare* reads it. A
+  Subversion server reached over `svn+ssh` that would ask for a password fails instead of
+  waiting for an answer that cannot come. With Git and Mercurial, a file whose name is not
+  valid UTF-8 is refused rather than read under a changed name. Checked on Windows with the
+  same SlikSVN and Mercurial versions, including a Subversion file whose name is not ASCII.
 - **Docker test environment for Linux:** `scripts/docker-test.sh` (`make docker-test`)
   checks Linux from any computer with Docker. It runs Clippy, the tests, a release build and
   the command-line and window checks. It also runs tests against real servers: OpenSSH (keys,

@@ -83,8 +83,8 @@ fixed thresholds, so CI reports the numbers without failing on them.
 - **binary-moved-firmware**: the mixed-edit firmware samples, with 18 expected matches.
 - **image-4k**: two 3840 x 2160 PNG images with 1% of the pixels changed, decoded and
   compared.
-- **folder-small-files**: 20,000 files of 1 KB up to 8 folders deep, 1% changed and 1% on
-  one side only. "First result" is the time until the first item reaches the folder list.
+- **folder-small-files**: 20,000 files of 12 short lines (about 400 bytes) up to 8 folders
+  deep, 1% changed and 1% on one side only. "First result" is the time until the first item reaches the folder list.
 - **folder-large-files**: 20 files of 8 MB, two changed in their last byte.
 - **folder-mixed**: 2,000 files of 100 bytes to 2 MB, some 60 folders deep.
 - **sync-preview-20k**: the folders of folder-small-files compared, then a mirror plan
@@ -93,9 +93,10 @@ fixed thresholds, so CI reports the numbers without failing on them.
   alone.
 - **sync-apply-large** (`OXIDEMERGE_BENCH_LARGE=2`): three random 2 GiB files mirrored
   into a copy of a folder that has one of them equal, one changed in its last byte and one
-  missing. The time covers the scan, the plan and the apply, which fingerprints, copies
-  through a verified temporary file, keeps the replaced file in the journal and checks the
-  result.
+  missing. The time also covers copying the right folder to a fresh working folder before
+  the scan, and removing it and the journal afterwards; "preview" and "apply" time the scan
+  and plan, and the apply, which fingerprints, copies through a verified temporary file,
+  keeps the replaced file in the journal and checks the result.
 - **folder-navigation-20k**: the folders of folder-small-files compared, then stepped
   through from the first file with differences to the last, as *Next Difference* does
   without the file pane, reading the status bar position at each file.
@@ -126,8 +127,8 @@ Measured on macOS aarch64, Apple M2 Max, 12 threads, 32 GB memory; OxideMerge 0.
 release build.
 
 The table is shortened from the one the program prints: the Input column (see the
-workloads above) and counts of zero are left out, and large numbers have thousands
-separators.
+workloads above) and counts of zero are left out, as is the first-result time of
+folder-large-files, and large numbers have thousands separators.
 
 | Workload | Time (median) | Peak memory | Result |
 | --- | ---: | ---: | --- |
@@ -303,8 +304,9 @@ alignment of the positional compare has many more changes to work through. Table
 than 100,000 records (both sides together) are matched on another thread, which checks for
 a stop every 4,096 records; stopping one half way through 1,000,000 records took 23 ms,
 freeing the keys it had built included. Stepping to the next file with differences among
-20,000 files takes about 2.5 ms, as each step finds the file's place in the listed order
-again.
+20,000 files then took about 2.5 ms, as each step found the file's place in the listed
+order again; keeping that order between steps has since brought a step to 0.19 ms (see
+folder-navigation-20k above).
 
 ## Large UTF-8 text comparison
 

@@ -20,6 +20,15 @@ You need a Rust toolchain from [rustup](https://rustup.rs/). On Linux, you also 
 compiler. OxideMerge loads the X11, Wayland, keyboard and OpenGL libraries when it starts,
 so you do not need their development packages to build it.
 
+The SFTP support builds OpenSSL from source, which needs Perl:
+
+- **Windows:** install [Strawberry Perl](https://strawberryperl.com/), for example with
+  `winget install StrawberryPerl.StrawberryPerl`, and open a new terminal. To use a Perl
+  that is not on `PATH`, set `OPENSSL_SRC_PERL` to its `perl.exe`. The Perl that comes
+  with Git for Windows does not work.
+- **Linux:** `perl` with its `IPC::Cmd` module (`perl-IPC-Cmd` on Fedora).
+- **macOS:** the Perl that comes with the system is enough.
+
 Run these commands in the repository folder:
 
 ```sh
@@ -138,6 +147,13 @@ test runs that must not touch your settings, set `OXIDEMERGE_CONFIG_DIR` to a se
 folder. Some web tests start a local HTTP server, so the test system must allow programs
 to listen on local network ports.
 
+The version-control tests use the real programs: Git, `svn` and `svnadmin` from
+Subversion, and `hg` from Mercurial. When Subversion or Mercurial is missing, its tests
+print that they were skipped and pass, so install both to run them. The CI workflow does
+not install Subversion or Mercurial, so there these tests run only where the runner already
+has them; the [Docker test environment](#docker-test-environment) installs both. Perforce
+has no automated test.
+
 ### Saved reports
 
 The semantic, release summary and impact reports of fixed inputs must match the JSON and
@@ -193,14 +209,16 @@ To check Linux from any computer with Docker, including a Mac, run `scripts/dock
 (or `make docker-test`). [docker/Dockerfile](../docker/Dockerfile) defines the container. It
 runs Clippy, the full test suite, a release build, and the command-line and window checks on
 Xvfb, building the tests for release as continuous integration does. The tests run as an
-ordinary user. The container also starts real servers ([docker/servers.sh](../docker/servers.sh))
-and runs the tests that a normal `cargo test` run skips:
+ordinary user. The container also starts real servers ([docker/servers.sh](../docker/servers.sh)),
+has Subversion and Mercurial installed, and runs the tests that a normal `cargo test` run
+skips:
 
 - OpenSSH: sign-in with keys, passphrases, host certificates, jump hosts and a
   `ProxyCommand`, and keyboard-interactive sign-in through PAM.
 - vsftpd and ProFTPD: FTP, explicit and implicit FTPS, active mode, and a client certificate.
 - Dante and tinyproxy: SFTP, FTP and FTPS through SOCKS5 and HTTP CONNECT proxies, with and
   without sign-in.
+- Subversion and Mercurial: comparing real working copies with their revisions.
 
 Cargo runs offline. It uses the crates already downloaded to `~/.cargo/registry`, so on a
 new computer, run `cargo fetch --locked` first. Building the container the first time needs

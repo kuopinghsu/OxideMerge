@@ -1355,18 +1355,23 @@ Git and Mercurial read their revisions from the local repository.
 Subversion reads `BASE` of an ASCII path from the working copy.
 On Windows, that build of `svn` keeps only ASCII arguments, so for a path that is not ASCII
 OxideMerge starts `svn` in the folder, whose name it receives whole.
-A folder is read there from the working copy.
-A file is read by its repository URL at the revision the working copy has, so a file renamed
-since then is still found.
+A folder is given to it there as `.`, and is read as an ASCII path is.
+A file is read by its repository URL, pinned at the revision the working copy has, so an older
+revision is found even when the file had another name then, as for an ASCII path.
 `BASE` of such a file is the pristine copy stored in the working copy, with the line endings
-`svn cat` gives it; a file with `svn:keywords` gets `BASE` from the server, which fills the
-keywords in.
+its committed `svn:eol-style` gives it, as `svn cat` does; a file committed with
+`svn:keywords` gets `BASE` from the server, which fills the keywords in.
 Other revisions come from the server.
 The list of recent revisions also comes from the server, which may ask for a sign-in that
 OxideMerge cannot provide.
 Sign in with `svn` itself first.
 On Windows, Mercurial reads names in the ANSI code page, as `hg` itself does: a name that
 code page cannot spell cannot be compared.
+On Windows, `svn` and `hg` write a folder's revision to your temporary folder, and are given
+the short (8.3) name of that folder when its path is not ASCII.
+On a drive with short names turned off, set `TMP`, which Windows reads before `TEMP`, to an
+ASCII folder to compare a folder with a revision; set `TEMP` to the same folder so other
+programs agree.
 
 The revision is read in the background; *Cancel* stops a server that is slow or does not respond,
 and the dialog returns.
@@ -4475,8 +4480,8 @@ If a line names another tool, change the value where it is set.
 
 To compare a file with the depot, run `p4 diff f.txt`.
 OxideMerge opens with the depot revision on the left and your workspace file on the right.
-The depot revision is a temporary file with a name such as `tmp.63484.0x20d2d0f40.90`; only
-your workspace file can be edited.
+The depot revision is a temporary file, with a name such as `tmp.63484.0x20d2d0f40.90` on
+macOS; only your workspace file can be edited.
 Because p4 passes the words in `P4DIFF` on to OxideMerge, you can give the panes names instead:
 
 [source,sh]

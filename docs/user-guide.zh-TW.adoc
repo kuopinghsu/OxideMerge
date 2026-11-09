@@ -1161,15 +1161,20 @@ Git 與 Mercurial 會從本機儲存庫讀取修訂版本。
 路徑為 ASCII 時，Subversion 會從工作複本讀取 `BASE`。
 在 Windows 上，該版 `svn` 只保留 ASCII 參數，因此路徑不是 ASCII 時，
 OxideMerge 會在所在資料夾中啟動 `svn`，資料夾名稱會完整傳給它。
-資料夾會在該處從工作複本讀取。
-檔案則以儲存庫 URL 在工作複本所在的修訂版本讀取，因此之後改名的檔案仍找得到。
-這類檔案的 `BASE` 是工作複本裡的原始複本，行尾與 `svn cat` 給出的相同；
-設有 `svn:keywords` 的檔案則從伺服器讀取 `BASE`，由伺服器填入關鍵字。
+資料夾會在該處以 `.` 傳給它，讀取方式與 ASCII 路徑相同。
+檔案則以儲存庫 URL 讀取，並固定在工作複本所在的修訂版本，
+因此即使檔案在較早的修訂版本中是另一個名稱，也找得到，與 ASCII 路徑相同。
+這類檔案的 `BASE` 是工作複本裡的原始複本，行尾依提交時的 `svn:eol-style` 轉換，與 `svn cat` 相同；
+提交時設有 `svn:keywords` 的檔案則從伺服器讀取 `BASE`，由伺服器填入關鍵字。
 其他修訂版本來自伺服器。
 最近修訂版本清單也來自伺服器，而伺服器可能要求 OxideMerge 無法提供的登入，
 請先使用 `svn` 本身登入。
 在 Windows 上，Mercurial 以 ANSI 字碼頁讀取名稱，這與 `hg` 本身相同：
 字碼頁拼不出來的名稱無法比較。
+在 Windows 上，`svn` 與 `hg` 會把資料夾的修訂版本寫入您的暫存資料夾；
+暫存資料夾的路徑不是 ASCII 時，傳給它們的是該路徑的短檔名（8.3）。
+若該磁碟機關閉了短檔名，請將 `TMP`（Windows 會先於 `TEMP` 讀取）設為 ASCII 資料夾，
+才能將資料夾與修訂版本比較；並將 `TEMP` 設為同一個資料夾，讓其他程式一致。
 
 修訂版本會在背景讀取；伺服器緩慢或沒有回應時，按「取消」即可停止，並回到對話方塊。
 按下「比較」時，Mercurial 會讀取儲存庫本身的 `.hg/hgrc`，如同會套用 Git 的篩選器；
@@ -3864,7 +3869,7 @@ p4 set P4MERGE=oxidemerge
 +
 若 `oxidemerge` 不在 `PATH` 中，請使用完整路徑，例如 macOS 上的
 `/Applications/OxideMerge.app/Contents/MacOS/oxidemerge`。
-請勿在 `P4DIFF` 加上 `--cli`：加上後，檔案不同時程式會以 1 結束，
+請勿在 `P4DIFF` 加上 `--cli`：加上後，
 OxideMerge 會改為列出差異而不開啟視窗，且在檔案不同時以 1 結束，
 macOS 上的 p4 會將此回報為 *Execution Failed*。
 +
@@ -3883,7 +3888,8 @@ P4MERGE=oxidemerge (enviro)
 
 要將檔案與 depot 比較，請執行 `p4 diff f.txt`。
 OxideMerge 會在左側顯示 depot 修訂版本，右側顯示您工作區中的檔案。
-depot 修訂版本是暫存檔，名稱類似 `tmp.63484.0x20d2d0f40.90`，只有工作區中的檔案可以編輯。
+depot 修訂版本是暫存檔，名稱在 macOS 上類似 `tmp.63484.0x20d2d0f40.90`，
+只有工作區中的檔案可以編輯。
 由於 p4 會將 `P4DIFF` 中的字詞傳給 OxideMerge，您也可以改為替窗格命名：
 
 [source,sh]
