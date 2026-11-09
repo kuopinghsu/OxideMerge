@@ -507,6 +507,7 @@ fn program(command: &str) -> String {
         Some(rest) => rest.split('"').next().unwrap_or(rest),
         None => command.split_whitespace().next().unwrap_or(""),
     };
+    let first = first.trim_end_matches(['/', '\\']);
     first
         .rsplit(['/', '\\'])
         .next()
@@ -2723,6 +2724,7 @@ mod tests {
             "pandoc.exe"
         );
         assert_eq!(program("/usr/bin/pdftotext ${file} -"), "pdftotext");
+        assert_eq!(program("C:\\Tools\\ ${file}"), "Tools");
     }
 
     #[test]
