@@ -1224,6 +1224,17 @@ const MENU_ARROW_HEIGHT: f32 = 18.0;
 /// How far a menu scrolls in a second while the pointer rests on one of its arrows.
 const MENU_ARROW_SPEED: f32 = 360.0;
 
+/// What a scrolling menu keeps from one frame to the next while it is open.
+#[derive(Clone, Copy, Default)]
+struct MenuScroll {
+    /// The pass it was last shown in.
+    pass: Option<u64>,
+    /// Where its arrows scroll it to next.
+    to: Option<f32>,
+    /// Whether the pointer has moved since it opened.
+    moved: bool,
+}
+
 fn scrolling<R>(ui: &mut Ui, room: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let room = room.max(MENU_MIN_HEIGHT);
     // A menu too tall for its room scrolls under arrows at its ends, as the system's menus do,
@@ -1237,10 +1248,25 @@ fn scrolling<R>(ui: &mut Ui, room: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
         .auto_shrink([true; 2])
         .animated(false)
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
-    // Where the arrows scrolled to the frame before.
-    let scrolled = ui.scope_id().with("menu_arrow_scroll");
-    if let Some(y) = ui.data_mut(|d| d.remove_temp::<f32>(scrolled)) {
+    let key = ui.scope_id().with("menu_scroll");
+    let pass = ui.ctx().cumulative_pass_nr();
+    let mut kept = ui
+        .data(|d| d.get_temp::<MenuScroll>(key))
+        .unwrap_or_default();
+    if kept.pass.is_none_or(|p| p + 1 < pass) {
+        // Just opened: at the top, as egui keeps (and saves) where a scroll area was scrolled.
+        kept = MenuScroll::default();
+        area = area.vertical_scroll_offset(0.0);
+    } else if let Some(y) = kept.to.take() {
         area = area.vertical_scroll_offset(y);
+    }
+    kept.pass = Some(pass);
+    kept.moved |= ui.input(|i| i.pointer.delta() != Vec2::ZERO);
+    // The pointer as it was before its buttons last went down, to take back a click on an arrow.
+    let idle = key.with("idle_pointer");
+    let pointer = ui.input(|i| i.pointer.clone());
+    if !pointer.any_down() && !pointer.any_released() {
+        ui.data_mut(|d| d.insert_temp(idle, pointer));
     }
     let out = area.show(ui, |ui| {
         let inner = add(ui);
@@ -1276,15 +1302,25 @@ fn scrolling<R>(ui: &mut Ui, room: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
         // Clicks on an arrow do not reach the item under it, and the arrow keys pass it by.
         let r = ui.interact(strip, out.id.with(up), Sense::CLICK);
         menu_arrow(ui, strip, up, r.hovered());
-        if r.hovered() {
+        // A menu, and the menus it opened from, close on any click in them, read from the
+        // pointer after their contents: the pointer from before the click makes it never was.
+        if r.hovered() && ui.input(|i| i.pointer.any_click()) {
+            if let Some(before) = ui.data(|d| d.get_temp::<egui::PointerState>(idle)) {
+                ui.ctx().input_mut(|i| i.pointer = before);
+            }
+        }
+        // A menu that opens with the pointer on an arrow, such as a context menu moved up to
+        // fit, waits for the pointer to move before it scrolls.
+        if r.hovered() && kept.moved {
             let step = MENU_ARROW_SPEED * ui.input(|i| i.stable_dt).min(0.1);
             to = if up { offset - step } else { offset + step }.clamp(0.0, end);
         }
     }
     if to != offset {
-        ui.data_mut(|d| d.insert_temp(scrolled, to));
+        kept.to = Some(to);
         ui.ctx().request_repaint();
     }
+    ui.data_mut(|d| d.insert_temp(key, kept));
     out.inner
 }
 
@@ -1401,6 +1437,60 @@ pub fn menu_check(ui: &mut Ui, on: bool, label: &str, keys: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs a frame of a 400 × 300 window, showing a list of 30 items scrolling like a menu at
+    /// the top left when `shown`, and says where its first item is.
+    fn menu_frame(ctx: &egui::Context, shown: bool, events: Vec<egui::Event>) -> Option<Rect> {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut first = None;
+        let mut out = ctx.run_ui(raw, |ui| {
+            if shown {
+                egui::Area::new(egui::Id::unique("menu"))
+                    .fixed_pos(egui::pos2(10.0, 10.0))
+                    .show(ui.ctx(), |ui| {
+                        menu_scroll(ui, |ui| {
+                            for i in 0..30 {
+                                let r = ui.button(format!("item {i}"));
+                                first = first.or(Some(r.rect));
+                            }
+                        })
+                    });
+            }
+        });
+        out.textures_delta.clear();
+        first
+    }
+
+    #[test]
+    fn a_menu_opened_with_the_pointer_on_its_arrow_scrolls_once_the_pointer_moves() {
+        let ctx = egui::Context::default();
+        // Where the bottom arrow will be: the menu scrolls in all the window's height but its
+        // margins, from 10 points down.
+        let room = 300.0 - ctx.global_style().spacing.menu_margin.sum().y - 2.0 * MENU_EDGE;
+        let on_arrow = egui::pos2(20.0, 10.0 + room - MENU_ARROW_HEIGHT / 2.0);
+        menu_frame(&ctx, false, vec![egui::Event::PointerMoved(on_arrow)]);
+        menu_frame(&ctx, false, vec![]);
+        menu_frame(&ctx, true, vec![]);
+        let top = menu_frame(&ctx, true, vec![]).unwrap().top();
+        for _ in 0..30 {
+            menu_frame(&ctx, true, vec![]);
+        }
+        assert_eq!(menu_frame(&ctx, true, vec![]).unwrap().top(), top);
+        let nudged = on_arrow + egui::vec2(1.0, 0.0);
+        menu_frame(&ctx, true, vec![egui::Event::PointerMoved(nudged)]);
+        for _ in 0..30 {
+            menu_frame(&ctx, true, vec![]);
+        }
+        let now = menu_frame(&ctx, true, vec![]).unwrap().top();
+        assert!(now < top - 40.0, "{now} from {top}");
+    }
 
     #[test]
     fn mac_shortcuts_use_symbols_in_mac_order() {

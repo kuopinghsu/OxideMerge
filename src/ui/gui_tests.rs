@@ -3561,6 +3561,18 @@ fn menus_too_tall_for_the_window_scroll_while_the_pointer_rests_on_their_arrows(
             .map(|w| w.rect.top())
     };
     let top = first(&gui).expect("the first item shows");
+    // A click on an arrow neither closes the menu nor picks the item under it.
+    let shown = |gui: &Gui| {
+        gui.ctx.memory(|m| {
+            m.layer_ids()
+                .filter(|l| l.order == egui::Order::Foreground && m.areas().visible_last_frame(l))
+                .count()
+        })
+    };
+    gui.click_at(egui::pos2(menu.center().x, menu.bottom() - 12.0));
+    assert_eq!(shown(&gui), 1, "the menu stays open");
+    gui.click_at(egui::pos2(menu.center().x, menu.top() + 12.0));
+    assert_eq!(shown(&gui), 1, "the menu stays open");
     let rest = |gui: &mut Gui, y: f32| {
         gui.events
             .push(Event::PointerMoved(egui::pos2(menu.center().x, y)));
@@ -3578,6 +3590,19 @@ fn menus_too_tall_for_the_window_scroll_while_the_pointer_rests_on_their_arrows(
     );
     rest(&mut gui, menu.top() + 12.0);
     assert_eq!(first(&gui), Some(top));
+    // Opened again, it starts at the top, however far down it was left.
+    rest(&mut gui, menu.bottom() - 12.0);
+    assert_ne!(first(&gui), Some(top));
+    gui.click_menu(tr(MENUS[0]));
+    gui.frames(3);
+    gui.click_menu(tr(MENUS[0]));
+    gui.frames(3);
+    assert_eq!(first(&gui), Some(top));
+    // The clicks taken back on the arrows leave the next click to work as ever.
+    let tabs = gui.app.tabs.len();
+    gui.click_at(egui::pos2(menu.center().x, top + 8.0));
+    assert_eq!(shown(&gui), 0, "an item closes the menu");
+    assert_eq!(gui.app.tabs.len(), tabs + 1, "New opened a tab");
 }
 
 #[test]
