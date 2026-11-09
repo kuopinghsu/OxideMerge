@@ -124,6 +124,7 @@
   "label.notebook_markdown_cell": "Ячейка Markdown",
   "label.notebook_raw_cell": "Необработанная ячейка",
   "menu.workspaces": "Рабочие области",
+  "menu.projects_jobs": "Проекты и задания",
   "menu.save_workspace": "Сохранить как рабочую область...",
   "menu.open_workspace": "Открыть рабочую область",
   "menu.manage_workspaces": "Управление рабочими областями...",

@@ -1,5 +1,5 @@
-//! *File → Save as job…* and *File → Run job…*: a folder comparison saved as a job file
-//! (`.oxjob`), and a job file run as `--job` runs it, with its results listed.
+//! *File → Projects and jobs → Save as job…* and *Run job…*: a folder comparison saved as a job
+//! file (`.oxjob`), and a job file run as `--job` runs it, with its results listed.
 //!
 //! Running goes through the same code as `--job`, so a job gives in the program what it gives on
 //! the command line. A job file that synchronizes folders, or writes outside its own folder, runs

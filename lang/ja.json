@@ -124,6 +124,7 @@
   "label.notebook_markdown_cell": "Markdown セル",
   "label.notebook_raw_cell": "Raw セル",
   "menu.workspaces": "ワークスペース",
+  "menu.projects_jobs": "プロジェクトとジョブ",
   "menu.save_workspace": "ワークスペースとして保存...",
   "menu.open_workspace": "ワークスペースを開く",
   "menu.manage_workspaces": "ワークスペースを管理...",

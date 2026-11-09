@@ -124,6 +124,7 @@
   "label.notebook_markdown_cell": "Markdown cell",
   "label.notebook_raw_cell": "Raw cell",
   "menu.workspaces": "Workspaces",
+  "menu.projects_jobs": "Projects and jobs",
   "menu.save_workspace": "Save as workspace...",
   "menu.open_workspace": "Open workspace",
   "menu.manage_workspaces": "Manage workspaces...",

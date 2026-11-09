@@ -124,6 +124,7 @@
   "label.notebook_markdown_cell": "Celda Markdown",
   "label.notebook_raw_cell": "Celda sin formato",
   "menu.workspaces": "Espacios de trabajo",
+  "menu.projects_jobs": "Proyectos y tareas",
   "menu.save_workspace": "Guardar como espacio de trabajo...",
   "menu.open_workspace": "Abrir espacio de trabajo",
   "menu.manage_workspaces": "Administrar espacios de trabajo...",

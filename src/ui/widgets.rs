@@ -1219,36 +1219,104 @@ pub fn bar_menu<R>(ui: &mut Ui, bar_bottom: f32, add: impl FnOnce(&mut Ui) -> R)
     })
 }
 
+/// Height of the arrows at the ends of a menu too tall for its room.
+const MENU_ARROW_HEIGHT: f32 = 18.0;
+/// How far a menu scrolls in a second while the pointer rests on one of its arrows.
+const MENU_ARROW_SPEED: f32 = 360.0;
+
 fn scrolling<R>(ui: &mut Ui, room: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let room = room.max(MENU_MIN_HEIGHT);
-    // A bar over the contents keeps a scrolling menu as wide as the others. Even at its widest,
-    // under the pointer, it stays within the rows' padding, clear of the shortcuts at their ends.
-    let mut scroll = egui::style::ScrollStyle::floating();
-    scroll.bar_width = MENU_ITEM_PADDING.x - 2.0;
-    ui.spacing_mut().scroll = scroll;
+    // A menu too tall for its room scrolls under arrows at its ends, as the system's menus do,
+    // rather than by a scroll bar: any click in a menu closes it, a click on its scroll bar too.
     // A popup's room is the size it had the frame before, so a scroll area held to that would
     // never grow: the minimum lets it take all of `room` when the contents need it.
-    egui::ScrollArea::vertical()
+    let mut area = egui::ScrollArea::vertical()
         .id_salt("menu")
         .min_scrolled_height(room)
         .max_height(room)
         .auto_shrink([true; 2])
         .animated(false)
-        .show(ui, |ui| {
-            let inner = add(ui);
-            // The item the arrow keys move to is scrolled into view.
-            let focused = ui.memory(|m| m.focused());
-            let seen = ui.scope_id().with("menu_focus");
-            if ui.data(|d| d.get_temp::<Option<egui::Id>>(seen)) != Some(focused) {
-                ui.data_mut(|d| d.insert_temp(seen, focused));
-                let item = focused.and_then(|id| ui.ctx().read_response(id));
-                if let Some(item) = item.filter(|r| r.layer_id == ui.layer_id()) {
-                    item.scroll_to_me(None);
-                }
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+    // Where the arrows scrolled to the frame before.
+    let scrolled = ui.scope_id().with("menu_arrow_scroll");
+    if let Some(y) = ui.data_mut(|d| d.remove_temp::<f32>(scrolled)) {
+        area = area.vertical_scroll_offset(y);
+    }
+    let out = area.show(ui, |ui| {
+        let inner = add(ui);
+        // The item the arrow keys move to is scrolled into view, clear of the arrows.
+        let focused = ui.memory(|m| m.focused());
+        let seen = ui.scope_id().with("menu_focus");
+        if ui.data(|d| d.get_temp::<Option<egui::Id>>(seen)) != Some(focused) {
+            ui.data_mut(|d| d.insert_temp(seen, focused));
+            let item = focused.and_then(|id| ui.ctx().read_response(id));
+            if let Some(item) = item.filter(|r| r.layer_id == ui.layer_id()) {
+                let clear = item.rect.expand2(egui::vec2(0.0, MENU_ARROW_HEIGHT));
+                ui.scroll_to_rect(clear, None);
             }
-            inner
-        })
-        .inner
+        }
+        inner
+    });
+    let view = out.inner_rect;
+    let end = (out.content_size.y - view.height()).max(0.0);
+    let offset = out.state.clamped_offset().y;
+    let mut to = offset;
+    for up in [true, false] {
+        if (up && offset <= 0.5) || (!up && offset >= end - 0.5) {
+            continue;
+        }
+        let strip = if up {
+            Rect::from_min_size(view.min, egui::vec2(view.width(), MENU_ARROW_HEIGHT))
+        } else {
+            Rect::from_min_max(
+                egui::pos2(view.left(), view.bottom() - MENU_ARROW_HEIGHT),
+                view.max,
+            )
+        };
+        // Clicks on an arrow do not reach the item under it, and the arrow keys pass it by.
+        let r = ui.interact(strip, out.id.with(up), Sense::CLICK);
+        menu_arrow(ui, strip, up, r.hovered());
+        if r.hovered() {
+            let step = MENU_ARROW_SPEED * ui.input(|i| i.stable_dt).min(0.1);
+            to = if up { offset - step } else { offset + step }.clamp(0.0, end);
+        }
+    }
+    if to != offset {
+        ui.data_mut(|d| d.insert_temp(scrolled, to));
+        ui.ctx().request_repaint();
+    }
+    out.inner
+}
+
+/// An arrow at the top (`up`) or bottom of a scrolling menu, over the rows it covers. The
+/// triangle is drawn, so it needs no symbol in the fonts.
+fn menu_arrow(ui: &Ui, strip: Rect, up: bool, hovered: bool) {
+    let visuals = ui.visuals();
+    let painter = ui.painter();
+    painter.rect_filled(strip, 0.0, visuals.window_fill);
+    let state = if hovered {
+        painter.rect_filled(
+            strip,
+            visuals.menu_corner_radius,
+            visuals.widgets.hovered.weak_bg_fill,
+        );
+        &visuals.widgets.hovered
+    } else {
+        &visuals.widgets.inactive
+    };
+    let c = strip.center();
+    let (w, h) = (5.0, 3.0);
+    let (tip, base) = if up { (-h, h) } else { (h, -h) };
+    let points = vec![
+        c + egui::vec2(0.0, tip),
+        c + egui::vec2(w, base),
+        c + egui::vec2(-w, base),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        state.text_color(),
+        Stroke::NONE,
+    ));
 }
 
 /// Room between a menu item's label and its shortcut.

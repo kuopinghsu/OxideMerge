@@ -447,9 +447,9 @@ patch outside the job file's folder. The run stops at the first job that fails, 
 `"continue_on_error": true`, prints a JSON summary, and exits with the worst code of its
 jobs. See the user guide for every field.
 
-In the program, *File → Save as job...* saves a folder comparison as a job, and *File →
-Run job...* runs a job file and lists the results; a sync job runs there only after you
-allow its changes.
+In the program, *File → Projects and jobs → Save as job...* saves a folder comparison as a
+job, and *File → Projects and jobs → Run job...* runs a job file and lists the results; a
+sync job runs there only after you allow its changes.
 
 ## Git and file manager integration
 

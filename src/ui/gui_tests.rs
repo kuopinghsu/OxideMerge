@@ -3541,6 +3541,46 @@ fn menus_scroll_under_their_button_in_short_windows() {
 }
 
 #[test]
+fn menus_too_tall_for_the_window_scroll_while_the_pointer_rests_on_their_arrows() {
+    let mut gui = Gui::start("menu_arrows", None);
+    gui.screen = egui::vec2(640.0, 400.0);
+    gui.frames(3);
+    gui.click_menu(tr(MENUS[0]));
+    gui.frames(3);
+    let menu = gui.ctx.memory(|m| {
+        m.layer_ids()
+            .filter(|l| l.order == egui::Order::Foreground && m.areas().visible_last_frame(l))
+            .find_map(|l| m.area_rect(l.id))
+            .expect("the File menu is open")
+    });
+    // Where the first item is, if it is still in view.
+    let first = |gui: &Gui| {
+        gui.widgets
+            .iter()
+            .find(|w| named(w, tr("menu.new")) && menu.contains(w.rect.center()))
+            .map(|w| w.rect.top())
+    };
+    let top = first(&gui).expect("the first item shows");
+    let rest = |gui: &mut Gui, y: f32| {
+        gui.events
+            .push(Event::PointerMoved(egui::pos2(menu.center().x, y)));
+        gui.frames(60);
+    };
+    rest(&mut gui, menu.bottom() - 12.0);
+    assert!(
+        first(&gui).is_none_or(|y| y < top - 40.0),
+        "{:?} from {top}",
+        first(&gui)
+    );
+    assert!(
+        gui.app.open_dlg.is_none(),
+        "resting on the arrow picks nothing"
+    );
+    rest(&mut gui, menu.top() + 12.0);
+    assert_eq!(first(&gui), Some(top));
+}
+
+#[test]
 fn menus_open_equally_wide() {
     let same = |widths: &[(&str, f32)]| widths.iter().all(|(_, w)| (w - widths[0].1).abs() < 0.01);
     let mut fresh = Vec::new();
@@ -5426,7 +5466,11 @@ fn a_folder_compare_saves_as_a_job_and_a_sync_job_runs_only_once_allowed() {
     gui.wait_until("the compare", |g| !g.busy());
 
     // Save as job offers the three kinds and names the folders.
-    gui.menu(&[tr("menu.file"), tr("menu.save_job")]);
+    gui.menu(&[
+        tr("menu.file"),
+        tr("menu.projects_jobs"),
+        tr("menu.save_job"),
+    ]);
     assert!(gui.shows(tr("job.kind_compare")), "{}", gui.describe());
     assert!(gui.shows_text(&roots[0].display().to_string()));
     gui.click(tr("job.kind_sync"));

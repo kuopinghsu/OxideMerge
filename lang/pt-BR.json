@@ -124,6 +124,7 @@
   "label.notebook_markdown_cell": "Célula Markdown",
   "label.notebook_raw_cell": "Célula bruta",
   "menu.workspaces": "Espaços de trabalho",
+  "menu.projects_jobs": "Projetos e tarefas",
   "menu.save_workspace": "Salvar como espaço de trabalho...",
   "menu.open_workspace": "Abrir espaço de trabalho",
   "menu.manage_workspaces": "Gerenciar espaços de trabalho...",

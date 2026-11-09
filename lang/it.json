@@ -124,6 +124,7 @@
   "label.notebook_markdown_cell": "Cella Markdown",
   "label.notebook_raw_cell": "Cella grezza",
   "menu.workspaces": "Aree di lavoro",
+  "menu.projects_jobs": "Progetti e attività",
   "menu.save_workspace": "Salva come area di lavoro...",
   "menu.open_workspace": "Apri area di lavoro",
   "menu.manage_workspaces": "Gestisci aree di lavoro...",
