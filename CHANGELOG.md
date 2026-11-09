@@ -95,10 +95,12 @@ uses its section of this file as the release notes.
   Checked on Linux with OpenSSH 10.5p1 and vsftpd 3.0.5: SFTP with a private key refuses an
   untrusted server until `--trust-fingerprint` confirms the fingerprint `ssh-keygen -lf` prints,
   then an identical file exits 0 and a different one exits 1, a folder compare names the changed
-  file, and the window opens the file as writable. A sync job uploads a new file, a shorter
-  upload replaces it in place, and an upload is refused when the server file has changed since
-  the fetch. Anonymous FTP does the same for a file, including with `--ftp-active`, and a second
-  sync updates the uploaded file. An address that contains a password is refused.
+  file, and the window opens the file as writable. A sync job uploads a new file. Uploading a
+  shorter file replaces it in place, and an upload is refused when the server file has changed
+  since the fetch. Anonymous FTP used a vsftpd process running as the current user, with no
+  chroot: an identical file exits 0, a different file exits 1, the window opens it as writable,
+  a sync job uploads a file and a second run updates it, and `--ftp-active` compared an identical
+  file (exit 0). An address that contains a password is refused.
 - **Workspaces:** *File → Workspaces → Save as workspace...* saves the open tabs under a
   name, kept until deleted; *File → Workspaces* then lists every saved workspace to reopen
   all of its tabs at once, alongside whatever is open already, and *Manage workspaces...*

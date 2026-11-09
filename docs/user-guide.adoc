@@ -722,11 +722,14 @@ key is remembered.
 An identical file exits 0, a different file exits 1, and a folder compare names the file that
 differs.
 The window opens the fetched file as writable and shows the difference.
-A sync job uploads a new file, a shorter upload replaces that file in place, and an upload is
-refused when the file on the server has changed since it was fetched.
-Anonymous FTP does the same for a file: identical exits 0, different exits 1, the window shows
-it as writable, a sync job uploads a file and a second run updates it, and `--ftp-active`
-compared an identical file (exit 0).
+A sync job uploads a new file.
+Uploading a shorter file replaces it in place, and an upload is refused when the file on the
+server has changed since it was fetched.
+Anonymous FTP used a vsftpd process running as the current user, with no chroot, so the remote
+path was the real directory.
+An identical file exits 0, a different file exits 1, and the window opens it as writable.
+A sync job uploads a file, and a second run updates it.
+`--ftp-active` compared an identical file and exited 0.
 An address that contains a password is refused for both.
 
 [[compare-types]]
