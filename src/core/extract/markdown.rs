@@ -960,10 +960,7 @@ const MAX_DECIMALS: usize = 30;
 /// placed on it, each with the cell it is placed at.
 pub fn xlsx_blocks(path: &Path, cancel: Option<&AtomicBool>) -> Result<Vec<Block>> {
     let workbook = parse(&part(path, "xl/workbook.xml")?, cancel)?;
-    let date1904 = workbook
-        .child(SHEET_NS, "workbookPr")
-        .and_then(|p| p.attr("date1904"))
-        .is_some_and(|v| v == "1" || v == "true");
+    let (formats, date1904) = number_formats(path, cancel)?;
     let targets: HashMap<String, String> =
         relationships(&optional_part(path, "xl/_rels/workbook.xml.rels")?.unwrap_or_default())
             .into_iter()
@@ -971,10 +968,6 @@ pub fn xlsx_blocks(path: &Path, cancel: Option<&AtomicBool>) -> Result<Vec<Block
     let shared = match optional_part(path, "xl/sharedStrings.xml")? {
         Some(xml) => shared_strings(&xml)?,
         None => Vec::new(),
-    };
-    let formats = match optional_part(path, "xl/styles.xml")? {
-        Some(xml) => NumberFormats::read(&parse(&xml, cancel)?),
-        None => NumberFormats::default(),
     };
     let book = Book {
         path,
@@ -1343,9 +1336,26 @@ fn inline_string(is: &Element) -> String {
     out
 }
 
+/// The number formats of the workbook at `path`, and whether it counts dates from 1904.
+pub(super) fn number_formats(
+    path: &Path,
+    cancel: Option<&AtomicBool>,
+) -> Result<(NumberFormats, bool)> {
+    let workbook = parse(&part(path, "xl/workbook.xml")?, cancel)?;
+    let date1904 = workbook
+        .child(SHEET_NS, "workbookPr")
+        .and_then(|p| p.attr("date1904"))
+        .is_some_and(|v| v == "1" || v == "true");
+    let formats = match optional_part(path, "xl/styles.xml")? {
+        Some(xml) => NumberFormats::read(&parse(&xml, cancel)?),
+        None => NumberFormats::default(),
+    };
+    Ok((formats, date1904))
+}
+
 /// The number formats of `xl/styles.xml`, by cell style.
 #[derive(Default)]
-struct NumberFormats {
+pub(super) struct NumberFormats {
     /// The number format of each cell style.
     styles: Vec<u32>,
     /// The formats the workbook defines itself, by number.
@@ -1381,7 +1391,7 @@ impl NumberFormats {
     }
 
     /// The number `value` as a cell of style `style` shows it.
-    fn show(&self, value: &str, style: usize, date1904: bool) -> String {
+    pub(super) fn show(&self, value: &str, style: usize, date1904: bool) -> String {
         let id = self.styles.get(style).copied().unwrap_or(0);
         let code = self
             .codes
@@ -2326,6 +2336,27 @@ mod tests {
         }
         zip.finish().unwrap();
         file
+    }
+
+    #[test]
+    fn a_workbook_read_the_other_way_has_its_numbers_formatted_line_for_line() {
+        let sheet = concat!(
+            r#"<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>0</v></c></row>"#,
+            r#"<row r="2"><c r="A2" s="1"><v>46295</v></c><c r="B2" s="2"><v>1234.5</v></c></row>"#,
+            r#"<row r="4"><c r="A4"><v>9</v></c></row></sheetData>"#,
+        );
+        let file = xlsx(sheet, &[]);
+        let text = crate::core::extract::Kind::Spreadsheet
+            .read(file.path(), None)
+            .unwrap();
+        let other = crate::core::extract::other_cells(file.path(), None).unwrap();
+        assert!(other.shown);
+        let (a, b): (Vec<&str>, Vec<&str>) = (text.lines().collect(), other.text.lines().collect());
+        assert_eq!(a.len(), b.len(), "{text}\n{}", other.text);
+        let row = a.iter().position(|l| l.starts_with("46295")).unwrap();
+        assert_eq!(a[row], "46295,1234.5");
+        assert_eq!(b[row], "2026-09-30,\"1,235\"");
+        assert_eq!(a[row + 2], b[row + 2]);
     }
 
     #[test]

@@ -5244,7 +5244,7 @@ impl OxideMergeApp {
                 out.push(entry(Icon::Inline, label, detail, PaletteAction::Inline));
             }
         }
-        let toggles: [(&str, ConfigFlag); 14] = [
+        let toggles: [(&str, ConfigFlag); 15] = [
             ("view.line_numbers", |c| &mut c.show_line_numbers),
             ("view.location_pane", |c| &mut c.show_location_pane),
             ("view.line_detail", |c| &mut c.show_line_detail),
@@ -5255,6 +5255,7 @@ impl OxideMergeApp {
             ("view.tree_mode", |c| &mut c.tree_mode),
             ("menu.open_reports", |c| &mut c.open_reports),
             ("menu.pdf_letter", |c| &mut c.pdf_letter),
+            ("menu.report_hide_paths", |c| &mut c.report_hide_paths),
             ("opt.color_blind", |c| &mut c.color_blind_colors),
             ("opt.high_contrast", |c| &mut c.high_contrast),
             ("opt.reduce_motion", |c| &mut c.reduce_motion),
@@ -7991,6 +7992,13 @@ impl OxideMergeApp {
             ui.separator();
             check(ui, &mut self.cfg.open_reports, tr("menu.open_reports"), "");
             check(ui, &mut self.cfg.pdf_letter, tr("menu.pdf_letter"), "");
+            let hide = &mut self.cfg.report_hide_paths;
+            if widgets::menu_check(ui, *hide, tr("menu.report_hide_paths"), "")
+                .on_hover_text(tr("menu.report_hide_paths_tip"))
+                .clicked()
+            {
+                *hide = !*hide;
+            }
         });
         m.item(ui, Cmd::Print);
         m.item(ui, Cmd::ApplyPatch);

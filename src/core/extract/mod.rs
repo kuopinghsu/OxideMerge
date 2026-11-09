@@ -94,14 +94,16 @@ impl Kind {
 
     /// Reads the file at `path` as text, giving up once `cancel` is set.
     pub fn read(self, path: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
+        let mut pages = None;
         let text = match self {
             Kind::Document => document(path, cancel),
             Kind::Rtf => rtf(path),
             Kind::Spreadsheet => spreadsheet(path, cancel),
             Kind::Elf => elf(path),
-            Kind::Pdf => read_whole(path)
-                .and_then(|bytes| pdf::text(&bytes, cancel))
-                .map(tidy),
+            Kind::Pdf => pdf_text(path, cancel).map(|(text, starts)| {
+                pages = Some(starts);
+                text
+            }),
             Kind::Notebook => notebook::read(path, cancel),
         }
         .with_context(|| {
@@ -110,7 +112,11 @@ impl Kind {
                 &[("file", path.display().to_string())],
             )
         })?;
-        Ok(cut(text))
+        let text = cut(text);
+        if let Some(starts) = pages {
+            remember_pages(path, (starts, super::text::lines(&text).count()));
+        }
+        Ok(text)
     }
 }
 
@@ -427,9 +433,20 @@ fn odf_text(xml: &[u8], cancel: Option<&AtomicBool>) -> Result<String> {
 
 /// Trailing spaces off each line, no more than one blank line in a row, one newline at the end.
 fn tidy(text: String) -> String {
+    tidy_marked(text, &[]).0
+}
+
+/// [`tidy`], with the line of the tidy text that each of `marks`, byte offsets into `text` in
+/// order, is at: the line it is on, or the next line kept when its own is left out.
+fn tidy_marked(text: String, marks: &[usize]) -> (String, Vec<usize>) {
     let mut out = String::with_capacity(text.len());
-    let mut blanks = 0;
-    for line in text.lines() {
+    let mut at = Vec::with_capacity(marks.len());
+    let (mut lines, mut blanks, mut offset) = (0usize, 0, 0);
+    for line in text.split_inclusive('\n') {
+        offset += line.len();
+        while at.len() < marks.len() && marks[at.len()] < offset {
+            at.push(lines);
+        }
         let line = line.trim_end();
         if line.is_empty() {
             blanks += 1;
@@ -441,20 +458,98 @@ fn tidy(text: String) -> String {
         }
         out.push_str(line);
         out.push('\n');
+        lines += 1;
     }
-    while out.starts_with('\n') {
-        out.remove(0);
+    at.resize(marks.len(), lines);
+    let lead = out.len() - out.trim_start_matches('\n').len();
+    if lead > 0 {
+        out.drain(..lead);
+        at.iter_mut().for_each(|a| *a = a.saturating_sub(lead));
     }
-    out
+    (out, at)
+}
+
+/// The text of the PDF file at `path` as [`Kind::read`] reads it, with the line each of its
+/// pages starts on.
+fn pdf_text(path: &Path, cancel: Option<&AtomicBool>) -> Result<(String, Vec<usize>)> {
+    let (text, starts) = pdf::Document::read(&read_whole(path)?, cancel)?.text_pages()?;
+    Ok(tidy_marked(text, &starts))
+}
+
+/// The line each page of a PDF file starts on in the text [`Kind::read`] reads from it, with the
+/// number of lines of that text.
+type Pages = (Vec<usize>, usize);
+
+/// A file as it was when read: its path, size and the time it was written.
+type Stamp = (std::path::PathBuf, u64, Option<std::time::SystemTime>);
+
+/// The pages of the PDF files read lately, the latest last, so that a report naming the pages
+/// of a difference finds them without reading a file it compared again.
+static PAGES: std::sync::Mutex<Vec<(Stamp, Pages)>> = std::sync::Mutex::new(Vec::new());
+
+/// How many files [`PAGES`] keeps the pages of.
+const PAGES_KEPT: usize = 256;
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((path.to_path_buf(), meta.len(), meta.modified().ok()))
+}
+
+fn remember_pages(path: &Path, pages: Pages) {
+    let Some(stamp) = stamp(path) else { return };
+    let mut kept = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+    kept.retain(|(s, _)| s.0 != stamp.0);
+    if kept.len() >= PAGES_KEPT {
+        kept.remove(0);
+    }
+    kept.push((stamp, pages));
+}
+
+/// The pages of the PDF file at `path`: as found when [`Kind::read`] read it, while the file is
+/// unchanged, or read again.
+pub fn pdf_pages(path: &Path, cancel: Option<&AtomicBool>) -> Result<Pages> {
+    if let Some(stamp) = stamp(path) {
+        let kept = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, pages)) = kept.iter().find(|(s, _)| *s == stamp) {
+            return Ok(pages.clone());
+        }
+    }
+    let (text, starts) = pdf_text(path, cancel)?;
+    let pages = (starts, super::text::lines(&cut(text)).count());
+    remember_pages(path, pages.clone());
+    Ok(pages)
 }
 
 // ---------- spreadsheets ----------
 
 fn spreadsheet(path: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
     match super::text::extension(path).as_str() {
-        "ods" => ods(&part(path, "content.xml")?, cancel),
-        _ => xlsx(path, cancel),
+        "ods" => ods(&part(path, "content.xml")?, cancel, false),
+        _ => xlsx(path, cancel, false),
     }
+}
+
+/// A spreadsheet's records read the other way from [`Kind::read`], line for line as it: the
+/// numbers of an `.xlsx` workbook as their number formats show them, where its text has them
+/// as stored, or the values of an `.ods` one as stored, where its text has them as shown.
+pub struct OtherCells {
+    pub text: String,
+    /// Whether `text` has the values as shown rather than as stored.
+    pub shown: bool,
+}
+
+/// The records of the spreadsheet at `path` read the other way, as [`OtherCells`] says.
+pub fn other_cells(path: &Path, cancel: Option<&AtomicBool>) -> Result<OtherCells> {
+    Ok(match super::text::extension(path).as_str() {
+        "ods" => OtherCells {
+            text: cut(ods(&part(path, "content.xml")?, cancel, true)?),
+            shown: false,
+        },
+        _ => OtherCells {
+            text: cut(xlsx(path, cancel, true)?),
+            shown: true,
+        },
+    })
 }
 
 /// The first line of a sheet's records when a workbook has several, so that a reader can tell
@@ -526,7 +621,15 @@ fn column_of(reference: &str) -> Option<usize> {
     Some(n - 1)
 }
 
-fn xlsx(path: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
+/// The sheets of the workbook at `path` as comma separated records, with numbers as stored, or
+/// as their number formats show them when `shown` is set.
+fn xlsx(path: &Path, cancel: Option<&AtomicBool>, shown: bool) -> Result<String> {
+    let formats = if shown {
+        Some(markdown::number_formats(path, cancel)?)
+    } else {
+        None
+    };
+    let formats = formats.as_ref().map(|(f, date1904)| (f, *date1904));
     let shared = match optional_part(path, "xl/sharedStrings.xml")? {
         Some(xml) => shared_strings(&xml)?,
         None => Vec::new(),
@@ -553,7 +656,7 @@ fn xlsx(path: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
         if many {
             out.push_str(&sheet_heading(name));
         }
-        out.push_str(&sheet(&xml, &shared, out.len(), cancel)?);
+        out.push_str(&sheet(&xml, &shared, formats, out.len(), cancel)?);
         if many {
             out.push('\n');
         }
@@ -705,10 +808,13 @@ fn shared_strings(xml: &[u8]) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// One worksheet as comma separated records, when `used` bytes of the workbook are already read.
+/// One worksheet as comma separated records, when `used` bytes of the workbook are already read:
+/// its numbers as stored, or in the number formats `formats` gives with whether the workbook
+/// counts dates from 1904.
 fn sheet(
     xml: &[u8],
     shared: &[String],
+    formats: Option<(&markdown::NumberFormats, bool)>,
     used: usize,
     cancel: Option<&AtomicBool>,
 ) -> Result<String> {
@@ -724,6 +830,7 @@ fn sheet(
     // The number of the row the next one is when the sheet leaves none out, from one.
     let mut next_row = 1usize;
     let mut kind = String::new();
+    let mut style = 0usize;
     let mut value = String::new();
     let mut in_value = false;
     let mut phonetic = 0usize;
@@ -759,6 +866,7 @@ fn sheet(
                             .and_then(column_of)
                             .unwrap_or(cells.len());
                         kind = attribute(e, "t").unwrap_or_default();
+                        style = attribute(e, "s").and_then(|s| s.parse().ok()).unwrap_or(0);
                         value.clear();
                     }
                     "v" => {
@@ -802,6 +910,10 @@ fn sheet(
                                 "1" => "TRUE".to_string(),
                                 _ => "FALSE".to_string(),
                             },
+                            "" | "n" => match formats {
+                                Some((f, date1904)) => f.show(&value, style, date1904),
+                                None => value.clone(),
+                            },
                             _ => value.clone(),
                         };
                         while cells.len() < column {
@@ -829,8 +941,9 @@ fn sheet(
     Ok(out)
 }
 
-/// An OpenDocument spreadsheet `content.xml` as comma separated records.
-fn ods(xml: &[u8], cancel: Option<&AtomicBool>) -> Result<String> {
+/// An OpenDocument spreadsheet `content.xml` as comma separated records: its cells as shown, or
+/// the values of those that store one apart from what they show when `stored` is set.
+fn ods(xml: &[u8], cancel: Option<&AtomicBool>, stored: bool) -> Result<String> {
     let source = String::from_utf8_lossy(xml).into_owned();
     let mut reader = quick_xml::NsReader::from_str(&source);
     reader.config_mut().trim_text(false);
@@ -845,6 +958,7 @@ fn ods(xml: &[u8], cancel: Option<&AtomicBool>) -> Result<String> {
     // The bytes of the row so far, and of every sheet so far.
     let (mut row_bytes, mut used) = (0usize, 0usize);
     let mut cell = String::new();
+    let mut value: Option<String> = None;
     let mut repeat = 1usize;
     let mut rows_repeat = 1usize;
     // Empty rows not yet written: only those with a row after them in the same sheet are, so
@@ -881,6 +995,13 @@ fn ods(xml: &[u8], cancel: Option<&AtomicBool>) -> Result<String> {
                     }
                     (Some(ODF_TABLE), "table-cell" | "covered-table-cell") => {
                         cell.clear();
+                        value = stored
+                            .then(|| {
+                                ["value", "date-value", "time-value", "boolean-value"]
+                                    .iter()
+                                    .find_map(|name| attribute(e, name))
+                            })
+                            .flatten();
                         in_cell = true;
                         // A run of equal cells is recorded once; a long trailing run of empty
                         // ones is how a sheet records its unused width.
@@ -905,7 +1026,10 @@ fn ods(xml: &[u8], cancel: Option<&AtomicBool>) -> Result<String> {
                     (Some(ODF_TEXT), "p") if in_cell && !cell.ends_with(' ') => cell.push(' '),
                     (Some(ODF_TABLE), "table-cell" | "covered-table-cell") => {
                         in_cell = false;
-                        let text = cell.trim().to_string();
+                        let text = match value.take() {
+                            Some(v) => v.trim().to_string(),
+                            None => cell.trim().to_string(),
+                        };
                         let mut copies = repeat.min(MAX_COLUMNS.saturating_sub(cells.len()));
                         if !text.is_empty() {
                             let field = text.len() + 1;
@@ -1800,6 +1924,37 @@ mod tests {
             Kind::Spreadsheet.read(&path, None).unwrap(),
             "same\nsame\n\n\na & b\n"
         );
+    }
+
+    #[test]
+    fn an_opendocument_spreadsheet_read_the_other_way_has_its_stored_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = concat!(
+            r#"<table:table-row><table:table-cell><text:p>share</text:p></table:table-cell>"#,
+            r#"<table:table-cell><text:p>due</text:p></table:table-cell></table:table-row>"#,
+            r#"<table:table-row><table:table-cell office:value-type="percentage" "#,
+            r#"office:value="0.25"><text:p>25%</text:p></table:table-cell>"#,
+            r#"<table:table-cell office:value-type="date" office:date-value="2026-09-30">"#,
+            r#"<text:p>30/09/26</text:p></table:table-cell></table:table-row>"#
+        );
+        let path = ods_with(dir.path(), rows);
+        assert_eq!(
+            Kind::Spreadsheet.read(&path, None).unwrap(),
+            "share,due\n25%,30/09/26\n"
+        );
+        let other = other_cells(&path, None).unwrap();
+        assert!(!other.shown);
+        assert_eq!(other.text, "share,due\n0.25,2026-09-30\n");
+    }
+
+    #[test]
+    fn tidy_text_says_which_line_each_mark_is_on() {
+        let text = "\n\na  \n\n\n\nb\nc\n".to_string();
+        let marks = [0, 3, 8, 11, 13];
+        let (tidy, at) = tidy_marked(text.clone(), &marks);
+        assert_eq!(tidy, "a\n\nb\nc\n");
+        assert_eq!(tidy, super::tidy(text));
+        assert_eq!(at, [0, 0, 2, 3, 4]);
     }
 
     /// A small file can say a long value is repeated across every column of a million rows;

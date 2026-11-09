@@ -454,9 +454,49 @@ uses its section of this file as the release notes.
   vsftpd and ProFTPD (FTP, FTPS, active mode and client certificates), and Dante and
   tinyproxy (SOCKS5 and HTTP CONNECT proxies). The tests are built for release, as
   continuous integration builds them. See the development guide.
+- **Folder reports without folder paths:** *File → Export → Hide folder paths in reports*,
+  `--report-hide-paths`, or `report_hide_paths` in a job file names the compared folders Left,
+  Middle and Right in HTML, PDF, slideshow, CSV, text and XML folder reports, and keeps their
+  paths out of the review notes and review summary the reports carry. HTML and PDF reports keep
+  their paths out of their notes, filter and settings too, and warn that file names and the
+  differences shown can still be sensitive.
 
 ### Changed
 
+- **HTML reports** are easier to read, search and share:
+  - A folder report counts the files with different contents, the files on one side only and
+    the differences exported apart. Its index lists every changed or one-sided file, and a file
+    shown without its differences says *Summary only* and why.
+  - Each file says how it was compared, such as *Text*, *Spreadsheet cells*, *Document text* or
+    the converter program. Each difference gives its sheet and rows, its PDF pages, or its
+    notebook cell, and a changed CSV, TSV or spreadsheet row lists the fields that changed, as
+    in `Alice · score · 90 → 95`. A spreadsheet value reads as the sheet shows it, with the
+    value it stores when that differs, as in `741,700 (741700)`; a sheet's title rows above its
+    header and rows ending in empty cells no longer keep its fields from being listed, and a
+    header over two rows names a column by both, as in `Quarter Q3`.
+  - A changed binary file that OxideMerge or a configured converter reads as text, such as an
+    ELF program, shows the differences of that text in HTML, PDF and slideshow reports and in
+    the tab of all the differences, rather than only that it is binary. When that text is the
+    same, the report says the files differ in bytes it leaves out.
+  - A *Comparison settings* section shows the method, filter, options and report limits, and a
+    note says what the report leaves out or shortens.
+  - *Previous* and *Next* buttons with a counter go through the differences across files, and a
+    link to a difference opens its file and scrolls it below the header.
+  - Search covers file names and paths, or the text of the differences, with a count of matches
+    and a *Clear* button.
+  - On a phone the index folds away and the page fits the screen.
+  - The page carries its language, labels its controls and their states for screen readers,
+    shows keyboard focus, and has more contrast in the light theme.
+- **PDF folder reports** hold what the HTML folder report holds:
+  - The summary counts the files with different contents, the files on one side only, the
+    differences exported and those left out.
+  - A *File differences* index lists every changed or one-sided file with its differences
+    drawn, or *Summary only* and why, and how it was compared; each entry links to the file.
+  - Every changed file has its own part, a file shown without differences included. Each
+    difference gives its sheet and rows, PDF pages or notebook cell, and the fields of a changed
+    CSV, TSV or spreadsheet row.
+  - The *Comparison settings* section and the note of what the report leaves out or shortens
+    follow the summary, and the PDF carries the language of its text.
 - **About** shows just the build date for a release build, and the build date together
   with the commit it was built from for any other build, instead of one or the other.
 - **File → Export** has three reports: *HTML report...*, *Slideshow report...* and *PDF
@@ -466,6 +506,13 @@ uses its section of this file as the release notes.
   plain text.
 - **Slideshow reports** carry the OxideMerge icon in their header, embedded in the file;
   the icon and the last slide link to the project page.
+- **Folder slideshows** hold what the HTML folder report holds: the title slide counts the
+  files with different contents, the files on one side only and the exported diff blocks, and
+  says what the slideshow leaves out. Each slide says how its file was compared and gives the
+  sheet and rows, PDF pages, notebook cell or changed fields of its difference. The last slide lists
+  every changed or one-sided file, linked to its first slide or saying *Summary only* and why,
+  followed by the comparison settings. The slide buttons have names for screen readers, the
+  slide count is announced, and a long closing slide scrolls from its top.
 
 - **HTML reports** carry the OxideMerge icon in their header, embedded in the file (about
   10 KB), and move: the sections and file cards fade in, the counts in the summary cards

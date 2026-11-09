@@ -323,6 +323,7 @@ oxidemerge -r old-folder new-folder --report report.html --report-diffs
 | `-L <title>` | 依序為下一側指定標題，與 `diff -L` 相同（Subversion 會傳入）。 |
 | `--report <file>` | 匯出 `.html`、`.pdf` 或 `.xml` 報告；資料夾比較也可匯出 `.csv` 或 `.txt`。 |
 | `--report-diffs` | 在資料夾的 HTML 或 PDF 報告中加入文字差異。 |
+| `--report-hide-paths` | 在資料夾報告中以左側、中間、右側稱呼資料夾，而不顯示其路徑。 |
 | `--page-size a4\|letter`、`--portrait`、`--unified`、`--whole-file` | 設定 `.pdf` 報告的版面：紙張大小、直式頁面、兩個檔案以單欄顯示，或顯示完整檔案而非只顯示差異與 `--context` 行前後文。 |
 | `--slideshow` | 匯出每張投影片顯示一個差異的 HTML 投影片。 |
 | `--patch <file>` | 從雙向檔案或資料夾比較產生修補檔。 |

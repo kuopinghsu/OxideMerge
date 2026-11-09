@@ -145,6 +145,8 @@ pub struct Config {
     pub open_reports: bool,
     /// Whether PDF reports use US Letter pages rather than A4.
     pub pdf_letter: bool,
+    /// Whether folder reports name the compared folders by their sides, not their paths.
+    pub report_hide_paths: bool,
     pub folder: FolderOptions,
     pub filter: String,
     pub recent_paths: Vec<String>,
@@ -211,6 +213,7 @@ impl Default for Config {
             rules_migrated: false,
             open_reports: true,
             pdf_letter: false,
+            report_hide_paths: false,
             folder: FolderOptions::default(),
             filter: "*.*".into(),
             recent_paths: Vec::new(),
