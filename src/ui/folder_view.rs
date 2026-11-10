@@ -59,6 +59,8 @@ pub enum FolderAction {
     ShowAll,
     /// Add a rule, picked in the docked file compare, to the compare rules file.
     AddRule(RuleDraft),
+    /// Use the layout picked in the docked file compare.
+    Layout(crate::config::TextLayout),
     /// Open the compare rules files in the options.
     EditRules,
     /// Save the HTML report of the folder compare with the differences of every changed file.
@@ -408,6 +410,8 @@ pub struct FolderView {
     rule_names: Vec<String>,
     /// A rule picked in the docked file compare, until the app takes it.
     rule_request: Option<RuleDraft>,
+    /// A layout picked in the docked file compare, until the app takes it.
+    layout_choice: Option<crate::config::TextLayout>,
     /// The HTML report asked for in the docked file compare, until the app takes it.
     file_report: Option<(String, report::ReportJob)>,
     /// The last comparison was stopped before comparing every file.
@@ -805,6 +809,7 @@ impl FolderView {
             rules_found: false,
             rule_names: Vec::new(),
             rule_request: None,
+            layout_choice: None,
             file_report: None,
             stopped: false,
             failed: false,
@@ -2837,6 +2842,9 @@ impl FolderView {
                     if let Some(r) = v.rule_request.take() {
                         self.rule_request = Some(r);
                     }
+                    if let Some(layout) = v.layout_choice.take() {
+                        self.layout_choice = Some(layout);
+                    }
                     if std::mem::take(&mut v.export_request) {
                         let name = report::html_file_name(&v.titles());
                         self.file_report =
@@ -4128,6 +4136,7 @@ impl FolderView {
         let mut result: Option<FolderAction> = captured_action
             .or(header_action)
             .or_else(|| self.rule_request.take().map(FolderAction::AddRule))
+            .or_else(|| self.layout_choice.take().map(FolderAction::Layout))
             .or_else(|| {
                 self.file_report
                     .take()

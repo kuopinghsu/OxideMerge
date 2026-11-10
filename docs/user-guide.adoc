@@ -1288,7 +1288,9 @@ them separately.
 
 *View → Zoom* (kbd:[Ctrl+{plus}], kbd:[Ctrl+-] and kbd:[Ctrl+0]) changes the text size.
 
-*Text layout* is available in *View → Text compare* and in *Options → General*:
+*Layout* is available in *View → Layout*, in *Options → General*, and as the *Compact rows* and
+*Aligned rows* buttons on the toolbar of text and binary comparisons: a pair of icons that show
+two columns of lines, packed or with a gap:
 
 Compact rows:: The default. Each side shows its own lines, without empty space.
 Aligned rows:: Empty space is added opposite inserted and deleted lines, so that the lines after
@@ -1296,7 +1298,10 @@ them stay side by side.
 
 The layout applies to all open two-way and three-way text comparisons and is saved for the next
 session.
-It does not change the files or the compare rules.
+The same setting lays out the moved blocks of a binary comparison (see <<binary-comparison>>).
+The toolbar buttons are unavailable in the inline view and the table view, which show no empty
+space either way.
+The layout does not change the files or the compare rules.
 
 [[inline-view]]
 ==== Inline view
@@ -2272,9 +2277,6 @@ firmware images, archives and data files.
 OxideMerge shows both files byte by byte, points out exactly where they differ, and lets you edit
 individual bytes and copy differences from one file to the other.
 
-.A binary comparison
-image::binary.png[Binary comparison]
-
 Binary files open in a side-by-side hexadecimal view.
 Bytes that differ are highlighted, and both sides scroll together.
 
@@ -2293,6 +2295,12 @@ two files.
 *Moved blocks* on the binary toolbar highlights identical blocks that are found at different
 offsets, in the hex and text columns and in the location pane.
 
+In the location pane, each side has a column of its own.
+Moved blocks are shaded in a light color, and solid bars mark the bytes that changed: the
+differing bytes that no moved block accounts for, such as inserted or overwritten bytes.
+The bars of the current difference are in the accent color.
+Click a bar to scroll to it.
+
 To visit the counterpart of a highlighted block, select a highlighted byte and use
 *Go to matching block*.
 Your position within the block is kept.
@@ -2303,6 +2311,46 @@ Moved blocks are supported in two-way and three-way comparisons.
 In a three-way comparison, the button uses the first matching side shown beside it.
 Turn the checkbox off to see only ordinary differences.
 OxideMerge remembers the checkbox setting for the next binary comparison.
+
+While the checkbox is on, *Compact rows* and *Aligned rows* on the toolbar lay out the bytes.
+They are the same *Layout* setting as in text comparisons, also in *View → Layout*:
+
+Compact rows:: Each side shows its bytes at their own offsets, so each row has the same offsets
+on both sides.
+Aligned rows:: Each moved block is shown on the same rows as its match.
+Blank cells stand opposite the bytes between the blocks, like the space opposite inserted and
+deleted lines in a text comparison.
+Each row starts with the offset of its first byte on that side.
+
+To try it, compare `samples/left/bin/firmware.bin` with `samples/right/bin/firmware.bin`.
+The left file has an extra byte, `A5`, at offset `0x20`, and the files differ in a few more places
+further on.
+
+.Moved blocks with Compact rows
+image::binary-compact.png[Binary comparison of the firmware samples with Compact rows]
+
+With *Compact rows*, every byte after `A5` is one offset later on the left than on the right, so
+from row `00000020` on, the two sides show different bytes on the same row.
+The bytes that match are highlighted as moved blocks.
+
+.The same files with Aligned rows
+image::binary-aligned.png[Binary comparison of the firmware samples with Aligned rows]
+
+With *Aligned rows*, a blank cell on the right stands opposite `A5`, and the bytes after it line
+up again.
+At the next difference, two blank cells on the left stand opposite `52 71`, which only the right
+file has.
+From there on, the rows of each side start at different offsets, such as `0000004E` on the left
+and `0000004D` on the right.
+
+Blocks that cross each other, such as two swapped blocks, cannot all be side by side; the
+longest set that keeps its order on both sides is.
+In a three-way comparison, the left and right sides are each lined up with the middle side;
+blocks that only the left and right sides share are highlighted but not lined up.
+The arrow keys move by the rows shown, and clicking a blank cell selects the next byte of that
+side.
+While you edit, the rows stay where they are until the blocks are found again.
+Difference navigation and the difference count still compare the same offsets of both sides.
 
 Detection finds two kinds of identical bytes:
 
@@ -4930,7 +4978,7 @@ General::
 * *Line numbers*, *Location pane*, *View whitespace* and *Syntax highlighting*.
 * *Highlight files up to*: the size in MB above which a file is shown without syntax highlighting
   (16 MB by default; see <<troubleshooting>>, _Performance_).
-* *Text layout* (see the view options in <<text-comparison>>).
+* *Layout* (see the view options in <<text-comparison>>).
 * *Keep a .bak copy when saving over a file*, *Use the recycle bin when deleting* and
   *Confirm copy operations*.
 * *Reopen previous comparisons at startup*.

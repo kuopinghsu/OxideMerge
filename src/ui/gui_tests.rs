@@ -5816,6 +5816,21 @@ fn text_layout_settings_apply_immediately_and_keep_merge_content_correct() {
         gui.text_view().panes[0].doc.text(),
         "start\ninserted\nend\n"
     );
+
+    gui.click(tr("view.layout_aligned"));
+    gui.settle();
+    assert_eq!(
+        gui.app.cfg.text_layout,
+        TextLayout::Aligned,
+        "the toolbar sets the shared layout"
+    );
+    gui.menu(&[
+        tr("menu.view"),
+        tr("view.layout"),
+        tr("view.layout_compact"),
+    ]);
+    assert_eq!(gui.app.cfg.text_layout, TextLayout::Compact);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
 }
 
 #[test]
@@ -7490,5 +7505,59 @@ fn binary_moved_blocks_toggle_and_navigate_without_changing_merge_ranges() {
     assert_eq!(binary(&gui).2, original.2);
     assert_eq!(std::fs::read(d.join("left.bin")).unwrap(), left);
     assert_eq!(std::fs::read(d.join("right.bin")).unwrap(), right);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn binary_aligned_rows_follow_the_text_layout_and_move_the_cursor_by_rows() {
+    fn binary(g: &mut Gui) -> &mut crate::ui::binary_view::BinaryView {
+        match g.app.tabs[g.app.active].content.view_mut() {
+            Content::Binary(v) => v,
+            _ => panic!("expected a binary comparison"),
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let (a, inserted, c): (Vec<u8>, Vec<u8>, Vec<u8>) =
+        ((0..64).collect(), (200..232).collect(), (64..128).collect());
+    std::fs::write(d.join("left.bin"), [a.clone(), c.clone()].concat()).unwrap();
+    std::fs::write(d.join("right.bin"), [a, inserted, c].concat()).unwrap();
+    let mut gui = Gui::start(
+        "binary_aligned_rows",
+        compare(&[d.join("left.bin"), d.join("right.bin")]),
+    );
+    gui.app.cfg.binary_bytes_per_line = 16;
+    gui.app.cfg.text_layout = TextLayout::Compact;
+    gui.frame();
+    binary(&mut gui).wait_for_moved_scan();
+    gui.frame();
+    let rows = |g: &mut Gui| (binary(g).row_of(0, 64), binary(g).row_of(1, 96));
+    assert_eq!(
+        rows(&mut gui),
+        (4, 6),
+        "compact rows keep each byte at its offset"
+    );
+
+    gui.click(tr("view.layout_aligned"));
+    assert_eq!(gui.app.cfg.text_layout, TextLayout::Aligned);
+    assert_eq!(rows(&mut gui), (6, 6), "the moved bytes stand side by side");
+    let v = binary(&mut gui);
+    v.pane = Some(0);
+    v.move_cursor(63);
+    gui.frames(2);
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    assert_eq!(
+        binary(&mut gui).cursor,
+        Some(64),
+        "down from the last byte before blank cells"
+    );
+    gui.key(Modifiers::NONE, Key::ArrowUp);
+    assert_eq!(binary(&mut gui).cursor, Some(63), "up over blank cells");
+
+    gui.click(tr("view.layout_compact"));
+    assert_eq!(gui.app.cfg.text_layout, TextLayout::Compact);
+    assert_eq!(rows(&mut gui), (4, 6));
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    assert_eq!(binary(&mut gui).cursor, Some(79));
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
 }

@@ -60,11 +60,15 @@ pub enum Icon {
     Inline,
     /// The file compare docked below the folder list.
     BottomPane,
+    /// Two columns of lines, each packed without gaps.
+    RowsCompact,
+    /// Two columns of lines with a gap on the right opposite lines on the left.
+    RowsAligned,
 }
 
 #[cfg(test)]
 impl Icon {
-    pub const ALL: [Icon; 52] = [
+    pub const ALL: [Icon; 54] = [
         Icon::First,
         Icon::Prev,
         Icon::Next,
@@ -117,6 +121,8 @@ impl Icon {
         Icon::Sidebar,
         Icon::Inline,
         Icon::BottomPane,
+        Icon::RowsCompact,
+        Icon::RowsAligned,
     ];
 }
 
@@ -496,6 +502,20 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.line(&[(3.5, 9.0), (3.5, 11.0)]);
             pen.line(&[(6.5, 10.0), (13.5, 10.0)]);
             pen.line(&[(2.5, 13.0), (9.0, 13.0)]);
+        }
+        Icon::RowsCompact => {
+            for y in [3.5, 6.5, 9.5, 12.5] {
+                pen.line(&[(2.0, y), (7.0, y)]);
+            }
+            pen.line(&[(9.0, 3.5), (14.0, 3.5)]);
+            pen.line(&[(9.0, 6.5), (14.0, 6.5)]);
+        }
+        Icon::RowsAligned => {
+            for y in [3.5, 6.5, 9.5, 12.5] {
+                pen.line(&[(2.0, y), (7.0, y)]);
+            }
+            pen.line(&[(9.0, 3.5), (14.0, 3.5)]);
+            pen.line(&[(9.0, 12.5), (14.0, 12.5)]);
         }
     }
 }
