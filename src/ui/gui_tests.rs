@@ -55,6 +55,8 @@ struct Gui {
     focus: Option<Widget>,
     copied: Vec<String>,
     closed: bool,
+    /// Whether the window is asked to close on the next frame, as by its close button.
+    close_asked: bool,
 }
 
 fn config() -> Config {
@@ -96,6 +98,7 @@ impl Gui {
             focus: None,
             copied: Vec::new(),
             closed: false,
+            close_asked: false,
         };
         gui.settle();
         gui
@@ -116,6 +119,11 @@ impl Gui {
             focused: self.focused,
             ..Default::default()
         };
+        let close_asked = std::mem::take(&mut self.close_asked);
+        if close_asked {
+            let root = raw.viewports.entry(egui::ViewportId::ROOT).or_default();
+            root.events.push(egui::ViewportEvent::Close);
+        }
         self.time += 1.0 / 60.0;
         eframe::App::raw_input_hook(&mut self.app, &self.ctx, &mut raw);
         let (app, frame) = (&mut self.app, &mut self.frame);
@@ -131,10 +139,12 @@ impl Gui {
             self.controls = controls_of(tree);
             self.focus = focused_of(tree);
         }
-        self.closed |= out
-            .viewport_output
-            .values()
-            .any(|v| v.commands.contains(&egui::ViewportCommand::Close));
+        let commands = |c: &egui::ViewportCommand| {
+            out.viewport_output.values().any(|v| v.commands.contains(c))
+        };
+        // A window asked to close closes unless the program cancels it.
+        self.closed |= commands(&egui::ViewportCommand::Close)
+            || close_asked && !commands(&egui::ViewportCommand::CancelClose);
     }
 
     fn frames(&mut self, n: usize) {
@@ -797,7 +807,15 @@ fn press(gui: &mut Gui, cmd: crate::ui::commands::Cmd) {
         .iter()
         .find(|b| b.cmd == cmd)
         .unwrap_or_else(|| panic!("no key for {cmd:?}"));
-    gui.key(b.key.modifiers, b.key.logical_key);
+    // A system key egui does not take itself (Alt+F4) reaches the program from the window
+    // manager as a request to close the window.
+    let egui_takes = gui.ctx.options(|o| o.quit_shortcuts.contains(&b.key));
+    if matches!(b.scope, crate::ui::commands::Scope::System) && !egui_takes {
+        gui.close_asked = true;
+        gui.settle();
+    } else {
+        gui.key(b.key.modifiers, b.key.logical_key);
+    }
 }
 
 /// The whole round of a comparison with no pointer at all: the paths typed on the start page,
@@ -1299,9 +1317,10 @@ fn a_long_session_of_switching_editing_and_cancelling_stays_consistent() {
         gui.app.background_open_bytes = 1;
         gui.app
             .open(compare(&[d.join("c.txt"), d.join("a.txt")]).unwrap());
-        gui.frame();
+        // Cancelled before a frame: a fast machine finishes it within one.
         let id = gui.app.opening.last().unwrap().id;
         gui.app.cancel_open(id);
+        gui.frame();
         gui.app.background_open_bytes = BACKGROUND_OPEN_BYTES;
         // A tab closed and opened again, at the end.
         let (l, r) = pairs[round % 3];
