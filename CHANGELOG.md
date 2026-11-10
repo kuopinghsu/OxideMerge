@@ -7,6 +7,36 @@ uses its section of this file as the release notes.
 
 ### Added
 
+- **Large comparisons open in the background:** text files that add up to 32 MB or more are
+  read and compared on another thread. An *Opening* window names the file and counts the
+  seconds while the rest of the window stays usable, and its *Cancel* button stops the work
+  (in about 25 ms for a 10 MB pair) without opening the tab.
+- **Highlight limit:** *Options → General → Highlight files up to* (16 MB by default) sets
+  the size above which a file is shown without syntax highlighting, and a message now says
+  when that happens instead of the colors silently missing.
+- **Release checks:** every release now publishes `SHA256SUMS`, written after each package
+  is checked as a whole file of its kind (archives list and decompress, AppImage and disk
+  image marks, PDF start and end). The macOS app can be signed with a Developer ID,
+  notarized and stapled once the project's five `MACOS_*` secrets are set; without them it
+  is still signed ad hoc, as before. Releases stay ad hoc and not notarized for now.
+- **Translation checks:** tests now fail when a language names other keys than English,
+  gives a key twice, or leaves a warning about losing work untranslated; when the
+  Traditional Chinese guides lose a section or anchor of the English ones; and when a
+  dialog button of the recovery prompt or Options leaves an 800 × 600 window in any language,
+  or when an item of a menu or a control of an Options tab reaches past an 800 × 600 window,
+  its menu or another control in any language. On macOS, each disk image built is installed
+  as a download would be, judged by Gatekeeper, run and removed again
+  (`scripts/macos-install-check.sh`).
+- **Recovering unsaved work:** with *Options → General → Keep unsaved work for recovery*
+  turned on (off by default), OxideMerge keeps a snapshot of its open comparisons and the
+  text of unsaved edits in a private `recovery` folder of its settings, every 5 seconds while
+  there are edits. After a window that did not close normally, the next start offers
+  *Restore*, *Show details*, *Discard* or *Later*. Restoring reopens the comparisons with the
+  unsaved text back in their sides, still unsaved, and names the files that changed since;
+  it never writes a compared file. The text cursor's line and the bookmarks come back too.
+  Snapshots keep at most 32 MB of unsaved text, five snapshots at most are kept, and one
+  written by a later version is not restored. *Keep for recovery* in a tab's context menu
+  leaves that one comparison out.
 - **Compare over SFTP and FTP:** *File → Compare over SFTP/FTP...*, and a "Browse a server
   over SFTP/FTP" button beside every path on the start page and the *Open* dialog, connect
   to a server over SFTP, FTPS (explicit or implicit TLS) or plain FTP by host, port, user,
@@ -20,8 +50,12 @@ uses its section of this file as the release notes.
   fetching the other side of a compare from the same server does not need them retyped;
   the password or passphrase is never remembered this way. A fetched file is
   writable: *Save* re-uploads it to the server over a fresh connection, in the
-  background with a *Cancel* button. It updates the existing file in place to preserve its
-  owner, group and access controls. You can cancel before writing starts. An upload is refused
+  background with a *Cancel* button. Over SFTP it uploads a staged copy beside the file
+  first, with the original's owner, group and permissions. It reads the copy back to check it,
+  and renames it into place only once complete, so an interrupted save leaves the server's file
+  as it was. *File → Save remote files in place* writes over the file directly instead, keeping
+  access-control lists and hard links. FTP, a file owned by someone else, and a folder no file
+  can be created in always use that in-place write. You can cancel before writing starts. An upload is refused
   when the file changed on the server since it was fetched, and the tab stays unsaved until an
   upload succeeds; closing it or quitting asks first. A fetched folder is writable too: *Save*
   uploads the files that are new or changed, creates new folders and deletes what was
@@ -462,8 +496,36 @@ uses its section of this file as the release notes.
   their paths out of their notes, filter and settings too, and warn that file names and the
   differences shown can still be sensitive.
 
+- **HTML report detail:** *File → Export → HTML report detail* (`--report-detail`, and
+  `report_detail` in job files) chooses *Summary*, *Standard* or *Full*. *Summary* lists where
+  each difference is without its lines, and a folder report made with it reads no file;
+  *Standard* keeps the limits reports had (20,000 rows in all, 400 per diff block, 2,000
+  characters per line); *Full* shows every row and whole lines, so the page grows with the
+  differences. Every HTML report, text reports included, now opens with a box that says
+  whether it is complete or counts the files, diff blocks and rows it left out or shortened, and
+  states the policy it was exported with. A text report cut by its limit counts the differences left out
+  in its stat cards too. Reports stay a single self-contained file; the guide explains why and
+  what each detail costs.
+
 ### Changed
 
+- **Less memory for large text comparisons:** lines are numbered through a smaller table,
+  loaded files give back their spare room, and the text view keeps less per line. Measured
+  on an Apple M2 Max: two 100 MB files peak at 561 MB instead of 620 MB and compare 7% faster;
+  two 1 GiB files peak at 5.5 GB instead of 5.7 GB (engine) and 7.0 GB instead of 7.7 GB in
+  the text view, with the same speed (22.9 s against 22.8 s for the 1 GiB view); see
+  `docs/benchmarks.md`.
+- **Focus after dialogs and menus:** closing a dialog or a menu with Esc or one of its
+  buttons gives the keyboard focus back to the control that opened it, rather than leaving
+  nothing focused; a menu command that moves the focus itself, such as *Find*, keeps it there.
+- **Screen readers** now read out the difference counter, the merge status, the status bar
+  and messages as they change (errors interrupt), and check boxes report whether they are on.
+- **Memory of word-level differences** in the text view is now bounded (8,192 rows kept,
+  those furthest from the view dropped first and worked out again when shown).
+- **Report links:** a file's anchor in a folder report is now made from its path, as in
+  `#f-3f9a0c12d4e7`, so a link to a file or one of its differences still works in the next
+  report of the same folders; links copied from earlier reports (`#f7d0`) no longer resolve.
+  Printed reports repeat the sides above a difference's rows on each page.
 - **Menus in short windows:** a menu too tall for the window scrolls within it instead of
   being cut off. A menu of the menu bar stays under its button. Arrows at its top and bottom
   scroll it while the pointer rests on them, and the mouse wheel and the arrow keys scroll it
@@ -586,6 +648,12 @@ uses its section of this file as the release notes.
 
 ### Fixed
 
+- **Undoing a synchronization the program ended in no longer fails on a folder it made:**
+  when OxideMerge ended while a copy was still under its temporary name in a folder the
+  synchronization had just created, the first attempt to undo it could not remove that folder
+  ("Directory not empty"). Undoing now removes the synchronization's temporary files first.
+  When something still cannot be undone, the message now says what to do next, and choosing
+  *Undo those changes* again is safe.
 - **An FTP upload no longer risks losing its end:** the data connection was closed while
   the server might still send on it (a TLS session ticket, say). That reset the connection,
   and the server could throw away the end of the file before reading it. OxideMerge now

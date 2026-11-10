@@ -455,13 +455,46 @@ The password or a key's passphrase is never filled in this way.
 
 A fetched *file* is writable.
 When you edit it, *Save* uploads it back to the server over a fresh connection in the background.
-The upload updates the file in place to preserve its owner, group and access controls.
 If the server's path is a link, the file it points to is updated.
-*Cancel* can stop an upload before it starts writing.
-A connection failure during the write can leave partial contents on the server; the message says
-so, and choosing *Save* again finishes writing the file.
 If the server's file changed or disappeared after you fetched it, the upload is refused before
 writing.
+
+Over SFTP, the upload goes to a hidden temporary file beside the original, named
+`.NAME.oxidemerge-new-...`, with the original's owner, group and permissions.
+OxideMerge then reads that copy back and compares it with the file here.
+Only a complete, matching copy replaces the original.
+Just before the swap, OxideMerge checks again that nobody else changed the file on the server.
+So a dropped connection, a full disk or *Cancel* leaves the server's file as it was, and the
+message says so.
+
+Most SFTP servers, OpenSSH's included, cannot rename one file over another in one step.
+OxideMerge then renames the original aside first (`.NAME.oxidemerge-old-...`), renames the new
+copy into its place, and deletes the original.
+For that moment the file is missing, but it is never partly written.
+If the connection drops between the two renames, the message names the file that holds the
+other version, so you can check the server and rename it back if needed.
+A temporary file that could not be removed is named the same way, and you can delete it.
+
+A copy that replaces the original is a new file.
+It keeps the original's owner, group and permissions, but not its access-control lists (ACLs).
+It is not one of the original's hard links either.
+SFTP cannot show these, so OxideMerge cannot tell when a file has them.
+For a server where that matters, turn on *File → Save remote files in place*: *Save* then writes
+over the original in place, which keeps them.
+
+OxideMerge also writes in place, without asking, in three cases:
+
+* The file belongs to someone else.
+* No new file can be created in its folder.
+* The server does not show who owns the file.
+
+Over FTP, *Save* always writes in place, because FTP cannot set a new file's owner or
+permissions.
+
+An upload in place can be cancelled until it starts writing.
+After that, a dropped connection can leave the file partly written on the server.
+The message says so, and choosing *Save* again finishes writing it.
+
 Your edits stay in the tab, and you can compare them with the server's version.
 Until an upload succeeds, the tab counts as unsaved, so closing it or quitting asks first, and
 *Save* tries again.
@@ -1984,6 +2017,15 @@ Before it replaces or deletes a file, OxideMerge copies the file into a recovery
 * If OxideMerge exits before the synchronization finishes, it offers at the next start to undo the
   synchronization or to keep the folders as they are.
   Until you choose, these folders cannot be synchronized again.
+* This holds wherever OxideMerge stops: while making the journal, while a copy is still under
+  its temporary name, between a rename's two steps, after a deletion, during the final check, or
+  while undoing.
+  Undoing first removes the temporary files the synchronization left, then puts back each
+  change.
+* Undoing can be repeated safely: what is already back is skipped.
+  If something still cannot be undone, the message names each path and why.
+  Deal with each one (a program holding the file open, a full disk, a missing permission, or a
+  file changed since), then choose *Undo those changes* again.
 
 IMPORTANT: Applying a plan to several files is not a single atomic step.
 Each file is replaced atomically, but another program can see some files already changed.
@@ -2895,6 +2937,49 @@ under the name you gave it.
 When two OxideMerge windows run at the same time, a workspace that you save or delete in one
 window stays saved or deleted when the other window saves its settings.
 
+[[recovery]]
+=== Recovering unsaved work
+
+With *Keep unsaved work for recovery* turned on in *Options → General* (it is off by default),
+OxideMerge keeps a snapshot of its open comparisons while it runs: their paths and settings, the
+selected difference, the line of the text cursor, the bookmarks, the size and modification time
+of each compared file, and the whole text of every side that has edits you have not saved.
+The snapshot is written every 5 seconds while a side has unsaved edits, and every 30 seconds
+otherwise, to a private `recovery` folder in the configuration folder (readable only by you on
+Linux and macOS), never next to the compared files.
+Each running window has a snapshot of its own; it is deleted when the window closes normally, or
+when you turn the option off.
+
+When OxideMerge starts after a window did not close normally (a crash, a forced quit, a power
+cut), it asks what to do with the snapshot left behind:
+
+* *Restore* reopens the comparisons and puts the unsaved text back in their sides.
+  The restored sides are marked as modified and are written to the files only when you save them.
+  A message names every compared file that changed since the snapshot, so you can check the
+  restored edits against it before saving.
+* *Show details* lists the snapshot's comparisons, which of their files changed since, and how
+  many sides have unsaved edits.
+* *Discard* deletes the snapshot.
+* *Later*, or kbd:[Esc], keeps it, to ask again at the next start.
+
+Limits:
+
+* Only comparisons that can be reopened from their files are kept, as in the session that
+  OxideMerge reopens on its own; tabs of temporary copies (files fetched over SFTP or FTP,
+  revisions, files inside archives) are left out.
+  Unsaved text is kept for text comparisons only.
+* At most 32 MB of unsaved text is kept in one snapshot; sides past it are left out, and the
+  details say how many.
+* A snapshot is only as recent as its last write: edits made in the last few seconds before a
+  crash can be missing.
+* A snapshot is taken as left behind once it has not been written for 2 minutes; at most five are
+  kept, the oldest deleted first.
+* A snapshot written by a later version of OxideMerge is shown but not restored.
+
+To leave out one comparison, right-click its tab and turn off *Keep for recovery*: from the next
+snapshot on, it and its unsaved text are no longer written.
+Turn the option off for work whose unsaved text should not be kept on disk at all.
+
 [[saved-comparisons]]
 === Saved comparisons
 
@@ -2981,8 +3066,10 @@ Recipients can open it in any browser, without OxideMerge.
   themes, a status filter and search.
 * *Previous* and *Next* in the header, or kbd:[P] and kbd:[N], go to the previous and the next
   difference across files; a counter shows where you are, and the difference pulses briefly.
-  A link to a difference, such as `report.html#f7d0`, opens its file and scrolls it into view
-  below the header.
+  A link to a difference, such as `report.html#f-3f9a0c12d4e7-d0`, opens its file and scrolls it
+  into view below the header. A file's link is made from its path, not its place in the list,
+  so it still points at the same file in the next report of the same folders. A text report
+  numbers its differences: `#d0` is the first.
   The view you switch to keeps the difference you were reading in place.
 * The search box searches file names and paths, or, with *Search diff content*, the text of the
   differences shown, whether their files are expanded or not. It shows how many files or
@@ -3013,6 +3100,52 @@ A folder report includes the differences of each changed text file, and also:
 * a *Comparison settings* section with the compare method, file filter, options, line filters,
   substitutions and report limits, and which files the folder view showed;
 * a note of what the report leaves out or shortens.
+
+[[report-detail]]
+==== How much a report shows
+
+Every HTML report starts with a box that says whether it is complete. *This report shows every
+difference in full* means nothing was left out. Otherwise the box is headed *Not everything is
+in this report* and counts what is missing: files listed without their differences, diff blocks
+left out, and diff blocks shortened. Below that, it states the export policy the report was made
+with.
+
+*File → Export → HTML report detail* chooses that policy (`--report-detail` on the command line,
+`report_detail` in a job file):
+
+[cols="1,3,3"]
+|===
+|Detail |What the report shows |Size and time
+
+|*Summary*
+|The counts, and where each difference is, without its lines. A folder report lists the files
+and their status, and reads none of them.
+|About the size of the file list. A folder report takes no longer than the comparison.
+
+|*Standard* (default)
+|Up to 20,000 rows of differences in all, 400 rows per diff block and 2,000 characters per line.
+|A few megabytes at most for the differences, however large the files.
+
+|*Full*
+|Every row of every difference, with whole lines.
+|Grows with the differences. A report of two large files that differ throughout can be as large
+as both files together, and slow for a browser to open.
+|===
+
+Whatever the detail, a folder report shows the differences of files up to 16 MiB and 50,000 lines.
+Larger files are listed with the reason they are not shown, and are counted in the box.
+The detail applies to HTML reports. PDF reports have their own limit (see <<pdf-reports>>), and
+slideshows show up to 400 rows per difference.
+
+A report is always a single HTML file. OxideMerge does not split a large report into several
+pages or files: a single file is what you can attach, archive and open anywhere. For a very large
+comparison, export *Standard* to share and *Full* for your own review, or narrow the comparison
+with filters first.
+
+When a report is printed, the sides above the rows of a difference repeat at the top of each
+page, every file is expanded, and the light theme is used. The added, removed and changed rows
+are told apart by their colors, so on a monochrome printer the kind of each difference is in its
+heading, and the unified view's `+` and `-` signs show each row's side.
 
 To share a folder report without the paths of your folders, turn on
 *File → Export → Hide folder paths in reports* (`--report-hide-paths` on the command line).
@@ -3395,6 +3528,12 @@ source side does not have it.
 
 * Only the text where the value is written changes.
   Comments, layout and the rest of the file stay as they are.
+  A removed member takes its own lines with it, including a comment at the end of them; a
+  comment on a line of its own stays.
+* The value is copied as the source side writes it: its quotes, the digits of a number (even
+  one too long for a 64-bit number) and, for an XML element, its namespace prefix.
+  An element whose prefix the other file does not declare is not copied, because it would get
+  another name there.
 * Before the copy is kept, the edited file is read again.
   If the result is not exactly the expected structure, nothing changes and the view tells you why.
   Edit such a value in the text view.
@@ -3982,6 +4121,10 @@ See <<pdf-reports>>.
 
 |`--report-hide-paths`
 |Names the compared folders Left, Middle and Right in a folder report, rather than by their paths.
+
+|`--report-detail <DETAIL>`
+|How much of the differences an `.html` report shows: `summary`, `standard` (the default) or
+`full`. See <<report-detail>>.
 
 |`--slideshow`
 |Writes the `.html` report as a slideshow, with one difference per slide.
@@ -4760,6 +4903,8 @@ The options are grouped as follows.
 General::
 * *Language*, *Theme* (*Light*, *Dark* or *Match system*), *Font size* and *Tab size*.
 * *Line numbers*, *Location pane*, *View whitespace* and *Syntax highlighting*.
+* *Highlight files up to*: the size in MB above which a file is shown without syntax highlighting
+  (16 MB by default; see <<troubleshooting>>, _Performance_).
 * *Text layout* (see the view options in <<text-comparison>>).
 * *Keep a .bak copy when saving over a file*, *Use the recycle bin when deleting* and
   *Confirm copy operations*.
@@ -4774,6 +4919,11 @@ General::
 ** *Compact density*: uses lower rows and less space.
 +
 You can also switch these four options from the command palette.
++
+Screen readers read out what changes without moving the keyboard: the difference counter
+(_Difference 3 of 12_), the merge status of a three-way comparison, the parts of the status bar
+and each message as it appears; error messages interrupt what is being read.
+Check boxes report whether they are on.
 Compare::
 The comparison options (see <<compare-options>>).
 Compare rules::
@@ -4860,6 +5010,13 @@ For the complete list in the program, including mouse actions, open *Help → He
 (kbd:[F1]).
 
 NOTE: On macOS, use kbd:[⌘] for kbd:[Ctrl] and kbd:[⌥] for kbd:[Alt].
+
+Everything a comparison needs works without a mouse: kbd:[Tab] moves through the controls, and
+kbd:[Enter] or kbd:[Space] presses the one that has the focus.
+You can type the paths on the start page, start the comparison, go to a difference, copy it,
+save, close the tab and quit with the keyboard alone.
+A dialog takes the focus when it opens. When it closes, with kbd:[Esc] or one of its buttons,
+the focus goes back to the control that opened it.
 
 .General
 [cols="2,3"]
@@ -5081,7 +5238,15 @@ Binary and image views also load the complete files.
 * Valid UTF-8 files of 16 MiB or more load in parts.
   UTF-16 files and legacy encodings are decoded completely.
   The text stays editable, and the compare rules work as usual.
-* Syntax highlighting is turned off above 50,000 lines or 16 MiB of decoded text.
+* Text comparisons whose files add up to 32 MB or more open in the background: an *Opening*
+  window at the bottom right names the file and counts the seconds, and the rest of the window
+  stays usable.
+  *Cancel* in it stops the comparison, usually within a fraction of a second, and the tab is not
+  opened.
+* Syntax highlighting is turned off for a file larger than *Highlight files up to* in
+  *Options → General* (16 MB by default), or with more than 3,125 lines for each of those MB
+  (50,000 lines at 16 MB), and a message says so.
+  Raise the limit to highlight larger files; highlighting takes time and memory for every line.
 * Editing, undo, word wrap and unusual compare rules can still use more memory.
 --
 +

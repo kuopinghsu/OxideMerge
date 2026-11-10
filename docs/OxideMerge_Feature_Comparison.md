@@ -1,7 +1,7 @@
 # Feature Comparison: OxideMerge vs. WinMerge vs. Meld vs. Beyond Compare vs. Araxis Merge
 
-**Review date:** November 9, 2026\
-**OxideMerge reference:** `main` at `54a85e8`, with the changes not yet committed on November 9, 2026\
+**Review date:** November 10, 2026\
+**OxideMerge reference:** `main` at `1198f5d`\
 **Version:** 0.9.8 (`Unreleased` in CHANGELOG; not a claim that a v0.9.8 binary is published).\
 **Other products, as documented on that date:** WinMerge 2.16.60, Meld 3.24.1, Beyond Compare 5.2.7 (Standard and Pro), Araxis Merge 2026.1 (Standard and Professional).
 
@@ -14,11 +14,21 @@
 | ❌ | Not found in the vendor's feature list or manual |
 | ? | Not checked against the vendor's documentation |
 
-Footnotes in a cell: **ᴾ** Beyond Compare Pro or Araxis Merge Professional only · **ᵂ** Windows only · **ᴱ** documented as experimental.
+Footnotes in a cell: **ᴾ** Beyond Compare Pro or Araxis Merge Professional only (in part, in a ◐ cell) · **ᵂ** Windows only · **ᴱ** documented as experimental.
 
 > This is a documentation-based comparison, not hands-on feature or performance validation. ✅ does not imply equal depth, implementation quality, or usability. ❌ means the documentation reviewed did not establish a capability; it is not proof that the capability is impossible. Rows describing OxideMerge-specific features (journals, review decisions, impact analysis and similar) are ❌ for another product whenever its documentation describes nothing comparable.
 
 ## Revision notes
+
+**November 10, 2026**
+
+- The Beyond Compare column was rechecked against Scooter Software's [feature list by version](https://www.scootersoftware.com/kb/feature_compare) (BC5, which marks the Pro-only features) and the Beyond Compare 5 help, searched through its index. Beyond Compare 5.2.7 (build 32913, October 27, 2026) is still the current release. The feature list confirms the existing cells; these changed:
+  - *Image blink / swipe* is ❌: the Picture Compare help describes tolerance, mismatch range and blend modes, and neither the help nor the feature list mentions blinking or swiping between the images.
+  - *Password-protected archives* is ❌: the Archive Files help lists the formats and the packer plug-ins, and the help mentions passwords only for FTP profiles, scripting and administrator policies.
+  - *Rename / move detection* is ◐ rather than ◐ᴾ: aligning file names that differ only in extension is in Standard, and only aligning them through wildcard masks is Pro. Neither detects a moved or renamed file by its content.
+- Rows were added for features Beyond Compare's list names: *Backup copy when saving* (section 1), *Word wrap* (section 2) and *Registry comparison* (section 4, Pro and Windows only in Beyond Compare). OxideMerge has the first two (*View → Word wrap*, and *Keep a .bak copy when saving over a file* in the options) and no registry comparison. WinMerge documents word wrap and backup files, Araxis Merge documents line wrapping, and Meld's help covers neither; Meld's word-wrap cell stays ? because its help documents only some of its preferences.
+- Meld's *Ignore line-ending differences* is ◐: its help says line-ending differences are ignored in folder comparisons when text filters are applied to them, and says nothing about file comparisons.
+- The header now names the commit reviewed; the menu changes of November 9 are committed and change no rating.
 
 **November 9, 2026**
 
@@ -74,6 +84,7 @@ Footnotes in a cell: **ᴾ** Beyond Compare Pro or Araxis Merge Professional onl
 | Command-line interface | ✅ | ✅ | ✅ | ✅ | ✅ |
 | File manager integration | ✅ | ✅ | ❌ | ✅ | ✅ |
 | Printing | ✅ | ✅ | ? | ✅ | ✅ |
+| Backup copy when saving | ✅ | ✅ | ❌ | ✅ | ❌ |
 
 ### 2. File and Text Comparison
 
@@ -90,8 +101,9 @@ Footnotes in a cell: **ᴾ** Beyond Compare Pro or Araxis Merge Professional onl
 | Inline editing | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Undo / Redo | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Search and replace | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Word wrap | ✅ | ✅ | ? | ✅ | ✅ |
 | Ignore whitespace | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Ignore line-ending differences | ✅ | ✅ | ? | ✅ | ✅ |
+| Ignore line-ending differences | ✅ | ✅ | ◐ | ✅ | ✅ |
 | Ignore case | ✅ | ✅ | ◐ | ✅ | ✅ |
 | Ignore comments | ✅ | ✅ | ◐ | ✅ | ✅ |
 | Regex-based ignore rules | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -117,7 +129,7 @@ Footnotes in a cell: **ᴾ** Beyond Compare Pro or Araxis Merge Professional onl
 | Mirror synchronization | ✅ | ❌ | ❌ | ✅ | ❌ |
 | Update-only synchronization | ✅ | ❌ | ❌ | ✅ | ❌ |
 | Synchronization preview | ✅ | ❌ | ❌ | ✅ | ❌ |
-| Rename / move detection | ✅ | ✅ | ❌ | ◐ᴾ | ❌ |
+| Rename / move detection | ✅ | ✅ | ❌ | ◐ | ❌ |
 | Stale-file revalidation | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Recovery journal | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Rollback on synchronization failure | ✅ | ❌ | ❌ | ❌ | ❌ |
@@ -137,7 +149,7 @@ Footnotes in a cell: **ᴾ** Beyond Compare Pro or Araxis Merge Professional onl
 | Binary moved-block detection | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Image comparison | ✅ | ✅ | ◐ | ✅ | ✅ |
 | Image overlay | ✅ | ✅ | ❌ | ✅ | ✅ |
-| Image blink / swipe | ✅ | ◐ | ❌ | ? | ? |
+| Image blink / swipe | ✅ | ◐ | ❌ | ❌ | ? |
 | Image difference view | ✅ | ✅ | ❌ | ✅ | ✅ |
 | CSV / TSV comparison | ✅ | ✅ | ❌ | ✅ | ◐ |
 | Table cell editing | ✅ | ✅ | ❌ | ✅ | ❌ |
@@ -152,9 +164,10 @@ Footnotes in a cell: **ᴾ** Beyond Compare Pro or Araxis Merge Professional onl
 | ELF binary structure comparison | ✅ | ❌ | ❌ | ❌ | ❌ |
 | HTML / web page comparison | ✅ | ◐ᴱ | ❌ | ✅ | ✅ |
 | ZIP / TAR / 7z comparison | ✅ | ✅ | ❌ | ✅ | ◐ᵂ |
-| Password-protected archives | ✅ | ? | ❌ | ? | ? |
+| Password-protected archives | ✅ | ? | ❌ | ❌ | ? |
 | Edit and save inside archives | ✅ | ◐ | ❌ | ✅ | ❌ |
 | Jupyter notebook cell-aware comparison | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Registry comparison | ❌ | ❌ | ❌ | ◐ᴾᵂ | ❌ |
 
 ### 5. Structured and Semantic Comparison
 
@@ -234,24 +247,26 @@ OxideMerge:
 WinMerge:
 
 - [About WinMerge (feature list)](https://winmerge.org/about/)
-- [WinMerge 2.16 Manual](https://manual.winmerge.org/en/): [Comparing and merging folders](https://manual.winmerge.org/en/Compare_dirs.html), [Comparing in table format](https://manual.winmerge.org/en/Compare_table.html), [Comparing images](https://manual.winmerge.org/en/Compare_images.html), [Comparing web pages](https://manual.winmerge.org/en/Compare_webpages.html), [Plugins](https://manual.winmerge.org/en/Plugins.html), [Configuration (rename/move detection)](https://manual.winmerge.org/en/Configuration.html), [Using WinMerge with other tools (version control)](https://manual.winmerge.org/en/Version_control.html), [FAQ (printing, patches, line endings, OpenOffice files)](https://manual.winmerge.org/en/Faq.html), [Command line](https://manual.winmerge.org/en/Command_line.html)
+- [WinMerge 2.16 Manual](https://manual.winmerge.org/en/): [Comparing and merging folders](https://manual.winmerge.org/en/Compare_dirs.html), [Comparing in table format](https://manual.winmerge.org/en/Compare_table.html), [Comparing images](https://manual.winmerge.org/en/Compare_images.html), [Comparing web pages](https://manual.winmerge.org/en/Compare_webpages.html), [Plugins](https://manual.winmerge.org/en/Plugins.html), [Configuration (rename/move detection, backup files)](https://manual.winmerge.org/en/Configuration.html), [Using WinMerge with other tools (version control)](https://manual.winmerge.org/en/Version_control.html), [FAQ (printing, patches, line endings, OpenOffice files)](https://manual.winmerge.org/en/Faq.html), [Command line](https://manual.winmerge.org/en/Command_line.html)
 - [WinMerge change log](https://github.com/WinMerge/winmerge/blob/master/Docs/Users/ChangeLog.md)
 
 Meld:
 
 - [Meld home page (features, platforms, version control, current release)](https://meldmerge.org/)
 - [Meld Help: Synchronization Points](https://help.gnome.org/meld/syncpoints.html)
+- [Meld Help: Meld's preferences (line endings in folder comparisons)](https://help.gnome.org/meld/preferences.html)
 - [Meld Help: Things that Meld doesn't do](https://help.gnome.org/meld/missing-functionality.html)
 - [Meld 3.23.0 release notes (image comparison)](https://download.gnome.org/sources/meld/3.23/meld-3.23.0.news)
 
 Beyond Compare:
 
 - [Standard vs. Pro](https://www.scootersoftware.com/kb/editions)
-- [Feature list by version](https://www.scootersoftware.com/kb/feature_compare)
+- [Feature list by version](https://www.scootersoftware.com/kb/feature_compare): BC5 to BC2, with the Pro-only features marked
 - [Beyond Compare 5 Help](https://www.scootersoftware.com/v5help/index.html): the current manual, covering Standard and Pro
 - [Beyond Compare 4 User Guide (PDF)](https://www.scootersoftware.com/BC4Help.pdf): Folder Sync, Table Compare, scripting reference (`folder-report layout:xml`, `text-report layout:patch`); version 4, so recheck these against the version 5 help
 - [Running Beyond Compare from removable media](https://www.scootersoftware.com/kb/removablemedia)
-- [Picture Compare: Blend Mode](https://www.scootersoftware.com/v5help/pix_how_to_compare.html)
+- [Picture Compare: How to Compare (tolerance, mismatch range and blend modes)](https://www.scootersoftware.com/v5help/pix_how_to_compare.html)
+- [Archive Files](https://www.scootersoftware.com/v5help/archive_files.html): formats and packer plug-ins
 - [Beyond Compare 5 change log](https://www.scootersoftware.com/download/v5changelog): 5.2.7, build 32913
 
 Araxis Merge:

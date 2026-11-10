@@ -2,13 +2,11 @@
 
 [English](README.md) | 繁體中文
 
+OxideMerge 是以 Rust 打造、免費且開放原始碼的跨平台差異比較與合併工具。名稱取自氧化鐵（iron oxide），也就是鐵鏽（rust）的成分；它讓檔案比較、資料夾同步與衝突解決更清楚、更安心。
+
+**看清每一處差異，安心合併每項變更。**
+
 ![Windows、macOS 與 Linux 上的 OxideMerge](images/banner.jpg)
-
-OxideMerge 是免費、開放原始碼的檔案與資料夾比較及合併工具，可在
-**Windows、macOS 與 Linux** 上執行。
-您可以用它檢視差異、整合修改內容，並解決合併衝突。
-
-OxideMerge 以 Rust 開發，可以比較文字、資料夾、二進位檔、影像與網頁。
 
 **[下載](https://github.com/kuopinghsu/OxideMerge/releases)** ·
 [使用者指南](docs/user-guide.zh-TW.adoc)（[PDF](docs/dist/oxidemerge-user-guide.zh-TW.pdf)） ·
@@ -190,7 +188,9 @@ OxideMerge 以 Rust 開發，可以比較文字、資料夾、二進位檔、影
 請從 [GitHub 發行頁面](https://github.com/kuopinghsu/OxideMerge/releases)下載適合您系統的
 套件。
 每個發行版本也附有英文與繁體中文 PDF 使用者指南。發行頁面會列出每個檔案的 SHA-256 檢查碼，
-方便您驗證下載的檔案。
+`SHA256SUMS` 檔案則列出全部的檢查碼，方便您驗證下載的檔案：在同時放有兩者的資料夾中，
+macOS 請執行 `shasum -a 256 -c --ignore-missing SHA256SUMS`，Linux 請執行
+`sha256sum -c --ignore-missing SHA256SUMS`。
 
 | 作業系統 | 支援版本 | 套件 |
 | --- | --- | --- |

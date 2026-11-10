@@ -164,6 +164,22 @@ cargo test --release --locked format_regression -- --nocapture
 它們也會確認結果與 Git 簽出及 Git 修補檔相容，因此必須安裝 Git。
 持續整合會在 Windows、Linux 與 macOS 上，於完整測試中執行這些檢查。
 
+### 翻譯檢查
+
+若 `lang/` 中的語言檔缺少 `lang/en.json` 的鍵、含有英文沒有的鍵、同一個鍵出現兩次、
+少了或多了 `{placeholder}`、提到的按鍵與英文不同（`Ctrl+V`、`F5`；德文的 *Strg* 視為 *Ctrl*），
+或將刪除、取代或遺失工作的警告留為英文，`i18n` 測試就會讓建置失敗。
+這些測試也會確認 `docs/user-guide.zh-TW.adoc`、`docs/development.zh-TW.md` 與 `README_zh-TW.md`
+的標題、層級與錨點都與英文文件相同，且使用者指南中的每個 `<<anchor>>` 都存在。
+另有一個視窗測試會以每種語言，在 800 × 600 的視窗中開啟復原提示與「選項」對話方塊，
+若有按鈕超出視窗或與其他按鈕重疊就會失敗。
+
+```sh
+cargo test --locked i18n::
+```
+
+這些測試無法判斷譯文是否自然，仍需由母語人士審閱。
+
 ### 隨機測試
 
 隨機測試失敗時會輸出一個種子值。可用此種子值重新執行相同案例，或執行更多案例：
@@ -179,6 +195,10 @@ OXIDEMERGE_TEST_CASES=20000 cargo test --release regress
 `scripts/gui-smoke.sh path/to/oxidemerge`。指令碼會檢查雙檔、三檔與資料夾比較。
 Linux 沒有顯示環境時，會自動啟動 Xvfb。設定 `OXIDEMERGE_SMOKE_REPORT=<file>` 後，
 程式會在比較完成時，將分頁與訊息寫入該檔案，然後關閉。
+
+在 Linux 與 macOS 上，指令碼也會以實際的程序檢查當機復原：先開啟復原功能啟動程式，
+等第一份快照寫入後以 `kill -9` 結束程式，再確認下次啟動時會提供兩個檔案的復原，
+且在使用者選擇之前保留快照。
 
 若要製作文件圖片，設定 `OXIDEMERGE_SCREENSHOT=<file.png>` 後，程式會在比較完成時，
 直接儲存它所繪製的視窗畫面（不需擷取螢幕），然後關閉。將 `OXIDEMERGE_SCREENSHOT_COMMAND`
@@ -240,11 +260,20 @@ Cargo 以離線方式執行，使用已下載到 `~/.cargo/registry` 的套件�
 - **Linux AppImage：** 在使用 glibc 2.28 的 AlmaLinux 8 上建置。
   套件內含 X11、Wayland 與鍵盤函式庫，系統缺少這些函式庫時才會使用。
   兩種處理器架構都會在 Ubuntu 22.04 與 AlmaLinux 8 上，檢查函式庫載入、指令列行為與視窗啟動。
-- **macOS：** 採用臨時簽署的通用應用程式，以 DMG 套件提供。
+- **macOS：** 以 DMG 套件提供的通用應用程式，由 `scripts/macos-sign.sh` 簽署：
+  沒有簽署機密時採用臨時簽署；五個 `MACOS_*` 機密都設定時，則以 Developer ID 簽署、公證並裝訂
+  （請參閱 [macOS 簽署](macos-signing.md)）。
   會驗證 Apple 晶片與 Intel 兩種程式碼，並透過 Rosetta 測試 Intel 程式。
+  接著 `scripts/macos-install-check.sh` 會像下載的檔案一樣，從 DMG 安裝應用程式
+  （安裝到獨立的「應用程式」資料夾並加上隔離標記），檢查 Gatekeeper 的判定
+  （臨時簽署時應被拒絕，Developer ID 簽署時應被接受為已公證），依 README 的說明清除標記，
+  執行程式後再移除。若該 Mac 已關閉 Gatekeeper，會說明此情況，不判斷其結果。
 - **說明文件：** 英文與繁體中文 PDF 指南。若字型缺少所需字元，文件建置會失敗。
 
 Windows 與 Linux 的 Arm64 套件會在實體 Arm 架構電腦上建置與測試，而非使用模擬環境。
+
+發布前，發行工作會以 `scripts/check-release.sh` 檢查下載的每個套件：壓縮檔必須能列出內容並解壓縮，
+AppImage 與 DMG 必須帶有其格式標記，PDF 必須完整。之後會將 `SHA256SUMS` 與套件一併發布。
 
 ## 版本發布
 
