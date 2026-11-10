@@ -391,6 +391,67 @@ Limits of this record:
   500 MiB pair, and no native window run.
 - Results were checked to be the same difference count; the unit tests compare diff content.
 
+## Large text results and release gates (2026-11-10)
+
+The working tree after the text memory changes, the background open with *Cancel*, the
+highlight limit and the bounded word-difference cache, run on the macOS aarch64 host above
+(Apple M2 Max, 12 threads, 32 GB, macOS 27.3 pre-release), three runs each, median time and
+highest peak memory, nothing else running:
+
+```sh
+OXIDEMERGE_BENCH_LARGE=3 OXIDEMERGE_BENCH_RUNS=3 \
+OXIDEMERGE_BENCH_ONLY=text-100mb,text-500mb,text-1gb,text-view-100mb,text-view-500mb,text-view-1gb,text-cancel-100mb,text-cancel-500mb \
+  cargo test --release --locked --bin oxidemerge bench -- --ignored --nocapture --test-threads 1
+```
+
+| Workload | Time | Peak | Result |
+| --- | ---: | ---: | --- |
+| text-100mb | 0.962 s | 552 MB | 15,086 differences |
+| text-500mb | 7.697 s | 2,663 MB | 74,725 differences |
+| text-1gb | 15.548 s | 5,441 MB | 152,307 differences |
+| text-view-100mb | 1.376 s | 674 MB | load 304 ms, compare 814 ms, first frame 37 ms, a scrolled frame 0.63 ms, a step 0.63 ms |
+| text-view-500mb | 9.476 s | 3,433 MB | load 1,566 ms, compare 6,607 ms, first frame 172 ms, a scrolled frame 4.03 ms, a step 3.85 ms |
+| text-view-1gb | 20.974 s | 7,016 MB | load 3,208 ms, compare 14,740 ms, first frame 412 ms, a scrolled frame 9.10 ms, a step 9.16 ms |
+| text-cancel-100mb | | | read again 307 ms; open 1,252 ms; stopped in 2 ms median, 5 ms worst; freed in 79 ms median, 83 ms worst |
+| text-cancel-500mb | | | read again 1,501 ms; open 7,546 ms; stopped in 1 ms median, 6 ms worst; freed in 378 ms median, 403 ms worst |
+
+The time and peak of the text-cancel workloads are those of ten opens in one process and are
+left out; their peak is also inflated by the allocator finding above.
+
+What the view holds, by kind (from `TextView::memory_use`, counted from sizes and
+capacities): at 1 GiB, lines 3,391 MiB, edit marks 234 MiB, rows 486 MiB, layout 1,448 MiB;
+at 500 MB, 1,656 + 114 + 237 + 713 MiB; at 100 MB, 331 + 23 + 47 + 155 MiB. Line ends,
+highlighting, word-level differences and undo history were 0 in these runs (one line-end
+style, no syntax for `.txt`, nothing scrolled into word-level differences yet, no edits). The
+lines are about half of the peak; a store that keeps them in one buffer is the next large
+reduction and has not been made (several hundred places read `lines`).
+
+Cancelling used to wait for the line diff: the 500 MB open, cancelled halfway through, took
+up to 2.1 s to stop. Checks inside the anchor search and the walk between anchors brought the
+worst case to 6 ms. Freeing what was built takes longer (0.4 s at 500 MB), but the window does
+not wait for it.
+
+### Release gates
+
+Measured on this host; other machines need a baseline of their own (`OXIDEMERGE_BENCH_SAVE`
+on the commit before, then `OXIDEMERGE_BENCH_BASELINE` on the change). A release candidate
+passes when, on the same host and inputs:
+
+| Gate | Limit | Now |
+| --- | --- | --- |
+| Time of each workload above (text-cancel excluded) | at most 1.25 × the table (`OXIDEMERGE_BENCH_TOLERANCE=1.25`) | — |
+| Peak of text-100mb / 500mb / 1gb | at most 610 / 2,930 / 5,990 MB (+10%) | 552 / 2,663 / 5,441 MB |
+| Peak of text-view-100mb / 500mb / 1gb | at most 745 / 3,780 / 7,720 MB (+10%) | 674 / 3,433 / 7,016 MB |
+| First frame | at most 100 ms at 100 MB, 500 ms at 1 GiB | 37 / 412 ms |
+| A scrolled frame and a step to the next difference | at most 16 ms (one frame at 60 Hz) at every size | 9.16 ms worst (1 GiB) |
+| Work stopped after *Cancel* | at most 50 ms at worst | 6 ms |
+| Memory freed after *Cancel* at 500 MB | at most 1 s | 0.40 s |
+| Difference count at 100 MB and 500 MB | exactly 15,086 and 74,725 | same |
+
+The harness checks only the time gate on its own; the others are read from its output. The
+1 GiB difference count is not a gate, because the line diff's deadline makes it vary (see
+the findings).
+
 ## Large UTF-8 text comparison
 
 On 2026-10-30, two 1 GiB UTF-8 inputs (`text-1gb`, deterministic generator seed 7, about

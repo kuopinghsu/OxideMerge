@@ -343,7 +343,8 @@ To work with tabs:
 
 To change the interface language, use *Options → General*, or start OxideMerge with `--lang`.
 
-To see the version, click the app logo or choose *Help → About OxideMerge*.
+To see the version, click the app logo or the name next to it, or choose
+*Help → About OxideMerge*.
 The dialog also shows a build identifier:
 
 * A development build shows a short Git hash.

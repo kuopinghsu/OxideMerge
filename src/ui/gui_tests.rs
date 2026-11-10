@@ -5619,6 +5619,25 @@ fn scrolling_reaches_a_row_the_list_has_not_drawn() {
 }
 
 #[test]
+fn the_logo_and_the_name_beside_it_open_the_about_dialog() {
+    let mut gui = Gui::start("about_logo", None);
+    gui.frames(3);
+    let name = gui
+        .widgets
+        .iter()
+        .find(|w| w.label == "OxideMerge" && w.rect.width() < 200.0)
+        .expect("the name shows next to the logo")
+        .rect;
+    gui.click_at(name.center());
+    assert!(gui.app.about, "the name opens About");
+    gui.app.about = false;
+    gui.frames(2);
+    let logo = egui::pos2(name.left() - 14.0, name.center().y);
+    gui.click_at(logo);
+    assert!(gui.app.about, "the logo opens About");
+}
+
+#[test]
 fn about_displays_the_build_identifier_and_keeps_the_calendar_copyright_year() {
     let mut gui = Gui::start("about_build", None);
     gui.menu(&[tr("menu.help"), tr("menu.about")]);
