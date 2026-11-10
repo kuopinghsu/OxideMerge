@@ -431,6 +431,33 @@ up to 2.1 s to stop. Checks inside the anchor search and the walk between anchor
 worst case to 6 ms. Freeing what was built takes longer (0.4 s at 500 MB), but the window does
 not wait for it.
 
+### Linux in Docker on the same Mac
+
+The same workloads, except the 1 GiB view, which needs about 7 GB, were run on Linux
+aarch64 (glibc) in a Docker VM on the same Mac (12 threads, 7.7 GiB for the VM), three runs
+each. It is the same CPU through a virtual machine, not a native Linux computer and not x86:
+use it for correctness and for memory, which the Linux kernel measures with glibc's
+allocator, not for Linux timings.
+
+| Workload | Time | Peak | Result |
+| --- | ---: | ---: | --- |
+| text-100mb | 2.263 s | 532 MB | 15,086 differences |
+| text-500mb | 13.444 s | 2,562 MB | 74,725 differences |
+| text-1gb | 16.448 s | 5,236 MB | 152,526 differences |
+| text-view-100mb | 1.593 s | 693 MB | load 356 ms, compare 942 ms, first frame 51 ms, a scrolled frame 0.84 ms, a step 0.83 ms |
+| text-view-500mb | 9.738 s | 3,207 MB | load 1,693 ms, compare 6,124 ms, first frame 242 ms, a scrolled frame 4.67 ms, a step 4.72 ms |
+| text-cancel-100mb | | 854 MB | stopped in 2 ms median, 5 ms worst; freed in 124 ms median, 126 ms worst |
+| text-cancel-500mb | | 3,577 MB | stopped in 2 ms median, 4 ms worst; freed in 362 ms median, 868 ms worst |
+
+- The difference counts match macOS up to 500 MB. At 1 GiB the count was a third value
+  (152,526), as the deadline finding predicts.
+- Peaks are within 8% of macOS for one open. The cancel workloads, ten opens in one process,
+  peak at 854 and 3,577 MB here against 1,774 and 7,095 MB on macOS: on Linux the memory of
+  one open is reused by the next.
+- The times are noisy: the engine alone (text-100mb, text-500mb) took longer than the view,
+  which does the same work and more, so the VM's timings are not reliable at this size.
+  Native Linux and Windows timings were not measured.
+
 ### Release gates
 
 Measured on this host; other machines need a baseline of their own (`OXIDEMERGE_BENCH_SAVE`

@@ -3367,6 +3367,7 @@ mod tests {
     // Pin the fixture's public host key in `oxidemerge-test-config/known_hosts` under the
     // test process's temporary directory, using the app's hexadecimal key format.
     // `docker/servers.sh` sets all of this up for the tests below.
+    #[cfg(unix)]
     #[test]
     #[ignore]
     fn smoke_test_against_a_local_sshd() {
