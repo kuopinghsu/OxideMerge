@@ -461,9 +461,13 @@ If the server's file changed or disappeared after you fetched it, the upload is 
 writing.
 
 Over SFTP, the upload goes to a hidden temporary file beside the original, named
-`.NAME.oxidemerge-new-...`, with the original's owner, group and permissions.
+`.NAME.oxidemerge-new-...` and ending in the original's extension (`.config.oxidemerge-new-....php`
+for `config.php`), so a web server never shows a script's source as text.
+Only you can read that copy until it is checked.
 OxideMerge then reads that copy back and compares it with the file here.
-Only a complete, matching copy replaces the original.
+Only a complete, matching copy is given the original's owner, group and permissions (set-user-ID
+and set-group-ID bits included) and replaces the original.
+If someone else puts another file or a link in the copy's place meanwhile, the save is refused.
 Just before the swap, OxideMerge checks again that nobody else changed the file on the server.
 So a dropped connection, a full disk or *Cancel* leaves the server's file as it was, and the
 message says so.
@@ -475,6 +479,10 @@ For that moment the file is missing, but it is never partly written.
 If the connection drops between the two renames, the message names the file that holds the
 other version, so you can check the server and rename it back if needed.
 A temporary file that could not be removed is named the same way, and you can delete it.
+If only the original renamed aside cannot be deleted once the new copy is in its place, the file
+is saved all the same, and a warning names the copy to delete.
+A connection that drops just after the new copy took the original's place does not fail the save
+either.
 
 A copy that replaces the original is a new file.
 It keeps the original's owner, group and permissions, but not its access-control lists (ACLs).
@@ -483,11 +491,12 @@ SFTP cannot show these, so OxideMerge cannot tell when a file has them.
 For a server where that matters, turn on *File → Save remote files in place*: *Save* then writes
 over the original in place, which keeps them.
 
-OxideMerge also writes in place, without asking, in three cases:
+OxideMerge also writes in place, without asking, in four cases:
 
 * The file belongs to someone else.
 * No new file can be created in its folder.
 * The server does not show who owns the file.
+* The server does not rename files.
 
 Over FTP, *Save* always writes in place, because FTP cannot set a new file's owner or
 permissions.
@@ -746,6 +755,7 @@ In the window, *Save* writes changes back to the server as described above.
 Without a window, what the run changed in a fetched copy, as a `sync` job does in its
 destination, is written back to the server after the run, with the same checks; a file that the
 server changed in the meantime is reported as an error (exit code 2).
+These writes follow *File → Save remote files in place* as saved in the settings.
 A synchronization that stopped part way without undoing all it changed (exit code 5) is undone
 in the fetched copy instead, and nothing is written back.
 A sync plan made with `--sync-plan` names a server folder by its address, so `--sync-apply`
@@ -2946,10 +2956,13 @@ OxideMerge keeps a snapshot of its open comparisons while it runs: their paths a
 selected difference, the line of the text cursor, the bookmarks, the size and modification time
 of each compared file, and the whole text of every side that has edits you have not saved.
 The snapshot is written every 5 seconds while a side has unsaved edits, and every 30 seconds
-otherwise, to a private `recovery` folder in the configuration folder (readable only by you on
+otherwise, to a private `recovery` folder beside the settings file (readable only by you on
 Linux and macOS), never next to the compared files.
+In portable mode, that folder is next to the program.
 Each running window has a snapshot of its own; it is deleted when the window closes normally, or
 when you turn the option off.
+Turning the option off, or starting with it off, also deletes the snapshots that windows which
+did not close normally left behind, without asking.
 
 When OxideMerge starts after a window did not close normally (a crash, a forced quit, a power
 cut), it asks what to do with the snapshot left behind:
@@ -2958,11 +2971,13 @@ cut), it asks what to do with the snapshot left behind:
   The restored sides are marked as modified and are written to the files only when you save them.
   A message names every compared file that changed since the snapshot, so you can check the
   restored edits against it before saving.
-  A comparison of the same files already open, with no edits, takes the text rather than
-  opening a second time.
+  A comparison of the same files already open as the same kind, with no edits, takes the text
+  rather than opening a second time.
   The unsaved text of a comparison whose files can no longer be opened (moved, deleted, or on
   a drive not connected) comes back in a new text compare, each side named after its file, to
-  save where you choose; the snapshot keeps that text and offers it again at the next start.
+  save where you choose.
+  Until you save it, that text is kept in this window's snapshot like any unsaved edit, so it is
+  offered again if this window does not close normally either.
 * *Show details* lists the snapshot's comparisons, which of their files changed since, and how
   many sides have unsaved edits.
 * *Discard* deletes the snapshot.
@@ -3126,8 +3141,8 @@ with.
 |Detail |What the report shows |Size and time
 
 |*Summary*
-|The counts, and where each difference is, without its lines. A folder report lists the files
-and their status, and reads none of them.
+|The counts, and where each difference is, without its lines (up to 20,000 differences; the rest
+are counted). A folder report lists the files and their status, and reads none of them.
 |About the size of the file list. A folder report takes no longer than the comparison.
 
 |*Standard* (default)
@@ -3142,6 +3157,8 @@ as both files together, and slow for a browser to open.
 
 Whatever the detail, a folder report shows the differences of files up to 16 MiB and 50,000 lines.
 Larger files are listed with the reason they are not shown, and are counted in the box.
+A folder report also stops showing differences once it holds 1 GiB of them: the rest of that
+file's diff blocks are counted, and the files after it are listed with that reason and not read.
 The detail applies to HTML reports. PDF reports have their own limit (see <<pdf-reports>>), and
 slideshows show up to 400 rows per difference.
 
@@ -5253,7 +5270,7 @@ Binary and image views also load the complete files.
   opened.
 * Syntax highlighting is turned off for a file larger than *Highlight files up to* in
   *Options → General* (16 MB by default), or with more than 3,125 lines for each of those MB
-  (50,000 lines at 16 MB), and a message says so.
+  (50,000 lines at 16 MB), and a message says which of the two limits the file is past.
   Raise the limit to highlight larger files; highlighting takes time and memory for every line.
 * Editing, undo, word wrap and unusual compare rules can still use more memory.
 --

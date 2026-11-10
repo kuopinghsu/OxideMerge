@@ -912,7 +912,16 @@ pub(crate) fn summary_reason(
     reason(it, n, diffs, unread, redact)
 }
 
-/// As [`summary_reason`]; `unread` says why no file was read, when none was.
+/// `bytes` as a whole number of GiB where it is one, else of MiB.
+fn size_label(bytes: usize) -> String {
+    if bytes >= 1 << 30 && bytes.is_multiple_of(1 << 30) {
+        format!("{} GiB", bytes >> 30)
+    } else {
+        format!("{} MiB", bytes >> 20)
+    }
+}
+
+/// As [`summary_reason`]; `unread` says why the file was not read, when it was not.
 fn reason(
     it: &DirItem,
     n: usize,
@@ -2031,12 +2040,22 @@ fn folder_report_within(
     let mut budget = limits.rows;
     let dopts = opts.cloned().unwrap_or_default();
     let anchors = file_anchors(&listed);
+    let bytes_size = size_label(limits.bytes);
     for (k, it) in listed.iter().enumerate() {
         let st = status_class(it.status);
         let rel = it.rel_path();
         let anchor = &anchors[k];
         let changed = matches!(st, "different" | "unique" | "error");
-        let diffs = shown_opts.map_or(FileDiffs::None, |o| file_diffs(it, roots, o));
+        // Past the byte limit no file is read: its differences would not be shown.
+        let full = files.len() >= limits.bytes;
+        let diffs = match shown_opts {
+            Some(o) if !full => file_diffs(it, roots, o),
+            _ => FileDiffs::None,
+        };
+        let unread = match shown_opts {
+            Some(_) if full => Some(trf("report.why_bytes", &[("size", bytes_size.clone())])),
+            _ => unread.clone(),
+        };
         let reads: Vec<ReadAs> = match &diffs {
             FileDiffs::Diffs(docs, _) => docs.iter().map(|d| ReadAs::of(d, &dopts)).collect(),
             _ => Vec::new(),
@@ -2045,7 +2064,7 @@ fn folder_report_within(
         let mut body = String::new();
         let mut badges = String::new();
         let (mut rendered, mut total) = (0, 0);
-        let why = reason(it, n, &diffs, unread.clone(), &redact);
+        let why = reason(it, n, &diffs, unread, &redact);
         if let FileDiffs::Diffs(docs, result) = &diffs {
             let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
             let list = hunks(result);
@@ -2323,10 +2342,7 @@ fn folder_report_within(
     if left_out_bytes > 0 {
         omissions.push(trf(
             "report.omit_bytes",
-            &[
-                ("n", left_out_bytes.to_string()),
-                ("size", format!("{} MiB", limits.bytes >> 20)),
-            ],
+            &[("n", left_out_bytes.to_string()), ("size", bytes_size)],
         ));
     }
     if cut_blocks > 0 {
@@ -2745,28 +2761,37 @@ mod tests {
         assert_eq!(whole.matches("class=\"hunk").count(), 150);
         assert!(whole.contains(&esc(tr("report.complete"))));
 
-        let bytes = 20_000;
+        // Reached part way through the first file: the rest of its blocks are left out, and the
+        // other two files are not read at all.
+        let bytes = whole.len() / 6;
         let html = with(bytes);
         let shown = html.matches("class=\"hunk").count();
-        assert!(shown > 0 && shown < 100, "{shown}");
+        assert!(shown > 0 && shown < 50, "{shown}");
         assert!(html.len() < whole.len() / 2);
         assert!(!html.contains(&esc(tr("report.complete"))));
         let omitted = trf(
             "report.omit_bytes",
-            &[
-                ("n", (150 - shown).to_string()),
-                ("size", format!("{} MiB", bytes >> 20)),
-            ],
+            &[("n", (50 - shown).to_string()), ("size", size_label(bytes))],
         );
         assert!(html.contains(&esc(&omitted)), "{html}");
         let left = format!(
             "<div class=\"v\">{}</div><div class=\"l\">{}</div>",
-            150 - shown,
+            50 - shown,
             esc(tr("report.blocks_left_out"))
         );
         assert!(html.contains(&left));
+        let unread = trf("report.why_bytes", &[("size", size_label(bytes))]);
+        assert_eq!(
+            html.matches(&format!("<div class=\"why\">{}</div>", esc(&unread)))
+                .count(),
+            2
+        );
+        let listed = trf("report.omit_summary", &[("n", "2".into())]);
+        assert!(html.contains(&esc(&listed)));
         // Whole lines and every row still, for what is shown.
         assert!(!html.contains(&esc(tr("report.shortened"))));
+        assert_eq!(size_label(REPORT_BYTES), "1 GiB");
+        assert_eq!(size_label(16 << 20), "16 MiB");
     }
 
     #[test]

@@ -13,8 +13,11 @@ uses its section of this file as the release notes.
   within a few milliseconds, even inside the line comparison of a 500 MB pair, without
   opening the tab.
 - **Highlight limit:** *Options → General → Highlight files up to* (16 MB by default) sets
-  the size above which a file is shown without syntax highlighting, and a message now says
-  when that happens instead of the colors silently missing.
+  the size above which a file is shown without syntax highlighting, as well as a file of more
+  than 3,125 lines for each of those MB. A message now says when that happens, and which of the
+  two limits the file is past, instead of the colors silently missing; a script without an
+  extension is recognized by its `#!` line for it. Changing only the limit no longer highlights
+  again a file within both the old limit and the new.
 - **Release checks:** every release now publishes `SHA256SUMS`, written after each package
   is checked as a whole file of its kind (archives list and decompress, AppImage and disk
   image marks, PDF start and end). The macOS app can be signed with a Developer ID,
@@ -30,16 +33,20 @@ uses its section of this file as the release notes.
   (`scripts/macos-install-check.sh`).
 - **Recovering unsaved work:** with *Options → General → Keep unsaved work for recovery*
   turned on (off by default), OxideMerge keeps a snapshot of its open comparisons and the
-  text of unsaved edits in a private `recovery` folder of its settings, every 5 seconds while
-  there are edits. After a window that did not close normally, the next start offers
-  *Restore*, *Show details*, *Discard* or *Later*. Restoring reopens the comparisons with the
-  unsaved text back in their sides, still unsaved, and names the files that changed since;
-  it never writes a compared file. The text cursor's line and the bookmarks come back too.
-  Unsaved text whose files can no longer be opened comes back in a new text compare and is
-  offered again at the next start. A running window locks its snapshot, so no other window
-  takes it for one left behind, however long it goes without writing. Snapshots keep at most 32 MB of unsaved text, five snapshots at most are kept, and one
-  written by a later version is not restored. *Keep for recovery* in a tab's context menu
-  leaves that one comparison out.
+  text of unsaved edits in a private `recovery` folder beside its settings file (next to the
+  program in portable mode), every 5 seconds while there are edits. After a window that did
+  not close normally, the next start offers *Restore*, *Show details*, *Discard* or *Later*.
+  Restoring reopens the comparisons with the unsaved text back in their sides, still unsaved,
+  and names the files that changed since; it never writes a compared file. The text cursor's
+  line and the bookmarks come back too. A comparison of the same files already open as the
+  same kind, unedited, takes the text instead of opening twice. Unsaved text whose files can
+  no longer be opened comes back in a new text compare, kept in this window's snapshot
+  until it is saved. A running window locks its snapshot, so no other window takes it for one
+  left behind, however long it goes without writing; where the folder cannot be locked, a
+  snapshot not written for 2 minutes is. Snapshots keep at most 32 MB of unsaved text, five
+  snapshots at most are kept, and one written by a later version is not restored. Turning the
+  option off, or starting with it off, deletes the snapshots left behind too. *Keep for
+  recovery* in a tab's context menu leaves that one comparison out.
 - **Compare over SFTP and FTP:** *File → Compare over SFTP/FTP...*, and a "Browse a server
   over SFTP/FTP" button beside every path on the start page and the *Open* dialog, connect
   to a server over SFTP, FTPS (explicit or implicit TLS) or plain FTP by host, port, user,
@@ -54,11 +61,16 @@ uses its section of this file as the release notes.
   the password or passphrase is never remembered this way. A fetched file is
   writable: *Save* re-uploads it to the server over a fresh connection, in the
   background with a *Cancel* button. Over SFTP it uploads a staged copy beside the file
-  first, with the original's owner, group and permissions. It reads the copy back to check it,
-  and renames it into place only once complete, so an interrupted save leaves the server's file
-  as it was. *File → Save remote files in place* writes over the file directly instead, keeping
-  access-control lists and hard links. FTP, a file owned by someone else, and a folder no file
-  can be created in always use that in-place write. You can cancel before writing starts. An upload is refused
+  first, readable only by you and ending in the original's extension, so a web server never
+  shows a script's source. It reads the copy back to check it, gives it the original's owner,
+  group and permissions (set-user-ID and set-group-ID bits included), refuses it if another
+  file or a link took its name meanwhile, and renames it into place only once complete, so an
+  interrupted save leaves the server's file as it was. An original renamed aside that cannot
+  be deleted afterwards does not fail the save, and a warning names it. *File → Save remote
+  files in place* writes over the file directly instead, keeping access-control lists and
+  hard links; command-line runs and jobs follow it too. FTP, a file owned by someone else, a
+  folder no file can be created in, a server that does not tell owners and one that renames
+  no files always use that in-place write. You can cancel before writing starts. An upload is refused
   when the file changed on the server since it was fetched, and the tab stays unsaved until an
   upload succeeds; closing it or quitting asks first. A fetched folder is writable too: *Save*
   uploads the files that are new or changed, creates new folders and deletes what was
@@ -356,7 +368,8 @@ uses its section of this file as the release notes.
   fingerprint first, so a file edited after the preview is never overwritten, copies
   through a verified temporary file, shows the item being changed, and keeps replaced and
   deleted files in a recovery journal outside both folders. A failure or *Stop* undoes the
-  changes; a synchronization cut short is offered for undoing at the next start.
+  changes, putting back a deleted folder with its permissions, and an empty one with its
+  modified time; a synchronization cut short is offered for undoing at the next start.
   File/folder clashes, folders renamed only in case and other names that differ only in
   case or in how accents on Latin letters are written are left alone, and so are symbolic
   links unless *Copy symbolic links as links* (`--sync-links`, `"copy_links"` in a job;
@@ -501,10 +514,13 @@ uses its section of this file as the release notes.
 
 - **HTML report detail:** *File → Export → HTML report detail* (`--report-detail`, and
   `report_detail` in job files) chooses *Summary*, *Standard* or *Full*. *Summary* lists where
-  each difference is without its lines, and a folder report made with it reads no file;
+  each difference is without its lines (up to 20,000 of them), and a folder report made with it
+  reads no file and says each file's differences are left out for that detail;
   *Standard* keeps the limits reports had (20,000 rows in all, 400 per diff block, 2,000
   characters per line); *Full* shows every row and whole lines, so the page grows with the
-  differences. Every HTML report, text reports included, now opens with a box that says
+  differences. At any detail, a folder report stops showing differences once it holds 1 GiB of
+  them, and does not read the files after that. Every HTML report, text reports included, now
+  opens with a box that says
   whether it is complete or counts the files, diff blocks and rows it left out or shortened, and
   states the policy it was exported with. A text report cut by its limit counts the differences left out
   in its stat cards too. Reports stay a single self-contained file; the guide explains why and
@@ -666,7 +682,9 @@ uses its section of this file as the release notes.
   found once on each side and compared gap by gap, and one 2-second limit used to cover all
   the gaps, so on a 1 GiB pair the gaps compared after it were shown coarsely and the result
   depended on the machine's speed. Each gap now has 2 seconds of its own (20 for the whole
-  file). A 1 GiB comparison takes about 1.5 s longer, for the finer result.
+  file) when the comparison runs in the background, where *Cancel* can stop it between gaps.
+  A comparison made again after an edit, which the window waits for, still has 2 seconds in
+  all. A 1 GiB comparison takes about 1.5 s longer, for the finer result.
 - **Undoing a synchronization the program ended in no longer fails on a folder it made:**
   when OxideMerge ended while a copy was still under its temporary name in a folder the
   synchronization had just created, the first attempt to undo it could not remove that folder

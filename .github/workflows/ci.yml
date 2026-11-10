@@ -534,12 +534,27 @@ jobs:
           test "$code" -eq 1 || { echo "::error::Expected exit code 1 for differing files, got $code"; exit 1; }
 
       - name: Install a virtual display
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           if command -v apt-get >/dev/null; then
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              xvfb libgl1 libglx-mesa0 libegl1 libegl-mesa0 libgl1-mesa-dri
+            # archive.ubuntu.com can stall for minutes from GitHub's runners; its Azure mirror
+            # does not. Arm64 packages come from ports.ubuntu.com, left as it is.
+            sed -i 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+              /etc/apt/sources.list
+            apt_options=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20)
+            for attempt in 1 2 3; do
+              if apt-get "${apt_options[@]}" update &&
+                DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y \
+                  --no-install-recommends \
+                  xvfb libgl1 libglx-mesa0 libegl1 libegl-mesa0 libgl1-mesa-dri; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::error::Ubuntu display dependency installation failed after 3 attempts"
+                exit 1
+              fi
+              sleep $((attempt * 5))
+            done
           else
             dnf_options=(
               --setopt=timeout=20 --setopt=retries=2 --setopt=minrate=100000
