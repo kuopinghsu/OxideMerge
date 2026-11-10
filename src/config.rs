@@ -49,12 +49,115 @@ impl TextLayout {
 /// A tab of the previous session: what was compared, and how.
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Default)]
 pub struct SessionTab {
+    /// The paths as text, to show; opened through [`SessionTab::paths`].
     pub paths: Vec<String>,
+    /// Where a path is not valid Unicode, which text cannot hold: for each of `paths`, the path
+    /// exactly as the system has it, `None` for one `paths` holds exactly. Empty when none is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw: Vec<Option<String>>,
     /// "text", "binary", "image" or "web"; none for folder compares.
     pub kind: Option<String>,
     /// Compare rules file of the tab when it has its own ("" = none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<String>,
+}
+
+impl SessionTab {
+    pub fn new(paths: &[PathBuf], kind: Option<String>, rules: Option<String>) -> SessionTab {
+        let raw: Vec<Option<String>> = paths
+            .iter()
+            .map(|p| p.to_str().is_none().then(|| encode_path(p)).flatten())
+            .collect();
+        SessionTab {
+            paths: paths.iter().map(|p| p.display().to_string()).collect(),
+            raw: if raw.iter().any(Option::is_some) {
+                raw
+            } else {
+                Vec::new()
+            },
+            kind,
+            rules,
+        }
+    }
+
+    /// The paths compared, exact also where they are not valid Unicode. One written by another
+    /// kind of system, which cannot name it, is taken as its text.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        self.paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                self.raw
+                    .get(i)
+                    .and_then(|r| r.as_deref())
+                    .and_then(decode_path)
+                    .unwrap_or_else(|| PathBuf::from(p))
+            })
+            .collect()
+    }
+}
+
+/// `path` as text: its bytes in hex after `u:` on Unix, its UTF-16 units after `w:` on Windows.
+fn encode_path(path: &std::path::Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        Some(
+            std::iter::once("u:".to_string())
+                .chain(bytes.iter().map(|b| format!("{b:02x}")))
+                .collect(),
+        )
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let units = path.as_os_str().encode_wide();
+        Some(
+            std::iter::once("w:".to_string())
+                .chain(units.map(|u| format!("{u:04x}")))
+                .collect(),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// The path [`encode_path`] wrote as `text` on this kind of system; `None` for another kind.
+fn decode_path(text: &str) -> Option<PathBuf> {
+    let units = |hex: &str, width: usize| -> Option<Vec<u32>> {
+        if !hex.len().is_multiple_of(width) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        (0..hex.len())
+            .step_by(width)
+            .map(|i| u32::from_str_radix(&hex[i..i + width], 16).ok())
+            .collect()
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let bytes = units(text.strip_prefix("u:")?, 2)?;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(
+            bytes.into_iter().map(|b| b as u8).collect(),
+        )))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let wide = units(text.strip_prefix("w:")?, 4)?;
+        Some(PathBuf::from(std::ffi::OsString::from_wide(
+            &wide.into_iter().map(|u| u as u16).collect::<Vec<_>>(),
+        )))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (text, units);
+        None
+    }
 }
 
 /// A named, saved set of tabs, for `File → Workspaces`: unlike [`Config::session`] (the one,
@@ -489,6 +592,47 @@ mod tests {
             merge_workspaces(&base, &ours, &theirs),
             vec![ws("A", 1), ws("b", 1), ws("gone", 1), ws("other", 1)]
         );
+    }
+
+    #[test]
+    fn session_paths_come_back_exactly_even_when_not_valid_unicode() {
+        #[cfg(unix)]
+        let odd = {
+            use std::os::unix::ffi::OsStringExt;
+            PathBuf::from(std::ffi::OsString::from_vec(b"/data/caf\xe9.txt".to_vec()))
+        };
+        #[cfg(windows)]
+        let odd = {
+            use std::os::windows::ffi::OsStringExt;
+            let mut wide: Vec<u16> = r"C:\data\caf".encode_utf16().collect();
+            wide.extend([0xd800, u16::from(b'.'), u16::from(b't')]);
+            PathBuf::from(std::ffi::OsString::from_wide(&wide))
+        };
+        let plain = PathBuf::from("/data/plain ✓.txt");
+        assert!(odd.to_str().is_none());
+
+        let tab = SessionTab::new(&[odd.clone(), plain.clone()], Some("text".into()), None);
+        let json = serde_json::to_string(&tab).unwrap();
+        let back: SessionTab = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.paths(), [odd, plain.clone()]);
+        assert_eq!(back.paths[1], plain.display().to_string());
+
+        let tab = SessionTab::new(std::slice::from_ref(&plain), None, None);
+        let json = serde_json::to_string(&tab).unwrap();
+        assert!(!json.contains("raw"), "{json}");
+
+        // Written before paths were kept exactly, or by another kind of system.
+        let old: SessionTab =
+            serde_json::from_str(r#"{"paths": ["/a.txt"], "kind": null}"#).unwrap();
+        assert_eq!(old.paths(), [PathBuf::from("/a.txt")]);
+        for other in ["x:00", "u:zz", "u:c", "u:+0", "w:d80", "w:+0d8"] {
+            let tab = SessionTab {
+                paths: vec!["/shown.txt".into()],
+                raw: vec![Some(other.into())],
+                ..Default::default()
+            };
+            assert_eq!(tab.paths(), [PathBuf::from("/shown.txt")], "{other}");
+        }
     }
 
     #[test]

@@ -26,6 +26,9 @@ pub struct Saved {
     pub deleted: usize,
     /// What could not be saved, one message each; everything else was.
     pub errors: Vec<String>,
+    /// Files saved, whose original renamed aside could not be removed from the server once
+    /// replaced: one message each, naming it for the user to delete.
+    pub left_over: Vec<String>,
 }
 
 /// The files and folders of a local copy, by their `/`-separated paths relative to it.
@@ -380,8 +383,9 @@ fn upload_file(
         }
         None => None,
     };
-    match r.put(local_path, path, expected, in_place, cancel) {
-        Ok(stamp) => {
+    match r.put_saved(local_path, path, expected, in_place, cancel) {
+        Ok(super::remote_stage::Saved { stamp, left_over }) => {
+            out.left_over.extend(left_over.map(|l| l.to_string()));
             out.manifest.files.insert(rel.to_string(), (stamp, hash));
             out.uploaded += 1;
             None

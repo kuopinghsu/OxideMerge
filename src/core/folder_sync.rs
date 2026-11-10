@@ -384,6 +384,23 @@ fn nanos(t: Option<SystemTime>) -> Option<u64> {
     u64::try_from(d.as_nanos()).ok()
 }
 
+/// Gives the folder `path` the time `modified`, in nanoseconds since 1970.
+fn set_dir_time(path: &Path, modified: u64) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    let folder = std::fs::File::open(path)?;
+    // Windows opens a folder only with FILE_FLAG_BACKUP_SEMANTICS, and its times only for
+    // writing.
+    #[cfg(windows)]
+    let folder = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(0x0200_0000)
+            .open(path)?
+    };
+    folder.set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(modified))
+}
+
 /// Opens a file for reading without following a symbolic link at its name.
 fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
@@ -1341,7 +1358,14 @@ struct Header {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Before {
     Missing,
-    Dir,
+    /// A folder, with its Unix permission bits and its time in nanoseconds since 1970, which
+    /// journals of earlier versions do not have.
+    Dir {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modified: Option<u64>,
+    },
     File {
         /// The copy in the journal, relative to it.
         backup: String,
@@ -2202,7 +2226,13 @@ fn step(
             {
                 return Err(changed_since_preview());
             }
-            journal.record(entry(Before::Dir, None))?;
+            let md = std::fs::symlink_metadata(dp)?;
+            #[cfg(unix)]
+            let mode = Some(std::os::unix::fs::PermissionsExt::mode(&md.permissions()) & 0o7777);
+            #[cfg(not(unix))]
+            let mode = None;
+            let modified = nanos(md.modified().ok());
+            journal.record(entry(Before::Dir { mode, modified }, None))?;
             recorded()?;
             if std::fs::remove_dir(dp).is_err() {
                 kept.push(o.path.clone());
@@ -2359,6 +2389,21 @@ fn roll_back(header: &Header, entries: &[Entry], fault: Faults) -> RollbackOutco
         }
     }
     remove_temporaries(&folders, &prefix);
+    // Last, as putting back the files in a folder changes its time.
+    for e in entries {
+        let Before::Dir {
+            modified: Some(t), ..
+        } = e.before
+        else {
+            continue;
+        };
+        let target = under(root, &e.path);
+        if !escapes(root, &e.path, &target)
+            && std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir())
+        {
+            let _ = set_dir_time(&target, t);
+        }
+    }
     out
 }
 
@@ -2438,9 +2483,19 @@ fn undo(dir: &Path, e: &Entry, target: &Path, prefix: &str) -> std::io::Result<b
                 _ => Err(not_ours()),
             }
         }
-        Before::Dir => match now.kind {
+        Before::Dir { mode, .. } => match now.kind {
             Kind::Dir => Ok(false),
-            Kind::Missing => std::fs::create_dir_all(target).map(|()| true),
+            Kind::Missing => {
+                std::fs::create_dir_all(target)?;
+                #[cfg(unix)]
+                if let Some(mode) = *mode {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))?;
+                }
+                #[cfg(not(unix))]
+                let _ = mode;
+                Ok(true)
+            }
             _ => Err(not_ours()),
         },
         Before::Moved { from, via } => {
@@ -3789,6 +3844,35 @@ mod tests {
     }
 
     #[test]
+    fn a_removed_folder_in_a_journal_of_an_earlier_version_is_still_read() {
+        let e: Entry = serde_json::from_str(r#"{"path":"gone","before":{"kind":"dir"}}"#).unwrap();
+        assert!(matches!(
+            e.before,
+            Before::Dir {
+                mode: None,
+                modified: None
+            }
+        ));
+        let line = serde_json::to_string(&Entry {
+            path: "gone".into(),
+            before: Before::Dir {
+                mode: Some(0o700),
+                modified: Some(7),
+            },
+            written: None,
+        })
+        .unwrap();
+        let back: Entry = serde_json::from_str(&line).unwrap();
+        assert!(matches!(
+            back.before,
+            Before::Dir {
+                mode: Some(0o700),
+                modified: Some(7)
+            }
+        ));
+    }
+
+    #[test]
     fn a_plan_made_again_after_a_file_was_only_touched_agrees() {
         let f = sample();
         let plan = make(&f, MIRROR);
@@ -4417,13 +4501,17 @@ mod tests {
         assert_eq!(tree(&f.roots[1]), before);
     }
 
-    /// Set for a copy of the test program that applies a plan and is killed part way.
-    /// Every path under `root` with its contents (folders as `/`), time and permissions.
+    /// Every path under `root` with its contents (folders as `/`), time and permissions. A
+    /// folder's time only for an empty one: putting back the files in a folder changes its
+    /// time, as it does that of every folder above a file changed, which are not put back.
     fn state(root: &Path) -> BTreeMap<String, (String, Option<SystemTime>, u32)> {
         tree(root)
             .into_iter()
-            .map(|(rel, (text, time))| {
+            .map(|(rel, (text, mut time))| {
                 let md = std::fs::symlink_metadata(root.join(&rel)).unwrap();
+                if md.is_dir() && std::fs::read_dir(root.join(&rel)).unwrap().next().is_none() {
+                    time = md.modified().ok();
+                }
                 #[cfg(unix)]
                 let mode = std::os::unix::fs::PermissionsExt::mode(&md.permissions()) & 0o7777;
                 #[cfg(not(unix))]
@@ -4441,24 +4529,33 @@ mod tests {
             .collect()
     }
 
-    /// The sample folders, with a file only renamed in the source (moved, not copied) and
-    /// destination files with their own permissions and times, to be put back as they were.
+    /// The sample folders, with a file only renamed in the source (moved, not copied), and
+    /// destination files and folders with their own permissions and times, among them an
+    /// empty private folder only the destination has, to be put back as they were.
     fn every_change() -> Folders {
         let f = sample();
         let (l, r) = (&f.roots[0], &f.roots[1]);
         write(l, "moved/new.txt", "moving\n");
         write(r, "was.txt", "moving\n");
+        std::fs::create_dir(r.join("private")).unwrap();
         let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
         for p in [l.join("moved/new.txt"), r.join("was.txt"), r.join("a.txt")] {
             let file = std::fs::File::options().write(true).open(&p).unwrap();
             file.set_modified(time).unwrap();
         }
         #[cfg(unix)]
-        for (p, mode) in [("a.txt", 0o640), ("old.txt", 0o600), ("gone/c.txt", 0o604)] {
+        for (p, mode) in [
+            ("a.txt", 0o640),
+            ("old.txt", 0o600),
+            ("gone/c.txt", 0o604),
+            ("gone", 0o700),
+            ("private", 0o700),
+        ] {
             use std::os::unix::fs::PermissionsExt;
             let perm = std::fs::Permissions::from_mode(mode);
             std::fs::set_permissions(r.join(p), perm).unwrap();
         }
+        set_dir_time(&r.join("private"), nanos(Some(time)).unwrap()).unwrap();
         f
     }
 
@@ -4590,6 +4687,7 @@ mod tests {
         assert!(temporaries(&f.roots[1]).is_empty());
     }
 
+    /// Set for a copy of the test program that applies a plan and is killed part way.
     const CHILD: &str = "OXIDEMERGE_TEST_SYNC_CHILD";
 
     /// Where a child process is killed, by name, for

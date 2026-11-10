@@ -288,26 +288,25 @@ mod tests {
         assert_eq!(placeholders("{b} of {a}, {} {X}"), ["{a}", "{b}"]);
     }
 
-    /// The keys a message names (`Ctrl+V`, `F5`), with the modifier names some languages
+    /// The keys a message names (`Ctrl+Shift+V`, `F5`), with the modifier names some languages
     /// translate (German *Strg*, *Umschalt*) read as the English ones, sorted.
     fn shortcuts(s: &str) -> Vec<String> {
         let re = regex::Regex::new(
-            r"\b(Ctrl|Strg|Alt|Shift|Umschalt|Cmd)\+([A-Za-z0-9]+)|\bF(\d{1,2})\b",
+            r"\b(?:(?:Ctrl|Strg|Alt|Shift|Umschalt|Cmd)\+)+[A-Za-z0-9]+|\bF\d{1,2}\b",
         )
         .unwrap();
         let mut v: Vec<String> = re
-            .captures_iter(s)
-            .map(|c| match (c.get(1), c.get(2), c.get(3)) {
-                (Some(m), Some(k), _) => {
-                    let m = match m.as_str() {
+            .find_iter(s)
+            .map(|m| {
+                m.as_str()
+                    .split('+')
+                    .map(|part| match part {
                         "Strg" => "Ctrl",
                         "Umschalt" => "Shift",
-                        m => m,
-                    };
-                    format!("{m}+{}", k.as_str())
-                }
-                (_, _, Some(n)) => format!("F{}", n.as_str()),
-                _ => unreachable!(),
+                        part => part,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("+")
             })
             .collect();
         v.sort();
@@ -327,6 +326,10 @@ mod tests {
             }
         }
         assert_eq!(shortcuts("Mit Strg+V oder F5, Alto"), ["Ctrl+V", "F5"]);
+        assert_eq!(
+            shortcuts("Strg+Umschalt+V, Ctrl+Alt+Shift+F12, Shift+F3"),
+            ["Ctrl+Alt+Shift+F12", "Ctrl+Shift+V", "Shift+F3"]
+        );
     }
 
     /// JSON lets a key appear twice, and the last one silently wins.

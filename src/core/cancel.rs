@@ -39,6 +39,12 @@ pub fn check() {
     }
 }
 
+/// Whether this thread runs a job, which can be stopped: work there may take longer than
+/// where nothing can stop it, such as on the UI thread.
+pub fn in_job() -> bool {
+    FLAG.with(|f| f.borrow().is_some())
+}
+
 /// Like [`check`], every `every` steps of a loop (a power of two), so that a loop of millions
 /// of short steps does not look at the flag on each.
 #[inline]
@@ -69,6 +75,8 @@ mod tests {
     fn a_job_stops_at_its_next_check_and_only_there() {
         let stop = Arc::new(AtomicBool::new(false));
         assert_eq!(run(stop.clone(), || 7), Some(7));
+        assert_eq!(run(stop.clone(), in_job), Some(true));
+        assert!(!in_job());
         let mut reached = 0;
         let flag = stop.clone();
         let out = run(stop, || {

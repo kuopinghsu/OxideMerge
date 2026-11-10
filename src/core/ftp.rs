@@ -1454,8 +1454,9 @@ mod tests {
         assert!(!f.is_dir);
         assert_eq!(f.stamp.unwrap().size, 5);
         std::fs::write(&f.local, "gamma 2").unwrap();
-        let stamp =
-            remote::upload(conn, &f.local, "/data/new/c.txt", f.stamp, None, &never).unwrap();
+        let stamp = remote::upload(conn, &f.local, "/data/new/c.txt", f.stamp, None, &never)
+            .unwrap()
+            .stamp;
         assert_eq!(read(data.join("new/c.txt")), "gamma 2");
         std::fs::write(data.join("new/c.txt"), "someone else's").unwrap();
         std::fs::write(&f.local, "gamma 3").unwrap();

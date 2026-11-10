@@ -961,7 +961,7 @@ fn a_recovered_comparison_comes_back_unsaved_and_never_written() {
             snapshot.tabs[0].unsaved[0], None,
             "the left side was not edited"
         );
-        recovery::write(&snaps, "session-1-1.json", &snapshot).unwrap();
+        recovery::write(&snaps, "session-1-1.json", snapshot).unwrap();
     }
     assert_eq!(
         read(&b),
@@ -977,10 +977,7 @@ fn a_recovered_comparison_comes_back_unsaved_and_never_written() {
     // Every file counts as large, so an ordinary open would go to another thread: a restore
     // must still put the unsaved text back into the tab it opens.
     gui.app.background_open_bytes = 1;
-    gui.app.recovery_offer = Some(RecoveryOffer {
-        found,
-        inspect: false,
-    });
+    gui.app.recovery_offer = Some(RecoveryOffer::new(found));
     gui.frames(2);
     assert!(gui.shows(tr("recovery.title")), "{}", gui.describe());
     gui.click(tr("recovery.inspect"));
@@ -1010,6 +1007,88 @@ fn a_recovered_comparison_comes_back_unsaved_and_never_written() {
         !snaps.join("session-1-1.json").exists(),
         "a restored snapshot is gone"
     );
+}
+
+/// A snapshot of `a` and `b` with `b` edited by copying the first difference over, written
+/// as `session-1-1.json` in `snaps` as a crashed program leaves it.
+fn leave_edited_snapshot(snaps: &Path, a: &Path, b: &Path) -> Vec<recovery::Found> {
+    let mut gui = Gui::start(
+        "recovery_left",
+        compare(&[a.to_path_buf(), b.to_path_buf()]),
+    );
+    gui.settle();
+    press(&mut gui, crate::ui::commands::Cmd::NextDiff);
+    press(&mut gui, crate::ui::commands::Cmd::CopyRight);
+    recovery::write(snaps, "session-1-1.json", gui.app.recovery_snapshot()).unwrap();
+    let later = std::time::SystemTime::now() + recovery::ABANDONED_AFTER;
+    recovery::abandoned(snaps, "session-2-2.json", later)
+}
+
+/// Unsaved text whose files can no longer be opened comes back in a new tab of its own, each
+/// side named after its file, and the snapshot is kept to offer again, at once, at the next
+/// start.
+#[test]
+fn recovered_text_of_a_missing_file_opens_untitled_and_stays_offered() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "same\nold\n"), ("b.txt", "same\nnew\n")]);
+    let (a, b) = (d.join("a.txt"), d.join("b.txt"));
+    let snaps = d.join("recovery");
+    let found = leave_edited_snapshot(&snaps, &a, &b);
+    assert_eq!(found.len(), 1);
+    std::fs::remove_file(&b).unwrap();
+
+    let mut gui = Gui::start("recovery_missing", None);
+    gui.app.recovery_offer = Some(RecoveryOffer::new(found));
+    gui.frames(2);
+    gui.click(tr("recovery.restore"));
+    gui.settle();
+
+    assert_eq!(gui.app.tabs.len(), 1, "{}", gui.describe());
+    let v = gui.text_view();
+    assert_eq!(v.panes[1].doc.lines, ["same", "old"]);
+    assert!(v.panes[1].doc.modified, "the recovered text is not saved");
+    let named = |p: &Path| Some(p.display().to_string());
+    assert_eq!(v.panes[0].doc.description, named(&a));
+    assert_eq!(v.panes[1].doc.description, named(&b));
+    assert!(!b.exists(), "restoring writes no file");
+    assert!(
+        gui.toasts()
+            .iter()
+            .any(|(_, t)| t.contains(&trf("recovery.kept", &[("n", "1".into())]))),
+        "{:?}",
+        gui.toasts()
+    );
+    let again = recovery::abandoned(&snaps, "session-2-2.json", std::time::SystemTime::now());
+    assert_eq!(again.len(), 1, "offered again at the next start");
+    let snapshot = again[0].snapshot.as_ref().unwrap();
+    assert_eq!(snapshot.tabs.len(), 1);
+    assert_eq!(snapshot.unsaved_sides(), 1);
+}
+
+/// Restoring into a program that already shows the same files, unedited, puts the unsaved text
+/// into that tab rather than opening a second one.
+#[test]
+fn a_recovered_comparison_reuses_an_unedited_tab_of_its_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "same\nold\n"), ("b.txt", "same\nnew\n")]);
+    let (a, b) = (d.join("a.txt"), d.join("b.txt"));
+    let snaps = d.join("recovery");
+    let found = leave_edited_snapshot(&snaps, &a, &b);
+
+    let mut gui = Gui::start("recovery_reuse", compare(&[a.clone(), b.clone()]));
+    gui.settle();
+    gui.app.recovery_offer = Some(RecoveryOffer::new(found));
+    gui.frames(2);
+    gui.click(tr("recovery.restore"));
+    gui.settle();
+
+    assert_eq!(gui.app.tabs.len(), 1, "{}", gui.describe());
+    let v = gui.text_view();
+    assert_eq!(v.panes[1].doc.lines, ["same", "old"]);
+    assert!(v.panes[1].doc.modified);
+    assert!(!snaps.join("session-1-1.json").exists());
 }
 
 /// In every language, on a small window, the buttons of the recovery prompt and of the
@@ -1058,13 +1137,10 @@ fn dialog_buttons_fit_a_small_window_in_every_language() {
             }
         };
 
-        gui.app.recovery_offer = Some(RecoveryOffer {
-            found: vec![recovery::Found {
-                path: "session-1-1.json".into(),
-                snapshot: Ok(snapshot.clone()),
-            }],
-            inspect: false,
-        });
+        gui.app.recovery_offer = Some(RecoveryOffer::new(vec![recovery::Found {
+            path: "session-1-1.json".into(),
+            snapshot: Ok(snapshot.clone()),
+        }]));
         gui.frames(3);
         check(
             &gui,
@@ -1460,28 +1536,34 @@ fn closing_a_menu_with_escape_leaves_the_focus_on_its_button() {
 }
 
 /// A command run from a menu that puts the focus somewhere (Find, into its field) keeps it
-/// there: the menu's button does not take it back.
+/// there: neither the menu's button nor what had the focus before the menu takes it back.
 #[test]
 fn a_menu_command_that_moves_the_focus_keeps_it() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     write(d, &[("a.txt", "one\ntwo\n"), ("b.txt", "one\n2\n")]);
-    let mut gui = Gui::start(
-        "menu_command_focus",
-        compare(&[d.join("a.txt"), d.join("b.txt")]),
-    );
-    gui.settle();
-    let find = tr(crate::ui::commands::Cmd::Find.label()).to_string();
-    gui.menu(&[tr("menu.edit"), &find]);
-    gui.frames(5);
-    let focus = gui.focus.clone();
-    assert!(
-        focus
-            .as_ref()
-            .is_some_and(|f| f.role == accesskit::Role::TextInput),
-        "the find field keeps the focus, not {:?}",
-        focus.as_ref().map(|f| (f.role, f.label.clone()))
-    );
+    for focused_before in [false, true] {
+        let mut gui = Gui::start(
+            "menu_command_focus",
+            compare(&[d.join("a.txt"), d.join("b.txt")]),
+        );
+        gui.settle();
+        if focused_before {
+            gui.tab_to("a button", |w| w.role == accesskit::Role::Button);
+            gui.frames(3);
+        }
+        let find = tr(crate::ui::commands::Cmd::Find.label()).to_string();
+        gui.menu(&[tr("menu.edit"), &find]);
+        gui.frames(8);
+        let focus = gui.focus.clone();
+        assert!(
+            focus
+                .as_ref()
+                .is_some_and(|f| f.role == accesskit::Role::TextInput),
+            "focused before: {focused_before}; the find field keeps the focus, not {:?}",
+            focus.as_ref().map(|f| (f.role, f.label.clone()))
+        );
+    }
 }
 
 #[test]
@@ -3421,6 +3503,57 @@ fn compare_over_sftp_from_the_start_page_fills_in_its_path_field_and_compares() 
     assert_eq!(gui.app.tabs.len(), 1);
     assert_eq!(gui.text_view().panes[0].doc.lines, ["one", "two"]);
     assert!(gui.app.pending_remote.is_empty(), "the fetch was claimed");
+
+    remote::fake::uninstall();
+}
+
+/// A fetched file large enough to open on another thread is still claimed by the comparison
+/// it opens: the tab knows where to upload it, and its staged copy lives as long as the tab.
+#[test]
+fn a_fetched_file_opened_in_the_background_stays_staged_for_its_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("b.txt", "one\ntwo\n")]);
+    remote::fake::install(remote::fake::Server::new().file("/srv/a.txt", "one\ntwo\n"));
+    let mut gui = Gui::start("compare_over_sftp_background", None);
+    gui.app.background_open_bytes = 1;
+
+    gui.app.start_remote_connect(RemoteTarget::Start(0));
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+        d.remote_path = "/srv/a.txt".to_string();
+    }
+    gui.frame();
+    gui.click(tr("btn.connect"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let staged = gui.app.start_paths[0].clone();
+
+    gui.app.start_paths[2] = dir.path().join("b.txt").display().to_string();
+    gui.frame();
+    // Clicked without settling, to catch the comparison while it is still being opened.
+    let at = gui.widget(tr("btn.compare")).rect.center();
+    gui.events.push(Event::PointerMoved(at));
+    gui.frame();
+    for pressed in [true, false] {
+        gui.events.push(Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        });
+        gui.frame();
+    }
+    assert_eq!(gui.app.opening.len(), 1, "opened on another thread");
+    assert!(gui.app.pending_remote.is_empty(), "the fetch was claimed");
+    gui.settle();
+    assert_eq!(gui.app.tabs.len(), 1, "{}", gui.describe());
+    assert_eq!(gui.text_view().panes[0].doc.lines, ["one", "two"]);
+    assert!(gui.app.tabs[0].remote[0].is_some(), "the tab can upload it");
+    gui.frames(3);
+    assert!(Path::new(&staged).is_file(), "the staged copy is kept");
 
     remote::fake::uninstall();
 }

@@ -156,7 +156,13 @@ impl TextDoc {
         }
         doc.mixed_eol = mixed;
         if mixed {
-            doc.original_eols = self::lines(text).map(|(_, eol)| eol).collect();
+            doc.original_eols = self::lines(text)
+                .enumerate()
+                .map(|(i, (_, eol))| {
+                    super::cancel::check_every(i, 1 << 16);
+                    eol
+                })
+                .collect();
         }
         doc.final_newline = nl || doc.lines.is_empty();
         doc
@@ -438,7 +444,9 @@ pub fn split_lines(s: &str) -> (Vec<String>, Option<Eol>, bool, bool) {
     let mut counts = EolCounts::default();
     let mut final_newline = false;
     let lines = lines(s)
-        .map(|(line, eol)| {
+        .enumerate()
+        .map(|(i, (line, eol))| {
+            super::cancel::check_every(i, 1 << 16);
             counts.add(eol);
             final_newline = eol.is_some();
             line.to_string()
@@ -465,6 +473,7 @@ pub fn load_doc(path: &Path, forced: Option<TextEncoding>) -> Result<TextDoc> {
     reader
         .read_to_end(&mut bytes)
         .with_context(|| format!("reading {}", path.display()))?;
+    super::cancel::check();
     Ok(doc_from_bytes(Some(path.to_path_buf()), &bytes, forced))
 }
 
@@ -553,6 +562,7 @@ pub fn doc_from_bytes(
     forced: Option<TextEncoding>,
 ) -> TextDoc {
     let (text, enc, bom) = decode(bytes, forced);
+    super::cancel::check();
     let mut doc = TextDoc::from_text(path, &text);
     doc.encoding = enc;
     doc.bom = bom;

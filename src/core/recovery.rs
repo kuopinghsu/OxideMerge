@@ -19,11 +19,16 @@ pub const MAX_TEXT: usize = 32 << 20;
 pub const KEEP: usize = 5;
 /// How often a running program writes its snapshot again, even unchanged.
 pub const BEAT: Duration = Duration::from_secs(30);
-/// A snapshot not written for this long belongs to a program that is no longer running.
+/// A snapshot without a lock file (see [`lock`]) not written for this long belongs to a
+/// program that is no longer running.
 pub const ABANDONED_AFTER: Duration = Duration::from_secs(120);
 
 const PREFIX: &str = "session-";
 const SUFFIX: &str = ".json";
+/// Beside a snapshot, the file its program holds locked for as long as it runs.
+const LOCK: &str = ".lock";
+/// What [`super::fsutil::write_atomic_with`] names a file being written.
+const WRITING: &str = ".oxidemerge-";
 
 /// The size and modification time of a compared file when the snapshot was written; the file
 /// is reported changed when either differs at the next start.
@@ -71,10 +76,10 @@ impl RecoveredTab {
     /// Which of the compared files changed (or appeared, or went away) since the snapshot.
     pub fn changed_sources(&self) -> Vec<bool> {
         self.tab
-            .paths
+            .paths()
             .iter()
             .enumerate()
-            .map(|(i, p)| self.sources.get(i).copied().flatten() != Fingerprint::of(Path::new(p)))
+            .map(|(i, p)| self.sources.get(i).copied().flatten() != Fingerprint::of(p))
             .collect()
     }
 }
@@ -111,9 +116,10 @@ impl Snapshot {
     }
 }
 
-/// The folder of the snapshots, in the settings folder.
+/// The folder of the snapshots, beside the settings file (next to the program in portable
+/// mode).
 pub fn dir() -> Option<PathBuf> {
-    crate::config::config_dir().map(|d| d.join("recovery"))
+    crate::config::config_path().and_then(|p| p.parent().map(|d| d.join("recovery")))
 }
 
 /// The file name of this run's snapshot: its process and start time, so two programs running
@@ -142,11 +148,56 @@ fn make_private(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn lock_path(snapshot: &Path) -> PathBuf {
+    let mut name = snapshot.as_os_str().to_owned();
+    name.push(LOCK);
+    PathBuf::from(name)
+}
+
+/// Locks the lock file of snapshot `name` in `dir`, for this program to hold as long as it
+/// runs: while it is held, no other program takes the snapshot for one left behind, however
+/// long ago it was written. `None` where it cannot be locked; age alone tells then.
+pub fn lock(dir: &Path, name: &str) -> Option<std::fs::File> {
+    make_private(dir).ok()?;
+    let file = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path(&dir.join(name)))
+        .ok()?;
+    file.try_lock().ok()?;
+    Some(file)
+}
+
+/// Whether a running program holds the lock of `snapshot`: `Some(true)` if so, `Some(false)`
+/// if its lock file is there but no longer held, `None` if it has none.
+fn held(snapshot: &Path) -> Option<bool> {
+    let file = std::fs::File::options()
+        .write(true)
+        .open(lock_path(snapshot))
+        .ok()?;
+    Some(matches!(
+        file.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ))
+}
+
+/// Fills in each tab's [`RecoveredTab::sources`] still to be read, off the window's thread:
+/// on a network share reading a file's details can take a while.
+fn fingerprint(snapshot: &mut Snapshot) {
+    for t in &mut snapshot.tabs {
+        if t.sources.is_empty() {
+            t.sources = t.tab.paths().iter().map(|p| Fingerprint::of(p)).collect();
+        }
+    }
+}
+
 /// Writes `snapshot` as `name` in `dir`, whole or not at all, then deletes the oldest snapshots
 /// of other runs past [`KEEP`].
-pub fn write(dir: &Path, name: &str, snapshot: &Snapshot) -> Result<()> {
+pub fn write(dir: &Path, name: &str, mut snapshot: Snapshot) -> Result<()> {
     make_private(dir)?;
-    let text = serde_json::to_vec(snapshot)?;
+    fingerprint(&mut snapshot);
+    let text = serde_json::to_vec(&snapshot)?;
     let path = dir.join(name);
     super::fsutil::write_atomic_with(&path, &text, false)?;
     #[cfg(unix)]
@@ -155,6 +206,15 @@ pub fn write(dir: &Path, name: &str, snapshot: &Snapshot) -> Result<()> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
     prune(dir, name);
+    Ok(())
+}
+
+/// Writes `snapshot`, what is left of one left behind, back as `name` in `dir` to offer again:
+/// beside a lock file no one holds, so the next start takes it for left behind at once rather
+/// than [`ABANDONED_AFTER`] after this write.
+pub fn keep(dir: &Path, name: &str, snapshot: Snapshot) -> Result<()> {
+    write(dir, name, snapshot)?;
+    drop(lock(dir, name));
     Ok(())
 }
 
@@ -180,9 +240,40 @@ fn others(dir: &Path, own: &str) -> Vec<(PathBuf, SystemTime)> {
     found
 }
 
+/// Deletes the oldest snapshots of programs no longer running past [`KEEP`], and what crashed
+/// programs left beside them: lock files without a snapshot, and files half written.
 fn prune(dir: &Path, own: &str) {
-    for (path, _) in others(dir, own).into_iter().skip(KEEP) {
-        let _ = std::fs::remove_file(path);
+    for (path, _) in others(dir, own)
+        .into_iter()
+        .filter(|(p, _)| held(p) != Some(true))
+        .skip(KEEP)
+    {
+        forget(&path);
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let path = e.path();
+        let stale = match name.strip_suffix(LOCK) {
+            Some(snapshot) => {
+                is_snapshot(snapshot)
+                    && !dir.join(snapshot).exists()
+                    && held(&dir.join(snapshot)) == Some(false)
+            }
+            None => {
+                name.starts_with(WRITING)
+                    && e.metadata().and_then(|m| m.modified()).is_ok_and(|at| {
+                        now.duration_since(at).unwrap_or_default() >= ABANDONED_AFTER
+                    })
+            }
+        };
+        if stale {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -194,12 +285,16 @@ pub struct Found {
     pub snapshot: Result<Snapshot, String>,
 }
 
-/// The snapshots in `dir` that no running program writes any more (none written for
-/// [`ABANDONED_AFTER`] before `now`), other than `own`, newest first.
+/// The snapshots in `dir` of programs no longer running, other than `own`, newest first: whose
+/// lock is no longer held or, without a lock file, not written for [`ABANDONED_AFTER`] before
+/// `now`.
 pub fn abandoned(dir: &Path, own: &str, now: SystemTime) -> Vec<Found> {
     others(dir, own)
         .into_iter()
-        .filter(|(_, at)| now.duration_since(*at).unwrap_or_default() >= ABANDONED_AFTER)
+        .filter(|(path, at)| match held(path) {
+            Some(held) => !held,
+            None => now.duration_since(*at).unwrap_or_default() >= ABANDONED_AFTER,
+        })
         .map(|(path, _)| {
             let snapshot = read(&path);
             Found { path, snapshot }
@@ -220,30 +315,81 @@ fn read(path: &Path) -> Result<Snapshot, String> {
     }
 }
 
-/// Deletes a snapshot: discarded, restored, or this run's own at a normal exit.
+/// Deletes this run's own snapshot while it runs, keeping its lock.
 pub fn remove(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Keeps the unsaved text of each side while the total stays within [`MAX_TEXT`]; returns the
-/// text kept for each side and how many sides were left out.
-pub fn within_budget(sides: Vec<Option<String>>, used: &mut usize) -> (Vec<Option<String>>, usize) {
-    let mut left_out = 0;
-    let kept = sides
-        .into_iter()
-        .map(|s| {
-            s.and_then(|text| {
-                if *used + text.len() > MAX_TEXT {
-                    left_out += 1;
-                    None
-                } else {
-                    *used += text.len();
-                    Some(text)
-                }
-            })
-        })
-        .collect();
-    (kept, left_out)
+/// Deletes a snapshot and its lock file: discarded, restored, or this run's own at a normal
+/// exit, once its lock is let go.
+pub fn forget(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(lock_path(path));
+}
+
+/// Deletes every snapshot of a program no longer running, for recovery turned off: unsaved
+/// text is then not kept on disk at all.
+pub fn forget_abandoned(dir: &Path, own: &str) {
+    for found in abandoned(dir, own, SystemTime::now() + ABANDONED_AFTER) {
+        forget(&found.path);
+    }
+    prune(dir, own);
+}
+
+/// Writes one program's snapshot on other threads, in the order asked: a write that would
+/// finish after a later write, or after the snapshot was removed, is dropped.
+#[derive(Default)]
+pub struct Writer {
+    asked: u64,
+    done: std::sync::Arc<std::sync::Mutex<u64>>,
+}
+
+impl Writer {
+    pub fn write(&mut self, dir: PathBuf, name: String, snapshot: Snapshot) {
+        std::thread::spawn(self.queue(dir, name, snapshot));
+    }
+
+    /// The write of `snapshot`, in its place in the order asked, to run when it will.
+    fn queue(
+        &mut self,
+        dir: PathBuf,
+        name: String,
+        snapshot: Snapshot,
+    ) -> impl FnOnce() + Send + 'static {
+        self.asked += 1;
+        let (at, done) = (self.asked, self.done.clone());
+        move || {
+            let mut done = done.lock().unwrap_or_else(|e| e.into_inner());
+            if *done < at {
+                let _ = write(&dir, &name, snapshot);
+                *done = at;
+            }
+        }
+    }
+
+    /// Removes the snapshot at `path` once any write under way has finished, and keeps writes
+    /// asked for before from bringing it back. With `lock`, its lock file goes too.
+    pub fn remove(&mut self, path: &Path, lock: bool) {
+        self.asked += 1;
+        let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        *done = self.asked;
+        if lock {
+            forget(path);
+        } else {
+            remove(path);
+        }
+    }
+}
+
+/// Whether a side's unsaved text of about `len` bytes still fits in the [`MAX_TEXT`] a snapshot
+/// keeps, `used` already; if so, it counts towards `used`. Asked before the text is made, so a
+/// side too large is never copied.
+pub fn within_budget(len: usize, used: &mut usize) -> bool {
+    let fits = used.saturating_add(len) <= MAX_TEXT;
+    if fits {
+        *used += len;
+    }
+    fits
 }
 
 #[cfg(test)]
@@ -252,11 +398,11 @@ mod tests {
 
     fn tab(paths: &[&Path], unsaved: Vec<Option<String>>) -> RecoveredTab {
         RecoveredTab {
-            tab: SessionTab {
-                paths: paths.iter().map(|p| p.display().to_string()).collect(),
-                kind: Some("text".into()),
-                rules: None,
-            },
+            tab: SessionTab::new(
+                &paths.iter().map(|p| p.to_path_buf()).collect::<Vec<_>>(),
+                Some("text".into()),
+                None,
+            ),
             sources: paths.iter().map(|p| Fingerprint::of(p)).collect(),
             unsaved,
             block: Some(1),
@@ -281,7 +427,7 @@ mod tests {
             0,
             0,
         );
-        write(&dir, "session-1-1.json", &snap).unwrap();
+        write(&dir, "session-1-1.json", snap.clone()).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -353,10 +499,10 @@ mod tests {
         let dir = d.path();
         for i in 0..KEEP + 3 {
             let name = format!("session-{i}-{i}.json");
-            write(dir, &name, &Snapshot::new(Vec::new(), 0, 0)).unwrap();
+            write(dir, &name, Snapshot::new(Vec::new(), 0, 0)).unwrap();
             age(&dir.join(&name), Duration::from_secs(1000 - i as u64));
         }
-        write(dir, "session-own-0.json", &Snapshot::new(Vec::new(), 0, 0)).unwrap();
+        write(dir, "session-own-0.json", Snapshot::new(Vec::new(), 0, 0)).unwrap();
         let left: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -368,11 +514,96 @@ mod tests {
         assert!(!left.contains(&"session-0-0.json".to_string()));
 
         let mut used = MAX_TEXT - 10;
-        let (kept, out) = within_budget(
-            vec![Some("12345".into()), None, Some("too much text".into())],
-            &mut used,
+        assert!(within_budget(5, &mut used));
+        assert!(!within_budget(13, &mut used));
+        assert_eq!(used, MAX_TEXT - 5);
+        assert!(within_budget(5, &mut used));
+        assert!(!within_budget(usize::MAX, &mut used));
+    }
+
+    #[test]
+    fn a_held_lock_keeps_a_snapshot_however_old_and_a_dropped_one_offers_it_at_once() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        let name = "session-1-1.json";
+        let held = lock(dir, name).unwrap();
+        write(dir, name, Snapshot::new(Vec::new(), 0, 0)).unwrap();
+        age(&dir.join(name), ABANDONED_AFTER * 2);
+        assert!(abandoned(dir, "x", SystemTime::now()).is_empty());
+        forget_abandoned(dir, "x");
+        assert!(
+            dir.join(name).exists(),
+            "a running program's snapshot is kept"
         );
-        assert_eq!(kept, [Some("12345".into()), None, None]);
-        assert_eq!(out, 1);
+
+        write(dir, name, Snapshot::new(Vec::new(), 0, 0)).unwrap();
+        drop(held);
+        assert_eq!(abandoned(dir, "x", SystemTime::now()).len(), 1);
+        forget(&dir.join(name));
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+
+        keep(dir, "session-2-2.json", Snapshot::new(Vec::new(), 0, 0)).unwrap();
+        assert_eq!(abandoned(dir, "x", SystemTime::now()).len(), 1);
+    }
+
+    #[test]
+    fn the_writer_keeps_the_last_write_and_a_removal_beats_writes_under_way() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().to_path_buf();
+        let path = dir.join("session-1-1.json");
+        let mut w = Writer::default();
+        let queue = |w: &mut Writer, left_out| {
+            w.queue(
+                dir.clone(),
+                "session-1-1.json".into(),
+                Snapshot::new(Vec::new(), 0, left_out),
+            )
+        };
+        let (first, second) = (queue(&mut w, 1), queue(&mut w, 2));
+        second();
+        first();
+        assert_eq!(read(&path).unwrap().left_out, 2, "the later write stays");
+
+        let late = queue(&mut w, 3);
+        w.remove(&path, false);
+        late();
+        assert!(
+            !path.exists(),
+            "a write asked before the removal never brings it back"
+        );
+
+        w.write(
+            dir.clone(),
+            "session-1-1.json".into(),
+            Snapshot::new(Vec::new(), 0, 4),
+        );
+        let start = std::time::Instant::now();
+        while *w.done.lock().unwrap() < w.asked {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            read(&path).unwrap().left_out,
+            4,
+            "written on another thread"
+        );
+    }
+
+    #[test]
+    fn pruning_removes_stale_lock_files_and_old_half_written_files() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        let stale = dir.join("session-1-1.json.lock");
+        std::fs::write(&stale, "").unwrap();
+        let _running = lock(dir, "session-2-2.json").unwrap();
+        let (old, new) = (dir.join(".oxidemerge-old"), dir.join(".oxidemerge-new"));
+        std::fs::write(&old, "half").unwrap();
+        std::fs::write(&new, "half").unwrap();
+        age(&old, ABANDONED_AFTER * 2);
+        write(dir, "session-own-0.json", Snapshot::new(Vec::new(), 0, 0)).unwrap();
+        assert!(!stale.exists());
+        assert!(dir.join("session-2-2.json.lock").exists(), "still held");
+        assert!(!old.exists());
+        assert!(new.exists(), "possibly still being written");
     }
 }
