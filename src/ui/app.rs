@@ -911,7 +911,9 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
                 ui.end_row();
             }
         });
-    ui.horizontal(|ui| {
+    // Wrapped, as the labels are long in some languages: one row would widen the dialog past
+    // a small window.
+    ui.horizontal_wrapped(|ui| {
         if widgets::ghost_icon_button(ui, Icon::Plus, tr("rules.new")).clicked() {
             edit = Some(None);
         }
@@ -933,7 +935,11 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
                 import = files;
             }
         }
-        ui.add_enabled_ui(!d.rule_sets.is_empty(), |ui| {
+        // A plain disabled button when there is nothing to export: a disabled menu needs a
+        // nested layout, which a wrapped row squeezes into a narrow column.
+        if d.rule_sets.is_empty() {
+            ui.add_enabled(false, egui::Button::new(tr("rules.export")));
+        } else {
             ui.menu_button(tr("rules.export"), |ui| {
                 widgets::menu_scroll(ui, |ui| {
                     for set in &d.rule_sets {
@@ -949,7 +955,7 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
                     }
                 });
             });
-        });
+        }
     });
     // Another action disarms a delete waiting to be confirmed, and replaces an earlier note.
     if edit.is_some() || !import.is_empty() || export.is_some() {
@@ -8329,19 +8335,22 @@ impl OxideMergeApp {
                 ui.add_space(64.0);
             }
             let logo = widgets::logo(ui, 22.0);
-            if ui
-                .interact(logo.rect, logo.id.with("about"), Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(tr("menu.about"))
-                .clicked()
-            {
-                self.about = true;
-            }
+            let mut brand = logo.rect;
             // Narrow windows give the name's room to the menus and icons.
             if ui.available_width() > 640.0 {
-                ui.label(
-                    egui::RichText::new("OxideMerge").font(theme::semibold(theme::size::SUBTITLE)),
-                );
+                let name =
+                    egui::RichText::new("OxideMerge").font(theme::semibold(theme::size::SUBTITLE));
+                brand = brand.union(ui.add(egui::Label::new(name).selectable(false)).rect);
+            }
+            let about = ui
+                .interact(brand, logo.id.with("about"), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(tr("menu.about"));
+            about.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Button, true, tr("menu.about"))
+            });
+            if about.clicked() {
+                self.about = true;
             }
             ui.add_space(12.0);
             let bar_bottom = ui.max_rect().bottom();

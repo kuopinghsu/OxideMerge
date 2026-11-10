@@ -10,7 +10,8 @@ uses its section of this file as the release notes.
 - **Large comparisons open in the background:** text files that add up to 32 MB or more are
   read and compared on another thread. An *Opening* window names the file and counts the
   seconds while the rest of the window stays usable, and its *Cancel* button stops the work
-  (in about 25 ms for a 10 MB pair) without opening the tab.
+  within a few milliseconds, even inside the line comparison of a 500 MB pair, without
+  opening the tab.
 - **Highlight limit:** *Options → General → Highlight files up to* (16 MB by default) sets
   the size above which a file is shown without syntax highlighting, and a message now says
   when that happens instead of the colors silently missing.
@@ -645,9 +646,14 @@ uses its section of this file as the release notes.
   measures its column widths once, so scrolling a page with a table of 1,500 rows takes
   about 2 ms a frame instead of 35 ms. The pages are converted, lined up and compared on
   the loading thread, so opening a large page no longer holds up the window.
+- **About from the title bar:** clicking the name *OxideMerge* next to the logo opens the
+  About dialog too, as clicking the logo does. Screen readers name the two as a button.
 
 ### Fixed
 
+- **The Rules tab of Options fits a small window:** in French, Japanese, Russian, Spanish
+  and Portuguese its row of buttons widened the dialog past an 800 × 600 window when no rules
+  file existed yet. The row now wraps.
 - **Undoing a synchronization the program ended in no longer fails on a folder it made:**
   when OxideMerge ended while a copy was still under its temporary name in a folder the
   synchronization had just created, the first attempt to undo it could not remove that folder
