@@ -530,12 +530,26 @@ fn popups(gui: &Gui) -> Vec<Rect> {
     })
 }
 
-/// Whether one of the File menu's submenus is at `at`, in sight or not.
-fn file_submenu_at(gui: &Gui, at: Pos2) -> bool {
+/// The buttons of the File menu's submenus, in sight or not.
+fn file_submenus(gui: &Gui) -> impl Iterator<Item = &Widget> {
     let submenus = ["menu.projects_jobs", "menu.workspaces", "menu.export"];
     gui.widgets
         .iter()
-        .any(|w| w.rect.contains(at) && submenus.iter().any(|k| named(w, tr(k))))
+        .filter(move |w| submenus.iter().any(|k| named(w, tr(k))))
+}
+
+/// Whether one of the File menu's submenus is at `at`, in sight or not.
+fn file_submenu_at(gui: &Gui, at: Pos2) -> bool {
+    file_submenus(gui).any(|w| w.rect.contains(at))
+}
+
+/// A point of `area` over one of the File menu's submenus, in sight or not. Not simply the
+/// middle of `area`: where the buttons fall depends on the system's fonts.
+fn file_submenu_within(gui: &Gui, area: Rect) -> Option<Pos2> {
+    file_submenus(gui)
+        .map(|w| w.rect.intersect(area))
+        .find(|r| r.is_positive())
+        .map(|r| r.center())
 }
 
 /// The named widgets of an accessibility tree, in drawing order.
@@ -960,6 +974,9 @@ fn a_recovered_comparison_comes_back_unsaved_and_never_written() {
     let found = recovery::abandoned(&snaps, "session-2-2.json", later);
     assert_eq!(found.len(), 1);
     let mut gui = Gui::start("recovery_restore", None);
+    // Every file counts as large, so an ordinary open would go to another thread: a restore
+    // must still put the unsaved text back into the tab it opens.
+    gui.app.background_open_bytes = 1;
     gui.app.recovery_offer = Some(RecoveryOffer {
         found,
         inspect: false,
@@ -1146,7 +1163,26 @@ fn menus_and_options_fit_a_small_window_in_every_language() {
             gui.key(Modifiers::NONE, Key::Escape);
             gui.frames(3);
         }
-        for (tab, _, name) in OptTab::ALL {
+        // The Rules tab is laid out differently with and without rules files: both are
+        // checked, whatever files other tests left in the settings folder.
+        let long_rules = vec![crate::core::rules::RuleSet {
+            name: "Generated logs and build output of the nightly pipeline".into(),
+            description: "Ignores timestamps, build numbers and absolute paths".into(),
+            ..Default::default()
+        }];
+        let cases = OptTab::ALL.iter().flat_map(|&(tab, _, name)| {
+            let rules: &[Option<&str>] = if matches!(tab, OptTab::Rules) {
+                &[Some("no rules"), Some("rules")]
+            } else {
+                &[None]
+            };
+            rules.iter().map(move |&r| (tab, name, r))
+        });
+        for (tab, key, rules) in cases {
+            let name = match rules {
+                Some(r) => format!("{key} ({r})"),
+                None => key.to_string(),
+            };
             let behind: Vec<(String, Rect)> = gui
                 .controls
                 .iter()
@@ -1154,6 +1190,13 @@ fn menus_and_options_fit_a_small_window_in_every_language() {
                 .collect();
             let on_top = |w: &Widget| !behind.iter().any(|(l, r)| *l == w.label && *r == w.rect);
             gui.app.open_options(tab);
+            if let (Some(r), Some(d)) = (rules, gui.app.options_dlg.as_mut()) {
+                d.rule_sets = if r == "rules" {
+                    long_rules.clone()
+                } else {
+                    Vec::new()
+                };
+            }
             gui.frames(4);
             let Some(&dialog) = popups(&gui)
                 .iter()
@@ -1180,6 +1223,28 @@ fn menus_and_options_fit_a_small_window_in_every_language() {
     assert!(found.is_empty(), "{found:#?}");
 }
 
+/// Reopening a saved session waits for each tab, large ones too: it counts what opened and
+/// picks the tab to show from them.
+#[test]
+fn a_restored_session_opens_large_comparisons_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "one\ntwo\n"), ("b.txt", "one\n2\n")]);
+    let mut gui = Gui::start("session_large", None);
+    gui.app.background_open_bytes = 1;
+    let tab = SessionTab {
+        paths: vec![
+            d.join("a.txt").display().to_string(),
+            d.join("b.txt").display().to_string(),
+        ],
+        ..Default::default()
+    };
+    let (active, failed) = gui.app.open_saved_tabs(&[tab], 0);
+    assert_eq!((active, failed), (Some(0), 0));
+    assert_eq!(gui.app.tabs.len(), 1);
+    assert!(gui.app.opening.is_empty(), "nothing left on another thread");
+}
+
 /// Large files open on another thread: the window keeps drawing, a *Cancel* button shows,
 /// and the tab opens once the comparison is done. A cancelled one never opens, not even after
 /// a later comparison has.
@@ -1204,9 +1269,22 @@ fn large_comparisons_open_in_the_background_and_can_be_cancelled() {
         .open(compare(&[d.join("a.txt"), d.join("b.txt")]).unwrap());
     assert_eq!(gui.app.tabs.len(), 0, "not opened on the window's thread");
     assert_eq!(gui.app.opening.len(), 1);
+    assert!(gui.app.busy(), "a running open counts as busy");
+    let names = |a: &str, b: &str| {
+        vec![
+            d.join(a).display().to_string(),
+            d.join(b).display().to_string(),
+        ]
+    };
+    let recent = |g: &Gui, paths: &Vec<String>| g.app.cfg.recent_compares.contains(paths);
+    assert!(
+        !recent(&gui, &names("a.txt", "b.txt")),
+        "remembered only once it opens"
+    );
     gui.wait_until("the background comparison", |g| g.app.tabs.len() == 1);
     assert!(gui.app.opening.is_empty());
     assert_eq!(gui.text_view().panes[1].doc.lines, ["one", "three"]);
+    assert!(recent(&gui, &names("a.txt", "b.txt")));
 
     gui.app
         .open(compare(&[d.join("big-a.txt"), d.join("big-b.txt")]).unwrap());
@@ -1227,6 +1305,10 @@ fn large_comparisons_open_in_the_background_and_can_be_cancelled() {
         gui.app.tabs.len(),
         2,
         "the cancelled comparison never opens"
+    );
+    assert!(
+        !recent(&gui, &names("big-a.txt", "big-b.txt")),
+        "nor is it remembered"
     );
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
     assert!(!gui.shows(tr("open.title")));
@@ -4244,11 +4326,9 @@ fn submenus_out_of_sight_or_under_an_arrow_do_not_open() {
     }
     assert!(under, "no submenu went under the arrow");
     // Scrolled down, the submenus near its top are out of sight, over the menu bar.
-    assert!(
-        file_submenu_at(&gui, file.center()),
-        "no submenu went out of sight under the File button"
-    );
-    gui.events.push(Event::PointerMoved(file.center()));
+    let hidden = file_submenu_within(&gui, file)
+        .expect("no submenu went out of sight under the File button");
+    gui.events.push(Event::PointerMoved(hidden));
     gui.frames(10);
     assert_eq!(popups(&gui).len(), 1, "a submenu out of sight opened");
     // One in sight opens as ever.
@@ -4274,12 +4354,16 @@ fn submenus_kept_from_opening_under_the_pointer_still_take_the_keyboard() {
     let at = egui::pos2(menu.center().x, menu.bottom() - 12.0);
     gui.events.push(Event::PointerMoved(at));
     gui.frames(60);
-    // The pointer left where the submenus near the top went out of sight.
+    // The pointer left where the submenus near the top went out of sight, once they stop.
     gui.events.push(Event::PointerMoved(file.center()));
+    gui.frames(10);
+    let hidden = file_submenu_within(&gui, file)
+        .expect("no submenu went out of sight under the File button");
+    gui.events.push(Event::PointerMoved(hidden));
     gui.frames(3);
     assert!(
-        file_submenu_at(&gui, file.center()),
-        "no submenu went out of sight under the File button"
+        file_submenu_at(&gui, hidden),
+        "the submenu under the File button moved away"
     );
     let mut reached = Vec::new();
     for _ in 0..40 {

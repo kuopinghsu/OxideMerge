@@ -1367,6 +1367,9 @@ pub struct TextView {
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     inline_cache: HashMap<usize, [Vec<Range<usize>>; 3]>,
+    /// Rows asked for in this frame (at most a quarter of [`INLINE_CACHE_ROWS`]): kept when the
+    /// cache makes room, so that two places drawn in one frame do not push each other out.
+    inline_frame: HashSet<usize>,
     edit: Option<EditState>,
     /// The column selection made by Alt+dragging, if any (boxed: it is rare).
     pub col_sel: Option<Box<ColSel>>,
@@ -1509,6 +1512,7 @@ impl TextView {
             undo: Vec::new(),
             redo: Vec::new(),
             inline_cache: HashMap::new(),
+            inline_frame: HashSet::new(),
             edit: None,
             col_sel: None,
             caret: None,
@@ -5699,15 +5703,21 @@ impl TextView {
     }
 
     fn ensure_inline(&mut self, r: usize) {
+        let near = INLINE_CACHE_ROWS / 4;
+        if self.inline_frame.len() < near {
+            self.inline_frame.insert(r);
+        }
         if self.inline_cache.contains_key(&r) || self.opts.inline == InlineMode::Off {
             return;
         }
         // Bounded: past the limit, rows far from this one go and are worked out again when
         // they are shown again. Scrolling through a file of millions of changed lines would
-        // otherwise keep the inline differences of every line seen.
+        // otherwise keep the inline differences of every line seen. Rows already asked for in
+        // this frame stay, as they are about to be drawn.
         if self.inline_cache.len() >= INLINE_CACHE_ROWS {
-            let near = INLINE_CACHE_ROWS / 4;
-            self.inline_cache.retain(|&k, _| k.abs_diff(r) < near);
+            let frame = &self.inline_frame;
+            self.inline_cache
+                .retain(|&k, _| k.abs_diff(r) < near || frame.contains(&k));
         }
         let row = self.diff.rows[r];
         let mut out: [Vec<Range<usize>>; 3] = Default::default();
@@ -9599,6 +9609,7 @@ impl TextView {
     }
 
     pub fn ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
+        self.inline_frame.clear();
         self.settle_diff_for_input(ui.ctx());
         if self.text_layout != cfg.text_layout {
             self.text_layout = cfg.text_layout;
@@ -12069,13 +12080,36 @@ mod tests {
         v.ensure_inline(5);
         let first = v.inline_cache[&5].clone();
         assert!(!first[0].is_empty(), "row 5 has inline differences");
+        // Scrolled through, a frame's worth of rows at a time.
         for r in 0..v.diff.rows.len() {
+            if r % 100 == 0 {
+                v.inline_frame.clear();
+            }
             v.ensure_inline(r);
             assert!(v.inline_cache.len() <= INLINE_CACHE_ROWS);
         }
         assert!(!v.inline_cache.contains_key(&5), "row 5 was let go");
         v.ensure_inline(5);
         assert_eq!(v.inline_cache[&5], first);
+
+        // A frame that draws two places far apart keeps both, even with the cache full.
+        v.inline_cache.clear();
+        v.inline_frame.clear();
+        for r in 0..INLINE_CACHE_ROWS {
+            v.ensure_inline(r);
+            if r % 100 == 0 {
+                v.inline_frame.clear();
+            }
+        }
+        assert_eq!(v.inline_cache.len(), INLINE_CACHE_ROWS);
+        v.inline_frame.clear();
+        let shown: Vec<usize> = (100..150).collect();
+        for &r in &shown {
+            v.ensure_inline(r);
+        }
+        v.ensure_inline(n - 10);
+        assert!(shown.iter().all(|r| v.inline_cache.contains_key(r)));
+        assert!(v.inline_cache.contains_key(&(n - 10)));
     }
 
     /// A file past the highlighting budget of the options is shown plain, the status bar says

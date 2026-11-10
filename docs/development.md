@@ -293,8 +293,9 @@ packages:
   `scripts/macos-install-check.sh` then installs the app from the DMG as a download would
   arrive (into an Applications folder of its own, with the quarantine flag), checks
   Gatekeeper's verdict (rejected when ad hoc, accepted as notarized with a Developer ID),
-  clears the flag as the README says, runs the program, and removes it again. On a Mac
-  where Gatekeeper is turned off, it says so and does not judge the verdict.
+  clears the flag as the README says, runs the program, and removes it again, checking
+  that it left nothing behind. Where Gatekeeper is turned off it only warns; in CI it turns
+  Gatekeeper on first and fails if it cannot (`INSTALL_CHECK_GATEKEEPER=require`).
 - **Documentation:** the English and Traditional Chinese PDF guides. The build fails if a
   font is missing characters.
 

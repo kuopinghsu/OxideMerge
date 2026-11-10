@@ -13,7 +13,12 @@
 # 4. For an ad hoc build, the README's workaround (`xattr -dr com.apple.quarantine`) clears
 #    the flag.
 # 5. The installed program runs and compares files, with settings in a folder of its own.
-# 6. Removing it as the README says leaves nothing of it behind.
+# 6. Removing it as the README says leaves nothing of it behind: no file of its own in the
+#    Applications folder, and nothing new named after it in ~/Library or the temporary folder.
+#
+# Where Gatekeeper is turned off its verdict means nothing, and the check says so and goes on.
+# With INSTALL_CHECK_GATEKEEPER=require (as in CI) it turns Gatekeeper on first (sudo -n), and
+# fails if it cannot, rather than passing without having checked.
 #
 # This is not a clean machine: Gatekeeper's first-launch dialog and the Open Anyway button
 # cannot be clicked from a script, so that part stays a manual check before a release.
@@ -54,9 +59,16 @@ xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;" "$app"
 xattr -p com.apple.quarantine "$app" >/dev/null || fail "the quarantine flag was not set"
 
 echo "3. Gatekeeper"
+# Read whole into a string, so that `grep -q` cannot cut the pipe short under pipefail.
+gatekeeper_off() { grep -q disabled <<<"$(spctl --status 2>&1)"; }
+if gatekeeper_off && [ "${INSTALL_CHECK_GATEKEEPER:-}" = require ]; then
+  echo "   Gatekeeper is turned off; turning it on"
+  sudo -n spctl --master-enable 2>/dev/null || sudo -n spctl --global-enable 2>/dev/null || true
+  ! gatekeeper_off || fail "Gatekeeper is turned off and could not be turned on, so its verdict cannot be checked"
+fi
 verdict=$(spctl --assess --type execute -vv "$app" 2>&1) && accepted=1 || accepted=0
 echo "$verdict" | sed 's/^/   /'
-if grep -q 'override=security disabled' <<<"$verdict" || spctl --status 2>&1 | grep -q disabled; then
+if grep -q 'override=security disabled' <<<"$verdict" || gatekeeper_off; then
   # With assessments turned off (spctl --master-disable) every app is accepted, so the
   # verdict says nothing about the build. Say so rather than pass or fail on it.
   echo "::warning::install check: Gatekeeper is turned off on this Mac; its verdict was not checked"
@@ -83,6 +95,9 @@ if [ "$expect" = ad-hoc ]; then
 fi
 
 echo "5. the installed program"
+# Anything of OxideMerge's written from here on is newer than this file.
+since=$work/since
+touch "$since"
 bin=$app/Contents/MacOS/oxidemerge
 export OXIDEMERGE_CONFIG_DIR=$work/settings
 "$bin" --version
@@ -93,7 +108,16 @@ code=0
 codesign --verify --strict "$app" || fail "the installed app's signature does not verify"
 
 echo "6. removed"
+# As the README says: the app, then its settings folder (here the one it was given).
 rm -rf "$app" "$OXIDEMERGE_CONFIG_DIR"
 [ -z "$(ls -A "$apps")" ] || fail "something was left in the Applications folder: $(ls -A "$apps")"
-[ ! -e "$OXIDEMERGE_CONFIG_DIR" ] || fail "the settings folder was left"
+# What the program may have written past the settings folder it was given: preferences,
+# caches, saved window state, settings, or temporary folders of its own.
+places=()
+for d in "$HOME/Library/Application Support" "$HOME/Library/Caches" "$HOME/Library/Preferences" \
+  "$HOME/Library/Saved Application State" "${TMPDIR:-/tmp}"; do
+  [ -d "$d" ] && places+=("$d")
+done
+left=$(find "${places[@]}" -maxdepth 1 -newer "$since" -iname '*oxidemerge*' 2>/dev/null || true)
+[ -z "$left" ] || fail "the program left files outside its settings folder: $left"
 echo "install check: ok ($expect)"

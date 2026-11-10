@@ -138,11 +138,15 @@ Applications folder of its own with the quarantine flag a browser sets, checks G
 verdict (`spctl --assess` must reject an ad hoc app, which is why the README asks for Open
 Anyway, and accept a Developer ID app as notarized), clears the flag with the README's
 `xattr -dr` command, runs the program on the sample files with settings in a folder of its
-own, and removes it, checking that nothing is left. On a Mac where Gatekeeper is turned
-off (`spctl --status` says "assessments disabled") every app is accepted, so the script
-prints a warning instead of judging the verdict. That was the case on the Mac it was
-written on, so the rejection has not been seen yet; the macOS runner, where Gatekeeper is on,
-is the first place that checks it.
+own, and removes it, checking that nothing of it is left in the Applications folder and
+nothing new named after it in `~/Library` (Application Support, Caches, Preferences, Saved
+Application State) or the temporary folder. On a Mac where Gatekeeper is turned off
+(`spctl --status` says "assessments disabled") every app is accepted, so the script prints a
+warning instead of judging the verdict. In CI it runs with `INSTALL_CHECK_GATEKEEPER=require`:
+it turns Gatekeeper on with `sudo -n spctl --master-enable` if the runner has it off, and
+fails if that does not work, so a green job means the verdict was checked. Gatekeeper was
+off on the Mac the script was written on, so the ad hoc rejection has not been seen yet, and
+whether the hosted runner allows turning it on is only known once the job runs.
 
 What it cannot do: click through the first-launch dialog and Open Anyway, or start from a
 system that has never run OxideMerge, so the manual test above is still needed before a

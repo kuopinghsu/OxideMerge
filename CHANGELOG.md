@@ -653,7 +653,14 @@ uses its section of this file as the release notes.
 
 - **The Rules tab of Options fits a small window:** in French, Japanese, Russian, Spanish
   and Portuguese its row of buttons widened the dialog past an 800 × 600 window when no rules
-  file existed yet. The row now wraps.
+  file existed yet, and in every language a rules file with a long name or description did
+  the same. The row now wraps, and long names and descriptions are shortened (in full on
+  hover).
+- **Very large comparisons give the same result on every run:** files are split at lines
+  found once on each side and compared gap by gap, and one 2-second limit used to cover all
+  the gaps, so on a 1 GiB pair the gaps compared after it were shown coarsely and the result
+  depended on the machine's speed. Each gap now has 2 seconds of its own (20 for the whole
+  file). A 1 GiB comparison takes about 1.5 s longer, for the finer result.
 - **Undoing a synchronization the program ended in no longer fails on a folder it made:**
   when OxideMerge ended while a copy was still under its temporary name in a folder the
   synchronization had just created, the first attempt to undo it could not remove that folder

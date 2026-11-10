@@ -725,7 +725,7 @@ fn line_ops(
     alg: DiffAlgorithm,
 ) -> Vec<(DiffTag, Range<usize>, Range<usize>)> {
     // Past the deadline Myers settles for a coarser diff instead of freezing the window.
-    let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+    let deadline = Some(std::time::Instant::now() + GAP_DEADLINE);
     // LCS needs a table of a.len() * b.len() entries, which the deadline does not bound.
     let alg = if alg == DiffAlgorithm::Lcs && (a.len() as u64) * (b.len() as u64) > 25_000_000 {
         DiffAlgorithm::Myers
@@ -739,18 +739,27 @@ fn line_ops(
     if !anchored {
         return ops_between(a, b, (0, 0), alg, deadline);
     }
+    // Each gap between anchors has a deadline of its own, so that how finely one is compared
+    // does not depend on how long the gaps before it took (on a large file, on the machine's
+    // speed). The whole walk still has a limit, for files that are hard everywhere.
+    let started = std::time::Instant::now();
+    let gap_deadline =
+        || Some((std::time::Instant::now() + GAP_DEADLINE).min(started + WALK_DEADLINE));
     let mut out = Vec::new();
     let (mut pa, mut pb) = (0, 0);
     for (k, (ia, ib)) in unique_anchors(a, b).into_iter().enumerate() {
         super::cancel::check_every(k, 1 << 12);
         let (ia, ib) = (ia as usize, ib as usize);
-        out.extend(ops_between(
-            &a[pa..ia],
-            &b[pb..ib],
-            (pa, pb),
-            DiffAlgorithm::Myers,
-            deadline,
-        ));
+        // Most anchors follow one another: no gap, and no clock to read for it.
+        if ia > pa || ib > pb {
+            out.extend(ops_between(
+                &a[pa..ia],
+                &b[pb..ib],
+                (pa, pb),
+                DiffAlgorithm::Myers,
+                gap_deadline(),
+            ));
+        }
         // Adjacent anchors are a single equal run, not millions of tiny operations.
         if let Some((DiffTag::Equal, a, b)) = out
             .last_mut()
@@ -768,12 +777,18 @@ fn line_ops(
         &b[pb..],
         (pa, pb),
         DiffAlgorithm::Myers,
-        deadline,
+        gap_deadline(),
     ));
     out
 }
 
 const ANCHOR_MIN_LINES: usize = 10_000;
+
+/// How long Myers may take over one comparison, or one gap between anchors of a large file,
+/// before it settles for a coarser result.
+const GAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long the gaps of one large file may take together.
+const WALK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Lines that occur exactly once in `a` and once in `b`, paired, keeping the longest run of
 /// pairs that is in order on both sides.

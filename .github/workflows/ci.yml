@@ -743,7 +743,8 @@ jobs:
           # Signed, notarized, stapled and checked by Gatekeeper; or, ad hoc, only verified.
           bash scripts/macos-sign.sh dmg "dist/$name.dmg"
           # Installed as a download would be, judged by Gatekeeper, run and removed again.
-          bash scripts/macos-install-check.sh "dist/$name.dmg" "$signing"
+          # Gatekeeper is turned on first if the runner has it off; the job fails if it can't be.
+          INSTALL_CHECK_GATEKEEPER=require bash scripts/macos-install-check.sh "dist/$name.dmg" "$signing"
 
           ls -l dist
           echo "name=$name" >> "$GITHUB_OUTPUT"
