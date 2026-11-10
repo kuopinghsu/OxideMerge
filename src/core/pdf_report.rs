@@ -2502,6 +2502,7 @@ mod tests {
             filter: "*.csv;*.bin;*.txt".into(),
             scope: None,
             hide_paths: true,
+            detail: Default::default(),
         };
         LINES.with(|l| l.set(Some(40)));
         let pdf = folder_pdf(

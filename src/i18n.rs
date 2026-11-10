@@ -288,6 +288,156 @@ mod tests {
         assert_eq!(placeholders("{b} of {a}, {} {X}"), ["{a}", "{b}"]);
     }
 
+    /// The keys a message names (`Ctrl+V`, `F5`), with the modifier names some languages
+    /// translate (German *Strg*, *Umschalt*) read as the English ones, sorted.
+    fn shortcuts(s: &str) -> Vec<String> {
+        let re = regex::Regex::new(
+            r"\b(Ctrl|Strg|Alt|Shift|Umschalt|Cmd)\+([A-Za-z0-9]+)|\bF(\d{1,2})\b",
+        )
+        .unwrap();
+        let mut v: Vec<String> = re
+            .captures_iter(s)
+            .map(|c| match (c.get(1), c.get(2), c.get(3)) {
+                (Some(m), Some(k), _) => {
+                    let m = match m.as_str() {
+                        "Strg" => "Ctrl",
+                        "Umschalt" => "Shift",
+                        m => m,
+                    };
+                    format!("{m}+{}", k.as_str())
+                }
+                (_, _, Some(n)) => format!("F{}", n.as_str()),
+                _ => unreachable!(),
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn translations_name_the_same_keys() {
+        let en = english();
+        for (code, text) in EMBEDDED {
+            for (k, v) in parse(text) {
+                assert_eq!(
+                    shortcuts(en[&k]),
+                    shortcuts(v),
+                    "{code}: {k} names other keys than English: {v}"
+                );
+            }
+        }
+        assert_eq!(shortcuts("Mit Strg+V oder F5, Alto"), ["Ctrl+V", "F5"]);
+    }
+
+    /// JSON lets a key appear twice, and the last one silently wins.
+    #[test]
+    fn language_files_name_each_key_once() {
+        for (code, text) in EMBEDDED {
+            let mut seen = std::collections::HashSet::new();
+            for line in text.lines() {
+                let Some(rest) = line.trim_start().strip_prefix('"') else {
+                    continue;
+                };
+                let Some(end) = rest.find("\":") else {
+                    continue;
+                };
+                assert!(
+                    seen.insert(&rest[..end]),
+                    "{code}: {} is given twice",
+                    &rest[..end]
+                );
+            }
+        }
+    }
+
+    /// Warnings before something is deleted, replaced or lost are translated in every
+    /// language, apart from the areas deliberately left in English.
+    #[test]
+    fn warnings_of_lost_work_are_translated() {
+        let en = english();
+        let risky =
+            regex::Regex::new(r"(?i)delet|overwrit|discard|replac|undone|\blos[et]").unwrap();
+        let english_on_purpose = ["analysis.", "workspace.", "baseline.", "impact."];
+        for (code, text) in EMBEDDED.iter().filter(|(c, _)| *c != "en") {
+            let t = parse(text);
+            let left: Vec<&String> = en
+                .iter()
+                .filter(|(k, v)| {
+                    risky.is_match(v)
+                        && !english_on_purpose.iter().any(|p| k.starts_with(p))
+                        && t.get(*k) == Some(*v)
+                })
+                .map(|(k, _)| k)
+                .collect();
+            assert!(
+                left.is_empty(),
+                "{code} leaves these warnings in English: {left:?}"
+            );
+        }
+    }
+
+    /// The structure of a document: its headings' levels and its anchors, in order.
+    fn outline(path: &str) -> Vec<String> {
+        let text =
+            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+                .unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut code = false;
+        text.lines()
+            .filter_map(|l| {
+                if l.starts_with("```") || l == "----" {
+                    code = !code;
+                }
+                if code {
+                    return None;
+                }
+                let level = l.bytes().take_while(|&b| b == b'=' || b == b'#').count();
+                if level > 0 && l[level..].starts_with(' ') {
+                    return Some(format!("h{level}"));
+                }
+                l.strip_prefix("[[")
+                    .and_then(|a| a.strip_suffix("]]"))
+                    .map(|a| format!("[[{a}]]"))
+            })
+            .collect()
+    }
+
+    /// The English and Traditional Chinese documents have the same sections, at the same
+    /// levels, with the same anchors, and every cross reference in a user guide leads to one.
+    #[test]
+    fn english_and_chinese_documents_keep_the_same_structure() {
+        for (en, zh) in [
+            ("docs/user-guide.adoc", "docs/user-guide.zh-TW.adoc"),
+            ("docs/development.md", "docs/development.zh-TW.md"),
+            ("README.md", "README_zh-TW.md"),
+        ] {
+            let (a, b) = (outline(en), outline(zh));
+            assert!(a.len() > 10, "{en} has an outline");
+            if let Some(i) = (0..a.len().max(b.len())).find(|&i| a.get(i) != b.get(i)) {
+                panic!(
+                    "{zh} differs from {en} at item {i}: {:?} against {:?}",
+                    b.get(i.saturating_sub(1)..(i + 2).min(b.len())),
+                    a.get(i.saturating_sub(1)..(i + 2).min(a.len()))
+                );
+            }
+        }
+        let xref = regex::Regex::new(r"<<([A-Za-z0-9_-]+)[,>]").unwrap();
+        for guide in ["docs/user-guide.adoc", "docs/user-guide.zh-TW.adoc"] {
+            let anchors = outline(guide);
+            let text = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(guide),
+            )
+            .unwrap();
+            for c in xref.captures_iter(&text) {
+                let target = format!("[[{}]]", &c[1]);
+                assert!(
+                    anchors.contains(&target),
+                    "{guide}: <<{}>> leads nowhere",
+                    &c[1]
+                );
+            }
+        }
+    }
+
     #[test]
     fn chinese_packs_keep_to_their_script() {
         // Simplified and Traditional forms of common characters in the interface.

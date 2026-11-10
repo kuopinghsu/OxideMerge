@@ -597,6 +597,35 @@ mod tests {
         }
     }
 
+    /// No key runs two commands, on macOS (where ⌘ and Control are different keys) or on
+    /// Windows and Linux (where the command key is Control), so a shortcut never does
+    /// something else on another system.
+    #[test]
+    fn no_key_runs_two_commands_on_any_system() {
+        for mac in [true, false] {
+            let pressed = |b: &Binding| {
+                let m = b.key.modifiers;
+                let (ctrl, command) = if mac {
+                    (m.ctrl, m.command || m.mac_cmd)
+                } else {
+                    (m.ctrl || m.command, false)
+                };
+                (ctrl, command, m.alt, m.shift, b.key.logical_key)
+            };
+            for (i, a) in BINDINGS.iter().enumerate() {
+                for b in &BINDINGS[i + 1..] {
+                    assert!(
+                        a.cmd == b.cmd || pressed(a) != pressed(b),
+                        "{} runs both {:?} and {:?} (macOS: {mac})",
+                        a.written,
+                        a.cmd,
+                        b.cmd
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn shift_variants_are_tried_first() {
         for (i, b) in BINDINGS.iter().enumerate() {

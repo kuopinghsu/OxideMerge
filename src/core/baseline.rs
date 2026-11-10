@@ -746,6 +746,7 @@ pub fn html_report(summary: &ReleaseSummary, left: &Capture, right: &Capture) ->
                 &summary.left.rules,
                 &[],
                 "Captured baseline comparison options",
+                super::report::ReportDetail::Standard,
             );
             let escaped = esc(&html);
             if out.len() + escaped.len() <= 16 << 20 {

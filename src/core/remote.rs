@@ -29,7 +29,7 @@
 //! GUI tests.
 
 use crate::i18n::{tr, trf};
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -152,6 +152,11 @@ pub struct ConnOptions {
     pub client_cert: Option<PathBuf>,
     /// The certificate's private key (PEM), when it is not in the certificate's file.
     pub client_key: Option<PathBuf>,
+    /// Whether *Save* writes an existing file over in place, rather than replacing it through
+    /// a staged copy where its owner, group and permissions can be kept (see
+    /// [`super::remote_stage`]). For servers with access-control lists or hard links, which a
+    /// replacement would lose. FTP always writes in place.
+    pub in_place: bool,
     /// SFTP only: whether the port was written out, so that it wins over the `Port` of
     /// `~/.ssh/config` even when it is 22. Otherwise only another port does.
     pub port_given: bool,
@@ -1916,12 +1921,15 @@ pub(crate) struct Listed {
 /// What saving a file or a folder needs from the server, besides reading it.
 pub(crate) trait RemoteWrite {
     /// Writes `local`'s bytes to the file `remote`, which must be as `expected` (`None`: not
-    /// there at all), and returns how it is on the server now.
+    /// there at all), and returns how it is on the server now. With `in_place`, an existing
+    /// file is written over in place even where it could be replaced through a staged copy
+    /// (see [`super::remote_stage`]).
     fn put(
         &self,
         local: &Path,
         remote: &str,
         expected: Option<RemoteStamp>,
+        in_place: bool,
         cancel: &AtomicBool,
     ) -> Result<RemoteStamp>;
     fn make_dir(&self, remote: &str) -> Result<()>;
@@ -2030,10 +2038,8 @@ impl RemoteFs for ssh2::Sftp {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     Ok(None)
                 } else {
-                    Err(anyhow::Error::from(e).context(trf(
-                        "msg.sftp_cannot_read",
-                        &[("path", remote.to_string())],
-                    )))
+                    Err(anyhow::Error::from(e)
+                        .context(trf("msg.sftp_cannot_read", &[("path", remote.to_string())])))
                 }
             }
         }
@@ -2425,7 +2431,13 @@ pub fn upload(
             ));
         }
     }
-    remote.put(local_path, remote_path, expected, cancel)
+    remote.put(
+        local_path,
+        remote_path,
+        expected,
+        conn.options.in_place,
+        cancel,
+    )
 }
 
 impl RemoteWrite for ssh2::Sftp {
@@ -2434,9 +2446,10 @@ impl RemoteWrite for ssh2::Sftp {
         local: &Path,
         remote: &str,
         expected: Option<RemoteStamp>,
+        in_place: bool,
         cancel: &AtomicBool,
     ) -> Result<RemoteStamp> {
-        upload_on(self, local, remote, expected, cancel)
+        upload_on(self, local, remote, expected, in_place, cancel)
     }
 
     fn make_dir(&self, remote: &str) -> Result<()> {
@@ -2455,12 +2468,15 @@ impl RemoteWrite for ssh2::Sftp {
     }
 }
 
-/// [`upload`] over the open session `sftp`.
+/// [`upload`] over the open session `sftp`: through a staged copy (see
+/// [`super::remote_stage`]) unless `in_place`, or the file cannot be replaced keeping its
+/// owner, group and permissions; otherwise written over in place.
 fn upload_on(
     sftp: &ssh2::Sftp,
     local_path: &Path,
     remote_path: &str,
     expected: Option<RemoteStamp>,
+    in_place: bool,
     cancel: &AtomicBool,
 ) -> Result<RemoteStamp> {
     let cannot_write = || {
@@ -2505,80 +2521,102 @@ fn upload_on(
             &[("path", remote_path.to_string())]
         ));
     }
+    let Some(stamp_now) = stamp_now else {
+        // A new file has no access controls to preserve.
+        return super::remote_stage::create(sftp, local_path, &real, cancel)
+            .with_context(cannot_write);
+    };
+    if !in_place {
+        if let Some(stamp) =
+            super::remote_stage::replace(sftp, local_path, &real, stamp_now, cancel)
+                .with_context(cannot_write)?
+        {
+            return Ok(stamp);
+        }
+    }
     let mut from = std::fs::File::open(local_path).with_context(|| {
         trf(
             "msg.sftp_cannot_read",
             &[("path", local_path.display().to_string())],
         )
     })?;
-    if let Some(stamp_now) = stamp_now {
-        let mut to = sftp
-            .open_mode(target, ssh2::OpenFlags::WRITE, 0, ssh2::OpenType::File)
-            .with_context(cannot_write)?;
-        // Validate the handle before writing so the check and the write use the same file.
-        let stat = to.stat().with_context(cannot_write)?;
-        if !stat.is_file() || RemoteStamp::of(&stat) != stamp_now {
-            return Err(changed());
+    let mut to = sftp
+        .open_mode(target, ssh2::OpenFlags::WRITE, 0, ssh2::OpenType::File)
+        .with_context(cannot_write)?;
+    // Validate the handle before writing so the check and the write use the same file.
+    let stat = to.stat().with_context(cannot_write)?;
+    if !stat.is_file() || RemoteStamp::of(&stat) != stamp_now {
+        return Err(changed());
+    }
+    check(cancel)?;
+    // Not cancelled once writing has started: stopping then would leave the file partly
+    // written on the server.
+    let written = (|| -> Result<()> {
+        let size = std::io::copy(&mut from, &mut to)?;
+        if size < stamp_now.size {
+            to.setstat(ssh2::FileStat {
+                size: Some(size),
+                uid: None,
+                gid: None,
+                perm: None,
+                atime: None,
+                mtime: None,
+            })?;
         }
-        check(cancel)?;
-        // Not cancelled once writing has started: stopping then would leave the file partly
-        // written on the server.
-        let written = (|| -> Result<()> {
-            let size = std::io::copy(&mut from, &mut to)?;
-            if size < stamp_now.size {
-                to.setstat(ssh2::FileStat {
-                    size: Some(size),
-                    uid: None,
-                    gid: None,
-                    perm: None,
-                    atime: None,
-                    mtime: None,
-                })?;
-            }
-            let _ = to.fsync();
-            to.close()?;
-            Ok(())
-        })();
-        let after = sftp.stat(target).map(|s| RemoteStamp::of(&s));
-        return match (written, after) {
-            (Ok(()), Ok(stamp)) => Ok(stamp),
-            (Ok(()), Err(e)) => Err(anyhow::Error::from(e).context(cannot_write())),
-            (Err(e), after) => Err(e.context(cannot_write()).context(PartlyWritten {
-                path: remote_path.to_string(),
-                stamp: after.ok(),
+        let _ = to.fsync();
+        to.close()?;
+        Ok(())
+    })();
+    let after = sftp.stat(target).map(|s| RemoteStamp::of(&s));
+    match (written, after) {
+        (Ok(()), Ok(stamp)) => Ok(stamp),
+        (Ok(()), Err(e)) => Err(anyhow::Error::from(e).context(cannot_write())),
+        (Err(e), after) => Err(e.context(cannot_write()).context(PartlyWritten {
+            path: remote_path.to_string(),
+            stamp: after.ok(),
+        })),
+    }
+}
+
+impl super::remote_stage::Stage for ssh2::Sftp {
+    fn meta(&self, path: &str) -> Result<Option<super::remote_stage::Meta>> {
+        match self.stat(Path::new(path)) {
+            Ok(s) => Ok(Some(super::remote_stage::Meta {
+                stamp: RemoteStamp::of(&s),
+                is_file: s.is_file(),
+                owner: s.uid.zip(s.gid),
+                perm: s.perm.map(|p| p & 0o7777),
             })),
-        };
+            Err(e) => {
+                let e = std::io::Error::from(e);
+                match e.kind() {
+                    std::io::ErrorKind::NotFound => Ok(None),
+                    _ => Err(e.into()),
+                }
+            }
+        }
     }
 
-    // A new file has no access controls to preserve. Publish it only after the upload
-    // finishes, without overwriting a concurrent creation.
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let name = remote_file_name(&real).to_string_lossy().into_owned();
-    // Keep the temporary name within the 255 bytes most file systems allow.
-    let mut end = name.len().min(100);
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    let dir = real.trim_end_matches('/');
-    let dir = &dir[..dir.rfind('/').map_or(0, |i| i + 1)];
-    let tmp_path = format!(
-        "{dir}.{}.oxidemerge-{}-{unique}",
-        &name[..end],
-        std::process::id()
-    );
-    let tmp = Path::new(&tmp_path);
-    let mut to = sftp
-        .open_mode(
-            tmp,
+    fn create(&self, path: &str, perm: u32) -> Result<()> {
+        let f = self.open_mode(
+            Path::new(path),
             ssh2::OpenFlags::WRITE | ssh2::OpenFlags::EXCLUSIVE,
-            0o644,
+            perm as i32,
             ssh2::OpenType::File,
-        )
-        .with_context(cannot_write)?;
-    let written = (move || -> Result<RemoteStamp> {
-        let mut buf = [0u8; CHUNK];
+        )?;
+        drop(f);
+        Ok(())
+    }
+
+    fn write(&self, path: &str, from: &mut dyn Read, cancel: &AtomicBool) -> Result<u64> {
+        let mut to = self.open_mode(
+            Path::new(path),
+            ssh2::OpenFlags::WRITE,
+            0,
+            ssh2::OpenType::File,
+        )?;
+        let mut buf = vec![0u8; CHUNK];
+        let mut written = 0;
         loop {
             check(cancel)?;
             let n = from.read(&mut buf)?;
@@ -2586,21 +2624,60 @@ fn upload_on(
                 break;
             }
             to.write_all(&buf[..n])?;
+            written += n as u64;
         }
+        // Not every server can flush a file to disk (`fsync@openssh.com`).
         let _ = to.fsync();
-        let stamp = RemoteStamp::of(&to.stat()?);
         to.close()?;
-        Ok(stamp)
-    })();
-    let published = written.and_then(|stamp| {
-        check(cancel)?;
-        sftp.rename(tmp, target, Some(ssh2::RenameFlags::empty()))?;
-        Ok(stamp)
-    });
-    if published.is_err() {
-        let _ = sftp.unlink(tmp);
+        Ok(written)
     }
-    published.with_context(cannot_write)
+
+    fn set_owner(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
+        Ok(self.setstat(
+            Path::new(path),
+            ssh2::FileStat {
+                size: None,
+                uid: Some(uid),
+                gid: Some(gid),
+                perm: None,
+                atime: None,
+                mtime: None,
+            },
+        )?)
+    }
+
+    fn set_perm(&self, path: &str, perm: u32) -> Result<()> {
+        Ok(self.setstat(
+            Path::new(path),
+            ssh2::FileStat {
+                size: None,
+                uid: None,
+                gid: None,
+                perm: Some(perm),
+                atime: None,
+                mtime: None,
+            },
+        )?)
+    }
+
+    fn read(&self, path: &str) -> Result<Box<dyn Read + '_>> {
+        Ok(Box::new(self.open(Path::new(path))?))
+    }
+
+    fn rename(&self, from: &str, to: &str, replace: bool) -> Result<()> {
+        // Version 3 of the protocol (OpenSSH's) has no flags: its rename refuses to replace.
+        let flags = match replace {
+            true => {
+                ssh2::RenameFlags::OVERWRITE | ssh2::RenameFlags::ATOMIC | ssh2::RenameFlags::NATIVE
+            }
+            false => ssh2::RenameFlags::empty(),
+        };
+        Ok(self.rename(Path::new(from), Path::new(to), Some(flags))?)
+    }
+
+    fn remove(&self, path: &str) -> Result<()> {
+        Ok(self.unlink(Path::new(path))?)
+    }
 }
 
 /// A connection's user and host, for showing what a tab is reading from or saving to, without
@@ -3091,13 +3168,17 @@ pub mod fake {
             local: &Path,
             remote: &str,
             expected: Option<RemoteStamp>,
+            _in_place: bool,
             cancel: &AtomicBool,
         ) -> Result<RemoteStamp> {
             check(cancel)?;
             let bytes = std::fs::read(local)?;
             with(|s| {
                 if s.write_fails.iter().any(|p| p == remote) {
-                    bail!(trf("msg.sftp_cannot_write", &[("path", remote.to_string())]));
+                    bail!(trf(
+                        "msg.sftp_cannot_write",
+                        &[("path", remote.to_string())]
+                    ));
                 }
                 if expected.is_some() && s.stamp(remote) != expected {
                     bail!(trf(
@@ -3262,7 +3343,11 @@ pub mod fake {
 
     /// Whether `path` was deleted on the server by a save, as against by [`remove`].
     pub fn was_removed(path: &str) -> bool {
-        SERVER.with(|s| s.borrow().as_ref().is_some_and(|s| s.removed.iter().any(|p| p == path)))
+        SERVER.with(|s| {
+            s.borrow()
+                .as_ref()
+                .is_some_and(|s| s.removed.iter().any(|p| p == path))
+        })
     }
 
     /// The file or folder at `path` on the installed server: its bytes, `Some(None)` for a
@@ -3312,21 +3397,71 @@ mod tests {
         let up_local = up_dir.path().join("out.txt");
         std::fs::write(&up_local, "uploaded by smoke test\n").unwrap();
         let uploaded = "/tmp/sshtest/uploaded.txt";
-        let stamp = upload(&conn, &up_local, uploaded, None, None, &never).unwrap();
+        upload(&conn, &up_local, uploaded, None, None, &never).unwrap();
         assert_eq!(
             std::fs::read_to_string(uploaded).unwrap(),
             "uploaded by smoke test\n"
         );
 
-        // A hard link still sees the new contents only if saving kept the original file.
-        // Use a shorter payload to check that an in-place save also removes the old tail.
+        // Saved through a staged copy: a new file takes the original's place, with its
+        // permissions, so a hard link keeps the old contents, and nothing is left beside it.
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        std::fs::set_permissions(uploaded, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let stamp =
+            std::fs::metadata(uploaded).map(|m| RemoteStamp::new(m.len(), m.mtime() as u64));
+        let stamp = stamp.unwrap();
         let alias = up_dir.path().join("alias.txt");
         std::fs::hard_link(uploaded, &alias).unwrap();
+        let inode = std::fs::metadata(uploaded).unwrap().ino();
+        std::fs::write(&up_local, "staged save\n").unwrap();
+        let stamp = upload(&conn, &up_local, uploaded, Some(stamp), None, &never).unwrap();
+        let meta = std::fs::metadata(uploaded).unwrap();
+        assert_eq!(std::fs::read_to_string(uploaded).unwrap(), "staged save\n");
+        assert_ne!(meta.ino(), inode);
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o640);
+        assert_eq!(
+            std::fs::read_to_string(&alias).unwrap(),
+            "uploaded by smoke test\n"
+        );
+        let left: Vec<_> = std::fs::read_dir("/tmp/sshtest")
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.contains("oxidemerge-"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+
+        // In place, as asked: a hard link sees the new contents. A shorter payload checks
+        // that an in-place save also removes the old tail.
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::hard_link(uploaded, &alias).unwrap();
+        let in_place = RemoteConnection {
+            options: ConnOptions {
+                in_place: true,
+                ..Default::default()
+            },
+            ..conn.clone()
+        };
         std::fs::write(&up_local, "short\n").unwrap();
-        let saved = upload(&conn, &up_local, uploaded, Some(stamp), None, &never).unwrap();
+        let saved = upload(&in_place, &up_local, uploaded, Some(stamp), None, &never).unwrap();
         assert_eq!(saved.size, 6);
-        assert_eq!(std::fs::read_to_string(alias).unwrap(), "short\n");
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), "short\n");
         assert!(upload(&conn, &up_local, uploaded, Some(stamp), None, &never).is_err());
+
+        // A folder no file can be created in, whose file can still be written: in place.
+        let locked = "/tmp/sshtest/locked";
+        let _ = std::fs::set_permissions(locked, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(locked);
+        std::fs::create_dir(locked).unwrap();
+        let file = format!("{locked}/file.txt");
+        std::fs::write(&file, "before\n").unwrap();
+        std::fs::set_permissions(locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let m = std::fs::metadata(&file).unwrap();
+        let before = RemoteStamp::new(m.len(), m.mtime() as u64);
+        std::fs::write(&up_local, "after\n").unwrap();
+        upload(&conn, &up_local, &file, Some(before), None, &never).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "after\n");
+        assert_eq!(std::fs::metadata(&file).unwrap().ino(), m.ino());
+        std::fs::set_permissions(locked, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     // Jump hosts, a proxy command and host certificates against the same local test sshd as

@@ -127,7 +127,14 @@ pub fn save_folder(
     cancel: &AtomicBool,
 ) -> Result<Saved> {
     let remote = connect(conn, cancel)?;
-    Ok(save_with(&*remote, local, remote_dir, manifest, cancel))
+    Ok(save_with(
+        &*remote,
+        local,
+        remote_dir,
+        manifest,
+        conn.options.in_place,
+        cancel,
+    ))
 }
 
 fn save_with(
@@ -135,6 +142,7 @@ fn save_with(
     local: &Path,
     remote_dir: &str,
     manifest: &Manifest,
+    in_place: bool,
     cancel: &AtomicBool,
 ) -> Saved {
     let remote_dir = match remote_dir.trim_end_matches('/') {
@@ -248,6 +256,7 @@ fn save_with(
             rel,
             local_path,
             manifest,
+            in_place,
             cancel,
             &mut out,
         ));
@@ -281,7 +290,16 @@ fn save_with(
         if stopped(&mut out) {
             break;
         }
-        let _ = upload_file(r, &at(rel), rel, local_path, manifest, cancel, &mut out);
+        let _ = upload_file(
+            r,
+            &at(rel),
+            rel,
+            local_path,
+            manifest,
+            in_place,
+            cancel,
+            &mut out,
+        );
     }
     out
 }
@@ -319,12 +337,14 @@ fn delete_file(
 /// Uploads `local_path`, the file `rel` here, to `path` if it is new or changed since
 /// `manifest` was made, and the server's copy did not change meanwhile. Returns the hash of
 /// its bytes when it was not written.
+#[allow(clippy::too_many_arguments)]
 fn upload_file(
     r: &dyn Remote,
     path: &str,
     rel: &str,
     local_path: &Path,
     manifest: &Manifest,
+    in_place: bool,
     cancel: &AtomicBool,
     out: &mut Saved,
 ) -> Option<u64> {
@@ -360,7 +380,7 @@ fn upload_file(
         }
         None => None,
     };
-    match r.put(local_path, path, expected, cancel) {
+    match r.put(local_path, path, expected, in_place, cancel) {
         Ok(stamp) => {
             out.manifest.files.insert(rel.to_string(), (stamp, hash));
             out.uploaded += 1;

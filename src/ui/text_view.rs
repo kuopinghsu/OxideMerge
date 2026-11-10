@@ -37,6 +37,10 @@ pub struct Pane {
     hl_rx: Option<Receiver<Option<Vec<LineSpans>>>>,
     hl_dirty: bool,
     hl_dark: bool,
+    /// Too large to highlight within the budget of the options; said once in the status bar.
+    hl_over_budget: bool,
+    /// The budget (MiB) the highlighting was last started or refused with.
+    hl_limit: u32,
     /// Number of times this pane was saved; undo snapshots from before a save are unsaved changes.
     saves: u64,
     /// Modification time of the file when it was loaded or saved.
@@ -44,7 +48,7 @@ pub struct Pane {
     /// The document as loaded while a reformatted (JSON / XML) copy is shown instead.
     original: Option<TextDoc>,
     /// Hashes of the lines as loaded, to tell which lines were edited since.
-    baseline: Vec<u64>,
+    baseline: Vec<u32>,
     /// Lines inserted or changed since the document was loaded.
     edited: HashSet<usize>,
 }
@@ -80,6 +84,8 @@ impl Pane {
             hl_rx: None,
             hl_dirty: true,
             hl_dark: false,
+            hl_over_budget: false,
+            hl_limit: 0,
             saves: 0,
             disk_time,
             original: None,
@@ -116,20 +122,24 @@ impl Pane {
     }
 }
 
-fn line_hashes(lines: &[String]) -> Vec<u64> {
+/// A 32-bit hash of each line: half the memory of a full hash for every line of a large file,
+/// and two lines with the same hash only hide one line's edit marker.
+fn line_hashes(lines: &[String]) -> Vec<u32> {
     use std::hash::{Hash, Hasher};
     lines
         .iter()
-        .map(|l| {
+        .enumerate()
+        .map(|(i, l)| {
+            crate::core::cancel::check_every(i, 1 << 16);
             let mut h = std::collections::hash_map::DefaultHasher::new();
             l.hash(&mut h);
-            h.finish()
+            h.finish() as u32
         })
         .collect()
 }
 
 /// Lines of `new` inserted or changed since the lines hashed in `old`.
-fn edited_lines(old: &[u64], new: &[String]) -> HashSet<usize> {
+fn edited_lines(old: &[u32], new: &[String]) -> HashSet<usize> {
     let new = line_hashes(new);
     if old == new {
         return HashSet::new();
@@ -742,6 +752,8 @@ pub fn redirect_output(docs: &mut [TextDoc], out: &std::path::Path) {
 
 /// Unchanged lines kept visible around each difference when folding.
 const FOLD_CONTEXT: usize = 3;
+/// Rows whose inline differences are kept at most; see [`TextView::ensure_inline`].
+const INLINE_CACHE_ROWS: usize = 8192;
 /// Shorter unchanged runs are not worth folding.
 const MIN_FOLD: usize = 4;
 const SCROLL_ANIM_SECS: f64 = 0.18;
@@ -771,17 +783,68 @@ struct Layout {
 #[derive(Default)]
 struct PaneLayout {
     /// Shared display boundary -> compact pane boundary, including the end sentinel.
-    boundaries: Vec<usize>,
+    boundaries: LineMap,
     /// Compact line -> shared display line, for pointer and keyboard navigation.
-    shared: Vec<usize>,
+    shared: LineMap,
 }
 
 impl PaneLayout {
     fn position(&self, shared: f32) -> f32 {
         let i = (shared.floor() as usize).min(self.boundaries.len().saturating_sub(1));
-        let start = self.boundaries[i];
-        let end = self.boundaries.get(i + 1).copied().unwrap_or(start);
+        let start = self.boundaries.get(i);
+        let end = if i + 1 < self.boundaries.len() {
+            self.boundaries.get(i + 1)
+        } else {
+            start
+        };
         start as f32 + shared.fract() * (end - start) as f32
+    }
+}
+
+/// Display line numbers, one for each display line of a pane. In the aligned layout each is
+/// its own index, so only how many there are is kept: a large file has millions of lines, and
+/// a number for each, in each pane, would take tens of megabytes for nothing.
+#[derive(Clone, Debug)]
+enum LineMap {
+    /// `0..n`.
+    Same(usize),
+    Listed(Vec<u32>),
+}
+
+impl Default for LineMap {
+    fn default() -> Self {
+        LineMap::Same(0)
+    }
+}
+
+impl LineMap {
+    fn len(&self) -> usize {
+        match self {
+            LineMap::Same(n) => *n,
+            LineMap::Listed(v) => v.len(),
+        }
+    }
+
+    /// The number at `i`, which must be less than [`LineMap::len`].
+    fn get(&self, i: usize) -> usize {
+        match self {
+            LineMap::Same(n) => {
+                assert!(i < *n, "line {i} of {n}");
+                i
+            }
+            LineMap::Listed(v) => v[i] as usize,
+        }
+    }
+
+    /// The numbers from `range.start` (up to `range.end`, at most [`LineMap::len`]).
+    fn range(&self, range: std::ops::Range<usize>) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        let range = range.start.min(self.len())..range.end.min(self.len());
+        range.map(|i| self.get(i))
+    }
+
+    #[cfg(test)]
+    fn iter(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        self.range(0..self.len())
     }
 }
 
@@ -4766,8 +4829,16 @@ impl TextView {
     /// Makes the HTML report of the compare as it is now, on any thread; `default_rules` is the
     /// compare rules file of the options, used when the compare has none of its own. A rules
     /// file that could not be read is not named: the compare runs without it.
-    pub fn html_report_job(&self, default_rules: &str) -> crate::core::report::ReportJob {
-        self.report_job(crate::core::report::ReportFormat::Html, default_rules)
+    pub fn html_report_job(
+        &self,
+        default_rules: &str,
+        detail: crate::core::report::ReportDetail,
+    ) -> crate::core::report::ReportJob {
+        self.report_job(
+            crate::core::report::ReportFormat::Html,
+            default_rules,
+            detail,
+        )
     }
 
     /// Makes the report of this compare as `format` (HTML, XML or a slideshow); it can run on
@@ -4776,6 +4847,7 @@ impl TextView {
         &self,
         format: crate::core::report::ReportFormat,
         default_rules: &str,
+        detail: crate::core::report::ReportDetail,
     ) -> crate::core::report::ReportJob {
         let titles = self.titles();
         let lines: Vec<Vec<String>> = self.panes.iter().map(|p| p.doc.lines.clone()).collect();
@@ -4793,7 +4865,7 @@ impl TextView {
         Box::new(move || {
             let refs: Vec<&[String]> = lines.iter().map(Vec::as_slice).collect();
             let report = crate::core::report::text_report(
-                format, &titles, &refs, &diff, &opts, &notes, &rules,
+                format, &titles, &refs, &diff, &opts, &notes, &rules, detail,
             );
             match &table {
                 Some((m, counts, warnings, summary)) => {
@@ -5429,6 +5501,21 @@ impl TextView {
         self.bulk_edit = Some(trf("msg.replaced", &[("n", n.to_string())]));
     }
 
+    /// The side the caret is in and its line there (from 0), when the caret is on a line.
+    pub fn caret_line(&self) -> Option<(usize, usize)> {
+        let p = self.active_pane;
+        let line = self.diff.rows.get(self.cursor_row?)?.line(p)?;
+        Some((p, line))
+    }
+
+    /// Puts the caret on `line` (from 0) of side `pane`, and the view on it.
+    pub fn set_caret_line(&mut self, pane: usize, line: usize) {
+        if pane < self.panes.len() && line < self.panes[pane].doc.lines.len() {
+            self.active_pane = pane;
+            self.goto_line(line + 1);
+        }
+    }
+
     pub fn goto_line(&mut self, line: usize) {
         let r = self
             .diff
@@ -5550,6 +5637,7 @@ impl TextView {
     // ---------- rendering ----------
 
     fn poll_highlight(&mut self, cfg: &Config) {
+        let mut over_budget = Vec::new();
         for p in &mut self.panes {
             if let Some(rx) = &p.hl_rx {
                 match rx.try_recv() {
@@ -5568,9 +5656,11 @@ impl TextView {
                 p.hl = None;
                 continue;
             }
-            if (p.hl_dirty || p.hl_dark != cfg.dark_mode) && p.hl_rx.is_none() {
+            let limit_changed = p.hl_limit != cfg.highlight_limit_mb;
+            if (p.hl_dirty || p.hl_dark != cfg.dark_mode || limit_changed) && p.hl_rx.is_none() {
                 p.hl_dirty = false;
                 p.hl_dark = cfg.dark_mode;
+                p.hl_limit = cfg.highlight_limit_mb;
                 let ext = p
                     .doc
                     .path
@@ -5579,18 +5669,45 @@ impl TextView {
                     .or_else(|| p.doc.syntax.clone())
                     .unwrap_or_default();
                 // Check the highlighter's limit before cloning a potentially gigabyte document.
-                if syntax::within_limits(&p.doc.lines) {
-                    p.hl_rx = Some(syntax::spawn(p.doc.lines.clone(), ext, cfg.dark_mode));
+                let budget = syntax::Budget::of_mb(cfg.highlight_limit_mb);
+                let over = !syntax::within_limits(&p.doc.lines, budget);
+                if !over {
+                    p.hl_rx = Some(syntax::spawn(
+                        p.doc.lines.clone(),
+                        ext,
+                        cfg.dark_mode,
+                        budget,
+                    ));
                 } else {
                     p.hl = None;
+                    if !p.hl_over_budget && syntax::has_syntax(&ext) {
+                        over_budget.push(p.doc.title());
+                    }
                 }
+                p.hl_over_budget = over;
             }
+        }
+        if !over_budget.is_empty() {
+            self.status = trf(
+                "view.syntax_over_budget",
+                &[
+                    ("file", over_budget.join(", ")),
+                    ("mb", cfg.highlight_limit_mb.max(1).to_string()),
+                ],
+            );
         }
     }
 
     fn ensure_inline(&mut self, r: usize) {
         if self.inline_cache.contains_key(&r) || self.opts.inline == InlineMode::Off {
             return;
+        }
+        // Bounded: past the limit, rows far from this one go and are worked out again when
+        // they are shown again. Scrolling through a file of millions of changed lines would
+        // otherwise keep the inline differences of every line seen.
+        if self.inline_cache.len() >= INLINE_CACHE_ROWS {
+            let near = INLINE_CACHE_ROWS / 4;
+            self.inline_cache.retain(|&k, _| k.abs_diff(r) < near);
         }
         let row = self.diff.rows[r];
         let mut out: [Vec<Range<usize>>; 3] = Default::default();
@@ -5797,7 +5914,16 @@ impl TextView {
                     Some(p) => format!("{} / {total}", p + 1),
                     None => format!("– / {total}"),
                 };
-                widgets::chip(ui, &counter, pal.text, pal.control).on_hover_ui(|ui| {
+                let shown = widgets::chip(ui, &counter, pal.text, pal.control);
+                let spoken = match pos {
+                    Some(p) => trf(
+                        "msg.diff_of",
+                        &[("n", (p + 1).to_string()), ("total", total.to_string())],
+                    ),
+                    None => trf("msg.diff_count", &[("total", total.to_string())]),
+                };
+                widgets::announce_as(ui, &shown, &spoken, false);
+                shown.on_hover_ui(|ui| {
                     ui.label(self.status_line());
                 });
                 if let Some((del, add)) = self.change_counts().filter(|&(d, a)| d + a > 0) {
@@ -6050,7 +6176,8 @@ impl TextView {
             ui.add_space(4.0);
             widgets::inline_icon(ui, icon, color);
             ui.add_space(4.0);
-            ui.label(RichText::new(text).color(color).strong());
+            let said = ui.label(RichText::new(text).color(color).strong());
+            widgets::announce(ui, &said, false);
             let next = tr("merge.next_conflict");
             if left > 0
                 && widgets::bar_button(ui, true, Some(Icon::NextConflict), next, false)
@@ -6923,10 +7050,16 @@ impl TextView {
         }
         let panes = (0..self.n())
             .map(|p| {
-                let mut pane = PaneLayout::default();
+                if self.text_layout == TextLayout::Aligned {
+                    return PaneLayout {
+                        boundaries: LineMap::Same(lines.len() + 1),
+                        shared: LineMap::Same(lines.len()),
+                    };
+                }
+                let (mut boundaries, mut shared) = (Vec::new(), Vec::new());
                 let mut segments = 0;
                 for (v, &line) in lines.iter().enumerate() {
-                    pane.boundaries.push(pane.shared.len());
+                    boundaries.push(shared.len() as u32);
                     let include = self.text_layout == TextLayout::Aligned
                         || match line {
                             VLine::Fold(..) => true,
@@ -6946,11 +7079,14 @@ impl TextView {
                             }
                         };
                     if include {
-                        pane.shared.push(v);
+                        shared.push(v as u32);
                     }
                 }
-                pane.boundaries.push(pane.shared.len());
-                pane
+                boundaries.push(shared.len() as u32);
+                PaneLayout {
+                    boundaries: LineMap::Listed(boundaries),
+                    shared: LineMap::Listed(shared),
+                }
             })
             .collect();
         self.layout = Layout {
@@ -7028,15 +7164,15 @@ impl TextView {
     fn row_near(&self, v: usize, forward: bool) -> Option<usize> {
         let lines = &self.layout.panes[self.active_pane].shared;
         let v = v.min(lines.len().checked_sub(1)?);
-        let row = |&index: &usize| match self.layout.lines[index] {
+        let row = |index: usize| match self.layout.lines[index] {
             VLine::Row(r, _) => Some(r),
             VLine::Fold(..) => None,
         };
         let find = |fwd: bool| {
             if fwd {
-                lines[v..].iter().find_map(row)
+                lines.range(v..lines.len()).find_map(row)
             } else {
-                lines[..=v].iter().rev().find_map(row)
+                lines.range(0..v + 1).rev().find_map(row)
             }
         };
         find(forward).or_else(|| find(!forward))
@@ -7100,7 +7236,10 @@ impl TextView {
         }
         let page = self.page_rows.max(1);
         let (cur, below) = match self.cursor_row.and_then(|r| self.row_span(r)) {
-            Some((start, end)) => (pane_layout.boundaries[start], pane_layout.boundaries[end]),
+            Some((start, end)) => (
+                pane_layout.boundaries.get(start),
+                pane_layout.boundaries.get(end),
+            ),
             None => {
                 let v = (pane_layout.position(self.scroll) as usize).min(total - 1);
                 (v, v)
@@ -9705,9 +9844,9 @@ impl TextView {
                 let end = (start + visible.ceil() as usize + 1).min(p.shared.len());
                 (
                     start,
-                    p.shared[start..end]
-                        .iter()
-                        .map(|&v| self.layout.lines[v])
+                    p.shared
+                        .range(start..end)
+                        .map(|v| self.layout.lines[v])
                         .collect(),
                 )
             })
@@ -9724,10 +9863,7 @@ impl TextView {
             .map(|p| {
                 let start = p.position(self.scroll).floor() as usize;
                 p.shared
-                    .iter()
-                    .skip(start)
-                    .take(visible.ceil() as usize + 2)
-                    .copied()
+                    .range(start..start.saturating_add(visible.ceil() as usize + 2))
                     .collect()
             })
             .collect();
@@ -10344,8 +10480,8 @@ impl TextView {
                 }
             }
             if let Some((v0, v1)) = self.cursor_row.and_then(|cr| self.row_span(cr)) {
-                let v0 = self.layout.panes[p].boundaries[v0];
-                let v1 = self.layout.panes[p].boundaries[v1];
+                let v0 = self.layout.panes[p].boundaries.get(v0);
+                let v1 = self.layout.panes[p].boundaries.get(v1);
                 if v1 > *pane_first && v0 < pane_first + shown.len() {
                     let rr = Rect::from_min_max(
                         pos2(text_rect.left() + 1.0, line_y(v0)),
@@ -10382,7 +10518,7 @@ impl TextView {
                 let VLine::Fold(s, e) = *l else { continue };
                 let y = body_top + ((pane_first + k) as f32 - pane_scroll[p]) * row_h;
                 let rect = Rect::from_min_max(pos2(x, y), pos2(x + pane_w, y + row_h));
-                let hovered = hover_fold == Some(self.layout.panes[p].shared[pane_first + k]);
+                let hovered = hover_fold == Some(self.layout.panes[p].shared.get(pane_first + k));
                 bp.rect_filled(
                     rect,
                     0.0,
@@ -10444,9 +10580,10 @@ impl TextView {
                 let (start, end) = self.block_span(b);
                 let span = |p: usize| {
                     let layout = &self.layout.panes[p];
-                    let top = body_top + (layout.boundaries[start] as f32 - pane_scroll[p]) * row_h;
+                    let top =
+                        body_top + (layout.boundaries.get(start) as f32 - pane_scroll[p]) * row_h;
                     let bottom =
-                        body_top + (layout.boundaries[end] as f32 - pane_scroll[p]) * row_h;
+                        body_top + (layout.boundaries.get(end) as f32 - pane_scroll[p]) * row_h;
                     (top, bottom)
                 };
                 let left = span(div);
@@ -10578,7 +10715,7 @@ impl TextView {
         let edit_line = self.edit.as_ref().and_then(|e| {
             let (v0, v1) = self.row_span(e.row)?;
             let b = &self.layout.panes[e.pane].boundaries;
-            Some((b[v0], b[v1]))
+            Some((b.get(v0), b.get(v1)))
         });
         if let Some(e) = &mut self.edit {
             let mut done: Option<bool> = None;
@@ -10843,6 +10980,280 @@ impl TextView {
     }
 }
 
+/// Bytes held by a list of lines: the list and each line's text.
+#[cfg(test)]
+fn lines_bytes(lines: &[String], capacity: usize) -> usize {
+    capacity * std::mem::size_of::<String>() + lines.iter().map(String::capacity).sum::<usize>()
+}
+
+#[cfg(test)]
+impl LineMap {
+    fn bytes(&self) -> usize {
+        match self {
+            LineMap::Same(_) => 0,
+            LineMap::Listed(v) => v.capacity() * 4,
+        }
+    }
+}
+
+#[cfg(test)]
+impl TextView {
+    /// What the view holds, by kind, in bytes, as allocated (capacities, not lengths): for the
+    /// benchmarks, to tell where memory goes. Find has no index to count: it searches the
+    /// lines as they are each time.
+    pub(crate) fn memory_use(&self) -> Vec<(&'static str, usize)> {
+        use std::mem::size_of;
+        let panes = |f: &dyn Fn(&Pane) -> usize| self.panes.iter().map(f).sum::<usize>();
+        let snapshots = |list: &[Snapshot]| {
+            list.iter()
+                .flat_map(|s| &s.lines)
+                .map(|l| lines_bytes(l, l.capacity()))
+                .sum::<usize>()
+        };
+        let inline: usize = self
+            .inline_cache
+            .values()
+            .map(|r| {
+                size_of::<(usize, [Vec<Range<usize>>; 3])>()
+                    + r.iter()
+                        .map(|v| v.capacity() * size_of::<Range<usize>>())
+                        .sum::<usize>()
+            })
+            .sum();
+        vec![
+            (
+                "lines",
+                panes(&|p| lines_bytes(&p.doc.lines, p.doc.lines.capacity())),
+            ),
+            (
+                "line ends",
+                panes(&|p| p.doc.original_eols.capacity() * size_of::<Option<text::Eol>>()),
+            ),
+            (
+                "edit marks",
+                panes(&|p| p.baseline.capacity() * 4 + p.edited.capacity() * size_of::<usize>()),
+            ),
+            (
+                "highlighting",
+                panes(&|p| {
+                    p.hl.as_ref().map_or(0, |h| {
+                        h.capacity() * size_of::<syntax::LineSpans>()
+                            + h.iter()
+                                .map(|s| s.capacity() * size_of::<(Range<usize>, Color32)>())
+                                .sum::<usize>()
+                    })
+                }),
+            ),
+            (
+                "rows",
+                self.diff.rows.capacity() * size_of::<diff::Row>()
+                    + self.diff.blocks.capacity() * size_of::<diff::Block>()
+                    + self
+                        .diff
+                        .moved
+                        .iter()
+                        .map(|m| m.capacity() * size_of::<usize>())
+                        .sum::<usize>(),
+            ),
+            (
+                "layout",
+                self.layout.lines.capacity() * size_of::<VLine>()
+                    + self.layout.row_line.capacity() * size_of::<usize>()
+                    + self
+                        .layout
+                        .panes
+                        .iter()
+                        .map(|p| p.boundaries.bytes() + p.shared.bytes())
+                        .sum::<usize>(),
+            ),
+            ("inline differences", inline),
+            ("undo", snapshots(&self.undo) + snapshots(&self.redo)),
+        ]
+    }
+}
+
+#[cfg(test)]
+/// Times the text view on `a.txt` and `b.txt` in `dir`, for the benchmarks, as the window
+/// opens them: loading, comparing (building the view), the first frame, a frame while
+/// scrolling (a different stretch of the files each frame), and a step to the next difference
+/// with the frame it is drawn in. Each stage also reports the process's resident memory after
+/// it, to tell where memory goes; the benchmark runner measures the peak.
+pub(crate) fn render_bench(dir: &std::path::Path) -> String {
+    use crate::core::bench::rss_mib;
+    use std::fmt::Write as _;
+    use std::time::Instant;
+    let cfg = Config::default();
+    let colors = theme::colors(false);
+    let mut stages: Vec<(&str, String, Option<f64>)> = Vec::new();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+
+    let started = Instant::now();
+    let docs: Vec<TextDoc> = ["a.txt", "b.txt"]
+        .iter()
+        .map(|n| text::load_doc(&dir.join(n), None).unwrap())
+        .collect();
+    stages.push((
+        "load",
+        format!("{:.0} ms", ms(started.elapsed())),
+        rss_mib(),
+    ));
+
+    let started = Instant::now();
+    let mut view = TextView::new(docs, &cfg);
+    stages.push((
+        "compare",
+        format!("{:.0} ms", ms(started.elapsed())),
+        rss_mib(),
+    ));
+    let rows = view.diff.rows.len();
+    let blocks = view.diff.blocks.len();
+
+    let ctx = egui::Context::default();
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0));
+    let mut time = 0.0;
+    let mut paint = |view: &mut TextView| {
+        time += 1.0 / 60.0;
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(time),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| view.ui(ui, &cfg, &colors));
+        });
+        std::hint::black_box(out.shapes.len());
+    };
+    let started = Instant::now();
+    paint(&mut view);
+    stages.push((
+        "first frame",
+        format!("{:.0} ms", ms(started.elapsed())),
+        rss_mib(),
+    ));
+
+    let frames = 100;
+    let started = Instant::now();
+    for i in 0..frames {
+        view.goto_line(1 + i * view.panes[0].doc.lines.len() / frames);
+        paint(&mut view);
+    }
+    stages.push((
+        "a scrolled frame",
+        format!("{:.2} ms", ms(started.elapsed()) / frames as f64),
+        rss_mib(),
+    ));
+
+    view.goto_line(1);
+    paint(&mut view);
+    let steps = 100.min(blocks);
+    let started = Instant::now();
+    for _ in 0..steps {
+        view.next_diff(false);
+        paint(&mut view);
+    }
+    stages.push((
+        "a step",
+        format!(
+            "{:.2} ms over {steps}",
+            ms(started.elapsed()) / steps.max(1) as f64
+        ),
+        rss_mib(),
+    ));
+
+    let held: Vec<String> = view
+        .memory_use()
+        .into_iter()
+        .filter(|(_, b)| *b > 0)
+        .map(|(what, b)| format!("{what} {:.0} MiB", b as f64 / (1 << 20) as f64))
+        .collect();
+    stages.push(("held", held.join(" + "), None));
+
+    let mut out = format!("{rows} rows, {blocks} differences;");
+    for (what, value, rss) in stages {
+        let _ = write!(out, " {what} {value}");
+        if let Some(mb) = rss {
+            let _ = write!(out, " ({mb:.0} MiB)");
+        }
+        out.push(',');
+    }
+    out.pop();
+    out
+}
+
+/// Opening the files in `dir` as the window opens large ones, on another thread, and
+/// stopping it as *Cancel* does at nine points from 10% to 90% of the time an open takes:
+/// how long until the work noticed and stopped, and until the thread had also freed what it
+/// built, each the median and the worst. The window does not wait for either: it drops the
+/// job at once. Also the time to read the files a second time, from the file cache.
+#[cfg(test)]
+pub(crate) fn cancel_bench(dir: &std::path::Path) -> String {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let load = || -> Vec<TextDoc> {
+        ["a.txt", "b.txt"]
+            .iter()
+            .map(|n| text::load_doc(&dir.join(n), None).unwrap())
+            .collect()
+    };
+    let started = Instant::now();
+    drop(load());
+    let first = ms(started.elapsed());
+    let started = Instant::now();
+    let docs = load();
+    let again = ms(started.elapsed());
+    let started = Instant::now();
+    let view = TextView::new(docs, &Config::default());
+    let open = again + ms(started.elapsed());
+    let blocks = view.diff.blocks.len();
+    drop(view);
+
+    let (mut noticed_ms, mut freed_ms, mut finished) = (Vec::new(), Vec::new(), 0);
+    for tenth in 1..10 {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (job_stop, dir) = (stop.clone(), dir.to_path_buf());
+        let job = std::thread::spawn(move || {
+            crate::core::cancel::run(job_stop, move || {
+                let docs: Vec<TextDoc> = ["a.txt", "b.txt"]
+                    .iter()
+                    .map(|n| text::load_doc(&dir.join(n), None).unwrap())
+                    .collect();
+                TextView::new(docs, &Config::default()).diff.rows.len()
+            })
+        });
+        std::thread::sleep(Duration::from_secs_f64(open * tenth as f64 / 10_000.0));
+        *crate::core::cancel::NOTICED.lock().unwrap() = None;
+        let asked = Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        if job.join().unwrap().is_none() {
+            let noticed = crate::core::cancel::NOTICED.lock().unwrap().unwrap();
+            noticed_ms.push(ms(noticed - asked));
+            freed_ms.push(ms(asked.elapsed()));
+        } else {
+            finished += 1;
+        }
+    }
+    let summary = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        match v.last() {
+            Some(worst) => format!("{:.0} ms median, {worst:.0} ms at worst", v[v.len() / 2]),
+            None => "-".to_string(),
+        }
+    };
+    format!(
+        "{blocks} differences; load {first:.0} ms, load again {again:.0} ms, open {open:.0} ms; \
+         stopped in {}; freed in {}{}",
+        summary(&mut noticed_ms),
+        summary(&mut freed_ms),
+        if finished > 0 {
+            format!("; {finished} of 9 finished first")
+        } else {
+            String::new()
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10906,15 +11317,11 @@ mod tests {
                     assert_eq!(
                         pane.shared
                             .iter()
-                            .map(|&v| view.layout.lines[v])
+                            .map(|v| view.layout.lines[v])
                             .collect::<Vec<_>>(),
                         view.layout.lines
                     );
-                    assert!(pane
-                        .boundaries
-                        .iter()
-                        .copied()
-                        .eq(0..=view.layout.lines.len()));
+                    assert!(pane.boundaries.iter().eq(0..=view.layout.lines.len()));
                 }
                 assert!(view.layout.lines.iter().any(
                     |line| matches!(line, VLine::Row(r, _) if view.diff.rows[*r].line(0).is_none())
@@ -10934,7 +11341,7 @@ mod tests {
                 assert_eq!(
                     pane.shared
                         .iter()
-                        .map(|&v| view.layout.lines[v])
+                        .map(|v| view.layout.lines[v])
                         .collect::<Vec<_>>(),
                     view.layout.lines
                 );
@@ -10978,7 +11385,7 @@ mod tests {
                     let actual: Vec<_> = pane
                         .shared
                         .iter()
-                        .map(|&index| {
+                        .map(|index| {
                             let line = &v.layout.lines[index];
                             let VLine::Row(r, seg) = *line else {
                                 panic!("unexpected fold")
@@ -10987,7 +11394,7 @@ mod tests {
                         })
                         .collect();
                     assert_eq!(actual, expected);
-                    for (local, &shared) in pane.shared.iter().enumerate() {
+                    for (local, shared) in pane.shared.iter().enumerate() {
                         assert_eq!(pane.position(shared as f32), local as f32);
                         assert_eq!(pane.position(shared as f32 + 0.5), local as f32 + 0.5);
                     }
@@ -11231,7 +11638,7 @@ mod tests {
             ..by_id()
         };
         let v = keyed_view(left, right, m);
-        let xml = (v.report_job(ReportFormat::Xml, ""))();
+        let xml = (v.report_job(ReportFormat::Xml, "", Default::default()))();
         let at = xml
             .find("<table-match version=\"1\"")
             .expect("table-match element");
@@ -11245,15 +11652,21 @@ mod tests {
         // The differences are still those of the text.
         assert!(xml.contains("<difference index=\"1\""));
 
-        let html = (v.report_job(ReportFormat::Html, ""))();
+        let html = (v.report_job(ReportFormat::Html, "", Default::default()))();
         let section = html.find("<section class=\"table-match\">").unwrap();
         assert!(section < html.find("<p class=\"foot\">").unwrap());
         assert!(html.contains("Rows in: Key order"), "{html}");
         assert!(html.contains("Numeric tolerance: 1%"));
 
         let plain = keyed_view(left, right, TableMatch::default());
-        assert!(!(plain.report_job(ReportFormat::Xml, ""))().contains("table-match"));
-        assert!(!(plain.report_job(ReportFormat::Html, ""))().contains("table-match"));
+        assert!(
+            !(plain.report_job(ReportFormat::Xml, "", Default::default()))()
+                .contains("table-match")
+        );
+        assert!(
+            !(plain.report_job(ReportFormat::Html, "", Default::default()))()
+                .contains("table-match")
+        );
     }
 
     #[test]
@@ -11637,6 +12050,95 @@ mod tests {
         v.save_pane(1).unwrap();
         assert!(!v.diff.is_identical());
         assert_eq!(std::fs::read(&paths[1]).unwrap(), b"ONE\ntwo\nthree\n");
+    }
+
+    /// The inline differences kept stay within their bound however far the view goes, and a
+    /// row whose differences were let go gets the same ones back.
+    #[test]
+    fn inline_differences_kept_are_bounded_and_come_back_the_same() {
+        let n = INLINE_CACHE_ROWS * 3;
+        let left: Vec<String> = (0..n).map(|i| format!("value {i} old")).collect();
+        let right: Vec<String> = (0..n).map(|i| format!("value {i} new")).collect();
+        let mut v = TextView::new(
+            vec![
+                TextDoc::from_text(None, &(left.join("\n") + "\n")),
+                TextDoc::from_text(None, &(right.join("\n") + "\n")),
+            ],
+            &Config::default(),
+        );
+        v.ensure_inline(5);
+        let first = v.inline_cache[&5].clone();
+        assert!(!first[0].is_empty(), "row 5 has inline differences");
+        for r in 0..v.diff.rows.len() {
+            v.ensure_inline(r);
+            assert!(v.inline_cache.len() <= INLINE_CACHE_ROWS);
+        }
+        assert!(!v.inline_cache.contains_key(&5), "row 5 was let go");
+        v.ensure_inline(5);
+        assert_eq!(v.inline_cache[&5], first);
+    }
+
+    /// A file past the highlighting budget of the options is shown plain, the status bar says
+    /// why once, and a larger budget highlights it.
+    #[test]
+    fn files_past_the_highlight_budget_say_so_and_a_larger_budget_highlights_them() {
+        let text: String = (0..4_000)
+            .map(|i| format!("let value_{i} = {i}; // {}\n", "padding ".repeat(36)))
+            .collect();
+        assert!(text.len() > 1 << 20 && text.len() < 2 << 20);
+        let doc = || {
+            let mut d = TextDoc::from_text(None, &text);
+            d.syntax = Some("rs".into());
+            d
+        };
+        let mut cfg = Config {
+            highlight_limit_mb: 1,
+            ..Config::default()
+        };
+        let mut v = TextView::new(vec![doc(), doc()], &cfg);
+        v.poll_highlight(&cfg);
+        assert!(v.panes.iter().all(|p| p.hl_rx.is_none() && p.hl.is_none()));
+        let said = trf(
+            "view.syntax_over_budget",
+            &[
+                ("file", format!("{t}, {t}", t = v.panes[0].doc.title())),
+                ("mb", "1".into()),
+            ],
+        );
+        assert_eq!(v.status, said);
+        v.status.clear();
+        v.panes[0].hl_dirty = true;
+        v.poll_highlight(&cfg);
+        assert_eq!(v.status, "", "said once, not on every check");
+
+        cfg.highlight_limit_mb = 2;
+        v.poll_highlight(&cfg);
+        assert!(
+            v.panes.iter().all(|p| p.hl_rx.is_some()),
+            "highlighting started"
+        );
+    }
+
+    /// The memory the benchmarks report is counted for each kind, and an edit shows up as
+    /// undo history.
+    #[test]
+    fn memory_is_counted_by_kind() {
+        let docs = ["one\ntwo\nthree\n", "one\n2\nthree\n"]
+            .map(|t| TextDoc::from_text(None, t))
+            .to_vec();
+        let mut v = TextView::new(docs, &Config::default());
+        let held = |v: &TextView, kind: &str| {
+            v.memory_use()
+                .into_iter()
+                .find(|(k, _)| *k == kind)
+                .unwrap()
+                .1
+        };
+        assert!(held(&v, "lines") >= 6 * std::mem::size_of::<String>());
+        assert!(held(&v, "rows") > 0 && held(&v, "edit marks") > 0);
+        assert_eq!(held(&v, "undo"), 0);
+        v.copy_block(0, 0, 1);
+        assert!(held(&v, "undo") > 0, "{:?}", v.memory_use());
     }
 
     #[test]
@@ -14733,7 +15235,8 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         drop(tx);
         let p = &mut v.panes[0];
-        (p.hl_rx, p.hl_dirty, p.hl_dark) = (Some(rx), false, cfg.dark_mode);
+        (p.hl_rx, p.hl_dirty, p.hl_dark, p.hl_limit) =
+            (Some(rx), false, cfg.dark_mode, cfg.highlight_limit_mb);
         v.poll_highlight(&cfg);
         assert!(v.panes[0].hl_rx.is_none() && v.panes[0].hl.is_none());
     }

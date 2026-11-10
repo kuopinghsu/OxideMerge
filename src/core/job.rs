@@ -120,6 +120,9 @@ pub struct Job {
     pub report_diffs: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub report_hide_paths: bool,
+    /// `summary`, `standard` or `full`: how much of the differences an HTML report shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_detail: Option<super::report::ReportDetail>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub slideshow: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -343,6 +346,9 @@ impl Job {
         if let Some(p) = &self.page_size {
             opt("page-size", text(p));
         }
+        if let Some(d) = self.report_detail {
+            opt("report-detail", text(d.name()));
+        }
         if let Some(k) = &self.ssh_key {
             opt("ssh-key", Some(path("ssh_key", k)?));
         }
@@ -485,6 +491,7 @@ impl Job {
                     (self.context.is_some(), "context"),
                     (self.report_diffs, "report_diffs"),
                     (self.report_hide_paths, "report_hide_paths"),
+                    (self.report_detail.is_some(), "report_detail"),
                     (self.slideshow, "slideshow"),
                     (self.page_size.is_some(), "page_size"),
                     (self.portrait, "portrait"),
@@ -587,7 +594,7 @@ mod tests {
         let j = job(&format!(
             r#"{{"kind": "compare", "left": "a", "right": {}, "recursive": true,
                 "filter": "*.c;!*.bak", "whitespace": "all", "ignore_case": true,
-                "report": "out/r.html", "report_diffs": true}}"#,
+                "report": "out/r.html", "report_diffs": true, "report_detail": "full"}}"#,
             serde_json::to_string(&abs).unwrap()
         ))
         .unwrap();
@@ -602,11 +609,26 @@ mod tests {
                 "--ignore-case".into(),
                 "--report-diffs".into(),
                 format!("--report={}", join("out/r.html")),
+                "--report-detail=full".into(),
                 "--".into(),
                 join("a"),
                 abs.to_string_lossy().into_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn an_unknown_report_detail_is_refused() {
+        assert!(
+            job(r#"{"kind": "compare", "left": "a", "right": "b", "report_detail": "most"}"#)
+                .is_err()
+        );
+        let sync = job(
+            r#"{"kind": "sync_plan", "source": "a", "destination": "b", "mode": "update",
+                "report": "p.json", "report_detail": "full"}"#,
+        )
+        .unwrap();
+        assert!(sync.prepare(Path::new("/jobs")).is_err());
     }
 
     #[test]

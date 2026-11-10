@@ -1056,8 +1056,8 @@ impl RemoteFs for Client {
 }
 
 impl RemoteWrite for Client {
-    /// Writes over an existing file in place, which keeps its permissions on the server. FTP
-    /// has no way to create a file only if it is not there, so a file created by someone else
+    /// Writes over an existing file in place, which keeps its permissions on the server: FTP
+    /// cannot set a replacement's owner or permissions, so it never stages one. FTP has no way to create a file only if it is not there, so a file created by someone else
     /// between the check and the write is written over. A failed or cancelled upload may leave
     /// the file partly written; its error then carries [`PartlyWritten`].
     fn put(
@@ -1065,6 +1065,7 @@ impl RemoteWrite for Client {
         local: &Path,
         remote: &str,
         expected: Option<RemoteStamp>,
+        _in_place: bool,
         cancel: &AtomicBool,
     ) -> Result<RemoteStamp> {
         let cannot = || trf("msg.sftp_cannot_write", &[("path", remote.to_string())]);

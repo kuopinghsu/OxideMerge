@@ -519,6 +519,7 @@ fn read_utf8_lines(
             counts.add(Some(eol));
             doc.lines.push(line);
             doc.original_eols.push(Some(eol));
+            super::cancel::check_every(doc.lines.len(), 1 << 16);
             end + 1
         } else {
             len
@@ -532,6 +533,9 @@ fn read_utf8_lines(
         doc.lines.push(line);
         doc.original_eols.push(None);
     }
+    // Pushed one at a time, the list has up to twice the room it needs: a large file's lines
+    // are the biggest thing a compare keeps, so the room is given back.
+    doc.lines.shrink_to_fit();
     doc.final_newline = doc.original_eols.last().is_none_or(Option::is_some);
     doc.mixed_eol = counts.mixed();
     if let Some(eol) = counts.dominant() {

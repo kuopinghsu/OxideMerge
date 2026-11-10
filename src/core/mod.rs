@@ -1,7 +1,8 @@
 pub mod archive;
 #[cfg(test)]
-mod bench;
+pub(crate) mod bench;
 pub mod binary;
+pub mod cancel;
 pub mod comments;
 pub mod conflict;
 pub mod diff;
@@ -23,9 +24,11 @@ pub mod pdf_report;
 pub mod prettify;
 pub mod problem;
 pub mod project;
+pub mod recovery;
 #[cfg(test)]
 mod regress;
 pub mod remote;
+pub mod remote_stage;
 pub mod remote_sync;
 pub mod remote_url;
 pub mod report;

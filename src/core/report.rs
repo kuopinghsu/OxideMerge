@@ -3,7 +3,7 @@
 
 use super::diff::{DiffOptions, DiffResult};
 use super::folder::{CmpStatus, DirItem};
-pub use super::html_report::FolderReportInfo;
+pub use super::html_report::{FolderReportInfo, ReportDetail};
 use crate::i18n::{tr, trf};
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -163,7 +163,8 @@ pub(crate) fn esc_marked(line: &str, marks: &[std::ops::Range<usize>]) -> String
 }
 
 /// Report of a 2-way or 3-way text compare, listing every difference, with bookmark comments
-/// and the compare rules file `rules` ("" = none) used.
+/// and the compare rules file `rules` ("" = none) used, showing as much of the differences as
+/// `detail` asks for.
 pub fn text_html(
     titles: &[String],
     panes: &[&[String]],
@@ -171,12 +172,14 @@ pub fn text_html(
     opts: &DiffOptions,
     notes: &[BTreeMap<usize, String>],
     rules: &str,
+    detail: ReportDetail,
 ) -> String {
-    super::html_report::text_report(titles, panes, result, opts, notes, rules)
+    super::html_report::text_report(titles, panes, result, opts, notes, rules, detail)
 }
 
 /// Report of a 2-way or 3-way text compare as `format`: XML, an HTML slideshow, or else the
 /// HTML report (see [`text_html`]).
+#[allow(clippy::too_many_arguments)]
 pub fn text_report(
     format: ReportFormat,
     titles: &[String],
@@ -185,13 +188,14 @@ pub fn text_report(
     opts: &DiffOptions,
     notes: &[BTreeMap<usize, String>],
     rules: &str,
+    detail: ReportDetail,
 ) -> String {
     match format {
         ReportFormat::Xml => super::xml_report::text_xml(titles, panes, result, notes, rules),
         ReportFormat::Slideshow => {
             super::slideshow::text_slideshow(titles, panes, result, opts, notes, rules)
         }
-        _ => text_html(titles, panes, result, opts, notes, rules),
+        _ => text_html(titles, panes, result, opts, notes, rules, detail),
     }
 }
 

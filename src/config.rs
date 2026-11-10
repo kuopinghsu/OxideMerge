@@ -147,6 +147,11 @@ pub struct Config {
     pub pdf_letter: bool,
     /// Whether folder reports name the compared folders by their sides, not their paths.
     pub report_hide_paths: bool,
+    /// How much of the differences HTML reports show.
+    pub report_detail: crate::core::report::ReportDetail,
+    /// Whether saving a file opened from a server writes it over in place, rather than
+    /// replacing it through a staged copy (see [`crate::core::remote_stage`]).
+    pub remote_in_place: bool,
     pub folder: FolderOptions,
     pub filter: String,
     pub recent_paths: Vec<String>,
@@ -154,6 +159,9 @@ pub struct Config {
     pub recent_compares: Vec<Vec<String>>,
     pub recent_filters: Vec<String>,
     pub syntax_highlight: bool,
+    /// Files larger than this many MiB (or 3,125 lines a MiB) are shown without syntax
+    /// highlighting, which says so in the status bar.
+    pub highlight_limit_mb: u32,
     pub show_location_pane: bool,
     /// Diff colors told apart without red and green: blue for added, orange for removed.
     pub color_blind_colors: bool,
@@ -181,6 +189,10 @@ pub struct Config {
     pub unpackers: Vec<Unpacker>,
     pub web_mode: WebMode,
     pub restore_session: bool,
+    /// Whether open comparisons and unsaved edits are kept in a recovery snapshot while the
+    /// program runs, to offer them again after it ends without closing normally (see
+    /// [`crate::core::recovery`]).
+    pub recovery: bool,
     /// Text compares fold long runs of unchanged lines.
     pub collapse_unchanged: bool,
     /// Text compares wrap long lines instead of scrolling sideways.
@@ -213,7 +225,9 @@ impl Default for Config {
             rules_migrated: false,
             open_reports: true,
             pdf_letter: false,
+            remote_in_place: false,
             report_hide_paths: false,
+            report_detail: Default::default(),
             folder: FolderOptions::default(),
             filter: "*.*".into(),
             recent_paths: Vec::new(),
@@ -225,6 +239,7 @@ impl Default for Config {
                 "!.git\\;!target\\".into(),
             ],
             syntax_highlight: true,
+            highlight_limit_mb: crate::ui::syntax::DEFAULT_LIMIT_MB,
             show_location_pane: true,
             color_blind_colors: false,
             high_contrast: false,
@@ -252,6 +267,7 @@ impl Default for Config {
             }],
             web_mode: WebMode::Markdown,
             restore_session: true,
+            recovery: false,
             collapse_unchanged: false,
             word_wrap: false,
             backup_on_save: false,
