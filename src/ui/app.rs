@@ -8,9 +8,10 @@ use crate::core::filter::{self, FltFilter, FLT_PREFIX};
 use crate::core::folder::CompareMethod;
 use crate::core::patch::{self, PatchStyle};
 use crate::core::project::{self, Project};
+use crate::core::recovery;
 use crate::core::remote;
 use crate::core::remote_sync;
-use crate::core::report::{self, side_name, ReportFormat};
+use crate::core::report::{self, side_name, ReportDetail, ReportFormat};
 use crate::core::rules::{self, RuleDraft, RuleKind, RuleSet};
 use crate::core::saved::{self, SavedCompare};
 use crate::core::text::{self, FileKind, TextDoc};
@@ -129,6 +130,8 @@ pub struct Tab {
     /// over SFTP), deleted with the last tab showing them: the folder compare and the files
     /// opened from it.
     temps: Vec<std::sync::Arc<tempfile::TempDir>>,
+    /// Left out of the recovery snapshot, at the user's request (see [`recovery`]).
+    no_recovery: bool,
     /// The connection and remote path of a side staged from [`remote::fetch`], one slot per
     /// `source`, for *Save* to write it back to; `None` for a side opened any other way.
     remote: Vec<Option<RemoteFile>>,
@@ -585,6 +588,7 @@ const OPT_INDEX: &[(OptTab, &str)] = &[
     (OptTab::General, "opt.recycle_bin"),
     (OptTab::General, "opt.confirm_ops"),
     (OptTab::General, "opt.restore_session"),
+    (OptTab::General, "opt.recovery"),
     (OptTab::Compare, "opt.whitespace"),
     (OptTab::Compare, "opt.ws_compare"),
     (OptTab::Compare, "opt.ws_change"),
@@ -1512,6 +1516,7 @@ impl RemoteDialog {
             active: self.protocol.is_ftp() && self.active,
             client_cert: file(&self.client_cert),
             client_key: file(&self.client_key).filter(|_| !self.client_cert.trim().is_empty()),
+            in_place: false,
             port_given: false,
         };
         let auth = match sign_in {
@@ -1860,6 +1865,24 @@ struct RemoteLoad {
 }
 
 /// A revision being read for *Compare with revision*, on another thread.
+/// A text comparison of large files being opened on another thread (see
+/// [`OxideMergeApp::start_background_open`]). Its result opens a tab only while it is still
+/// listed: a cancelled one is taken off the list, so whatever it sends later is thrown away.
+struct PendingOpen {
+    id: u64,
+    names: String,
+    started: std::time::Instant,
+    /// `None` when the job stopped because it was cancelled.
+    rx: std::sync::mpsc::Receiver<Option<anyhow::Result<TextView>>>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    source: Vec<PathBuf>,
+    descriptions: Vec<Option<String>>,
+}
+
+/// Files together at least this large are compared on another thread, with a *Cancel*
+/// button, instead of holding the window still while they load.
+const BACKGROUND_OPEN_BYTES: u64 = 32 << 20;
+
 struct RevLoad {
     path: PathBuf,
     rev: String,
@@ -1896,6 +1919,13 @@ const TOAST_SECS: f64 = 4.0;
 /// Folder compares that take at least this long announce when they finish unattended.
 const LONG_COMPARE: std::time::Duration = std::time::Duration::from_secs(5);
 const UNDO_TOAST_SECS: f64 = 8.0;
+/// Snapshots left behind, offered at the start (see [`OxideMergeApp::recovery_dialog`]).
+struct RecoveryOffer {
+    found: Vec<recovery::Found>,
+    /// Whether the dialog lists what each snapshot holds.
+    inspect: bool,
+}
+
 /// The most workspaces listed in the *Workspaces* menu; *Manage workspaces...* lists them all.
 const MAX_WORKSPACE_MENU: usize = 15;
 /// The longest name a workspace can be given.
@@ -1942,6 +1972,11 @@ pub struct OxideMergeApp {
     run_job: Option<crate::ui::job_dialog::RunJob>,
     git_dlg: Option<GitDialog>,
     rev_load: Option<RevLoad>,
+    /// Text comparisons being opened on other threads, oldest first.
+    opening: Vec<PendingOpen>,
+    next_open: u64,
+    /// See [`BACKGROUND_OPEN_BYTES`]; tests lower it.
+    background_open_bytes: u64,
     remote_dlg: Option<RemoteDialog>,
     remote_load: Option<RemoteLoad>,
     host_prompt: Option<HostPrompt>,
@@ -2004,6 +2039,19 @@ pub struct OxideMergeApp {
     /// Whether the window had focus on the previous frame; files are checked for outside changes
     /// when it comes back.
     was_focused: bool,
+    /// The widget that had the keyboard focus before a dialog opened, given it back once the
+    /// last dialog closes; while no dialog is open, the focus at the start of the last frame.
+    focus_before_dialog: Option<egui::Id>,
+    /// Whether a dialog was open in the last frame.
+    was_modal: bool,
+    /// The file name of this run's recovery snapshot (see [`recovery::own_name`]).
+    recovery_name: String,
+    /// When this run's snapshot was last written; `None` while it has none.
+    recovery_at: Option<std::time::Instant>,
+    /// Snapshots left behind by programs that did not close normally, offered at the start.
+    recovery_offer: Option<RecoveryOffer>,
+    /// The widget being given the focus back after a dialog, and how many more frames to try.
+    focus_back: Option<(egui::Id, u8, Option<egui::Id>)>,
     next_tab_id: u64,
     /// Whether the open tabs are remembered for the next start; not when started to compare
     /// something given on the command line, so a one-off compare keeps the previous session.
@@ -2839,6 +2887,9 @@ impl OxideMergeApp {
             archive_password: None,
             archive_passwords: Vec::new(),
             rev_load: None,
+            opening: Vec::new(),
+            next_open: 0,
+            background_open_bytes: BACKGROUND_OPEN_BYTES,
             report_job: None,
             report_opens: false,
             prints: Vec::new(),
@@ -2862,6 +2913,12 @@ impl OxideMergeApp {
             shown_active: None,
             pass_on: None,
             was_focused: true,
+            focus_before_dialog: None,
+            was_modal: false,
+            recovery_name: recovery::own_name(),
+            recovery_at: None,
+            recovery_offer: None,
+            focus_back: None,
             next_tab_id: 0,
             track_session: initial.is_none(),
             palette: None,
@@ -2895,6 +2952,9 @@ impl OxideMergeApp {
             app.open(req);
         } else if app.cfg.restore_session {
             app.restore_session();
+        }
+        if app.cfg.recovery && !cfg!(test) {
+            app.find_recovery();
         }
         if let (Some(u), Some(p)) = (crate::config::unreadable(), crate::config::config_path()) {
             app.error(crate::config::unreadable_message(
@@ -2967,6 +3027,14 @@ impl OxideMergeApp {
     /// workspace): "All differences" and review tabs, and tabs of temporary copies, have
     /// nothing of their own to reopen from and are left out.
     fn session_tabs(&self) -> Vec<SessionTab> {
+        self.tabs
+            .iter()
+            .filter_map(|t| self.session_tab(t))
+            .collect()
+    }
+
+    /// Tab `t` as a tab to save, when it can be opened again from its files.
+    fn session_tab(&self, t: &Tab) -> Option<SessionTab> {
         let tab = |t: &Tab| -> Option<SessionTab> {
             if t.source.is_empty() {
                 return None;
@@ -2996,7 +3064,299 @@ impl OxideMergeApp {
                 rules,
             })
         };
-        self.tabs.iter().filter_map(tab).collect()
+        tab(t)
+    }
+
+    /// The open comparisons as a recovery snapshot: each that can be opened again from its
+    /// files, with the text of its sides that have unsaved edits. Tabs of server files,
+    /// revisions and archives, which need their temporary copies, are left out like a session.
+    fn recovery_snapshot(&self) -> recovery::Snapshot {
+        let (mut used, mut left_out) = (0, 0);
+        let mut tabs = Vec::new();
+        let mut active = 0;
+        for (i, t) in self.tabs.iter().enumerate() {
+            let Some(tab) = self.session_tab(t).filter(|_| !t.no_recovery) else {
+                continue;
+            };
+            if i == self.active {
+                active = tabs.len();
+            }
+            let (unsaved, block, caret, bookmarks) = match &t.content {
+                Content::Text(v) => (
+                    v.panes
+                        .iter()
+                        .map(|p| p.doc.modified.then(|| p.doc.text()))
+                        .collect(),
+                    v.cur_block,
+                    v.caret_line(),
+                    v.bookmarks
+                        .iter()
+                        .map(|b| b.iter().map(|(l, n)| (*l, n.clone())).collect())
+                        .collect(),
+                ),
+                _ => (Vec::new(), None, None, Vec::new()),
+            };
+            let (unsaved, out) = recovery::within_budget(unsaved, &mut used);
+            left_out += out;
+            let sources = tab
+                .paths
+                .iter()
+                .map(|p| recovery::Fingerprint::of(Path::new(p)))
+                .collect();
+            tabs.push(recovery::RecoveredTab {
+                tab,
+                sources,
+                unsaved,
+                block,
+                caret,
+                bookmarks,
+            });
+        }
+        recovery::Snapshot::new(tabs, active, left_out)
+    }
+
+    /// Writes this run's recovery snapshot when recovery is on: every few seconds while a tab
+    /// has unsaved edits, else every [`recovery::BEAT`], on another thread. With recovery off,
+    /// or nothing open, there is no snapshot.
+    fn keep_recovery(&mut self) {
+        let Some(dir) = recovery::dir() else {
+            return;
+        };
+        let path = dir.join(&self.recovery_name);
+        if !self.cfg.recovery || self.tabs.is_empty() {
+            if self.recovery_at.take().is_some() {
+                recovery::remove(&path);
+            }
+            return;
+        }
+        let edited = self.tabs.iter().any(|t| match &t.content {
+            Content::Text(v) => v.is_modified(),
+            _ => false,
+        });
+        let every = if edited {
+            std::time::Duration::from_secs(5)
+        } else {
+            recovery::BEAT
+        };
+        if self.recovery_at.is_some_and(|at| at.elapsed() < every) {
+            return;
+        }
+        self.recovery_at = Some(std::time::Instant::now());
+        let snapshot = self.recovery_snapshot();
+        if snapshot.tabs.is_empty() {
+            // Every tab left out, or none that can be opened again: nothing to keep.
+            recovery::remove(&path);
+            return;
+        }
+        let name = self.recovery_name.clone();
+        std::thread::spawn(move || {
+            let _ = recovery::write(&dir, &name, &snapshot);
+        });
+    }
+
+    /// Offers the snapshots that programs which did not close normally left behind.
+    fn find_recovery(&mut self) {
+        let Some(dir) = recovery::dir() else {
+            return;
+        };
+        let found = recovery::abandoned(&dir, &self.recovery_name, std::time::SystemTime::now());
+        if !found.is_empty() {
+            self.recovery_offer = Some(RecoveryOffer {
+                found,
+                inspect: false,
+            });
+        }
+    }
+
+    /// Opens the tabs of `snapshot` with their unsaved text in their sides, unsaved, and says
+    /// which files changed since. Nothing is written to the compared files.
+    fn restore_snapshot(&mut self, snapshot: &recovery::Snapshot) {
+        let mut changed = Vec::new();
+        let mut failed = 0;
+        let mut first = None;
+        for (i, r) in snapshot.tabs.iter().enumerate() {
+            for (p, c) in r.tab.paths.iter().zip(r.changed_sources()) {
+                if c {
+                    changed.push(p.clone());
+                }
+            }
+            let before = self.tabs.len();
+            let (opened, _) = self.open_saved_tabs(std::slice::from_ref(&r.tab), 0);
+            let Some(at) = opened.filter(|_| self.tabs.len() > before) else {
+                failed += 1;
+                continue;
+            };
+            if i == snapshot.active || first.is_none() {
+                first = Some(at);
+            }
+            if let Content::Text(v) = &mut self.tabs[at].content {
+                let mut edited = false;
+                for (pane, text) in v.panes.iter_mut().zip(&r.unsaved) {
+                    let Some(text) = text else { continue };
+                    let fresh = crate::core::text::TextDoc::from_text(None, text);
+                    let doc = &mut pane.doc;
+                    doc.lines = fresh.lines;
+                    doc.eol = fresh.eol;
+                    doc.mixed_eol = fresh.mixed_eol;
+                    doc.original_eols = fresh.original_eols;
+                    doc.final_newline = fresh.final_newline;
+                    doc.preserve_eols = false;
+                    doc.modified = true;
+                    edited = true;
+                }
+                if edited {
+                    v.rediff();
+                }
+                if let Some(b) = r.block.filter(|&b| b < v.diff.blocks.len()) {
+                    v.cur_block = Some(b);
+                }
+                for (p, marks) in r.bookmarks.iter().enumerate().take(v.bookmarks.len()) {
+                    let len = v.panes[p].doc.lines.len();
+                    v.bookmarks[p] = marks.iter().filter(|(l, _)| *l < len).cloned().collect();
+                }
+                if let Some((p, line)) = r.caret {
+                    v.set_caret_line(p, line);
+                }
+            }
+        }
+        if let Some(a) = first {
+            self.active = a;
+        }
+        let mut msg = trf(
+            "recovery.restored",
+            &[("n", (snapshot.tabs.len() - failed).to_string())],
+        );
+        if failed > 0 {
+            msg.push(' ');
+            msg.push_str(&trf("recovery.not_reopened", &[("n", failed.to_string())]));
+        }
+        if !changed.is_empty() {
+            msg.push(' ');
+            msg.push_str(&trf(
+                "recovery.changed_since",
+                &[("files", changed.join(", "))],
+            ));
+        }
+        self.push_toast(msg, !changed.is_empty() || failed > 0, None);
+    }
+
+    /// The prompt for snapshots left behind: *Restore*, *Show details* (what each holds and
+    /// which files changed since), *Discard* (deleted), or *Later* (kept for the next start).
+    fn recovery_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut offer) = self.recovery_offer.take() else {
+            return;
+        };
+        let (mut restore, mut discard, mut later) = (false, false, false);
+        let usable: Vec<&recovery::Snapshot> = offer
+            .found
+            .iter()
+            .filter_map(|f| f.snapshot.as_ref().ok())
+            .collect();
+        let tabs: usize = usable.iter().map(|s| s.tabs.len()).sum();
+        let unsaved: usize = usable.iter().map(|s| s.unsaved_sides()).sum();
+        let changed: usize = usable
+            .iter()
+            .flat_map(|s| &s.tabs)
+            .map(|t| t.changed_sources().iter().filter(|&&c| c).count())
+            .sum();
+        let modal = egui::Modal::new(egui::Id::unique("recovery_dialog")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.heading(tr("recovery.title"));
+            let saved = usable.first().map(|s| s.saved.clone()).unwrap_or_default();
+            ui.label(trf(
+                "recovery.found",
+                &[
+                    ("saved", saved),
+                    ("tabs", tabs.to_string()),
+                    ("unsaved", unsaved.to_string()),
+                ],
+            ));
+            if changed > 0 {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    trf("recovery.files_changed", &[("n", changed.to_string())]),
+                );
+            }
+            ui.weak(tr("recovery.never_saved"));
+            if offer.inspect {
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for f in &offer.found {
+                            ui.separator();
+                            ui.monospace(f.path.display().to_string());
+                            match &f.snapshot {
+                                Err(e) => {
+                                    ui.colored_label(ui.visuals().error_fg_color, e);
+                                }
+                                Ok(s) => {
+                                    for t in &s.tabs {
+                                        let changed = t.changed_sources();
+                                        for (p, c) in t.tab.paths.iter().zip(&changed) {
+                                            let note = if *c {
+                                                format!("{p}  ⚠ {}", tr("recovery.changed"))
+                                            } else {
+                                                p.clone()
+                                            };
+                                            ui.label(note);
+                                        }
+                                        let n = t.unsaved.iter().flatten().count();
+                                        if n > 0 {
+                                            ui.weak(trf(
+                                                "recovery.sides_unsaved",
+                                                &[("n", n.to_string())],
+                                            ));
+                                        }
+                                    }
+                                    if s.left_out > 0 {
+                                        ui.weak(trf(
+                                            "recovery.left_out",
+                                            &[("n", s.left_out.to_string())],
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    });
+            }
+            widgets::dialog_footer(ui, |ui| {
+                ui.add_enabled_ui(!usable.is_empty(), |ui| {
+                    if widgets::primary_button(ui, tr("recovery.restore")).clicked() {
+                        restore = true;
+                    }
+                });
+                let inspect = if offer.inspect {
+                    tr("recovery.hide_details")
+                } else {
+                    tr("recovery.inspect")
+                };
+                if widgets::secondary_button(ui, inspect).clicked() {
+                    offer.inspect = !offer.inspect;
+                }
+                if widgets::secondary_button(ui, tr("recovery.discard")).clicked() {
+                    discard = true;
+                }
+                if widgets::secondary_button(ui, tr("recovery.later")).clicked()
+                    || ui.input(|i| i.key_pressed(Key::Escape))
+                {
+                    later = true;
+                }
+            });
+        });
+        if restore {
+            for f in &offer.found {
+                if let Ok(s) = &f.snapshot {
+                    self.restore_snapshot(s);
+                    recovery::remove(&f.path);
+                }
+            }
+        } else if discard {
+            for f in &offer.found {
+                recovery::remove(&f.path);
+            }
+        } else if !(later || modal.should_close()) {
+            self.recovery_offer = Some(offer);
+        }
     }
 
     fn save_session(&mut self) {
@@ -3157,6 +3517,34 @@ impl OxideMergeApp {
         if self.toasts.len() > 4 {
             self.toasts.remove(0);
         }
+    }
+
+    /// Gives the keyboard focus back to where it was once the dialogs opened over it close, so a
+    /// keyboard user carries on from the control that opened them rather than from nowhere.
+    /// A dialog opened in a frame takes the focus in that frame, so the focus to keep is the
+    /// one seen at the start of the frame before.
+    fn keep_focus_across_dialogs(&mut self, ctx: &egui::Context, modal: bool) {
+        let focused = ctx.memory(|m| m.focused());
+        match (self.was_modal, modal) {
+            (true, false) => {
+                // What had the focus as it closed (its Cancel button, say) is gone with it.
+                self.focus_back = self.focus_before_dialog.take().map(|id| (id, 3, focused));
+            }
+            (false, false) if self.focus_back.is_none() => self.focus_before_dialog = focused,
+            _ => {}
+        }
+        // The control is asked for the focus again for a few frames: the frame a dialog closes
+        // in may not draw it where it takes the focus.
+        // Only while nothing has the focus: a command run from a menu or dialog (Find, Go to
+        // line) may have put it somewhere on purpose.
+        if let Some((id, left, gone)) = self.focus_back.take() {
+            let free = focused.is_none() || focused == gone;
+            if !modal && free && focused != Some(id) && left > 0 {
+                ctx.memory_mut(|m| m.request_focus(id));
+                self.focus_back = Some((id, left - 1, gone));
+            }
+        }
+        self.was_modal = modal;
     }
 
     fn new_open_dialog(&self, left: Option<String>) -> OpenDialog {
@@ -3496,6 +3884,10 @@ impl OxideMergeApp {
                 // A merge written to an output file (`git mergetool`) works on the files as
                 // they are: text read out of a notebook or document could not be saved there.
                 let raw = req.snapshot_options.is_some() || req.output.is_some();
+                if self.opens_in_background(&req, &paths, &missing) {
+                    self.start_background_open(&req, paths, source);
+                    return Ok(());
+                }
                 for (i, p) in paths.iter().enumerate() {
                     let mut d = if raw && !missing[i] {
                         text::load_doc(p, None)?
@@ -4254,6 +4646,149 @@ impl OxideMergeApp {
     }
 
     /// Shows that a revision is being read, with a button to stop, and opens its tab once read.
+    /// Whether a text comparison of `paths` opens on another thread: plain files (no unpacker,
+    /// none missing, no compare rules, table matching, output file or frozen options) that are
+    /// together at least [`Self::background_open_bytes`].
+    fn opens_in_background(&self, req: &OpenRequest, paths: &[PathBuf], missing: &[bool]) -> bool {
+        let plain = req.table.is_none()
+            && req.rules.is_none()
+            && req.snapshot_options.is_none()
+            && req.output.is_none()
+            && !missing.iter().any(|&m| m)
+            && paths
+                .iter()
+                .all(|p| unpacker::find(&self.cfg.comparison_options(), p).is_none());
+        let size: u64 = paths
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum();
+        plain && size >= self.background_open_bytes
+    }
+
+    /// Loads and compares `paths` on another thread; [`Self::opening_progress`] shows it with a
+    /// *Cancel* button and opens its tab when it is done. Cancelling stops the reading and the
+    /// comparison at their next check, within a fraction of a second, and drops what they made.
+    fn start_background_open(
+        &mut self,
+        req: &OpenRequest,
+        paths: Vec<PathBuf>,
+        source: Vec<PathBuf>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (stop, cfg) = (cancel.clone(), self.cfg.clone());
+        let read_only = req.read_only.clone();
+        let descriptions = req.descriptions.clone();
+        let names = paths
+            .iter()
+            .map(|p| {
+                p.file_name().map_or_else(
+                    || p.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ↔ ");
+        let job_paths = paths.clone();
+        let job_descriptions = descriptions.clone();
+        std::thread::spawn(move || {
+            let made = crate::core::cancel::run(stop, || -> anyhow::Result<TextView> {
+                let mut docs = Vec::new();
+                for (i, p) in job_paths.iter().enumerate() {
+                    let mut d = text::load_doc(p, None)?;
+                    if let Some(Some(desc)) = job_descriptions.get(i) {
+                        d.description = Some(desc.clone());
+                    }
+                    if read_only.get(i).copied().unwrap_or(false) {
+                        d.read_only = true;
+                    }
+                    docs.push(d);
+                    crate::core::cancel::check();
+                }
+                Ok(TextView::new(docs, &cfg))
+            });
+            let _ = tx.send(made);
+        });
+        self.next_open += 1;
+        self.opening.push(PendingOpen {
+            id: self.next_open,
+            names,
+            started: std::time::Instant::now(),
+            rx,
+            cancel,
+            source,
+            descriptions,
+        });
+    }
+
+    /// Cancels the comparison being opened with `id`; nothing it sends afterwards is used.
+    fn cancel_open(&mut self, id: u64) {
+        if let Some(at) = self.opening.iter().position(|o| o.id == id) {
+            let o = self.opening.remove(at);
+            o.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.push_toast(trf("open.cancelled", &[("name", o.names)]), false, None);
+        }
+    }
+
+    /// Opens the tabs of the comparisons finished on other threads, and shows the ones still
+    /// running, each with how long it has run and a *Cancel* button. The window is not modal:
+    /// the other tabs stay usable meanwhile.
+    fn opening_progress(&mut self, ctx: &egui::Context) {
+        let mut done = Vec::new();
+        for (k, o) in self.opening.iter().enumerate() {
+            match o.rx.try_recv() {
+                Ok(r) => done.push((k, r)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done.push((k, Some(Err(anyhow::anyhow!("{}", tr("status.error"))))));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        for (k, result) in done.into_iter().rev() {
+            let o = self.opening.remove(k);
+            match result {
+                Some(Ok(view)) => {
+                    self.push_tab(Content::Text(view), o.source);
+                    self.tabs.last_mut().unwrap().descriptions = o.descriptions;
+                }
+                Some(Err(e)) => self.error(format!("{e:#}")),
+                None => {}
+            }
+        }
+        if self.opening.is_empty() {
+            return;
+        }
+        let mut stop = None;
+        egui::Window::new(tr("open.title"))
+            .id(egui::Id::unique("opening_progress"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -40.0))
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                for o in &self.opening {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        // Not a live region: its seconds would be read out every second.
+                        ui.label(trf(
+                            "open.comparing",
+                            &[
+                                ("name", o.names.clone()),
+                                ("secs", o.started.elapsed().as_secs().to_string()),
+                            ],
+                        ));
+                        if widgets::secondary_button(ui, tr("btn.cancel")).clicked() {
+                            stop = Some(o.id);
+                        }
+                    });
+                }
+            });
+        if let Some(id) = stop {
+            self.cancel_open(id);
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
     fn rev_load_dialog(&mut self, ctx: &egui::Context) {
         let Some(load) = self.rev_load.take() else {
             return;
@@ -4596,6 +5131,7 @@ impl OxideMergeApp {
             origin: None,
             temps,
             remote,
+            no_recovery: false,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -5246,7 +5782,7 @@ impl OxideMergeApp {
                 out.push(entry(Icon::Inline, label, detail, PaletteAction::Inline));
             }
         }
-        let toggles: [(&str, ConfigFlag); 15] = [
+        let toggles: [(&str, ConfigFlag); 16] = [
             ("view.line_numbers", |c| &mut c.show_line_numbers),
             ("view.location_pane", |c| &mut c.show_location_pane),
             ("view.line_detail", |c| &mut c.show_line_detail),
@@ -5258,6 +5794,7 @@ impl OxideMergeApp {
             ("menu.open_reports", |c| &mut c.open_reports),
             ("menu.pdf_letter", |c| &mut c.pdf_letter),
             ("menu.report_hide_paths", |c| &mut c.report_hide_paths),
+            ("menu.remote_in_place", |c| &mut c.remote_in_place),
             ("opt.color_blind", |c| &mut c.color_blind_colors),
             ("opt.high_contrast", |c| &mut c.high_contrast),
             ("opt.reduce_motion", |c| &mut c.reduce_motion),
@@ -5829,7 +6366,11 @@ impl OxideMergeApp {
                 };
                 match ReportFormat::from_path(&path) {
                     ReportFormat::Xml => {
-                        let job = v.report_job(ReportFormat::Xml, &self.cfg.rules);
+                        let job = v.report_job(
+                            ReportFormat::Xml,
+                            &self.cfg.rules,
+                            self.cfg.report_detail,
+                        );
                         self.spawn_report(path, job);
                     }
                     _ => self.export_text_html_to(path),
@@ -5958,7 +6499,11 @@ impl OxideMergeApp {
             match self.tabs.get(self.active).map(|t| t.content.view()) {
                 Some(Content::Text(v)) => (
                     report::html_file_name(&v.titles()),
-                    v.report_job(ReportFormat::Slideshow, &self.cfg.rules),
+                    v.report_job(
+                        ReportFormat::Slideshow,
+                        &self.cfg.rules,
+                        self.cfg.report_detail,
+                    ),
                 ),
                 Some(Content::Folder(v)) => (
                     report::html_file_name(&v.display_roots),
@@ -6468,9 +7013,12 @@ impl OxideMergeApp {
         errors
     }
 
-    fn start_uploads(&mut self, jobs: Vec<UploadJob>) {
+    fn start_uploads(&mut self, mut jobs: Vec<UploadJob>) {
         if jobs.is_empty() {
             return;
+        }
+        for job in &mut jobs {
+            job.conn.options.in_place = self.cfg.remote_in_place;
         }
         if self.upload.is_some() {
             for job in jobs {
@@ -6998,7 +7546,7 @@ impl OxideMergeApp {
         let Some(Content::Text(v)) = self.tabs.get(self.active).map(|t| t.content.view()) else {
             return;
         };
-        let job = v.html_report_job(&self.cfg.rules);
+        let job = v.html_report_job(&self.cfg.rules, self.cfg.report_detail);
         self.spawn_report(path, job);
     }
 
@@ -7936,6 +8484,13 @@ impl OxideMergeApp {
         m.item(ui, Cmd::Open);
         m.item(ui, Cmd::OpenRemote);
         m.item(ui, Cmd::ReloadRemote);
+        let in_place = &mut self.cfg.remote_in_place;
+        if widgets::menu_check(ui, *in_place, tr("menu.remote_in_place"), "")
+            .on_hover_text(tr("menu.remote_in_place_tip"))
+            .clicked()
+        {
+            *in_place = !*in_place;
+        }
         let recent = &self.cfg.recent_compares;
         ui.add_enabled_ui(!recent.is_empty(), |ui| {
             submenu_list(ui, tr("menu.open_recent"), |ui| {
@@ -8000,6 +8555,12 @@ impl OxideMergeApp {
             ui.separator();
             check(ui, &mut self.cfg.open_reports, tr("menu.open_reports"), "");
             check(ui, &mut self.cfg.pdf_letter, tr("menu.pdf_letter"), "");
+            submenu(ui, tr("menu.report_detail"), |ui| {
+                for d in ReportDetail::ALL {
+                    ui.radio_value(&mut self.cfg.report_detail, d, d.label())
+                        .on_hover_text(crate::core::html_report::limits_text(d));
+                }
+            });
             let hide = &mut self.cfg.report_hide_paths;
             if widgets::menu_check(ui, *hide, tr("menu.report_hide_paths"), "")
                 .on_hover_text(tr("menu.report_hide_paths_tip"))
@@ -8213,6 +8774,8 @@ impl OxideMergeApp {
         let mut activate: Option<usize> = None;
         let mut new_tab = false;
         let mut tab_cmd: Option<Cmd> = None;
+        let mut recovery_toggle: Option<usize> = None;
+        let recovery_on = self.cfg.recovery;
         let mut drag_move: Option<(usize, usize)> = None;
         let n_tabs = self.tabs.len();
         egui::ScrollArea::horizontal()
@@ -8382,6 +8945,18 @@ impl OxideMergeApp {
                             );
                             item(ui, tr("tab.close_right"), !last, Cmd::CloseTabsToRight(i));
                             item(ui, tr("tab.close_all"), true, Cmd::CloseAllTabs);
+                            if recovery_on {
+                                ui.separator();
+                                let mut keep = !t.no_recovery;
+                                if ui
+                                    .checkbox(&mut keep, tr("tab.keep_for_recovery"))
+                                    .on_hover_text(tr("tab.keep_for_recovery_tip"))
+                                    .changed()
+                                {
+                                    recovery_toggle = Some(i);
+                                    ui.close();
+                                }
+                            }
                             if !paths.is_empty() {
                                 ui.separator();
                                 if ui.button(tr("cmd.copy_path")).clicked() {
@@ -8442,6 +9017,11 @@ impl OxideMergeApp {
         }
         if let Some(i) = close {
             self.close_tab(i, false);
+        }
+        if let Some(i) = recovery_toggle {
+            self.tabs[i].no_recovery = !self.tabs[i].no_recovery;
+            // Written again at once, so a tab left out leaves the disk now.
+            self.recovery_at = None;
         }
         if let Some(c) = tab_cmd {
             let ctx = ui.ctx().clone();
@@ -8512,11 +9092,14 @@ impl OxideMergeApp {
                     );
                 }
                 let text = egui::RichText::new(part).size(theme::size::SMALL);
-                ui.label(if k == 0 {
+                // Read out when it changes: the difference selected, the conflicts left, a
+                // comparison's progress.
+                let shown = ui.label(if k == 0 {
                     text.color(p.text)
                 } else {
                     text.color(p.text_dim)
                 });
+                widgets::announce(ui, &shown, false);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let lang = i18n::languages()
@@ -9272,6 +9855,17 @@ impl OxideMergeApp {
                                     );
                                     ui.checkbox(&mut c.show_whitespace, tr("view.whitespace"));
                                     ui.checkbox(&mut c.syntax_highlight, tr("view.syntax"));
+                                    ui.add_enabled_ui(c.syntax_highlight, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(tr("opt.highlight_limit"));
+                                            ui.add(
+                                                egui::DragValue::new(&mut c.highlight_limit_mb)
+                                                    .range(1..=1024)
+                                                    .suffix(" MB"),
+                                            )
+                                            .on_hover_text(tr("opt.highlight_limit_tip"));
+                                        });
+                                    });
                                     ui.label(egui::RichText::new(tr("opt.accessibility")).strong());
                                     ui.checkbox(&mut c.color_blind_colors, tr("opt.color_blind"));
                                     ui.checkbox(&mut c.high_contrast, tr("opt.high_contrast"));
@@ -9286,6 +9880,8 @@ impl OxideMergeApp {
                                     ui.checkbox(&mut c.use_recycle_bin, tr("opt.recycle_bin"));
                                     ui.checkbox(&mut c.confirm_operations, tr("opt.confirm_ops"));
                                     ui.checkbox(&mut c.restore_session, tr("opt.restore_session"));
+                                    ui.checkbox(&mut c.recovery, tr("opt.recovery"))
+                                        .on_hover_text(tr("opt.recovery_tip"));
                                 }
                                 OptTab::Compare => {
                                     let o = &mut d.cfg.diff;
@@ -9951,12 +10547,14 @@ impl OxideMergeApp {
                                         ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                                     ui.painter().circle_filled(r.center(), 4.0, accent);
                                 }
-                                ui.add(
+                                let said = ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(&t.text).size(theme::size::CONTROL),
                                     )
                                     .wrap(),
                                 );
+                                // Errors are read out at once, other messages in turn.
+                                widgets::announce(ui, &said, t.error);
                                 if t.undo.is_some()
                                     && widgets::ghost_icon_button(ui, Icon::Undo, tr("cmd.undo"))
                                         .clicked()
@@ -10102,6 +10700,10 @@ impl eframe::App for OxideMergeApp {
             self.merge_saved_workspaces();
             let _ = self.stored_cfg().save();
         }
+        // A normal exit leaves nothing to recover.
+        if let Some(dir) = recovery::dir() {
+            recovery::remove(&dir.join(&self.recovery_name));
+        }
     }
 
     /// Takes Ctrl+Tab before egui sees it: egui moves the keyboard focus on Tab whatever the
@@ -10215,11 +10817,15 @@ impl eframe::App for OxideMergeApp {
             || self.help
             || self.about
             || self.palette.is_some()
+            || self.recovery_offer.is_some()
             || matches!(
                 self.tabs.get(self.active).map(|t| t.content.view()),
                 Some(Content::Folder(v)) if v.has_dialog()
             );
         widgets::set_modal_open(ctx, modal);
+        // A menu or other popup gives the focus back as a dialog does.
+        let popup = egui::Popup::is_any_open(ctx);
+        self.keep_focus_across_dialogs(ctx, modal || popup);
         if modal {
             self.tab_keys.clear();
         } else {
@@ -10411,6 +11017,7 @@ impl eframe::App for OxideMergeApp {
         self.save_job_dialog(ctx);
         self.run_job_dialog(ctx);
         self.rev_load_dialog(ctx);
+        self.opening_progress(ctx);
         self.remote_connect_dialog(ctx);
         self.ask_dialog(ctx);
         self.archive_password_dialog(ctx);
@@ -10419,6 +11026,8 @@ impl eframe::App for OxideMergeApp {
         self.repack_dialog(ctx);
         self.upload_dialog(ctx);
         self.reload_prompt_dialog(ctx);
+        self.recovery_dialog(ctx);
+        self.keep_recovery();
         self.reload_dialog(ctx);
         self.gc_pending_remote();
         self.workspace_save_dialog(ctx);
@@ -10519,6 +11128,16 @@ impl OxideMergeApp {
                 t.title(),
                 t.status_line()
             ));
+        }
+        if let Some(o) = &self.recovery_offer {
+            let tabs: Vec<String> = o
+                .found
+                .iter()
+                .filter_map(|f| f.snapshot.as_ref().ok())
+                .flat_map(|s| &s.tabs)
+                .map(|t| t.tab.paths.join(" ↔ "))
+                .collect();
+            out.push_str(&format!("recovery offered | {}\n", tabs.join(" | ")));
         }
         for t in &self.toasts {
             let kind = if t.error { "error" } else { "note" };

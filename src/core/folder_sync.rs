@@ -1507,6 +1507,7 @@ fn publish(
     expected: &str,
     place: Place,
     prefix: &str,
+    staged: &dyn Fn() -> std::io::Result<()>,
     stop: &AtomicBool,
 ) -> std::io::Result<()> {
     let dir = to
@@ -1527,6 +1528,13 @@ fn publish(
         let _ = tmp.as_file().set_modified(t);
     }
     tmp.as_file().sync_all()?;
+    if let Err(e) = staged() {
+        // A crash leaves the temporary file behind, as the program ending would.
+        if is_crash(&e) {
+            let _ = tmp.keep();
+        }
+        return Err(e);
+    }
     match place {
         Place::New => {
             tmp.persist_noclobber(fsutil::long_path(to))
@@ -1556,14 +1564,22 @@ fn publish(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum Point {
+    /// Once the journal is made, before anything changes.
+    Journaled,
     /// Before changing a path.
     Before,
+    /// Once the journal records a change, before it is made.
+    Recorded,
+    /// Once a copy is written in full to its temporary name, before it is renamed into place.
+    Staged,
     /// After a file was written, before it is checked.
     Written,
     /// Half way through moving a renamed file: at its temporary name.
     Moving,
-    /// Before putting a path back.
+    /// Before putting a path back. A crash here ends undoing at once, keeping the journal.
     Rollback,
+    /// Once every change is made and checked, before the journal is removed.
+    Verified,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1593,6 +1609,20 @@ impl std::error::Error for Crash {}
 
 fn injected() -> std::io::Error {
     std::io::Error::other("injected failure")
+}
+
+/// The error `fault` stands for at `point` of `path`, if any.
+fn hit(fault: Faults, point: Point, path: &str) -> std::io::Result<()> {
+    match fault(point, path) {
+        Fault::None => Ok(()),
+        Fault::Fail => Err(injected()),
+        Fault::Full => Err(std::io::ErrorKind::StorageFull.into()),
+        Fault::Crash => Err(std::io::Error::other(Crash)),
+    }
+}
+
+fn is_crash(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<Crash>())
 }
 
 /// Applies `plan` to the folders it was made for, keeping a recovery journal under
@@ -1900,6 +1930,11 @@ fn apply_with(
         *problem = Some(problem_of(&e));
         Some(Some(format!("{path}: {e}")))
     };
+    match hit(fault, Point::Journaled, "") {
+        Ok(()) => {}
+        Err(e) if is_crash(&e) => return crashed(journal),
+        Err(e) => failure = fail(tr("folder_sync.journal"), e, &mut problem),
+    }
     // The deletions renames are made from, by path, and those already moved away.
     let sources: HashMap<&str, &SyncOperation> = plan
         .operations
@@ -1909,6 +1944,9 @@ fn apply_with(
         .collect();
     let mut moved: HashSet<&str> = HashSet::new();
     for o in plan.operations.iter().filter(|o| o.action.changes()) {
+        if failure.is_some() {
+            break;
+        }
         if stop.load(Ordering::Relaxed) {
             failure = Some(None);
             break;
@@ -1965,10 +2003,10 @@ fn apply_with(
                 }
                 r
             }
-            None => step(&mut journal, o, (&sp, &dp), &mut kept, stop),
+            None => step(&mut journal, o, (&sp, &dp), &mut kept, fault, stop),
         };
         if let Err(e) = result {
-            if e.get_ref().is_some_and(|inner| inner.is::<Crash>()) {
+            if is_crash(&e) {
                 return crashed(journal);
             }
             failure = if stop.load(Ordering::Relaxed) {
@@ -2011,6 +2049,13 @@ fn apply_with(
                 )));
                 break;
             }
+        }
+    }
+    if failure.is_none() {
+        match hit(fault, Point::Verified, "") {
+            Ok(()) => {}
+            Err(e) if is_crash(&e) => return crashed(journal),
+            Err(e) => failure = fail(tr("folder_sync.journal"), e, &mut problem),
         }
     }
     let Journal {
@@ -2056,8 +2101,11 @@ fn step(
     o: &SyncOperation,
     (sp, dp): (&Path, &Path),
     kept: &mut Vec<String>,
+    fault: Faults,
     stop: &AtomicBool,
 ) -> std::io::Result<()> {
+    let recorded = || hit(fault, Point::Recorded, &o.path);
+    let staged = || hit(fault, Point::Staged, &o.path);
     let unchanged = |p: &Path, planned: &Precondition| {
         planned.matches(&Precondition::read_until(
             p,
@@ -2077,6 +2125,7 @@ fn step(
                 return Err(changed_since_preview());
             }
             journal.record(entry(Before::Missing, None))?;
+            recorded()?;
             std::fs::create_dir(dp)
         }
         Action::Copy if o.source.kind == Kind::Link => {
@@ -2086,6 +2135,7 @@ fn step(
                 return Err(changed_since_preview());
             }
             journal.record(entry(Before::Missing, Some(expected)))?;
+            recorded()?;
             make_link(&target, dp)
         }
         Action::Replace if o.source.kind == Kind::Link => {
@@ -2094,6 +2144,7 @@ fn step(
             let old = o.destination.sha256.clone().unwrap_or_default();
             let before = keep_link(dp, &old)?;
             journal.record(entry(before, Some(expected)))?;
+            recorded()?;
             replace_link(&target, dp, &old, &prefix)
         }
         Action::Delete if o.destination.kind == Kind::Link => {
@@ -2103,6 +2154,7 @@ fn step(
             let old = o.destination.sha256.clone().unwrap_or_default();
             let before = keep_link(dp, &old)?;
             journal.record(entry(before, None))?;
+            recorded()?;
             planned_link(dp, &old)?;
             remove_file(dp)
         }
@@ -2112,14 +2164,24 @@ fn step(
                 return Err(changed_since_preview());
             }
             journal.record(entry(Before::Missing, Some(expected.clone())))?;
-            publish(sp, dp, &expected, Place::New, &prefix, stop)
+            recorded()?;
+            publish(sp, dp, &expected, Place::New, &prefix, &staged, stop)
         }
         Action::Replace => {
             let expected = o.source.sha256.clone().unwrap_or_default();
             let (before, stamp) =
                 journal.keep(dp, o.destination.sha256.as_deref().unwrap_or(""), stop)?;
             journal.record(entry(before, Some(expected.clone())))?;
-            publish(sp, dp, &expected, Place::Over(Some(stamp)), &prefix, stop)
+            recorded()?;
+            publish(
+                sp,
+                dp,
+                &expected,
+                Place::Over(Some(stamp)),
+                &prefix,
+                &staged,
+                stop,
+            )
         }
         Action::Delete => {
             // Only what the source verifiably no longer has is deleted.
@@ -2129,6 +2191,7 @@ fn step(
             let (before, stamp) =
                 journal.keep(dp, o.destination.sha256.as_deref().unwrap_or(""), stop)?;
             journal.record(entry(before, None))?;
+            recorded()?;
             if Stamp::at(dp) != Some(stamp) {
                 return Err(changed_since_preview());
             }
@@ -2140,6 +2203,7 @@ fn step(
                 return Err(changed_since_preview());
             }
             journal.record(entry(Before::Dir, None))?;
+            recorded()?;
             if std::fs::remove_dir(dp).is_err() {
                 kept.push(o.path.clone());
             }
@@ -2258,10 +2322,27 @@ fn roll_back(header: &Header, entries: &[Entry], fault: Faults) -> RollbackOutco
     let root = &header.roots[header.destination];
     let prefix = temp_prefix(&header.plan);
     let mut out = RollbackOutcome::default();
-    let mut folders = std::collections::BTreeSet::new();
+    let folders: std::collections::BTreeSet<PathBuf> = entries
+        .iter()
+        .filter_map(|e| {
+            let target = under(root, &e.path);
+            (!escapes(root, &e.path, &target))
+                .then(|| target.parent().map(Path::to_path_buf))
+                .flatten()
+        })
+        .collect();
+    // Left by copying when the program ended part way: removed first, as one in a folder
+    // this made would keep that folder from being removed.
+    remove_temporaries(&folders, &prefix);
     for e in entries.iter().rev() {
         let target = under(root, &e.path);
-        let result = if fault(Point::Rollback, &e.path) != Fault::None {
+        let at = fault(Point::Rollback, &e.path);
+        if at == Fault::Crash {
+            // The program ended while undoing: the journal stays for the next attempt.
+            out.failed.push((e.path.clone(), Crash.to_string()));
+            return out;
+        }
+        let result = if at != Fault::None {
             Err(injected())
         } else if escapes(root, &e.path, &target) {
             Err(std::io::Error::other(trf(
@@ -2269,7 +2350,6 @@ fn roll_back(header: &Header, entries: &[Entry], fault: Faults) -> RollbackOutco
                 &[("path", e.path.clone())],
             )))
         } else {
-            folders.extend(target.parent().map(Path::to_path_buf));
             undo(&header.dir, e, &target, &prefix)
         };
         match result {
@@ -2278,16 +2358,22 @@ fn roll_back(header: &Header, entries: &[Entry], fault: Faults) -> RollbackOutco
             Err(err) => out.failed.push((e.path.clone(), err.to_string())),
         }
     }
-    // Left by copying when the program ended part way.
+    remove_temporaries(&folders, &prefix);
+    out
+}
+
+/// Removes the files and links named with `prefix`, this plan's temporary files, from
+/// `folders`.
+fn remove_temporaries(folders: &std::collections::BTreeSet<PathBuf>, prefix: &str) {
     for dir in folders {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
+        let Ok(rd) = std::fs::read_dir(dir) else {
             continue;
         };
         for item in rd.flatten() {
             let ours = item
                 .file_name()
                 .to_str()
-                .is_some_and(|n| n.starts_with(&prefix));
+                .is_some_and(|n| n.starts_with(prefix));
             if ours
                 && item
                     .file_type()
@@ -2297,7 +2383,6 @@ fn roll_back(header: &Header, entries: &[Entry], fault: Faults) -> RollbackOutco
             }
         }
     }
-    out
 }
 
 /// Removes the journal once everything is put back, else keeps it with its copies.
@@ -2407,7 +2492,16 @@ fn undo(dir: &Path, e: &Entry, target: &Path, prefix: &str) -> std::io::Result<b
                 _ if now.sha256.is_some() && now.sha256 == e.written => Place::Over(stamp),
                 _ => return Err(not_ours()),
             };
-            publish(&dir.join(backup), target, sha256, place, prefix, &NEVER).map(|()| true)
+            publish(
+                &dir.join(backup),
+                target,
+                sha256,
+                place,
+                prefix,
+                &|| Ok(()),
+                &NEVER,
+            )
+            .map(|()| true)
         }
     }
 }
@@ -2588,6 +2682,10 @@ pub fn abandoned(journal_root: Option<&Path>, roots: &[PathBuf], why: String) ->
 
 /// Undoes an unfinished synchronization from its journal.
 pub fn recover(u: &Unfinished) -> RollbackOutcome {
+    recover_with(u, &|_, _| Fault::None)
+}
+
+fn recover_with(u: &Unfinished, fault: Faults) -> RollbackOutcome {
     let failed = |e: String| RollbackOutcome {
         failed: vec![(u.dir.display().to_string(), e)],
         journal: Some(u.dir.clone()),
@@ -2611,7 +2709,7 @@ pub fn recover(u: &Unfinished) -> RollbackOutcome {
         Err(e) if gone(&e) => return RollbackOutcome::default(),
         Err(e) => return failed(e.to_string()),
     };
-    let mut out = roll_back(&header, &read_entries(&file), &|_, _| Fault::None);
+    let mut out = roll_back(&header, &read_entries(&file), fault);
     settle(&u.dir, file, &mut out);
     out
 }
@@ -4320,19 +4418,211 @@ mod tests {
     }
 
     /// Set for a copy of the test program that applies a plan and is killed part way.
+    /// Every path under `root` with its contents (folders as `/`), time and permissions.
+    fn state(root: &Path) -> BTreeMap<String, (String, Option<SystemTime>, u32)> {
+        tree(root)
+            .into_iter()
+            .map(|(rel, (text, time))| {
+                let md = std::fs::symlink_metadata(root.join(&rel)).unwrap();
+                #[cfg(unix)]
+                let mode = std::os::unix::fs::PermissionsExt::mode(&md.permissions()) & 0o7777;
+                #[cfg(not(unix))]
+                let mode = md.permissions().readonly() as u32;
+                (rel, (text, time, mode))
+            })
+            .collect()
+    }
+
+    /// Names this program's temporary files and journal copies have, anywhere under `root`.
+    fn temporaries(root: &Path) -> Vec<String> {
+        tree(root)
+            .into_keys()
+            .filter(|rel| rel.contains(".oxidemerge-"))
+            .collect()
+    }
+
+    /// The sample folders, with a file only renamed in the source (moved, not copied) and
+    /// destination files with their own permissions and times, to be put back as they were.
+    fn every_change() -> Folders {
+        let f = sample();
+        let (l, r) = (&f.roots[0], &f.roots[1]);
+        write(l, "moved/new.txt", "moving\n");
+        write(r, "was.txt", "moving\n");
+        let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        for p in [l.join("moved/new.txt"), r.join("was.txt"), r.join("a.txt")] {
+            let file = std::fs::File::options().write(true).open(&p).unwrap();
+            file.set_modified(time).unwrap();
+        }
+        #[cfg(unix)]
+        for (p, mode) in [("a.txt", 0o640), ("old.txt", 0o600), ("gone/c.txt", 0o604)] {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = std::fs::Permissions::from_mode(mode);
+            std::fs::set_permissions(r.join(p), perm).unwrap();
+        }
+        f
+    }
+
+    /// Fails or ends the program at every point of applying a plan that makes every kind of
+    /// change, at each path in turn, and then (after a crash) at every point of undoing it.
+    /// Each time, what applying or recovery leaves is the destination exactly as it was:
+    /// contents, names, times and permissions, with no temporary file left and no journal.
+    #[test]
+    fn every_failure_and_crash_part_way_leaves_the_destination_as_it_was() {
+        use std::cell::Cell;
+        let points = [
+            Point::Journaled,
+            Point::Before,
+            Point::Recorded,
+            Point::Staged,
+            Point::Written,
+            Point::Moving,
+            Point::Verified,
+        ];
+        let plan_paths: Vec<String> = {
+            let f = every_change();
+            let p = make(&f, MIRROR);
+            assert_eq!(p.estimate.renames, 1, "{:?}", ops(&p));
+            let mut paths: Vec<String> = p
+                .operations
+                .iter()
+                .filter(|o| o.action.changes())
+                .map(|o| o.path.clone())
+                .collect();
+            paths.push(String::new());
+            paths
+        };
+        let mut hits = 0;
+        for point in points {
+            for target in &plan_paths {
+                for fault in [Fault::Crash, Fault::Fail, Fault::Full] {
+                    let f = every_change();
+                    let before = state(&f.roots[1]);
+                    let plan = make(&f, MIRROR);
+                    let hit = Cell::new(false);
+                    let outcome = run(&f, &plan, &|p, path| {
+                        if p == point && path == target && !hit.replace(true) {
+                            fault
+                        } else {
+                            Fault::None
+                        }
+                    });
+                    let case = format!("{fault:?} at {point:?} of {target:?}");
+                    if !hit.get() {
+                        assert!(
+                            matches!(outcome, SyncOutcome::Applied { .. }),
+                            "{case}: {outcome:?}"
+                        );
+                        continue;
+                    }
+                    hits += 1;
+                    if fault == Fault::Crash {
+                        assert_eq!(outcome.problem(), Some(Problem::RecoveryNeeded), "{case}");
+                        let pending = unfinished(&f.journal);
+                        assert_eq!(pending.len(), 1, "{case}");
+                        // Recovery itself ends part way, at each change in turn, and is
+                        // started again until it finishes.
+                        let entries = pending[0].changes;
+                        for k in 0..entries {
+                            let n = Cell::new(0);
+                            let out = recover_with(&pending[0], &|p, _| {
+                                if p == Point::Rollback && n.replace(n.get() + 1) == k {
+                                    Fault::Crash
+                                } else {
+                                    Fault::None
+                                }
+                            });
+                            assert!(!out.complete(), "{case}, recovery cut at {k}");
+                            assert_eq!(unfinished(&f.journal).len(), 1, "{case}, {k}");
+                        }
+                        let out = recover(&pending[0]);
+                        assert!(out.complete(), "{case}: {:?}", out.failed);
+                        // Recovering again, as from a window that listed it before, changes
+                        // nothing.
+                        assert!(recover(&pending[0]).complete(), "{case}");
+                    } else {
+                        let SyncOutcome::Stopped { rollback, .. } = &outcome else {
+                            panic!("{case}: {outcome:?}");
+                        };
+                        assert!(rollback.complete(), "{case}: {:?}", rollback.failed);
+                    }
+                    assert_eq!(state(&f.roots[1]), before, "{case}");
+                    assert!(temporaries(&f.roots[1]).is_empty(), "{case}");
+                    assert!(unfinished(&f.journal).is_empty(), "{case}");
+                    // The source is never changed.
+                    assert!(temporaries(&f.roots[0]).is_empty(), "{case}");
+                }
+            }
+        }
+        // Each point was reached somewhere.
+        assert!(hits >= points.len() * 3, "{hits}");
+    }
+
+    /// A rollback that fails part way, as undoing a change to a file someone else then changed
+    /// does, says which paths are left as they are and keeps the journal for another try,
+    /// which finishes once the obstacle is gone.
+    #[test]
+    fn a_rollback_that_fails_part_way_can_be_finished_later() {
+        let f = every_change();
+        let before = state(&f.roots[1]);
+        let plan = make(&f, MIRROR);
+        let outcome = run(&f, &plan, &|p, path| match (p, path) {
+            (Point::Verified, _) => Fault::Fail,
+            (Point::Rollback, "a.txt") => Fault::Fail,
+            _ => Fault::None,
+        });
+        let SyncOutcome::Stopped { rollback, .. } = outcome else {
+            panic!("not stopped: {outcome:?}");
+        };
+        assert_eq!(
+            rollback
+                .failed
+                .iter()
+                .map(|f| f.0.as_str())
+                .collect::<Vec<_>>(),
+            ["a.txt"]
+        );
+        assert!(rollback.journal.is_some());
+        let pending = unfinished(&f.journal);
+        assert_eq!(pending.len(), 1);
+        let out = recover(&pending[0]);
+        assert!(out.complete(), "{:?}", out.failed);
+        assert_eq!(state(&f.roots[1]), before);
+        assert!(temporaries(&f.roots[1]).is_empty());
+    }
+
     const CHILD: &str = "OXIDEMERGE_TEST_SYNC_CHILD";
 
+    /// Where a child process is killed, by name, for
+    /// [`a_synchronization_whose_process_was_killed_is_undone_later`]: the point and path it
+    /// waits at, and whether it first fails once all is written, so that it is killed while
+    /// undoing.
+    const KILL_POINTS: [(&str, Point, &str, bool); 6] = [
+        ("journal", Point::Journaled, "", false),
+        ("staged", Point::Staged, "d/b.txt", false),
+        ("written", Point::Written, "d/b.txt", false),
+        ("deleted", Point::Written, "old.txt", false),
+        ("verified", Point::Verified, "", false),
+        ("rollback", Point::Rollback, "d/b.txt", true),
+    ];
+
+    /// The program killed for real, at each of [`KILL_POINTS`]: whatever it left is found and
+    /// undone the next time, and the destination is as it was, times and permissions too.
     #[test]
     fn a_synchronization_whose_process_was_killed_is_undone_later() {
         let name =
             "core::folder_sync::tests::a_synchronization_whose_process_was_killed_is_undone_later";
         if let Ok(dirs) = std::env::var(CHILD) {
-            let dirs: Vec<PathBuf> = dirs.split('\n').map(PathBuf::from).collect();
-            let (roots, journal, ready) = (&dirs[..2], &dirs[2], &dirs[3]);
-            let p = plan(&scan(roots), roots, MIRROR, ALL, &AtomicBool::new(false)).unwrap();
+            let dirs: Vec<String> = dirs.split('\n').map(String::from).collect();
+            let roots: Vec<PathBuf> = dirs[..2].iter().map(PathBuf::from).collect();
+            let (journal, ready) = (Path::new(&dirs[2]), Path::new(&dirs[3]));
+            let &(_, point, at, fail_first) = KILL_POINTS.iter().find(|k| k.0 == dirs[4]).unwrap();
+            let p = plan(&scan(&roots), &roots, MIRROR, ALL, &AtomicBool::new(false)).unwrap();
             let (stop, done) = (AtomicBool::new(false), AtomicUsize::new(0));
-            apply_with(&p, roots, journal, &stop, &done, &|pt, path| {
-                if pt == Point::Written && path == "d/b.txt" {
+            apply_with(&p, &roots, journal, &stop, &done, &|pt, path| {
+                if fail_first && pt == Point::Verified {
+                    return Fault::Fail;
+                }
+                if pt == point && path == at {
                     std::fs::write(ready, "").unwrap();
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -4342,53 +4632,55 @@ mod tests {
             });
             unreachable!("killed part way");
         }
-        let f = sample();
-        let before = tree(&f.roots[1]);
-        let ready = f.journal.with_extension("ready");
-        let dirs = [&f.roots[0], &f.roots[1], &f.journal, &ready]
-            .map(|p| p.to_string_lossy().into_owned())
-            .join("\n");
-        /// Killed when dropped, so a failed check leaves no copy running.
-        struct Killed(std::process::Child);
-        impl Drop for Killed {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
+        for (kill, ..) in KILL_POINTS {
+            let f = every_change();
+            let before = state(&f.roots[1]);
+            let ready = f.journal.with_extension("ready");
+            let dirs = [&f.roots[0], &f.roots[1], &f.journal, &ready]
+                .map(|p| p.to_string_lossy().into_owned())
+                .join("\n");
+            /// Killed when dropped, so a failed check leaves no copy running.
+            struct Killed(std::process::Child);
+            impl Drop for Killed {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
             }
-        }
-        let mut child = Killed(
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", name, "--test-threads=1"])
-                .env(CHILD, dirs)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        let start = std::time::Instant::now();
-        while !ready.exists() {
-            assert!(
-                start.elapsed().as_secs() < 60 && child.0.try_wait().unwrap().is_none(),
-                "the copy did not reach the point to be killed at"
+            let mut child = Killed(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", name, "--test-threads=1"])
+                    .env(CHILD, format!("{dirs}\n{kill}"))
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
             );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        drop(child);
-        assert_ne!(tree(&f.roots[1]), before);
-        // the lock of a killed process may be released a little later on some systems
-        let start = std::time::Instant::now();
-        let pending = loop {
-            let pending = unfinished(&f.journal);
-            if !pending.is_empty() || start.elapsed().as_secs() >= 10 {
-                break pending;
+            let start = std::time::Instant::now();
+            while !ready.exists() {
+                assert!(
+                    start.elapsed().as_secs() < 60 && child.0.try_wait().unwrap().is_none(),
+                    "{kill}: the copy did not reach the point to be killed at"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        };
-        assert_eq!(pending.len(), 1);
-        let rollback = recover(&pending[0]);
-        assert!(rollback.complete(), "{:?}", rollback.failed);
-        assert_eq!(tree(&f.roots[1]), before);
-        assert!(unfinished(&f.journal).is_empty());
+            drop(child);
+            // The lock of a killed process may be released a little later on some systems.
+            let start = std::time::Instant::now();
+            let pending = loop {
+                let pending = unfinished(&f.journal);
+                if !pending.is_empty() || start.elapsed().as_secs() >= 10 {
+                    break pending;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            };
+            assert_eq!(pending.len(), 1, "{kill}");
+            let rollback = recover(&pending[0]);
+            assert!(rollback.complete(), "{kill}: {:?}", rollback.failed);
+            assert_eq!(state(&f.roots[1]), before, "{kill}");
+            assert!(temporaries(&f.roots[1]).is_empty(), "{kill}");
+            assert!(unfinished(&f.journal).is_empty(), "{kill}");
+        }
     }
 
     #[cfg(unix)]
@@ -4550,6 +4842,67 @@ mod tests {
             "outside",
             "what the junction points at was changed"
         );
+    }
+
+    /// A file whose permissions stop it being read after the preview, on either side, is
+    /// reported as one that cannot be read, and nothing changes. Made unreadable part way, the
+    /// step that reaches it fails and what was done before it is undone.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_can_no_longer_be_read_stops_the_synchronization() {
+        use std::os::unix::fs::PermissionsExt;
+        let lock =
+            |p: &Path| std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unlock =
+            |p: &Path| std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for (side, rel) in [(0, "d/b.txt"), (1, "a.txt")] {
+            let f = every_change();
+            let before = state(&f.roots[1]);
+            let plan = make(&f, MIRROR);
+            let path = f.roots[side].join(rel);
+            lock(&path);
+            if std::fs::read(&path).is_ok() {
+                // Run as an administrator, who reads it anyway.
+                unlock(&path);
+                return;
+            }
+            let outcome = run(&f, &plan, &|_, _| Fault::None);
+            unlock(&path);
+            assert_eq!(outcome.problem(), Some(Problem::ReadFailure), "{rel}");
+            let SyncOutcome::NotApplied(_, errors) = outcome else {
+                panic!("{rel}: applied");
+            };
+            assert_eq!(
+                errors,
+                [trf("folder_sync.err_unreadable", &[("path", rel.into())])]
+            );
+            let mut now = state(&f.roots[1]);
+            // Its permissions were put back by hand above.
+            if side == 1 {
+                now.get_mut(rel).unwrap().2 = before[rel].2;
+            }
+            assert_eq!(now, before, "{rel}");
+            assert!(unfinished(&f.journal).is_empty());
+        }
+
+        // Made unreadable once the changes are under way.
+        let f = every_change();
+        let before = state(&f.roots[1]);
+        let plan = make(&f, MIRROR);
+        let source = f.roots[0].join("d/b.txt");
+        let outcome = run(&f, &plan, &|point, path| {
+            if point == Point::Recorded && path == "d/b.txt" {
+                lock(&source);
+            }
+            Fault::None
+        });
+        unlock(&source);
+        let SyncOutcome::Stopped { rollback, .. } = &outcome else {
+            panic!("not stopped: {outcome:?}");
+        };
+        assert!(rollback.complete(), "{:?}", rollback.failed);
+        assert_eq!(state(&f.roots[1]), before);
+        assert!(temporaries(&f.roots[1]).is_empty());
     }
 
     /// Windows refuses to read, replace or delete a file another program holds open without

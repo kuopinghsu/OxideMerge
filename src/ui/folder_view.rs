@@ -2839,7 +2839,8 @@ impl FolderView {
                     }
                     if std::mem::take(&mut v.export_request) {
                         let name = report::html_file_name(&v.titles());
-                        self.file_report = Some((name, v.html_report_job(&rules)));
+                        self.file_report =
+                            Some((name, v.html_report_job(&rules, cfg.report_detail)));
                     }
                 }
                 Some((i, Dock::Failed(error))) => {
@@ -2960,6 +2961,7 @@ impl FolderView {
             filter: self.filter_spec.clone(),
             scope: (!scope.is_empty()).then(|| scope.join(" · ")),
             hide_paths: cfg.report_hide_paths,
+            detail: cfg.report_detail,
         }
     }
 

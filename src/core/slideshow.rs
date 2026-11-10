@@ -848,6 +848,7 @@ mod tests {
             filter: roots[0].join("*.csv").display().to_string(),
             scope: None,
             hide_paths: true,
+            detail: Default::default(),
         };
         let html = folder_slideshow(&refs, &roots, &roots, &opts, "", &info);
         // Title, the one difference of prices.csv, end.

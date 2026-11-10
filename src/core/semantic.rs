@@ -1238,6 +1238,196 @@ mod tests {
         }
     }
 
+    /// A commented document for [`commented_copies_change_only_the_values_they_copy`]: sections
+    /// of members, each section and some members with a comment on the line above.
+    #[derive(Clone)]
+    struct Commented {
+        /// Per section: its comment, and its members.
+        sections: Vec<(Option<String>, Vec<Member>)>,
+    }
+
+    /// A member of a [`Commented`] section: its name, its value as written, and its comment.
+    type Member = (String, String, Option<String>);
+
+    impl Commented {
+        fn render(&self, format: Format, comments: bool) -> String {
+            let mut out = String::new();
+            if format == Format::Xml {
+                out.push_str("<root>\n");
+            }
+            for (i, (note, members)) in self.sections.iter().enumerate() {
+                let note = note.as_ref().filter(|_| comments);
+                match format {
+                    Format::Yaml => {
+                        if let Some(n) = note {
+                            out.push_str(&format!("# {n}\n"));
+                        }
+                        out.push_str(&format!("s{i}:\n"));
+                        for (k, v, c) in members {
+                            if let Some(c) = c.as_ref().filter(|_| comments) {
+                                out.push_str(&format!("  # {c}\n"));
+                            }
+                            out.push_str(&format!("  {k}: {v}\n"));
+                        }
+                    }
+                    Format::Toml => {
+                        if let Some(n) = note {
+                            out.push_str(&format!("# {n}\n"));
+                        }
+                        out.push_str(&format!("[s{i}]\n"));
+                        for (k, v, c) in members {
+                            if let Some(c) = c.as_ref().filter(|_| comments) {
+                                out.push_str(&format!("# {c}\n"));
+                            }
+                            out.push_str(&format!("{k} = {v}\n"));
+                        }
+                    }
+                    _ => {
+                        // Members as attributes, which have names, so one going in or out
+                        // moves no other node; comments are nodes between the elements.
+                        if let Some(n) = note {
+                            out.push_str(&format!("  <!-- {n} -->\n"));
+                        }
+                        out.push_str(&format!("  <s{i}"));
+                        for (k, v, _) in members {
+                            out.push_str(&format!(" {k}={v}"));
+                        }
+                        out.push_str("/>\n");
+                    }
+                }
+            }
+            if format == Format::Xml {
+                out.push_str("</root>\n");
+            }
+            out
+        }
+
+        /// The comments, in order.
+        fn comments(text: &str) -> Vec<String> {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| l.starts_with('#') || l.starts_with("<!--"))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    fn scalar(rng: &mut Rng, format: Format) -> String {
+        let plain = rng.below(1000).to_string();
+        match (format, rng.below(4)) {
+            (Format::Xml, 0) => format!("'{plain}'"),
+            (Format::Xml, 1) => "\"a &amp; b\"".into(),
+            (Format::Xml, _) => format!("\"{plain}\""),
+            (_, 0) => plain,
+            // a string that holds the comment sign and a colon, and must stay quoted
+            (_, 1) => format!("\"v#{plain}: x\""),
+            (Format::Yaml, 2) => format!("'q{plain}'"),
+            (Format::Toml, 2) => format!("'lit{plain}'"),
+            // past what a 64-bit float holds exactly; TOML integers stop at 64 bits
+            (Format::Toml, _) => format!("1.2345678901234567890{plain}"),
+            _ => format!("12345678901234567890{plain}"),
+        }
+    }
+
+    fn commented(rng: &mut Rng, format: Format, id: &mut usize) -> Commented {
+        let sections = (0..1 + rng.below(4))
+            .map(|_| {
+                *id += 1;
+                let note = (rng.below(2) == 0).then(|| format!("section note {id}"));
+                let members = (0..1 + rng.below(5))
+                    .map(|j| {
+                        *id += 1;
+                        let c = (rng.below(2) == 0).then(|| format!("member note {id}"));
+                        (format!("k{j}"), scalar(rng, format), c)
+                    })
+                    .collect();
+                (note, members)
+            })
+            .collect();
+        Commented { sections }
+    }
+
+    #[test]
+    fn commented_copies_change_only_the_values_they_copy() {
+        let mut rng = Rng(0x5EED_C0DE);
+        let mut copies = 0;
+        for round in 0..120 {
+            for format in [Format::Yaml, Format::Toml, Format::Xml] {
+                let mut id = 0;
+                let dst = commented(&mut rng, format, &mut id);
+                // The other side: values changed, members gone, members added at the end,
+                // and its own comments, which are never copied.
+                let mut src = dst.clone();
+                for (note, members) in &mut src.sections {
+                    // XML comments are nodes the comparison counts; the others are layout.
+                    if format != Format::Xml {
+                        *note = note.as_ref().map(|n| format!("{n} elsewhere"));
+                    }
+                    for m in members.iter_mut() {
+                        if rng.below(3) == 0 {
+                            m.1 = scalar(&mut rng, format);
+                        }
+                        m.2 = m.2.as_ref().map(|c| format!("{c} elsewhere"));
+                    }
+                    if members.len() > 1 && rng.below(3) == 0 {
+                        let gone = rng.below(members.len());
+                        members.remove(gone);
+                    }
+                    if rng.below(3) == 0 {
+                        members.push(("added".into(), scalar(&mut rng, format), None));
+                    }
+                }
+                let (src_text, start) = (src.render(format, true), dst.render(format, true));
+                let mut text = start.clone();
+                let mut steps = 0;
+                loop {
+                    let r = compare(&src_text, &text, format);
+                    assert!(
+                        r.errors.is_empty(),
+                        "{round} {format:?}: {:?}\n{text}",
+                        r.errors
+                    );
+                    let Some(change) = r
+                        .changes
+                        .iter()
+                        .find(|c| c.kind != ChangeKind::Moved && !c.path.contains("comment()"))
+                    else {
+                        break;
+                    };
+                    let before = text.clone();
+                    text = write::copy_change(change, [&src_text, &before], format, 0)
+                        .unwrap_or_else(|e| {
+                            panic!("{round} {format:?}: {e:?} {change:?}\n{src_text}\n{before}")
+                        });
+                    // The text read back as a whole, with nothing but the value changed.
+                    assert!(parse(&text, format).is_ok(), "{round} {format:?}: {text}");
+                    assert_eq!(
+                        Commented::comments(&text),
+                        Commented::comments(&before),
+                        "{round} {format:?}: a comment changed\n{before}\n{text}"
+                    );
+                    copies += 1;
+                    steps += 1;
+                    assert!(steps < 100, "{round} {format:?}: {text}");
+                }
+                assert_eq!(Commented::comments(&text), Commented::comments(&start));
+                // Without their comments, the sides are now the same text: quoting, number
+                // digits, indentation and line breaks came over as they were written.
+                let strip = |t: &str| -> String {
+                    t.lines()
+                        .filter(|l| {
+                            let l = l.trim();
+                            !(l.starts_with('#') || l.starts_with("<!--"))
+                        })
+                        .map(|l| format!("{l}\n"))
+                        .collect()
+                };
+                assert_eq!(strip(&text), strip(&src_text), "{round} {format:?}");
+            }
+        }
+        assert!(copies > 500, "{copies} copies");
+    }
+
     #[test]
     fn fixed_seed_fuzzing_copies_every_change_until_the_sides_agree() {
         let mut rng = Rng(0x0C0F_FEE5);

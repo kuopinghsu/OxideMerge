@@ -622,6 +622,86 @@ fn algorithm(a: DiffAlgorithm) -> Algorithm {
     }
 }
 
+/// An id for each line of `panes`, the same for equal lines, numbered in the order lines are
+/// first seen. The table holds where each distinct line was first seen with 32 bits of its
+/// hash: 8 bytes a slot where a map from `&str` takes 24, which for a file of tens of millions
+/// of lines is hundreds of megabytes. The hash bits kept turn away almost every other line
+/// without reading it, and let the table grow without hashing the lines again. A line seen
+/// before is first given the place of its first sighting, and those places are numbered in a
+/// second pass, in place: going through the table to a number, and from it to the line to
+/// compare, would read one more scattered place for each repeated line, which on a file of a
+/// gigabyte took a second longer. `initial` is the number of distinct lines expected.
+fn intern_borrowed(panes: &[&[String]], initial: usize) -> Vec<Vec<u32>> {
+    use std::hash::BuildHasher;
+    // A line is named by its pane (2 bits) and its index (30 bits). A pane of more lines than
+    // that, over a gigabyte of empty lines, takes the map instead.
+    const INDEX: u32 = (1 << 30) - 1;
+    if panes.iter().any(|p| p.len() > INDEX as usize) || panes.len() > 4 {
+        let mut dictionary = HashMap::<&str, u32>::with_capacity(initial);
+        return panes
+            .iter()
+            .map(|lines| {
+                lines
+                    .iter()
+                    .map(|line| {
+                        let next = dictionary.len() as u32;
+                        *dictionary.entry(line.as_str()).or_insert(next)
+                    })
+                    .collect()
+            })
+            .collect();
+    }
+    let state = std::hash::RandomState::new();
+    // The table's hash, made from the 32 bits kept: both halves, as the table takes its slot
+    // from the low bits and a tag from the high ones.
+    let spread = |h: u32| (u64::from(h) << 32) | u64::from(h);
+    let place = |p: usize, i: usize| ((p as u32) << 30) | i as u32;
+    let text = |at: u32| panes[(at >> 30) as usize][(at & INDEX) as usize].as_str();
+    let mut table = hashbrown::HashTable::<(u32, u32)>::with_capacity(initial);
+    // Where each line was first seen.
+    let mut ids: Vec<Vec<u32>> = panes
+        .iter()
+        .enumerate()
+        .map(|(p, lines)| {
+            lines
+                .iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    super::cancel::check_every(i, 1 << 16);
+                    let h = state.hash_one(line.as_str()) as u32;
+                    let found =
+                        table.find(spread(h), |&(first, kept)| kept == h && text(first) == line);
+                    match found {
+                        Some(&(first, _)) => first,
+                        None => {
+                            let at = place(p, i);
+                            table.insert_unique(spread(h), (at, h), |&(_, kept)| spread(kept));
+                            at
+                        }
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    drop(table);
+    // A first sighting takes the next number; a line seen before, the number its first
+    // sighting took, which comes earlier and is numbered already.
+    let mut next = 0;
+    for p in 0..ids.len() {
+        for i in 0..ids[p].len() {
+            super::cancel::check_every(i, 1 << 16);
+            let first = ids[p][i];
+            ids[p][i] = if first == place(p, i) {
+                next += 1;
+                next - 1
+            } else {
+                ids[(first >> 30) as usize][(first & INDEX) as usize]
+            };
+        }
+    }
+    ids
+}
+
 struct Interner<'a> {
     map: HashMap<Cow<'a, str>, u32>,
 }
@@ -661,7 +741,8 @@ fn line_ops(
     }
     let mut out = Vec::new();
     let (mut pa, mut pb) = (0, 0);
-    for (ia, ib) in unique_anchors(a, b) {
+    for (k, (ia, ib)) in unique_anchors(a, b).into_iter().enumerate() {
+        super::cancel::check_every(k, 1 << 12);
         let (ia, ib) = (ia as usize, ib as usize);
         out.extend(ops_between(
             &a[pa..ia],
@@ -708,6 +789,7 @@ fn unique_anchors(a: &[u32], b: &[u32]) -> Vec<(u32, u32)> {
         let mut positions = vec![(MISSING, MISSING); max_id + 1];
         for (side, ids) in [a, b].into_iter().enumerate() {
             for (i, &id) in ids.iter().enumerate() {
+                super::cancel::check_every(i, 1 << 18);
                 let entry = &mut positions[id as usize];
                 let pos = if side == 0 {
                     &mut entry.0
@@ -720,6 +802,7 @@ fn unique_anchors(a: &[u32], b: &[u32]) -> Vec<(u32, u32)> {
         a.iter()
             .enumerate()
             .filter_map(|(i, &id)| {
+                super::cancel::check_every(i, 1 << 18);
                 let (left, right) = positions[id as usize];
                 (left == i as u32 && right < REPEATED).then_some((i as u32, right))
             })
@@ -752,6 +835,7 @@ fn unique_anchors(a: &[u32], b: &[u32]) -> Vec<(u32, u32)> {
     let mut tails: Vec<u32> = Vec::new();
     let mut prev = vec![u32::MAX; pairs.len()];
     for (k, &(_, y)) in pairs.iter().enumerate() {
+        super::cancel::check_every(k, 1 << 16);
         let pos = tails.partition_point(|&t| pairs[t as usize].1 < y);
         prev[k] = pos.checked_sub(1).map_or(u32::MAX, |p| tails[p]);
         if pos == tails.len() {
@@ -940,19 +1024,7 @@ pub fn compute_synced(
         let sample = first.len().min(4096);
         let distinct: HashSet<&str> = first.iter().take(sample).map(String::as_str).collect();
         let initial = first.len().saturating_mul(distinct.len()) / sample.max(1) / 2;
-        let mut dictionary = HashMap::<&str, u32>::with_capacity(initial);
-        keyed
-            .iter()
-            .map(|lines| {
-                lines
-                    .iter()
-                    .map(|line| {
-                        let next = dictionary.len() as u32;
-                        *dictionary.entry(line.as_str()).or_insert(next)
-                    })
-                    .collect()
-            })
-            .collect()
+        intern_borrowed(&keyed, initial)
     } else {
         let mut interner = Interner {
             map: HashMap::new(),
@@ -965,6 +1037,7 @@ pub fn compute_synced(
         format!("unique_max={}", ids.iter().flatten().max().unwrap_or(&0))
     });
 
+    super::cancel::check();
     let lens: Vec<usize> = panes.iter().map(|p| p.len()).collect();
     let sync = valid_sync_points(sync, &lens);
     let mut result = if sync.is_empty() {
@@ -1222,6 +1295,8 @@ fn diff2(a: &[u32], b: &[u32], ignorable: &Ignorable, opts: &DiffOptions) -> Dif
         }
     };
     for (tag, o, n) in ops {
+        // One look at the flag per run of rows, of which there are thousands, not millions.
+        super::cancel::check();
         if tag == DiffTag::Equal {
             flush(&mut result, &mut pending);
             for k in 0..o.len() {
@@ -1593,6 +1668,50 @@ mod tests {
         assert_eq!(row.block(), Some(42));
         row.set_block(None);
         assert_eq!(row.block(), None);
+    }
+
+    /// Lines get the same numbers as a plain map would give them, first seen first, across
+    /// panes, for repeats, empty lines and a table that grows from too small a guess.
+    #[test]
+    fn borrowed_interning_numbers_lines_as_first_seen() {
+        let pane = |seed: u64, n: usize| -> Vec<String> {
+            let mut x = seed;
+            (0..n)
+                .map(|_| {
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    match x >> 61 {
+                        0 => String::new(),
+                        1 => "same".into(),
+                        _ => format!("line {}", (x >> 33) % 700),
+                    }
+                })
+                .collect()
+        };
+        let panes = [pane(1, 3000), pane(2, 2500), pane(3, 10), Vec::new()];
+        for count in 1..=panes.len() {
+            let refs: Vec<&[String]> = panes[..count].iter().map(Vec::as_slice).collect();
+            let mut map = HashMap::<&str, u32>::new();
+            let expected: Vec<Vec<u32>> = refs
+                .iter()
+                .map(|p| {
+                    p.iter()
+                        .map(|l| {
+                            let next = map.len() as u32;
+                            *map.entry(l.as_str()).or_insert(next)
+                        })
+                        .collect()
+                })
+                .collect();
+            for initial in [0, 1, 5000] {
+                assert_eq!(
+                    intern_borrowed(&refs, initial),
+                    expected,
+                    "{count} panes, {initial}"
+                );
+            }
+        }
     }
 
     #[test]

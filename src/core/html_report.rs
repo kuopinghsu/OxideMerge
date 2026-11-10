@@ -24,6 +24,73 @@ pub(crate) const LINE_CHARS: usize = 2_000;
 /// Rows shown in a text report, all differences together; the differences after them are only
 /// counted, keeping the page small enough for a browser.
 const REPORT_ROWS: usize = 20_000;
+
+/// How much of the differences an HTML report shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReportDetail {
+    /// The counts and the list of differences or files, without their lines.
+    Summary,
+    /// Up to [`REPORT_ROWS`] rows in all, [`HUNK_MAX_ROWS`] per block and [`LINE_CHARS`]
+    /// characters per line.
+    #[default]
+    Standard,
+    /// Every row of every difference, whole lines; the page grows with the differences.
+    Full,
+}
+
+impl ReportDetail {
+    pub const ALL: [ReportDetail; 3] = [Self::Summary, Self::Standard, Self::Full];
+
+    /// The name used on the command line and in job files.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Summary => "summary",
+            Self::Standard => "standard",
+            Self::Full => "full",
+        }
+    }
+
+    /// The name shown to people.
+    pub fn label(self) -> &'static str {
+        tr(match self {
+            Self::Summary => "report.detail_summary",
+            Self::Standard => "report.detail_standard",
+            Self::Full => "report.detail_full",
+        })
+    }
+
+    pub(crate) fn limits(self) -> Limits {
+        match self {
+            Self::Summary => Limits {
+                rows: 0,
+                hunk: 0,
+                chars: LINE_CHARS,
+            },
+            Self::Standard => Limits {
+                rows: REPORT_ROWS,
+                hunk: HUNK_MAX_ROWS,
+                chars: LINE_CHARS,
+            },
+            Self::Full => Limits {
+                rows: usize::MAX,
+                hunk: usize::MAX,
+                chars: usize::MAX,
+            },
+        }
+    }
+}
+
+/// The rows and characters an HTML report shows at most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Limits {
+    /// Rows of all differences together.
+    pub rows: usize,
+    /// Rows of one difference.
+    pub hunk: usize,
+    /// Characters of one line.
+    pub chars: usize,
+}
 /// Rows of a table difference read field by field at most.
 const FIELD_ROWS: usize = 50;
 /// Field changes listed for one difference at most.
@@ -91,7 +158,9 @@ button:disabled{opacity:.45;cursor:default}button:disabled:hover{border-color:va
 .box{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:16px;box-shadow:var(--shadow);font-size:13px}
 .box>summary{padding:10px 14px;cursor:pointer;font-weight:600}
 .box h2{margin:0;font-size:13px;font-weight:600}
-.omit{padding:10px 14px}.omit ul{margin:4px 0 0;padding-left:18px}
+.omit{padding:10px 14px}.omit ul{margin:4px 0 0;padding-left:18px}.omit:not(.complete){border-left:4px solid var(--warn)}
+.omit.complete h2{color:var(--ok-t)}.omit .pol{margin:6px 0 0;color:var(--dim)}
+.sumlist{margin:0;padding:10px 14px 10px 44px;font-size:13px}.sumlist li{padding:3px 0}.sumlist .pos{color:var(--dim);font-family:var(--mono)}.sumlist .pos b{color:var(--text);font-family:system-ui,sans-serif;font-weight:600;margin-right:3px}
 .box dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:4px 16px;margin:0;padding:4px 14px 14px}
 .box dt{color:var(--dim)}.box dd{margin:0;word-break:break-word}.box dd ul{margin:0;padding-left:18px}
 .box code{font-family:var(--mono);font-size:12px}
@@ -761,6 +830,7 @@ fn column_letters(mut c: usize) -> String {
 /// with, bookmark comments, and whether the lines were read from the files rather than being
 /// theirs.
 struct Doc<'a> {
+    limits: Limits,
     panes: &'a [&'a [String]],
     result: &'a DiffResult,
     opts: &'a DiffOptions,
@@ -857,6 +927,7 @@ fn hunk_html(
     extra: &Extra,
 ) -> bool {
     let Doc {
+        limits,
         panes,
         result,
         opts,
@@ -899,7 +970,7 @@ fn hunk_html(
         out.push_str("</ul>");
     }
     out.push_str("<div class=\"scroll\">");
-    let shown = rows.start..rows.end.min(rows.start + HUNK_MAX_ROWS);
+    let shown = rows.start..rows.end.min(rows.start.saturating_add(limits.hunk));
     let hidden = rows.len() - shown.len();
     let mut cut_lines = false;
 
@@ -912,7 +983,8 @@ fn hunk_html(
     for _ in 0..n {
         out.push_str("<col style=\"width:4.5em\"><col>");
     }
-    out.push_str("</colgroup><tr>");
+    // In a <thead>, printed pages repeat the sides above the rows they carry on with.
+    out.push_str("</colgroup><thead><tr>");
     let line_key = if extracted {
         "report.line_of_extracted"
     } else {
@@ -927,7 +999,7 @@ fn hunk_html(
             esc(side)
         );
     }
-    out.push_str("</tr>");
+    out.push_str("</tr></thead><tbody>");
     for r in shown {
         out.push_str("<tr>");
         let cells = row_cells(result, panes, opts, r);
@@ -935,7 +1007,7 @@ fn hunk_html(
             match result.rows[r].line(p) {
                 Some(l) => {
                     let line = &lines[l];
-                    let cut = line.char_indices().nth(LINE_CHARS).map(|(i, _)| i);
+                    let cut = line.char_indices().nth(limits.chars).map(|(i, _)| i);
                     cut_lines |= cut.is_some();
                     let more = match cut {
                         Some(c) if marks.iter().any(|m| m.end > c) => "<span class=\"m\">…</span>",
@@ -979,7 +1051,7 @@ fn hunk_html(
             esc(&trf("report.more_lines", &[("n", hidden.to_string())]))
         );
     }
-    out.push_str("</table>");
+    out.push_str("</tbody></table>");
     out.push_str("</div></section>\n");
     hidden > 0 || cut_lines
 }
@@ -1223,20 +1295,27 @@ pub fn text_report(
     opts: &DiffOptions,
     notes: &[BTreeMap<usize, String>],
     rules: &str,
+    detail: ReportDetail,
 ) -> String {
     let n = panes.len();
-    let mut list = hunks(result);
+    let limits = detail.limits();
+    let list = hunks(result);
+    let total = list.len();
+    // The differences shown with their lines, in order, until the rows run out.
     let mut rows = 0;
-    let fits = list
+    let shown = list
         .iter()
         .take_while(|(_, r)| {
-            rows += r.len().min(HUNK_MAX_ROWS);
-            rows <= REPORT_ROWS
+            rows += r.len().min(limits.hunk);
+            rows <= limits.rows
         })
-        .count()
-        .max(1);
-    let total = list.len();
-    list.truncate(fits);
+        .count();
+    let shown = if detail == ReportDetail::Summary {
+        0
+    } else {
+        // One difference is always shown, however long.
+        shown.max(1).min(total)
+    };
     let mut out = String::new();
     let title = tr("report.text_title");
     page_start(
@@ -1244,12 +1323,23 @@ pub fn text_report(
         title,
         &Controls {
             filter: false,
-            view: n == 2 && !list.is_empty(),
+            view: n == 2 && shown > 0,
             expand: false,
-            nav: !list.is_empty(),
+            nav: shown > 0,
         },
     );
-    let toc = !list.is_empty();
+    // The line of the base side, or of the first side that has lines here.
+    let position = |b: usize| {
+        let ranges = &result.blocks[b].ranges;
+        let order: &[usize] = if n == 3 { &[1, 0, 2] } else { &[0, 1] };
+        let range = order
+            .iter()
+            .map(|&p| &ranges[p])
+            .find(|r| !r.is_empty())
+            .unwrap_or(&ranges[order[0]]);
+        line_range(range)
+    };
+    let toc = shown > 0;
     let _ = write!(
         out,
         "<div class=\"layout{}\">",
@@ -1261,22 +1351,14 @@ pub fn text_report(
             out,
             "<nav class=\"toc\" aria-label=\"{heading}\"><details id=\"toc-d\" open><summary><h2>{heading}</h2></summary><div>"
         );
-        for (k, (b, _)) in list.iter().enumerate() {
+        for (k, (b, _)) in list.iter().take(shown).enumerate() {
             let (_, label) = kind(result, *b);
-            // The line of the base side, or of the first side that has lines here.
-            let ranges = &result.blocks[*b].ranges;
-            let order: &[usize] = if n == 3 { &[1, 0, 2] } else { &[0, 1] };
-            let range = order
-                .iter()
-                .map(|&p| &ranges[p])
-                .find(|r| !r.is_empty())
-                .unwrap_or(&ranges[order[0]]);
-            let pos = line_range(range);
             let _ = write!(
                 out,
-                "<a href=\"#d{k}\"><span>{}. {}</span><span class=\"c\">{pos}</span></a>",
+                "<a href=\"#d{k}\"><span>{}. {}</span><span class=\"c\">{}</span></a>",
                 k + 1,
-                esc(label)
+                esc(label),
+                position(*b)
             );
         }
         out.push_str("</div></details></nav>");
@@ -1301,7 +1383,90 @@ pub fn text_report(
     if ignored > 0 {
         cards.push(("", ignored.to_string(), tr("report.ignored")));
     }
+    if shown < total && detail != ReportDetail::Summary {
+        cards.push((
+            "",
+            (total - shown).to_string(),
+            tr("report.blocks_left_out"),
+        ));
+    }
     stat_cards(&mut out, &cards);
+
+    // The differences come first, so the box above them can count what they left out.
+    let mut body = String::new();
+    let mut cut = 0;
+    if total == 0 {
+        let _ = write!(
+            body,
+            "<div class=\"file\"><div class=\"empty\">✓ {}</div></div>",
+            esc(tr("report.no_diffs"))
+        );
+    } else if shown == 0 {
+        // A summary: where each difference is, without its lines.
+        let _ = write!(
+            body,
+            "<div class=\"file\"><ol class=\"sumlist\" aria-label=\"{}\">",
+            esc(tr("report.differences"))
+        );
+        for (k, (b, _)) in list.iter().enumerate() {
+            let (kclass, label) = kind(result, *b);
+            let blk = &result.blocks[*b];
+            let sides: Vec<String> = blk
+                .ranges
+                .iter()
+                .enumerate()
+                .take(n)
+                .map(|(p, r)| format!("<b>{}</b>{}", esc(side_name(p, n)), line_range(r)))
+                .collect();
+            let _ = write!(
+                body,
+                "<li id=\"d{k}\"><span class=\"kind k-{kclass}\">{}</span> <span class=\"pos\">{}</span></li>",
+                esc(label),
+                sides.join(" &nbsp;")
+            );
+        }
+        body.push_str("</ol></div>");
+    } else {
+        body.push_str("<div class=\"file\"><div class=\"body\" style=\"border-top:0\">");
+        let doc = Doc {
+            limits,
+            panes,
+            result,
+            opts,
+            notes,
+            extracted: false,
+        };
+        for (k, h) in list.into_iter().take(shown).enumerate() {
+            let id = format!("d{k}");
+            if hunk_html(&mut body, &doc, &id, (k, total), h, &Extra::default()) {
+                cut += 1;
+            }
+        }
+        if shown < total {
+            let more = trf("report.more_diffs", &[("n", (total - shown).to_string())]);
+            let _ = write!(body, "<div class=\"note\">{}</div>", esc(&more));
+        }
+        body.push_str("</div></div>");
+    }
+    let mut omissions = Vec::new();
+    if detail == ReportDetail::Summary && total > 0 {
+        omissions.push(trf(
+            "report.omit_detail_summary",
+            &[("n", total.to_string())],
+        ));
+    } else if shown < total {
+        omissions.push(trf(
+            "report.omit_limit",
+            &[
+                ("n", (total - shown).to_string()),
+                ("rows", fmt_size(Some(limits.rows as u64))),
+            ],
+        ));
+    }
+    if cut > 0 {
+        omissions.push(cut_text(cut, limits));
+    }
+    omissions_html(&mut out, &omissions, detail);
 
     let comments: Vec<String> = notes
         .iter()
@@ -1328,38 +1493,7 @@ pub fn text_report(
             comments.concat()
         );
     }
-    if list.is_empty() {
-        let _ = write!(
-            out,
-            "<div class=\"file\"><div class=\"empty\">✓ {}</div></div>",
-            esc(tr("report.no_diffs"))
-        );
-    } else {
-        out.push_str("<div class=\"file\"><div class=\"body\" style=\"border-top:0\">");
-        let shown = list.len();
-        let doc = Doc {
-            panes,
-            result,
-            opts,
-            notes,
-            extracted: false,
-        };
-        for (k, h) in list.into_iter().enumerate() {
-            hunk_html(
-                &mut out,
-                &doc,
-                &format!("d{k}"),
-                (k, total),
-                h,
-                &Extra::default(),
-            );
-        }
-        if shown < total {
-            let more = trf("report.more_diffs", &[("n", (total - shown).to_string())]);
-            let _ = write!(out, "<div class=\"note\">{}</div>", esc(&more));
-        }
-        out.push_str("</div></div>");
-    }
+    out.push_str(&body);
     page_end(&mut out, toc);
     out
 }
@@ -1469,6 +1603,8 @@ pub struct FolderReportInfo {
     pub scope: Option<String>,
     /// Name the compared folders by their side only, and keep their paths out of the report.
     pub hide_paths: bool,
+    /// How much of the differences the report shows.
+    pub detail: ReportDetail,
 }
 
 /// Replaces the compared folders' paths in a text with the names of their sides.
@@ -1641,18 +1777,100 @@ pub(crate) fn settings_rows(
     rows
 }
 
-/// The size limits of a report that shows up to `rows` rows of differences in all.
-pub(crate) fn limits_text(rows: usize) -> String {
+/// The size limits of an HTML report of `detail`, as the policy it was exported with.
+pub(crate) fn limits_text(detail: ReportDetail) -> String {
+    let files = [
+        ("size", format!("{} MiB", MAX_BYTES >> 20)),
+        ("lines", fmt_size(Some(MAX_LINES as u64))),
+    ];
+    let limits = match detail {
+        ReportDetail::Summary => tr("report.limits_summary").to_string(),
+        ReportDetail::Full => trf("report.limits_full", &files),
+        ReportDetail::Standard => {
+            let l = detail.limits();
+            let [size, lines] = files;
+            trf(
+                "report.limits",
+                &[
+                    ("rows", fmt_size(Some(l.rows as u64))),
+                    ("hunk", l.hunk.to_string()),
+                    ("chars", fmt_size(Some(l.chars as u64))),
+                    size,
+                    lines,
+                ],
+            )
+        }
+    };
     trf(
-        "report.limits",
+        "report.policy",
+        &[("detail", detail.label().to_string()), ("limits", limits)],
+    )
+}
+
+/// What a report says of the `n` blocks it shows shortened to `limits`.
+fn cut_text(n: usize, limits: Limits) -> String {
+    trf(
+        "report.omit_cut",
         &[
-            ("rows", fmt_size(Some(rows as u64))),
-            ("hunk", HUNK_MAX_ROWS.to_string()),
-            ("chars", fmt_size(Some(LINE_CHARS as u64))),
-            ("size", format!("{} MiB", MAX_BYTES >> 20)),
-            ("lines", fmt_size(Some(MAX_LINES as u64))),
+            ("n", n.to_string()),
+            ("rows", limits.hunk.to_string()),
+            ("chars", fmt_size(Some(limits.chars as u64))),
         ],
     )
+}
+
+/// The ids of the files of a folder report, made from their paths so that a link to a file
+/// keeps working in the next report of the same folders: `f-` and 12 hex digits of a hash of
+/// the path, and a number after it in the rare case two paths share them.
+fn file_anchors(listed: &[&DirItem]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    listed
+        .iter()
+        .map(|it| {
+            // FNV-1a: the same everywhere, unlike the hasher of the standard library.
+            let hash = it
+                .rel_path()
+                .bytes()
+                .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+                });
+            let base = format!("f-{:012x}", hash >> 16);
+            let mut id = base.clone();
+            let mut k = 2;
+            while !seen.insert(id.clone()) {
+                id = format!("{base}-{k}");
+                k += 1;
+            }
+            id
+        })
+        .collect()
+}
+
+/// The box that says whether a report shows everything: the `omissions` when there are any,
+/// and the export policy of `detail` either way.
+fn omissions_html(out: &mut String, omissions: &[String], detail: ReportDetail) {
+    if omissions.is_empty() {
+        let _ = write!(
+            out,
+            "<div class=\"box omit complete\" role=\"note\" id=\"completeness\"><h2>✓ {}</h2>",
+            esc(tr("report.complete"))
+        );
+    } else {
+        let _ = write!(
+            out,
+            "<div class=\"box omit\" role=\"note\" id=\"completeness\"><h2>{}</h2><ul>",
+            esc(tr("report.omissions"))
+        );
+        for o in omissions {
+            let _ = write!(out, "<li>{}</li>", esc(o));
+        }
+        out.push_str("</ul>");
+    }
+    let _ = writeln!(
+        out,
+        "<p class=\"pol\">{}</p></div>",
+        esc(&limits_text(detail))
+    );
 }
 
 /// The settings section of a folder report: how the files were compared and what was exported.
@@ -1672,7 +1890,7 @@ fn settings_html(
         info,
         redact,
         CONTEXT.to_string(),
-        limits_text(REPORT_ROWS),
+        limits_text(info.detail),
     );
     out.push_str(&settings_dl(&rows));
     out.push_str("</details>\n");
@@ -1749,14 +1967,18 @@ pub fn folder_report(
     let mut summary_only = 0;
     let mut total_ignored = 0;
     let mut any_hunks = false;
-    // All files share the size limit of a text report.
-    let mut budget = REPORT_ROWS;
+    // All files share the size limit of a text report; a summary reads no file.
+    let limits = info.detail.limits();
+    let shown_opts = opts.filter(|_| info.detail != ReportDetail::Summary);
+    let mut budget = limits.rows;
     let dopts = opts.cloned().unwrap_or_default();
+    let anchors = file_anchors(&listed);
     for (k, it) in listed.iter().enumerate() {
         let st = status_class(it.status);
         let rel = it.rel_path();
+        let anchor = &anchors[k];
         let changed = matches!(st, "different" | "unique" | "error");
-        let diffs = opts.map_or(FileDiffs::None, |o| file_diffs(it, roots, o));
+        let diffs = shown_opts.map_or(FileDiffs::None, |o| file_diffs(it, roots, o));
         let reads: Vec<ReadAs> = match &diffs {
             FileDiffs::Diffs(docs, _) => docs.iter().map(|d| ReadAs::of(d, &dopts)).collect(),
             _ => Vec::new(),
@@ -1765,7 +1987,7 @@ pub fn folder_report(
         let mut body = String::new();
         let mut badges = String::new();
         let (mut rendered, mut total) = (0, 0);
-        let why = summary_reason(it, n, &diffs, opts.is_some(), &redact);
+        let why = summary_reason(it, n, &diffs, shown_opts.is_some(), &redact);
         if let FileDiffs::Diffs(docs, result) = &diffs {
             let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
             let list = hunks(result);
@@ -1799,6 +2021,7 @@ pub fn folder_report(
                 );
             }
             let doc = Doc {
+                limits,
                 panes: &refs,
                 result,
                 opts: &dopts,
@@ -1807,14 +2030,21 @@ pub fn folder_report(
             };
             let mut cut = 0;
             for (j, h) in list.into_iter().enumerate() {
-                let cost = h.1.len().min(HUNK_MAX_ROWS);
+                let cost = h.1.len().min(limits.hunk);
                 if cost > budget {
                     break;
                 }
                 budget -= cost;
                 rendered += 1;
                 let extra = block_extra(&reads, docs, result, h.0);
-                if hunk_html(&mut body, &doc, &format!("f{k}d{j}"), (j, total), h, &extra) {
+                if hunk_html(
+                    &mut body,
+                    &doc,
+                    &format!("{anchor}-d{j}"),
+                    (j, total),
+                    h,
+                    &extra,
+                ) {
                     cut += 1;
                 }
             }
@@ -1843,8 +2073,8 @@ pub fn folder_report(
                     esc(&trf(
                         "report.cut_note",
                         &[
-                            ("rows", HUNK_MAX_ROWS.to_string()),
-                            ("chars", fmt_size(Some(LINE_CHARS as u64)))
+                            ("rows", limits.hunk.to_string()),
+                            ("chars", fmt_size(Some(limits.chars as u64)))
                         ]
                     )),
                     esc(tr("report.shortened"))
@@ -1882,7 +2112,7 @@ pub fn folder_report(
             };
             let _ = write!(
                 toc,
-                "<a href=\"#f{k}\" title=\"{}\"><span>{}</span>{count}</a>",
+                "<a href=\"#{anchor}\" title=\"{}\"><span>{}</span>{count}</a>",
                 esc(&rel),
                 esc(&it.name),
             );
@@ -1897,7 +2127,7 @@ pub fn folder_report(
         };
         let _ = write!(
             files,
-            "<{outer} class=\"file st-{st}\" id=\"f{k}\" data-status=\"{st}\" data-name=\"{}\" data-blocks=\"{rendered}\"><{tag}{} title=\"{}\"><span class=\"dot\" aria-hidden=\"true\"></span><span class=\"path\" title=\"{}\">{}<span class=\"dir\">{}</span></span>{badges}",
+            "<{outer} class=\"file st-{st}\" id=\"{anchor}\" data-status=\"{st}\" data-name=\"{}\" data-blocks=\"{rendered}\"><{tag}{} title=\"{}\"><span class=\"dot\" aria-hidden=\"true\"></span><span class=\"path\" title=\"{}\">{}<span class=\"dir\">{}</span></span>{badges}",
             esc(&rel),
             if open { "" } else { " class=\"sum\"" },
             esc(&dates.join("\n")),
@@ -2015,31 +2245,14 @@ pub fn folder_report(
             "report.omit_limit",
             &[
                 ("n", left_out.to_string()),
-                ("rows", fmt_size(Some(REPORT_ROWS as u64))),
+                ("rows", fmt_size(Some(limits.rows as u64))),
             ],
         ));
     }
     if cut_blocks > 0 {
-        omissions.push(trf(
-            "report.omit_cut",
-            &[
-                ("n", cut_blocks.to_string()),
-                ("rows", HUNK_MAX_ROWS.to_string()),
-                ("chars", fmt_size(Some(LINE_CHARS as u64))),
-            ],
-        ));
+        omissions.push(cut_text(cut_blocks, limits));
     }
-    if !omissions.is_empty() {
-        let _ = write!(
-            out,
-            "<div class=\"box omit\" role=\"note\"><h2>{}</h2><ul>",
-            esc(tr("report.omissions"))
-        );
-        for o in &omissions {
-            let _ = write!(out, "<li>{}</li>", esc(o));
-        }
-        out.push_str("</ul></div>\n");
-    }
+    omissions_html(&mut out, &omissions, info.detail);
     settings_html(&mut out, opts, info, &redact);
     let _ = write!(
         out,
@@ -2150,7 +2363,15 @@ mod tests {
         let b = v(&["y"]);
         let opts = DiffOptions::default();
         let r = compute(&[&a, &b], &opts);
-        let html = text_report(&["a".into(), "b".into()], &[&a, &b], &r, &opts, &[], "");
+        let html = text_report(
+            &["a".into(), "b".into()],
+            &[&a, &b],
+            &r,
+            &opts,
+            &[],
+            "",
+            ReportDetail::Standard,
+        );
         let start = html
             .find("<img class=\"logo\" alt=\"\" src=\"data:image/png;base64,")
             .expect("icon");
@@ -2201,6 +2422,7 @@ mod tests {
             &opts,
             &notes,
             "My rules",
+            ReportDetail::Standard,
         );
         let total = hunks(&r).len();
         assert!(total >= 2, "{html}");
@@ -2227,6 +2449,7 @@ mod tests {
             &opts,
             &[],
             "",
+            ReportDetail::Standard,
         );
         assert!(!same.contains("class=\"meta\""));
         assert!(!same.contains("id=\"prev\""));
@@ -2250,7 +2473,15 @@ mod tests {
         let opts = DiffOptions::default();
         let r = compute(&[&a, &b], &opts);
         let total = hunks(&r).len();
-        let html = text_report(&["a".into(), "b".into()], &[&a, &b], &r, &opts, &[], "");
+        let html = text_report(
+            &["a".into(), "b".into()],
+            &[&a, &b],
+            &r,
+            &opts,
+            &[],
+            "",
+            ReportDetail::Standard,
+        );
         let shown = html.matches(" id=\"d").count();
         assert!(shown > 0 && shown < total, "{shown} of {total}");
         let more = trf("report.more_diffs", &[("n", (total - shown).to_string())]);
@@ -2263,6 +2494,7 @@ mod tests {
             &opts,
             &[],
             "",
+            ReportDetail::Standard,
         );
         assert!(added.contains("<span class=\"c\">4</span>"), "{added}");
     }
@@ -2340,6 +2572,119 @@ mod tests {
         );
         assert!(html.contains(&esc(&limit)));
         assert!(html.contains(&esc(tr("report.search_partial"))));
+    }
+
+    #[test]
+    fn every_detail_says_what_it_left_out() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        // A block of 1,000 changed rows, longer than a standard block, and a long line.
+        let lines: Vec<String> = (0..1000).map(|i| format!("{i}\n")).collect();
+        let long = "y".repeat(LINE_CHARS + 50);
+        std::fs::write(a.path().join("big.txt"), lines.concat()).unwrap();
+        std::fs::write(b.path().join("big.txt"), format!("{long}\n")).unwrap();
+        std::fs::write(a.path().join("small.txt"), "a\n").unwrap();
+        std::fs::write(b.path().join("small.txt"), "b\n").unwrap();
+        let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        let opts = DiffOptions::default();
+        let with = |detail| {
+            report(
+                &roots,
+                Some(&opts),
+                &FolderReportInfo {
+                    detail,
+                    ..FolderReportInfo::default()
+                },
+            )
+        };
+        let complete = esc(tr("report.complete"));
+        let policy = |d: ReportDetail| esc(&limits_text(d));
+
+        let standard = with(ReportDetail::Standard);
+        let cut = cut_text(1, ReportDetail::Standard.limits());
+        assert!(standard.contains(&esc(&cut)), "the long block is counted");
+        assert!(!standard.contains(&complete));
+        assert!(standard.contains(&policy(ReportDetail::Standard)));
+        assert!(!standard.contains(&long));
+
+        let full = with(ReportDetail::Full);
+        assert!(full.contains(&complete), "nothing is left out");
+        assert!(!full.contains(&esc(tr("report.omissions"))));
+        assert!(full.contains(&long), "whole lines");
+        assert!(full.contains("<td class=\"n\">1000</td>"), "every row");
+        assert!(full.contains(&policy(ReportDetail::Full)));
+
+        let summary = with(ReportDetail::Summary);
+        assert!(!summary.contains("class=\"hunk"));
+        let omitted = trf("report.omit_summary", &[("n", "2".into())]);
+        assert!(summary.contains(&esc(&omitted)), "both files are counted");
+        assert!(summary.contains(&policy(ReportDetail::Summary)));
+        assert!(summary.len() < standard.len());
+    }
+
+    #[test]
+    fn text_reports_say_whether_they_are_complete() {
+        let a: Vec<String> = (0..1000).map(|i| format!("{i}")).collect();
+        let b: Vec<String> = (0..1000).map(|i| format!("{i}x")).collect();
+        let r = crate::core::diff::compute(&[&a, &b], &DiffOptions::default());
+        let titles = ["a".to_string(), "b".to_string()];
+        let opts = DiffOptions::default();
+        let html = |d| text_report(&titles, &[&a, &b], &r, &opts, &[], "", d);
+        let complete = esc(tr("report.complete"));
+
+        let standard = html(ReportDetail::Standard);
+        assert!(standard.contains(&esc(&cut_text(1, ReportDetail::Standard.limits()))));
+        assert!(!standard.contains(&complete));
+        assert!(standard.contains("id=\"completeness\""));
+
+        let full = html(ReportDetail::Full);
+        assert!(full.contains(&complete));
+        assert!(full.contains("<td class=\"n\">1000</td>"));
+
+        let summary = html(ReportDetail::Summary);
+        assert!(!summary.contains("<table class=\"d"));
+        assert!(summary.contains("<ol class=\"sumlist\""));
+        assert!(summary.contains("<li id=\"d0\">"));
+        let n = hunks(&r).len().to_string();
+        assert!(summary.contains(&esc(&trf("report.omit_detail_summary", &[("n", n)]))));
+
+        let same = text_report(
+            &titles,
+            &[&a, &a],
+            &crate::core::diff::compute(&[&a, &a], &opts),
+            &opts,
+            &[],
+            "",
+            ReportDetail::Summary,
+        );
+        assert!(same.contains(&complete), "nothing to leave out");
+    }
+
+    #[test]
+    fn file_anchors_follow_the_path_not_the_order() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        for f in ["one.txt", "two.txt"] {
+            std::fs::write(a.path().join(f), "a\n").unwrap();
+            std::fs::write(b.path().join(f), "b\n").unwrap();
+        }
+        let items = scan(
+            &[a.path().to_path_buf(), b.path().to_path_buf()],
+            &DiffOptions::default(),
+        );
+        let mut refs: Vec<&DirItem> = items.iter().filter(|it| !it.is_dir).collect();
+        let first = file_anchors(&refs);
+        refs.reverse();
+        let mut second = file_anchors(&refs);
+        second.reverse();
+        assert_eq!(first, second);
+        assert_ne!(first[0], first[1]);
+        assert!(
+            first[0].starts_with("f-") && first[0].len() == 14,
+            "{}",
+            first[0]
+        );
+        // The same path twice still gets two ids.
+        let twice = file_anchors(&[refs[0], refs[0]]);
+        assert_eq!(twice[1], format!("{}-2", twice[0]));
     }
 
     #[test]
@@ -2750,7 +3095,15 @@ mod tests {
             assert!(!html.contains(secret), "{secret} is in the report");
         }
         assert!(html.contains(&esc(tr("report.paths_hidden"))));
-        assert!(html.contains("id=\"f0d0\""), "differences are still linked");
+        let anchor = file_anchors(&[&scan(&roots, &DiffOptions::default())
+            .into_iter()
+            .find(|it| it.name == "f.txt")
+            .unwrap()])
+        .remove(0);
+        assert!(
+            html.contains(&format!("id=\"{anchor}-d0\"")),
+            "differences are still linked"
+        );
         let shown = report(
             &roots,
             Some(&DiffOptions::default()),

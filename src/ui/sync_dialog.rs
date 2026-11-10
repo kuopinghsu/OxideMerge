@@ -785,6 +785,7 @@ fn outcome_ui(ui: &mut Ui, outcome: &SyncOutcome) {
                 .map(|(p, e)| format!("{p}: {e}"))
                 .collect();
             list(ui, failed.iter().map(String::as_str));
+            ui.label(tr("folder_sync.recovery_next"));
         }
     }
 }
@@ -914,6 +915,7 @@ impl Recovery {
                     for (p, e) in &r.failed {
                         text.push_str(&format!("\n{p}: {e}"));
                     }
+                    text.push_str(&format!("\n{}", tr("folder_sync.recovery_next")));
                     (text, false)
                 }
             }

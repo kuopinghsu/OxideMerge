@@ -27,23 +27,64 @@ fn highlighter() -> &'static Highlighter {
     })
 }
 
-const MAX_LINES: usize = 50_000;
-const MAX_BYTES: usize = 16 * 1024 * 1024;
+/// The default size of a file that is highlighted, in MiB ([`crate::config::Config::highlight_limit_mb`]).
+pub const DEFAULT_LIMIT_MB: u32 = 16;
+
+/// How much a file may hold to be highlighted: `mb` MiB of text, and 3,125 lines for each
+/// MiB (50,000 lines at the default 16 MiB), as highlighting takes time for each line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub lines: usize,
+    pub bytes: usize,
+}
+
+impl Budget {
+    pub fn of_mb(mb: u32) -> Budget {
+        let mb = mb.max(1) as usize;
+        Budget {
+            lines: mb * 3125,
+            bytes: mb << 20,
+        }
+    }
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Budget::of_mb(DEFAULT_LIMIT_MB)
+    }
+}
 
 /// Check before cloning input for the worker, not only after allocating its copy.
-pub fn within_limits(lines: &[String]) -> bool {
-    lines.len() <= MAX_LINES
+pub fn within_limits(lines: &[String], budget: Budget) -> bool {
+    lines.len() <= budget.lines
         && lines
             .iter()
             .try_fold(0usize, |total, line| {
                 let next = total.checked_add(line.len())?;
-                (next <= MAX_BYTES).then_some(next)
+                (next <= budget.bytes).then_some(next)
             })
             .is_some()
 }
 
+/// Whether files named with extension `ext` have a syntax to highlight.
+pub fn has_syntax(ext: &str) -> bool {
+    highlighter()
+        .ss
+        .find_syntax_by_extension(ext)
+        .is_some_and(|s| s.name != "Plain Text")
+}
+
 pub fn highlight(lines: &[String], ext: &str, dark: bool) -> Option<Vec<LineSpans>> {
-    if !within_limits(lines) {
+    highlight_within(lines, ext, dark, Budget::default())
+}
+
+fn highlight_within(
+    lines: &[String],
+    ext: &str,
+    dark: bool,
+    budget: Budget,
+) -> Option<Vec<LineSpans>> {
+    if !within_limits(lines, budget) {
         return None;
     }
     let h = highlighter();
@@ -75,10 +116,15 @@ pub fn highlight(lines: &[String], ext: &str, dark: bool) -> Option<Vec<LineSpan
     Some(out)
 }
 
-pub fn spawn(lines: Vec<String>, ext: String, dark: bool) -> Receiver<Option<Vec<LineSpans>>> {
+pub fn spawn(
+    lines: Vec<String>,
+    ext: String,
+    dark: bool,
+    budget: Budget,
+) -> Receiver<Option<Vec<LineSpans>>> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
-        let _ = tx.send(highlight(&lines, &ext, dark));
+        let _ = tx.send(highlight_within(&lines, &ext, dark, budget));
     });
     rx
 }
@@ -89,10 +135,24 @@ mod tests {
 
     #[test]
     fn limits_reject_large_line_counts_and_single_giant_lines_before_worker_copy() {
-        assert!(within_limits(&["let n = 1;".into()]));
-        assert!(!within_limits(&vec![String::new(); MAX_LINES + 1]));
-        let lines = vec!["x".repeat(MAX_BYTES + 1)];
-        assert!(!within_limits(&lines));
+        let b = Budget::default();
+        assert_eq!(
+            b,
+            Budget {
+                lines: 50_000,
+                bytes: 16 << 20
+            }
+        );
+        assert!(within_limits(&["let n = 1;".into()], b));
+        assert!(!within_limits(&vec![String::new(); b.lines + 1], b));
+        let lines = vec!["x".repeat(b.bytes + 1)];
+        assert!(!within_limits(&lines, b));
         assert!(highlight(&lines, "rs", false).is_none());
+        // A larger budget takes them.
+        assert!(within_limits(
+            &vec![String::new(); b.lines + 1],
+            Budget::of_mb(17)
+        ));
+        assert!(within_limits(&lines, Budget::of_mb(17)));
     }
 }

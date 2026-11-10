@@ -1508,6 +1508,35 @@ pub fn menu_check(ui: &mut Ui, on: bool, label: &str, keys: &str) -> Response {
     r
 }
 
+/// Makes what `response` shows a live region: a screen reader reads it out when it changes,
+/// after what it is reading (`assertive`: at once, for errors).
+pub fn announce(ui: &egui::Ui, response: &egui::Response, assertive: bool) {
+    use egui::accesskit::Live;
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_live(if assertive {
+            Live::Assertive
+        } else {
+            Live::Polite
+        });
+    });
+}
+
+/// Like [`announce`], read out as `spoken` instead of what is shown: "Difference 2 of 5" for a
+/// counter that shows "2 / 5".
+pub fn announce_as(ui: &egui::Ui, response: &egui::Response, spoken: &str, assertive: bool) {
+    use egui::accesskit::Live;
+    // A plain frame has no node of its own until it says what it is.
+    response.widget_info(|| WidgetInfo::labeled(Role::Label, true, spoken));
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_label(spoken);
+        node.set_live(if assertive {
+            Live::Assertive
+        } else {
+            Live::Polite
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

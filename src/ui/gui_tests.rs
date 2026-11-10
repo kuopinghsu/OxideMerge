@@ -16,6 +16,10 @@ struct Widget {
     label: String,
     rect: Rect,
     enabled: bool,
+    /// Read out when it changes (a live region).
+    live: Option<accesskit::Live>,
+    /// The state of a check box or switch.
+    toggled: Option<accesskit::Toggled>,
 }
 
 #[derive(Debug)]
@@ -495,6 +499,8 @@ fn focused_of(tree: &accesskit::TreeUpdate) -> Option<Widget> {
             Pos2::new(b.x1 as f32, b.y1 as f32),
         ),
         enabled: !n.is_disabled(),
+        live: n.live(),
+        toggled: n.toggled(),
     })
 }
 
@@ -555,6 +561,8 @@ fn widgets_of(tree: &accesskit::TreeUpdate) -> Vec<Widget> {
                 Pos2::new(b.x1 as f32, b.y1 as f32),
             ),
             enabled: !n.is_disabled(),
+            live: n.live(),
+            toggled: n.toggled(),
         });
     }
     out
@@ -595,6 +603,8 @@ fn controls_of(tree: &accesskit::TreeUpdate) -> Vec<Widget> {
                     Pos2::new(b.x1 as f32, b.y1 as f32),
                 ),
                 enabled: !n.is_disabled(),
+                live: n.live(),
+                toggled: n.toggled(),
             })
         })
         .collect()
@@ -779,6 +789,598 @@ fn the_recent_comparisons_are_cleared_from_the_start_page_and_the_file_menu() {
     assert!(gui.app.cfg.recent_compares.is_empty());
     gui.click_menu(tr("menu.file"));
     assert!(!gui.widget(tr("menu.open_recent")).enabled);
+}
+
+/// Presses the key of command `cmd`, as the keyboard shortcuts list it.
+fn press(gui: &mut Gui, cmd: crate::ui::commands::Cmd) {
+    let b = crate::ui::commands::BINDINGS
+        .iter()
+        .find(|b| b.cmd == cmd)
+        .unwrap_or_else(|| panic!("no key for {cmd:?}"));
+    gui.key(b.key.modifiers, b.key.logical_key);
+}
+
+/// The whole round of a comparison with no pointer at all: the paths typed on the start page,
+/// the comparison started, a difference found, copied and saved, the tab closed and the
+/// program left.
+#[test]
+fn a_comparison_runs_from_start_to_exit_with_the_keyboard_alone() {
+    use crate::ui::commands::Cmd;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("a.txt", "same\nold\nsame\n"),
+            ("b.txt", "same\nnew\nsame\n"),
+        ],
+    );
+    let mut gui = Gui::start("keyboard_start_to_exit", None);
+    let mut fields = Vec::new();
+    for file in ["a.txt", "b.txt"] {
+        let field = gui.tab_to("a path field not yet filled", |w| {
+            w.role == accesskit::Role::TextInput && !fields.contains(&w.rect)
+        });
+        fields.push(field.rect);
+        gui.type_text(&d.join(file).display().to_string());
+        // A list of matching paths may open under the field; Escape closes only that.
+        gui.key(Modifiers::NONE, Key::Escape);
+    }
+    assert_eq!(gui.app.tabs.len(), 0, "Escape in a field closes no compare");
+    // The start page's button, below the fields, not the Compare menu of the menu bar.
+    let below = fields[1].max.y;
+    gui.tab_to("the Compare button", |w| {
+        named(w, tr("btn.compare")) && w.rect.min.y > below
+    });
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.settle();
+    assert_eq!(gui.app.tabs.len(), 1, "{}", gui.describe());
+    assert_eq!(gui.text_view().panes[1].doc.lines, ["same", "new", "same"]);
+
+    press(&mut gui, Cmd::NextDiff);
+    assert!(gui.text_view().cur_block.is_some());
+    press(&mut gui, Cmd::CopyRight);
+    assert_eq!(gui.text_view().panes[1].doc.lines, ["same", "old", "same"]);
+    press(&mut gui, Cmd::Save);
+    assert_eq!(read(&d.join("b.txt")), "same\nold\nsame\n");
+    assert_eq!(read(&d.join("a.txt")), "same\nold\nsame\n");
+
+    gui.key(CMD, Key::W);
+    assert_eq!(gui.app.tabs.len(), 0, "a saved tab closes without asking");
+    assert!(!gui.closed);
+    press(&mut gui, Cmd::Exit);
+    gui.frames(3);
+    assert!(gui.closed, "the exit key closes the window");
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+/// A dialog opened from the keyboard gives the focus back to the control that opened it when
+/// it closes, whether with Escape or its own button, so the keyboard carries on from there.
+#[test]
+fn closing_a_dialog_gives_the_focus_back_to_what_opened_it() {
+    let mut gui = Gui::start("dialog_focus_back", None);
+    let options = tr("menu.options").trim_end_matches(['.', '…']);
+    let opener = gui.tab_to("the Options button", |w| named(w, options));
+    for close in ["escape", "button"] {
+        gui.key(Modifiers::NONE, Key::Enter);
+        gui.frames(3);
+        assert!(
+            gui.app.options_dlg.is_some(),
+            "{close}: Enter opens the dialog"
+        );
+        assert_ne!(
+            gui.focus.as_ref().map(|f| f.rect),
+            Some(opener.rect),
+            "{close}: the focus moved into the dialog"
+        );
+        match close {
+            "escape" => gui.key(Modifiers::NONE, Key::Escape),
+            _ => {
+                gui.tab_to("the dialog's Cancel button", |w| named(w, tr("btn.cancel")));
+                gui.key(Modifiers::NONE, Key::Enter);
+            }
+        }
+        gui.frames(3);
+        assert!(gui.app.options_dlg.is_none(), "{close}: the dialog closed");
+        let focus = gui.focus.clone();
+        assert!(
+            focus.as_ref().is_some_and(|f| f.rect == opener.rect),
+            "{close}: the focus is on {:?}, not the Options button",
+            focus.as_ref().map(|f| (f.role, f.label.clone()))
+        );
+    }
+}
+
+/// A snapshot left behind by a program that did not close normally comes back on *Restore*:
+/// the comparison opens with its unsaved edit in its side, still unsaved, the files untouched,
+/// and a file changed since is named.
+#[test]
+fn a_recovered_comparison_comes_back_unsaved_and_never_written() {
+    use crate::core::recovery;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("a.txt", "same\nold\nsame\n"),
+            ("b.txt", "same\nnew\nsame\n"),
+        ],
+    );
+    let (a, b) = (d.join("a.txt"), d.join("b.txt"));
+    let snaps = d.join("recovery");
+    {
+        let mut gui = Gui::start("recovery_before", compare(&[a.clone(), b.clone()]));
+        gui.settle();
+        press(&mut gui, crate::ui::commands::Cmd::NextDiff);
+        press(&mut gui, crate::ui::commands::Cmd::CopyRight);
+        assert!(gui.text_view().panes[1].doc.modified);
+        if let Content::Text(v) = &mut gui.app.tabs[0].content {
+            v.bookmarks[0].insert(2, "last".into());
+            v.set_caret_line(1, 2);
+        }
+        let snapshot = gui.app.recovery_snapshot();
+        assert_eq!(snapshot.tabs[0].caret, Some((1, 2)));
+        // A tab left out of recovery is not in the snapshot.
+        gui.app.tabs[0].no_recovery = true;
+        assert!(gui.app.recovery_snapshot().tabs.is_empty());
+        gui.app.tabs[0].no_recovery = false;
+        assert_eq!(snapshot.unsaved_sides(), 1);
+        assert_eq!(
+            snapshot.tabs[0].unsaved[0], None,
+            "the left side was not edited"
+        );
+        recovery::write(&snaps, "session-1-1.json", &snapshot).unwrap();
+    }
+    assert_eq!(
+        read(&b),
+        "same\nnew\nsame\n",
+        "nothing saved before the crash"
+    );
+    write(d, &[("a.txt", "same\nold\nsame\nmore\n")]);
+
+    let later = std::time::SystemTime::now() + recovery::ABANDONED_AFTER;
+    let found = recovery::abandoned(&snaps, "session-2-2.json", later);
+    assert_eq!(found.len(), 1);
+    let mut gui = Gui::start("recovery_restore", None);
+    gui.app.recovery_offer = Some(RecoveryOffer {
+        found,
+        inspect: false,
+    });
+    gui.frames(2);
+    assert!(gui.shows(tr("recovery.title")), "{}", gui.describe());
+    gui.click(tr("recovery.inspect"));
+    gui.frames(2);
+    assert!(gui.shows_text(tr("recovery.changed")), "{}", gui.describe());
+    gui.click(tr("recovery.restore"));
+    gui.settle();
+
+    assert!(gui.app.recovery_offer.is_none());
+    assert_eq!(gui.app.tabs.len(), 1, "{}", gui.describe());
+    let v = gui.text_view();
+    assert_eq!(v.panes[1].doc.lines, ["same", "old", "same"]);
+    assert!(v.panes[1].doc.modified, "the recovered edit is not saved");
+    assert!(!v.panes[0].doc.modified);
+    assert_eq!(v.panes[0].doc.lines, ["same", "old", "same", "more"]);
+    assert_eq!(v.bookmarks[0].get(&2).map(String::as_str), Some("last"));
+    assert_eq!(v.caret_line(), Some((1, 2)), "the caret where it was");
+    assert_eq!(read(&b), "same\nnew\nsame\n", "restoring writes no file");
+    assert!(
+        gui.toasts()
+            .iter()
+            .any(|(warn, t)| *warn && t.contains(&a.display().to_string())),
+        "the changed file is named: {:?}",
+        gui.toasts()
+    );
+    assert!(
+        !snaps.join("session-1-1.json").exists(),
+        "a restored snapshot is gone"
+    );
+}
+
+/// In every language, on a small window, the buttons of the recovery prompt and of the
+/// Options dialog lie wholly inside the window and none covers another, so no translation
+/// pushes a choice such as *Discard* out of sight.
+#[test]
+fn dialog_buttons_fit_a_small_window_in_every_language() {
+    use crate::core::recovery;
+    let small = egui::vec2(800.0, 600.0);
+    let window = Rect::from_min_size(Pos2::ZERO, small);
+    let snapshot = recovery::Snapshot::new(Vec::new(), 0, 0);
+    for lang in i18n::languages().iter().map(|l| l.code.clone()) {
+        let cfg = Config {
+            language: lang.clone(),
+            ..config()
+        };
+        let mut gui = Gui::with_config("dialog_buttons_fit", cfg, None);
+        gui.screen = small;
+        let check = |gui: &Gui, what: &str, labels: &[&str]| {
+            let buttons: Vec<&Widget> = gui
+                .widgets
+                .iter()
+                .filter(|w| w.role == accesskit::Role::Button && labels.contains(&w.label.as_str()))
+                .collect();
+            assert_eq!(
+                buttons.len(),
+                labels.len(),
+                "{lang} {what}: {labels:?} not all shown\n{}",
+                gui.describe()
+            );
+            for (i, b) in buttons.iter().enumerate() {
+                assert!(
+                    window.contains_rect(b.rect),
+                    "{lang} {what}: {:?} at {:?} is outside the window",
+                    b.label,
+                    b.rect
+                );
+                for o in &buttons[i + 1..] {
+                    assert!(
+                        !b.rect.shrink(0.5).intersects(o.rect.shrink(0.5)),
+                        "{lang} {what}: {:?} covers {:?}",
+                        b.label,
+                        o.label
+                    );
+                }
+            }
+        };
+
+        gui.app.recovery_offer = Some(RecoveryOffer {
+            found: vec![recovery::Found {
+                path: "session-1-1.json".into(),
+                snapshot: Ok(snapshot.clone()),
+            }],
+            inspect: false,
+        });
+        gui.frames(3);
+        check(
+            &gui,
+            "recovery",
+            &[
+                tr("recovery.restore"),
+                tr("recovery.inspect"),
+                tr("recovery.discard"),
+                tr("recovery.later"),
+            ],
+        );
+        gui.app.recovery_offer = None;
+        gui.frames(2);
+
+        gui.app.open_options(OptTab::General);
+        gui.frames(3);
+        check(&gui, "options", &[tr("btn.ok"), tr("btn.cancel")]);
+    }
+}
+
+/// In every language, each menu of the menu bar and each tab of the Options dialog fits an
+/// 800×600 window: no item reaches past the window or its menu, and no two lie over one
+/// another, however long the translation.
+#[test]
+fn menus_and_options_fit_a_small_window_in_every_language() {
+    use accesskit::Role;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "one\ntwo\n"), ("b.txt", "one\n2\n")]);
+    let small = egui::vec2(800.0, 600.0);
+    let window = Rect::from_min_size(Pos2::ZERO, small).expand(1.0);
+    let mut found = Vec::new();
+    for lang in i18n::languages().iter().map(|l| l.code.clone()) {
+        let cfg = Config {
+            language: lang.clone(),
+            ..config()
+        };
+        let mut gui = Gui::with_config(
+            "menus_fit",
+            cfg,
+            compare(&[d.join("a.txt"), d.join("b.txt")]),
+        );
+        gui.screen = small;
+        gui.settle();
+        // What the window shows without a menu or dialog: covered by one, not part of it.
+        let behind: Vec<(String, Rect)> = gui
+            .controls
+            .iter()
+            .map(|w| (w.label.clone(), w.rect))
+            .collect();
+        let on_top = |w: &Widget| !behind.iter().any(|(l, r)| *l == w.label && *r == w.rect);
+        for menu in MENUS {
+            gui.click_menu(tr(menu));
+            gui.frames(3);
+            let shown = popups(&gui);
+            let Some(&area) = shown.iter().max_by(|a, b| a.area().total_cmp(&b.area())) else {
+                found.push(format!("{lang} {menu}: did not open"));
+                continue;
+            };
+            if !window.contains_rect(area) {
+                found.push(format!("{lang} {menu}: the menu at {area:?} is cut off"));
+            }
+            let items: Vec<&Widget> = gui
+                .controls
+                .iter()
+                .filter(|w| {
+                    matches!(
+                        w.role,
+                        Role::Button | Role::MenuItem | Role::CheckBox | Role::RadioButton
+                    ) && w.rect.is_finite()
+                        && w.rect.area() > 0.0
+                        && area.contains(w.rect.center())
+                        && on_top(w)
+                })
+                .collect();
+            if items.len() < 2 {
+                found.push(format!("{lang} {menu}: {} items", items.len()));
+            }
+            for (i, a) in items.iter().enumerate() {
+                if a.rect.left() < area.left() - 1.0 || a.rect.right() > area.right() + 1.0 {
+                    found.push(format!(
+                        "{lang} {menu}: {:?} at {:?} reaches past the menu at {area:?}",
+                        a.label, a.rect
+                    ));
+                }
+                for b in &items[i + 1..] {
+                    let both = a.rect.intersect(b.rect);
+                    if both.width() > 2.0 && both.height() > 2.0 {
+                        found.push(format!(
+                            "{lang} {menu}: {:?} lies over {:?}",
+                            a.label, b.label
+                        ));
+                    }
+                }
+            }
+            gui.key(Modifiers::NONE, Key::Escape);
+            gui.frames(3);
+        }
+        for (tab, _, name) in OptTab::ALL {
+            let behind: Vec<(String, Rect)> = gui
+                .controls
+                .iter()
+                .map(|w| (w.label.clone(), w.rect))
+                .collect();
+            let on_top = |w: &Widget| !behind.iter().any(|(l, r)| *l == w.label && *r == w.rect);
+            gui.app.open_options(tab);
+            gui.frames(4);
+            let Some(&dialog) = popups(&gui)
+                .iter()
+                .max_by(|a, b| a.area().total_cmp(&b.area()))
+            else {
+                found.push(format!("{lang} {name}: the Options dialog did not open"));
+                continue;
+            };
+            if !window.contains_rect(dialog) {
+                found.push(format!(
+                    "{lang} {name}: the dialog at {dialog:?} is cut off"
+                ));
+            }
+            // Only what is in the dialog: the window behind it is covered on purpose.
+            let inside = gui
+                .controls
+                .iter()
+                .filter(|w| dialog.contains(w.rect.center()) && on_top(w));
+            crowded_among(inside, small.x, &format!("{lang} {name}"), &mut found);
+            gui.app.options_dlg = None;
+            gui.frames(2);
+        }
+    }
+    assert!(found.is_empty(), "{found:#?}");
+}
+
+/// Large files open on another thread: the window keeps drawing, a *Cancel* button shows,
+/// and the tab opens once the comparison is done. A cancelled one never opens, not even after
+/// a later comparison has.
+#[test]
+fn large_comparisons_open_in_the_background_and_can_be_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "one\ntwo\n"), ("b.txt", "one\nthree\n")]);
+    // Big enough for the comparison to take a while in a test build.
+    let big: String = (0..3_000_000).map(|i| format!("line {i}\n")).collect();
+    write(
+        d,
+        &[
+            ("big-a.txt", &big),
+            ("big-b.txt", &big.replacen("line 7\n", "seven\n", 1)),
+        ],
+    );
+    let mut gui = Gui::start("background_open", None);
+    gui.app.background_open_bytes = 1;
+
+    gui.app
+        .open(compare(&[d.join("a.txt"), d.join("b.txt")]).unwrap());
+    assert_eq!(gui.app.tabs.len(), 0, "not opened on the window's thread");
+    assert_eq!(gui.app.opening.len(), 1);
+    gui.wait_until("the background comparison", |g| g.app.tabs.len() == 1);
+    assert!(gui.app.opening.is_empty());
+    assert_eq!(gui.text_view().panes[1].doc.lines, ["one", "three"]);
+
+    gui.app
+        .open(compare(&[d.join("big-a.txt"), d.join("big-b.txt")]).unwrap());
+    gui.frames(2);
+    assert!(gui.shows(tr("open.title")), "{}", gui.describe());
+    let started = Instant::now();
+    gui.click(tr("btn.cancel"));
+    assert!(gui.app.opening.is_empty(), "cancelled at once");
+    gui.app
+        .open(compare(&[d.join("b.txt"), d.join("a.txt")]).unwrap());
+    gui.wait_until("the later comparison", |g| g.app.tabs.len() == 2);
+    // Long enough for the cancelled job to have finished, had it not stopped.
+    while started.elapsed() < Duration::from_secs(4) {
+        std::thread::sleep(Duration::from_millis(20));
+        gui.frame();
+    }
+    assert_eq!(
+        gui.app.tabs.len(),
+        2,
+        "the cancelled comparison never opens"
+    );
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert!(!gui.shows(tr("open.title")));
+}
+
+/// A long session on large files: tabs switched every frame, closed and opened again, large
+/// comparisons started and cancelled in the background, edits undone and redone. Nothing
+/// fails, no file is written, and every tab ends as it began.
+#[test]
+fn a_long_session_of_switching_editing_and_cancelling_stays_consistent() {
+    use crate::ui::commands::Cmd;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let side = |seed: usize| -> String {
+        (0..40_000)
+            .map(|i| {
+                if i % 97 == seed {
+                    format!("changed {i}\n")
+                } else {
+                    format!("line {i} of the file\n")
+                }
+            })
+            .collect()
+    };
+    write(
+        d,
+        &[
+            ("a.txt", &side(1)),
+            ("b.txt", &side(2)),
+            ("c.txt", &side(3)),
+        ],
+    );
+    let pairs = [("a.txt", "b.txt"), ("b.txt", "c.txt"), ("a.txt", "c.txt")];
+    let originals: Vec<String> = ["a.txt", "b.txt", "c.txt"]
+        .iter()
+        .map(|n| read(&d.join(n)))
+        .collect();
+    let mut gui = Gui::start("long_session", None);
+    for (l, r) in pairs {
+        gui.app.open(compare(&[d.join(l), d.join(r)]).unwrap());
+    }
+    gui.settle();
+    assert_eq!(gui.app.tabs.len(), 3);
+    // Each tab's lines, by its files: a tab opened again comes last.
+    let lines_of = |gui: &Gui| -> std::collections::BTreeMap<Vec<PathBuf>, Vec<Vec<String>>> {
+        gui.app
+            .tabs
+            .iter()
+            .map(|t| match &t.content {
+                Content::Text(v) => (
+                    t.source.clone(),
+                    v.panes.iter().map(|p| p.doc.lines.clone()).collect(),
+                ),
+                _ => panic!("a text tab"),
+            })
+            .collect()
+    };
+    let before = lines_of(&gui);
+
+    for round in 0..12 {
+        // Switching on every frame.
+        for _ in 0..6 {
+            press(&mut gui, Cmd::NextTab);
+        }
+        // Edits in the tab in front, undone and redone, then undone for good.
+        let tab = gui.app.active;
+        for _ in 0..3 {
+            press(&mut gui, Cmd::NextDiff);
+            press(&mut gui, Cmd::CopyRight);
+        }
+        assert!(gui.text_view().panes[1].doc.modified, "round {round}");
+        for _ in 0..3 {
+            press(&mut gui, Cmd::Undo);
+        }
+        for _ in 0..3 {
+            press(&mut gui, Cmd::Redo);
+        }
+        for _ in 0..3 {
+            press(&mut gui, Cmd::Undo);
+        }
+        assert_eq!(gui.app.active, tab);
+        let source = gui.app.tabs[tab].source.clone();
+        assert!(
+            lines_of(&gui)[&source] == before[&source],
+            "round {round}: {source:?} not undone to the start"
+        );
+        // A large comparison started in the background and cancelled.
+        gui.app.background_open_bytes = 1;
+        gui.app
+            .open(compare(&[d.join("c.txt"), d.join("a.txt")]).unwrap());
+        gui.frame();
+        let id = gui.app.opening.last().unwrap().id;
+        gui.app.cancel_open(id);
+        gui.app.background_open_bytes = BACKGROUND_OPEN_BYTES;
+        // A tab closed and opened again, at the end.
+        let (l, r) = pairs[round % 3];
+        let at = gui
+            .app
+            .tabs
+            .iter()
+            .position(|t| t.source == [d.join(l), d.join(r)])
+            .unwrap();
+        gui.app.active = at;
+        gui.frame();
+        press(&mut gui, Cmd::CloseTab);
+        assert_eq!(
+            gui.app.tabs.len(),
+            2,
+            "round {round}: an unedited tab closes without asking"
+        );
+        gui.app.open(compare(&[d.join(l), d.join(r)]).unwrap());
+        gui.frame();
+        assert_eq!(gui.app.tabs.len(), 3);
+    }
+    gui.frames(30);
+    assert_eq!(gui.app.tabs.len(), 3, "no cancelled comparison opened late");
+    assert!(lines_of(&gui) == before, "every tab as it began");
+    let now: Vec<String> = ["a.txt", "b.txt", "c.txt"]
+        .iter()
+        .map(|n| read(&d.join(n)))
+        .collect();
+    assert_eq!(now, originals, "no file written");
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+/// A menu opened from the keyboard and closed with Escape leaves the focus on its button, so
+/// the keyboard carries on from there.
+#[test]
+fn closing_a_menu_with_escape_leaves_the_focus_on_its_button() {
+    let mut gui = Gui::start("menu_focus_back", None);
+    for menu in [tr("menu.file"), tr("menu.edit"), tr("menu.help")] {
+        let button = gui.tab_to(menu, |w| {
+            named(w, menu) && w.role == accesskit::Role::Button
+        });
+        gui.key(Modifiers::NONE, Key::Enter);
+        gui.frames(3);
+        assert!(!popups(&gui).is_empty(), "{menu}: Enter opens it");
+        gui.key(Modifiers::NONE, Key::Escape);
+        gui.frames(3);
+        assert!(popups(&gui).is_empty(), "{menu}: Escape closes it");
+        let focus = gui.focus.clone();
+        assert!(
+            focus.as_ref().is_some_and(|f| f.rect == button.rect),
+            "{menu}: the focus is on {:?}",
+            focus.as_ref().map(|f| (f.role, f.label.clone()))
+        );
+    }
+}
+
+/// A command run from a menu that puts the focus somewhere (Find, into its field) keeps it
+/// there: the menu's button does not take it back.
+#[test]
+fn a_menu_command_that_moves_the_focus_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "one\ntwo\n"), ("b.txt", "one\n2\n")]);
+    let mut gui = Gui::start(
+        "menu_command_focus",
+        compare(&[d.join("a.txt"), d.join("b.txt")]),
+    );
+    gui.settle();
+    let find = tr(crate::ui::commands::Cmd::Find.label()).to_string();
+    gui.menu(&[tr("menu.edit"), &find]);
+    gui.frames(5);
+    let focus = gui.focus.clone();
+    assert!(
+        focus
+            .as_ref()
+            .is_some_and(|f| f.role == accesskit::Role::TextInput),
+        "the find field keeps the focus, not {:?}",
+        focus.as_ref().map(|f| (f.role, f.label.clone()))
+    );
 }
 
 #[test]
@@ -3586,7 +4188,8 @@ fn menus_too_tall_for_the_window_scroll_while_the_pointer_rests_on_their_arrows(
         gui.app.open_dlg.is_none(),
         "resting on the arrow picks nothing"
     );
-    rest(&mut gui, menu.top() + 12.0, 60);
+    // Long enough to scroll all the way up from wherever it got to, however long the menu.
+    rest(&mut gui, menu.top() + 12.0, 200);
     assert_eq!(first(&gui), Some(top));
     // Opened again, it starts at the top, however far down it was left.
     rest(&mut gui, menu.bottom() - 12.0, 60);
@@ -5394,10 +5997,18 @@ Y
 
 /// Notes controls of `view` that reach past the window's edges or lie over one another.
 fn crowded_controls(gui: &Gui, view: &str, found: &mut Vec<String>) {
+    crowded_among(gui.controls.iter(), gui.screen.x, view, found);
+}
+
+/// [`crowded_controls`] for some of the controls, in a window `width` wide.
+fn crowded_among<'a>(
+    controls: impl Iterator<Item = &'a Widget>,
+    width: f32,
+    view: &str,
+    found: &mut Vec<String>,
+) {
     use accesskit::Role;
-    let controls: Vec<&Widget> = gui
-        .controls
-        .iter()
+    let controls: Vec<&Widget> = controls
         .filter(|w| {
             w.rect.is_finite()
                 && w.rect.area() > 0.0
@@ -5414,7 +6025,7 @@ fn crowded_controls(gui: &Gui, view: &str, found: &mut Vec<String>) {
         })
         .collect();
     for w in &controls {
-        if w.rect.left() < -1.0 || w.rect.right() > gui.screen.x + 1.0 {
+        if w.rect.left() < -1.0 || w.rect.right() > width + 1.0 {
             found.push(format!(
                 "{view}: {:?} {:?} is cut off at {:?}",
                 w.role, w.label, w.rect
@@ -5483,6 +6094,166 @@ fn controls_fit_scaled_and_narrow_windows() {
             crowded_controls(
                 &gui,
                 &format!("{name} {}x{} at {}%", size.x, size.y, scale * 100.0),
+                &mut found,
+            );
+        }
+    }
+    assert!(found.is_empty(), "crowded controls: {found:#?}");
+}
+
+/// What a screen reader is told without being asked: the status bar is a polite live region,
+/// so moving to another difference, or the conflicts left in a merge, are read out; an error
+/// is an assertive one, read out at once.
+#[test]
+fn changes_and_errors_are_read_out_by_screen_readers() {
+    use crate::ui::commands::Cmd;
+    use accesskit::Live;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            ("a.txt", "one\ntwo\nthree\nfour\nfive\nsix\nseven\n"),
+            ("b.txt", "one\n2\nthree\nfour\nfive\n6\nseven\n"),
+            ("base.txt", "a\nb\nc\n"),
+            ("left.txt", "a\nleft\nc\n"),
+            ("right.txt", "a\nright\nc\n"),
+        ],
+    );
+    let live = |gui: &Gui, kind: Live| -> Vec<String> {
+        gui.widgets
+            .iter()
+            .filter(|w| w.live == Some(kind))
+            .map(|w| w.label.clone())
+            .collect()
+    };
+    let mut gui = Gui::start("live_regions", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    gui.settle();
+    let before = live(&gui, Live::Polite);
+    assert!(
+        !before.is_empty(),
+        "the status bar is a live region\n{}",
+        gui.describe()
+    );
+    press(&mut gui, Cmd::NextDiff);
+    press(&mut gui, Cmd::NextDiff);
+    gui.frames(2);
+    let after = live(&gui, Live::Polite);
+    assert_ne!(
+        after, before,
+        "moving to a difference changes what is read out"
+    );
+    let second = trf("msg.diff_of", &[("n", "2".into()), ("total", "2".into())]);
+    assert!(after.contains(&second), "{after:?}");
+
+    gui.app.error("Could not save b.txt");
+    gui.frames(2);
+    assert!(
+        live(&gui, Live::Assertive)
+            .iter()
+            .any(|t| t.contains("Could not save b.txt")),
+        "an error is read out at once: {:?}",
+        live(&gui, Live::Assertive)
+    );
+    assert!(
+        !live(&gui, Live::Polite)
+            .iter()
+            .any(|t| t.contains("Could not save")),
+        "and only once"
+    );
+
+    let mut merge = Gui::start(
+        "live_regions_merge",
+        compare(&[d.join("left.txt"), d.join("base.txt"), d.join("right.txt")]),
+    );
+    merge.settle();
+    let said = live(&merge, Live::Polite);
+    let conflicts = trf("merge.conflicts_left_one", &[("n", "1".into())]);
+    assert!(
+        said.contains(&conflicts),
+        "the conflicts left are read out: {said:?}"
+    );
+}
+
+/// Check boxes tell a screen reader whether they are on, and the state follows a click.
+#[test]
+fn check_boxes_report_their_state() {
+    let mut gui = Gui::start("check_box_states", None);
+    gui.click(tr("menu.options").trim_end_matches(['.', '…']));
+    gui.frames(3);
+    let boxes: Vec<Widget> = gui
+        .controls
+        .iter()
+        .filter(|w| w.role == accesskit::Role::CheckBox)
+        .cloned()
+        .collect();
+    assert!(boxes.len() > 5, "{}", gui.describe());
+    let unknown: Vec<&String> = boxes
+        .iter()
+        .filter(|w| w.toggled.is_none())
+        .map(|w| &w.label)
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "check boxes without a state: {unknown:?}"
+    );
+    let first = &boxes[0];
+    gui.click_at(first.rect.center());
+    gui.frames(2);
+    let now = gui
+        .controls
+        .iter()
+        .find(|w| w.role == accesskit::Role::CheckBox && w.label == first.label)
+        .unwrap();
+    assert_ne!(
+        now.toggled, first.toggled,
+        "{} did not change state",
+        first.label
+    );
+}
+
+/// Each accessibility look (colour-blind colours, high contrast, reduced motion, compact rows),
+/// alone, with large text on a short window: no control is crowded or cut off. Reduced motion
+/// also turns animation off.
+#[test]
+fn accessibility_looks_fit_large_text_and_short_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[("a.txt", "one\ntwo\nthree\n"), ("b.txt", "one\n2\nthree\n")],
+    );
+    type Look = (&'static str, fn(&mut Config));
+    let looks: [Look; 4] = [
+        ("color blind", |c| c.color_blind_colors = true),
+        ("high contrast", |c| c.high_contrast = true),
+        ("reduced motion", |c| c.reduce_motion = true),
+        ("compact", |c| c.compact_density = true),
+    ];
+    let mut found = Vec::new();
+    for (look, set) in looks {
+        let mut cfg = config();
+        set(&mut cfg);
+        let mut gui = Gui::with_config(
+            "accessibility_looks",
+            cfg,
+            compare(&[d.join("a.txt"), d.join("b.txt")]),
+        );
+        gui.settle();
+        if look == "reduced motion" {
+            let style = gui.ctx.global_style();
+            assert_eq!(style.animation_time, 0.0, "no animation");
+        }
+        for (size, scale) in [
+            (egui::vec2(1024.0, 560.0), 1.5),
+            (egui::vec2(800.0, 480.0), 2.0),
+        ] {
+            gui.screen = size;
+            gui.ctx.set_pixels_per_point(scale);
+            gui.frames(4);
+            crowded_controls(
+                &gui,
+                &format!("{look}, {}x{} at {}%", size.x, size.y, scale * 100.0),
                 &mut found,
             );
         }

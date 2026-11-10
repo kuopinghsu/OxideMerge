@@ -751,4 +751,103 @@ mod tests {
             r#"{"l":[1,2,3]}"#
         );
     }
+
+    /// Copies every change of `a` → `b` from `from`, as [`converge`], checking that each step's
+    /// text keeps every byte of the side it changes outside one stretch.
+    fn every_copy(a: &str, b: &str, format: Format, from: usize) -> String {
+        let mut docs = [a.to_string(), b.to_string()];
+        for _ in 0..50 {
+            let r = compare(&docs[0], &docs[1], format);
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            let Some(change) = r.changes.iter().find(|c| c.kind != ChangeKind::Moved) else {
+                return docs[1 - from].clone();
+            };
+            let text = copy_change(change, [&docs[0], &docs[1]], format, from).unwrap();
+            docs[1 - from] = text;
+        }
+        panic!("no end: {docs:?}");
+    }
+
+    #[test]
+    fn edge_cases_copy_exactly_or_are_refused_without_a_change() {
+        // XML: namespace prefixes stay as each side writes them, and mixed content copies
+        // its text and elements in place.
+        let xml = [
+            "<r xmlns:p=\"urn:p\">\n  <p:x>1</p:x>\n  <y>t<b>bold</b>tail</y>\n</r>\n",
+            "<r xmlns:p=\"urn:p\">\n  <p:x>2</p:x>\n  <y>t<b>BOLD</b>tail2</y>\n</r>\n",
+        ];
+        for from in [0, 1] {
+            let out = every_copy(xml[0], xml[1], Format::Xml, from);
+            assert_eq!(out, xml[from]);
+        }
+        let prefixed = [
+            "<r xmlns='urn:a'><x>1</x></r>",
+            "<q:r xmlns:q='urn:a'><q:x>2</q:x></q:r>",
+        ];
+        let r = compare(prefixed[0], prefixed[1], Format::Xml);
+        assert_eq!(r.changes.len(), 1, "the same names: {:?}", r.changes);
+        assert_eq!(
+            copy_change(&r.changes[0], prefixed, Format::Xml, 0).unwrap(),
+            "<q:r xmlns:q='urn:a'><q:x>1</q:x></q:r>"
+        );
+        // An element whose prefix the other file does not declare would change its name
+        // there: refused, and nothing is written.
+        let undeclared = [
+            "<r xmlns:p=\"urn:p\"><p:x>1</p:x><z/></r>",
+            "<r xmlns:p2=\"urn:p\"><z/></r>",
+        ];
+        let r = compare(undeclared[0], undeclared[1], Format::Xml);
+        let x = r
+            .changes
+            .iter()
+            .find(|c| c.path.ends_with("node()[0]"))
+            .unwrap();
+        assert_eq!(
+            copy_change(x, undeclared, Format::Xml, 0),
+            Err(Refusal::NoEdit)
+        );
+
+        // YAML anchors and aliases, and duplicate keys anywhere, are not read at all: the
+        // comparison says so and offers nothing to copy.
+        for (text, format) in [
+            ("base: &b\n  x: 1\nuse: *b\n", Format::Yaml),
+            ("a: 1\na: 2\n", Format::Yaml),
+            ("{\"a\": 1, \"a\": 2}", Format::Json),
+            ("a = 1\na = 2\n", Format::Toml),
+        ] {
+            let r = compare(text, text, format);
+            assert!(!r.errors.is_empty(), "{text:?} was read");
+            assert!(r.changes.is_empty());
+        }
+
+        // TOML dotted keys and tables: the members copy beside their siblings, comments stay.
+        let toml = [
+            "a.b = 1\na.c = 2 # keep\n\n# tbl\n[x]\ny.z = 3\n",
+            "a.b = 5\na.c = 2 # keep\na.d = 1\n\n# tbl\n[x]\ny.z = 4\n",
+        ];
+        for from in [0, 1] {
+            assert_eq!(every_copy(toml[0], toml[1], Format::Toml, from), toml[from]);
+        }
+
+        // JSON numbers past 64-bit precision copy as written, digit for digit.
+        let json = [
+            "{\"n\": 12345678901234567890123, \"m\": 1.0000000000000000001}",
+            "{\"n\": 12345678901234567890124, \"m\": 1.0000000000000000002}",
+        ];
+        for from in [0, 1] {
+            assert_eq!(every_copy(json[0], json[1], Format::Json, from), json[from]);
+        }
+
+        // A move is refused, whether the array is keyed or not.
+        let keyed = Options {
+            array_key: Some("id".into()),
+        };
+        let moved = [r#"[{"id":1},{"id":2}]"#, r#"[{"id":2},{"id":1}]"#];
+        let r = compare_with(moved[0], moved[1], Format::Json, &keyed);
+        assert!(!r.changes.is_empty());
+        for c in &r.changes {
+            assert_eq!(c.kind, ChangeKind::Moved);
+            assert_eq!(copy_change(c, moved, Format::Json, 0), Err(Refusal::Moved));
+        }
+    }
 }

@@ -9,7 +9,7 @@
 //! into `target/bench-data`; results are printed and written to `target/bench/results.md`.
 //!
 //! - `OXIDEMERGE_BENCH_LARGE=1` adds 100 MB inputs, `=2` also a 1 GB binary compare and a
-//!   synchronization of 2 GB files, `=3` a 1 GB text compare.
+//!   synchronization of 2 GB files, `=3` 500 MB and 1 GB text compares.
 //! - `OXIDEMERGE_BENCH_ONLY=text,folder` runs the workloads whose names contain one of these.
 //! - `OXIDEMERGE_BENCH_RUNS=<n>` sets the number of runs (the median time is reported).
 //! - `OXIDEMERGE_BENCH_SAVE=<file>` saves the results as a baseline (after the comparison
@@ -60,11 +60,60 @@ const WORKLOADS: &[Workload] = &[
         run: |d| diff_files(d, &["a.txt", "b.txt"]),
     },
     Workload {
+        name: "text-500mb",
+        what: "2 text files of 500 MB, 1 line in 200 changed",
+        level: 3,
+        make: |d| text_pair(d, 500 * MB, 200),
+        run: |d| diff_files(d, &["a.txt", "b.txt"]),
+    },
+    Workload {
         name: "text-1gb",
         what: "2 text files of 1 GB, 1 line in 200 changed",
         level: 3,
         make: |d| text_pair(d, 1024 * MB, 200),
         run: |d| diff_files(d, &["a.txt", "b.txt"]),
+    },
+    Workload {
+        name: "text-view-10mb",
+        what: "the files of text-10mb opened in the text view: compare, first frame, scrolling and stepping",
+        level: 0,
+        make: |d| text_pair(d, 10 * MB, 20),
+        run: crate::ui::text_view::render_bench,
+    },
+    Workload {
+        name: "text-view-100mb",
+        what: "2 text files of 100 MB, 1 line in 200 changed, opened in the text view",
+        level: 1,
+        make: |d| text_pair(d, 100 * MB, 200),
+        run: crate::ui::text_view::render_bench,
+    },
+    Workload {
+        name: "text-view-500mb",
+        what: "2 text files of 500 MB, 1 line in 200 changed, opened in the text view",
+        level: 3,
+        make: |d| text_pair(d, 500 * MB, 200),
+        run: crate::ui::text_view::render_bench,
+    },
+    Workload {
+        name: "text-view-1gb",
+        what: "2 text files of 1 GB, 1 line in 200 changed, opened in the text view",
+        level: 3,
+        make: |d| text_pair(d, 1024 * MB, 200),
+        run: crate::ui::text_view::render_bench,
+    },
+    Workload {
+        name: "text-cancel-100mb",
+        what: "the files of text-100mb opened as the window opens large files, cancelled at 10% to 90% of the way",
+        level: 1,
+        make: |d| text_pair(d, 100 * MB, 200),
+        run: crate::ui::text_view::cancel_bench,
+    },
+    Workload {
+        name: "text-cancel-500mb",
+        what: "the files of text-500mb opened as the window opens large files, cancelled at 10% to 90% of the way",
+        level: 3,
+        make: |d| text_pair(d, 500 * MB, 200),
+        run: crate::ui::text_view::cancel_bench,
     },
     Workload {
         name: "table-10k",
@@ -619,6 +668,17 @@ fn mixed_files(dir: &Path) {
 }
 
 // ---------- measured work ----------
+
+/// The resident memory of this process in MiB, as `ps` reports it; `None` where there is no
+/// `ps` (Windows).
+pub fn rss_mib() -> Option<f64> {
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    let kib: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    Some(kib / 1024.0)
+}
 
 /// Optional local profiling, kept off during ordinary benchmarks.
 pub fn profile(phase: &str, detail: impl FnOnce() -> String) {

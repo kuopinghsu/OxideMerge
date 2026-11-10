@@ -61,6 +61,27 @@ enum PageArg {
     Letter,
 }
 
+/// How much of the differences an HTML report shows.
+#[derive(Clone, Copy, ValueEnum)]
+enum DetailArg {
+    /// Counts and where each difference is, without lines; reads no file of a folder compare
+    Summary,
+    /// Up to 20,000 rows in all, 400 per difference and 2,000 characters per line
+    Standard,
+    /// Every row and whole lines; the report grows with the differences
+    Full,
+}
+
+impl From<DetailArg> for core::report::ReportDetail {
+    fn from(d: DetailArg) -> Self {
+        match d {
+            DetailArg::Summary => Self::Summary,
+            DetailArg::Standard => Self::Standard,
+            DetailArg::Full => Self::Full,
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum PatchArg {
     Normal,
@@ -202,6 +223,9 @@ struct Cli {
     /// Name the compared folders Left, Middle and Right in a folder report, not by their paths
     #[arg(long)]
     report_hide_paths: bool,
+    /// How much of the differences an .html report shows [default: standard]
+    #[arg(long, value_enum, value_name = "DETAIL")]
+    report_detail: Option<DetailArg>,
     /// Write the .html report as a slideshow, one difference per slide
     #[arg(long)]
     slideshow: bool,
@@ -475,6 +499,11 @@ fn write_output(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
     }
 }
 
+/// How much of the differences an HTML report shows, from the command line.
+fn report_detail(cli: &Cli) -> core::report::ReportDetail {
+    cli.report_detail.map(Into::into).unwrap_or_default()
+}
+
 /// Whether a report file is a PDF.
 fn is_pdf(path: &std::path::Path) -> bool {
     core::text::extension(path) == "pdf"
@@ -551,6 +580,14 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     if cli.report_hide_paths && cli.report.is_none() {
         eprintln!("note: --report-hide-paths needs --report");
     }
+    if cli.report_detail.is_some() {
+        let html = cli.report.as_deref().map(ReportFormat::from_path) == Some(ReportFormat::Html);
+        if cli.report.is_none() {
+            eprintln!("note: --report-detail needs --report");
+        } else if !html || cli.slideshow {
+            eprintln!("note: --report-detail only applies to .html reports");
+        }
+    }
     if cli.slideshow && cli.report.is_none() {
         eprintln!("note: --slideshow needs --report");
     }
@@ -607,6 +644,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             filter: filter_spec.clone(),
             scope: None,
             hide_paths: cli.report_hide_paths,
+            detail: report_detail(cli),
         };
         if let Some(r) = cli.report.as_deref().filter(|r| is_pdf(r)) {
             if cli.slideshow {
@@ -638,11 +676,9 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
                 }
             }
             let text = match format {
-                ReportFormat::Slideshow => {
-                    core::report::folder_slideshow(
-                        &files, paths, &shown, &cfg.diff, &cfg.rules, &info,
-                    )
-                }
+                ReportFormat::Slideshow => core::report::folder_slideshow(
+                    &files, paths, &shown, &cfg.diff, &cfg.rules, &info,
+                ),
                 ReportFormat::Html => core::report::folder_html(
                     &files,
                     paths,
@@ -801,7 +837,16 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             .collect();
         export(
             r,
-            &core::report::text_report(format, &titles, &refs, &result, &cfg.diff, &[], &cfg.rules),
+            &core::report::text_report(
+                format,
+                &titles,
+                &refs,
+                &result,
+                &cfg.diff,
+                &[],
+                &cfg.rules,
+                report_detail(cli),
+            ),
         )?;
     }
     if docs.len() == 2 {
@@ -1422,6 +1467,7 @@ fn stage_remote(
         active: cli.ftp_active,
         client_cert: cli.client_cert.clone(),
         client_key: cli.client_key.clone(),
+        in_place: false,
         port_given: false,
     };
     let staged = core::remote_url::stage(&mut cli.paths, &creds, cancel)?;

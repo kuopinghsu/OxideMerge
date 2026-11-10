@@ -131,6 +131,58 @@ check three-files '^tab\* .*left\.txt.* \| Some\(Different\)' -- files/left.txt 
 check folders '^busy false' '^tab\* left ↔ right \| Some\(Different\)' -- left right
 check identical '^tab\* a\.txt ↔ a\.txt \| Some\(Identical\)' -- files/a.txt files/a.txt
 
+# A crash and the next start, with recovery on: a window killed outright leaves its snapshot
+# behind, and the next start offers it. Not on Windows, where Git Bash cannot kill the native
+# program outright.
+crash_recovery() {
+  local config=$work/crash-config log=$artifacts/crash.log report=$artifacts/crash.report
+  mkdir -p "$config"
+  echo '{"recovery": true}' >"$config/config.json"
+  OXIDEMERGE_CONFIG_DIR=$config "$bin" --lang en files/a.txt files/b.txt >"$log" 2>&1 &
+  local pid=$! waited=0 snapshot=
+  while [ "$waited" -lt 60 ] && kill -0 "$pid" 2>/dev/null; do
+    snapshot=$(ls "$config"/recovery/session-*.json 2>/dev/null | head -n 1 || true)
+    [ -n "$snapshot" ] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if ! kill -0 "$pid" 2>/dev/null; then
+    wait "$pid" 2>/dev/null || true
+    if [ "${GUI_SMOKE_STRICT:-0}" != 1 ] && grep -qiE 'opengl|glutin|egl|wgl|glx|no suitable|display|winit' "$log"; then
+      echo "::warning::gui-smoke: crash: no usable display or OpenGL here; not checked"
+      return
+    fi
+    echo "gui-smoke: crash: the program ended before it was killed"
+    sed 's/^/    /' "$log"
+    failed=1
+    return
+  fi
+  kill -9 "$pid"
+  wait "$pid" 2>/dev/null || true
+  if [ -z "$snapshot" ] || ! grep -q 'a\.txt' "$snapshot" || ! grep -q 'b\.txt' "$snapshot"; then
+    echo "gui-smoke: crash: no snapshot naming a.txt and b.txt after ${waited}s"
+    ls -la "$config" "$config/recovery" 2>/dev/null | sed 's/^/    /'
+    failed=1
+    return
+  fi
+  # As if the crash were minutes ago, so no running program could still be writing it.
+  perl -e 'my $t = time - 600; utime($t, $t, @ARGV) or die' "$snapshot"
+  OXIDEMERGE_CONFIG_DIR=$config OXIDEMERGE_SMOKE_REPORT=$report "$bin" --lang en >>"$log" 2>&1 || true
+  if ! grep -qE '^recovery offered \| .*a\.txt ↔ .*b\.txt' "$report" 2>/dev/null; then
+    echo "gui-smoke: crash: the next start did not offer the snapshot"
+    sed 's/^/    /' "$report" 2>/dev/null || true
+    failed=1
+    return
+  fi
+  [ -f "$snapshot" ] || { echo "gui-smoke: crash: the snapshot went before it was answered"; failed=1; return; }
+  echo "gui-smoke: crash: ok (snapshot after ${waited}s, offered at the next start)"
+}
+
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) echo "gui-smoke: crash: skipped on Windows" ;;
+  *) crash_recovery ;;
+esac
+
 if [ "$failed" != 0 ]; then
   echo "gui-smoke: failed; logs and reports in $artifacts"
   exit 1
