@@ -578,7 +578,7 @@ const OPT_INDEX: &[(OptTab, &str)] = &[
     (OptTab::General, "view.theme"),
     (OptTab::General, "opt.font_size"),
     (OptTab::General, "opt.tab_size"),
-    (OptTab::General, "view.text_layout"),
+    (OptTab::General, "view.layout"),
     (OptTab::General, "view.layout_compact"),
     (OptTab::General, "view.layout_aligned"),
     (OptTab::General, "view.line_numbers"),
@@ -8844,11 +8844,6 @@ impl OxideMergeApp {
             check(ui, &mut cfg.show_unique[2], tr("view.right_only"), "");
         });
         submenu(ui, tr("view.text_menu"), |ui| {
-            submenu(ui, tr("view.text_layout"), |ui| {
-                for layout in TextLayout::ALL {
-                    ui.radio_value(&mut cfg.text_layout, layout, tr(layout.key()));
-                }
-            });
             check(
                 ui,
                 &mut cfg.show_location_pane,
@@ -8870,6 +8865,11 @@ impl OxideMergeApp {
             );
             let wrap = Cmd::ToggleWrap.shown_key();
             check(ui, &mut cfg.word_wrap, tr("cmd.word_wrap"), &wrap);
+        });
+        submenu(ui, tr("view.layout"), |ui| {
+            for layout in TextLayout::ALL {
+                ui.radio_value(&mut cfg.text_layout, layout, tr(layout.key()));
+            }
         });
         ui.separator();
         submenu(ui, tr("label.zoom"), |ui| {
@@ -10087,7 +10087,7 @@ impl OxideMergeApp {
                                         egui::Slider::new(&mut c.tab_size, 1..=16)
                                             .text(tr("opt.tab_size")),
                                     );
-                                    ui.label(egui::RichText::new(tr("view.text_layout")).strong());
+                                    ui.label(egui::RichText::new(tr("view.layout")).strong());
                                     for layout in TextLayout::ALL {
                                         ui.radio_value(
                                             &mut c.text_layout,
@@ -11221,6 +11221,7 @@ impl eframe::App for OxideMergeApp {
                     self.cfg.folder.recursive = recursive;
                 }
                 FolderAction::FilePane(on) => self.cfg.folder_file_pane = on,
+                FolderAction::Layout(layout) => self.cfg.text_layout = layout,
                 FolderAction::ShowAll => {
                     self.cfg.show_identical = true;
                     self.cfg.show_different = true;
@@ -11305,10 +11306,18 @@ impl eframe::App for OxideMergeApp {
         let mut bulk = Vec::new();
         for t in &mut self.tabs {
             let msg = match t.content.view_mut() {
-                Content::Text(v) => v.bulk_edit.take(),
+                Content::Text(v) => {
+                    if let Some(layout) = v.layout_choice.take() {
+                        self.cfg.text_layout = layout;
+                    }
+                    v.bulk_edit.take()
+                }
                 Content::Binary(v) => {
                     if let Some(on) = v.moved_choice.take() {
                         self.cfg.binary_moved_blocks = on;
+                    }
+                    if let Some(layout) = v.layout_choice.take() {
+                        self.cfg.text_layout = layout;
                     }
                     v.bulk_edit.take()
                 }

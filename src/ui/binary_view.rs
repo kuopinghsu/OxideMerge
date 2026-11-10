@@ -1,6 +1,6 @@
 //! Binary (hex) compare view.
 
-use crate::config::Config;
+use crate::config::{Config, TextLayout};
 use crate::core::binary;
 use crate::i18n::{tr, trf};
 use crate::ui::commands::Cmd;
@@ -23,6 +23,96 @@ struct Step {
     len: usize,
     bytes: Vec<u8>,
     state: u64,
+}
+
+/// Display positions `at..at + len` of the aligned layout, where each side shows `count` of its
+/// bytes from offset `start`, then blank cells.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Run {
+    at: usize,
+    len: usize,
+    sides: [(usize, usize); 3],
+}
+
+/// The middle side, which the aligned layout lines each other side up with.
+const HUB: usize = 1;
+
+/// The moved blocks between side `other` and the middle side that keep their order on both,
+/// longest in total, as ranges of `other` and of the middle side: those that can stand side
+/// by side.
+fn aligned_chain(moved: &[binary::MovedBlock], other: usize) -> Vec<(Range<usize>, Range<usize>)> {
+    let mut blocks: Vec<_> = moved
+        .iter()
+        .filter_map(|m| {
+            if (m.from, m.to) == (other, HUB) {
+                Some((m.source.clone(), m.target.clone()))
+            } else if (m.from, m.to) == (HUB, other) {
+                Some((m.target.clone(), m.source.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    blocks.sort_unstable_by_key(|(s, t)| (s.start, t.start));
+    let mut best: Vec<(usize, Option<usize>)> = Vec::with_capacity(blocks.len());
+    for (i, (s, t)) in blocks.iter().enumerate() {
+        let before = (0..i)
+            .filter(|&j| blocks[j].0.end <= s.start && blocks[j].1.end <= t.start)
+            .max_by_key(|&j| best[j].0);
+        best.push((before.map_or(0, |j| best[j].0) + s.len(), before));
+    }
+    let mut at = (0..blocks.len()).max_by_key(|&i| best[i].0);
+    let mut chain = Vec::new();
+    while let Some(i) = at {
+        chain.push(blocks[i].clone());
+        at = best[i].1;
+    }
+    chain.reverse();
+    chain
+}
+
+/// `hub` bytes of the middle side beside `other` bytes of another side, the same bytes when
+/// `matched`.
+#[derive(Clone, Copy)]
+struct Stretch {
+    hub: usize,
+    other: usize,
+    matched: bool,
+}
+
+/// Another side of lengths `lens` (its own, then the middle side's) beside the middle side, from
+/// start to end: its anchors that still fit, and the bytes between them.
+fn stretches(
+    anchors: &[(Range<usize>, Range<usize>)],
+    lens: (usize, usize),
+) -> std::collections::VecDeque<Stretch> {
+    let (mut out, mut next) = (std::collections::VecDeque::new(), (0, 0));
+    let gap = |out: &mut std::collections::VecDeque<Stretch>,
+               to: (usize, usize),
+               next: (usize, usize)| {
+        let (other, hub) = (to.0 - next.0, to.1 - next.1);
+        if other + hub > 0 {
+            out.push_back(Stretch {
+                hub,
+                other,
+                matched: false,
+            });
+        }
+    };
+    for (o, h) in anchors {
+        if o.start < next.0 || h.start < next.1 || o.end > lens.0 || h.end > lens.1 {
+            continue;
+        }
+        gap(&mut out, (o.start, h.start), next);
+        out.push_back(Stretch {
+            hub: h.len(),
+            other: o.len(),
+            matched: true,
+        });
+        next = (o.end, h.end);
+    }
+    gap(&mut out, lens, next);
+    out
 }
 
 /// The moved blocks being found on another thread, from buffers it shares with the view.
@@ -65,9 +155,20 @@ pub struct BinaryView {
     moved_due: Option<f64>,
     moved_job: Option<MovedScan>,
     moved_ranges: Vec<Vec<Range<usize>>>,
+    /// The text layout last read from the settings.
+    layout: TextLayout,
+    /// Set when a layout was chosen on the toolbar, for the settings.
+    pub layout_choice: Option<TextLayout>,
+    /// For each side but the middle one, the moved blocks it shares with the middle side that the
+    /// aligned layout puts side by side (see `aligned_chain`), kept while an edit waits for the
+    /// next scan so the rows do not jump at every keystroke.
+    anchors: Vec<Vec<(Range<usize>, Range<usize>)>>,
+    /// The aligned layout; empty when each side shows its bytes at their own offsets.
+    runs: Vec<Run>,
     pub cur: Option<usize>,
     pub cursor: Option<usize>,
     scroll: f32,
+    /// An offset of the side with the cursor to bring into view.
     scroll_to: Option<usize>,
     undo: Vec<Step>,
     redo: Vec<Step>,
@@ -126,6 +227,10 @@ impl BinaryView {
             moved_due: None,
             moved_job: None,
             moved_ranges: vec![Vec::new(); n],
+            layout: TextLayout::Compact,
+            layout_choice: None,
+            anchors: vec![Vec::new(); n],
+            runs: Vec::new(),
             cur: None,
             cursor: None,
             scroll: 0.0,
@@ -237,6 +342,9 @@ impl BinaryView {
         self.moved_dirty = false;
         self.moved_due = None;
         if !self.detect_moved || self.diffs.is_empty() {
+            for anchors in &mut self.anchors {
+                anchors.clear();
+            }
             return;
         }
         // The worker shares the buffers; an edit stops it first (see `stop_moved_scan`), so no
@@ -296,6 +404,11 @@ impl BinaryView {
     }
 
     #[cfg(test)]
+    pub(super) fn row_of(&self, p: usize, off: usize) -> usize {
+        self.position_of(p, off) / self.bpl
+    }
+
+    #[cfg(test)]
     fn refresh_moved(&mut self) {
         self.moved_dirty = false;
         self.moved_due = None;
@@ -309,6 +422,15 @@ impl BinaryView {
     }
 
     fn apply_moved(&mut self, moved: Vec<binary::MovedBlock>) {
+        self.anchors = (0..self.n())
+            .map(|p| {
+                if p == HUB {
+                    Vec::new()
+                } else {
+                    aligned_chain(&moved, p)
+                }
+            })
+            .collect();
         self.moved = moved;
         for ranges in &mut self.moved_ranges {
             ranges.clear();
@@ -328,6 +450,186 @@ impl BinaryView {
             }
             *ranges = merged;
         }
+    }
+
+    /// Lays out the rows again for the layout, the anchors and the lengths of the sides, keeping
+    /// the bytes at the top of the view there.
+    fn align(&mut self) {
+        let mut runs = Vec::new();
+        let hub_len = self.data[HUB].len();
+        let mut sides: Vec<_> =
+            if self.layout == TextLayout::Aligned && self.detect_moved && !self.diffs.is_empty() {
+                (0..self.n())
+                    .filter(|&p| p != HUB)
+                    .map(|p| {
+                        (
+                            p,
+                            stretches(&self.anchors[p], (self.data[p].len(), hub_len)),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        if sides.iter().any(|(_, s)| s.iter().any(|s| s.matched)) {
+            // Along the middle side, a stretch of another side is cut where one of the others
+            // starts or ends, its bytes beside those of the middle side.
+            let (mut next, mut at) = ([0; 3], 0);
+            while sides.iter().any(|(_, s)| !s.is_empty()) {
+                let mut counts = [0; 3];
+                if sides
+                    .iter()
+                    .any(|(_, s)| s.front().is_some_and(|s| s.hub == 0))
+                {
+                    for (p, s) in &mut sides {
+                        if let Some(only) = s.front().filter(|s| s.hub == 0) {
+                            counts[*p] = only.other;
+                            s.pop_front();
+                        }
+                    }
+                } else {
+                    let k = sides
+                        .iter()
+                        .filter_map(|(_, s)| s.front().map(|s| s.hub))
+                        .min()
+                        .unwrap_or(0);
+                    counts[HUB] = k;
+                    for (p, s) in &mut sides {
+                        let Some(first) = s.front_mut() else { continue };
+                        let take = if k == first.hub {
+                            first.other
+                        } else if first.matched {
+                            k
+                        } else {
+                            first.other.min(k)
+                        };
+                        counts[*p] = take;
+                        first.hub -= k;
+                        first.other -= take;
+                        if first.hub == 0 {
+                            s.pop_front();
+                        }
+                    }
+                }
+                let len = counts.into_iter().max().unwrap_or(0);
+                if len > 0 {
+                    runs.push(Run {
+                        at,
+                        len,
+                        sides: std::array::from_fn(|p| (next[p], counts[p])),
+                    });
+                    at += len;
+                    for (next, count) in next.iter_mut().zip(counts) {
+                        *next += count;
+                    }
+                }
+            }
+        }
+        if runs != self.runs {
+            let top = self.offset_at(0, self.scroll as usize * self.bpl);
+            let within = self.scroll.fract();
+            self.runs = runs;
+            self.scroll = (self.position_of(0, top) / self.bpl) as f32 + within;
+        }
+    }
+
+    /// The run of the aligned layout at display position `d`.
+    fn run_at(&self, d: usize) -> Option<&Run> {
+        self.runs
+            .get(self.runs.partition_point(|r| r.at + r.len <= d))
+    }
+
+    /// The offset of the byte of side `p` at display position `d`, if it shows one.
+    fn byte_at(&self, p: usize, d: usize) -> Option<usize> {
+        if self.runs.is_empty() {
+            return (d < self.data[p].len()).then_some(d);
+        }
+        let r = self.run_at(d)?;
+        let (start, count) = r.sides[p];
+        (d - r.at < count).then(|| start + d - r.at)
+    }
+
+    /// The offset of side `p` at display position `d`: of its byte there, or of the next one
+    /// after a blank cell.
+    fn offset_at(&self, p: usize, d: usize) -> usize {
+        if self.runs.is_empty() {
+            return d;
+        }
+        match self.run_at(d) {
+            Some(r) => r.sides[p].0 + (d - r.at).min(r.sides[p].1),
+            None => self.data[p].len(),
+        }
+    }
+
+    /// The display position of offset `off` of side `p`, counting on after its last byte.
+    fn position_of(&self, p: usize, off: usize) -> usize {
+        if self.runs.is_empty() {
+            return off;
+        }
+        let len = self.data[p].len();
+        if off >= len {
+            let after = len
+                .checked_sub(1)
+                .map_or(0, |last| self.position_of(p, last) + 1);
+            return after + off - len;
+        }
+        let i = self
+            .runs
+            .partition_point(|r| r.sides[p].0 + r.sides[p].1 <= off);
+        self.runs.get(i).map_or(off, |r| r.at + off - r.sides[p].0)
+    }
+
+    /// The side whose rows show offset `off`: the side being edited, else the first that has it.
+    fn side_of(&self, off: usize) -> usize {
+        self.pane.unwrap_or_else(|| {
+            (0..self.n())
+                .find(|&p| off < self.data[p].len())
+                .unwrap_or(0)
+        })
+    }
+
+    /// Display positions in all.
+    fn shown_len(&self) -> usize {
+        match self.runs.last() {
+            Some(r) => r.at + r.len,
+            None => self.data.iter().map(|d| d.len()).max().unwrap_or(0),
+        }
+    }
+
+    /// Whether the cells at display position `d` differ, a blank cell from any byte.
+    fn differs_at(&self, refs: &[&[u8]], d: usize) -> bool {
+        if self.runs.is_empty() {
+            return d < self.shown_len() && binary::byte_differs(refs, d);
+        }
+        let cell = |p: usize| self.byte_at(p, d).map(|o| refs[p][o]);
+        (1..refs.len()).any(|p| cell(p) != cell(0))
+    }
+
+    /// The bytes of side `p` in each difference that no moved block accounts for, with the
+    /// index of the difference.
+    fn changed_bytes(&self, p: usize) -> Vec<(usize, Range<usize>)> {
+        let (len, moved) = (self.data[p].len(), &self.moved_ranges[p]);
+        let (mut j, mut out) = (0, Vec::new());
+        for (i, r) in self.diffs.iter().enumerate() {
+            let (mut start, end) = (r.start, r.end.min(len));
+            while start < end {
+                while moved.get(j).is_some_and(|m| m.end <= start) {
+                    j += 1;
+                }
+                match moved.get(j) {
+                    Some(m) if m.start <= start => start = m.end,
+                    Some(m) if m.start < end => {
+                        out.push((i, start..m.start));
+                        start = m.end;
+                    }
+                    _ => {
+                        out.push((i, start..end));
+                        start = end;
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn is_moved(&self, pane: usize, offset: usize) -> bool {
@@ -387,7 +689,7 @@ impl BinaryView {
     fn select(&mut self, i: usize) {
         self.cur = Some(i);
         self.cursor = Some(self.diffs[i].start);
-        self.scroll_to = Some(self.diffs[i].start / self.bpl);
+        self.scroll_to = Some(self.diffs[i].start);
         self.nibble = None;
         self.run = None;
     }
@@ -461,7 +763,7 @@ impl BinaryView {
         let off = off.min(max.saturating_sub(1));
         self.cursor = Some(off);
         self.cur = self.diffs.iter().position(|r| r.contains(&off));
-        self.scroll_to = Some(off / self.bpl);
+        self.scroll_to = Some(off);
         self.hit = None;
         self.nibble = None;
         self.run = None;
@@ -477,7 +779,7 @@ impl BinaryView {
         let off = off.min(end);
         self.cursor = Some(off);
         self.cur = self.diffs.iter().position(|r| r.contains(&off));
-        self.scroll_to = Some(off / self.bpl);
+        self.scroll_to = Some(off);
         self.hit = None;
         self.nibble = None;
         self.run = None;
@@ -507,7 +809,7 @@ impl BinaryView {
     fn edited(&mut self, p: usize, off: usize) {
         self.cursor = Some(off);
         self.cur = self.diffs.iter().position(|r| r.contains(&off));
-        self.scroll_to = Some(off / self.bpl);
+        self.scroll_to = Some(off);
         self.hit = None;
         self.run = Some((p, off));
     }
@@ -778,6 +1080,8 @@ impl BinaryView {
                 self.invalidate_moved();
             }
         }
+        self.layout = cfg.text_layout;
+        self.align();
         let bpl = self.bpl;
         let active = ui.input(|i| {
             i.events.iter().any(|e| {
@@ -876,6 +1180,12 @@ impl BinaryView {
             {
                 self.goto = Some(String::new());
             }
+            widgets::toolbar_sep(ui);
+            ui.add_enabled_ui(self.detect_moved, |ui| {
+                if widgets::layout_choice(ui, &mut self.layout) {
+                    self.layout_choice = Some(self.layout);
+                }
+            });
         });
         widgets::toolbar(ui, |ui| {
             if ui
@@ -918,6 +1228,7 @@ impl BinaryView {
                 }
             }
         });
+        self.align();
         if self.find.open {
             self.find_bar(ui);
         }
@@ -945,8 +1256,12 @@ impl BinaryView {
         let visible = (bottom - top) / row_h;
         self.page_rows = (visible.floor() as usize).saturating_sub(1).max(1);
         let max_len = self.data.iter().map(|d| d.len()).max().unwrap_or(0);
+        let shown = self.shown_len();
         // The cursor can stand just past the last byte, where typing adds one.
-        let end = max_len.max(self.cursor.map_or(0, |c| c + 1));
+        let end = shown.max(
+            self.cursor
+                .map_or(0, |c| self.position_of(self.side_of(c), c) + 1),
+        );
         let total = end.div_ceil(bpl).max(1);
 
         let pal = widgets::pal(ui);
@@ -1011,8 +1326,8 @@ impl BinaryView {
         if ui.rect_contains_pointer(body) {
             self.scroll -= ui.input(|i| i.smooth_scroll_delta.y) / row_h;
         }
-        if let Some(line) = self.scroll_to.take() {
-            let l = line as f32;
+        if let Some(off) = self.scroll_to.take() {
+            let l = (self.position_of(self.side_of(off), off) / bpl) as f32;
             if l < self.scroll || l > self.scroll + visible - 2.0 {
                 self.scroll = l - (visible / 3.0).floor();
             }
@@ -1041,7 +1356,7 @@ impl BinaryView {
                 if let Some((k, ascii)) = hit {
                     self.pane = Some(p);
                     self.ascii = ascii;
-                    self.move_cursor(line * bpl + k);
+                    self.move_cursor(self.offset_at(p, line * bpl + k));
                 }
             }
         }
@@ -1053,6 +1368,7 @@ impl BinaryView {
             let rect = Rect::from_min_max(pos2(x0, top), pos2(x0 + pane_w - 2.0, bottom));
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, c.text_bg);
+            let cursor_at = self.cursor.map(|off| self.position_of(p, off));
             for line in first..last {
                 let y = top + (line as f32 - self.scroll) * row_h;
                 let mut job = LayoutJob::default();
@@ -1062,26 +1378,36 @@ impl BinaryView {
                     background: bg,
                     ..Default::default()
                 };
+                let row = line * bpl..(line + 1) * bpl;
+                let label = if self.runs.is_empty() {
+                    Some(row.start)
+                } else {
+                    row.clone().find_map(|d| self.byte_at(p, d))
+                };
                 job.append(
-                    &format!("{:08X}  ", line * bpl),
+                    &label.map_or_else(|| " ".repeat(10), |off| format!("{off:08X}  ")),
                     0.0,
                     fmt(c.gutter_text, Color32::TRANSPARENT),
                 );
                 let mut ascii = LayoutJob::default();
-                for k in 0..bpl {
-                    let off = line * bpl + k;
-                    let byte = refs[p].get(off).copied();
-                    let differs = off < max_len && binary::byte_differs(&refs, off);
-                    let sel = cur_range.as_ref().is_some_and(|r| r.contains(&off));
-                    let bg = match (byte, differs, sel) {
-                        (None, _, _) if off < max_len => c.missing,
-                        (Some(_), _, _) if self.is_moved(p, off) => c.moved,
+                for d in row {
+                    let at = self.byte_at(p, d);
+                    let byte = at.map(|o| refs[p][o]);
+                    // Compact rows keep the offset of a blank cell past the end of a side.
+                    let off = if self.runs.is_empty() { Some(d) } else { at };
+                    let differs = self.differs_at(&refs, d);
+                    let sel =
+                        off.is_some_and(|o| cur_range.as_ref().is_some_and(|r| r.contains(&o)));
+                    let bg = match (at, differs, sel) {
+                        (None, _, _) if d < shown => c.missing,
+                        (Some(o), _, _) if self.is_moved(p, o) => c.moved,
                         (_, true, true) => c.inline_sel,
                         (_, true, false) => c.inline,
                         _ => Color32::TRANSPARENT,
                     };
-                    let found = self.hit.as_ref().is_some_and(|h| h.contains(&off));
-                    let bg = if self.cursor == Some(off) || found {
+                    let found =
+                        off.is_some_and(|o| self.hit.as_ref().is_some_and(|h| h.contains(&o)));
+                    let bg = if cursor_at == Some(d) || found {
                         c.find_hit
                     } else {
                         bg
@@ -1106,10 +1432,10 @@ impl BinaryView {
                 let galley = ui.fonts_mut(|f| f.layout_job(job));
                 painter.galley(pos2(x0 + 4.0, y + 1.0), galley, c.text);
             }
-            if let (Some(off), true) = (self.cursor, self.pane == Some(p)) {
-                let line = off / bpl;
+            if let (Some(off), Some(pos), true) = (self.cursor, cursor_at, self.pane == Some(p)) {
+                let line = pos / bpl;
                 if (first..last).contains(&line) {
-                    let k = (off % bpl) as f32;
+                    let k = (pos % bpl) as f32;
                     let (col, width) = if self.ascii {
                         (text_col + k, 1.0)
                     } else if self.nibble == Some((p, off)) {
@@ -1141,34 +1467,31 @@ impl BinaryView {
 
         if cfg.show_location_pane {
             let loc = Rect::from_min_max(pos2(right, top), pos2(right + loc_w - 2.0, bottom));
-            let mut marks: Vec<Mark> = self
-                .diffs
-                .iter()
-                .enumerate()
-                .map(|(i, r)| {
-                    let start = r.start / bpl;
-                    let end = (r.end.saturating_sub(1)) / bpl;
+            let mark = |p: usize, r: &Range<usize>, color: Color32| {
+                let start = self.position_of(p, r.start) / bpl;
+                let end = self.position_of(p, r.end - 1) / bpl;
+                let mut columns = [None; 3];
+                columns[p] = Some(color);
+                Mark {
+                    start,
+                    len: end - start + 1,
+                    columns,
+                }
+            };
+            // The changed bytes come last, to be painted over the moved blocks around them.
+            let mut marks: Vec<Mark> = Vec::new();
+            let moved = c.change_bar.gamma_multiply(0.35);
+            for (p, ranges) in self.moved_ranges.iter().enumerate() {
+                marks.extend(ranges.iter().map(|r| mark(p, r, moved)));
+            }
+            for p in 0..n {
+                for (i, r) in self.changed_bytes(p) {
                     let color = if self.cur == Some(i) {
                         c.ui.accent
                     } else {
                         c.change_bar
                     };
-                    Mark {
-                        start,
-                        len: end - start + 1,
-                        columns: [Some(color); 3],
-                    }
-                })
-                .collect();
-            for (p, ranges) in self.moved_ranges.iter().enumerate() {
-                for r in ranges {
-                    let mut columns = [None; 3];
-                    columns[p] = Some(c.moved);
-                    marks.push(Mark {
-                        start: r.start / bpl,
-                        len: (r.end - 1) / bpl - r.start / bpl + 1,
-                        columns,
-                    });
+                    marks.push(mark(p, &r, color));
                 }
             }
             if let Some(t) = widgets::location_pane(
@@ -1219,7 +1542,27 @@ impl BinaryView {
             None => self.data.iter().map(|d| d.len()).max().unwrap_or(0),
         };
         let at = self.cursor.unwrap_or(0).min(end);
-        let line_start = at - at % bpl;
+        let side = self.side_of(at);
+        let d = self.position_of(side, at);
+        let row = |d: usize| self.offset_at(side, d);
+        let back = |d: usize| match self.byte_at(side, d) {
+            None if !self.runs.is_empty() => row(d).saturating_sub(1),
+            _ => row(d),
+        };
+        let line_start = d - d % bpl;
+        let line_end = if self.runs.is_empty() {
+            line_start + bpl - 1
+        } else {
+            (line_start..line_start + bpl)
+                .rev()
+                .find_map(|d| self.byte_at(side, d))
+                .unwrap_or(at)
+        };
+        let down = if d + bpl <= self.position_of(side, end) {
+            row(d + bpl)
+        } else {
+            at
+        };
         let mut target = None;
         let (mut insert, mut delete) = (false, None);
         let mut typed = String::new();
@@ -1233,17 +1576,13 @@ impl BinaryView {
                 (
                     Modifiers::NONE,
                     Key::ArrowUp,
-                    at.checked_sub(bpl).unwrap_or(at),
+                    d.checked_sub(bpl).map_or(at, back),
                 ),
-                (
-                    Modifiers::NONE,
-                    Key::ArrowDown,
-                    if at + bpl <= end { at + bpl } else { at },
-                ),
-                (Modifiers::NONE, Key::PageUp, at.saturating_sub(page)),
-                (Modifiers::NONE, Key::PageDown, at + page),
-                (Modifiers::NONE, Key::Home, line_start),
-                (Modifiers::NONE, Key::End, line_start + bpl - 1),
+                (Modifiers::NONE, Key::ArrowDown, down),
+                (Modifiers::NONE, Key::PageUp, back(d.saturating_sub(page))),
+                (Modifiers::NONE, Key::PageDown, row(d + page)),
+                (Modifiers::NONE, Key::Home, row(line_start)),
+                (Modifiers::NONE, Key::End, line_end),
             ] {
                 if i.consume_key(modifiers, key) {
                     target = Some(to);
@@ -1979,5 +2318,203 @@ mod tests {
         v.save().unwrap();
         assert_eq!(std::fs::read(&paths[1]).unwrap(), [b'O', 0x12, 0xCD, 0xEF]);
         assert_eq!(std::fs::read(&paths[0]).unwrap(), [0x00, 0x11, 0x22]);
+    }
+
+    /// 64 bytes both sides share, 32 that only the right side inserts, and 64 shifted by them.
+    fn inserted_view() -> (tempfile::TempDir, BinaryView) {
+        let (a, inserted, c): (Vec<u8>, Vec<u8>, Vec<u8>) =
+            ((0..64).collect(), (200..232).collect(), (64..128).collect());
+        view_of(&[a.clone(), c.clone()].concat(), &[a, inserted, c].concat())
+    }
+
+    #[test]
+    fn aligned_rows_put_moved_blocks_side_by_side_with_blank_cells_opposite_the_rest() {
+        let (_dir, mut v) = inserted_view();
+        v.refresh_moved();
+        v.align();
+        assert!(
+            v.runs.is_empty(),
+            "compact rows keep each byte at its offset"
+        );
+        assert_eq!((v.position_of(0, 64), v.position_of(1, 96)), (64, 96));
+        v.scroll = 6.0;
+
+        v.layout = TextLayout::Aligned;
+        v.align();
+        assert_eq!(v.position_of(0, 64), 96);
+        assert_eq!(v.position_of(1, 96), 96);
+        assert_eq!(v.scroll, 8.0, "the bytes at the top stay there");
+        assert_eq!(v.shown_len(), 160);
+        assert_eq!(v.byte_at(0, 63), Some(63));
+        assert_eq!(
+            v.byte_at(0, 64),
+            None,
+            "a blank cell opposite the inserted bytes"
+        );
+        assert_eq!(v.byte_at(1, 64), Some(64));
+        assert_eq!(
+            v.offset_at(0, 70),
+            64,
+            "a blank cell stands for the byte after it"
+        );
+        assert_eq!(v.position_of(0, 128), 160, "just past the end");
+        assert_eq!((v.side_of(10), v.side_of(150)), (0, 1));
+        assert_eq!(
+            v.position_of(v.side_of(150), 150),
+            150,
+            "without a chosen side, an offset only the right side has is shown on its rows"
+        );
+        let refs: Vec<&[u8]> = v.data.iter().map(|d| d.as_slice()).collect();
+        assert!(!v.differs_at(&refs, 10));
+        assert!(v.differs_at(&refs, 64));
+        assert!(
+            !v.differs_at(&refs, 100),
+            "the moved bytes match side by side"
+        );
+
+        v.pane = Some(0);
+        v.insert = true;
+        v.move_cursor(0);
+        v.write_bytes(&[0xa5]);
+        assert!(v.moved.is_empty());
+        v.align();
+        assert!(
+            !v.runs.is_empty(),
+            "an edit keeps the rows until the next scan"
+        );
+        v.refresh_moved();
+        v.align();
+        assert_eq!(v.position_of(0, 65), v.position_of(1, 96));
+        assert_eq!(v.position_of(0, 1), v.position_of(1, 0));
+
+        v.copy_all(true);
+        assert!(v.diffs.is_empty() && !v.anchors[0].is_empty());
+        v.align();
+        assert!(v.runs.is_empty(), "identical sides are never shifted apart");
+        v.undo();
+        v.refresh_moved();
+
+        v.detect_moved = false;
+        v.invalidate_moved();
+        v.align();
+        assert!(
+            v.runs.is_empty(),
+            "without moved blocks there is nothing to align"
+        );
+    }
+
+    #[test]
+    fn the_location_pane_marks_the_changed_bytes_that_no_moved_block_accounts_for() {
+        let (_dir, mut v) = inserted_view();
+        assert_eq!(v.diffs.len(), 1);
+        assert_eq!(v.diffs[0], 64..160);
+        assert_eq!(v.changed_bytes(0), [(0, 64..128)]);
+        assert_eq!(v.changed_bytes(1), [(0, 64..160)]);
+        v.refresh_moved();
+        assert!(v.changed_bytes(0).is_empty(), "the left bytes all moved");
+        assert_eq!(v.changed_bytes(1), [(0, 64..96)], "only the inserted bytes");
+
+        let mut v = BinaryView::load(firmware_paths().into()).unwrap();
+        v.refresh_moved();
+        let changed: Vec<_> = (0..2).map(|p| v.changed_bytes(p)).collect();
+        assert!(
+            changed[0].iter().any(|(_, r)| r.contains(&0x20)),
+            "the inserted A5"
+        );
+        for (p, ranges) in changed.iter().enumerate() {
+            for (_, r) in ranges {
+                assert!(r.clone().all(|off| !v.is_moved(p, off)));
+                assert!(r
+                    .clone()
+                    .all(|off| binary::byte_differs(&[&v.data[0], &v.data[1]], off)));
+            }
+        }
+        let total: usize = changed.iter().flatten().map(|(_, r)| r.len()).sum();
+        assert!(
+            total < 200,
+            "a few edits, not the {} bytes after A5",
+            v.data[0].len() - 0x20
+        );
+    }
+
+    #[test]
+    fn aligned_rows_put_only_blocks_in_the_same_order_side_by_side() {
+        let (_dir, mut v) = moved_view();
+        v.refresh_moved();
+        v.layout = TextLayout::Aligned;
+        v.align();
+        assert_eq!(v.moved.len(), 2);
+        assert_eq!(v.anchors[0].len(), 1, "the two blocks cross");
+        let (s, t) = v.anchors[0][0].clone();
+        for (left, right) in s.zip(t) {
+            assert_eq!(v.position_of(0, left), v.position_of(1, right));
+        }
+        assert_eq!(v.position_of(0, 0), v.position_of(1, 0));
+        for p in 0..2 {
+            let shown: Vec<usize> = (0..v.shown_len()).filter_map(|d| v.byte_at(p, d)).collect();
+            assert_eq!(shown, (0..v.data[p].len()).collect::<Vec<_>>(), "side {p}");
+        }
+    }
+
+    #[test]
+    fn aligned_rows_line_up_three_sides_with_the_middle_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, i, j, c): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = (
+            (0..64).collect(),
+            (200..232).collect(),
+            (232..248).collect(),
+            (64..128).collect(),
+        );
+        let sides = [
+            [a.clone(), c.clone()].concat(),
+            [a.clone(), i.clone(), c.clone()].concat(),
+            [a, j, i, c].concat(),
+        ];
+        let paths: Vec<_> = (0..3)
+            .map(|p| dir.path().join(format!("{p}.bin")))
+            .collect();
+        for (path, bytes) in paths.iter().zip(&sides) {
+            std::fs::write(path, bytes).unwrap();
+        }
+        let mut v = BinaryView::load(paths).unwrap();
+        v.refresh_moved();
+        v.layout = TextLayout::Aligned;
+        v.align();
+        assert!(!v.runs.is_empty());
+        for k in 0..64 {
+            let at = v.position_of(1, 96 + k);
+            assert_eq!(v.position_of(0, 64 + k), at, "C on the left");
+            assert_eq!(v.position_of(2, 112 + k), at, "C on the right");
+        }
+        for k in 0..32 {
+            assert_eq!(v.position_of(1, 64 + k), v.position_of(2, 80 + k), "I");
+            assert_eq!(v.byte_at(0, v.position_of(1, 64 + k)), None);
+        }
+        for k in 0..16 {
+            let at = v.position_of(2, 64 + k);
+            assert_eq!((v.byte_at(0, at), v.byte_at(1, at)), (None, None), "J");
+        }
+        for p in 0..3 {
+            let shown: Vec<usize> = (0..v.shown_len()).filter_map(|d| v.byte_at(p, d)).collect();
+            assert_eq!(shown, (0..v.data[p].len()).collect::<Vec<_>>(), "side {p}");
+        }
+    }
+
+    #[test]
+    fn aligned_rows_line_up_every_run_of_the_firmware_sample() {
+        let mut v = BinaryView::load(firmware_paths().into()).unwrap();
+        v.refresh_moved();
+        v.layout = TextLayout::Aligned;
+        v.align();
+        for (right_range, shift) in &FIRMWARE_RUNS {
+            for right in right_range.clone() {
+                let left = right.checked_add_signed(*shift).unwrap();
+                assert_eq!(
+                    v.position_of(0, left),
+                    v.position_of(1, right),
+                    "right {right:#x}"
+                );
+            }
+        }
     }
 }

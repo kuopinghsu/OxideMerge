@@ -7,6 +7,20 @@ uses its section of this file as the release notes.
 
 ### Added
 
+- **One layout setting for text and binary comparisons:** *Text layout* is now *Layout*,
+  in *View → Layout* instead of under *View → Text compare*, and both text and binary
+  comparisons have the same *Compact rows* and *Aligned rows* buttons on their toolbar. The
+  buttons change the setting for every comparison and are unavailable where it shows no
+  difference: the inline and table views, and binary comparisons with *Moved blocks* off.
+- **Aligned rows for binary moved blocks:** a binary comparison with *Moved blocks* on now
+  follows *Layout*. *Aligned rows* puts each moved block on the same rows as its match,
+  with blank cells opposite the bytes between the blocks and each side's own offset at the start
+  of a row; of blocks that cross, the longest set in the same order on both sides is lined up.
+  In a three-way comparison the left and right sides are each lined up with the middle one.
+  The arrow keys move by the rows shown, the location pane marks each side's own rows, and
+  the rows stay put while you edit until the blocks are found again. *Compact rows* keeps
+  each byte at its own offset, as before. The user guide shows both layouts with the firmware
+  samples.
 - **Large comparisons open in the background:** text files that add up to 32 MB or more are
   read and compared on another thread. An *Opening* window names the file and counts the
   seconds while the rest of the window stays usable, and its *Cancel* button stops the work
@@ -669,6 +683,11 @@ uses its section of this file as the release notes.
 
 ### Fixed
 
+- **The binary location pane shows where bytes changed:** after an insertion or deletion,
+  the one difference that runs to the end of the file filled the whole location pane, and the
+  moved-block marks drawn over it in a near-white color hid the real edits. Each side's column
+  now shades its moved blocks lightly and marks with solid bars only the differing bytes that
+  no moved block accounts for, so an inserted or overwritten byte stands out.
 - **Paths that are not valid Unicode reopen:** a file whose name is not valid UTF-8 on Linux
   (or holds a lone UTF-16 surrogate on Windows) was saved in the session, a workspace or a
   recovery snapshot with its odd characters replaced, so it could not be opened again. Such a

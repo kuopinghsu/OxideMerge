@@ -445,6 +445,63 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T,
     changed
 }
 
+/// The Compact rows / Aligned rows choice of the comparison toolbars, as icons named in their
+/// tooltips; true when it changed.
+pub fn layout_choice(ui: &mut Ui, layout: &mut crate::config::TextLayout) -> bool {
+    use crate::config::TextLayout;
+    use crate::i18n::tr;
+    let p = pal(ui);
+    let mut changed = false;
+    let pad = f32::from(theme::space::XXS);
+    let n = TextLayout::ALL.len() as f32;
+    let size = Vec2::new(
+        n * (ICON_SIZE + 20.0) + (n - 1.0) * 2.0 + 2.0 * pad,
+        24.0 + 2.0 * pad,
+    );
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().rect_filled(rect, theme::radius::LG, p.control);
+    let mut row = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink(pad))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    {
+        let ui = &mut row;
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for v in TextLayout::ALL {
+            let sel = *layout == v;
+            let icon = match v {
+                TextLayout::Compact => Icon::RowsCompact,
+                TextLayout::Aligned => Icon::RowsAligned,
+            };
+            let name = tr(v.key());
+            let enabled = ui.is_enabled();
+            if paint_button(
+                ui,
+                Some(icon),
+                "",
+                name,
+                FontId::proportional(theme::size::DENSE),
+                Vec2::new(0.0, 24.0),
+                Look::Segment(sel),
+                enabled,
+            )
+            .on_hover_ui(|ui| {
+                ui.set_max_width(340.0);
+                ui.label(name);
+                ui.weak(tr("view.layout_help"));
+            })
+            .clicked()
+                && !sel
+            {
+                *layout = v;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// A button drawn like a search field, for opening a search such as the command palette:
 /// an icon, `hint`, and the shortcut `keys` at the right end. Named `label` for accessibility.
 pub fn search_button(ui: &mut Ui, width: f32, hint: &str, keys: &str, label: &str) -> Response {
@@ -944,7 +1001,8 @@ pub struct Mark {
 }
 
 /// Location pane: overview of all differences with the visible region outlined.
-/// `marks` must be sorted by `start`. Returns the row the user clicked/dragged to (to be centered).
+/// The marks of each color must be sorted by `start`; later marks are painted over earlier
+/// ones. Returns the row the user clicked/dragged to (to be centered).
 #[allow(clippy::too_many_arguments)]
 pub fn location_pane(
     ui: &mut Ui,

@@ -1463,6 +1463,8 @@ pub struct TextView {
     pub rule_request: Option<RuleDraft>,
     /// Whether the HTML report was asked for from the toolbar, until the app takes it.
     pub export_request: bool,
+    /// The layout picked in the toolbar, until the app takes it into the settings.
+    pub layout_choice: Option<TextLayout>,
     /// Conflicts accepted as they are, by their content (see [`Self::block_key`]).
     resolved: HashSet<u64>,
     /// See [`Self::open_conflicts`]: the layout generation, number of resolved conflicts and
@@ -1571,6 +1573,7 @@ impl TextView {
             rule_set: None,
             rule_request: None,
             export_request: false,
+            layout_choice: None,
             resolved: HashSet::new(),
             open_cache: Default::default(),
             unified: false,
@@ -6194,6 +6197,13 @@ impl TextView {
                         tr("cmd.table_mode"),
                     );
                 }
+                ui.add_enabled_ui(!self.table_mode && !self.shows_inline(), |ui| {
+                    let mut layout = self.text_layout;
+                    if widgets::layout_choice(ui, &mut layout) {
+                        self.layout_choice = Some(layout);
+                        ui.ctx().request_repaint();
+                    }
+                });
             });
             ui.add_space(4.0);
             let tip = Cmd::HtmlReport.tip_if(self.keys_enabled);
