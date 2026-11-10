@@ -240,13 +240,14 @@ and the times there were measured with the memory tool attached.
 - Folder compares by contents read files of up to 16 MB whole, a few at a time, and larger
   ones in 1 MB chunks. Memory follows the number of threads (138 MB for 8 MB files on 12
   threads), not the size of the tree.
-- The line diff has one 2-second deadline for a whole comparison. Large files are first
-  split at lines found once on each side, and Myers then runs between those anchors; once
-  the 2 seconds are up, every gap still left is compared coarsely (as one change) instead of
-  line by line. At 1 GiB the comparison passes the deadline, so its difference count depends
-  on the machine's speed and load: 152,307 in some runs and 152,424 in others on the same
-  inputs. Up to 500 MB the counts stayed the same from run to run. The rows are still
-  correct; only how finely some differences are split varies.
+- Large files are first split at lines found once on each side, and Myers then runs
+  between those anchors. Until 2026-11-10 one 2-second deadline covered the whole walk: once
+  it was up, every gap still left was compared coarsely (as one change), so at 1 GiB the
+  difference count depended on the machine's speed and load (152,307, 152,424 and 152,526 on
+  the same inputs). Each gap now has 2 seconds of its own, with 20 seconds for the whole
+  walk, and the 1 GiB count is 152,526 in every run. Comparing every gap finely costs about
+  1.5 s more at 1 GiB (17.2 s against 15.5–16.2 s for the engine); 100 MB and 500 MB, which
+  never reached the deadline, are unchanged.
 - On the macOS 27.3 pre-release this was measured on (build 26C5035r), memory freed in
   large blocks is not reused or given back: loading the 100 MB pair, dropping it and loading
   it again adds about 137 MB of resident memory each time, with the same growth in a
@@ -408,10 +409,10 @@ OXIDEMERGE_BENCH_ONLY=text-100mb,text-500mb,text-1gb,text-view-100mb,text-view-5
 | --- | ---: | ---: | --- |
 | text-100mb | 0.962 s | 552 MB | 15,086 differences |
 | text-500mb | 7.697 s | 2,663 MB | 74,725 differences |
-| text-1gb | 15.548 s | 5,441 MB | 152,307 differences |
+| text-1gb | 17.162 s | 5,440 MB | 152,526 differences |
 | text-view-100mb | 1.376 s | 674 MB | load 304 ms, compare 814 ms, first frame 37 ms, a scrolled frame 0.63 ms, a step 0.63 ms |
 | text-view-500mb | 9.476 s | 3,433 MB | load 1,566 ms, compare 6,607 ms, first frame 172 ms, a scrolled frame 4.03 ms, a step 3.85 ms |
-| text-view-1gb | 20.974 s | 7,016 MB | load 3,208 ms, compare 14,740 ms, first frame 412 ms, a scrolled frame 9.10 ms, a step 9.16 ms |
+| text-view-1gb | 23.750 s | 7,019 MB | load 3,453 ms, compare 16,719 ms, first frame 404 ms, a scrolled frame 10.84 ms, a step 10.74 ms |
 | text-cancel-100mb | | | read again 307 ms; open 1,252 ms; stopped in 2 ms median, 5 ms worst; freed in 79 ms median, 83 ms worst |
 | text-cancel-500mb | | | read again 1,501 ms; open 7,546 ms; stopped in 1 ms median, 6 ms worst; freed in 378 ms median, 403 ms worst |
 
@@ -449,8 +450,9 @@ allocator, not for Linux timings.
 | text-cancel-100mb | | 854 MB | stopped in 2 ms median, 5 ms worst; freed in 124 ms median, 126 ms worst |
 | text-cancel-500mb | | 3,577 MB | stopped in 2 ms median, 4 ms worst; freed in 362 ms median, 868 ms worst |
 
-- The difference counts match macOS up to 500 MB. At 1 GiB the count was a third value
-  (152,526), as the deadline finding predicts.
+- The difference counts match macOS at every size, 1 GiB included (152,526, the count
+  every gap compared finely gives; this run was made before the per-gap deadline, when the
+  macOS runs still varied).
 - Peaks are within 8% of macOS for one open. The cancel workloads, ten opens in one process,
   peak at 854 and 3,577 MB here against 1,774 and 7,095 MB on macOS: on Linux the memory of
   one open is reused by the next.
@@ -468,16 +470,16 @@ passes when, on the same host and inputs:
 | --- | --- | --- |
 | Time of each workload above (text-cancel excluded) | at most 1.25 × the table (`OXIDEMERGE_BENCH_TOLERANCE=1.25`) | — |
 | Peak of text-100mb / 500mb / 1gb | at most 610 / 2,930 / 5,990 MB (+10%) | 552 / 2,663 / 5,441 MB |
-| Peak of text-view-100mb / 500mb / 1gb | at most 745 / 3,780 / 7,720 MB (+10%) | 674 / 3,433 / 7,016 MB |
-| First frame | at most 100 ms at 100 MB, 500 ms at 1 GiB | 37 / 412 ms |
-| A scrolled frame and a step to the next difference | at most 16 ms (one frame at 60 Hz) at every size | 9.16 ms worst (1 GiB) |
+| Peak of text-view-100mb / 500mb / 1gb | at most 745 / 3,780 / 7,720 MB (+10%) | 674 / 3,433 / 7,019 MB |
+| First frame | at most 100 ms at 100 MB, 500 ms at 1 GiB | 37 / 404 ms |
+| A scrolled frame and a step to the next difference | at most 16 ms (one frame at 60 Hz) at every size | 10.84 ms worst (1 GiB) |
 | Work stopped after *Cancel* | at most 50 ms at worst | 6 ms |
 | Memory freed after *Cancel* at 500 MB | at most 1 s | 0.40 s |
-| Difference count at 100 MB and 500 MB | exactly 15,086 and 74,725 | same |
+| Difference count at 100 MB, 500 MB and 1 GiB | exactly 15,086, 74,725 and 152,526 | same |
 
 The harness checks only the time gate on its own; the others are read from its output. The
-1 GiB difference count is not a gate, because the line diff's deadline makes it vary (see
-the findings).
+1 GiB rows were measured again after the per-gap deadline (see the findings); the other rows
+are from the run above.
 
 ## Large UTF-8 text comparison
 

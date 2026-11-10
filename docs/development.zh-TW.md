@@ -267,7 +267,8 @@ Cargo 以離線方式執行，使用已下載到 `~/.cargo/registry` 的套件�
   接著 `scripts/macos-install-check.sh` 會像下載的檔案一樣，從 DMG 安裝應用程式
   （安裝到獨立的「應用程式」資料夾並加上隔離標記），檢查 Gatekeeper 的判定
   （臨時簽署時應被拒絕，Developer ID 簽署時應被接受為已公證），依 README 的說明清除標記，
-  執行程式後再移除。若該 Mac 已關閉 Gatekeeper，會說明此情況，不判斷其結果。
+  執行程式後再移除，並確認沒有留下任何檔案。若該 Mac 已關閉 Gatekeeper，只會發出警告；
+  在 CI 中會先開啟 Gatekeeper，無法開啟時即失敗（`INSTALL_CHECK_GATEKEEPER=require`）。
 - **說明文件：** 英文與繁體中文 PDF 指南。若字型缺少所需字元，文件建置會失敗。
 
 Windows 與 Linux 的 Arm64 套件會在實體 Arm 架構電腦上建置與測試，而非使用模擬環境。

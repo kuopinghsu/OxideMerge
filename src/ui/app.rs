@@ -52,6 +52,10 @@ pub struct OpenRequest {
     pub snapshot_options: Option<Box<DiffOptions>>,
     /// How a table compare matches records.
     pub table: Option<crate::core::table_match::TableMatch>,
+    /// Loads and compares on this thread even when the files are large, so that the tab is
+    /// there when the call returns: for callers that go on to use it (a restored session or
+    /// recovery snapshot, which put state back into the tab).
+    pub wait: bool,
 }
 
 pub enum Content {
@@ -861,8 +865,11 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
     let mut import: Vec<PathBuf> = Vec::new();
     // `Some(None)` exports every rules file.
     let mut export: Option<Option<RuleSet>> = None;
+    // Long names and descriptions wrap or are shortened, rather than widening the dialog
+    // past a small window.
     egui::Grid::new("rules_grid")
         .num_columns(4)
+        .max_col_width(220.0)
         .striped(true)
         .show(ui, |ui| {
             if ui.radio(d.cfg.rules.is_empty(), tr("rules.none")).clicked() {
@@ -883,7 +890,10 @@ fn rules_options(ui: &mut egui::Ui, d: &mut OptionsDialog) {
                 } else {
                     set.description.clone()
                 };
-                ui.label(egui::RichText::new(about).small().color(pal(ui).text_dim));
+                ui.add(
+                    egui::Label::new(egui::RichText::new(about).small().color(pal(ui).text_dim))
+                        .truncate(),
+                );
                 let editing = d
                     .rule_edit
                     .as_ref()
@@ -1883,6 +1893,9 @@ struct PendingOpen {
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     source: Vec<PathBuf>,
     descriptions: Vec<Option<String>>,
+    /// The paths to add to the recent comparisons once the tab opens; not if it fails or is
+    /// cancelled.
+    recent: Option<Vec<String>>,
 }
 
 /// Files together at least this large are compared on another thread, with a *Cancel*
@@ -3013,6 +3026,7 @@ impl OxideMergeApp {
                 kind,
                 skip_recent: true,
                 rules: s.rules.clone(),
+                wait: true,
                 ..Default::default()
             };
             if self.try_open(req).is_ok() && self.tabs.len() > before {
@@ -3594,6 +3608,7 @@ impl OxideMergeApp {
         let recent: Option<Vec<String>> = (!req.skip_recent && !staged && req.paths.len() >= 2)
             .then(|| req.paths.iter().map(|p| p.display().to_string()).collect());
         let retry = req.clone();
+        let opening = self.opening.len();
         let result = self.try_open(req);
         if let Some(n) = result
             .as_ref()
@@ -3611,6 +3626,12 @@ impl OxideMergeApp {
         }
         self.forget_archive_passwords();
         match result {
+            // An open still running on another thread is remembered once its tab opens.
+            Ok(()) if self.opening.len() > opening => {
+                if let Some(o) = self.opening.last_mut() {
+                    o.recent = recent;
+                }
+            }
             Ok(()) => {
                 if let Some(r) = recent {
                     self.cfg.add_recent_compare(&r);
@@ -4651,12 +4672,12 @@ impl OxideMergeApp {
         });
     }
 
-    /// Shows that a revision is being read, with a button to stop, and opens its tab once read.
     /// Whether a text comparison of `paths` opens on another thread: plain files (no unpacker,
     /// none missing, no compare rules, table matching, output file or frozen options) that are
-    /// together at least [`Self::background_open_bytes`].
+    /// together at least [`Self::background_open_bytes`], unless the caller waits for the tab.
     fn opens_in_background(&self, req: &OpenRequest, paths: &[PathBuf], missing: &[bool]) -> bool {
-        let plain = req.table.is_none()
+        let plain = !req.wait
+            && req.table.is_none()
             && req.rules.is_none()
             && req.snapshot_options.is_none()
             && req.output.is_none()
@@ -4725,6 +4746,7 @@ impl OxideMergeApp {
             cancel,
             source,
             descriptions,
+            recent: None,
         });
     }
 
@@ -4757,6 +4779,9 @@ impl OxideMergeApp {
                 Some(Ok(view)) => {
                     self.push_tab(Content::Text(view), o.source);
                     self.tabs.last_mut().unwrap().descriptions = o.descriptions;
+                    if let Some(r) = o.recent {
+                        self.cfg.add_recent_compare(&r);
+                    }
                 }
                 Some(Err(e)) => self.error(format!("{e:#}")),
                 None => {}
@@ -4795,6 +4820,7 @@ impl OxideMergeApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
+    /// Shows that a revision is being read, with a button to stop, and opens its tab once read.
     fn rev_load_dialog(&mut self, ctx: &egui::Context) {
         let Some(load) = self.rev_load.take() else {
             return;
@@ -11161,9 +11187,11 @@ impl OxideMergeApp {
     }
 
     fn busy(&self) -> bool {
-        self.tabs
-            .iter()
-            .any(|t| matches!(t.content.outcome(), Some(Outcome::Busy)))
+        !self.opening.is_empty()
+            || self
+                .tabs
+                .iter()
+                .any(|t| matches!(t.content.outcome(), Some(Outcome::Busy)))
     }
 
     /// For documentation pictures: once compares are done (or after about a minute), runs the
