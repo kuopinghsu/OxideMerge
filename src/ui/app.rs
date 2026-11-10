@@ -136,6 +136,9 @@ pub struct Tab {
     temps: Vec<std::sync::Arc<tempfile::TempDir>>,
     /// Left out of the recovery snapshot, at the user's request (see [`recovery`]).
     no_recovery: bool,
+    /// For a tab of recovered text whose files could not be opened: those files, so its text
+    /// is kept in this run's snapshot, as theirs, while it has unsaved edits.
+    recovered: Option<SessionTab>,
     /// The connection and remote path of a side staged from [`remote::fetch`], one slot per
     /// `source`, for *Save* to write it back to; `None` for a side opened any other way.
     remote: Vec<Option<RemoteFile>>,
@@ -2090,6 +2093,8 @@ pub struct OxideMergeApp {
     focus_in_dialog: Option<egui::Id>,
     /// Whether a dialog was open in the last frame.
     was_modal: bool,
+    /// The folder of the recovery snapshots (see [`recovery::dir`]).
+    recovery_dir: Option<PathBuf>,
     /// The file name of this run's recovery snapshot (see [`recovery::own_name`]).
     recovery_name: String,
     /// When this run's snapshot was last written; `None` while it has none.
@@ -2967,6 +2972,7 @@ impl OxideMergeApp {
             focus_before_dialog: None,
             focus_in_dialog: None,
             was_modal: false,
+            recovery_dir: recovery::dir(),
             recovery_name: recovery::own_name(),
             recovery_at: None,
             recovery_lock: None,
@@ -3010,7 +3016,7 @@ impl OxideMergeApp {
         }
         if app.cfg.recovery && !cfg!(test) {
             app.find_recovery();
-        } else if let Some(dir) = recovery::dir().filter(|_| !cfg!(test)) {
+        } else if let Some(dir) = app.recovery_dir.clone().filter(|_| !cfg!(test)) {
             recovery::forget_abandoned(&dir, &app.recovery_name);
         }
         if let (Some(u), Some(p)) = (crate::config::unreadable(), crate::config::config_path()) {
@@ -3126,12 +3132,16 @@ impl OxideMergeApp {
     /// The open comparisons as a recovery snapshot: each that can be opened again from its
     /// files, with the text of its sides that have unsaved edits. Tabs of server files,
     /// revisions and archives, which need their temporary copies, are left out like a session.
+    /// Recovered text whose files could not be opened is kept as theirs until it is saved.
     fn recovery_snapshot(&self) -> recovery::Snapshot {
         let (mut used, mut left_out) = (0, 0);
         let mut tabs = Vec::new();
         let mut active = 0;
         for (i, t) in self.tabs.iter().enumerate() {
-            let Some(tab) = self.session_tab(t).filter(|_| !t.no_recovery) else {
+            let tab = self
+                .session_tab(t)
+                .or_else(|| t.recovered.clone().filter(|_| t.is_modified()));
+            let Some(tab) = tab.filter(|_| !t.no_recovery) else {
                 continue;
             };
             if i == self.active {
@@ -3181,7 +3191,7 @@ impl OxideMergeApp {
     /// or nothing open, there is no snapshot; turning recovery off also deletes those of
     /// programs no longer running.
     fn keep_recovery(&mut self, ctx: &egui::Context) {
-        let Some(dir) = recovery::dir() else {
+        let Some(dir) = self.recovery_dir.clone() else {
             return;
         };
         let path = dir.join(&self.recovery_name);
@@ -3189,7 +3199,9 @@ impl OxideMergeApp {
             if std::mem::take(&mut self.recovery_on) {
                 self.recovery_at = None;
                 self.recovery_lock = None;
-                self.recovery_writer.remove(&path, true);
+                // At once, not on another thread: quitting right after must not leave the text
+                // behind for the next start to offer.
+                self.recovery_writer.remove_now(path, true);
                 recovery::forget_abandoned(&dir, &self.recovery_name);
             }
             return;
@@ -3197,7 +3209,7 @@ impl OxideMergeApp {
         self.recovery_on = true;
         if self.tabs.is_empty() {
             if self.recovery_at.take().is_some() {
-                self.recovery_writer.remove(&path, false);
+                self.recovery_writer.remove(path, false);
             }
             return;
         }
@@ -3226,7 +3238,7 @@ impl OxideMergeApp {
         let snapshot = self.recovery_snapshot();
         if snapshot.tabs.is_empty() {
             // Every tab left out, or none that can be opened again: nothing to keep.
-            self.recovery_writer.remove(&path, false);
+            self.recovery_writer.remove(path, false);
             return;
         }
         if self.recovery_lock.is_none() {
@@ -3239,9 +3251,27 @@ impl OxideMergeApp {
             .write(dir, self.recovery_name.clone(), snapshot);
     }
 
+    /// Writes this run's snapshot now, on this thread, when recovery is on: before a snapshot
+    /// whose text it now holds is deleted. `Ok` also when there is nothing to keep.
+    fn write_recovery_now(&mut self) -> anyhow::Result<()> {
+        let Some(dir) = self.recovery_dir.clone().filter(|_| self.cfg.recovery) else {
+            return Ok(());
+        };
+        let snapshot = self.recovery_snapshot();
+        if snapshot.tabs.is_empty() {
+            return Ok(());
+        }
+        if self.recovery_lock.is_none() {
+            self.recovery_lock = recovery::lock(&dir, &self.recovery_name);
+        }
+        self.recovery_at = Some(std::time::Instant::now());
+        self.recovery_writer
+            .write_now(dir, self.recovery_name.clone(), snapshot)
+    }
+
     /// Offers the snapshots that programs which did not close normally left behind.
     fn find_recovery(&mut self) {
-        let Some(dir) = recovery::dir() else {
+        let Some(dir) = self.recovery_dir.clone() else {
             return;
         };
         let found = recovery::abandoned(&dir, &self.recovery_name, std::time::SystemTime::now());
@@ -3252,25 +3282,34 @@ impl OxideMergeApp {
 
     /// Opens the tabs of `snapshot` with their unsaved text in their sides, unsaved, and says
     /// which files changed since. Nothing is written to the compared files. A tab already open
-    /// on the same files, unedited (from the session), takes the text instead of a second tab.
-    /// The text of a tab that cannot be opened from its files any more (one moved, or a new
-    /// file never saved) opens in a new text compare; it is returned, to keep.
-    fn restore_snapshot(&mut self, snapshot: &recovery::Snapshot) -> Vec<recovery::RecoveredTab> {
-        let mut changed = Vec::new();
+    /// on the same files, of the same kind and unedited (from the session), takes the text
+    /// instead of a second tab. The text of a tab that cannot be opened from its files any more
+    /// (one moved, or a new file never saved) opens in a new text compare, kept in this run's
+    /// snapshot until it is saved. `changed` is, for each tab, which of its files changed since,
+    /// as the offer found.
+    fn restore_snapshot(&mut self, snapshot: &recovery::Snapshot, changed: &[Vec<bool>]) {
+        let mut changed_files = Vec::new();
         let mut failed = 0;
-        let mut kept = Vec::new();
+        let mut kept = 0;
         let mut first = None;
         for (i, r) in snapshot.tabs.iter().enumerate() {
-            for (p, c) in r.tab.paths.iter().zip(r.changed_sources()) {
+            let found = changed.get(i).cloned();
+            for (p, c) in r
+                .tab
+                .paths
+                .iter()
+                .zip(found.unwrap_or_else(|| r.changed_sources()))
+            {
                 if c {
-                    changed.push(p.clone());
+                    changed_files.push(p.clone());
                 }
             }
             let paths = r.tab.paths();
-            let open = self
-                .tabs
-                .iter()
-                .position(|t| t.source == paths && !t.is_modified());
+            let open = self.tabs.iter().position(|t| {
+                t.source == paths
+                    && !t.is_modified()
+                    && self.session_tab(t).is_some_and(|s| s.kind == r.tab.kind)
+            });
             let at = match open {
                 Some(at) => Some(at),
                 None => {
@@ -3283,7 +3322,7 @@ impl OxideMergeApp {
                 failed += 1;
                 if r.unsaved.iter().any(Option::is_some) {
                     self.open_unsaved_text(r);
-                    kept.push(r.clone());
+                    kept += 1;
                 }
                 continue;
             };
@@ -3331,23 +3370,23 @@ impl OxideMergeApp {
             msg.push(' ');
             msg.push_str(&trf("recovery.not_reopened", &[("n", failed.to_string())]));
         }
-        if !kept.is_empty() {
+        if kept > 0 {
             msg.push(' ');
-            msg.push_str(&trf("recovery.kept", &[("n", kept.len().to_string())]));
+            msg.push_str(&trf("recovery.kept", &[("n", kept.to_string())]));
         }
-        if !changed.is_empty() {
+        if !changed_files.is_empty() {
             msg.push(' ');
             msg.push_str(&trf(
                 "recovery.changed_since",
-                &[("files", changed.join(", "))],
+                &[("files", changed_files.join(", "))],
             ));
         }
-        self.push_toast(msg, !changed.is_empty() || failed > 0, None);
-        kept
+        self.push_toast(msg, !changed_files.is_empty() || failed > 0, None);
     }
 
     /// Opens the unsaved text of `r`, whose files cannot be opened, in a new text compare: each
-    /// side named after its file, to save where the user chooses.
+    /// side named after its file, to save where the user chooses. Until then, the snapshot keeps
+    /// it as the text of those files.
     fn open_unsaved_text(&mut self, r: &recovery::RecoveredTab) {
         let mut docs: Vec<TextDoc> = r
             .unsaved
@@ -3371,6 +3410,7 @@ impl OxideMergeApp {
         }
         let v = TextView::new(docs, &self.cfg);
         self.push_tab(Content::Text(v), Vec::new());
+        self.tabs.last_mut().unwrap().recovered = Some(r.tab.clone());
     }
 
     /// The prompt for snapshots left behind: *Restore*, *Show details* (what each holds and
@@ -3478,19 +3518,20 @@ impl OxideMergeApp {
             });
         });
         if restore {
-            for f in &offer.found {
+            for (f, changed) in offer.found.iter().zip(&offer.changed) {
                 if let Ok(s) = &f.snapshot {
-                    let kept = self.restore_snapshot(s);
-                    // Deleted only once all its unsaved text is back in a tab of its files.
-                    let at = f.path.parent().zip(f.path.file_name());
-                    match at.filter(|_| !kept.is_empty()) {
-                        Some((dir, name)) => {
-                            let left = recovery::Snapshot::new(kept, 0, s.left_out);
-                            let _ = recovery::keep(dir, &name.to_string_lossy(), left);
-                        }
-                        None => recovery::forget(&f.path),
+                    self.restore_snapshot(s, changed);
+                }
+            }
+            // The restored text is this run's to keep now: in its snapshot before the ones it
+            // came from are deleted, and those stay if it cannot be written.
+            match self.write_recovery_now() {
+                Ok(()) => {
+                    for f in offer.found.iter().filter(|f| f.snapshot.is_ok()) {
+                        recovery::forget(&f.path);
                     }
                 }
+                Err(e) => self.error(trf("recovery.not_written", &[("error", format!("{e:#}"))])),
             }
         } else if discard {
             for f in &offer.found {
@@ -5322,6 +5363,7 @@ impl OxideMergeApp {
             temps,
             remote,
             no_recovery: false,
+            recovered: None,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -10908,10 +10950,10 @@ impl eframe::App for OxideMergeApp {
         }
         // A normal exit leaves nothing to recover. The lock goes first: a file held open
         // cannot be deleted on Windows.
-        if let Some(dir) = recovery::dir() {
+        if let Some(dir) = self.recovery_dir.clone() {
             self.recovery_lock = None;
             self.recovery_writer
-                .remove(&dir.join(&self.recovery_name), true);
+                .remove_now(dir.join(&self.recovery_name), true);
         }
     }
 

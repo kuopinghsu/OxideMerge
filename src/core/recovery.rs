@@ -156,30 +156,47 @@ fn lock_path(snapshot: &Path) -> PathBuf {
 
 /// Locks the lock file of snapshot `name` in `dir`, for this program to hold as long as it
 /// runs: while it is held, no other program takes the snapshot for one left behind, however
-/// long ago it was written. `None` where it cannot be locked; age alone tells then.
+/// long ago it was written. `None` where it cannot be locked; age alone tells then, and no
+/// lock file is left that others would take for one let go.
 pub fn lock(dir: &Path, name: &str) -> Option<std::fs::File> {
     make_private(dir).ok()?;
+    let path = lock_path(&dir.join(name));
     let file = std::fs::File::options()
         .write(true)
         .create(true)
         .truncate(false)
-        .open(lock_path(&dir.join(name)))
+        .open(&path)
         .ok()?;
-    file.try_lock().ok()?;
-    Some(file)
+    // Another program finding out whether it is held holds it for a moment.
+    for _ in 0..10 {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(std::fs::TryLockError::Error(_)) => {
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+                return None;
+            }
+        }
+    }
+    None
 }
 
 /// Whether a running program holds the lock of `snapshot`: `Some(true)` if so, `Some(false)`
-/// if its lock file is there but no longer held, `None` if it has none.
+/// if its lock file is there but no longer held, `None` if it has none or this system cannot
+/// tell.
 fn held(snapshot: &Path) -> Option<bool> {
     let file = std::fs::File::options()
         .write(true)
         .open(lock_path(snapshot))
         .ok()?;
-    Some(matches!(
-        file.try_lock(),
-        Err(std::fs::TryLockError::WouldBlock)
-    ))
+    match file.try_lock() {
+        Ok(()) => Some(false),
+        Err(std::fs::TryLockError::WouldBlock) => Some(true),
+        Err(std::fs::TryLockError::Error(_)) => None,
+    }
 }
 
 /// Fills in each tab's [`RecoveredTab::sources`] still to be read, off the window's thread:
@@ -206,15 +223,6 @@ pub fn write(dir: &Path, name: &str, mut snapshot: Snapshot) -> Result<()> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
     prune(dir, name);
-    Ok(())
-}
-
-/// Writes `snapshot`, what is left of one left behind, back as `name` in `dir` to offer again:
-/// beside a lock file no one holds, so the next start takes it for left behind at once rather
-/// than [`ABANDONED_AFTER`] after this write.
-pub fn keep(dir: &Path, name: &str, snapshot: Snapshot) -> Result<()> {
-    write(dir, name, snapshot)?;
-    drop(lock(dir, name));
     Ok(())
 }
 
@@ -336,8 +344,9 @@ pub fn forget_abandoned(dir: &Path, own: &str) {
     prune(dir, own);
 }
 
-/// Writes one program's snapshot on other threads, in the order asked: a write that would
-/// finish after a later write, or after the snapshot was removed, is dropped.
+/// Writes and removes one program's snapshot on other threads, in the order asked: a write or
+/// removal that would finish after a later one is dropped, so an earlier write never brings
+/// back a snapshot removed since, nor an earlier removal deletes one written since.
 #[derive(Default)]
 pub struct Writer {
     asked: u64,
@@ -346,37 +355,67 @@ pub struct Writer {
 
 impl Writer {
     pub fn write(&mut self, dir: PathBuf, name: String, snapshot: Snapshot) {
-        std::thread::spawn(self.queue(dir, name, snapshot));
+        std::thread::spawn(self.queue_write(dir, name, snapshot));
     }
 
-    /// The write of `snapshot`, in its place in the order asked, to run when it will.
-    fn queue(
+    /// As [`Writer::write`], on this thread: written when it returns, or why not.
+    pub fn write_now(&mut self, dir: PathBuf, name: String, snapshot: Snapshot) -> Result<()> {
+        // Asked last, so never passed over by an earlier write or removal.
+        self.queue_write(dir, name, snapshot)().unwrap_or(Ok(()))
+    }
+
+    /// Removes the snapshot at `path`, once any write under way has finished. With `lock`, its
+    /// lock file goes too.
+    pub fn remove(&mut self, path: PathBuf, lock: bool) {
+        std::thread::spawn(self.queue_remove(path, lock));
+    }
+
+    /// Whether everything asked has been done or passed over.
+    #[cfg(test)]
+    pub fn idle(&self) -> bool {
+        *self.done.lock().unwrap_or_else(|e| e.into_inner()) >= self.asked
+    }
+
+    /// As [`Writer::remove`], on this thread: removed when it returns.
+    pub fn remove_now(&mut self, path: PathBuf, lock: bool) {
+        self.queue_remove(path, lock)();
+    }
+
+    fn queue_write(
         &mut self,
         dir: PathBuf,
         name: String,
         snapshot: Snapshot,
-    ) -> impl FnOnce() + Send + 'static {
+    ) -> impl FnOnce() -> Option<Result<()>> + Send + 'static {
+        self.queue(move || write(&dir, &name, snapshot))
+    }
+
+    fn queue_remove(
+        &mut self,
+        path: PathBuf,
+        lock: bool,
+    ) -> impl FnOnce() -> Option<()> + Send + 'static {
+        self.queue(move || match lock {
+            true => forget(&path),
+            false => remove(&path),
+        })
+    }
+
+    /// `op`, in its place in the order asked, to run when it will: what it gave, `None` when
+    /// it was passed over for a later one already done.
+    fn queue<T>(
+        &mut self,
+        op: impl FnOnce() -> T + Send + 'static,
+    ) -> impl FnOnce() -> Option<T> + Send + 'static {
         self.asked += 1;
         let (at, done) = (self.asked, self.done.clone());
         move || {
             let mut done = done.lock().unwrap_or_else(|e| e.into_inner());
-            if *done < at {
-                let _ = write(&dir, &name, snapshot);
+            (*done < at).then(|| {
+                let out = op();
                 *done = at;
-            }
-        }
-    }
-
-    /// Removes the snapshot at `path` once any write under way has finished, and keeps writes
-    /// asked for before from bringing it back. With `lock`, its lock file goes too.
-    pub fn remove(&mut self, path: &Path, lock: bool) {
-        self.asked += 1;
-        let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
-        *done = self.asked;
-        if lock {
-            forget(path);
-        } else {
-            remove(path);
+                out
+            })
         }
     }
 }
@@ -527,6 +566,9 @@ mod tests {
         let dir = d.path();
         let name = "session-1-1.json";
         let held = lock(dir, name).unwrap();
+        // Held elsewhere: not taken, and its lock file stays.
+        assert!(lock(dir, name).is_none());
+        assert_eq!(held_now(dir, name), Some(true));
         write(dir, name, Snapshot::new(Vec::new(), 0, 0)).unwrap();
         age(&dir.join(name), ABANDONED_AFTER * 2);
         assert!(abandoned(dir, "x", SystemTime::now()).is_empty());
@@ -541,19 +583,20 @@ mod tests {
         assert_eq!(abandoned(dir, "x", SystemTime::now()).len(), 1);
         forget(&dir.join(name));
         assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+    }
 
-        keep(dir, "session-2-2.json", Snapshot::new(Vec::new(), 0, 0)).unwrap();
-        assert_eq!(abandoned(dir, "x", SystemTime::now()).len(), 1);
+    fn held_now(dir: &Path, name: &str) -> Option<bool> {
+        held(&dir.join(name))
     }
 
     #[test]
-    fn the_writer_keeps_the_last_write_and_a_removal_beats_writes_under_way() {
+    fn the_writer_keeps_the_last_write_or_removal_asked() {
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().to_path_buf();
         let path = dir.join("session-1-1.json");
         let mut w = Writer::default();
         let queue = |w: &mut Writer, left_out| {
-            w.queue(
+            w.queue_write(
                 dir.clone(),
                 "session-1-1.json".into(),
                 Snapshot::new(Vec::new(), 0, left_out),
@@ -565,11 +608,25 @@ mod tests {
         assert_eq!(read(&path).unwrap().left_out, 2, "the later write stays");
 
         let late = queue(&mut w, 3);
-        w.remove(&path, false);
+        w.remove_now(path.clone(), false);
         late();
         assert!(
             !path.exists(),
             "a write asked before the removal never brings it back"
+        );
+
+        let removal = w.queue_remove(path.clone(), true);
+        w.write_now(
+            dir.clone(),
+            "session-1-1.json".into(),
+            Snapshot::new(Vec::new(), 0, 3),
+        )
+        .unwrap();
+        assert_eq!(removal(), None, "passed over");
+        assert_eq!(
+            read(&path).unwrap().left_out,
+            3,
+            "a removal asked before the write never deletes it"
         );
 
         w.write(
@@ -577,16 +634,22 @@ mod tests {
             "session-1-1.json".into(),
             Snapshot::new(Vec::new(), 0, 4),
         );
-        let start = std::time::Instant::now();
-        while *w.done.lock().unwrap() < w.asked {
-            assert!(start.elapsed() < Duration::from_secs(10));
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        let settle = |w: &Writer| {
+            let start = std::time::Instant::now();
+            while !w.idle() {
+                assert!(start.elapsed() < Duration::from_secs(10));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        settle(&w);
         assert_eq!(
             read(&path).unwrap().left_out,
             4,
             "written on another thread"
         );
+        w.remove(path.clone(), false);
+        settle(&w);
+        assert!(!path.exists(), "removed on another thread");
     }
 
     #[test]

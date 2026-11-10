@@ -1025,10 +1025,10 @@ fn leave_edited_snapshot(snaps: &Path, a: &Path, b: &Path) -> Vec<recovery::Foun
 }
 
 /// Unsaved text whose files can no longer be opened comes back in a new tab of its own, each
-/// side named after its file, and the snapshot is kept to offer again, at once, at the next
-/// start.
+/// side named after its file, and is kept in this run's snapshot, as the text of those files,
+/// until it is saved.
 #[test]
-fn recovered_text_of_a_missing_file_opens_untitled_and_stays_offered() {
+fn recovered_text_of_a_missing_file_opens_untitled_and_is_kept_until_saved() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     write(d, &[("a.txt", "same\nold\n"), ("b.txt", "same\nnew\n")]);
@@ -1039,6 +1039,8 @@ fn recovered_text_of_a_missing_file_opens_untitled_and_stays_offered() {
     std::fs::remove_file(&b).unwrap();
 
     let mut gui = Gui::start("recovery_missing", None);
+    gui.app.cfg.recovery = true;
+    gui.app.recovery_dir = Some(snaps.clone());
     gui.app.recovery_offer = Some(RecoveryOffer::new(found));
     gui.frames(2);
     gui.click(tr("recovery.restore"));
@@ -1059,11 +1061,53 @@ fn recovered_text_of_a_missing_file_opens_untitled_and_stays_offered() {
         "{:?}",
         gui.toasts()
     );
-    let again = recovery::abandoned(&snaps, "session-2-2.json", std::time::SystemTime::now());
-    assert_eq!(again.len(), 1, "offered again at the next start");
-    let snapshot = again[0].snapshot.as_ref().unwrap();
+    // The snapshot it came from is gone; this run's holds the text, and is not taken for one
+    // left behind while it runs.
+    assert!(!snaps.join("session-1-1.json").exists());
+    let own = std::fs::read(snaps.join(&gui.app.recovery_name)).unwrap();
+    let snapshot: recovery::Snapshot = serde_json::from_slice(&own).unwrap();
     assert_eq!(snapshot.tabs.len(), 1);
+    assert_eq!(snapshot.tabs[0].tab.paths(), [a.clone(), b.clone()]);
     assert_eq!(snapshot.unsaved_sides(), 1);
+    let later = std::time::SystemTime::now() + recovery::ABANDONED_AFTER * 2;
+    assert!(recovery::abandoned(&snaps, "session-2-2.json", later).is_empty());
+
+    // Saved, it is no longer kept.
+    match gui.app.tabs[0].content.view_mut() {
+        Content::Text(v) => v.panes.iter_mut().for_each(|p| p.doc.modified = false),
+        _ => unreachable!(),
+    }
+    assert!(gui.app.recovery_snapshot().tabs.is_empty());
+}
+
+/// A comparison of the same files open as another kind (binary, here) does not take the
+/// recovered text, which it could not show: a text compare of its own opens.
+#[test]
+fn a_recovered_comparison_never_goes_into_a_tab_of_another_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "same\nold\n"), ("b.txt", "same\nnew\n")]);
+    let (a, b) = (d.join("a.txt"), d.join("b.txt"));
+    let snaps = d.join("recovery");
+    let found = leave_edited_snapshot(&snaps, &a, &b);
+
+    let binary = OpenRequest {
+        paths: vec![a.clone(), b.clone()],
+        kind: Some(FileKind::Binary),
+        ..Default::default()
+    };
+    let mut gui = Gui::start("recovery_other_kind", Some(binary));
+    gui.settle();
+    assert!(matches!(gui.app.tabs[0].content.view(), Content::Binary(_)));
+    gui.app.recovery_offer = Some(RecoveryOffer::new(found));
+    gui.frames(2);
+    gui.click(tr("recovery.restore"));
+    gui.settle();
+
+    assert_eq!(gui.app.tabs.len(), 2, "{}", gui.describe());
+    let v = gui.text_view();
+    assert_eq!(v.panes[1].doc.lines, ["same", "old"]);
+    assert!(v.panes[1].doc.modified);
 }
 
 /// Restoring into a program that already shows the same files, unedited, puts the unsaved text
@@ -1078,6 +1122,8 @@ fn a_recovered_comparison_reuses_an_unedited_tab_of_its_files() {
     let found = leave_edited_snapshot(&snaps, &a, &b);
 
     let mut gui = Gui::start("recovery_reuse", compare(&[a.clone(), b.clone()]));
+    gui.app.cfg.recovery = true;
+    gui.app.recovery_dir = Some(snaps.clone());
     gui.settle();
     gui.app.recovery_offer = Some(RecoveryOffer::new(found));
     gui.frames(2);
@@ -1089,6 +1135,73 @@ fn a_recovered_comparison_reuses_an_unedited_tab_of_its_files() {
     assert_eq!(v.panes[1].doc.lines, ["same", "old"]);
     assert!(v.panes[1].doc.modified);
     assert!(!snaps.join("session-1-1.json").exists());
+    // Already in this run's snapshot, not only at its next write.
+    let own = std::fs::read(snaps.join(&gui.app.recovery_name)).unwrap();
+    let snapshot: recovery::Snapshot = serde_json::from_slice(&own).unwrap();
+    assert_eq!(snapshot.unsaved_sides(), 1);
+}
+
+/// Where this run's snapshot cannot be written, the snapshots restored from are kept, to offer
+/// again, and a message says why.
+#[test]
+fn a_restore_keeps_its_snapshots_when_its_own_cannot_be_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "same\nold\n"), ("b.txt", "same\nnew\n")]);
+    let (a, b) = (d.join("a.txt"), d.join("b.txt"));
+    let snaps = d.join("recovery");
+    let found = leave_edited_snapshot(&snaps, &a, &b);
+
+    let mut gui = Gui::start("recovery_unwritable", None);
+    gui.app.cfg.recovery = true;
+    // A file where its folder would go: nothing can be written there.
+    gui.app.recovery_dir = Some(a.clone());
+    gui.app.recovery_offer = Some(RecoveryOffer::new(found));
+    gui.frames(2);
+    gui.click(tr("recovery.restore"));
+    gui.settle();
+
+    assert_eq!(gui.app.tabs.len(), 1, "{}", gui.describe());
+    assert!(gui.text_view().panes[1].doc.modified);
+    assert!(
+        snaps.join("session-1-1.json").exists(),
+        "kept to offer again"
+    );
+    let lead = tr("recovery.not_written");
+    let lead = &lead[..lead.find('{').unwrap()];
+    assert!(
+        gui.errors().iter().any(|e| e.starts_with(lead)),
+        "{:?}",
+        gui.errors()
+    );
+}
+
+/// Turning recovery off deletes this run's snapshot at once: no write still under way brings it
+/// back, and quitting right after leaves nothing to offer.
+#[test]
+fn turning_recovery_off_deletes_the_snapshot_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("a.txt", "one\n"), ("b.txt", "two\n")]);
+    let snaps = d.join("recovery");
+    let mut gui = Gui::start("recovery_off", compare(&[d.join("a.txt"), d.join("b.txt")]));
+    gui.app.cfg.recovery = true;
+    gui.app.recovery_dir = Some(snaps.clone());
+    gui.settle();
+    assert!(gui.app.recovery_at.is_some(), "a snapshot was asked for");
+    let own = snaps.join(&gui.app.recovery_name);
+
+    gui.app.cfg.recovery = false;
+    gui.app.keep_recovery(&gui.ctx);
+    assert!(gui.app.recovery_writer.idle(), "done before it returns");
+    assert!(!own.exists());
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(!own.exists(), "nothing written after");
+    assert_eq!(
+        std::fs::read_dir(&snaps).map_or(0, |e| e.count()),
+        0,
+        "the lock file too"
+    );
 }
 
 /// In every language, on a small window, the buttons of the recovery prompt and of the
