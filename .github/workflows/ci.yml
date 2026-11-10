@@ -630,10 +630,19 @@ jobs:
             target/gui-smoke
           if-no-files-found: ignore
 
+      # With the five MACOS_* secrets set, the app and .dmg are signed with a Developer ID,
+      # notarized and stapled (scripts/macos-sign.sh); with none of them, as on forks and pull
+      # requests, the app is signed ad hoc. Secrets reach this step only.
       - name: Package
         if: github.event_name == 'push' || inputs.packages
         id: package
         shell: bash
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
         run: |
           set -euo pipefail
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
@@ -646,6 +655,9 @@ jobs:
           else
             label="$version-${GITHUB_SHA::7}"
           fi
+          signing=$(bash scripts/macos-sign.sh mode)
+          echo "Signing: $signing"
+          bash scripts/macos-sign.sh setup
           name="oxidemerge-$label-macos-universal"
           app=staging/dmg/OxideMerge.app
           mkdir -p dist "$app/Contents/MacOS" "$app/Contents/Resources"
@@ -701,11 +713,10 @@ jobs:
           plutil -lint "$app/Contents/Info.plist"
           cp README.md LICENSE staging/dmg/
 
-          # Ad-hoc signature: Apple silicon refuses to run unsigned code. The
-          # app is not notarized (see docs/macos-signing.md), so the first launch
-          # needs System Settings > Privacy & Security > Open Anyway.
-          codesign --force --deep --sign - "$app"
-          codesign --verify --deep --strict "$app"
+          # A Developer ID signature with the hardened runtime, or else an ad hoc one: Apple
+          # silicon refuses to run unsigned code. An ad hoc app is not notarized (see
+          # docs/macos-signing.md), so its first launch needs Open Anyway.
+          bash scripts/macos-sign.sh app "$app"
 
           # The packaged binary must still work from the command line.
           bin="$app/Contents/MacOS/oxidemerge"
@@ -729,9 +740,17 @@ jobs:
             [ "$attempt" = 3 ] && exit 1
             sleep 10
           done
+          # Signed, notarized, stapled and checked by Gatekeeper; or, ad hoc, only verified.
+          bash scripts/macos-sign.sh dmg "dist/$name.dmg"
+          # Installed as a download would be, judged by Gatekeeper, run and removed again.
+          bash scripts/macos-install-check.sh "dist/$name.dmg" "$signing"
 
           ls -l dist
           echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Remove the signing keychain
+        if: always() && (github.event_name == 'push' || inputs.packages)
+        run: bash scripts/macos-sign.sh cleanup
 
       - if: github.event_name == 'push' || inputs.packages
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -895,6 +914,7 @@ jobs:
           sparse-checkout: |
             CHANGELOG.md
             scripts/release-notes.sh
+            scripts/check-release.sh
           sparse-checkout-cone-mode: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -937,6 +957,11 @@ jobs:
           done
           [ "$ok" = 1 ]
 
+      # Each package is checked as what it claims to be, after its trip through the
+      # artifact store, then its digest is listed in SHA256SUMS.
+      - name: Check package integrity
+        run: bash scripts/check-release.sh dist
+
       # The release notes are this version's section of CHANGELOG.md, followed
       # by the download instructions.
       - name: Release notes
@@ -956,7 +981,7 @@ jobs:
 
           **User guide:** `oxidemerge-*-user-guide.pdf` in English and `oxidemerge-*-user-guide.zh-TW.pdf` in Traditional Chinese.
 
-          GitHub lists each download's SHA-256 digest on this page for checking it.
+          GitHub lists each download's SHA-256 digest on this page for checking it, and `SHA256SUMS` lists them all: `sha256sum -c --ignore-missing SHA256SUMS` (Linux) or `shasum -a 256 -c --ignore-missing SHA256SUMS` (macOS) checks the files you downloaded.
           EOF
             echo
             echo "Built from commit \`$GITHUB_SHA\` by [this workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."

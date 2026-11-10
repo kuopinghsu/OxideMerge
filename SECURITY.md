@@ -45,11 +45,20 @@ the following as **untrusted** and handles them without running anything they co
   interrupted or stopped while asking, and answers are overwritten once sent. A password
   the server refused is never sent again, and an encrypted key with its `.pub` file beside it
   has its passphrase asked for only after the server has said it would take that key. Fetched names are checked to be plain file names before anything
-  is written, and a fetch is limited in size, file count and depth. Uploads update the original
-  file in place to preserve ownership and ACLs. Before writing, they check that its size and
-  modification time (or, where the server gives no time, its contents) still match what was
-  fetched. An interrupted write can leave partial contents; it is reported, and saving
-  again finishes it. Passwords and passphrases stay in memory only, and are overwritten when no
+  is written, and a fetch is limited in size, file count and depth. Before writing, an upload checks that the
+  file's size and modification time (or, where the server gives no time, its contents) still
+  match what was fetched. Over SFTP it writes a staged copy beside the file, gives it the
+  original's owner, group and permissions, reads it back to compare it with what was sent,
+  checks the original once more, and only then renames it into place. On servers without an
+  overwriting rename (OpenSSH's protocol version 3), the original is first renamed aside, so
+  for a moment the file is missing. The replacement is not atomic in that case, but the file
+  is never partial. A replacement does not keep access-control lists or hard links, which
+  SFTP cannot show. OxideMerge writes in place instead when the user asks
+  (*Save remote files in place*), over FTP, and when ownership or permissions cannot be kept.
+  An interrupted in-place write can leave partial contents; it is reported, and saving again
+  finishes it. When a connection drops mid-rename, the error names the files left on the
+  server instead of claiming a rollback. Temporary names hold only the file's name, the
+  process id and a time, never the user or server. Passwords and passphrases stay in memory only, and are overwritten when no
   longer needed. An FTPS server's certificate is checked before the password is sent, either
   against the bundled certificate authorities or against the certificate the user confirmed
   and pinned in `known_certs` next to the settings; a changed pin, or a server that offers no
@@ -76,6 +85,13 @@ the following as **untrusted** and handles them without running anything they co
   computer, but not from another one (`file://host/share`).
 - **Reports.** Every file name, path and line written into an HTML report, slideshow or
   XML report is escaped. Slideshows run only their own embedded script.
+- **Recovery snapshots** (off by default; *Keep unsaved work for recovery*): while on, the
+  text of unsaved edits is written to the `recovery` folder in the configuration folder,
+  created readable by you only on Linux and macOS, and deleted at a normal exit. Restoring
+  one only puts the text back in the tabs, unsaved; it never writes a compared file. A
+  snapshot is read as data, and one from a later format is not restored. A single
+  comparison can be left out with *Keep for recovery* in its tab's context menu; from the
+  next snapshot on, its text is no longer written.
 - **Language packs** added to a `Languages` folder: only text for known messages is used,
   and a translation that drops or adds a `{placeholder}` is replaced by the English text.
 

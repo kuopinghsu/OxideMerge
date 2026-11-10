@@ -307,6 +307,77 @@ fn reports_are_written_as_xml_and_slideshows() {
     assert!(read(d.join("t2.xml")).contains("<comparison "));
 }
 
+#[test]
+fn html_reports_come_in_three_details() {
+    let d = tmp();
+    let d = d.path();
+    let long: String = (0..1000).map(|i| format!("{i}\n")).collect();
+    files(
+        d,
+        &[
+            ("left/f.txt", &long),
+            ("right/f.txt", "other\n"),
+            ("a.txt", &long),
+            ("b.txt", "other\n"),
+        ],
+    );
+    let folder = |detail: &str, out: &str| {
+        let args = [
+            "--report",
+            out,
+            "--report-diffs",
+            "--report-detail",
+            detail,
+            "-r",
+            "left",
+            "right",
+        ];
+        let run = oxidemerge(d, &args);
+        assert_eq!(run.code, 1, "{}", run.stderr);
+        read(d.join(out))
+    };
+    let summary = folder("summary", "s.html");
+    assert!(!summary.contains("class=\"hunk"));
+    assert!(summary.contains("id=\"completeness\""));
+    let full = folder("full", "f.html");
+    assert!(full.contains("<td class=\"n\">1000</td>"), "every row");
+    let standard = folder("standard", "d.html");
+    assert!(
+        !standard.contains("<td class=\"n\">1000</td>"),
+        "400 rows a block"
+    );
+
+    let run = oxidemerge(
+        d,
+        &[
+            "--report",
+            "t.html",
+            "--report-detail",
+            "full",
+            "a.txt",
+            "b.txt",
+        ],
+    );
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(read(d.join("t.html")).contains("<td class=\"n\">1000</td>"));
+    // Only HTML reports have it, and saying so is not an error.
+    let run = oxidemerge(
+        d,
+        &[
+            "--report",
+            "t.xml",
+            "--report-detail",
+            "full",
+            "a.txt",
+            "b.txt",
+        ],
+    );
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(run
+        .stderr
+        .contains("--report-detail only applies to .html reports"));
+}
+
 #[cfg(unix)]
 #[test]
 fn file_names_in_reports_are_escaped() {

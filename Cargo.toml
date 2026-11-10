@@ -43,6 +43,8 @@ yaml-rust = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value", "arbitrary_precision"] }
 sha2 = "0.10"
+# Already built for egui; its `HashTable` lets line interning store 4-byte ids alone.
+hashbrown = { version = "0.17", default-features = false }
 aho-corasick = "1"
 dirs = "5"
 clap = { version = "4", features = ["derive"] }

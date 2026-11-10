@@ -14,7 +14,8 @@ The inputs are made once into `target/bench-data`: about 1 GB on disk, 1.3 GB wi
 `OXIDEMERGE_BENCH_LARGE=1` and about 14 GB with `=2`, of which 10 GiB are the five 2 GiB
 files of sync-apply-large. That workload also needs about 10 GiB more free space while it
 runs, for its working copy, the new and replacement files and the journal. `=3` adds about
-2 GB for the 1 GB text pair. Each workload then runs three times, each in a process of its
+2 GB for the 1 GB text pair and 1 GB for the 500 MB one (each `text-view-` and `text-cancel-`
+workload has a copy of its own). Each workload then runs three times, each in a process of its
 own; the median time and the highest peak memory are reported and written to
 `target/bench/results.md`, with the machine, the commit and the build. Peak memory is
 measured with `/usr/bin/time`, so it is missing on Windows. The files are read from the
@@ -22,7 +23,7 @@ system's file cache after the first run, so the times don't include disk reads.
 
 | Variable | Effect |
 | --- | --- |
-| `OXIDEMERGE_BENCH_LARGE=1` | Adds the 100 MB text and binary compares; `=2` also a 1 GB binary compare and the synchronization of 2 GB files; `=3` also two 1 GB text inputs |
+| `OXIDEMERGE_BENCH_LARGE=1` | Adds the 100 MB text and binary compares; `=2` also a 1 GB binary compare and the synchronization of 2 GB files; `=3` also the 500 MB and 1 GB text inputs |
 | `OXIDEMERGE_BENCH_ONLY=text,folder` | Runs only the workloads whose names contain one of these |
 | `OXIDEMERGE_BENCH_RUNS=5` | Number of runs per workload (default 3) |
 | `OXIDEMERGE_BENCH_SAVE=base.txt` | Saves the times as a baseline |
@@ -47,8 +48,8 @@ fixed thresholds, so CI reports the numbers without failing on them.
   (or 200) changed, inserted or deleted.
 - **text-repeated**: 300,000 equal lines with 300 inserted, which defeats line matching by
   content.
-- **text-1gb**: two 1 GiB UTF-8 source-like files, with one line in 200 changed, inserted
-  or deleted. Fixture generation writes incrementally, avoiding whole-file generation
+- **text-500mb**, **text-1gb** (`OXIDEMERGE_BENCH_LARGE=3`): two 500 MiB (or 1 GiB) UTF-8
+  source-like files, with one line in 200 changed, inserted or deleted. Fixture generation writes incrementally, avoiding whole-file generation
   buffers.
 - **table-10k**, **table-100k**: two CSV tables of 10,000 (or 100,000) records keyed by
   `id`, the right one shuffled, with 1% of the amounts changed, 0.5% of the records
@@ -71,6 +72,24 @@ fixed thresholds, so CI reports the numbers without failing on them.
   view rather than of the engine behind it.
 - **xml-semantic-12k**: the files of xml-tree-12k compared by the Semantic view's
   path-by-path engine, for comparison.
+- **text-view-10mb**, **text-view-100mb** (`OXIDEMERGE_BENCH_LARGE=1`), **text-view-500mb**,
+  **text-view-1gb** (`=3`): the files of text-10mb, text-100mb, text-500mb and text-1gb opened
+  in the real text view, off screen. Besides the total it reports, each with the process's
+  resident memory at that point: loading both files, the comparison and everything the view
+  builds from it, the first frame drawn, a frame after jumping to a different line (100 of
+  them, spread over the file), and a step to the next difference with its frame (100 steps).
+  Last, *held* breaks down what the view keeps, by kind: the lines, the line ends, edit marks,
+  highlighting, rows, layout, word-level differences and undo history (counted from their
+  sizes and capacities, not measured by the allocator). The workload's peak memory is what a
+  window showing the comparison needs, without the window itself.
+- **text-cancel-100mb** (`=1`), **text-cancel-500mb** (`=3`): the same files opened as the
+  window opens large ones, reading and comparing on another thread, and stopped as *Cancel*
+  does at nine points from 10% to 90% of the time an open takes. It reports reading the files
+  twice (the second time from the file cache for certain), the whole open, and for the nine
+  cancels, the median and worst time until the work noticed and stopped, and until the thread
+  had also freed what it had built. The window waits for neither: it lets go of the job at
+  once and the thread frees its memory on its own. This workload's peak memory says nothing
+  about one open (see the findings below).
 - **merge3-10mb**: three 10 MB files compared as a 3-way compare, then merged
   automatically.
 - **binary-10mb**, **binary-100mb**, **binary-1gb**: two random files with 100 bytes
@@ -221,6 +240,21 @@ and the times there were measured with the memory tool attached.
 - Folder compares by contents read files of up to 16 MB whole, a few at a time, and larger
   ones in 1 MB chunks. Memory follows the number of threads (138 MB for 8 MB files on 12
   threads), not the size of the tree.
+- The line diff has one 2-second deadline for a whole comparison. Large files are first
+  split at lines found once on each side, and Myers then runs between those anchors; once
+  the 2 seconds are up, every gap still left is compared coarsely (as one change) instead of
+  line by line. At 1 GiB the comparison passes the deadline, so its difference count depends
+  on the machine's speed and load: 152,307 in some runs and 152,424 in others on the same
+  inputs. Up to 500 MB the counts stayed the same from run to run. The rows are still
+  correct; only how finely some differences are split varies.
+- On the macOS 27.3 pre-release this was measured on (build 26C5035r), memory freed in
+  large blocks is not reused or given back: loading the 100 MB pair, dropping it and loading
+  it again adds about 137 MB of resident memory each time, with the same growth in a
+  20-line Rust program outside OxideMerge (it is the blocks freed as the list of lines
+  doubles), and none on Linux (glibc) in Docker. `footprint` counts it as dirty *Malloc
+  Large* memory, not as reclaimable. A list sized up front does not grow. So on that
+  system, opening large comparisons again and again in one window grows its memory until it
+  is restarted; it was not checked on a released macOS.
 
 ## Recorded comparison: 0.9.6 (2026-10-30)
 
@@ -307,6 +341,55 @@ freeing the keys it had built included. Stepping to the next file with differenc
 20,000 files then took about 2.5 ms, as each step found the file's place in the listed
 order again; keeping that order between steps has since brought a step to 0.19 ms (see
 folder-navigation-20k above).
+
+## Recorded comparison: text memory changes (2026-11-09)
+
+Commit `1198f5d` with only the benchmark harness added (a `git worktree`), and the working
+tree with the memory changes, were run one after the other on the macOS aarch64 host above
+(Apple M2 Max, 32 GB), reading the same generated inputs: the 100 MB workloads five times,
+the 1 GiB workloads three times, median time and highest peak memory.
+
+| Workload | Before | First version | After the fix (2026-11-10) |
+| --- | ---: | ---: | ---: |
+| text-100mb | 1.181 s, 620 MB | 1.099 s, 561 MB | 1.004 s, 552 MB |
+| text-view-100mb | 1.742 s, 722 MB | 1.671 s, 693 MB | 1.464 s, 673 MB |
+| text-1gb | 16.434 s, 5,705 MB | 16.348 s, 5,480 MB | 16.173 s, 5,441 MB |
+| text-view-1gb | 22.820 s, 7,725 MB | 24.279 s, 7,007 MB | 22.883 s, 7,017 MB |
+
+The last column was run on 2026-11-10 on the same host and inputs, three runs each.
+
+The view's stages at 1 GiB, before → first version → after the fix: load 3.25 → 3.26 →
+3.33 s; comparison and what the view builds from it 16.1 → 17.5 → 16.2 s (5.9 → 5.5 → 5.6 GiB
+resident afterwards); first frame 424 → 398 → 423 ms; a frame after jumping to another line
+11.1 → 11.4 → 10.2 ms; a step to the next difference 11.0 → 11.2 → 10.0 ms. All versions
+found 152,307 differences in 30,659,207 rows.
+
+What changed: lines are numbered through a table of 8-byte slots (where a line was first
+seen and 32 bits of its hash) instead of a map holding a 16-byte `&str` per distinct line;
+the list of loaded lines gives back its spare room; the view keeps one 32-bit hash per line
+instead of 64 bits; and a pane whose rows are one per line keeps no table of row boundaries.
+
+The first version made the 1 GiB view about 6% slower. Timing the numbering alone on the
+1 GiB pair, six alternating runs each, gave a median of 7.9–8.9 s for the old map and 8.9–10.1 s
+for the first table: its slots held a line's number, and the line to compare against had to
+be found through a list of first lines, two more scattered reads for each of the ~55% of
+lines that repeat an earlier one. The fixed table holds the place where a line was first
+seen, so the line is read straight from it, and the places are turned into numbers in a
+second, in-place pass: 8.0 s against 7.9 s for the old map in the same runs, with the same
+numbers (checked line for line, and by a unit test).
+
+Limits of this record:
+
+- The engine timing of `text-1gb` did not show the first version's slowdown (16.43 against
+  16.35 s) although it numbers lines the same way; run-to-run noise at this size is about
+  ±0.5 s, so differences under ~3% are not established either way.
+- The lines themselves (a 24-byte `String` and its text for each of 30 million lines a side)
+  remain most of the peak; storing them in one buffer would be the next large reduction, and
+  it touches several hundred places that read `lines`.
+- Peak memory is the process's maximum resident size from `/usr/bin/time -l`; it varies with
+  memory pressure on the host. Only macOS was measured; no Windows or Linux figures, no
+  500 MiB pair, and no native window run.
+- Results were checked to be the same difference count; the unit tests compare diff content.
 
 ## Large UTF-8 text comparison
 

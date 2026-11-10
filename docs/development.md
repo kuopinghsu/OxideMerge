@@ -179,6 +179,24 @@ They also check that the results work with Git checkout and Git patches, so Git 
 installed. Continuous integration runs these checks on Windows, Linux and macOS as part of
 the full test suite.
 
+### Translation checks
+
+The `i18n` tests fail the build when a language file in `lang/` lacks a key of
+`lang/en.json`, has a key English does not, gives a key twice, drops or adds a
+`{placeholder}`, names other keys than English (`Ctrl+V`, `F5`; German *Strg* counts as
+*Ctrl*), or leaves a warning about deleting, replacing or losing work in English. They
+also check that `docs/user-guide.zh-TW.adoc`, `docs/development.zh-TW.md` and
+`README_zh-TW.md` have the same headings, at the same levels, and the same anchors as their
+English documents, and that every `<<anchor>>` in a user guide exists. A window test opens
+the recovery prompt and the Options dialog in every language on an 800 × 600 window and
+fails when a button is outside it or covers another.
+
+```sh
+cargo test --locked i18n::
+```
+
+They cannot tell whether a translation reads naturally; that still needs a native speaker.
+
 ### Random tests
 
 When a random test fails, it prints a seed. Use the seed to run the same case again, or
@@ -196,6 +214,11 @@ To test with real program windows, run `make gui-smoke` or
 folder comparisons. On Linux without a display, it starts Xvfb. If you set
 `OXIDEMERGE_SMOKE_REPORT=<file>`, the program writes its tabs and messages to that file
 after the comparison, and then closes.
+
+On Linux and macOS the script also checks crash recovery with a real process: it starts the
+program with recovery turned on, waits for the first snapshot, ends the program with
+`kill -9`, and checks that the next start offers the two files for recovery and keeps the
+snapshot until the user chooses.
 
 For documentation pictures, `OXIDEMERGE_SCREENSHOT=<file.png>` saves the window as the
 program draws it, without a screen grab, once the comparison is done, and then closes. Set
@@ -263,12 +286,24 @@ packages:
   Wayland and keyboard libraries and use them when the system does not have them. Both
   processor types are checked on Ubuntu 22.04 and AlmaLinux 8: library loading,
   command-line behavior and window start.
-- **macOS:** a universal app in a DMG package, with an ad hoc signature. Both Apple
-  silicon and Intel code are checked. The Intel program is tested with Rosetta.
+- **macOS:** a universal app in a DMG package, signed by `scripts/macos-sign.sh`: ad hoc
+  without signing secrets, or with a Developer ID, notarized and stapled when all five
+  `MACOS_*` secrets are set (see [macOS signing](macos-signing.md)). Both Apple silicon and
+  Intel code are checked. The Intel program is tested with Rosetta.
+  `scripts/macos-install-check.sh` then installs the app from the DMG as a download would
+  arrive (into an Applications folder of its own, with the quarantine flag), checks
+  Gatekeeper's verdict (rejected when ad hoc, accepted as notarized with a Developer ID),
+  clears the flag as the README says, runs the program, and removes it again. On a Mac
+  where Gatekeeper is turned off, it says so and does not judge the verdict.
 - **Documentation:** the English and Traditional Chinese PDF guides. The build fails if a
   font is missing characters.
 
 The Windows and Linux Arm64 packages are built and tested on Arm computers, not emulated.
+
+Before publishing, the release job checks each downloaded package with
+`scripts/check-release.sh`: archives must list and decompress, the AppImage and DMG must
+carry their format marks, and the PDFs must be whole. It then publishes `SHA256SUMS` with
+the packages.
 
 ## Releases
 

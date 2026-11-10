@@ -2,14 +2,11 @@
 
 English | [繁體中文](README_zh-TW.md)
 
+OxideMerge is a free, open-source, cross-platform diff and merge tool built in Rust. Named after iron oxide—the compound associated with rust—it brings clarity and confidence to file comparisons, folder synchronization, and conflict resolution.
+
+**See the Difference. Merge with Confidence.**
+
 ![OxideMerge on Windows, macOS and Linux](images/banner.jpg)
-
-OxideMerge is a free and open-source tool that compares and merges files and folders. It
-runs on **Windows, macOS and Linux**. Use it to review changes, combine edits and resolve
-merge conflicts.
-
-OxideMerge is written in Rust. It compares text, folders, binary files, images and web
-pages.
 
 **[Download](https://github.com/kuopinghsu/OxideMerge/releases)** ·
 [User guide](docs/user-guide.adoc) ([PDF](docs/dist/oxidemerge-user-guide.pdf)) ·
@@ -216,7 +213,9 @@ For the rules and limits of each tool, see the [analysis guide](docs/analysis-gu
 Download the package for your system from
 [GitHub Releases](https://github.com/kuopinghsu/OxideMerge/releases). Each release also
 has PDF user guides in English and Traditional Chinese. The release page lists the SHA-256
-checksum of each file, so you can check your download.
+checksum of each file, and the `SHA256SUMS` file lists them all, so you can check your
+download: `shasum -a 256 -c --ignore-missing SHA256SUMS` on macOS, or `sha256sum -c
+--ignore-missing SHA256SUMS` on Linux, in the folder holding both.
 
 | System | Supported versions | Package |
 | --- | --- | --- |

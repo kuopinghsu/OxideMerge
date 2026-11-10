@@ -3103,6 +3103,7 @@ dependencies = [
  "egui_extras",
  "encoding_rs",
  "flate2",
+ "hashbrown 0.17.1",
  "image",
  "krilla",
  "libc",
