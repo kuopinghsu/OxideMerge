@@ -230,6 +230,7 @@ impl Normalizer {
         let mut mask = vec![false; lines.len()];
         let mut open: Option<(usize, &Regex)> = None;
         for (i, line) in lines.iter().enumerate() {
+            super::cancel::check_every(i, 1 << 16);
             match open {
                 Some((start, end)) if end.is_match(line) => {
                     mask[start..=i].fill(true);
@@ -622,6 +623,13 @@ fn algorithm(a: DiffAlgorithm) -> Algorithm {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The bits of each line's hash that interning keeps, fewer in tests of lines whose kept
+    /// bits are the same.
+    static KEPT_HASH_BITS: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
+
 /// An id for each line of `panes`, the same for equal lines, numbered in the order lines are
 /// first seen. The table holds where each distinct line was first seen with 32 bits of its
 /// hash: 8 bytes a slot where a map from `&str` takes 24, which for a file of tens of millions
@@ -669,6 +677,8 @@ fn intern_borrowed(panes: &[&[String]], initial: usize) -> Vec<Vec<u32>> {
                 .map(|(i, line)| {
                     super::cancel::check_every(i, 1 << 16);
                     let h = state.hash_one(line.as_str()) as u32;
+                    #[cfg(test)]
+                    let h = h & KEPT_HASH_BITS.get();
                     let found =
                         table.find(spread(h), |&(first, kept)| kept == h && text(first) == line);
                     match found {
@@ -710,7 +720,9 @@ impl<'a> Interner<'a> {
     fn ids(&mut self, norm: &Normalizer, lines: &'a [String]) -> Vec<u32> {
         lines
             .iter()
-            .map(|l| {
+            .enumerate()
+            .map(|(i, l)| {
+                super::cancel::check_every(i, 1 << 16);
                 let k = norm.key(l);
                 let next = self.map.len() as u32;
                 *self.map.entry(k).or_insert(next)
@@ -739,12 +751,9 @@ fn line_ops(
     if !anchored {
         return ops_between(a, b, (0, 0), alg, deadline);
     }
-    // Each gap between anchors has a deadline of its own, so that how finely one is compared
-    // does not depend on how long the gaps before it took (on a large file, on the machine's
-    // speed). The whole walk still has a limit, for files that are hard everywhere.
     let started = std::time::Instant::now();
-    let gap_deadline =
-        || Some((std::time::Instant::now() + GAP_DEADLINE).min(started + WALK_DEADLINE));
+    let (gap, walk) = walk_limits();
+    let gap_deadline = || Some((std::time::Instant::now() + gap).min(started + walk));
     let mut out = Vec::new();
     let (mut pa, mut pb) = (0, 0);
     for (k, (ia, ib)) in unique_anchors(a, b).into_iter().enumerate() {
@@ -752,6 +761,9 @@ fn line_ops(
         let (ia, ib) = (ia as usize, ib as usize);
         // Most anchors follow one another: no gap, and no clock to read for it.
         if ia > pa || ib > pb {
+            // A gap can take up to its deadline: a few hundred of them would hold Cancel
+            // back for the whole walk.
+            super::cancel::check();
             out.extend(ops_between(
                 &a[pa..ia],
                 &b[pb..ib],
@@ -784,11 +796,24 @@ fn line_ops(
 
 const ANCHOR_MIN_LINES: usize = 10_000;
 
-/// How long Myers may take over one comparison, or one gap between anchors of a large file,
-/// before it settles for a coarser result.
+/// How long Myers may take over one comparison before it settles for a coarser result. For a
+/// large file split at anchors, that is each gap between them in a job, which can be stopped,
+/// and all the gaps together anywhere else: a compare again after an edit runs on the UI
+/// thread, and must not freeze the window for longer.
 const GAP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
-/// How long the gaps of one large file may take together.
+/// How long the gaps of one large file may take together in a job.
 const WALK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long each gap between anchors may take, and all of them together. In a job each gap
+/// has a deadline of its own, so that how finely one is compared does not depend on how long
+/// the gaps before it took (on a large file, on the machine's speed).
+fn walk_limits() -> (std::time::Duration, std::time::Duration) {
+    if super::cancel::in_job() {
+        (GAP_DEADLINE, WALK_DEADLINE)
+    } else {
+        (GAP_DEADLINE, GAP_DEADLINE)
+    }
+}
 
 /// Lines that occur exactly once in `a` and once in `b`, paired, keeping the longest run of
 /// pairs that is in order on both sides.
@@ -1453,9 +1478,13 @@ fn detect_moved(result: &mut DiffResult, ids: &[Vec<u32>]) {
     let n = result.panes;
     // For each pane, the sorted, deduplicated blocks each line id appears in.
     let mut per_pane: Vec<HashMap<u32, Vec<usize>>> = vec![HashMap::new(); n];
+    // Lines looked at, counted across blocks, which can be a few lines each.
+    let mut step = 0usize;
     for (bi, b) in result.blocks.iter().enumerate() {
         for p in 0..n {
             for line in b.ranges[p].clone() {
+                step += 1;
+                super::cancel::check_every(step, 1 << 16);
                 let blocks = per_pane[p].entry(ids[p][line]).or_default();
                 if blocks.last() != Some(&bi) {
                     blocks.push(bi);
@@ -1470,6 +1499,8 @@ fn detect_moved(result: &mut DiffResult, ids: &[Vec<u32>]) {
         }
         for p in 0..n {
             for line in b.ranges[p].clone() {
+                step += 1;
+                super::cancel::check_every(step, 1 << 16);
                 let id = ids[p][line];
                 // Moved: the line is in another block of another pane, but not in this block there.
                 let found = (0..n).filter(|&q| q != p).any(|q| {
@@ -1727,6 +1758,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Lines whose kept hash bits are the same are told apart by their text.
+    #[test]
+    fn interning_tells_apart_lines_whose_kept_hash_bits_collide() {
+        let a: Vec<String> = (0..300).map(|i| format!("line {}", i % 40)).collect();
+        let b: Vec<String> = (0..200).map(|i| format!("line {}", i % 70)).collect();
+        let refs = [a.as_slice(), b.as_slice()];
+        let mut map = HashMap::<&str, u32>::new();
+        let expected: Vec<Vec<u32>> = refs
+            .iter()
+            .map(|p| {
+                p.iter()
+                    .map(|l| {
+                        let next = map.len() as u32;
+                        *map.entry(l.as_str()).or_insert(next)
+                    })
+                    .collect()
+            })
+            .collect();
+        for bits in [0, 0b1, 0b11] {
+            KEPT_HASH_BITS.set(bits);
+            for initial in [0, 100] {
+                assert_eq!(intern_borrowed(&refs, initial), expected, "{bits:b}");
+            }
+        }
+        KEPT_HASH_BITS.set(u32::MAX);
+    }
+
+    /// Outside a job, which can be stopped, the gaps of a large file share one short budget.
+    #[test]
+    fn the_walk_has_one_short_budget_unless_it_can_be_stopped() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        assert_eq!(walk_limits(), (GAP_DEADLINE, GAP_DEADLINE));
+        let stop = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            crate::core::cancel::run(stop, walk_limits),
+            Some((GAP_DEADLINE, WALK_DEADLINE))
+        );
+    }
+
+    /// Cancelling during a walk of many slow gaps stops within a gap or so, not at its end.
+    #[test]
+    fn cancelling_stops_the_walk_between_gaps() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        // Each gap holds lines of only its own side, repeated so that none is an anchor.
+        let (gaps, width) = (1_000u32, 1_000u32);
+        let side = |base: u32| -> Vec<u32> {
+            (0..gaps)
+                .flat_map(|k| std::iter::once(k).chain((0..width).map(move |j| base + j % 7)))
+                .collect()
+        };
+        let (a, b) = (side(1 << 20), side(2 << 20));
+        let stop = Arc::new(AtomicBool::new(false));
+        let job_stop = stop.clone();
+        let job = std::thread::spawn(move || {
+            crate::core::cancel::run(job_stop, || line_ops(&a, &b, DiffAlgorithm::Myers).len())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let asked = std::time::Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        let out = job.join().unwrap();
+        let took = asked.elapsed();
+        assert_eq!(out, None, "the walk ended before it was stopped");
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "stopped {took:?} after cancelling"
+        );
     }
 
     #[test]

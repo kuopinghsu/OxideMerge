@@ -6,7 +6,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 pub type LineSpans = Vec<(Range<usize>, Color32)>;
 
@@ -54,24 +54,50 @@ impl Default for Budget {
     }
 }
 
-/// Check before cloning input for the worker, not only after allocating its copy.
-pub fn within_limits(lines: &[String], budget: Budget) -> bool {
-    lines.len() <= budget.lines
-        && lines
-            .iter()
-            .try_fold(0usize, |total, line| {
-                let next = total.checked_add(line.len())?;
-                (next <= budget.bytes).then_some(next)
-            })
-            .is_some()
+/// Which part of a [`Budget`] a file goes over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Over {
+    Lines,
+    Bytes,
 }
 
-/// Whether files named with extension `ext` have a syntax to highlight.
-pub fn has_syntax(ext: &str) -> bool {
-    highlighter()
-        .ss
-        .find_syntax_by_extension(ext)
-        .is_some_and(|s| s.name != "Plain Text")
+/// Check before cloning input for the worker, not only after allocating its copy.
+pub fn over_budget(lines: &[String], budget: Budget) -> Option<Over> {
+    if lines.len() > budget.lines {
+        return Some(Over::Lines);
+    }
+    lines
+        .iter()
+        .try_fold(0usize, |total, line| {
+            let next = total.checked_add(line.len())?;
+            (next <= budget.bytes).then_some(next)
+        })
+        .is_none()
+        .then_some(Over::Bytes)
+}
+
+/// The syntax of a file named with extension `ext` whose first line is `first`, as a shebang
+/// can name it; none for plain text.
+fn find_syntax<'a>(ss: &'a SyntaxSet, ext: &str, first: &str) -> Option<&'a SyntaxReference> {
+    ss.find_syntax_by_extension(ext)
+        .or_else(|| ss.find_syntax_by_first_line(first))
+        .filter(|s| s.name != "Plain Text")
+}
+
+/// Whether a file named with extension `ext` whose first line is `first` has a syntax to
+/// highlight.
+pub fn has_syntax(ext: &str, first: &str) -> bool {
+    find_syntax(&highlighter().ss, ext, first).is_some()
+}
+
+/// [`has_syntax`] on a thread of its own: the first look loads syntect's syntaxes, which
+/// takes too long for a frame.
+pub fn spawn_has_syntax(ext: String, first: String) -> Receiver<bool> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(has_syntax(&ext, &first));
+    });
+    rx
 }
 
 pub fn highlight(lines: &[String], ext: &str, dark: bool) -> Option<Vec<LineSpans>> {
@@ -84,17 +110,12 @@ fn highlight_within(
     dark: bool,
     budget: Budget,
 ) -> Option<Vec<LineSpans>> {
-    if !within_limits(lines, budget) {
+    if over_budget(lines, budget).is_some() {
         return None;
     }
     let h = highlighter();
     let first = lines.first().map(|s| s.as_str()).unwrap_or("");
-    let syntax =
-        h.ss.find_syntax_by_extension(ext)
-            .or_else(|| h.ss.find_syntax_by_first_line(first))?;
-    if syntax.name == "Plain Text" {
-        return None;
-    }
+    let syntax = find_syntax(&h.ss, ext, first)?;
     let theme = if dark { &h.dark } else { &h.light };
     let mut hl = HighlightLines::new(syntax, theme);
     let mut out = Vec::with_capacity(lines.len());
@@ -143,16 +164,36 @@ mod tests {
                 bytes: 16 << 20
             }
         );
-        assert!(within_limits(&["let n = 1;".into()], b));
-        assert!(!within_limits(&vec![String::new(); b.lines + 1], b));
+        assert_eq!(over_budget(&["let n = 1;".into()], b), None);
+        assert_eq!(
+            over_budget(&vec![String::new(); b.lines + 1], b),
+            Some(Over::Lines)
+        );
         let lines = vec!["x".repeat(b.bytes + 1)];
-        assert!(!within_limits(&lines, b));
+        assert_eq!(over_budget(&lines, b), Some(Over::Bytes));
         assert!(highlight(&lines, "rs", false).is_none());
         // A larger budget takes them.
-        assert!(within_limits(
-            &vec![String::new(); b.lines + 1],
-            Budget::of_mb(17)
-        ));
-        assert!(within_limits(&lines, Budget::of_mb(17)));
+        assert_eq!(
+            over_budget(&vec![String::new(); b.lines + 1], Budget::of_mb(17)),
+            None
+        );
+        assert_eq!(over_budget(&lines, Budget::of_mb(17)), None);
+    }
+
+    /// A file without a known extension has the syntax its shebang names, wherever it is
+    /// looked up.
+    #[test]
+    fn a_shebang_names_the_syntax_for_the_check_and_the_highlighter_alike() {
+        let script = vec!["#!/bin/bash".to_string(), "echo hi".into()];
+        assert!(has_syntax("", &script[0]));
+        assert!(spawn_has_syntax(String::new(), script[0].clone())
+            .recv()
+            .unwrap());
+        assert!(highlight(&script, "", false).is_some());
+        assert!(has_syntax("rs", ""));
+        assert!(!has_syntax("", "just words"));
+        assert!(highlight(&["just words".to_string()], "", false).is_none());
+        // A known extension of plain text wins over a first line.
+        assert!(!has_syntax("txt", &script[0]));
     }
 }

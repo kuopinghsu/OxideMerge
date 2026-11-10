@@ -39,6 +39,9 @@ pub struct Pane {
     hl_dark: bool,
     /// Too large to highlight within the budget of the options; said once in the status bar.
     hl_over_budget: bool,
+    /// What to say of a file found over the budget, which is worth saying only if it has a
+    /// syntax.
+    hl_note: Option<HlNote>,
     /// The budget (MiB) the highlighting was last started or refused with.
     hl_limit: u32,
     /// Number of times this pane was saved; undo snapshots from before a save are unsaved changes.
@@ -51,6 +54,15 @@ pub struct Pane {
     baseline: Vec<u32>,
     /// Lines inserted or changed since the document was loaded.
     edited: HashSet<usize>,
+}
+
+/// The status bar's word on a file over the highlighting budget, with the part of the budget
+/// it goes over.
+enum HlNote {
+    /// Waiting to hear whether the file has a syntax.
+    Asked(Receiver<bool>, syntax::Over),
+    /// It has: to be said with the other panes' notes.
+    Due(syntax::Over),
 }
 
 /// Modification time of a document's file. Documents with a description (unpacked or
@@ -85,6 +97,7 @@ impl Pane {
             hl_dirty: true,
             hl_dark: false,
             hl_over_budget: false,
+            hl_note: None,
             hl_limit: 0,
             saves: 0,
             disk_time,
@@ -5641,7 +5654,6 @@ impl TextView {
     // ---------- rendering ----------
 
     fn poll_highlight(&mut self, cfg: &Config) {
-        let mut over_budget = Vec::new();
         for p in &mut self.panes {
             if let Some(rx) = &p.hl_rx {
                 match rx.try_recv() {
@@ -5658,10 +5670,13 @@ impl TextView {
             }
             if !cfg.syntax_highlight {
                 p.hl = None;
+                p.hl_note = None;
+                p.hl_dirty = true;
                 continue;
             }
+            let restyle = p.hl_dirty || p.hl_dark != cfg.dark_mode;
             let limit_changed = p.hl_limit != cfg.highlight_limit_mb;
-            if (p.hl_dirty || p.hl_dark != cfg.dark_mode || limit_changed) && p.hl_rx.is_none() {
+            if (restyle || limit_changed) && p.hl_rx.is_none() {
                 p.hl_dirty = false;
                 p.hl_dark = cfg.dark_mode;
                 p.hl_limit = cfg.highlight_limit_mb;
@@ -5674,31 +5689,77 @@ impl TextView {
                     .unwrap_or_default();
                 // Check the highlighter's limit before cloning a potentially gigabyte document.
                 let budget = syntax::Budget::of_mb(cfg.highlight_limit_mb);
-                let over = !syntax::within_limits(&p.doc.lines, budget);
-                if !over {
-                    p.hl_rx = Some(syntax::spawn(
-                        p.doc.lines.clone(),
-                        ext,
-                        cfg.dark_mode,
-                        budget,
-                    ));
-                } else {
-                    p.hl = None;
-                    if !p.hl_over_budget && syntax::has_syntax(&ext) {
-                        over_budget.push(p.doc.title());
+                let over = syntax::over_budget(&p.doc.lines, budget);
+                match over {
+                    // The highlighting of a file within the old budget and the new one is
+                    // the same: only the budget changing does not start it again.
+                    None if restyle || p.hl_over_budget || p.hl.is_none() => {
+                        p.hl_note = None;
+                        p.hl_rx = Some(syntax::spawn(
+                            p.doc.lines.clone(),
+                            ext,
+                            cfg.dark_mode,
+                            budget,
+                        ));
+                    }
+                    None => {}
+                    Some(over) => {
+                        p.hl = None;
+                        if !p.hl_over_budget {
+                            let first = p.doc.lines.first().cloned().unwrap_or_default();
+                            p.hl_note =
+                                Some(HlNote::Asked(syntax::spawn_has_syntax(ext, first), over));
+                        }
                     }
                 }
-                p.hl_over_budget = over;
+                p.hl_over_budget = over.is_some();
+            }
+            if let Some(HlNote::Asked(rx, over)) = &p.hl_note {
+                match rx.try_recv() {
+                    Ok(true) => p.hl_note = Some(HlNote::Due(*over)),
+                    Ok(false) | Err(TryRecvError::Disconnected) => p.hl_note = None,
+                    Err(TryRecvError::Empty) => {}
+                }
             }
         }
-        if !over_budget.is_empty() {
-            self.status = trf(
-                "view.syntax_over_budget",
+        // Each pane's answer comes in a frame of its own: said together, one does not
+        // replace another in the status bar.
+        if self
+            .panes
+            .iter()
+            .any(|p| matches!(p.hl_note, Some(HlNote::Asked(..))))
+        {
+            return;
+        }
+        let (mut over_lines, mut over_bytes) = (Vec::new(), Vec::new());
+        for p in &mut self.panes {
+            match p.hl_note.take() {
+                Some(HlNote::Due(syntax::Over::Lines)) => over_lines.push(p.doc.title()),
+                Some(HlNote::Due(syntax::Over::Bytes)) => over_bytes.push(p.doc.title()),
+                _ => {}
+            }
+        }
+        let budget = syntax::Budget::of_mb(cfg.highlight_limit_mb);
+        let mb = cfg.highlight_limit_mb.max(1).to_string();
+        let mut said = Vec::new();
+        if !over_lines.is_empty() {
+            said.push(trf(
+                "view.syntax_over_line_budget",
                 &[
-                    ("file", over_budget.join(", ")),
-                    ("mb", cfg.highlight_limit_mb.max(1).to_string()),
+                    ("file", over_lines.join(", ")),
+                    ("lines", budget.lines.to_string()),
+                    ("mb", mb.clone()),
                 ],
-            );
+            ));
+        }
+        if !over_bytes.is_empty() {
+            said.push(trf(
+                "view.syntax_over_budget",
+                &[("file", over_bytes.join(", ")), ("mb", mb)],
+            ));
+        }
+        if !said.is_empty() {
+            self.status = said.join("  |  ");
         }
     }
 
@@ -9620,7 +9681,11 @@ impl TextView {
             self.edit_markers = cfg.show_edit_markers;
             self.update_edited();
         }
-        if self.panes.iter().any(|p| p.hl_rx.is_some()) {
+        if self
+            .panes
+            .iter()
+            .any(|p| p.hl_rx.is_some() || p.hl_note.is_some())
+        {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -12113,36 +12178,62 @@ mod tests {
     }
 
     /// A file past the highlighting budget of the options is shown plain, the status bar says
-    /// why once, and a larger budget highlights it.
+    /// once which part of the budget it is past, and a larger budget highlights it. Changing
+    /// only the budget leaves highlighting that is within both alone.
     #[test]
     fn files_past_the_highlight_budget_say_so_and_a_larger_budget_highlights_them() {
-        let text: String = (0..4_000)
-            .map(|i| format!("let value_{i} = {i}; // {}\n", "padding ".repeat(36)))
-            .collect();
-        assert!(text.len() > 1 << 20 && text.len() < 2 << 20);
-        let doc = || {
+        let doc = |text: String| {
             let mut d = TextDoc::from_text(None, &text);
             d.syntax = Some("rs".into());
             d
+        };
+        // Past 3,125 lines, but well within 1 MiB; and past 1 MiB in a few lines.
+        let many: String = (0..4_000).map(|i| format!("let v{i} = {i};\n")).collect();
+        let long: String = (0..1_000)
+            .map(|i| format!("let v{i} = {i}; // {}\n", "padding ".repeat(140)))
+            .collect();
+        assert!(many.len() < 1 << 20 && long.len() > 1 << 20 && long.len() < 2 << 20);
+        let settle = |v: &mut TextView, cfg: &Config| {
+            let started = std::time::Instant::now();
+            v.poll_highlight(cfg);
+            while v
+                .panes
+                .iter()
+                .any(|p| p.hl_rx.is_some() || p.hl_note.is_some())
+            {
+                assert!(started.elapsed() < std::time::Duration::from_secs(60));
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                v.poll_highlight(cfg);
+            }
         };
         let mut cfg = Config {
             highlight_limit_mb: 1,
             ..Config::default()
         };
-        let mut v = TextView::new(vec![doc(), doc()], &cfg);
+        let mut v = TextView::new(vec![doc(many), doc(long)], &cfg);
         v.poll_highlight(&cfg);
         assert!(v.panes.iter().all(|p| p.hl_rx.is_none() && p.hl.is_none()));
-        let said = trf(
-            "view.syntax_over_budget",
-            &[
-                ("file", format!("{t}, {t}", t = v.panes[0].doc.title())),
-                ("mb", "1".into()),
-            ],
+        settle(&mut v, &cfg);
+        let title = v.panes[0].doc.title();
+        let said = format!(
+            "{}  |  {}",
+            trf(
+                "view.syntax_over_line_budget",
+                &[
+                    ("file", title.clone()),
+                    ("lines", "3125".into()),
+                    ("mb", "1".into())
+                ],
+            ),
+            trf(
+                "view.syntax_over_budget",
+                &[("file", title), ("mb", "1".into())],
+            ),
         );
         assert_eq!(v.status, said);
         v.status.clear();
         v.panes[0].hl_dirty = true;
-        v.poll_highlight(&cfg);
+        settle(&mut v, &cfg);
         assert_eq!(v.status, "", "said once, not on every check");
 
         cfg.highlight_limit_mb = 2;
@@ -12151,6 +12242,19 @@ mod tests {
             v.panes.iter().all(|p| p.hl_rx.is_some()),
             "highlighting started"
         );
+        settle(&mut v, &cfg);
+        assert!(v.panes.iter().all(|p| p.hl.is_some()));
+
+        cfg.highlight_limit_mb = 3;
+        v.poll_highlight(&cfg);
+        assert!(
+            v.panes.iter().all(|p| p.hl_rx.is_none() && p.hl.is_some()),
+            "highlighting within both budgets is kept"
+        );
+        cfg.highlight_limit_mb = 1;
+        settle(&mut v, &cfg);
+        assert!(v.panes.iter().all(|p| p.hl.is_none()));
+        assert_eq!(v.status, said, "said again once within the budget before");
     }
 
     /// The memory the benchmarks report is counted for each kind, and an edit shows up as

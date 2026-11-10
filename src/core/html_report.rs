@@ -24,6 +24,10 @@ pub(crate) const LINE_CHARS: usize = 2_000;
 /// Rows shown in a text report, all differences together; the differences after them are only
 /// counted, keeping the page small enough for a browser.
 const REPORT_ROWS: usize = 20_000;
+/// Bytes of the files and differences of a folder report at most, at any detail: past them,
+/// the differences of the files left are only counted, so a report of many large files is not
+/// built beyond what memory holds.
+const REPORT_BYTES: usize = 1 << 30;
 
 /// How much of the differences an HTML report shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -35,7 +39,8 @@ pub enum ReportDetail {
     /// characters per line.
     #[default]
     Standard,
-    /// Every row of every difference, whole lines; the page grows with the differences.
+    /// Every row of every difference, whole lines; the page grows with the differences, a
+    /// folder report up to [`REPORT_BYTES`].
     Full,
 }
 
@@ -66,16 +71,19 @@ impl ReportDetail {
                 rows: 0,
                 hunk: 0,
                 chars: LINE_CHARS,
+                bytes: REPORT_BYTES,
             },
             Self::Standard => Limits {
                 rows: REPORT_ROWS,
                 hunk: HUNK_MAX_ROWS,
                 chars: LINE_CHARS,
+                bytes: REPORT_BYTES,
             },
             Self::Full => Limits {
                 rows: usize::MAX,
                 hunk: usize::MAX,
                 chars: usize::MAX,
+                bytes: REPORT_BYTES,
             },
         }
     }
@@ -90,6 +98,8 @@ pub(crate) struct Limits {
     pub hunk: usize,
     /// Characters of one line.
     pub chars: usize,
+    /// Bytes of the files listed in a folder report, with their differences.
+    pub bytes: usize,
 }
 /// Rows of a table difference read field by field at most.
 const FIELD_ROWS: usize = 50;
@@ -898,6 +908,18 @@ pub(crate) fn summary_reason(
     with_diffs: bool,
     redact: &Redact,
 ) -> Option<String> {
+    let unread = (!with_diffs).then(|| tr("report.why_scope").to_string());
+    reason(it, n, diffs, unread, redact)
+}
+
+/// As [`summary_reason`]; `unread` says why no file was read, when none was.
+fn reason(
+    it: &DirItem,
+    n: usize,
+    diffs: &FileDiffs,
+    unread: Option<String>,
+    redact: &Redact,
+) -> Option<String> {
     let changed = matches!(status_class(it.status), "different" | "unique" | "error");
     match diffs {
         _ if !changed => None,
@@ -905,8 +927,8 @@ pub(crate) fn summary_reason(
         FileDiffs::Note(note) => Some(redact.apply(note)),
         FileDiffs::None => Some(if it.status == CmpStatus::Error {
             redact.apply(&status_text(it, n))
-        } else if !with_diffs {
-            tr("report.why_scope").to_string()
+        } else if let Some(unread) = unread {
+            unread
         } else if it.is_dir {
             tr("report.why_folder").to_string()
         } else if it.binary {
@@ -1316,6 +1338,12 @@ pub fn text_report(
         // One difference is always shown, however long.
         shown.max(1).min(total)
     };
+    // A summary lists where each difference is, as many as the rows a standard report holds.
+    let listed = if detail == ReportDetail::Summary {
+        total.min(REPORT_ROWS)
+    } else {
+        shown
+    };
     let mut out = String::new();
     let title = tr("report.text_title");
     page_start(
@@ -1383,10 +1411,10 @@ pub fn text_report(
     if ignored > 0 {
         cards.push(("", ignored.to_string(), tr("report.ignored")));
     }
-    if shown < total && detail != ReportDetail::Summary {
+    if listed < total {
         cards.push((
             "",
-            (total - shown).to_string(),
+            (total - listed).to_string(),
             tr("report.blocks_left_out"),
         ));
     }
@@ -1408,7 +1436,7 @@ pub fn text_report(
             "<div class=\"file\"><ol class=\"sumlist\" aria-label=\"{}\">",
             esc(tr("report.differences"))
         );
-        for (k, (b, _)) in list.iter().enumerate() {
+        for (k, (b, _)) in list.iter().take(listed).enumerate() {
             let (kclass, label) = kind(result, *b);
             let blk = &result.blocks[*b];
             let sides: Vec<String> = blk
@@ -1425,7 +1453,12 @@ pub fn text_report(
                 sides.join(" &nbsp;")
             );
         }
-        body.push_str("</ol></div>");
+        body.push_str("</ol>");
+        if listed < total {
+            let more = trf("report.more_diffs", &[("n", (total - listed).to_string())]);
+            let _ = write!(body, "<div class=\"note\">{}</div>", esc(&more));
+        }
+        body.push_str("</div>");
     } else {
         body.push_str("<div class=\"file\"><div class=\"body\" style=\"border-top:0\">");
         let doc = Doc {
@@ -1452,14 +1485,15 @@ pub fn text_report(
     if detail == ReportDetail::Summary && total > 0 {
         omissions.push(trf(
             "report.omit_detail_summary",
-            &[("n", total.to_string())],
+            &[("n", listed.to_string())],
         ));
-    } else if shown < total {
+    }
+    if listed < total {
         omissions.push(trf(
             "report.omit_limit",
             &[
-                ("n", (total - shown).to_string()),
-                ("rows", fmt_size(Some(limits.rows as u64))),
+                ("n", (total - listed).to_string()),
+                ("rows", fmt_size(Some(REPORT_ROWS as u64))),
             ],
         ));
     }
@@ -1935,6 +1969,20 @@ pub fn folder_report(
     rules: &str,
     info: &FolderReportInfo,
 ) -> String {
+    let limits = info.detail.limits();
+    folder_report_within(items, roots, display, opts, rules, info, limits)
+}
+
+/// As [`folder_report`], showing at most `limits`.
+fn folder_report_within(
+    items: &[&DirItem],
+    roots: &[PathBuf],
+    display: &[PathBuf],
+    opts: Option<&DiffOptions>,
+    rules: &str,
+    info: &FolderReportInfo,
+    limits: Limits,
+) -> String {
     let n = display.len();
     let redact = Redact::new(info.hide_paths, roots, display);
     let mut listed: Vec<&DirItem> = items
@@ -1962,14 +2010,24 @@ pub fn folder_report(
     let mut files = String::new();
     let mut toc = String::new();
     let mut toc_len = 0;
-    // Blocks shown, left out by the size limit, and shown with rows or lines cut.
-    let (mut shown_blocks, mut left_out, mut cut_blocks) = (0, 0, 0);
+    // Blocks shown, left out by the row limit or the byte limit, and shown with rows or lines
+    // cut.
+    let (mut shown_blocks, mut left_out, mut left_out_bytes, mut cut_blocks) = (0, 0, 0, 0);
     let mut summary_only = 0;
     let mut total_ignored = 0;
     let mut any_hunks = false;
     // All files share the size limit of a text report; a summary reads no file.
-    let limits = info.detail.limits();
     let shown_opts = opts.filter(|_| info.detail != ReportDetail::Summary);
+    let unread = if opts.is_none() {
+        Some(tr("report.why_scope").to_string())
+    } else if shown_opts.is_none() {
+        Some(trf(
+            "report.why_detail_summary",
+            &[("detail", ReportDetail::Summary.label().to_string())],
+        ))
+    } else {
+        None
+    };
     let mut budget = limits.rows;
     let dopts = opts.cloned().unwrap_or_default();
     let anchors = file_anchors(&listed);
@@ -1987,7 +2045,7 @@ pub fn folder_report(
         let mut body = String::new();
         let mut badges = String::new();
         let (mut rendered, mut total) = (0, 0);
-        let why = summary_reason(it, n, &diffs, shown_opts.is_some(), &redact);
+        let why = reason(it, n, &diffs, unread.clone(), &redact);
         if let FileDiffs::Diffs(docs, result) = &diffs {
             let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
             let list = hunks(result);
@@ -2029,7 +2087,12 @@ pub fn folder_report(
                 extracted,
             };
             let mut cut = 0;
+            let mut full = false;
             for (j, h) in list.into_iter().enumerate() {
+                if files.len() + body.len() >= limits.bytes {
+                    full = true;
+                    break;
+                }
                 let cost = h.1.len().min(limits.hunk);
                 if cost > budget {
                     break;
@@ -2050,7 +2113,11 @@ pub fn folder_report(
             }
             cut_blocks += cut;
             if rendered < total {
-                left_out += total - rendered;
+                if full {
+                    left_out_bytes += total - rendered;
+                } else {
+                    left_out += total - rendered;
+                }
                 let more = trf(
                     "report.more_diffs",
                     &[("n", (total - rendered).to_string())],
@@ -2219,15 +2286,19 @@ pub fn folder_report(
     if other > 0 {
         cards.push(("", other.to_string(), tr("report.not_compared")));
     }
-    if opts.is_some() {
+    if shown_opts.is_some() {
         cards.push((
             "acc",
             shown_blocks.to_string(),
             tr("report.blocks_exported"),
         ));
     }
-    if left_out > 0 {
-        cards.push(("", left_out.to_string(), tr("report.blocks_left_out")));
+    if left_out + left_out_bytes > 0 {
+        cards.push((
+            "",
+            (left_out + left_out_bytes).to_string(),
+            tr("report.blocks_left_out"),
+        ));
     }
     if total_ignored > 0 {
         cards.push(("", total_ignored.to_string(), tr("report.ignored")));
@@ -2246,6 +2317,15 @@ pub fn folder_report(
             &[
                 ("n", left_out.to_string()),
                 ("rows", fmt_size(Some(limits.rows as u64))),
+            ],
+        ));
+    }
+    if left_out_bytes > 0 {
+        omissions.push(trf(
+            "report.omit_bytes",
+            &[
+                ("n", left_out_bytes.to_string()),
+                ("size", format!("{} MiB", limits.bytes >> 20)),
             ],
         ));
     }
@@ -2619,6 +2699,115 @@ mod tests {
         assert!(summary.contains(&esc(&omitted)), "both files are counted");
         assert!(summary.contains(&policy(ReportDetail::Summary)));
         assert!(summary.len() < standard.len());
+        // Differences were asked for: the files say it is the detail that left them out, and
+        // no count of exported blocks says none were found.
+        let why = trf(
+            "report.why_detail_summary",
+            &[("detail", ReportDetail::Summary.label().to_string())],
+        );
+        assert_eq!(
+            summary
+                .matches(&format!("<div class=\"why\">{}</div>", esc(&why)))
+                .count(),
+            2
+        );
+        assert!(!summary.contains(&esc(tr("report.why_scope"))));
+        assert!(!summary.contains(&esc(tr("report.blocks_exported"))));
+        assert!(standard.contains(&esc(tr("report.blocks_exported"))));
+    }
+
+    #[test]
+    fn a_full_folder_report_stops_showing_differences_at_its_byte_limit() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        // 50 blocks in each of three files.
+        let side =
+            |s: &str| -> String { (0..50).map(|i| format!("same {i}\n{s} {i}\n")).collect() };
+        for f in ["1.txt", "2.txt", "3.txt"] {
+            std::fs::write(a.path().join(f), side("left")).unwrap();
+            std::fs::write(b.path().join(f), side("right")).unwrap();
+        }
+        let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        let opts = DiffOptions::default();
+        let items = scan(&roots, &opts);
+        let refs: Vec<&DirItem> = items.iter().collect();
+        let info = FolderReportInfo {
+            detail: ReportDetail::Full,
+            ..FolderReportInfo::default()
+        };
+        let with = |bytes| {
+            let limits = Limits {
+                bytes,
+                ..ReportDetail::Full.limits()
+            };
+            folder_report_within(&refs, &roots, &roots, Some(&opts), "", &info, limits)
+        };
+        let whole = with(REPORT_BYTES);
+        assert_eq!(whole.matches("class=\"hunk").count(), 150);
+        assert!(whole.contains(&esc(tr("report.complete"))));
+
+        let bytes = 20_000;
+        let html = with(bytes);
+        let shown = html.matches("class=\"hunk").count();
+        assert!(shown > 0 && shown < 100, "{shown}");
+        assert!(html.len() < whole.len() / 2);
+        assert!(!html.contains(&esc(tr("report.complete"))));
+        let omitted = trf(
+            "report.omit_bytes",
+            &[
+                ("n", (150 - shown).to_string()),
+                ("size", format!("{} MiB", bytes >> 20)),
+            ],
+        );
+        assert!(html.contains(&esc(&omitted)), "{html}");
+        let left = format!(
+            "<div class=\"v\">{}</div><div class=\"l\">{}</div>",
+            150 - shown,
+            esc(tr("report.blocks_left_out"))
+        );
+        assert!(html.contains(&left));
+        // Whole lines and every row still, for what is shown.
+        assert!(!html.contains(&esc(tr("report.shortened"))));
+    }
+
+    #[test]
+    fn a_summary_text_report_lists_as_many_differences_as_a_standard_one_holds_rows() {
+        let total = REPORT_ROWS + 5;
+        let side = |s: &str| -> Vec<String> {
+            (0..total)
+                .flat_map(|i| [format!("same {i}"), format!("{s} {i}")])
+                .collect()
+        };
+        let (a, b) = (side("left"), side("right"));
+        let opts = DiffOptions::default();
+        let r = crate::core::diff::compute(&[&a, &b], &opts);
+        assert_eq!(hunks(&r).len(), total);
+        let titles = ["a".to_string(), "b".to_string()];
+        let html = text_report(
+            &titles,
+            &[&a, &b],
+            &r,
+            &opts,
+            &[],
+            "",
+            ReportDetail::Summary,
+        );
+        assert_eq!(html.matches("<li id=\"d").count(), REPORT_ROWS);
+        assert!(!html.contains(&format!("<li id=\"d{REPORT_ROWS}\">")));
+        let listed = trf(
+            "report.omit_detail_summary",
+            &[("n", REPORT_ROWS.to_string())],
+        );
+        assert!(html.contains(&esc(&listed)));
+        let limit = trf(
+            "report.omit_limit",
+            &[
+                ("n", "5".into()),
+                ("rows", fmt_size(Some(REPORT_ROWS as u64))),
+            ],
+        );
+        assert!(html.contains(&esc(&limit)));
+        let more = trf("report.more_diffs", &[("n", "5".into())]);
+        assert!(html.contains(&esc(&more)));
     }
 
     #[test]

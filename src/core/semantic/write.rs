@@ -753,17 +753,45 @@ mod tests {
     }
 
     /// Copies every change of `a` → `b` from `from`, as [`converge`], checking that each step's
-    /// text keeps every byte of the side it changes outside one stretch.
+    /// text keeps every byte of the side it changes outside one stretch, which lies within the
+    /// lines of the node holding the change on that side.
     fn every_copy(a: &str, b: &str, format: Format, from: usize) -> String {
+        let to = 1 - from;
         let mut docs = [a.to_string(), b.to_string()];
         for _ in 0..50 {
             let r = compare(&docs[0], &docs[1], format);
             assert!(r.errors.is_empty(), "{:?}", r.errors);
             let Some(change) = r.changes.iter().find(|c| c.kind != ChangeKind::Moved) else {
-                return docs[1 - from].clone();
+                return docs[to].clone();
             };
             let text = copy_change(change, [&docs[0], &docs[1]], format, from).unwrap();
-            docs[1 - from] = text;
+            let old = docs[to].as_bytes();
+            let same =
+                |x: &mut dyn Iterator<Item = (&u8, &u8)>| x.take_while(|(a, b)| a == b).count();
+            let start = same(&mut old.iter().zip(text.as_bytes()));
+            let end = old.len()
+                - same(&mut old.iter().rev().zip(text.as_bytes().iter().rev()))
+                    .min(old.len().min(text.len()) - start);
+            let steps = segments(&change.at[to]);
+            let root = parse(&docs[to], format).unwrap();
+            let holder = find_steps(&root, &steps[..steps.len().saturating_sub(1)]).unwrap();
+            // A line taken out or put in takes its line break with it.
+            let span = &holder.span.bytes;
+            let within = old[..span.start]
+                .iter()
+                .rposition(|&c| c == b'\n')
+                .map_or(0, |i| i + 1)
+                ..old[span.end..]
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .map_or(old.len(), |i| span.end + i + 1);
+            assert!(
+                within.start <= start && end <= within.end,
+                "{start}..{end} outside {within:?} of {:?}:\n{}\n{text}",
+                change.at[to],
+                docs[to]
+            );
+            docs[to] = text;
         }
         panic!("no end: {docs:?}");
     }

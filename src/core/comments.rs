@@ -157,7 +157,9 @@ pub fn strip<S: AsRef<str>>(lines: &[S], syn: &CommentSyntax) -> Vec<Stripped> {
     let mut in_block: Option<&str> = None;
     lines
         .iter()
-        .map(|line| {
+        .enumerate()
+        .map(|(n, line)| {
+            super::cancel::check_every(n, 1 << 16);
             let line = line.as_ref();
             let mut code = String::with_capacity(line.len());
             let mut had_comment = false;

@@ -1448,9 +1448,11 @@ fn run_jobs(file: &std::path::Path, yes: bool, base: &Config) -> anyhow::Result<
 }
 
 /// Fetches the paths of `cli` that are on a server (see [`core::remote_url`]) to temporary
-/// copies, which it then compares instead.
+/// copies, which it then compares instead. `in_place` is the *Save remote files in place*
+/// setting, for writing them back.
 fn stage_remote(
     cli: &mut Cli,
+    in_place: bool,
     cancel: &AtomicBool,
 ) -> anyhow::Result<Vec<core::remote_url::Staged>> {
     let remote = |p: &PathBuf| p.to_str().is_some_and(core::remote_url::is_remote_url);
@@ -1467,7 +1469,7 @@ fn stage_remote(
         active: cli.ftp_active,
         client_cert: cli.client_cert.clone(),
         client_key: cli.client_key.clone(),
-        in_place: false,
+        in_place,
         port_given: false,
     };
     let staged = core::remote_url::stage(&mut cli.paths, &creds, cancel)?;
@@ -1568,7 +1570,7 @@ pub(crate) fn job_summary(
                     )]
                 )
             );
-            let staged = stage_remote(&mut cli, stop)?;
+            let staged = stage_remote(&mut cli, cfg.remote_in_place, stop)?;
             let result = if job.kind == JobKind::Sync {
                 sync_now(&cli, &cfg, prepared.allow_large_deletion, stop)
                     .map(|(code, report)| (code, Some(report)))
@@ -1811,7 +1813,7 @@ fn main() -> ExitCode {
     let never = AtomicBool::new(false);
     cli.paths = paths;
     core::remote::set_asker(Some(std::sync::Arc::new(prompt::ask)));
-    let staged = match stage_remote(&mut cli, &never) {
+    let staged = match stage_remote(&mut cli, cfg.remote_in_place, &never) {
         Ok(staged) => staged,
         Err(e) => {
             eprintln!("error: {e:#}");

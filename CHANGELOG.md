@@ -35,7 +35,9 @@ uses its section of this file as the release notes.
   *Restore*, *Show details*, *Discard* or *Later*. Restoring reopens the comparisons with the
   unsaved text back in their sides, still unsaved, and names the files that changed since;
   it never writes a compared file. The text cursor's line and the bookmarks come back too.
-  Snapshots keep at most 32 MB of unsaved text, five snapshots at most are kept, and one
+  Unsaved text whose files can no longer be opened comes back in a new text compare and is
+  offered again at the next start. A running window locks its snapshot, so no other window
+  takes it for one left behind, however long it goes without writing. Snapshots keep at most 32 MB of unsaved text, five snapshots at most are kept, and one
   written by a later version is not restored. *Keep for recovery* in a tab's context menu
   leaves that one comparison out.
 - **Compare over SFTP and FTP:** *File → Compare over SFTP/FTP...*, and a "Browse a server
@@ -651,6 +653,10 @@ uses its section of this file as the release notes.
 
 ### Fixed
 
+- **Paths that are not valid Unicode reopen:** a file whose name is not valid UTF-8 on Linux
+  (or holds a lone UTF-16 surrogate on Windows) was saved in the session, a workspace or a
+  recovery snapshot with its odd characters replaced, so it could not be opened again. Such a
+  path is now kept exactly beside its readable text; older settings still load as before.
 - **The Rules tab of Options fits a small window:** in French, Japanese, Russian, Spanish
   and Portuguese its row of buttons widened the dialog past an 800 × 600 window when no rules
   file existed yet, and in every language a rules file with a long name or description did

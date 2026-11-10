@@ -197,8 +197,8 @@ struct UploadDone {
 
 /// What an [`UploadJob`] wrote.
 enum Uploaded {
-    /// A file, now as this stamp says on the server.
-    File(remote::RemoteStamp),
+    /// A file, now as its stamp says on the server.
+    File(crate::core::remote_stage::Saved),
     /// What changed in a folder, as far as it could be written.
     Folder(remote_sync::Saved),
 }
@@ -1896,6 +1896,11 @@ struct PendingOpen {
     /// The paths to add to the recent comparisons once the tab opens; not if it fails or is
     /// cancelled.
     recent: Option<Vec<String>>,
+    /// The temporary copies the files are read from and, for each side, the server it was
+    /// fetched from: claimed when the open starts, since the path fields that kept them are
+    /// gone by then, and handed to the tab.
+    temps: Vec<std::sync::Arc<tempfile::TempDir>>,
+    remote: Vec<Option<RemoteFile>>,
 }
 
 /// Files together at least this large are compared on another thread, with a *Cancel*
@@ -1941,8 +1946,28 @@ const UNDO_TOAST_SECS: f64 = 8.0;
 /// Snapshots left behind, offered at the start (see [`OxideMergeApp::recovery_dialog`]).
 struct RecoveryOffer {
     found: Vec<recovery::Found>,
+    /// For each of `found`, each of its tabs and each of its files: whether the file changed
+    /// since. Found out once, not on every frame the dialog is drawn.
+    changed: Vec<Vec<Vec<bool>>>,
     /// Whether the dialog lists what each snapshot holds.
     inspect: bool,
+}
+
+impl RecoveryOffer {
+    fn new(found: Vec<recovery::Found>) -> RecoveryOffer {
+        let changed = found
+            .iter()
+            .map(|f| match &f.snapshot {
+                Ok(s) => s.tabs.iter().map(|t| t.changed_sources()).collect(),
+                Err(_) => Vec::new(),
+            })
+            .collect();
+        RecoveryOffer {
+            found,
+            changed,
+            inspect: false,
+        }
+    }
 }
 
 /// The most workspaces listed in the *Workspaces* menu; *Manage workspaces...* lists them all.
@@ -2061,12 +2086,19 @@ pub struct OxideMergeApp {
     /// The widget that had the keyboard focus before a dialog opened, given it back once the
     /// last dialog closes; while no dialog is open, the focus at the start of the last frame.
     focus_before_dialog: Option<egui::Id>,
+    /// While a dialog is open, the focus at the start of the last frame.
+    focus_in_dialog: Option<egui::Id>,
     /// Whether a dialog was open in the last frame.
     was_modal: bool,
     /// The file name of this run's recovery snapshot (see [`recovery::own_name`]).
     recovery_name: String,
     /// When this run's snapshot was last written; `None` while it has none.
     recovery_at: Option<std::time::Instant>,
+    /// The lock of this run's snapshot, held from its first write (see [`recovery::lock`]).
+    recovery_lock: Option<std::fs::File>,
+    recovery_writer: recovery::Writer,
+    /// Whether recovery was on in the last frame.
+    recovery_on: bool,
     /// Snapshots left behind by programs that did not close normally, offered at the start.
     recovery_offer: Option<RecoveryOffer>,
     /// The widget being given the focus back after a dialog, and how many more frames to try.
@@ -2933,9 +2965,13 @@ impl OxideMergeApp {
             pass_on: None,
             was_focused: true,
             focus_before_dialog: None,
+            focus_in_dialog: None,
             was_modal: false,
             recovery_name: recovery::own_name(),
             recovery_at: None,
+            recovery_lock: None,
+            recovery_writer: recovery::Writer::default(),
+            recovery_on: false,
             recovery_offer: None,
             focus_back: None,
             next_tab_id: 0,
@@ -2974,6 +3010,8 @@ impl OxideMergeApp {
         }
         if app.cfg.recovery && !cfg!(test) {
             app.find_recovery();
+        } else if let Some(dir) = recovery::dir().filter(|_| !cfg!(test)) {
+            recovery::forget_abandoned(&dir, &app.recovery_name);
         }
         if let (Some(u), Some(p)) = (crate::config::unreadable(), crate::config::config_path()) {
             app.error(crate::config::unreadable_message(
@@ -3006,9 +3044,11 @@ impl OxideMergeApp {
         let mut active = None;
         let mut failed = 0;
         for (i, s) in tabs.iter().enumerate() {
+            let paths = s.paths();
             if s.paths
                 .iter()
-                .any(|p| !web::is_url(p) && !Path::new(p).exists())
+                .zip(&paths)
+                .any(|(text, p)| !web::is_url(text) && !p.exists())
             {
                 failed += 1;
                 continue;
@@ -3022,7 +3062,7 @@ impl OxideMergeApp {
             };
             let before = self.tabs.len();
             let req = OpenRequest {
-                paths: s.paths.iter().map(PathBuf::from).collect(),
+                paths,
                 kind,
                 skip_recent: true,
                 rules: s.rules.clone(),
@@ -3078,11 +3118,7 @@ impl OxideMergeApp {
                 Content::Folder(v) => Some(v.rules.clone()).filter(|r| *r != self.cfg.rules),
                 _ => None,
             };
-            Some(SessionTab {
-                paths: t.source.iter().map(|p| p.display().to_string()).collect(),
-                kind: kind.map(str::to_string),
-                rules,
-            })
+            Some(SessionTab::new(&t.source, kind.map(str::to_string), rules))
         };
         tab(t)
     }
@@ -3105,7 +3141,18 @@ impl OxideMergeApp {
                 Content::Text(v) => (
                     v.panes
                         .iter()
-                        .map(|p| p.doc.modified.then(|| p.doc.text()))
+                        .map(|p| {
+                            if !p.doc.modified {
+                                return None;
+                            }
+                            let len = p.doc.lines.iter().map(|l| l.len() + 2).sum();
+                            if recovery::within_budget(len, &mut used) {
+                                Some(p.doc.text())
+                            } else {
+                                left_out += 1;
+                                None
+                            }
+                        })
                         .collect(),
                     v.cur_block,
                     v.caret_line(),
@@ -3116,16 +3163,10 @@ impl OxideMergeApp {
                 ),
                 _ => (Vec::new(), None, None, Vec::new()),
             };
-            let (unsaved, out) = recovery::within_budget(unsaved, &mut used);
-            left_out += out;
-            let sources = tab
-                .paths
-                .iter()
-                .map(|p| recovery::Fingerprint::of(Path::new(p)))
-                .collect();
             tabs.push(recovery::RecoveredTab {
                 tab,
-                sources,
+                // Read by the thread that writes the snapshot.
+                sources: Vec::new(),
                 unsaved,
                 block,
                 caret,
@@ -3137,15 +3178,26 @@ impl OxideMergeApp {
 
     /// Writes this run's recovery snapshot when recovery is on: every few seconds while a tab
     /// has unsaved edits, else every [`recovery::BEAT`], on another thread. With recovery off,
-    /// or nothing open, there is no snapshot.
-    fn keep_recovery(&mut self) {
+    /// or nothing open, there is no snapshot; turning recovery off also deletes those of
+    /// programs no longer running.
+    fn keep_recovery(&mut self, ctx: &egui::Context) {
         let Some(dir) = recovery::dir() else {
             return;
         };
         let path = dir.join(&self.recovery_name);
-        if !self.cfg.recovery || self.tabs.is_empty() {
+        if !self.cfg.recovery {
+            if std::mem::take(&mut self.recovery_on) {
+                self.recovery_at = None;
+                self.recovery_lock = None;
+                self.recovery_writer.remove(&path, true);
+                recovery::forget_abandoned(&dir, &self.recovery_name);
+            }
+            return;
+        }
+        self.recovery_on = true;
+        if self.tabs.is_empty() {
             if self.recovery_at.take().is_some() {
-                recovery::remove(&path);
+                self.recovery_writer.remove(&path, false);
             }
             return;
         }
@@ -3158,20 +3210,33 @@ impl OxideMergeApp {
         } else {
             recovery::BEAT
         };
-        if self.recovery_at.is_some_and(|at| at.elapsed() < every) {
-            return;
+        // The window draws nothing while left alone: woken for the last edits, and for the beat
+        // that alone tells other programs this one runs when it holds no lock.
+        let wake = edited || self.recovery_lock.is_none();
+        if let Some(at) = self.recovery_at {
+            let left = every.saturating_sub(at.elapsed());
+            if !left.is_zero() {
+                if wake {
+                    ctx.request_repaint_after(left);
+                }
+                return;
+            }
         }
         self.recovery_at = Some(std::time::Instant::now());
         let snapshot = self.recovery_snapshot();
         if snapshot.tabs.is_empty() {
             // Every tab left out, or none that can be opened again: nothing to keep.
-            recovery::remove(&path);
+            self.recovery_writer.remove(&path, false);
             return;
         }
-        let name = self.recovery_name.clone();
-        std::thread::spawn(move || {
-            let _ = recovery::write(&dir, &name, &snapshot);
-        });
+        if self.recovery_lock.is_none() {
+            self.recovery_lock = recovery::lock(&dir, &self.recovery_name);
+        }
+        if wake {
+            ctx.request_repaint_after(every);
+        }
+        self.recovery_writer
+            .write(dir, self.recovery_name.clone(), snapshot);
     }
 
     /// Offers the snapshots that programs which did not close normally left behind.
@@ -3181,18 +3246,19 @@ impl OxideMergeApp {
         };
         let found = recovery::abandoned(&dir, &self.recovery_name, std::time::SystemTime::now());
         if !found.is_empty() {
-            self.recovery_offer = Some(RecoveryOffer {
-                found,
-                inspect: false,
-            });
+            self.recovery_offer = Some(RecoveryOffer::new(found));
         }
     }
 
     /// Opens the tabs of `snapshot` with their unsaved text in their sides, unsaved, and says
-    /// which files changed since. Nothing is written to the compared files.
-    fn restore_snapshot(&mut self, snapshot: &recovery::Snapshot) {
+    /// which files changed since. Nothing is written to the compared files. A tab already open
+    /// on the same files, unedited (from the session), takes the text instead of a second tab.
+    /// The text of a tab that cannot be opened from its files any more (one moved, or a new
+    /// file never saved) opens in a new text compare; it is returned, to keep.
+    fn restore_snapshot(&mut self, snapshot: &recovery::Snapshot) -> Vec<recovery::RecoveredTab> {
         let mut changed = Vec::new();
         let mut failed = 0;
+        let mut kept = Vec::new();
         let mut first = None;
         for (i, r) in snapshot.tabs.iter().enumerate() {
             for (p, c) in r.tab.paths.iter().zip(r.changed_sources()) {
@@ -3200,10 +3266,25 @@ impl OxideMergeApp {
                     changed.push(p.clone());
                 }
             }
-            let before = self.tabs.len();
-            let (opened, _) = self.open_saved_tabs(std::slice::from_ref(&r.tab), 0);
-            let Some(at) = opened.filter(|_| self.tabs.len() > before) else {
+            let paths = r.tab.paths();
+            let open = self
+                .tabs
+                .iter()
+                .position(|t| t.source == paths && !t.is_modified());
+            let at = match open {
+                Some(at) => Some(at),
+                None => {
+                    let before = self.tabs.len();
+                    let (opened, _) = self.open_saved_tabs(std::slice::from_ref(&r.tab), 0);
+                    opened.filter(|_| self.tabs.len() > before)
+                }
+            };
+            let Some(at) = at else {
                 failed += 1;
+                if r.unsaved.iter().any(Option::is_some) {
+                    self.open_unsaved_text(r);
+                    kept.push(r.clone());
+                }
                 continue;
             };
             if i == snapshot.active || first.is_none() {
@@ -3250,6 +3331,10 @@ impl OxideMergeApp {
             msg.push(' ');
             msg.push_str(&trf("recovery.not_reopened", &[("n", failed.to_string())]));
         }
+        if !kept.is_empty() {
+            msg.push(' ');
+            msg.push_str(&trf("recovery.kept", &[("n", kept.len().to_string())]));
+        }
         if !changed.is_empty() {
             msg.push(' ');
             msg.push_str(&trf(
@@ -3258,6 +3343,34 @@ impl OxideMergeApp {
             ));
         }
         self.push_toast(msg, !changed.is_empty() || failed > 0, None);
+        kept
+    }
+
+    /// Opens the unsaved text of `r`, whose files cannot be opened, in a new text compare: each
+    /// side named after its file, to save where the user chooses.
+    fn open_unsaved_text(&mut self, r: &recovery::RecoveredTab) {
+        let mut docs: Vec<TextDoc> = r
+            .unsaved
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let mut d = match text {
+                    Some(text) => {
+                        let mut d = TextDoc::from_text(None, text);
+                        d.modified = true;
+                        d
+                    }
+                    None => blank_doc(),
+                };
+                d.description = r.tab.paths.get(i).cloned();
+                d
+            })
+            .collect();
+        while docs.len() < 2 {
+            docs.push(blank_doc());
+        }
+        let v = TextView::new(docs, &self.cfg);
+        self.push_tab(Content::Text(v), Vec::new());
     }
 
     /// The prompt for snapshots left behind: *Restore*, *Show details* (what each holds and
@@ -3274,11 +3387,13 @@ impl OxideMergeApp {
             .collect();
         let tabs: usize = usable.iter().map(|s| s.tabs.len()).sum();
         let unsaved: usize = usable.iter().map(|s| s.unsaved_sides()).sum();
-        let changed: usize = usable
+        let changed = offer
+            .changed
             .iter()
-            .flat_map(|s| &s.tabs)
-            .map(|t| t.changed_sources().iter().filter(|&&c| c).count())
-            .sum();
+            .flatten()
+            .flatten()
+            .filter(|&&c| c)
+            .count();
         let modal = egui::Modal::new(egui::Id::unique("recovery_dialog")).show(ctx, |ui| {
             ui.set_width(520.0);
             ui.heading(tr("recovery.title"));
@@ -3302,7 +3417,7 @@ impl OxideMergeApp {
                 egui::ScrollArea::vertical()
                     .max_height(260.0)
                     .show(ui, |ui| {
-                        for f in &offer.found {
+                        for (f, changed) in offer.found.iter().zip(&offer.changed) {
                             ui.separator();
                             ui.monospace(f.path.display().to_string());
                             match &f.snapshot {
@@ -3310,9 +3425,8 @@ impl OxideMergeApp {
                                     ui.colored_label(ui.visuals().error_fg_color, e);
                                 }
                                 Ok(s) => {
-                                    for t in &s.tabs {
-                                        let changed = t.changed_sources();
-                                        for (p, c) in t.tab.paths.iter().zip(&changed) {
+                                    for (t, changed) in s.tabs.iter().zip(changed) {
+                                        for (p, c) in t.tab.paths.iter().zip(changed) {
                                             let note = if *c {
                                                 format!("{p}  ⚠ {}", tr("recovery.changed"))
                                             } else {
@@ -3366,13 +3480,21 @@ impl OxideMergeApp {
         if restore {
             for f in &offer.found {
                 if let Ok(s) = &f.snapshot {
-                    self.restore_snapshot(s);
-                    recovery::remove(&f.path);
+                    let kept = self.restore_snapshot(s);
+                    // Deleted only once all its unsaved text is back in a tab of its files.
+                    let at = f.path.parent().zip(f.path.file_name());
+                    match at.filter(|_| !kept.is_empty()) {
+                        Some((dir, name)) => {
+                            let left = recovery::Snapshot::new(kept, 0, s.left_out);
+                            let _ = recovery::keep(dir, &name.to_string_lossy(), left);
+                        }
+                        None => recovery::forget(&f.path),
+                    }
                 }
             }
         } else if discard {
             for f in &offer.found {
-                recovery::remove(&f.path);
+                recovery::forget(&f.path);
             }
         } else if !(later || modal.should_close()) {
             self.recovery_offer = Some(offer);
@@ -3548,19 +3670,24 @@ impl OxideMergeApp {
         match (self.was_modal, modal) {
             (true, false) => {
                 // What had the focus as it closed (its Cancel button, say) is gone with it.
-                self.focus_back = self.focus_before_dialog.take().map(|id| (id, 3, focused));
+                // Not the focus now: the command it ran (Find, Go to line) may have moved it.
+                let gone = self.focus_in_dialog.take();
+                self.focus_back = self.focus_before_dialog.take().map(|id| (id, 3, gone));
             }
+            (_, true) => self.focus_in_dialog = focused,
             (false, false) if self.focus_back.is_none() => self.focus_before_dialog = focused,
             _ => {}
         }
         // The control is asked for the focus again for a few frames: the frame a dialog closes
         // in may not draw it where it takes the focus.
-        // Only while nothing has the focus: a command run from a menu or dialog (Find, Go to
-        // line) may have put it somewhere on purpose.
+        // Only while nothing else has the focus: a command run from a menu or dialog may have
+        // put it somewhere on purpose. A control of the closed dialog that still has it loses
+        // it within a frame, as egui drops the focus of a widget no longer drawn.
         if let Some((id, left, gone)) = self.focus_back.take() {
-            let free = focused.is_none() || focused == gone;
-            if !modal && free && focused != Some(id) && left > 0 {
-                ctx.memory_mut(|m| m.request_focus(id));
+            if !modal && focused != Some(id) && left > 0 {
+                if focused.is_none() || focused == gone {
+                    ctx.memory_mut(|m| m.request_focus(id));
+                }
                 self.focus_back = Some((id, left - 1, gone));
             }
         }
@@ -4738,6 +4865,7 @@ impl OxideMergeApp {
             let _ = tx.send(made);
         });
         self.next_open += 1;
+        let (temps, remote) = self.take_pending_remote(&source);
         self.opening.push(PendingOpen {
             id: self.next_open,
             names,
@@ -4747,7 +4875,35 @@ impl OxideMergeApp {
             source,
             descriptions,
             recent: None,
+            temps,
+            remote,
         });
+    }
+
+    /// Gives `temps` and `remote` to what an open just started made: its tab, or the open still
+    /// running on another thread, which hands them to its tab.
+    fn give_staged(
+        &mut self,
+        (tabs, opening): (usize, usize),
+        temps: Vec<std::sync::Arc<tempfile::TempDir>>,
+        remote: Vec<Option<RemoteFile>>,
+    ) {
+        let (to_temps, to_remote) = if self.tabs.len() > tabs {
+            let t = self.tabs.last_mut().unwrap();
+            (&mut t.temps, &mut t.remote)
+        } else if self.opening.len() > opening {
+            let o = self.opening.last_mut().unwrap();
+            (&mut o.temps, &mut o.remote)
+        } else {
+            return;
+        };
+        to_temps.extend(temps);
+        to_remote.resize(remote.len().max(to_remote.len()), None);
+        for (slot, r) in to_remote.iter_mut().zip(remote) {
+            if slot.is_none() {
+                *slot = r;
+            }
+        }
     }
 
     /// Cancels the comparison being opened with `id`; nothing it sends afterwards is used.
@@ -4777,8 +4933,10 @@ impl OxideMergeApp {
             let o = self.opening.remove(k);
             match result {
                 Some(Ok(view)) => {
+                    let opening = self.opening.len();
                     self.push_tab(Content::Text(view), o.source);
                     self.tabs.last_mut().unwrap().descriptions = o.descriptions;
+                    self.give_staged((self.tabs.len() - 1, opening), o.temps, o.remote);
                     if let Some(r) = o.recent {
                         self.cfg.add_recent_compare(&r);
                     }
@@ -6163,23 +6321,14 @@ impl OxideMergeApp {
                         // The new tab shows the same staged copies: it keeps them, and writes a
                         // remote side back to its server, as this one does.
                         let (temps, remote) = (tab.temps.clone(), tab.remote.clone());
-                        let before = self.tabs.len();
+                        let before = (self.tabs.len(), self.opening.len());
                         self.open(OpenRequest {
                             paths,
                             kind: Some(kind),
                             rules,
                             ..Default::default()
                         });
-                        if self.tabs.len() > before {
-                            if let Some(new) = self.tabs.last_mut() {
-                                new.temps.extend(temps);
-                                for (slot, r) in new.remote.iter_mut().zip(remote) {
-                                    if slot.is_none() {
-                                        *slot = r;
-                                    }
-                                }
-                            }
-                        }
+                        self.give_staged(before, temps, remote);
                     }
                 }
             }
@@ -7345,6 +7494,7 @@ impl OxideMergeApp {
         let Some(mut run) = self.upload.take() else {
             return;
         };
+        let mut left_over = Vec::new();
         let finished = loop {
             match run.rx.try_recv() {
                 Ok(done) => {
@@ -7358,8 +7508,13 @@ impl OxideMergeApp {
                         .find(|t| t.id == done.tab)
                         .and_then(|t| t.remote.get_mut(done.side))
                         .and_then(Option::as_mut);
+                    let cancelled = run.cancel.load(std::sync::atomic::Ordering::Relaxed);
                     match done.result {
-                        Ok(Uploaded::File(stamp)) => {
+                        Ok(Uploaded::File(saved)) => {
+                            let stamp = saved.stamp;
+                            if let Some(left) = saved.left_over {
+                                left_over.push(format!("{}: {left}", done.label));
+                            }
                             // A later upload of this side expects the server's file as this
                             // one left it, not as it was before.
                             for q in &mut self.upload_queue {
@@ -7380,8 +7535,14 @@ impl OxideMergeApp {
                                     q.manifest = Some(saved.manifest.clone());
                                 }
                             }
+                            left_over.extend(
+                                saved
+                                    .left_over
+                                    .iter()
+                                    .map(|l| format!("{}: {l}", done.label)),
+                            );
                             let failed = !saved.errors.is_empty();
-                            if failed && !run.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            if failed && !cancelled {
                                 run.errors.push(trf(
                                     "msg.sftp_upload_failed",
                                     &[("name", done.label), ("error", saved.errors.join("\n"))],
@@ -7408,7 +7569,13 @@ impl OxideMergeApp {
                                     file.sent = None;
                                 }
                             }
-                            if !run.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            // What a stopped upload left on the server is named all the same.
+                            let left = e
+                                .downcast_ref::<crate::core::remote_stage::LeftOver>()
+                                .is_some()
+                                || e.downcast_ref::<crate::core::remote_stage::Uncertain>()
+                                    .is_some();
+                            if !cancelled || left {
                                 run.errors.push(trf(
                                     "msg.sftp_upload_failed",
                                     &[("name", done.label), ("error", format!("{e:#}"))],
@@ -7421,6 +7588,10 @@ impl OxideMergeApp {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => break true,
             }
         };
+        // Saved all the same: a warning, which neither fails the save nor stops the queue.
+        for l in left_over {
+            self.push_toast(l, true, None);
+        }
         if !finished {
             let mut stop = false;
             egui::Modal::new(egui::Id::unique("upload_dialog")).show(ctx, |ui| {
@@ -10735,9 +10906,12 @@ impl eframe::App for OxideMergeApp {
             self.merge_saved_workspaces();
             let _ = self.stored_cfg().save();
         }
-        // A normal exit leaves nothing to recover.
+        // A normal exit leaves nothing to recover. The lock goes first: a file held open
+        // cannot be deleted on Windows.
         if let Some(dir) = recovery::dir() {
-            recovery::remove(&dir.join(&self.recovery_name));
+            self.recovery_lock = None;
+            self.recovery_writer
+                .remove(&dir.join(&self.recovery_name), true);
         }
     }
 
@@ -11062,7 +11236,7 @@ impl eframe::App for OxideMergeApp {
         self.upload_dialog(ctx);
         self.reload_prompt_dialog(ctx);
         self.recovery_dialog(ctx);
-        self.keep_recovery();
+        self.keep_recovery(ctx);
         self.reload_dialog(ctx);
         self.gc_pending_remote();
         self.workspace_save_dialog(ctx);

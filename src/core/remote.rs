@@ -12,8 +12,9 @@
 //! the local copy back over a fresh connection made with the same credentials kept with its
 //! tab, since a connection is not worth holding open for as long as a tab might stay open
 //! (through sleep, a changed network, or a server that closes idle sessions). An upload
-//! updates the existing file in place to keep its access controls, and is refused when the
-//! file changed on the server since it was fetched (see [`upload`]); a folder is synchronized
+//! replaces the file through a checked staged copy, or writes it in place where that would
+//! lose its owner or permissions, and is refused when the file changed on the server since it
+//! was fetched (see [`upload`]); a folder is synchronized
 //! back the same way, file by file (see [`super::remote_sync`]).
 //!
 //! The server's host key is checked before a password or a key ever reaches it: against the
@@ -1932,6 +1933,22 @@ pub(crate) trait RemoteWrite {
         in_place: bool,
         cancel: &AtomicBool,
     ) -> Result<RemoteStamp>;
+    /// [`RemoteWrite::put`], also naming what it could not remove from the server once the
+    /// file was written.
+    fn put_saved(
+        &self,
+        local: &Path,
+        remote: &str,
+        expected: Option<RemoteStamp>,
+        in_place: bool,
+        cancel: &AtomicBool,
+    ) -> Result<super::remote_stage::Saved> {
+        let stamp = self.put(local, remote, expected, in_place, cancel)?;
+        Ok(super::remote_stage::Saved {
+            stamp,
+            left_over: None,
+        })
+    }
     fn make_dir(&self, remote: &str) -> Result<()>;
     fn remove_file(&self, remote: &str) -> Result<()>;
     /// Removes the folder `remote`, which must be empty.
@@ -2404,16 +2421,30 @@ pub fn refetch(
 }
 
 /// Writes `local_path`'s bytes to `remote_path` on the server, for *Save* of a file opened
-/// with [`fetch`], returning how the file is on the server now. A link on the server is kept,
-/// and the file it names is written instead.
+/// with [`fetch`], returning how the file is on the server now, and what the upload left on
+/// the server for the user to delete. A link on the server is kept, and the file it names is
+/// written instead.
 ///
 /// Refused when the file is not as `expected` (how it was fetched or last uploaded) any more:
 /// someone else changed or deleted it on the server meanwhile, and writing over it would lose
-/// their change. Existing files are updated through their open handle to preserve ownership
-/// and ACLs, which cannot be copied portably through SFTP. Cancellation stops the upload
-/// before it starts updating the file. A failed write may leave a partial update, and its
-/// error then carries [`PartlyWritten`]. With `expected` `None` the file must not exist.
-/// `sent`, the hash of the file as fetched or last uploaded, tells a change the stamp cannot.
+/// their change. With `expected` `None` the file must not exist. `sent`, the hash of the file
+/// as fetched or last uploaded, tells a change the stamp cannot.
+///
+/// Over SFTP the bytes go to a staged copy beside the file, checked against what was sent,
+/// which then takes the original's place with its owner, group and permissions (see
+/// [`super::remote_stage`]). A failed or cancelled upload leaves the file as it was, and its
+/// error carries [`super::remote_stage::Unchanged`]; a connection lost while renaming leaves
+/// either version in its place, and the error carries [`super::remote_stage::Uncertain`],
+/// naming where the other is. A temporary file that could not be removed from the server is
+/// named by a [`super::remote_stage::LeftOver`]: attached to the error, or, when the upload
+/// succeeded, in [`super::remote_stage::Saved::left_over`].
+///
+/// The file is written over in place instead, through its open handle, when
+/// [`ConnOptions::in_place`] asks for it (on servers with access-control lists or hard links,
+/// which a replacement loses), when it cannot be replaced keeping its owner, group and
+/// permissions, when no file can be created in its folder or the server renames no files,
+/// and over FTP. Cancelling then stops the upload only before it starts writing, and a failed
+/// write may leave the file partly written; its error then carries [`PartlyWritten`].
 pub fn upload(
     conn: &RemoteConnection,
     local_path: &Path,
@@ -2421,7 +2452,7 @@ pub fn upload(
     expected: Option<RemoteStamp>,
     sent: Option<u64>,
     cancel: &AtomicBool,
-) -> Result<RemoteStamp> {
+) -> Result<super::remote_stage::Saved> {
     let remote = connect(conn, cancel)?;
     if let (Some(stamp), Some(sent)) = (expected, sent) {
         if stamp.is_weak() && !still_as(&*remote, remote_path, stamp, sent, cancel)? {
@@ -2431,7 +2462,7 @@ pub fn upload(
             ));
         }
     }
-    remote.put(
+    remote.put_saved(
         local_path,
         remote_path,
         expected,
@@ -2449,6 +2480,17 @@ impl RemoteWrite for ssh2::Sftp {
         in_place: bool,
         cancel: &AtomicBool,
     ) -> Result<RemoteStamp> {
+        upload_on(self, local, remote, expected, in_place, cancel).map(|s| s.stamp)
+    }
+
+    fn put_saved(
+        &self,
+        local: &Path,
+        remote: &str,
+        expected: Option<RemoteStamp>,
+        in_place: bool,
+        cancel: &AtomicBool,
+    ) -> Result<super::remote_stage::Saved> {
         upload_on(self, local, remote, expected, in_place, cancel)
     }
 
@@ -2470,7 +2512,8 @@ impl RemoteWrite for ssh2::Sftp {
 
 /// [`upload`] over the open session `sftp`: through a staged copy (see
 /// [`super::remote_stage`]) unless `in_place`, or the file cannot be replaced keeping its
-/// owner, group and permissions; otherwise written over in place.
+/// owner, group and permissions, or the server renames no files; otherwise written over in
+/// place.
 fn upload_on(
     sftp: &ssh2::Sftp,
     local_path: &Path,
@@ -2478,7 +2521,7 @@ fn upload_on(
     expected: Option<RemoteStamp>,
     in_place: bool,
     cancel: &AtomicBool,
-) -> Result<RemoteStamp> {
+) -> Result<super::remote_stage::Saved> {
     let cannot_write = || {
         trf(
             "msg.sftp_cannot_write",
@@ -2527,11 +2570,11 @@ fn upload_on(
             .with_context(cannot_write);
     };
     if !in_place {
-        if let Some(stamp) =
+        if let Some(saved) =
             super::remote_stage::replace(sftp, local_path, &real, stamp_now, cancel)
                 .with_context(cannot_write)?
         {
-            return Ok(stamp);
+            return Ok(saved);
         }
     }
     let mut from = std::fs::File::open(local_path).with_context(|| {
@@ -2569,7 +2612,10 @@ fn upload_on(
     })();
     let after = sftp.stat(target).map(|s| RemoteStamp::of(&s));
     match (written, after) {
-        (Ok(()), Ok(stamp)) => Ok(stamp),
+        (Ok(()), Ok(stamp)) => Ok(super::remote_stage::Saved {
+            stamp,
+            left_over: None,
+        }),
         (Ok(()), Err(e)) => Err(anyhow::Error::from(e).context(cannot_write())),
         (Err(e), after) => Err(e.context(cannot_write()).context(PartlyWritten {
             path: remote_path.to_string(),
@@ -2580,13 +2626,8 @@ fn upload_on(
 
 impl super::remote_stage::Stage for ssh2::Sftp {
     fn meta(&self, path: &str) -> Result<Option<super::remote_stage::Meta>> {
-        match self.stat(Path::new(path)) {
-            Ok(s) => Ok(Some(super::remote_stage::Meta {
-                stamp: RemoteStamp::of(&s),
-                is_file: s.is_file(),
-                owner: s.uid.zip(s.gid),
-                perm: s.perm.map(|p| p & 0o7777),
-            })),
+        match self.lstat(Path::new(path)) {
+            Ok(s) => Ok(Some(stage_meta(&s))),
             Err(e) => {
                 let e = std::io::Error::from(e);
                 match e.kind() {
@@ -2597,71 +2638,13 @@ impl super::remote_stage::Stage for ssh2::Sftp {
         }
     }
 
-    fn create(&self, path: &str, perm: u32) -> Result<()> {
-        let f = self.open_mode(
+    fn create(&self, path: &str, perm: u32) -> Result<Box<dyn super::remote_stage::NewFile + '_>> {
+        Ok(Box::new(self.open_mode(
             Path::new(path),
-            ssh2::OpenFlags::WRITE | ssh2::OpenFlags::EXCLUSIVE,
+            ssh2::OpenFlags::READ | ssh2::OpenFlags::WRITE | ssh2::OpenFlags::EXCLUSIVE,
             perm as i32,
             ssh2::OpenType::File,
-        )?;
-        drop(f);
-        Ok(())
-    }
-
-    fn write(&self, path: &str, from: &mut dyn Read, cancel: &AtomicBool) -> Result<u64> {
-        let mut to = self.open_mode(
-            Path::new(path),
-            ssh2::OpenFlags::WRITE,
-            0,
-            ssh2::OpenType::File,
-        )?;
-        let mut buf = vec![0u8; CHUNK];
-        let mut written = 0;
-        loop {
-            check(cancel)?;
-            let n = from.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            to.write_all(&buf[..n])?;
-            written += n as u64;
-        }
-        // Not every server can flush a file to disk (`fsync@openssh.com`).
-        let _ = to.fsync();
-        to.close()?;
-        Ok(written)
-    }
-
-    fn set_owner(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
-        Ok(self.setstat(
-            Path::new(path),
-            ssh2::FileStat {
-                size: None,
-                uid: Some(uid),
-                gid: Some(gid),
-                perm: None,
-                atime: None,
-                mtime: None,
-            },
-        )?)
-    }
-
-    fn set_perm(&self, path: &str, perm: u32) -> Result<()> {
-        Ok(self.setstat(
-            Path::new(path),
-            ssh2::FileStat {
-                size: None,
-                uid: None,
-                gid: None,
-                perm: Some(perm),
-                atime: None,
-                mtime: None,
-            },
-        )?)
-    }
-
-    fn read(&self, path: &str) -> Result<Box<dyn Read + '_>> {
-        Ok(Box::new(self.open(Path::new(path))?))
+        )?))
     }
 
     fn rename(&self, from: &str, to: &str, replace: bool) -> Result<()> {
@@ -2677,6 +2660,69 @@ impl super::remote_stage::Stage for ssh2::Sftp {
 
     fn remove(&self, path: &str) -> Result<()> {
         Ok(self.unlink(Path::new(path))?)
+    }
+}
+
+fn stage_meta(s: &ssh2::FileStat) -> super::remote_stage::Meta {
+    super::remote_stage::Meta {
+        stamp: RemoteStamp::of(s),
+        is_file: s.is_file(),
+        owner: s.uid.zip(s.gid),
+        perm: s.perm.map(|p| p & 0o7777),
+    }
+}
+
+impl super::remote_stage::NewFile for ssh2::File {
+    fn write(&mut self, from: &mut dyn Read, cancel: &AtomicBool) -> Result<u64> {
+        let mut buf = vec![0u8; CHUNK];
+        let mut written = 0;
+        loop {
+            check(cancel)?;
+            let n = from.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            self.write_all(&buf[..n])?;
+            written += n as u64;
+        }
+        // Not every server can flush a file to disk (`fsync@openssh.com`).
+        let _ = self.fsync();
+        Ok(written)
+    }
+
+    fn read(&mut self) -> Result<Box<dyn Read + '_>> {
+        std::io::Seek::seek(self, std::io::SeekFrom::Start(0))?;
+        Ok(Box::new(self))
+    }
+
+    fn meta(&mut self) -> Result<super::remote_stage::Meta> {
+        Ok(stage_meta(&self.stat()?))
+    }
+
+    fn set_owner(&mut self, uid: u32, gid: u32) -> Result<()> {
+        Ok(self.setstat(ssh2::FileStat {
+            size: None,
+            uid: Some(uid),
+            gid: Some(gid),
+            perm: None,
+            atime: None,
+            mtime: None,
+        })?)
+    }
+
+    fn set_perm(&mut self, perm: u32) -> Result<()> {
+        Ok(self.setstat(ssh2::FileStat {
+            size: None,
+            uid: None,
+            gid: None,
+            perm: Some(perm),
+            atime: None,
+            mtime: None,
+        })?)
+    }
+
+    fn close(mut self: Box<Self>) -> Result<()> {
+        Ok(ssh2::File::close(&mut self)?)
     }
 }
 
@@ -3405,9 +3451,10 @@ mod tests {
         );
 
         // Saved through a staged copy: a new file takes the original's place, with its
-        // permissions, so a hard link keeps the old contents, and nothing is left beside it.
+        // permissions, set-user-ID bit included, so a hard link keeps the old contents, and
+        // nothing is left beside it.
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        std::fs::set_permissions(uploaded, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::set_permissions(uploaded, std::fs::Permissions::from_mode(0o4750)).unwrap();
         let stamp =
             std::fs::metadata(uploaded).map(|m| RemoteStamp::new(m.len(), m.mtime() as u64));
         let stamp = stamp.unwrap();
@@ -3415,11 +3462,13 @@ mod tests {
         std::fs::hard_link(uploaded, &alias).unwrap();
         let inode = std::fs::metadata(uploaded).unwrap().ino();
         std::fs::write(&up_local, "staged save\n").unwrap();
-        let stamp = upload(&conn, &up_local, uploaded, Some(stamp), None, &never).unwrap();
+        let stamp = upload(&conn, &up_local, uploaded, Some(stamp), None, &never)
+            .unwrap()
+            .stamp;
         let meta = std::fs::metadata(uploaded).unwrap();
         assert_eq!(std::fs::read_to_string(uploaded).unwrap(), "staged save\n");
         assert_ne!(meta.ino(), inode);
-        assert_eq!(meta.permissions().mode() & 0o7777, 0o640);
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o4750);
         assert_eq!(
             std::fs::read_to_string(&alias).unwrap(),
             "uploaded by smoke test\n"
@@ -3444,7 +3493,7 @@ mod tests {
         };
         std::fs::write(&up_local, "short\n").unwrap();
         let saved = upload(&in_place, &up_local, uploaded, Some(stamp), None, &never).unwrap();
-        assert_eq!(saved.size, 6);
+        assert_eq!(saved.stamp.size, 6);
         assert_eq!(std::fs::read_to_string(&alias).unwrap(), "short\n");
         assert!(upload(&conn, &up_local, uploaded, Some(stamp), None, &never).is_err());
 
@@ -3937,7 +3986,9 @@ mod tests {
         assert!(e.to_string().contains("/a.txt"), "{e}");
         assert_eq!(fake::upload_count("/a.txt"), 0);
         let fetched = fetch(&conn, "/a.txt", &never).unwrap();
-        let first = upload(&conn, &local, "/a.txt", fetched.stamp, None, &never).unwrap();
+        let first = upload(&conn, &local, "/a.txt", fetched.stamp, None, &never)
+            .unwrap()
+            .stamp;
         assert_eq!(fake::uploaded("/a.txt").unwrap(), b"new");
         assert_eq!(fake::upload_count("/a.txt"), 1);
         upload(&conn, &local, "/a.txt", Some(first), None, &never).unwrap();

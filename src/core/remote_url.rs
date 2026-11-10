@@ -432,18 +432,22 @@ pub fn write_back(staged: &[Staged], cancel: &AtomicBool) -> Vec<String> {
                     Err(e) => errors.push(format!("{label}: {e:#}")),
                 }
             }
-            None => {
-                if let Err(e) = remote::upload(
-                    &s.conn,
-                    local,
-                    &s.remote_path,
-                    s.fetched.stamp,
-                    s.sent,
-                    cancel,
-                ) {
-                    errors.push(format!("{label}: {e:#}"));
+            None => match remote::upload(
+                &s.conn,
+                local,
+                &s.remote_path,
+                s.fetched.stamp,
+                s.sent,
+                cancel,
+            ) {
+                // Saved all the same: said, but not a failure.
+                Ok(saved) => {
+                    if let Some(left) = saved.left_over {
+                        eprintln!("note: {label}: {left}");
+                    }
                 }
-            }
+                Err(e) => errors.push(format!("{label}: {e:#}")),
+            },
         }
     }
     errors

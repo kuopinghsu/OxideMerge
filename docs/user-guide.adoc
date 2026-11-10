@@ -2958,6 +2958,11 @@ cut), it asks what to do with the snapshot left behind:
   The restored sides are marked as modified and are written to the files only when you save them.
   A message names every compared file that changed since the snapshot, so you can check the
   restored edits against it before saving.
+  A comparison of the same files already open, with no edits, takes the text rather than
+  opening a second time.
+  The unsaved text of a comparison whose files can no longer be opened (moved, deleted, or on
+  a drive not connected) comes back in a new text compare, each side named after its file, to
+  save where you choose; the snapshot keeps that text and offers it again at the next start.
 * *Show details* lists the snapshot's comparisons, which of their files changed since, and how
   many sides have unsaved edits.
 * *Discard* deletes the snapshot.
@@ -2973,8 +2978,10 @@ Limits:
   details say how many.
 * A snapshot is only as recent as its last write: edits made in the last few seconds before a
   crash can be missing.
-* A snapshot is taken as left behind once it has not been written for 2 minutes; at most five are
-  kept, the oldest deleted first.
+* A running window holds a lock on its snapshot, so another window never offers it, however long
+  ago it was written; once the window is gone, the next start offers it at once. Where the lock
+  cannot be taken, a snapshot is taken as left behind once it has not been written for 2
+  minutes. At most five are kept, the oldest deleted first.
 * A snapshot written by a later version of OxideMerge is shown but not restored.
 
 To leave out one comparison, right-click its tab and turn off *Keep for recovery*: from the next
