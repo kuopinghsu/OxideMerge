@@ -3663,8 +3663,9 @@ fn a_fetched_file_opened_in_the_background_stays_staged_for_its_tab() {
     }
     assert_eq!(gui.app.opening.len(), 1, "opened on another thread");
     assert!(gui.app.pending_remote.is_empty(), "the fetch was claimed");
+    // `settle` does not wait for an open on another thread, so wait for its tab.
+    gui.wait_until("the background comparison", |g| g.app.tabs.len() == 1);
     gui.settle();
-    assert_eq!(gui.app.tabs.len(), 1, "{}", gui.describe());
     assert_eq!(gui.text_view().panes[0].doc.lines, ["one", "two"]);
     assert!(gui.app.tabs[0].remote[0].is_some(), "the tab can upload it");
     gui.frames(3);
