@@ -542,6 +542,13 @@ uses its section of this file as the release notes.
 
 ### Changed
 
+- **Large text comparisons use several threads:** numbering the lines, which took most of
+  the time of a large comparison, is now shared among up to eight threads, with the same
+  results. On an Intel Core i9-12900KF (Windows), two 100 MB files compare in 0.80 s
+  instead of 1.66 s, and two 1 GiB files in 12.9 s instead of 24.0 s (in the text view,
+  23.0 s instead of 33.3 s). Comparisons running at once, as in a folder compare, share
+  those eight threads rather than each starting its own. *Cancel* stops every thread. See
+  `docs/benchmarks.md`.
 - **Less memory for large text comparisons:** lines are numbered through a smaller table,
   loaded files give back their spare room, and the text view keeps less per line. Measured
   on an Apple M2 Max: two 100 MB files peak at 561 MB instead of 620 MB and compare 7% faster;
@@ -680,9 +687,18 @@ uses its section of this file as the release notes.
   the loading thread, so opening a large page no longer holds up the window.
 - **About from the title bar:** clicking the name *OxideMerge* next to the logo opens the
   About dialog too, as clicking the logo does. Screen readers name the two as a button.
+- **The About dialog shows the slogan:** "See the Difference. Merge with Confidence."
+  replaces the tagline and the one-line description, in every language, and the Credits
+  section is gone.
 
 ### Fixed
 
+- **Headings are bold in Chinese, Japanese and Korean:** the semibold title font has no CJK
+  glyphs, so headings in those languages, such as the ones in the About dialog, fell back to
+  the regular face. A bold Han or Hangul face is now added to the title font: Microsoft
+  JhengHei or YaHei Bold, Yu Gothic Bold or Malgun Gothic Bold on Windows, PingFang Semibold,
+  Hiragino Sans W6 or Apple SD Gothic Neo on macOS, and Noto Sans CJK Bold or Nanum Gothic
+  Bold on Linux. Other languages load no extra font.
 - **The binary location pane shows where bytes changed:** after an insertion or deletion,
   the one difference that runs to the end of the file filled the whole location pane, and the
   moved-block marks drawn over it in a near-white color hid the real edits. Each side's column

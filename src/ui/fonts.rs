@@ -361,6 +361,98 @@ fn fallbacks(lang: &str) -> Vec<LoadedFont> {
     ordered.into_iter().flatten().collect()
 }
 
+/// The first of `paths` with a face of `prefs` (or face 0) that is at least semibold.
+fn first_bold_face(paths: impl IntoIterator<Item = String>, prefs: &[&str]) -> Option<LoadedFont> {
+    paths.into_iter().find_map(|path| {
+        let bytes = std::fs::read(&path).ok()?;
+        let index = face_index(&bytes, prefs);
+        let face = ttf_parser::Face::parse(&bytes, index).ok()?;
+        (face.weight().to_number() >= 600).then_some(LoadedFont { path, bytes, index })
+    })
+}
+
+/// Bold faces for the title font in languages whose script the semibold UI font lacks: without
+/// them headings fall back to the regular Han or Hangul face. Other languages load none, as each
+/// CJK face costs several megabytes.
+fn bold_fallbacks(lang: &str) -> Vec<LoadedFont> {
+    let noto = |file: &str| {
+        ["opentype/noto", "noto-cjk", "google-noto-cjk"]
+            .map(|dir| format!("/usr/share/fonts/{dir}/{file}"))
+    };
+    match lang {
+        "zh-TW" | "zh-CN" | "ja" => {
+            let (win, prefs): (&[&str], &[&str]) = match lang {
+                "zh-TW" => (
+                    &["msjhbd.ttc", "msyhbd.ttc", "YuGothB.ttc"],
+                    &[
+                        "PingFangTC-Semibold",
+                        "PingFangSC-Semibold",
+                        "NotoSansCJKtc-Bold",
+                    ],
+                ),
+                "zh-CN" => (
+                    &["msyhbd.ttc", "msjhbd.ttc", "YuGothB.ttc"],
+                    &[
+                        "PingFangSC-Semibold",
+                        "PingFangTC-Semibold",
+                        "NotoSansCJKsc-Bold",
+                    ],
+                ),
+                _ => (
+                    &["YuGothB.ttc", "meiryob.ttc", "msjhbd.ttc"],
+                    &["HiraginoSans-W6", "NotoSansCJKjp-Bold"],
+                ),
+            };
+            let mut unix = Vec::new();
+            if cfg!(target_os = "macos") {
+                if lang == "ja" {
+                    unix.push("/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc".to_string());
+                } else {
+                    unix.extend(asset_fonts("PingFang.ttc"));
+                    unix.push("/System/Library/Fonts/PingFang.ttc".to_string());
+                }
+            }
+            unix.extend(noto("NotoSansCJK-Bold.ttc"));
+            first_bold_face(system_fonts(win.to_vec(), unix, Vec::new()), prefs)
+                .into_iter()
+                .collect()
+        }
+        "ko" => {
+            let unix = [
+                "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+                "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            ]
+            .map(str::to_string)
+            .into_iter()
+            .chain(noto("NotoSansCJK-Bold.ttc"))
+            .collect();
+            first_bold_face(
+                system_fonts(vec!["malgunbd.ttf"], unix, Vec::new()),
+                &[
+                    "AppleSDGothicNeo-SemiBold",
+                    "AppleSDGothicNeo-Bold",
+                    "NotoSansCJKkr-Bold",
+                ],
+            )
+            .into_iter()
+            .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The title font: the semibold UI font, the `bold` CJK faces, then the `regular` family.
+/// Without a semibold UI font the first regular one takes its place ahead of the CJK faces, as
+/// the first font sets the row height and the CJK faces carry a baseline shift.
+fn semibold_family(
+    semibold: Option<String>,
+    bold: Vec<String>,
+    mut regular: Vec<String>,
+) -> Vec<String> {
+    let head = semibold.or_else(|| (!regular.is_empty()).then(|| regular.remove(0)));
+    head.into_iter().chain(bold).chain(regular).collect()
+}
+
 /// Installs the UI, title and code fonts, then fallback fonts: a Han/kana font (preferring the
 /// UI language's script variant), a Hangul font and a symbol font when available.
 pub fn setup(ctx: &egui::Context, lang: &str) {
@@ -397,14 +489,19 @@ pub fn setup(ctx: &egui::Context, lang: &str) {
         }
     }
 
-    let mut family: Vec<String> = semibold.into_iter().collect();
-    family.extend(
-        fonts
-            .families
-            .get(&FontFamily::Proportional)
-            .cloned()
-            .unwrap_or_default(),
-    );
+    let bold: Vec<String> = bold_fallbacks(lang)
+        .into_iter()
+        .map(|loaded| {
+            let tweak = fallback_tweak(primary_metrics, &loaded.bytes, loaded.index);
+            insert(&mut fonts, &loaded.path, loaded.bytes, loaded.index, tweak)
+        })
+        .collect();
+    let regular = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let family = semibold_family(semibold, bold, regular);
     fonts
         .families
         .insert(FontFamily::Name(crate::ui::theme::SEMIBOLD.into()), family);
@@ -658,6 +755,39 @@ mod tests {
                 .count();
             assert_eq!(same_bytes, 1, "a font file is embedded twice");
         }
+    }
+
+    #[test]
+    fn headings_in_cjk_languages_use_bold_faces() {
+        assert!(bold_fallbacks("en").is_empty());
+        for lang in ["zh-TW", "zh-CN", "ja", "ko"] {
+            for f in bold_fallbacks(lang) {
+                let face = ttf_parser::Face::parse(&f.bytes, f.index).expect("bold face");
+                assert!(
+                    face.weight().to_number() >= 600,
+                    "{lang}: {} is not bold",
+                    f.path
+                );
+            }
+        }
+        if cfg!(windows) && std::path::Path::new("C:\\Windows\\Fonts\\msjhbd.ttc").is_file() {
+            assert!(bold_fallbacks("zh-TW")[0].path.ends_with("msjhbd.ttc"));
+        }
+    }
+
+    /// Latin text in headings keeps a Latin font where no semibold one is installed (macOS).
+    #[test]
+    fn bold_cjk_faces_come_after_a_latin_font() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            semibold_family(Some("sb".into()), s(&["cjk"]), s(&["ui", "han"])),
+            s(&["sb", "cjk", "ui", "han"])
+        );
+        assert_eq!(
+            semibold_family(None, s(&["cjk"]), s(&["ui", "han"])),
+            s(&["ui", "cjk", "han"])
+        );
+        assert_eq!(semibold_family(None, s(&["cjk"]), Vec::new()), s(&["cjk"]));
     }
 
     #[test]

@@ -18,7 +18,8 @@ runs, for its working copy, the new and replacement files and the journal. `=3` 
 workload has a copy of its own). Each workload then runs three times, each in a process of its
 own; the median time and the highest peak memory are reported and written to
 `target/bench/results.md`, with the machine, the commit and the build. Peak memory is
-measured with `/usr/bin/time`, so it is missing on Windows. The files are read from the
+measured with `/usr/bin/time`, so it is missing on Windows, as is the resident memory of
+each stage of the text-view workloads (read with `ps`). The files are read from the
 system's file cache after the first run, so the times don't include disk reads.
 
 | Variable | Effect |
@@ -224,6 +225,135 @@ the ancestors of the row, scrolling it into view and drawing the frame.
 
 These Windows numbers are not comparable with the macOS numbers above: another machine,
 and the times there were measured with the memory tool attached.
+
+## Windows x86_64 (2026-11-11)
+
+Every workload up to `OXIDEMERGE_BENCH_LARGE=1`, then the 500 MB and 1 GiB text workloads,
+run natively on Windows 11 (build 26300), Intel Core i9-12900KF (24 threads), 32 GB memory;
+OxideMerge 0.9.8 (`e6a117e`), rustc 1.99.0, release build, three runs each, median time:
+
+```powershell
+$env:OXIDEMERGE_BENCH_LARGE = "1"
+cargo test --release --locked --bin oxidemerge bench -- --ignored --nocapture --test-threads 1
+$env:OXIDEMERGE_BENCH_LARGE = "3"
+$env:OXIDEMERGE_BENCH_ONLY = "text-500mb,text-1gb,text-view-500mb,text-view-1gb,text-cancel-500mb"
+cargo test --release --locked --bin oxidemerge bench -- --ignored --nocapture --test-threads 1
+```
+
+There is no `/usr/bin/time` on Windows, so peak memory and the resident memory of each
+stage are missing. With `CARGO_TARGET_DIR` set to a long path (a sandboxed agent's, here),
+OpenSSL's build for libssh2 failed in `nmake`; building into the repository's own `target`
+worked.
+
+| Workload | Time (median) | Result |
+| --- | ---: | --- |
+| text-10mb | 0.132 s | 14,305 differences |
+| text-repeated | 0.041 s | 300 differences |
+| text-100mb | 1.657 s | 15,086 differences |
+| text-500mb | 10.979 s | 74,725 differences |
+| text-1gb | 24.003 s | 152,307 differences (see below) |
+| text-view-10mb | 0.457 s | 303,878 rows; load 46 ms, compare 112 ms, first frame 11 ms, a scrolled frame 1.34 ms, a step 1.32 ms |
+| text-view-100mb | 2.498 s | 2,993,833 rows; load 429 ms, compare 1,483 ms, first frame 55 ms, a scrolled frame 1.52 ms, a step 1.47 ms |
+| text-view-500mb | 15.032 s | 14,970,455 rows; load 2,031 ms, compare 9,986 ms, first frame 240 ms, a scrolled frame 8.85 ms, a step 8.94 ms |
+| text-view-1gb | 33.254 s | 30,659,207 rows, 152,307 differences; load 4,290 ms, compare 22,623 ms, first frame 551 ms, a scrolled frame 18.74 ms, a step 18.51 ms |
+| text-cancel-100mb | | read again 417 ms; open 1,938 ms; stopped in 3 ms median, 11 ms worst; freed in 126 ms median, 135 ms worst |
+| text-cancel-500mb | | read again 2,125 ms; open 12,073 ms; stopped in 3 ms median, 13 ms worst; freed in 825 ms median, 1,083 ms worst |
+| merge3-10mb | 0.441 s | 14,107 differences, conflicts left |
+| table-10k | 0.021 s | 95 modified, 50 added, 55 removed, 9,749 reordered |
+| table-10k-position | 0.023 s | 197 differences |
+| table-100k | 0.288 s | 1,030 modified, 500 added, 532 removed, 98,850 reordered |
+| table-100k-position | 0.324 s | 614 differences |
+| table-cancel-1m | 0.902 s | stopped 44.4 ms after asked, at 1,004,096 of 1,999,985 records |
+| xml-tree-12k | 0.230 s | 72,297 rows; 59 added, 64 removed, 252 modified, 1 moved, 1 ambiguous |
+| xml-tree-12k-keyed | 0.263 s | 72,302 rows; 60 added, 65 removed, 248 modified, 11,718 moved, 96 ambiguous |
+| xml-tree-view-12k | 0.952 s | 72,297 rows, 376 changes; compare 219 ms, first rows 6 ms, a scrolled frame 0.29 ms, unfold 2 ms, fold 1 ms, a step 1.83 ms |
+| xml-semantic-12k | 0.158 s | 29,430 changes |
+| binary-10mb | 0.007 s | 100 ranges |
+| binary-100mb | 0.074 s | 100 ranges |
+| binary-moved-unrelated | 0.053 s | 0 moved blocks |
+| binary-moved-swap | 0.014 s | 2 moved blocks, 131,072 matched bytes |
+| binary-moved-large | 0.193 s | 2 moved blocks, 2,097,152 matched bytes |
+| binary-moved-short-shift | 0.008 s | 1 moved block, 15 matched bytes |
+| binary-moved-wide-shift | 0.003 s | 1 moved block, 524,288 matched bytes |
+| binary-moved-firmware | 0.001 s | 18 moved blocks, 4,014 matched bytes |
+| image-4k | 0.113 s | 82,116 pixels differ |
+| folder-small-files | 0.220 s | 220 differ, 198 unique; first result after 2 ms |
+| folder-large-files | 0.039 s | 2 differ |
+| folder-mixed | 0.051 s | 80 differ; first result after 2 ms |
+| sync-preview-20k | 2.292 s | 198 copies, 220 replaces; plan 2,109 ms |
+| folder-navigation-20k | 0.416 s | 418 files in 181 ms, 0.43 ms a step, first 5 ms; compare 193 ms |
+
+As above, the time of the text-cancel workloads is that of ten opens in one process and is
+left out.
+
+- Every result count matches the macOS runs except at 1 GiB. text-1gb and text-view-1gb
+  compare on the calling thread, not in a job, and there the gaps between anchors share one
+  2-second deadline (`walk_limits` in `src/core/diff.rs`). This machine went past it, and the
+  gaps left were compared coarsely: 152,307 differences, not the 152,526 of every gap
+  compared finely. The window opens large files in a job, where each gap has 2 seconds and
+  the walk 20, so these two workloads do not show the count the window gets on this machine.
+- What the view holds, counted from sizes and capacities, is the same as on macOS at every
+  size (at 1 GiB: lines 3,391 MiB, edit marks 234 MiB, rows 486 MiB, layout 1,448 MiB).
+- Against the absolute limits of the release gates below, this machine misses three at the
+  largest sizes: the first frame at 1 GiB (551 ms against 500 ms), a scrolled frame and a
+  step at 1 GiB (18.74 and 18.51 ms against 16 ms), and freeing the memory after *Cancel* at
+  500 MB (1,083 ms worst against 1 s). At 500 MB and below, frames and steps stay under 9 ms
+  and *Cancel* stops the work within 13 ms.
+- The XML workloads took 1–21% longer than on 2026-11-03 above (xml-tree-view-12k 0.952
+  against 0.785 s, a step 1.83 against 1.40 ms) with the same results. The two runs were not
+  made one after the other, so this is not a measured regression.
+
+### Line numbering on several threads (2026-11-11)
+
+Before a text comparison, each line is given a number, the same for equal lines. This
+step took most of the time of a large comparison: on the machine above, 0.86 s of the
+100 MB engine run and 12.7 s of the 1 GiB one, against 2.7 s for the anchor search and 1.2 s
+for the walk between anchors. From 262,144 lines (all panes together) it is now shared
+among up to eight threads (`core::parallel::threads`, one per processor thread, as a folder
+compare uses by default). The lines are hashed in parallel; then each thread owns the lines
+whose hash starts with its bits and looks them up in a table of its own, so threads never
+share a table. The numbers are the same as on one thread, checked by a unit test with
+forced hash collisions, so every comparison result is unchanged. *Cancel* stops all the
+threads.
+
+The same machine and inputs, three runs each, median time, before (`e6a117e`, the table
+above) and after:
+
+| Workload | Before | After | Result (both) |
+| --- | ---: | ---: | --- |
+| text-10mb | 0.132 s | 0.099 s | 14,305 differences |
+| text-repeated | 0.041 s | 0.039 s | 300 differences |
+| text-100mb | 1.657 s | 0.804 s | 15,086 differences |
+| text-500mb | 10.979 s | 5.854 s | 74,725 differences |
+| text-1gb | 24.003 s | 12.899 s | 152,307 differences |
+| merge3-10mb | 0.441 s | 0.318 s | 14,107 differences, conflicts left |
+| text-view-10mb | 0.457 s (compare 112 ms) | 0.455 s (compare 86 ms) | 303,878 rows |
+| text-view-100mb | 2.498 s (compare 1,483 ms) | 1.696 s (compare 756 ms) | 2,993,833 rows |
+| text-view-500mb | 15.032 s (compare 9,986 ms) | 10.002 s (compare 5,138 ms) | 14,970,455 rows |
+| text-view-1gb | 33.254 s (compare 22,623 ms) | 23.042 s (compare 11,563 ms) | 30,659,207 rows |
+| text-cancel-100mb | open 1,938 ms; stopped 11 ms, freed 135 ms worst | open 1,183 ms; stopped 4 ms, freed 143 ms worst | |
+| text-cancel-500mb | open 12,073 ms; stopped 13 ms, freed 1,083 ms worst | open 7,327 ms; stopped 5 ms, freed 828 ms worst | |
+
+- Measured alone, numbering the lines took 0.13 s instead of 0.86 s at 100 MB, and 2.2 s
+  instead of 12.7 s at 1 GiB.
+- The stages of a workload are those of its last run. At 1 GiB, that run's first frame (713
+  ms), scrolled frame (20.14 ms) and step (21.07 ms) were slower than before, but drawing
+  is unchanged: three more runs gave 462–604 ms, 17.0–17.8 ms and 16.5–17.5 ms, and totals
+  of 19.9–20.3 s.
+- Freeing what a cancelled 500 MB open built now stays under the 1 s gate (828 ms worst).
+  The first frame and a scrolled frame at 1 GiB are still near or over their limits on this
+  machine.
+- Reading the two files on two threads was tried and left out. It halved the reading time
+  at 1 GiB (4.1 to 2.2 s), but on Windows freeing the lines then took 7.1 s instead of 1.5 s,
+  so the run took longer overall (15.4 against 12.1 s), and the freeing after *Cancel* would
+  have been slower too.
+- The anchor search and the walk between anchors (2.5 and 1.2 s at 1 GiB) still run on one
+  thread. The 2-second walk budget outside a job starts before the anchor search, so on
+  this machine the 1 GiB count stays 152,307. With the clock started after the anchor
+  search, it was 152,526.
+- Peak memory was not measured (Windows). The threads' tables together hold as many entries
+  as the one table did, and the list of numbers is the same size, so the peak should not
+  change, but that was not checked on macOS or Linux.
 
 ## Findings
 
@@ -458,7 +588,8 @@ allocator, not for Linux timings.
   one open is reused by the next.
 - The times are noisy: the engine alone (text-100mb, text-500mb) took longer than the view,
   which does the same work and more, so the VM's timings are not reliable at this size.
-  Native Linux and Windows timings were not measured.
+  Native Linux timings were not measured; for native Windows timings, see
+  [Windows x86_64 (2026-11-11)](#windows-x86_64-2026-11-11).
 
 ### Release gates
 

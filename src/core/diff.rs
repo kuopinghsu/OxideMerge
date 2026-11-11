@@ -659,6 +659,18 @@ fn intern_borrowed(panes: &[&[String]], initial: usize) -> Vec<Vec<u32>> {
             })
             .collect();
     }
+    #[cfg(test)]
+    let kept = KEPT_HASH_BITS.get();
+    #[cfg(not(test))]
+    let kept = u32::MAX;
+    if panes.iter().map(|p| p.len()).sum::<usize>() >= PARALLEL_LINES {
+        let threads = super::parallel::take_power_of_two(super::parallel::threads());
+        if threads.count() > 1 {
+            if let Some(ids) = intern_sharded(panes, initial, threads.count(), kept) {
+                return ids;
+            }
+        }
+    }
     let state = std::hash::RandomState::new();
     // The table's hash, made from the 32 bits kept: both halves, as the table takes its slot
     // from the low bits and a tag from the high ones.
@@ -676,9 +688,7 @@ fn intern_borrowed(panes: &[&[String]], initial: usize) -> Vec<Vec<u32>> {
                 .enumerate()
                 .map(|(i, line)| {
                     super::cancel::check_every(i, 1 << 16);
-                    let h = state.hash_one(line.as_str()) as u32;
-                    #[cfg(test)]
-                    let h = h & KEPT_HASH_BITS.get();
+                    let h = state.hash_one(line.as_str()) as u32 & kept;
                     let found =
                         table.find(spread(h), |&(first, kept)| kept == h && text(first) == line);
                     match found {
@@ -710,6 +720,111 @@ fn intern_borrowed(panes: &[&[String]], initial: usize) -> Vec<Vec<u32>> {
         }
     }
     ids
+}
+
+/// Lines from which [`intern_borrowed`] shares the work among threads, all panes together.
+const PARALLEL_LINES: usize = 1 << 18;
+
+/// [`intern_borrowed`] on `threads` threads, giving the same numbers. The lines are first
+/// hashed in parallel into the list of ids. Each thread then owns the lines whose hash starts
+/// with its bits, so equal lines have one owner, and looks them up in a table of its own,
+/// going through the lines in order so that the first sighting it finds is the first. Over an
+/// owned line's hash it writes the place of the first sighting, a line's index across all
+/// panes, behind the same bits, so the other threads still see whose line it is. The places
+/// are then numbered as there. `None` when the places don't fit beside the bits.
+fn intern_sharded(
+    panes: &[&[String]],
+    initial: usize,
+    threads: usize,
+    kept: u32,
+) -> Option<Vec<Vec<u32>>> {
+    use std::hash::BuildHasher;
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    const CHUNK: usize = 1 << 16;
+    let bits = threads.next_power_of_two().trailing_zeros().max(1);
+    let shift = 32 - bits;
+    let places = (1u32 << shift) - 1;
+    if panes.iter().map(|p| p.len()).sum::<usize>() > places as usize {
+        return None;
+    }
+    let starts: Vec<u32> = panes
+        .iter()
+        .scan(0, |at, p| {
+            let start = *at;
+            *at += p.len() as u32;
+            Some(start)
+        })
+        .collect();
+    let pane_of = |at: u32| starts.iter().rposition(|&s| s <= at).unwrap();
+    let text = |at: u32| {
+        let p = pane_of(at);
+        panes[p][(at - starts[p]) as usize].as_str()
+    };
+    let ids: Vec<Vec<AtomicU32>> = panes
+        .iter()
+        .map(|p| vec![0; p.len()].into_iter().map(AtomicU32::new).collect())
+        .collect();
+
+    let state = std::hash::RandomState::new();
+    let chunks: Vec<(usize, usize)> = panes
+        .iter()
+        .enumerate()
+        .flat_map(|(p, lines)| (0..lines.len()).step_by(CHUNK).map(move |i| (p, i)))
+        .collect();
+    super::parallel::map(&chunks, threads, |&(p, from)| {
+        super::cancel::check();
+        let lines = &panes[p][from..(from + CHUNK).min(panes[p].len())];
+        for (line, id) in lines.iter().zip(&ids[p][from..]) {
+            id.store(state.hash_one(line.as_str()) as u32 & kept, Relaxed);
+        }
+    });
+
+    // The table takes its slot from the low bits and a tag from the top seven. The bits that
+    // pick the owner, the same for every line of a table, are kept out of both.
+    let mix = |h: u32| (u64::from(h.rotate_left(bits)) << 32) | u64::from(h);
+    let owners: Vec<u32> = (0..1 << bits).collect();
+    super::parallel::map(&owners, threads, |&owner| {
+        let mut table = hashbrown::HashTable::<(u32, u32)>::with_capacity(initial >> bits);
+        for (p, lines) in panes.iter().enumerate() {
+            for (i, (line, id)) in lines.iter().zip(&ids[p]).enumerate() {
+                super::cancel::check_every(i, 1 << 16);
+                let h = id.load(Relaxed);
+                if h >> shift != owner {
+                    continue;
+                }
+                let found = table.find(mix(h), |&(first, k)| k == h && text(first) == line);
+                let first = match found {
+                    Some(&(first, _)) => first,
+                    None => {
+                        let at = starts[p] + i as u32;
+                        table.insert_unique(mix(h), (at, h), |&(_, k)| mix(k));
+                        at
+                    }
+                };
+                id.store((owner << shift) | first, Relaxed);
+            }
+        }
+    });
+
+    let mut ids: Vec<Vec<u32>> = ids
+        .into_iter()
+        .map(|p| p.into_iter().map(AtomicU32::into_inner).collect())
+        .collect();
+    let mut next = 0;
+    for p in 0..ids.len() {
+        for i in 0..ids[p].len() {
+            super::cancel::check_every(i, 1 << 16);
+            let first = ids[p][i] & places;
+            ids[p][i] = if first == starts[p] + i as u32 {
+                next += 1;
+                next - 1
+            } else {
+                let q = pane_of(first);
+                ids[q][(first - starts[q]) as usize]
+            };
+        }
+    }
+    Some(ids)
 }
 
 struct Interner<'a> {
@@ -1785,6 +1900,75 @@ mod tests {
             }
         }
         KEPT_HASH_BITS.set(u32::MAX);
+    }
+
+    /// Shared among threads, lines get the numbers they get on one, however many threads,
+    /// panes, repeats and hash collisions there are.
+    #[test]
+    fn interning_on_several_threads_numbers_lines_as_on_one() {
+        let pane = |seed: u64, len: usize, kinds: u64| -> Vec<String> {
+            let mut x = seed;
+            (0..len)
+                .map(|_| {
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    match x >> 62 {
+                        0 => String::new(),
+                        _ => format!("line {}", (x >> 33) % kinds),
+                    }
+                })
+                .collect()
+        };
+        let panes = [
+            pane(1, 30_000, 9_000),
+            Vec::new(),
+            pane(2, 25_000, 20_000),
+            pane(3, 7, 5),
+        ];
+        for count in 1..=3 {
+            let refs: Vec<&[String]> = panes[..=count].iter().map(Vec::as_slice).collect();
+            let mut map = HashMap::<&str, u32>::new();
+            let expected: Vec<Vec<u32>> = refs
+                .iter()
+                .map(|p| {
+                    p.iter()
+                        .map(|l| {
+                            let next = map.len() as u32;
+                            *map.entry(l.as_str()).or_insert(next)
+                        })
+                        .collect()
+                })
+                .collect();
+            for threads in [2, 3, 8] {
+                for kept in [u32::MAX, 0xF000_000F, 0] {
+                    assert_eq!(
+                        intern_sharded(&refs, 1000, threads, kept).unwrap(),
+                        expected,
+                        "{count} panes, {threads} threads, {kept:x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A job stopped while its lines are interned on several threads stops them all.
+    #[test]
+    fn interning_on_several_threads_stops_with_its_job() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let lines: Vec<String> = (0..400_000).map(|i| format!("line {i}")).collect();
+        let refs = [lines.as_slice(), lines.as_slice()];
+        let stop = std::sync::Arc::new(AtomicBool::new(true));
+        assert!(
+            crate::core::cancel::run(stop.clone(), || intern_sharded(&refs, 0, 4, u32::MAX))
+                .is_none()
+        );
+        stop.store(false, Ordering::Relaxed);
+        let ids = crate::core::cancel::run(stop, || intern_sharded(&refs, 0, 4, u32::MAX))
+            .flatten()
+            .unwrap();
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(ids[1][399_999], 399_999);
     }
 
     /// Outside a job, which can be stopped, the gaps of a large file share one short budget.

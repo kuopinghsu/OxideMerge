@@ -19,6 +19,7 @@ pub mod html_report;
 pub mod image_cmp;
 pub mod job;
 pub mod net;
+pub mod parallel;
 pub mod patch;
 pub mod pdf_report;
 pub mod prettify;

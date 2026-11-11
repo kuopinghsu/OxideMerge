@@ -145,18 +145,20 @@ fn body(ui: &mut egui::Ui) {
         );
     }
     ui.label(title);
-
-    heading(ui, tr("app.tagline"));
-    text(ui, tr("app.about"));
+    ui.add_space(2.0);
+    ui.add(
+        egui::Label::new(
+            RichText::new(tr("about.slogan"))
+                .size(theme::size::SUBTITLE)
+                .color(p.text_dim),
+        )
+        .wrap(),
+    );
 
     heading(ui, tr("about.features"));
     for feature in FEATURES {
         text(ui, &format!("-  {}", tr(feature)));
     }
-
-    heading(ui, tr("about.credits"));
-    text(ui, tr("about.built_with"));
-    text(ui, tr("about.thanks"));
 
     heading(ui, tr("about.license"));
     let repository = env!("CARGO_PKG_REPOSITORY");

@@ -54,6 +54,21 @@ pub fn check_every(step: usize, every: usize) {
     }
 }
 
+/// The flag of the job this thread runs, for the threads it hands part of the work to.
+pub fn current() -> Option<Arc<AtomicBool>> {
+    FLAG.with(|f| f.borrow().clone())
+}
+
+/// Runs `work` on another thread as part of the job whose flag is `job` (from [`current`]):
+/// `None` when the job was stopped, and the thread that started it should then [`check`].
+/// Without a job, `work` runs to its end.
+pub fn share<T>(job: &Option<Arc<AtomicBool>>, work: impl FnOnce() -> T) -> Option<T> {
+    match job {
+        Some(stop) => run(stop.clone(), work),
+        None => Some(work()),
+    }
+}
+
 /// Runs `job` on this thread until it ends or `stop` is set: `None` when it was stopped. A
 /// real panic in the job goes on unwinding.
 pub fn run<T>(stop: Arc<AtomicBool>, job: impl FnOnce() -> T) -> Option<T> {
