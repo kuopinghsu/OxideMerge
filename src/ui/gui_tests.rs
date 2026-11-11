@@ -2175,7 +2175,8 @@ fn formatted_web_pages_step_on_to_the_next_file() {
             ("right/two.html", "<p>two</p><p>right</p>"),
         ],
     );
-    let cfg = config();
+    let mut cfg = config();
+    cfg.web_mode = crate::core::web::WebMode::Html;
     let roots = [d.join("left"), d.join("right")];
     let mut gui = Gui::with_config("web_step_file", cfg, compare_folders(&roots));
     let shown = |gui: &mut Gui| {
@@ -2201,6 +2202,7 @@ fn formatted_web_pages_step_on_to_the_next_file() {
     gui.key(ALT, Key::ArrowDown);
     gui.key(ALT, Key::ArrowDown);
     assert!(shown(&mut gui).ends_with("/two.html"));
+    assert_eq!(gui.app.cfg.web_mode, crate::core::web::WebMode::Html);
 }
 
 /// A Word document and a spreadsheet, built as the real formats are, so that the window is

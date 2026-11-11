@@ -2496,7 +2496,8 @@ the command line.
 === Comparison modes
 
 Each mode looks at the pages from a different angle.
-Choose a mode in the selector at the top of the tab; OxideMerge remembers the last mode you used.
+Choose a mode in the selector at the top of the tab. Local HTML files start in *Formatted*
+view. Comparisons that include an online page remember the last mode you used for online pages.
 
 [cols="1,3"]
 |===
