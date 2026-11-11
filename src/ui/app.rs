@@ -11130,7 +11130,9 @@ impl eframe::App for OxideMergeApp {
                 }
             });
         if let Some(Content::Web(w)) = self.tabs.get(self.active).map(|t| &t.content) {
-            self.cfg.web_mode = w.mode;
+            if !w.is_local() {
+                self.cfg.web_mode = w.mode;
+            }
         }
         self.sync_text_layout();
         crate::core::fsutil::set_backup(self.cfg.backup_on_save);

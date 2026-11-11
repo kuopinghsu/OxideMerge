@@ -97,7 +97,7 @@ impl WebView {
     pub fn new(urls: Vec<Url>, cfg: &Config) -> Self {
         let mut v = WebView {
             urls,
-            mode: cfg.web_mode,
+            mode: WebMode::Markdown,
             pages: None,
             inner: None,
             formatted: None,
@@ -106,8 +106,15 @@ impl WebView {
             note: String::new(),
             land: None,
         };
+        if !v.is_local() {
+            v.mode = cfg.web_mode;
+        }
         v.start(cfg);
         v
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.urls.iter().all(|url| url.scheme() == "file")
     }
 
     pub fn title(&self) -> String {
