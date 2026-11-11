@@ -16,8 +16,8 @@ existing comparison reports. Standard comparisons remain unchanged.
   (`nearby_edits`) or both change the same `name = value`, `name: value` or
   `"name": value` setting in different places (`shared_setting`); a deletion review is
   raised only where base lines are deleted.
-- JSON objects are unordered; arrays are ordered. Duplicate keys fail. Numeric spellings
-  are retained exactly (for example `1` and `1.0` can differ). Missing is distinct from
+- JSON objects are unordered; arrays are ordered. Duplicate keys fail. Numbers compare
+  by value, as in TOML and YAML (`1` = `1.0` = `1e0`, `-0` = `0`). Missing is distinct from
   null. XML uses expanded namespaces; attributes are unordered; child order, whitespace,
   comments and mixed content matter. DTDs/external entities/XML 1.1 are unsupported.
   Source spans refer to decoded UTF-8, not encoded bytes.
@@ -179,8 +179,8 @@ The Tree view (*Tree* beside *Text* and *Semantic* for two JSON, YAML, TOML or X
 is a read-only presentation built from the same parsers, limits and comparison rules as
 the semantic adapters; it never re-serializes or writes either file. Values therefore
 compare exactly as in the Semantic view: for JSON, YAML and TOML, key order, comments,
-quoting and flow or block style do not count, and YAML and TOML numbers compare by value
-(`1` equals `1.0`) while JSON keeps numeric spellings (`1` and `1.0` differ); for XML,
+quoting and flow or block style do not count, and numbers compare by value
+(`1` equals `1.0`) in all three; for XML,
 attributes are unordered and child order, text whitespace and comments count.
 
 - **Projection.** Each document becomes nodes with per-load ids (not persistent across

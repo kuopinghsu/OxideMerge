@@ -413,15 +413,21 @@ impl XmlTreeView {
         });
         ui.horizontal_wrapped(|ui| {
             let before = self.filter;
-            ui.selectable_value(&mut self.filter, None, tr("analysis.all"));
-            for (f, key) in [
-                (Filter::Added, "analysis.added"),
-                (Filter::Removed, "analysis.removed"),
-                (Filter::Modified, "analysis.modified"),
-                (Filter::Moved, "analysis.moved"),
-                (Filter::Ambiguous, "analysis.tree_ambiguous"),
+            let pal = widgets::pal(ui);
+            let total = diff.targets.len();
+            if filter_chip(ui, self.filter.is_none(), tr("analysis.all"), total, None).clicked() {
+                self.filter = None;
+            }
+            for (f, key, n, dot) in [
+                (Filter::Added, "analysis.added", c.added, pal.success),
+                (Filter::Removed, "analysis.removed", c.removed, pal.danger),
+                (Filter::Modified, "analysis.modified", c.modified, pal.accent),
+                (Filter::Moved, "analysis.moved", c.moved, pal.sides[1]),
+                (Filter::Ambiguous, "analysis.tree_ambiguous", c.ambiguous, pal.warning),
             ] {
-                ui.selectable_value(&mut self.filter, Some(f), tr(key));
+                if filter_chip(ui, self.filter == Some(f), tr(key), n, Some(dot)).clicked() {
+                    self.filter = if self.filter == Some(f) { None } else { Some(f) };
+                }
             }
             if before != self.filter {
                 if let Some(s) = self.selected {
@@ -785,6 +791,14 @@ impl XmlTreeView {
                 continue;
             }
             let indent = area.min.x + 6.0 + row.depth as f32 * INDENT;
+            // indent guides: one faint line per level, so deep nesting stays readable
+            let guide = egui::Stroke::new(1.0, dim.gamma_multiply(0.25));
+            for d in 0..row.depth {
+                let gx = area.min.x + 6.0 + d as f32 * INDENT + 5.0;
+                if gx < area.max.x {
+                    painter.vline(gx, rect.y_range(), guide);
+                }
+            }
             let has_children =
                 !row.children.is_empty() && row.children.iter().any(|&c| !diff.rows[c].blank);
             if has_children {
@@ -972,7 +986,7 @@ impl XmlTreeView {
                                 job.append(": ", 0.0, fmt(dim, mono));
                                 let other =
                                     row.sides[1 - s].map(|o| &diff.docs[1 - s].nodes[o.node()]);
-                                let mut f = fmt(text, mono);
+                                let mut f = fmt(value_color(&node.tag, colors, text), mono);
                                 if other.is_some_and(|o| o.kind != node.kind || o.tag != node.tag) {
                                     f.background = colors.inline;
                                 }
@@ -1342,6 +1356,89 @@ fn labeled(response: &egui::Response, label: &str, text: &str) {
 
 const GUTTER: f32 = 28.0;
 const INDENT: f32 = 14.0;
+
+/// The color a scalar of type `tag` is written in, as editors color JSON: strings, numbers,
+/// booleans and null, and date-times each their own, else `text`.
+fn value_color(tag: &str, colors: &theme::Colors, text: Color32) -> Color32 {
+    let dark = colors.text_bg.r() < 128;
+    let rgb = match (tag, dark) {
+        ("string", true) => (0x7e, 0xe7, 0x87),
+        ("string", false) => (0x1a, 0x7f, 0x37),
+        ("number", true) => (0x79, 0xc0, 0xff),
+        ("number", false) => (0x05, 0x50, 0xae),
+        ("bool" | "null", true) => (0xd2, 0xa8, 0xff),
+        ("bool" | "null", false) => (0x82, 0x50, 0xdf),
+        ("datetime", true) => (0xff, 0xa6, 0x57),
+        ("datetime", false) => (0x95, 0x38, 0x00),
+        _ => return text,
+    };
+    Color32::from_rgb(rgb.0, rgb.1, rgb.2)
+}
+
+/// A rounded filter toggle: a colored dot, its name and a count. Screen readers and tests read
+/// it as `name  (n)`.
+pub fn filter_chip(
+    ui: &mut Ui,
+    selected: bool,
+    name: &str,
+    n: usize,
+    dot: Option<Color32>,
+) -> egui::Response {
+    let pal = widgets::pal(ui);
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let small = egui::TextStyle::Small.resolve(ui.style());
+    let fg = if selected { pal.on_accent } else { pal.text };
+    let name_g = ui.painter().layout_no_wrap(name.to_owned(), font, fg);
+    let count_fg = if selected { pal.on_accent } else { pal.text_dim };
+    let count_g = ui.painter().layout_no_wrap(n.to_string(), small, count_fg);
+    let dot_w = if dot.is_some() { 12.0 } else { 0.0 };
+    let w = 10.0 + dot_w + name_g.size().x + 6.0 + count_g.size().x + 10.0;
+    let h = name_g.size().y.max(18.0) + 4.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(w, h), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::Role::Button,
+            true,
+            selected,
+            format!("{name}  ({n})"),
+        )
+    });
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let fill = if selected {
+            pal.accent
+        } else if response.hovered() {
+            pal.control_hover
+        } else {
+            pal.control
+        };
+        p.rect_filled(rect, h / 2.0, fill);
+        if !selected {
+            p.rect_stroke(
+                rect,
+                h / 2.0,
+                egui::Stroke::new(1.0, pal.border),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let mut x = rect.min.x + 10.0;
+        if let Some(dot) = dot {
+            let color = if selected { pal.on_accent } else { dot };
+            p.circle_filled(egui::pos2(x + 3.5, rect.center().y), 3.5, color);
+            x += dot_w;
+        }
+        let ny = rect.center().y - name_g.size().y / 2.0;
+        let name_w = name_g.size().x;
+        p.galley(egui::pos2(x, ny), name_g, fg);
+        x += name_w + 6.0;
+        let cy = rect.center().y - count_g.size().y / 2.0;
+        p.galley(egui::pos2(x, cy), count_g, count_fg);
+        if response.has_focus() {
+            widgets::focus_ring(ui, &response, rect, (h / 2.0) as u8);
+        }
+    }
+    response
+}
 
 fn status_name(diff: &TreeDiff, r: usize) -> &'static str {
     let row = &diff.rows[r];
