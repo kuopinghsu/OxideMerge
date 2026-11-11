@@ -2993,6 +2993,15 @@ impl TextView {
         found.is_some()
     }
 
+    /// Which difference of the Formatted view is selected and how many it has, while it is
+    /// shown: its blocks are what the toolbar steps through then, not the lines of the text.
+    fn formatted_position(&self) -> Option<(Option<usize>, usize)> {
+        match &self.formatted.view {
+            Some((_, Ok(view))) if self.formatted_active => Some(view.position()),
+            _ => None,
+        }
+    }
+
     pub fn diff_position(&self) -> (Option<usize>, usize) {
         // Asked for several times a frame, so counted without collecting.
         let place = |stops: &mut dyn Iterator<Item = usize>, at: Option<usize>| {
@@ -3005,6 +3014,9 @@ impl TextView {
             }
             (pos, total)
         };
+        if let Some(position) = self.formatted_position() {
+            return position;
+        }
         if let Some(d) = self.keyed() {
             let mut rows = (0..d.rows.len()).filter(|&i| d.rows[i].differs(d.ignore_order));
             return place(&mut rows, self.table.selected);
@@ -6431,7 +6443,12 @@ impl TextView {
                 shown.on_hover_ui(|ui| {
                     ui.label(self.status_line());
                 });
-                if let Some((del, add)) = self.change_counts().filter(|&(d, a)| d + a > 0) {
+                // Lines added and removed say nothing of the blocks the Formatted view shows.
+                let counts = match self.formatted_position() {
+                    Some(_) => None,
+                    None => self.change_counts(),
+                };
+                if let Some((del, add)) = counts.filter(|&(d, a)| d + a > 0) {
                     let (added, removed) = (format!("+{add}"), format!("−{del}"));
                     let diff = theme::colors(ui.visuals().dark_mode).ui;
                     ui.label(RichText::new(&added).monospace().color(diff.success));
@@ -11024,7 +11041,8 @@ impl TextView {
             if let Some(result) = task.poll() {
                 let labels = self.panes.iter().map(|p| p.doc.title()).collect();
                 let view = result
-                    .map(|prepared| MarkdownView::from_prepared(prepared, labels))
+                    // The toolbar above steps through its differences and says where it is.
+                    .map(|prepared| MarkdownView::from_prepared(prepared, labels).hosted())
                     .map_err(|e| format!("{e:#}"));
                 self.formatted.view = Some((key.clone(), view));
                 self.formatted.job = None;
