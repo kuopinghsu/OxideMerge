@@ -1245,11 +1245,27 @@ fn change_details(
     panes: [usize; 2],
     out: &mut Option<SemanticAction>,
 ) {
-    ui.monospace(format!(
-        "{} → {}",
-        shorten(change.before.as_deref().unwrap_or("∅"), 512),
-        shorten(change.after.as_deref().unwrap_or("∅"), 512),
-    ));
+    // the old value on a red ground and the new on a green one, as the text view marks them
+    let colors = super::theme::colors(ui.visuals().dark_mode);
+    let mono = egui::TextStyle::Monospace.resolve(ui.style());
+    let text = ui.visuals().text_color();
+    let fmt = |background: Color32, color: Color32| egui::TextFormat {
+        font_id: mono.clone(),
+        color,
+        background,
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    match change.before.as_deref() {
+        Some(v) => job.append(&shorten(v, 512), 0.0, fmt(colors.inline_removed, text)),
+        None => job.append("∅", 0.0, fmt(Color32::TRANSPARENT, widgets::pal(ui).text_dim)),
+    }
+    job.append(" → ", 0.0, fmt(Color32::TRANSPARENT, widgets::pal(ui).text_dim));
+    match change.after.as_deref() {
+        Some(v) => job.append(&shorten(v, 512), 0.0, fmt(colors.inline_added, text)),
+        None => job.append("∅", 0.0, fmt(Color32::TRANSPARENT, widgets::pal(ui).text_dim)),
+    }
+    ui.label(job);
     let paired = match change.confidence.as_str() {
         "array_key" => Some("analysis.paired_by_key"),
         "reordered" => Some("analysis.paired_by_reordering"),
@@ -1286,7 +1302,16 @@ fn semantic_tree_ui(
 ) {
     use crate::core::semantic::ChangeKind;
     for change in &node.changes {
-        egui::CollapsingHeader::new(change_label(change))
+        let pal = widgets::pal(ui);
+        let color = match change.kind {
+            ChangeKind::Added => pal.success,
+            ChangeKind::Removed => pal.danger,
+            ChangeKind::Modified => pal.accent,
+            ChangeKind::TypeChanged => pal.warning,
+            ChangeKind::Moved => pal.sides[1],
+        };
+        let header = egui::RichText::new(change_label(change)).color(color).strong();
+        egui::CollapsingHeader::new(header)
             .id_salt(&change.id)
             .default_open(true)
             .show(ui, |ui| {
@@ -1910,6 +1935,13 @@ impl TextView {
         v.apply_prettify();
         v.rediff();
         v.first_diff();
+        // Word documents and PDFs open in the Formatted view; workbooks open as a table.
+        v.formatted_mode = v.documents().is_some_and(|paths| {
+            matches!(
+                formatted_kind(&paths[0]),
+                Some(FormattedKind::Document | FormattedKind::Pdf)
+            )
+        });
         v
     }
 
@@ -11165,16 +11197,25 @@ impl TextView {
             }
             return;
         }
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.semantic_filter, None, tr("analysis.all"));
-            for (kind, key) in [
-                (semantic::ChangeKind::Added, "analysis.added"),
-                (semantic::ChangeKind::Removed, "analysis.removed"),
-                (semantic::ChangeKind::Modified, "analysis.modified"),
-                (semantic::ChangeKind::TypeChanged, "analysis.type_changed"),
-                (semantic::ChangeKind::Moved, "analysis.moved"),
+        ui.horizontal_wrapped(|ui| {
+            use super::xml_tree_view::filter_chip;
+            let pal = widgets::pal(ui);
+            let all = self.semantic_filter.is_none();
+            if filter_chip(ui, all, tr("analysis.all"), report.changes.len(), None).clicked() {
+                self.semantic_filter = None;
+            }
+            for (kind, key, dot) in [
+                (semantic::ChangeKind::Added, "analysis.added", pal.success),
+                (semantic::ChangeKind::Removed, "analysis.removed", pal.danger),
+                (semantic::ChangeKind::Modified, "analysis.modified", pal.accent),
+                (semantic::ChangeKind::TypeChanged, "analysis.type_changed", pal.warning),
+                (semantic::ChangeKind::Moved, "analysis.moved", pal.sides[1]),
             ] {
-                ui.selectable_value(&mut self.semantic_filter, Some(kind), tr(key));
+                let n = report.changes.iter().filter(|c| c.kind == kind).count();
+                let on = self.semantic_filter.as_ref() == Some(&kind);
+                if filter_chip(ui, on, tr(key), n, Some(dot)).clicked() {
+                    self.semantic_filter = if on { None } else { Some(kind) };
+                }
             }
             if ui.button(tr("analysis.export")).clicked() {
                 self.export_semantic(report);

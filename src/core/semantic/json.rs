@@ -82,7 +82,11 @@ fn node(source: &str, raw: &str, depth: usize, budget: &mut usize) -> Result<Nod
                 _ => unreachable!(),
             }
             .into();
-            n.value = Some(value.to_string());
+            // Numbers compare by value as in TOML and YAML: `1`, `1.0`, `1e0` and `-0`/`0`.
+            n.value = Some(match value {
+                serde_json::Value::Number(_) => super::float_literal(raw.trim()),
+                _ => value.to_string(),
+            });
         }
     }
     Ok(n)

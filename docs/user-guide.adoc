@@ -2199,6 +2199,8 @@ message saying so instead; compare such a file as text.
 The *Text* / *Formatted* switch appears above the panes when every side is a `.docx` file, every
 side is a workbook (`.xlsx`, `.xlsm`) or every side is a `.pdf` file, read by OxideMerge itself.
 It is not offered for `.odt`, `.rtf` or `.ods` files.
+A comparison of `.docx` or `.pdf` files opens in the Formatted view; a workbook opens in the
+Table view.
 The Formatted view reads the files itself even when a converter is set up for them under
 *Options → Plugins*.
 Whether a block differs depends on its text alone; the comparison options decide only which words
@@ -5053,7 +5055,7 @@ The structure option works with the *Full contents* method.
 When the text of a file differs, OxideMerge reads the file as structured data and counts it as
 identical when the values are the same.
 As in <<semantic>>, key order, layout and comments do not count.
-TOML and YAML numbers compare by value: `30` and `30.0` are the same, even where a program that
+JSON, TOML and YAML numbers compare by value: `30` and `30.0` are the same, even where a program that
 reads the file tells them apart.
 When you open such a file, the comparison still shows its text differences;
 choose *Semantic* to see that the structure is the same.

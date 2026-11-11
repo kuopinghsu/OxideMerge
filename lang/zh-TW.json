@@ -1276,7 +1276,7 @@
   "analysis.tree_tip": "將兩個 XML 檔案顯示為一棵對齊的樹：對應的元素位於同一列，只存在於一側的節點以占位列表示。唯讀。",
   "analysis.tree_policy": "樹狀檢視：每一列配對一個節點與其對應節點，因此插入一個同層節點只算一項新增，數量可能少於語意檢視逐路徑列出的變更。屬性不分順序；子節點順序、文字空白與註解都會比較，與語意檢視相同。唯讀。",
   "analysis.tree_tip_values": "將兩個檔案顯示為一棵對齊的樹：物件成員依索引鍵位於同一列，陣列元素會對齊，只存在於一側的值以占位列表示。唯讀。",
-  "analysis.tree_policy_values": "樹狀檢視：物件成員依索引鍵配對，陣列元素會對齊，因此插入一個元素只算一項新增，數量可能少於語意檢視逐路徑列出的變更。值的比較方式與語意檢視相同：不計索引鍵順序、註解與格式；TOML 與 YAML 的數字依數值比較（1 等於 1.0），JSON 的數字則不然。唯讀。",
+  "analysis.tree_policy_values": "樹狀檢視：物件成員依索引鍵配對，陣列元素會對齊，因此插入一個元素只算一項新增，數量可能少於語意檢視逐路徑列出的變更。值的比較方式與語意檢視相同：不計索引鍵順序、註解與格式；JSON、TOML 與 YAML 的數字都依數值比較（1 等於 1.0）。唯讀。",
   "analysis.tree_search_hint_values": "名稱、值或路徑，例如 $.server.port",
   "analysis.tree_keys_hint_values": "servers@name; ports@name+protocol",
   "analysis.tree_keys_tip_values": "依成員值而非位置配對陣列中的物件：寫成 array@member，多個成員以 + 連接，規則之間以 ; 分隔。只套用於此檢視。",

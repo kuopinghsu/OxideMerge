@@ -571,6 +571,19 @@ uses its section of this file as the release notes.
 
 ### Changed
 
+- **Documents open in the Formatted view:** a comparison of Word documents or PDF files now
+  opens in the *Formatted* view instead of *Text*; CSV, TSV and spreadsheet comparisons
+  open in the *Table* view as before.
+- **JSON numbers compare by value:** the Semantic and Tree views, and folder comparisons by
+  structure, now treat `1`, `1.0` and `1e0` (or `-0` and `0`) as the same JSON number, as they
+  already did for TOML and YAML. Before, a different spelling of the same number was reported
+  as a modification.
+- **Easier to read Tree and Semantic views:** in the Tree view of JSON, YAML and TOML, values
+  are colored by type (strings, numbers, booleans and null, date-times), and faint guide lines
+  mark each level of nesting. The change filters of both views are now chips with a colored dot
+  and the number of changes of each kind; clicking a selected chip shows all changes again. In
+  the Semantic view each change is titled in the color of its kind, and its old value is shown
+  on a red background and its new one on a green background.
 - **Large text comparisons use several threads:** numbering the lines, which took most of
   the time of a large comparison, is now shared among up to eight threads, with the same
   results. On an Intel Core i9-12900KF (Windows), two 100 MB files compare in 0.80 s
