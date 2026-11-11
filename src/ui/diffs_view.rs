@@ -2078,6 +2078,13 @@ impl DiffsView {
         let hover = resp.hover_pos();
         let mut tip = None;
         let painter = ui.painter();
+        // Lines only one of two files has are shown as added, as the compare of a single file
+        // shows them, and not in the color of changed lines.
+        let one_sided = n == 2
+            && row
+                .block()
+                .and_then(|b| d.result.blocks.get(b))
+                .is_some_and(|b| b.one_sided());
         for (s, (class, marks)) in cells.iter().enumerate() {
             let col = Rect::from_min_size(
                 pos2(rect.left() + s as f32 * col_w, rect.top()),
@@ -2085,13 +2092,7 @@ impl DiffsView {
             );
             let num = Rect::from_min_size(col.min, vec2(gutter, col.height()));
             let text = Rect::from_min_max(pos2(num.right(), col.top()), col.max);
-            let bg = match *class {
-                "ctx" => colors.text_bg,
-                "ign" => colors.ignored,
-                "gap" => colors.missing,
-                "conf" => colors.conflict,
-                _ => colors.diff,
-            };
+            let bg = row_fill(class, one_sided, colors);
             painter.rect_filled(num, 0.0, colors.gutter_bg);
             painter.rect_filled(text, 0.0, bg);
             if s > 0 {
@@ -2203,6 +2204,19 @@ fn copy_changes(d: &Diffs, b: usize, from: usize, to: usize) -> bool {
     lines(from) != lines(to)
 }
 
+/// The background of a line of a file by the class the report gives it. `one_sided` says its
+/// difference is lines only one of two files has.
+fn row_fill(class: &str, one_sided: bool, colors: &theme::Colors) -> Color32 {
+    match class {
+        "ctx" => colors.text_bg,
+        "ign" => colors.ignored,
+        "gap" => colors.missing,
+        "conf" => colors.conflict,
+        _ if one_sided => colors.added,
+        _ => colors.diff,
+    }
+}
+
 /// Color of a file's marks: the same, missing on a side, or different.
 fn card_color(p: &theme::Palette, card: &Card, n: usize) -> Color32 {
     let missing = match card.diffs() {
@@ -2294,6 +2308,21 @@ fn line_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lines only one file has are in the color of added lines and changed ones in that of
+    /// changes, as the compare of a single file colors them.
+    #[test]
+    fn added_lines_are_not_in_the_color_of_changed_ones() {
+        let c = theme::colors(false);
+        for class in ["add", "del"] {
+            assert_eq!(row_fill(class, true, &c), c.added);
+            assert_eq!(row_fill(class, false, &c), c.diff);
+        }
+        // The side without the lines, and lines that are not compared, stay as they are.
+        assert_eq!(row_fill("gap", true, &c), c.missing);
+        assert_eq!(row_fill("ign", true, &c), c.ignored);
+        assert_eq!(row_fill("ctx", false, &c), c.text_bg);
+    }
 
     fn item(name: &str, exists: [bool; 3], status: CmpStatus) -> DirItem {
         DirItem {

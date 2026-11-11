@@ -25,6 +25,13 @@ pub enum ImgMode {
 }
 
 const BLINK_SECS: f64 = 0.6;
+/// A block whose pixels are off by less than this in every channel is one the eye may not
+/// tell apart in the two images: its mark blinks with them.
+const FAINT: u8 = 24;
+/// How strongly a pixel that differs is marked, and one of a block that differs faintly
+/// while the blink view shows the last image.
+const MARK: f32 = 0.4;
+const FLASH: f32 = 0.65;
 
 pub struct ImageView {
     pub paths: Vec<PathBuf>,
@@ -33,6 +40,10 @@ pub struct ImageView {
     images: Vec<RgbaImage>,
     textures: Vec<Option<TextureHandle>>,
     diff_tex: Option<TextureHandle>,
+    /// The pixels that differ, white on nothing, to be drawn over the images in the color of
+    /// the marks: those of blocks that differ plainly, and those of blocks that differ
+    /// faintly. `None` where there are no such pixels.
+    mask_tex: [Option<TextureHandle>; 2],
     textures_dirty: bool,
     diff_dirty: bool,
     diff: ImageDiff,
@@ -55,6 +66,8 @@ pub struct ImageView {
     /// Set when difference navigation ran past the last (true) or first (false) difference,
     /// so the app can move on to the next or previous file of the folder compare.
     pub step_file: Option<bool>,
+    /// The pixel under the pointer, which the status line tells the place and colors of.
+    probe: Option<(u32, u32)>,
     id: egui::Id,
 }
 
@@ -74,6 +87,7 @@ impl ImageView {
             images,
             textures: vec![None; n],
             diff_tex: None,
+            mask_tex: [None, None],
             textures_dirty: true,
             diff_dirty: true,
             diff,
@@ -94,6 +108,7 @@ impl ImageView {
             status: String::new(),
             id: egui::Id::unique(("imgview", std::time::Instant::now())),
             step_file: None,
+            probe: None,
         })
     }
 
@@ -291,6 +306,45 @@ impl ImageView {
         s
     }
 
+    /// The status line for the status bar: with the pixel under the pointer, its place, its
+    /// color in each image and the most these are apart in a channel. Not part of
+    /// [`Self::status_line`], which is also what a run without a user reports and must not
+    /// depend on where the pointer happens to be.
+    pub fn status_bar_line(&self) -> String {
+        let mut s = self.status_line();
+        let Some((x, y)) = self.probe else {
+            return s;
+        };
+        // The same place in every image: they are shown at one zoom and offset. These are the
+        // colors of the images whatever the view draws there, a blend or the difference.
+        let pixels: Vec<Option<[u8; 4]>> = self
+            .images
+            .iter()
+            .map(|img| img.get_pixel_checked(x, y).map(|p| p.0))
+            .collect();
+        let colors: Vec<String> = pixels
+            .iter()
+            .map(|p| match p {
+                Some([r, g, b, 255]) => format!("RGB({r}, {g}, {b})"),
+                Some([r, g, b, a]) => format!("RGBA({r}, {g}, {b}, {a})"),
+                // A smaller image has nothing there.
+                None => "–".to_string(),
+            })
+            .collect();
+        s.push_str(&format!("  |  X: {x}, Y: {y}  |  {}", colors.join("  ↔  ")));
+        if let Some(Some(first)) = pixels.first() {
+            let apart = pixels[1..]
+                .iter()
+                .flatten()
+                .flat_map(|p| (0..4).map(|i| p[i].abs_diff(first[i])))
+                .max();
+            if let Some(apart) = apart {
+                s.push_str(&format!("  |  Δ {apart}"));
+            }
+        }
+        s
+    }
+
     fn ensure_textures(&mut self, ctx: &egui::Context) {
         if self.textures_dirty {
             self.textures_dirty = false;
@@ -317,6 +371,29 @@ impl ImageView {
         );
         self.diff_tex =
             Some(ctx.load_texture(format!("{:?}diff", self.id), ci, TextureOptions::NEAREST));
+        let (w, h) = (self.diff.width as usize, self.diff.height as usize);
+        let (bs, bw) = (self.diff.block_size as usize, self.diff.blocks_x as usize);
+        for (class, tex) in self.mask_tex.iter_mut().enumerate() {
+            let mut any = false;
+            let pixels: Vec<Color32> = (self.diff.mask.iter().enumerate())
+                .map(|(i, &differs)| {
+                    let block = (i / w / bs) * bw + (i % w) / bs;
+                    if differs && is_faint(self.diff.strength[block]) == (class == 1) {
+                        any = true;
+                        Color32::WHITE
+                    } else {
+                        Color32::TRANSPARENT
+                    }
+                })
+                .collect();
+            *tex = any.then(|| {
+                ctx.load_texture(
+                    format!("{:?}mask{class}", self.id),
+                    ColorImage::new([w, h], pixels),
+                    TextureOptions::NEAREST,
+                )
+            });
+        }
     }
 
     pub fn ui(&mut self, ui: &mut Ui, _cfg: &Config, c: &Colors) {
@@ -447,6 +524,18 @@ impl ImageView {
             }
         }
 
+        // The pane a place across the view is in, and where a pane shows its image.
+        let pane_at =
+            |x: f32| (((x - avail.left()) / pane_w).floor().max(0.0) as usize).min(panes - 1);
+        let view_of = |pane: usize| {
+            Rect::from_min_size(
+                pos2(
+                    avail.left() + pane as f32 * pane_w + 2.0,
+                    avail.top() + header_h,
+                ),
+                view_size,
+            )
+        };
         let all_rect = Rect::from_min_max(pos2(avail.left(), avail.top() + header_h), avail.max);
         let resp = ui.interact(all_rect, self.id.with("drag"), Sense::click_and_drag());
         resp.widget_info(|| {
@@ -484,17 +573,38 @@ impl ImageView {
             });
             self.offset += pan;
             if factor != 1.0 {
-                let local = hover
-                    - pos2(
-                        avail.left() + ((hover.x - avail.left()) / pane_w).floor() * pane_w,
-                        avail.top() + header_h,
-                    );
+                let local = hover - view_of(pane_at(hover.x)).min;
                 let old = self.zoom;
                 let new = (old * factor).clamp(0.02, 64.0);
                 factor = new / old;
                 self.offset = local - (local - self.offset) * factor;
                 self.zoom = new;
             }
+        }
+
+        // The pixel under the pointer, for the status bar: none while the images are dragged
+        // about, nor under the handle of the swipe view, which is not a place in an image.
+        let probe = resp
+            .hover_pos()
+            .filter(|_| !resp.dragged())
+            .and_then(|hover| {
+                let view = view_of(pane_at(hover.x));
+                let handle = view.left() + view.width() * self.swipe;
+                if self.mode == ImgMode::Swipe && (hover.x - handle).abs() <= 8.0 {
+                    return None;
+                }
+                let at = (hover - view.min - self.offset) / self.zoom;
+                let inside = view.contains(hover)
+                    && (0.0..img_size.x).contains(&at.x)
+                    && (0.0..img_size.y).contains(&at.y);
+                inside.then_some((at.x as u32, at.y as u32))
+            });
+        if probe != self.probe {
+            self.probe = probe;
+            // The status bar was drawn before this view. A pointer on the move draws the next
+            // frame itself; this one is for the pixel it comes to rest on.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
         }
 
         let dims: Vec<String> = self
@@ -571,7 +681,7 @@ impl ImageView {
                     }
                 });
             });
-            let view = Rect::from_min_size(pos2(x0 + 2.0, avail.top() + header_h), view_size);
+            let view = view_of(p);
             let painter = ui.painter_at(view);
             painter.rect_filled(view, 0.0, c.missing);
             let img_rect =
@@ -700,32 +810,17 @@ impl ImageView {
                     Color32::WHITE,
                 ),
             }
-            if self.show_blocks {
-                let bs = self.diff.block_size as f32 * self.zoom;
-                let (bw, bh) = (self.diff.blocks_x, self.diff.blocks_y);
-                let span = |lo: f32, hi: f32, n: u32| {
-                    let first = (lo / bs).floor().clamp(0.0, n as f32) as u32;
-                    let last = (hi / bs).ceil().clamp(0.0, n as f32) as u32;
-                    first..last
-                };
-                let fill = c.conflict_bar.gamma_multiply(0.22);
-                for by in span(view.top() - origin.y, view.bottom() - origin.y, bh) {
-                    let cols = span(view.left() - origin.x, view.right() - origin.x, bw);
-                    let mut run: Option<u32> = None;
-                    for bx in cols.start..=cols.end {
-                        let set = bx < cols.end && self.diff.blocks[(by * bw + bx) as usize];
-                        match (set, run) {
-                            (true, None) => run = Some(bx),
-                            (false, Some(start)) => {
-                                let r = Rect::from_min_size(
-                                    origin + vec2(start as f32 * bs, by as f32 * bs),
-                                    vec2((bx - start) as f32 * bs, bs),
-                                );
-                                painter.rect_filled(r, 0.0, fill);
-                                run = None;
-                            }
-                            _ => {}
-                        }
+            // While the images blink, the marks of what differs faintly blink with them, on the
+            // last image only and stronger: a pixel one shade off looks the same in both
+            // images, and under a mark that stayed it could not be told to differ at all. What
+            // differs plainly is seen to blink by itself, under the mark it always has.
+            let blink = (self.mode == ImgMode::Blink).then(|| self.blink_side(ui) != 0);
+            let whole = Rect::from_min_size(origin, img_size * self.zoom);
+            for (faint, strength) in block_marks(self.show_blocks, blink) {
+                let tint = c.conflict_bar.gamma_multiply(strength);
+                for (class, tex) in self.mask_tex.iter().enumerate() {
+                    if let (Some(t), true) = (tex, faint.is_none_or(|f| f == (class == 1))) {
+                        painter.image(t.id(), whole, uv, tint);
                     }
                 }
             }
@@ -769,9 +864,80 @@ impl ImageView {
     }
 }
 
+/// Whether a block whose first and last image are `strength` apart at most differs so little
+/// between them that the eye may not see it change.
+fn is_faint(strength: u8) -> bool {
+    (1..FAINT).contains(&strength)
+}
+
+/// The marks drawn over the pixels that differ: those of which blocks, by whether the blocks
+/// differ faintly (`None` for all of them), and how strongly. `blink` is whether the blink view shows the
+/// last image now, and `None` in the other views.
+fn block_marks(shown: bool, blink: Option<bool>) -> Vec<(Option<bool>, f32)> {
+    match (shown, blink) {
+        (false, _) => Vec::new(),
+        (true, None) => vec![(None, MARK)],
+        (true, Some(false)) => vec![(Some(false), MARK)],
+        (true, Some(true)) => vec![(Some(false), MARK), (Some(true), FLASH)],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In the blink view the marks of blocks that differ faintly are there with the last
+    /// image only, so they blink; every other mark stays, as in the other views.
+    #[test]
+    fn faint_blocks_blink_with_the_images() {
+        assert!(block_marks(false, Some(true)).is_empty());
+        assert_eq!(block_marks(true, None), [(None, MARK)]);
+        assert_eq!(block_marks(true, Some(false)), [(Some(false), MARK)]);
+        assert_eq!(
+            block_marks(true, Some(true)),
+            [(Some(false), MARK), (Some(true), FLASH)]
+        );
+        // A shade apart is faint; the same, or far apart, is not.
+        assert!(is_faint(1) && is_faint(FAINT - 1));
+        assert!(!is_faint(0) && !is_faint(FAINT) && !is_faint(255));
+    }
+
+    #[test]
+    fn the_status_line_tells_the_pixel_under_the_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let pixels = [
+            (2, image::Rgba([10, 20, 30, 255])),
+            (1, image::Rgba([1, 2, 3, 128])),
+        ];
+        let paths: Vec<_> = pixels
+            .iter()
+            .enumerate()
+            .map(|(i, (width, color))| {
+                let path = dir.path().join(format!("{i}.png"));
+                RgbaImage::from_pixel(*width, 1, *color)
+                    .save(&path)
+                    .unwrap();
+                path
+            })
+            .collect();
+        let mut v = ImageView::load(paths, &Config::default()).unwrap();
+        assert_eq!(v.status_bar_line(), v.status_line());
+        v.probe = Some((0, 0));
+        let status = v.status_bar_line();
+        assert!(
+            status.ends_with("X: 0, Y: 0  |  RGB(10, 20, 30)  ↔  RGBA(1, 2, 3, 128)  |  Δ 127"),
+            "{status}"
+        );
+        // What a run without a user reports does not depend on the pointer.
+        assert!(!v.status_line().contains("X:"), "{}", v.status_line());
+        // The second image is one pixel wide: it has nothing at the second.
+        v.probe = Some((1, 0));
+        let status = v.status_bar_line();
+        assert!(
+            status.ends_with("X: 1, Y: 0  |  RGB(10, 20, 30)  ↔  –"),
+            "{status}"
+        );
+    }
 
     #[test]
     fn image_locks_and_undo_after_save_protect_disk_contents() {

@@ -7,13 +7,17 @@ pub struct ImageDiff {
     pub height: u32,
     pub block_size: u32,
     pub blocks_x: u32,
-    pub blocks_y: u32,
-    /// Block grid; true when a block contains differing pixels.
-    pub blocks: Vec<bool>,
+    /// Whether each pixel differs, row by row: what the blocks are worked out from, kept to
+    /// mark the pixels themselves.
+    pub mask: Vec<bool>,
     pub diff_pixels: u64,
     /// Bounding rectangles (x, y, w, h) of connected differing regions, in pixels.
     pub regions: Vec<[u32; 4]>,
-    /// Visualisation of the absolute difference between the first and last image.
+    /// The most any channel of a pixel differs between the first image and the last, block by
+    /// block; 0 for a block where these two do not differ. They are the two the blink view
+    /// shows in turn, so this tells whether the eye can see a block change there.
+    pub strength: Vec<u8>,
+    /// Visualisation of the absolute difference between the first image and the others.
     pub diff_image: RgbaImage,
 }
 
@@ -36,6 +40,18 @@ fn differs(a: Option<[u8; 4]>, b: Option<[u8; 4]>, threshold: u8) -> bool {
     }
 }
 
+/// The most a channel of two pixels differs; all of it where only one image has the pixel.
+fn apart(a: Option<[u8; 4]>, b: Option<[u8; 4]>) -> u8 {
+    match (a, b) {
+        (Some(a), Some(b)) => (0..4).map(|i| a[i].abs_diff(b[i])).max().unwrap_or(0),
+        (None, None) => 0,
+        _ => 255,
+    }
+}
+
+/// How red the difference image shows the least difference there can be, of 255.
+const FAINTEST: u8 = 96;
+
 pub fn compare(images: &[&RgbaImage], threshold: u8, block_size: u32) -> ImageDiff {
     let width = images.iter().map(|i| i.width()).max().unwrap_or(0);
     let height = images.iter().map(|i| i.height()).max().unwrap_or(0);
@@ -43,6 +59,8 @@ pub fn compare(images: &[&RgbaImage], threshold: u8, block_size: u32) -> ImageDi
     let bx = width.div_ceil(bs).max(1);
     let by = height.div_ceil(bs).max(1);
     let mut blocks = vec![false; (bx * by) as usize];
+    let mut strength = vec![0u8; blocks.len()];
+    let mut mask = Vec::with_capacity(width as usize * height as usize);
     let mut diff_pixels = 0u64;
     let first = images[0];
     let last = images[images.len() - 1];
@@ -50,16 +68,27 @@ pub fn compare(images: &[&RgbaImage], threshold: u8, block_size: u32) -> ImageDi
     for y in 0..height {
         for x in 0..width {
             let p0 = pixel(first, x, y);
-            let d = images[1..]
-                .iter()
-                .any(|img| differs(p0, pixel(img, x, y), threshold));
+            // Whether any image differs from the first here, and by how much at most: of three
+            // images the middle one may be the only one that does. Most pixels are the same in
+            // every image, and those are passed over at once.
+            let (mut d, mut v) = (false, 0u8);
+            for img in &images[1..] {
+                let p = pixel(img, x, y);
+                if p != p0 {
+                    d |= differs(p0, p, threshold);
+                    v = v.max(apart(p0, p));
+                }
+            }
             let pl = pixel(last, x, y);
             let out = match (p0, pl) {
-                (Some(a), Some(b)) => {
-                    let m = |i: usize| a[i].abs_diff(b[i]);
-                    let v = m(0).max(m(1)).max(m(2)).max(m(3));
+                (Some(a), Some(_)) => {
                     if d {
-                        [255, 255u8.saturating_sub(v), 255u8.saturating_sub(v), 255]
+                        // From a clear red for the least difference to a full one for the
+                        // most: one shade off is as much a difference as any, and in
+                        // proportion alone it would be lost in the white.
+                        let rest =
+                            255 - FAINTEST - (v as u32 * (255 - FAINTEST as u32) / 255) as u8;
+                        [255, rest, rest, 255]
                     } else {
                         let g = ((a[0] as u32 + a[1] as u32 + a[2] as u32) / 3) as u8;
                         let g = 128 + g / 2;
@@ -69,9 +98,14 @@ pub fn compare(images: &[&RgbaImage], threshold: u8, block_size: u32) -> ImageDi
                 _ => [255, 0, 255, 255],
             };
             diff_image.put_pixel(x, y, image::Rgba(out));
+            mask.push(d);
             if d {
                 diff_pixels += 1;
-                blocks[((y / bs) * bx + x / bs) as usize] = true;
+                let block = ((y / bs) * bx + x / bs) as usize;
+                blocks[block] = true;
+                if differs(p0, pl, threshold) {
+                    strength[block] = strength[block].max(apart(p0, pl));
+                }
             }
         }
     }
@@ -81,8 +115,8 @@ pub fn compare(images: &[&RgbaImage], threshold: u8, block_size: u32) -> ImageDi
         height,
         block_size: bs,
         blocks_x: bx,
-        blocks_y: by,
-        blocks,
+        mask,
+        strength,
         diff_pixels,
         regions,
         diff_image,
@@ -131,6 +165,36 @@ fn regions(blocks: &[bool], bx: u32, by: u32, bs: u32, w: u32, h: u32) -> Vec<[u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The difference image shows one shade of difference in a red that can be seen, and
+    /// the difference of the middle of three images as well as that of the last.
+    #[test]
+    fn the_least_difference_shows_and_the_middle_image_counts() {
+        let px = |v: u8| RgbaImage::from_pixel(8, 8, image::Rgba([v, v, v, 255]));
+        let (a, shade, far) = (px(100), px(101), px(255));
+        let d = compare(&[&a, &shade], 0, 8);
+        assert_eq!(d.diff_image.get_pixel(0, 0).0, [255, 159, 159, 255]);
+        assert_eq!(d.strength, [1]);
+        // The middle image alone differs, and much: a full red, but nothing for the blink
+        // view to show between the first image and the last.
+        let d = compare(&[&a, &far, &a], 0, 8);
+        assert_eq!(d.diff_pixels, 64);
+        assert_eq!(d.diff_image.get_pixel(0, 0).0, [255, 63, 63, 255]);
+        assert_eq!(d.strength, [0]);
+        // The last image is a shade off under a middle one far off: the blink view shows
+        // the shade.
+        let d = compare(&[&a, &far, &shade], 0, 8);
+        assert_eq!(d.strength, [1]);
+        // One pixel that differs is the only one marked, though its whole block is the area.
+        let mut one = a.clone();
+        one.put_pixel(3, 2, image::Rgba([0, 0, 0, 255]));
+        let d = compare(&[&a, &one], 0, 8);
+        let marked: Vec<usize> = (0..d.mask.len()).filter(|&i| d.mask[i]).collect();
+        assert_eq!((marked, d.regions), (vec![2 * 8 + 3], vec![[0, 0, 8, 8]]));
+        // Images that are the same have no difference at all.
+        let d = compare(&[&a, &a], 0, 8);
+        assert_eq!((d.diff_pixels, d.strength), (0, vec![0]));
+    }
 
     #[test]
     fn image_diff() {

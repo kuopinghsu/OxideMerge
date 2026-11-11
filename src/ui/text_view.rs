@@ -6279,7 +6279,7 @@ impl TextView {
                 return None;
             }
         }
-        if self.n() == 2 && blk.ranges[..2].iter().any(Range::is_empty) {
+        if self.n() == 2 && blk.one_sided() {
             return Some(if sel { c.added_sel } else { c.added });
         }
         let conflict = blk.kind == BlockKind::Conflict && self.is_open_conflict(b);

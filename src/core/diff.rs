@@ -345,6 +345,14 @@ pub struct Block {
     pub rows: usize,
 }
 
+impl Block {
+    /// Whether one of the first two files has no lines here: of two files, lines that were
+    /// added or removed rather than changed, which the views color as such.
+    pub fn one_sided(&self) -> bool {
+        self.ranges[..2].iter().any(Range::is_empty)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Row {
     // A missing index is u32::MAX. Avoid four 16-byte Option<usize> values
