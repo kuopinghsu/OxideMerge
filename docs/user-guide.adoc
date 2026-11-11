@@ -5015,6 +5015,11 @@ reads the file tells them apart.
 When you open such a file, the comparison still shows its text differences;
 choose *Semantic* to see that the structure is the same.
 Folder synchronization still copies a file whose contents differ.
++
+*Worker threads* is the number of files a folder comparison compares at once; *0* uses one
+thread per processor thread, up to eight.
+Large text comparisons share their work among up to eight threads whatever this setting is;
+comparisons running at once share those threads.
 Image / Binary::
 *Color distance threshold*, *Block size* and *Bytes per line (binary)*.
 Plugins::

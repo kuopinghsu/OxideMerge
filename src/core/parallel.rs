@@ -5,11 +5,56 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// How many threads to share one piece of work among: one per processor thread, up to eight,
 /// as a folder compare does by default. Beyond that, memory rather than the processor limits
-/// the work this is used for.
+/// the work this is used for. Asked of the system once: on Linux that reads cgroup files.
 pub fn threads() -> usize {
-    std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(8)
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(8)
+    })
+}
+
+/// Threads taken beside their callers by all the work running at once, out of
+/// [`threads`]` - 1`, so that the comparisons of a folder compare's workers don't each start
+/// [`threads`] more.
+static TAKEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Threads for one piece of work: the calling thread and those taken from what [`threads`]
+/// allows all work at once, given back when this is dropped.
+pub struct Threads {
+    taken: usize,
+    from: &'static AtomicUsize,
+}
+
+impl Threads {
+    pub fn count(&self) -> usize {
+        self.taken + 1
+    }
+}
+
+impl Drop for Threads {
+    fn drop(&mut self) {
+        self.from.fetch_sub(self.taken, Ordering::Relaxed);
+    }
+}
+
+/// Up to `want` threads, a power of two (1 when none are free): work split into a power of two
+/// of parts gets no faster from the threads between two powers.
+pub fn take_power_of_two(want: usize) -> Threads {
+    take_from(&TAKEN, threads() - 1, want)
+}
+
+fn take_from(from: &'static AtomicUsize, spare: usize, want: usize) -> Threads {
+    let mut used = from.load(Ordering::Relaxed);
+    loop {
+        let count = want.clamp(1, spare.saturating_sub(used) + 1);
+        let taken = (1 << count.ilog2()) - 1;
+        match from.compare_exchange_weak(used, used + taken, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Threads { taken, from },
+            Err(now) => used = now,
+        }
+    }
 }
 
 /// `f` of each of `items`, in order, on up to `threads` threads taking the next item as they
@@ -68,6 +113,26 @@ mod tests {
         );
         assert_eq!(map(&items, 1, |i| i + 1)[999], 1000);
         assert!(map(&[] as &[usize], 4, |i| *i).is_empty());
+    }
+
+    /// Work running at once shares the threads, each taking a power of two of them, and gives
+    /// them back when done.
+    #[test]
+    fn work_at_once_shares_the_threads() {
+        static FROM: AtomicUsize = AtomicUsize::new(0);
+        let a = take_from(&FROM, 7, 8);
+        assert_eq!(a.count(), 8);
+        let b = take_from(&FROM, 7, 8);
+        assert_eq!(b.count(), 1, "none left");
+        drop(a);
+        let c = take_from(&FROM, 7, 6);
+        assert_eq!(c.count(), 4, "6 rounds down");
+        let d = take_from(&FROM, 7, 8);
+        assert_eq!(d.count(), 4, "4 of the 8 are free");
+        drop((b, c, d));
+        assert_eq!(FROM.load(Ordering::Relaxed), 0);
+        assert_eq!(take_from(&FROM, 0, 8).count(), 1);
+        assert_eq!(take_from(&FROM, 7, 0).count(), 1);
     }
 
     #[test]
