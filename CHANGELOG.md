@@ -7,6 +7,9 @@ uses its section of this file as the release notes.
 
 ### Added
 
+- **The pixel under the pointer in the image compare:** the status bar shows the X and Y
+  position of the pixel the pointer is over and its color in each image, as *RGB(10, 20, 30)*,
+  or as RGBA when it is not opaque.
 - **A table view that looks and works like a spreadsheet:** the table view of CSV, TSV and
   spreadsheet comparisons is now a grid with numbered rows and columns headed by their letters,
   or by their names with *First row is header*, whose row is no longer listed as a record.
@@ -571,6 +574,16 @@ uses its section of this file as the release notes.
 
 ### Changed
 
+- **All differences colors added lines as a file compare does:** in the *All differences*
+  view of two folders, lines only one file has are now shown in the color of added lines and
+  changed lines in that of changes, where both had the color of changes.
+- **Image differences are marked pixel by pixel:** *Highlight differences* now colors only
+  the pixels that differ instead of every block of pixels with a differing one in it. *Block
+  size* still sets how near pixels must be to count as one difference to step to.
+- **Faint image differences can be seen:** in the blink view the marks of the areas that
+  differ now blink with the images, so an area whose colors are only a shade apart flashes
+  instead of looking the same in both. The difference view shows the smallest difference in
+  a clear red instead of one next to white. The sample `images/gradient.ppm` has such an area.
 - **A clearer Formatted view:** a block that differs now has a stripe down its edge as well as
   its colour, and in a comparison of two files a block only the left one has is shown as
   removed instead of in the colour of an added one. The place of a block a file lacks is

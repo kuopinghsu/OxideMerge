@@ -104,6 +104,7 @@ impl Content {
             Content::Folder(v) => v.status_detail(),
             Content::Text(v) => v.status_detail(),
             Content::Web(v) => v.status_line(v.inner.as_deref().map(Content::status_bar_line)),
+            Content::Image(v) => v.status_bar_line(),
             other => other.status_line(),
         }
     }
