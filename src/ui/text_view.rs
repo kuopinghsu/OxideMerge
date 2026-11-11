@@ -778,14 +778,13 @@ fn sheet_name<'a>(cells: &'a [String], prefix: &str) -> Option<&'a str> {
     }
 }
 
+/// Sheet names and their record ranges, in workbook order.
+type SheetRanges = Vec<(String, Range<usize>)>;
+
 /// Aligns the records of workbooks sheet by sheet, the sheets paired by name, so that a sheet
 /// only one side has is a difference as a whole and never lined up with another. `keys` are
 /// the records of each side, `sheets` the name and records of each of its sheets.
-fn diff_by_sheet(
-    keys: &[Vec<String>],
-    sheets: &[Vec<(String, Range<usize>)>],
-    opts: &DiffOptions,
-) -> DiffResult {
+fn diff_by_sheet(keys: &[Vec<String>], sheets: &[SheetRanges], opts: &DiffOptions) -> DiffResult {
     // The sheets in the order of the first side, with those only another has after the sheet
     // they follow there.
     let mut order: Vec<&str> = Vec::new();
@@ -835,15 +834,15 @@ fn diff_by_sheet(
             diff::Row::new(lines, row.block().map(|b| b + block0))
         }));
         out.blocks.extend(d.blocks.into_iter().map(|mut b| {
-            for p in 0..n {
-                let at = ranges[p].start;
+            for (p, range) in ranges.iter().enumerate().take(n) {
+                let at = range.start;
                 b.ranges[p] = b.ranges[p].start + at..b.ranges[p].end + at;
             }
             b.first_row += row0;
             b
         }));
-        for p in 0..n {
-            out.moved[p].extend(d.moved[p].iter().map(|l| l + ranges[p].start));
+        for (p, range) in ranges.iter().enumerate().take(n) {
+            out.moved[p].extend(d.moved[p].iter().map(|l| l + range.start));
         }
     }
     out
@@ -1472,6 +1471,8 @@ struct CellEdit {
     focus: bool,
 }
 
+type OtherTables<T> = Vec<Option<(T, bool)>>;
+
 #[derive(Default)]
 struct TableState {
     docs: Vec<Result<Arc<table::Table>, String>>,
@@ -1518,8 +1519,8 @@ struct TableState {
     /// [`crate::core::extract::other_cells`]), and whether those are the values as shown;
     /// `None` for a side that is no spreadsheet or could not be read so. Not read yet when
     /// the whole is `None`.
-    other: Option<Vec<Option<(Arc<table::Table>, bool)>>>,
-    other_job: Option<super::analysis::Task<Vec<Option<(table::Table, bool)>>>>,
+    other: Option<OtherTables<Arc<table::Table>>>,
+    other_job: Option<super::analysis::Task<OtherTables<table::Table>>>,
     /// The sheets of the rows, one for a plain table; `None` until worked out for these rows.
     sheets: Option<Vec<Sheet>>,
     /// The sheet shown.
@@ -8789,8 +8790,8 @@ impl TextView {
                 if row.block().is_some_and(|b| !diff.blocks[b].ignored) {
                     sheet.differences += 1;
                 }
-                for p in 0..n {
-                    let record = row.line(p).zip(docs[p]).map(|(r, t)| &t.records[r]);
+                for (p, doc) in docs.iter().copied().enumerate().take(n) {
+                    let record = row.line(p).zip(doc).map(|(r, t)| &t.records[r]);
                     if let Some(record) = record {
                         sheet.widths[p] = sheet.widths[p].max(record.cells.len());
                     }
@@ -8819,7 +8820,7 @@ impl TextView {
     /// The sheets of each side of a compare of workbooks of several sheets: the name of each
     /// and its records, heading first. Records before the first heading, as of a side that is
     /// no such workbook, are a sheet without a name.
-    fn sheet_ranges(&self) -> Option<Vec<Vec<(String, Range<usize>)>>> {
+    fn sheet_ranges(&self) -> Option<Vec<SheetRanges>> {
         if !self.several_sheets() {
             return None;
         }
@@ -8829,7 +8830,7 @@ impl TextView {
             .iter()
             .map(|t| {
                 let records = &t.as_ref().ok()?.records;
-                let mut sheets: Vec<(String, Range<usize>)> = Vec::new();
+                let mut sheets = SheetRanges::new();
                 for (i, record) in records.iter().enumerate() {
                     let name = sheet_name(&record.cells, &prefix);
                     if name.is_some() || sheets.is_empty() {
