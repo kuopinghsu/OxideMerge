@@ -11,8 +11,8 @@ pub fn delimiter_for(path: &Path) -> Option<char> {
 }
 
 /// The delimiter of the records `doc` holds, when they are a table. A spreadsheet OxideMerge
-/// reads itself is comma separated records, so it is compared as a table too, unless it has
-/// several sheets, which are not one table. What a converter the user configured writes is
+/// reads itself is comma separated records, so it is compared as a table too; the records of
+/// each of several sheets follow a heading that names the sheet. What a converter the user configured writes is
 /// not known, so it is compared as text.
 pub fn delimiter_of_doc(
     doc: &super::text::TextDoc,
@@ -28,11 +28,7 @@ pub fn delimiter_of_doc(
             super::extract::Kind::Spreadsheet
         ))
     );
-    let several = doc
-        .lines
-        .first()
-        .is_some_and(|l| super::extract::is_sheet_heading(l));
-    (read_here && !several).then_some(',')
+    read_here.then_some(',')
 }
 
 /// Splits one line into cells, honoring double quotes.

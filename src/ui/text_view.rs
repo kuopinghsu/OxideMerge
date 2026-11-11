@@ -697,6 +697,243 @@ fn warning_text(warning: &table_match::Warning) -> String {
     }
 }
 
+/// How to match by key the records of two tables that hold mostly the same records in another
+/// order: by the first column whose values are unique on both sides and largely shared.
+fn reorder_hint(a: &table::Table, b: &table::Table, current: &TableMatch) -> Option<TableMatch> {
+    let names = |t: &table::Table| -> Vec<String> {
+        let first = t.records.first();
+        first.map_or_else(Vec::new, |r| r.cells.iter().map(|c| c.trim().to_string()).collect())
+    };
+    let (left, right) = (names(a), names(b));
+    let is_header = |names: &[String]| {
+        let distinct: HashSet<&String> = names.iter().collect();
+        distinct.len() == names.len() && names.iter().all(|n| !n.is_empty() && !is_number(n))
+    };
+    let header = is_header(&left) && is_header(&right);
+    let start = usize::from(header);
+    if a.records.len() < start + 3 || b.records.len() < start + 3 {
+        return None;
+    }
+    // The distinct values of a column in record order, when nearly every record has its own.
+    let unique = |t: &table::Table, column: usize| -> Option<Vec<String>> {
+        let records = &t.records[start..];
+        let mut seen = HashSet::new();
+        let values: Vec<String> = records
+            .iter()
+            .filter_map(|r| r.cells.get(column).map(|c| c.trim()))
+            .filter(|value| !value.is_empty() && seen.insert(*value))
+            .map(str::to_string)
+            .collect();
+        (values.len() + (records.len() / 10).max(1) >= records.len()).then_some(values)
+    };
+    (0..left.len()).find_map(|i| {
+        let j = if header {
+            right.iter().position(|n| *n == left[i])?
+        } else {
+            i
+        };
+        let (x, y) = (unique(a, i)?, unique(b, j)?);
+        let on_right: HashSet<&String> = y.iter().collect();
+        let on_left: HashSet<&String> = x.iter().collect();
+        let shared: Vec<&String> = x.iter().filter(|v| on_right.contains(v)).collect();
+        let shared_right: Vec<&String> = y.iter().filter(|v| on_left.contains(v)).collect();
+        (shared.len() * 2 >= x.len().min(y.len()) && shared != shared_right).then(|| TableMatch {
+            header,
+            keys: vec![key_column(&left, i, header)],
+            columns: if header {
+                table_match::ColumnPolicy::Name
+            } else {
+                table_match::ColumnPolicy::Position
+            },
+            ..current.clone()
+        })
+    })
+}
+
+/// Whether a cell holds a number, which is shown right-aligned: also one written as a number
+/// format shows it, with a currency sign, a percent sign, separators of thousands or in
+/// brackets when negative.
+fn is_number(cell: &str) -> bool {
+    let cell = cell.trim();
+    let bare = cell
+        .trim_start_matches(['(', '-', '+', '$', '€', '£', '¥'])
+        .trim_end_matches([')', '%'])
+        .replace(',', "");
+    cell.len() <= 40 && bare.starts_with(|c: char| c.is_ascii_digit()) && bare.parse::<f64>().is_ok()
+}
+
+/// What the heading of a sheet starts with in the records of a workbook of several sheets.
+fn sheet_prefix() -> String {
+    format!(
+        "# {}",
+        trf("label.sheet", &[("name", String::new())]).trim_end()
+    )
+}
+
+/// The name of the sheet whose heading the record of `cells` is; `prefix` is [`sheet_prefix`].
+fn sheet_name<'a>(cells: &'a [String], prefix: &str) -> Option<&'a str> {
+    match cells {
+        [cell] => cell.strip_prefix(prefix).map(str::trim),
+        _ => None,
+    }
+}
+
+/// Aligns the records of workbooks sheet by sheet, the sheets paired by name, so that a sheet
+/// only one side has is a difference as a whole and never lined up with another. `keys` are
+/// the records of each side, `sheets` the name and records of each of its sheets.
+fn diff_by_sheet(
+    keys: &[Vec<String>],
+    sheets: &[Vec<(String, Range<usize>)>],
+    opts: &DiffOptions,
+) -> DiffResult {
+    // The sheets in the order of the first side, with those only another has after the sheet
+    // they follow there.
+    let mut order: Vec<&str> = Vec::new();
+    for side in sheets {
+        let mut at = 0;
+        for (name, _) in side {
+            match order.iter().position(|n| n == name) {
+                Some(i) => at = i + 1,
+                None => {
+                    // after the sheets only the sides before have there
+                    while order.get(at).is_some_and(|n| side.iter().all(|(s, _)| s != n)) {
+                        at += 1;
+                    }
+                    order.insert(at, name);
+                    at += 1;
+                }
+            }
+        }
+    }
+    let n = keys.len();
+    let mut out = DiffResult {
+        panes: n,
+        rows: Vec::new(),
+        blocks: Vec::new(),
+        moved: Default::default(),
+    };
+    for name in order {
+        let ranges: Vec<Range<usize>> = sheets
+            .iter()
+            .map(|side| {
+                let sheet = side.iter().find(|(n, _)| n == name);
+                sheet.map_or(0..0, |(_, records)| records.clone())
+            })
+            .collect();
+        let parts: Vec<&[String]> = keys
+            .iter()
+            .zip(&ranges)
+            .map(|(k, r)| &k[r.clone()])
+            .collect();
+        let d = diff::compute_with(&parts, opts, None);
+        let (row0, block0) = (out.rows.len(), out.blocks.len());
+        out.rows.extend(d.rows.iter().map(|row| {
+            let mut lines = [None; 3];
+            for (p, line) in lines.iter_mut().enumerate().take(n) {
+                *line = row.line(p).map(|l| l + ranges[p].start);
+            }
+            diff::Row::new(lines, row.block().map(|b| b + block0))
+        }));
+        out.blocks.extend(d.blocks.into_iter().map(|mut b| {
+            for p in 0..n {
+                let at = ranges[p].start;
+                b.ranges[p] = b.ranges[p].start + at..b.ranges[p].end + at;
+            }
+            b.first_row += row0;
+            b
+        }));
+        for p in 0..n {
+            out.moved[p].extend(d.moved[p].iter().map(|l| l + ranges[p].start));
+        }
+    }
+    out
+}
+
+/// The letters of a column as a spreadsheet names it: A, B, …, Z, AA, ….
+fn column_letters(mut column: usize) -> String {
+    let mut letters = Vec::new();
+    loop {
+        letters.push(b'A' + (column % 26) as u8);
+        if column < 26 {
+            break;
+        }
+        column = column / 26 - 1;
+    }
+    letters.reverse();
+    String::from_utf8(letters).unwrap_or_default()
+}
+
+/// Colours a table cell.
+fn fill_cell(ui: &Ui, fill: Color32) {
+    ui.painter().rect_filled(ui.max_rect(), 0.0, fill);
+}
+
+/// The grid lines of a table cell: below it and to its right.
+fn grid_cell(ui: &Ui, c: &Colors) {
+    let rect = ui.max_rect();
+    let stroke = Stroke::new(1.0, c.table_grid);
+    ui.painter()
+        .hline(rect.x_range(), rect.bottom() - 0.5, stroke);
+    ui.painter()
+        .vline(rect.right() - 0.5, rect.y_range(), stroke);
+}
+
+/// Marks a table cell of a record its side does not have.
+fn hatch_cell(ui: &Ui, c: &Colors) {
+    let rect = ui.max_rect();
+    fill_cell(ui, c.missing);
+    let painter = ui.painter();
+    let mut x = rect.left() - rect.height();
+    while x < rect.right() {
+        painter.line_segment(
+            [pos2(x, rect.bottom()), pos2(x + rect.height(), rect.top())],
+            Stroke::new(1.0, c.table_grid),
+        );
+        x += 8.0;
+    }
+}
+
+/// The text of a cell on one line, with what differs from `against` on the background `mark`:
+/// all but what the two start and end with alike.
+fn cell_job(text: &str, against: Option<&str>, mark: Color32, font: FontId, ink: Color32) -> LayoutJob {
+    let flat = |s: &str| s.replace("\r\n", "⏎").replace(['\n', '\r'], "⏎");
+    let text: Vec<char> = flat(text).chars().collect();
+    let plain = TextFormat {
+        font_id: font.clone(),
+        color: ink,
+        ..Default::default()
+    };
+    let mut job = LayoutJob::default();
+    let other: Vec<char> = match against.map(flat) {
+        Some(other) if other.chars().ne(text.iter().copied()) => other.chars().collect(),
+        _ => {
+            job.append(&text.iter().collect::<String>(), 0.0, plain);
+            return job;
+        }
+    };
+    let head = text.iter().zip(&other).take_while(|(a, b)| a == b).count();
+    let room = text.len().min(other.len()) - head;
+    let tail = text
+        .iter()
+        .rev()
+        .zip(other.iter().rev())
+        .take(room)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let part = |range: Range<usize>| text[range].iter().collect::<String>();
+    job.append(&part(0..head), 0.0, plain.clone());
+    job.append(
+        &part(head..text.len() - tail),
+        0.0,
+        TextFormat {
+            background: mark,
+            ..plain.clone()
+        },
+    );
+    job.append(&part(text.len() - tail..text.len()), 0.0, plain);
+    job
+}
+
 /// The marker, description and edge colour of a row matched by key.
 fn row_marker(m: &table_match::MatchedRow, c: &Colors) -> (String, String, Option<Color32>) {
     let (mark, key, fill) = match m.state {
@@ -1254,6 +1491,65 @@ struct TableState {
     selected: Option<usize>,
     /// Text of the numeric tolerance field.
     tolerance: String,
+    /// How to match the records by key instead, offered when most rows differ by position
+    /// though a column tells them apart; `None` until worked out for these records.
+    hint: Option<Option<TableMatch>>,
+    /// Which rows are listed.
+    filter: RowFilter,
+    /// Columns taken out of view, each the column `.2` of pane `.1` on sheet `.0`.
+    hidden: HashSet<(usize, usize, usize)>,
+    /// Whether only the columns holding a changed cell are shown, and which those are; `None`
+    /// until worked out for these rows.
+    changed_only: bool,
+    changed_columns: Option<HashSet<(usize, usize)>>,
+    /// Whether the columns are as wide as their contents, rather than as wide as set by hand;
+    /// the widths set by hand are kept for when this is turned off.
+    fit: bool,
+    /// The columns take the width of their contents on the next frame.
+    fit_now: bool,
+    /// How far down the rows are scrolled, and whether to scroll there again: the fitted table
+    /// keeps a place of its own, so turning the fit on or off would lose this one.
+    scroll: f32,
+    restore_scroll: bool,
+    /// Whether the cells of a spreadsheet show their values as stored, rather than as its
+    /// number formats show them. The rows are compared as the text has them either way.
+    stored_values: bool,
+    /// The records of each side read the other way than its text has them (see
+    /// [`crate::core::extract::other_cells`]), and whether those are the values as shown;
+    /// `None` for a side that is no spreadsheet or could not be read so. Not read yet when
+    /// the whole is `None`.
+    other: Option<Vec<Option<(Arc<table::Table>, bool)>>>,
+    other_job: Option<super::analysis::Task<Vec<Option<(table::Table, bool)>>>>,
+    /// The sheets of the rows, one for a plain table; `None` until worked out for these rows.
+    sheets: Option<Vec<Sheet>>,
+    /// The sheet shown.
+    sheet: usize,
+}
+
+/// The rows of the table view that are listed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RowFilter {
+    #[default]
+    All,
+    Changed,
+    Added,
+    Removed,
+    Modified,
+    Moved,
+    Ambiguous,
+}
+
+/// A sheet of a workbook among the rows of the table view.
+#[derive(Clone, Debug, Default)]
+struct Sheet {
+    name: String,
+    /// Its rows, the row of its heading first when it has one.
+    rows: Range<usize>,
+    heading: bool,
+    /// The rows that differ.
+    differences: usize,
+    /// The most cells a record of each side has.
+    widths: [usize; 3],
 }
 
 /// A line of the inline view.
@@ -1907,8 +2203,17 @@ impl TextView {
             };
             self.table.keyed = None;
             self.table.job = None;
+            self.table.hint = None;
+            self.table.sheets = None;
+            self.table.changed_columns = None;
+            self.table.other = None;
+            self.table.other_job = None;
             if self.table.docs.iter().all(Result::is_ok) {
-                if self.table_mode && self.table_match.by_key() && self.n() == 2 {
+                if self.table_mode
+                    && self.table_match.by_key()
+                    && self.n() == 2
+                    && !self.several_sheets()
+                {
                     self.match_table_by_key(selected);
                 }
                 if self.table.job.is_none() && !matches!(self.table.keyed.as_deref(), Some(Ok(_))) {
@@ -6188,15 +6493,6 @@ impl TextView {
                         &Cmd::ToggleWrap.tip_if(self.keys_enabled),
                     );
                 });
-                if self.table_delim.is_some() {
-                    widgets::toggle_icon_button(
-                        ui,
-                        &mut self.table_mode,
-                        Some(Icon::Table),
-                        tr("cmd.table_mode"),
-                        tr("cmd.table_mode"),
-                    );
-                }
                 ui.add_enabled_ui(!self.table_mode && !self.shows_inline(), |ui| {
                     let mut layout = self.text_layout;
                     if widgets::layout_choice(ui, &mut layout) {
@@ -7668,6 +7964,8 @@ impl TextView {
             };
         }
         self.table.keyed = Some(Box::new(result));
+        self.table.sheets = None;
+        self.table.changed_columns = None;
     }
 
     /// Aligns the records of the sides by position, as text lines are.
@@ -7679,11 +7977,16 @@ impl TextView {
             .filter_map(|t| t.as_ref().ok())
             .map(|t| t.keys(self.opts.ignore_eol))
             .collect();
-        self.table.diff = diff::compute_with(
-            &keys.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-            &self.opts,
-            None,
-        );
+        self.table.diff = match self.sheet_ranges() {
+            Some(sheets) => diff_by_sheet(&keys, &sheets, &self.opts),
+            None => diff::compute_with(
+                &keys.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                &self.opts,
+                None,
+            ),
+        };
+        self.table.sheets = None;
+        self.table.changed_columns = None;
     }
 
     /// Selects the row holding one of the record `lines`, or none.
@@ -7830,6 +8133,32 @@ impl TextView {
             })
     }
 
+    /// The columns of the table view from left to right, each the column `.1` of pane `.0`:
+    /// the columns that are compared with each other stand side by side.
+    fn table_columns(&self) -> Vec<(usize, usize)> {
+        if let Some(d) = self.keyed() {
+            return d
+                .columns
+                .iter()
+                .flat_map(|pair| (0..2).filter_map(move |p| pair[p].map(|column| (p, column))))
+                .collect();
+        }
+        let n = self.n();
+        let columns = self
+            .table
+            .docs
+            .iter()
+            .filter_map(|t| t.as_ref().ok())
+            .flat_map(|t| &t.records)
+            .map(|r| r.cells.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        (0..columns)
+            .flat_map(|column| (0..n).map(move |p| (p, column)))
+            .collect()
+    }
+
     fn table_cursor(&self) -> Option<usize> {
         if self.keyed().is_some() {
             if let Some(row) = self
@@ -7891,20 +8220,31 @@ impl TextView {
         {
             return;
         }
-        let current = self.table_cursor().unwrap_or(0);
+        // The arrow keys move through the rows and columns listed.
+        self.note_sheets();
+        let rows = self.table_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let current = self.table_cursor().unwrap_or(rows[0]);
+        // From a row that is not listed, a step down goes to the first listed row after it.
+        let here = rows.partition_point(|&r| r < current);
+        let listed = rows.get(here) == Some(&current);
+        let step = |by: isize| {
+            let by = if listed || by < 0 { by } else { by - 1 };
+            rows[here.saturating_add_signed(by).min(rows.len() - 1)]
+        };
         let (mut target, mut pane, mut column) = (current, self.active_pane, self.table.column);
-        let last = self.table.diff.rows.len() - 1;
+        let page = self.page_rows as isize;
         let mut navigate = false;
         let mut edit = false;
+        let shown = self.shown_columns();
         ui.input_mut(|input| {
             for (key, next) in [
-                (Key::ArrowDown, current.saturating_add(1).min(last)),
-                (Key::ArrowUp, current.saturating_sub(1)),
-                (
-                    Key::PageDown,
-                    current.saturating_add(self.page_rows).min(last),
-                ),
-                (Key::PageUp, current.saturating_sub(self.page_rows)),
+                (Key::ArrowDown, step(1)),
+                (Key::ArrowUp, step(-1)),
+                (Key::PageDown, step(page)),
+                (Key::PageUp, step(-page)),
             ] {
                 if input.consume_key(Modifiers::NONE, key) {
                     target = next;
@@ -7912,38 +8252,23 @@ impl TextView {
                 }
             }
             if input.consume_key(Modifiers::COMMAND, Key::Home) {
-                target = 0;
+                target = rows[0];
                 navigate = true;
             }
             if input.consume_key(Modifiers::COMMAND, Key::End) {
-                target = last;
+                target = rows[rows.len() - 1];
                 navigate = true;
             }
-            let columns = self
-                .table
-                .docs
-                .iter()
-                .filter_map(|t| t.as_ref().ok())
-                .flat_map(|t| &t.records)
-                .map(|r| r.cells.len())
-                .max()
-                .unwrap_or(1)
-                .max(1);
+            let at = shown.iter().position(|&cell| cell == (pane, column));
             if input.consume_key(Modifiers::NONE, Key::ArrowRight) {
-                if column + 1 < columns {
-                    column += 1;
-                } else if pane + 1 < self.n() {
-                    pane += 1;
-                    column = 0;
+                if let Some(&cell) = at.map_or(shown.first(), |i| shown.get(i + 1)) {
+                    (pane, column) = cell;
                 }
                 navigate = true;
             }
             if input.consume_key(Modifiers::NONE, Key::ArrowLeft) {
-                if column > 0 {
-                    column -= 1;
-                } else if pane > 0 {
-                    pane -= 1;
-                    column = columns - 1;
+                if let Some(&cell) = at.and_then(|i| i.checked_sub(1)).and_then(|i| shown.get(i)) {
+                    (pane, column) = cell;
                 }
                 navigate = true;
             }
@@ -8143,6 +8468,48 @@ impl TextView {
         }
     }
 
+    /// Offers to match by key when the rows, matched by position, mostly differ though a column
+    /// tells the records apart.
+    fn reorder_hint_bar(&mut self, ui: &mut Ui, names: &[String]) {
+        if self.table_match.by_key() || self.table.job.is_some() {
+            return;
+        }
+        if self.table.hint.is_none() {
+            let rows = &self.table.diff.rows;
+            let differing = rows
+                .iter()
+                .filter(|r| r.block().is_some_and(|b| !self.table.diff.blocks[b].ignored))
+                .count();
+            self.table.hint = Some(match (self.table.docs.first(), self.table.docs.get(1)) {
+                (Some(Ok(a)), Some(Ok(b)))
+                    if differing * 2 >= rows.len().max(1)
+                        && a.records.len() + b.records.len() <= BACKGROUND_RECORDS =>
+                {
+                    reorder_hint(a, b, &self.table_match)
+                }
+                _ => None,
+            });
+        }
+        let Some(Some(m)) = &self.table.hint else {
+            return;
+        };
+        let column = m.keys.first().map_or_else(String::new, |k| key_label(k, names));
+        let (mut apply, mut dismiss) = (false, false);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(trf("table.hint_reordered", &[("column", column.clone())]));
+            apply = ui
+                .button(trf("table.hint_match", &[("column", column.clone())]))
+                .clicked();
+            dismiss = ui.button(tr("table.hint_dismiss")).clicked();
+        });
+        if apply {
+            let m = m.clone();
+            self.set_table_match(m);
+        } else if dismiss {
+            self.table.hint = Some(None);
+        }
+    }
+
     /// Choosing how the table view matches records, and what matching found.
     fn table_match_bar(&mut self, ui: &mut Ui, c: &Colors) {
         let before = self.table_match.clone();
@@ -8188,26 +8555,6 @@ impl TextView {
             if !self.table_match.by_key() {
                 return;
             }
-            let mut header = self.table_match.header;
-            if ui.checkbox(&mut header, tr("table.header_row")).changed() {
-                self.table_match.header = header;
-                self.table_match.keys = self
-                    .table_match
-                    .keys
-                    .iter()
-                    .map(|k| {
-                        let column = match k {
-                            KeyColumn::Index(i) => Some(*i),
-                            KeyColumn::Name(n) => names.iter().position(|x| x == n),
-                        };
-                        // A name no column has stays, to be shown as missing and removed.
-                        column.map_or_else(|| k.clone(), |c| key_column(&names, c, header))
-                    })
-                    .collect();
-                if !header {
-                    self.table_match.columns = table_match::ColumnPolicy::Position;
-                }
-            }
             let chosen: Vec<String> = self
                 .table_match
                 .keys
@@ -8242,62 +8589,78 @@ impl TextView {
                     })
                 },
             );
-            ui.label(tr("table.columns_by"));
-            let columns = &mut self.table_match.columns;
-            egui::ComboBox::from_id_salt(self.id.with("columns_by"))
-                .selected_text(tr(match columns {
-                    table_match::ColumnPolicy::Position => "table.columns_position",
-                    table_match::ColumnPolicy::Name => "table.columns_name",
-                }))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
+            // The settings seldom changed are a click away, so the bar stays on one line.
+            egui::containers::menu::MenuButton::new(tr("table.options"))
+                .config(
+                    egui::containers::menu::MenuConfig::new()
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                )
+                .ui(ui, |ui| {
+                    let mut header = self.table_match.header;
+                    if ui.checkbox(&mut header, tr("table.header_row")).changed() {
+                        self.table_match.header = header;
+                        self.table_match.keys = self
+                            .table_match
+                            .keys
+                            .iter()
+                            .map(|k| {
+                                let column = match k {
+                                    KeyColumn::Index(i) => Some(*i),
+                                    KeyColumn::Name(n) => names.iter().position(|x| x == n),
+                                };
+                                // A name no column has stays, to be shown as missing and removed.
+                                column.map_or_else(|| k.clone(), |c| key_column(&names, c, header))
+                            })
+                            .collect();
+                        if !header {
+                            self.table_match.columns = table_match::ColumnPolicy::Position;
+                        }
+                    }
+                    ui.separator();
+                    ui.label(tr("table.columns_by"));
+                    let columns = &mut self.table_match.columns;
+                    ui.radio_value(
                         columns,
                         table_match::ColumnPolicy::Position,
                         tr("table.columns_position"),
                     );
                     ui.add_enabled_ui(header, |ui| {
-                        ui.selectable_value(
+                        ui.radio_value(
                             columns,
                             table_match::ColumnPolicy::Name,
                             tr("table.columns_name"),
                         );
                     });
-                });
-            ui.checkbox(&mut self.table_match.ignore_order, tr("table.ignore_order"));
-            ui.label(tr("table.order"));
-            let order = &mut self.table_match.order;
-            let order_key = |o: table_match::RowOrder| match o {
-                table_match::RowOrder::Left => "table.order_left",
-                table_match::RowOrder::Right => "table.order_right",
-                table_match::RowOrder::Key => "table.order_key",
-            };
-            egui::ComboBox::from_id_salt(self.id.with("row_order"))
-                .selected_text(tr(order_key(*order)))
-                .show_ui(ui, |ui| {
-                    for o in [
-                        table_match::RowOrder::Left,
-                        table_match::RowOrder::Right,
-                        table_match::RowOrder::Key,
+                    ui.separator();
+                    ui.checkbox(&mut self.table_match.ignore_order, tr("table.ignore_order"));
+                    ui.label(tr("table.order"))
+                        .on_hover_text(tr("tip.table_order"));
+                    let order = &mut self.table_match.order;
+                    for (o, key) in [
+                        (table_match::RowOrder::Left, "table.order_left"),
+                        (table_match::RowOrder::Right, "table.order_right"),
+                        (table_match::RowOrder::Key, "table.order_key"),
                     ] {
-                        ui.selectable_value(order, o, tr(order_key(o)));
+                        ui.radio_value(order, o, tr(key));
                     }
-                })
-                .response
-                .on_hover_text(tr("tip.table_order"));
-            ui.label(tr("table.tolerance"));
-            let response = ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.table.tolerance)
-                        .desired_width(64.0)
-                        .hint_text("0"),
-                )
-                .on_hover_text(tr("tip.table_tolerance"));
-            if response.changed() {
-                if let Some((abs, rel)) = parse_tolerance(&self.table.tolerance) {
-                    self.table_match.abs_tolerance = abs;
-                    self.table_match.rel_tolerance = rel;
-                }
-            }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(tr("table.tolerance"));
+                        let response = ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.table.tolerance)
+                                    .desired_width(64.0)
+                                    .hint_text("0"),
+                            )
+                            .on_hover_text(tr("tip.table_tolerance"));
+                        if response.changed() {
+                            if let Some((abs, rel)) = parse_tolerance(&self.table.tolerance) {
+                                self.table_match.abs_tolerance = abs;
+                                self.table_match.rel_tolerance = rel;
+                            }
+                        }
+                    });
+                });
         });
         if self.table_match != before {
             self.rediff();
@@ -8334,16 +8697,6 @@ impl TextView {
             Some(Ok(d)) => {
                 ui.horizontal_wrapped(|ui| {
                     let n = d.counts;
-                    ui.label(trf(
-                        "table.summary",
-                        &[
-                            ("added", n.added.to_string()),
-                            ("removed", n.removed.to_string()),
-                            ("modified", n.modified.to_string()),
-                            ("moved", n.moved.to_string()),
-                            ("ambiguous", n.ambiguous.to_string()),
-                        ],
-                    ));
                     if d.ignore_order && n.moved > 0 {
                         ui.weak(tr("table.order_ignored"));
                     }
@@ -8384,7 +8737,586 @@ impl TextView {
         if again {
             self.rediff();
         }
+        self.reorder_hint_bar(ui, &names);
         ui.separator();
+    }
+
+    /// Works out the sheets of the rows, when they are not known.
+    fn note_sheets(&mut self) {
+        if self.table.sheets.is_some() {
+            return;
+        }
+        let n = self.n();
+        let sheets = {
+            let docs: Vec<Option<&table::Table>> = self
+                .table
+                .docs
+                .iter()
+                .map(|t| t.as_ref().ok().map(Arc::as_ref))
+                .collect();
+            let prefix = sheet_prefix();
+            let heading = |p: usize, record: usize| -> Option<&str> {
+                let cells = &docs.get(p).copied().flatten()?.records.get(record)?.cells;
+                sheet_name(cells, &prefix)
+            };
+            // Only a workbook read here starts with the heading of a sheet.
+            let sheeted = (0..n).any(|p| heading(p, 0).is_some());
+            let diff = &self.table.diff;
+            let mut sheets: Vec<Sheet> = Vec::new();
+            for (i, row) in diff.rows.iter().enumerate() {
+                let names: Vec<&str> = (0..n)
+                    .filter(|_| sheeted)
+                    .filter_map(|p| heading(p, row.line(p)?))
+                    .collect();
+                if !names.is_empty() || sheets.is_empty() {
+                    let mut name: Vec<&str> = Vec::new();
+                    for x in &names {
+                        if !name.contains(x) {
+                            name.push(x);
+                        }
+                    }
+                    if let Some(last) = sheets.last_mut() {
+                        last.rows.end = i;
+                    }
+                    sheets.push(Sheet {
+                        name: name.join(" / "),
+                        rows: i..diff.rows.len(),
+                        heading: !names.is_empty(),
+                        ..Default::default()
+                    });
+                }
+                let sheet = sheets.last_mut().unwrap();
+                if row.block().is_some_and(|b| !diff.blocks[b].ignored) {
+                    sheet.differences += 1;
+                }
+                for p in 0..n {
+                    let record = row.line(p).zip(docs[p]).map(|(r, t)| &t.records[r]);
+                    if let Some(record) = record {
+                        sheet.widths[p] = sheet.widths[p].max(record.cells.len());
+                    }
+                }
+            }
+            sheets
+        };
+        if self.table.sheet >= sheets.len() {
+            self.table.sheet = 0;
+        }
+        self.table.sheets = Some(sheets);
+    }
+
+    /// The record of pane `pane` on the selected row of the table view.
+    #[cfg(test)]
+    pub fn selected_record(&self, pane: usize) -> Option<usize> {
+        self.table.diff.rows.get(self.table_cursor()?)?.line(pane)
+    }
+
+    /// Whether the columns of the table view are as wide as their contents.
+    #[cfg(test)]
+    pub fn columns_fitted(&self) -> bool {
+        self.table.fit
+    }
+
+    /// The sheets of each side of a compare of workbooks of several sheets: the name of each
+    /// and its records, heading first. Records before the first heading, as of a side that is
+    /// no such workbook, are a sheet without a name.
+    fn sheet_ranges(&self) -> Option<Vec<Vec<(String, Range<usize>)>>> {
+        if !self.several_sheets() {
+            return None;
+        }
+        let prefix = sheet_prefix();
+        self.table
+            .docs
+            .iter()
+            .map(|t| {
+                let records = &t.as_ref().ok()?.records;
+                let mut sheets: Vec<(String, Range<usize>)> = Vec::new();
+                for (i, record) in records.iter().enumerate() {
+                    let name = sheet_name(&record.cells, &prefix);
+                    if name.is_some() || sheets.is_empty() {
+                        if let Some(last) = sheets.last_mut() {
+                            last.1.end = i;
+                        }
+                        sheets.push((name.unwrap_or_default().to_string(), i..records.len()));
+                    }
+                }
+                Some(sheets)
+            })
+            .collect()
+    }
+
+    /// Whether a side is a workbook of several sheets, whose records start with the heading of
+    /// a sheet. The records of such sheets have no key in common, so they are never matched by
+    /// key, whatever [`Self::table_match`] says.
+    fn several_sheets(&self) -> bool {
+        self.table.docs.iter().any(|t| {
+            t.as_ref()
+                .ok()
+                .and_then(|t| t.records.first())
+                .is_some_and(|r| match r.cells.as_slice() {
+                    [cell] => crate::core::extract::is_sheet_heading(cell),
+                    _ => false,
+                })
+        })
+    }
+
+    /// The files of the sides that are spreadsheets OxideMerge reads itself.
+    fn spreadsheets(&self) -> Vec<Option<std::path::PathBuf>> {
+        self.panes
+            .iter()
+            .map(|p| {
+                let path = p.doc.path.as_deref()?;
+                let read_here = table::delimiter_for(path).is_none() && self.table_delim.is_some();
+                let sheet = matches!(text::extension(path).as_str(), "xlsx" | "xlsm" | "ods");
+                (read_here && sheet).then(|| path.to_path_buf())
+            })
+            .collect()
+    }
+
+    /// Reads, in the background, the records of the spreadsheets the other way than their text
+    /// has them, for the values to be shown formatted or as stored.
+    fn load_other_cells(&mut self) {
+        if let Some(job) = &mut self.table.other_job {
+            if let Some(result) = job.poll() {
+                let other = result.unwrap_or_default();
+                self.table.other = Some(
+                    other
+                        .into_iter()
+                        .map(|o| o.map(|(table, shown)| (Arc::new(table), shown)))
+                        .collect(),
+                );
+                self.table.other_job = None;
+            }
+            return;
+        }
+        let paths = self.spreadsheets();
+        if self.table.other.is_some() || paths.iter().all(Option::is_none) {
+            return;
+        }
+        self.table.other_job = Some(super::analysis::Task::start(move |cancel, _| {
+            Ok(paths
+                .iter()
+                .map(|path| {
+                    let other =
+                        crate::core::extract::other_cells(path.as_deref()?, Some(cancel)).ok()?;
+                    let table = table::Table::parse(other.text, ',').ok()?;
+                    Some((table, other.shown))
+                })
+                .collect())
+        }));
+    }
+
+    /// The cell of record `record` in column `column` of pane `p` as the table shows it: of
+    /// a spreadsheet, the value as its number format shows it or as stored, as chosen.
+    fn display_cell(&self, p: usize, record: usize, column: usize) -> Option<&str> {
+        let own = self.table.docs[p].as_ref().ok()?.records[record]
+            .cells
+            .get(column)?;
+        let other = self.table.other.as_ref().and_then(|o| o.get(p)?.as_ref());
+        let other = other
+            .filter(|(_, shown)| *shown != self.table.stored_values)
+            .zip(self.table.docs[p].as_ref().ok())
+            // read at another time, the file may hold other records than the text
+            .filter(|((table, _), doc)| table.records.len() == doc.records.len())
+            .and_then(|((table, _), _)| table.records[record].cells.get(column));
+        Some(other.unwrap_or(own).as_str())
+    }
+
+    /// The sheet shown.
+    fn sheet(&self) -> Option<&Sheet> {
+        self.table.sheets.as_deref()?.get(self.table.sheet)
+    }
+
+    /// Whether row `index` is one the row filter lists.
+    fn row_matches(&self, index: usize) -> bool {
+        let filter = self.table.filter;
+        if filter == RowFilter::All {
+            return true;
+        }
+        match self.keyed().and_then(|d| Some((d, d.rows.get(index)?))) {
+            Some((d, m)) => match filter {
+                RowFilter::All => true,
+                RowFilter::Changed => m.differs(d.ignore_order),
+                RowFilter::Added => m.state == RowState::Added,
+                RowFilter::Removed => m.state == RowState::Removed,
+                RowFilter::Modified => m.state == RowState::Modified,
+                RowFilter::Moved => m.moved,
+                RowFilter::Ambiguous => m.state == RowState::Ambiguous,
+            },
+            None => self.table.diff.rows.get(index).is_some_and(|row| {
+                row.block()
+                    .is_some_and(|b| !self.table.diff.blocks[b].ignored)
+            }),
+        }
+    }
+
+    /// The rows listed: those of the sheet shown that the filter lets through, without the
+    /// heading of the sheet and the header row that names the columns.
+    fn table_rows(&self) -> Vec<usize> {
+        let range = match self.sheet() {
+            Some(s) => s.rows.start + usize::from(s.heading)..s.rows.end,
+            None => 0..self.table.diff.rows.len(),
+        };
+        let header = self
+            .keyed()
+            .filter(|_| self.table_match.header)
+            .and_then(|d| d.rows.iter().position(|r| r.header));
+        range
+            .filter(|&i| Some(i) != header && self.row_matches(i))
+            .collect()
+    }
+
+    /// Shows the sheet of row `row`, and every row when the filter leaves it out.
+    fn reveal_table_row(&mut self, row: usize) {
+        let sheet = self
+            .table
+            .sheets
+            .as_ref()
+            .and_then(|sheets| sheets.iter().position(|s| s.rows.contains(&row)));
+        if let Some(sheet) = sheet {
+            self.table.sheet = sheet;
+        }
+        if !self.row_matches(row) {
+            self.table.filter = RowFilter::All;
+        }
+    }
+
+    /// The key columns of each side, when the rows are matched by key.
+    fn key_columns(&self) -> Vec<Vec<usize>> {
+        let keyed = self.keyed().is_some();
+        (0..self.n())
+            .map(|p| {
+                let names = self.table.docs[p]
+                    .as_ref()
+                    .ok()
+                    .and_then(|t| t.records.first())
+                    .filter(|_| self.table_match.header);
+                self.table_match
+                    .keys
+                    .iter()
+                    .filter(|_| keyed)
+                    .filter_map(|k| match k {
+                        KeyColumn::Index(i) => Some(*i),
+                        KeyColumn::Name(name) => names?.cells.iter().position(|c| c.trim() == name),
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Whether the cell of row `index` in column `column` of pane `p` differs from the cell it
+    /// is compared with. A record only one side has is no changed cell.
+    fn cell_changed(
+        &self,
+        index: usize,
+        p: usize,
+        column: usize,
+        normalizer: &diff::Normalizer,
+    ) -> bool {
+        if let Some(m) = self.keyed().and_then(|d| d.rows.get(index)) {
+            return m.changed[p].contains(&column);
+        }
+        let Some(aligned) = self.table.diff.rows.get(index) else {
+            return false;
+        };
+        let cell = |q: usize| {
+            aligned.line(q).and_then(|r| {
+                self.table.docs[q]
+                    .as_ref()
+                    .ok()
+                    .and_then(|t| t.records[r].cells.get(column))
+            })
+        };
+        let Some(value) = cell(p) else {
+            return false;
+        };
+        let clean = |s: &str| {
+            if self.opts.ignore_eol {
+                s.replace("\r\n", "\n").replace('\r', "\n")
+            } else {
+                s.to_string()
+            }
+        };
+        aligned
+            .block()
+            .is_some_and(|b| !self.table.diff.blocks[b].ignored)
+            && (0..self.n())
+                .filter(|&q| q != p && aligned.line(q).is_some())
+                .any(|q| match cell(q) {
+                    Some(other) => !normalizer.close(&clean(value), &clean(other)),
+                    None => true,
+                })
+    }
+
+    /// The columns that hold a changed cell.
+    fn changed_columns(&self) -> HashSet<(usize, usize)> {
+        let mut changed = HashSet::new();
+        if let Some(d) = self.keyed() {
+            for m in &d.rows {
+                for p in 0..2 {
+                    changed.extend(m.changed[p].iter().map(|&column| (p, column)));
+                }
+            }
+            return changed;
+        }
+        let normalizer = diff::Normalizer::new(&self.opts);
+        let columns = self.table_columns();
+        for index in 0..self.table.diff.rows.len() {
+            for &(p, column) in &columns {
+                if !changed.contains(&(p, column)) && self.cell_changed(index, p, column, &normalizer)
+                {
+                    changed.extend((0..self.n()).map(|q| (q, column)));
+                }
+            }
+        }
+        changed
+    }
+
+    /// The columns shown, from left to right: those of [`Self::table_columns`] the sheet has
+    /// that are not hidden, and with only the changed columns shown, those and the keys.
+    fn shown_columns(&self) -> Vec<(usize, usize)> {
+        let keys = self.key_columns();
+        let several = self.table.sheets.as_ref().is_some_and(|s| s.len() > 1);
+        let sheet = self.sheet().filter(|_| several);
+        let changed = self
+            .table
+            .changed_columns
+            .as_ref()
+            .filter(|changed| self.table.changed_only && !changed.is_empty());
+        self.table_columns()
+            .into_iter()
+            .filter(|cell @ &(p, column)| {
+                !self.table.hidden.contains(&(self.table.sheet, p, column))
+                    && sheet.is_none_or(|s| column < s.widths[p])
+                    && changed.is_none_or(|c| c.contains(cell) || keys[p].contains(&column))
+            })
+            .collect()
+    }
+
+    /// The columns compared with column `column` of pane `p`, itself among them.
+    fn paired_columns(&self, p: usize, column: usize) -> Vec<(usize, usize)> {
+        match self.keyed() {
+            Some(d) => d
+                .columns
+                .iter()
+                .find(|pair| pair[p] == Some(column))
+                .map(|pair| (0..2).filter_map(|q| Some((q, pair[q]?))).collect())
+                .unwrap_or_else(|| vec![(p, column)]),
+            None => (0..self.n()).map(|q| (q, column)).collect(),
+        }
+    }
+
+    /// Takes column `column` of pane `p`, and the columns it is compared with, out of view on
+    /// the sheet shown.
+    fn hide_column(&mut self, p: usize, column: usize) {
+        let sheet = self.table.sheet;
+        let columns = self.paired_columns(p, column);
+        self.table
+            .hidden
+            .extend(columns.into_iter().map(|(p, column)| (sheet, p, column)));
+    }
+
+    /// Which rows and columns the table lists.
+    fn table_tools(&mut self, ui: &mut Ui) {
+        let counts = self.keyed().map(|d| d.counts);
+        let header = usize::from(self.keyed().is_some() && self.table_match.header);
+        let (all, changed) = self.sheet().map_or((0, 0), |s| {
+            (
+                (s.rows.len() - usize::from(s.heading)).saturating_sub(header),
+                s.differences,
+            )
+        });
+        let mut chips = vec![
+            (RowFilter::All, "table.filter_all", all),
+            (RowFilter::Changed, "table.filter_changed", changed),
+        ];
+        if let Some(n) = counts {
+            chips.extend([
+                (RowFilter::Added, "table.filter_added", n.added),
+                (RowFilter::Removed, "table.filter_removed", n.removed),
+                (RowFilter::Modified, "table.filter_modified", n.modified),
+                (RowFilter::Moved, "table.filter_moved", n.moved),
+                (RowFilter::Ambiguous, "table.filter_ambiguous", n.ambiguous),
+            ]);
+        }
+        let sheet = self.table.sheet;
+        let hidden = self.table.hidden.iter().filter(|h| h.0 == sheet).count();
+        let (filter_before, changed_before, hidden_before) =
+            (self.table.filter, self.table.changed_only, hidden);
+        ui.horizontal_wrapped(|ui| {
+            for (filter, key, count) in chips {
+                let always = matches!(filter, RowFilter::All | RowFilter::Changed);
+                if (count > 0 || always || self.table.filter == filter)
+                    && ui
+                        .selectable_label(
+                            self.table.filter == filter,
+                            format!("{}  {count}", tr(key)),
+                        )
+                        .clicked()
+                {
+                    self.table.filter = filter;
+                }
+            }
+            ui.separator();
+            widgets::toggle_button(
+                ui,
+                &mut self.table.changed_only,
+                tr("table.changed_columns"),
+                tr("tip.table_changed_columns"),
+            );
+            if self.table.other.is_some() || self.table.other_job.is_some() {
+                let mut formatted = !self.table.stored_values;
+                widgets::toggle_button(
+                    ui,
+                    &mut formatted,
+                    tr("table.formatted_values"),
+                    tr("tip.table_formatted_values"),
+                );
+                self.table.stored_values = !formatted;
+            }
+            let fitted = self.table.fit;
+            widgets::toggle_button(
+                ui,
+                &mut self.table.fit,
+                tr("table.fit_columns"),
+                tr("tip.table_fit_columns"),
+            );
+            // What is listed is measured again, as its contents differ.
+            let listed = (self.table.filter, self.table.changed_only, hidden);
+            let before = (filter_before, changed_before, hidden_before);
+            self.table.fit_now |= self.table.fit && (!fitted || listed != before);
+            self.table.restore_scroll |= self.table.fit != fitted;
+            if hidden > 0
+                && ui
+                    .button(trf("table.show_columns", &[("count", hidden.to_string())]))
+                    .clicked()
+            {
+                self.table.hidden.retain(|h| h.0 != sheet);
+            }
+        });
+    }
+
+    /// The selected cell as a spreadsheet shows it: where it is, and what each side has there,
+    /// with what differs marked.
+    fn formula_bar(&self, ui: &mut Ui, c: &Colors) {
+        let n = self.n();
+        let pal = widgets::pal(ui);
+        let (p, column) = (self.active_pane.min(n - 1), self.table.column);
+        let row = self
+            .table_cursor()
+            .and_then(|i| Some((i, *self.table.diff.rows.get(i)?)));
+        let cell = |q: usize| -> Option<&str> {
+            let (_, aligned) = row?;
+            let column = match self.keyed() {
+                Some(d) if q != p => d.paired_column(p, column, q)?,
+                _ => column,
+            };
+            self.display_cell(q, aligned.line(q)?, column)
+        };
+        // A sheet's rows are numbered from its first, as the grid numbers them.
+        let heading = self.sheet().filter(|s| s.heading).map(|s| s.rows.start);
+        let name = match row.and_then(|(i, aligned)| Some((i, aligned.line(p)?))) {
+            Some((i, record)) => format!(
+                "{}{}",
+                column_letters(column),
+                heading.map_or(record + 1, |heading| i.saturating_sub(heading))
+            ),
+            None => column_letters(column),
+        };
+        let normalizer = diff::Normalizer::new(&self.opts);
+        let changed = row.is_some_and(|(i, _)| self.cell_changed(i, p, column, &normalizer));
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let ink = ui.visuals().text_color();
+        egui::Frame::new()
+            .fill(pal.surface_alt)
+            .inner_margin(egui::Margin::symmetric(6, 3))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [72.0, 20.0],
+                        egui::Label::new(RichText::new(name).monospace().strong()),
+                    )
+                    .on_hover_text(self.panes[p].doc.title());
+                    ui.separator();
+                    ui.columns(n, |columns| {
+                        for (q, ui) in columns.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                widgets::side_chip(ui, q, n);
+                                let Some(value) = cell(q) else {
+                                    ui.weak("—");
+                                    return;
+                                };
+                                // Each side against the selected one; that against another.
+                                let against = (0..n)
+                                    .filter(|&o| changed && o != q && (q == p || o == p))
+                                    .find_map(cell);
+                                let mark = if q == 0 && n == 2 {
+                                    c.inline_removed
+                                } else {
+                                    c.inline_added
+                                };
+                                ui.add(
+                                    egui::Label::new(cell_job(
+                                        value,
+                                        against,
+                                        mark,
+                                        font.clone(),
+                                        ink,
+                                    ))
+                                    .truncate(),
+                                )
+                                .on_hover_text(value);
+                            });
+                        }
+                    });
+                });
+            });
+    }
+
+    /// The sheets of a workbook as tabs below the table, each with how many rows differ.
+    fn sheet_tabs(&mut self, ui: &mut Ui, c: &Colors) {
+        let Some(sheets) = self.table.sheets.as_ref().filter(|s| s.len() > 1) else {
+            return;
+        };
+        let tabs: Vec<String> = sheets
+            .iter()
+            .map(|s| match s.differences {
+                0 => s.name.clone(),
+                differences => format!("{}  ·  {differences}", s.name),
+            })
+            .collect();
+        let mut pick = None;
+        egui::Panel::bottom(self.id.with("sheet_tabs"))
+            .frame(
+                egui::Frame::new()
+                    .fill(c.gutter_bg)
+                    .inner_margin(egui::Margin::symmetric(6, 3)),
+            )
+            .show(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt(self.id.with("sheet_tabs_scroll"))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (i, tab) in tabs.iter().enumerate() {
+                                let on = i == self.table.sheet;
+                                let text = if on {
+                                    RichText::new(tab).strong()
+                                } else {
+                                    RichText::new(tab)
+                                };
+                                if ui.selectable_label(on, text).clicked() {
+                                    pick = Some(i);
+                                }
+                            }
+                        });
+                    });
+            });
+        if let Some(sheet) = pick.filter(|&i| i != self.table.sheet) {
+            self.table.sheet = sheet;
+            self.table.fit_now = self.table.fit;
+            if let Some(&row) = self.table_rows().first() {
+                self.select_table_row(row, self.active_pane, 0);
+            }
+        }
     }
 
     fn table_ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) {
@@ -8392,6 +9324,7 @@ impl TextView {
         // matched when table mode is turned on, not while it is off
         if self.table_match.by_key()
             && self.n() == 2
+            && !self.several_sheets()
             && self.table.keyed.is_none()
             && self.table.job.is_none()
             && self.table.docs.iter().all(Result::is_ok)
@@ -8414,44 +9347,18 @@ impl TextView {
             }
             return;
         }
-        if self.n() == 2 {
+        self.note_sheets();
+        if self.n() == 2 && !self.several_sheets() {
             self.table_match_bar(ui, c);
         }
         if self.table.job.is_some() {
             return;
         }
+        self.note_sheets();
         let n = self.n();
-        let columns = self
-            .table
-            .docs
-            .iter()
-            .filter_map(|t| t.as_ref().ok())
-            .flat_map(|t| &t.records)
-            .map(|r| r.cells.len())
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        let line_height = cfg.font_size + 6.0;
-        let heights: Vec<f32> = self
-            .table
-            .diff
-            .rows
-            .iter()
-            .map(|row| {
-                (0..n)
-                    .filter_map(|p| {
-                        row.line(p)
-                            .map(|r| &self.table.docs[p].as_ref().unwrap().records[r])
-                    })
-                    .flat_map(|r| &r.cells)
-                    .map(|s| s.lines().count().clamp(1, 8))
-                    .max()
-                    .unwrap_or(1) as f32
-                    * line_height
-                    + 8.0
-            })
-            .collect();
         let keyed = self.keyed().is_some();
+        // The header row of a table matched by key names the columns instead of being a row.
+        let named = keyed && self.table_match.header;
         let target = self.scroll_to.take().and_then(|raw_row| {
             let raw = self.diff.rows.get(raw_row)?;
             self.table
@@ -8470,172 +9377,459 @@ impl TextView {
         if keyed && target.is_some() {
             self.table.selected = target;
         }
+        if let Some(row) = target {
+            self.reveal_table_row(row);
+        }
+        if self.table.changed_only && self.table.changed_columns.is_none() {
+            self.table.changed_columns = Some(self.changed_columns());
+        }
+        self.load_other_cells();
+        self.table_tools(ui);
+        self.formula_bar(ui, c);
+        self.sheet_tabs(ui, c);
+        let visible = self.table_rows();
+        let shown = self.shown_columns();
+        if visible.is_empty() {
+            ui.add_space(8.0);
+            ui.weak(tr("table.no_rows"));
+            self.cell_window(ui);
+            return;
+        }
+        let line_height = cfg.font_size + 6.0;
+        let heights: Vec<f32> = visible
+            .iter()
+            .map(|&i| {
+                let row = &self.table.diff.rows[i];
+                (0..n)
+                    .filter_map(|p| {
+                        row.line(p)
+                            .map(|r| &self.table.docs[p].as_ref().unwrap().records[r])
+                    })
+                    .flat_map(|r| &r.cells)
+                    .map(|s| s.lines().count().clamp(1, 8))
+                    .max()
+                    .unwrap_or(1) as f32
+                    * line_height
+                    + 8.0
+            })
+            .collect();
         let cursor = self.table_cursor();
+        let focus = (self.active_pane, self.table.column);
+        let fit = self.table.fit;
+        let fit_now = std::mem::take(&mut self.table.fit_now);
+        let restore = std::mem::take(&mut self.table.restore_scroll).then_some(self.table.scroll);
+        let mut scroll = None;
+        let pal = widgets::pal(ui);
         let normalizer = diff::Normalizer::new(&self.opts);
+        let header_row = self
+            .keyed()
+            .filter(|_| named)
+            .and_then(|d| d.rows.iter().find(|r| r.header));
+        let header_cell = |p: usize, column: usize| {
+            self.table.docs[p]
+                .as_ref()
+                .ok()
+                .and_then(|t| t.records.first())
+                .and_then(|r| r.cells.get(column))
+                .map(|s| s.trim())
+                .filter(|s| named && !s.is_empty())
+        };
+        // A column is named by its header, or as a spreadsheet does, by its letters.
+        let title = |p: usize, column: usize| {
+            header_cell(p, column).map_or_else(|| column_letters(column), str::to_string)
+        };
+        // The key columns of each side, which stay in view with the record number.
+        let key_columns = self.key_columns();
+        // The rows of a sheet are numbered from its first, as in the workbook.
+        let heading = self.sheet().filter(|s| s.heading).map(|s| s.rows.start);
+        let number = |index: usize| heading.map_or(index + 1, |heading| index - heading);
+        // The colour of a row: of its cells on side `pane`, or of the row as a whole.
+        let row_fill = |index: usize, pane: Option<usize>| -> Option<Color32> {
+            let aligned = self.table.diff.rows[index];
+            match self.keyed().and_then(|d| Some((d, d.rows.get(index)?))) {
+                Some((d, m)) => match m.state {
+                    RowState::Ambiguous => Some(c.conflict),
+                    RowState::Added => Some(c.added),
+                    RowState::Removed => Some(c.removed),
+                    // A row in another place is no difference when the order is ignored.
+                    _ => (m.moved && !d.ignore_order).then_some(c.moved),
+                },
+                None => {
+                    let differs = aligned
+                        .block()
+                        .is_some_and(|b| !self.table.diff.blocks[b].ignored);
+                    let gap = (0..n).any(|q| aligned.line(q).is_none());
+                    let here = pane.is_none_or(|p| aligned.line(p).is_some());
+                    (differs && gap && here).then_some(
+                        if n == 2 && aligned.line(1).is_none() {
+                            c.removed
+                        } else {
+                            c.added
+                        },
+                    )
+                }
+            }
+        };
         let mut clicked = None;
         let mut edit_cell = None;
         let mut copy = None;
+        let mut hide = None;
         egui::ScrollArea::horizontal()
             .id_salt(self.id.with("table_horizontal"))
             .show(ui, |ui| {
-                ui.set_min_width((columns * n) as f32 * 140.0 + 60.0);
+                ui.set_min_width(shown.len() as f32 * 140.0 + 60.0);
+                // Cells touch, with grid lines between them, as in a spreadsheet.
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                let view = ui.clip_rect();
+                let scrolled = ui.max_rect().left() < view.left() - 0.5;
+                // Cells out of view are not drawn, so a row is as high as one that was, and the
+                // record column as wide as when it was last in view.
+                let width_id = self.id.with("record_width");
+                let band = std::cell::Cell::new(None);
+                let mut header_band = None;
+                // The rows drawn, as in the diff, with their height on screen.
+                let mut drawn: Vec<(usize, egui::Rangef)> = Vec::new();
                 let mut builder = egui_extras::TableBuilder::new(ui)
-                    .id_salt(self.id.with("records"))
+                    // Fitted widths are kept apart from those set by hand, which come back.
+                    .id_salt(self.id.with(("records", self.table.sheet, fit)))
                     .resizable(true)
-                    .striped(true)
+                    .striped(false)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .sense(Sense::click())
                     .column(egui_extras::Column::initial(55.0).at_least(40.0))
                     .columns(
                         egui_extras::Column::initial(140.0)
-                            .at_least(60.0)
-                            .clip(true),
-                        columns * n,
+                            .at_least(40.0)
+                            .clip(true)
+                            .auto_size_this_frame(fit_now),
+                        shown.len(),
                     );
-                if let Some(row) = target {
+                if let Some(row) = target.and_then(|t| visible.iter().position(|&i| i == t)) {
                     builder = builder.scroll_to_row(row, Some(egui::Align::Center));
+                } else if let Some(offset) = restore {
+                    builder = builder.vertical_scroll_offset(offset);
                 }
-                builder
-                    .header(34.0, |mut header| {
+                let body = builder
+                    .header(40.0, |mut header| {
                         header.col(|ui| {
-                            ui.label(tr("table.record"));
+                            band.set(Some(ui.max_rect().y_range()));
+                            fill_cell(ui, c.gutter_bg);
+                            grid_cell(ui, c);
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(tr("table.record"))
+                                    .small()
+                                    .color(c.gutter_text),
+                            );
                         });
-                        for p in 0..n {
-                            for column in 0..columns {
-                                header.col(|ui| {
-                                    ui.label(format!("{} · {}", side_name(p, n), column + 1))
-                                        .on_hover_text(self.panes[p].doc.title());
+                        for &(p, column) in &shown {
+                            header.col(|ui| {
+                                band.set(Some(ui.max_rect().y_range()));
+                                fill_cell(
+                                    ui,
+                                    if header_row.is_some_and(|m| m.changed[p].contains(&column)) {
+                                        c.inline
+                                    } else if cursor.is_some() && focus == (p, column) {
+                                        pal.accent_soft
+                                    } else {
+                                        c.gutter_bg
+                                    },
+                                );
+                                grid_cell(ui, c);
+                                let cell = ui
+                                    .interact(ui.max_rect(), ui.scope_id().with("head"), Sense::click())
+                                    .on_hover_text(self.panes[p].doc.title());
+                                if cell.double_clicked() && header_cell(p, column).is_some() {
+                                    edit_cell = Some((p, 0, column));
+                                }
+                                cell.context_menu(|ui| {
+                                    if ui.button(tr("table.hide_column")).clicked() {
+                                        hide = Some((p, column));
+                                        ui.close();
+                                    }
                                 });
-                            }
+                                ui.add_space(6.0);
+                                ui.vertical(|ui| {
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::Label::new(RichText::new(title(p, column)).strong())
+                                            .truncate()
+                                            .selectable(false),
+                                    );
+                                    // Under a header name, the letters tell where the column is.
+                                    let place = match header_cell(p, column) {
+                                        Some(_) => format!(
+                                            "{} · {}",
+                                            side_name(p, n),
+                                            column_letters(column)
+                                        ),
+                                        None => side_name(p, n).to_string(),
+                                    };
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(place)
+                                                .small()
+                                                .color(widgets::side_color(ui, p, n)),
+                                        )
+                                        .truncate()
+                                        .selectable(false),
+                                    );
+                                });
+                            });
                         }
+                        header_band = band.take();
                     })
                     .body(|body| {
                         body.heterogeneous_rows(heights.into_iter(), |mut row| {
-                            let index = row.index();
+                            let index = visible[row.index()];
                             let aligned = self.table.diff.rows[index];
                             let matched = self.keyed().and_then(|d| d.rows.get(index));
                             row.col(|ui| {
-                                if cursor == Some(index) {
-                                    ui.painter().rect_filled(ui.max_rect(), 0.0, c.cursor_row);
+                                band.set(Some(ui.max_rect().y_range()));
+                                let width = ui.max_rect().width();
+                                ui.data_mut(|d| d.insert_temp(width_id, width));
+                                let on = cursor == Some(index);
+                                fill_cell(ui, if on { pal.accent_soft } else { c.gutter_bg });
+                                grid_cell(ui, c);
+                                let (mark, tip, edge) = match matched {
+                                    Some(m) => row_marker(m, c),
+                                    None => (String::new(), String::new(), None),
+                                };
+                                if let Some(edge) = edge.or(row_fill(index, None)) {
+                                    let mut rect = ui.max_rect();
+                                    rect.set_width(4.0);
+                                    ui.painter().rect_filled(rect, 0.0, edge);
                                 }
-                                match matched {
-                                    Some(m) => {
-                                        let (mark, tip, fill) = row_marker(m, c);
-                                        if let Some(fill) = fill {
-                                            let mut rect = ui.max_rect();
-                                            rect.set_width(4.0);
-                                            ui.painter().rect_filled(rect, 0.0, fill);
-                                        }
-                                        ui.label(format!("{} {mark}", index + 1))
-                                            .on_hover_text(tip);
-                                    }
-                                    None => {
-                                        ui.label((index + 1).to_string());
-                                    }
+                                ui.add_space(8.0);
+                                let text = RichText::new(format!("{} {mark}", number(index)))
+                                    .color(c.gutter_text);
+                                let label = ui.label(if on { text.strong() } else { text });
+                                if !tip.is_empty() {
+                                    label.on_hover_text(tip);
                                 }
                             });
-                            for p in 0..n {
-                                for column in 0..columns {
-                                    row.col(|ui| {
-                                        let record = aligned.line(p).map(|r| {
-                                            &self.table.docs[p].as_ref().unwrap().records[r]
-                                        });
-                                        let value = record.and_then(|r| r.cells.get(column));
-                                        let changed = match matched {
-                                            Some(m) => m.changed[p].contains(&column),
-                                            None => {
-                                                value.is_some()
-                                                    && aligned.block().is_some_and(|b| {
-                                                        !self.table.diff.blocks[b].ignored
-                                                    })
-                                                    && (0..n).filter(|&q| q != p).any(|q| {
-                                                        let other = aligned.line(q).and_then(|r| {
-                                                            self.table.docs[q]
-                                                                .as_ref()
-                                                                .unwrap()
-                                                                .records[r]
-                                                                .cells
-                                                                .get(column)
-                                                        });
-                                                        match (value, other) {
-                                                            (Some(a), Some(b)) => {
-                                                                let clean = |s: &str| {
-                                                                    if self.opts.ignore_eol {
-                                                                        s.replace("\r\n", "\n")
-                                                                            .replace('\r', "\n")
-                                                                    } else {
-                                                                        s.to_string()
-                                                                    }
-                                                                };
-                                                                !normalizer
-                                                                    .close(&clean(a), &clean(b))
-                                                            }
-                                                            _ => value != other,
-                                                        }
-                                                    })
-                                            }
-                                        };
-                                        if changed {
-                                            ui.painter().rect_filled(ui.max_rect(), 0.0, c.inline);
+                            for &(p, column) in &shown {
+                                row.col(|ui| {
+                                    band.set(Some(ui.max_rect().y_range()));
+                                    let focused = cursor == Some(index) && focus == (p, column);
+                                    let outline = |ui: &Ui| {
+                                        if focused {
+                                            ui.painter().rect_stroke(
+                                                ui.max_rect().shrink(0.5),
+                                                0.0,
+                                                Stroke::new(2.0, pal.accent),
+                                                StrokeKind::Inside,
+                                            );
                                         }
-                                        let response = ui
-                                            .add(
-                                                egui::Label::new(
-                                                    value.map(String::as_str).unwrap_or("—"),
+                                    };
+                                    let cell = ui.interact(
+                                        ui.max_rect(),
+                                        ui.scope_id().with("cell"),
+                                        Sense::click(),
+                                    );
+                                    if cell.clicked() {
+                                        clicked = Some((index, p, column));
+                                    }
+                                    let Some(record) = aligned
+                                        .line(p)
+                                        .map(|r| &self.table.docs[p].as_ref().unwrap().records[r])
+                                    else {
+                                        // A record this side does not have.
+                                        hatch_cell(ui, c);
+                                        grid_cell(ui, c);
+                                        outline(ui);
+                                        return;
+                                    };
+                                    let value = record.cells.get(column);
+                                    let text = aligned
+                                        .line(p)
+                                        .and_then(|r| self.display_cell(p, r, column));
+                                    if self.cell_changed(index, p, column, &normalizer) {
+                                        fill_cell(ui, c.inline);
+                                    } else if let Some(fill) = row_fill(index, Some(p)) {
+                                        fill_cell(ui, fill);
+                                    }
+                                    grid_cell(ui, c);
+                                    outline(ui);
+                                    let number = text.is_some_and(is_number);
+                                    let text = match text {
+                                        Some(v) if number => RichText::new(v).monospace(),
+                                        Some(v) => RichText::new(v),
+                                        None => RichText::new(""),
+                                    };
+                                    let label = egui::Label::new(text).selectable(false);
+                                    // Numbers line up on the right, to be compared at a glance.
+                                    if number {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.add_space(6.0);
+                                                ui.add(label);
+                                            },
+                                        );
+                                    } else {
+                                        ui.add_space(6.0);
+                                        ui.add(label);
+                                    }
+                                    let cell = match value {
+                                        Some(v) => cell.on_hover_text(v.as_str()),
+                                        None => cell,
+                                    };
+                                    if cell.double_clicked() {
+                                        if let Some(r) = aligned.line(p) {
+                                            edit_cell = Some((p, r, column));
+                                        }
+                                    }
+                                    cell.context_menu(|ui| {
+                                        if let Some(r) = aligned.line(p) {
+                                            if ui
+                                                .add_enabled(
+                                                    !self.panes[p].doc.read_only
+                                                        && value.is_some(),
+                                                    egui::Button::new(tr("table.edit_cell")),
                                                 )
-                                                .sense(Sense::click()),
-                                            )
-                                            .on_hover_text(value.map(String::as_str).unwrap_or(""));
-                                        if response.clicked() {
-                                            clicked = Some((index, p, column));
-                                        }
-                                        if response.double_clicked() {
-                                            if let Some(r) = aligned.line(p) {
+                                                .clicked()
+                                            {
                                                 edit_cell = Some((p, r, column));
+                                                ui.close();
                                             }
-                                        }
-                                        response.context_menu(|ui| {
-                                            if let Some(r) = aligned.line(p) {
-                                                if ui
-                                                    .add_enabled(
-                                                        !self.panes[p].doc.read_only
-                                                            && value.is_some(),
-                                                        egui::Button::new(tr("table.edit_cell")),
-                                                    )
-                                                    .clicked()
+                                            let safe = matched
+                                                .is_none_or(|m| m.state != RowState::Ambiguous);
+                                            for to in 0..n {
+                                                if to != p
+                                                    && aligned.line(to).is_some()
+                                                    && ui
+                                                        .add_enabled(
+                                                            !self.panes[to].doc.read_only
+                                                                && value.is_some()
+                                                                && safe,
+                                                            egui::Button::new(format!(
+                                                                "{} → {}",
+                                                                tr("table.copy_cell"),
+                                                                side_name(to, n)
+                                                            )),
+                                                        )
+                                                        .clicked()
                                                 {
-                                                    edit_cell = Some((p, r, column));
+                                                    copy = Some((index, column, p, to));
                                                     ui.close();
                                                 }
-                                                let safe = matched
-                                                    .is_none_or(|m| m.state != RowState::Ambiguous);
-                                                for to in 0..n {
-                                                    if to != p
-                                                        && aligned.line(to).is_some()
-                                                        && ui
-                                                            .add_enabled(
-                                                                !self.panes[to].doc.read_only
-                                                                    && value.is_some()
-                                                                    && safe,
-                                                                egui::Button::new(format!(
-                                                                    "{} → {}",
-                                                                    tr("table.copy_cell"),
-                                                                    side_name(to, n)
-                                                                )),
-                                                            )
-                                                            .clicked()
-                                                    {
-                                                        copy = Some((index, column, p, to));
-                                                        ui.close();
-                                                    }
-                                                }
                                             }
-                                        });
+                                        }
+                                        if ui.button(tr("table.hide_column")).clicked() {
+                                            hide = Some((p, column));
+                                            ui.close();
+                                        }
                                     });
-                                }
+                                });
+                            }
+                            if let Some(band) = band.take() {
+                                drawn.push((index, band));
                             }
                         });
                     });
+                scroll = Some(body.state.clamped_offset().y);
+                // Scrolled sideways, the record number and the key stay at the left edge.
+                let Some(header_band) = header_band.filter(|_| scrolled) else {
+                    return;
+                };
+                let record_width = ui.data(|d| d.get_temp(width_id)).unwrap_or(55.0);
+                let key_width = if key_columns.iter().all(Vec::is_empty) {
+                    0.0
+                } else {
+                    150.0
+                };
+                let strip = |band: egui::Rangef| {
+                    Rect::from_x_y_ranges(
+                        view.left()..=view.left() + record_width + key_width,
+                        band,
+                    )
+                };
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let (base, ink, edge) = (
+                    ui.visuals().panel_fill,
+                    ui.visuals().text_color(),
+                    Stroke::new(1.0, c.table_grid),
+                );
+                let key_text = |index: usize| {
+                    let aligned = self.table.diff.rows[index];
+                    (0..n)
+                        .find_map(|p| {
+                            let r = aligned.line(p)?;
+                            let record = &self.table.docs[p].as_ref().ok()?.records[r];
+                            Some(
+                                key_columns[p]
+                                    .iter()
+                                    .map(|&k| record.cells.get(k).map_or("", |s| s.trim()))
+                                    .collect::<Vec<_>>()
+                                    .join(" · "),
+                            )
+                        })
+                        .unwrap_or_default()
+                };
+                let body_clip =
+                    Rect::from_min_max(pos2(view.left(), header_band.max), view.max);
+                for &(index, band) in &drawn {
+                    let strip = strip(band);
+                    let painter = ui.painter().with_clip_rect(strip.intersect(body_clip));
+                    painter.rect_filled(strip, 0.0, base);
+                    if let Some(fill) = row_fill(index, None) {
+                        painter.rect_filled(strip, 0.0, fill);
+                    }
+                    let mut gutter = strip;
+                    gutter.set_width(record_width);
+                    let on = cursor == Some(index);
+                    painter.rect_filled(gutter, 0.0, if on { pal.accent_soft } else { c.gutter_bg });
+                    let mark = self
+                        .keyed()
+                        .and_then(|d| d.rows.get(index))
+                        .map(|m| row_marker(m, c).0)
+                        .unwrap_or_default();
+                    painter.with_clip_rect(gutter.intersect(body_clip)).text(
+                        pos2(strip.left() + 8.0, strip.center().y),
+                        Align2::LEFT_CENTER,
+                        format!("{} {mark}", number(index)),
+                        font.clone(),
+                        c.gutter_text,
+                    );
+                    painter.text(
+                        pos2(gutter.right() + 6.0, strip.center().y),
+                        Align2::LEFT_CENTER,
+                        key_text(index),
+                        font.clone(),
+                        ink,
+                    );
+                    painter.hline(strip.x_range(), strip.bottom() - 0.5, edge);
+                    painter.vline(gutter.right() - 0.5, strip.y_range(), edge);
+                    painter.vline(strip.right() - 0.5, strip.y_range(), edge);
+                    let id = self.id.with(("pinned", index));
+                    if ui
+                        .interact(strip.intersect(body_clip), id, Sense::click())
+                        .clicked()
+                    {
+                        clicked = Some((index, self.active_pane, self.table.column));
+                    }
+                }
+                let strip = strip(header_band);
+                let painter = ui.painter().with_clip_rect(strip.intersect(view));
+                painter.rect_filled(strip, 0.0, c.gutter_bg);
+                let keys: Vec<String> = (0..n)
+                    .find(|&p| !key_columns[p].is_empty())
+                    .map(|p| key_columns[p].iter().map(|&k| title(p, k)).collect())
+                    .unwrap_or_default();
+                painter.text(
+                    pos2(strip.left() + record_width + 6.0, strip.center().y),
+                    Align2::LEFT_CENTER,
+                    keys.join(" · "),
+                    font,
+                    ink,
+                );
+                painter.hline(strip.x_range(), strip.bottom() - 0.5, edge);
+                painter.vline(strip.right() - 0.5, strip.y_range(), edge);
             });
+        if let Some(scroll) = scroll {
+            self.table.scroll = scroll;
+        }
         if let Some((row, pane, column)) = clicked {
             self.select_table_row(row, pane, column);
         }
@@ -8644,6 +9838,9 @@ impl TextView {
         }
         if let Some((r, col, from, to)) = copy {
             self.copy_cell(r, col, from, to);
+        }
+        if let Some((p, column)) = hide {
+            self.hide_column(p, column);
         }
         self.cell_window(ui);
     }
@@ -9317,6 +10514,35 @@ impl TextView {
             })
     }
 
+    /// The Text / Table switch of CSV, TSV and spreadsheet compares, where the other views have
+    /// their own switch; a workbook that has a Formatted view too has it on the same switch,
+    /// which [`Self::formatted_ui`] then leaves out.
+    fn table_tabs(&mut self, ui: &mut Ui) {
+        if self.table_delim.is_none() {
+            return;
+        }
+        let formatted = self.documents().is_some();
+        self.formatted_mode &= formatted;
+        let mut mode = match (self.formatted_mode, self.table_mode) {
+            (true, _) => 2,
+            (false, table) => table as u8,
+        };
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut mode, 0, tr("analysis.text"));
+            ui.selectable_value(&mut mode, 1, tr("analysis.table"))
+                .on_hover_text(tr("analysis.table_tip"));
+            if formatted {
+                ui.selectable_value(&mut mode, 2, tr("analysis.formatted"))
+                    .on_hover_text(tr("analysis.formatted_tip"));
+            }
+        });
+        // The Formatted view keeps which of the other two it was opened from.
+        if mode != 2 {
+            self.table_mode = mode == 1;
+        }
+        self.formatted_mode = mode == 2;
+    }
+
     /// The Text / Formatted switch of Word document, workbook and PDF compares, and the
     /// Formatted view: the files as Markdown, block by block side by side, with their tables
     /// drawn as tables, merged cells included; a workbook is a heading and a table for each sheet,
@@ -9328,11 +10554,13 @@ impl TextView {
         let Some(paths) = self.documents() else {
             return false;
         };
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.formatted_mode, false, tr("analysis.text"));
-            ui.selectable_value(&mut self.formatted_mode, true, tr("analysis.formatted"))
-                .on_hover_text(tr("analysis.formatted_tip"));
-        });
+        if self.table_delim.is_none() {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.formatted_mode, false, tr("analysis.text"));
+                ui.selectable_value(&mut self.formatted_mode, true, tr("analysis.formatted"))
+                    .on_hover_text(tr("analysis.formatted_tip"));
+            });
+        }
         if !self.formatted_mode {
             return false;
         }
@@ -9714,6 +10942,7 @@ impl TextView {
         } else {
             self.verification_ui(None, cfg);
         }
+        self.table_tabs(ui);
         if self.formatted_ui(ui, cfg, c) || self.analysis_ui(ui) {
             return;
         }
@@ -11626,6 +12855,204 @@ mod tests {
         );
         v.set_table_match(m);
         v
+    }
+
+    #[test]
+    fn a_column_that_tells_reordered_records_apart_is_offered_as_the_key() {
+        let table = |text: &str| table::Table::parse(text.to_string(), ',').unwrap();
+        let left = table("id,name,amount\n1,a,10\n2,b,20\n3,c,30\n4,d,40\n");
+        let moved = table("name,id,amount\nc,3,30\na,1,10\nd,4,40\nb,2,20\nd,4,41\n");
+        let m = reorder_hint(&left, &moved, &TableMatch::default()).unwrap();
+        assert!(m.header);
+        assert_eq!(m.keys, vec![KeyColumn::Name("id".into())]);
+        assert_eq!(m.columns, table_match::ColumnPolicy::Name);
+        // In the same order, matching by position already lines the records up.
+        let edited = table("id,name,amount\n1,a,10\n2,b,21\n3,c,30\n4,d,40\n");
+        assert_eq!(reorder_hint(&left, &edited, &TableMatch::default()), None);
+        // Without a header row the key is the column's position.
+        let (a, b) = (table("1,a\n2,b\n3,c\n"), table("3,c\n1,a\n2,b\n"));
+        let m = reorder_hint(&a, &b, &TableMatch::default()).unwrap();
+        assert_eq!((m.header, m.keys), (false, vec![KeyColumn::Index(0)]));
+        // No column tells these records apart.
+        let (a, b) = (table("x,1\nx,1\nx,2\ny,2\n"), table("y,2\nx,2\nx,1\nx,1\n"));
+        assert_eq!(reorder_hint(&a, &b, &TableMatch::default()), None);
+    }
+
+    #[test]
+    fn table_columns_stand_beside_the_column_they_are_compared_with() {
+        let (left, right) = ("id,a,b\n1,x,y\n", "id,b,a,c\n1,y,x,z\n");
+        let mut v = keyed_view(left, right, TableMatch::default());
+        v.table_mode = true;
+        assert_eq!(v.table_columns()[..4], [(0, 0), (1, 0), (0, 1), (1, 1)]);
+        v.set_table_match(TableMatch {
+            columns: table_match::ColumnPolicy::Name,
+            ..by_id()
+        });
+        assert_eq!(
+            v.table_columns(),
+            [(0, 0), (1, 0), (0, 1), (1, 2), (0, 2), (1, 1), (1, 3)]
+        );
+    }
+
+    #[test]
+    fn numbers_are_told_from_text_as_a_number_format_writes_them() {
+        for cell in ["12", " 75.505 ", "-3", "1e3", "$741,700", "82.4%", "(1,200.50)", "€9"] {
+            assert!(is_number(cell), "{cell}");
+        }
+        for cell in ["", "abc", "2026-09-30", "1,2,x", "inf", "NaN", "$", "A1", "12 kg"] {
+            assert!(!is_number(cell), "{cell}");
+        }
+    }
+
+    #[test]
+    fn columns_are_lettered_as_in_a_spreadsheet() {
+        let letters = [(0, "A"), (25, "Z"), (26, "AA"), (27, "AB"), (701, "ZZ"), (702, "AAA")];
+        for (column, name) in letters {
+            assert_eq!(column_letters(column), name);
+        }
+    }
+
+    #[test]
+    fn the_formula_bar_marks_what_differs_between_two_cells() {
+        let marked = |text: &str, against: Option<&str>| -> Vec<String> {
+            let mark = Color32::RED;
+            let job = cell_job(text, against, mark, FontId::default(), Color32::BLACK);
+            job.sections
+                .iter()
+                .filter(|s| s.format.background == mark)
+                .map(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].to_string())
+                .collect()
+        };
+        assert_eq!(marked("shipped", Some("shipped")), Vec::<String>::new());
+        assert_eq!(marked("shipped", None), Vec::<String>::new());
+        assert_eq!(marked("75.505", Some("75.50")), ["5"]);
+        assert_eq!(marked("A. Chen", Some("B. Okafor")), ["A. Chen"]);
+        assert_eq!(marked("aXc", Some("aYYc")), ["X"]);
+        assert_eq!(marked("a\nb", Some("a\nc")), ["b"]);
+    }
+
+    #[test]
+    fn the_row_filter_lists_the_rows_of_one_kind() {
+        let left = "id,v\n1,a\n2,b\n3,c\n4,d\n";
+        let right = "id,v\n1,a\n3,x\n5,e\n4,d\n";
+        let mut v = keyed_view(left, right, by_id());
+        v.table_mode = true;
+        v.note_sheets();
+        let ids = |v: &TextView| -> Vec<String> {
+            let d = v.keyed().unwrap();
+            v.table_rows()
+                .into_iter()
+                .map(|i| {
+                    let side = usize::from(d.rows[i].records[0].is_none());
+                    let record = d.rows[i].records[side].unwrap();
+                    v.table.docs[side].as_ref().unwrap().records[record].cells[0].clone()
+                })
+                .collect()
+        };
+        // The header row names the columns, so it is not listed.
+        assert_eq!(ids(&v).len(), 5);
+        for (filter, expected) in [
+            (RowFilter::Added, vec!["5"]),
+            (RowFilter::Removed, vec!["2"]),
+            (RowFilter::Modified, vec!["3"]),
+            (RowFilter::Changed, vec!["2", "3", "5"]),
+        ] {
+            v.table.filter = filter;
+            let mut found = ids(&v);
+            found.sort();
+            assert_eq!(found, expected, "{filter:?}");
+        }
+        // Going to a row the filter leaves out lists every row again.
+        let hidden = keyed_row(&v, 0, "1");
+        v.table.filter = RowFilter::Added;
+        v.reveal_table_row(hidden);
+        assert_eq!(v.table.filter, RowFilter::All);
+        // Only the column with a changed cell is shown beside the key.
+        v.table.changed_only = true;
+        v.table.changed_columns = Some(v.changed_columns());
+        assert_eq!(v.shown_columns(), [(0, 0), (1, 0), (0, 1), (1, 1)]);
+        v.hide_column(0, 1);
+        assert_eq!(v.shown_columns(), [(0, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn the_sheets_of_a_workbook_are_told_apart_by_their_headings() {
+        let heading = |name: &str| format!("# {}\n", trf("label.sheet", &[("name", name.into())]));
+        let book = |extra: &str| {
+            format!(
+                "{}a,b\n1,2\n{}x,y,z\n{extra}{}p\n",
+                heading("One"),
+                heading("Two"),
+                heading("Three")
+            )
+        };
+        let mut v = keyed_view(&book(""), &book("3,4,5\n"), TableMatch::default());
+        v.table_mode = true;
+        v.note_sheets();
+        let sheets = v.table.sheets.clone().unwrap();
+        let names: Vec<&str> = sheets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["One", "Two", "Three"]);
+        let differences: Vec<usize> = sheets.iter().map(|s| s.differences).collect();
+        assert_eq!(differences, [0, 1, 0]);
+        assert_eq!(sheets[1].widths[..2], [3, 3]);
+        // The heading of a sheet is its tab, not a row, and its columns are its own.
+        v.table.sheet = 0;
+        assert_eq!(v.table_rows().len(), 2);
+        assert_eq!(v.shown_columns(), [(0, 0), (1, 0), (0, 1), (1, 1)]);
+        v.table.sheet = 1;
+        assert_eq!(v.table_rows().len(), 2);
+        assert_eq!(v.shown_columns().len(), 6);
+        // A column hidden on one sheet stays on the others.
+        v.hide_column(0, 1);
+        assert_eq!(v.shown_columns().len(), 4);
+        v.table.sheet = 0;
+        assert_eq!(v.shown_columns().len(), 4);
+        // Going to a row of another sheet shows that sheet.
+        v.table.sheet = 1;
+        v.reveal_table_row(sheets[0].rows.start + 1);
+        assert_eq!(v.table.sheet, 0);
+        // Sheets have no key in common, so keys from a project leave the rows in their place.
+        v.set_table_match(TableMatch {
+            keys: vec![KeyColumn::Index(0)],
+            ..Default::default()
+        });
+        assert!(v.several_sheets() && v.keyed().is_none());
+    }
+
+    #[test]
+    fn the_sheets_of_two_workbooks_are_paired_by_name() {
+        let heading = |name: &str| format!("# {}\n", trf("label.sheet", &[("name", name.into())]));
+        let book = |sheets: &[(&str, &str)]| -> String {
+            sheets
+                .iter()
+                .map(|(name, rows)| heading(name) + rows)
+                .collect()
+        };
+        // The right side has a sheet the left has not, between two they share, and its last
+        // sheet under another name.
+        let left = book(&[("One", "a,b\n"), ("Two", "c,d\n"), ("Old", "x\n")]);
+        let right = book(&[("One", "a,b\n"), ("Extra", "c,d\n"), ("Two", "c,e\n"), ("New", "x\n")]);
+        let mut v = keyed_view(&left, &right, TableMatch::default());
+        v.table_mode = true;
+        v.note_sheets();
+        let sheets = v.table.sheets.clone().unwrap();
+        let names: Vec<&str> = sheets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["One", "Extra", "Two", "Old", "New"]);
+        // A sheet of one side is not lined up with a sheet of another name.
+        for (sheet, sides) in [(1, [false, true]), (3, [true, false]), (4, [false, true])] {
+            for row in sheets[sheet].rows.clone() {
+                let has = [0, 1].map(|p| v.table.diff.rows[row].line(p).is_some());
+                assert_eq!(has, sides, "{}", sheets[sheet].name);
+            }
+        }
+        let differences: Vec<usize> = sheets.iter().map(|s| s.differences).collect();
+        assert_eq!(differences, [0, 2, 1, 2, 2]);
+        // Every record is on exactly one row, in the order of its side.
+        for p in 0..2 {
+            let lines: Vec<usize> = v.table.diff.rows.iter().filter_map(|r| r.line(p)).collect();
+            let records = v.table.docs[p].as_ref().unwrap().records.len();
+            assert_eq!(lines, (0..records).collect::<Vec<_>>());
+        }
     }
 
     fn by_id() -> TableMatch {
