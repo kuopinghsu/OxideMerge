@@ -367,6 +367,10 @@ impl WebView {
             {
                 reload = true;
             }
+            if let Some(formatted) = &mut self.formatted {
+                widgets::toolbar_sep(ui);
+                formatted.nav(ui);
+            }
         });
         if mode != self.mode {
             self.mode = mode;

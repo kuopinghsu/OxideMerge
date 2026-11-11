@@ -14,11 +14,21 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use std::ops::Range;
 
 /// Room between the pages.
-const GAP: f32 = 10.0;
+const GAP: f32 = 12.0;
 /// Room between the blocks of a page.
 const ROW_GAP: f32 = 4.0;
-/// Room around a block, inside its highlight.
-const PAD: f32 = 6.0;
+/// Room around a block, inside its highlight, across and down.
+const PAD: [f32; 2] = [12.0, 7.0];
+/// Rounding of a block's highlight.
+const RADIUS: f32 = 6.0;
+/// Width of the stripe down the edge of a block that differs, which says so without color.
+const STRIPE: f32 = 3.0;
+/// Room left and right of the pages.
+const MARGIN: f32 = 8.0;
+/// Room between the lines hatched over the place of a block a page lacks.
+const HATCH: f32 = 8.0;
+/// Height of the strip naming the pages.
+const HEADER: f32 = 28.0;
 /// Indentation of a block per list it is nested in.
 const INDENT: f32 = 18.0;
 /// Height of a block not shown yet.
@@ -26,11 +36,21 @@ const ESTIMATE: f32 = 28.0;
 /// How far beyond the visible area blocks are laid out, so scrolling finds them measured.
 const OVERSCAN: f32 = 300.0;
 /// Room between a table cell's lines and its text, across and down.
-const CELL_PAD: [f32; 2] = [6.0, 3.0];
+const CELL_PAD: [f32; 2] = [10.0, 6.0];
 /// Narrowest a table column is made to fit the page.
 const MIN_COLUMN: f32 = 36.0;
-/// Width of the scroll bar right of the pages.
+/// Width of the scroll bar right of the pages, shown while the location pane is not.
 const BAR: f32 = 12.0;
+
+/// A scroll under way to a row, eased rather than jumped so the eye can follow it.
+#[derive(Clone, Copy)]
+struct Glide {
+    row: usize,
+    /// Where the pages were scrolled to when it started.
+    from: f32,
+    /// When it started, in the window's time.
+    start: f64,
+}
 
 pub struct MarkdownView {
     pages: Vec<Vec<Block>>,
@@ -64,6 +84,13 @@ pub struct MarkdownView {
     /// that what is in view stays put.
     shift: f32,
     scroll_to: Option<usize>,
+    glide: Option<Glide>,
+    /// How far from the middle of its box the location pane is held while dragged.
+    grab: Option<f32>,
+    /// Whether [`Self::nav`] was drawn this frame in a toolbar of the view around this one.
+    nav_drawn: bool,
+    /// Whether the view around this one steps through the differences with buttons of its own.
+    hosted: bool,
     cache: CommonMarkCache,
     /// URLs used to open fragment links in the page belonging to the clicked pane.
     page_urls: Vec<url::Url>,
@@ -136,6 +163,10 @@ impl MarkdownView {
             active: 0,
             scroll: 0.0,
             scroll_to: None,
+            glide: None,
+            grab: None,
+            nav_drawn: false,
+            hosted: false,
             cache: CommonMarkCache::default(),
             page_urls: Vec::new(),
             step_file: None,
@@ -145,6 +176,18 @@ impl MarkdownView {
     pub fn with_page_urls(mut self, urls: Vec<url::Url>) -> Self {
         self.page_urls = urls;
         self
+    }
+
+    /// For a view whose own toolbar steps through the differences and shows
+    /// [`Self::position`]: none is drawn here.
+    pub fn hosted(mut self) -> Self {
+        self.hosted = true;
+        self
+    }
+
+    /// Which difference is selected, and how many there are.
+    pub fn position(&self) -> (Option<usize>, usize) {
+        (self.cur, self.diffs.len())
     }
 
     pub fn outcome(&self) -> Outcome {
@@ -239,14 +282,14 @@ impl MarkdownView {
         let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&body, 'n')).max(1.0);
         self.stable = (0..self.rows.len())
             .map(|i| {
-                let mut tall: f32 = 2.0 * PAD + 4.0;
+                let mut tall: f32 = 2.0 * PAD[1] + 4.0;
                 for p in 0..self.pages.len() {
                     let Some(b) = self.rows[i].cells.get(p).copied().flatten() else {
                         continue;
                     };
                     let block = &self.pages[p][b];
                     let indent = INDENT * block.depth as f32;
-                    let width = (col - 2.0 * PAD - indent).max(20.0);
+                    let width = (col - 2.0 * PAD[0] - indent).max(20.0);
                     let inner = match self
                         .marks
                         .get(i)
@@ -264,7 +307,7 @@ impl MarkdownView {
                             lines.max(1.0) * line
                         }
                     };
-                    tall = tall.max(inner + 2.0 * PAD);
+                    tall = tall.max(inner + 2.0 * PAD[1]);
                 }
                 tall
             })
@@ -321,83 +364,206 @@ impl MarkdownView {
                 top
             })
             .collect();
-        self.diffs
-            .iter()
-            .enumerate()
-            .map(|(d, run)| {
-                let start = tops[run.start];
-                let end = tops[run.end - 1] + heights[run.end - 1];
-                let columns = std::array::from_fn(|p| {
-                    let present = self.rows[run.clone()]
-                        .iter()
-                        .any(|r| r.cells.get(p).copied().flatten().is_some());
-                    Some(if !present {
-                        c.ui.border_strong
-                    } else if self.cur == Some(d) {
-                        c.ui.accent
-                    } else {
-                        c.change_bar
-                    })
-                });
-                Mark {
+        let mut out = Vec::new();
+        for (d, run) in self.diffs.iter().enumerate() {
+            let start = tops[run.start];
+            let end = tops[run.end - 1] + heights[run.end - 1];
+            let color = if self.cur == Some(d) {
+                c.ui.accent
+            } else {
+                c.change_bar
+            };
+            // The pages marked from the top of the difference to its end.
+            let mut whole = [None; 3];
+            // The rows of a page's table that differ, marked where they are: a sheet is one
+            // block, and marked whole it would say no more than that something in it differs.
+            let mut within = Vec::new();
+            for (p, column) in whole.iter_mut().enumerate().take(self.pages.len()) {
+                let present = self.rows[run.clone()]
+                    .iter()
+                    .any(|r| r.cells.get(p).copied().flatten().is_some());
+                let table = match self.marks.get(run.start).and_then(|m| m.get(p)) {
+                    Some(Some(Marks::Table(t))) if present && run.len() == 1 && !t.is_empty() => t,
+                    _ => {
+                        *column = Some(if present { color } else { c.ui.border_strong });
+                        continue;
+                    }
+                };
+                if !table.iter().any(|row| row_differs(row)) {
+                    // Nothing says where: changed words are not looked for, or this page's
+                    // table only lacks what another has.
+                    *column = Some(color);
+                    continue;
+                }
+                let each = (end - start - 2.0 * PAD[1]).max(1.0) / table.len() as f32;
+                let mut r = 0;
+                while r < table.len() {
+                    let from = r;
+                    while r < table.len() && row_differs(&table[r]) {
+                        r += 1;
+                    }
+                    if r == from {
+                        r += 1;
+                        continue;
+                    }
+                    let mut columns = [None; 3];
+                    columns[p] = Some(color);
+                    within.push(Mark {
+                        start: (start + PAD[1] + from as f32 * each) as usize,
+                        len: ((r - from) as f32 * each).max(1.0) as usize,
+                        columns,
+                    });
+                }
+            }
+            if whole.iter().any(Option::is_some) {
+                out.push(Mark {
                     start: start as usize,
                     len: (end - start).max(1.0) as usize,
-                    columns,
-                }
-            })
-            .collect()
+                    columns: whole,
+                });
+            }
+            out.extend(within);
+        }
+        out
+    }
+
+    /// The buttons that step through the differences, and where among them the view is. Drawn
+    /// in the toolbar of the view around this one, which saves a row; [`Self::ui`] draws them in
+    /// a toolbar of its own otherwise.
+    pub fn nav(&mut self, ui: &mut Ui) {
+        self.nav_drawn = true;
+        let any = !self.diffs.is_empty();
+        if widgets::icon_button_enabled(ui, any, Icon::First, &Cmd::FirstDiff.tip()).clicked() {
+            self.first_diff();
+        }
+        if widgets::icon_button_hint(ui, Icon::Prev, &Cmd::PrevDiff.tip(), tr("tip.nav_diff"))
+            .clicked()
+            && !self.prev_diff()
+        {
+            self.step_file = Some(false);
+        }
+        if widgets::icon_button_hint(ui, Icon::Next, &Cmd::NextDiff.tip(), tr("tip.nav_diff"))
+            .clicked()
+            && !self.next_diff()
+        {
+            self.step_file = Some(true);
+        }
+        if widgets::icon_button_enabled(ui, any, Icon::Last, &Cmd::LastDiff.tip()).clicked() {
+            self.last_diff();
+        }
+        ui.add_space(6.0);
+        let pal = widgets::pal(ui);
+        let total = self.diffs.len();
+        let (text, fg, bg) = match self.cur {
+            _ if total == 0 => (
+                tr("web.md_identical").to_string(),
+                pal.text_dim,
+                pal.surface,
+            ),
+            Some(d) => (format!("{} / {total}", d + 1), pal.accent, pal.accent_soft),
+            None => (
+                trf("msg.diff_count", &[("total", total.to_string())]),
+                pal.text_dim,
+                pal.surface,
+            ),
+        };
+        widgets::chip(ui, &text, fg, bg).on_hover_text(self.status_line());
     }
 
     /// `location` shows the location pane, as it does in the text compare.
     pub fn ui(&mut self, ui: &mut Ui, c: &Colors, location: bool) {
-        widgets::toolbar(ui, |ui| {
-            let any = !self.diffs.is_empty();
-            if widgets::icon_button_enabled(ui, any, Icon::First, &Cmd::FirstDiff.tip()).clicked() {
-                self.first_diff();
-            }
-            if widgets::icon_button_hint(ui, Icon::Prev, &Cmd::PrevDiff.tip(), tr("tip.nav_diff"))
-                .clicked()
-                && !self.prev_diff()
-            {
-                self.step_file = Some(false);
-            }
-            if widgets::icon_button_hint(ui, Icon::Next, &Cmd::NextDiff.tip(), tr("tip.nav_diff"))
-                .clicked()
-                && !self.next_diff()
-            {
-                self.step_file = Some(true);
-            }
-            if widgets::icon_button_enabled(ui, any, Icon::Last, &Cmd::LastDiff.tip()).clicked() {
-                self.last_diff();
-            }
-        });
+        if !std::mem::take(&mut self.nav_drawn) && !self.hosted {
+            widgets::toolbar(ui, |ui| self.nav(ui));
+            self.nav_drawn = false;
+        }
         let pal = widgets::pal(ui);
         let n = self.pages.len().clamp(1, 3);
-        let loc_w = if location { 14.0 + 8.0 * n as f32 } else { 0.0 };
-        let side = loc_w + BAR;
-        let header = ui.allocate_space(vec2(ui.available_width(), 24.0)).1;
-        let (lefts, col) = self.columns(header.left(), header.width() - side);
-        for (left, label) in lefts.iter().zip(&self.labels) {
-            let rect = Rect::from_min_size(pos2(*left + PAD, header.top()), vec2(col - PAD, 24.0));
+        // The location pane is the scroll bar too: its box is the part in view, and is dragged.
+        let side = if location { 8.0 + 7.0 * n as f32 } else { BAR };
+        let header = ui.allocate_space(vec2(ui.available_width(), HEADER)).1;
+        ui.painter().rect_filled(header, 0.0, pal.surface_alt);
+        ui.painter().hline(
+            header.x_range(),
+            header.bottom() - 0.5,
+            Stroke::new(1.0_f32, pal.border),
+        );
+        let (lefts, col) =
+            self.columns(header.left() + MARGIN, header.width() - side - 2.0 * MARGIN);
+        for (p, (left, label)) in lefts.iter().zip(&self.labels).enumerate() {
+            if p > 0 {
+                ui.painter().vline(
+                    left - GAP / 2.0,
+                    header.y_range(),
+                    Stroke::new(1.0_f32, pal.border),
+                );
+            }
+            let rect = Rect::from_min_size(
+                pos2(*left + PAD[0], header.top()),
+                vec2(col - 2.0 * PAD[0], HEADER),
+            );
             let mut cell = ui.new_child(
                 UiBuilder::new()
                     .max_rect(rect)
                     .layout(Layout::left_to_right(Align::Center)),
             );
-            cell.add(egui::Label::new(egui::RichText::new(label).color(pal.text_dim)).truncate())
+            // The page last clicked is named in full strength, as its outline is drawn.
+            let color = if self.cursor.is_some() && p == self.active {
+                pal.text
+            } else {
+                pal.text_dim
+            };
+            let text = egui::RichText::new(label)
+                .color(color)
+                .size(crate::ui::theme::size::DENSE);
+            cell.add(egui::Label::new(text).truncate())
                 .on_hover_text(label);
         }
 
         let body = ui.available_rect_before_wrap();
         ui.allocate_rect(body, egui::Sense::hover());
-        let view = Rect::from_min_max(body.min, pos2(body.right() - side, body.bottom()));
+        let view = Rect::from_min_max(
+            pos2(body.left() + MARGIN, body.top()),
+            pos2(body.right() - side - MARGIN, body.bottom()),
+        );
         let view_h = view.height().max(1.0);
         let total = self.top(self.heights.len());
         let max_scroll = (total - view_h).max(0.0);
-        let mut offset = self.scroll + std::mem::take(&mut self.shift);
+        let shift = std::mem::take(&mut self.shift);
+        let mut offset = self.scroll + shift;
+        let now = ui.input(|i| i.time);
+        if let Some(g) = &mut self.glide {
+            g.from += shift;
+        }
         if let Some(r) = self.scroll_to.take() {
-            if let Some(to) = reveal(self.top(r), self.heights[r], offset, view_h) {
-                offset = to;
+            self.glide = reveal(self.top(r), self.heights[r], offset, view_h).map(|_| Glide {
+                row: r,
+                from: offset,
+                start: now,
+            });
+        }
+        let taken_over = ui.input(|i| {
+            i.smooth_scroll_delta != egui::Vec2::ZERO
+                || i.pointer.is_decidedly_dragging()
+                || i.any_touches()
+        });
+        if taken_over {
+            // The wheel, a drag or a finger scrolls the pages now.
+            self.glide = None;
+        }
+        if let Some(g) = self.glide {
+            // Where the row is now: rows measured on the way move it.
+            let to = (self.top(g.row) - (view_h / 3.0).floor()).clamp(0.0, max_scroll);
+            let time = ui.style().animation_time * 2.0;
+            let t = if time > 0.0 {
+                ((now - g.start) as f32 / time).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            offset = g.from + (to - g.from) * (1.0 - (1.0 - t).powi(3));
+            if t < 1.0 {
+                ui.ctx().request_repaint();
+            } else {
+                self.glide = None;
             }
         }
         // The overview and the scroll bar are drawn in the steady heights, so they do not
@@ -405,17 +571,15 @@ impl MarkdownView {
         self.update_stable(ui, self.columns(view.left(), view.width()).1);
         let steady = self.stable_total();
         let at = |v: &Self, y: f32| v.convert(y, &v.heights, &v.stable);
+        let strip = Rect::from_min_max(pos2(body.right() - side, body.top()), body.max);
         if location {
-            let rect = Rect::from_min_max(
-                pos2(view.right(), body.top()),
-                pos2(view.right() + loc_w - 2.0, body.bottom()),
-            );
             let marks = self.location_marks(c);
-            let shown = (at(self, offset + view_h) - at(self, offset)).max(1.0);
-            if let Some(to) = widgets::location_pane(
+            let first = at(self, offset);
+            let shown = (at(self, offset + view_h) - first).max(1.0);
+            let to = widgets::location_pane(
                 ui,
                 Id::unique("md_location"),
-                rect,
+                strip,
                 steady as usize,
                 n,
                 &marks,
@@ -423,23 +587,39 @@ impl MarkdownView {
                 shown,
                 c.location_bg,
                 c.viewport,
-            ) {
-                offset = self.convert(to, &self.stable, &self.heights) - view_h / 2.0;
+            );
+            match to {
+                Some(to) => {
+                    // The box of the part in view is dragged by where it was taken hold of,
+                    // as a scroll bar's is; a press anywhere else brings that place to the
+                    // middle of the view.
+                    let inside = (first..=first + shown).contains(&to);
+                    let from_middle = if inside {
+                        to - (first + shown / 2.0)
+                    } else {
+                        0.0
+                    };
+                    let held = *self.grab.get_or_insert(from_middle);
+                    offset = self.convert(to - held, &self.stable, &self.heights) - view_h / 2.0;
+                    self.glide = None;
+                }
+                None => self.grab = None,
             }
-        }
-        let bar = Rect::from_min_max(pos2(body.right() - BAR, body.top()), body.max);
-        let mut dragged = at(self, offset);
-        let was = dragged;
-        widgets::vscrollbar(
-            ui,
-            Id::unique("md_vbar"),
-            bar,
-            &mut dragged,
-            steady as usize,
-            (at(self, offset + view_h) - was).max(1.0),
-        );
-        if (dragged - was).abs() > 0.01 {
-            offset = self.convert(dragged, &self.stable, &self.heights);
+        } else {
+            let mut dragged = at(self, offset);
+            let was = dragged;
+            widgets::vscrollbar(
+                ui,
+                Id::unique("md_vbar"),
+                strip,
+                &mut dragged,
+                steady as usize,
+                (at(self, offset + view_h) - was).max(1.0),
+            );
+            if (dragged - was).abs() > 0.01 {
+                offset = self.convert(dragged, &self.stable, &self.heights);
+                self.glide = None;
+            }
         }
         let offset = offset.clamp(0.0, max_scroll);
         let mut area = egui::ScrollArea::vertical()
@@ -482,6 +662,27 @@ impl MarkdownView {
                         .iter()
                         .map(|_| ui.painter().add(Shape::Noop))
                         .collect();
+                    // The widest each column of the row's tables is on any page, so that the
+                    // tables of a sheet or a document stand column under column side by side.
+                    let shared = (0..lefts.len())
+                        .filter_map(|q| tables.get(&(i, q)))
+                        .map(|t| &t.natural)
+                        .filter(|n| !n.is_empty())
+                        .fold(Vec::new(), |mut all: Vec<f32>, n| {
+                            for (k, w) in n.iter().enumerate() {
+                                match all.get_mut(k) {
+                                    Some(a) => *a = a.max(*w),
+                                    None => all.push(*w),
+                                }
+                            }
+                            all
+                        });
+                    let is_table = |p: usize| {
+                        matches!(
+                            marks.get(i).and_then(|m| m.get(p)).and_then(Option::as_ref),
+                            Some(Marks::Table(_))
+                        )
+                    };
                     let mut height: f32 = 0.0;
                     // How much taller the rows of its tables above the view were found.
                     let mut grew: f32 = 0.0;
@@ -492,8 +693,8 @@ impl MarkdownView {
                         let block = &pages[p][b];
                         let indent = INDENT * block.depth as f32;
                         let inner = Rect::from_min_size(
-                            pos2(left + PAD + indent, top + PAD),
-                            vec2((col - 2.0 * PAD - indent).max(20.0), f32::INFINITY),
+                            pos2(left + PAD[0] + indent, top + PAD[1]),
+                            vec2((col - 2.0 * PAD[0] - indent).max(20.0), f32::INFINITY),
                         );
                         let mut cell = ui.new_child(
                             UiBuilder::new()
@@ -511,7 +712,7 @@ impl MarkdownView {
                         match marks.get(i).and_then(|m| m.get(p)).and_then(Option::as_ref) {
                             Some(Marks::Table(t)) => {
                                 let layout = tables.entry((i, p)).or_default();
-                                let (r, g) = table(&mut cell, cache, layout, id, t, words);
+                                let (r, g) = table(&mut cell, cache, layout, id, t, words, &shared);
                                 relaid |= r;
                                 grew = grew.max(g);
                             }
@@ -525,9 +726,9 @@ impl MarkdownView {
                                 resolve_fragment_links(page, &mut out.commands[start..]);
                             });
                         }
-                        height = height.max(cell.min_rect().height() + 2.0 * PAD);
+                        height = height.max(cell.min_rect().height() + 2.0 * PAD[1]);
                     }
-                    let height = height.max(2.0 * PAD + 4.0);
+                    let height = height.max(2.0 * PAD[1] + 4.0);
                     if y + heights[i] <= viewport.min.y {
                         shift += height - heights[i];
                     } else if y < viewport.min.y {
@@ -537,25 +738,51 @@ impl MarkdownView {
                         heights[i] = height;
                         relaid = true;
                     }
-                    if row.changed {
-                        let all = row.cells.iter().all(Option::is_some);
-                        for (p, left) in lefts.iter().enumerate() {
-                            let color = match (row.cells.get(p).copied().flatten(), current) {
-                                (None, false) => c.missing,
-                                (None, true) => c.missing_sel,
-                                (Some(_), false) if all => c.diff,
-                                (Some(_), true) if all => c.diff_sel,
-                                (Some(_), false) => c.added,
-                                (Some(_), true) => c.added_sel,
-                            };
-                            let rect = Rect::from_min_size(pos2(*left, top), vec2(col, heights[i]));
-                            ui.painter()
-                                .set(backs[p], Shape::rect_filled(rect, 3.0, color));
-                        }
-                    }
+                    let all = row.cells.iter().all(Option::is_some);
                     for (p, left) in lefts.iter().enumerate() {
                         let rect = Rect::from_min_size(pos2(*left, top), vec2(col, heights[i]));
-                        if pressed && ui.rect_contains_pointer(rect) {
+                        let present = row.cells.get(p).copied().flatten().is_some();
+                        let mut under = Vec::new();
+                        if row.changed && !present {
+                            // Nothing here: a faint hatched place rather than a solid block.
+                            let fill = if current { c.missing_sel } else { c.missing };
+                            under.push(Shape::rect_filled(rect, RADIUS, fill));
+                            let lines = Stroke::new(1.0_f32, c.ui.border);
+                            hatch(&mut under, rect.shrink(2.0), lines);
+                        } else if row.changed {
+                            // Changed on every page; or on some only, where of two pages the
+                            // left one has what the right one lost.
+                            let (fill, fill_sel, bar) = if all {
+                                (c.diff, c.diff_sel, c.change_bar)
+                            } else if lefts.len() == 2 && p == 0 {
+                                (c.removed, c.removed_sel, c.inline_removed)
+                            } else {
+                                (c.added, c.added_sel, c.inline_added)
+                            };
+                            let fill = match (current, all && is_table(p)) {
+                                (true, _) => fill_sel,
+                                // A changed table marks its cells: tinted whole as strongly as
+                                // a paragraph, a sheet would be one slab with the marks lost.
+                                (false, true) => fill.gamma_multiply(0.45),
+                                (false, false) => fill,
+                            };
+                            under.push(Shape::rect_filled(rect, RADIUS, fill));
+                            let stripe = Rect::from_min_size(
+                                pos2(*left, top + 2.0),
+                                vec2(STRIPE, (heights[i] - 4.0).max(0.0)),
+                            );
+                            under.push(Shape::rect_filled(stripe, STRIPE / 2.0, bar));
+                        }
+                        let hovered = ui.rect_contains_pointer(rect);
+                        // Not a table, which may be a whole sheet.
+                        if hovered && cursor != Some(i) && !is_table(p) {
+                            let tint = ui.visuals().text_color().gamma_multiply(0.05);
+                            under.push(Shape::rect_filled(rect, RADIUS, tint));
+                        }
+                        if !under.is_empty() {
+                            ui.painter().set(backs[p], Shape::Vec(under));
+                        }
+                        if pressed && hovered {
                             clicked = Some((i, p));
                         }
                         // The compared row, as the text compare outlines its cursor row.
@@ -567,7 +794,7 @@ impl MarkdownView {
                             };
                             ui.painter().rect_stroke(
                                 rect,
-                                crate::ui::theme::radius::XS,
+                                RADIUS,
                                 Stroke::new(1.5_f32, color),
                                 StrokeKind::Inside,
                             );
@@ -601,6 +828,38 @@ impl MarkdownView {
             // Rows measured anew move the ones below: draw again with the heights settled.
             ui.ctx().request_repaint();
         }
+    }
+}
+
+/// Whether any cell of a table's row differs from the other pages.
+fn row_differs(row: &[(String, Cell)]) -> bool {
+    row.iter().any(|(_, cell)| match cell {
+        Cell::Whole => true,
+        Cell::Words(marks) => !marks.is_empty(),
+    })
+}
+
+/// Adds lines slanting across `rect` to `out`, each cut off at its edges.
+fn hatch(out: &mut Vec<Shape>, rect: Rect, stroke: Stroke) {
+    let (w, h) = (rect.width(), rect.height());
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    // A line is the points `d` from the top left corner, across and down added up.
+    let mut d = HATCH;
+    while d < w + h {
+        let a = if d <= w {
+            pos2(rect.left() + d, rect.top())
+        } else {
+            pos2(rect.right(), rect.top() + d - w)
+        };
+        let b = if d <= h {
+            pos2(rect.left(), rect.top() + d)
+        } else {
+            pos2(rect.left() + d - h, rect.bottom())
+        };
+        out.push(Shape::line_segment([a, b], stroke));
+        d += HATCH;
     }
 }
 
@@ -718,6 +977,9 @@ fn show_marked(
     if search.search_ranges != marks {
         search.search_ranges = marks.to_vec();
     }
+    // A line of text is as tall as its text, not as a button: the viewer draws a list's bullet
+    // in a text-high place at the top of the line, which sat it above the words.
+    ui.spacing_mut().interact_size.y = ui.text_style_height(&egui::TextStyle::Body);
     CommonMarkViewer::new()
         .search_match_color(color)
         .show_with_id(id, ui, cache, text);
@@ -753,6 +1015,8 @@ impl TableLayout {
 /// Draws a table as a grid of cells with lines around them and the header rows shaded. A
 /// merged cell is drawn across the cells it covers. What differs is highlighted in `words`:
 /// changed words, and whole cells the other page lacks. Only the rows in view are laid out.
+/// `shared` is how wide the columns are on one line on any of the pages, as far as known: no
+/// column is made narrower than that while there is room, so the tables line up across pages.
 /// Returns whether a row's height changed, and how much taller the rows above the view were
 /// found.
 fn table(
@@ -762,6 +1026,7 @@ fn table(
     id: Id,
     rows: &[Vec<(String, Cell)>],
     words: Color32,
+    shared: &[f32],
 ) -> (bool, f32) {
     let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
     if cols == 0 {
@@ -838,16 +1103,21 @@ fn table(
             }
         }
         layout.heights.clear();
+        // Drawn again with the widths the other pages' tables now share with this one.
+        ui.ctx().request_repaint();
     }
     let line_height = ui.text_style_height(&egui::TextStyle::Body);
     if layout.heights.len() != rows.len() {
         layout.heights = vec![line_height + 2.0 * py; rows.len()];
     }
     let header = header_rows(&layout.slots);
-    let widths = fit(
-        &layout.natural,
-        ui.available_width() - cols as f32 * 2.0 * px,
-    );
+    let natural: Vec<f32> = layout
+        .natural
+        .iter()
+        .enumerate()
+        .map(|(k, w)| shared.get(k).map_or(*w, |s| w.max(*s)))
+        .collect();
+    let widths = fit(&natural, ui.available_width() - cols as f32 * 2.0 * px);
     let origin = ui.cursor().min;
     let mut xs = vec![origin.x];
     for w in &widths {
@@ -855,7 +1125,7 @@ fn table(
     }
     let clip = ui.clip_rect();
     let shown = clip.expand2(vec2(0.0, OVERSCAN)).y_range();
-    let shade = ui.visuals().text_color().gamma_multiply(0.07);
+    let shade = ui.visuals().text_color().gamma_multiply(0.05);
     let mut relaid = false;
     let mut grew = 0.0;
     let mut ys = vec![origin.y];
@@ -960,8 +1230,10 @@ fn table(
         }
         ys.push(bottom);
     }
-    let color = ui.visuals().text_color().gamma_multiply(0.35);
-    let stroke = Stroke::new(1.0, color);
+    // Rows are ruled off lightly and columns more lightly still, so the text leads.
+    let text = ui.visuals().text_color();
+    let stroke = Stroke::new(1.0, text.gamma_multiply(0.16));
+    let between = Stroke::new(1.0, text.gamma_multiply(0.08));
     let outer = Rect::from_x_y_ranges(xs[0]..=xs[cols], origin.y..=ys[ys.len() - 1]);
     let painter = ui.painter();
     // Lines between cells, except within a merged cell.
@@ -972,21 +1244,25 @@ fn table(
         }
         for (k, &x) in xs.iter().enumerate().take(cols).skip(1) {
             if layout.owner(r, k - 1) != layout.owner(r, k) {
-                painter.vline(x, top..=bottom, stroke);
+                painter.vline(x, top..=bottom, between);
             }
         }
         if r == 0 {
             continue;
         }
-        // The header rows end with a heavier line.
-        let line = Stroke::new(if r == header { 2.0 } else { 1.0 }, color);
+        // The header rows end with a stronger line.
+        let line = if r == header {
+            Stroke::new(1.0, text.gamma_multiply(0.34))
+        } else {
+            stroke
+        };
         for k in 0..cols {
             if layout.owner(r - 1, k) != layout.owner(r, k) {
                 painter.hline(xs[k]..=xs[k + 1], top, line);
             }
         }
     }
-    painter.rect_stroke(outer, 2.0, stroke, StrokeKind::Inside);
+    painter.rect_stroke(outer, 4.0, stroke, StrokeKind::Inside);
     ui.advance_cursor_after_rect(outer);
     (relaid, grew)
 }
@@ -1373,7 +1649,7 @@ mod tests {
         // Where table row `k` is in the view.
         let y_of = |v: &MarkdownView, k: usize| {
             let h = &v.tables[&(0, 0)].heights;
-            v.top(0) + PAD + h[..k].iter().sum::<f32>() - v.scroll
+            v.top(0) + PAD[1] + h[..k].iter().sum::<f32>() - v.scroll
         };
         let mut k = 0;
         while y_of(&v, k) < 200.0 {
@@ -1507,6 +1783,32 @@ mod tests {
             marks[1].columns[..2],
             [Some(c.ui.border_strong), Some(c.change_bar)]
         );
+    }
+
+    /// A table is one block however many rows it has: the overview marks the rows of it that
+    /// differ, not the whole table.
+    #[test]
+    fn the_overview_marks_the_changed_rows_of_a_table() {
+        let table = |last: &str| {
+            let mut t = String::from("| a | b |\n| --- | --- |\n");
+            for r in 0..8 {
+                t.push_str(&format!("| {r} | same |\n"));
+            }
+            t.push_str(&format!("| 8 | {last} |\n"));
+            block(&t)
+        };
+        let opts = DiffOptions::default();
+        let pages = vec![vec![table("left")], vec![table("right")]];
+        let mut v = MarkdownView::new(pages, vec!["l".into(), "r".into()], &opts);
+        v.heights = vec![2.0 * PAD[1] + 100.0];
+        let c = crate::ui::theme::colors(true);
+        let marks = v.location_marks(&c);
+        // Ten rows with the header, the last of them changed, on each page.
+        let at: Vec<_> = marks.iter().map(|m| (m.start, m.len)).collect();
+        let last = (PAD[1] as usize + 90, 10);
+        assert_eq!(at, [last, last]);
+        assert_eq!(marks[0].columns[..2], [Some(c.change_bar), None]);
+        assert_eq!(marks[1].columns[..2], [None, Some(c.change_bar)]);
     }
 
     /// Rows are measured only as they are drawn, so a row further down grows from its estimate

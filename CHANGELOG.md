@@ -571,6 +571,20 @@ uses its section of this file as the release notes.
 
 ### Changed
 
+- **A clearer Formatted view:** a block that differs now has a stripe down its edge as well as
+  its colour, and in a comparison of two files a block only the left one has is shown as
+  removed instead of in the colour of an added one. The place of a block a file lacks is
+  hatched instead of filled grey. The buttons that step through the differences sit on the
+  row of the view switch, followed by where you are, such as *3 / 10*. The location pane is
+  narrower and is the scroll bar too, stepping to a difference scrolls there smoothly (not
+  with *Reduce motion*), and the block under the pointer is tinted. Tables are ruled more
+  lightly with more room in their cells, blocks have more room around them, list bullets
+  line up with their text, and the names of the files stand in a strip of their own.
+  Tables that stand side by side, such as the sheets of two workbooks, now have columns of
+  the same width, and a changed table is tinted lightly so its changed cells stand out. The
+  location pane marks the rows of a table that differ instead of the whole table. For
+  Word documents, workbooks and PDF files the toolbar counts and steps through the blocks
+  of the Formatted view while it is shown, instead of a second row of buttons doing so.
 - **Documents open in the Formatted view:** a comparison of Word documents or PDF files now
   opens in the *Formatted* view instead of *Text*; CSV, TSV and spreadsheet comparisons
   open in the *Table* view as before.
