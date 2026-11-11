@@ -353,7 +353,86 @@ above) and after:
   search, it was 152,526.
 - Peak memory was not measured (Windows). The threads' tables together hold as many entries
   as the one table did, and the list of numbers is the same size, so the peak should not
-  change, but that was not checked on macOS or Linux.
+  change. On Linux (see below) the peaks of text-100mb, 500mb and 1gb are 540, 2,563 and
+  5,234 MB, under the 552, 2,663 and 5,441 MB of the release gates; macOS was not checked.
+
+## Linux x86_64 in WSL2 (2026-11-11)
+
+The same workloads as on Windows above, on the same computer: Ubuntu under WSL2 (kernel
+6.18.58.1-microsoft-standard-WSL2) on that Windows 11 host, Intel Core i9-12900KF
+(24 threads), with 15 GB of the 32 GB given to the virtual machine; OxideMerge 0.9.8
+(`2eb8793`), rustc 1.97.1, release build, three runs each, median time, peak memory from
+`/usr/bin/time`:
+
+```sh
+OXIDEMERGE_BENCH_LARGE=1 cargo test --release --locked --bin oxidemerge bench -- --ignored --nocapture --test-threads 1
+OXIDEMERGE_BENCH_LARGE=3 OXIDEMERGE_BENCH_ONLY=text-500mb,text-1gb,text-view-500mb,text-view-1gb,text-cancel-500mb \
+  cargo test --release --locked --bin oxidemerge bench -- --ignored --nocapture --test-threads 1
+```
+
+The inputs are on the virtual machine's own ext4 disk, not on a Windows drive under `/mnt`.
+
+| Workload | Time (median) | Peak memory | Result |
+| --- | ---: | ---: | --- |
+| text-10mb | 0.098 s | 87 MB | 14,305 differences |
+| text-repeated | 0.045 s | 54 MB | 300 differences |
+| text-100mb | 0.695 s | 540 MB | 15,086 differences |
+| text-500mb | 4.764 s | 2,563 MB | 74,725 differences |
+| text-1gb | 11.071 s | 5,234 MB | 152,307 differences |
+| text-view-10mb | 0.350 s | 104 MB | 303,878 rows; load 48 ms, compare 74 ms, first frame 10 ms, a scrolled frame 0.98 ms, a step 1.00 ms |
+| text-view-100mb | 1.448 s | 685 MB | 2,993,833 rows; load 376 ms, compare 669 ms, first frame 63 ms, a scrolled frame 1.08 ms, a step 1.06 ms |
+| text-view-500mb | 9.207 s | 3,214 MB | 14,970,455 rows; load 1,863 ms, compare 4,584 ms, first frame 724 ms, a scrolled frame 7.13 ms, a step 7.02 ms |
+| text-view-1gb | 55.723 s | 6,479 MB | 30,659,207 rows, 152,307 differences; load 40,503 ms (see below), compare 10,335 ms, first frame 800 ms, a scrolled frame 14.97 ms, a step 15.17 ms |
+| text-cancel-100mb | | 871 MB | read again 296 ms; open 1,001 ms; stopped in 1 ms median, 3 ms worst; freed in 93 ms median, 96 ms worst |
+| text-cancel-500mb | | 4,173 MB | read again 1,455 ms; open 5,930 ms; stopped in 1 ms median, 3 ms worst; freed in 465 ms median, 484 ms worst |
+| merge3-10mb | 0.275 s | 124 MB | 14,107 differences, conflicts left |
+| table-10k | 0.017 s | 29 MB | 95 modified, 50 added, 55 removed, 9,749 reordered |
+| table-10k-position | 0.018 s | 28 MB | 197 differences |
+| table-100k | 0.262 s | 160 MB | 1,030 modified, 500 added, 532 removed, 98,850 reordered |
+| table-100k-position | 0.261 s | 142 MB | 614 differences |
+| table-cancel-1m | 0.874 s | 928 MB | stopped 31.6 ms after asked, at 1,004,096 of 1,999,985 records |
+| xml-tree-12k | 0.175 s | 103 MB | 72,297 rows; 59 added, 64 removed, 252 modified, 1 moved, 1 ambiguous |
+| xml-tree-12k-keyed | 0.192 s | 103 MB | 72,302 rows; 60 added, 65 removed, 248 modified, 11,718 moved, 96 ambiguous |
+| xml-tree-view-12k | 0.793 s | 112 MB | 72,297 rows, 376 changes; compare 165 ms, first rows 4 ms, a scrolled frame 0.26 ms, unfold 2 ms, fold 1 ms, a step 1.31 ms |
+| xml-semantic-12k | 0.145 s | 122 MB | 29,430 changes |
+| binary-10mb | 0.008 s | 31 MB | 100 ranges |
+| binary-100mb | 0.076 s | 211 MB | 100 ranges |
+| binary-moved-unrelated | 0.051 s | 32 MB | 0 moved blocks |
+| binary-moved-swap | 0.014 s | 25 MB | 2 moved blocks, 131,072 matched bytes |
+| binary-moved-large | 0.192 s | 143 MB | 2 moved blocks, 2,097,152 matched bytes |
+| binary-moved-short-shift | 0.008 s | 19 MB | 1 moved block, 15 matched bytes |
+| binary-moved-wide-shift | 0.003 s | 15 MB | 1 moved block, 524,288 matched bytes |
+| binary-moved-firmware | 0.001 s | 12 MB | 18 moved blocks, 4,014 matched bytes |
+| image-4k | 0.125 s | 109 MB | 82,116 pixels differ |
+| folder-small-files | 0.247 s | 29 MB | 220 differ, 198 unique; first result after 2 ms |
+| folder-large-files | 0.025 s | 143 MB | 2 differ |
+| folder-mixed | 0.024 s | 50 MB | 80 differ; first result after 2 ms |
+| sync-preview-20k | 0.740 s | 28 MB | 198 copies, 220 replaces; plan 499 ms |
+| folder-navigation-20k | 0.334 s | 31 MB | 418 files in 88 ms, 0.21 ms a step, first 3 ms; compare 240 ms |
+
+As above, the time of the text-cancel workloads is that of ten opens in one process and is
+left out.
+
+- Every result count matches the Windows run, including the 152,307 differences at 1 GiB:
+  the 2-second deadline shared by the gaps outside a job is passed here too (see the Windows
+  findings).
+- The engine is faster here than on Windows on the same CPU: text-100mb 0.695 against
+  1.657 s, text-500mb 4.76 against 10.98 s, text-1gb 11.07 against 24.00 s, merge3-10mb
+  0.275 against 0.441 s, and sync-preview-20k 0.74 against 2.29 s (its plan 499 against
+  2,109 ms, from file system calls). Binary, image and table workloads are within a few
+  percent of each other.
+- text-view-1gb loaded in 40.5 s against 4.3 s on Windows; the compare after it took 10.3 s.
+  Its peak of 6.5 GB, with 4 GB of input in the file cache, nearly fills the 15 GB the
+  virtual machine has, so the files were most likely read from disk again rather than from
+  the cache. Treat its load time as a limit of this virtual machine, not of OxideMerge; the
+  load of text-view-500mb (1.9 s) is in line with Windows (2.0 s).
+- What the view holds is the same as on Windows and macOS at every size (at 1 GiB: lines
+  3,391 MiB, edit marks 234 MiB, rows 486 MiB, layout 1,448 MiB).
+- Against the release gates below: peak memory passes at every size (text-1gb 5,234 against
+  5,990 MB, text-view-1gb 6,479 against 7,720 MB), as do *Cancel* (3 ms worst) and freeing
+  memory at 500 MB (484 ms worst). The first frame misses at 1 GiB (800 against 500 ms) and
+  is 724 ms at 500 MB; a scrolled frame and a step stay under 16 ms at every size
+  (15.17 ms worst, at 1 GiB).
 
 ## Findings
 
