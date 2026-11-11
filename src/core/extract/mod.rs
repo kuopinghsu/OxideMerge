@@ -1972,9 +1972,10 @@ mod tests {
         assert!(text.ends_with(&format!("{}\n", crate::i18n::tr("msg.extract_truncated"))));
     }
 
-    /// The sheets of a workbook of several are not one table, so it is compared as text.
+    /// A workbook of several sheets is compared as a table too: the table view shows each
+    /// sheet, told apart by its heading, on a tab of its own.
     #[test]
-    fn a_workbook_of_several_sheets_is_not_compared_as_one_table() {
+    fn a_workbook_of_several_sheets_is_compared_as_a_table_of_sheets() {
         let dir = tempfile::tempdir().unwrap();
         let parts = workbook(
             &[
@@ -1991,7 +1992,7 @@ mod tests {
         let opts = super::super::diff::DiffOptions::default();
         let doc = super::super::unpacker::load_doc(&path, &opts, None).unwrap();
         assert!(is_sheet_heading(&doc.lines[0]), "{:?}", doc.lines);
-        assert_eq!(super::super::table::delimiter_of_doc(&doc, &opts), None);
+        assert_eq!(super::super::table::delimiter_of_doc(&doc, &opts), Some(','));
     }
 
     #[test]

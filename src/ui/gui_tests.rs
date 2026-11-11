@@ -5126,6 +5126,47 @@ fn table_keyboard_navigation_cell_editing_and_go_to_line_work() {
     assert_eq!(line(&gui), 0);
 }
 
+/// From a row the filter does not list, the first step down goes to the first listed row after
+/// it rather than past that one.
+#[test]
+fn arrow_down_from_a_row_that_is_not_listed_selects_the_next_listed_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let left = "id,name\n1,a\n2,b\n3,c\n";
+    let right = "id,name\n1,a\n2,x\n3,c\n4,d\n5,e\n";
+    write(dir.path(), &[("left.csv", left), ("right.csv", right)]);
+    let mut gui = Gui::start(
+        "table_arrow_from_unlisted",
+        compare(&[dir.path().join("left.csv"), dir.path().join("right.csv")]),
+    );
+    gui.click("Position");
+    gui.click("Key columns");
+    assert_eq!(gui.text_view().selected_record(1), Some(2), "starts on the changed record");
+    gui.click("Added  2");
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    gui.settle();
+    assert_eq!(gui.text_view().selected_record(1), Some(4));
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    gui.settle();
+    assert_eq!(gui.text_view().selected_record(1), Some(5));
+}
+
+/// *Fit columns* stays on until it is clicked again, which brings the widths set by hand back.
+#[test]
+fn fit_columns_is_turned_on_and_off_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let left = "id,name\n1,a rather long name that needs room\n";
+    write(dir.path(), &[("left.csv", left), ("right.csv", "id,name\n1,b\n")]);
+    let mut gui = Gui::start(
+        "table_fit_columns",
+        compare(&[dir.path().join("left.csv"), dir.path().join("right.csv")]),
+    );
+    assert!(!gui.text_view().columns_fitted());
+    gui.click("Fit columns");
+    assert!(gui.text_view().columns_fitted());
+    gui.click("Fit columns");
+    assert!(!gui.text_view().columns_fitted(), "a second click turns it off");
+}
+
 #[test]
 fn table_rows_matched_by_key_from_the_toolbar_copy_and_reopen_from_a_project() {
     let dir = tempfile::tempdir().unwrap();
@@ -5140,8 +5181,9 @@ fn table_rows_matched_by_key_from_the_toolbar_copy_and_reopen_from_a_project() {
     gui.click("Position");
     gui.click("Key columns");
     assert!(gui.text_view().table_match.by_key());
-    assert!(gui.shows_text("Modified 1 · Reordered 2 · Ambiguous 0"));
+    assert!(gui.shows_text("Modified  1") && gui.shows_text("Reordered  2"));
     assert_eq!(gui.text_view().diff_position(), (None, 2));
+    gui.click("Options");
     gui.click("Ignore row order");
     assert!(gui.shows("(row order ignored)"));
     assert_eq!(gui.text_view().diff_position(), (None, 1));

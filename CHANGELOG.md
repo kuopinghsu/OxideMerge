@@ -7,6 +7,30 @@ uses its section of this file as the release notes.
 
 ### Added
 
+- **A table view that looks and works like a spreadsheet:** the table view of CSV, TSV and
+  spreadsheet comparisons is now a grid with numbered rows and columns headed by their letters,
+  or by their names with *First row is header*, whose row is no longer listed as a record.
+  The columns that are compared with each other stand side by side instead of all left columns
+  followed by all right ones, so a column paired by header name sits next to its counterpart.
+  The selected cell is outlined, and a bar above the table shows where it is and what each side
+  has there, with the part that differs marked. A record only one side has is coloured across
+  its row, with the other side's cells hatched instead of filled with dashes; numbers are
+  right-aligned; and the record number and key stay at the left edge when you scroll sideways.
+- **Filters and column tools in the table view:** chips list all rows, the changed ones, or
+  when matching by key the added, removed, modified, reordered or ambiguous ones, each with its
+  count, in place of the summary line. *Changed columns* shows only the columns that hold a
+  changed cell, *Hide column* takes a column and its counterpart out of view, and *Fit columns*
+  sizes every column to its contents. The matching settings other than the keys are now under
+  *Options*, so the bar stays on one line. When most rows differ by position but a column tells
+  the records apart, the bar offers to match the rows by that column.
+- **Workbooks with several sheets open as tables:** each sheet has a tab below the table that
+  shows how many of its rows differ, instead of the workbook being compared as text. Sheets are
+  paired by name, so a sheet only one side has is one whole difference, and the rows of such a
+  workbook are matched by position. *Formatted values* shows the numbers and dates of a
+  spreadsheet as its number formats do, or as stored when turned off.
+- **One switch for the views of a comparison:** the *Table view* button of the toolbar is now a
+  *Text* / *Table* switch above the panes, where documents have *Text* / *Formatted*. A workbook
+  has *Text*, *Table* and *Formatted* on the one switch.
 - **One layout setting for text and binary comparisons:** *Text layout* is now *Layout*,
   in *View → Layout* instead of under *View → Text compare*, and both text and binary
   comparisons have the same *Compact rows* and *Aligned rows* buttons on their toolbar. The

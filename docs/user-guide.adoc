@@ -830,7 +830,7 @@ first one that matches:
 . Every file is one that OxideMerge reads as text — a document, a spreadsheet or an ELF program
   (see <<documents>>) — or one that an unpacker plugin converts (see <<unpackers>>): read-only
   text comparison of what was read.
-  A spreadsheet of one sheet that OxideMerge reads itself opens as a table comparison.
+  A spreadsheet that OxideMerge reads itself opens as a table comparison.
   This rule comes before the archive and binary rules, so `.docx`, `.xlsx` and `.odt` files open
   as their text rather than as the zip archives they are.
   Turning off *Read documents, spreadsheets and ELF files as text* in *Options → Plugins* leaves
@@ -1328,13 +1328,34 @@ image::inline.png[Inline view]
 [[table-compare]]
 === CSV and TSV files
 
-For CSV and TSV files, the toolbar offers a *Table view*.
+CSV and TSV files, and spreadsheets, open in the *Table* view.
+The *Text* / *Table* switch above the panes changes between the lines of the file and the table,
+in the same place as the *Text* / *Formatted* switch of documents; a workbook has all three.
 It compares records rather than lines, so a quoted field can contain line breaks.
 
 .The table view of two CSV files
 image::csv.png[Table view of two CSV files]
 
+The table looks like a spreadsheet: a grid with numbered rows and columns headed by their
+letters, or by their names when the first row is the header.
+
+* Columns that are compared with each other stand side by side, the left one first.
+* Click a cell to select it. The bar above the table shows where it is, such as `B4`, and what
+  each side has there, with the part that differs marked.
+* The chips above the table list *All* rows or only the *Changed* ones; when matching by key,
+  also the *Added*, *Removed*, *Modified*, *Reordered* or *Ambiguous* ones, each with its count.
+  Going to a row that is not listed shows all rows again.
+* *Changed columns* shows only the columns that hold a changed cell, and the key columns.
+  To hide a column and the one it is compared with, right-click it and choose *Hide column*;
+  *Show hidden columns* brings them back.
+* *Fit columns* gives every column the width of its contents, and clicking it again brings back
+  the widths you had; double-clicking a column border
+  does so for one column.
+* Numbers are right-aligned. A changed cell is highlighted; a record that only one side has is
+  coloured across its row, and the cells of the side without it are hatched.
 * Drag a column border to change the column width.
+* When you scroll sideways, the record number and, when matching by key, the key stay at the
+  left edge.
 * To edit a cell, double-click it, or right-click it and choose *Edit cell*.
   You can also select the cell and press kbd:[F2] or kbd:[Enter].
   A cell can contain several lines.
@@ -1361,11 +1382,16 @@ If a quoted record is not valid, the table shows an error; switch to the text vi
 By default, the table view pairs records by their position, as it does with lines.
 When records are sorted differently, or some have been added or removed, pair them by a key
 instead.
-In a two-way comparison, the bar above the table provides these settings:
+When most rows differ by position but a column tells the records apart, the bar offers
+*Match rows by* that column; one click turns matching by key on.
+
+In a two-way comparison, the bar above the table provides these settings; all but the first two
+are under *Options*:
 
 *Match rows by*:: *Position* (the default) or *Key columns*.
 *Keys*:: The columns that identify a record, such as `id`. Choose one or more.
-*First row is header*:: Use the first row for column names. The first row is then not compared.
+*First row is header*:: Use the first row for column names. The first row is then not compared;
+its names head the columns, and double-clicking a name edits it.
 *Columns by*:: Pair columns by *Position* or by *Header name*, so that reordered columns still
 match.
 *Ignore row order*:: A record that has only moved is not a difference: next and previous
@@ -1377,7 +1403,7 @@ records that exist only on the right after the record that precedes them. *Right
 the right table. *Key order* sorts by key: numbers by value and before text, and rows without a
 key last.
 
-The summary shows how many records were added, removed, modified, reordered and ambiguous.
+The chips show how many records were added, removed, modified, reordered and ambiguous.
 The row markers are `+` for added, `−` for removed, `~` for modified, `↕` for moved and `?` for
 ambiguous.
 
@@ -2078,10 +2104,15 @@ Words shown as deleted and field codes are left out.
 |Every sheet, one line per row, with its cells separated by commas.
 Empty rows between rows are kept, so rows keep their places; empty rows after the last row are
 not.
-A workbook with one sheet opens as a <<table-compare,table compare>>: columns, sorting and
-*Match rows by → Key columns* all apply.
-A workbook with more than one sheet names each sheet before its rows and is compared as text,
-because its sheets do not form one table.
+A workbook opens as a <<table-compare,table compare>>.
+With one sheet, columns, sorting and *Match rows by → Key columns* all apply.
+With more than one sheet, each sheet has a tab below the table that shows how many of its rows
+differ; the rows are matched by position, because the sheets do not form one table.
+Sheets are paired by name, so a sheet that only one side has is one whole difference.
+*Formatted values* shows numbers and dates as their number formats do, as a spreadsheet program
+shows them; turn it off to see the values as stored. The rows are compared by the stored values
+either way.
+In the text view, each sheet is named before its rows.
 
 |ELF programs, shared objects and object files
 |First, the header: class, byte order, kind, machine, ABI, entry point and the counts of the
