@@ -107,12 +107,13 @@ OxideMerge is a free, open-source, cross-platform diff and merge tool built in R
 - **Images:** compare images side by side, or with the overlay, swipe, blink and
   difference views.
 - **Documents, spreadsheets and programs:** PDF, Word (`.docx`), OpenDocument text
-  (`.odt`), Rich Text (`.rtf`), Excel (`.xlsx`) and OpenDocument spreadsheets (`.ods`) are
-  compared as the text in them, and ELF programs, shared objects and object files as their
+  (`.odt`), Rich Text (`.rtf`), Excel (`.xlsx`, `.xlsm`) and OpenDocument spreadsheets (`.ods`)
+  are compared as the text in them, and ELF programs, shared objects and object files as their
   header, program headers, section table and symbols sorted by name — with nothing to
-  install. A workbook of one sheet opens as a table comparison, with the columns and key
-  matching that offers. These comparisons are read-only: the file itself is never written
-  back.
+  install. Workbooks open in **Table** view, with a tab for each sheet in a multi-sheet workbook.
+  Single-sheet workbooks support matching rows by key.
+  Excel merged cells show their range in each pane while cell values determine differences.
+  These comparisons are read-only.
 - **Jupyter notebooks (`.ipynb`):** compared cell by cell, each one labeled as a code cell,
   a Markdown cell or a raw cell, with that cell's own source and nothing else; outputs,
   execution counts and other run metadata are left out, so re-running a notebook without

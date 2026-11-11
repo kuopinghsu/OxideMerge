@@ -862,6 +862,18 @@ fn column_letters(mut column: usize) -> String {
     String::from_utf8(letters).unwrap_or_default()
 }
 
+fn merged_range(merge: crate::core::extract::TableMerge) -> String {
+    let (top, left) = merge.first;
+    let (bottom, right) = merge.last;
+    format!(
+        "{}{}:{}{}",
+        column_letters(left),
+        top + 1,
+        column_letters(right),
+        bottom + 1
+    )
+}
+
 /// Colours a table cell.
 fn fill_cell(ui: &Ui, fill: Color32) {
     ui.painter().rect_filled(ui.max_rect(), 0.0, fill);
@@ -869,12 +881,20 @@ fn fill_cell(ui: &Ui, fill: Color32) {
 
 /// The grid lines of a table cell: below it and to its right.
 fn grid_cell(ui: &Ui, c: &Colors) {
+    grid_edges(ui, c, true, true);
+}
+
+fn grid_edges(ui: &Ui, c: &Colors, bottom: bool, right: bool) {
     let rect = ui.max_rect();
     let stroke = Stroke::new(1.0, c.table_grid);
-    ui.painter()
-        .hline(rect.x_range(), rect.bottom() - 0.5, stroke);
-    ui.painter()
-        .vline(rect.right() - 0.5, rect.y_range(), stroke);
+    if bottom {
+        ui.painter()
+            .hline(rect.x_range(), rect.bottom() - 0.5, stroke);
+    }
+    if right {
+        ui.painter()
+            .vline(rect.right() - 0.5, rect.y_range(), stroke);
+    }
 }
 
 /// Marks a table cell of a record its side does not have.
@@ -1490,6 +1510,8 @@ struct TableState {
     background_at: Option<usize>,
     /// The selected row of `diff`.
     selected: Option<usize>,
+    /// A selected row with no physical line in the underlying workbook.
+    scroll_to_row: Option<usize>,
     /// Text of the numeric tolerance field.
     tolerance: String,
     /// How to match the records by key instead, offered when most rows differ by position
@@ -1551,6 +1573,12 @@ struct Sheet {
     differences: usize,
     /// The most cells a record of each side has.
     widths: [usize; 3],
+}
+
+/// Aligned rows between two consecutive records of one worksheet.
+struct MergeGap {
+    rows: Range<usize>,
+    records: (usize, usize),
 }
 
 /// A line of the inline view.
@@ -2190,7 +2218,10 @@ impl TextView {
             self.table.docs = self
                 .panes
                 .iter()
-                .map(|p| table::Table::parse(table::source(&p.doc), d).map(Arc::new))
+                .map(|p| {
+                    table::Table::parse(table::source(&p.doc), d)
+                        .map(|t| Arc::new(t.with_spreadsheet_merges(&p.doc.sheet_merges)))
+                })
                 .collect();
             // The records of the selected row, to select them again in the new rows; while a
             // match runs there are no rows, only the selection to make when it ends.
@@ -2206,6 +2237,7 @@ impl TextView {
             self.table.job = None;
             self.table.hint = None;
             self.table.sheets = None;
+            self.table.scroll_to_row = None;
             self.table.changed_columns = None;
             self.table.other = None;
             self.table.other_job = None;
@@ -2734,6 +2766,13 @@ impl TextView {
             }
             return;
         }
+        if self.positional_merge_table() {
+            let first = self.table_difference_blocks().next();
+            if let Some(block) = first {
+                self.select_table_difference(block);
+            }
+            return;
+        }
         let first = self.significant().next();
         if let Some(b) = first {
             self.select_block(b);
@@ -2745,6 +2784,16 @@ impl TextView {
         if let Some(rows) = self.keyed_differences() {
             if let Some(&r) = rows.get(n).or(rows.last()) {
                 self.select_keyed_row(r);
+            }
+            return;
+        }
+        if self.positional_merge_table() {
+            let block = self
+                .table_difference_blocks()
+                .nth(n)
+                .or_else(|| self.table_difference_blocks().next_back());
+            if let Some(block) = block {
+                self.select_table_difference(block);
             }
             return;
         }
@@ -2767,6 +2816,13 @@ impl TextView {
         if let Some(rows) = self.keyed_differences() {
             if let Some(&r) = rows.last() {
                 self.select_keyed_row(r);
+            }
+            return;
+        }
+        if self.positional_merge_table() {
+            let last = self.table_difference_blocks().next_back();
+            if let Some(block) = last {
+                self.select_table_difference(block);
             }
             return;
         }
@@ -2860,6 +2916,9 @@ impl TextView {
         if self.keyed().is_some() {
             return !conflicts_only && self.step_keyed(true) == Some(true);
         }
+        if !conflicts_only && self.positional_merge_table() {
+            return self.step_table_difference(true);
+        }
         let row = self.cursor_row;
         let found = self
             .significant()
@@ -2885,6 +2944,9 @@ impl TextView {
         }
         if self.keyed().is_some() {
             return !conflicts_only && self.step_keyed(false) == Some(true);
+        }
+        if !conflicts_only && self.positional_merge_table() {
+            return self.step_table_difference(false);
         }
         let row = self.cursor_row.unwrap_or(self.diff.rows.len());
         let containing = self.diff.rows.get(row).and_then(|r| r.block());
@@ -2914,6 +2976,9 @@ impl TextView {
         if let Some(d) = self.keyed() {
             let mut rows = (0..d.rows.len()).filter(|&i| d.rows[i].differs(d.ignore_order));
             return place(&mut rows, self.table.selected);
+        }
+        if self.positional_merge_table() {
+            return place(&mut self.table_difference_blocks(), self.current_table_block());
         }
         place(&mut self.significant(), self.cur_block)
     }
@@ -3307,6 +3372,28 @@ impl TextView {
         if let Some((r0, r1)) = self.selection() {
             let (from, to) = self.copy_direction(to_right);
             self.copy_rows(r0, r1, from, to);
+            return;
+        }
+        if self.positional_merge_table() {
+            let Some(index) = self.current_table_block() else { return };
+            let (from, to) = self.copy_direction(to_right);
+            if self.table.diff.blocks[index].ignored || !self.writable(to) {
+                return;
+            }
+            let block = &self.table.diff.blocks[index];
+            let (Ok(source), Ok(destination)) = (&self.table.docs[from], &self.table.docs[to])
+            else {
+                return;
+            };
+            let copied = destination.copy_lines(
+                destination.record_lines(block.ranges[to].clone()),
+                source,
+                source.record_lines(block.ranges[from].clone()),
+                self.panes[to].doc.eol.as_str(),
+            );
+            if let Err(error) = self.replace_table_source(to, copied) {
+                self.status = error;
+            }
             return;
         }
         let Some(b) = self.cur_block else { return };
@@ -5861,6 +5948,12 @@ impl TextView {
     /// Lines removed from the left and added on the right of a 2-way compare.
     pub fn change_counts(&self) -> Option<(usize, usize)> {
         (self.n() == 2).then(|| {
+            if self.positional_merge_table() {
+                return self.table_difference_blocks().fold((0, 0), |(del, add), b| {
+                    let r = &self.table.diff.blocks[b].ranges;
+                    (del + r[0].len(), add + r[1].len())
+                });
+            }
             self.significant().fold((0, 0), |(del, add), b| {
                 let r = &self.diff.blocks[b].ranges;
                 (del + r[0].len(), add + r[1].len())
@@ -7935,8 +8028,37 @@ impl TextView {
     }
 
     /// Shows the rows matched by key, or keeps why they could not be.
-    fn show_keyed(&mut self, result: Result<TableDiff, table_match::Problem>) {
-        if let Ok(d) = &result {
+    fn show_keyed(&mut self, mut result: Result<TableDiff, table_match::Problem>) {
+        if let Ok(d) = &mut result {
+            // Blank merge continuations have no key to match.
+            let mut empty_merge_keys = [0; 2];
+            for row in d.rows.iter_mut().filter(|r| r.state == RowState::Ambiguous) {
+                let mut only_merge_rows = true;
+                for (p, count) in empty_merge_keys.iter_mut().enumerate() {
+                    if let Some(record) = row.records[p] {
+                        let blank = self.panes[p].doc.sheet_merges.extends_to(record)
+                            && self.table.docs[p].as_ref().is_ok_and(|table| {
+                                table.records[record].cells.iter().all(String::is_empty)
+                            });
+                        *count += usize::from(blank);
+                        only_merge_rows &= blank;
+                    }
+                }
+                if only_merge_rows {
+                    row.state = RowState::Identical;
+                    row.changed = Default::default();
+                    d.counts.ambiguous -= 1;
+                    d.counts.identical += 1;
+                }
+            }
+            d.warnings.retain_mut(|warning| {
+                if let table_match::Warning::EmptyKeys { side, records } = warning {
+                    *records = records.saturating_sub(empty_merge_keys[*side]);
+                    *records != 0
+                } else {
+                    true
+                }
+            });
             let mut blocks = Vec::new();
             let rows = d
                 .rows
@@ -7971,21 +8093,44 @@ impl TextView {
 
     /// Aligns the records of the sides by position, as text lines are.
     fn table_by_position(&mut self) {
-        let keys: Vec<Vec<String>> = self
+        let mut keys: Vec<Vec<String>> = self
             .table
             .docs
             .iter()
             .filter_map(|t| t.as_ref().ok())
             .map(|t| t.keys(self.opts.ignore_eol))
             .collect();
+        let has_merges = self.panes.iter().any(|p| !p.doc.sheet_merges.is_empty());
         self.table.diff = match self.sheet_ranges() {
-            Some(sheets) => diff_by_sheet(&keys, &sheets, &self.opts),
+            Some(sheets) => {
+                if has_merges {
+                    // Match the empty separator with the other separator, even when one sheet
+                    // has additional empty rows to show the rest of a vertical merge.
+                    for (keys, ranges) in keys.iter_mut().zip(&sheets) {
+                        for (_, records) in ranges {
+                            if records.len() > 1 && keys[records.end - 1] == r#"[""]"# {
+                                keys[records.end - 1] = "\0".into();
+                            }
+                        }
+                    }
+                }
+                diff_by_sheet(&keys, &sheets, &self.opts)
+            }
             None => diff::compute_with(
                 &keys.iter().map(Vec::as_slice).collect::<Vec<_>>(),
                 &self.opts,
                 None,
             ),
         };
+        if has_merges {
+            for b in 0..self.table.diff.blocks.len() {
+                let block = &self.table.diff.blocks[b];
+                let rows = block.first_row..block.first_row + block.rows;
+                if !block.ignored && rows.into_iter().all(|i| self.merge_only_row(i)) {
+                    self.table.diff.blocks[b].ignored = true;
+                }
+            }
+        }
         self.table.sheets = None;
         self.table.changed_columns = None;
     }
@@ -8008,6 +8153,60 @@ impl TextView {
                 .filter(|&i| d.rows[i].differs(d.ignore_order))
                 .collect(),
         )
+    }
+
+    /// Positional workbooks can have different raw text and displayed cell values.
+    fn positional_merge_table(&self) -> bool {
+        self.table_mode
+            && self.table_delim.is_some()
+            && self.panes.iter().any(|p| !p.doc.sheet_merges.is_empty())
+            && self.table.docs.iter().all(Result::is_ok)
+    }
+
+    fn table_difference_blocks(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        self.table
+            .diff
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| (!block.ignored).then_some(index))
+    }
+
+    fn current_table_block(&self) -> Option<usize> {
+        self.table.diff.rows.get(self.table_cursor()?)?.block()
+    }
+
+    fn select_table_difference(&mut self, block: usize) {
+        let b = &self.table.diff.blocks[block];
+        let row = (b.first_row..b.first_row + b.rows)
+            .find(|&row| !self.merge_only_row(row))
+            .unwrap_or(b.first_row);
+        let aligned = self.table.diff.rows[row];
+        let pane = std::iter::once(self.active_pane)
+            .chain(0..self.n())
+            .find(|&p| aligned.line(p).is_some())
+            .unwrap_or(self.active_pane);
+        self.select_table_row(row, pane, self.table.column);
+        self.scroll_to = None;
+        self.table.scroll_to_row = Some(row);
+    }
+
+    fn step_table_difference(&mut self, forward: bool) -> bool {
+        let row = self.table_cursor();
+        let current = self.current_table_block();
+        let found = if forward {
+            self.table_difference_blocks().find(|&b| {
+                row.is_none_or(|r| self.table.diff.blocks[b].first_row > r)
+            })
+        } else {
+            self.table_difference_blocks().rev().find(|&b| {
+                Some(b) != current && row.is_none_or(|r| self.table.diff.blocks[b].first_row < r)
+            })
+        };
+        if let Some(block) = found {
+            self.select_table_difference(block);
+        }
+        found.is_some()
     }
 
     /// Selects row `row` of the rows matched by key, on a side that has its record, at its
@@ -8138,11 +8337,22 @@ impl TextView {
     /// the columns that are compared with each other stand side by side.
     fn table_columns(&self) -> Vec<(usize, usize)> {
         if let Some(d) = self.keyed() {
-            return d
+            let mut columns: Vec<_> = d
                 .columns
                 .iter()
                 .flat_map(|pair| (0..2).filter_map(move |p| pair[p].map(|column| (p, column))))
                 .collect();
+            let widths = [0, 1].map(|p| self.panes[p].doc.sheet_merges.width(None));
+            if widths == [0, 0] {
+                return columns;
+            }
+            let present: HashSet<_> = columns.iter().copied().collect();
+            columns.extend(
+                (0..widths[0].max(widths[1]))
+                    .flat_map(|k| (0..2).map(move |p| (p, k)))
+                    .filter(|&(p, k)| k < widths[p] && !present.contains(&(p, k))),
+            );
+            return columns;
         }
         let n = self.n();
         let columns = self
@@ -8152,6 +8362,7 @@ impl TextView {
             .filter_map(|t| t.as_ref().ok())
             .flat_map(|t| &t.records)
             .map(|r| r.cells.len())
+            .chain(self.panes.iter().map(|p| p.doc.sheet_merges.width(None)))
             .max()
             .unwrap_or(1)
             .max(1);
@@ -8161,16 +8372,26 @@ impl TextView {
     }
 
     fn table_cursor(&self) -> Option<usize> {
-        if self.keyed().is_some() {
-            if let Some(row) = self
-                .table
-                .selected
-                .filter(|&r| r < self.table.diff.rows.len())
-            {
-                return Some(row);
-            }
+        if let Some(row) = self.table.selected.filter(|&index| {
+            self.table.diff.rows.get(index).is_some_and(|row| {
+                self.keyed().is_some()
+                    || (self.cursor_row.is_none() && self.table_padding_row(row))
+                    || (self.positional_merge_table()
+                        && self.cursor_row.and_then(|r| self.diff.rows.get(r)).is_some_and(|raw| {
+                            (0..self.n()).any(|p| self.holds(row, raw, p))
+                        }))
+            })
+        }) {
+            return Some(row);
         }
         self.table_row_at(self.cursor_row?, self.active_pane)
+    }
+
+    fn table_padding_row(&self, row: &diff::Row) -> bool {
+        (0..self.n()).any(|p| {
+            row.line(p)
+                .is_some_and(|r| self.panes[p].doc.sheet_merges.is_padding(r))
+        })
     }
 
     /// Pick an actual changed physical line within the record, even when its opening
@@ -8206,7 +8427,16 @@ impl TextView {
             self.table.column = column;
             self.cursor_row = Some(raw);
             self.scroll_to = Some(raw);
+            self.table.scroll_to_row = None;
             self.cur_block = rows[raw].block().filter(|&b| !self.diff.blocks[b].ignored);
+            self.sel_anchor = None;
+        } else if self.table_padding_row(aligned) {
+            self.active_pane = pane;
+            self.table.column = column;
+            self.cursor_row = None;
+            self.scroll_to = None;
+            self.table.scroll_to_row = Some(row);
+            self.cur_block = None;
             self.sel_anchor = None;
         }
     }
@@ -8787,10 +9017,14 @@ impl TextView {
                     });
                 }
                 let sheet = sheets.last_mut().unwrap();
-                if row.block().is_some_and(|b| !diff.blocks[b].ignored) {
+                if row.block().is_some_and(|b| !diff.blocks[b].ignored) && !self.merge_only_row(i) {
                     sheet.differences += 1;
                 }
                 for (p, doc) in docs.iter().copied().enumerate().take(n) {
+                    if let Some(record) = row.line(p).filter(|&r| heading(p, r).is_some()) {
+                        sheet.widths[p] = sheet.widths[p]
+                            .max(self.panes[p].doc.sheet_merges.width(Some(record + 1)));
+                    }
                     let record = row.line(p).zip(doc).map(|(r, t)| &t.records[r]);
                     if let Some(record) = record {
                         sheet.widths[p] = sheet.widths[p].max(record.cells.len());
@@ -8899,7 +9133,9 @@ impl TextView {
                 .map(|path| {
                     let other =
                         crate::core::extract::other_cells(path.as_deref()?, Some(cancel)).ok()?;
-                    let table = table::Table::parse(other.text, ',').ok()?;
+                    let table = table::Table::parse(other.text, ',')
+                        .ok()?
+                        .with_spreadsheet_merges(&other.sheet_merges);
                     Some((table, other.shown))
                 })
                 .collect())
@@ -8946,8 +9182,32 @@ impl TextView {
             None => self.table.diff.rows.get(index).is_some_and(|row| {
                 row.block()
                     .is_some_and(|b| !self.table.diff.blocks[b].ignored)
+                    && !self.merge_only_row(index)
             }),
         }
+    }
+
+    /// An unmatched blank row inside a merge has no value change.
+    fn merge_only_row(&self, index: usize) -> bool {
+        let row = self.table.diff.rows[index];
+        let mut missing = false;
+        let mut continuation = false;
+        for (p, doc) in self.table.docs.iter().enumerate() {
+            let Some(record) = row.line(p) else {
+                missing = true;
+                continue;
+            };
+            if doc.as_ref().is_ok_and(|doc| {
+                doc.records[record]
+                    .cells
+                    .iter()
+                    .any(|cell| !cell.is_empty())
+            }) {
+                return false;
+            }
+            continuation |= self.panes[p].doc.sheet_merges.extends_to(record);
+        }
+        missing && continuation
     }
 
     /// The rows listed: those of the sheet shown that the filter lets through, without the
@@ -8964,6 +9224,61 @@ impl TextView {
         range
             .filter(|&i| Some(i) != header && self.row_matches(i))
             .collect()
+    }
+
+    fn table_merge_gaps(&self) -> [Vec<MergeGap>; 3] {
+        std::array::from_fn(|pane| {
+            let mut gaps = Vec::new();
+            if self
+                .panes
+                .get(pane)
+                .is_none_or(|p| p.doc.sheet_merges.is_empty())
+            {
+                return gaps;
+            }
+            let rows = self
+                .sheet()
+                .map_or(0..self.table.diff.rows.len(), |s| s.rows.clone());
+            let mut previous = None;
+            for index in rows {
+                if let Some(record) = self.table.diff.rows[index].line(pane) {
+                    if let Some((row, last)) = previous {
+                        if row + 1 < index && record.abs_diff(last) == 1 {
+                            gaps.push(MergeGap {
+                                rows: row + 1..index,
+                                records: (last.min(record), last.max(record)),
+                            });
+                        }
+                    }
+                    previous = Some((index, record));
+                }
+            }
+            gaps
+        })
+    }
+
+    fn merged_cell(
+        &self,
+        index: usize,
+        pane: usize,
+        column: usize,
+        gaps: &[MergeGap],
+    ) -> Option<crate::core::extract::TableMerge> {
+        let merges = &self.panes[pane].doc.sheet_merges;
+        if merges.is_empty() {
+            return None;
+        }
+        let records = match self.table.diff.rows[index].line(pane) {
+            Some(record) => (record, record),
+            None => {
+                let gap = gaps.get(gaps.partition_point(|gap| gap.rows.end <= index))?;
+                if !gap.rows.contains(&index) {
+                    return None;
+                }
+                gap.records
+            }
+        };
+        merges.covering(records, column)
     }
 
     /// Shows the sheet of row `row`, and every row when the filter leaves it out.
@@ -9060,12 +9375,27 @@ impl TextView {
             return changed;
         }
         let normalizer = diff::Normalizer::new(&self.opts);
-        let columns = self.table_columns();
-        for index in 0..self.table.diff.rows.len() {
-            for &(p, column) in &columns {
-                if !changed.contains(&(p, column)) && self.cell_changed(index, p, column, &normalizer)
+        let n = self.n();
+        for (index, row) in self.table.diff.rows.iter().enumerate() {
+            if row
+                .block()
+                .is_none_or(|b| self.table.diff.blocks[b].ignored)
+            {
+                continue;
+            }
+            let width = self
+                .table
+                .docs
+                .iter()
+                .enumerate()
+                .filter_map(|(p, doc)| Some(doc.as_ref().ok()?.records[row.line(p)?].cells.len()))
+                .max()
+                .unwrap_or(0);
+            for column in 0..width {
+                if !changed.contains(&(0, column))
+                    && (0..n).any(|p| self.cell_changed(index, p, column, &normalizer))
                 {
-                    changed.extend((0..self.n()).map(|q| (q, column)));
+                    changed.extend((0..n).map(|q| (q, column)));
                 }
             }
         }
@@ -9198,21 +9528,18 @@ impl TextView {
 
     /// The selected cell as a spreadsheet shows it: where it is, and what each side has there,
     /// with what differs marked.
-    fn formula_bar(&self, ui: &mut Ui, c: &Colors) {
+    fn formula_bar(&self, ui: &mut Ui, c: &Colors, merge_gaps: &[Vec<MergeGap>; 3]) {
         let n = self.n();
         let pal = widgets::pal(ui);
         let (p, column) = (self.active_pane.min(n - 1), self.table.column);
         let row = self
             .table_cursor()
             .and_then(|i| Some((i, *self.table.diff.rows.get(i)?)));
-        let cell = |q: usize| -> Option<&str> {
-            let (_, aligned) = row?;
-            let column = match self.keyed() {
-                Some(d) if q != p => d.paired_column(p, column, q)?,
-                _ => column,
-            };
-            self.display_cell(q, aligned.line(q)?, column)
+        let side_column = |q| match self.keyed() {
+            Some(d) if q != p => d.paired_column(p, column, q),
+            _ => Some(column),
         };
+        let cell = |q| self.display_cell(q, row?.1.line(q)?, side_column(q)?);
         // A sheet's rows are numbered from its first, as the grid numbers them.
         let heading = self.sheet().filter(|s| s.heading).map(|s| s.rows.start);
         let name = match row.and_then(|(i, aligned)| Some((i, aligned.line(p)?))) {
@@ -9242,6 +9569,15 @@ impl TextView {
                         for (q, ui) in columns.iter_mut().enumerate() {
                             ui.horizontal(|ui| {
                                 widgets::side_chip(ui, q, n);
+                                if let Some(merge) = row.and_then(|(i, _)| {
+                                    self.merged_cell(i, q, side_column(q)?, &merge_gaps[q])
+                                }) {
+                                    let range = merged_range(merge);
+                                    ui.weak(&range).on_hover_text(trf(
+                                        "table.merged_range",
+                                        &[("range", range.clone())],
+                                    ));
+                                }
                                 let Some(value) = cell(q) else {
                                     ui.weak("—");
                                     return;
@@ -9360,21 +9696,25 @@ impl TextView {
         let keyed = self.keyed().is_some();
         // The header row of a table matched by key names the columns instead of being a row.
         let named = keyed && self.table_match.header;
-        let target = self.scroll_to.take().and_then(|raw_row| {
-            let raw = self.diff.rows.get(raw_row)?;
-            self.table
-                .selected
-                .filter(|&s| {
-                    keyed
-                        && self
-                            .table
-                            .diff
-                            .rows
-                            .get(s)
-                            .is_some_and(|row| (0..n).any(|p| self.holds(row, raw, p)))
-                })
-                .or_else(|| self.table_row_at(raw_row, self.active_pane))
-        });
+        let target = self
+            .scroll_to
+            .take()
+            .and_then(|raw_row| {
+                let raw = self.diff.rows.get(raw_row)?;
+                self.table
+                    .selected
+                    .filter(|&s| {
+                        keyed
+                            && self
+                                .table
+                                .diff
+                                .rows
+                                .get(s)
+                                .is_some_and(|row| (0..n).any(|p| self.holds(row, raw, p)))
+                    })
+                    .or_else(|| self.table_row_at(raw_row, self.active_pane))
+            })
+            .or(self.table.scroll_to_row.take());
         if keyed && target.is_some() {
             self.table.selected = target;
         }
@@ -9386,10 +9726,16 @@ impl TextView {
         }
         self.load_other_cells();
         self.table_tools(ui);
-        self.formula_bar(ui, c);
+        let merge_gaps = self.table_merge_gaps();
+        self.formula_bar(ui, c, &merge_gaps);
         self.sheet_tabs(ui, c);
         let visible = self.table_rows();
         let shown = self.shown_columns();
+        let mut next_column = [None; 3];
+        let mut following_columns = vec![None; shown.len()];
+        for (i, &(pane, column)) in shown.iter().enumerate().rev() {
+            following_columns[i] = next_column[pane].replace(column);
+        }
         if visible.is_empty() {
             ui.add_space(8.0);
             ui.weak(tr("table.no_rows"));
@@ -9458,7 +9804,8 @@ impl TextView {
                 None => {
                     let differs = aligned
                         .block()
-                        .is_some_and(|b| !self.table.diff.blocks[b].ignored);
+                        .is_some_and(|b| !self.table.diff.blocks[b].ignored)
+                        && !self.merge_only_row(index);
                     let gap = (0..n).any(|q| aligned.line(q).is_none());
                     let here = pane.is_none_or(|p| aligned.line(p).is_some());
                     (differs && gap && here).then_some(
@@ -9582,7 +9929,8 @@ impl TextView {
                     })
                     .body(|body| {
                         body.heterogeneous_rows(heights.into_iter(), |mut row| {
-                            let index = visible[row.index()];
+                            let row_index = row.index();
+                            let index = visible[row_index];
                             let aligned = self.table.diff.rows[index];
                             let matched = self.keyed().and_then(|d| d.rows.get(index));
                             row.col(|ui| {
@@ -9609,7 +9957,7 @@ impl TextView {
                                     label.on_hover_text(tip);
                                 }
                             });
-                            for &(p, column) in &shown {
+                            for (&(p, column), &following) in shown.iter().zip(&following_columns) {
                                 row.col(|ui| {
                                     band.set(Some(ui.max_rect().y_range()));
                                     let focused = cursor == Some(index) && focus == (p, column);
@@ -9631,6 +9979,48 @@ impl TextView {
                                     if cell.clicked() {
                                         clicked = Some((index, p, column));
                                     }
+                                    let merge = self.merged_cell(index, p, column, &merge_gaps[p]);
+                                    let mut merge_tip = None;
+                                    let (bottom, right) = if let Some(merge) = merge {
+                                        let range = merged_range(merge);
+                                        let tip = trf("table.merged_range", &[("range", range)]);
+                                        let bottom =
+                                            visible.get(row_index + 1).is_none_or(|&next| {
+                                                self.merged_cell(next, p, column, &merge_gaps[p])
+                                                    != Some(merge)
+                                            });
+                                        let right = following.is_none_or(|next| {
+                                            !(merge.first.1..=merge.last.1).contains(&next)
+                                        });
+                                        fill_cell(
+                                            ui,
+                                            ui.visuals().panel_fill.lerp_to_gamma(
+                                                widgets::side_color(ui, p, n),
+                                                0.18,
+                                            ),
+                                        );
+                                        let first = aligned.line(p) == Some(merge.first_record());
+                                        let anchor = first && column == merge.first.1;
+                                        if !anchor {
+                                            grid_edges(ui, c, bottom, right);
+                                            outline(ui);
+                                            if first {
+                                                ui.add_space(6.0);
+                                                ui.weak("←");
+                                            }
+                                            cell.on_hover_text(tip).context_menu(|ui| {
+                                                if ui.button(tr("table.hide_column")).clicked() {
+                                                    hide = Some((p, column));
+                                                    ui.close();
+                                                }
+                                            });
+                                            return;
+                                        }
+                                        merge_tip = Some(tip);
+                                        (bottom, right)
+                                    } else {
+                                        (true, true)
+                                    };
                                     let Some(record) = aligned
                                         .line(p)
                                         .map(|r| &self.table.docs[p].as_ref().unwrap().records[r])
@@ -9650,8 +10040,12 @@ impl TextView {
                                     } else if let Some(fill) = row_fill(index, Some(p)) {
                                         fill_cell(ui, fill);
                                     }
-                                    grid_cell(ui, c);
+                                    grid_edges(ui, c, bottom, right);
                                     outline(ui);
+                                    if merge_tip.is_some() {
+                                        ui.add_space(6.0);
+                                        ui.weak("▣");
+                                    }
                                     let number = text.is_some_and(is_number);
                                     let text = match text {
                                         Some(v) if number => RichText::new(v).monospace(),
@@ -9672,9 +10066,13 @@ impl TextView {
                                         ui.add_space(6.0);
                                         ui.add(label);
                                     }
-                                    let cell = match value {
-                                        Some(v) => cell.on_hover_text(v.as_str()),
-                                        None => cell,
+                                    let cell = match (value, merge_tip) {
+                                        (Some(v), Some(tip)) if !v.is_empty() => {
+                                            cell.on_hover_text(format!("{tip}\n{v}"))
+                                        }
+                                        (_, Some(tip)) => cell.on_hover_text(tip),
+                                        (Some(v), None) => cell.on_hover_text(v.as_str()),
+                                        (None, None) => cell,
                                     };
                                     if cell.double_clicked() {
                                         if let Some(r) = aligned.line(p) {
@@ -13054,6 +13452,286 @@ mod tests {
             let records = v.table.docs[p].as_ref().unwrap().records.len();
             assert_eq!(lines, (0..records).collect::<Vec<_>>());
         }
+    }
+
+    #[test]
+    fn workbook_merge_geometry_survives_alignment_without_changing_values() {
+        use crate::core::extract::{TableMerge, TableMerges};
+        let heading = |name: &str| format!("# {}\n", trf("label.sheet", &[("name", name.into())]));
+        let book = |rows: &str| {
+            TextDoc::from_text(
+                Some("book.xlsx".into()),
+                &format!("{}{rows}\n{}Other\n\n", heading("First"), heading("Second")),
+            )
+        };
+        let mut left = book("first,Anchor\nsecond\nthird\n");
+        let mut right = book("first,Anchor\nsecond\nthird\n");
+        let vertical = TableMerge::new(1, (0, 1), (3, 1));
+        let horizontal = TableMerge::new(1, (0, 1), (0, 3));
+        let blank = TableMerge::new(1, (4, 1), (4, 3));
+        left.sheet_merges =
+            TableMerges::new(vec![vertical, blank], std::iter::once(4..6).collect());
+        right.sheet_merges = TableMerges::new(vec![horizontal], Vec::new());
+        let mut v = TextView::new(vec![left.clone(), right], &strict_config());
+        v.note_sheets();
+        assert!(v.diff.is_identical());
+        assert!(v.table.diff.is_identical());
+        assert_eq!(v.sheet().unwrap().differences, 0);
+        assert!(v.shown_columns().contains(&(1, 3)));
+        let gaps = v.table_merge_gaps();
+        assert_eq!(v.merged_cell(1, 0, 1, &gaps[0]), Some(vertical));
+        assert_eq!(v.merged_cell(1, 1, 3, &gaps[1]), Some(horizontal));
+        assert_eq!(v.merged_cell(2, 1, 1, &gaps[1]), None);
+        v.table_mode = true;
+        let padding = v
+            .table
+            .diff
+            .rows
+            .iter()
+            .position(|row| row.line(0) == Some(5))
+            .unwrap();
+        v.select_table_row(padding, 0, 1);
+        assert_eq!(v.table_cursor(), Some(padding));
+        v.select_table_row(1, 0, 1);
+        let output = frame(&mut v, &egui::Context::default(), Vec::new());
+        let text: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for label in ["B1:B4", "B1:D1", "▣", "←"] {
+            assert!(text.contains(&label), "{label}: {text:?}");
+        }
+
+        let right = book("first,Anchor\ninserted\nsecond\nthird,Visible\n");
+        let mut v = TextView::new(vec![left, right], &strict_config());
+        v.note_sheets();
+        let gaps = v.table_merge_gaps();
+        let inserted = v
+            .table
+            .diff
+            .rows
+            .iter()
+            .position(|r| r.line(1) == Some(2))
+            .unwrap();
+        assert_eq!(v.table.diff.rows[inserted].line(0), None);
+        assert_eq!(v.merged_cell(inserted, 0, 1, &gaps[0]), Some(vertical));
+        assert_eq!(v.merged_cell(inserted, 0, 2, &gaps[0]), None);
+        let changed = v
+            .table
+            .diff
+            .rows
+            .iter()
+            .position(|r| r.line(1) == Some(4))
+            .unwrap();
+        assert!(v.cell_changed(changed, 1, 1, &diff::Normalizer::new(&v.opts)));
+        assert_eq!(v.changed_columns(), HashSet::from([(0, 1), (1, 1)]));
+
+        let file = |rows| TextDoc::from_text(Some("book.xlsx".into()), rows);
+        let mut left = file("id,value\n1,Anchor\n");
+        left.sheet_merges = TableMerges::new(
+            vec![TableMerge::new(0, (1, 1), (2, 1))],
+            std::iter::once(2..3).collect(),
+        );
+        let mut v = TextView::new(vec![left, file("id,value\n1,Anchor\n")], &strict_config());
+        v.table_mode = true;
+        v.set_table_match(by_id());
+        assert!(v.table.diff.is_identical());
+        assert_eq!(v.keyed().unwrap().counts.ambiguous, 0);
+        assert!(v.keyed().unwrap().warnings.is_empty());
+    }
+
+    #[test]
+    fn workbook_row_copy_uses_visible_values_in_both_table_matching_modes() {
+        use crate::core::extract::{TableMerge, TableMerges};
+        let left_text = "id,value,note\n1,Keep,Shown\n2,Anchor,\"hidden\nvalue\"\n";
+        let right_text = "id,value,note\n1,Keep,Shown\n";
+        let mut left = TextDoc::from_text(Some("book.xlsx".into()), left_text);
+        left.read_only = true;
+        left.sheet_merges = TableMerges::new(
+            vec![TableMerge::new(0, (2, 1), (2, 2))],
+            Vec::new(),
+        );
+        for keyed in [false, true] {
+            let right = TextDoc::from_text(Some("table.csv".into()), right_text);
+            let mut v = TextView::new(vec![left.clone(), right], &strict_config());
+            v.table_mode = true;
+            if keyed {
+                v.set_table_match(by_id());
+            }
+            assert_eq!(v.diff_position().1, 1);
+            v.first_diff();
+            v.copy_current(true);
+            assert_eq!(table::source(&v.panes[1].doc), format!("{right_text}2,Anchor\n"));
+            assert_eq!(table::source(&v.panes[0].doc), left_text);
+            assert_eq!(v.diff_position().1, 0);
+        }
+    }
+
+    #[test]
+    fn positional_workbook_navigation_counts_displayed_values() {
+        use crate::core::extract::{TableMerge, TableMerges};
+        let book = |rows| {
+            let mut doc = TextDoc::from_text(Some("book.xlsx".into()), rows);
+            doc.sheet_merges =
+                TableMerges::new(vec![TableMerge::new(0, (0, 0), (0, 1))], Vec::new());
+            doc
+        };
+        let left = book("Anchor,hidden\nsame\nold\nseparator\nbefore\n");
+        let right = book("Anchor,different\nsame\nnew\nseparator\nafter\n");
+        let mut v = TextView::new(vec![left, right], &strict_config());
+        v.table_mode = true;
+        assert_eq!(v.diff_position(), (Some(0), 2));
+        assert_eq!(v.change_counts(), Some((2, 2)));
+        v.first_diff();
+        assert_eq!(v.table_cursor(), Some(2));
+        assert_eq!(v.diff_position(), (Some(0), 2));
+        assert!(v.next_diff(false));
+        assert_eq!(v.table_cursor(), Some(4));
+        assert_eq!(v.diff_position(), (Some(1), 2));
+        assert!(v.prev_diff(false));
+        assert!(!v.prev_diff(false));
+        v.last_diff();
+        assert_eq!(v.table_cursor(), Some(4));
+        v.go_to_diff(0);
+        assert_eq!(v.table_cursor(), Some(2));
+        v.table_mode = false;
+        assert_eq!(v.diff_position().1, 3);
+    }
+
+    #[test]
+    fn keyed_workbook_matching_ignores_explicit_blank_merge_rows() {
+        use crate::core::extract::{TableMerge, TableMerges};
+        let file = |rows| TextDoc::from_text(Some("book.xlsx".into()), rows);
+        let mut left = file("id,value\n1,Anchor\n,hidden\n");
+        left.sheet_merges = TableMerges::new(vec![TableMerge::new(0, (1, 1), (2, 1))], Vec::new());
+        let mut v = TextView::new(vec![left, file("id,value\n1,Anchor\n")], &strict_config());
+        v.table_mode = true;
+        v.set_table_match(by_id());
+        assert!(v.table.diff.is_identical());
+        assert!(v.display_cell(0, 2, 1).is_none_or(str::is_empty));
+        assert_eq!(v.keyed().unwrap().counts.ambiguous, 0);
+        assert!(v.keyed().unwrap().warnings.is_empty());
+    }
+
+    #[test]
+    fn a_vertical_merge_bridges_gaps_when_keyed_order_reverses_its_records() {
+        use crate::core::extract::{TableMerge, TableMerges};
+        let file = |rows| TextDoc::from_text(Some("book.xlsx".into()), rows);
+        let mut left = file("id,value\n30,Anchor\n10\n");
+        let merge = TableMerge::new(0, (1, 1), (2, 1));
+        left.sheet_merges = TableMerges::new(vec![merge], Vec::new());
+        let right = file("id,value\n10\n20,Added\n30,Anchor\n");
+        let mut v = TextView::new(vec![left, right], &strict_config());
+        v.table_mode = true;
+        v.set_table_match(TableMatch {
+            order: table_match::RowOrder::Right,
+            ..by_id()
+        });
+        v.note_sheets();
+        let index = v
+            .table
+            .diff
+            .rows
+            .iter()
+            .position(|r| r.line(1) == Some(2))
+            .unwrap();
+        assert_eq!(v.table.diff.rows[index - 1].line(0), Some(2));
+        assert_eq!(v.table.diff.rows[index].line(0), None);
+        assert_eq!(v.table.diff.rows[index + 1].line(0), Some(1));
+        let gaps = v.table_merge_gaps();
+        assert_eq!(v.merged_cell(index, 0, 1, &gaps[0]), Some(merge));
+    }
+
+    #[test]
+    fn sample_workbooks_cover_each_pair_of_merge_shapes() {
+        let cfg = strict_config();
+        let docs = ["left", "right"]
+            .into_iter()
+            .map(|side| {
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("samples")
+                    .join(side)
+                    .join("docs/budget.xlsx");
+                crate::core::unpacker::load_doc(&path, &cfg.diff, None).unwrap()
+            })
+            .collect();
+        let mut v = TextView::new(docs, &cfg);
+        v.note_sheets();
+        v.table.sheet = v
+            .table
+            .sheets
+            .as_ref()
+            .unwrap()
+            .iter()
+            .position(|sheet| sheet.name == "Merged Cells")
+            .unwrap();
+        let gaps = v.table_merge_gaps();
+        let mut cases = HashSet::new();
+        for index in v.table_rows() {
+            let row = v.table.diff.rows[index];
+            let Some(record) = row.line(0) else { continue };
+            let cells = &v.table.docs[0].as_ref().unwrap().records[record].cells;
+            let [left, right, placement, ..] = cells.as_slice() else {
+                continue;
+            };
+            if !matches!(
+                placement.as_str(),
+                "Same anchor" | "Offset overlap" | "Disjoint"
+            ) {
+                continue;
+            }
+            let left_anchor = (1, 4);
+            let right_anchor = match placement.as_str() {
+                "Same anchor" => (1, 4),
+                "Disjoint" => (1, 7),
+                _ if right == "vertical" => (0, 4),
+                _ => (1, 3),
+            };
+            let merge_at = |pane, record, column| {
+                let index = v
+                    .table
+                    .diff
+                    .rows
+                    .iter()
+                    .position(|row| row.line(pane) == Some(record))
+                    .unwrap();
+                v.merged_cell(index, pane, column, &gaps[pane])
+            };
+            let right_record = v.table.docs[1]
+                .as_ref()
+                .unwrap()
+                .records
+                .iter()
+                .position(|r| r.cells.get(..3) == Some(&cells[..3]))
+                .unwrap();
+            let left_merge = merge_at(0, record + left_anchor.0, left_anchor.1);
+            let right_merge = merge_at(1, right_record + right_anchor.0, right_anchor.1);
+            for (merge, expected) in [(left_merge, left), (right_merge, right)] {
+                let shape = merge.map_or("none", |m| {
+                    match (m.first.0 != m.last.0, m.first.1 != m.last.1) {
+                        (false, true) => "horizontal",
+                        (true, false) => "vertical",
+                        (true, true) => "rectangle",
+                        (false, false) => unreachable!(),
+                    }
+                });
+                assert_eq!(shape, expected);
+            }
+            if let (Some(a), Some(b)) = (left_merge, right_merge) {
+                let overlaps = a.first.0 <= b.last.0
+                    && b.first.0 <= a.last.0
+                    && a.first.1 <= b.last.1
+                    && b.first.1 <= a.last.1;
+                assert_eq!(overlaps, placement != "Disjoint");
+                assert_eq!(a.first == b.first, placement == "Same anchor");
+            }
+            assert!(cases.insert((left, right, placement)));
+        }
+        assert_eq!(cases.len(), 16 + 9 * 2);
     }
 
     fn by_id() -> TableMatch {

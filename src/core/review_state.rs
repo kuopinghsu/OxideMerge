@@ -271,15 +271,13 @@ pub fn annotate_report(
     summary: &Summary,
 ) -> String {
     use super::report::ReportFormat;
+    if !matches!(format, ReportFormat::Xml | ReportFormat::Text) {
+        return content;
+    }
     let json = serde_json::to_string_pretty(summary).expect("review summary serializes");
-    let escaped = super::xml_report::esc(&json);
     match format {
-        ReportFormat::Html | ReportFormat::Slideshow => {
-            let section = format!("<aside class=\"review-summary\"><h2>Review workspace</h2><pre>{escaped}</pre></aside>");
-            let at = content.rfind("</body>").unwrap_or(content.len());
-            content.insert_str(at, &section);
-        }
         ReportFormat::Xml => {
+            let escaped = super::xml_report::esc(&json);
             let at = content.rfind("</comparison>").unwrap_or(content.len());
             content.insert_str(
                 at,

@@ -1141,6 +1141,7 @@
   "table.formatted_values": "서식 있는 값",
   "table.ignore_order": "행 순서 무시",
   "table.record": "레코드",
+  "table.merged_range": "병합된 셀 {range}",
   "table.report_title": "키로 맞춘 행",
   "table.show_ambiguous": "다음 모호한 행",
   "table.column": "열",

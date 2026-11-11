@@ -28,6 +28,11 @@ uses its section of this file as the release notes.
   paired by name, so a sheet only one side has is one whole difference, and the rows of such a
   workbook are matched by position. *Formatted values* shows the numbers and dates of a
   spreadsheet as its number formats do, or as stored when turned off.
+- **Merged cells in workbook table comparisons:** Table view shows vertical spans and marks
+  horizontal continuations in each pane for `.xlsx` and `.xlsm` files. Hover over a merged
+  cell or select it to see its range. The comparison counts cell values, so a change to the
+  merge range alone adds no difference. The sample budget workbooks have a *Merged Cells*
+  sheet with matching, overlapping, disjoint and one-sided merges.
 - **One switch for the views of a comparison:** the *Table view* button of the toolbar is now a
   *Text* / *Table* switch above the panes, where documents have *Text* / *Formatted*. A workbook
   has *Text*, *Table* and *Formatted* on the one switch.

@@ -1141,6 +1141,7 @@
   "table.formatted_values": "Valores formatados",
   "table.ignore_order": "Ignorar a ordem das linhas",
   "table.record": "Registro",
+  "table.merged_range": "Células mescladas {range}",
   "table.report_title": "Linhas pareadas por chave",
   "table.show_ambiguous": "Próxima linha ambígua",
   "table.column": "Coluna",

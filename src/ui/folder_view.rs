@@ -956,48 +956,47 @@ impl FolderView {
     }
 
     fn report_notes(&self, content: String, format: ReportFormat, cfg: &Config) -> String {
-        let (notes, summary) = self.report_review(cfg, self.items.iter());
+        let notes = self.report_review_notes(cfg);
         let content = crate::core::review::annotate_report(content, format, &notes);
-        match summary {
-            Some(summary) => crate::core::review_state::annotate_report(content, format, &summary),
-            None => content,
+        if matches!(format, ReportFormat::Xml | ReportFormat::Text) {
+            if let Some(summary) = self.report_review_summary(cfg, self.items.iter()) {
+                return crate::core::review_state::annotate_report(content, format, &summary);
+            }
         }
+        content
     }
 
-    /// The review notes and the review summary of `items` that a report carries, with the
-    /// compared folders' paths in their text replaced by the names of their sides when reports
-    /// hide them.
-    fn report_review<'a>(
+    fn report_redact(&self, cfg: &Config) -> crate::core::html_report::Redact {
+        let display: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
+        crate::core::html_report::Redact::new(cfg.report_hide_paths, &self.roots, &display)
+    }
+
+    fn report_review_notes(&self, cfg: &Config) -> BTreeMap<String, String> {
+        let redact = self.report_redact(cfg);
+        self.notes
+            .iter()
+            .map(|(path, note)| (redact.apply(path), redact.apply(note)))
+            .collect()
+    }
+
+    fn report_review_summary<'a>(
         &self,
         cfg: &Config,
         items: impl Iterator<Item = &'a DirItem>,
-    ) -> (
-        BTreeMap<String, String>,
-        Option<crate::core::review_state::Summary>,
-    ) {
-        let display: Vec<PathBuf> = self.display_roots.iter().map(PathBuf::from).collect();
-        let redact =
-            crate::core::html_report::Redact::new(cfg.report_hide_paths, &self.roots, &display);
-        let notes = self
-            .notes
-            .iter()
-            .map(|(path, note)| (redact.apply(path), redact.apply(note)))
-            .collect();
+    ) -> Option<crate::core::review_state::Summary> {
+        if self.workspace.entries.is_empty() {
+            return None;
+        }
+        let summary = self
+            .workspace
+            .summary(items.filter(|i| !i.is_dir).map(|i| i.rel_path()));
+        if !cfg.report_hide_paths {
+            return Some(summary);
+        }
         // A summary whose paths cannot be hidden is left out rather than shown with them.
-        let summary = (!self.workspace.entries.is_empty())
-            .then(|| {
-                let summary = self
-                    .workspace
-                    .summary(items.filter(|i| !i.is_dir).map(|i| i.rel_path()));
-                if !cfg.report_hide_paths {
-                    return Some(summary);
-                }
-                let mut value = serde_json::to_value(&summary).ok()?;
-                redact_strings(&mut value, &redact);
-                serde_json::from_value(value).ok()
-            })
-            .flatten();
-        (notes, summary)
+        let mut value = serde_json::to_value(&summary).ok()?;
+        redact_strings(&mut value, &self.report_redact(cfg));
+        serde_json::from_value(value).ok()
     }
 
     pub fn set_recursive(&mut self, recursive: bool) {
@@ -2985,29 +2984,21 @@ impl FolderView {
         let (roots, dopts) = (self.roots.clone(), self.dopts.clone());
         let rules = self.used_rules().to_string();
         let info = self.report_info(cfg);
-        let (notes, review_summary) = self.report_review(cfg, items.iter());
+        let notes = self.report_review_notes(cfg);
         let temps = self.temps.clone();
         move || {
             let _keep_alive = temps;
             let refs: Vec<&DirItem> = items.iter().collect();
-            let content = crate::core::review::annotate_report(
+            crate::core::review::annotate_report(
                 report::folder_html_with_diffs(&refs, &roots, &display, &dopts, &rules, &info),
                 ReportFormat::Html,
                 &notes,
-            );
-            match review_summary {
-                Some(summary) => crate::core::review_state::annotate_report(
-                    content,
-                    ReportFormat::Html,
-                    &summary,
-                ),
-                None => content,
-            }
+            )
         }
     }
 
     /// Makes the PDF report of the listed items with the differences of every changed text
-    /// file, review notes and the review summary, as the HTML report with differences; it reads
+    /// file, review notes and the review summary; it reads
     /// every changed file, so it runs on another thread.
     pub fn pdf_job(
         &self,
@@ -3025,7 +3016,8 @@ impl FolderView {
         let (roots, dopts) = (self.roots.clone(), self.dopts.clone());
         let rules = self.used_rules().to_string();
         let info = self.report_info(cfg);
-        let (notes, review_summary) = self.report_review(cfg, items.iter());
+        let notes = self.report_review_notes(cfg);
+        let review_summary = self.report_review_summary(cfg, items.iter());
         let mut sections = Vec::new();
         if !notes.is_empty() {
             sections.push(Section {
@@ -3076,24 +3068,16 @@ impl FolderView {
         let (roots, dopts) = (self.roots.clone(), self.dopts.clone());
         let rules = self.used_rules().to_string();
         let info = self.report_info(cfg);
-        let (notes, review_summary) = self.report_review(cfg, items.iter());
+        let notes = self.report_review_notes(cfg);
         let temps = self.temps.clone();
         move || {
             let _keep_alive = temps;
             let refs: Vec<&DirItem> = items.iter().collect();
-            let content = crate::core::review::annotate_report(
+            crate::core::review::annotate_report(
                 report::folder_slideshow(&refs, &roots, &display, &dopts, &rules, &info),
                 ReportFormat::Html,
                 &notes,
-            );
-            match review_summary {
-                Some(summary) => crate::core::review_state::annotate_report(
-                    content,
-                    ReportFormat::Html,
-                    &summary,
-                ),
-                None => content,
-            }
+            )
         }
     }
 
@@ -5206,10 +5190,25 @@ mod tests {
         let right = b.path().display().to_string();
         v.notes
             .insert("a.txt".into(), format!("checked against {right}"));
+        v.workspace.entries.insert(
+            "a.txt".into(),
+            crate::core::review_state::Decision {
+                comment: "workspace decision metadata".into(),
+                ..Default::default()
+            },
+        );
         cfg.report_hide_paths = true;
-        let slides = v.slideshow_job(&cfg)();
-        assert!(slides.contains("checked against"), "no note in {slides}");
-        assert!(!slides.contains(&right), "{right} shows in {slides}");
+        for html in [
+            v.report(ReportFormat::Html, &cfg),
+            v.report_with_diffs_job(&cfg)(),
+            v.slideshow_job(&cfg)(),
+        ] {
+            assert!(html.contains("checked against"));
+            assert!(!html.contains(&right));
+            assert!(!html.contains("review-summary"));
+            assert!(!html.contains("workspace decision metadata"));
+        }
+        assert!(v.report(ReportFormat::Xml, &cfg).contains("<review-summary"));
         cfg.report_hide_paths = false;
         assert!(v.slideshow_job(&cfg)().contains(&crate::core::report::esc(&right)));
     }

@@ -1141,6 +1141,7 @@
   "table.formatted_values": "Valeurs formatées",
   "table.ignore_order": "Ignorer l'ordre des lignes",
   "table.record": "Enregistrement",
+  "table.merged_range": "Cellules fusionnées {range}",
   "table.report_title": "Lignes appariées par clé",
   "table.show_ambiguous": "Ligne ambiguë suivante",
   "table.column": "Colonne",

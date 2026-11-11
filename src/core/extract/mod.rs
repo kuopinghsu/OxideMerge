@@ -93,12 +93,29 @@ impl Kind {
     }
 
     /// Reads the file at `path` as text, giving up once `cancel` is set.
+    #[cfg(test)]
     pub fn read(self, path: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
+        self.read_with_merges(path, cancel).map(|(text, _)| text)
+    }
+
+    /// Reads the extracted text and the table coordinates of any worksheet merges.
+    pub fn read_with_merges(
+        self,
+        path: &Path,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(String, TableMerges)> {
         let mut pages = None;
+        let mut merges = TableMerges::default();
         let text = match self {
             Kind::Document => document(path, cancel),
             Kind::Rtf => rtf(path),
-            Kind::Spreadsheet => spreadsheet(path, cancel),
+            Kind::Spreadsheet => match super::text::extension(path).as_str() {
+                "ods" => part(path, "content.xml").and_then(|xml| ods(&xml, cancel, false)),
+                _ => xlsx(path, cancel, false).map(|(text, ranges)| {
+                    merges = ranges;
+                    text
+                }),
+            },
             Kind::Elf => elf(path),
             Kind::Pdf => pdf_text(path, cancel).map(|(text, starts)| {
                 pages = Some(starts);
@@ -116,7 +133,7 @@ impl Kind {
         if let Some(starts) = pages {
             remember_pages(path, (starts, super::text::lines(&text).count()));
         }
-        Ok(text)
+        Ok((text, merges))
     }
 }
 
@@ -522,10 +539,153 @@ pub fn pdf_pages(path: &Path, cancel: Option<&AtomicBool>) -> Result<Pages> {
 
 // ---------- spreadsheets ----------
 
-fn spreadsheet(path: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
-    match super::text::extension(path).as_str() {
-        "ods" => ods(&part(path, "content.xml")?, cancel, false),
-        _ => xlsx(path, cancel, false),
+/// A rectangle in a worksheet, with zero-based, inclusive corners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MergeRange {
+    first: (usize, usize),
+    last: (usize, usize),
+}
+
+impl MergeRange {
+    fn parse(reference: &str) -> Option<Self> {
+        let (a, b) = reference.split_once(':')?;
+        let (a, b) = (cell_at(a)?, cell_at(b)?);
+        let first = (a.0.min(b.0), a.1.min(b.1));
+        let last = (a.0.max(b.0), a.1.max(b.1));
+        (first != last).then_some(Self { first, last })
+    }
+}
+
+/// A worksheet merge and the table record corresponding to row 1 of that worksheet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableMerge {
+    pub sheet_start: usize,
+    pub first: (usize, usize),
+    pub last: (usize, usize),
+    visible_last: (usize, usize),
+}
+
+impl TableMerge {
+    #[cfg(test)]
+    pub fn new(sheet_start: usize, first: (usize, usize), last: (usize, usize)) -> Self {
+        Self {
+            sheet_start,
+            first,
+            last,
+            visible_last: last,
+        }
+    }
+
+    pub fn first_record(self) -> usize {
+        self.sheet_start + self.first.0
+    }
+
+    fn last_record(self) -> usize {
+        self.sheet_start + self.visible_last.0
+    }
+}
+
+/// Merges ordered by their first record, with an index of the latest end in each subtree.
+#[derive(Clone, Debug, Default)]
+pub struct TableMerges {
+    ranges: std::sync::Arc<[TableMerge]>,
+    latest_end: std::sync::Arc<[usize]>,
+    /// Blank records added to show the parts of merges beyond the last written row.
+    padding: std::sync::Arc<[std::ops::Range<usize>]>,
+}
+
+impl TableMerges {
+    pub fn new(mut ranges: Vec<TableMerge>, padding: Vec<std::ops::Range<usize>>) -> Self {
+        ranges.sort_unstable_by_key(|m| (m.first_record(), m.first.1));
+        let leaves = ranges.len().next_power_of_two();
+        let mut latest_end = vec![0; 2 * leaves];
+        for (i, merge) in ranges.iter().enumerate() {
+            latest_end[leaves + i] = merge.last_record();
+        }
+        for i in (1..leaves).rev() {
+            latest_end[i] = latest_end[2 * i].max(latest_end[2 * i + 1]);
+        }
+        Self {
+            ranges: ranges.into(),
+            latest_end: latest_end.into(),
+            padding: padding.into(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    pub fn width(&self, sheet_start: Option<usize>) -> usize {
+        let ranges = match sheet_start {
+            Some(start) => {
+                let first = self.ranges.partition_point(|m| m.sheet_start < start);
+                let count = self.ranges[first..].partition_point(|m| m.sheet_start == start);
+                &self.ranges[first..first + count]
+            }
+            None => &self.ranges,
+        };
+        ranges
+            .iter()
+            .map(|m| m.visible_last.1 + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The merge covering a cell or spanning the records on either side of an aligned gap.
+    pub fn covering(&self, (first, last): (usize, usize), column: usize) -> Option<TableMerge> {
+        self.find_spanning(first, last, |m| (m.first.1..=m.last.1).contains(&column))
+    }
+
+    pub fn covers_row(&self, record: usize) -> bool {
+        self.find_spanning(record, record, |_| true).is_some()
+    }
+
+    /// A row covered from above or added to reach the end of a merged range.
+    pub fn extends_to(&self, record: usize) -> bool {
+        self.is_padding(record)
+            || record
+                .checked_sub(1)
+                .is_some_and(|previous| self.find_spanning(previous, record, |_| true).is_some())
+    }
+
+    pub fn is_padding(&self, record: usize) -> bool {
+        let padding = self.padding.partition_point(|range| range.end <= record);
+        self.padding
+            .get(padding)
+            .is_some_and(|r| r.contains(&record))
+    }
+
+    pub fn padding(&self) -> &[std::ops::Range<usize>] {
+        &self.padding
+    }
+
+    fn find_spanning(
+        &self,
+        first: usize,
+        last: usize,
+        mut matches: impl FnMut(TableMerge) -> bool,
+    ) -> Option<TableMerge> {
+        let stop = self.ranges.partition_point(|m| m.first_record() <= first);
+        self.find_in_subtree(1, 0..self.latest_end.len() / 2, (stop, last), &mut matches)
+    }
+
+    fn find_in_subtree(
+        &self,
+        node: usize,
+        records: std::ops::Range<usize>,
+        (stop, last): (usize, usize),
+        matches: &mut impl FnMut(TableMerge) -> bool,
+    ) -> Option<TableMerge> {
+        if records.start >= stop || self.latest_end[node] < last {
+            return None;
+        }
+        if records.len() == 1 {
+            return self.ranges.get(records.start).copied().filter(|&m| matches(m));
+        }
+        let mid = records.start + records.len() / 2;
+        self.find_in_subtree(2 * node, records.start..mid, (stop, last), matches)
+            .or_else(|| self.find_in_subtree(2 * node + 1, mid..records.end, (stop, last), matches))
     }
 }
 
@@ -536,6 +696,7 @@ pub struct OtherCells {
     pub text: String,
     /// Whether `text` has the values as shown rather than as stored.
     pub shown: bool,
+    pub sheet_merges: TableMerges,
 }
 
 /// The records of the spreadsheet at `path` read the other way, as [`OtherCells`] says.
@@ -544,11 +705,16 @@ pub fn other_cells(path: &Path, cancel: Option<&AtomicBool>) -> Result<OtherCell
         "ods" => OtherCells {
             text: cut(ods(&part(path, "content.xml")?, cancel, true)?),
             shown: false,
+            sheet_merges: TableMerges::default(),
         },
-        _ => OtherCells {
-            text: cut(xlsx(path, cancel, true)?),
-            shown: true,
-        },
+        _ => {
+            let (text, sheet_merges) = xlsx(path, cancel, true)?;
+            OtherCells {
+                text: cut(text),
+                shown: true,
+                sheet_merges,
+            }
+        }
     })
 }
 
@@ -570,6 +736,10 @@ fn sheet_heading(name: &str) -> String {
 
 /// The most columns a row is read as; as many as the widest spreadsheet programs allow.
 const MAX_COLUMNS: usize = 16_384;
+const MAX_XLSX_ROWS: usize = 1_048_576;
+// Merge geometry alone can describe an entire worksheet with one XML element.
+const MAX_MERGE_PADDING_ROWS: usize = 1_024;
+const MAX_MERGE_PADDING_COLUMNS: usize = 128;
 
 /// How many more copies of `line` fit when `used` bytes are already read, at least one.
 fn copies_that_fit(line: &str, used: usize, wanted: usize) -> usize {
@@ -621,9 +791,18 @@ fn column_of(reference: &str) -> Option<usize> {
     Some(n - 1)
 }
 
+/// A reference such as `B12` as a zero-based row and column.
+fn cell_at(reference: &str) -> Option<(usize, usize)> {
+    let reference = reference.trim_start_matches('$');
+    let col = column_of(reference)?;
+    let digits = reference.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+    let row: usize = digits.trim_start_matches('$').parse().ok()?;
+    Some((row.checked_sub(1)?, col))
+}
+
 /// The sheets of the workbook at `path` as comma separated records, with numbers as stored, or
 /// as their number formats show them when `shown` is set.
-fn xlsx(path: &Path, cancel: Option<&AtomicBool>, shown: bool) -> Result<String> {
+fn xlsx(path: &Path, cancel: Option<&AtomicBool>, shown: bool) -> Result<(String, TableMerges)> {
     let formats = if shown {
         Some(markdown::number_formats(path, cancel)?)
     } else {
@@ -638,6 +817,10 @@ fn xlsx(path: &Path, cancel: Option<&AtomicBool>, shown: bool) -> Result<String>
         relationships(&optional_part(path, "xl/_rels/workbook.xml.rels")?.unwrap_or_default());
     let sheets = workbook_sheets(&part(path, "xl/workbook.xml")?)?;
     let mut out = String::new();
+    let mut merges = Vec::new();
+    let mut padding = Vec::new();
+    let mut padding_left = MAX_MERGE_PADDING_ROWS;
+    let mut record_count = 0;
     let many = sheets.len() > 1;
     let mut found = false;
     for (name, id) in &sheets {
@@ -655,10 +838,27 @@ fn xlsx(path: &Path, cancel: Option<&AtomicBool>, shown: bool) -> Result<String>
         found = true;
         if many {
             out.push_str(&sheet_heading(name));
+            record_count += 1;
         }
-        out.push_str(&sheet(&xml, &shared, formats, out.len(), cancel)?);
+        let sheet = sheet(&xml, &shared, formats, out.len(), padding_left, cancel)?;
+        merges.extend(sheet.merges.into_iter().map(|range| TableMerge {
+            sheet_start: record_count,
+            first: range.first,
+            last: range.last,
+            visible_last: (
+                range.last.0.min(sheet.records - 1),
+                range.last.1.min(sheet.width - 1),
+            ),
+        }));
+        if sheet.written < sheet.records {
+            padding.push(record_count + sheet.written..record_count + sheet.records);
+            padding_left -= sheet.records - sheet.written;
+        }
+        record_count += sheet.records;
+        out.push_str(&sheet.text);
         if many {
             out.push('\n');
+            record_count += 1;
         }
         if out.len() > MAX_OUTPUT {
             break;
@@ -670,7 +870,7 @@ fn xlsx(path: &Path, cancel: Option<&AtomicBool>, shown: bool) -> Result<String>
     if !found {
         bail!("none of the sheets the workbook lists is in the file");
     }
-    Ok(out)
+    Ok((out, TableMerges::new(merges, padding)))
 }
 
 /// The part a relationship of a part in `folder` leads to: a target that starts with `/` is
@@ -808,6 +1008,14 @@ fn shared_strings(xml: &[u8]) -> Result<Vec<String>> {
     Ok(out)
 }
 
+struct Worksheet {
+    text: String,
+    records: usize,
+    written: usize,
+    width: usize,
+    merges: Vec<MergeRange>,
+}
+
 /// One worksheet as comma separated records, when `used` bytes of the workbook are already read:
 /// its numbers as stored, or in the number formats `formats` gives with whether the workbook
 /// counts dates from 1904.
@@ -816,8 +1024,9 @@ fn sheet(
     shared: &[String],
     formats: Option<(&markdown::NumberFormats, bool)>,
     used: usize,
+    padding_left: usize,
     cancel: Option<&AtomicBool>,
-) -> Result<String> {
+) -> Result<Worksheet> {
     let source = String::from_utf8_lossy(xml).into_owned();
     let mut reader = quick_xml::NsReader::from_str(&source);
     reader.config_mut().trim_text(false);
@@ -825,6 +1034,9 @@ fn sheet(
     // an empty cell, most of all — is not missed by code that waits for its end.
     reader.config_mut().expand_empty_elements = true;
     let mut out = String::new();
+    let mut records = 0;
+    let mut width = 0;
+    let mut merges = Vec::new();
     let mut cells: Vec<String> = Vec::new();
     let mut column = 0usize;
     // The number of the row the next one is when the sheet leaves none out, from one.
@@ -857,8 +1069,11 @@ fn sheet(
                         if let Some(number) = number.filter(|&n| n > next_row) {
                             let gap = copies_that_fit("\n", used + out.len(), number - next_row);
                             out.push_str(&"\n".repeat(gap));
+                            records += gap;
                         }
-                        next_row = number.map_or(next_row, |n| n.max(next_row)) + 1;
+                        next_row = number
+                            .map_or(next_row, |n| n.max(next_row))
+                            .saturating_add(1);
                     }
                     "c" => {
                         column = attribute(e, "r")
@@ -876,6 +1091,15 @@ fn sheet(
                     // The words of an inline string may be in several runs, each with its own.
                     "t" => in_value = true,
                     "rPh" => phonetic += 1,
+                    "mergeCell" => {
+                        if let Some(range) = attribute(e, "ref")
+                            .as_deref()
+                            .and_then(MergeRange::parse)
+                            .filter(|m| m.last.0 < MAX_XLSX_ROWS && m.last.1 < MAX_COLUMNS)
+                        {
+                            merges.push(range);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -926,7 +1150,12 @@ fn sheet(
                         }
                         value.clear();
                     }
-                    "row" => out.push_str(&record(&trim_record(std::mem::take(&mut cells)))),
+                    "row" => {
+                        let cells = trim_record(std::mem::take(&mut cells));
+                        width = width.max(cells.len());
+                        out.push_str(&record(&cells));
+                        records += 1;
+                    }
                     _ => {}
                 }
             }
@@ -938,7 +1167,23 @@ fn sheet(
             break;
         }
     }
-    Ok(out)
+    // XLSX can omit empty rows at the end of a merged region from sheetData.
+    let written = records;
+    let width = (width + MAX_MERGE_PADDING_COLUMNS).min(MAX_COLUMNS);
+    let padding = MAX_OUTPUT
+        .saturating_sub(used + out.len())
+        .min(padding_left);
+    merges.retain(|m| m.first.0 < written + padding && m.first.1 < width);
+    if let Some(last) = merges.iter().map(|m| m.last.0).max() {
+        records += (last + 1).saturating_sub(written).min(padding);
+    }
+    Ok(Worksheet {
+        text: out,
+        records,
+        written,
+        width,
+        merges,
+    })
 }
 
 /// An OpenDocument spreadsheet `content.xml` as comma separated records: its cells as shown, or
@@ -2074,6 +2319,104 @@ mod tests {
             super::super::table::delimiter_of_doc(&doc, &opts),
             Some(',')
         );
+    }
+
+    #[test]
+    fn xlsm_merges_keep_sparse_rows_and_use_record_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = r#"<row r="1"><c r="A1" t="inlineStr"><is><t>line
+break</t></is></c></row>"#;
+        let second = r#"<row r="2"><c r="B2"><v>1</v></c><c r="D2"><v>99</v></c></row>"#;
+        let mut parts = workbook(&[("First", first), ("Second", second)], &[]);
+        let sheet = &mut parts
+            .iter_mut()
+            .find(|(part, _)| part == "xl/worksheets/sheet2.xml")
+            .unwrap()
+            .1;
+        *sheet = sheet.replace(
+            "</worksheet>",
+            r#"<mergeCells><mergeCell ref="B2:D4"/></mergeCells></worksheet>"#,
+        );
+        let borrowed: Vec<_> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let path = zipped(dir.path(), "book.xlsm", &borrowed);
+        let (text, merges) = Kind::Spreadsheet.read_with_merges(&path, None).unwrap();
+        let table = super::super::table::Table::parse(text.clone(), ',').unwrap();
+        assert_eq!(table.records[1].cells, ["line\nbreak"]);
+        assert_eq!(table.records[5].cells, ["", "1", "", "99"]);
+        assert_eq!(table.records.len(), 7);
+        let table = table.with_spreadsheet_merges(&merges);
+        assert_eq!(table.source, text);
+        assert_eq!(table.records[5].cells, ["", "1"]);
+        assert!(table.records[7].cells.is_empty());
+        assert_eq!(
+            merges.covering((5, 7), 3),
+            Some(TableMerge::new(4, (1, 1), (3, 3)))
+        );
+    }
+
+    #[test]
+    fn a_long_merge_does_not_force_scanning_expired_ranges() {
+        let rows = 20_000;
+        let long = TableMerge::new(0, (0, 0), (rows - 1, 0));
+        let short = |row| TableMerge::new(0, (row, 1), (row, 2));
+        let merges = TableMerges::new(
+            std::iter::once(long).chain((0..rows).map(short)).collect(),
+            Vec::new(),
+        );
+        for row in 0..rows {
+            assert_eq!(merges.covering((row, row), 2), Some(short(row)));
+            assert_eq!(merges.covering((row, row), 3), None);
+        }
+        assert_eq!(merges.covering((0, rows - 1), 0), Some(long));
+        assert_eq!(merges.covering((0, rows - 1), 2), None);
+    }
+
+    #[test]
+    fn a_whole_sheet_merge_has_bounded_table_extents() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parts = workbook(
+            &[("Only", r#"<row r="1"><c r="A1"><v>1</v></c></row>"#)],
+            &[],
+        );
+        let xml = &mut parts.last_mut().unwrap().1;
+        *xml = xml.replace(
+            "</worksheet>",
+            r#"<mergeCells><mergeCell ref="A1:XFD1048576"/></mergeCells></worksheet>"#,
+        );
+        let unreachable = xml.replace("A1:XFD1048576", "A1048575:A1048576");
+        let distant = sheet(
+            unreachable.as_bytes(),
+            &[],
+            None,
+            0,
+            MAX_MERGE_PADDING_ROWS,
+            None,
+        )
+        .unwrap();
+        assert_eq!(distant.records, distant.written);
+        assert!(distant.merges.is_empty());
+
+        let borrowed: Vec<_> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let path = zipped(dir.path(), "whole-sheet.xlsx", &borrowed);
+        let (text, merges) = Kind::Spreadsheet.read_with_merges(&path, None).unwrap();
+        assert_eq!(text, "1\n");
+        assert_eq!(
+            merges.padding(),
+            std::slice::from_ref(&(1..1 + MAX_MERGE_PADDING_ROWS))
+        );
+        assert_eq!(merges.width(None), 1 + MAX_MERGE_PADDING_COLUMNS);
+        assert_eq!(
+            merges.covering((0, 0), 0).unwrap().last,
+            (MAX_XLSX_ROWS - 1, MAX_COLUMNS - 1)
+        );
+        let beyond = MAX_MERGE_PADDING_ROWS + 1;
+        assert!(merges.covering((beyond, beyond), 0).is_none());
     }
 
     #[test]

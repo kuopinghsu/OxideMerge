@@ -1141,6 +1141,7 @@
   "table.formatted_values": "格式化的值",
   "table.ignore_order": "忽略行顺序",
   "table.record": "记录",
+  "table.merged_range": "合并单元格 {range}",
   "table.report_title": "按键匹配的行",
   "table.show_ambiguous": "下一个不明确的行",
   "table.column": "列",

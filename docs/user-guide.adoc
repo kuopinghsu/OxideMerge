@@ -1367,6 +1367,16 @@ letters, or by their names when the first row is the header.
   kbd:[Ctrl+End] select the first and the last record.
 * *Go to line* uses the line numbers of the file.
 
+In an Excel workbook (`.xlsx` or `.xlsm`), a vertical merge continues across the rows it covers,
+including gaps created by alignment. Horizontal continuations are shaded and marked in their
+own pane so that compared columns stay side by side. The anchor displays the value. Hover over
+a merged cell to see its range, such as `B2:D4`, or select it to see the ranges in the bar above
+the table.
+The table treats covered cells as empty and compares cell values. A change to the merge range
+alone adds no difference. A very large merge can extend beyond the grid, while its range label
+still gives the worksheet coordinates. Open the two sample `docs/budget.xlsx` files and select
+the *Merged Cells* tab to see matching, overlapping and disjoint ranges.
+
 When you edit a cell, OxideMerge preserves the quotes and line endings outside that field, and you
 can undo and redo the change.
 Converted or read-only documents cannot be edited.
@@ -3255,6 +3265,8 @@ To share a folder report without the paths of your folders, turn on
 *File → Export → Hide folder paths in reports* (`--report-hide-paths` on the command line).
 The report then names the folders by their sides, and their paths appear nowhere in it, review
 notes and the review summary included.
+HTML reports include review notes. Use *Export review summary…* in the review panel to share
+the workspace summary as a separate JSON file.
 File names and the differences shown can still be sensitive, so check the report before you
 share it.
 

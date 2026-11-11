@@ -1141,6 +1141,7 @@
   "table.formatted_values": "Formatted values",
   "table.ignore_order": "Ignore row order",
   "table.record": "Record",
+  "table.merged_range": "Merged cells {range}",
   "table.report_title": "Rows matched by key",
   "table.show_ambiguous": "Next ambiguous row",
   "table.column": "Column",

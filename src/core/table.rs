@@ -87,6 +87,8 @@ pub struct Record {
 pub struct Table {
     pub source: String,
     pub records: Vec<Record>,
+    /// Byte spans of stored fields hidden by merges, in source order.
+    covered_fields: Vec<std::ops::Range<usize>>,
 }
 
 /// Reconstructs the actual terminators, even when ordinary text editing normalizes EOLs.
@@ -196,7 +198,76 @@ impl Table {
             line += 1;
             start_line = line;
         }
-        Ok(Self { source, records })
+        Ok(Self {
+            source,
+            records,
+            covered_fields: Vec::new(),
+        })
+    }
+
+    /// Applies merge geometry to table values while retaining the original source and spans.
+    pub fn with_spreadsheet_merges(mut self, merges: &super::extract::TableMerges) -> Self {
+        self.add_merge_rows(merges);
+        if merges.is_empty() {
+            return self;
+        }
+        for (index, record) in self.records.iter_mut().enumerate() {
+            if record.cells.is_empty() || !merges.covers_row(index) {
+                continue;
+            }
+            let mut cleared = false;
+            for (column, cell) in record.cells.iter_mut().enumerate() {
+                if !cell.is_empty()
+                    && merges
+                        .covering((index, index), column)
+                        .is_some_and(|merge| {
+                            index != merge.first_record() || column != merge.first.1
+                        })
+                {
+                    cell.clear();
+                    self.covered_fields.push(record.fields[column].clone());
+                    cleared = true;
+                }
+            }
+            if cleared {
+                while record.cells.len() > 1 && record.cells.last().is_some_and(String::is_empty) {
+                    record.cells.pop();
+                }
+                if record.cells.len() < record.fields.len() {
+                    let tail = record.fields[record.cells.len()].start - 1
+                        ..record.fields.last().unwrap().end;
+                    let keep = self.covered_fields.partition_point(|field| field.end <= tail.start);
+                    self.covered_fields.truncate(keep);
+                    self.covered_fields.push(tail);
+                }
+            }
+        }
+        self
+    }
+
+    /// Blank worksheet rows beyond the last written record have no physical text or fields.
+    fn add_merge_rows(&mut self, merges: &super::extract::TableMerges) {
+        if merges.padding().is_empty() {
+            return;
+        }
+        let mut written = std::mem::take(&mut self.records).into_iter();
+        let mut records = Vec::<Record>::new();
+        for range in merges.padding() {
+            let before = range.start - records.len();
+            if before > written.len() {
+                // The extraction can truncate a worksheet before the range starts.
+                break;
+            }
+            records.extend(written.by_ref().take(before));
+            let line = records.last().map_or(0, |r| r.lines.end);
+            records.resize_with(range.end, || Record {
+                lines: line..line,
+                cells: Vec::new(),
+                fields: Vec::new(),
+            });
+        }
+        records.extend(written);
+        self.records = records;
     }
 
     pub fn replace_cell(
@@ -267,7 +338,18 @@ impl Table {
                     .unwrap_or(table.source.len())
         };
         let destination = span(self, lines);
-        let mut value = source.source[span(source, source_lines)].to_string();
+        let from = span(source, source_lines);
+        let first = source.covered_fields.partition_point(|field| field.end <= from.start);
+        let mut value = String::new();
+        let mut at = from.start;
+        for field in &source.covered_fields[first..] {
+            if field.start >= from.end {
+                break;
+            }
+            value.push_str(&source.source[at..field.start.max(at)]);
+            at = field.end.min(from.end);
+        }
+        value.push_str(&source.source[at..from.end]);
         if !value.is_empty() {
             if destination.end < self.source.len() && !value.ends_with(['\r', '\n']) {
                 value.push_str(eol);
@@ -281,10 +363,28 @@ impl Table {
         result
     }
 
+    /// Physical lines occupied by a record range, or its insertion point when empty.
+    pub fn record_lines(&self, records: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let start = self.records.get(records.start).map_or_else(
+            || self.records.last().map_or(0, |r| r.lines.end),
+            |r| r.lines.start,
+        );
+        let end = if records.is_empty() {
+            start
+        } else {
+            self.records[records.end - 1].lines.end
+        };
+        start..end
+    }
+
     pub fn keys(&self, ignore_eol: bool) -> Vec<String> {
         self.records
             .iter()
             .map(|r| {
+                if r.cells.is_empty() {
+                    // A virtual worksheet row compares like a written blank record.
+                    return r#"[""]"#.into();
+                }
                 let cells: Vec<String> = r
                     .cells
                     .iter()
