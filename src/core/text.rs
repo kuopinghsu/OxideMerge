@@ -122,6 +122,8 @@ pub struct TextDoc {
     /// read as text, a formatted copy, a web page): it can be compared but never written back,
     /// so it stays read-only.
     pub compare_only: bool,
+    /// Worksheet merges in the same record coordinates as the extracted spreadsheet text.
+    pub sheet_merges: super::extract::TableMerges,
     pub description: Option<String>,
     /// File extension used to pick syntax highlighting when there is no path.
     pub syntax: Option<String>,
@@ -142,6 +144,7 @@ impl TextDoc {
             modified: false,
             read_only: false,
             compare_only: false,
+            sheet_merges: Default::default(),
             description: None,
             syntax: None,
         }

@@ -16,7 +16,7 @@
 //! paragraphs, lists, tables and figures and the cells a table cell spans.
 
 use super::{
-    check, column_of, optional_part, part, part_name, pdf, read_whole, reference, relationships,
+    cell_at, check, optional_part, part, part_name, pdf, read_whole, reference, relationships,
     shared_strings, MARKUP_COMPATIBILITY, MAX_OUTPUT, SHEET_NS, W,
 };
 use crate::core::web_markdown::{
@@ -1034,14 +1034,6 @@ struct Book<'a> {
     prints: RefCell<HashMap<String, Option<String>>>,
 }
 
-/// A cell reference such as `B12` as a row and column, counting from zero.
-fn cell_at(reference: &str) -> Option<(usize, usize)> {
-    let col = column_of(reference)?;
-    let digits = reference.trim_start_matches(|c: char| c.is_ascii_alphabetic());
-    let row: usize = digits.trim_start_matches('$').parse().ok()?;
-    Some((row.checked_sub(1)?, col))
-}
-
 /// A cell's reference, such as `B12`, from its row and column counting from zero.
 fn cell_name(row: usize, col: usize) -> String {
     let mut letters = String::new();
@@ -1100,12 +1092,11 @@ impl Book<'_> {
                 m.elements()
                     .filter(|e| e.is(SHEET_NS, "mergeCell"))
                     .filter_map(|e| {
-                        let (a, b) = e.attr("ref")?.split_once(':')?;
-                        let (a, b) = (cell_at(a)?, cell_at(b)?);
-                        let top = (a.0.min(b.0), a.1.min(b.1));
+                        let range = super::MergeRange::parse(e.attr("ref")?)?;
+                        let top = range.first;
                         let end = (
-                            a.0.max(b.0).min(MAX_SHEET_ROWS - 1),
-                            a.1.max(b.1).min(MAX_SHEET_COLUMNS - 1),
+                            range.last.0.min(MAX_SHEET_ROWS - 1),
+                            range.last.1.min(MAX_SHEET_COLUMNS - 1),
                         );
                         (top.0 <= end.0 && top.1 <= end.1).then_some((top, end))
                     })

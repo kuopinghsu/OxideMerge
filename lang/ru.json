@@ -1141,6 +1141,7 @@
   "table.formatted_values": "Форматированные значения",
   "table.ignore_order": "Не учитывать порядок строк",
   "table.record": "Запись",
+  "table.merged_range": "Объединённые ячейки {range}",
   "table.report_title": "Строки, сопоставленные по ключу",
   "table.show_ambiguous": "Следующая неоднозначная строка",
   "table.column": "Столбец",

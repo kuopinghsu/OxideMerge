@@ -283,6 +283,8 @@ struct Table {
 
 struct Converter {
     base: Option<Url>,
+    /// The page itself, when comparing its own links by fragment in Formatted view.
+    document_url: Option<Url>,
     /// Whether a `<base href>` set `base`: only the first one counts.
     based: bool,
     blocks: Vec<Block>,
@@ -338,6 +340,23 @@ impl Converter {
             }
             Err(_) => None,
         }
+    }
+
+    fn anchor_to(&self, href: &str) -> Option<String> {
+        let url = self.link_to(href)?;
+        if let Some(document) = self.document_url.as_ref().filter(|_| {
+            decode(href.trim())
+                .trim_start_matches(|c| c <= ' ')
+                .starts_with('#')
+        }) {
+            if let Ok(target) = Url::parse(&url) {
+                let end = url::Position::AfterQuery;
+                if target.fragment().is_some() && target[..end] == document[..end] {
+                    return Some(target[end..].to_owned());
+                }
+            }
+        }
+        Some(url)
     }
 
     fn space(&mut self) {
@@ -748,7 +767,7 @@ impl Converter {
             "a" => {
                 let href = attr(attrs, "href").filter(|h| !h.trim().is_empty());
                 if let (Some(href), false) = (href, self.in_link()) {
-                    if let Some(url) = self.link_to(href) {
+                    if let Some(url) = self.anchor_to(href) {
                         self.open_mark(name, Mark::Link(url));
                     }
                 }
@@ -897,17 +916,27 @@ fn code_language(attrs: &str) -> String {
 /// The page `html` as Markdown blocks, in the order they appear. Links and images are made
 /// absolute against `base`, the page's address. Hidden elements are left out.
 pub fn html_to_blocks(html: &str, base: Option<&Url>) -> Vec<Block> {
-    html_to_blocks_until(html, base, &std::sync::atomic::AtomicBool::new(false)).unwrap_or_default()
+    convert_html(html, base, None, &std::sync::atomic::AtomicBool::new(false)).unwrap_or_default()
 }
 
-/// [`html_to_blocks`], given up (`None`) soon after `abort` is set.
-pub fn html_to_blocks_until(
+/// Converts HTML for Formatted view. Same-page links compare by fragment.
+pub fn formatted_html_to_blocks(
+    html: &str,
+    page: &Url,
+    abort: &std::sync::atomic::AtomicBool,
+) -> Option<Vec<Block>> {
+    convert_html(html, Some(page), Some(page), abort)
+}
+
+fn convert_html(
     html: &str,
     base: Option<&Url>,
+    document_url: Option<&Url>,
     abort: &std::sync::atomic::AtomicBool,
 ) -> Option<Vec<Block>> {
     let mut c = Converter {
         base: base.cloned(),
+        document_url: document_url.cloned(),
         based: false,
         blocks: Vec::new(),
         line: String::new(),
@@ -1610,6 +1639,57 @@ mod tests {
              [Logo](https://example.com/docs/img/logo.png) \
              [pic.jpg](https://example.com/i/pic.jpg) inline"
         );
+    }
+
+    #[test]
+    fn formatted_comparison_compares_same_page_links_by_fragment() {
+        let abort = std::sync::atomic::AtomicBool::new(false);
+        let left = Url::parse("file:///D:/reports/standard.html").unwrap();
+        let right = Url::parse("file:///D:/reports/full.html").unwrap();
+        let html = r##"<p><a href="#entry">Open</a></p>
+            <table><tr><th>File</th></tr><tr><td><a href="#entry">Report</a></td></tr></table>
+            <p>Standard detail</p>"##;
+        let a = formatted_html_to_blocks(html, &left, &abort).unwrap();
+        let b = formatted_html_to_blocks(
+            &html.replace("Standard detail", "Full detail"),
+            &right,
+            &abort,
+        )
+        .unwrap();
+        assert_eq!(a[0].text, "[Open](#entry)");
+        let rows = align(&[a.clone(), b]);
+        assert_eq!(
+            rows.iter().map(|r| r.changed).collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        assert_eq!(
+            html_to_blocks(html, Some(&left))[0].text,
+            "[Open](file:///D:/reports/standard.html#entry)"
+        );
+        let changed =
+            formatted_html_to_blocks(&html.replace("#entry", "#other"), &right, &abort).unwrap();
+        assert!(align(&[a, changed])[0].changed);
+
+        let elsewhere =
+            r##"<head><base href="other.html"></head><p><a href="#entry">Open</a></p>"##;
+        let blocks = formatted_html_to_blocks(elsewhere, &right, &abort).unwrap();
+        assert_eq!(
+            blocks[0].text,
+            "[Open](file:///D:/reports/other.html#entry)"
+        );
+        let explicit = r#"<a href="standard.html#entry">Open</a>"#;
+        let a = formatted_html_to_blocks(explicit, &left, &abort).unwrap();
+        let b = formatted_html_to_blocks(explicit, &right, &abort).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a[0].text, "[Open](file:///D:/reports/standard.html#entry)");
+
+        for href in ["&#32;#entry", "&#9;&#10;#entry"] {
+            let html = format!(r#"<a href="{href}">Open</a>"#);
+            let a = formatted_html_to_blocks(&html, &left, &abort).unwrap();
+            let b = formatted_html_to_blocks(&html, &right, &abort).unwrap();
+            assert_eq!(a[0].text, "[Open](#entry)");
+            assert!(!align(&[a, b])[0].changed);
+        }
     }
 
     #[test]

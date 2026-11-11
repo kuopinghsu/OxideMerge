@@ -156,9 +156,7 @@ impl WebView {
                         let abort = &converting.abort;
                         let blocks = pages
                             .iter()
-                            .map(|p| {
-                                web_markdown::html_to_blocks_until(&p.html, Some(&p.url), abort)
-                            })
+                            .map(|p| web_markdown::formatted_html_to_blocks(&p.html, &p.url, abort))
                             .collect::<Option<Vec<_>>>()
                             .ok_or_else(|| anyhow::anyhow!(tr("msg.aborted")))?;
                         Ok(Loaded::Formatted(
@@ -221,7 +219,8 @@ impl WebView {
         let content = match loaded {
             Loaded::Formatted(pages, prepared) => {
                 let labels = pages.iter().map(label).collect();
-                let mut view = MarkdownView::from_prepared(*prepared, labels);
+                let mut view = MarkdownView::from_prepared(*prepared, labels)
+                    .with_page_urls(pages.iter().map(|page| page.url.clone()).collect());
                 match self.land.take() {
                     Some(true) => view.first_diff(),
                     Some(false) => view.last_diff(),

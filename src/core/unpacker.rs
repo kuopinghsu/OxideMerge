@@ -233,32 +233,34 @@ pub fn load_doc(
     opts: &super::diff::DiffOptions,
     cancel: Option<&AtomicBool>,
 ) -> Result<super::text::TextDoc> {
-    let (bytes, label) = match find(opts, path) {
+    let (bytes, label, merges) = match find(opts, path) {
         Some(Converter::Command(converter)) => {
             let bytes = match cancel {
                 Some(cancel) => converter.run_with(path, Some(cancel))?,
                 None => converter.run(path)?,
             };
-            (bytes, crate::i18n::tr("label.unpacked"))
+            (bytes, crate::i18n::tr("label.unpacked"), Default::default())
         }
         Some(Converter::BuiltIn(kind)) => {
             // A reader is given what anyone sends it, so a mistake in one fails the file
             // rather than the window or the scan that asked for it.
-            let read =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kind.read(path, cancel)))
-                    .unwrap_or_else(|_| {
-                        Err(anyhow::anyhow!(crate::i18n::trf(
-                            "msg.cannot_extract",
-                            &[("file", path.display().to_string())],
-                        )))
-                    });
+            let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                kind.read_with_merges(path, cancel)
+            }))
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(crate::i18n::trf(
+                    "msg.cannot_extract",
+                    &[("file", path.display().to_string())],
+                )))
+            });
             // A notebook is JSON text to begin with: one this can't read (an older or broken
             // one) is still worth comparing as it is.
             let cancelled = cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
             if read.is_err() && kind == super::extract::Kind::Notebook && !cancelled {
                 return super::text::load_doc(path, None);
             }
-            (read?.into_bytes(), crate::i18n::tr(kind.label()))
+            let (text, merges) = read?;
+            (text.into_bytes(), crate::i18n::tr(kind.label()), merges)
         }
         None => return super::text::load_doc(path, None),
     };
@@ -266,6 +268,7 @@ pub fn load_doc(
     // Read from the file rather than being it: what is shown cannot be written back.
     doc.read_only = true;
     doc.compare_only = true;
+    doc.sheet_merges = merges;
     doc.description = Some(format!("{} [{label}]", path.display()));
     Ok(doc)
 }
@@ -282,6 +285,7 @@ pub fn load_compare_doc(
             .and_then(|kind| super::prettify::format(&source, kind))
         {
             doc.lines = super::text::split_lines(&pretty).0;
+            doc.sheet_merges = Default::default();
             doc.read_only = true;
             doc.compare_only = true;
         }

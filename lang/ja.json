@@ -1141,6 +1141,7 @@
   "table.formatted_values": "書式付きの値",
   "table.ignore_order": "行の順序を無視",
   "table.record": "レコード",
+  "table.merged_range": "結合セル {range}",
   "table.report_title": "キーで対応付けた行",
   "table.show_ambiguous": "次のあいまいな行",
   "table.column": "列",

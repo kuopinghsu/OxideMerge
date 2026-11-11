@@ -1141,6 +1141,7 @@
   "table.formatted_values": "Formatierte Werte",
   "table.ignore_order": "Zeilenreihenfolge ignorieren",
   "table.record": "Datensatz",
+  "table.merged_range": "Verbundene Zellen {range}",
   "table.report_title": "Nach Schlüssel zugeordnete Zeilen",
   "table.show_ambiguous": "Nächste mehrdeutige Zeile",
   "table.column": "Spalte",

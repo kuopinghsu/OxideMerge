@@ -1141,6 +1141,7 @@
   "table.formatted_values": "Valores con formato",
   "table.ignore_order": "Ignorar el orden de las filas",
   "table.record": "Registro",
+  "table.merged_range": "Celdas combinadas {range}",
   "table.report_title": "Filas emparejadas por clave",
   "table.show_ambiguous": "Siguiente fila ambigua",
   "table.column": "Columna",

@@ -65,6 +65,8 @@ pub struct MarkdownView {
     shift: f32,
     scroll_to: Option<usize>,
     cache: CommonMarkCache,
+    /// URLs used to open fragment links in the page belonging to the clicked pane.
+    page_urls: Vec<url::Url>,
     /// Set when stepping ran past the last (`true`) or first (`false`) difference.
     pub step_file: Option<bool>,
 }
@@ -135,8 +137,14 @@ impl MarkdownView {
             scroll: 0.0,
             scroll_to: None,
             cache: CommonMarkCache::default(),
+            page_urls: Vec::new(),
             step_file: None,
         }
+    }
+
+    pub fn with_page_urls(mut self, urls: Vec<url::Url>) -> Self {
+        self.page_urls = urls;
+        self
     }
 
     pub fn outcome(&self) -> Outcome {
@@ -458,6 +466,7 @@ impl MarkdownView {
                 heights,
                 tables,
                 cache,
+                page_urls,
                 ..
             } = self;
             let pressed = ui.input(|i| i.pointer.primary_clicked());
@@ -497,6 +506,8 @@ impl MarkdownView {
                         cell.set_clip_rect(column.intersect(ui.clip_rect()));
                         cell.set_width(inner.width());
                         let id = Id::unique(("md_block", i, p));
+                        let page = page_urls.get(p);
+                        let commands = page.map(|_| cell.ctx().output(|out| out.commands.len()));
                         match marks.get(i).and_then(|m| m.get(p)).and_then(Option::as_ref) {
                             Some(Marks::Table(t)) => {
                                 let layout = tables.entry((i, p)).or_default();
@@ -508,6 +519,11 @@ impl MarkdownView {
                                 show_marked(&mut cell, cache, id, &block.text, r, words);
                             }
                             None => show_marked(&mut cell, cache, id, &block.text, &[], words),
+                        }
+                        if let (Some(page), Some(start)) = (page, commands) {
+                            cell.ctx().output_mut(|out| {
+                                resolve_fragment_links(page, &mut out.commands[start..]);
+                            });
                         }
                         height = height.max(cell.min_rect().height() + 2.0 * PAD);
                     }
@@ -584,6 +600,19 @@ impl MarkdownView {
         if relaid {
             // Rows measured anew move the ones below: draw again with the heights settled.
             ui.ctx().request_repaint();
+        }
+    }
+}
+
+/// The viewer emits link clicks as URL commands. Resolve fragments against the clicked pane.
+fn resolve_fragment_links(page: &url::Url, commands: &mut [egui::OutputCommand]) {
+    for command in commands {
+        if let egui::OutputCommand::OpenUrl(open) = command {
+            if open.url.starts_with('#') {
+                if let Ok(url) = page.join(&open.url) {
+                    open.url = url.into();
+                }
+            }
         }
     }
 }
@@ -1054,6 +1083,63 @@ mod tests {
         assert_eq!(fit(&[10.0, 200.0, 300.0], 110.0), [10.0, 50.0, 50.0]);
         // No column gets narrower than the least.
         assert_eq!(fit(&[100.0, 100.0], 20.0), [MIN_COLUMN, MIN_COLUMN]);
+    }
+
+    #[test]
+    fn formatted_fragment_clicks_open_their_own_page() {
+        let pages = [
+            "file:///D:/reports/standard.html",
+            "file:///D:/reports/full.html",
+        ]
+        .map(|url| url::Url::parse(url).unwrap());
+        let mut view = MarkdownView::new(
+            vec![vec![block("[Jump](#entry)")]; 2],
+            vec!["Standard".into(), "Full".into()],
+            &DiffOptions::default(),
+        )
+        .with_page_urls(pages.to_vec());
+        let ctx = egui::Context::default();
+        let colors = crate::ui::theme::colors(false);
+        let mut frame = |events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 400.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| view.ui(ui, &colors, false),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        frame(Vec::new());
+        let output = frame(Vec::new());
+        let mut targets: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(t) if t.galley.job.text == "Jump" => {
+                    Some(t.pos + t.galley.rect.center().to_vec2())
+                }
+                _ => None,
+            })
+            .collect();
+        targets.sort_by(|a, b| a.x.total_cmp(&b.x));
+        assert_eq!(targets.len(), 2);
+        for (target, page) in targets.into_iter().zip(pages) {
+            let button = |pressed| egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(vec![egui::Event::PointerMoved(target), button(true)]);
+            let output = frame(vec![button(false)]);
+            assert!(output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::OpenUrl(open)
+                    if open.url == page.join("#entry").unwrap().as_str())
+            }));
+        }
     }
 
     #[test]

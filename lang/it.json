@@ -1141,6 +1141,7 @@
   "table.formatted_values": "Valori formattati",
   "table.ignore_order": "Ignora l'ordine delle righe",
   "table.record": "Record",
+  "table.merged_range": "Celle unite {range}",
   "table.report_title": "Righe abbinate per chiave",
   "table.show_ambiguous": "Riga ambigua successiva",
   "table.column": "Colonna",
