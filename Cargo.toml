@@ -56,7 +56,7 @@ tempfile = "3"
 trash = "5"
 sys-locale = "0.3"
 ttf-parser = "0.25"
-krilla = { version = "0.8", default-features = false, features = ["simple-text", "raster-images"] }
+krilla = { version = "0.8", default-features = false, features = ["raster-images"] }
 ureq = "3"
 url = "2"
 unicode-segmentation = "1"

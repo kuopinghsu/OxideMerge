@@ -6053,12 +6053,14 @@ fn about_displays_the_build_identifier_and_keeps_the_calendar_copyright_year() {
     let build = env!("OXIDEMERGE_BUILD_ID");
     let date = env!("OXIDEMERGE_BUILD_DATE");
     assert!(gui.shows_text(build));
-    // A release build's id is its date and nothing more; this test binary is never that (see
-    // `build_info::identifier`), so it must show the date *and* the commit it was built from
-    // together, not the commit alone.
-    assert_ne!(build, date, "this test assumes a non-release build");
     assert!(gui.shows_text(date));
-    assert!(gui.shows_text(&format!("{date}, {build}")));
+    // A clean build of the matching version tag has its date as its id and nothing more (see
+    // `build_info::identifier`), and the release workflow runs these tests on such a build.
+    // Any other build must show the date *and* the commit it was built from together, not the
+    // commit alone.
+    if build != date {
+        assert!(gui.shows_text(&format!("{date}, {build}")));
+    }
     let copyright = trf(
         "about.copyright",
         &[
