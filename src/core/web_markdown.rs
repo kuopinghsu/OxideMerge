@@ -1452,14 +1452,22 @@ pub enum Marks {
 pub enum Cell {
     /// Byte ranges of the cell's text; none when it is the same.
     Words(Vec<Range<usize>>),
+    /// A paired cell differs, with changed characters only on the other side.
+    PairedChange,
     /// The whole cell, in a row or column the other page does not have.
     Whole,
 }
 
 impl Cell {
     fn add(&mut self, more: Vec<Range<usize>>) {
-        if let Cell::Words(v) = self {
-            add_ranges(v, more);
+        match self {
+            Cell::Words(v) if more.is_empty() && v.is_empty() => *self = Cell::PairedChange,
+            Cell::Words(v) => add_ranges(v, more),
+            Cell::PairedChange if !more.is_empty() => {
+                *self = Cell::Words(Vec::new());
+                self.add(more);
+            }
+            _ => {}
         }
     }
 }
@@ -1540,6 +1548,13 @@ type TableCells = [Vec<(String, Cell)>];
 /// changed ones with the same first cell, then the rest in order; the cells of rows side by
 /// side are compared column by column.
 fn mark_tables(a: &mut TableCells, b: &mut TableCells, opts: &DiffOptions) {
+    // Cell backgrounds and row markers still need a comparison when word highlights are off.
+    let without_inline = opts.inline == super::diff::InlineMode::Off;
+    let comparison = without_inline.then(|| DiffOptions {
+        inline: super::diff::InlineMode::Word,
+        ..opts.clone()
+    });
+    let compare_opts = comparison.as_ref().unwrap_or(opts);
     let key = |r: &Vec<(String, Cell)>| -> Vec<String> { r.iter().map(|c| c.0.clone()).collect() };
     let ka: Vec<_> = a.iter().map(key).collect();
     let kb: Vec<_> = b.iter().map(key).collect();
@@ -1563,9 +1578,16 @@ fn mark_tables(a: &mut TableCells, b: &mut TableCells, opts: &DiffOptions) {
                 for k in 0..a[i].len().max(b[j].len()) {
                     match (a[i].get_mut(k), b[j].get_mut(k)) {
                         (Some(x), Some(y)) if x.0 != y.0 => {
-                            let (rx, ry) = inline_diff(&x.0, &y.0, opts);
-                            x.1.add(rx);
-                            y.1.add(ry);
+                            let (rx, ry) = inline_diff(&x.0, &y.0, compare_opts);
+                            if !rx.is_empty() || !ry.is_empty() {
+                                if without_inline {
+                                    x.1.add(Vec::new());
+                                    y.1.add(Vec::new());
+                                } else {
+                                    x.1.add(rx);
+                                    y.1.add(ry);
+                                }
+                            }
                         }
                         (Some(x), None) => x.1 = Cell::Whole,
                         (None, Some(y)) => y.1 = Cell::Whole,
@@ -2117,6 +2139,7 @@ mod tests {
                     row.iter()
                         .map(|(text, cell)| match cell {
                             Cell::Whole => format!("[{text}]"),
+                            Cell::PairedChange => text.clone(),
                             Cell::Words(w) if w.is_empty() => text.clone(),
                             Cell::Words(w) => {
                                 let mut s = text.clone();

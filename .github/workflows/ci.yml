@@ -433,6 +433,11 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The mounted checkout belongs to the runner, and checkout trusts it only
+      # under its temporary HOME. build.rs needs Git under the container's HOME.
+      - name: Trust the mounted checkout for the build
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
@@ -523,7 +528,16 @@ jobs:
         run: |
           set -euo pipefail
           app=squashfs-root/AppRun
-          "$app" --version
+          version_output=$("$app" --version)
+          echo "$version_output"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            expected="oxidemerge ${GITHUB_REF_NAME#v} (build "
+            date_pattern='^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\)$'
+            if [[ "$version_output" != "$expected"* || ! "${version_output#"$expected"}" =~ $date_pattern ]]; then
+              echo "::error::Expected the tagged AppImage to report its release version and build date"
+              exit 1
+            fi
+          fi
           mkdir -p left right
           printf 'one\ntwo\n' > left/a.txt
           printf 'one\ntwo\n' > right/a.txt

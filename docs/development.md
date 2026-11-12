@@ -310,7 +310,7 @@ the packages.
 
 ### Release rules
 
-- Pushing a tag such as `v0.9.8` publishes the packages on GitHub Releases.
+- Pushing a tag such as `v0.9.9` publishes the packages on GitHub Releases.
 - The tag must match the version in `Cargo.toml`.
 - `CHANGELOG.md` must have a section for that version.
 - A tag that contains `-`, such as `v1.0.0-rc1`, is published as a pre-release.
@@ -321,36 +321,36 @@ The workflow reads the changelog but does not change it.
 Before publishing, the workflow checks that the release does not exist yet. It also checks
 that all expected packages exist, and no other files. Each release names the source commit
 that it was built from, and GitHub lists the SHA-256 checksum of every file. For version
-0.9.8, a release has exactly these files:
+0.9.9, a release has exactly these files:
 
 ```text
-oxidemerge-0.9.8-linux-arm64.AppImage
-oxidemerge-0.9.8-linux-arm64.tar.gz
-oxidemerge-0.9.8-linux-x64.AppImage
-oxidemerge-0.9.8-linux-x64.tar.gz
-oxidemerge-0.9.8-macos-universal.dmg
-oxidemerge-0.9.8-user-guide.pdf
-oxidemerge-0.9.8-user-guide.zh-TW.pdf
-oxidemerge-0.9.8-windows-arm64.zip
-oxidemerge-0.9.8-windows-x64.zip
+oxidemerge-0.9.9-linux-arm64.AppImage
+oxidemerge-0.9.9-linux-arm64.tar.gz
+oxidemerge-0.9.9-linux-x64.AppImage
+oxidemerge-0.9.9-linux-x64.tar.gz
+oxidemerge-0.9.9-macos-universal.dmg
+oxidemerge-0.9.9-user-guide.pdf
+oxidemerge-0.9.9-user-guide.zh-TW.pdf
+oxidemerge-0.9.9-windows-arm64.zip
+oxidemerge-0.9.9-windows-x64.zip
 ```
 
 ### Publish a release
 
-These steps use version `0.9.8` as an example. Use the version that you want to release.
+These steps use version `0.9.9` as an example. Use the version that you want to release.
 
 1. Change `version` in `Cargo.toml`. Run `cargo build` to update `Cargo.lock`.
-2. Check the `0.9.8` section in `CHANGELOG.md`. In its heading, replace `Unreleased` with
+2. Check the `0.9.9` section in `CHANGELOG.md`. In its heading, replace `Unreleased` with
    the release date in the form `YYYY-MM-DD`.
-3. Run `make fmt-check ci`. Check the release notes with `scripts/release-notes.sh 0.9.8`.
+3. Run `make fmt-check ci`. Check the release notes with `scripts/release-notes.sh 0.9.9`.
    Run `make user-guide-docs`, so that the guides in `docs/dist/` show the new version.
 4. Commit, and push to `main`. Wait until the required CI checks pass on all platforms.
 5. Tag the checked commit and push the tag. First make sure with `git log -1 --oneline`
    that `HEAD` is the commit that passed the checks.
 
    ```sh
-   git tag -a v0.9.8 -m "OxideMerge 0.9.8"
-   git push origin v0.9.8
+   git tag -a v0.9.9 -m "OxideMerge 0.9.9"
+   git push origin v0.9.9
    ```
 
 6. When the workflow finishes, check the new GitHub release. Make sure that all packages
@@ -362,13 +362,13 @@ These steps use version `0.9.8` as an example. Use the version that you want to 
 
 The workflow publishes a release only after all build and test jobs pass. So if one of
 these jobs fails for a release tag, nothing is published, and you can publish the same
-version again from a fixed commit. These steps use `v0.9.8` as an example. Use the version
+version again from a fixed commit. These steps use `v0.9.9` as an example. Use the version
 whose build failed.
 
-1. Make sure that GitHub has no `v0.9.8` release:
+1. Make sure that GitHub has no `v0.9.9` release:
 
    ```sh
-   gh release view v0.9.8
+   gh release view v0.9.9
    ```
 
    This command needs the GitHub CLI, signed in. It must answer `release not found`. You
@@ -377,9 +377,9 @@ whose build failed.
    exists, even with only some files, do not move the tag. See
    [Fix a published release](#fix-a-published-release) instead.
 
-2. Fix the problem on `main`. Keep the version `0.9.8` in `Cargo.toml` and in the
+2. Fix the problem on `main`. Keep the version `0.9.9` in `Cargo.toml` and in the
    changelog. If the release date changes, update it in the changelog heading. Run
-   `make fmt-check ci`, and check the release notes with `scripts/release-notes.sh 0.9.8`.
+   `make fmt-check ci`, and check the release notes with `scripts/release-notes.sh 0.9.9`.
    Commit, and push to `main`. Wait until the required CI checks pass on all platforms.
 
 3. Move the tag to the fixed commit, and push it again:
@@ -388,8 +388,8 @@ whose build failed.
    git switch main
    git pull --ff-only origin main
    git log -1 --oneline
-   git tag -a -f v0.9.8 -m "OxideMerge 0.9.8"
-   git push --force origin v0.9.8
+   git tag -a -f v0.9.9 -m "OxideMerge 0.9.9"
+   git push --force origin v0.9.9
    ```
 
    `git log` must show the commit that passed the checks. The tag push starts a new
@@ -412,7 +412,7 @@ already has a release. Instead, publish a new patch version:
 
 1. Fix the problem on `main`.
 2. Follow the steps in [Publish a release](#publish-a-release) with the next patch
-   version, for example `0.9.9` after `0.9.8`. Describe the fix in the changelog section
+   version, for example `0.9.10` after `0.9.9`. Describe the fix in the changelog section
    of the new version.
 
 Keep the old tag and the files of the old release.

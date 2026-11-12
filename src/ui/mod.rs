@@ -13,6 +13,7 @@ pub mod job_dialog;
 mod macos;
 pub mod markdown_view;
 pub mod palette;
+pub(crate) mod remote_folder;
 pub mod sync_dialog;
 pub mod syntax;
 pub mod text_view;
