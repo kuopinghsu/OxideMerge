@@ -1475,6 +1475,7 @@ struct RemoteDialog {
     user: String,
     sign_in: SignIn,
     password: String,
+    show_password: bool,
     key_path: String,
     passphrase: String,
     remote_path: String,
@@ -1592,6 +1593,7 @@ impl RemoteDialog {
         };
         self.key_path = r.key_path.clone();
         remote::wipe(&mut self.password);
+        self.show_password = false;
         remote::wipe(&mut self.passphrase);
         remote::wipe(&mut self.proxy_password);
         self.proxy = r.proxy.clone();
@@ -1613,6 +1615,7 @@ impl RemoteDialog {
 
     /// Switches to `protocol`, and to its usual port unless another was typed.
     fn set_protocol(&mut self, protocol: remote::Protocol) {
+        self.show_password = false;
         let port = self.port.trim();
         if port.is_empty() || port == self.protocol.default_port().to_string() {
             self.port = protocol.default_port().to_string();
@@ -3351,6 +3354,31 @@ fn path_status_rect(field: egui::Rect) -> egui::Rect {
     )
 }
 
+fn comparison_path_field(
+    ui: &mut egui::Ui,
+    path: &mut String,
+    pending: &[PendingRemote],
+    width: f32,
+) -> egui::Response {
+    // Keep the unique staging key for each connection, but display the path it names.
+    let mut shown = pending
+        .iter()
+        .find(|p| p.list_folder && p.local == Path::new(path))
+        .map(|p| remote::label(&p.file.conn, &p.file.remote_path));
+    let edit = shown.as_mut().unwrap_or(path);
+    let field = ui.add(
+        egui::TextEdit::singleline(edit)
+            .hint_text(egui::RichText::new(tr("dlg.path_hint")).color(pal(ui).text_dim))
+            .margin(PATH_FIELD_MARGIN)
+            .desired_width(width),
+    );
+    if let (true, Some(shown)) = (field.changed(), shown) {
+        *path = shown;
+    }
+    path_status(ui, &field, path);
+    field
+}
+
 /// Options search result: the setting, and the tab it lives on.
 fn option_result_row(ui: &mut egui::Ui, icon: Icon, label: &str, tab: &str) -> egui::Response {
     let p = pal(ui);
@@ -4748,6 +4776,7 @@ impl OxideMergeApp {
             user: String::new(),
             sign_in: SignIn::Password,
             password: String::new(),
+            show_password: false,
             key_path: String::new(),
             passphrase: String::new(),
             remote_path: String::new(),
@@ -4967,11 +4996,52 @@ impl OxideMergeApp {
                                 ui.end_row();
                             } else {
                                 ui.label(tr("label.remote_password"));
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut d.password)
-                                        .password(true)
-                                        .desired_width(220.0),
-                                );
+                                let sftp = d.protocol == remote::Protocol::Sftp;
+                                let mut edit = egui::TextEdit::singleline(&mut d.password)
+                                    .password(!sftp || !d.show_password)
+                                    .desired_width(220.0);
+                                if sftp {
+                                    edit = edit.margin(PATH_FIELD_MARGIN);
+                                }
+                                let field = ui.add(edit);
+                                if sftp {
+                                    let (icon, label) = if d.show_password {
+                                        (Icon::EyeOff, tr("label.hide_remote_password"))
+                                    } else {
+                                        (Icon::Eye, tr("label.show_remote_password"))
+                                    };
+                                    let icon_rect = path_status_rect(field.rect);
+                                    let hit = icon_rect.expand(4.0).intersect(field.rect);
+                                    let toggle = ui
+                                        .interact(hit, field.id.with("visibility"), Sense::click())
+                                        .on_hover_text(label)
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    toggle.widget_info(|| {
+                                        egui::WidgetInfo::labeled(egui::Role::Button, true, label)
+                                    });
+                                    let colors = pal(ui);
+                                    if toggle.hovered() {
+                                        ui.painter().rect_filled(
+                                            hit,
+                                            theme::radius::XS,
+                                            colors.control_hover,
+                                        );
+                                    }
+                                    crate::ui::icons::paint(
+                                        ui.painter(),
+                                        icon_rect,
+                                        icon,
+                                        if toggle.hovered() {
+                                            colors.text
+                                        } else {
+                                            colors.text_dim
+                                        },
+                                    );
+                                    widgets::focus_ring(ui, &toggle, hit, theme::radius::XS);
+                                    if toggle.clicked() {
+                                        d.show_password = !d.show_password;
+                                    }
+                                }
                                 ui.end_row();
                             }
                             ui.label(tr("label.remote_path"));
@@ -10402,15 +10472,12 @@ impl OxideMergeApp {
                             |ui| widgets::side_chip(ui, k, sides),
                         );
                         ui.add_space((60.0 - chip.response.rect.width()).max(0.0));
-                        let field = ui.add(
-                            egui::TextEdit::singleline(&mut self.start_paths[s])
-                                .hint_text(
-                                    egui::RichText::new(tr("dlg.path_hint")).color(p.text_dim),
-                                )
-                                .margin(PATH_FIELD_MARGIN)
-                                .desired_width(field_w),
+                        let field = comparison_path_field(
+                            ui,
+                            &mut self.start_paths[s],
+                            &self.pending_remote,
+                            field_w,
                         );
-                        path_status(ui, &field, &self.start_paths[s]);
                         if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             go = true;
                         }
@@ -10506,15 +10573,8 @@ impl OxideMergeApp {
                             let trailing =
                                 ui.data(|m| m.get_temp::<f32>(trailing_id)).unwrap_or(150.0);
                             let w = *field_w.get_or_insert(ui.available_width() - trailing - 16.0);
-                            let field = ui.add(
-                                egui::TextEdit::singleline(&mut d.paths[s])
-                                    .hint_text(
-                                        egui::RichText::new(tr("dlg.path_hint")).color(p.text_dim),
-                                    )
-                                    .margin(PATH_FIELD_MARGIN)
-                                    .desired_width(w),
-                            );
-                            path_status(ui, &field, &d.paths[s]);
+                            let field =
+                                comparison_path_field(ui, &mut d.paths[s], &self.pending_remote, w);
                             ui.add_space(4.0);
                             let recent_id = egui::Id::unique(("open_recent", s));
                             let r = widgets::icon_button_enabled(

@@ -6,6 +6,8 @@
   "label.remote_user": "ユーザー",
   "label.remote_auth": "認証方法",
   "label.remote_password": "パスワード",
+  "label.show_remote_password": "パスワードを表示",
+  "label.hide_remote_password": "パスワードを隠す",
   "label.remote_key": "秘密鍵",
   "label.remote_key_path": "鍵ファイル",
   "label.remote_passphrase": "パスフレーズ",

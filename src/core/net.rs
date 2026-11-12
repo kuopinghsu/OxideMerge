@@ -209,9 +209,16 @@ pub(crate) fn connect(
 fn direct(host: &str, port: u16, cancel: &AtomicBool) -> Result<std::io::Result<TcpStream>> {
     let addrs = resolve(host, port)?;
     check(cancel)?;
+    // Local services can listen on just one address family. A loopback address that
+    // silently drops connections must not delay trying the other one for 20 seconds.
+    let timeout = if addrs.len() > 1 && addrs.iter().all(|addr| addr.ip().is_loopback()) {
+        Duration::from_millis(250)
+    } else {
+        CONNECT_TIMEOUT
+    };
     let mut tcp = Err(std::io::Error::other("no address"));
     for addr in &addrs {
-        tcp = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT);
+        tcp = TcpStream::connect_timeout(addr, timeout);
         if tcp.is_ok() {
             break;
         }

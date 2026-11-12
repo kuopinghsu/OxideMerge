@@ -38,6 +38,8 @@ pub enum Icon {
     Plus,
     Lock,
     Unlock,
+    Eye,
+    EyeOff,
     Swap,
     Bolt,
     Table,
@@ -68,7 +70,7 @@ pub enum Icon {
 
 #[cfg(test)]
 impl Icon {
-    pub const ALL: [Icon; 54] = [
+    pub const ALL: [Icon; 56] = [
         Icon::First,
         Icon::Prev,
         Icon::Next,
@@ -100,6 +102,8 @@ impl Icon {
         Icon::Plus,
         Icon::Lock,
         Icon::Unlock,
+        Icon::Eye,
+        Icon::EyeOff,
         Icon::Swap,
         Icon::Bolt,
         Icon::Table,
@@ -372,6 +376,26 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 shackle.extend(pen.arc(8.0, 5.0, 2.8, 0.0, -150.0));
             }
             pen.line(&shackle);
+        }
+        Icon::Eye | Icon::EyeOff => {
+            pen.closed(&[
+                (1.0, 8.0),
+                (3.0, 5.5),
+                (5.5, 4.0),
+                (8.0, 3.5),
+                (10.5, 4.0),
+                (13.0, 5.5),
+                (15.0, 8.0),
+                (13.0, 10.5),
+                (10.5, 12.0),
+                (8.0, 12.5),
+                (5.5, 12.0),
+                (3.0, 10.5),
+            ]);
+            pen.circle(8.0, 8.0, 2.0);
+            if icon == Icon::EyeOff {
+                pen.line(&[(2.0, 2.0), (14.0, 14.0)]);
+            }
         }
         Icon::Swap => {
             pen.line(&[(2.5, 5.0), (13.0, 5.0)]);

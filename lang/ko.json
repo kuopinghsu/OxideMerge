@@ -6,6 +6,8 @@
   "label.remote_user": "사용자",
   "label.remote_auth": "인증",
   "label.remote_password": "비밀번호",
+  "label.show_remote_password": "비밀번호 표시",
+  "label.hide_remote_password": "비밀번호 숨기기",
   "label.remote_key": "개인 키",
   "label.remote_key_path": "키 파일",
   "label.remote_passphrase": "암호 구문",
