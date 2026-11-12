@@ -60,6 +60,7 @@ pub struct OpenRequest {
 
 pub enum Content {
     Folder(FolderView),
+    RemoteFolder(Box<super::remote_folder::RemoteFolder>),
     Text(TextView),
     Binary(BinaryView),
     Image(ImageView),
@@ -90,6 +91,7 @@ impl Content {
     fn status_line(&self) -> String {
         match self {
             Content::Folder(v) => v.status_line(),
+            Content::RemoteFolder(v) => v.status_line(),
             Content::Text(v) => v.status_line(),
             Content::Binary(v) => v.status_line(),
             Content::Image(v) => v.status_line(),
@@ -112,6 +114,7 @@ impl Content {
     fn outcome(&self) -> Option<Outcome> {
         match self {
             Content::Folder(v) => Some(v.outcome()),
+            Content::RemoteFolder(_) => None,
             Content::Text(v) => Some(v.outcome()),
             Content::Binary(v) => Some(v.outcome()),
             Content::Image(v) => Some(v.outcome()),
@@ -131,6 +134,7 @@ pub struct Tab {
     descriptions: Vec<Option<String>>,
     /// The folder compare this tab was opened from, for moving on to its next or previous file.
     origin: Option<Origin>,
+    live_folder_origin: Option<(u64, String)>,
     /// Temporary copies of sides (a Git revision, extracted archives, a file or folder fetched
     /// over SFTP), deleted with the last tab showing them: the folder compare and the files
     /// opened from it.
@@ -299,6 +303,7 @@ struct PendingRemote {
     local: PathBuf,
     temp: std::sync::Arc<tempfile::TempDir>,
     file: RemoteFile,
+    list_folder: bool,
 }
 
 #[derive(Clone)]
@@ -371,7 +376,7 @@ impl Tab {
                 proj.kind = Some(kind_name(FileKind::Web).into());
                 proj.read_only = vec![true; v.urls.len()];
             }
-            Content::Diffs(_) => return None,
+            Content::Diffs(_) | Content::RemoteFolder(_) => return None,
         }
         Some(proj)
     }
@@ -402,6 +407,7 @@ impl Tab {
     fn title(&self) -> String {
         match &self.content {
             Content::Folder(v) => v.title(),
+            Content::RemoteFolder(v) => v.title(),
             Content::Text(v) => v.title(),
             Content::Binary(v) => v.title(),
             Content::Image(v) => v.title(),
@@ -412,7 +418,7 @@ impl Tab {
 
     fn icon(&self) -> Icon {
         match &self.content {
-            Content::Folder(_) => Icon::Folder,
+            Content::Folder(_) | Content::RemoteFolder(_) => Icon::Folder,
             Content::Text(_) => Icon::Text,
             Content::Binary(_) => Icon::Binary,
             Content::Image(_) => Icon::Image,
@@ -427,7 +433,7 @@ impl Tab {
         }
         match &self.content {
             Content::Folder(v) => v.has_archive_changes() || v.has_remote_changes(),
-            Content::Web(_) => false,
+            Content::Web(_) | Content::RemoteFolder(_) => false,
             Content::Text(v) => v.is_modified(),
             Content::Binary(v) => v.is_modified(),
             Content::Image(v) => v.is_modified(),
@@ -448,7 +454,7 @@ impl Tab {
                 errors if errors.is_empty() => Ok(()),
                 errors => anyhow::bail!("{}", errors.join("\n")),
             },
-            Content::Web(_) => Ok(()),
+            Content::Web(_) | Content::RemoteFolder(_) => Ok(()),
             Content::Text(v) => v.save_modified(),
             Content::Binary(v) => v.save(),
             Content::Image(v) => v.save(),
@@ -483,6 +489,7 @@ fn content_ui(
             None
         }
         Content::Folder(v) => v.ui(ui, cfg, colors, named),
+        Content::RemoteFolder(_) => None,
         Content::Diffs(v) => {
             v.ui(ui, cfg, colors);
             v.open_request.take()
@@ -1471,6 +1478,7 @@ struct RemoteDialog {
     key_path: String,
     passphrase: String,
     remote_path: String,
+    list_folder: bool,
     /// The server's folders and files, shown to pick `remote_path` from.
     browse: Option<RemoteBrowse>,
     /// A proxy to connect through, and its password when the URL has a user.
@@ -2314,6 +2322,7 @@ enum ViewKind {
     Binary,
     Image,
     Folder,
+    RemoteFolder,
     Web,
     Diffs,
 }
@@ -2368,7 +2377,7 @@ impl Menus {
     /// Whether `c` does something for the active tab, matching what [`App::run`] handles.
     fn enabled(&self, c: Cmd) -> bool {
         use Cmd::*;
-        use ViewKind::{Binary, Diffs, Folder, Image, Text, Web};
+        use ViewKind::{Binary, Diffs, Folder, Image, RemoteFolder, Text, Web};
         match (c, self.view) {
             (SaveAs(p), _) => p < self.panes,
             (TakeBoth(_), _) => self.can_take_both,
@@ -2407,7 +2416,7 @@ impl Menus {
             (SyncFolders, Folder) => self.sides == 2 && !self.folder_busy && !self.folder_job,
             (Patch, Text) => self.sides == 2,
             (HtmlReport | Slideshow | ExportPdf | Print | Statistics, Text) => true,
-            (Refresh, Text | Folder | Web) => true,
+            (Refresh, Text | Folder | RemoteFolder | Web) => true,
             (NextDiff | PrevDiff | FirstDiff | LastDiff, Web) => self.formatted,
             (AllDiffs, Folder) => !self.folder_busy,
             (
@@ -3118,7 +3127,7 @@ impl OxideMergeApp {
                 Content::Binary(_) => Some("binary"),
                 Content::Image(_) => Some("image"),
                 Content::Web(_) => Some("web"),
-                Content::Diffs(_) => return None,
+                Content::Diffs(_) | Content::RemoteFolder(_) => return None,
             };
             let rules = match &t.content {
                 Content::Text(v) => v.rules.clone(),
@@ -3894,6 +3903,9 @@ impl OxideMergeApp {
                 trf("msg.too_many_paths", &[("n", paths.len().to_string())])
             );
         }
+        if self.open_live_remote_folder(&req)? {
+            return Ok(());
+        }
         if let Some(r) = req.rules.as_deref().filter(|r| !r.is_empty()) {
             if rules::find(r).is_none() {
                 let name = rules::display_name(r).to_string();
@@ -4187,6 +4199,7 @@ impl OxideMergeApp {
             key_path: last.map_or_else(String::new, |l| l.key_path.clone()),
             passphrase: String::new(),
             remote_path: String::new(),
+            list_folder: true,
             browse: None,
             proxy: last.map_or_else(String::new, |l| l.proxy.clone()),
             proxy_password: String::new(),
@@ -4485,6 +4498,10 @@ impl OxideMergeApp {
                     ui.weak(tr("msg.remote_browse_hint"));
                 });
             }
+            if d.protocol == remote::Protocol::Sftp {
+                ui.checkbox(&mut d.list_folder, tr("remote_compare.list_folder"))
+                    .on_hover_text(tr("remote_compare.list_folder_tip"));
+            }
             widgets::dialog_footer(ui, |ui| {
                 ui.add_enabled_ui(ready, |ui| {
                     if widgets::primary_button(ui, tr("btn.connect")).clicked()
@@ -4624,6 +4641,13 @@ impl OxideMergeApp {
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (c, p, stop) = (conn.clone(), remote_path.clone(), cancel.clone());
+        let mode = if conn.protocol == remote::Protocol::Sftp
+            && dialog.as_ref().is_some_and(|d| d.list_folder)
+        {
+            remote::FetchMode::ListFolder
+        } else {
+            remote::FetchMode::Complete
+        };
         // Tests stand in for the network with a thread-local fake server (see
         // `remote::fake`), so a fetch for one runs on this thread rather than a spawned one,
         // which would not see it.
@@ -4632,10 +4656,10 @@ impl OxideMergeApp {
         #[cfg(not(test))]
         let on_this_thread = false;
         if on_this_thread {
-            let _ = tx.send(remote::fetch(&c, &p, &stop));
+            let _ = tx.send(remote::fetch_with(&c, &p, &stop, mode));
         } else {
             std::thread::spawn(move || {
-                let _ = tx.send(remote::fetch(&c, &p, &stop));
+                let _ = tx.send(remote::fetch_with(&c, &p, &stop, mode));
             });
         }
         self.remote_load = Some(RemoteLoad {
@@ -4688,10 +4712,11 @@ impl OxideMergeApp {
         };
         let stopped = load.cancel.load(std::sync::atomic::Ordering::Relaxed);
         match result {
-            Ok(fetched) => {
+            Ok(fetched) if !stopped => {
                 self.last_remote = Some(LastRemote::from_conn(&load.conn));
                 self.use_remote_fetch(load.target, load.conn, load.remote_path, fetched);
             }
+            Ok(_) => self.remote_dlg = load.dialog,
             Err(e) => match e.downcast::<remote::UnknownHost>() {
                 Ok(host) if !stopped => {
                     self.host_prompt = Some(HostPrompt {
@@ -4827,9 +4852,11 @@ impl OxideMergeApp {
             manifest,
         } = fetched;
         let sent = if is_dir { None } else { file_hash(&local) };
+        let list_folder = is_dir && manifest.is_none();
         self.pending_remote.push(PendingRemote {
             local,
             temp: std::sync::Arc::new(temp),
+            list_folder,
             file: RemoteFile {
                 conn,
                 remote_path,
@@ -4839,6 +4866,101 @@ impl OxideMergeApp {
                 pending: false,
             },
         });
+    }
+
+    fn open_live_remote_folder(&mut self, req: &OpenRequest) -> anyhow::Result<bool> {
+        use crate::core::remote_compare::Side;
+
+        let pending = |path: &Path| self.pending_remote.iter().find(|p| p.local == path);
+        if !req
+            .paths
+            .iter()
+            .any(|p| pending(p).is_some_and(|p| p.list_folder))
+        {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            req.paths.len() == 2 && req.kind.is_none(),
+            "{}",
+            tr("remote_compare.two_folders")
+        );
+        let mut sides = Vec::with_capacity(2);
+        for path in &req.paths {
+            if let Some(p) = pending(path) {
+                anyhow::ensure!(p.list_folder, "{}", tr("remote_compare.two_folders"));
+                sides.push(Side::Sftp(
+                    std::sync::Arc::new(p.file.conn.clone()),
+                    p.file.remote_path.clone(),
+                ));
+            } else {
+                anyhow::ensure!(
+                    path.is_dir() && !self.is_staged(path),
+                    "{}",
+                    tr("remote_compare.two_folders")
+                );
+                sides.push(Side::Local(path.clone()));
+            }
+        }
+        let mut options = self.cfg.folder.clone();
+        if let Some(recursive) = req.recursive {
+            options.recursive = recursive;
+        }
+        if let Some(method) = req.method {
+            options.method = method;
+        }
+        let view = super::remote_folder::RemoteFolder::new(
+            sides.try_into().ok().expect("two folder sides"),
+            req.filter
+                .clone()
+                .unwrap_or_else(|| self.cfg.filter.clone()),
+            options,
+            std::array::from_fn(|side| req.read_only.get(side).copied().unwrap_or(false)),
+            req.rules.clone().unwrap_or_else(|| self.cfg.rules.clone()),
+            &self.named_filters,
+        );
+        // A listing-only path is a token for the form. Once claimed, no empty local
+        // directory or duplicate credentials need to stay in the form.
+        for path in &mut self.start_paths {
+            let local = Path::new(path);
+            if req.paths.iter().any(|p| p == local)
+                && self
+                    .pending_remote
+                    .iter()
+                    .any(|p| p.list_folder && p.local == local)
+            {
+                path.clear();
+            }
+        }
+        self.pending_remote
+            .retain(|p| !p.list_folder || !req.paths.contains(&p.local));
+        self.push_tab(Content::RemoteFolder(Box::new(view)), Vec::new());
+        Ok(true)
+    }
+
+    fn open_live_remote_files(&mut self, request: super::remote_folder::OpenFiles) {
+        let parent = self.tabs[self.active].id;
+        let count = self.tabs.len();
+        let mut paths = Vec::with_capacity(2);
+        let mut descriptions = Vec::with_capacity(2);
+        for file in request.files {
+            paths.push(file.path);
+            descriptions.push(file.fetched.map(|(conn, path, fetched)| {
+                let description = remote::label(&conn, &path);
+                self.stage_fetch(conn, path, fetched);
+                description
+            }));
+        }
+        self.open(OpenRequest {
+            paths,
+            descriptions,
+            read_only: request.read_only.to_vec(),
+            rules: Some(request.rules),
+            skip_recent: true,
+            ..Default::default()
+        });
+        if self.tabs.len() > count {
+            self.tabs.last_mut().unwrap().live_folder_origin = Some((parent, request.path));
+        }
     }
 
     /// Whether a text comparison of `paths` opens on another thread: plain files (no unpacker,
@@ -5361,6 +5483,7 @@ impl OxideMergeApp {
             source,
             descriptions: Vec::new(),
             origin: None,
+            live_folder_origin: None,
             temps,
             remote,
             no_recovery: false,
@@ -5764,8 +5887,10 @@ impl OxideMergeApp {
     fn rules_changed(&mut self) {
         rules::apply_selected(&mut self.cfg);
         for t in &mut self.tabs {
-            if let Content::Text(v) = t.content.view_mut() {
-                v.reload_rules();
+            match t.content.view_mut() {
+                Content::Text(v) => v.reload_rules(),
+                Content::RemoteFolder(v) => v.reload_rules(&self.cfg),
+                _ => {}
             }
         }
     }
@@ -6514,6 +6639,11 @@ impl OxideMergeApp {
                         Cmd::CopyLeft => v.copy_current(false),
                         _ => {}
                     },
+                    Content::RemoteFolder(v) => {
+                        if cmd == Cmd::Refresh {
+                            v.refresh(&named);
+                        }
+                    }
                     Content::Web(v) => {
                         if let Some(f) = &mut v.formatted {
                             match cmd {
@@ -6862,6 +6992,15 @@ impl OxideMergeApp {
                 }
             }
         }
+        for &id in ids {
+            if self
+                .tabs
+                .iter()
+                .any(|tab| tab.id == id && tab.remote.iter().any(Option::is_none))
+            {
+                self.invalidate_live_folder_row(id);
+            }
+        }
         let mut up = ids.to_vec();
         up.extend(folders);
         up.extend(self.mark_origin_remote_folders(ids));
@@ -6871,6 +7010,22 @@ impl OxideMergeApp {
             self.start_repacks(slow, up);
         }
         errors
+    }
+
+    fn invalidate_live_folder_row(&mut self, child: u64) {
+        let Some((parent, path)) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == child)
+            .and_then(|tab| tab.live_folder_origin.clone())
+        else {
+            return;
+        };
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == parent) {
+            if let Content::RemoteFolder(view) = &mut tab.content {
+                view.invalidate(&path, &self.named_filters);
+            }
+        }
     }
 
     /// The archive sides of the folder tabs in `folders` that saving left as slow to repack
@@ -7498,7 +7653,7 @@ impl OxideMergeApp {
                             Err(e) => errors.push(format!("{e:#}")),
                         }
                     }
-                    Content::Web(_) | Content::Diffs(_) => {}
+                    Content::Web(_) | Content::Diffs(_) | Content::RemoteFolder(_) => {}
                 }
             }
         }
@@ -7571,6 +7726,7 @@ impl OxideMergeApp {
                                 file.sent = Some(done.hash);
                                 file.pending = queued;
                             }
+                            self.invalidate_live_folder_row(done.tab);
                         }
                         Ok(Uploaded::Folder(saved)) => {
                             for q in &mut self.upload_queue {
@@ -7613,11 +7769,16 @@ impl OxideMergeApp {
                                 }
                             }
                             // What a stopped upload left on the server is named all the same.
+                            let uncertain = e
+                                .downcast_ref::<crate::core::remote_stage::Uncertain>()
+                                .is_some();
+                            if partly.is_some() || uncertain {
+                                self.invalidate_live_folder_row(done.tab);
+                            }
                             let left = e
                                 .downcast_ref::<crate::core::remote_stage::LeftOver>()
                                 .is_some()
-                                || e.downcast_ref::<crate::core::remote_stage::Uncertain>()
-                                    .is_some();
+                                || uncertain;
                             if !cancelled || left {
                                 run.errors.push(trf(
                                     "msg.sftp_upload_failed",
@@ -8517,6 +8678,7 @@ impl OxideMergeApp {
                 Some(Content::Folder(_)) => ViewKind::Folder,
                 Some(Content::Web(_)) => ViewKind::Web,
                 Some(Content::Diffs(_)) => ViewKind::Diffs,
+                Some(Content::RemoteFolder(_)) => ViewKind::RemoteFolder,
             },
             panes: match view {
                 Some(Content::Text(v)) => v.n(),
@@ -11112,6 +11274,7 @@ impl eframe::App for OxideMergeApp {
 
         let colors = theme::colors(self.cfg.dark_mode);
         let mut folder_action: Option<FolderAction> = None;
+        let mut remote_files = None;
         let content_fill = if self.tabs.is_empty() {
             p.chrome
         } else {
@@ -11127,9 +11290,13 @@ impl eframe::App for OxideMergeApp {
                 }
                 match self.tabs.get_mut(self.active).map(|t| &mut t.content) {
                     None => self.start_page(ui),
+                    Some(Content::RemoteFolder(view)) => remote_files = view.ui(ui, &cfg, &named),
                     Some(c) => folder_action = content_ui(c, ui, &cfg, &colors, &named),
                 }
             });
+        if let Some(files) = remote_files {
+            self.open_live_remote_files(files);
+        }
         if let Some(Content::Web(w)) = self.tabs.get(self.active).map(|t| &t.content) {
             if !w.is_local() {
                 self.cfg.web_mode = w.mode;

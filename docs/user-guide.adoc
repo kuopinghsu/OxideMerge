@@ -1,7 +1,7 @@
 ifdef::backend-pdf[= OxideMerge User Guide: Compare, review and merge files and folders]
 ifndef::backend-pdf[= OxideMerge User Guide]
 :description: How to compare, review and merge files and folders with OxideMerge.
-:revnumber: 0.9.8
+:revnumber: 0.9.9
 :doctype: book
 :toc: left
 :toclevels: 2
@@ -436,8 +436,8 @@ server if the *Remote path* is empty.
 Folders come first, then files with their sizes; hidden entries, whose names start with a dot,
 come last in each group.
 Click a folder to open it, or click a file to choose it.
-The *Remote path* follows what you click, so *Connect* fetches the folder you are in or the file
-you chose.
+The *Remote path* follows what you click, so *Connect* selects the folder you are in or
+fetches the file you chose.
 Double-click a file to fetch it immediately.
 The up-arrow button opens the folder above, and the refresh button lists the *Remote path* again,
 including a path you typed.
@@ -510,7 +510,22 @@ Until an upload succeeds, the tab counts as unsaved, so closing it or quitting a
 *Save* tries again.
 When you close a tab with *Save*, the tab waits for its upload to finish before it closes.
 
-A fetched *folder* is writable too.
+*Comparing SFTP folders from listings*
+
+In the SFTP connection dialog, *List folders without downloading files* is selected by default.
+Use it to compare two folders, with either one or both on SFTP servers. The comparison shows
+rows as the listings arrive. *Metadata match* means that size and modification time match
+within the configured tolerance. Use *Verify Selected* or *Verify All* to check the contents
+of paired files. *Binary contents* compares the bytes, and *Full contents* applies the
+comparison options for the file type.
+
+Double-click a paired file to open it in a separate comparison, or choose *Open File Comparison*.
+OxideMerge fetches the selected remote files and uploads your edits when you save them.
+Use *Refresh* in the folder comparison to get an updated listing.
+For folder-wide copy, delete or save operations, clear *List folders without downloading files*
+when connecting to each remote folder.
+
+A fully fetched *folder* is writable too.
 Copy or delete files in the folder comparison, or open a file from it and edit it.
 *Save* then writes what changed back to the server:
 

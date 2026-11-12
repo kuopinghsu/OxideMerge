@@ -29,6 +29,7 @@ pub mod recovery;
 #[cfg(test)]
 mod regress;
 pub mod remote;
+pub(crate) mod remote_compare;
 pub mod remote_stage;
 pub mod remote_sync;
 pub mod remote_url;

@@ -237,7 +237,7 @@ struct Entry {
     mtime: Option<SystemTime>,
 }
 
-fn is_hidden(e: &std::fs::DirEntry) -> bool {
+pub(super) fn is_hidden(e: &std::fs::DirEntry) -> bool {
     if e.file_name().to_string_lossy().starts_with('.') {
         return true;
     }
@@ -629,7 +629,7 @@ fn head_is_binary(path: &Path) -> Result<bool> {
     Ok(text::looks_binary(&head[..n]))
 }
 
-fn read_full(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+pub(super) fn read_full(r: &mut (impl Read + ?Sized), buf: &mut [u8]) -> std::io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
         let k = r.read(&mut buf[n..])?;
@@ -840,7 +840,7 @@ pub fn compare_files(
     compare_files_with_cancel(paths, item, fopts, dopts, norm, None)
 }
 
-fn compare_files_with_cancel(
+pub(super) fn compare_files_with_cancel(
     paths: &[PathBuf],
     item: &DirItem,
     fopts: &FolderOptions,

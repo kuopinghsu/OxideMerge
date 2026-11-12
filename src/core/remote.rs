@@ -1790,9 +1790,9 @@ struct Budget {
 /// The most bytes a single fetch (one file, or a whole folder together) reads from the server.
 const MAX_REMOTE_BYTES: u64 = 4 << 30;
 /// The most files and folders a single folder fetch reads from the server.
-const MAX_REMOTE_ENTRIES: usize = 50_000;
+pub(super) const MAX_REMOTE_ENTRIES: usize = 50_000;
 /// The most folders deep a folder fetch goes.
-const MAX_REMOTE_DEPTH: usize = 64;
+pub(super) const MAX_REMOTE_DEPTH: usize = 64;
 
 impl Budget {
     fn new() -> Self {
@@ -2076,7 +2076,7 @@ impl RemoteFs for ssh2::Sftp {
                     name: name.unwrap_or_default(),
                     is_dir: usable && stat.is_dir(),
                     is_file: usable && stat.is_file(),
-                    stamp: stat.is_file().then(|| RemoteStamp::of(&stat)),
+                    stamp: (stat.is_file() && stat.size.is_some()).then(|| RemoteStamp::of(&stat)),
                 }
             })
             .collect())
@@ -2125,7 +2125,7 @@ impl RemoteFs for ssh2::Sftp {
 
 /// Whether `name`, a remote folder entry, can be a file name here: not a path of its own, and on
 /// Windows, none of the names or characters Windows refuses.
-fn local_name_ok(name: &str) -> bool {
+pub(super) fn local_name_ok(name: &str) -> bool {
     if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
         return false;
     }
@@ -2289,18 +2289,47 @@ fn remote_file_name(remote_path: &str) -> std::ffi::OsString {
 /// [`MAX_REMOTE_ENTRIES`] and [`MAX_REMOTE_DEPTH`]. Fails with [`UnknownHost`] for a server
 /// not trusted yet.
 pub fn fetch(conn: &RemoteConnection, remote_path: &str, cancel: &AtomicBool) -> Result<Fetched> {
+    fetch_with(conn, remote_path, cancel, FetchMode::Complete)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FetchMode {
+    Complete,
+    ListFolder,
+    FileOnly,
+}
+
+pub(crate) fn fetch_with(
+    conn: &RemoteConnection,
+    remote_path: &str,
+    cancel: &AtomicBool,
+    mode: FetchMode,
+) -> Result<Fetched> {
     let remote = connect(conn, cancel)?;
-    let temp = tempfile::Builder::new()
-        .prefix("oxidemerge-sftp-")
-        .tempdir()?;
+    let fetched = fetch_from(&*remote, remote_path, cancel, mode)?;
+    if fetched.is_dir && fetched.manifest.is_none() {
+        return Ok(fetched);
+    }
     if let Ok(mut staged) = STAGED.lock() {
-        staged.push(temp.path().to_path_buf());
-        if let Ok(real) = std::fs::canonicalize(temp.path()) {
+        staged.push(fetched.temp.path().to_path_buf());
+        if let Ok(real) = std::fs::canonicalize(fetched.temp.path()) {
             staged.push(real);
         }
     }
+    Ok(fetched)
+}
+
+pub(crate) fn fetch_from(
+    remote: &dyn RemoteFs,
+    remote_path: &str,
+    cancel: &AtomicBool,
+    mode: FetchMode,
+) -> Result<Fetched> {
+    let temp = tempfile::Builder::new()
+        .prefix("oxidemerge-sftp-")
+        .tempdir()?;
     let local = temp.path().join(remote_file_name(remote_path));
-    let staged = fetch_into(&*remote, remote_path, &local, cancel)?;
+    let staged = fetch_into_mode(remote, remote_path, &local, cancel, mode)?;
     Ok(Fetched {
         temp,
         local,
@@ -2343,12 +2372,31 @@ fn fetch_into(
     local: &Path,
     cancel: &AtomicBool,
 ) -> Result<Staged> {
+    fetch_into_mode(fs, remote_path, local, cancel, FetchMode::Complete)
+}
+
+fn fetch_into_mode(
+    fs: &dyn RemoteFs,
+    remote_path: &str,
+    local: &Path,
+    cancel: &AtomicBool,
+    mode: FetchMode,
+) -> Result<Staged> {
     let trimmed = remote_path.trim_end_matches('/');
     let remote_path = if trimmed.is_empty() { "/" } else { trimmed };
     let cannot = || trf("msg.sftp_cannot_read", &[("path", remote_path.to_string())]);
     let mut budget = Budget::new();
     match fs.kind(remote_path).with_context(cannot)? {
-        Some(EntryKind::Dir) => {
+        Some(EntryKind::Dir) if matches!(mode, FetchMode::ListFolder) => {
+            // A path-field token only. A folder comparison opens the live remote root.
+            std::fs::create_dir(local)?;
+            Ok(Staged {
+                is_dir: true,
+                stamp: None,
+                manifest: None,
+            })
+        }
+        Some(EntryKind::Dir) if matches!(mode, FetchMode::Complete) => {
             let mut manifest = Manifest::default();
             let mut at = Walk {
                 rel: String::new(),
@@ -2983,6 +3031,7 @@ pub mod fake {
         versions: BTreeMap<String, u64>,
         fail: Option<String>,
         uploaded: Vec<(String, Vec<u8>)>,
+        opened: Vec<String>,
         /// Whether the server's key is not trusted yet (see [`Server::unknown_host`]).
         unknown: bool,
         /// The folder a relative path is in; the root when empty.
@@ -3166,7 +3215,10 @@ pub mod fake {
     impl RemoteFs for Conn {
         fn open_read(&self, remote: &str) -> Result<Box<dyn Read + '_>> {
             let mut bytes = Vec::new();
-            with(|s| Ok(s.open_read(remote)?.read_to_end(&mut bytes)?))?;
+            with(|s| {
+                s.opened.push(remote.to_string());
+                Ok(s.open_read(remote)?.read_to_end(&mut bytes)?)
+            })?;
             Ok(Box::new(std::io::Cursor::new(bytes)))
         }
 
@@ -3176,7 +3228,30 @@ pub mod fake {
             limit: usize,
             cancel: &AtomicBool,
         ) -> Result<Vec<(String, bool, bool)>> {
-            with(|s| s.list_dir(remote, limit, cancel))
+            with(|s| {
+                s.kind(remote)?;
+                s.list_dir(remote, limit, cancel)
+            })
+        }
+
+        fn list_dir_stamped(
+            &self,
+            remote: &str,
+            limit: usize,
+            cancel: &AtomicBool,
+        ) -> Result<Vec<Listed>> {
+            with(|s| {
+                s.kind(remote)?;
+                Ok(s.list_dir(remote, limit, cancel)?
+                    .into_iter()
+                    .map(|(name, is_dir, is_file)| Listed {
+                        stamp: s.stamp(&join(remote, &name)),
+                        name,
+                        is_dir,
+                        is_file,
+                    })
+                    .collect())
+            })
         }
 
         fn real_path(&self, remote: &str) -> Result<String> {
@@ -3329,6 +3404,10 @@ pub mod fake {
     /// I/O, unlike the fake server, can be slow.
     pub fn installed() -> bool {
         SERVER.with(|s| s.borrow().is_some())
+    }
+
+    pub fn opened_paths() -> Vec<String> {
+        with(|s| Ok(s.opened.clone())).expect("fake server installed")
     }
 
     /// Someone else writing `contents` to the file at `path` on the server.

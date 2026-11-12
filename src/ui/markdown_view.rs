@@ -378,24 +378,30 @@ impl MarkdownView {
             // The rows of a page's table that differ, marked where they are: a sheet is one
             // block, and marked whole it would say no more than that something in it differs.
             let mut within = Vec::new();
+            let tables = self.marks.get(run.start).filter(|_| run.len() == 1);
+            let table_rows = tables
+                .into_iter()
+                .flatten()
+                .filter_map(|marks| match marks {
+                    Some(Marks::Table(rows)) => Some(rows),
+                    _ => None,
+                });
+            let row_count = table_rows.clone().map(Vec::len).max().unwrap_or(0);
+            let has_row_marks = table_rows.flatten().any(|row| row_differs(row));
             for (p, column) in whole.iter_mut().enumerate().take(self.pages.len()) {
                 let present = self.rows[run.clone()]
                     .iter()
                     .any(|r| r.cells.get(p).copied().flatten().is_some());
-                let table = match self.marks.get(run.start).and_then(|m| m.get(p)) {
-                    Some(Some(Marks::Table(t))) if present && run.len() == 1 && !t.is_empty() => t,
+                let table = match tables.and_then(|m| m.get(p)) {
+                    Some(Some(Marks::Table(t))) if present && has_row_marks => t,
                     _ => {
                         *column = Some(if present { color } else { c.ui.border_strong });
                         continue;
                     }
                 };
-                if !table.iter().any(|row| row_differs(row)) {
-                    // Nothing says where: changed words are not looked for, or this page's
-                    // table only lacks what another has.
-                    *column = Some(color);
-                    continue;
-                }
-                let each = (end - start - 2.0 * PAD[1]).max(1.0) / table.len() as f32;
+                // The aligned block height includes the longest table. Shorter tables
+                // start at the same top and leave the rest of the block empty.
+                let each = (end - start - 2.0 * PAD[1]).max(1.0) / row_count as f32;
                 let mut r = 0;
                 while r < table.len() {
                     let from = r;
@@ -712,7 +718,9 @@ impl MarkdownView {
                         match marks.get(i).and_then(|m| m.get(p)).and_then(Option::as_ref) {
                             Some(Marks::Table(t)) => {
                                 let layout = tables.entry((i, p)).or_default();
-                                let (r, g) = table(&mut cell, cache, layout, id, t, words, &shared);
+                                let colors = table_colors(c, current, lefts.len(), p);
+                                let (r, g) =
+                                    table(&mut cell, cache, layout, id, t, colors, &shared);
                                 relaid |= r;
                                 grew = grew.max(g);
                             }
@@ -750,21 +758,18 @@ impl MarkdownView {
                             let lines = Stroke::new(1.0_f32, c.ui.border);
                             hatch(&mut under, rect.shrink(2.0), lines);
                         } else if row.changed {
-                            // Changed on every page; or on some only, where of two pages the
-                            // left one has what the right one lost.
-                            let (fill, fill_sel, bar) = if all {
-                                (c.diff, c.diff_sel, c.change_bar)
-                            } else if lefts.len() == 2 && p == 0 {
-                                (c.removed, c.removed_sel, c.inline_removed)
+                            let (fill, bar) = if !all && lefts.len() == 2 {
+                                // Text Compare uses the insertion color for either side of
+                                // a one-sided block, with the absent side shown as a gap.
+                                (if current { c.added_sel } else { c.added }, c.ui.success)
                             } else {
-                                (c.added, c.added_sel, c.inline_added)
+                                (if current { c.diff_sel } else { c.diff }, c.change_bar)
                             };
-                            let fill = match (current, all && is_table(p)) {
-                                (true, _) => fill_sel,
-                                // A changed table marks its cells: tinted whole as strongly as
-                                // a paragraph, a sheet would be one slab with the marks lost.
-                                (false, true) => fill.gamma_multiply(0.45),
-                                (false, false) => fill,
+                            // Let the individual changes in a paired table stand out.
+                            let fill = if all && is_table(p) {
+                                fill.gamma_multiply(0.45)
+                            } else {
+                                fill
                             };
                             under.push(Shape::rect_filled(rect, RADIUS, fill));
                             let stripe = Rect::from_min_size(
@@ -833,10 +838,14 @@ impl MarkdownView {
 
 /// Whether any cell of a table's row differs from the other pages.
 fn row_differs(row: &[(String, Cell)]) -> bool {
-    row.iter().any(|(_, cell)| match cell {
-        Cell::Whole => true,
+    row.iter().any(|(_, cell)| cell_differs(cell))
+}
+
+fn cell_differs(cell: &Cell) -> bool {
+    match cell {
+        Cell::Whole | Cell::PairedChange => true,
         Cell::Words(marks) => !marks.is_empty(),
-    })
+    }
 }
 
 /// Adds lines slanting across `rect` to `out`, each cut off at its edges.
@@ -944,7 +953,12 @@ fn prepare_table(rows: &mut [Vec<(String, Cell)>]) {
                 }
             }
             if let Cell::Words(v) = cell {
-                *v = viewer_ranges(text, v);
+                let visible = viewer_ranges(text, v);
+                if visible.is_empty() && !v.is_empty() {
+                    *cell = Cell::PairedChange;
+                } else {
+                    *v = visible;
+                }
             }
         }
     }
@@ -1012,20 +1026,39 @@ impl TableLayout {
     }
 }
 
-/// Draws a table as a grid of cells with lines around them and the header rows shaded. A
-/// merged cell is drawn across the cells it covers. What differs is highlighted in `words`:
-/// changed words, and whole cells the other page lacks. Only the rows in view are laid out.
-/// `shared` is how wide the columns are on one line on any of the pages, as far as known: no
-/// column is made narrower than that while there is room, so the tables line up across pages.
-/// Returns whether a row's height changed, and how much taller the rows above the view were
-/// found.
+#[derive(Clone, Copy)]
+struct TableColors {
+    inline: Color32,
+    modified: Color32,
+    one_sided: Color32,
+}
+
+fn table_colors(c: &Colors, selected: bool, panes: usize, pane: usize) -> TableColors {
+    let modified = if selected { c.diff_sel } else { c.diff };
+    let one_sided = match (panes, pane, selected) {
+        (2, 0, false) => c.removed,
+        (2, 0, true) => c.removed_sel,
+        (2, 1, false) => c.added,
+        (2, 1, true) => c.added_sel,
+        _ => modified,
+    };
+    TableColors {
+        inline: if selected { c.inline_sel } else { c.inline },
+        modified,
+        one_sided,
+    }
+}
+
+/// Draws the visible table rows, including merged cells and change colors. Shared column
+/// widths line up tables across panes. Returns whether a row's height changed and how much
+/// rows above the view grew.
 fn table(
     ui: &mut Ui,
     cache: &mut CommonMarkCache,
     layout: &mut TableLayout,
     id: Id,
     rows: &[Vec<(String, Cell)>],
-    words: Color32,
+    colors: TableColors,
     shared: &[f32],
 ) -> (bool, f32) {
     let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
@@ -1166,9 +1199,16 @@ fn table(
             c.set_width(width);
             let marks = match cell {
                 Cell::Words(v) => v.as_slice(),
-                Cell::Whole => &[],
+                Cell::Whole | Cell::PairedChange => &[],
             };
-            show_marked(&mut c, cache, id.with(("cell", r, k)), text, marks, words);
+            show_marked(
+                &mut c,
+                cache,
+                id.with(("cell", r, k)),
+                text,
+                marks,
+                colors.inline,
+            );
             let tall = c.min_rect().height();
             if down == 1 {
                 height = height.max(tall);
@@ -1198,10 +1238,10 @@ fn table(
             relaid = true;
         }
         for (k, back) in backs.into_iter().enumerate() {
-            let changed = match row.get(k).map(|c| &c.1) {
-                Some(Cell::Whole) => true,
-                Some(Cell::Words(v)) => !v.is_empty(),
-                None => false,
+            let change_fill = match row.get(k).map(|c| &c.1) {
+                Some(Cell::Whole) => Some(colors.one_sided),
+                Some(cell) if cell_differs(cell) => Some(colors.modified),
+                _ => None,
             };
             let (fill, rect) = match slot(layout, r, k) {
                 Slot::Anchor {
@@ -1212,16 +1252,16 @@ fn table(
                     let last = (r + down).min(rows.len());
                     let below: f32 = layout.heights[r + 1..last].iter().sum();
                     let rect = Rect::from_x_y_ranges(xs[k]..=xs[end], top..=bottom + below);
-                    match row.get(k) {
-                        Some((_, Cell::Whole)) => (words, rect),
+                    match change_fill {
+                        Some(fill) => (fill, rect),
                         _ if r < header => (shade, rect),
                         _ => continue,
                     }
                 }
                 // A covered cell of a row or column the other page lacks, or one merged on
                 // one page only, is highlighted where it is.
-                Slot::Covered { .. } if changed => (
-                    words,
+                Slot::Covered { .. } if change_fill.is_some() => (
+                    change_fill.unwrap(),
                     Rect::from_x_y_ranges(xs[k]..=xs[k + 1], top..=bottom),
                 ),
                 Slot::Covered { .. } => continue,
@@ -1809,6 +1849,104 @@ mod tests {
         assert_eq!(at, [last, last]);
         assert_eq!(marks[0].columns[..2], [Some(c.change_bar), None]);
         assert_eq!(marks[1].columns[..2], [None, Some(c.change_bar)]);
+    }
+
+    #[test]
+    fn the_overview_marks_an_extra_html_table_row_only_on_the_side_that_has_it() {
+        let page = |extra: &str| {
+            web_markdown::html_to_blocks(
+                &format!(
+                    "<h3>iDMA Options</h3><table><tr><th>Option</th><th>Selection</th></tr>
+                     <tr><td>iDMA</td><td>Selected</td></tr>
+                     <tr><td>Channels</td><td>4</td></tr>{extra}</table>"
+                ),
+                None,
+            )
+        };
+        let longer = page("<tr><td>iDMA ZVC Decompression</td><td>Not Selected</td></tr>");
+        let shorter = page("");
+        for (pages, side) in [
+            (vec![longer.clone(), shorter.clone()], 0),
+            (vec![shorter, longer], 1),
+        ] {
+            let mut v =
+                MarkdownView::new(pages, vec!["l".into(), "r".into()], &DiffOptions::default());
+            v.heights = vec![20.0, 2.0 * PAD[1] + 40.0];
+            let c = crate::ui::theme::colors(true);
+            let marks = v.location_marks(&c);
+            assert_eq!(marks.len(), 1);
+            assert_eq!(marks[0].start, (20.0 + ROW_GAP + PAD[1] + 30.0) as usize);
+            assert_eq!(marks[0].len, 10);
+            assert_eq!(marks[0].columns[side], Some(c.change_bar));
+            assert_eq!(marks[0].columns[1 - side], None);
+        }
+    }
+
+    #[test]
+    fn the_overview_marks_both_sides_when_paired_interrupt_labels_gain_a_prefix() {
+        let page = |prefix: &str| {
+            let rows: String = (0..32)
+                .map(|i| format!("<tr><td>{prefix}{i}</td><td>Edge</td></tr>"))
+                .collect();
+            web_markdown::html_to_blocks(
+                &format!("<table><tr><th>Interrupt</th><th>Type</th></tr>{rows}</table>"),
+                None,
+            )
+        };
+        let mut view = MarkdownView::new(
+            vec![page(""), page("Interrupt ")],
+            vec!["l".into(), "r".into()],
+            &DiffOptions::default(),
+        );
+        view.heights = vec![2.0 * PAD[1] + 330.0];
+        let colors = crate::ui::theme::colors(true);
+        let marks = view.location_marks(&colors);
+        assert_eq!(marks.len(), 2);
+        for (side, mark) in marks.iter().enumerate() {
+            assert_eq!(mark.start, PAD[1] as usize + 10);
+            assert_eq!(mark.len, 320);
+            assert_eq!(mark.columns[side], Some(colors.change_bar));
+        }
+    }
+
+    #[test]
+    fn table_row_markers_survive_markdown_formatting_changes() {
+        let table = |value: &str| block(&format!("| Label |\n| --- |\n| {value} |"));
+        let options = DiffOptions {
+            inline: crate::core::diff::InlineMode::Char,
+            ..Default::default()
+        };
+        let mut view = MarkdownView::new(
+            vec![vec![table("foo")], vec![table("**foo**")]],
+            Vec::new(),
+            &options,
+        );
+        view.heights = vec![2.0 * PAD[1] + 20.0];
+        let colors = crate::ui::theme::colors(false);
+        let marks = view.location_marks(&colors);
+        assert_eq!(marks.len(), 2);
+        for (side, mark) in marks.iter().enumerate() {
+            assert_eq!(mark.start, PAD[1] as usize + 10);
+            assert_eq!(mark.len, 10);
+            assert_eq!(mark.columns[side], Some(colors.change_bar));
+        }
+    }
+
+    #[test]
+    fn formatted_tables_use_text_compare_colors_in_both_themes() {
+        for dark in [false, true] {
+            let colors = crate::ui::theme::colors(dark);
+            let left = table_colors(&colors, false, 2, 0);
+            let right = table_colors(&colors, true, 2, 1);
+            assert_eq!(
+                (left.modified, left.one_sided, left.inline),
+                (colors.diff, colors.removed, colors.inline)
+            );
+            assert_eq!(
+                (right.modified, right.one_sided, right.inline),
+                (colors.diff_sel, colors.added_sel, colors.inline_sel)
+            );
+        }
     }
 
     /// Rows are measured only as they are drawn, so a row further down grows from its estimate

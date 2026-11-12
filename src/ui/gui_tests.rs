@@ -3117,6 +3117,15 @@ fn compare_over_sftp_fetches_both_sides_edits_one_and_saves_it_back_to_the_serve
 
 /// Fetches `remote_path` from the fake server into the start page's side `side`.
 fn fetch_to_start_page(gui: &mut Gui, side: usize, remote_path: &str) {
+    fetch_to_start_page_with_listing(gui, side, remote_path, true);
+}
+
+fn fetch_to_start_page_with_listing(
+    gui: &mut Gui,
+    side: usize,
+    remote_path: &str,
+    list_folder: bool,
+) {
     gui.app.start_remote_connect(RemoteTarget::Start(side));
     gui.frames(2);
     {
@@ -3124,6 +3133,7 @@ fn fetch_to_start_page(gui: &mut Gui, side: usize, remote_path: &str) {
         d.host = "example.com".to_string();
         d.user = "ann".to_string();
         d.remote_path = remote_path.to_string();
+        d.list_folder = list_folder;
     }
     gui.frame();
     gui.click(tr("btn.connect"));
@@ -3355,6 +3365,120 @@ fn remote_folder_view(gui: &mut Gui) -> &mut FolderView {
 }
 
 #[test]
+fn live_sftp_folder_lists_then_opens_and_verifies_only_requested_files() {
+    let local = tempfile::tempdir().unwrap();
+    write(local.path(), &[("a.txt", "local"), ("b.txt", "same")]);
+    remote::fake::install(
+        remote::fake::Server::new()
+            .dir("/srv/data")
+            .file("/srv/data/a.txt", "other")
+            .file("/srv/data/b.txt", "same")
+            .file("/srv/data/remote-only.txt", "never read"),
+    );
+    let mut gui = Gui::start("live_sftp_folder", None);
+    fetch_to_start_page(&mut gui, 0, "/srv/data");
+    gui.app.start_paths[2] = local.path().display().to_string();
+    gui.frame();
+    gui.click(tr("btn.compare"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert!(matches!(gui.app.tabs[0].content, Content::RemoteFolder(_)));
+    assert!(gui.shows("remote-only.txt"));
+    assert!(remote::fake::opened_paths().is_empty());
+
+    gui.click("a.txt");
+    gui.click(tr("remote_compare.verify_selected"));
+    gui.settle();
+    assert!(gui.shows(tr("remote_compare.content_different")));
+    assert_eq!(remote::fake::opened_paths(), ["/srv/data/a.txt"]);
+
+    gui.click(tr("remote_compare.verify_all"));
+    gui.settle();
+    assert!(gui.shows(tr("remote_compare.content_match")));
+    assert_eq!(
+        remote::fake::opened_paths(),
+        ["/srv/data/a.txt", "/srv/data/a.txt", "/srv/data/b.txt"]
+    );
+
+    gui.click(tr("remote_compare.open"));
+    gui.settle();
+    assert_eq!(gui.app.tabs.len(), 2);
+    assert_eq!(
+        remote::fake::opened_paths().last().unwrap(),
+        "/srv/data/a.txt"
+    );
+    let tab = &gui.app.tabs[1];
+    assert!(matches!(tab.content, Content::Text(_)));
+    assert_eq!(
+        tab.remote[0].as_ref().unwrap().remote_path,
+        "/srv/data/a.txt"
+    );
+    assert!(tab.remote[0].as_ref().unwrap().manifest.is_none());
+    assert!(!tab.is_modified());
+    active_text_view_mut(&mut gui).place_caret(0, (0, 5), false);
+    gui.events.push(Event::Text("-edited".into()));
+    gui.frames(2);
+    gui.key(CMD, Key::S);
+    gui.frames(3);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(
+        remote::fake::entry("/srv/data/a.txt"),
+        Some(Some(b"other-edited".to_vec()))
+    );
+    assert!(!gui.app.tabs[1].is_modified());
+    gui.app.active = 0;
+    gui.frames(2);
+    assert!(gui.shows(tr("remote_compare.unverified")));
+    assert!(!gui.shows(tr("remote_compare.content_different")));
+    assert!(gui.shows(tr("remote_compare.content_match")));
+    gui.app.cfg.diff.ignore_case = !gui.app.cfg.diff.ignore_case;
+    gui.frames(2);
+    assert!(!gui.shows(tr("remote_compare.content_match")));
+    gui.click(tr("remote_compare.verify_selected"));
+    gui.settle();
+    assert!(gui.shows(tr("remote_compare.content_different")));
+    assert!(!gui.shows(tr("remote_compare.content_match")));
+    remote::fake::uninstall();
+}
+
+#[test]
+fn a_partial_sftp_upload_invalidates_the_verified_folder_row() {
+    remote::fake::install(
+        remote::fake::Server::new()
+            .dir("/left")
+            .dir("/right")
+            .file("/left/a.txt", "one\n")
+            .file("/right/a.txt", "one\n")
+            .partly_fails("/left/a.txt"),
+    );
+    let mut gui = Gui::start("live_sftp_partial_upload", None);
+    fetch_to_start_page(&mut gui, 0, "/left");
+    fetch_to_start_page(&mut gui, 2, "/right");
+    gui.click(tr("btn.compare"));
+    gui.settle();
+    gui.click("a.txt");
+    gui.click(tr("remote_compare.verify_selected"));
+    gui.settle();
+    assert!(gui.shows(tr("remote_compare.content_match")));
+    gui.click(tr("remote_compare.open"));
+    gui.settle();
+    active_text_view_mut(&mut gui).place_caret(0, (0, 3), false);
+    gui.events.push(Event::Text("-mine".into()));
+    gui.frames(2);
+    gui.app.run(Cmd::Save, &gui.ctx);
+    gui.frames(3);
+    assert_eq!(
+        remote::fake::entry("/left/a.txt"),
+        Some(Some(b"one-".to_vec()))
+    );
+    gui.app.active = 0;
+    gui.frames(2);
+    assert!(gui.shows(tr("remote_compare.unverified")));
+    assert!(!gui.shows(tr("remote_compare.content_match")));
+    remote::fake::uninstall();
+}
+
+#[test]
 fn a_folder_fetched_from_the_start_page_is_written_back_on_save_and_reloads_from_the_server() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), &[("a.txt", "local")]);
@@ -3365,7 +3489,7 @@ fn a_folder_fetched_from_the_start_page_is_written_back_on_save_and_reloads_from
             .file("/srv/data/old.txt", "old"),
     );
     let mut gui = Gui::start("sftp_start_page_folder", None);
-    fetch_to_start_page(&mut gui, 0, "/srv/data");
+    fetch_to_start_page_with_listing(&mut gui, 0, "/srv/data", false);
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
     gui.app.start_paths[2] = dir.path().display().to_string();
     gui.frame();
@@ -3442,7 +3566,7 @@ fn a_file_opened_from_a_remote_folder_is_uploaded_when_saved_also_once_the_folde
             .file("/srv/data/a.txt", "remote\n"),
     );
     let mut gui = Gui::start("remote_folder_child_save", None);
-    fetch_to_start_page(&mut gui, 0, "/srv/data");
+    fetch_to_start_page_with_listing(&mut gui, 0, "/srv/data", false);
     gui.app.start_paths[2] = dir.path().display().to_string();
     gui.frame();
     gui.click(tr("btn.compare"));
@@ -3549,6 +3673,7 @@ fn compare_over_sftp_fetches_a_writable_folder_and_a_failure_reopens_the_dialog(
         d.host = "example.com".to_string();
         d.user = "ann".to_string();
         d.remote_path = "/srv/data".to_string();
+        d.list_folder = false;
     }
     gui.frame();
     gui.click(tr("btn.connect"));
