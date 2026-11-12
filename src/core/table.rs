@@ -236,7 +236,9 @@ impl Table {
                 if record.cells.len() < record.fields.len() {
                     let tail = record.fields[record.cells.len()].start - 1
                         ..record.fields.last().unwrap().end;
-                    let keep = self.covered_fields.partition_point(|field| field.end <= tail.start);
+                    let keep = self
+                        .covered_fields
+                        .partition_point(|field| field.end <= tail.start);
                     self.covered_fields.truncate(keep);
                     self.covered_fields.push(tail);
                 }
@@ -339,7 +341,9 @@ impl Table {
         };
         let destination = span(self, lines);
         let from = span(source, source_lines);
-        let first = source.covered_fields.partition_point(|field| field.end <= from.start);
+        let first = source
+            .covered_fields
+            .partition_point(|field| field.end <= from.start);
         let mut value = String::new();
         let mut at = from.start;
         for field in &source.covered_fields[first..] {

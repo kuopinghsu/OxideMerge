@@ -5208,7 +5208,9 @@ mod tests {
             assert!(!html.contains("review-summary"));
             assert!(!html.contains("workspace decision metadata"));
         }
-        assert!(v.report(ReportFormat::Xml, &cfg).contains("<review-summary"));
+        assert!(v
+            .report(ReportFormat::Xml, &cfg)
+            .contains("<review-summary"));
         cfg.report_hide_paths = false;
         assert!(v.slideshow_job(&cfg)().contains(&crate::core::report::esc(&right)));
     }

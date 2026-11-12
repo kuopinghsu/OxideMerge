@@ -1209,10 +1209,18 @@ impl<'a> Writer<'a> {
             if !name.is_empty() {
                 // Beside the name of the last side, or the whole line when no side is named.
                 let label = match labels {
-                    true => self.faces.width(Family::Sans, SMALL_SIZE, side_name(n - 1, n)) + 24.0,
+                    true => {
+                        self.faces
+                            .width(Family::Sans, SMALL_SIZE, side_name(n - 1, n))
+                            + 24.0
+                    }
                     false => 0.0,
                 };
-                let room = if labels { w / n as f32 - label } else { w - 12.0 };
+                let room = if labels {
+                    w / n as f32 - label
+                } else {
+                    w - 12.0
+                };
                 let name = self.fit(Family::Sans, SMALL_SIZE, name, room);
                 let nw = self.faces.width(Family::Sans, SMALL_SIZE, &name);
                 self.text(
@@ -1243,7 +1251,14 @@ impl<'a> Writer<'a> {
             self.bold(x + 12.0, base, TITLE_SIZE, line, BLACK);
         }
         let date = self.date.clone();
-        self.text(x + 12.0, top + h - 2.0, SMALL_SIZE, Family::Sans, &date, DIM);
+        self.text(
+            x + 12.0,
+            top + h - 2.0,
+            SMALL_SIZE,
+            Family::Sans,
+            &date,
+            DIM,
+        );
         self.y = top + h + 12.0;
     }
 
@@ -2344,9 +2359,8 @@ pub fn folder_pdf(
         w.para(SMALL_SIZE, Family::Sans, tr("report.paths_hidden"), DIM);
         w.gap(6.0);
     }
-    let card = |label: &'static str, class: &str| {
-        (label, count(class).to_string(), class_color(class))
-    };
+    let card =
+        |label: &'static str, class: &str| (label, count(class).to_string(), class_color(class));
     let mut cards = vec![
         (tr("report.files"), listed.len().to_string(), LINK),
         card(tr("report.identical"), "identical"),
