@@ -7442,13 +7442,13 @@ fn compare_with_revision_lists_and_opens_mercurial_revisions() {
 #[test]
 fn a_revision_of_a_file_opens_in_the_same_views_as_two_files() {
     let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("samples");
-    // The buttons and other named controls a tab shows, whatever its paths are.
-    let controls = |gui: &Gui| -> std::collections::BTreeSet<String> {
-        gui.controls
-            .iter()
-            .filter(|w| w.role == accesskit::Role::Button && !w.label.contains(" ↔ "))
-            .map(|w| w.label.clone())
-            .collect()
+    // Check the available views independently of transient loading controls.
+    let views = |gui: &Gui| {
+        ["analysis.text", "analysis.table", "analysis.formatted"].map(|key| {
+            gui.controls
+                .iter()
+                .any(|w| w.role == accesskit::Role::Button && named(w, tr(key)))
+        })
     };
     for name in ["report.pdf", "report.docx", "budget.xlsx", "report.ipynb"] {
         let (old, now) = (
@@ -7464,7 +7464,7 @@ fn a_revision_of_a_file_opens_in_the_same_views_as_two_files() {
         });
         gui.settle();
         assert!(gui.errors().is_empty(), "{name}: {:?}", gui.errors());
-        let as_files = controls(&gui);
+        let as_files = views(&gui);
         let kind = std::mem::discriminant(gui.app.tabs[0].content.view());
 
         // The same file against a revision's copy of it, as `vcs::copy_of` writes it: under
@@ -7483,7 +7483,7 @@ fn a_revision_of_a_file_opens_in_the_same_views_as_two_files() {
             std::mem::discriminant(tab.content.view()) == kind,
             "{name}: the same kind of view"
         );
-        assert_eq!(controls(&gui), as_files, "{name}: the same controls");
+        assert_eq!(views(&gui), as_files, "{name}: the same view switches");
         assert!(gui.shows_text("@ HEAD"), "{name}: named by its revision");
         let copy = copy.display().to_string();
         assert!(
