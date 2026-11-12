@@ -53,13 +53,26 @@ pub enum Auth {
     /// The keys of the running SSH agent (`SSH_AUTH_SOCK`, or Pageant on Windows), then those
     /// `~/.ssh/config` names for the server or else the usual `~/.ssh/id_*`: SFTP only.
     Agent,
+    /// Try SSH agent and configured keys before handing off to the connection dialog.
+    AgentKeysOnly,
 }
+
+#[derive(Debug)]
+pub(crate) struct KeyAuthFailed;
+
+impl std::fmt::Display for KeyAuthFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SSH key authentication failed")
+    }
+}
+
+impl std::error::Error for KeyAuthFailed {}
 
 impl Drop for Auth {
     fn drop(&mut self) {
         match self {
             Auth::Password(p) | Auth::Key { passphrase: p, .. } => wipe(p),
-            Auth::Agent => {}
+            Auth::Agent | Auth::AgentKeysOnly => {}
         }
     }
 }
@@ -1201,7 +1214,12 @@ fn open_ssh(
         .map_or(0, |d| d.as_secs());
     verify_host_key(key, &name, &known, &path, &files, now)?;
     check(cancel)?;
-    sign_in(&sess, target, auth, &name.shown, cancel)?;
+    let signed_in = sign_in(&sess, target, auth, &name.shown, cancel);
+    if matches!(auth, Auth::AgentKeysOnly) {
+        signed_in.context(KeyAuthFailed)?;
+    } else {
+        signed_in?;
+    }
     Ok(sess)
 }
 
@@ -1405,10 +1423,11 @@ fn relay_wait(
 
 /// The ways of signing in tried, in order, for each kind of [`Auth`]: the one given first,
 /// then what else the server asks for (a second factor, or a server that refused the first).
-fn sign_in_order(auth: &Auth) -> [&'static str; 3] {
+fn sign_in_order(auth: &Auth) -> &'static [&'static str] {
     match auth {
-        Auth::Password(_) => ["password", "keyboard-interactive", "publickey"],
-        Auth::Key { .. } | Auth::Agent => ["publickey", "keyboard-interactive", "password"],
+        Auth::Password(_) => &["password", "keyboard-interactive", "publickey"],
+        Auth::Key { .. } | Auth::Agent => &["publickey", "keyboard-interactive", "password"],
+        Auth::AgentKeysOnly => &["publickey"],
     }
 }
 
@@ -1437,7 +1456,7 @@ fn sign_in(
         let key = match auth {
             Auth::Password(_) => "msg.sftp_password",
             Auth::Key { .. } => "msg.sftp_key",
-            Auth::Agent => "msg.sftp_agent",
+            Auth::Agent | Auth::AgentKeysOnly => "msg.sftp_agent",
         };
         trf(key, &[("server", shown.to_string())])
     };
@@ -1456,7 +1475,8 @@ fn sign_in(
     loop {
         let offers = |m: &str| methods.split(',').any(|o| o == m);
         let Some(method) = sign_in_order(auth)
-            .into_iter()
+            .iter()
+            .copied()
             .find(|m| offers(m) && !tried.contains(m))
         else {
             break;
@@ -2018,7 +2038,7 @@ impl<T: RemoteFs + RemoteWrite + Send> Remote for T {}
 /// steps. Fails with [`UnknownHost`] for a server not trusted yet.
 pub(crate) fn connect(conn: &RemoteConnection, cancel: &AtomicBool) -> Result<Box<dyn Remote>> {
     #[cfg(test)]
-    if let Some(fake) = fake::connect() {
+    if let Some(fake) = fake::connect(&conn.auth) {
         if fake.is_ok() {
             note_connected();
         }
@@ -2850,10 +2870,15 @@ pub fn label(conn: &RemoteConnection, remote_path: &str) -> String {
     } else {
         format!("/~/{remote_path}")
     };
+    // No user is named when `~/.ssh/config` or the local user's name stands in for one.
+    let user = if conn.user.is_empty() {
+        String::new()
+    } else {
+        format!("{}@", conn.user)
+    };
     format!(
-        "{}://{}@{}{path}",
+        "{}://{user}{}{path}",
         conn.protocol.scheme(),
-        conn.user,
         server(&conn.host, conn.port)
     )
 }
@@ -3088,7 +3113,7 @@ impl Browser {
         self.since.set(Instant::now());
         #[cfg(test)]
         if self.requests.is_none() {
-            if let Some(remote) = fake::connect() {
+            if let Some(remote) = fake::connect(&Auth::Agent) {
                 let listed = remote.and_then(|r| browse_in(&*r, path, &self.cancel));
                 let _ = self.done.send((n, listed));
             }
@@ -3135,6 +3160,7 @@ pub mod fake {
         /// How many times each file was written, standing in for its modified time.
         versions: BTreeMap<String, u64>,
         fail: Option<String>,
+        reject_keys: bool,
         uploaded: Vec<(String, Vec<u8>)>,
         opened: Vec<String>,
         /// Whether the server's key is not trusted yet (see [`Server::unknown_host`]).
@@ -3197,6 +3223,11 @@ pub mod fake {
         /// Every connection and transfer fails with `message`, instead of reading `entries`.
         pub fn failing(mut self, message: &str) -> Self {
             self.fail = Some(message.to_string());
+            self
+        }
+
+        pub fn reject_keys(mut self) -> Self {
+            self.reject_keys = true;
             self
         }
 
@@ -3292,7 +3323,7 @@ pub mod fake {
 
     /// A connection to the installed server, as [`super::connect`] makes to a real one; `None`
     /// when none is installed.
-    pub(super) fn connect() -> Option<Result<Box<dyn Remote>>> {
+    pub(super) fn connect(auth: &Auth) -> Option<Result<Box<dyn Remote>>> {
         SERVER.with(|s| {
             let server = s.borrow();
             let server = server.as_ref()?;
@@ -3301,6 +3332,9 @@ pub mod fake {
             }
             if server.unknown {
                 return Some(Err(unknown_host().into()));
+            }
+            if server.reject_keys && matches!(auth, Auth::AgentKeysOnly) {
+                return Some(Err(KeyAuthFailed.into()));
             }
             Some(Ok(Box::new(Conn) as Box<dyn Remote>))
         })

@@ -84,6 +84,13 @@ pub fn location(p: &Path) -> Result<Url> {
         return Url::parse(s.trim()).with_context(|| format!("invalid address: {s}"));
     }
     let abs = std::path::absolute(p).with_context(|| p.display().to_string())?;
+    // A folder is there, but is no page to load: said so, rather than that it is missing.
+    if abs.is_dir() {
+        bail!(crate::i18n::trf(
+            "msg.web_needs_file",
+            &[("path", p.display().to_string())]
+        ));
+    }
     if !abs.is_file() {
         bail!("{}: not found", p.display());
     }
@@ -1075,6 +1082,12 @@ mod tests {
         };
         let (a, b, c) = (file("a.html"), file("B.HTM"), file("c.txt"));
         assert!(are_html_files(&[a.clone(), b.clone()]));
+        // A folder is not reported as missing, and a path that is not there still is.
+        let folder = location(a.parent().unwrap()).unwrap_err().to_string();
+        assert!(!folder.contains("not found"), "{folder}");
+        assert!(folder.contains(&a.parent().unwrap().display().to_string()));
+        let gone = location(&a.with_file_name("gone.html")).unwrap_err();
+        assert!(gone.to_string().contains("not found"));
         assert!(!are_html_files(&[a.clone(), c]));
         assert!(!are_html_files(&[a, dir.path().join("missing.html")]));
         assert!(!are_html_files(&[]));

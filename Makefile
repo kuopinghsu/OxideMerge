@@ -181,7 +181,9 @@ else
 endif
 
 # Same PDF files as the CI user-guide job; scripts/build-user-guide.sh lists what it needs.
-ifeq ($(OS),Windows_NT)
+# Windows and macOS have neither its tools nor its fonts as Linux packages them, so there the
+# script runs in a Docker container that does; on Linux it runs as it is.
+ifneq ($(filter windows darwin,$(PLATFORM)),)
 GUIDE_IMAGE := oxidemerge-user-guide
 GUIDE_DOCKER := docker run --rm --mount "type=bind,source=$(CURDIR),target=/work" --workdir /work --env "VERSION=$(VERSION)"
 

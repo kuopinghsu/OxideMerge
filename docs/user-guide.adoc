@@ -406,6 +406,34 @@ your changes back.
 the *Select files or folders* dialog, connect to a server to fetch a file or folder to compare,
 instead of browsing the local disk.
 
+To enter an SFTP or FTP address directly, paste it into a comparison path field on the start page or
+in the *Select files or folders* dialog, then click *Compare*. You can enter an address on
+either side or both sides.
+
+----
+sftp://[username[:password]@]hostname[:port][/path/to/file_or_directory]
+sftp://ann@build.example.com:2222/var/www/site
+----
+
+An FTP address works the same way, with `ftp://`, `ftpes://` (explicit TLS) or `ftps://`
+(implicit TLS) in place of `sftp://`.
+FTP without a user name, or as `anonymous`, signs in anonymously; with a user name and no
+password, the connection dialog opens for the password.
+
+If an SFTP URL has no password, OxideMerge first tries SSH agent and configured keys. If that
+fails, it opens the connection dialog with the URL fields filled in and a note saying so.
+If you connected to that server before, the dialog also recalls how you signed in, such as your
+key file. Enter the password and
+click *Connect* to continue. The eye icon in the password field toggles visibility. You can
+also select *Private key* or *SSH agent*.
+*Cancel* returns to where you typed the address.
+If you include a password in the URL, percent-encode reserved characters such as `@` (`%40`)
+and `/` (`%2F`). OxideMerge removes the password from the path field when you submit it.
+After a comparison opens, its addresses appear without passwords in the start page's recent
+list. Select the entry to connect and compare again.
+
+image::sftp-connect.png[SFTP connection dialog with the password field and visibility icon]
+
 To fetch a file or folder from a server:
 
 . Choose the *Protocol*.
@@ -418,6 +446,9 @@ To fetch a file or folder from a server:
 ** *FTPS (implicit TLS, port 990)*, for servers that expect TLS from the start.
 ** *FTP (not encrypted)*.
 . Enter the server's *Host*, *Port* and *User*.
+  You can also type or paste an address such as `ann@build.example.com` or
+  `sftp://ann@build.example.com:2222/var/www` into *Host*: when you leave the field, its parts
+  move to the fields they belong to.
   For SFTP, the host can be a `Host` alias of your `~/.ssh/config`, and you can leave the user
   empty, as with `ssh` (see <<remote-ssh-config>>).
 . For SFTP, choose how to sign in: *Password*, *Private key* (which can have a *Passphrase*),
@@ -427,9 +458,20 @@ To fetch a file or folder from a server:
   FTP and FTPS sign in with a password.
 . If needed, open *Advanced* for a proxy, FTP's active mode or an FTPS client certificate (see
   <<remote-advanced>>).
-. Enter the *Remote path* of the file or folder to fetch, or click the folder button beside it
-  to choose it from a list of the server's folders and files.
+. Enter the *Remote path* of the file or folder to fetch, or leave it empty to choose it from
+  a list of the server's folders and files.
 . Click *Connect*.
+  With a *Remote path*, the file or folder is fetched.
+  Without one, OxideMerge connects and lists your home folder on the server: open the folder
+  or choose the file you want and click *OK* to fetch it.
+
+When the dialog opens, the keyboard is in the first field left to fill in: *Host*, or for a
+server you connected to before, its password or passphrase.
+Once a file or folder is fetched, its path field shows the address on the server it came from,
+such as `sftp://ann@build.example.com:22/var/www`.
+On the start page, a fetch that fills the last empty path field starts the comparison at once.
+A fetch into a field that already held a path only replaces it; click *Compare* when the other
+side is right.
 
 The folder button connects and opens a chooser in place of the dialog, listing the folder of the
 *Remote path*, or your home folder on the server if the *Remote path* is empty.
@@ -440,8 +482,9 @@ come last in each group.
 Click a folder to open it, or click a file to choose it.
 The path at the bottom of the chooser follows what you click: the folder you are in, or the file
 you chose.
-*OK* returns to the dialog with that path as the *Remote path*, ready for *Connect*; *Cancel* or
-Esc returns with the *Remote path* as it was.
+When you opened the chooser with the folder button, *OK* returns to the dialog with that path
+as the *Remote path*, ready for *Connect*; when *Connect* opened it, *OK* fetches that path.
+*Cancel* or Esc returns to the dialog with the *Remote path* as it was.
 Double-click a file to fetch it immediately.
 The bar above the list names the server and each folder on the way to the one shown; click any
 of them to open it.

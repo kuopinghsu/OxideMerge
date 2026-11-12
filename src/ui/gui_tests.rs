@@ -3509,9 +3509,10 @@ fn a_partial_sftp_upload_invalidates_the_verified_folder_row() {
     );
     let mut gui = Gui::start("live_sftp_partial_upload", None);
     fetch_to_start_page(&mut gui, 0, "/left");
+    assert!(gui.app.tabs.is_empty(), "the other side is still to choose");
+    // The fetch that fills the last empty field starts the comparison.
     fetch_to_start_page(&mut gui, 2, "/right");
-    gui.click(tr("btn.compare"));
-    gui.settle();
+    assert_eq!(gui.app.tabs.len(), 1);
     gui.click("a.txt");
     gui.click(tr("remote_compare.verify_selected"));
     gui.settle();
@@ -3698,6 +3699,171 @@ fn the_sftp_password_can_be_shown_and_hidden_again() {
 }
 
 #[test]
+fn typed_sftp_addresses_connect_and_resume_the_comparison() {
+    remote::fake::install(
+        remote::fake::Server::new()
+            .reject_keys()
+            .file("/left file.txt", "left")
+            .file("/right.txt", "right"),
+    );
+    let mut gui = Gui::start("typed_sftp_addresses", None);
+    gui.app.start_paths[0] = "sftp://ann:sample%40secret@example.com:2222/left%20file.txt".into();
+    gui.app.start_paths[2] = "sftp://bob@example.com:2223/right.txt".into();
+    gui.frame();
+    gui.click(tr("btn.compare"));
+    gui.wait_until("the SFTP password prompt", |g| g.app.remote_dlg.is_some());
+    gui.key(Modifiers::NONE, Key::Enter);
+    assert!(gui.app.tabs.is_empty());
+    assert!(gui.app.remote_load.is_none());
+    gui.frame();
+    assert!(gui.shows(tr("label.remote_password")));
+    assert!(
+        gui.shows(tr("msg.remote_keys_failed")),
+        "the dialog says why it is there"
+    );
+    let dialog = gui.app.remote_dlg.as_mut().unwrap();
+    assert_eq!(dialog.host, "example.com");
+    assert_eq!(dialog.port, "2223");
+    assert_eq!(dialog.user, "bob");
+    assert_eq!(dialog.remote_path, "/right.txt");
+    assert!(dialog.password.is_empty());
+    dialog.password = "entered password".into();
+    gui.frame();
+    gui.click(tr("btn.connect"));
+    gui.wait_until("both SFTP sides to open", |g| {
+        g.app.tabs.len() == 1 && !g.busy()
+    });
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert!(!gui.app.start_paths[0].contains("secret"));
+    assert!(!gui
+        .app
+        .cfg
+        .recent_compares
+        .iter()
+        .flatten()
+        .any(|p| p.contains("secret")));
+    let remote = &gui.app.tabs[0].remote;
+    let left = remote[0].as_ref().unwrap();
+    assert_eq!(left.remote_path, "/left file.txt");
+    assert_eq!(left.conn.port, 2222);
+    assert!(
+        matches!(&left.conn.auth, remote::Auth::Password(password) if password == "sample@secret")
+    );
+    assert!(matches!(
+        &remote[1].as_ref().unwrap().conn.auth,
+        remote::Auth::Password(password) if password == "entered password"
+    ));
+    let recent = gui.app.cfg.recent_compares[0].clone();
+    assert_eq!(
+        recent,
+        [
+            "sftp://ann@example.com:2222/left%20file.txt",
+            "sftp://bob@example.com:2223/right.txt",
+        ]
+    );
+    remote::fake::install(
+        remote::fake::Server::new()
+            .file("/left file.txt", "left")
+            .file("/right.txt", "right"),
+    );
+    gui.app.open_recent(recent);
+    gui.wait_until("SSH keys to reopen the recent SFTP comparison", |g| {
+        g.app.tabs.len() == 2 && !g.busy()
+    });
+    assert!(gui.app.remote_dlg.is_none());
+    assert_eq!(gui.app.cfg.recent_compares.len(), 1);
+    remote::fake::uninstall();
+}
+
+/// Giving up on the sign-in a typed address asked for comes back to the start page it was
+/// typed on, not to a dialog nobody opened.
+#[test]
+fn cancelling_the_sign_in_for_a_typed_address_returns_to_the_start_page() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("b.txt", "local")]);
+    remote::fake::install(
+        remote::fake::Server::new()
+            .reject_keys()
+            .file("/a.txt", "remote"),
+    );
+    let mut gui = Gui::start("typed_address_cancelled", None);
+    gui.app.start_paths[0] = "sftp://ann@example.com/a.txt".into();
+    gui.app.start_paths[2] = dir.path().join("b.txt").display().to_string();
+    gui.frame();
+    gui.click(tr("btn.compare"));
+    gui.wait_until("the sign-in dialog", |g| g.app.remote_dlg.is_some());
+    gui.frame();
+    gui.click(tr("btn.cancel"));
+    gui.frames(2);
+    assert!(gui.app.remote_dlg.is_none() && gui.app.open_dlg.is_none());
+    assert!(gui.app.tabs.is_empty());
+    assert_eq!(gui.app.start_paths[0], "sftp://ann@example.com/a.txt");
+    assert!(gui.shows(tr("btn.compare")), "the start page is back");
+    remote::fake::uninstall();
+}
+
+/// An FTP address typed into a path field connects as an SFTP one does: at once when it is
+/// anonymous or carries its password, and through the dialog, for the password, otherwise.
+#[test]
+fn typed_ftp_addresses_connect_and_resume_the_comparison() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("b.txt", "local")]);
+    remote::fake::install(remote::fake::Server::new().file("/pub/a.txt", "remote"));
+    let mut gui = Gui::start("typed_ftp_addresses", None);
+    let local = dir.path().join("b.txt").display().to_string();
+
+    gui.app.start_paths[0] = "ftp://files.example/pub/a.txt".into();
+    gui.app.start_paths[2] = local.clone();
+    gui.frame();
+    gui.click(tr("btn.compare"));
+    gui.wait_until("the anonymous FTP side to open", |g| {
+        g.app.tabs.len() == 1 && !g.busy()
+    });
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert!(gui.app.remote_dlg.is_none());
+    let side = gui.app.tabs[0].remote[0].as_ref().unwrap();
+    assert_eq!(side.conn.protocol, remote::Protocol::Ftp);
+    assert_eq!((side.conn.user.as_str(), side.conn.port), ("anonymous", 21));
+    assert!(matches!(&side.conn.auth, remote::Auth::Password(p) if p == "anonymous@"));
+    assert_eq!(
+        gui.app.cfg.recent_compares[0],
+        [
+            "ftp://anonymous@files.example/pub/a.txt".to_string(),
+            local.clone()
+        ]
+    );
+
+    // A user without a password is asked for it, with the address's fields filled in.
+    gui.app.open_recent(vec![
+        "ftpes://bob@files.example:2121/pub/a.txt".into(),
+        local,
+    ]);
+    gui.frames(2);
+    assert!(gui.app.remote_load.is_none(), "nothing to sign in with yet");
+    let dialog = gui.app.remote_dlg.as_mut().unwrap();
+    assert_eq!(dialog.protocol, remote::Protocol::Ftps);
+    assert_eq!(
+        (
+            dialog.host.as_str(),
+            dialog.port.as_str(),
+            dialog.user.as_str()
+        ),
+        ("files.example", "2121", "bob")
+    );
+    assert_eq!(dialog.remote_path, "/pub/a.txt");
+    dialog.password = "entered password".into();
+    gui.frame();
+    gui.click(tr("btn.connect"));
+    gui.wait_until("the FTPS side to open", |g| {
+        g.app.tabs.len() == 2 && !g.busy()
+    });
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let side = gui.app.tabs[1].remote[0].as_ref().unwrap();
+    assert!(matches!(&side.conn.auth, remote::Auth::Password(p) if p == "entered password"));
+    remote::fake::uninstall();
+}
+
+#[test]
 fn the_connection_dialog_offers_ftp_with_a_warning_and_sftp_with_ssh_agent() {
     let mut gui = Gui::start("remote_protocols", None);
     gui.app.start_remote_connect(RemoteTarget::Start(0));
@@ -3833,6 +3999,13 @@ fn compare_over_sftp_from_the_start_page_fills_in_its_path_field_and_compares() 
     assert_eq!(gui.app.tabs.len(), 1);
     assert_eq!(gui.text_view().panes[0].doc.lines, ["one", "two"]);
     assert!(gui.app.pending_remote.is_empty(), "the fetch was claimed");
+
+    // A fetch into a field that already holds a path only replaces it: the other field may
+    // be left from an earlier comparison, as it is here.
+    fetch_to_start_page_with_listing(&mut gui, 0, "/srv/a.txt", false);
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(gui.app.tabs.len(), 1, "nothing was compared unasked");
+    assert_ne!(gui.app.start_paths[0], staged);
 
     remote::fake::uninstall();
 }
@@ -4136,6 +4309,100 @@ fn the_connection_dialog_lists_the_servers_folders_to_pick_the_remote_path_from(
     );
 
     remote::fake::uninstall();
+}
+
+/// *Connect* with no remote path named lists the server to choose from, and what is chosen
+/// there is fetched without going back to the dialog; the path field then shows where the
+/// copy it holds came from.
+#[test]
+fn connecting_without_a_remote_path_lists_the_server_and_fetches_what_is_chosen() {
+    remote::fake::install(
+        remote::fake::Server::new()
+            .home("/home/ann")
+            .dir("/home")
+            .dir("/home/ann")
+            .dir("/home/ann/srv")
+            .file("/home/ann/srv/a.txt", "one\n"),
+    );
+    let mut gui = Gui::start("sftp_connect_then_choose", None);
+    gui.app.start_remote_connect(RemoteTarget::Start(0));
+    gui.frames(2);
+    assert!(
+        gui.ctx.memory(|m| m.focused()).is_some(),
+        "the keyboard starts in the first field to fill in"
+    );
+    assert!(!gui.widget(tr("btn.connect")).enabled, "no server yet");
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+    }
+    gui.frame();
+    gui.click(tr("btn.connect"));
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert!(gui.app.remote_load.is_none(), "nothing is fetched yet");
+    assert!(gui.app.remote_dlg.as_ref().unwrap().browse.is_some());
+    gui.click("srv");
+    gui.click("a.txt");
+    gui.click(tr("btn.ok"));
+    assert!(gui.app.remote_dlg.is_none(), "what was chosen is fetched");
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(
+        std::fs::read_to_string(&gui.app.start_paths[0]).unwrap(),
+        "one\n"
+    );
+    assert!(gui.shows("sftp://ann@example.com:22/home/ann/srv/a.txt"));
+
+    // Cancelling the chooser opened that way comes back to the dialog, with nothing chosen.
+    gui.app.start_remote_connect(RemoteTarget::Start(2));
+    gui.frames(2);
+    gui.click(tr("btn.connect"));
+    gui.click(tr("btn.cancel"));
+    let d = gui.app.remote_dlg.as_ref().unwrap();
+    assert!(d.browse.is_none() && d.remote_path.is_empty());
+
+    remote::fake::uninstall();
+}
+
+/// An address typed or pasted into the host field is taken apart into the fields it names.
+#[test]
+fn an_address_in_the_host_field_fills_in_the_other_fields() {
+    let mut d = RemoteDialog::new(RemoteTarget::Start(0));
+    d.host = "sftp://ann@build.example.com:2222/var/www".to_string();
+    assert!(d.split_host());
+    assert_eq!(
+        (d.host.as_str(), d.port.as_str(), d.user.as_str()),
+        ("build.example.com", "2222", "ann")
+    );
+    assert_eq!(d.remote_path, "/var/www");
+    assert_eq!(d.protocol, remote::Protocol::Sftp);
+
+    d.host = "bob@files.example".to_string();
+    assert!(d.split_host());
+    assert_eq!((d.host.as_str(), d.user.as_str()), ("files.example", "bob"));
+    assert_eq!(
+        d.port, "2222",
+        "a port is kept unless the address names one"
+    );
+
+    d.host = "ftp://carol@files.example/pub".to_string();
+    assert!(d.split_host());
+    assert_eq!(d.protocol, remote::Protocol::Ftp);
+    assert_eq!((d.port.as_str(), d.user.as_str()), ("21", "carol"));
+    assert_eq!(d.remote_path, "/pub");
+
+    // A plain host name, or an IPv6 address, is left as it is.
+    for host in ["files.example", "::1", "not a://server"] {
+        d.host = host.to_string();
+        assert!(!d.split_host(), "{host}");
+        assert_eq!(d.host, host);
+    }
+    // A connection with no user named is shown without one.
+    let mut d = RemoteDialog::new(RemoteTarget::Start(0));
+    d.host = "example.com".to_string();
+    let conn = d.conn().unwrap();
+    assert_eq!(remote::label(&conn, "/srv"), "sftp://example.com:22/srv");
 }
 
 #[test]
