@@ -2675,7 +2675,8 @@ mod tests {
                 .collect();
             format!("<catalog>{items}\n</catalog>")
         };
-        let d = diff(&make(1), &make(2));
+        // Pair items by ID so this path test does not depend on the unkeyed diff deadline.
+        let d = diff_with(&make(1), &make(2), "item@id");
         let last = *d.targets.last().unwrap();
         let attr = d.rows[d.rows[d.rows[last].parent.unwrap()].parent.unwrap()].children[0];
         let start = std::time::Instant::now();

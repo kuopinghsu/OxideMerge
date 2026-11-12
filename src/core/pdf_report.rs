@@ -27,7 +27,7 @@ use krilla::image::Image;
 use krilla::metadata::Metadata;
 use krilla::outline::{Outline, OutlineNode};
 use krilla::page::PageSettings;
-use krilla::paint::{Fill, FillRule, Stroke};
+use krilla::paint::{Fill, FillRule, LineJoin, Stroke};
 use krilla::surface::Surface;
 use krilla::text::{Font, GlyphId, KrillaGlyph};
 use krilla::Document;
@@ -151,6 +151,9 @@ const TITLE_SIZE: f32 = 20.0;
 /// The headings of the parts of a report, and the name of each file of a folder report.
 const HEAD_SIZE: f32 = 11.5;
 const SMALL_SIZE: f32 = 7.5;
+/// The least width of a card of the counts, and the room between two cards.
+const CARD_MIN: f32 = 88.0;
+const CARD_GAP: f32 = 8.0;
 /// How far a fill reaches into the row below it, so that no hairline shows between the rows
 /// of one block where a viewer rounds their edges apart.
 const SEAM: f32 = 0.3;
@@ -840,8 +843,17 @@ struct Writer<'a> {
     palette: Palette,
     /// The title in the header of each page.
     title: String,
-    /// When the report was made, under its title and in the header of each page.
+    /// When the report was made, under its title.
     date: String,
+    /// The compared sides, in the header of each page; empty when their paths are hidden.
+    subject: Vec<String>,
+    /// Whether the statuses of files have the color-blind colors.
+    color_blind: bool,
+    /// How far the content keeps from the left and right margins, for parts set side by side.
+    inset: (f32, f32),
+    /// The backgrounds of line numbers that the next unchanged line may extend: the page and
+    /// place of the fill among its drawings, its left edge and its bottom.
+    gutters: Vec<(usize, usize, f32, f32)>,
     /// The bookmark level of a difference: 0 in a text report, 1 under its file in a folder
     /// report.
     diff_level: u8,
@@ -882,6 +894,10 @@ impl<'a> Writer<'a> {
             palette: Palette::new(opts.color_blind),
             title: title.to_owned(),
             date: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            subject: Vec::new(),
+            color_blind: opts.color_blind,
+            inset: (0.0, 0.0),
+            gutters: Vec::new(),
             diff_level: 0,
             lines_left: report_lines(),
             unified: false,
@@ -893,13 +909,13 @@ impl<'a> Writer<'a> {
     }
 
     fn left(&self) -> f32 {
-        MARGIN
+        MARGIN + self.inset.0
     }
     fn right(&self) -> f32 {
-        self.w - MARGIN
+        self.w - MARGIN - self.inset.1
     }
     fn content_w(&self) -> f32 {
-        self.w - 2.0 * MARGIN
+        self.right() - self.left()
     }
     fn top(&self) -> f32 {
         MARGIN + 16.0
@@ -988,6 +1004,52 @@ impl<'a> Writer<'a> {
         if let Some(square) = Rect::from_xywh(x - r, y - r, 2.0 * r, 2.0 * r) {
             self.op(Op::Round(square, r, Some(color), None));
         }
+    }
+
+    /// The background of the line numbers of an unchanged line. The lines under one another
+    /// share one fill, so a long run of them is one rectangle and not one for each line.
+    fn gutter(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        let page = self.page();
+        let above = self
+            .gutters
+            .iter()
+            .position(|g| g.0 == page && g.2 == x && (g.3 - y).abs() < 0.01);
+        if let Some(k) = above {
+            let at = self.gutters[k].1;
+            if let Some(Op::Fill(rect, _)) = self.pages[page].get_mut(at) {
+                let taller =
+                    Rect::from_xywh(rect.left(), rect.top(), rect.width(), y + h - rect.top());
+                if let Some(taller) = taller {
+                    *rect = taller;
+                    self.gutters[k].3 = y + h;
+                    return;
+                }
+            }
+        }
+        self.gutters.retain(|g| g.0 == page && g.2 != x);
+        let at = self.pages[page].len();
+        self.fill(x, y, w, h, GUTTER);
+        self.gutters.push((page, at, x, y + h));
+    }
+
+    /// The color of the status of a file, for its dot and its count: with the color-blind
+    /// setting, blue, orange, purple and yellow, as the differences have.
+    fn class_color(&self, class: &str) -> Color {
+        match (class, self.color_blind) {
+            ("identical", false) => (0x16, 0xa3, 0x4a),
+            ("different", false) => (0xd9, 0x77, 0x06),
+            ("unique", false) => (0x7c, 0x3a, 0xed),
+            ("error", false) => (0xdc, 0x26, 0x26),
+            ("identical", true) => (0x00, 0x72, 0xb2),
+            ("different", true) => (0xd5, 0x5e, 0x00),
+            ("unique", true) => (0x7b, 0x5b, 0xc4),
+            ("error", true) => (0xa8, 0x92, 0x00),
+            _ => DIM,
+        }
+    }
+
+    fn status_color(&self, it: &DirItem) -> Color {
+        self.class_color(status_class(it.status))
     }
 
     fn fill(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
@@ -1276,19 +1338,86 @@ impl<'a> Writer<'a> {
                 super::rules::display_name(rules).to_string(),
             ));
         }
+        self.subject = names.to_vec();
         self.pairs(&rows);
+    }
+
+    /// The compared sides and the counts of the report. On a page wide enough for both, the
+    /// counts stand in one row beside the sides; otherwise under them.
+    fn summary(&mut self, names: &[String], rules: &str, cards: &[(&str, String, Color)]) {
+        let full = self.content_w();
+        let cards_w = cards.len() as f32 * (CARD_MIN + CARD_GAP) - CARD_GAP;
+        if cards.is_empty() || cards.len() > 5 || full - cards_w - 12.0 < 280.0 {
+            self.sides(names, rules);
+            self.counts(cards);
+            return;
+        }
+        let top = self.y;
+        self.inset = (0.0, cards_w + 12.0);
+        self.sides(names, rules);
+        let below_sides = self.y;
+        self.y = top;
+        self.inset = (full - cards_w, 0.0);
+        self.counts(cards);
+        self.inset = (0.0, 0.0);
+        self.y = self.y.max(below_sides + 4.0);
+    }
+
+    /// What the signs and backgrounds of the compared lines mean, on one line: a sample of
+    /// each of `classes` (see [`Palette::of`]) with its name, and of a line missing on one
+    /// side.
+    fn legend(&mut self, classes: &[(&str, &str)]) {
+        const SWATCH: (f32, f32) = (13.0, 9.0);
+        let lead = SWATCH.1 + 4.0;
+        self.need(lead);
+        let mut x = self.left();
+        let missing = [("gap", tr("peek.missing"))];
+        for (class, label) in classes.iter().chain(&missing) {
+            let lw = self.faces.width(Family::Sans, SMALL_SIZE, label);
+            let item = SWATCH.0 + 4.0 + lw;
+            if x + item > self.right() && x > self.left() {
+                self.y += lead;
+                self.need(lead);
+                x = self.left();
+            }
+            let y = self.y;
+            match self.palette.of(class) {
+                Some((bg, _, sign_color, sign)) => {
+                    self.fill(x, y, SWATCH.0, SWATCH.1, bg);
+                    let sw = self.faces.width(Family::Mono, CODE_SIZE, sign);
+                    let sx = x + (SWATCH.0 - sw) / 2.0;
+                    self.text(sx, y + 7.0, CODE_SIZE, Family::Mono, sign, sign_color);
+                }
+                None => {
+                    if let Some(r) = Rect::from_xywh(x, y, SWATCH.0, SWATCH.1) {
+                        self.op(Op::Hatch(r));
+                    }
+                }
+            }
+            let base = y + 7.2;
+            self.text(
+                x + SWATCH.0 + 4.0,
+                base,
+                SMALL_SIZE,
+                Family::Sans,
+                label,
+                DIM,
+            );
+            x += item + 16.0;
+        }
+        self.y += lead + 6.0;
     }
 
     /// The counts of the report as a row of cards, each a number over its label beside a bar
     /// of its color; the cards that do not fit go on the next row.
     fn counts(&mut self, cards: &[(&str, String, Color)]) {
-        const GAP: f32 = 8.0;
+        const GAP: f32 = CARD_GAP;
         const VALUE: f32 = 15.0;
         if cards.is_empty() {
             return;
         }
         let total = self.content_w();
-        let per_row = (((total + GAP) / (88.0 + GAP)) as usize).clamp(1, cards.len());
+        let per_row = (((total + GAP + 0.01) / (CARD_MIN + GAP)) as usize).clamp(1, cards.len());
         let w = ((total - GAP * (per_row - 1) as f32) / per_row as f32).min(136.0);
         let lead = SMALL_SIZE * 1.3;
         for row in cards.chunks(per_row) {
@@ -1328,9 +1457,11 @@ impl<'a> Writer<'a> {
         n: usize,
         (i, total): (usize, usize),
         location: Option<&str>,
+        notes: f32,
     ) {
         let h = TEXT_SIZE * 1.9;
-        self.need(h + 5.0 * CODE_LEAD);
+        // The bar stays on the page of the notes under it and of its first lines.
+        self.need(h + notes + 5.0 * CODE_LEAD);
         let (class, label) = kind(result, b);
         let blk = &result.blocks[b];
         let mut pos = (0..n)
@@ -1346,7 +1477,17 @@ impl<'a> Writer<'a> {
         let sign_color = self.palette.of(class).map_or(DIM, |c| c.2);
         self.fill(x, y, 3.0, h, sign_color);
         let base = y + h * 0.68;
-        self.bold(x + 10.0, base, TEXT_SIZE, label, sign_color);
+        // The stripe has the color of the kind; its name is darker, to read well on the bar
+        // and on a printer without colors.
+        let (r, g, b) = sign_color;
+        let dark = |c: u8| (c as f32 * 0.62) as u8;
+        self.bold(
+            x + 10.0,
+            base,
+            TEXT_SIZE,
+            label,
+            (dark(r), dark(g), dark(b)),
+        );
         let lw = self.faces.width(Family::Sans, TEXT_SIZE, label) + 5.0;
         let num = trf(
             "report.diff_n",
@@ -1381,10 +1522,11 @@ impl<'a> Writer<'a> {
                 }
             }
             (_, Some((bg, ..))) => self.fill(x, y, w, CODE_LEAD + SEAM, bg),
-            // An unchanged line: only its line numbers have a background.
+            // An unchanged line: only its line numbers have a background, which starts
+            // where the fill of a changed line above it ends.
             _ => {
                 let gutter = 2.0 + nums.len() as f32 * num_w;
-                self.fill(x, y, gutter, CODE_LEAD + SEAM, GUTTER);
+                self.gutter(x, y + SEAM, gutter, CODE_LEAD);
             }
         }
         let base = y + CODE_LEAD * 0.78;
@@ -1675,12 +1817,16 @@ impl<'a> Writer<'a> {
             } else {
                 rows.start
             };
+            // What is drawn between the bar and its lines, as far as it can be kept with it.
+            let more_above = if rows.len() > cap { 1 } else { 0 };
+            let notes = (extra.fields.len() + more_above).min(12) as f32 * SMALL_SIZE * 1.4;
             self.hunk_bar(
                 doc.result,
                 b,
                 doc.panes.len(),
                 (k, total),
                 extra.location.as_deref(),
+                notes,
             );
             for field in &extra.fields {
                 self.bullet(SMALL_SIZE, Family::Sans, field, BLACK);
@@ -1826,9 +1972,23 @@ impl<'a> Writer<'a> {
                 s.draw_image(img.clone(), size);
                 s.pop();
             }
-            // The title keeps clear of the date at the other end of the line.
-            let dw = self.faces.width(Family::Sans, SMALL_SIZE, &self.date);
-            let room = self.w - 2.0 * MARGIN - icon - 4.0 - dw - 16.0;
+            // The compared sides at the other end of the line, each cut to its share of half
+            // the line; the title keeps clear of them.
+            let line = self.w - 2.0 * MARGIN;
+            let joiner = if self.faces.has(Family::Sans, '↔') {
+                "  ↔  "
+            } else {
+                "  |  "
+            };
+            let share = line / 2.0 / self.subject.len().max(1) as f32;
+            let subject = self
+                .subject
+                .iter()
+                .map(|name| self.fit(Family::Sans, SMALL_SIZE, name, share))
+                .collect::<Vec<_>>()
+                .join(joiner);
+            let dw = self.faces.width(Family::Sans, SMALL_SIZE, &subject);
+            let room = line - icon - 4.0 - dw - 16.0;
             let title = self.fit(Family::Sans, SMALL_SIZE, &self.title, room);
             let header = Op::Text {
                 x: MARGIN + icon + 4.0,
@@ -1845,7 +2005,7 @@ impl<'a> Writer<'a> {
                 y: MARGIN,
                 size: SMALL_SIZE,
                 family: Family::Sans,
-                text: self.date.clone(),
+                text: self.shown_text(Family::Sans, &subject),
                 color: DIM,
                 bold: false,
             };
@@ -2028,6 +2188,8 @@ impl<'a> Writer<'a> {
                 s.set_stroke(bold.then(|| Stroke {
                     paint: color(*c).into(),
                     width: *size * 0.035,
+                    // Round, so that the sharp corners of letters grow no spikes.
+                    line_join: LineJoin::Round,
                     ..Default::default()
                 }));
                 s.set_fill(Some(Fill {
@@ -2145,7 +2307,6 @@ pub fn text_pdf(
     let title = tr("report.text_title");
     let mut w = Writer::new(fonts, pdf, title)?;
     w.heading(title);
-    w.sides(titles, rules);
     let list = hunks_with(result, 0);
     let s = result.stats();
     let (add, del, chg) = (w.palette.add.2, w.palette.del.2, w.palette.chg.2);
@@ -2163,7 +2324,7 @@ pub fn text_pdf(
     if ignored > 0 {
         cards.push((tr("report.ignored"), ignored.to_string(), ign));
     }
-    w.counts(&cards);
+    w.summary(titles, rules, &cards);
     let comments: Vec<String> = notes
         .iter()
         .enumerate()
@@ -2184,6 +2345,21 @@ pub fn text_pdf(
     if list.is_empty() {
         w.para(TEXT_SIZE, Family::Sans, tr("report.no_diffs"), BLACK);
     } else {
+        let mut classes = match n {
+            2 => vec![
+                ("del", tr("report.kind_removed")),
+                ("add", tr("report.kind_added")),
+                ("chg", tr("report.kind_changed")),
+            ],
+            _ => vec![
+                ("chg", tr("report.kind_changed")),
+                ("conf", tr("report.kind_conflict")),
+            ],
+        };
+        if ignored > 0 {
+            classes.push(("ign", tr("report.ignored")));
+        }
+        w.legend(&classes);
         let doc = Doc {
             name: "",
             panes,
@@ -2241,6 +2417,9 @@ pub fn folder_pdf(
     let mut index: Vec<IndexRow> = Vec::new();
     let (mut shown_blocks, mut left_out, mut cut_blocks, mut cut_short) = (0, 0, 0, 0);
     let (mut summary_only, mut total_ignored) = (0, 0);
+    // The changed files whose differences are not shown: the place of each in `index`, its
+    // name, the color of its status, what is known about it and why it shows no differences.
+    let mut summaries: Vec<(usize, String, Color, String, String)> = Vec::new();
     for it in &listed {
         if !matches!(status_class(it.status), "different" | "unique" | "error") {
             continue;
@@ -2256,19 +2435,49 @@ pub fn folder_pdf(
         };
         let read = file_read(it, &found, &reads);
         let rel = it.rel_path();
-        if !index.is_empty() {
-            w.gap(8.0);
-        }
-        // The name stays on the page of the first lines of its first difference.
-        // its name, two lines about it, and what the bar of a difference asks for.
-        w.need(HEAD_SIZE * 2.0 + SMALL_SIZE * 4.0 + TEXT_SIZE * 1.9 + 5.0 * CODE_LEAD + 8.0);
-        let at = (w.page(), w.y);
-        w.mark(rel.clone(), 0);
-        w.file_heading(&rel, status_color(it));
         let mut meta = vec![redact.apply(&status_text(it, n))];
         if let Some(r) = &read {
             meta.push(format!("{}: {}", tr("report.read_as"), r.label()));
         }
+        let differs = match &found {
+            FileDiffs::Diffs(_, result) => !hunks_with(result, 0).is_empty(),
+            _ => false,
+        };
+        if !differs {
+            // No difference to draw: the file is a row of the table after the parts.
+            summary_only += 1;
+            if let FileDiffs::Diffs(_, result) = &found {
+                let ignored = ignored_blocks(result);
+                total_ignored += ignored;
+                if ignored > 0 {
+                    meta.push(trf("report.n_ignored", &[("n", ignored.to_string())]));
+                }
+            }
+            let why = summary_reason(it, n, &found, true, &redact).unwrap_or_default();
+            let mut blocks = vec![tr("report.summary_only").to_string()];
+            if !why.is_empty() {
+                blocks.push(why.clone());
+            }
+            let color = w.status_color(it);
+            summaries.push((index.len(), rel, color, meta.join("   ·   "), why));
+            index.push(IndexRow {
+                item: it,
+                at: (0, 0.0),
+                blocks: blocks.join("\n"),
+                read: read.map(|r| r.label()).unwrap_or_default(),
+            });
+            continue;
+        }
+        if w.y > w.top() {
+            w.gap(8.0);
+        }
+        // The name stays on the page of the first lines of its first difference: it needs
+        // its name, two lines about it, and what the bar of a difference asks for.
+        w.need(HEAD_SIZE * 2.0 + SMALL_SIZE * 4.0 + TEXT_SIZE * 1.9 + 5.0 * CODE_LEAD + 8.0);
+        let at = (w.page(), w.y);
+        w.mark(rel.clone(), 0);
+        let color = w.status_color(it);
+        w.file_heading(&rel, color);
         let (mut shown, mut total, mut cut, mut short) = (0, 0, 0, 0);
         if let FileDiffs::Diffs(docs, result) = &found {
             let ignored = ignored_blocks(result);
@@ -2310,30 +2519,15 @@ pub fn folder_pdf(
         left_out += total - shown;
         cut_blocks += cut;
         cut_short += short;
-        let mut blocks = Vec::new();
-        if total == 0 {
-            summary_only += 1;
-            blocks.push(tr("report.summary_only").to_string());
-            if !matches!(found, FileDiffs::Diffs(..)) {
-                meta.push(tr("report.summary_only").to_string());
-                w.para_in(12.0, SMALL_SIZE, Family::Sans, &meta.join("   ·   "), DIM);
-                w.gap(2.0);
-            }
-            if let Some(why) = summary_reason(it, n, &found, true, &redact) {
-                w.para_in(12.0, TEXT_SIZE, Family::Sans, &why, BLACK);
-                blocks.push(why);
-            }
-        } else {
-            blocks.push(shown.to_string());
-            if shown < total {
-                blocks.push(trf(
-                    "report.n_left_out",
-                    &[("n", (total - shown).to_string())],
-                ));
-            }
-            if cut + short > 0 {
-                blocks.push(tr("report.shortened").to_string());
-            }
+        let mut blocks = vec![shown.to_string()];
+        if shown < total {
+            blocks.push(trf(
+                "report.n_left_out",
+                &[("n", (total - shown).to_string())],
+            ));
+        }
+        if cut + short > 0 {
+            blocks.push(tr("report.shortened").to_string());
         }
         index.push(IndexRow {
             item: it,
@@ -2342,6 +2536,30 @@ pub fn folder_pdf(
             read: read.map(|r| r.label()).unwrap_or_default(),
         });
     }
+    if !summaries.is_empty() {
+        let heading = format!("{} ({})", tr("report.summary_only"), summaries.len());
+        w.part(&heading, true);
+        let total = w.content_w() - 12.0;
+        let widths = [total * 0.34, total * 0.33, total * 0.33];
+        let header: Vec<String> = vec![
+            tr("col.name").into(),
+            tr("col.result").into(),
+            tr("report.summary_only").into(),
+        ];
+        table_row(&mut w, &header, &widths, &[], None, None);
+        for (k, name, color, about, why) in summaries {
+            let cells = vec![name.clone(), about, why];
+            let (page, y, _) = table_row(&mut w, &cells, &widths, &[], Some(color), Some(&header));
+            index[k].at = (page, y);
+            w.marks.push(Mark {
+                title: name,
+                page,
+                y,
+                level: 1,
+            });
+        }
+    }
+    w.gutters.clear();
     let body_pages = std::mem::take(&mut w.pages);
     let body_marks = std::mem::take(&mut w.marks);
     let body_y = w.y;
@@ -2354,24 +2572,22 @@ pub fn folder_pdf(
     } else {
         display.iter().map(|d| d.display().to_string()).collect()
     };
-    w.sides(&names, rules);
-    if info.hide_paths {
-        w.para(SMALL_SIZE, Family::Sans, tr("report.paths_hidden"), DIM);
-        w.gap(6.0);
-    }
-    let card =
-        |label: &'static str, class: &str| (label, count(class).to_string(), class_color(class));
+    let colors = ["identical", "different", "unique", "error", "other"].map(|c| w.class_color(c));
+    let card = |label: &'static str, k: usize| {
+        let class = ["identical", "different", "unique", "error", "other"][k];
+        (label, count(class).to_string(), colors[k])
+    };
     let mut cards = vec![
         (tr("report.files"), listed.len().to_string(), LINK),
-        card(tr("report.identical"), "identical"),
-        card(tr("report.files_different"), "different"),
-        card(tr("report.files_unique"), "unique"),
+        card(tr("report.identical"), 0),
+        card(tr("report.files_different"), 1),
+        card(tr("report.files_unique"), 2),
     ];
     if count("error") > 0 {
-        cards.push(card(tr("report.errors"), "error"));
+        cards.push(card(tr("report.errors"), 3));
     }
     if count("other") > 0 {
-        cards.push(card(tr("report.not_compared"), "other"));
+        cards.push(card(tr("report.not_compared"), 4));
     }
     if diffs.is_some() {
         let n = shown_blocks.to_string();
@@ -2379,13 +2595,32 @@ pub fn folder_pdf(
     }
     if left_out > 0 {
         let n = left_out.to_string();
-        cards.push((tr("report.blocks_left_out"), n, class_color("error")));
+        cards.push((tr("report.blocks_left_out"), n, colors[3]));
     }
     if total_ignored > 0 {
         let n = total_ignored.to_string();
         cards.push((tr("report.ignored"), n, w.palette.ign.2));
     }
-    w.counts(&cards);
+    w.summary(&names, rules, &cards);
+    if info.hide_paths {
+        w.subject.clear();
+        w.para(SMALL_SIZE, Family::Sans, tr("report.paths_hidden"), DIM);
+        w.gap(6.0);
+    }
+    if shown_blocks > 0 {
+        let mut classes = vec![
+            ("del", tr("report.kind_removed")),
+            ("add", tr("report.kind_added")),
+            ("chg", tr("report.kind_changed")),
+        ];
+        if n == 3 {
+            classes.push(("conf", tr("report.kind_conflict")));
+        }
+        if total_ignored > 0 {
+            classes.push(("ign", tr("report.ignored")));
+        }
+        w.legend(&classes);
+    }
 
     let mut omissions = Vec::new();
     if summary_only > 0 {
@@ -2504,7 +2739,7 @@ fn index_table(
         tr("report.blocks_exported").into(),
         tr("report.read_as").into(),
     ];
-    table_row(w, &header, &widths, None, None);
+    table_row(w, &header, &widths, &[], None, None);
     let mut links = Vec::new();
     for row in index {
         let it = row.item;
@@ -2514,7 +2749,8 @@ fn index_table(
             redact.apply(&row.blocks),
             row.read.clone(),
         ];
-        let (page, y, h) = table_row(w, &cells, &widths, Some(status_color(it)), Some(&header));
+        let color = w.status_color(it);
+        let (page, y, h) = table_row(w, &cells, &widths, &[], Some(color), Some(&header));
         if let Some(rect) = Rect::from_xywh(w.left(), y, w.content_w(), h) {
             links.push((page, rect, row.at));
         }
@@ -2522,38 +2758,26 @@ fn index_table(
     links
 }
 
-fn status_color(it: &DirItem) -> Color {
-    class_color(status_class(it.status))
-}
-
-/// The color of a status of [`status_class`], for its dot and its count.
-fn class_color(class: &str) -> Color {
-    match class {
-        "identical" => (0x16, 0xa3, 0x4a),
-        "different" => (0xd9, 0x77, 0x06),
-        "unique" => (0x7c, 0x3a, 0xed),
-        "error" => (0xdc, 0x26, 0x26),
-        _ => DIM,
-    }
-}
-
-/// The table of the files of a folder report.
+/// The table of the files of a folder report: for each side the size of the file, the sizes
+/// under one another with their ends in line, and when it was changed.
 fn file_table(w: &mut Writer, listed: &[&DirItem], n: usize, redact: &Redact) {
     let total = w.content_w() - 12.0;
-    let side_w = total * 0.40 / n as f32;
-    let widths = [total * 0.26, total * 0.18, total * 0.16];
+    let side_w = total * 0.44 / n as f32;
+    let size_w = (side_w * 0.34).max(44.0).min(side_w * 0.5);
+    let mut widths = vec![total * 0.24, total * 0.16, total * 0.16];
     let mut header: Vec<String> = vec![
         tr("col.name").into(),
         tr("col.folder").into(),
         tr("col.result").into(),
     ];
+    let mut right = Vec::new();
     for s in 0..n {
+        right.push(header.len());
         header.push(side_name(s, n).to_string());
+        header.push(tr("col.modified").into());
+        widths.extend([size_w, side_w - size_w]);
     }
-    let widths: Vec<f32> = (0..header.len())
-        .map(|i| if i < 3 { widths[i] } else { side_w })
-        .collect();
-    table_row(w, &header, &widths, None, None);
+    table_row(w, &header, &widths, &right, None, None);
     for it in listed {
         let mut cells = vec![
             it.name.clone(),
@@ -2561,32 +2785,32 @@ fn file_table(w: &mut Writer, listed: &[&DirItem], n: usize, redact: &Redact) {
             redact.apply(&status_text(it, n)),
         ];
         for s in 0..n {
-            let size = match it.size[s] {
+            cells.push(match it.size[s] {
                 Some(_) => fmt_size(it.size[s]),
                 None => "—".to_owned(),
-            };
-            let time = fmt_time(it.mtime[s]);
-            cells.push(if it.is_dir || time.is_empty() {
-                size
-            } else {
-                format!("{size}\n{time}")
+            });
+            cells.push(match it.is_dir {
+                true => String::new(),
+                false => fmt_time(it.mtime[s]),
             });
         }
-        table_row(w, &cells, &widths, Some(status_color(it)), Some(&header));
+        let color = w.status_color(it);
+        table_row(w, &cells, &widths, &right, Some(color), Some(&header));
     }
     if listed.is_empty() {
         w.para(TEXT_SIZE, Family::Sans, tr("report.no_match"), DIM);
     }
 }
 
-/// One row of the file table, each cell wrapped to its column and cut with `…` where it would
-/// not fit on a page. `header` is the table's header row, drawn again first when this row
-/// starts a new page; `None` for the header row itself. Returns the page, top and height of the
-/// row.
+/// One row of a table, each cell wrapped to its column and cut with `…` where it would not
+/// fit on a page; the cells of the columns in `right` end at the right edge of their column.
+/// `header` is the table's header row, drawn again first when this row starts a new page;
+/// `None` for the header row itself. Returns the page, top and height of the row.
 fn table_row(
     w: &mut Writer,
     cells: &[String],
     widths: &[f32],
+    right: &[usize],
     color: Option<Color>,
     header: Option<&[String]>,
 ) -> (usize, f32, f32) {
@@ -2597,7 +2821,7 @@ fn table_row(
         .iter()
         .zip(widths)
         .map(|(c, &cw)| {
-            let mut lines = w.wrap(Family::Sans, SMALL_SIZE, c, cw - 6.0);
+            let mut lines = w.wrap(Family::Sans, SMALL_SIZE, c, cw - 8.0);
             if lines.len() > max_lines {
                 lines.truncate(max_lines);
                 lines[max_lines - 1].push('…');
@@ -2610,7 +2834,7 @@ fn table_row(
     let page = w.page();
     w.need(h);
     if let (true, Some(head)) = (w.page() != page, header) {
-        table_row(w, head, widths, None, None);
+        table_row(w, head, widths, right, None, None);
     }
     let (x0, y) = (w.left(), w.y);
     // The header row is a band; the rows under it are parted by lines.
@@ -2622,13 +2846,17 @@ fn table_row(
         w.dot(x0 + 5.0, y + 2.5 + CODE_LEAD * 0.5, 2.2, c);
     }
     let mut x = x0 + 12.0;
-    for (lines, cw) in wrapped.iter().zip(widths) {
+    for (col, (lines, cw)) in wrapped.iter().zip(widths).enumerate() {
         for (k, l) in lines.iter().enumerate() {
             let base = y + 2.5 + CODE_LEAD * (k as f32 + 0.78);
+            let at = match right.contains(&col) {
+                true => x + cw - 8.0 - w.faces.width(Family::Sans, SMALL_SIZE, l),
+                false => x,
+            };
             if head {
-                w.bold(x, base, SMALL_SIZE, l, DIM);
+                w.bold(at, base, SMALL_SIZE, l, DIM);
             } else {
-                w.text(x, base, SMALL_SIZE, Family::Sans, l, BLACK);
+                w.text(at, base, SMALL_SIZE, Family::Sans, l, BLACK);
             }
         }
         x += cw;
@@ -3232,6 +3460,177 @@ mod tests {
         for want in ["base.txt", "theirs.txt", "deux", "zwei"] {
             assert!(text.contains(want), "{want} missing in {text}");
         }
+    }
+
+    /// The texts drawn on a page of `w`, with where each starts.
+    fn texts<'w>(w: &'w Writer, page: usize) -> Vec<(&'w str, f32, f32)> {
+        w.pages[page]
+            .iter()
+            .filter_map(|op| match op {
+                Op::Text { text, x, y, .. } => Some((text.as_str(), *x, *y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_heading_at_the_foot_of_a_page_moves_on_with_its_bookmark() {
+        let f = fonts();
+        let mut w = Writer::new(&f, &PdfOptions::default(), "").unwrap();
+        w.y = w.bottom() - 40.0;
+        w.part("Review notes", true);
+        assert_eq!(w.page(), 1, "no room for the heading and what follows it");
+        assert_eq!(w.marks[0].page, 1, "the bookmark is where the heading is");
+        assert!(texts(&w, 1).iter().any(|t| t.0 == "Review notes"));
+        assert!(texts(&w, 0).is_empty());
+    }
+
+    #[test]
+    fn the_counts_stand_beside_the_sides_only_where_both_fit() {
+        let f = fonts();
+        let cards: Vec<(&str, String, Color)> =
+            (0..9).map(|i| ("count", i.to_string(), LINK)).collect();
+        let names = v(&["left.txt", "right.txt"]);
+        let place = |w: &Writer, text: &str| {
+            let found = texts(w, 0).into_iter().find(|t| t.0 == text);
+            found.map(|t| (t.1, t.2)).expect("drawn")
+        };
+        // Landscape, four counts: one row, to the right of the sides and level with them.
+        let mut wide = Writer::new(&f, &PdfOptions::default(), "").unwrap();
+        wide.summary(&names, "", &cards[..4]);
+        let (side, first, last) = (
+            place(&wide, "left.txt"),
+            place(&wide, "0"),
+            place(&wide, "3"),
+        );
+        assert!(
+            first.0 > side.0 && first.1 == last.1,
+            "{side:?} {first:?} {last:?}"
+        );
+        assert!((first.1 - side.1).abs() < 20.0, "level with the sides");
+        assert!(last.0 < wide.right());
+        assert_eq!(wide.inset, (0.0, 0.0));
+        // Portrait, nine counts: under the sides, on more than one row, within the margins.
+        let portrait = PdfOptions {
+            portrait: true,
+            ..Default::default()
+        };
+        let mut narrow = Writer::new(&f, &portrait, "").unwrap();
+        narrow.summary(&names, "", &cards);
+        let (side, first, last) = (
+            place(&narrow, "left.txt"),
+            place(&narrow, "0"),
+            place(&narrow, "8"),
+        );
+        assert!(first.1 > side.1 + 20.0, "under the sides");
+        assert!(last.1 > first.1, "the counts wrap");
+        for op in &narrow.pages[0] {
+            if let Op::Round(rect, ..) = op {
+                assert!(rect.right() <= narrow.right() + 0.01, "{rect:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unchanged_lines_under_one_another_share_one_line_number_background() {
+        let a: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
+        let mut b = a.clone();
+        b[29] = "changed".into();
+        let panes: Vec<&[String]> = vec![&a, &b];
+        let opts = DiffOptions::default();
+        let result = compute(&panes, &opts);
+        let f = fonts();
+        let whole = PdfOptions {
+            context: None,
+            ..Default::default()
+        };
+        let mut w = Writer::new(&f, &whole, "").unwrap();
+        let doc = Doc {
+            name: "",
+            panes: &panes,
+            result: &result,
+            opts: &opts,
+            notes: &[],
+            read: None,
+        };
+        w.diffs(&doc, &whole);
+        let gutters = w.pages[0]
+            .iter()
+            .filter(|op| matches!(op, Op::Fill(_, GUTTER)))
+            .count();
+        assert_eq!(
+            gutters, 2,
+            "one for each side, not one for each of the 29 lines"
+        );
+    }
+
+    #[test]
+    fn a_report_explains_its_signs_and_names_the_sides_on_each_page() {
+        let a: Vec<String> = (0..400).map(|i| format!("line {i}")).collect();
+        let b: Vec<String> = (0..400).map(|i| format!("row {i}")).collect();
+        let pdf = report(&a, &b, &PdfOptions::default());
+        let text = read(&pdf);
+        for want in [
+            tr("report.kind_removed"),
+            tr("report.kind_added"),
+            tr("peek.missing"),
+        ] {
+            assert!(text.contains(want), "{want} missing in the legend");
+        }
+        assert!(pages(&pdf) > 1);
+        assert!(
+            text.matches("right.txt").count() > pages(&pdf),
+            "in each header"
+        );
+    }
+
+    #[test]
+    fn files_without_differences_to_show_are_listed_in_one_table() {
+        use crate::core::filter::FileFilter;
+        use crate::core::folder::{FolderOptions, Progress, Scanner};
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        for name in ["one.bin", "two.bin"] {
+            std::fs::write(a.path().join(name), [0u8, 1, 2, 3, 0, 9]).unwrap();
+            std::fs::write(b.path().join(name), [0u8, 1, 2, 4, 0, 9]).unwrap();
+        }
+        std::fs::write(a.path().join("text.txt"), "one\n").unwrap();
+        std::fs::write(b.path().join("text.txt"), "two\n").unwrap();
+        let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        let opts = DiffOptions::default();
+        let items = Scanner {
+            roots: &roots,
+            filter: &FileFilter::default(),
+            fopts: &FolderOptions::default(),
+            dopts: &opts,
+            progress: &Progress::default(),
+        }
+        .run();
+        let refs: Vec<&DirItem> = items.iter().filter(|i| !i.is_dir).collect();
+        let pdf = folder_pdf(
+            &refs,
+            &roots,
+            &roots,
+            Some(&opts),
+            "",
+            &FolderReportInfo::default(),
+            &[],
+            &fonts(),
+            &Default::default(),
+        )
+        .unwrap();
+        let flat = read(&pdf).split_whitespace().collect::<Vec<_>>().join(" ");
+        let heading = format!("{} (2)", tr("report.summary_only"));
+        assert!(flat.contains(&heading), "{heading} missing in {flat}");
+        // Each file is in the index, in the table of its kind or its own part, and in the
+        // list of all files.
+        for name in ["one.bin", "two.bin", "text.txt"] {
+            assert!(flat.matches(name).count() >= 3, "{name} in {flat}");
+        }
+        let raw = String::from_utf8_lossy(&pdf);
+        assert!(
+            raw.matches("/Dest").count() >= 3,
+            "each index row links to its file"
+        );
     }
 
     #[test]

@@ -575,13 +575,18 @@ uses its section of this file as the release notes.
 ### Changed
 
 - **PDF reports have a cleaner layout:** a report starts with its title, a panel naming the
-  compared sides and the counts as a row of cards. The parts have headings, the settings of a
-  folder report are a table of labels and values, and each file's part starts with its name
-  beside a dot in the color of its status. The bar above a difference has a stripe in the color
-  of its kind, the line numbers of unchanged lines have a quiet background, the tables have a
-  header band, and the header of each page also gives the time the report was made. The content
-  of the report, the signs, underlines and hatching that keep it legible in black and white,
-  and the color-blind colors are unchanged.
+  compared sides and the counts as a row of cards, beside the panel where the page is wide
+  enough, and a line that explains the signs and backgrounds of the compared lines. The parts
+  have headings, the settings of a folder report are a table of labels and values, and each
+  file's part starts with its name beside a dot in the color of its status. The files of a
+  folder report that show no differences, such as binary files, are listed in one *Summary
+  only* table after the parts instead of each under a heading of its own. The list of all
+  files has the sizes in a column with their ends in line and the dates in a column of their
+  own. The bar above a difference has a stripe in the color of its kind, the line numbers of
+  unchanged lines have a quiet background, the tables have a header band, and the header of
+  each page names the compared sides. With *Color-blind friendly diff colors* on, the dots
+  and counts of the file statuses use those colors too. The content of the report and the
+  signs, underlines and hatching that keep it legible in black and white are unchanged.
 - **All differences colors added lines as a file compare does:** in the *All differences*
   view of two folders, lines only one file has are now shown in the color of added lines and
   changed lines in that of changes, where both had the color of changes.
