@@ -5143,7 +5143,11 @@ fn arrow_down_from_a_row_that_is_not_listed_selects_the_next_listed_row() {
     );
     gui.click("Position");
     gui.click("Key columns");
-    assert_eq!(gui.text_view().selected_record(1), Some(2), "starts on the changed record");
+    assert_eq!(
+        gui.text_view().selected_record(1),
+        Some(2),
+        "starts on the changed record"
+    );
     gui.click("Added  2");
     gui.key(Modifiers::NONE, Key::ArrowDown);
     gui.settle();
@@ -5158,7 +5162,10 @@ fn arrow_down_from_a_row_that_is_not_listed_selects_the_next_listed_row() {
 fn fit_columns_is_turned_on_and_off_again() {
     let dir = tempfile::tempdir().unwrap();
     let left = "id,name\n1,a rather long name that needs room\n";
-    write(dir.path(), &[("left.csv", left), ("right.csv", "id,name\n1,b\n")]);
+    write(
+        dir.path(),
+        &[("left.csv", left), ("right.csv", "id,name\n1,b\n")],
+    );
     let mut gui = Gui::start(
         "table_fit_columns",
         compare(&[dir.path().join("left.csv"), dir.path().join("right.csv")]),
@@ -5167,7 +5174,10 @@ fn fit_columns_is_turned_on_and_off_again() {
     gui.click("Fit columns");
     assert!(gui.text_view().columns_fitted());
     gui.click("Fit columns");
-    assert!(!gui.text_view().columns_fitted(), "a second click turns it off");
+    assert!(
+        !gui.text_view().columns_fitted(),
+        "a second click turns it off"
+    );
 }
 
 #[test]

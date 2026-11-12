@@ -681,7 +681,11 @@ impl TableMerges {
             return None;
         }
         if records.len() == 1 {
-            return self.ranges.get(records.start).copied().filter(|&m| matches(m));
+            return self
+                .ranges
+                .get(records.start)
+                .copied()
+                .filter(|&m| matches(m));
         }
         let mid = records.start + records.len() / 2;
         self.find_in_subtree(2 * node, records.start..mid, (stop, last), matches)
@@ -2237,7 +2241,10 @@ mod tests {
         let opts = super::super::diff::DiffOptions::default();
         let doc = super::super::unpacker::load_doc(&path, &opts, None).unwrap();
         assert!(is_sheet_heading(&doc.lines[0]), "{:?}", doc.lines);
-        assert_eq!(super::super::table::delimiter_of_doc(&doc, &opts), Some(','));
+        assert_eq!(
+            super::super::table::delimiter_of_doc(&doc, &opts),
+            Some(',')
+        );
     }
 
     #[test]

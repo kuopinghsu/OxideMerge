@@ -421,12 +421,26 @@ impl XmlTreeView {
             for (f, key, n, dot) in [
                 (Filter::Added, "analysis.added", c.added, pal.success),
                 (Filter::Removed, "analysis.removed", c.removed, pal.danger),
-                (Filter::Modified, "analysis.modified", c.modified, pal.accent),
+                (
+                    Filter::Modified,
+                    "analysis.modified",
+                    c.modified,
+                    pal.accent,
+                ),
                 (Filter::Moved, "analysis.moved", c.moved, pal.sides[1]),
-                (Filter::Ambiguous, "analysis.tree_ambiguous", c.ambiguous, pal.warning),
+                (
+                    Filter::Ambiguous,
+                    "analysis.tree_ambiguous",
+                    c.ambiguous,
+                    pal.warning,
+                ),
             ] {
                 if filter_chip(ui, self.filter == Some(f), tr(key), n, Some(dot)).clicked() {
-                    self.filter = if self.filter == Some(f) { None } else { Some(f) };
+                    self.filter = if self.filter == Some(f) {
+                        None
+                    } else {
+                        Some(f)
+                    };
                 }
             }
             if before != self.filter {
@@ -1389,19 +1403,18 @@ pub fn filter_chip(
     let small = egui::TextStyle::Small.resolve(ui.style());
     let fg = if selected { pal.on_accent } else { pal.text };
     let name_g = ui.painter().layout_no_wrap(name.to_owned(), font, fg);
-    let count_fg = if selected { pal.on_accent } else { pal.text_dim };
+    let count_fg = if selected {
+        pal.on_accent
+    } else {
+        pal.text_dim
+    };
     let count_g = ui.painter().layout_no_wrap(n.to_string(), small, count_fg);
     let dot_w = if dot.is_some() { 12.0 } else { 0.0 };
     let w = 10.0 + dot_w + name_g.size().x + 6.0 + count_g.size().x + 10.0;
     let h = name_g.size().y.max(18.0) + 4.0;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(w, h), Sense::click());
     response.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::Role::Button,
-            true,
-            selected,
-            format!("{name}  ({n})"),
-        )
+        egui::WidgetInfo::selected(egui::Role::Button, true, selected, format!("{name}  ({n})"))
     });
     if ui.is_rect_visible(rect) {
         let p = ui.painter();

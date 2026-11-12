@@ -702,7 +702,9 @@ fn warning_text(warning: &table_match::Warning) -> String {
 fn reorder_hint(a: &table::Table, b: &table::Table, current: &TableMatch) -> Option<TableMatch> {
     let names = |t: &table::Table| -> Vec<String> {
         let first = t.records.first();
-        first.map_or_else(Vec::new, |r| r.cells.iter().map(|c| c.trim().to_string()).collect())
+        first.map_or_else(Vec::new, |r| {
+            r.cells.iter().map(|c| c.trim().to_string()).collect()
+        })
     };
     let (left, right) = (names(a), names(b));
     let is_header = |names: &[String]| {
@@ -759,7 +761,9 @@ fn is_number(cell: &str) -> bool {
         .trim_start_matches(['(', '-', '+', '$', '€', '£', '¥'])
         .trim_end_matches([')', '%'])
         .replace(',', "");
-    cell.len() <= 40 && bare.starts_with(|c: char| c.is_ascii_digit()) && bare.parse::<f64>().is_ok()
+    cell.len() <= 40
+        && bare.starts_with(|c: char| c.is_ascii_digit())
+        && bare.parse::<f64>().is_ok()
 }
 
 /// What the heading of a sheet starts with in the records of a workbook of several sheets.
@@ -795,7 +799,10 @@ fn diff_by_sheet(keys: &[Vec<String>], sheets: &[SheetRanges], opts: &DiffOption
                 Some(i) => at = i + 1,
                 None => {
                     // after the sheets only the sides before have there
-                    while order.get(at).is_some_and(|n| side.iter().all(|(s, _)| s != n)) {
+                    while order
+                        .get(at)
+                        .is_some_and(|n| side.iter().all(|(s, _)| s != n))
+                    {
                         at += 1;
                     }
                     order.insert(at, name);
@@ -914,7 +921,13 @@ fn hatch_cell(ui: &Ui, c: &Colors) {
 
 /// The text of a cell on one line, with what differs from `against` on the background `mark`:
 /// all but what the two start and end with alike.
-fn cell_job(text: &str, against: Option<&str>, mark: Color32, font: FontId, ink: Color32) -> LayoutJob {
+fn cell_job(
+    text: &str,
+    against: Option<&str>,
+    mark: Color32,
+    font: FontId,
+    ink: Color32,
+) -> LayoutJob {
     let flat = |s: &str| s.replace("\r\n", "⏎").replace(['\n', '\r'], "⏎");
     let text: Vec<char> = flat(text).chars().collect();
     let plain = TextFormat {
@@ -1258,12 +1271,24 @@ fn change_details(
     let mut job = egui::text::LayoutJob::default();
     match change.before.as_deref() {
         Some(v) => job.append(&shorten(v, 512), 0.0, fmt(colors.inline_removed, text)),
-        None => job.append("∅", 0.0, fmt(Color32::TRANSPARENT, widgets::pal(ui).text_dim)),
+        None => job.append(
+            "∅",
+            0.0,
+            fmt(Color32::TRANSPARENT, widgets::pal(ui).text_dim),
+        ),
     }
-    job.append(" → ", 0.0, fmt(Color32::TRANSPARENT, widgets::pal(ui).text_dim));
+    job.append(
+        " → ",
+        0.0,
+        fmt(Color32::TRANSPARENT, widgets::pal(ui).text_dim),
+    );
     match change.after.as_deref() {
         Some(v) => job.append(&shorten(v, 512), 0.0, fmt(colors.inline_added, text)),
-        None => job.append("∅", 0.0, fmt(Color32::TRANSPARENT, widgets::pal(ui).text_dim)),
+        None => job.append(
+            "∅",
+            0.0,
+            fmt(Color32::TRANSPARENT, widgets::pal(ui).text_dim),
+        ),
     }
     ui.label(job);
     let paired = match change.confidence.as_str() {
@@ -1310,7 +1335,9 @@ fn semantic_tree_ui(
             ChangeKind::TypeChanged => pal.warning,
             ChangeKind::Moved => pal.sides[1],
         };
-        let header = egui::RichText::new(change_label(change)).color(color).strong();
+        let header = egui::RichText::new(change_label(change))
+            .color(color)
+            .strong();
         egui::CollapsingHeader::new(header)
             .id_salt(&change.id)
             .default_open(true)
@@ -3022,7 +3049,10 @@ impl TextView {
             return place(&mut rows, self.table.selected);
         }
         if self.positional_merge_table() {
-            return place(&mut self.table_difference_blocks(), self.current_table_block());
+            return place(
+                &mut self.table_difference_blocks(),
+                self.current_table_block(),
+            );
         }
         place(&mut self.significant(), self.cur_block)
     }
@@ -3419,7 +3449,9 @@ impl TextView {
             return;
         }
         if self.positional_merge_table() {
-            let Some(index) = self.current_table_block() else { return };
+            let Some(index) = self.current_table_block() else {
+                return;
+            };
             let (from, to) = self.copy_direction(to_right);
             if self.table.diff.blocks[index].ignored || !self.writable(to) {
                 return;
@@ -5993,10 +6025,12 @@ impl TextView {
     pub fn change_counts(&self) -> Option<(usize, usize)> {
         (self.n() == 2).then(|| {
             if self.positional_merge_table() {
-                return self.table_difference_blocks().fold((0, 0), |(del, add), b| {
-                    let r = &self.table.diff.blocks[b].ranges;
-                    (del + r[0].len(), add + r[1].len())
-                });
+                return self
+                    .table_difference_blocks()
+                    .fold((0, 0), |(del, add), b| {
+                        let r = &self.table.diff.blocks[b].ranges;
+                        (del + r[0].len(), add + r[1].len())
+                    });
             }
             self.significant().fold((0, 0), |(del, add), b| {
                 let r = &self.diff.blocks[b].ranges;
@@ -8244,9 +8278,8 @@ impl TextView {
         let row = self.table_cursor();
         let current = self.current_table_block();
         let found = if forward {
-            self.table_difference_blocks().find(|&b| {
-                row.is_none_or(|r| self.table.diff.blocks[b].first_row > r)
-            })
+            self.table_difference_blocks()
+                .find(|&b| row.is_none_or(|r| self.table.diff.blocks[b].first_row > r))
         } else {
             self.table_difference_blocks().rev().find(|&b| {
                 Some(b) != current && row.is_none_or(|r| self.table.diff.blocks[b].first_row < r)
@@ -8426,9 +8459,10 @@ impl TextView {
                 self.keyed().is_some()
                     || (self.cursor_row.is_none() && self.table_padding_row(row))
                     || (self.positional_merge_table()
-                        && self.cursor_row.and_then(|r| self.diff.rows.get(r)).is_some_and(|raw| {
-                            (0..self.n()).any(|p| self.holds(row, raw, p))
-                        }))
+                        && self
+                            .cursor_row
+                            .and_then(|r| self.diff.rows.get(r))
+                            .is_some_and(|raw| (0..self.n()).any(|p| self.holds(row, raw, p))))
             })
         }) {
             return Some(row);
@@ -8758,7 +8792,10 @@ impl TextView {
             let rows = &self.table.diff.rows;
             let differing = rows
                 .iter()
-                .filter(|r| r.block().is_some_and(|b| !self.table.diff.blocks[b].ignored))
+                .filter(|r| {
+                    r.block()
+                        .is_some_and(|b| !self.table.diff.blocks[b].ignored)
+                })
                 .count();
             self.table.hint = Some(match (self.table.docs.first(), self.table.docs.get(1)) {
                 (Some(Ok(a)), Some(Ok(b)))
@@ -8773,7 +8810,10 @@ impl TextView {
         let Some(Some(m)) = &self.table.hint else {
             return;
         };
-        let column = m.keys.first().map_or_else(String::new, |k| key_label(k, names));
+        let column = m
+            .keys
+            .first()
+            .map_or_else(String::new, |k| key_label(k, names));
         let (mut apply, mut dismiss) = (false, false);
         ui.horizontal_wrapped(|ui| {
             ui.label(trf("table.hint_reordered", &[("column", column.clone())]));
@@ -9857,13 +9897,11 @@ impl TextView {
                         && !self.merge_only_row(index);
                     let gap = (0..n).any(|q| aligned.line(q).is_none());
                     let here = pane.is_none_or(|p| aligned.line(p).is_some());
-                    (differs && gap && here).then_some(
-                        if n == 2 && aligned.line(1).is_none() {
-                            c.removed
-                        } else {
-                            c.added
-                        },
-                    )
+                    (differs && gap && here).then_some(if n == 2 && aligned.line(1).is_none() {
+                        c.removed
+                    } else {
+                        c.added
+                    })
                 }
             }
         };
@@ -9934,7 +9972,11 @@ impl TextView {
                                 );
                                 grid_cell(ui, c);
                                 let cell = ui
-                                    .interact(ui.max_rect(), ui.scope_id().with("head"), Sense::click())
+                                    .interact(
+                                        ui.max_rect(),
+                                        ui.scope_id().with("head"),
+                                        Sense::click(),
+                                    )
                                     .on_hover_text(self.panes[p].doc.title());
                                 if cell.double_clicked() && header_cell(p, column).is_some() {
                                     edit_cell = Some((p, 0, column));
@@ -10043,10 +10085,9 @@ impl TextView {
                                         });
                                         fill_cell(
                                             ui,
-                                            ui.visuals().panel_fill.lerp_to_gamma(
-                                                widgets::side_color(ui, p, n),
-                                                0.18,
-                                            ),
+                                            ui.visuals()
+                                                .panel_fill
+                                                .lerp_to_gamma(widgets::side_color(ui, p, n), 0.18),
                                         );
                                         let first = aligned.line(p) == Some(merge.first_record());
                                         let anchor = first && column == merge.first.1;
@@ -10132,8 +10173,7 @@ impl TextView {
                                         if let Some(r) = aligned.line(p) {
                                             if ui
                                                 .add_enabled(
-                                                    !self.panes[p].doc.read_only
-                                                        && value.is_some(),
+                                                    !self.panes[p].doc.read_only && value.is_some(),
                                                     egui::Button::new(tr("table.edit_cell")),
                                                 )
                                                 .clicked()
@@ -10215,8 +10255,7 @@ impl TextView {
                         })
                         .unwrap_or_default()
                 };
-                let body_clip =
-                    Rect::from_min_max(pos2(view.left(), header_band.max), view.max);
+                let body_clip = Rect::from_min_max(pos2(view.left(), header_band.max), view.max);
                 for &(index, band) in &drawn {
                     let strip = strip(band);
                     let painter = ui.painter().with_clip_rect(strip.intersect(body_clip));
@@ -10227,7 +10266,11 @@ impl TextView {
                     let mut gutter = strip;
                     gutter.set_width(record_width);
                     let on = cursor == Some(index);
-                    painter.rect_filled(gutter, 0.0, if on { pal.accent_soft } else { c.gutter_bg });
+                    painter.rect_filled(
+                        gutter,
+                        0.0,
+                        if on { pal.accent_soft } else { c.gutter_bg },
+                    );
                     let mark = self
                         .keyed()
                         .and_then(|d| d.rows.get(index))
@@ -11224,9 +11267,21 @@ impl TextView {
             }
             for (kind, key, dot) in [
                 (semantic::ChangeKind::Added, "analysis.added", pal.success),
-                (semantic::ChangeKind::Removed, "analysis.removed", pal.danger),
-                (semantic::ChangeKind::Modified, "analysis.modified", pal.accent),
-                (semantic::ChangeKind::TypeChanged, "analysis.type_changed", pal.warning),
+                (
+                    semantic::ChangeKind::Removed,
+                    "analysis.removed",
+                    pal.danger,
+                ),
+                (
+                    semantic::ChangeKind::Modified,
+                    "analysis.modified",
+                    pal.accent,
+                ),
+                (
+                    semantic::ChangeKind::TypeChanged,
+                    "analysis.type_changed",
+                    pal.warning,
+                ),
                 (semantic::ChangeKind::Moved, "analysis.moved", pal.sides[1]),
             ] {
                 let n = report.changes.iter().filter(|c| c.kind == kind).count();
@@ -13354,17 +13409,43 @@ mod tests {
 
     #[test]
     fn numbers_are_told_from_text_as_a_number_format_writes_them() {
-        for cell in ["12", " 75.505 ", "-3", "1e3", "$741,700", "82.4%", "(1,200.50)", "€9"] {
+        for cell in [
+            "12",
+            " 75.505 ",
+            "-3",
+            "1e3",
+            "$741,700",
+            "82.4%",
+            "(1,200.50)",
+            "€9",
+        ] {
             assert!(is_number(cell), "{cell}");
         }
-        for cell in ["", "abc", "2026-09-30", "1,2,x", "inf", "NaN", "$", "A1", "12 kg"] {
+        for cell in [
+            "",
+            "abc",
+            "2026-09-30",
+            "1,2,x",
+            "inf",
+            "NaN",
+            "$",
+            "A1",
+            "12 kg",
+        ] {
             assert!(!is_number(cell), "{cell}");
         }
     }
 
     #[test]
     fn columns_are_lettered_as_in_a_spreadsheet() {
-        let letters = [(0, "A"), (25, "Z"), (26, "AA"), (27, "AB"), (701, "ZZ"), (702, "AAA")];
+        let letters = [
+            (0, "A"),
+            (25, "Z"),
+            (26, "AA"),
+            (27, "AB"),
+            (701, "ZZ"),
+            (702, "AAA"),
+        ];
         for (column, name) in letters {
             assert_eq!(column_letters(column), name);
         }
@@ -13489,7 +13570,12 @@ mod tests {
         // The right side has a sheet the left has not, between two they share, and its last
         // sheet under another name.
         let left = book(&[("One", "a,b\n"), ("Two", "c,d\n"), ("Old", "x\n")]);
-        let right = book(&[("One", "a,b\n"), ("Extra", "c,d\n"), ("Two", "c,e\n"), ("New", "x\n")]);
+        let right = book(&[
+            ("One", "a,b\n"),
+            ("Extra", "c,d\n"),
+            ("Two", "c,e\n"),
+            ("New", "x\n"),
+        ]);
         let mut v = keyed_view(&left, &right, TableMatch::default());
         v.table_mode = true;
         v.note_sheets();
@@ -13610,10 +13696,7 @@ mod tests {
         let right_text = "id,value,note\n1,Keep,Shown\n";
         let mut left = TextDoc::from_text(Some("book.xlsx".into()), left_text);
         left.read_only = true;
-        left.sheet_merges = TableMerges::new(
-            vec![TableMerge::new(0, (2, 1), (2, 2))],
-            Vec::new(),
-        );
+        left.sheet_merges = TableMerges::new(vec![TableMerge::new(0, (2, 1), (2, 2))], Vec::new());
         for keyed in [false, true] {
             let right = TextDoc::from_text(Some("table.csv".into()), right_text);
             let mut v = TextView::new(vec![left.clone(), right], &strict_config());
@@ -13624,7 +13707,10 @@ mod tests {
             assert_eq!(v.diff_position().1, 1);
             v.first_diff();
             v.copy_current(true);
-            assert_eq!(table::source(&v.panes[1].doc), format!("{right_text}2,Anchor\n"));
+            assert_eq!(
+                table::source(&v.panes[1].doc),
+                format!("{right_text}2,Anchor\n")
+            );
             assert_eq!(table::source(&v.panes[0].doc), left_text);
             assert_eq!(v.diff_position().1, 0);
         }
