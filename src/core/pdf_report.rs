@@ -147,8 +147,13 @@ fn icon_image() -> Option<&'static Image> {
 const CODE_SIZE: f32 = 7.5;
 const CODE_LEAD: f32 = 9.6;
 const TEXT_SIZE: f32 = 9.0;
-const TITLE_SIZE: f32 = 16.0;
+const TITLE_SIZE: f32 = 20.0;
+/// The headings of the parts of a report, and the name of each file of a folder report.
+const HEAD_SIZE: f32 = 11.5;
 const SMALL_SIZE: f32 = 7.5;
+/// How far a fill reaches into the row below it, so that no hairline shows between the rows
+/// of one block where a viewer rounds their edges apart.
+const SEAM: f32 = 0.3;
 /// Spaces a tab stands for.
 const TAB: usize = 4;
 
@@ -157,8 +162,14 @@ const BLACK: Color = (0x1d, 0x23, 0x30);
 const DIM: Color = (0x66, 0x70, 0x85);
 /// The report's accent, for the footer link.
 const LINK: Color = (0x5b, 0x6c, 0xff);
-const RULE: Color = (0xd0, 0xd4, 0xdb);
-const SURFACE: Color = (0xf1, 0xf3, 0xf6);
+const RULE: Color = (0xd9, 0xdd, 0xe4);
+/// The background of panels: the compared sides, the settings and the column names.
+const SURFACE: Color = (0xf5, 0xf6, 0xf9);
+/// The background of the bar above a difference and of the header row of a table.
+const BAND: Color = (0xea, 0xed, 0xf2);
+/// The background of the line numbers of unchanged lines.
+const GUTTER: Color = (0xf7, 0xf8, 0xfa);
+const WHITE: Color = (0xff, 0xff, 0xff);
 
 /// The colors of the kinds of lines: a background, the background of the changed words, and the
 /// color of the sign in front.
@@ -754,6 +765,8 @@ enum Op {
     Fill(Rect, Color),
     Hatch(Rect),
     Line(f32, f32, f32, f32, f32, Color),
+    /// A rectangle with round corners: its radius, fill and outline.
+    Round(Rect, f32, Option<Color>, Option<Color>),
     Text {
         x: f32,
         y: f32,
@@ -761,7 +774,51 @@ enum Op {
         family: Family,
         text: String,
         color: Color,
+        /// Drawn heavier, for titles and headings: the fonts of a report have one weight, so
+        /// the outlines are filled and stroked, which works for every script alike.
+        bold: bool,
     },
+}
+
+/// A labeled value of a panel: a compared side, or a setting with one value or a list.
+struct Pair {
+    label: String,
+    items: Vec<String>,
+    /// The items in the code font.
+    code: bool,
+    /// Each item on a line of its own with a bullet, rather than all on one line.
+    list: bool,
+}
+
+impl Pair {
+    fn new(label: &str, value: String) -> Pair {
+        Pair {
+            label: label.to_owned(),
+            items: vec![value],
+            code: false,
+            list: false,
+        }
+    }
+}
+
+/// The path of `rect` with corners of radius `r`.
+fn round_path(rect: Rect, r: f32) -> Option<krilla::geom::Path> {
+    let r = r.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let (x0, y0, x1, y1) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    // How far the control points of a quarter circle are from its ends.
+    let k = r * 0.447_715;
+    let mut pb = PathBuilder::new();
+    pb.move_to(x0 + r, y0);
+    pb.line_to(x1 - r, y0);
+    pb.cubic_to(x1 - k, y0, x1, y0 + k, x1, y0 + r);
+    pb.line_to(x1, y1 - r);
+    pb.cubic_to(x1, y1 - k, x1 - k, y1, x1 - r, y1);
+    pb.line_to(x0 + r, y1);
+    pb.cubic_to(x0 + k, y1, x0, y1 - k, x0, y1 - r);
+    pb.line_to(x0, y0 + r);
+    pb.cubic_to(x0, y0 + k, x0 + k, y0, x0 + r, y0);
+    pb.close();
+    pb.finish()
 }
 
 /// A bookmark: its title, page, height on the page, and nesting level (0 or 1).
@@ -783,6 +840,8 @@ struct Writer<'a> {
     palette: Palette,
     /// The title in the header of each page.
     title: String,
+    /// When the report was made, under its title and in the header of each page.
+    date: String,
     /// The bookmark level of a difference: 0 in a text report, 1 under its file in a folder
     /// report.
     diff_level: u8,
@@ -822,6 +881,7 @@ impl<'a> Writer<'a> {
             marks: Vec::new(),
             palette: Palette::new(opts.color_blind),
             title: title.to_owned(),
+            date: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             diff_level: 0,
             lines_left: report_lines(),
             unified: false,
@@ -882,6 +942,22 @@ impl<'a> Writer<'a> {
         self.put_text(x, y, size, family, text, color);
     }
 
+    /// `text` drawn heavier, in the font of everything but the compared lines.
+    fn bold(&mut self, x: f32, y: f32, size: f32, text: &str, color: Color) {
+        let text = self.shown_text(Family::Sans, text);
+        if !text.is_empty() {
+            self.op(Op::Text {
+                x,
+                y,
+                size,
+                family: Family::Sans,
+                text,
+                color,
+                bold: true,
+            });
+        }
+    }
+
     /// `text` in the order its characters are drawn.
     fn shown_text(&self, family: Family, text: &str) -> String {
         let chars: Vec<char> = text.chars().collect();
@@ -902,7 +978,15 @@ impl<'a> Writer<'a> {
                 family,
                 text,
                 color,
+                bold: false,
             });
+        }
+    }
+
+    /// A filled circle of radius `r` around `x`, `y`.
+    fn dot(&mut self, x: f32, y: f32, r: f32, color: Color) {
+        if let Some(square) = Rect::from_xywh(x - r, y - r, 2.0 * r, 2.0 * r) {
+            self.op(Op::Round(square, r, Some(color), None));
         }
     }
 
@@ -948,13 +1032,118 @@ impl<'a> Writer<'a> {
 
     /// A paragraph of `text`, wrapped to the page.
     fn para(&mut self, size: f32, family: Family, text: &str, color: Color) {
-        let lead = size * 1.35;
-        for line in self.wrap(family, size, text, self.content_w()) {
+        self.para_in(0.0, size, family, text, color);
+    }
+
+    /// A paragraph of `text` starting `indent` from the left margin, wrapped to the page.
+    fn para_in(&mut self, indent: f32, size: f32, family: Family, text: &str, color: Color) {
+        let lead = match family {
+            Family::Mono => size * 1.35,
+            Family::Sans => size * 1.4,
+        };
+        for line in self.wrap(family, size, text, self.content_w() - indent) {
             self.need(lead);
-            let (x, y) = (self.left(), self.y + size);
+            let (x, y) = (self.left() + indent, self.y + size);
             self.text(x, y, size, family, &line, color);
             self.y += lead;
         }
+    }
+
+    /// An item of a list: a bullet, and `text` wrapped beside it.
+    fn bullet(&mut self, size: f32, family: Family, text: &str, color: Color) {
+        let lead = size * 1.4;
+        let indent = size * 1.4;
+        let lines = self.wrap(family, size, text, self.content_w() - indent - 2.0);
+        for (k, line) in lines.iter().enumerate() {
+            self.need(lead);
+            let (x, y) = (self.left() + 2.0, self.y + size);
+            if k == 0 {
+                self.text(x, y, size, Family::Sans, "•", DIM);
+            }
+            self.text(x + indent, y, size, family, line, color);
+            self.y += lead;
+        }
+    }
+
+    /// The heading of a part of the report, with a line under it, and with `mark` a bookmark
+    /// at it. It stays on the page of what follows it.
+    fn part(&mut self, text: &str, mark: bool) {
+        if self.y > self.top() {
+            self.gap(8.0);
+        }
+        self.need(HEAD_SIZE * 6.0);
+        if mark {
+            self.mark(text.to_owned(), 0);
+        }
+        let lead = HEAD_SIZE * 1.3;
+        for line in self.wrap(Family::Sans, HEAD_SIZE, text, self.content_w()) {
+            self.need(lead);
+            let (x, y) = (self.left(), self.y + HEAD_SIZE);
+            self.bold(x, y, HEAD_SIZE, &line, BLACK);
+            self.y += lead;
+        }
+        let y = self.y + 2.0;
+        self.op(Op::Line(self.left(), y, self.right(), y, 0.6, RULE));
+        self.y += 7.0;
+    }
+
+    /// A panel of labeled values, the labels in a column of their own. A value too long for
+    /// its line wraps, and one too long for the page goes on onto the next.
+    fn pairs(&mut self, rows: &[Pair]) {
+        const PAD: f32 = 8.0;
+        let lead = TEXT_SIZE * 1.4;
+        let widest = rows
+            .iter()
+            .map(|r| self.faces.width(Family::Sans, TEXT_SIZE, &r.label))
+            .fold(0.0, f32::max);
+        let label_w = widest.min(self.content_w() * 0.3);
+        let value_x = self.left() + PAD + label_w + 16.0;
+        let value_w = self.right() - PAD - value_x;
+        for row in rows {
+            let labels = self.wrap(Family::Sans, TEXT_SIZE, &row.label, label_w);
+            let (family, size) = match row.code {
+                true => (Family::Mono, SMALL_SIZE),
+                false => (Family::Sans, TEXT_SIZE),
+            };
+            let indent = if row.list { TEXT_SIZE * 1.4 } else { 0.0 };
+            // Each line of the value, and whether it starts an item of a list.
+            let mut values: Vec<(String, bool)> = Vec::new();
+            let joined;
+            let items: &[String] = if row.list {
+                &row.items
+            } else {
+                joined = [row.items.join(" ")];
+                &joined
+            };
+            for item in items {
+                let lines = self.wrap(family, size, item, value_w - indent);
+                values.extend(lines.into_iter().enumerate().map(|(k, l)| (l, k == 0)));
+            }
+            let n = labels.len().max(values.len()).max(1);
+            for k in 0..n {
+                let above = if k == 0 { 3.0 } else { 0.0 };
+                let below = if k + 1 == n { 3.5 } else { 0.0 };
+                let h = above + lead + below;
+                self.need(h);
+                let (x, y, w) = (self.left(), self.y, self.content_w());
+                let seam = if k + 1 == n { 0.0 } else { SEAM };
+                self.fill(x, y, w, h + seam, SURFACE);
+                let base = y + above + TEXT_SIZE;
+                if let Some(label) = labels.get(k) {
+                    self.text(x + PAD, base, TEXT_SIZE, Family::Sans, label, DIM);
+                }
+                if let Some((line, first)) = values.get(k) {
+                    if row.list && *first {
+                        self.text(value_x, base, TEXT_SIZE, Family::Sans, "•", DIM);
+                    }
+                    self.text(value_x + indent, base, size, family, line, BLACK);
+                }
+                self.y += h;
+            }
+            // A white line between the rows.
+            self.y += 1.5;
+        }
+        self.gap(6.5);
     }
 
     fn gap(&mut self, h: f32) {
@@ -1002,20 +1191,32 @@ impl<'a> Writer<'a> {
         let labels = !self.unified && n > 1;
         let name = if continued { doc.name } else { "" };
         if labels || !name.is_empty() {
-            self.need(CODE_LEAD);
-            let y = self.y + CODE_LEAD * 0.78;
+            let h = CODE_LEAD + 2.0;
+            self.need(h + CODE_LEAD);
+            let (x0, top, w) = (self.left(), self.y, self.content_w());
+            self.fill(x0, top, w, h, SURFACE);
+            let y = top + h * 0.72;
             if labels {
-                let col_w = self.content_w() / n as f32;
+                let col_w = w / n as f32;
                 for p in 0..n {
-                    let x = self.left() + p as f32 * col_w + 2.0;
-                    self.text(x, y, SMALL_SIZE, Family::Sans, side_name(p, n), DIM);
+                    let x = x0 + p as f32 * col_w;
+                    self.bold(x + 6.0, y, SMALL_SIZE, side_name(p, n), DIM);
+                    if p > 0 {
+                        self.op(Op::Line(x, top, x, top + h, 0.5, RULE));
+                    }
                 }
             }
             if !name.is_empty() {
-                let name = self.fit(Family::Sans, SMALL_SIZE, name, self.content_w() / 2.0);
-                let w = self.faces.width(Family::Sans, SMALL_SIZE, &name);
+                // Beside the name of the last side, or the whole line when no side is named.
+                let label = match labels {
+                    true => self.faces.width(Family::Sans, SMALL_SIZE, side_name(n - 1, n)) + 24.0,
+                    false => 0.0,
+                };
+                let room = if labels { w / n as f32 - label } else { w - 12.0 };
+                let name = self.fit(Family::Sans, SMALL_SIZE, name, room);
+                let nw = self.faces.width(Family::Sans, SMALL_SIZE, &name);
                 self.text(
-                    self.right() - w - 2.0,
+                    self.right() - nw - 6.0,
                     y,
                     SMALL_SIZE,
                     Family::Sans,
@@ -1023,55 +1224,84 @@ impl<'a> Writer<'a> {
                     DIM,
                 );
             }
-            self.y += CODE_LEAD;
+            self.y += h;
         }
         self.labeled = self.page();
     }
 
+    /// The title of the report with the time it was made, beside a bar in the accent color.
     fn heading(&mut self, text: &str) {
-        self.need(TITLE_SIZE * 2.5);
-        let y = self.y + TITLE_SIZE;
-        self.text(self.left(), y, TITLE_SIZE, Family::Sans, text, BLACK);
-        self.y += TITLE_SIZE * 1.5;
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        self.para(SMALL_SIZE, Family::Sans, &now, DIM);
-        self.gap(4.0);
+        let (x, top) = (self.left(), self.y + 2.0);
+        let lines = self.wrap(Family::Sans, TITLE_SIZE, text, self.content_w() - 12.0);
+        let lead = TITLE_SIZE * 1.2;
+        let h = TITLE_SIZE + lead * (lines.len().max(1) - 1) as f32 + SMALL_SIZE + 11.0;
+        if let Some(bar) = Rect::from_xywh(x, top, 3.0, h) {
+            self.op(Op::Round(bar, 1.5, Some(LINK), None));
+        }
+        for (k, line) in lines.iter().enumerate() {
+            let base = top + TITLE_SIZE - 1.0 + lead * k as f32;
+            self.bold(x + 12.0, base, TITLE_SIZE, line, BLACK);
+        }
+        let date = self.date.clone();
+        self.text(x + 12.0, top + h - 2.0, SMALL_SIZE, Family::Sans, &date, DIM);
+        self.y = top + h + 12.0;
     }
 
-    /// The compared sides, one per line.
-    fn sides(&mut self, names: &[String]) {
+    /// The compared sides, each with its name, and the rules file when there is one.
+    fn sides(&mut self, names: &[String], rules: &str) {
         let n = names.len();
-        for (p, name) in names.iter().enumerate() {
-            self.para(
-                TEXT_SIZE,
-                Family::Sans,
-                &format!("{}: {name}", side_name(p, n)),
-                BLACK,
-            );
-        }
-    }
-
-    fn rules(&mut self, rules: &str) {
-        if !rules.is_empty() {
-            let text = format!(
-                "{}: {}",
-                tr("report.rules"),
-                super::rules::display_name(rules)
-            );
-            self.para(TEXT_SIZE, Family::Sans, &text, DIM);
-        }
-    }
-
-    /// The counts of the report on one line, as `label value` pairs.
-    fn counts(&mut self, cards: &[(&str, String)]) {
-        let text = cards
+        let mut rows: Vec<Pair> = names
             .iter()
-            .map(|(label, v)| format!("{label}: {v}"))
-            .collect::<Vec<_>>()
-            .join("   ·   ");
+            .enumerate()
+            .map(|(p, name)| Pair::new(side_name(p, n), name.clone()))
+            .collect();
+        if !rules.is_empty() {
+            rows.push(Pair::new(
+                tr("report.rules"),
+                super::rules::display_name(rules).to_string(),
+            ));
+        }
+        self.pairs(&rows);
+    }
+
+    /// The counts of the report as a row of cards, each a number over its label beside a bar
+    /// of its color; the cards that do not fit go on the next row.
+    fn counts(&mut self, cards: &[(&str, String, Color)]) {
+        const GAP: f32 = 8.0;
+        const VALUE: f32 = 15.0;
+        if cards.is_empty() {
+            return;
+        }
+        let total = self.content_w();
+        let per_row = (((total + GAP) / (88.0 + GAP)) as usize).clamp(1, cards.len());
+        let w = ((total - GAP * (per_row - 1) as f32) / per_row as f32).min(136.0);
+        let lead = SMALL_SIZE * 1.3;
+        for row in cards.chunks(per_row) {
+            let labels: Vec<Vec<String>> = row
+                .iter()
+                .map(|(label, ..)| self.wrap(Family::Sans, SMALL_SIZE, label, w - 20.0))
+                .collect();
+            let lines = labels.iter().map(Vec::len).max().unwrap_or(1);
+            let h = 6.0 + VALUE + 3.0 + lines as f32 * lead + 5.0;
+            self.need(h);
+            let y = self.y;
+            for (k, ((_, value, color), label)) in row.iter().zip(&labels).enumerate() {
+                let x = self.left() + k as f32 * (w + GAP);
+                if let Some(card) = Rect::from_xywh(x, y, w, h) {
+                    self.op(Op::Round(card, 4.0, Some(WHITE), Some(RULE)));
+                }
+                if let Some(bar) = Rect::from_xywh(x + 6.0, y + 6.0, 2.5, h - 12.0) {
+                    self.op(Op::Round(bar, 1.25, Some(*color), None));
+                }
+                self.bold(x + 14.0, y + 6.0 + VALUE * 0.86, VALUE, value, BLACK);
+                for (i, line) in label.iter().enumerate() {
+                    let base = y + 6.0 + VALUE + 3.0 + lead * i as f32 + SMALL_SIZE * 0.85;
+                    self.text(x + 14.0, base, SMALL_SIZE, Family::Sans, line, DIM);
+                }
+            }
+            self.y += h + GAP;
+        }
         self.gap(2.0);
-        self.para(TEXT_SIZE, Family::Sans, &text, BLACK);
-        self.gap(6.0);
     }
 
     /// The bar above a difference: its kind, where it is on each side and in the file, and its
@@ -1085,7 +1315,7 @@ impl<'a> Writer<'a> {
         location: Option<&str>,
     ) {
         let h = TEXT_SIZE * 1.9;
-        self.need(h + 3.0 * CODE_LEAD);
+        self.need(h + 5.0 * CODE_LEAD);
         let (class, label) = kind(result, b);
         let blk = &result.blocks[b];
         let mut pos = (0..n)
@@ -1097,19 +1327,20 @@ impl<'a> Writer<'a> {
         }
         self.mark(format!("{}. {label}  {pos}", i + 1), self.diff_level);
         let (x, y, w) = (self.left(), self.y, self.content_w());
-        self.fill(x, y, w, h, SURFACE);
+        self.fill(x, y, w, h, BAND);
         let sign_color = self.palette.of(class).map_or(DIM, |c| c.2);
+        self.fill(x, y, 3.0, h, sign_color);
         let base = y + h * 0.68;
-        self.text(x + 5.0, base, TEXT_SIZE, Family::Sans, label, sign_color);
-        let lw = self.faces.width(Family::Sans, TEXT_SIZE, label);
+        self.bold(x + 10.0, base, TEXT_SIZE, label, sign_color);
+        let lw = self.faces.width(Family::Sans, TEXT_SIZE, label) + 5.0;
         let num = trf(
             "report.diff_n",
             &[("i", (i + 1).to_string()), ("n", total.to_string())],
         );
         let nw = self.faces.width(Family::Sans, SMALL_SIZE, &num);
-        let pos = self.fit(Family::Sans, TEXT_SIZE, &pos, w - lw - nw - 30.0);
+        let pos = self.fit(Family::Sans, TEXT_SIZE, &pos, w - lw - nw - 36.0);
         self.text(x + 14.0 + lw, base, TEXT_SIZE, Family::Sans, &pos, DIM);
-        self.text(x + w - nw - 5.0, base, SMALL_SIZE, Family::Sans, &num, DIM);
+        self.text(x + w - nw - 8.0, base, SMALL_SIZE, Family::Sans, &num, DIM);
         self.y += h;
     }
 
@@ -1130,12 +1361,16 @@ impl<'a> Writer<'a> {
         let colors = self.palette.of(class);
         match (class, colors) {
             ("gap", _) => {
-                if let Some(r) = Rect::from_xywh(x, y, w, CODE_LEAD) {
+                if let Some(r) = Rect::from_xywh(x, y, w, CODE_LEAD + SEAM) {
                     self.op(Op::Hatch(r));
                 }
             }
-            (_, Some((bg, ..))) => self.fill(x, y, w, CODE_LEAD, bg),
-            _ => {}
+            (_, Some((bg, ..))) => self.fill(x, y, w, CODE_LEAD + SEAM, bg),
+            // An unchanged line: only its line numbers have a background.
+            _ => {
+                let gutter = 2.0 + nums.len() as f32 * num_w;
+                self.fill(x, y, gutter, CODE_LEAD + SEAM, GUTTER);
+            }
         }
         let base = y + CODE_LEAD * 0.78;
         let mut tx = x + 2.0;
@@ -1378,7 +1613,8 @@ impl<'a> Writer<'a> {
             for part in self.wrap(Family::Sans, SMALL_SIZE, &line, self.content_w() - 16.0) {
                 self.need(CODE_LEAD);
                 let (x, y) = (self.left(), self.y);
-                self.fill(x, y, self.content_w(), CODE_LEAD, (0xfb, 0xf6, 0xe4));
+                self.fill(x, y, self.content_w(), CODE_LEAD + SEAM, (0xfb, 0xf6, 0xe4));
+                self.fill(x, y, 3.0, CODE_LEAD + SEAM, (0xd9, 0xa4, 0x06));
                 self.text(
                     x + 12.0,
                     y + CODE_LEAD * 0.78,
@@ -1432,7 +1668,7 @@ impl<'a> Writer<'a> {
                 extra.location.as_deref(),
             );
             for field in &extra.fields {
-                self.para(SMALL_SIZE, Family::Sans, &format!("•  {field}"), BLACK);
+                self.bullet(SMALL_SIZE, Family::Sans, field, BLACK);
             }
             let more = |n: usize| trf("report.more_lines", &[("n", n.to_string())]);
             if start > rows.start {
@@ -1445,6 +1681,10 @@ impl<'a> Writer<'a> {
             } else {
                 self.rows_side_by_side(doc, drawn)
             };
+            // The line that closes the difference.
+            let (x0, x1, y) = (self.left(), self.right(), self.y + SEAM);
+            self.op(Op::Line(x0, y, x1, y, 0.5, RULE));
+            self.gap(1.0);
             let hidden = rows.end - (start + done);
             if hidden > 0 {
                 self.para(SMALL_SIZE, Family::Sans, &more(hidden), DIM);
@@ -1456,7 +1696,7 @@ impl<'a> Writer<'a> {
                     cut_short += 1;
                 }
             }
-            self.gap(8.0);
+            self.gap(9.0);
         }
         if shown < total {
             let more = trf("report.more_diffs", &[("n", (total - shown).to_string())]);
@@ -1492,16 +1732,13 @@ impl<'a> Writer<'a> {
     /// The parts added at the end, each with a bookmark.
     fn sections(&mut self, sections: &[Section]) {
         for sec in sections {
-            self.gap(10.0);
-            self.need(TEXT_SIZE * 5.0);
-            self.mark(sec.title.clone(), 0);
-            self.para(TEXT_SIZE + 2.0, Family::Sans, &sec.title, BLACK);
-            self.gap(2.0);
+            self.gap(4.0);
+            self.part(&sec.title, true);
             for line in &sec.lines {
                 if sec.mono {
                     self.para(SMALL_SIZE, Family::Mono, line, BLACK);
                 } else {
-                    self.para(TEXT_SIZE, Family::Sans, &format!("•  {line}"), BLACK);
+                    self.bullet(TEXT_SIZE, Family::Sans, line, BLACK);
                 }
             }
         }
@@ -1509,35 +1746,49 @@ impl<'a> Writer<'a> {
 
     /// A titled list, as the omissions of a folder report.
     fn list(&mut self, title: &str, items: &[String]) {
-        self.need(TEXT_SIZE * 5.0);
-        self.para(TEXT_SIZE + 1.0, Family::Sans, title, BLACK);
+        self.part(title, false);
         for item in items {
-            self.para(TEXT_SIZE, Family::Sans, &format!("•  {item}"), BLACK);
+            self.bullet(TEXT_SIZE, Family::Sans, item, BLACK);
         }
-        self.gap(6.0);
+        self.gap(4.0);
     }
 
     /// The settings of a folder report, each with its label.
     fn settings(&mut self, rows: &[(&str, Setting)]) {
-        self.need(TEXT_SIZE * 5.0);
-        self.para(TEXT_SIZE + 1.0, Family::Sans, tr("report.settings"), BLACK);
-        for (term, value) in rows {
-            if value.list {
-                self.para(TEXT_SIZE, Family::Sans, &format!("{term}:"), DIM);
-                let family = if value.code {
-                    Family::Mono
-                } else {
-                    Family::Sans
-                };
-                for item in &value.items {
-                    self.para(SMALL_SIZE, family, &format!("    •  {item}"), BLACK);
-                }
-            } else {
-                let text = format!("{term}: {}", value.items.join(" "));
-                self.para(TEXT_SIZE, Family::Sans, &text, BLACK);
-            }
+        self.part(tr("report.settings"), false);
+        let rows: Vec<Pair> = rows
+            .iter()
+            .map(|(term, value)| Pair {
+                label: term.to_string(),
+                items: value.items.clone(),
+                code: value.list && value.code,
+                list: value.list,
+            })
+            .collect();
+        self.pairs(&rows);
+    }
+
+    /// The name of a file of a folder report at the start of its part, under a line, with a
+    /// dot in the color of its status.
+    fn file_heading(&mut self, name: &str, color: Color) {
+        // The line parts the file from the one above it, so the first of a page has none.
+        if self.y > self.top() {
+            let y = self.y;
+            self.op(Op::Line(self.left(), y, self.right(), y, 0.9, BLACK));
+            self.gap(7.0);
         }
-        self.gap(6.0);
+        let lead = HEAD_SIZE * 1.3;
+        let lines = self.wrap(Family::Sans, HEAD_SIZE, name, self.content_w() - 12.0);
+        for (k, line) in lines.iter().enumerate() {
+            self.need(lead);
+            let (x, y) = (self.left(), self.y + HEAD_SIZE);
+            if k == 0 {
+                self.dot(x + 4.0, y - HEAD_SIZE * 0.34, 3.0, color);
+            }
+            self.bold(x + 12.0, y, HEAD_SIZE, line, BLACK);
+            self.y += lead;
+        }
+        self.gap(1.0);
     }
 
     /// Draws the pages laid out, with a header and page numbers on each, and the bookmarks.
@@ -1560,15 +1811,30 @@ impl<'a> Writer<'a> {
                 s.draw_image(img.clone(), size);
                 s.pop();
             }
+            // The title keeps clear of the date at the other end of the line.
+            let dw = self.faces.width(Family::Sans, SMALL_SIZE, &self.date);
+            let room = self.w - 2.0 * MARGIN - icon - 4.0 - dw - 16.0;
+            let title = self.fit(Family::Sans, SMALL_SIZE, &self.title, room);
             let header = Op::Text {
-                x: MARGIN + icon + 3.0,
+                x: MARGIN + icon + 4.0,
                 y: MARGIN,
                 size: SMALL_SIZE,
                 family: Family::Sans,
-                text: self.shown_text(Family::Sans, &self.title),
+                text: self.shown_text(Family::Sans, &title),
                 color: DIM,
+                bold: true,
             };
             self.draw(&mut s, &header);
+            let date = Op::Text {
+                x: self.w - MARGIN - dw,
+                y: MARGIN,
+                size: SMALL_SIZE,
+                family: Family::Sans,
+                text: self.date.clone(),
+                color: DIM,
+                bold: false,
+            };
+            self.draw(&mut s, &date);
             self.draw(
                 &mut s,
                 &Op::Line(
@@ -1592,8 +1858,14 @@ impl<'a> Writer<'a> {
                 family: Family::Sans,
                 text: num,
                 color: DIM,
+                bold: false,
             };
             self.draw(&mut s, &footer);
+            let rule = self.h - MARGIN - 6.5;
+            self.draw(
+                &mut s,
+                &Op::Line(MARGIN, rule, self.w - MARGIN, rule, 0.5, RULE),
+            );
             let brand = Op::Text {
                 x: MARGIN,
                 y: self.h - MARGIN + 4.0,
@@ -1601,6 +1873,7 @@ impl<'a> Writer<'a> {
                 family: Family::Sans,
                 text: "OxideMerge".into(),
                 color: LINK,
+                bold: true,
             };
             self.draw(&mut s, &brand);
             s.finish();
@@ -1700,6 +1973,20 @@ impl<'a> Writer<'a> {
                 }
                 s.pop();
             }
+            Op::Round(rect, r, fill, outline) => {
+                if let Some(path) = round_path(*rect, *r) {
+                    s.set_fill(fill.map(|c| Fill {
+                        paint: color(c).into(),
+                        ..Default::default()
+                    }));
+                    s.set_stroke(outline.map(|c| Stroke {
+                        paint: color(c).into(),
+                        width: 0.6,
+                        ..Default::default()
+                    }));
+                    s.draw_path(&path);
+                }
+            }
             Op::Line(x1, y1, x2, y2, width, c) => {
                 let mut pb = PathBuilder::new();
                 pb.move_to(*x1, *y1);
@@ -1721,8 +2008,13 @@ impl<'a> Writer<'a> {
                 family,
                 text,
                 color: c,
+                bold,
             } => {
-                s.set_stroke(None);
+                s.set_stroke(bold.then(|| Stroke {
+                    paint: color(*c).into(),
+                    width: *size * 0.035,
+                    ..Default::default()
+                }));
                 s.set_fill(Some(Fill {
                     paint: color(*c).into(),
                     ..Default::default()
@@ -1838,21 +2130,23 @@ pub fn text_pdf(
     let title = tr("report.text_title");
     let mut w = Writer::new(fonts, pdf, title)?;
     w.heading(title);
-    w.sides(titles);
-    w.rules(rules);
+    w.sides(titles, rules);
     let list = hunks_with(result, 0);
     let s = result.stats();
-    let mut cards = vec![(tr("report.differences"), list.len().to_string())];
+    let (add, del, chg) = (w.palette.add.2, w.palette.del.2, w.palette.chg.2);
+    let (conf, ign) = (w.palette.conf.2, w.palette.ign.2);
+    let mut cards = vec![(tr("report.differences"), list.len().to_string(), LINK)];
     if n == 2 {
-        cards.push((tr("report.added"), s.added.to_string()));
-        cards.push((tr("report.removed"), s.removed.to_string()));
-        cards.push((tr("report.changed"), s.changed.to_string()));
+        cards.push((tr("report.added"), s.added.to_string(), add));
+        cards.push((tr("report.removed"), s.removed.to_string(), del));
+        cards.push((tr("report.changed"), s.changed.to_string(), chg));
     } else {
-        cards.push((tr("report.kind_conflict"), result.conflicts().to_string()));
+        let conflicts = result.conflicts().to_string();
+        cards.push((tr("report.kind_conflict"), conflicts, conf));
     }
     let ignored = ignored_blocks(result);
     if ignored > 0 {
-        cards.push((tr("report.ignored"), ignored.to_string()));
+        cards.push((tr("report.ignored"), ignored.to_string(), ign));
     }
     w.counts(&cards);
     let comments: Vec<String> = notes
@@ -1866,11 +2160,11 @@ pub fn text_pdf(
         })
         .collect();
     if !comments.is_empty() {
-        w.para(TEXT_SIZE, Family::Sans, tr("report.comments"), BLACK);
+        w.part(tr("report.comments"), false);
         for c in comments {
-            w.para(SMALL_SIZE, Family::Sans, &format!("•  {c}"), BLACK);
+            w.bullet(SMALL_SIZE, Family::Sans, &c, BLACK);
         }
-        w.gap(6.0);
+        w.gap(8.0);
     }
     if list.is_empty() {
         w.para(TEXT_SIZE, Family::Sans, tr("report.no_diffs"), BLACK);
@@ -1948,13 +2242,14 @@ pub fn folder_pdf(
         let read = file_read(it, &found, &reads);
         let rel = it.rel_path();
         if !index.is_empty() {
-            w.gap(6.0);
+            w.gap(8.0);
         }
-        w.need(TEXT_SIZE * 6.0);
+        // The name stays on the page of the first lines of its first difference.
+        // its name, two lines about it, and what the bar of a difference asks for.
+        w.need(HEAD_SIZE * 2.0 + SMALL_SIZE * 4.0 + TEXT_SIZE * 1.9 + 5.0 * CODE_LEAD + 8.0);
         let at = (w.page(), w.y);
         w.mark(rel.clone(), 0);
-        w.gap(4.0);
-        w.para(TEXT_SIZE + 2.0, Family::Sans, &rel, BLACK);
+        w.file_heading(&rel, status_color(it));
         let mut meta = vec![redact.apply(&status_text(it, n))];
         if let Some(r) = &read {
             meta.push(format!("{}: {}", tr("report.read_as"), r.label()));
@@ -1966,11 +2261,17 @@ pub fn folder_pdf(
             if ignored > 0 {
                 meta.push(trf("report.n_ignored", &[("n", ignored.to_string())]));
             }
-            w.para(SMALL_SIZE, Family::Sans, &meta.join("   ·   "), DIM);
-            w.gap(3.0);
+            w.para_in(12.0, SMALL_SIZE, Family::Sans, &meta.join("   ·   "), DIM);
+            w.gap(4.0);
             if read.as_ref().is_some_and(ReadAs::extracted) {
-                w.para(SMALL_SIZE, Family::Sans, tr("report.extracted_lines"), DIM);
-                w.gap(3.0);
+                w.para_in(
+                    12.0,
+                    SMALL_SIZE,
+                    Family::Sans,
+                    tr("report.extracted_lines"),
+                    DIM,
+                );
+                w.gap(4.0);
             }
             let refs: Vec<&[String]> = docs.iter().map(|d| d.lines.as_slice()).collect();
             let doc = Doc {
@@ -1984,7 +2285,7 @@ pub fn folder_pdf(
             (shown, total, cut, short) = if w.lines_left == 0 {
                 let total = hunks_with(result, 0).len();
                 let more = trf("report.more_diffs", &[("n", total.to_string())]);
-                w.para(TEXT_SIZE, Family::Sans, &more, DIM);
+                w.para_in(12.0, TEXT_SIZE, Family::Sans, &more, DIM);
                 (0, total, 0, 0)
             } else {
                 w.diffs(&doc, pdf)
@@ -2000,11 +2301,11 @@ pub fn folder_pdf(
             blocks.push(tr("report.summary_only").to_string());
             if !matches!(found, FileDiffs::Diffs(..)) {
                 meta.push(tr("report.summary_only").to_string());
-                w.para(SMALL_SIZE, Family::Sans, &meta.join("   ·   "), DIM);
-                w.gap(3.0);
+                w.para_in(12.0, SMALL_SIZE, Family::Sans, &meta.join("   ·   "), DIM);
+                w.gap(2.0);
             }
             if let Some(why) = summary_reason(it, n, &found, true, &redact) {
-                w.para(TEXT_SIZE, Family::Sans, &why, DIM);
+                w.para_in(12.0, TEXT_SIZE, Family::Sans, &why, BLACK);
                 blocks.push(why);
             }
         } else {
@@ -2038,31 +2339,37 @@ pub fn folder_pdf(
     } else {
         display.iter().map(|d| d.display().to_string()).collect()
     };
-    w.sides(&names);
+    w.sides(&names, rules);
     if info.hide_paths {
         w.para(SMALL_SIZE, Family::Sans, tr("report.paths_hidden"), DIM);
+        w.gap(6.0);
     }
-    w.rules(rules);
+    let card = |label: &'static str, class: &str| {
+        (label, count(class).to_string(), class_color(class))
+    };
     let mut cards = vec![
-        (tr("report.files"), listed.len().to_string()),
-        (tr("report.identical"), count("identical").to_string()),
-        (tr("report.files_different"), count("different").to_string()),
-        (tr("report.files_unique"), count("unique").to_string()),
+        (tr("report.files"), listed.len().to_string(), LINK),
+        card(tr("report.identical"), "identical"),
+        card(tr("report.files_different"), "different"),
+        card(tr("report.files_unique"), "unique"),
     ];
     if count("error") > 0 {
-        cards.push((tr("report.errors"), count("error").to_string()));
+        cards.push(card(tr("report.errors"), "error"));
     }
     if count("other") > 0 {
-        cards.push((tr("report.not_compared"), count("other").to_string()));
+        cards.push(card(tr("report.not_compared"), "other"));
     }
     if diffs.is_some() {
-        cards.push((tr("report.blocks_exported"), shown_blocks.to_string()));
+        let n = shown_blocks.to_string();
+        cards.push((tr("report.blocks_exported"), n, LINK));
     }
     if left_out > 0 {
-        cards.push((tr("report.blocks_left_out"), left_out.to_string()));
+        let n = left_out.to_string();
+        cards.push((tr("report.blocks_left_out"), n, class_color("error")));
     }
     if total_ignored > 0 {
-        cards.push((tr("report.ignored"), total_ignored.to_string()));
+        let n = total_ignored.to_string();
+        cards.push((tr("report.ignored"), n, w.palette.ign.2));
     }
     w.counts(&cards);
 
@@ -2131,16 +2438,12 @@ pub fn folder_pdf(
     let mut to_body = Vec::new();
     if !index.is_empty() {
         let heading = format!("{} ({})", tr("report.file_diffs"), index.len());
-        w.need(TEXT_SIZE * 5.0);
-        w.mark(heading.clone(), 0);
-        w.para(TEXT_SIZE + 1.0, Family::Sans, &heading, BLACK);
+        w.part(&heading, true);
         to_body = index_table(&mut w, &index, &redact);
-        w.gap(8.0);
+        w.gap(6.0);
     }
     let heading = format!("{} ({})", tr("report.files"), listed.len());
-    w.need(TEXT_SIZE * 5.0);
-    w.mark(heading.clone(), 0);
-    w.para(TEXT_SIZE + 1.0, Family::Sans, &heading, BLACK);
+    w.part(&heading, true);
     file_table(&mut w, &listed, n, &redact);
 
     if !index.is_empty() {
@@ -2179,7 +2482,7 @@ fn index_table(
     index: &[IndexRow],
     redact: &Redact,
 ) -> Vec<(usize, Rect, (usize, f32))> {
-    let total = w.content_w() - 10.0;
+    let total = w.content_w() - 12.0;
     let widths = [total * 0.30, total * 0.22, total * 0.30, total * 0.18];
     let header: Vec<String> = vec![
         tr("col.name").into(),
@@ -2206,7 +2509,12 @@ fn index_table(
 }
 
 fn status_color(it: &DirItem) -> Color {
-    match status_class(it.status) {
+    class_color(status_class(it.status))
+}
+
+/// The color of a status of [`status_class`], for its dot and its count.
+fn class_color(class: &str) -> Color {
+    match class {
         "identical" => (0x16, 0xa3, 0x4a),
         "different" => (0xd9, 0x77, 0x06),
         "unique" => (0x7c, 0x3a, 0xed),
@@ -2217,7 +2525,7 @@ fn status_color(it: &DirItem) -> Color {
 
 /// The table of the files of a folder report.
 fn file_table(w: &mut Writer, listed: &[&DirItem], n: usize, redact: &Redact) {
-    let total = w.content_w() - 10.0;
+    let total = w.content_w() - 12.0;
     let side_w = total * 0.40 / n as f32;
     let widths = [total * 0.26, total * 0.18, total * 0.16];
     let mut header: Vec<String> = vec![
@@ -2284,29 +2592,37 @@ fn table_row(
         })
         .collect();
     let lines = wrapped.iter().map(Vec::len).max().unwrap_or(1);
-    let h = lines as f32 * CODE_LEAD + 3.0;
+    let h = lines as f32 * CODE_LEAD + 5.0;
     let page = w.page();
     w.need(h);
     if let (true, Some(head)) = (w.page() != page, header) {
         table_row(w, head, widths, None, None);
     }
     let (x0, y) = (w.left(), w.y);
-    if header.is_none() {
-        w.fill(x0, y, w.content_w(), h, SURFACE);
+    // The header row is a band; the rows under it are parted by lines.
+    let head = header.is_none();
+    if head {
+        w.fill(x0, y, w.content_w(), h, BAND);
     }
     if let Some(c) = color {
-        w.fill(x0 + 2.0, y + 3.5, 4.0, 4.0, c);
+        w.dot(x0 + 5.0, y + 2.5 + CODE_LEAD * 0.5, 2.2, c);
     }
-    let mut x = x0 + 10.0;
+    let mut x = x0 + 12.0;
     for (lines, cw) in wrapped.iter().zip(widths) {
         for (k, l) in lines.iter().enumerate() {
-            let base = y + 1.5 + CODE_LEAD * (k as f32 + 0.78);
-            w.text(x, base, SMALL_SIZE, Family::Sans, l, BLACK);
+            let base = y + 2.5 + CODE_LEAD * (k as f32 + 0.78);
+            if head {
+                w.bold(x, base, SMALL_SIZE, l, DIM);
+            } else {
+                w.text(x, base, SMALL_SIZE, Family::Sans, l, BLACK);
+            }
         }
         x += cw;
     }
     w.y += h;
-    w.op(Op::Line(x0, w.y, w.right(), w.y, 0.4, RULE));
+    if !head {
+        w.op(Op::Line(x0, w.y, w.right(), w.y, 0.4, RULE));
+    }
     (w.page(), y, h)
 }
 

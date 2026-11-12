@@ -3407,8 +3407,14 @@ A PDF folder report has the folder report extras of the HTML report (see <<html-
 * With *Hide folder paths in reports* on, the sides are named Left, Middle and Right, and the
   report keeps the folder paths out of its notes and settings.
 
-Each page has a header with the OxideMerge icon and the report title, and a footer with *Page n of
-m* and *OxideMerge*, which links to the project page
+The report starts with its title and the time it was made, a panel that names each compared side
+(and the compare rules file), and the counts as a row of cards.
+Each part has a heading; in a folder report, the settings are a table of labels and values, and
+the part of each file starts with its name beside a dot in the color of its status.
+The bar above each difference gives its kind, its lines on each side and its number.
+
+Each page has a header with the OxideMerge icon, the report title and the time the report was
+made, and a footer with *Page n of m* and *OxideMerge*, which links to the project page
 (https://github.com/kuopinghsu/OxideMerge). The PDF contains a bookmark for each file and each
 difference.
 OxideMerge embeds the fonts it uses, with only the characters that the report needs, so Chinese,
