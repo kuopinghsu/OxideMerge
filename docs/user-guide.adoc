@@ -431,28 +431,44 @@ To fetch a file or folder from a server:
   to choose it from a list of the server's folders and files.
 . Click *Connect*.
 
-The folder button connects and lists the folder of the *Remote path*, or your home folder on the
-server if the *Remote path* is empty.
+The folder button connects and opens a chooser in place of the dialog, listing the folder of the
+*Remote path*, or your home folder on the server if the *Remote path* is empty.
+The chooser keeps the same size however many entries a folder has: the list scrolls inside it,
+and a name too long for it is cut short.
 Folders come first, then files with their sizes; hidden entries, whose names start with a dot,
 come last in each group.
 Click a folder to open it, or click a file to choose it.
-The *Remote path* follows what you click, so *Connect* selects the folder you are in or
-fetches the file you chose.
+The path at the bottom of the chooser follows what you click: the folder you are in, or the file
+you chose.
+*OK* returns to the dialog with that path as the *Remote path*, ready for *Connect*; *Cancel* or
+Esc returns with the *Remote path* as it was.
 Double-click a file to fetch it immediately.
-The up-arrow button opens the folder above, and the refresh button lists the *Remote path* again,
-including a path you typed.
+The bar above the list names the server and each folder on the way to the one shown; click any
+of them to open it.
+The up-arrow button opens the folder above, and the refresh button lists the folder again.
+With the keyboard, the arrow keys, Page Up, Page Down, Home and End move through the list, Enter
+opens the folder you are on or accepts the file you chose, and Backspace opens the folder above.
 A path that does not exist lists the nearest folder above it.
-The list stays connected while it is shown, so moving between folders does not sign in again
+If the server refuses a folder or the connection drops, the list says why; refresh or *Retry*
+asks again.
+The chooser stays connected while it is shown, so moving between folders does not sign in again
 each time.
-The list closes when the dialog closes, or when you change the host, port, user, password or key.
 A folder shows its first 10,000 entries.
 
 The fetched path then fills in the *Left*, *Middle* or *Right* path, the same as a local path.
 To compare two remote locations with each other, connect again for the other side.
 To compare a remote path with a local one, leave the other side local.
-The dialog starts with the host, port, user and key path of the last connection that succeeded,
-so that you can fetch a second path from the same server.
-The password or a key's passphrase is never filled in this way.
+OxideMerge remembers the last ten servers you connected to, in its settings file, so they are
+there the next time you start it: the protocol, host, port, user, how you signed in and the key
+file's path.
+The dialog starts with the last one filled in, so that you can fetch a second path from the same
+server, and *Recent* at the top of the dialog lists the others; choose one to fill in its
+settings.
+The button beside *Recent* removes the server shown from the list.
+A password or a key's passphrase is never saved or filled in this way; type it each time.
+While waiting, the window says what it is doing and for how long: connecting to the server,
+then fetching, with the bytes and, for a folder, the number of entries that have arrived.
+The folder chooser shows the same while it lists a folder, with the entries received so far.
 
 A fetched *file* is writable.
 When you edit it, *Save* uploads it back to the server over a fresh connection in the background.
@@ -512,18 +528,43 @@ When you close a tab with *Save*, the tab waits for its upload to finish before 
 
 *Comparing SFTP folders from listings*
 
-In the SFTP connection dialog, *List folders without downloading files* is selected by default.
+By default, *Connect* fetches a folder whole and it opens in the usual folder comparison, which
+shows every difference at once (see below for saving back to the server).
+For folders too large to fetch, select *List folders without downloading files* in the SFTP
+connection dialog; it is off by default.
 Use it to compare two folders, with either one or both on SFTP servers. The comparison shows
 rows as the listings arrive. *Metadata match* means that size and modification time match
 within the configured tolerance. Use *Verify Selected* or *Verify All* to check the contents
 of paired files. *Binary contents* compares the bytes, and *Full contents* applies the
 comparison options for the file type.
 
+The list is a table with a column for the name, the state and the size on each side.
+Each state has its own color and mark: red for contents that differ, amber for metadata that
+differs, green for contents read and found the same, and the side's color for a file only one
+side has.
+The row above the list counts the files in each state, those that differ first.
+While something is running, a strip below the toolbar shows how far it is: the number of entries
+listed so far, the files verified out of those to verify, or the bytes fetched of a file being
+opened. Until the server is reached, the strip says that it is connecting. The files a
+verification has yet to read show a spinner in their state. *Stop* in the strip ends it.
+
+Verifying does not open a comparison: it marks each file's state in the list.
+When it is done, a line over the list says how many files differ and how many match, and after
+*Verify All* the first file that differs is selected and scrolled into view; double-click it to
+compare.
+What a verification fetched is kept until you refresh.
+*Verify All* reads only the files not verified since the last refresh, so clicking it again
+fetches nothing; *Verify Selected* reads the selected file again.
+Opening a verified pair uses the copies the verification fetched, without another download.
+Files larger than 32 MB compared as *Binary contents* are compared as they arrive and are not
+kept, and at most 512 MB of copies are kept; those are fetched again when opened.
+*Refresh*, or saving a file to the server, discards what was kept for it and reads it again.
+
 Double-click a paired file to open it in a separate comparison, or choose *Open File Comparison*.
 OxideMerge fetches the selected remote files and uploads your edits when you save them.
 Use *Refresh* in the folder comparison to get an updated listing.
-For folder-wide copy, delete or save operations, clear *List folders without downloading files*
-when connecting to each remote folder.
+For folder-wide copy, delete or save operations, leave *List folders without downloading files*
+cleared when connecting to each remote folder.
 
 A fully fetched *folder* is writable too.
 Copy or delete files in the folder comparison, or open a file from it and edit it.
@@ -710,8 +751,8 @@ the one you chose.
   asks for one, in PEM, with its private key in the same file or in the key file.
   The key must not be encrypted.
 
-The dialog remembers the proxy's address, active mode and the certificate's files with the last
-connection that succeeded, but never the proxy password.
+The proxy's address, active mode and the certificate's files are remembered with each recent
+server, but never the proxy password.
 
 [[remote-command-line]]
 ==== Server paths on the command line and in jobs

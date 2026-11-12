@@ -2548,13 +2548,27 @@ impl Walk<'_, '_> {
     }
 }
 
+/// Why a PDF file without tags cannot be read as formatted blocks: nothing is wrong with it,
+/// it only has no structure to read. Told apart from other failures so that a window can say
+/// so kindly (see [`structure`]).
+#[derive(Debug)]
+pub struct NotTagged;
+
+impl std::fmt::Display for NotTagged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the PDF file is not tagged, so it says nothing of its headings, lists or tables",
+        )
+    }
+}
+
+impl std::error::Error for NotTagged {}
+
 /// The structure tree of the tagged PDF file `bytes`, with the text drawn for each element.
-/// A file without one is refused.
+/// A file without one is refused, with [`NotTagged`].
 pub(super) fn structure(bytes: &[u8], cancel: Option<&AtomicBool>) -> Result<Element> {
     let doc = Document::read(bytes, cancel)?;
-    let tree = doc.structure()?.context(
-        "the PDF file is not tagged, so it says nothing of its headings, lists or tables",
-    )?;
+    let tree = doc.structure()?.ok_or(NotTagged)?;
     if let Some(why) = doc.unreadable.borrow().as_ref() {
         if tree.kids.is_empty() {
             bail!("{why}");

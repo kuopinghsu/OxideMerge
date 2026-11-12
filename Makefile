@@ -181,12 +181,27 @@ else
 endif
 
 # Same PDF files as the CI user-guide job; scripts/build-user-guide.sh lists what it needs.
+ifeq ($(OS),Windows_NT)
+GUIDE_IMAGE := oxidemerge-user-guide
+GUIDE_DOCKER := docker run --rm --mount "type=bind,source=$(CURDIR),target=/work" --workdir /work --env "VERSION=$(VERSION)"
+
+.PHONY: user-guide-image
+user-guide-image:
+	docker build -t $(GUIDE_IMAGE) -f docker/user-guide.Dockerfile docker
+
+user-guide: user-guide-image
+	$(GUIDE_DOCKER) $(GUIDE_IMAGE) bash scripts/build-user-guide.sh dist
+
+user-guide-docs: user-guide-image
+	$(GUIDE_DOCKER) --env UNVERSIONED=1 $(GUIDE_IMAGE) bash scripts/build-user-guide.sh docs/dist
+else
 user-guide:
 	VERSION='$(VERSION)' bash scripts/build-user-guide.sh dist
 
 # The guides kept in the repository, under names that stay the same from one version to the next.
 user-guide-docs:
 	UNVERSIONED=1 VERSION='$(VERSION)' bash scripts/build-user-guide.sh docs/dist
+endif
 
 clean:
 	$(CARGO) clean

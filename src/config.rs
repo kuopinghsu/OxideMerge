@@ -229,6 +229,55 @@ pub fn saved_workspaces() -> Option<Vec<Workspace>> {
     }
 }
 
+/// How to reach a server connected to before over SFTP or FTP, as the connection dialog's
+/// fields hold it: everything but the secrets. The password, a key's passphrase and a proxy's
+/// password are typed again each time, and are never written to the settings file.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct RecentRemote {
+    /// The URL scheme of the protocol: "sftp", "ftp", "ftpes" or "ftps".
+    pub protocol: String,
+    pub host: String,
+    pub port: String,
+    pub user: String,
+    /// How to sign in: "password", "key" or "agent".
+    pub sign_in: String,
+    /// The private key file, when signing in with one.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub key_path: String,
+    /// The proxy's URL, without its password.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub proxy: String,
+    /// FTP in active mode.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub active: bool,
+    /// FTPS: a client certificate, and its key when not in the same file.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub client_cert: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub client_key: String,
+}
+
+impl RecentRemote {
+    /// Whether `other` is the same user on the same server, reached the same way.
+    pub fn same_server(&self, other: &RecentRemote) -> bool {
+        self.protocol == other.protocol
+            && self.host.eq_ignore_ascii_case(&other.host)
+            && self.port == other.port
+            && self.user == other.user
+    }
+
+    /// The server as a list shows it: `sftp://ann@example.com:2222`.
+    pub fn label(&self) -> String {
+        let user = if self.user.is_empty() {
+            String::new()
+        } else {
+            format!("{}@", self.user)
+        };
+        format!("{}://{user}{}:{}", self.protocol, self.host, self.port)
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct Config {
@@ -260,6 +309,10 @@ pub struct Config {
     pub recent_paths: Vec<String>,
     /// Recent comparisons, newest first: the 2 or 3 paths or URLs of each.
     pub recent_compares: Vec<Vec<String>>,
+    /// The servers connected to over SFTP or FTP, newest first, to fill in the connection
+    /// dialog with. Never a password, a passphrase or a proxy's password.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recent_remotes: Vec<RecentRemote>,
     pub recent_filters: Vec<String>,
     pub syntax_highlight: bool,
     /// Files larger than this many MiB (or 3,125 lines a MiB) are shown without syntax
@@ -335,6 +388,7 @@ impl Default for Config {
             filter: "*.*".into(),
             recent_paths: Vec::new(),
             recent_compares: Vec::new(),
+            recent_remotes: Vec::new(),
             recent_filters: vec![
                 "*.*".into(),
                 "*.c;*.cpp;*.h".into(),
@@ -538,6 +592,17 @@ impl Config {
 
     pub fn remove_recent_compare(&mut self, paths: &[String]) {
         self.recent_compares.retain(|x| x != paths);
+    }
+
+    /// Remembers a server connected to, ahead of the others, in place of what was kept for
+    /// the same user on it before.
+    pub fn add_recent_remote(&mut self, remote: RecentRemote) {
+        if remote.host.trim().is_empty() {
+            return;
+        }
+        self.recent_remotes.retain(|r| !r.same_server(&remote));
+        self.recent_remotes.insert(0, remote);
+        self.recent_remotes.truncate(10);
     }
 
     pub fn add_recent_filter(&mut self, f: &str) {

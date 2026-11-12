@@ -3386,27 +3386,68 @@ fn live_sftp_folder_lists_then_opens_and_verifies_only_requested_files() {
     assert!(gui.shows("remote-only.txt"));
     assert!(remote::fake::opened_paths().is_empty());
 
+    // The list is a table: every row is as wide as the list, and each row's state starts at
+    // the same place, whatever the length of its name.
+    let cells = |gui: &Gui, role: accesskit::Role, names: &[&str]| -> Vec<Rect> {
+        gui.widgets
+            .iter()
+            .filter(|w| w.role == role && names.iter().any(|n| named(w, n)))
+            .map(|w| w.rect)
+            .collect()
+    };
+    let rows = cells(
+        &gui,
+        accesskit::Role::Button,
+        &["a.txt", "b.txt", "remote-only.txt"],
+    );
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.x_range() == rows[0].x_range()));
+    let states = cells(
+        &gui,
+        accesskit::Role::Label,
+        &[
+            tr("remote_compare.left_only"),
+            tr("remote_compare.right_only"),
+            tr("remote_compare.unverified"),
+            tr("remote_compare.metadata_match"),
+            tr("remote_compare.metadata_different"),
+        ],
+    );
+    assert_eq!(states.len(), 3, "a state for each row");
+    assert!(
+        states.iter().all(|r| r.x_range() == states[0].x_range()),
+        "{states:?}"
+    );
+
     gui.click("a.txt");
     gui.click(tr("remote_compare.verify_selected"));
     gui.settle();
     assert!(gui.shows(tr("remote_compare.content_different")));
+    // The files in each state are counted over the list.
+    assert!(gui.shows_text(&format!("1  {}", tr("remote_compare.content_different"))));
     assert_eq!(remote::fake::opened_paths(), ["/srv/data/a.txt"]);
 
     gui.click(tr("remote_compare.verify_all"));
     gui.settle();
     assert!(gui.shows(tr("remote_compare.content_match")));
-    assert_eq!(
-        remote::fake::opened_paths(),
-        ["/srv/data/a.txt", "/srv/data/a.txt", "/srv/data/b.txt"]
-    );
+    // A file verified since the last refresh is not read again, and the result is said
+    // over the list.
+    let read_once = ["/srv/data/a.txt", "/srv/data/b.txt"];
+    assert_eq!(remote::fake::opened_paths(), read_once);
+    gui.click(tr("remote_compare.verify_all"));
+    gui.settle();
+    assert_eq!(remote::fake::opened_paths(), read_once);
+    assert!(gui.shows_text(&format!(
+        "1 {}  ·  1 {}",
+        tr("remote_compare.content_different"),
+        tr("remote_compare.content_match")
+    )));
 
+    // Opening a verified pair uses the copy the verification fetched.
     gui.click(tr("remote_compare.open"));
     gui.settle();
     assert_eq!(gui.app.tabs.len(), 2);
-    assert_eq!(
-        remote::fake::opened_paths().last().unwrap(),
-        "/srv/data/a.txt"
-    );
+    assert_eq!(remote::fake::opened_paths(), read_once);
     let tab = &gui.app.tabs[1];
     assert!(matches!(tab.content, Content::Text(_)));
     assert_eq!(
@@ -3438,6 +3479,19 @@ fn live_sftp_folder_lists_then_opens_and_verifies_only_requested_files() {
     gui.settle();
     assert!(gui.shows(tr("remote_compare.content_different")));
     assert!(!gui.shows(tr("remote_compare.content_match")));
+
+    // *Refresh* asks the server afresh: everything is read again after it.
+    gui.click(tr("remote_compare.verify_all"));
+    gui.settle();
+    let before = remote::fake::opened_paths().len();
+    gui.click(tr("remote_compare.verify_all"));
+    gui.settle();
+    assert_eq!(remote::fake::opened_paths().len(), before);
+    gui.click_a(accesskit::Role::Button, tr("cmd.refresh"));
+    gui.settle();
+    gui.click(tr("remote_compare.verify_all"));
+    gui.settle();
+    assert_eq!(remote::fake::opened_paths().len(), before + 2);
     remote::fake::uninstall();
 }
 
@@ -3843,6 +3897,10 @@ fn a_second_connection_starts_from_the_last_ones_server_but_not_its_password() {
 
     gui.app.start_remote_connect(RemoteTarget::Start(0));
     gui.frames(2);
+    assert!(
+        !gui.app.remote_dlg.as_ref().unwrap().list_folder,
+        "a folder is fetched whole, for the usual folder comparison, unless asked otherwise"
+    );
     {
         let d = gui.app.remote_dlg.as_mut().unwrap();
         d.host = "example.com".to_string();
@@ -3857,9 +3915,10 @@ fn a_second_connection_starts_from_the_last_ones_server_but_not_its_password() {
     gui.click(tr("btn.connect"));
     gui.settle();
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
-    assert!(
-        gui.app.last_remote.is_some(),
-        "last_remote should be set after a successful connect"
+    assert_eq!(
+        gui.app.cfg.recent_remotes.len(),
+        1,
+        "a server connected to is remembered"
     );
 
     // A second connection, for the other side, starts from the same server and key instead
@@ -3875,6 +3934,75 @@ fn a_second_connection_starts_from_the_last_ones_server_but_not_its_password() {
     assert_eq!(d.key_path, "/home/ann/.ssh/id_ed25519");
     assert_eq!(d.passphrase, "", "a passphrase is never remembered");
     assert_eq!(d.remote_path, "", "the remote path is always blank");
+
+    // A second server, signed in to with a password through a proxy that has one.
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.set_protocol(remote::Protocol::Ftp);
+        d.port = "21".to_string();
+        d.host = "files.example".to_string();
+        d.user = "bob".to_string();
+        d.password = "hunter2".to_string();
+        d.proxy = "socks5://carol@proxy:1080".to_string();
+        d.proxy_password = "pr0xy".to_string();
+        d.remote_path = "/srv/b.txt".to_string();
+    }
+    gui.frames(2);
+    gui.click(tr("btn.connect"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+
+    // The settings file keeps both servers, newest first, and none of what was typed as a
+    // password or passphrase; a later run of the program starts from them.
+    let saved = serde_json::to_string(&gui.app.stored_cfg()).unwrap();
+    for secret in ["s3cret", "hunter2", "pr0xy"] {
+        assert!(!saved.contains(secret), "{secret} was saved: {saved}");
+    }
+    let cfg: Config = serde_json::from_str(&saved).unwrap();
+    let labels: Vec<String> = cfg.recent_remotes.iter().map(|r| r.label()).collect();
+    assert_eq!(
+        labels,
+        ["ftp://bob@files.example:21", "sftp://ann@example.com:2222"]
+    );
+    let mut gui = Gui::with_config("compare_over_sftp_remembers_server_later", cfg, None);
+    gui.app.start_remote_connect(RemoteTarget::Start(0));
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_ref().unwrap();
+        assert_eq!(d.protocol, remote::Protocol::Ftp);
+        assert_eq!((d.host.as_str(), d.user.as_str()), ("files.example", "bob"));
+        assert_eq!(d.proxy, "socks5://carol@proxy:1080");
+        assert_eq!(d.password, "");
+        assert_eq!(d.proxy_password, "");
+    }
+
+    // *Recent* lists the servers; picking one fills in its fields and wipes a password
+    // typed for the other.
+    gui.app.remote_dlg.as_mut().unwrap().password = "typed".to_string();
+    assert!(gui.shows(tr("label.recent")));
+    gui.click("ftp://bob@files.example:21");
+    gui.click("sftp://ann@example.com:2222");
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_ref().unwrap();
+        assert_eq!(d.protocol, remote::Protocol::Sftp);
+        assert_eq!((d.host.as_str(), d.port.as_str()), ("example.com", "2222"));
+        assert_eq!(d.sign_in, SignIn::Key);
+        assert_eq!(d.key_path, "/home/ann/.ssh/id_ed25519");
+        assert_eq!(d.proxy, "");
+        assert_eq!(d.password, "");
+    }
+
+    // A server can be forgotten.
+    gui.click(tr("start.recent_remove"));
+    let labels: Vec<String> = gui
+        .app
+        .cfg
+        .recent_remotes
+        .iter()
+        .map(|r| r.label())
+        .collect();
+    assert_eq!(labels, ["ftp://bob@files.example:21"]);
 
     remote::fake::uninstall();
 }
@@ -3924,8 +4052,8 @@ fn the_connection_dialog_lists_the_servers_folders_to_pick_the_remote_path_from(
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
     assert_eq!(remote_path(&gui), "/home/ann");
     assert!(gui.shows("srv") && gui.shows("notes.txt"));
-    gui.frames(2);
-    assert!(width(&gui) <= 610.0, "{} wide with the list", width(&gui));
+    // The list is a chooser in the dialog's place, which comes back with what was chosen.
+    assert!(!gui.shows(tr("btn.connect")));
 
     // Clicking a folder opens it; clicking a file picks it; *Up* goes back.
     gui.click("srv");
@@ -3937,6 +4065,10 @@ fn the_connection_dialog_lists_the_servers_folders_to_pick_the_remote_path_from(
     assert_eq!(remote_path(&gui), "/home/ann");
     gui.click("srv");
     gui.click("a.txt");
+    gui.click(tr("btn.ok"));
+    assert!(gui.app.remote_dlg.as_ref().unwrap().browse.is_none());
+    assert_eq!(remote_path(&gui), "/home/ann/srv/a.txt");
+    assert!(width(&gui) <= 610.0, "{} wide after the list", width(&gui));
     gui.click(tr("btn.connect"));
     gui.settle();
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
@@ -3966,6 +4098,140 @@ fn the_connection_dialog_lists_the_servers_folders_to_pick_the_remote_path_from(
         std::fs::read_to_string(&gui.app.start_paths[2]).unwrap(),
         "notes\n"
     );
+
+    remote::fake::uninstall();
+}
+
+#[test]
+fn the_remote_chooser_keeps_its_size_and_place_whatever_it_lists() {
+    let long = "x".repeat(150);
+    let mut server = remote::fake::Server::new()
+        .dir("/data")
+        .dir("/data/empty")
+        .dir("/data/few")
+        .dir("/data/many");
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        server = server.file(&format!("/data/few/{name}"), "x");
+    }
+    for i in 0..3000 {
+        server = server.file(&format!("/data/many/{i:04}-{long}.txt"), "");
+    }
+    remote::fake::install(server);
+    let mut gui = Gui::start("sftp_browse_size", None);
+    let remote_path = |gui: &Gui| gui.app.remote_dlg.as_ref().unwrap().remote_path.clone();
+    gui.app.start_remote_connect(RemoteTarget::Start(0));
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+        d.remote_path = "/data".to_string();
+    }
+    gui.frames(2);
+    gui.click(tr("btn.list_remote"));
+    gui.frames(3);
+
+    // Where the chooser and its buttons are, which must not depend on what is listed.
+    let place = |gui: &mut Gui| {
+        gui.frames(3);
+        let dialog = gui
+            .ctx
+            .memory(|m| m.area_rect(egui::Id::unique("remote_browse_dialog")))
+            .expect("the chooser");
+        (
+            dialog,
+            gui.widget(tr("btn.ok")).rect,
+            gui.widget(tr("btn.cancel")).rect,
+        )
+    };
+    let at_first = place(&mut gui);
+    let (dialog, ok, _) = at_first;
+    assert!(
+        dialog.width() > 600.0 && dialog.height() > 500.0,
+        "{dialog:?}"
+    );
+    assert!(
+        dialog.contains_rect(ok) && ok.bottom() > dialog.bottom() - 40.0,
+        "the buttons are at the bottom of the chooser: {ok:?} in {dialog:?}"
+    );
+    assert!(gui.shows("empty") && gui.shows("few") && gui.shows("many"));
+
+    // Three entries, three thousand with names far wider than the chooser, and none.
+    gui.click("few");
+    assert!(gui.shows("a.txt") && gui.shows("c.txt"));
+    assert_eq!(place(&mut gui), at_first, "with three entries");
+    gui.click(tr("btn.remote_up"));
+    gui.click("many");
+    assert_eq!(remote_path(&gui), "/data/many");
+    assert_eq!(place(&mut gui), at_first, "with three thousand entries");
+    let rows: Vec<Rect> = gui
+        .widgets
+        .iter()
+        .filter(|w| w.label.ends_with(".txt"))
+        .map(|w| w.rect)
+        .collect();
+    assert!(
+        rows.iter().all(|r| dialog.contains_rect(*r)),
+        "long names are cut short inside the list"
+    );
+    assert!(
+        (5..60).contains(&rows.len()),
+        "only the rows in view are laid out: {}",
+        rows.len()
+    );
+
+    // The arrow keys pick entries, scrolling to them; Backspace goes up; Enter opens a folder.
+    let name = |i: usize| format!("{i:04}-{long}.txt");
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    assert_eq!(remote_path(&gui), format!("/data/many/{}", name(1)));
+    gui.key(Modifiers::NONE, Key::End);
+    assert_eq!(remote_path(&gui), format!("/data/many/{}", name(2999)));
+    let last = gui.widget(&name(2999)).rect;
+    assert!(dialog.contains_rect(last), "scrolled to: {last:?}");
+    assert_eq!(place(&mut gui), at_first, "scrolled to the end");
+    gui.key(Modifiers::NONE, Key::Backspace);
+    assert_eq!(remote_path(&gui), "/data");
+    gui.key(Modifiers::NONE, Key::ArrowDown);
+    gui.key(Modifiers::NONE, Key::Enter);
+    assert_eq!(remote_path(&gui), "/data/empty");
+    assert!(gui.shows(tr("msg.remote_empty")));
+    assert_eq!(place(&mut gui), at_first, "with no entries");
+
+    // While a folder is being listed, the chooser says what it is waiting for, and for how
+    // long: the server first, then the folder.
+    {
+        let b = gui
+            .app
+            .remote_dlg
+            .as_ref()
+            .unwrap()
+            .browse
+            .as_ref()
+            .unwrap();
+        let (stage, detail) = remote_browse_progress(b);
+        assert_eq!(
+            stage,
+            trf(
+                "msg.remote_connecting",
+                &[("server", "sftp://ann@example.com:22".to_string())]
+            )
+        );
+        assert!(detail.ends_with(" s"), "{detail}");
+    }
+
+    // A server that stops answering says so in the list, where *Retry* asks it again.
+    remote::fake::install(remote::fake::Server::new().failing("connection lost"));
+    gui.click(tr("cmd.refresh"));
+    assert!(gui.shows_text("connection lost"));
+    assert_eq!(place(&mut gui), at_first, "with an error");
+
+    // Escape closes the chooser and puts the path back as it was; the dialog returns.
+    gui.key(Modifiers::NONE, Key::Escape);
+    let d = gui.app.remote_dlg.as_ref().expect("the dialog");
+    assert!(d.browse.is_none());
+    assert_eq!(d.remote_path, "/data");
+    assert!(gui.shows(tr("btn.connect")));
 
     remote::fake::uninstall();
 }
@@ -6207,6 +6473,66 @@ fn about_displays_the_build_identifier_and_keeps_the_calendar_copyright_year() {
 }
 
 #[test]
+fn a_fetched_folders_path_leaves_the_start_page_once_its_copy_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("a.txt", "local")]);
+    remote::fake::install(
+        remote::fake::Server::new()
+            .dir("/srv/data")
+            .file("/srv/data/a.txt", "remote"),
+    );
+    let mut gui = Gui::start("fetched_path_cleared", None);
+    fetch_to_start_page_with_listing(&mut gui, 0, "/srv/data", false);
+    let local = dir.path().display().to_string();
+    gui.app.start_paths[2] = local.clone();
+    gui.frame();
+    let fetched = gui.app.start_paths[0].clone();
+    assert!(Path::new(&fetched).is_dir());
+    gui.click(tr("btn.compare"));
+    gui.settle();
+    assert_eq!(gui.app.tabs.len(), 1);
+    assert_eq!(
+        gui.app.start_paths[0], fetched,
+        "kept while the tab is open"
+    );
+
+    // Closing the tab deletes the copy, and its path with it; the local path stays.
+    gui.app.close_tab(0, true);
+    gui.frames(3);
+    assert!(!Path::new(&fetched).exists());
+    assert_eq!(gui.app.start_paths[0], "");
+    assert_eq!(gui.app.start_paths[2], local);
+    remote::fake::uninstall();
+}
+
+#[test]
+fn the_mark_of_what_a_path_points_to_is_inside_its_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut gui = Gui::start("path_status_mark", None);
+    gui.app.start_paths[0] = dir.path().display().to_string();
+    gui.frames(3);
+    // The first path field of the start page, and the button after it.
+    let field = gui
+        .widgets
+        .iter()
+        .find(|w| w.role == accesskit::Role::TextInput)
+        .expect("a path field")
+        .rect;
+    let browse = gui
+        .widgets
+        .iter()
+        .find(|w| named(w, tr("btn.browse_file")))
+        .expect("the browse button")
+        .rect;
+    let mark = path_status_rect(field);
+    assert!(field.contains_rect(mark), "{mark:?} in {field:?}");
+    assert!(
+        mark.right() < browse.left(),
+        "the mark keeps clear of the button: {mark:?}, {browse:?}"
+    );
+}
+
+#[test]
 fn dialogs_put_their_close_button_at_the_right_edge() {
     let mut gui = Gui::start("dialog_close_buttons", None);
     // How far the close button is from the right edge of the dialog, as each lays it out.
@@ -7111,6 +7437,60 @@ fn compare_with_revision_lists_and_opens_mercurial_revisions() {
     gui.wait_until("the second tab", |g| g.app.tabs.len() == 2 && !g.busy());
     assert_eq!(gui.text_view().panes[0].doc.text(), "one\n");
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+#[test]
+fn a_revision_of_a_file_opens_in_the_same_views_as_two_files() {
+    let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("samples");
+    // The buttons and other named controls a tab shows, whatever its paths are.
+    let controls = |gui: &Gui| -> std::collections::BTreeSet<String> {
+        gui.controls
+            .iter()
+            .filter(|w| w.role == accesskit::Role::Button && !w.label.contains(" ↔ "))
+            .map(|w| w.label.clone())
+            .collect()
+    };
+    for name in ["report.pdf", "report.docx", "budget.xlsx", "report.ipynb"] {
+        let (old, now) = (
+            samples.join("left/docs").join(name),
+            samples.join("right/docs").join(name),
+        );
+        // The two files, opened as files.
+        let mut gui = Gui::start("rev_document_files", None);
+        gui.app.open(OpenRequest {
+            paths: vec![old.clone(), now.clone()],
+            wait: true,
+            ..Default::default()
+        });
+        gui.settle();
+        assert!(gui.errors().is_empty(), "{name}: {:?}", gui.errors());
+        let as_files = controls(&gui);
+        let kind = std::mem::discriminant(gui.app.tabs[0].content.view());
+
+        // The same file against a revision's copy of it, as `vcs::copy_of` writes it: under
+        // the file's own name.
+        let temp = tempfile::tempdir().unwrap();
+        let copy = temp.path().join(name);
+        std::fs::copy(&old, &copy).unwrap();
+        let mut gui = Gui::start("rev_document", None);
+        gui.app
+            .show_revision(&now, "HEAD", temp, copy.clone())
+            .unwrap();
+        gui.settle();
+        assert!(gui.errors().is_empty(), "{name}: {:?}", gui.errors());
+        let tab = &gui.app.tabs[0];
+        assert!(
+            std::mem::discriminant(tab.content.view()) == kind,
+            "{name}: the same kind of view"
+        );
+        assert_eq!(controls(&gui), as_files, "{name}: the same controls");
+        assert!(gui.shows_text("@ HEAD"), "{name}: named by its revision");
+        let copy = copy.display().to_string();
+        assert!(
+            !gui.app.cfg.recent_paths.contains(&copy),
+            "{name}: the copy is not a recent path"
+        );
+    }
 }
 
 #[test]

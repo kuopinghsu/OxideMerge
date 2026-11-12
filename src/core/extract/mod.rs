@@ -11,6 +11,7 @@ mod notebook;
 pub(crate) mod pdf;
 
 pub use markdown::{docx_blocks, pdf_blocks, xlsx_blocks};
+pub use pdf::NotTagged;
 
 use anyhow::{bail, Context, Result};
 use std::io::Read;
