@@ -363,6 +363,8 @@ pub struct DiffsView {
     pending: Option<Pending>,
     /// The file last selected, as the folder compare was told.
     synced: Option<String>,
+    /// The selected file last brought into view in the sidebar.
+    listed_selection: Option<usize>,
     scroll_to: Option<Line>,
     /// First line in view, where moving to the next difference starts without a selection.
     top_line: usize,
@@ -462,6 +464,7 @@ impl DiffsView {
             current: None,
             pending: None,
             synced: None,
+            listed_selection: None,
             scroll_to: None,
             top_line: 0,
             undo: Vec::new(),
@@ -526,6 +529,7 @@ impl DiffsView {
         self.current = None;
         self.pending = None;
         self.synced = None;
+        self.listed_selection = None;
         self.scroll_to = None;
         self.top_line = 0;
         self.status.clear();
@@ -1464,7 +1468,9 @@ impl DiffsView {
                     .fill(pal(ui).surface_alt)
                     .inner_margin(egui::Margin::same(theme::space::MD)),
             )
-            .show(ui, |ui| self.file_list(ui));
+            .show(ui, |ui| {
+                self.file_list(ui);
+            });
         if self.cards.is_empty() {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
@@ -1568,7 +1574,7 @@ impl DiffsView {
         }
     }
 
-    fn file_list(&mut self, ui: &mut Ui) {
+    fn file_list(&mut self, ui: &mut Ui) -> egui::scroll_area::ScrollAreaOutput<()> {
         let p = pal(ui);
         let n = self.n();
         ui.horizontal(|ui| {
@@ -1595,16 +1601,37 @@ impl DiffsView {
         }
         if search.changed() {
             self.stale = true;
+            self.listed_selection = None;
         }
         ui.add_space(6.0);
         let listed: Vec<usize> = (0..self.cards.len()).filter(|&f| self.shown(f)).collect();
-        let current_file = self.current.map(|(f, _)| f);
+        let current_file = self
+            .current
+            .map(|(f, _)| f)
+            .or(self.pending.map(|p| p.file));
+        let reveal = if current_file != self.listed_selection {
+            self.listed_selection = current_file;
+            current_file.and_then(|f| listed.iter().position(|&index| index == f))
+        } else {
+            None
+        };
         let mut clicked = None;
-        egui::ScrollArea::vertical()
+        // Use the same spacing for the virtual row positions and the rows themselves.
+        let spacing = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let area = egui::ScrollArea::vertical()
             .id_salt(self.id.with("list"))
             .auto_shrink(false)
+            .animated(false)
             .show_rows(ui, LIST_ROW_H, listed.len(), |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
+                if let Some(row) = reveal {
+                    // show_rows positions this child at the first virtual row in range.
+                    let top = ui.max_rect().top() + (row as f32 - range.start as f32) * LIST_ROW_H;
+                    let rect =
+                        Rect::from_min_size(pos2(ui.max_rect().left(), top), vec2(1.0, LIST_ROW_H));
+                    ui.scroll_to_rect(rect, None);
+                    ui.ctx().request_repaint();
+                }
                 for &f in &listed[range] {
                     let card = &self.cards[f];
                     let (rect, resp) = ui.allocate_exact_size(
@@ -1675,9 +1702,11 @@ impl DiffsView {
                     }
                 }
             });
+        ui.spacing_mut().item_spacing.y = spacing;
         if let Some(f) = clicked {
             self.reveal(f);
         }
+        area
     }
 
     fn cards_ui(&mut self, ui: &mut Ui, cfg: &Config, colors: &Colors) {
@@ -2401,6 +2430,44 @@ mod tests {
 
     fn read(p: PathBuf) -> String {
         std::fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn stepping_between_files_scrolls_the_sidebar_in_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<_> = (0..40).map(|i| format!("{i:02}.txt")).collect();
+        let contents: &[Option<&str>] = &[Some("old\n"), Some("new\n")];
+        let files: Vec<_> = names.iter().map(|name| (name.as_str(), contents)).collect();
+        let (mut view, _) = view(dir.path(), &files, vec![false, false]);
+        let ctx = egui::Context::default();
+        let sidebar_offset = |view: &mut DiffsView| {
+            let mut offset = 0.0;
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(280.0, 200.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    offset = view.file_list(ui).state.clamped_offset().y;
+                },
+            );
+            out.textures_delta.clear();
+            offset
+        };
+
+        view.first();
+        assert_eq!(sidebar_offset(&mut view), 0.0);
+        for _ in 1..30 {
+            view.step(true);
+        }
+        assert_eq!(view.current, Some((29, 0)));
+        assert!(sidebar_offset(&mut view) > 20.0 * LIST_ROW_H);
+
+        for _ in 1..30 {
+            view.step(false);
+        }
+        assert_eq!(view.current, Some((0, 0)));
+        assert_eq!(sidebar_offset(&mut view), 0.0);
     }
 
     #[test]
