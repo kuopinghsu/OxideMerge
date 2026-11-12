@@ -3386,7 +3386,8 @@ A PDF report contains what the HTML report contains:
   pages, with the removed lines above the added ones.
 * For a folder comparison, the summary, the note of what the report leaves out, the comparison
   settings, the index of changed files and the list of all files with their status, sizes and
-  dates, followed by a part for each changed file, the review notes and the review summary.
+  dates, followed by a part for each changed file, the table of the files shown as a summary
+  only, the review notes and the review summary.
 * For a table compared by key, what matching by key found.
 
 A PDF folder report has the folder report extras of the HTML report (see <<html-reports>>):
@@ -3401,6 +3402,9 @@ A PDF folder report has the folder report extras of the HTML report (see <<html-
 * *File differences* lists every changed or one-sided file with the number of blocks drawn, or
   *Summary only* and why, and how the file was compared, such as *Text*, *Spreadsheet cells* or
   *ELF header and sections*. Click an entry to go to the part of its file.
+* A file that shows no differences, such as a binary file, has no part of its own: these files
+  are listed together in the *Summary only* table after the parts, each with its status, how it
+  was compared and why it shows none. Its entry in *File differences* goes to its row there.
 * The part of each file starts with its status and how it was compared. Each difference names
   its sheet and rows, its PDF pages or its notebook cell, and a changed CSV, TSV or spreadsheet
   row lists the fields that changed, as in `Alice · score · 90 → 95`.
@@ -3408,13 +3412,19 @@ A PDF folder report has the folder report extras of the HTML report (see <<html-
   report keeps the folder paths out of its notes and settings.
 
 The report starts with its title and the time it was made, a panel that names each compared side
-(and the compare rules file), and the counts as a row of cards.
+(and the compare rules file), and the counts as a row of cards; on a page wide enough for both,
+up to five cards stand beside the panel.
+Under them, a line shows the sign and background of removed, added and changed lines (and of
+conflicts and ignored differences when the report has them) and the hatching of a line that is
+missing on one side.
+In the list of all files, each side has a column for the size, with the ends of the numbers in
+line, and one for the date.
 Each part has a heading; in a folder report, the settings are a table of labels and values, and
 the part of each file starts with its name beside a dot in the color of its status.
 The bar above each difference gives its kind, its lines on each side and its number.
 
-Each page has a header with the OxideMerge icon, the report title and the time the report was
-made, and a footer with *Page n of m* and *OxideMerge*, which links to the project page
+Each page has a header with the OxideMerge icon, the report title and the names of the compared
+sides (not when the folder paths are hidden), and a footer with *Page n of m* and *OxideMerge*, which links to the project page
 (https://github.com/kuopinghsu/OxideMerge). The PDF contains a bookmark for each file and each
 difference.
 OxideMerge embeds the fonts it uses, with only the characters that the report needs, so Chinese,
@@ -3449,7 +3459,9 @@ Color is never the only cue, so a report printed in black and white still shows 
 * Changed words are underlined as well as highlighted.
 * The position of a line that is missing on one side is hatched.
 * When *Color-blind friendly diff colors* is on in *Options → General*, blue and orange take the
-  place of green and red, changes are purple and conflicts are yellow.
+  place of green and red, changes are purple and conflicts are yellow. The dots and counts of the
+  file statuses in a folder report follow: identical is blue, different orange, one side only
+  purple and errors yellow.
 
 Pages are A4 landscape.
 To use Letter pages, select *File → Export → US Letter pages for PDF reports*.
