@@ -551,6 +551,10 @@ fn plain(label: &str) -> String {
 
 struct OpenDialog {
     paths: [String; 3],
+    /// Whether this stands for the start page's own fields, submitted there, rather than
+    /// being a dialog the user opened: it goes away again if connecting for it is cancelled.
+    from_start: bool,
+    recent_remote: Vec<(String, String)>,
     three_way: bool,
     filter: String,
     recursive: bool,
@@ -1453,6 +1457,8 @@ enum RemoteTarget {
     Start(usize),
     /// A side of the Open dialog.
     Open(usize),
+    /// A typed SFTP address to resolve before resuming a submitted comparison.
+    Compare(usize),
 }
 
 /// How the remote connection dialog signs in. FTP has only a password.
@@ -1472,6 +1478,7 @@ struct RemoteDialog {
     protocol: remote::Protocol,
     host: String,
     port: String,
+    port_given: bool,
     user: String,
     sign_in: SignIn,
     password: String,
@@ -1482,6 +1489,15 @@ struct RemoteDialog {
     list_folder: bool,
     /// The server's folders and files, shown to pick `remote_path` from.
     browse: Option<RemoteBrowse>,
+    /// Whether what the chooser's *OK* takes is fetched at once: it was opened by *Connect*
+    /// with no remote path named, rather than by the folder button to fill the path in.
+    fetch_chosen: bool,
+    /// Whether the dialog has just opened, and still has to put the keyboard in the first
+    /// field left to fill in.
+    focus: bool,
+    /// Why the dialog is shown though it was not asked for, as the key of its words: signing
+    /// in to a typed address without it did not work.
+    note: Option<&'static str>,
     /// A proxy to connect through, and its password when the URL has a user.
     proxy: String,
     proxy_password: String,
@@ -1493,6 +1509,74 @@ struct RemoteDialog {
 }
 
 impl RemoteDialog {
+    fn new(target: RemoteTarget) -> Self {
+        Self {
+            target,
+            protocol: remote::Protocol::Sftp,
+            host: String::new(),
+            port: "22".to_string(),
+            port_given: false,
+            user: String::new(),
+            sign_in: SignIn::Password,
+            password: String::new(),
+            show_password: false,
+            key_path: String::new(),
+            passphrase: String::new(),
+            remote_path: String::new(),
+            list_folder: false,
+            browse: None,
+            fetch_chosen: false,
+            focus: true,
+            note: None,
+            proxy: String::new(),
+            proxy_password: String::new(),
+            active: false,
+            client_cert: String::new(),
+            client_key: String::new(),
+        }
+    }
+
+    /// Takes apart an address typed or pasted into the host field, `sftp://ann@host:2222/path`
+    /// or `ann@host`, into the fields it names; whether it was one.
+    fn split_host(&mut self) -> bool {
+        let mut text = self.host.trim().to_string();
+        if text.contains("://") {
+            use crate::core::remote_url;
+            let parsed = remote_url::parse_input(&text);
+            remote::wipe(&mut text);
+            let Ok((url, password)) = parsed else {
+                return false;
+            };
+            if url.protocol != self.protocol {
+                self.set_protocol(url.protocol);
+            }
+            remote::wipe(&mut self.host);
+            self.host = url.host;
+            self.port = url.port.to_string();
+            self.port_given = url.port_given;
+            if let Some(user) = url.user {
+                self.user = user;
+            }
+            if url.path != "." {
+                self.remote_path = url.path;
+            }
+            if let Some(password) = password.filter(|p| !p.is_empty()) {
+                remote::wipe(&mut self.password);
+                self.password = password;
+                self.sign_in = SignIn::Password;
+            }
+            return true;
+        }
+        match text.split_once('@') {
+            Some((user, host)) if !user.is_empty() && !host.is_empty() && !host.contains('@') => {
+                self.user = user.to_string();
+                self.host = host.to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The proxy the field names, if any.
     fn proxy(&self) -> anyhow::Result<Option<crate::core::net::Proxy>> {
         if self.proxy.trim().is_empty() {
@@ -1546,7 +1630,7 @@ impl RemoteDialog {
             client_cert: file(&self.client_cert),
             client_key: file(&self.client_key).filter(|_| !self.client_cert.trim().is_empty()),
             in_place: false,
-            port_given: false,
+            port_given: self.port_given,
         };
         let auth = match sign_in {
             SignIn::Key => remote::Auth::Key {
@@ -1579,6 +1663,7 @@ impl RemoteDialog {
     /// passphrase was for another server, so it is wiped; the remote path stays.
     fn fill(&mut self, r: &crate::config::RecentRemote) {
         self.protocol = remote::Protocol::from_scheme(&r.protocol).unwrap_or_default();
+        self.port_given = false;
         self.host = r.host.clone();
         self.port = if r.port.trim().is_empty() {
             self.protocol.default_port().to_string()
@@ -1616,6 +1701,7 @@ impl RemoteDialog {
     /// Switches to `protocol`, and to its usual port unless another was typed.
     fn set_protocol(&mut self, protocol: remote::Protocol) {
         self.show_password = false;
+        self.port_given = false;
         let port = self.port.trim();
         if port.is_empty() || port == self.protocol.default_port().to_string() {
             self.port = protocol.default_port().to_string();
@@ -1712,12 +1798,17 @@ fn remote_advanced(ui: &mut egui::Ui, d: &mut RemoteDialog) {
 
 /// `protocol` as the remote connection dialog lists it.
 fn protocol_name(protocol: remote::Protocol) -> &'static str {
-    tr(match protocol {
+    tr(protocol_key(protocol))
+}
+
+/// The key of the words for `protocol`.
+fn protocol_key(protocol: remote::Protocol) -> &'static str {
+    match protocol {
         remote::Protocol::Sftp => "label.protocol_sftp",
         remote::Protocol::Ftps => "label.protocol_ftps",
         remote::Protocol::FtpsImplicit => "label.protocol_ftps_implicit",
         remote::Protocol::Ftp => "label.protocol_ftp",
-    })
+    }
 }
 
 /// Whether `a` and `b` connect to the same server the same way, as the same user, signed in
@@ -2310,7 +2401,7 @@ fn recent_remote(conn: &remote::RemoteConnection) -> crate::config::RecentRemote
     let (sign_in, key_path) = match &conn.auth {
         remote::Auth::Password(_) => ("password", String::new()),
         remote::Auth::Key { path, .. } => ("key", path.display().to_string()),
-        remote::Auth::Agent => ("agent", String::new()),
+        remote::Auth::Agent | remote::Auth::AgentKeysOnly => ("agent", String::new()),
     };
     let shown = |p: &Option<PathBuf>| {
         p.as_ref()
@@ -2338,6 +2429,7 @@ fn recent_remote(conn: &remote::RemoteConnection) -> crate::config::RecentRemote
 /// opened is opened again.
 struct ArchivePrompt {
     req: OpenRequest,
+    recent: Option<Vec<String>>,
     archive: PathBuf,
     /// Whether the password given before was wrong.
     wrong: bool,
@@ -3119,7 +3211,7 @@ fn merge_menu(ui: &mut egui::Ui, m: &mut Menus) {
 
 /// File name of a compared path, or the whole URL.
 fn recent_name(s: &str) -> String {
-    if web::is_url(s) {
+    if web::is_url(s) || remote_scheme(s).is_some() {
         return s.to_string();
     }
     Path::new(s)
@@ -3285,7 +3377,7 @@ fn path_kind(raw: &str) -> PathKind {
     use std::time::Instant;
     type Cache = HashMap<String, (PathKind, Instant)>;
     static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
-    if web::is_url(raw) {
+    if web::is_url(raw) || remote_scheme(raw).is_some() {
         return PathKind::Url;
     }
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -3310,6 +3402,11 @@ fn path_kind(raw: &str) -> PathKind {
     kind
 }
 
+/// The protocol of a server address typed into a path field, `sftp://…` or one of FTP's.
+fn remote_scheme(text: &str) -> Option<remote::Protocol> {
+    remote::Protocol::from_scheme(text.split_once("://")?.0)
+}
+
 fn path_status(ui: &egui::Ui, field: &egui::Response, text: &str) {
     let raw = text.trim().trim_matches('"');
     if raw.is_empty() {
@@ -3319,7 +3416,11 @@ fn path_status(ui: &egui::Ui, field: &egui::Response, text: &str) {
     // Looks again once the status may be out of date, even with nothing else happening.
     ui.ctx().request_repaint_after(PATH_KIND_TTL);
     let (icon, color, what) = match path_kind(raw) {
-        PathKind::Url => (Icon::Globe, p.accent, "kind.web"),
+        PathKind::Url => (
+            Icon::Globe,
+            p.accent,
+            remote_scheme(raw).map_or("kind.web", protocol_key),
+        ),
         PathKind::Dir => (Icon::Folder, p.success, "col.folder"),
         PathKind::File => (Icon::File, p.success, "filters.source"),
         PathKind::Missing => (Icon::Warning, p.danger, "msg.not_exist"),
@@ -3360,10 +3461,11 @@ fn comparison_path_field(
     pending: &[PendingRemote],
     width: f32,
 ) -> egui::Response {
-    // Keep the unique staging key for each connection, but display the path it names.
+    // The field holds the local copy a fetch was staged to, which is what a comparison is
+    // opened from, but shows the address on the server it stands for.
     let mut shown = pending
         .iter()
-        .find(|p| p.list_folder && p.local == Path::new(path))
+        .find(|p| p.local == Path::new(path))
         .map(|p| remote::label(&p.file.conn, &p.file.remote_path));
     let edit = shown.as_mut().unwrap_or(path);
     let field = ui.add(
@@ -4329,12 +4431,39 @@ impl OxideMergeApp {
     fn new_open_dialog(&self, left: Option<String>) -> OpenDialog {
         OpenDialog {
             paths: [left.unwrap_or_default(), String::new(), String::new()],
+            from_start: false,
+            recent_remote: Vec::new(),
             three_way: false,
             filter: self.cfg.filter.clone(),
             recursive: self.cfg.folder.recursive,
             method: self.cfg.folder.method,
             kind: None,
             read_only: [false; 3],
+        }
+    }
+
+    fn recent_open_dialog(&self, paths: Vec<String>) -> OpenDialog {
+        let mut dialog = self.new_open_dialog(None);
+        dialog.three_way = paths.len() == 3;
+        let slots: &[usize] = if dialog.three_way {
+            &[0, 1, 2]
+        } else {
+            &[0, 2]
+        };
+        for (&side, path) in slots.iter().zip(paths) {
+            dialog.paths[side] = path;
+        }
+        dialog
+    }
+
+    fn open_recent(&mut self, paths: Vec<String>) {
+        if paths.iter().any(|p| remote_scheme(p).is_some()) {
+            self.submit_open(self.recent_open_dialog(paths));
+        } else {
+            self.open(OpenRequest {
+                paths: paths.into_iter().map(PathBuf::from).collect(),
+                ..Default::default()
+            });
         }
     }
 
@@ -4363,9 +4492,15 @@ impl OxideMergeApp {
     }
 
     pub fn open(&mut self, req: OpenRequest) {
+        self.open_with_recent(req, None);
+    }
+
+    fn open_with_recent(&mut self, req: OpenRequest, recent: Option<Vec<String>>) {
         let staged = req.paths.iter().any(|p| self.is_staged(p));
-        let recent: Option<Vec<String>> = (!req.skip_recent && !staged && req.paths.len() >= 2)
-            .then(|| req.paths.iter().map(|p| p.display().to_string()).collect());
+        let recent = recent.or_else(|| {
+            (!req.skip_recent && !staged && req.paths.len() >= 2)
+                .then(|| req.paths.iter().map(|p| p.display().to_string()).collect())
+        });
         let retry = req.clone();
         let opening = self.opening.len();
         let result = self.try_open(req);
@@ -4378,6 +4513,7 @@ impl OxideMergeApp {
                 archive: n.archive.clone(),
                 wrong: n.wrong,
                 req: retry,
+                recent,
                 password: Default::default(),
                 focus: true,
             });
@@ -4460,7 +4596,7 @@ impl OxideMergeApp {
                 let password = std::mem::take(&mut p.password);
                 archive::give_password(&p.archive, password);
                 self.archive_passwords.push(p.archive.clone());
-                self.open(p.req);
+                self.open_with_recent(p.req, p.recent);
             }
         }
     }
@@ -4768,29 +4904,7 @@ impl OxideMergeApp {
 
     /// Opens the connection dialog of *Compare over SFTP* for `target`'s path field.
     fn start_remote_connect(&mut self, target: RemoteTarget) {
-        let mut d = RemoteDialog {
-            target,
-            protocol: remote::Protocol::Sftp,
-            host: String::new(),
-            port: "22".to_string(),
-            user: String::new(),
-            sign_in: SignIn::Password,
-            password: String::new(),
-            show_password: false,
-            key_path: String::new(),
-            passphrase: String::new(),
-            remote_path: String::new(),
-            // A folder is fetched whole and opens in the usual folder comparison, which shows
-            // every difference at once; listing it without its files is there to choose, for
-            // folders too large to fetch.
-            list_folder: false,
-            browse: None,
-            proxy: String::new(),
-            proxy_password: String::new(),
-            active: false,
-            client_cert: String::new(),
-            client_key: String::new(),
-        };
+        let mut d = RemoteDialog::new(target);
         // The server connected to last, in this run or an earlier one, is the likeliest.
         if let Some(last) = self.cfg.recent_remotes.first() {
             d.fill(last);
@@ -4848,8 +4962,14 @@ impl OxideMergeApp {
         if d.browse.as_ref().is_some_and(|b| b.loading) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        let ready = conn.is_some() && !d.remote_path.trim().is_empty();
+        let needs_password = matches!(d.target, RemoteTarget::Compare(_))
+            && d.sign_in() == SignIn::Password
+            && d.password.is_empty();
+        // *Connect* needs no remote path: without one it lists the server to choose from.
+        let ready = conn.is_some() && !needs_password;
         let (mut toggle_browse, mut go, mut pick, mut fetch_now) = (false, None, None, None);
+        // Whether an address in the host field was just taken apart into the other fields.
+        let mut split = false;
         // The chooser takes the dialog's place while it is shown.
         if let Some(b) = &mut d.browse {
             let ask = remote_chooser(ctx, b, &d.remote_path, self.ask.is_none());
@@ -4858,13 +4978,34 @@ impl OxideMergeApp {
                 pick = Some(b.before.clone());
             }
             toggle_browse = ask.cancel || ask.accept;
+            connect = ask.accept && d.fetch_chosen;
         } else {
+            // The keyboard starts in the first field left to fill in: the host, or for a
+            // server filled in already, what signs in to it.
+            let focus = std::mem::take(&mut d.focus).then(|| {
+                if d.host.trim().is_empty() {
+                    0
+                } else {
+                    match d.sign_in() {
+                        SignIn::Password => 1,
+                        SignIn::Key => 2,
+                        SignIn::Agent => 3,
+                    }
+                }
+            });
             let modal =
                 egui::Modal::new(egui::Id::unique("remote_connect_dialog")).show(ctx, |ui| {
                     ui.set_min_width(440.0);
                     ui.set_max_width(600.0);
                     if widgets::dialog_title(ui, &plain(tr("menu.open_remote"))) {
                         cancel = true;
+                    }
+                    if let Some(note) = d.note {
+                        ui.horizontal_top(|ui| {
+                            widgets::inline_icon(ui, Icon::Help, pal(ui).text_dim);
+                            ui.add(egui::Label::new(tr(note)).wrap());
+                        });
+                        ui.add_space(6.0);
                     }
                     egui::Grid::new("remote_grid")
                         .num_columns(2)
@@ -4929,11 +5070,17 @@ impl OxideMergeApp {
                             ui.end_row();
                             ui.label(tr("label.remote_host"));
                             ui.horizontal(|ui| {
-                                ui.add(
+                                let host = ui.add(
                                     egui::TextEdit::singleline(&mut d.host)
                                         .hint_text("example.com")
                                         .desired_width(220.0),
                                 );
+                                if focus == Some(0) {
+                                    host.request_focus();
+                                }
+                                if host.lost_focus() && d.split_host() {
+                                    split = true;
+                                }
                                 ui.label(tr("label.remote_port"));
                                 ui.add(egui::TextEdit::singleline(&mut d.port).desired_width(50.0));
                             });
@@ -4988,11 +5135,14 @@ impl OxideMergeApp {
                                 });
                                 ui.end_row();
                                 ui.label(tr("label.remote_passphrase"));
-                                ui.add(
+                                let passphrase = ui.add(
                                     egui::TextEdit::singleline(&mut d.passphrase)
                                         .password(true)
                                         .desired_width(220.0),
                                 );
+                                if focus == Some(2) {
+                                    passphrase.request_focus();
+                                }
                                 ui.end_row();
                             } else {
                                 ui.label(tr("label.remote_password"));
@@ -5004,6 +5154,9 @@ impl OxideMergeApp {
                                     edit = edit.margin(PATH_FIELD_MARGIN);
                                 }
                                 let field = ui.add(edit);
+                                if focus == Some(1) {
+                                    field.request_focus();
+                                }
                                 if sftp {
                                     let (icon, label) = if d.show_password {
                                         (Icon::EyeOff, tr("label.hide_remote_password"))
@@ -5046,11 +5199,14 @@ impl OxideMergeApp {
                             }
                             ui.label(tr("label.remote_path"));
                             ui.horizontal(|ui| {
-                                ui.add(
+                                let path = ui.add(
                                     egui::TextEdit::singleline(&mut d.remote_path)
                                         .hint_text(tr("msg.remote_path_hint"))
                                         .desired_width(260.0),
                                 );
+                                if focus == Some(3) {
+                                    path.request_focus();
+                                }
                                 if widgets::icon_button_enabled(
                                     ui,
                                     conn.is_some(),
@@ -5060,6 +5216,7 @@ impl OxideMergeApp {
                                 .clicked()
                                 {
                                     toggle_browse = true;
+                                    d.fetch_chosen = false;
                                 }
                             });
                             ui.end_row();
@@ -5093,6 +5250,16 @@ impl OxideMergeApp {
                 cancel = true;
             }
         }
+        // The fields have just changed under an Enter that left the host field: it connects
+        // once they are seen.
+        connect &= !split;
+        if connect && !cancel && d.browse.is_none() && d.remote_path.trim().is_empty() {
+            // Nothing is named to fetch yet: the server's own folders are listed to choose it
+            // from, and what is chosen there is fetched.
+            connect = false;
+            toggle_browse = conn.is_some();
+            d.fetch_chosen = true;
+        }
         if toggle_browse {
             d.browse = match (d.browse.take(), &conn) {
                 (None, Some(c)) => Some(RemoteBrowse::start(c.clone(), &d.remote_path)),
@@ -5115,7 +5282,15 @@ impl OxideMergeApp {
                 let target = d.target;
                 self.open_remote(target, conn, remote_path, Some(d));
             }
-            _ if cancel => {}
+            _ if cancel => {
+                // The start page's fields were being compared, not a dialog of the user's:
+                // giving up on the connection comes back to the start page.
+                if matches!(d.target, RemoteTarget::Compare(_))
+                    && self.open_dlg.as_ref().is_some_and(|o| o.from_start)
+                {
+                    self.open_dlg = None;
+                }
+            }
             _ => self.remote_dlg = Some(d),
         }
     }
@@ -5320,8 +5495,12 @@ impl OxideMergeApp {
         let stopped = load.cancel.load(std::sync::atomic::Ordering::Relaxed);
         match result {
             Ok(fetched) if !stopped => {
-                self.cfg.add_recent_remote(recent_remote(&load.conn));
-                self.use_remote_fetch(load.target, load.conn, load.remote_path, fetched);
+                let mut conn = load.conn;
+                if matches!(conn.auth, remote::Auth::AgentKeysOnly) {
+                    conn.auth = remote::Auth::Agent;
+                }
+                self.cfg.add_recent_remote(recent_remote(&conn));
+                self.use_remote_fetch(load.target, conn, load.remote_path, fetched);
             }
             Ok(_) => self.remote_dlg = load.dialog,
             Err(e) => match e.downcast::<remote::UnknownHost>() {
@@ -5337,10 +5516,19 @@ impl OxideMergeApp {
                 }
                 Ok(_) => self.remote_dlg = load.dialog,
                 Err(e) => {
-                    if !stopped {
+                    let mut dialog = load.dialog;
+                    if stopped {
+                    } else if e.is::<remote::KeyAuthFailed>() {
+                        // No keys signed in to a typed address: the dialog asks how to, and
+                        // says why it is there.
+                        if let Some(d) = &mut dialog {
+                            d.note = Some("msg.remote_keys_failed");
+                            d.focus = true;
+                        }
+                    } else {
                         self.error(format!("{e:#}"));
                     }
-                    self.remote_dlg = load.dialog;
+                    self.remote_dlg = dialog;
                 }
             },
         }
@@ -5430,21 +5618,48 @@ impl OxideMergeApp {
         fetched: remote::Fetched,
     ) {
         let shown = fetched.local.display().to_string();
+        // A fetch that fills the last empty field of the start page leaves nothing to do
+        // there but compare, so it does. A field that held a path already is only replaced:
+        // the other one may be left from an earlier comparison.
+        let mut compare = false;
         match target {
             RemoteTarget::Start(s) => {
+                let slots: &[usize] = if self.start_three_way {
+                    &[0, 1, 2]
+                } else {
+                    &[0, 2]
+                };
+                compare = self.start_paths[s].trim().is_empty()
+                    && slots
+                        .iter()
+                        .all(|&o| o == s || !self.start_paths[o].trim().is_empty());
                 self.start_fetched[s] = Some(shown.clone());
                 self.start_paths[s] = shown;
             }
-            RemoteTarget::Open(s) => {
+            RemoteTarget::Open(s) | RemoteTarget::Compare(s) => {
                 let mut d = self
                     .open_dlg
                     .take()
                     .unwrap_or_else(|| self.new_open_dialog(None));
+                if matches!(target, RemoteTarget::Compare(_))
+                    && (!fetched.is_dir || fetched.manifest.is_some())
+                {
+                    d.recent_remote.push((
+                        shown.clone(),
+                        crate::core::remote_url::address(&conn, &remote_path),
+                    ));
+                }
                 d.paths[s] = shown;
                 self.open_dlg = Some(d);
             }
         }
         self.stage_fetch(conn, remote_path, fetched);
+        if matches!(target, RemoteTarget::Compare(_)) {
+            let d = self.open_dlg.take().expect("comparison form");
+            self.submit_open(d);
+        } else if compare {
+            self.submit_start();
+        }
     }
 
     /// Remembers `fetched`, from `remote_path` over `conn`, to claim once a tab opens with its
@@ -6851,10 +7066,7 @@ impl OxideMergeApp {
                 self.palette = None;
                 match action {
                     PaletteAction::Cmd(c) => self.run(c, ctx),
-                    PaletteAction::Compare(paths) => self.open(OpenRequest {
-                        paths: paths.iter().map(PathBuf::from).collect(),
-                        ..Default::default()
-                    }),
+                    PaletteAction::Compare(paths) => self.open_recent(paths),
                     PaletteAction::Settings(tab) => self.open_options(tab),
                     PaletteAction::Theme(m) => self.cfg.theme = m,
                     PaletteAction::Toggle(f) => {
@@ -9438,10 +9650,7 @@ impl OxideMergeApp {
             self.use_rules(self.active, name);
         }
         if let Some(paths) = m.recent {
-            self.open(OpenRequest {
-                paths: paths.iter().map(PathBuf::from).collect(),
-                ..Default::default()
-            });
+            self.open_recent(paths);
         }
         if m.clear_recent {
             self.clear_recent();
@@ -10332,28 +10541,16 @@ impl OxideMergeApp {
             self.open_sample();
         }
         if submit {
-            let mut d = self.new_open_dialog(None);
-            d.paths = self.start_paths.clone();
-            d.three_way = self.start_three_way;
-            self.submit_open(d);
+            self.submit_start();
         }
         if conflict {
             self.run(Cmd::OpenConflict, &ui.ctx().clone());
         }
         if let Some(paths) = compare {
-            self.open(OpenRequest {
-                paths: paths.iter().map(PathBuf::from).collect(),
-                ..Default::default()
-            });
+            self.open_recent(paths);
         }
         if let Some(paths) = edit {
-            let mut d = self.new_open_dialog(None);
-            d.three_way = paths.len() == 3;
-            let slots: &[usize] = if d.three_way { &[0, 1, 2] } else { &[0, 2] };
-            for (&s, p) in slots.iter().zip(&paths) {
-                d.paths[s] = p.clone();
-            }
-            self.open_dlg = Some(d);
+            self.open_dlg = Some(self.recent_open_dialog(paths));
         }
         if let Some(paths) = remove {
             self.cfg.remove_recent_compare(&paths);
@@ -10728,21 +10925,112 @@ impl OxideMergeApp {
         }
     }
 
+    /// Compares what the start page's path fields hold, as its *Compare* button does.
+    fn submit_start(&mut self) {
+        let mut d = self.new_open_dialog(None);
+        d.paths = self.start_paths.clone();
+        d.three_way = self.start_three_way;
+        d.from_start = true;
+        self.submit_open(d);
+    }
+
     /// Opens what the Open dialog (or the start page) holds; reopens the dialog when a path
     /// is missing.
-    fn submit_open(&mut self, d: OpenDialog) {
+    fn submit_open(&mut self, mut d: OpenDialog) {
         let idx: Vec<usize> = if d.three_way {
             vec![0, 1, 2]
         } else {
             vec![0, 2]
         };
-        let raw: Vec<String> = idx
-            .iter()
-            .map(|&i| d.paths[i].trim().trim_matches('"').to_string())
-            .collect();
-        if raw.iter().any(|p| p.is_empty()) {
+        fn path_text(s: &str) -> &str {
+            s.trim().trim_matches('"')
+        }
+        if idx.iter().any(|&i| path_text(&d.paths[i]).is_empty()) {
             self.open_dlg = Some(d);
             self.error(tr("msg.need_paths"));
+            return;
+        }
+        if let Some(&side) = idx
+            .iter()
+            .find(|&&i| remote_scheme(path_text(&d.paths[i])).is_some())
+        {
+            use crate::core::remote_url;
+            let mut address = path_text(&d.paths[side]).to_owned();
+            let parsed = remote_url::parse_input(&address);
+            let clean = if parsed.is_ok() {
+                remote_url::without_password(&address)
+            } else {
+                remote_url::shown(&address)
+            };
+            if clean != address {
+                remote::wipe(&mut d.paths[side]);
+                d.paths[side] = clean.clone();
+                for path in &mut self.start_paths {
+                    if path.trim().trim_matches('"') == address {
+                        remote::wipe(path);
+                        *path = clean.clone();
+                    }
+                }
+            }
+            remote::wipe(&mut address);
+            self.open_dlg = Some(d);
+            match parsed {
+                Ok((url, password)) => {
+                    let target = RemoteTarget::Compare(side);
+                    let mut dialog = RemoteDialog::new(target);
+                    dialog.set_protocol(url.protocol);
+                    // A server connected to before is signed in to as it was then, with its
+                    // key file and proxy, should the dialog be needed.
+                    let port = url.port.to_string();
+                    let known = self.cfg.recent_remotes.iter().find(|r| {
+                        r.protocol == url.protocol.scheme()
+                            && r.host.eq_ignore_ascii_case(&url.host)
+                            && r.port == port
+                            && url.user.as_ref().is_none_or(|u| *u == r.user)
+                    });
+                    if let Some(known) = known {
+                        dialog.fill(known);
+                    }
+                    dialog.host = url.host;
+                    dialog.port = port;
+                    dialog.port_given = url.port_given;
+                    if let Some(user) = url.user {
+                        dialog.user = user;
+                    }
+                    dialog.remote_path = url.path;
+                    // FTP with no user named, or as `anonymous`, signs in anonymously, as on
+                    // the command line.
+                    let ftp = url.protocol.is_ftp();
+                    let mut password = password.filter(|p| !p.is_empty());
+                    if ftp && password.is_none() {
+                        if dialog.user.trim().is_empty() {
+                            dialog.user = "anonymous".to_string();
+                        }
+                        if dialog.user == "anonymous" {
+                            password = Some("anonymous@".to_string());
+                        }
+                    }
+                    let Some(mut conn) = dialog.conn() else {
+                        // Something the dialog remembers is not usable as it is, a proxy
+                        // say: it is shown to be put right.
+                        self.remote_dlg = Some(dialog);
+                        return;
+                    };
+                    if let Some(password) = password {
+                        conn.auth = remote::Auth::Password(password.clone());
+                        dialog.sign_in = SignIn::Password;
+                        dialog.password = password;
+                    } else if ftp {
+                        // FTP signs in with a password only, which the dialog asks for.
+                        self.remote_dlg = Some(dialog);
+                        return;
+                    } else {
+                        conn.auth = remote::Auth::AgentKeysOnly;
+                    }
+                    self.open_remote(target, conn, dialog.remote_path.clone(), Some(dialog));
+                }
+                Err(error) => self.error(format!("{error:#}")),
+            }
             return;
         }
         self.cfg.filter = d.filter.clone();
@@ -10750,7 +11038,10 @@ impl OxideMergeApp {
         self.cfg.folder.recursive = d.recursive;
         self.cfg.add_recent_filter(&d.filter);
         let req = OpenRequest {
-            paths: raw.iter().map(PathBuf::from).collect(),
+            paths: idx
+                .iter()
+                .map(|&i| PathBuf::from(path_text(&d.paths[i])))
+                .collect(),
             read_only: idx.iter().map(|&i| d.read_only[i]).collect(),
             kind: d.kind,
             recursive: Some(d.recursive),
@@ -10758,7 +11049,21 @@ impl OxideMergeApp {
             method: Some(d.method),
             ..Default::default()
         };
-        self.open(req);
+        let recent = (!d.recent_remote.is_empty())
+            .then(|| {
+                req.paths
+                    .iter()
+                    .map(|path| {
+                        d.recent_remote
+                            .iter()
+                            .find(|(local, _)| Path::new(local) == path)
+                            .map(|(_, url)| url.clone())
+                            .or_else(|| (!self.is_staged(path)).then(|| path.display().to_string()))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .flatten();
+        self.open_with_recent(req, recent);
     }
 
     fn options_dialog(&mut self, ctx: &egui::Context) {

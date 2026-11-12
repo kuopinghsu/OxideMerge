@@ -127,6 +127,54 @@ pub fn shown(url: &str) -> String {
 
 /// Reads `scheme://[user@]host[:port][/path]`.
 pub fn parse(url: &str) -> Result<RemoteUrl> {
+    parse_with_password(url, false).map(|(url, _)| url)
+}
+
+/// Reads a server address entered in the GUI, of any protocol, including an optional inline
+/// password.
+pub(crate) fn parse_input(url: &str) -> Result<(RemoteUrl, Option<String>)> {
+    parse_with_password(url, true)
+}
+
+/// Removes an inline password while retaining the encoded username and path for a retry.
+pub(crate) fn without_password(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    if let Some((user, host)) = authority.rsplit_once('@') {
+        if let Some((user, _)) = user.split_once(':') {
+            return format!("{scheme}://{user}@{host}{path}");
+        }
+    }
+    url.to_owned()
+}
+
+/// An address for the comparison history, without credentials or a staging path.
+pub(crate) fn address(conn: &RemoteConnection, path: &str) -> String {
+    let encode = |s: &str| {
+        url::form_urlencoded::byte_serialize(s.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20")
+    };
+    let user = if conn.user.is_empty() {
+        String::new()
+    } else {
+        format!("{}@", encode(&conn.user))
+    };
+    let server = if conn.options.port_given || conn.port != conn.protocol.default_port() {
+        remote::server(&conn.host, conn.port)
+    } else if conn.host.contains(':') {
+        format!("[{}]", conn.host)
+    } else {
+        conn.host.clone()
+    };
+    let prefix = if path.starts_with('/') { "" } else { "/~/" };
+    let path = encode(path).replace("%2F", "/");
+    format!("{}://{user}{server}{prefix}{path}", conn.protocol.scheme())
+}
+
+fn parse_with_password(url: &str, allow_password: bool) -> Result<(RemoteUrl, Option<String>)> {
     let bad = || trf("msg.remote_url_bad", &[("url", shown(url))]);
     let (scheme, rest) = url.split_once("://").with_context(bad)?;
     let protocol = Protocol::from_scheme(scheme).with_context(bad)?;
@@ -141,12 +189,18 @@ pub fn parse(url: &str) -> Result<RemoteUrl> {
     // A password with a `/` in it ends the authority early, leaving its rest and the host in
     // the path's first name: `sftp://ann:12/34@h/x` is not port 12 of a host `ann`.
     let cut_password = user.is_none()
+        && !authority.starts_with('[')
         && authority.contains(':')
         && path
             .get(1..)
             .and_then(|p| p.split('/').next())
             .is_some_and(|first| first.contains('@'));
-    if cut_password || user.is_some_and(|u| u.contains(':')) {
+    let (user, password) = match user.and_then(|u| u.split_once(':')) {
+        Some((user, password)) if allow_password => (Some(user), Some(password)),
+        Some(_) => bail!(tr("msg.remote_url_password")),
+        None => (user, None),
+    };
+    if cut_password {
         bail!(tr("msg.remote_url_password"));
     }
     let user = user
@@ -193,14 +247,64 @@ pub fn parse(url: &str) -> Result<RemoteUrl> {
         _ if path.is_empty() => ".".to_string(),
         _ => path,
     };
-    Ok(RemoteUrl {
-        protocol,
-        host: host.to_string(),
-        port,
-        port_given,
-        user,
-        path,
-    })
+    let password = password.map(|p| decode(p, bad)).transpose()?;
+    Ok((
+        RemoteUrl {
+            protocol,
+            host: host.to_string(),
+            port,
+            port_given,
+            user,
+            path,
+        },
+        password,
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn sftp_input_decodes_password_and_preserves_the_encoded_address_without_it() {
+    let address = "sftp://ann:p%40ss%2Fword@[::1]:22/~/my%20file.txt";
+    let (url, password) = parse_input(address).unwrap();
+    assert_eq!(url.host, "::1");
+    assert!(url.port_given);
+    assert_eq!(url.user.as_deref(), Some("ann"));
+    assert_eq!(url.path, "my file.txt");
+    assert_eq!(password.as_deref(), Some("p@ss/word"));
+    assert_eq!(
+        without_password(address),
+        "sftp://ann@[::1]:22/~/my%20file.txt"
+    );
+    assert!(parse(address).is_err());
+    assert!(parse_input("sftp://ann:secret@host/%zz")
+        .unwrap_err()
+        .to_string()
+        .contains("…@host"));
+    assert_eq!(
+        without_password("sftp://[::1]/file@name"),
+        "sftp://[::1]/file@name"
+    );
+    assert_eq!(
+        parse_input("sftp://[::1]/file@name").unwrap().0.path,
+        "/file@name"
+    );
+    // The other protocols are read the same way, and written back with their own scheme and
+    // usual port.
+    let (url, password) = parse_input("ftpes://bob:pw@files.example/pub/a.txt").unwrap();
+    assert_eq!(url.protocol, Protocol::Ftps);
+    assert_eq!(password.as_deref(), Some("pw"));
+    let conn = RemoteConnection {
+        protocol: url.protocol,
+        host: url.host,
+        port: url.port,
+        user: url.user.unwrap(),
+        auth: Auth::Password(String::new()),
+        options: Default::default(),
+    };
+    assert_eq!(
+        self::address(&conn, &url.path),
+        "ftpes://bob@files.example/pub/a.txt"
+    );
 }
 
 /// How the command line or a job signs in to the servers its URLs name.

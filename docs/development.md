@@ -97,7 +97,8 @@ shows. For the web page samples, see [samples/web/README.md](../samples/web/READ
 After you change a user guide or its images, run `make user-guide-docs` and commit the PDF
 files with the change, so that `docs/dist/` always has the latest guides.
 
-On Windows, start Docker Desktop in Linux container mode and run either target with GNU Make.
+On Windows and macOS, both targets run in Docker: start Docker Desktop (on Windows, in Linux
+container mode) and run either target with GNU Make.
 The targets build a reusable image with the same Asciidoctor versions as CI and write the
 PDFs back into the checkout.
 
