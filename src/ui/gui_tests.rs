@@ -3377,6 +3377,8 @@ fn live_sftp_folder_lists_then_opens_and_verifies_only_requested_files() {
     );
     let mut gui = Gui::start("live_sftp_folder", None);
     fetch_to_start_page(&mut gui, 0, "/srv/data");
+    assert!(gui.shows("sftp://ann@example.com:22/srv/data"));
+    assert!(!gui.shows_text("oxidemerge-sftp-"));
     gui.app.start_paths[2] = local.path().display().to_string();
     gui.frame();
     gui.click(tr("btn.compare"));
@@ -3659,6 +3661,40 @@ fn a_file_opened_from_a_remote_folder_is_uploaded_when_saved_also_once_the_folde
         Some(Some(b"remote-edited!\n".to_vec()))
     );
     remote::fake::uninstall();
+}
+
+#[test]
+fn the_sftp_password_can_be_shown_and_hidden_again() {
+    let mut gui = Gui::start("sftp_password_visibility", None);
+    gui.app.start_remote_connect(RemoteTarget::Start(0));
+    let dialog = gui.app.remote_dlg.as_mut().unwrap();
+    dialog.password = "test-password".into();
+    gui.frames(2);
+    let masked = |g: &Gui| {
+        g.widgets
+            .iter()
+            .any(|w| w.role == accesskit::Role::PasswordInput)
+    };
+    assert!(masked(&gui));
+
+    let field = gui
+        .widgets
+        .iter()
+        .find(|w| w.role == accesskit::Role::PasswordInput)
+        .unwrap();
+    assert!(field
+        .rect
+        .contains_rect(gui.widget(tr("label.show_remote_password")).rect));
+    gui.click(tr("label.show_remote_password"));
+    gui.frames(2);
+    assert!(!masked(&gui));
+    gui.click(tr("label.hide_remote_password"));
+    gui.frames(2);
+    assert!(masked(&gui));
+    assert_eq!(
+        gui.app.remote_dlg.as_ref().unwrap().password,
+        "test-password"
+    );
 }
 
 #[test]

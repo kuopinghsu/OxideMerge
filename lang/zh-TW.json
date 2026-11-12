@@ -6,6 +6,8 @@
   "label.remote_user": "使用者名稱",
   "label.remote_auth": "身分驗證",
   "label.remote_password": "密碼",
+  "label.show_remote_password": "顯示密碼",
+  "label.hide_remote_password": "隱藏密碼",
   "label.remote_key": "私密金鑰",
   "label.remote_key_path": "金鑰檔案",
   "label.remote_passphrase": "金鑰密碼",

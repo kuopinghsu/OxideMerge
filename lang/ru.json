@@ -6,6 +6,8 @@
   "label.remote_user": "Пользователь",
   "label.remote_auth": "Аутентификация",
   "label.remote_password": "Пароль",
+  "label.show_remote_password": "Показать пароль",
+  "label.hide_remote_password": "Скрыть пароль",
   "label.remote_key": "Приватный ключ",
   "label.remote_key_path": "Файл ключа",
   "label.remote_passphrase": "Пароль ключа",
