@@ -389,13 +389,52 @@ pub(crate) fn open(sides: &[Side; 2], row: &Row, stop: &AtomicBool) -> Result<[O
     ])
 }
 
+/// Opens the pair of `row` from `kept`, the copies a verification fetched of it (one for each
+/// side on a server, in order), without fetching them again.
+pub(crate) fn open_kept(sides: &[Side; 2], row: &Row, kept: Vec<Fetched>) -> Result<[Opened; 2]> {
+    let mut kept = kept.into_iter();
+    let mut one = |side: usize| -> Result<Opened> {
+        let path = row.paths[side].as_deref().context("Missing path")?;
+        match &sides[side] {
+            Side::Local(root) => {
+                let path = root.join(path);
+                anyhow::ensure!(
+                    std::fs::symlink_metadata(&path)?.is_file(),
+                    "{}",
+                    path.display()
+                );
+                Ok(Opened {
+                    path,
+                    fetched: None,
+                })
+            }
+            Side::Sftp(conn, root) => {
+                let fetched = kept.next().context("Missing fetched file")?;
+                remote::register_fetch(&fetched);
+                Ok(Opened {
+                    path: fetched.local.clone(),
+                    fetched: Some(((**conn).clone(), remote_path(root, path), fetched)),
+                })
+            }
+        }
+    };
+    Ok([one(0)?, one(1)?])
+}
+
+/// The largest file a byte-for-byte verification fetches whole, to keep for opening later;
+/// larger ones are compared as they stream, stopping at the first difference.
+const MAX_KEPT_FILE: u64 = 32 << 20;
+
+/// Verifies each of `rows`, giving `send` its path, whether both sides hold the same, and the
+/// copies fetched of it from servers (one for each side on one, in order; none when it was
+/// compared as it streamed), which open it later without another fetch.
 pub(crate) fn verify(
     sides: &[Side; 2],
     rows: Vec<Row>,
     fopts: &FolderOptions,
     dopts: &DiffOptions,
     stop: &AtomicBool,
-    mut send: impl FnMut(String, Result<bool>),
+    mut send: impl FnMut(String, Result<bool>, Vec<Fetched>),
 ) -> Result<()> {
     let sources = [sides[0].connect(stop)?, sides[1].connect(stop)?];
     let norm = Normalizer::new(dopts);
@@ -403,9 +442,34 @@ pub(crate) fn verify(
         check(stop)?;
         let result = verify_file(&sources, &row, fopts, dopts, &norm, stop);
         check(stop)?;
-        send(row.path, result);
+        match result {
+            Ok((same, kept)) => send(row.path, Ok(same), kept),
+            Err(error) => send(row.path, Err(error), Vec::new()),
+        }
     }
     Ok(())
+}
+
+/// The two files of a pair as local paths, fetching the ones on servers; with the fetches.
+fn fetch_pair(
+    sources: &[Source<'_>; 2],
+    rels: [&str; 2],
+    stop: &AtomicBool,
+) -> Result<(Vec<PathBuf>, Vec<Fetched>)> {
+    let mut fetched = Vec::new();
+    let mut paths = Vec::new();
+    for (source, rel) in sources.iter().zip(rels) {
+        match source {
+            Source::Local(root) => paths.push(root.join(rel)),
+            Source::Sftp(fs, root) => {
+                let file =
+                    remote::fetch_from(&**fs, &remote_path(root, rel), stop, FetchMode::FileOnly)?;
+                paths.push(file.local.clone());
+                fetched.push(file);
+            }
+        }
+    }
+    Ok((paths, fetched))
 }
 
 fn verify_file(
@@ -415,31 +479,18 @@ fn verify_file(
     dopts: &DiffOptions,
     norm: &Normalizer,
     stop: &AtomicBool,
-) -> Result<bool> {
+) -> Result<(bool, Vec<Fetched>)> {
     let left = row.paths[0].as_deref().context("Missing left path")?;
     let right = row.paths[1].as_deref().context("Missing right path")?;
     let before = [
         sources[0].file_metadata(left)?,
         sources[1].file_metadata(right)?,
     ];
+    let mut kept = Vec::new();
+    let remote = sources.iter().any(|s| matches!(s, Source::Sftp(..)));
     let same = if fopts.method == CompareMethod::FullContents {
-        let mut fetched = Vec::new();
-        let mut paths = Vec::new();
-        for (source, rel) in sources.iter().zip([left, right]) {
-            match source {
-                Source::Local(root) => paths.push(root.join(rel)),
-                Source::Sftp(fs, root) => {
-                    let file = remote::fetch_from(
-                        &**fs,
-                        &remote_path(root, rel),
-                        stop,
-                        FetchMode::FileOnly,
-                    )?;
-                    paths.push(file.local.clone());
-                    fetched.push(file);
-                }
-            }
-        }
+        let (paths, fetched) = fetch_pair(sources, [left, right], stop)?;
+        kept = fetched;
         let name = row.path.rsplit('/').next().unwrap_or(&row.path);
         let item = DirItem {
             rel_dir: String::new(),
@@ -468,6 +519,19 @@ fn verify_file(
         .is_some_and(|(a, b)| a != b)
     {
         false
+    } else if remote
+        && before
+            .iter()
+            .all(|m| m.size.is_some_and(|size| size <= MAX_KEPT_FILE))
+    {
+        // Fetched whole, so that opening the pair later needs no second fetch.
+        let (paths, fetched) = fetch_pair(sources, [left, right], stop)?;
+        kept = fetched;
+        equal_streams(
+            &mut std::fs::File::open(&paths[0])?,
+            &mut std::fs::File::open(&paths[1])?,
+            stop,
+        )?
     } else {
         equal_streams(
             &mut sources[0].read(left)?,
@@ -480,7 +544,7 @@ fn verify_file(
         sources[1].file_metadata(right)?,
     ];
     anyhow::ensure!(before == after, "{}", tr("remote_compare.changed"));
-    Ok(same)
+    Ok((same, kept))
 }
 
 fn equal_streams(a: &mut dyn Read, b: &mut dyn Read, stop: &AtomicBool) -> Result<bool> {
@@ -561,7 +625,7 @@ mod tests {
             &options,
             &DiffOptions::default(),
             &cancel,
-            |path, result| {
+            |path, result, _| {
                 results.push((path, result.unwrap()));
             },
         )

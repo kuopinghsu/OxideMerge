@@ -1787,6 +1787,59 @@ struct Budget {
     max_entries: usize,
 }
 
+/// How far a fetch has come, for a window to show while it runs on another thread: the bytes
+/// and the files and folders read from the server so far.
+#[derive(Default)]
+pub struct Progress {
+    pub bytes: std::sync::atomic::AtomicU64,
+    pub entries: std::sync::atomic::AtomicU64,
+    /// The entries of the folder being listed that the server has sent so far.
+    pub listed: std::sync::atomic::AtomicU64,
+    /// Whether a server was connected to and signed in to: until then nothing else counts.
+    pub connected: AtomicBool,
+}
+
+thread_local! {
+    /// What the fetch running on this thread counts into (see [`with_progress`]).
+    static PROGRESS: std::cell::RefCell<Option<std::sync::Arc<Progress>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `work`, counting what its fetches on this thread read from a server into `progress`.
+pub fn with_progress<R>(progress: &std::sync::Arc<Progress>, work: impl FnOnce() -> R) -> R {
+    let before = PROGRESS.with(|p| p.replace(Some(progress.clone())));
+    let done = work();
+    PROGRESS.with(|p| p.replace(before));
+    done
+}
+
+/// Notes that a server is connected to and signed in to.
+fn note_connected() {
+    PROGRESS.with(|p| {
+        if let Some(p) = &*p.borrow() {
+            p.connected.store(true, Ordering::Relaxed);
+        }
+    });
+}
+
+/// Counts one more entry of a folder being listed.
+fn note_listed() {
+    PROGRESS.with(|p| {
+        if let Some(p) = &*p.borrow() {
+            p.listed.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+fn note_progress(bytes: u64, entries: u64) {
+    PROGRESS.with(|p| {
+        if let Some(p) = &*p.borrow() {
+            p.bytes.fetch_add(bytes, Ordering::Relaxed);
+            p.entries.fetch_add(entries, Ordering::Relaxed);
+        }
+    });
+}
+
 /// The most bytes a single fetch (one file, or a whole folder together) reads from the server.
 const MAX_REMOTE_BYTES: u64 = 4 << 30;
 /// The most files and folders a single folder fetch reads from the server.
@@ -1828,6 +1881,7 @@ impl Budget {
 
     fn take_entry(&mut self) -> Result<()> {
         self.entries += 1;
+        note_progress(0, 1);
         if self.entries > self.max_entries {
             return Err(self.too_many());
         }
@@ -1842,6 +1896,7 @@ impl Budget {
     }
 
     fn take_bytes(&mut self, n: u64) -> Result<()> {
+        note_progress(n, 0);
         self.bytes += n;
         if self.bytes > self.max_bytes {
             return Err(self.too_large());
@@ -1964,13 +2019,18 @@ impl<T: RemoteFs + RemoteWrite + Send> Remote for T {}
 pub(crate) fn connect(conn: &RemoteConnection, cancel: &AtomicBool) -> Result<Box<dyn Remote>> {
     #[cfg(test)]
     if let Some(fake) = fake::connect() {
+        if fake.is_ok() {
+            note_connected();
+        }
         return fake;
     }
-    if conn.protocol.is_ftp() {
-        Ok(Box::new(super::ftp::Client::connect(conn, cancel)?))
+    let remote: Box<dyn Remote> = if conn.protocol.is_ftp() {
+        Box::new(super::ftp::Client::connect(conn, cancel)?)
     } else {
-        Ok(Box::new(session(conn, cancel)?))
-    }
+        Box::new(session(conn, cancel)?)
+    };
+    note_connected();
+    Ok(remote)
 }
 
 /// The entries of `remote` with their names and attributes, no more than `limit + 1` of them,
@@ -1997,6 +2057,7 @@ fn read_dir(
             continue;
         }
         out.push((name.map(str::to_string), stat));
+        note_listed();
         if out.len() > limit {
             break;
         }
@@ -2310,13 +2371,19 @@ pub(crate) fn fetch_with(
     if fetched.is_dir && fetched.manifest.is_none() {
         return Ok(fetched);
     }
+    register_fetch(&fetched);
+    Ok(fetched)
+}
+
+/// Notes `fetched` as a copy of something on a server, whose contents saving uploads (see
+/// [`inside_fetch`]): what [`fetch`] does for what it fetches itself.
+pub(crate) fn register_fetch(fetched: &Fetched) {
     if let Ok(mut staged) = STAGED.lock() {
         staged.push(fetched.temp.path().to_path_buf());
         if let Ok(real) = std::fs::canonicalize(fetched.temp.path()) {
             staged.push(real);
         }
     }
-    Ok(fetched)
 }
 
 pub(crate) fn fetch_from(
@@ -2923,12 +2990,30 @@ pub struct Browser {
     /// the last one asked for is shown.
     asked: std::cell::Cell<u64>,
     cancel: std::sync::Arc<AtomicBool>,
+    /// Whether the connection is made, and what the listing under way has read (see
+    /// [`Browser::status`]).
+    connected: std::sync::Arc<AtomicBool>,
+    progress: std::sync::Arc<Progress>,
+    /// When the folder asked for last was asked for.
+    since: std::cell::Cell<Instant>,
+}
+
+/// How far a [`Browser`] is with the folder asked for last, for a window to show while waiting.
+pub struct BrowseStatus {
+    /// Whether the server is connected to and signed in to; it is still being reached if not.
+    pub connected: bool,
+    /// How many of the folder's entries the server has sent so far.
+    pub listed: u64,
+    /// How long ago the folder was asked for.
+    pub elapsed: Duration,
 }
 
 impl Browser {
     pub fn start(conn: RemoteConnection) -> Self {
         let (done, results) = mpsc::channel();
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let connected = std::sync::Arc::new(AtomicBool::new(false));
+        let progress = std::sync::Arc::<Progress>::default();
         #[cfg(test)]
         if fake::installed() {
             return Self {
@@ -2937,10 +3022,14 @@ impl Browser {
                 results,
                 asked: Default::default(),
                 cancel,
+                connected,
+                progress,
+                since: std::cell::Cell::new(Instant::now()),
             };
         }
         let (requests, asked) = mpsc::channel::<(u64, String)>();
         let (tx, stop) = (done.clone(), cancel.clone());
+        let (reached, counted) = (connected.clone(), progress.clone());
         std::thread::spawn(move || {
             let mut open: Option<Box<dyn Remote>> = None;
             while let Ok((mut n, mut path)) = asked.recv() {
@@ -2948,18 +3037,21 @@ impl Browser {
                 while let Ok(newer) = asked.try_recv() {
                     (n, path) = newer;
                 }
-                let listed = match &open {
+                counted.listed.store(0, Ordering::Relaxed);
+                let listed = with_progress(&counted, || match &open {
                     Some(r) => browse_in(&**r, &path, &stop),
                     None => connect(&conn, &stop).and_then(|r| {
+                        reached.store(true, Ordering::Relaxed);
                         let listed = browse_in(&*r, &path, &stop);
                         open = Some(r);
                         listed
                     }),
-                };
+                });
                 // The connection may be what failed (a server closes an idle one), so the next
                 // folder asked for connects again.
                 if listed.is_err() {
                     open = None;
+                    reached.store(false, Ordering::Relaxed);
                 }
                 if tx.send((n, listed)).is_err() {
                     break;
@@ -2973,6 +3065,18 @@ impl Browser {
             results,
             asked: Default::default(),
             cancel,
+            connected,
+            progress,
+            since: std::cell::Cell::new(Instant::now()),
+        }
+    }
+
+    /// How far the folder asked for last is: still connecting, or how much of it is listed.
+    pub fn status(&self) -> BrowseStatus {
+        BrowseStatus {
+            connected: self.connected.load(Ordering::Relaxed),
+            listed: self.progress.listed.load(Ordering::Relaxed),
+            elapsed: self.since.get().elapsed(),
         }
     }
 
@@ -2981,6 +3085,7 @@ impl Browser {
     pub fn list(&self, path: &str) {
         let n = self.asked.get() + 1;
         self.asked.set(n);
+        self.since.set(Instant::now());
         #[cfg(test)]
         if self.requests.is_none() {
             if let Some(remote) = fake::connect() {
@@ -4026,6 +4131,34 @@ mod tests {
         assert_eq!(l.entries.len(), MAX_BROWSE_ENTRIES);
         let cancelled = AtomicBool::new(true);
         assert!(browse_in(&server, "/big", &cancelled).is_err());
+    }
+
+    #[test]
+    fn a_fetch_counts_what_it_reads_for_the_window_to_show() {
+        let conn = RemoteConnection {
+            protocol: Protocol::Sftp,
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: Auth::Password(String::new()),
+            options: Default::default(),
+        };
+        fake::install(
+            fake::Server::new()
+                .dir("/srv")
+                .file("/srv/a.txt", "abc")
+                .file("/srv/b.txt", "de"),
+        );
+        let never = AtomicBool::new(false);
+        let progress = std::sync::Arc::<Progress>::default();
+        with_progress(&progress, || fetch(&conn, "/srv", &never)).unwrap();
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 5);
+        assert_eq!(progress.entries.load(Ordering::Relaxed), 3);
+        assert!(progress.connected.load(Ordering::Relaxed));
+        // Nothing is counted once the fetch it was for is over.
+        fetch(&conn, "/srv", &never).unwrap();
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 5);
+        fake::uninstall();
     }
 
     #[test]

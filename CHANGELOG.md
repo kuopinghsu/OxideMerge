@@ -7,15 +7,24 @@ release on GitHub uses its section of this file as the release notes.
 
 ### Added
 
-- SFTP folder comparisons list entries before reading file contents. Compare
-  a local folder with an SFTP folder or compare two SFTP folders, verify file
-  contents on demand, and open individual file comparisons for editing and saving.
-  The full-download option supports folder-wide copy, delete, and save operations.
+- SFTP can compare folders from directory listings, then verify file contents on demand.
+  Enable *List folders without downloading files* for local-to-remote or remote-to-remote
+  comparisons. The default full download supports folder-wide copy, delete, and save operations.
+- The remote connection dialog remembers the ten most recent servers across restarts.
+  Select a recent server to restore its connection settings, with credentials entered separately.
 
 ### Changed
 
 - Formatted comparisons of web pages, DOCX, XLSX, and PDF files use the Text Compare palette
   for changed blocks and the Table Compare palette for added, removed, and modified cells.
+- The remote file chooser keeps a fixed size and supports breadcrumbs, keyboard navigation,
+  and retrying failed listings. Remote connections show elapsed time, entry counts, or
+  bytes transferred as they connect, list folders, and fetch files.
+- Live SFTP comparisons show per-file results and verification progress. *Verify All* skips
+  files already verified since the last refresh and selects the first difference when done.
+  Opening a verified pair reuses its downloaded copies when they are still cached.
+- On Windows, GNU Make can build both user guide PDFs through Docker Desktop in Linux
+  container mode, using the same Asciidoctor versions as CI.
 
 ### Fixed
 
@@ -26,6 +35,10 @@ release on GitHub uses its section of this file as the release notes.
   verification results, and saving or partially uploading a file invalidates its row.
 - Tagged Linux AppImages report the release build date
   in About and `--version`, matching the Linux tarballs.
+- Comparing a file with a saved revision opens the same views as comparing two files,
+  including formatted documents and workbooks. The revision remains read-only.
+- Formatted Compare explains why untagged PDFs cannot show headings, lists, and tables,
+  and offers a return to Text view.
 
 ## [0.9.8] - 2026-11-12
 

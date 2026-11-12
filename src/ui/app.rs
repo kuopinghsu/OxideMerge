@@ -1574,6 +1574,43 @@ impl RemoteDialog {
         }
     }
 
+    /// Fills the fields in from a server connected to before. What was typed as a password or
+    /// passphrase was for another server, so it is wiped; the remote path stays.
+    fn fill(&mut self, r: &crate::config::RecentRemote) {
+        self.protocol = remote::Protocol::from_scheme(&r.protocol).unwrap_or_default();
+        self.host = r.host.clone();
+        self.port = if r.port.trim().is_empty() {
+            self.protocol.default_port().to_string()
+        } else {
+            r.port.clone()
+        };
+        self.user = r.user.clone();
+        self.sign_in = match r.sign_in.as_str() {
+            "key" => SignIn::Key,
+            "agent" => SignIn::Agent,
+            _ => SignIn::Password,
+        };
+        self.key_path = r.key_path.clone();
+        remote::wipe(&mut self.password);
+        remote::wipe(&mut self.passphrase);
+        remote::wipe(&mut self.proxy_password);
+        self.proxy = r.proxy.clone();
+        self.active = r.active;
+        self.client_cert = r.client_cert.clone();
+        self.client_key = r.client_key.clone();
+        self.browse = None;
+    }
+
+    /// The server among `recent` the fields name, if any.
+    fn recent(&self, recent: &[crate::config::RecentRemote]) -> Option<usize> {
+        recent.iter().position(|r| {
+            r.protocol == self.protocol.scheme()
+                && r.host.eq_ignore_ascii_case(self.host.trim())
+                && r.port == self.port.trim()
+                && r.user == self.user.trim()
+        })
+    }
+
     /// Switches to `protocol`, and to its usual port unless another was typed.
     fn set_protocol(&mut self, protocol: remote::Protocol) {
         let port = self.port.trim();
@@ -1720,6 +1757,16 @@ struct RemoteBrowse {
     /// The path field when `asked` was asked for: its listing fills the field in only if the
     /// user did not change it meanwhile (picking a file, say).
     field: String,
+    /// The path field when the chooser opened, put back if it is cancelled.
+    before: String,
+    /// The entry of `listing` the keyboard is on, shown selected.
+    cursor: Option<usize>,
+    /// Whether the list still has to scroll to bring `cursor` into view.
+    reveal: bool,
+    /// How far down the list is scrolled, and how tall the part of it in view is, as of the
+    /// last frame: what `reveal` scrolls from.
+    offset: f32,
+    view_height: f32,
 }
 
 impl RemoteBrowse {
@@ -1732,6 +1779,11 @@ impl RemoteBrowse {
             loading: false,
             error: None,
             field: String::new(),
+            before: path.to_string(),
+            cursor: None,
+            reveal: false,
+            offset: 0.0,
+            view_height: 0.0,
         };
         b.list(path, path);
         b
@@ -1743,54 +1795,539 @@ impl RemoteBrowse {
         self.loading = true;
         self.browser.list(path);
     }
+
+    /// Shows `listing`, from its top, or from the file it was asked for.
+    fn show(&mut self, listing: remote::Listing) {
+        self.cursor = listing
+            .file
+            .as_ref()
+            .and_then(|file| listing.entries.iter().position(|e| &e.name == file));
+        self.reveal = self.cursor.is_some();
+        self.offset = 0.0;
+        self.error = None;
+        self.listing = Some(listing);
+    }
 }
 
-/// Everything but the password or passphrase of the last connection the remote connect
-/// dialog succeeded with, to fill in a later one with: fetching a second path from the same
-/// server, most often the other side of a compare, should not need host, port, user and key
-/// path retyped. The password or a key's passphrase is never kept here, consistent with
-/// [`RemoteConnection`] itself never outliving the tab it was used for.
-struct LastRemote {
-    protocol: remote::Protocol,
-    host: String,
-    port: String,
-    user: String,
-    sign_in: SignIn,
-    key_path: String,
-    /// The proxy, without its password.
-    proxy: String,
-    active: bool,
-    client_cert: String,
-    client_key: String,
+/// What the remote chooser was asked for in one frame.
+#[derive(Default)]
+struct BrowseAsk {
+    /// A folder to list.
+    go: Option<String>,
+    /// What the remote path becomes: a file picked, or the folder shown.
+    pick: Option<String>,
+    /// A file to fetch straight away.
+    fetch: Option<String>,
+    /// Closes the chooser, keeping the remote path chosen.
+    accept: bool,
+    /// Closes the chooser, putting the remote path back as it was.
+    cancel: bool,
 }
 
-impl LastRemote {
-    fn from_conn(conn: &remote::RemoteConnection) -> Self {
-        let (sign_in, key_path) = match &conn.auth {
-            remote::Auth::Password(_) => (SignIn::Password, String::new()),
-            remote::Auth::Key { path, .. } => (SignIn::Key, path.display().to_string()),
-            remote::Auth::Agent => (SignIn::Agent, String::new()),
+/// The chooser's size: the same whatever is listed, and smaller only in a small window.
+fn remote_chooser_size(ctx: &egui::Context) -> egui::Vec2 {
+    let room = ctx.content_rect().size() - vec2(64.0, 96.0);
+    vec2(
+        room.x.clamp(320.0, REMOTE_CHOOSER_SIZE.x),
+        room.y.clamp(260.0, REMOTE_CHOOSER_SIZE.y),
+    )
+}
+
+/// The size of the remote chooser in a window with room for it.
+const REMOTE_CHOOSER_SIZE: egui::Vec2 = vec2(640.0, 520.0);
+/// The height of one entry of the remote chooser's list.
+const REMOTE_ROW_HEIGHT: f32 = 28.0;
+
+/// The folders `path` is in, outermost first, each with its name: `/home/ann` gives
+/// `("", "/")`, `("home", "/home")` and `("ann", "/home/ann")`.
+fn remote_crumbs(path: &str) -> Vec<(String, String)> {
+    let mut crumbs = vec![(String::new(), "/".to_string())];
+    let mut full = String::new();
+    for part in path.split('/').filter(|p| !p.is_empty()) {
+        full.push('/');
+        full.push_str(part);
+        crumbs.push((part.to_string(), full.clone()));
+    }
+    crumbs
+}
+
+/// One entry of the remote chooser's list, as wide as the list: an icon, the name, cut short
+/// if it is too long, and a file's size at the right.
+fn remote_row(ui: &mut egui::Ui, entry: &remote::RemoteEntry, selected: bool) -> egui::Response {
+    let p = pal(ui);
+    // Not a stop for Tab: the arrow keys go through the list as a whole.
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), REMOTE_ROW_HEIGHT), Sense::CLICK);
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::Button, true, selected, &entry.name)
+    });
+    if ui.is_rect_visible(rect) {
+        let fill = if selected {
+            p.accent_soft
+        } else if resp.is_pointer_button_down_on() {
+            p.control_active
+        } else if resp.hovered() {
+            p.control_hover
+        } else {
+            egui::Color32::TRANSPARENT
         };
-        let shown = |p: &Option<PathBuf>| {
-            p.as_ref()
-                .map_or_else(String::new, |p| p.display().to_string())
+        ui.painter().rect_filled(rect, theme::radius::SM, fill);
+        let (icon, tint) = match entry.kind {
+            remote::EntryKind::Dir => (Icon::Folder, p.folder),
+            remote::EntryKind::File => (Icon::File, p.text_dim),
+            remote::EntryKind::Link => (Icon::ChevronRight, p.text_dim),
         };
-        Self {
-            protocol: conn.protocol,
-            host: conn.host.clone(),
-            port: conn.port.to_string(),
-            user: conn.user.clone(),
-            sign_in,
-            key_path,
-            proxy: conn
-                .options
-                .proxy
-                .as_ref()
-                .map_or_else(String::new, |p| p.url()),
-            active: conn.options.active,
-            client_cert: shown(&conn.options.client_cert),
-            client_key: shown(&conn.options.client_key),
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 16.0, rect.center().y),
+            egui::Vec2::splat(16.0),
+        );
+        crate::ui::icons::paint(ui.painter(), icon_rect, icon, tint);
+        let mut right = rect.right() - 10.0;
+        if entry.kind == remote::EntryKind::File {
+            let size = ui.painter().layout_no_wrap(
+                report::fmt_size(Some(entry.size)),
+                FontId::proportional(theme::size::SMALL),
+                p.text_dim,
+            );
+            right -= size.size().x;
+            ui.painter().galley(
+                egui::pos2(right, rect.center().y - size.size().y / 2.0),
+                size,
+                p.text_dim,
+            );
+            right -= 12.0;
         }
+        let left = rect.left() + 32.0;
+        let name = egui::WidgetText::from(entry.name.as_str()).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            (right - left).max(24.0),
+            FontId::proportional(theme::size::BODY),
+        );
+        ui.painter().galley(
+            egui::pos2(left, rect.center().y - name.size().y / 2.0),
+            name,
+            p.text,
+        );
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// What a listing under way is doing, and how far it is: connecting to the server or listing
+/// the folder, then the entries received so far and the seconds it has taken.
+fn remote_browse_progress(b: &RemoteBrowse) -> (String, String) {
+    let status = b.browser.status();
+    let stage = if status.connected {
+        let path = if b.asked.trim().is_empty() {
+            "~"
+        } else {
+            b.asked.as_str()
+        };
+        trf("msg.remote_listing", &[("path", path.to_string())])
+    } else {
+        let server = remote::label(&b.conn, "/");
+        let server = server.trim_end_matches('/').to_string();
+        trf("msg.remote_connecting", &[("server", server)])
+    };
+    let seconds = format!("{} s", status.elapsed.as_secs());
+    let detail = if status.listed > 0 {
+        let entries = trf(
+            "remote_compare.entries",
+            &[("count", status.listed.to_string())],
+        );
+        format!("{entries}  ·  {seconds}")
+    } else {
+        seconds
+    };
+    (stage, detail)
+}
+
+/// A message in the middle of the remote chooser's list, where there is nothing to list: an
+/// icon or a spinner, `text`, and what `more` adds below.
+fn remote_notice(
+    ui: &mut egui::Ui,
+    icon: Option<Icon>,
+    text: &str,
+    color: egui::Color32,
+    more: impl FnOnce(&mut egui::Ui),
+) {
+    egui::ScrollArea::vertical()
+        .id_salt("remote_notice")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() * 0.28).max(8.0));
+                match icon {
+                    Some(icon) => {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::Vec2::splat(28.0), Sense::hover());
+                        crate::ui::icons::paint(ui.painter(), rect, icon, color);
+                    }
+                    None => {
+                        ui.add(egui::Spinner::new().size(24.0));
+                    }
+                }
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(egui::RichText::new(text).color(color)).wrap());
+                more(ui);
+            });
+        });
+}
+
+/// The chooser of the remote connection dialog: the server's folders and files, to pick
+/// `remote_path` from. It takes the dialog's place while it is shown, always at the same size,
+/// with the list scrolling inside it. `keys` is whether the keyboard is the chooser's (not a
+/// window's above it).
+fn remote_chooser(
+    ctx: &egui::Context,
+    b: &mut RemoteBrowse,
+    remote_path: &str,
+    keys: bool,
+) -> BrowseAsk {
+    let mut ask = BrowseAsk::default();
+    let size = remote_chooser_size(ctx);
+    let up = match &b.listing {
+        Some(l) => remote::parent_path(&l.path),
+        None if b.asked.starts_with('/') && !b.loading => remote::parent_path(&b.asked),
+        None => None,
+    };
+    let count = b.listing.as_ref().map_or(0, |l| l.entries.len());
+
+    // The keyboard: the arrows go through the list, Enter opens a folder or takes what is
+    // chosen, and Backspace goes up. A button Tab went to keeps Enter for itself.
+    let focused = ctx.memory(|m| m.focused());
+    let mut moved = None;
+    if keys && count > 0 {
+        let page = ((b.view_height / REMOTE_ROW_HEIGHT) as usize).max(1);
+        let at = b.cursor;
+        ctx.input(|i| {
+            let last = count - 1;
+            for (key, to) in [
+                (Key::ArrowDown, at.map_or(0, |c| (c + 1).min(last))),
+                (Key::ArrowUp, at.map_or(last, |c| c.saturating_sub(1))),
+                (Key::PageDown, at.map_or(0, |c| (c + page).min(last))),
+                (Key::PageUp, at.map_or(0, |c| c.saturating_sub(page))),
+                (Key::Home, 0),
+                (Key::End, last),
+            ] {
+                if i.key_pressed(key) {
+                    moved = Some(to);
+                }
+            }
+        });
+    }
+    if let (Some(to), Some(l)) = (moved, &b.listing) {
+        // The arrows are the list's here, not for moving between buttons.
+        if let Some(id) = focused {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+        }
+        b.cursor = Some(to);
+        b.reveal = true;
+        let e = &l.entries[to];
+        ask.pick = Some(if e.kind == remote::EntryKind::File {
+            remote::join(&l.path, &e.name)
+        } else {
+            l.path.clone()
+        });
+    }
+    if keys && focused.is_none() {
+        let (enter, back) =
+            ctx.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Backspace)));
+        let on = b
+            .listing
+            .as_ref()
+            .and_then(|l| Some((l, l.entries.get(b.cursor?)?)));
+        match on {
+            Some((l, e)) if enter && e.kind != remote::EntryKind::File => {
+                ask.go = Some(remote::join(&l.path, &e.name));
+            }
+            _ if enter && !remote_path.trim().is_empty() => ask.accept = true,
+            _ => {}
+        }
+        if back && up.is_some() {
+            ask.go = up.clone();
+        }
+    }
+
+    let modal = egui::Modal::new(egui::Id::unique("remote_browse_dialog")).show(ctx, |ui| {
+        ui.set_width(size.x);
+        ui.set_height(size.y);
+        if widgets::dialog_title(ui, tr("label.remote_path")) {
+            ask.cancel = true;
+        }
+
+        // The path bar: up, refresh, and the folders the one shown is in, each a button.
+        ui.allocate_ui_with_layout(
+            vec2(ui.available_width(), 28.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if widgets::icon_button_enabled(ui, up.is_some(), Icon::Prev, tr("btn.remote_up"))
+                    .clicked()
+                {
+                    ask.go = up.clone();
+                }
+                if widgets::icon_button(ui, Icon::Refresh, tr("cmd.refresh")).clicked() {
+                    ask.go = Some(remote_path.to_string());
+                }
+                ui.add_space(4.0);
+                let crumbs = match &b.listing {
+                    Some(l) => remote_crumbs(&l.path),
+                    None => Vec::new(),
+                };
+                egui::ScrollArea::horizontal()
+                    .id_salt("remote_crumbs")
+                    .max_width((ui.available_width() - 26.0).max(40.0))
+                    .auto_shrink([false, false])
+                    .stick_to_right(true)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        let p = pal(ui);
+                        if crumbs.is_empty() {
+                            // Nothing listed yet: the path asked for, as it was typed.
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&b.asked).weak())
+                                    .selectable(false),
+                            );
+                        }
+                        let last = crumbs.len().saturating_sub(1);
+                        for (i, (name, full)) in crumbs.iter().enumerate() {
+                            // The server stands for its root folder.
+                            let name = if i == 0 { &b.conn.host } else { name };
+                            if i > 0 {
+                                widgets::small_icon(ui, Icon::ChevronRight, p.text_dim);
+                            }
+                            if i == last {
+                                ui.add_space(6.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(name)
+                                            .font(theme::semibold(theme::size::CONTROL)),
+                                    )
+                                    .selectable(false),
+                                );
+                                ui.add_space(6.0);
+                            } else if widgets::ghost_button(ui, name).clicked() {
+                                ask.go = Some(full.clone());
+                            }
+                        }
+                    });
+                if b.loading {
+                    ui.add_space(4.0);
+                    ui.spinner();
+                }
+            },
+        );
+        ui.add_space(6.0);
+
+        // From the bottom up: the buttons, the hint, and the list in what is left between.
+        let rest = ui.available_size();
+        ui.allocate_ui_with_layout(rest, Layout::bottom_up(Align::Min), |ui| {
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), 32.0),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.add_enabled_ui(!remote_path.trim().is_empty(), |ui| {
+                        if widgets::primary_button(ui, tr("btn.ok")).clicked() {
+                            ask.accept = true;
+                        }
+                    });
+                    if widgets::secondary_button(ui, tr("btn.cancel")).clicked() {
+                        ask.cancel = true;
+                    }
+                    // What OK takes: the folder shown, or the file picked in it. While another
+                    // folder is being listed, how far that is instead.
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        if b.loading && b.listing.is_some() {
+                            let (stage, detail) = remote_browse_progress(b);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{stage}  {detail}")).weak(),
+                                )
+                                .truncate(),
+                            );
+                        } else {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(remote_path).monospace().weak(),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    });
+                },
+            );
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(tr("msg.remote_browse_hint"))
+                        .size(theme::size::SMALL)
+                        .weak(),
+                )
+                .wrap(),
+            );
+            ui.add_space(2.0);
+            let p = pal(ui);
+            let frame = egui::Frame::new()
+                .fill(p.input)
+                .stroke(Stroke::new(1.0_f32, p.border))
+                .corner_radius(theme::radius::MD)
+                .inner_margin(Margin::same(theme::space::XS));
+            let inner = (ui.available_size() - frame.total_margin().sum()).max(vec2(40.0, 40.0));
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                frame.show(ui, |ui| {
+                    ui.set_min_size(inner);
+                    ui.set_max_size(inner);
+                    remote_chooser_list(ui, b, remote_path, &mut ask);
+                });
+            });
+        });
+    });
+    if modal.should_close() {
+        ask.cancel = true;
+    }
+    ask
+}
+
+/// The list of the remote chooser, filling `ui`: the folder's entries, or why there are none
+/// to show.
+fn remote_chooser_list(
+    ui: &mut egui::Ui,
+    b: &mut RemoteBrowse,
+    remote_path: &str,
+    ask: &mut BrowseAsk,
+) {
+    let p = pal(ui);
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let Some(l) = &b.listing else {
+        if let Some(e) = &b.error {
+            let asked = b.asked.clone();
+            remote_notice(ui, Some(Icon::Warning), e, p.danger, |ui| {
+                ui.add_space(10.0);
+                if widgets::secondary_button(ui, tr("btn.retry")).clicked() {
+                    ask.go = Some(asked);
+                }
+            });
+        } else if b.loading {
+            let (stage, detail) = remote_browse_progress(b);
+            remote_notice(ui, None, &stage, p.text_dim, |ui| {
+                ui.add_space(4.0);
+                ui.weak(detail);
+            });
+        }
+        return;
+    };
+    // A folder that could not be opened says so over the one still shown.
+    if let Some(e) = &b.error {
+        egui::Frame::new()
+            .fill(p.danger.gamma_multiply(0.12))
+            .corner_radius(theme::radius::SM)
+            .inner_margin(Margin::symmetric(theme::space::MD, theme::space::SM))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_top(|ui| {
+                    widgets::inline_icon(ui, Icon::Warning, p.danger);
+                    ui.add(egui::Label::new(egui::RichText::new(e).color(p.text)).wrap());
+                });
+            });
+        ui.add_space(4.0);
+    }
+    if l.entries.is_empty() {
+        remote_notice(
+            ui,
+            Some(Icon::Folder),
+            tr("msg.remote_empty"),
+            p.text_dim,
+            |_| {},
+        );
+        return;
+    }
+    // Only the rows in view are laid out, so a folder of thousands scrolls like one of ten.
+    let rows = l.entries.len() + usize::from(l.truncated);
+    let mut area = egui::ScrollArea::vertical()
+        .id_salt("remote_entries")
+        .auto_shrink([false, false]);
+    if std::mem::take(&mut b.reveal) {
+        if let Some(c) = b.cursor {
+            let top = c as f32 * REMOTE_ROW_HEIGHT;
+            let bottom = top + REMOTE_ROW_HEIGHT - b.view_height;
+            if top < b.offset {
+                area = area.vertical_scroll_offset(top);
+            } else if b.view_height > 0.0 && bottom > b.offset {
+                area = area.vertical_scroll_offset(bottom);
+            }
+        }
+    }
+    let cursor = b.cursor;
+    let mut clicked = None;
+    let out = area.show_rows(ui, REMOTE_ROW_HEIGHT, rows, |ui, range| {
+        for i in range {
+            let Some(e) = l.entries.get(i) else {
+                ui.allocate_ui_with_layout(
+                    vec2(ui.available_width(), REMOTE_ROW_HEIGHT),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.add_space(10.0);
+                        ui.weak(trf(
+                            "msg.remote_truncated",
+                            &[("count", remote::MAX_BROWSE_ENTRIES.to_string())],
+                        ));
+                    },
+                );
+                continue;
+            };
+            let full = remote::join(&l.path, &e.name);
+            let file = e.kind == remote::EntryKind::File;
+            let selected = cursor == Some(i) || (file && remote_path == full);
+            let row = remote_row(ui, e, selected);
+            if !file {
+                if row.clicked() {
+                    ask.go = Some(full);
+                }
+            } else if row.double_clicked() {
+                ask.fetch = Some(full);
+            } else if row.clicked() {
+                ask.pick = Some(full);
+                clicked = Some(i);
+            }
+        }
+    });
+    b.offset = out.state.clamped_offset().y;
+    b.view_height = out.inner_rect.height();
+    if clicked.is_some() {
+        b.cursor = clicked;
+    }
+}
+
+/// What the settings file keeps of `conn` (see [`crate::config::RecentRemote`]): everything
+/// but its password or passphrase and its proxy's password, so that connecting to the same
+/// server again, in this run or a later one, needs only those typed.
+fn recent_remote(conn: &remote::RemoteConnection) -> crate::config::RecentRemote {
+    let (sign_in, key_path) = match &conn.auth {
+        remote::Auth::Password(_) => ("password", String::new()),
+        remote::Auth::Key { path, .. } => ("key", path.display().to_string()),
+        remote::Auth::Agent => ("agent", String::new()),
+    };
+    let shown = |p: &Option<PathBuf>| {
+        p.as_ref()
+            .map_or_else(String::new, |p| p.display().to_string())
+    };
+    crate::config::RecentRemote {
+        protocol: conn.protocol.scheme().to_string(),
+        host: conn.host.clone(),
+        port: conn.port.to_string(),
+        user: conn.user.clone(),
+        sign_in: sign_in.to_string(),
+        key_path,
+        proxy: conn
+            .options
+            .proxy
+            .as_ref()
+            .map_or_else(String::new, |p| p.url()),
+        active: conn.options.active,
+        client_cert: shown(&conn.options.client_cert),
+        client_key: shown(&conn.options.client_key),
     }
 }
 
@@ -1888,6 +2425,9 @@ struct RemoteLoad {
     remote_path: String,
     rx: std::sync::mpsc::Receiver<anyhow::Result<remote::Fetched>>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// How much was read from the server so far, shown while waiting, and since when.
+    progress: std::sync::Arc<remote::Progress>,
+    started: std::time::Instant,
     /// The dialog it was started from, shown again when fetching fails or is stopped.
     dialog: Option<RemoteDialog>,
 }
@@ -2019,6 +2559,9 @@ pub struct OxideMergeApp {
     open_dlg: Option<OpenDialog>,
     /// The paths typed on the start page, and whether it asks for a base (3-way).
     start_paths: [String; 3],
+    /// The path a fetch from a server put in each of `start_paths`, a temporary copy: once
+    /// that copy is gone (its tab was closed), the field is emptied instead of naming nothing.
+    start_fetched: [Option<String>; 3],
     start_three_way: bool,
     options_dlg: Option<OptionsDialog>,
     rule_dlg: Option<RuleDialog>,
@@ -2046,9 +2589,6 @@ pub struct OxideMergeApp {
     /// Fetches staged by the remote connection dialog, waiting for the tab they end up
     /// opening in to claim them (see [`PendingRemote`]).
     pending_remote: Vec<PendingRemote>,
-    /// Host, port, user and key path of the last successful connection, to fill in a new
-    /// connect dialog with (see [`LastRemote`]). Kept only for this run; never saved.
-    last_remote: Option<LastRemote>,
     /// A server's questions while signing in (see [`remote::set_asker`]), from connections on
     /// other threads, and the one being answered.
     asks: Option<std::sync::mpsc::Receiver<AskRequest>>,
@@ -2775,27 +3315,40 @@ fn path_status(ui: &egui::Ui, field: &egui::Response, text: &str) {
     let p = pal(ui);
     // Looks again once the status may be out of date, even with nothing else happening.
     ui.ctx().request_repaint_after(PATH_KIND_TTL);
-    let (icon, color, missing) = match path_kind(raw) {
-        PathKind::Url => (Icon::Globe, p.accent, false),
-        PathKind::Dir => (Icon::Folder, p.success, false),
-        PathKind::File => (Icon::File, p.success, false),
-        PathKind::Missing => (Icon::Warning, p.danger, true),
+    let (icon, color, what) = match path_kind(raw) {
+        PathKind::Url => (Icon::Globe, p.accent, "kind.web"),
+        PathKind::Dir => (Icon::Folder, p.success, "col.folder"),
+        PathKind::File => (Icon::File, p.success, "filters.source"),
+        PathKind::Missing => (Icon::Warning, p.danger, "msg.not_exist"),
     };
-    // The response covers only the text, inside the margin.
-    let r = field.rect + PATH_FIELD_MARGIN;
-    let icon_rect =
-        egui::Rect::from_center_size(egui::pos2(r.right() - 15.0, r.center().y), vec2(14.0, 14.0));
+    // The response covers the whole field, margin included.
+    let r = field.rect;
+    let icon_rect = path_status_rect(r);
     crate::ui::icons::paint(ui.painter(), icon_rect, icon, color);
-    if missing {
+    if what == "msg.not_exist" {
         ui.painter().rect_stroke(
             r,
             theme::radius::MD,
             Stroke::new(1.5_f32, p.danger),
             egui::StrokeKind::Inside,
         );
-        ui.interact(icon_rect, field.id.with("missing"), Sense::hover())
-            .on_hover_text(tr("msg.not_exist"));
     }
+    // Pointing at the mark says what it stands for.
+    ui.interact(
+        icon_rect.expand(4.0),
+        field.id.with("status"),
+        Sense::hover(),
+    )
+    .on_hover_text(tr(what));
+}
+
+/// Where the mark of [`path_status`] is in a path field at `field`: at its right end, inside
+/// it, in the room [`PATH_FIELD_MARGIN`] keeps clear of the text.
+fn path_status_rect(field: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(field.right() - 15.0, field.center().y),
+        vec2(14.0, 14.0),
+    )
 }
 
 /// Options search result: the setting, and the tab it lives on.
@@ -2931,6 +3484,7 @@ impl OxideMergeApp {
             active: 0,
             open_dlg: None,
             start_paths: Default::default(),
+            start_fetched: Default::default(),
             start_three_way: false,
             options_dlg: None,
             patch_dlg: None,
@@ -2947,7 +3501,6 @@ impl OxideMergeApp {
             reload_prompt: None,
             reload: None,
             pending_remote: Vec::new(),
-            last_remote: None,
             asks: Some(install_asker(&cc.egui_ctx)),
             ask: None,
             archive_password: None,
@@ -4187,26 +4740,33 @@ impl OxideMergeApp {
 
     /// Opens the connection dialog of *Compare over SFTP* for `target`'s path field.
     fn start_remote_connect(&mut self, target: RemoteTarget) {
-        let last = self.last_remote.as_ref();
-        self.remote_dlg = Some(RemoteDialog {
+        let mut d = RemoteDialog {
             target,
-            protocol: last.map_or(remote::Protocol::Sftp, |l| l.protocol),
-            host: last.map_or_else(String::new, |l| l.host.clone()),
-            port: last.map_or_else(|| "22".to_string(), |l| l.port.clone()),
-            user: last.map_or_else(String::new, |l| l.user.clone()),
-            sign_in: last.map_or(SignIn::Password, |l| l.sign_in),
+            protocol: remote::Protocol::Sftp,
+            host: String::new(),
+            port: "22".to_string(),
+            user: String::new(),
+            sign_in: SignIn::Password,
             password: String::new(),
-            key_path: last.map_or_else(String::new, |l| l.key_path.clone()),
+            key_path: String::new(),
             passphrase: String::new(),
             remote_path: String::new(),
-            list_folder: true,
+            // A folder is fetched whole and opens in the usual folder comparison, which shows
+            // every difference at once; listing it without its files is there to choose, for
+            // folders too large to fetch.
+            list_folder: false,
             browse: None,
-            proxy: last.map_or_else(String::new, |l| l.proxy.clone()),
+            proxy: String::new(),
             proxy_password: String::new(),
-            active: last.is_some_and(|l| l.active),
-            client_cert: last.map_or_else(String::new, |l| l.client_cert.clone()),
-            client_key: last.map_or_else(String::new, |l| l.client_key.clone()),
-        });
+            active: false,
+            client_cert: String::new(),
+            client_key: String::new(),
+        };
+        // The server connected to last, in this run or an earlier one, is the likeliest.
+        if let Some(last) = self.cfg.recent_remotes.first() {
+            d.fill(last);
+        }
+        self.remote_dlg = Some(d);
     }
 
     /// *File → Compare over SFTP*: a server, a user name, a password or a private key, and the
@@ -4234,8 +4794,7 @@ impl OxideMergeApp {
                                 None => l.path.clone(),
                             };
                         }
-                        b.error = None;
-                        b.listing = Some(l);
+                        b.show(l);
                     }
                     Err(e) => match e.downcast::<remote::UnknownHost>() {
                         Ok(host) => {
@@ -4262,263 +4821,207 @@ impl OxideMergeApp {
         }
         let ready = conn.is_some() && !d.remote_path.trim().is_empty();
         let (mut toggle_browse, mut go, mut pick, mut fetch_now) = (false, None, None, None);
-        let modal = egui::Modal::new(egui::Id::unique("remote_connect_dialog")).show(ctx, |ui| {
-            ui.set_min_width(440.0);
-            ui.set_max_width(600.0);
-            if widgets::dialog_title(ui, &plain(tr("menu.open_remote"))) {
+        // The chooser takes the dialog's place while it is shown.
+        if let Some(b) = &mut d.browse {
+            let ask = remote_chooser(ctx, b, &d.remote_path, self.ask.is_none());
+            (go, pick, fetch_now) = (ask.go, ask.pick, ask.fetch);
+            if ask.cancel {
+                pick = Some(b.before.clone());
+            }
+            toggle_browse = ask.cancel || ask.accept;
+        } else {
+            let modal =
+                egui::Modal::new(egui::Id::unique("remote_connect_dialog")).show(ctx, |ui| {
+                    ui.set_min_width(440.0);
+                    ui.set_max_width(600.0);
+                    if widgets::dialog_title(ui, &plain(tr("menu.open_remote"))) {
+                        cancel = true;
+                    }
+                    egui::Grid::new("remote_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 10.0])
+                        .show(ui, |ui| {
+                            // The servers connected to before: picking one fills in everything but
+                            // its password or passphrase.
+                            if !self.cfg.recent_remotes.is_empty() {
+                                let at = d.recent(&self.cfg.recent_remotes);
+                                ui.label(tr("label.recent"));
+                                ui.horizontal(|ui| {
+                                    let shown = at.map_or_else(String::new, |i| {
+                                        self.cfg.recent_remotes[i].label()
+                                    });
+                                    let mut picked = None;
+                                    egui::ComboBox::from_id_salt("remote_recent")
+                                        .selected_text(shown)
+                                        .width(300.0)
+                                        .truncate()
+                                        .show_ui(ui, |ui| {
+                                            for (i, r) in self.cfg.recent_remotes.iter().enumerate()
+                                            {
+                                                if ui
+                                                    .selectable_label(at == Some(i), r.label())
+                                                    .clicked()
+                                                {
+                                                    picked = Some(i);
+                                                }
+                                            }
+                                        });
+                                    if let Some(i) = picked {
+                                        d.fill(&self.cfg.recent_remotes[i]);
+                                    }
+                                    if widgets::icon_button_enabled(
+                                        ui,
+                                        at.is_some(),
+                                        Icon::Close,
+                                        tr("start.recent_remove"),
+                                    )
+                                    .clicked()
+                                    {
+                                        if let Some(i) = at {
+                                            self.cfg.recent_remotes.remove(i);
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                            ui.label(tr("label.remote_protocol"));
+                            let mut protocol = d.protocol;
+                            egui::ComboBox::from_id_salt("remote_protocol")
+                                .selected_text(protocol_name(protocol))
+                                .width(220.0)
+                                .show_ui(ui, |ui| {
+                                    for p in remote::Protocol::ALL {
+                                        ui.selectable_value(&mut protocol, p, protocol_name(p));
+                                    }
+                                });
+                            if protocol != d.protocol {
+                                d.set_protocol(protocol);
+                            }
+                            ui.end_row();
+                            ui.label(tr("label.remote_host"));
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut d.host)
+                                        .hint_text("example.com")
+                                        .desired_width(220.0),
+                                );
+                                ui.label(tr("label.remote_port"));
+                                ui.add(egui::TextEdit::singleline(&mut d.port).desired_width(50.0));
+                            });
+                            ui.end_row();
+                            ui.label(tr("label.remote_user"));
+                            ui.add(egui::TextEdit::singleline(&mut d.user).desired_width(220.0));
+                            ui.end_row();
+                            if !d.protocol.is_ftp() {
+                                ui.label(tr("label.remote_auth"));
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(
+                                        &mut d.sign_in,
+                                        SignIn::Password,
+                                        tr("label.remote_password"),
+                                    );
+                                    ui.selectable_value(
+                                        &mut d.sign_in,
+                                        SignIn::Key,
+                                        tr("label.remote_key"),
+                                    );
+                                    ui.selectable_value(
+                                        &mut d.sign_in,
+                                        SignIn::Agent,
+                                        tr("label.remote_agent"),
+                                    );
+                                });
+                                ui.end_row();
+                            }
+                            if d.sign_in() == SignIn::Agent {
+                                ui.label("");
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(tr("msg.remote_agent_hint")).weak(),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.end_row();
+                            } else if d.sign_in() == SignIn::Key {
+                                ui.label(tr("label.remote_key_path"));
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut d.key_path)
+                                            .desired_width(260.0),
+                                    );
+                                    if widgets::icon_button(ui, Icon::File, tr("btn.browse_file"))
+                                        .clicked()
+                                    {
+                                        if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                            d.key_path = p.display().to_string();
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+                                ui.label(tr("label.remote_passphrase"));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut d.passphrase)
+                                        .password(true)
+                                        .desired_width(220.0),
+                                );
+                                ui.end_row();
+                            } else {
+                                ui.label(tr("label.remote_password"));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut d.password)
+                                        .password(true)
+                                        .desired_width(220.0),
+                                );
+                                ui.end_row();
+                            }
+                            ui.label(tr("label.remote_path"));
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut d.remote_path)
+                                        .hint_text(tr("msg.remote_path_hint"))
+                                        .desired_width(260.0),
+                                );
+                                if widgets::icon_button_enabled(
+                                    ui,
+                                    conn.is_some(),
+                                    Icon::Folder,
+                                    tr("btn.list_remote"),
+                                )
+                                .clicked()
+                                {
+                                    toggle_browse = true;
+                                }
+                            });
+                            ui.end_row();
+                        });
+                    if d.protocol == remote::Protocol::Ftp {
+                        ui.add_space(4.0);
+                        ui.colored_label(ui.visuals().warn_fg_color, tr("msg.ftp_plain_warning"));
+                    }
+                    ui.add_space(4.0);
+                    remote_advanced(ui, &mut d);
+                    if d.protocol == remote::Protocol::Sftp {
+                        ui.checkbox(&mut d.list_folder, tr("remote_compare.list_folder"))
+                            .on_hover_text(tr("remote_compare.list_folder_tip"));
+                    }
+                    widgets::dialog_footer(ui, |ui| {
+                        ui.add_enabled_ui(ready, |ui| {
+                            if widgets::primary_button(ui, tr("btn.connect")).clicked()
+                                || (ready && ui.input(|i| i.key_pressed(Key::Enter)))
+                            {
+                                connect = true;
+                            }
+                        });
+                        if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
+                            || ui.input(|i| i.key_pressed(Key::Escape))
+                        {
+                            cancel = true;
+                        }
+                    });
+                });
+            if modal.should_close() {
                 cancel = true;
             }
-            egui::Grid::new("remote_grid")
-                .num_columns(2)
-                .spacing([12.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label(tr("label.remote_protocol"));
-                    let mut protocol = d.protocol;
-                    egui::ComboBox::from_id_salt("remote_protocol")
-                        .selected_text(protocol_name(protocol))
-                        .width(220.0)
-                        .show_ui(ui, |ui| {
-                            for p in remote::Protocol::ALL {
-                                ui.selectable_value(&mut protocol, p, protocol_name(p));
-                            }
-                        });
-                    if protocol != d.protocol {
-                        d.set_protocol(protocol);
-                    }
-                    ui.end_row();
-                    ui.label(tr("label.remote_host"));
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut d.host)
-                                .hint_text("example.com")
-                                .desired_width(220.0),
-                        );
-                        ui.label(tr("label.remote_port"));
-                        ui.add(egui::TextEdit::singleline(&mut d.port).desired_width(50.0));
-                    });
-                    ui.end_row();
-                    ui.label(tr("label.remote_user"));
-                    ui.add(egui::TextEdit::singleline(&mut d.user).desired_width(220.0));
-                    ui.end_row();
-                    if !d.protocol.is_ftp() {
-                        ui.label(tr("label.remote_auth"));
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(
-                                &mut d.sign_in,
-                                SignIn::Password,
-                                tr("label.remote_password"),
-                            );
-                            ui.selectable_value(
-                                &mut d.sign_in,
-                                SignIn::Key,
-                                tr("label.remote_key"),
-                            );
-                            ui.selectable_value(
-                                &mut d.sign_in,
-                                SignIn::Agent,
-                                tr("label.remote_agent"),
-                            );
-                        });
-                        ui.end_row();
-                    }
-                    if d.sign_in() == SignIn::Agent {
-                        ui.label("");
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(tr("msg.remote_agent_hint")).weak(),
-                            )
-                            .wrap(),
-                        );
-                        ui.end_row();
-                    } else if d.sign_in() == SignIn::Key {
-                        ui.label(tr("label.remote_key_path"));
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut d.key_path).desired_width(260.0),
-                            );
-                            if widgets::icon_button(ui, Icon::File, tr("btn.browse_file")).clicked()
-                            {
-                                if let Some(p) = rfd::FileDialog::new().pick_file() {
-                                    d.key_path = p.display().to_string();
-                                }
-                            }
-                        });
-                        ui.end_row();
-                        ui.label(tr("label.remote_passphrase"));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut d.passphrase)
-                                .password(true)
-                                .desired_width(220.0),
-                        );
-                        ui.end_row();
-                    } else {
-                        ui.label(tr("label.remote_password"));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut d.password)
-                                .password(true)
-                                .desired_width(220.0),
-                        );
-                        ui.end_row();
-                    }
-                    ui.label(tr("label.remote_path"));
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut d.remote_path)
-                                .hint_text(tr("msg.remote_path_hint"))
-                                .desired_width(260.0),
-                        );
-                        if widgets::icon_button_enabled(
-                            ui,
-                            conn.is_some(),
-                            Icon::Folder,
-                            tr("btn.list_remote"),
-                        )
-                        .clicked()
-                        {
-                            toggle_browse = true;
-                        }
-                    });
-                    ui.end_row();
-                });
-            if d.protocol == remote::Protocol::Ftp {
-                ui.add_space(4.0);
-                ui.colored_label(ui.visuals().warn_fg_color, tr("msg.ftp_plain_warning"));
-            }
-            ui.add_space(4.0);
-            remote_advanced(ui, &mut d);
-            if let Some(b) = &d.browse {
-                ui.add_space(6.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let up = b
-                            .listing
-                            .as_ref()
-                            .and_then(|l| remote::parent_path(&l.path));
-                        if widgets::icon_button_enabled(
-                            ui,
-                            up.is_some(),
-                            Icon::Prev,
-                            tr("btn.remote_up"),
-                        )
-                        .clicked()
-                        {
-                            go = up;
-                        }
-                        if widgets::icon_button(ui, Icon::Refresh, tr("cmd.refresh")).clicked() {
-                            go = Some(d.remote_path.clone());
-                        }
-                        if b.loading {
-                            ui.spinner();
-                        }
-                        if let Some(l) = &b.listing {
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(&l.path).monospace())
-                                    .truncate(),
-                            );
-                        }
-                    });
-                    if let Some(e) = &b.error {
-                        ui.colored_label(ui.visuals().error_fg_color, e);
-                    }
-                    egui::ScrollArea::vertical()
-                        .max_height(240.0)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| match &b.listing {
-                            None => {
-                                if b.loading {
-                                    ui.weak(trf(
-                                        "msg.remote_listing",
-                                        &[("path", b.asked.clone())],
-                                    ));
-                                }
-                            }
-                            Some(l) => {
-                                if l.entries.is_empty() {
-                                    ui.weak(tr("msg.remote_empty"));
-                                }
-                                for e in &l.entries {
-                                    let full = remote::join(&l.path, &e.name);
-                                    ui.horizontal(|ui| {
-                                        let icon = match e.kind {
-                                            remote::EntryKind::Dir => Icon::Folder,
-                                            remote::EntryKind::File => Icon::File,
-                                            remote::EntryKind::Link => Icon::ChevronRight,
-                                        };
-                                        widgets::small_icon(ui, icon, ui.visuals().text_color());
-                                        let size = (e.kind == remote::EntryKind::File)
-                                            .then(|| report::fmt_size(Some(e.size)));
-                                        let size_width = size.as_ref().map_or(0.0, |s| {
-                                            ui.painter()
-                                                .layout_no_wrap(
-                                                    s.clone(),
-                                                    egui::TextStyle::Body.resolve(ui.style()),
-                                                    egui::Color32::PLACEHOLDER,
-                                                )
-                                                .size()
-                                                .x
-                                                + ui.spacing().item_spacing.x
-                                        });
-                                        let row = ui
-                                            .scope(|ui| {
-                                                ui.set_max_width(
-                                                    (ui.available_width() - size_width).max(40.0),
-                                                );
-                                                ui.add(
-                                                    egui::Button::selectable(
-                                                        d.remote_path == full,
-                                                        &e.name,
-                                                    )
-                                                    .truncate(),
-                                                )
-                                            })
-                                            .inner;
-                                        if let Some(size) = size {
-                                            ui.weak(size);
-                                        }
-                                        if e.kind != remote::EntryKind::File {
-                                            if row.clicked() {
-                                                go = Some(full);
-                                            }
-                                        } else if row.double_clicked() {
-                                            fetch_now = Some(full);
-                                        } else if row.clicked() {
-                                            pick = Some(full);
-                                        }
-                                    });
-                                }
-                                if l.truncated {
-                                    ui.weak(trf(
-                                        "msg.remote_truncated",
-                                        &[("count", remote::MAX_BROWSE_ENTRIES.to_string())],
-                                    ));
-                                }
-                            }
-                        });
-                    ui.weak(tr("msg.remote_browse_hint"));
-                });
-            }
-            if d.protocol == remote::Protocol::Sftp {
-                ui.checkbox(&mut d.list_folder, tr("remote_compare.list_folder"))
-                    .on_hover_text(tr("remote_compare.list_folder_tip"));
-            }
-            widgets::dialog_footer(ui, |ui| {
-                ui.add_enabled_ui(ready, |ui| {
-                    if widgets::primary_button(ui, tr("btn.connect")).clicked()
-                        || (ready && ui.input(|i| i.key_pressed(Key::Enter)))
-                    {
-                        connect = true;
-                    }
-                });
-                if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
-                    || ui.input(|i| i.key_pressed(Key::Escape))
-                {
-                    cancel = true;
-                }
-            });
-        });
-        if modal.should_close() {
-            cancel = true;
         }
         if toggle_browse {
             d.browse = match (d.browse.take(), &conn) {
@@ -4655,12 +5158,17 @@ impl OxideMergeApp {
         let on_this_thread = remote::fake::installed();
         #[cfg(not(test))]
         let on_this_thread = false;
+        let progress = std::sync::Arc::<remote::Progress>::default();
+        let counted = progress.clone();
+        let fetch = move || {
+            let fetched =
+                remote::with_progress(&counted, || remote::fetch_with(&c, &p, &stop, mode));
+            let _ = tx.send(fetched);
+        };
         if on_this_thread {
-            let _ = tx.send(remote::fetch_with(&c, &p, &stop, mode));
+            fetch();
         } else {
-            std::thread::spawn(move || {
-                let _ = tx.send(remote::fetch_with(&c, &p, &stop, mode));
-            });
+            std::thread::spawn(fetch);
         }
         self.remote_load = Some(RemoteLoad {
             target,
@@ -4668,6 +5176,8 @@ impl OxideMergeApp {
             remote_path,
             rx,
             cancel,
+            progress,
+            started: std::time::Instant::now(),
             dialog,
         });
     }
@@ -4690,10 +5200,37 @@ impl OxideMergeApp {
             let mut stop = false;
             egui::Modal::new(egui::Id::unique("remote_load_dialog")).show(ctx, |ui| {
                 ui.set_width(480.0);
+                // What is going on: reaching the server, then fetching from it; and how far
+                // that is: the bytes and entries read, when there are any, and the seconds.
+                let relaxed = std::sync::atomic::Ordering::Relaxed;
+                let stage = if load.progress.connected.load(relaxed) {
+                    trf("msg.fetching_remote", &[("name", label)])
+                } else {
+                    let server = remote::label(&load.conn, "/");
+                    let server = server.trim_end_matches('/').to_string();
+                    trf("msg.remote_connecting", &[("server", server)])
+                };
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(trf("msg.fetching_remote", &[("name", label)]));
+                    ui.add(egui::Label::new(stage).wrap());
                 });
+                let (bytes, entries) = (
+                    load.progress.bytes.load(relaxed),
+                    load.progress.entries.load(relaxed),
+                );
+                let mut parts = Vec::new();
+                if bytes > 0 {
+                    parts.push(report::fmt_size(Some(bytes)));
+                }
+                if entries > 1 {
+                    parts.push(trf(
+                        "remote_compare.entries",
+                        &[("count", entries.to_string())],
+                    ));
+                }
+                parts.push(format!("{} s", load.started.elapsed().as_secs()));
+                ui.add_space(4.0);
+                ui.weak(parts.join("  ·  "));
                 widgets::dialog_footer(ui, |ui| {
                     if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
                         || ui.input(|i| i.key_pressed(Key::Escape))
@@ -4713,7 +5250,7 @@ impl OxideMergeApp {
         let stopped = load.cancel.load(std::sync::atomic::Ordering::Relaxed);
         match result {
             Ok(fetched) if !stopped => {
-                self.last_remote = Some(LastRemote::from_conn(&load.conn));
+                self.cfg.add_recent_remote(recent_remote(&load.conn));
                 self.use_remote_fetch(load.target, load.conn, load.remote_path, fetched);
             }
             Ok(_) => self.remote_dlg = load.dialog,
@@ -4795,6 +5332,7 @@ impl OxideMergeApp {
                     self.remote_dlg = p.dialog.map(|mut d| {
                         let mut b = RemoteBrowse::start(p.conn, &p.remote_path);
                         b.field = d.remote_path.clone();
+                        b.before = d.remote_path.clone();
                         d.browse = Some(b);
                         d
                     });
@@ -4823,7 +5361,10 @@ impl OxideMergeApp {
     ) {
         let shown = fetched.local.display().to_string();
         match target {
-            RemoteTarget::Start(s) => self.start_paths[s] = shown,
+            RemoteTarget::Start(s) => {
+                self.start_fetched[s] = Some(shown.clone());
+                self.start_paths[s] = shown;
+            }
             RemoteTarget::Open(s) => {
                 let mut d = self
                     .open_dlg
@@ -5319,7 +5860,7 @@ impl OxideMergeApp {
         copy: PathBuf,
     ) -> anyhow::Result<()> {
         let label = format!("{} @ {rev}", path.display());
-        let content = if path.is_dir() {
+        if path.is_dir() {
             let display = vec![label, path.display().to_string()];
             let mut v = FolderView::new(
                 vec![copy, path.to_path_buf()],
@@ -5330,29 +5871,27 @@ impl OxideMergeApp {
                 &self.cfg,
             );
             v.read_only[0] = true;
-            Content::Folder(v)
+            self.push_tab(Content::Folder(v), Vec::new());
         } else {
-            let paths = vec![copy.clone(), path.to_path_buf()];
-            if text::is_image_path(path) {
-                let mut v = ImageView::load(paths, &self.cfg)?;
-                v.read_only[0] = true;
-                Content::Image(v)
-            } else if text::detect_kind(&copy) == FileKind::Binary {
-                let mut v = BinaryView::load(paths)?;
-                v.read_only[0] = true;
-                Content::Binary(v)
-            } else {
-                let mut left = text::load_doc(&copy, None)?;
-                left.path = None;
-                left.syntax = Some(text::extension(path));
-                left.description = Some(label);
-                left.read_only = true;
-                let right = self.load_text(path, !path.exists())?;
-                Content::Text(TextView::new(vec![left, right], &self.cfg))
-            }
-        };
+            // A file is opened as any two files are, the revision's copy on the left: the
+            // same views, whatever the file is (text, a document read as text with its other
+            // views, a table, an image, a web page, or bytes). Only the left side differs:
+            // it cannot be changed, and is named by its revision, not by where its copy is.
+            let tabs = self.tabs.len();
+            self.try_open(OpenRequest {
+                paths: vec![copy.clone(), path.to_path_buf()],
+                descriptions: vec![Some(label), None],
+                read_only: vec![true, false],
+                skip_recent: true,
+                wait: true,
+                ..Default::default()
+            })?;
+            // The copy is gone with its tab: not a path to offer again.
+            let copy = copy.display().to_string();
+            self.cfg.recent_paths.retain(|p| *p != copy);
+            anyhow::ensure!(self.tabs.len() > tabs, "{}", tr("status.error"));
+        }
         self.cfg.add_recent_path(&path.display().to_string());
-        self.push_tab(content, Vec::new());
         if let Some(t) = self.tabs.last_mut() {
             t.temps = vec![std::sync::Arc::new(temp)];
         }
@@ -5523,6 +6062,18 @@ impl OxideMergeApp {
     /// else ever revisits [`Self::pending_remote`] once [`Self::use_remote_fetch`] adds to it.
     /// Run once a frame, alongside the dialogs that can add to or replace it.
     fn gc_pending_remote(&mut self) {
+        // A path field still naming a fetched copy that is gone, deleted with the tab that
+        // showed it, is emptied: the path leads nowhere and would only be marked as missing.
+        for (path, fetched) in self.start_paths.iter_mut().zip(&mut self.start_fetched) {
+            match fetched {
+                Some(copy) if copy != path => *fetched = None,
+                Some(copy) if !Path::new(copy).exists() => {
+                    path.clear();
+                    *fetched = None;
+                }
+                _ => {}
+            }
+        }
         if self.pending_remote.is_empty() {
             return;
         }

@@ -11086,7 +11086,14 @@ impl TextView {
                 let view = result
                     // The toolbar above steps through its differences and says where it is.
                     .map(|prepared| MarkdownView::from_prepared(prepared, labels).hosted())
-                    .map_err(|e| format!("{e:#}"));
+                    // A PDF without tags is nothing gone wrong: it is said in the user's
+                    // language, as a note.
+                    .map_err(
+                        |e| match e.downcast_ref::<crate::core::extract::NotTagged>() {
+                            Some(_) => tr("analysis.pdf_not_tagged").to_string(),
+                            None => format!("{e:#}"),
+                        },
+                    );
                 self.formatted.view = Some((key.clone(), view));
                 self.formatted.job = None;
             }
@@ -11106,7 +11113,17 @@ impl TextView {
                 }
             }
             Some((_, Err(error))) => {
-                ui.colored_label(widgets::pal(ui).danger, error.as_str());
+                let p = widgets::pal(ui);
+                ui.add_space(8.0);
+                if error.as_str() == tr("analysis.pdf_not_tagged") {
+                    ui.horizontal_top(|ui| {
+                        widgets::inline_icon(ui, Icon::Help, p.text_dim);
+                        ui.add(egui::Label::new(error.as_str()).wrap());
+                    });
+                } else {
+                    ui.colored_label(p.danger, error.as_str());
+                }
+                ui.add_space(6.0);
                 if ui.button(tr("analysis.text_fallback")).clicked() {
                     self.formatted_mode = false;
                 }

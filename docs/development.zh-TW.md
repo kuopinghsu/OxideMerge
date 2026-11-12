@@ -94,7 +94,10 @@ macOS 與 Linux 的程式位於 `target/release/oxidemerge`，Windows 則為
 變更使用者指南或其圖片後，請執行 `make user-guide-docs`，並將 PDF 檔案與變更一起提交，
 讓 `docs/dist/` 始終保有最新的指南。
 
-`make user-guide` 與 `make user-guide-docs` 需要 Asciidoctor PDF、`curl`、`shasum`、含 `fontTools` 的 Python 3、
+在 Windows 上，請以 Linux 容器模式啟動 Docker Desktop，再用 GNU Make 執行任一目標。
+目標會建置可重複使用的映像檔，其中的 Asciidoctor 版本與 CI 相同，並將 PDF 寫回儲存庫。
+
+在 macOS 與 Linux 上，這兩個目標需要 Asciidoctor PDF、`curl`、`shasum`、含 `fontTools` 的 Python 3、
 fontconfig 與 DejaVu Sans 字型。建置指令碼會自動下載所需的 Noto Sans CJK 字型。
 
 ## 結果的命名方式

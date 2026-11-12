@@ -97,7 +97,11 @@ shows. For the web page samples, see [samples/web/README.md](../samples/web/READ
 After you change a user guide or its images, run `make user-guide-docs` and commit the PDF
 files with the change, so that `docs/dist/` always has the latest guides.
 
-`make user-guide` and `make user-guide-docs` need Asciidoctor PDF, `curl`, `shasum`, Python 3 with `fontTools`,
+On Windows, start Docker Desktop in Linux container mode and run either target with GNU Make.
+The targets build a reusable image with the same Asciidoctor versions as CI and write the
+PDFs back into the checkout.
+
+On macOS and Linux, both targets need Asciidoctor PDF, `curl`, `shasum`, Python 3 with `fontTools`,
 fontconfig and the DejaVu Sans font. The build script downloads the Noto Sans CJK fonts
 that it needs.
 
