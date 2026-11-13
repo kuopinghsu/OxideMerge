@@ -9242,13 +9242,16 @@ impl OxideMergeApp {
                             tr("label.recent_commits"),
                         );
                         let close = egui::PopupCloseBehavior::CloseOnClickOutside;
-                        let popup = egui::Popup::menu(&commits).close_behavior(close);
+                        let popup = egui::Popup::menu(&commits)
+                            .close_behavior(close)
+                            .frame(widgets::pick_frame(ui));
                         popup.show(|ui| {
-                            widgets::menu_scroll(ui, |ui| {
-                                ui.set_min_width(420.0);
+                            widgets::pick_list(ui, 440.0, |ui| {
+                                widgets::pick_caption(ui, tr("label.recent_commits"));
                                 for (hash, subject) in &d.commits {
-                                    let text = egui::RichText::new(format!("{hash}  {subject}"));
-                                    if ui.button(text).clicked() {
+                                    let text = format!("{hash}  {subject}");
+                                    let on = d.rev == *hash;
+                                    if widgets::pick_row(ui, on, None, &text, false).clicked() {
                                         d.rev = hash.clone();
                                         ui.close();
                                     }
@@ -10779,11 +10782,25 @@ impl OxideMergeApp {
                             egui::Popup::from_toggle_button_response(&r)
                                 .id(recent_id)
                                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                .frame(widgets::pick_frame(ui))
                                 .show(|ui| {
-                                    widgets::menu_scroll(ui, |ui| {
-                                        ui.set_min_width(320.0);
+                                    let width = widgets::pick_width(
+                                        ui,
+                                        recent.iter().map(String::as_str),
+                                        320.0,
+                                        520.0,
+                                    );
+                                    widgets::pick_list(ui, width, |ui| {
+                                        widgets::pick_caption(ui, tr("label.recent"));
                                         for r in &recent {
-                                            if ui.selectable_label(false, r).clicked() {
+                                            let row = widgets::pick_row(
+                                                ui,
+                                                false,
+                                                Some(Icon::Clock),
+                                                r,
+                                                false,
+                                            );
+                                            if row.clicked() {
                                                 d.paths[s] = r.clone();
                                                 ui.close();
                                             }

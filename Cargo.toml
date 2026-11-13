@@ -34,6 +34,10 @@ lzma-rs = "0.3"
 # The LZMA2 encoder `sevenz-rust2` already builds, used for writing `.tar.xz`.
 lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "encoder", "optimization"] }
 sevenz-rust2 = { version = "0.25", default-features = false, features = ["util", "compress", "bzip2", "deflate", "ppmd", "aes256", "zstd", "brotli", "lz4"] }
+# The UnRAR library, built from its C++ source, which reads RAR archives. It comes under its
+# own license (the crate's `vendor/unrar/license.txt`): free to use and distribute, but not
+# for writing RAR archives.
+unrar_sys = "0.5.8"
 # The Zstandard library `zip` and `sevenz-rust2` already build, used for `.tar.zst`.
 zstd = "0.14"
 zeroize = "1"

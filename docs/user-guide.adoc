@@ -1382,7 +1382,8 @@ them separately.
 * *Location pane* and *Line detail pane*.
   The line detail pane shows the current line of each side, one above the other, with word wrap.
   Use it to find small differences in long lines.
-* *Line numbers*, *Edit markers*, *View whitespace* and *Syntax highlighting*.
+* *Line numbers*, *Edit markers*, *View whitespace* and *Syntax highlighting*
+  (see <<syntax-highlighting>>).
 * *Collapse unchanged lines* (kbd:[Alt+C]) hides unchanged lines behind a bar.
   Three lines stay visible around each difference; click the bar to show the hidden lines.
 * *Word wrap* (kbd:[Alt+Z]).
@@ -1403,6 +1404,82 @@ The same setting lays out the moved blocks of a binary comparison (see <<binary-
 The toolbar buttons are unavailable in the inline view and the table view, which show no empty
 space either way.
 The layout does not change the files or the compare rules.
+
+[[syntax-highlighting]]
+=== Syntax highlighting
+
+With *View → Text compare → Syntax highlighting* turned on, comments, strings, numbers and
+keywords are shown in color.
+The language is chosen from the file extension, from the whole name for files such as
+`Makefile`, `Dockerfile` and `CMakeLists.txt`, or from a `#!` first line for a script without an
+extension.
+The following languages are highlighted:
+
+[cols="1,3",options="header"]
+|===
+|Language |File extensions
+
+|C, C++, Objective-C
+|`.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hh`, `.hpp`, `.hxx`, `.inl`, `.ino`, `.sma`, `.m`, `.mm`
+
+|C#, D, Java, Groovy, Scala
+|`.cs`, `.d`, `.java`, `.groovy`, `.gradle`, `.scala`, `.sbt`, `.sc`
+
+|Rust, Go, Swift, Kotlin
+|`.rs`, `.go`, `.swift`, `.kt`, `.kts`
+
+|JavaScript, TypeScript, ActionScript
+|`.js`, `.mjs`, `.cjs`, `.jsx`, `.jsfl`, `.ts`, `.tsx`, `.as`, `.asc`
+
+|HTML, XML, CSS, PHP, ASP, JSP
+|`.html`, `.htm`, `.shtml`, `.xhtml`, `.hta`, `.htt`, `.htd`, `.cfm`, `.tpl`, `.xml`, `.xsd`,
+`.xsl`, `.xslt`, `.dtd`, `.svg`, `.xul`, `.rdf`, `.xaml`, `.vxml`, `.docbook`, `.wxs`, `.wxi`,
+`.vcproj`, `.vcxproj`, `.csproj`, `.css`, `.php`, `.php3`, `.phtml`, `.asp`, `.jsp`
+
+|Python, Ruby, Perl, Lua, Tcl, R
+|`.py`, `.pyw`, `SConstruct`, `SConscript`, `.rb`, `.rbw`, `.pl`, `.pm`, `.pod`, `.cgi`, `.lua`,
+`.tcl`, `.r`
+
+|Shell, PowerShell, batch files
+|`.sh`, `.bash`, `.zsh`, `.ps1`, `.psm1`, `.psd1`, `.bat`, `.cmd`
+
+|Visual Basic, VBScript
+|`.vb`, `.bas`, `.frm`, `.cls`, `.ctl`, `.pag`, `.dsr`, `.dob`, `.vbs`, `.dsm`
+
+|Pascal, Delphi
+|`.pas`, `.dpr`, `.dpk`, `.dfm`, `.inc`, `.pp`
+
+|OCaml, F#, Standard ML, Haskell, Erlang, Lisp, Clojure
+|`.ml`, `.mli`, `.caml`, `.fs`, `.fsi`, `.fsx`, `.sml`, `.sig`, `.hs`, `.erl`, `.hrl`, `.lisp`,
+`.lsp`, `.scm`, `.ss`, `.smd`, `.el`, `.clj`
+
+|Fortran, Smalltalk, MATLAB
+|`.f`, `.for`, `.f77`, `.f90`, `.f95`, `.f03`, `.f08`, `.f2k`, `.st`, `.pac`, `.src`, `.pkg`,
+`.matlab`
+
+|SQL
+|`.sql`, `.ddl`, `.dml`, `.spec`, `.body`, `.sps`, `.spb`, `.sf`, `.sp`
+
+|Verilog, SystemVerilog, VHDL, assembly
+|`.v`, `.vh`, `.sv`, `.svh`, `.vhd`, `.vhdl`, `.asm`, `.s`, `.nasm`, `.masm`
+
+|Windows resources, IDL, Protocol Buffers
+|`.rc`, `.rc2`, `.dlg`, `.idl`, `.odl`, `.proto`
+
+|Build files
+|`Makefile`, `.mk`, `.mak`, `CMakeLists.txt`, `.cmake`, `Dockerfile`, `Containerfile`,
+`.dockerfile`
+
+|Data and settings
+|`.json`, `.jsonc`, `.yaml`, `.yml`, `.toml`, `.ini`, `.cfg`, `.conf`, `.inf`, `.properties`,
+`.editorconfig`
+
+|Documents
+|`.md`, `.markdown`, `.rst`, `.tex`, `.bib`, `.textile`, `.diff`, `.patch`, `.dot`
+|===
+
+A file with another extension is shown without colors.
+Very large files are not highlighted either (see <<troubleshooting>>, _Performance_).
 
 [[inline-view]]
 ==== Inline view
@@ -2359,10 +2436,12 @@ The following formats are supported:
 * `.tar`, `.tar.gz` / `.tgz`, `.tar.bz2` / `.tbz2`, `.tar.xz` / `.txz` and `.tar.zst` /
   `.tzst`.
 * `.7z`.
+* `.rar`, in every version of the format up to RAR 7, solid archives included.
+  A RAR archive can be read but not changed (see below).
 
 When you open a password-protected ZIP archive (with either the original ZIP encryption,
-"ZipCrypto", or WinZip AES) or 7z archive (including one whose file names are encrypted too),
-OxideMerge asks for its password in an *Archive password* window.
+"ZipCrypto", or WinZip AES), 7z archive or RAR archive (including a 7z or RAR archive whose file
+names are encrypted too), OxideMerge asks for its password in an *Archive password* window.
 If the password is wrong, it asks again; *Cancel* gives up opening the archive.
 The password is kept only in memory, only while the comparison is open, and is overwritten there
 once it is no longer needed.
@@ -2408,10 +2487,16 @@ or because writing them again would break them:
 * signed packages (`.apk`, `.ipa`, `.appx`, `.msix`, `.crx`, `.xpi`, and any zip carrying a
   `META-INF` signature or an `_xmlsignatures` folder), because rewriting them invalidates the
   signature;
+* RAR archives, because the RAR format may be read by other programs but not written.
+  You can compare a RAR archive, and copy files out of it to a folder or to another kind of
+  archive;
 * an archive inside one of these.
 
 OxideMerge refuses archives that would extract to more than 8 GB or more than 500,000 files.
-RAR is not supported.
+
+NOTE: RAR archives are read with the UnRAR library by Alexander Roshal, which comes under its own
+license: it may be used and distributed freely, but not to create a program that writes RAR
+archives.
 
 [[binary-comparison]]
 == Comparing binary files
@@ -5502,9 +5587,10 @@ instead of by content (see <<compare-methods>>).
 This chapter lists what OxideMerge does not support, or supports only in part.
 Review it before you plan a workflow that depends on one of these areas.
 
-* Archives: OxideMerge supports ZIP-based formats, TAR (plain, gzip, bzip2, xz and Zstandard)
-  and 7z, including password-protected ZIP and 7z archives.
-  RAR and archives split into parts (`.zip.001`, `.7z.001`) are not supported.
+* Archives: OxideMerge supports ZIP-based formats, TAR (plain, gzip, bzip2, xz and Zstandard),
+  7z and RAR, including password-protected ZIP, 7z and RAR archives.
+  RAR archives are read-only.
+  Archives split into parts (`.zip.001`, `.7z.001`, `.part1.rar`) are not supported.
 * The text panes are meant for reviewing and merging changes, not as a full editor.
   The inline view does not support editing.
 * Unpacker plugins use external commands. WinMerge plugin DLLs and scripts are not supported.

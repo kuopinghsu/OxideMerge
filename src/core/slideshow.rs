@@ -252,12 +252,12 @@ fn diff_slide(
         );
     }
     out.push_str("<span class=\"pos\">");
-    for p in 0..n {
+    for (p, range) in blk.ranges.iter().enumerate().take(n) {
         let _ = write!(
             out,
             "<b>{}</b>{}",
             esc(side_name(p, n)),
-            esc(&line_range(&blk.ranges[p]))
+            esc(&line_range(range))
         );
     }
     out.push_str("</span>");
@@ -269,8 +269,8 @@ fn diff_slide(
         out.push_str("<col style=\"width:4.2em\"><col>");
     }
     out.push_str("</colgroup><tr>");
-    for p in 0..n {
-        let _ = write!(out, "<th></th><th>{}</th>", esc(&doc.names[p]));
+    for name in doc.names.iter().take(n) {
+        let _ = write!(out, "<th></th><th>{}</th>", esc(name));
     }
     out.push_str("</tr>");
     let shown = rows.start..rows.end.min(rows.start + HUNK_MAX_ROWS);

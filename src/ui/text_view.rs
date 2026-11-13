@@ -5487,7 +5487,7 @@ impl TextView {
                         .doc
                         .path
                         .as_deref()
-                        .map(text::extension)
+                        .map(syntax::key)
                         .or_else(|| p.doc.syntax.clone()),
                     bookmarks: marks.iter().map(|(&l, n)| (l + 1, n.clone())).collect(),
                 })
@@ -6164,7 +6164,7 @@ impl TextView {
                     .doc
                     .path
                     .as_deref()
-                    .map(text::extension)
+                    .map(syntax::key)
                     .or_else(|| p.doc.syntax.clone())
                     .unwrap_or_default();
                 // Check the highlighter's limit before cloning a potentially gigabyte document.
@@ -6819,14 +6819,13 @@ impl TextView {
                     e.saturating_sub(FOLD_CONTEXT)
                 };
                 let fold = self.collapse && hi >= lo + MIN_FOLD && !self.expanded.contains(&lo);
-                for k in r..e {
+                for (k, &row) in self.diff.rows.iter().enumerate().take(e).skip(r) {
                     if fold && k == lo {
                         out.push(ULine::Fold(lo, hi));
                     }
                     if fold && (lo..hi).contains(&k) {
                         continue;
                     }
-                    let row = self.diff.rows[k];
                     let pane = if row.line(1).is_some() { 1 } else { 0 };
                     out.push(ULine::Line {
                         row: k,
@@ -9457,8 +9456,8 @@ impl TextView {
         let mut changed = HashSet::new();
         if let Some(d) = self.keyed() {
             for m in &d.rows {
-                for p in 0..2 {
-                    changed.extend(m.changed[p].iter().map(|&column| (p, column)));
+                for (p, columns) in m.changed.iter().enumerate().take(2) {
+                    changed.extend(columns.iter().map(|&column| (p, column)));
                 }
             }
             return changed;
@@ -10183,12 +10182,13 @@ impl TextView {
                                             }
                                             let safe = matched
                                                 .is_none_or(|m| m.state != RowState::Ambiguous);
-                                            for to in 0..n {
+                                            for (to, pane) in self.panes.iter().enumerate().take(n)
+                                            {
                                                 if to != p
                                                     && aligned.line(to).is_some()
                                                     && ui
                                                         .add_enabled(
-                                                            !self.panes[to].doc.read_only
+                                                            !pane.doc.read_only
                                                                 && value.is_some()
                                                                 && safe,
                                                             egui::Button::new(format!(

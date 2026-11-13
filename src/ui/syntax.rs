@@ -1,7 +1,11 @@
-//! Syntax highlighting via syntect, computed on a background thread.
+//! Syntax highlighting via syntect, computed on a background thread. The languages syntect
+//! does not come with are defined in [`langs`].
+
+mod langs;
 
 use egui::Color32;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
@@ -19,7 +23,9 @@ struct Highlighter {
 fn highlighter() -> &'static Highlighter {
     static H: OnceLock<Highlighter> = OnceLock::new();
     H.get_or_init(|| {
-        let ss = SyntaxSet::load_defaults_newlines();
+        let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
+        langs::add_to(&mut builder);
+        let ss = builder.build();
         let mut ts = ThemeSet::load_defaults();
         let light = ts.themes.remove("InspiredGitHub").unwrap_or_default();
         let dark = ts.themes.remove("base16-ocean.dark").unwrap_or_default();
@@ -76,10 +82,24 @@ pub fn over_budget(lines: &[String], budget: Budget) -> Option<Over> {
         .then_some(Over::Bytes)
 }
 
+/// What names the language of the file at `path` to the functions here: its extension in
+/// lower case, or an extension of the language its whole name stands for (`Dockerfile`,
+/// `CMakeLists.txt`, `Makefile`).
+pub fn key(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match langs::file_name_key(&name) {
+        Some(key) => key.to_string(),
+        None => crate::core::text::extension(path),
+    }
+}
+
 /// The syntax of a file named with extension `ext` whose first line is `first`, as a shebang
 /// can name it; none for plain text.
 fn find_syntax<'a>(ss: &'a SyntaxSet, ext: &str, first: &str) -> Option<&'a SyntaxReference> {
-    ss.find_syntax_by_extension(ext)
+    ss.find_syntax_by_extension(langs::alias(ext).unwrap_or(ext))
         .or_else(|| ss.find_syntax_by_first_line(first))
         .filter(|s| s.name != "Plain Text")
 }
@@ -195,5 +215,96 @@ mod tests {
         assert!(highlight(&["just words".to_string()], "", false).is_none());
         // A known extension of plain text wins over a first line.
         assert!(!has_syntax("txt", &script[0]));
+    }
+
+    /// The pieces of `text`, the lines of a file with extension `ext`, with their colours
+    /// in the light theme.
+    fn colours(ext: &str, text: &str) -> Vec<(String, Color32)> {
+        let lines: Vec<String> = text.lines().map(String::from).collect();
+        let spans = highlight(&lines, ext, false).unwrap_or_else(|| panic!("no syntax: {ext}"));
+        lines
+            .iter()
+            .zip(spans)
+            .flat_map(|(line, spans)| {
+                spans
+                    .into_iter()
+                    .map(move |(range, colour)| (line[range].to_string(), colour))
+            })
+            .collect()
+    }
+
+    fn colour_of(spans: &[(String, Color32)], text: &str) -> Color32 {
+        let found = spans.iter().find(|(t, _)| t.contains(text));
+        found.unwrap_or_else(|| panic!("{text} in {spans:?}")).1
+    }
+
+    /// Each language added to syntect's own is found by its extension and colours a
+    /// comment, a string and a keyword, each differently from plain text.
+    #[test]
+    fn every_added_language_colours_comments_strings_and_keywords() {
+        let plain = colour_of(&colours("rs", "x"), "x");
+        for &(ext, text, keywords) in langs::tests::SAMPLES {
+            assert!(has_syntax(ext, ""), "{ext}");
+            let spans = colours(ext, text);
+            let comment = colour_of(&spans, "note");
+            let string = colour_of(&spans, "x");
+            let keyword = colours(ext, keywords)[0].1;
+            assert_ne!(comment, plain, "{ext}: comment");
+            assert_ne!(string, plain, "{ext}: string");
+            assert_ne!(keyword, plain, "{ext}: keyword in {keywords}");
+            assert_ne!(comment, string, "{ext}");
+            assert_ne!(comment, keyword, "{ext}");
+            // The dark theme has them too.
+            let lines: Vec<String> = text.lines().map(String::from).collect();
+            let dark = highlight(&lines, ext, true).unwrap();
+            let mut seen: Vec<Color32> = dark.iter().flatten().map(|(_, c)| *c).collect();
+            seen.dedup();
+            assert!(seen.len() > 1, "{ext}: {dark:?}");
+        }
+    }
+
+    /// The file extensions other comparison tools highlight are covered: by an added
+    /// language, or by one of syntect's under another extension.
+    #[test]
+    fn common_extensions_have_a_syntax() {
+        let exts = "c cc cpp cxx h hh hpp hxx sma m mm cs d rc rc2 dlg idl odl as asc jsfl java \
+                    js vb bas frm cls ctl pag dsr dob vbs dsm dpr dpk pas dfm inc pp html htm \
+                    asp shtml htd php3 phtml php htt cfm tpl dtd hta vxml xml xsl xslt svg xul \
+                    xsd axl xrc rdf vcproj wxs wxi docbook css caml ml mli fs fsi erl hrl f90 \
+                    f95 f2k f for lsp lisp scm smd ss pl pm cgi pod py pyw rb rbw sbt sc scala \
+                    st pac src pkg sql spec body sps spb sf sp md toml yaml yml ini cmake ps1 \
+                    psm1 kt kts swift go lua v sv svh vhd vhdl asm s proto ts tsx mk sh json rs";
+        for ext in exts.split_whitespace() {
+            assert!(has_syntax(ext, ""), "{ext}");
+        }
+        // The same language, whichever of its extensions names it.
+        let lines = ["SELECT 'x' FROM t; -- note".to_string()];
+        let sql = highlight(&lines, "sql", false);
+        assert_eq!(highlight(&lines, "sps", false), sql);
+        assert_ne!(highlight(&lines, "c", false), sql);
+    }
+
+    /// A file whose whole name tells its language is highlighted as that.
+    #[test]
+    fn whole_file_names_name_their_language() {
+        for (name, ext) in [
+            ("Dockerfile", "dockerfile"),
+            ("Dockerfile.dev", "dockerfile"),
+            ("app.dockerfile", "dockerfile"),
+            ("Containerfile", "dockerfile"),
+            ("CMakeLists.txt", "cmake"),
+            ("Makefile", "makefile"),
+            ("GNUmakefile", "makefile"),
+            ("SConstruct", "py"),
+            ("Cargo.lock", "toml"),
+            (".editorconfig", "ini"),
+            ("main.RS", "rs"),
+            ("notes.txt", "txt"),
+            ("README", ""),
+        ] {
+            let key = key(&Path::new("dir").join(name));
+            assert_eq!(key, ext, "{name}");
+            assert_eq!(has_syntax(&key, ""), !["txt", ""].contains(&ext), "{name}");
+        }
     }
 }

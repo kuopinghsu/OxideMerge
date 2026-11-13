@@ -16,3 +16,4 @@ tests/fixtures/reports/** -text
 *.jpg binary
 *.bin binary
 *.pdf binary
+*.rar binary

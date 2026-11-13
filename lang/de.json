@@ -617,6 +617,7 @@
   "msg.cannot_delete": "{file} konnte nicht gelöscht werden",
   "msg.cannot_write": "{file} konnte nicht geschrieben werden",
   "msg.archive_not_writable": "{file} kann nicht zurückgeschrieben werden: Es ist ein signiertes Paket, das diese App nur schreibgeschützt öffnet.",
+  "msg.archive_rar_not_writable": "{file} kann nicht zurückgeschrieben werden: Ein RAR-Archiv kann nur gelesen werden, daher öffnet diese App es schreibgeschützt.",
   "msg.archive_read_only": "{file} ist schreibgeschützt, daher wurden die Änderungen nicht zurückgeschrieben.",
   "msg.archive_changed": "{file} wurde nach dem Öffnen auf der Festplatte geändert, daher wurden die Änderungen nicht zurückgeschrieben. Vergleichen Sie erneut, um die neue Version zu bearbeiten.",
   "msg.archive_write_failed": "Die Änderungen konnten nicht in {file} zurückgeschrieben werden.",

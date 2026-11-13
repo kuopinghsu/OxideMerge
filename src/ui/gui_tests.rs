@@ -1945,8 +1945,8 @@ fn a_notebook_merged_into_an_output_file_is_merged_as_the_file_itself() {
         }),
     );
     let v = gui.text_view();
-    for p in 0..3 {
-        assert!(!v.panes[p].doc.compare_only, "pane {p} was read as cells");
+    for (p, pane) in v.panes.iter().enumerate().take(3) {
+        assert!(!pane.doc.compare_only, "pane {p} was read as cells");
     }
     assert!(!v.panes[1].doc.read_only);
     gui.menu(&[tr("menu.merge"), tr("cmd.auto_merge")]);
@@ -6712,6 +6712,48 @@ fn folder_chips_count_each_kind_and_hide_it() {
     gui.click(&format!("{}  3", tr("analysis.all")));
     gui.frames(3);
     assert!(gui.shows("same.txt") && gui.shows("gone.txt"));
+}
+
+/// The menus of the folder toolbar's chips (compare method, rules, filter) are as wide as what
+/// they list needs, not as wide as the window has room for.
+#[test]
+fn the_folder_toolbars_menus_are_no_wider_than_what_they_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            (
+                "left/a.txt",
+                "a
+",
+            ),
+            (
+                "right/a.txt",
+                "b
+",
+            ),
+        ],
+    );
+    let mut gui = Gui::start("folder_menus", compare(&[d.join("left"), d.join("right")]));
+    gui.settle();
+    for chip in ["label.method", "label.rules", "label.filter"] {
+        let at = gui
+            .widgets
+            .iter()
+            .find(|w| w.label.starts_with(tr(chip)))
+            .unwrap_or_else(|| panic!("{chip}: no chip"))
+            .rect;
+        gui.click_at(at.center());
+        gui.frames(3);
+        let menu = popups(&gui)
+            .into_iter()
+            .max_by(|a, b| a.width().total_cmp(&b.width()))
+            .unwrap_or_else(|| panic!("{chip}: no menu"));
+        assert!(menu.width() <= 300.0, "{chip}: {} wide", menu.width());
+        gui.key(Modifiers::NONE, Key::Escape);
+        gui.frames(2);
+    }
 }
 
 #[test]

@@ -13,13 +13,16 @@ ignore = [
   { id = "RUSTSEC-2026-0368", reason = "zip: no symbolic links are created; link entries are extracted as small regular files" },
   { id = "RUSTSEC-2026-0369", reason = "zip: no permissions are applied to extracted files" },
   { id = "RUSTSEC-2025-0141", reason = "bincode (unmaintained) loads syntect's built-in syntax definitions only" },
-  { id = "RUSTSEC-2024-0320", reason = "yaml-rust (unmaintained) comes with syntect, which loads no YAML syntax files, and reads YAML for the opt-in semantic compare: one document of at most 4 MiB, driven event by event with nesting and node limits, without aliases" },
+  { id = "RUSTSEC-2024-0320", reason = "yaml-rust (unmaintained) comes with syntect, which loads only the syntax definitions built into the program (src/ui/syntax/langs.rs), and reads YAML for the opt-in semantic compare: one document of at most 4 MiB, driven event by event with nesting and node limits, without aliases" },
   { id = "RUSTSEC-2026-0192", reason = "ttf-parser (unmaintained) reads the metrics of the bundled and installed system fonts to line up fallback fonts; the fonts come from the program and the system" },
   { id = "RUSTSEC-2026-0370", reason = "zvariant (unmaintained as a standalone crate) comes with zbus, used by the file dialogs and accessibility on Linux" },
   { id = "RUSTSEC-2026-0371", reason = "zbus_names: as above" },
   { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: as above" },
 ]
 
+# Not seen by this check: the `unrar_sys` crate, itself MIT OR Apache-2.0, compiles in the UnRAR
+# library under the UnRAR license (its `vendor/unrar/license.txt`), which allows any use and
+# distribution to read RAR archives but not writing them. The README states it.
 [licenses]
 confidence-threshold = 0.9
 allow = [

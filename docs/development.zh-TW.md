@@ -16,7 +16,8 @@
 
 ## 從原始碼建置
 
-請先透過 [rustup](https://rustup.rs/) 安裝 Rust 工具鏈。Linux 另需要 C 編譯器。
+請先透過 [rustup](https://rustup.rs/) 安裝 Rust 工具鏈。Linux 另需要 C 與 C++ 編譯器
+（`gcc` 與 `g++`，Fedora 系列為 `gcc-c++`）：讀取 RAR 壓縮檔的 UnRAR 程式庫以 C++ 撰寫。
 X11、Wayland、鍵盤與 OpenGL 函式庫會在程式啟動時才載入，
 因此建置時不需要安裝這些函式庫的開發套件。
 

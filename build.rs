@@ -14,6 +14,10 @@ fn main() {
     for key in ["SOURCE_DATE_EPOCH", "GITHUB_SHA"] {
         println!("cargo:rerun-if-env-changed={key}");
     }
+    // The UnRAR library calls into advapi32, which the `unrar_sys` crate does not link.
+    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
+        println!("cargo:rustc-link-lib=advapi32");
+    }
     watch_git_inputs();
     let date = build_date();
     let hash = git(&["rev-parse", "--short=7", "HEAD"])

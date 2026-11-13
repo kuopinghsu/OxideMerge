@@ -238,17 +238,16 @@ struct Entry {
 }
 
 pub(super) fn is_hidden(e: &std::fs::DirEntry) -> bool {
-    if e.file_name().to_string_lossy().starts_with('.') {
-        return true;
-    }
+    let dotted = e.file_name().to_string_lossy().starts_with('.');
+    // Windows also marks a file hidden with an attribute, whatever its name.
     #[cfg(windows)]
-    {
+    if !dotted {
         use std::os::windows::fs::MetadataExt;
         if let Ok(m) = e.metadata() {
             return m.file_attributes() & 0x2 != 0;
         }
     }
-    false
+    dotted
 }
 
 /// Start of the name of the folder a folder merge keeps its undo copies in, at the top of the

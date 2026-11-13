@@ -1,7 +1,10 @@
 //! Archive support: archives are extracted to a temporary folder and compared as folders.
-//! Zip based formats, tar (plain or compressed with gzip, bzip2, xz or Zstandard) and 7z are
-//! supported, password-protected zip and 7z archives included. Edits saved into the extracted
-//! copy are written back with [`repack`], which keeps every entry left alone as it was.
+//! Zip based formats, tar (plain or compressed with gzip, bzip2, xz or Zstandard), 7z and RAR
+//! are supported, password-protected zip, 7z and RAR archives included. Edits saved into the
+//! extracted copy are written back with [`repack`], which keeps every entry left alone as it
+//! was; a RAR archive is only read, as nothing free writes one.
+
+mod rar;
 
 use super::fsutil;
 use anyhow::{Context, Result};
@@ -26,9 +29,10 @@ enum Kind {
     TarXz,
     TarZst,
     SevenZ,
+    Rar,
 }
 
-/// File name endings of the tar and 7z formats; compound ones first.
+/// File name endings of the tar, 7z and RAR formats; compound ones first.
 const SUFFIXES: &[(&str, Kind)] = &[
     (".tar.gz", Kind::TarGz),
     (".tgz", Kind::TarGz),
@@ -41,6 +45,7 @@ const SUFFIXES: &[(&str, Kind)] = &[
     (".tzst", Kind::TarZst),
     (".tar", Kind::Tar),
     (".7z", Kind::SevenZ),
+    (".rar", Kind::Rar),
 ];
 
 /// The password of an encrypted archive, wiped from memory once dropped.
@@ -275,8 +280,8 @@ fn find_extraction<'a>(all: &'a mut [Extraction], dir: &Path) -> Option<&'a mut 
         .find(|e| e.dir == dir || real.is_some() && e.real == real)
 }
 
-/// Extracts the archive at `path` to a new temporary folder. An encrypted zip or 7z is read
-/// with the password [`give_password`] gave for it, failing with [`NeedsPassword`] without
+/// Extracts the archive at `path` to a new temporary folder. An encrypted zip, 7z or RAR is
+/// read with the password [`give_password`] gave for it, failing with [`NeedsPassword`] without
 /// one or with a wrong one.
 pub fn extract_to_temp(path: &Path) -> Result<tempfile::TempDir> {
     extract_with(path, LIMITS)
@@ -352,7 +357,91 @@ fn extract(
             },
         )
         .map_err(|e| sevenz_error(path, password, e)),
+        Kind::Rar => extract_rar(path, dir, budget, written, password),
     }
+}
+
+/// Whether `name`, the name of an archive's entry, stays in the archive: no step of it
+/// leads up or to a root.
+fn name_inside(name: &Path) -> bool {
+    name.components().all(|c| matches!(c, Component::Normal(_)))
+}
+
+/// Extracts the RAR archive at `path`, of any version of the format (see [`rar`]). The
+/// files are written here from the data the UnRAR library unpacks, so a symbolic link in
+/// the archive is left out, and an entry stored as a copy of another is copied from it. A
+/// set of volumes is turned down, whichever of them `path` is.
+fn extract_rar(
+    path: &Path,
+    dir: &Path,
+    budget: &Budget,
+    written: &std::cell::RefCell<HashSet<PathBuf>>,
+    password: Option<&Secret>,
+) -> Result<()> {
+    // Only a RAR 5 archive can tell a wrong password; an older one decrypts to data that
+    // does not check out, which is taken for one where the data is `encrypted`.
+    let failed = |e: rar::Error, encrypted: bool| match e {
+        rar::Error::NeedsPassword => needs_password(path, password),
+        rar::Error::BadData if encrypted && password.is_some() => needs_password(path, password),
+        rar::Error::TooLarge => {
+            budget.bytes.set(None);
+            anyhow::anyhow!("archive too large")
+        }
+        e => anyhow::anyhow!("{}: {e}", path.display()),
+    };
+    let mut ar =
+        rar::Reader::open(path, password.map(|p| p.as_str())).map_err(|e| failed(e, false))?;
+    let names_encrypted = ar.names_encrypted();
+    while let Some(entry) = ar.next().map_err(|e| failed(e, names_encrypted))? {
+        budget.entry()?;
+        let encrypted = entry.encrypted || names_encrypted;
+        // A volume with encrypted names may only show as one by a file going on in the next.
+        if entry.split {
+            return Err(failed(rar::Error::Volumes, false));
+        }
+        // A name leading out of the archive is not extracted, as for a zip.
+        let rel = clean(&entry.name);
+        if !name_inside(&entry.name) || apple_metadata(&rel) || rel.as_os_str().is_empty() {
+            ar.skip().map_err(|e| failed(e, encrypted))?;
+            continue;
+        }
+        let out = dir.join(&rel);
+        if entry.dir {
+            ar.skip().map_err(|e| failed(e, encrypted))?;
+            std::fs::create_dir_all(&out)?;
+        } else if let Some(link) = &entry.link {
+            ar.skip().map_err(|e| failed(e, encrypted))?;
+            // Only what was extracted before, a regular file, can be the one to copy.
+            let from = match link {
+                rar::Link::SameAs(name) if name_inside(name) => clean(name),
+                _ => continue,
+            };
+            if !written.borrow().contains(&from) || !dir.join(&from).is_file() {
+                continue;
+            }
+            Budget::take(&budget.bytes, std::fs::metadata(dir.join(&from))?.len())?;
+            if let Some(p) = out.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            std::fs::copy(dir.join(&from), &out)?;
+        } else {
+            if let Some(p) = out.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            let file = std::fs::File::create(&out)?;
+            // The header's size is only what the archive says: what is written counts.
+            let limit = budget.bytes.get().unwrap_or(0);
+            let n = ar.extract(file, limit).map_err(|e| failed(e, encrypted))?;
+            Budget::take(&budget.bytes, n)?;
+            if let Some(time) = entry.modified {
+                let file = std::fs::File::options().write(true).open(&out)?;
+                // Not every file system keeps a time: the file is extracted all the same.
+                let _ = file.set_modified(time);
+            }
+        }
+        written.borrow_mut().insert(rel);
+    }
+    Ok(())
 }
 
 fn sevenz_password(password: Option<&Secret>) -> sevenz_rust2::Password {
@@ -1085,10 +1174,11 @@ fn staging(dir: &Path) -> Result<tempfile::NamedTempFile> {
 const SIGNED_EXTS: &[&str] = &["apk", "ipa", "appx", "msix", "crx", "xpi"];
 
 /// Whether edits to an extraction of `path` can be written back with [`repack`]. Not for a
-/// signed package, whose signature a change would break.
+/// signed package, whose signature a change would break, nor for a RAR archive, which can
+/// only be read.
 pub fn writable(path: &Path) -> bool {
     match kind(path) {
-        None => false,
+        None | Some(Kind::Rar) => false,
         Some(Kind::Zip) => {
             !SIGNED_EXTS.contains(&super::text::extension(path).as_str()) && !zip_signed(path)
         }
@@ -1237,6 +1327,9 @@ pub fn repack_all(path: &Path, dir: &Path) -> Result<Vec<PathBuf>> {
 pub fn repack(path: &Path, dir: &Path) -> Result<bool> {
     use crate::i18n::{tr, trf};
     let file = || ("file", path.display().to_string());
+    if kind(path) == Some(Kind::Rar) {
+        anyhow::bail!(trf("msg.archive_rar_not_writable", &[file()]));
+    }
     if !writable(path) {
         anyhow::bail!(trf("msg.archive_not_writable", &[file()]));
     }
@@ -1339,7 +1432,7 @@ fn repack_into(
             (enc.finish().context("finish zstd")?, changed)
         }
         Some(Kind::SevenZ) => return repack_7z(path, dir, out_dir, ours, password),
-        None => anyhow::bail!("{}: cannot be written", path.display()),
+        Some(Kind::Rar) | None => anyhow::bail!("{}: cannot be written", path.display()),
     };
     Ok(changed.then_some(tmp))
 }
@@ -2353,6 +2446,189 @@ mod tests {
         assert_eq!(got[1].0, "edit.txt");
         assert_ne!(got[1].1, 1_000_000_000);
         assert_eq!(got[1].2, 0o640);
+    }
+
+    /// A RAR archive kept for the tests: `v4` ones are in the format of RAR 4 and older,
+    /// `v5` ones in the one of RAR 5 and later (see `tests/fixtures/rar/README.md`).
+    fn rar_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let work = tempfile::tempdir().unwrap();
+        let from = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rar")
+            .join(name);
+        let path = work.path().join(name);
+        std::fs::copy(from, &path).unwrap();
+        (work, path)
+    }
+
+    /// The tree every `v5` fixture holds, compressed: files, a folder with a file and an
+    /// empty folder.
+    fn assert_rar_tree(dir: &Path) {
+        let read = |rel: &str| std::fs::read_to_string(dir.join(rel)).unwrap();
+        assert_eq!(read("dir/a.txt"), "hello\n");
+        assert_eq!(read("keep.txt"), "keep\n");
+        let big = read("big.txt");
+        assert_eq!(big.lines().count(), 300);
+        assert!(big.ends_with("line 300 of a file long enough to be compressed\n"));
+        assert!(dir.join("sub").is_dir());
+    }
+
+    /// A RAR archive opens as a folder, in the format of RAR 5 (solid or not) and in the
+    /// older one.
+    #[test]
+    fn rar_archives_are_extracted() {
+        for name in ["v5.rar", "v5-solid.rar"] {
+            let (_work, path) = rar_fixture(name);
+            assert!(is_archive(&path), "{name}");
+            let extracted = extract_to_temp(&path).unwrap();
+            assert_rar_tree(extracted.path());
+        }
+        let (_work, path) = rar_fixture("v4.rar");
+        assert!(is_archive(&path));
+        let extracted = extract_to_temp(&path).unwrap();
+        let version = extracted.path().join("VERSION");
+        assert_eq!(std::fs::read_to_string(&version).unwrap(), "unrar-0.4.0");
+        // A file keeps the time the archive has for it: this one is from 2015.
+        let modified = std::fs::metadata(&version).unwrap().modified().unwrap();
+        let year_2020 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        assert!(modified < year_2020, "{modified:?}");
+        // The extension is what makes it one, in any case.
+        let upper = path.with_file_name("V4.RAR");
+        std::fs::rename(&path, &upper).unwrap();
+        assert!(is_archive(&upper));
+        assert!(extract_to_temp(&upper).is_ok());
+    }
+
+    /// An encrypted RAR archive, with its names encrypted too or not, asks for its password
+    /// and opens with it, in both formats.
+    #[test]
+    fn password_protected_rar_opens_with_its_password() {
+        let needs = |path: &Path| {
+            let e = extract_to_temp(path).unwrap_err();
+            let e = e.downcast_ref::<NeedsPassword>().map(|n| n.wrong);
+            e.unwrap_or_else(|| panic!("{}: not a password error", path.display()))
+        };
+        for name in ["v5-password.rar", "v5-names.rar"] {
+            let (_work, path) = rar_fixture(name);
+            assert!(!needs(&path), "{name}: none given yet");
+            give_password(&path, Zeroizing::new("wrong".into()));
+            assert!(needs(&path), "{name}: a wrong one");
+            give_password(&path, Zeroizing::new("secret".into()));
+            let extracted = extract_to_temp(&path).unwrap();
+            assert_rar_tree(extracted.path());
+            forget_password(&path);
+        }
+        // The older format can't tell a wrong password: it shows in the data.
+        let (_work, path) = rar_fixture("v4-password.rar");
+        assert!(!needs(&path));
+        give_password(&path, Zeroizing::new("wrong".into()));
+        assert!(needs(&path));
+        give_password(&path, Zeroizing::new("unrar".into()));
+        let extracted = extract_to_temp(&path).unwrap();
+        let read = std::fs::read_to_string(extracted.path().join(".gitignore")).unwrap();
+        assert_eq!(read, "target\nCargo.lock\n");
+        forget_password(&path);
+        // A password need not be ASCII.
+        let (_work, path) = rar_fixture("v5-unicode-password.rar");
+        assert!(!needs(&path));
+        give_password(&path, Zeroizing::new("pass".into()));
+        assert!(needs(&path));
+        give_password(&path, Zeroizing::new("p\u{e4}ss\u{5bc6}".into()));
+        let extracted = extract_to_temp(&path).unwrap();
+        let read = std::fs::read_to_string(extracted.path().join("keep.txt")).unwrap();
+        assert_eq!(read, "keep\n");
+        forget_password(&path);
+    }
+
+    /// A file stored once for several entries with the same contents comes out as each of
+    /// them; a link to a folder is left out, so that nothing is ever written through one.
+    #[test]
+    fn rar_copies_are_extracted_and_links_are_not() {
+        let (_work, path) = rar_fixture("v5-copies.rar");
+        let extracted = extract_to_temp(&path).unwrap();
+        let read = |rel: &str| std::fs::read_to_string(extracted.path().join(rel)).unwrap();
+        assert_eq!(read("one.txt").lines().count(), 4000);
+        assert_eq!(read("one.txt"), read("two.txt"));
+        assert_eq!(read("other.txt"), "other\n");
+
+        let (_work, path) = rar_fixture("v5-link.rar");
+        let extracted = extract_to_temp(&path).unwrap();
+        let real = extracted.path().join("real/a.txt");
+        assert_eq!(std::fs::read_to_string(real).unwrap(), "hello\n");
+        assert!(std::fs::symlink_metadata(extracted.path().join("link")).is_err());
+    }
+
+    /// A RAR archive is only read: it is not offered for editing, and writing an edited
+    /// copy back is refused, leaving the archive as it was.
+    #[test]
+    fn rar_archives_are_not_written_back() {
+        let (_work, path) = rar_fixture("v5.rar");
+        let before = std::fs::read(&path).unwrap();
+        assert!(!writable(&path));
+        assert!(!editable(&path));
+        let extracted = extract_to_temp(&path).unwrap();
+        std::fs::write(extracted.path().join("keep.txt"), "changed\n").unwrap();
+        let e = super::repack(&path, extracted.path()).unwrap_err();
+        let key = "msg.archive_rar_not_writable";
+        let file = ("file", path.display().to_string());
+        assert_eq!(e.to_string(), crate::i18n::trf(key, &[file]));
+        assert!(super::repack_all(&path, extracted.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A volume of a RAR archive in several is turned down, whatever it is named, before
+    /// anything of it is read.
+    #[test]
+    fn rar_volumes_are_refused() {
+        let (_work, path) = rar_fixture("volume.part1.rar");
+        let renamed = path.with_file_name("plain.rar");
+        std::fs::copy(&path, &renamed).unwrap();
+        for volume in [&path, &renamed] {
+            let e = extract_to_temp(volume).unwrap_err();
+            assert!(e.to_string().contains("several volumes"), "{e:#}");
+        }
+        // So is one whose names are encrypted, once its password is given.
+        let (_work, path) = rar_fixture("volume-names.part1.rar");
+        let renamed = path.with_file_name("plain.rar");
+        std::fs::copy(&path, &renamed).unwrap();
+        let e = extract_to_temp(&renamed).unwrap_err();
+        assert!(e.is::<NeedsPassword>(), "{e:#}");
+        give_password(&renamed, Zeroizing::new("secret".into()));
+        let e = extract_to_temp(&renamed).unwrap_err();
+        assert!(e.to_string().contains("several volumes"), "{e:#}");
+        forget_password(&renamed);
+    }
+
+    /// A file that is not a RAR archive, or a cut-off one, fails without a password prompt;
+    /// the limits on what an archive unpacks to hold for a RAR too.
+    #[test]
+    fn broken_and_oversized_rar_archives_fail() {
+        let (work, path) = rar_fixture("v5.rar");
+        let bytes = std::fs::read(&path).unwrap();
+        let not_rar = work.path().join("text.rar");
+        std::fs::write(&not_rar, "not an archive\n").unwrap();
+        let cut = work.path().join("cut.rar");
+        std::fs::write(&cut, &bytes[..bytes.len() / 2]).unwrap();
+        for broken in [&not_rar, &cut] {
+            let e = extract_to_temp(broken).unwrap_err();
+            assert!(!e.is::<NeedsPassword>(), "{e:#}");
+            // Nor with a password kept for it: the damage is not taken for a wrong one.
+            give_password(broken, Zeroizing::new("secret".into()));
+            let e = extract_to_temp(broken).unwrap_err();
+            assert!(!e.is::<NeedsPassword>(), "{e:#}");
+            forget_password(broken);
+        }
+        let small = Limits {
+            bytes: 1000,
+            entries: 100,
+        };
+        let e = extract_with(&path, small).unwrap_err();
+        assert!(e.to_string().contains("unpacks to more than"), "{e:#}");
+        let few = Limits {
+            bytes: 1 << 20,
+            entries: 2,
+        };
+        let e = extract_with(&path, few).unwrap_err();
+        assert!(e.to_string().contains("unpacks to more than"), "{e:#}");
     }
 
     /// An unchanged 7z is not rewritten either.
