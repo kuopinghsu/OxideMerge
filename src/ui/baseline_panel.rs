@@ -569,7 +569,7 @@ fn open_change(result: &ResultSet, change: &baseline::ReleaseChange) -> Captured
             let mut doc = text::doc_from_bytes(None, bytes, None);
             doc.read_only = true;
             doc.description = Some(format!("{key} · {}", &capture.metadata.fingerprint[..12]));
-            doc.syntax = Some(text::extension(std::path::Path::new(key)));
+            doc.syntax = Some(crate::ui::syntax::key(std::path::Path::new(key)));
             doc
         })
         .collect();

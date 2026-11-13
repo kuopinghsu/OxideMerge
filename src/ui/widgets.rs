@@ -1258,6 +1258,202 @@ pub fn menu<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     })
 }
 
+// ---------- pick lists ----------
+//
+// The drop-down of a chip button, and any other short list to pick one thing from: a rounded
+// panel of rows as wide as the list, the one chosen tinted and checked, with small captions
+// over its groups.
+
+/// Height of one row of a pick list.
+pub const PICK_ROW_HEIGHT: f32 = 28.0;
+/// Room at the left of a pick list's rows for a check mark or an icon.
+const PICK_GUTTER: f32 = 28.0;
+/// Room at the right of a row for a switch.
+const PICK_SWITCH: f32 = 40.0;
+
+/// The frame of a pick list's popup.
+pub fn pick_frame(ui: &Ui) -> egui::Frame {
+    egui::Frame::popup(ui.style())
+        .corner_radius(theme::radius::LG)
+        .inner_margin(Margin::same(6))
+}
+
+/// How wide a pick list is to show `labels` in full, within `min` and `max`.
+pub fn pick_width<'a>(
+    ui: &Ui,
+    labels: impl IntoIterator<Item = &'a str>,
+    min: f32,
+    max: f32,
+) -> f32 {
+    let font = FontId::proportional(theme::size::CONTROL);
+    let longest = labels
+        .into_iter()
+        .map(|l| {
+            ui.painter()
+                .layout_no_wrap(l.to_owned(), font.clone(), Color32::PLACEHOLDER)
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    (longest + PICK_GUTTER + PICK_SWITCH).clamp(min, max)
+}
+
+/// The contents of a pick list `width` wide, scrolling like those of a [`menu`].
+pub fn pick_list<R>(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    menu_scroll(ui, |ui| {
+        ui.set_width(width);
+        ui.spacing_mut().item_spacing.y = 1.0;
+        add(ui)
+    })
+}
+
+/// A small caption over a group of a pick list's rows.
+pub fn pick_caption(ui: &mut Ui, text: &str) {
+    let p = pal(ui);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
+    ui.painter().text(
+        egui::pos2(rect.left() + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(theme::size::CAPTION),
+        p.text_dim,
+    );
+}
+
+/// A line between two groups of a pick list.
+pub fn pick_sep(ui: &mut Ui) {
+    let p = pal(ui);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 9.0), Sense::hover());
+    ui.painter().hline(
+        rect.x_range().shrink(4.0),
+        rect.center().y,
+        Stroke::new(1.0_f32, p.border),
+    );
+}
+
+/// The background and the left mark of one row of a pick list; where its label starts, and
+/// the response to its clicks.
+fn pick_row_base(
+    ui: &mut Ui,
+    on: bool,
+    icon: Option<Icon>,
+    role: Role,
+    label: &str,
+) -> (Rect, Response) {
+    let p = pal(ui);
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), PICK_ROW_HEIGHT),
+        Sense::click(),
+    );
+    resp.widget_info(|| WidgetInfo::selected(role, ui.is_enabled(), on, label));
+    if ui.is_rect_visible(rect) {
+        let fill = if on {
+            p.accent_soft
+        } else if resp.is_pointer_button_down_on() {
+            p.control_active
+        } else if resp.hovered() || resp.has_focus() {
+            p.control_hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, theme::radius::SM, fill);
+        let mark = Rect::from_center_size(
+            egui::pos2(rect.left() + 14.0, rect.center().y),
+            Vec2::splat(14.0),
+        );
+        if on {
+            icons::paint(ui.painter(), mark, Icon::Check, p.accent);
+        } else if let Some(icon) = icon {
+            icons::paint(ui.painter(), mark, icon, p.text_dim);
+        }
+    }
+    (rect, resp.on_hover_cursor(egui::CursorIcon::PointingHand))
+}
+
+/// The label of a pick list's row at `rect`, cut short if it is too long, `right` short of
+/// the row's end.
+fn pick_label(ui: &Ui, rect: Rect, label: &str, font: FontId, color: Color32, right: f32) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let galley = egui::WidgetText::from(label).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        (rect.width() - PICK_GUTTER - right).max(24.0),
+        font,
+    );
+    ui.painter().galley(
+        egui::pos2(
+            rect.left() + PICK_GUTTER,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        color,
+    );
+}
+
+/// One choice of a pick list: tinted and checked when it is the one chosen (`on`), with
+/// `icon` in the check mark's place otherwise. `mono` shows a pattern or a path as typed.
+pub fn pick_row(ui: &mut Ui, on: bool, icon: Option<Icon>, label: &str, mono: bool) -> Response {
+    let p = pal(ui);
+    let (rect, resp) = pick_row_base(ui, on, icon, Role::CheckBox, label);
+    let font = if mono {
+        FontId::monospace(theme::size::SMALL)
+    } else {
+        FontId::proportional(theme::size::CONTROL)
+    };
+    pick_label(ui, rect, label, font, p.text, 10.0);
+    resp
+}
+
+/// A setting of a pick list that is on or off apart from its choices: a row with a switch at
+/// its right.
+pub fn pick_switch(ui: &mut Ui, on: bool, icon: Icon, label: &str) -> Response {
+    let p = pal(ui);
+    let (rect, resp) = pick_row_base(ui, false, Some(icon), Role::CheckBox, label);
+    resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, ui.is_enabled(), on, label));
+    pick_label(
+        ui,
+        rect,
+        label,
+        FontId::proportional(theme::size::CONTROL),
+        p.text,
+        PICK_SWITCH,
+    );
+    if ui.is_rect_visible(rect) {
+        let track = Rect::from_center_size(
+            egui::pos2(rect.right() - 22.0, rect.center().y),
+            Vec2::new(26.0, 14.0),
+        );
+        let fill = if on { p.accent } else { p.border_strong };
+        ui.painter().rect_filled(track, 7, fill);
+        let x = if on {
+            track.right() - 7.0
+        } else {
+            track.left() + 7.0
+        };
+        ui.painter()
+            .circle_filled(egui::pos2(x, track.center().y), 5.0, p.on_accent);
+    }
+    resp
+}
+
+/// Something a pick list does rather than a choice of it, below its choices.
+pub fn pick_action(ui: &mut Ui, icon: Icon, label: &str) -> Response {
+    let p = pal(ui);
+    let (rect, resp) = pick_row_base(ui, false, Some(icon), Role::Button, label);
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), label));
+    pick_label(
+        ui,
+        rect,
+        label,
+        FontId::proportional(theme::size::CONTROL),
+        p.text,
+        10.0,
+    );
+    resp
+}
+
 /// The contents of a popup list styled its own way, scrolling like those of a [`menu`].
 pub fn menu_scroll<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     let window = ui.ctx().content_rect();
@@ -1549,7 +1745,12 @@ pub fn menu_check(ui: &mut Ui, on: bool, label: &str, keys: &str) -> Response {
     }
     let r = ui.add(button);
     if on && ui.is_rect_visible(r.rect) {
-        let color = ui.style().interact(&r).text_color();
+        // In the accent color, as the mark of what is chosen in a pick list.
+        let color = if ui.is_enabled() {
+            pal(ui).accent
+        } else {
+            ui.style().interact(&r).text_color()
+        };
         let x = r.rect.left() + ui.spacing().button_padding.x;
         let c = egui::pos2(x + MENU_CHECK_GUTTER * 0.4, r.rect.center().y);
         let s = MENU_CHECK_GUTTER * 0.22;

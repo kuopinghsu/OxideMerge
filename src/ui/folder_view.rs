@@ -166,12 +166,12 @@ impl Tally {
                 &[("n", self.different.to_string())],
             ));
         }
-        for s in 0..n {
-            if self.only[s] > 0 {
+        for (s, &only) in self.only.iter().enumerate().take(n) {
+            if only > 0 {
                 parts.push(trf(
                     "folder.n_only",
                     &[
-                        ("n", self.only[s].to_string()),
+                        ("n", only.to_string()),
                         ("side", side_name(s, n).to_string()),
                     ],
                 ));
@@ -198,6 +198,24 @@ fn only_side(it: &DirItem, n: usize) -> Option<usize> {
         _ => None,
     }
 }
+
+/// Narrowest the filter drop-down opens: its field takes a few patterns.
+const FILTER_MENU_MIN_WIDTH: f32 = 240.0;
+/// Narrowest and widest the menus of the method and rules chips open.
+const PICK_MENU_MIN_WIDTH: f32 = 200.0;
+const PICK_MENU_MAX_WIDTH: f32 = 360.0;
+
+/// The words of a menu command as a caption or a row: without the dots that say it opens a
+/// window.
+fn plain_label(label: &str) -> String {
+    label
+        .trim_end_matches("...")
+        .trim_end_matches('\u{2026}')
+        .trim_end()
+        .to_string()
+}
+/// Widest the filter chip's menu opens: a longer filter is cut short in its list.
+const FILTER_MENU_MAX_WIDTH: f32 = 420.0;
 
 /// A popup under the button `r` with the id `id`, opened and closed by clicking the button.
 fn popup_below<'a>(
@@ -3399,17 +3417,32 @@ impl FolderView {
                     !compact,
                 )
                 .on_hover_text(tr("tip.click_change"));
-                popup_below(&r, method_id, close).show(|ui| {
-                    widgets::menu(ui, |ui| {
+                let frame = widgets::pick_frame(ui);
+                popup_below(&r, method_id, close).frame(frame).show(|ui| {
+                    let width = widgets::pick_width(
+                        ui,
+                        folder::CompareMethod::ALL
+                            .iter()
+                            .map(|m| tr(m.key()))
+                            .chain([tr("label.recursive")]),
+                        r.rect.width().max(PICK_MENU_MIN_WIDTH),
+                        PICK_MENU_MAX_WIDTH,
+                    );
+                    widgets::pick_list(ui, width, |ui| {
+                        widgets::pick_caption(ui, tr("label.method"));
                         for m in folder::CompareMethod::ALL {
                             let on = self.fopts.method == m;
-                            if widgets::menu_check(ui, on, tr(m.key()), "").clicked() && !on {
+                            if widgets::pick_row(ui, on, None, tr(m.key()), false).clicked() && !on
+                            {
                                 new_options = Some((m, self.fopts.recursive));
                             }
                         }
-                        ui.separator();
+                        widgets::pick_sep(ui);
+                        // Apart from the methods: it is on or off with any of them.
                         let recursive = self.fopts.recursive;
-                        if widgets::menu_check(ui, recursive, tr("label.recursive"), "").clicked() {
+                        if widgets::pick_switch(ui, recursive, Icon::Folder, tr("label.recursive"))
+                            .clicked()
+                        {
                             new_options = Some((self.fopts.method, !recursive));
                         }
                     })
@@ -3427,10 +3460,27 @@ impl FolderView {
                 if r.clicked() {
                     self.rule_names = rules::list().into_iter().map(|s| s.name).collect();
                 }
-                popup_below(&r, rules_id, close).show(|ui| {
-                    widgets::menu(ui, |ui| {
-                        if widgets::menu_check(ui, self.rules.is_empty(), tr("rules.none"), "")
-                            .clicked()
+                popup_below(&r, rules_id, close).frame(frame).show(|ui| {
+                    let edit = plain_label(tr("cmd.edit_rules"));
+                    let width = widgets::pick_width(
+                        ui,
+                        self.rule_names
+                            .iter()
+                            .map(String::as_str)
+                            .chain([tr("rules.none"), edit.as_str()]),
+                        r.rect.width().max(PICK_MENU_MIN_WIDTH),
+                        PICK_MENU_MAX_WIDTH,
+                    );
+                    widgets::pick_list(ui, width, |ui| {
+                        widgets::pick_caption(ui, tr("menu.rules"));
+                        if widgets::pick_row(
+                            ui,
+                            self.rules.is_empty(),
+                            None,
+                            tr("rules.none"),
+                            false,
+                        )
+                        .clicked()
                         {
                             new_rules = Some(String::new());
                         }
@@ -3438,12 +3488,14 @@ impl FolderView {
                         let picked = rules::chosen(&self.rules, &refs);
                         for name in &self.rule_names {
                             let on = picked == Some(name.as_str());
-                            if widgets::menu_check(ui, on, name, "").clicked() {
+                            if widgets::pick_row(ui, on, None, name, false).clicked() {
                                 new_rules = Some(name.clone());
                             }
                         }
-                        ui.separator();
-                        if ui.button(tr("cmd.edit_rules")).clicked() {
+                        widgets::pick_sep(ui);
+                        // Not a choice of the list: it opens the editor.
+                        if widgets::pick_action(ui, Icon::Settings, tr("cmd.edit_rules")).clicked()
+                        {
                             ui.close();
                             action = Some(FolderAction::EditRules);
                         }
@@ -3463,16 +3515,42 @@ impl FolderView {
                 if opened {
                     self.filter_edit = Some(self.filter_spec.clone());
                 }
-                popup_below(&r, filter_id, close).show(|ui| {
-                    widgets::menu_scroll(ui, |ui| {
-                        ui.set_min_width(widgets::menu_width(ui.ctx()).max(300.0));
+                popup_below(&r, filter_id, close).frame(frame).show(|ui| {
+                    // As wide as the longest filter listed, with room to type one in whatever
+                    // the chip shows of it, and no wider than a menu should be: a filter
+                    // longer than that is cut short.
+                    let saved = plain_label(tr("menu.filters"));
+                    let width = widgets::pick_width(
+                        ui,
+                        cfg.recent_filters
+                            .iter()
+                            .map(String::as_str)
+                            .chain(named.iter().map(|f| f.name.as_str())),
+                        r.rect.width().max(FILTER_MENU_MIN_WIDTH),
+                        FILTER_MENU_MAX_WIDTH,
+                    );
+                    widgets::pick_list(ui, width, |ui| {
                         let edit = self
                             .filter_edit
                             .get_or_insert_with(|| self.filter_spec.clone());
+                        // The key that applies what is typed is named at the field's end.
                         let field = ui.add(
                             egui::TextEdit::singleline(edit)
-                                .margin(vec2(8.0, 4.0))
+                                .font(FontId::monospace(theme::size::SMALL))
+                                .margin(Margin {
+                                    left: 8,
+                                    right: 48,
+                                    top: 5,
+                                    bottom: 5,
+                                })
                                 .desired_width(f32::INFINITY),
+                        );
+                        ui.painter().text(
+                            field.rect.right_center() - vec2(8.0, 0.0),
+                            egui::Align2::RIGHT_CENTER,
+                            widgets::key_text("Enter"),
+                            FontId::proportional(theme::size::CAPTION),
+                            widgets::pal(ui).text_dim,
                         );
                         if opened {
                             field.request_focus();
@@ -3480,15 +3558,30 @@ impl FolderView {
                         if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                             new_filter = Some(edit.clone());
                         }
-                        ui.separator();
-                        let listed = cfg.recent_filters.iter().cloned().chain(
-                            named
-                                .iter()
-                                .map(|f| format!("{}{}", crate::core::filter::FLT_PREFIX, f.name)),
-                        );
-                        for f in listed {
-                            if ui.selectable_label(f == self.filter_spec, &f).clicked() {
-                                new_filter = Some(f);
+                        ui.add_space(4.0);
+                        if !cfg.recent_filters.is_empty() {
+                            widgets::pick_caption(ui, tr("label.recent"));
+                        }
+                        for f in &cfg.recent_filters {
+                            let on = *f == self.filter_spec;
+                            if widgets::pick_row(ui, on, Some(Icon::Clock), f, true).clicked() {
+                                new_filter = Some(f.clone());
+                            }
+                        }
+                        // The filters kept as files, by their names.
+                        if !named.is_empty() {
+                            if !cfg.recent_filters.is_empty() {
+                                widgets::pick_sep(ui);
+                            }
+                            widgets::pick_caption(ui, &saved);
+                        }
+                        for f in named {
+                            let full = format!("{}{}", crate::core::filter::FLT_PREFIX, f.name);
+                            let on = full == self.filter_spec;
+                            if widgets::pick_row(ui, on, Some(Icon::Filter), &f.name, false)
+                                .clicked()
+                            {
+                                new_filter = Some(full);
                             }
                         }
                     })
@@ -4455,13 +4548,11 @@ impl FolderView {
                             });
                         }
                     });
-                    for s in 0..n {
+                    for &size in it.size.iter().take(n) {
                         row.col(|ui| {
                             paint_bg(ui);
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.add(
-                                    egui::Label::new(txt(fmt_size(it.size[s]))).selectable(false),
-                                );
+                                ui.add(egui::Label::new(txt(fmt_size(size))).selectable(false));
                             });
                         });
                     }
@@ -4501,7 +4592,7 @@ impl FolderView {
                                 });
                             }
                             ui.separator();
-                            for from in 0..n {
+                            for (from, &exists) in it.exists.iter().enumerate().take(n) {
                                 for to in 0..n {
                                     if from != to && (n == 2 || from == 1 || to == 1) {
                                         let label = trf(
@@ -4513,7 +4604,7 @@ impl FolderView {
                                         );
                                         if ui
                                             .add_enabled(
-                                                it.exists[from] && self.writable(to),
+                                                exists && self.writable(to),
                                                 egui::Button::new(label),
                                             )
                                             .clicked()
@@ -4524,12 +4615,9 @@ impl FolderView {
                                 }
                             }
                             widgets::submenu(ui, tr("cmd.copy_to_folder"), |ui| {
-                                for s in 0..n {
+                                for (s, &exists) in it.exists.iter().enumerate().take(n) {
                                     if ui
-                                        .add_enabled(
-                                            it.exists[s],
-                                            egui::Button::new(side_name(s, n)),
-                                        )
+                                        .add_enabled(exists, egui::Button::new(side_name(s, n)))
                                         .clicked()
                                     {
                                         menu = Some(MenuCmd::CopyTo(s));
@@ -4537,10 +4625,10 @@ impl FolderView {
                                 }
                             });
                             widgets::submenu(ui, tr("cmd.delete"), |ui| {
-                                for s in 0..n {
+                                for (s, &exists) in it.exists.iter().enumerate().take(n) {
                                     if ui
                                         .add_enabled(
-                                            it.exists[s] && self.writable(s),
+                                            exists && self.writable(s),
                                             egui::Button::new(side_name(s, n)),
                                         )
                                         .clicked()
@@ -4554,12 +4642,9 @@ impl FolderView {
                             });
                             ui.separator();
                             widgets::submenu(ui, tr("cmd.open_with_app"), |ui| {
-                                for s in 0..n {
+                                for (s, &exists) in it.exists.iter().enumerate().take(n) {
                                     if ui
-                                        .add_enabled(
-                                            it.exists[s],
-                                            egui::Button::new(side_name(s, n)),
-                                        )
+                                        .add_enabled(exists, egui::Button::new(side_name(s, n)))
                                         .clicked()
                                     {
                                         menu = Some(MenuCmd::SystemOpen(idx, s));
@@ -4567,12 +4652,9 @@ impl FolderView {
                                 }
                             });
                             widgets::submenu(ui, tr("cmd.reveal"), |ui| {
-                                for s in 0..n {
+                                for (s, &exists) in it.exists.iter().enumerate().take(n) {
                                     if ui
-                                        .add_enabled(
-                                            it.exists[s],
-                                            egui::Button::new(side_name(s, n)),
-                                        )
+                                        .add_enabled(exists, egui::Button::new(side_name(s, n)))
                                         .clicked()
                                     {
                                         menu = Some(MenuCmd::Reveal(idx, s));

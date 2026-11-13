@@ -617,6 +617,7 @@
   "msg.cannot_delete": "Impossibile eliminare {file}",
   "msg.cannot_write": "Impossibile scrivere {file}",
   "msg.archive_not_writable": "Impossibile riscrivere {file}: è un pacchetto firmato, che questa app apre in sola lettura.",
+  "msg.archive_rar_not_writable": "Impossibile riscrivere {file}: un archivio RAR può essere soltanto letto, quindi questa app lo apre in sola lettura.",
   "msg.archive_read_only": "{file} è di sola lettura, quindi le modifiche non sono state riscritte.",
   "msg.archive_changed": "{file} è cambiato sul disco dopo l'apertura, quindi le modifiche non sono state riscritte. Confrontalo di nuovo per modificare la nuova versione.",
   "msg.archive_write_failed": "Impossibile riscrivere le modifiche in {file}.",

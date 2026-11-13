@@ -1170,7 +1170,7 @@ kbd:[Esc] 會先回到這一個游標；不按 kbd:[Ctrl] 直接按一下也有�
 
 * 「位置窗格」與「行詳細資料窗格」。
   行詳細資料窗格會將各側的目前這一行上下排列並自動換行，方便您找出長行中的細微差異。
-* 「行號」、「編輯標記」、「顯示空白字元」與「語法醒目提示」。
+* 「行號」、「編輯標記」、「顯示空白字元」與「語法醒目提示」（請參閱 <<syntax-highlighting>>）。
 * 「摺疊未變更的行」（kbd:[Alt+C]）：將未變更的行收合成一列，每個差異前後保留三行。
   按一下該列即可展開。
 * 「自動換行」（kbd:[Alt+Z]）。
@@ -1186,6 +1186,80 @@ kbd:[Esc] 會先回到這一個游標；不按 kbd:[Ctrl] 直接按一下也有�
 二進位比較的移動區塊也依同一個設定排列（請參閱 <<binary-comparison>>）。
 內嵌檢視與表格檢視不論哪種排列都不留空白，因此在這兩種檢視中無法使用工具列按鈕。
 切換排列方式不會變更檔案內容或比較規則。
+
+[[syntax-highlighting]]
+=== 語法醒目提示
+
+開啟「檢視 → 文字比較 → 語法醒目提示」後，註解、字串、數字與關鍵字會以不同顏色顯示。
+語言依副檔名判斷；`Makefile`、`Dockerfile`、`CMakeLists.txt` 這類檔案依完整檔名判斷；
+沒有副檔名的指令碼則依第一行的 `#!` 判斷。
+支援下列語言：
+
+[cols="1,3",options="header"]
+|===
+|語言 |副檔名
+
+|C、C++、Objective-C
+|`.c`、`.cc`、`.cpp`、`.cxx`、`.h`、`.hh`、`.hpp`、`.hxx`、`.inl`、`.ino`、`.sma`、`.m`、`.mm`
+
+|C#、D、Java、Groovy、Scala
+|`.cs`、`.d`、`.java`、`.groovy`、`.gradle`、`.scala`、`.sbt`、`.sc`
+
+|Rust、Go、Swift、Kotlin
+|`.rs`、`.go`、`.swift`、`.kt`、`.kts`
+
+|JavaScript、TypeScript、ActionScript
+|`.js`、`.mjs`、`.cjs`、`.jsx`、`.jsfl`、`.ts`、`.tsx`、`.as`、`.asc`
+
+|HTML、XML、CSS、PHP、ASP、JSP
+|`.html`、`.htm`、`.shtml`、`.xhtml`、`.hta`、`.htt`、`.htd`、`.cfm`、`.tpl`、`.xml`、`.xsd`、
+`.xsl`、`.xslt`、`.dtd`、`.svg`、`.xul`、`.rdf`、`.xaml`、`.vxml`、`.docbook`、`.wxs`、`.wxi`、
+`.vcproj`、`.vcxproj`、`.csproj`、`.css`、`.php`、`.php3`、`.phtml`、`.asp`、`.jsp`
+
+|Python、Ruby、Perl、Lua、Tcl、R
+|`.py`、`.pyw`、`SConstruct`、`SConscript`、`.rb`、`.rbw`、`.pl`、`.pm`、`.pod`、`.cgi`、`.lua`、
+`.tcl`、`.r`
+
+|Shell、PowerShell、批次檔
+|`.sh`、`.bash`、`.zsh`、`.ps1`、`.psm1`、`.psd1`、`.bat`、`.cmd`
+
+|Visual Basic、VBScript
+|`.vb`、`.bas`、`.frm`、`.cls`、`.ctl`、`.pag`、`.dsr`、`.dob`、`.vbs`、`.dsm`
+
+|Pascal、Delphi
+|`.pas`、`.dpr`、`.dpk`、`.dfm`、`.inc`、`.pp`
+
+|OCaml、F#、Standard ML、Haskell、Erlang、Lisp、Clojure
+|`.ml`、`.mli`、`.caml`、`.fs`、`.fsi`、`.fsx`、`.sml`、`.sig`、`.hs`、`.erl`、`.hrl`、`.lisp`、
+`.lsp`、`.scm`、`.ss`、`.smd`、`.el`、`.clj`
+
+|Fortran、Smalltalk、MATLAB
+|`.f`、`.for`、`.f77`、`.f90`、`.f95`、`.f03`、`.f08`、`.f2k`、`.st`、`.pac`、`.src`、`.pkg`、
+`.matlab`
+
+|SQL
+|`.sql`、`.ddl`、`.dml`、`.spec`、`.body`、`.sps`、`.spb`、`.sf`、`.sp`
+
+|Verilog、SystemVerilog、VHDL、組合語言
+|`.v`、`.vh`、`.sv`、`.svh`、`.vhd`、`.vhdl`、`.asm`、`.s`、`.nasm`、`.masm`
+
+|Windows 資源檔、IDL、Protocol Buffers
+|`.rc`、`.rc2`、`.dlg`、`.idl`、`.odl`、`.proto`
+
+|建置檔
+|`Makefile`、`.mk`、`.mak`、`CMakeLists.txt`、`.cmake`、`Dockerfile`、`Containerfile`、
+`.dockerfile`
+
+|資料與設定檔
+|`.json`、`.jsonc`、`.yaml`、`.yml`、`.toml`、`.ini`、`.cfg`、`.conf`、`.inf`、`.properties`、
+`.editorconfig`
+
+|文件
+|`.md`、`.markdown`、`.rst`、`.tex`、`.bib`、`.textile`、`.diff`、`.patch`、`.dot`
+|===
+
+其他副檔名的檔案不會上色。
+非常大的檔案也不會套用醒目提示（請參閱 <<troubleshooting>> 的「效能」）。
 
 [[inline-view]]
 ==== 內嵌檢視
@@ -2001,8 +2075,11 @@ OxideMerge 會將壓縮檔解壓縮後，以資料夾的方式比較，讓您能
 * `.tar`、`.tar.gz` / `.tgz`、`.tar.bz2` / `.tbz2`、`.tar.xz` / `.txz` 與 `.tar.zst` /
   `.tzst`。
 * `.7z`。
+* `.rar`：支援到 RAR 7 為止的所有格式版本，包括結實（solid）壓縮檔。
+  RAR 壓縮檔只能讀取，無法變更（見下文）。
 
-開啟受密碼保護的 ZIP（傳統 ZIP 加密「ZipCrypto」或 WinZip AES）或 7z（包括連檔名也加密的）時，
+開啟受密碼保護的 ZIP（傳統 ZIP 加密「ZipCrypto」或 WinZip AES）、7z 或 RAR
+（包括連檔名也加密的 7z 與 RAR）時，
 會出現「壓縮檔密碼」視窗詢問密碼；密碼錯誤時會再次詢問，按一下「取消」則放棄開啟。
 密碼只保存在記憶體中，且只在比較開啟期間保留，不再需要時會在記憶體中覆寫清除。
 
@@ -2036,10 +2113,14 @@ OxideMerge 會將壓縮檔解壓縮後，以資料夾的方式比較，讓您能
 * 以檢閱快照開啟的壓縮檔，或從網頁比較出的頁面樹狀結構；
 * 已簽署的套件（`.apk`、`.ipa`、`.appx`、`.msix`、`.crx`、`.xpi`，以及含有 `META-INF` 簽章或
   `_xmlsignatures` 資料夾的 zip），因為重新寫入會使簽章失效；
+* RAR 壓縮檔，因為 RAR 格式只允許其他程式讀取，不允許寫入。
+  您可以比較 RAR 壓縮檔，並將其中的檔案複製到資料夾或其他格式的壓縮檔；
 * 位於上述壓縮檔內的壓縮檔。
 
 解壓縮後超過 8 GB 或 500,000 個檔案的壓縮檔不會開啟。
-不支援 RAR 格式。
+
+NOTE: RAR 壓縮檔是以 Alexander Roshal 的 UnRAR 程式庫讀取，該程式庫採用其專屬的授權條款：
+可自由使用與散布，但不得用來製作能寫入 RAR 壓縮檔的程式。
 
 [[binary-comparison]]
 == 比較二進位檔
@@ -4728,9 +4809,10 @@ IMPORTANT: 在成功儲存編輯內容之前，請不要關閉比較。
 本章列出 OxideMerge 不支援或僅部分支援的功能。
 若您的工作流程需要用到其中某個領域，請先閱讀本章。
 
-* 壓縮檔：支援 ZIP 類格式、TAR（未壓縮、gzip、bzip2、xz 與 Zstandard）與 7z，
-  包括受密碼保護的 ZIP 與 7z。
-  不支援 RAR 與分割成多個部分的壓縮檔（`.zip.001`、`.7z.001`）。
+* 壓縮檔：支援 ZIP 類格式、TAR（未壓縮、gzip、bzip2、xz 與 Zstandard）、7z 與 RAR，
+  包括受密碼保護的 ZIP、7z 與 RAR。
+  RAR 壓縮檔為唯讀。
+  不支援分割成多個部分的壓縮檔（`.zip.001`、`.7z.001`、`.part1.rar`）。
 * 文字窗格主要用於檢閱與合併變更，並非完整的編輯器。
   內嵌檢視無法編輯。
 * 解譯器外掛程式使用外部命令，不支援 WinMerge 的外掛程式動態連結程式庫與指令碼。

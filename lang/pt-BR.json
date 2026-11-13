@@ -617,6 +617,7 @@
   "msg.cannot_delete": "Não foi possível excluir {file}",
   "msg.cannot_write": "Não foi possível gravar {file}",
   "msg.archive_not_writable": "Não é possível gravar de volta em {file}: é um pacote assinado, que este aplicativo abre somente para leitura.",
+  "msg.archive_rar_not_writable": "Não é possível gravar de volta em {file}: um arquivo RAR só pode ser lido, então este aplicativo o abre somente para leitura.",
   "msg.archive_read_only": "{file} é somente leitura, então as alterações não foram gravadas nele.",
   "msg.archive_changed": "{file} mudou no disco depois de aberto, então as alterações não foram gravadas nele. Compare de novo para editar a nova versão.",
   "msg.archive_write_failed": "Não foi possível gravar as alterações em {file}.",

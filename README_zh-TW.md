@@ -44,9 +44,10 @@ oxide），也就是鐵鏽（rust）的成分；它讓檔案比較、資料夾�
   「**下一個衝突**」與「**上一個衝突**」會接著前往下一個兩側都有變更、且仍有未解決衝突的檔案。
 - **同步兩個資料夾：** 先預覽如何讓一個資料夾與另一個一致，或只以另一個更新
   它，經您確認後才套用變更。若套用失敗或您停止套用，已完成的變更會被復原。
-- 將 ZIP、TAR、7z 等支援的壓縮檔當作資料夾開啟，包括受密碼保護的 ZIP 與 7z，以及
+- 將 ZIP、TAR、7z、RAR 等支援的壓縮檔當作資料夾開啟，包括受密碼保護的 ZIP、7z 與 RAR，以及
   以各種常見方式壓縮的 ZIP 項目。可編輯、複製、合併或刪除其中的檔案，儲存後會將
   變更寫回壓縮檔，並以相同密碼維持加密；壓縮較慢的 `.tar.xz` 或 7z 會在背景寫入。
+  RAR 壓縮檔為唯讀。
 - 將檔案或資料夾與 Git、Subversion 或 Mercurial 的修訂版本比較。
 - **透過 SFTP 與 FTP 比較：** 以 SFTP、FTPS 或一般 FTP 連線到伺服器，輸入主機、埠號、使用者，
   以及密碼、私密金鑰或使用 `ssh-agent`，即可取得檔案或資料夾來比較——連線兩次可比較兩個遠端
@@ -502,7 +503,7 @@ Subversion 的 `merge-tool-cmd` 與 Perforce 的 `P4MERGE` 可以直接設為 `o
 ### 檔案與資料夾
 
 - 儲存編輯過的壓縮檔時，會以新的壓縮檔取代原始檔案。以檢閱快照或網頁的頁面樹狀結構開啟並
-  當作資料夾的內容仍為唯讀，已簽署的套件也是。不支援 RAR 檔案與分割成多個部分的壓縮檔。
+  當作資料夾的內容仍為唯讀，已簽署的套件與 RAR 壓縮檔也是。不支援分割成多個部分的壓縮檔。
 - 解譯器外掛程式會執行外部命令，在檔案比較、完整內容的資料夾比較、指令列與報告中的行為都相
   同，且一律優先於 OxideMerge 自行讀取的方式。 PDF 與 Office 預設組態需要另行安裝轉換工具。
 - 資料夾同步會逐一變更檔案，因此不是單一的不可分割操作。重新命名或移動過的檔案會在目的地中移動，
@@ -538,7 +539,7 @@ Subversion 的 `merge-tool-cmd` 與 Perforce 的 `P4MERGE` 可以直接設為 `o
 ## 開發
 
 若要從原始碼建置 OxideMerge，請先透過 [rustup](https://rustup.rs/) 安裝 Rust 工具鏈。
-Linux 另需要 C 編譯器；Windows 與 Linux 也需要 Perl 來建置 OpenSSL（請參閱
+Linux 另需要 C 與 C++ 編譯器；Windows 與 Linux 也需要 Perl 來建置 OpenSSL（請參閱
 [開發指南](docs/development.zh-TW.md#從原始碼建置)）。接著在儲存庫資料夾中執行：
 
 ```sh
@@ -568,3 +569,8 @@ OxideMerge 採用 [MIT 授權條款](LICENSE)發布。
 
 發行版本也包含採用各自寬鬆授權條款的第三方程式碼，列於 [`deny.toml`](deny.toml)：`Cargo.lock` 中
 的 Rust crate，以及為 SFTP 編譯進來的 C 函式庫 libssh2（BSD 3-Clause）與 OpenSSL（Apache 2.0）。
+
+RAR 壓縮檔是以同樣編譯進來的 UnRAR 程式庫（作者 Alexander Roshal）讀取，該程式庫並非開放原始碼：
+依 UnRAR 授權條款（`unrar_sys` crate 中的 `vendor/unrar/license.txt`），其原始碼可免費用於任何軟體以
+處理 RAR 壓縮檔，但不得用來開發與 RAR（WinRAR）相容的壓縮程式，也不得用來重現屬於專有技術的 RAR
+壓縮演算法。

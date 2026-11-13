@@ -377,12 +377,8 @@ pub fn generate(
         .iter()
         .map(|it| {
             let mut r = vec![it.name.clone(), it.rel_dir.clone(), status_text(it, panes)];
-            for s in 0..panes {
-                r.push(fmt_time(it.mtime[s]));
-            }
-            for s in 0..panes {
-                r.push(fmt_size(it.size[s]));
-            }
+            r.extend(it.mtime.iter().take(panes).map(|&t| fmt_time(t)));
+            r.extend(it.size.iter().take(panes).map(|&s| fmt_size(s)));
             r.push(it.ext());
             (it.status, r)
         })

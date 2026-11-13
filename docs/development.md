@@ -17,7 +17,8 @@ program, see the [README](../README.md) and the [user guide](user-guide.adoc).
 ## Build from source
 
 You need a Rust toolchain from [rustup](https://rustup.rs/). On Linux, you also need a C
-compiler. OxideMerge loads the X11, Wayland, keyboard and OpenGL libraries when it starts,
+and C++ compiler (`gcc` and `g++`, or `gcc-c++` on Fedora and its relatives): the UnRAR library
+that reads RAR archives is written in C++. OxideMerge loads the X11, Wayland, keyboard and OpenGL libraries when it starts,
 so you do not need their development packages to build it.
 
 The SFTP support builds OpenSSL from source, which needs Perl:

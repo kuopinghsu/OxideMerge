@@ -49,10 +49,11 @@ confidence to file comparisons, folder synchronization, and conflict resolution.
 - **Synchronize two folders:** preview how one folder would be made to match the
   other, or only brought up to date from it, then apply the changes after you
   confirm. If applying fails or you stop it, the changes made so far are undone.
-- Open ZIP, TAR, 7z and other supported archives as folders, including password-protected
-  ZIP and 7z archives and ZIP entries compressed with any common method. Edit, copy, merge or
+- Open ZIP, TAR, 7z, RAR and other supported archives as folders, including password-protected
+  ZIP, 7z and RAR archives and ZIP entries compressed with any common method. Edit, copy, merge or
   delete their files and save to write the changes back into the archive, which stays encrypted
   with the same password; a slow-to-compress `.tar.xz` or 7z is written in the background.
+  RAR archives are read-only.
 - Compare a file or folder with a Git, Subversion or Mercurial revision.
 - **Compare over SFTP and FTP:** connect to a server over SFTP, FTPS or plain FTP by host, port,
   user, and a password, a private key or `ssh-agent`, and fetch a file or folder to compare
@@ -550,7 +551,7 @@ most shortcuts use Command instead of Ctrl. The app shows the right keys for you
 
 - Saving an edited archive writes a new archive file in place of the original.
   A review snapshot or a web page tree kept as a folder stays read-only, and so
-  does a signed package. RAR files and archives split into parts are not supported.
+  does a signed package or a RAR archive. Archives split into parts are not supported.
 - Unpacker plugins run external commands. They work the same way in file
   comparisons, folder comparisons of full contents, the command line and
   reports, and a plugin is always used in preference to what OxideMerge reads
@@ -596,7 +597,7 @@ most shortcuts use Command instead of Ctrl. The app shows the right keys for you
 ## Development
 
 To build OxideMerge from source, install a Rust toolchain with [rustup](https://rustup.rs/).
-Linux also needs a C compiler, and Windows and Linux need Perl to build
+Linux also needs a C and C++ compiler, and Windows and Linux need Perl to build
 OpenSSL (see the [development guide](docs/development.md#build-from-source)).
 Then run these commands in the repository folder:
 
@@ -630,3 +631,9 @@ OxideMerge is released under the [MIT License](LICENSE).
 Release builds also contain third-party code under its own permissive licenses,
 listed in [`deny.toml`](deny.toml): the Rust crates in `Cargo.lock`, and, for
 SFTP, the C libraries libssh2 (BSD 3-Clause) and OpenSSL (Apache 2.0), compiled in.
+
+RAR archives are read with the UnRAR library by Alexander Roshal, also compiled in, which is
+not open source: under the UnRAR license (`vendor/unrar/license.txt` in the `unrar_sys` crate),
+its source code may be used in any software to handle RAR archives without limitations free of
+charge, but cannot be used to develop RAR (WinRAR) compatible archiver and to re-create RAR
+compression algorithm, which is proprietary.

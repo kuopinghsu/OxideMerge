@@ -418,7 +418,7 @@ jobs:
           )
           for attempt in 1 2 3; do
             if dnf "${dnf_options[@]}" install -y --setopt=install_weak_deps=False \
-              gcc make perl perl-IPC-Cmd pkgconf-pkg-config git curl tar gzip jq file desktop-file-utils \
+              gcc gcc-c++ make perl perl-IPC-Cmd pkgconf-pkg-config git curl tar gzip jq file desktop-file-utils \
               libX11 libX11-xcb libxcb libXcursor libXi libxkbcommon libxkbcommon-x11 \
               libwayland-client libwayland-cursor libwayland-egl; then
               break
