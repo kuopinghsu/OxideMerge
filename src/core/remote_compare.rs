@@ -26,6 +26,14 @@ impl Side {
         }
     }
 
+    /// How many more connections may be made beside one to read this side over.
+    fn more_connections(&self) -> usize {
+        match self {
+            Self::Local(_) => 0,
+            Self::Sftp(conn, _) => remote::more_connections(conn),
+        }
+    }
+
     fn connect<'a>(&'a self, stop: &AtomicBool) -> Result<Source<'a>> {
         match self {
             Self::Local(path) => Ok(Source::Local(path)),
@@ -154,8 +162,13 @@ impl Source<'_> {
             }
             Self::Sftp(fs, root) => {
                 let path = remote_path(root, rel);
-                anyhow::ensure!(fs.kind(&path)? == Some(remote::EntryKind::File), "{path}");
-                let mut meta = Metadata::from(fs.stamp(&path)?.with_context(|| path)?);
+                let (kind, stamp) = fs.kind_stamped(&path)?;
+                anyhow::ensure!(kind == Some(remote::EntryKind::File), "{path}");
+                let stamp = match stamp {
+                    Some(stamp) => stamp,
+                    None => fs.stamp(&path)?.with_context(|| path)?,
+                };
+                let mut meta = Metadata::from(stamp);
                 // SFTP stamps also use zero when the server omits size. Let the stream
                 // settle an empty-file comparison instead of relying on an ambiguous stat.
                 meta.size = meta.size.filter(|size| *size != 0);
@@ -232,18 +245,175 @@ fn status(entries: &[Option<Metadata>; 2], directory: bool, tolerance: u64) -> S
     }
 }
 
+/// How many more connections to make to both sides, to read them over several at once: as
+/// many as the server that takes the fewest does.
+fn more_connections(sides: &[Side; 2]) -> usize {
+    sides
+        .iter()
+        .map(Side::more_connections)
+        .filter(|&more| more > 0)
+        .min()
+        .unwrap_or(0)
+}
+
+/// A folder's listing, as [`Source::list`] gives it.
+type Listing = Result<(Vec<Entry>, usize)>;
+
+/// The folders of servers a scan comes to next, listed ahead of it over more connections: a
+/// server takes each listing in a few round trips, one after another on a connection.
+#[derive(Default)]
+struct Ahead {
+    state: std::sync::Mutex<AheadState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct AheadState {
+    /// The side, path and entry limit of each folder still to list. The last is the one the
+    /// scan comes to next.
+    wanted: Vec<(usize, String, usize)>,
+    /// The folders being listed.
+    listing: std::collections::HashSet<(usize, String)>,
+    listed: std::collections::HashMap<(usize, String), Listing>,
+    /// Whether the connections that list ahead were asked for.
+    connecting: bool,
+    /// Set once the scan is over.
+    over: bool,
+}
+
+/// How many folders must be waiting before more connections are made to list them ahead.
+const WORTH_LISTING_AHEAD: usize = 8;
+/// The most listings kept for the scan to come to.
+const MAX_LISTED_AHEAD: usize = 64;
+
+impl Ahead {
+    fn state(&self) -> std::sync::MutexGuard<'_, AheadState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Notes the folders the scan comes to next, the first of them last. Returns whether
+    /// more connections are now worth making, which it says once.
+    fn want(&self, folders: impl Iterator<Item = (usize, String, usize)>) -> bool {
+        let mut state = self.state();
+        state.wanted.extend(folders);
+        let connect = !state.connecting && state.wanted.len() >= WORTH_LISTING_AHEAD;
+        state.connecting |= connect;
+        drop(state);
+        self.changed.notify_all();
+        connect
+    }
+
+    /// The listing of `path` on `side` when it was read ahead, waiting for one being read;
+    /// `None` when the scan is to list it itself.
+    fn take(&self, side: usize, path: &str) -> Option<Listing> {
+        let key = (side, path.to_owned());
+        let mut state = self.state();
+        loop {
+            if let Some(listed) = state.listed.remove(&key) {
+                drop(state);
+                self.changed.notify_all();
+                return Some(listed);
+            }
+            if !state.listing.contains(&key) {
+                let wanted = &mut state.wanted;
+                if let Some(at) = wanted
+                    .iter()
+                    .rposition(|(s, p, _)| (*s, p) == (side, &key.1))
+                {
+                    wanted.remove(at);
+                }
+                return None;
+            }
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Lists wanted folders over `sources`, connections of its own, until the scan is over.
+    fn list(&self, sources: &[Source<'_>; 2], hidden: bool, stop: &AtomicBool) {
+        let mut state = self.state();
+        loop {
+            if state.over {
+                return;
+            }
+            if state.listed.len() < MAX_LISTED_AHEAD {
+                if let Some((side, path, limit)) = state.wanted.pop() {
+                    state.listing.insert((side, path.clone()));
+                    drop(state);
+                    let listed = sources[side].list(&path, hidden, limit, stop);
+                    state = self.state();
+                    let key = (side, path);
+                    state.listing.remove(&key);
+                    state.listed.insert(key, listed);
+                    self.changed.notify_all();
+                    continue;
+                }
+            }
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn finish(&self) {
+        self.state().over = true;
+        self.changed.notify_all();
+    }
+}
+
 pub(crate) fn scan(
     sides: &[Side; 2],
     options: &FolderOptions,
     filter: &FileFilter,
     stop: &AtomicBool,
-    mut send: impl FnMut(Vec<Row>),
+    send: impl FnMut(Vec<Row>),
 ) -> Result<()> {
     let sources = [sides[0].connect(stop)?, sides[1].connect(stop)?];
+    // The sides whose folders more connections can list ahead.
+    let ahead_of = sides.each_ref().map(|side| side.more_connections() > 0);
+    let more = more_connections(sides);
+    let ahead = Ahead::default();
+    // Set with the scan over, so that a connection still being made then is given up.
+    let over = AtomicBool::new(false);
+    let progress = remote::progress_here();
+    std::thread::scope(|scope| {
+        let (ahead, over, progress) = (&ahead, &over, &progress);
+        let connect = || {
+            for _ in 0..more {
+                scope.spawn(move || {
+                    // One that cannot be made is done without: the scan lists it all.
+                    let connect = || anyhow::Ok([sides[0].connect(over)?, sides[1].connect(over)?]);
+                    if let Ok(sources) = remote::quietly(connect) {
+                        remote::with_progress_of(progress, || {
+                            ahead.list(&sources, options.skip_hidden, stop)
+                        });
+                    }
+                });
+            }
+        };
+        let done = scan_over(
+            &sources, ahead_of, ahead, &connect, options, filter, stop, send,
+        );
+        over.store(true, Ordering::Relaxed);
+        ahead.finish();
+        done
+    })
+}
+
+/// [`scan`], over the connections `sources`. The folders of the sides `ahead_of` names are
+/// listed ahead through `ahead`, once `connect` made the connections for it.
+#[allow(clippy::too_many_arguments)]
+fn scan_over(
+    sources: &[Source<'_>; 2],
+    ahead_of: [bool; 2],
+    ahead: &Ahead,
+    connect: &dyn Fn(),
+    options: &FolderOptions,
+    filter: &FileFilter,
+    stop: &AtomicBool,
+    mut send: impl FnMut(Vec<Row>),
+) -> Result<()> {
     let mut pending = vec![(String::new(), [Some(String::new()), Some(String::new())], 0)];
-    let mut remaining = sides.each_ref().map(|side| match side {
-        Side::Local(_) => usize::MAX,
-        Side::Sftp(..) => remote::MAX_REMOTE_ENTRIES,
+    let mut remaining = sources.each_ref().map(|source| match source {
+        Source::Local(_) => usize::MAX,
+        Source::Sftp(..) => remote::MAX_REMOTE_ENTRIES,
     });
     while let Some((rel, paths, depth)) = pending.pop() {
         check(stop)?;
@@ -255,7 +425,10 @@ pub(crate) fn scan(
                 "{}",
                 tr("remote_compare.depth")
             );
-            let (listing, count) = source.list(path, options.skip_hidden, remaining[side], stop)?;
+            let (listing, count) = match ahead.take(side, path) {
+                Some(listed) => listed?,
+                None => source.list(path, options.skip_hidden, remaining[side], stop)?,
+            };
             remaining[side] = remaining[side]
                 .checked_sub(count)
                 .context(tr("remote_compare.limit"))?;
@@ -308,6 +481,15 @@ pub(crate) fn scan(
             }
         }
         pending[children_start..].reverse(); // visit this directory's children in name order
+        let next = pending[children_start..].iter().flat_map(|(_, paths, _)| {
+            (0..2)
+                .filter(|&side| ahead_of[side])
+                .filter_map(|side| Some((side, paths[side].clone()?, remaining[side])))
+                .rev()
+        });
+        if ahead.want(next) {
+            connect();
+        }
         send(rows);
     }
     Ok(())
@@ -438,16 +620,67 @@ pub(crate) fn verify(
 ) -> Result<()> {
     let sources = [sides[0].connect(stop)?, sides[1].connect(stop)?];
     let norm = Normalizer::new(dopts);
-    for row in rows {
-        check(stop)?;
-        let result = verify_file(&sources, &row, fopts, dopts, &norm, stop);
-        check(stop)?;
-        match result {
-            Ok((same, kept)) => send(row.path, Ok(same), kept),
-            Err(error) => send(row.path, Err(error), Vec::new()),
+    let mut send = |path: String, result: Result<(bool, Vec<Fetched>)>| match result {
+        Ok((same, kept)) => send(path, Ok(same), kept),
+        Err(error) => send(path, Err(error), Vec::new()),
+    };
+    // Many files are verified over several connections at once: each takes a server a few
+    // round trips, one after another on a connection.
+    let more = match rows.len() >= remote::WORTH_CONNECTING {
+        true => more_connections(sides),
+        false => 0,
+    };
+    let together = more > 0;
+    let rows = std::sync::Mutex::new(rows.into_iter());
+    let next = || rows.lock().unwrap_or_else(|e| e.into_inner()).next();
+    // Set once the first connection has verified all there was left for it, so that one
+    // still being made then is given up.
+    let over = AtomicBool::new(false);
+    let progress = remote::progress_here();
+    let (done, results) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..more {
+            let (next, over, progress, done) = (&next, &over, &progress, done.clone());
+            scope.spawn(move || {
+                // One that cannot be made is done without: the first verifies them all.
+                let connect = || anyhow::Ok([sides[0].connect(over)?, sides[1].connect(over)?]);
+                let Ok(sources) = remote::quietly(connect) else {
+                    return;
+                };
+                let norm = Normalizer::new(dopts);
+                remote::with_progress_of(progress, || {
+                    while let Some(row) = next() {
+                        let result = verify_file(&sources, &row, fopts, dopts, &norm, stop);
+                        if stop.load(Ordering::Relaxed) || done.send((row.path, result)).is_err() {
+                            return;
+                        }
+                    }
+                });
+            });
         }
-    }
-    Ok(())
+        drop(done);
+        let first = (|| {
+            while let Some(row) = next() {
+                check(stop)?;
+                let result = verify_file(&sources, &row, fopts, dopts, &norm, stop);
+                check(stop)?;
+                send(row.path, result);
+                for (path, result) in results.try_iter() {
+                    send(path, result);
+                }
+            }
+            Ok(())
+        })();
+        over.store(true, Ordering::Relaxed);
+        // What the other connections were verifying meanwhile.
+        for (path, result) in results.iter() {
+            if first.is_ok() && !stop.load(Ordering::Relaxed) {
+                send(path, result);
+            }
+        }
+        // Stopped, the other connections may have left files unverified.
+        first.and_then(|()| if together { check(stop) } else { Ok(()) })
+    })
 }
 
 /// The two files of a pair as local paths, fetching the ones on servers; with the fetches.
@@ -684,6 +917,142 @@ mod tests {
             .iter()
             .any(|row| row.path.ends_with("/a.txt") && row.status == Status::LeftOnly));
         remote::fake::uninstall();
+    }
+
+    /// Manual benchmark of a folder compare against a real server (see `docs/benchmarks.md`):
+    /// `OXIDEMERGE_BENCH_REMOTE` is the folder's URL, `OXIDEMERGE_BENCH_LOCAL` the local
+    /// folder to compare it with, and `OXIDEMERGE_REMOTE_PASSWORD` the password. The server
+    /// is trusted as it is found, in the tests' own list of known hosts. Ignored, as the
+    /// suite has no server.
+    #[test]
+    #[ignore]
+    fn bench_remote_folder_compare() {
+        use crate::core::remote_url;
+        let (Ok(url), Ok(local)) = (
+            std::env::var("OXIDEMERGE_BENCH_REMOTE"),
+            std::env::var("OXIDEMERGE_BENCH_LOCAL"),
+        ) else {
+            eprintln!("set OXIDEMERGE_BENCH_REMOTE and OXIDEMERGE_BENCH_LOCAL");
+            return;
+        };
+        let runs: usize = std::env::var("OXIDEMERGE_BENCH_RUNS")
+            .ok()
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(3);
+        let url = remote_url::parse(&url).unwrap();
+        let creds = remote_url::Credentials::from_env(None, None);
+        let conn = Arc::new(remote_url::connection(&url, &creds).unwrap());
+        let never = AtomicBool::new(false);
+        if let Err(e) = remote::connect(&conn, &never) {
+            remote::trust_host(&e.downcast::<remote::UnknownHost>().unwrap()).unwrap();
+        }
+        let sides = [
+            Side::Sftp(conn.clone(), url.path.clone()),
+            Side::Local(PathBuf::from(local)),
+        ];
+        // Each step is timed signing in anew, and again taking the connections the run
+        // before it left.
+        let median = |name: &str, work: &mut dyn FnMut() -> String| {
+            let mut note = String::new();
+            let [anew, kept] = [true, false].map(|anew| {
+                let mut times = Vec::new();
+                for _ in 0..runs {
+                    if anew {
+                        remote::close_idle();
+                    }
+                    let start = std::time::Instant::now();
+                    note = work();
+                    times.push(start.elapsed());
+                }
+                times.sort();
+                times[runs / 2].as_millis()
+            });
+            eprintln!("{name:<8} {anew:>7} ms  {kept:>7} ms kept  {note}");
+        };
+        median("connect", &mut || {
+            remote::connect(&conn, &never).unwrap();
+            String::new()
+        });
+        let options = FolderOptions {
+            method: CompareMethod::BinaryContents,
+            ..Default::default()
+        };
+        let filter = FileFilter::parse_mask("");
+        let mut rows = Vec::new();
+        median("scan", &mut || {
+            rows.clear();
+            scan(&sides, &options, &filter, &never, |batch| {
+                rows.extend(batch)
+            })
+            .unwrap();
+            format!("{} rows", rows.len())
+        });
+        let files: Vec<Row> = rows
+            .iter()
+            .filter(|r| !r.directory && r.present == [true, true])
+            .cloned()
+            .collect();
+        median("verify", &mut || {
+            let (mut same, mut failed) = (0, 0);
+            verify(
+                &sides,
+                files.clone(),
+                &options,
+                &DiffOptions::default(),
+                &never,
+                |_, result, _| match result {
+                    Ok(true) => same += 1,
+                    Ok(false) => {}
+                    Err(_) => failed += 1,
+                },
+            )
+            .unwrap();
+            format!("{} files, {same} same, {failed} failed", files.len())
+        });
+        median("fetch", &mut || {
+            let fetched = remote::fetch(&conn, &url.path, &never).unwrap();
+            let manifest = fetched.manifest.as_ref().unwrap();
+            let bytes: u64 = manifest.files.values().map(|(stamp, _)| stamp.size).sum();
+            format!("{} files, {bytes} bytes", manifest.files.len())
+        });
+    }
+
+    #[test]
+    fn a_folder_listed_ahead_is_the_one_the_scan_would_list_itself() {
+        let root = tempfile::tempdir().unwrap();
+        for file in ["a/x.txt", "a/y.txt", "b/z.txt"] {
+            let path = root.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "text").unwrap();
+        }
+        let never = AtomicBool::new(false);
+        let ahead = Ahead::default();
+        // One nobody asked for is the scan's own to list.
+        assert!(ahead.take(0, "a").is_none());
+        // The scan comes to `a` first; too few to connect for.
+        let folders = [(0, "b".to_owned(), 9), (0, "a".to_owned(), 9)];
+        assert!(!ahead.want(folders.into_iter()));
+        // One the scan comes to before it was read is its own to list too.
+        assert!(ahead.take(0, "a").is_none());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let sources = [Source::Local(root.path()), Source::Local(root.path())];
+                ahead.list(&sources, false, &never);
+            });
+            while ahead.state().listed.is_empty() {
+                std::thread::yield_now();
+            }
+            let (entries, count) = ahead.take(0, "b").unwrap().unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(entries[0].name, "z.txt");
+            ahead.finish();
+        });
+        assert!(ahead.take(0, "b").is_none());
+
+        let many = (0..WORTH_LISTING_AHEAD).map(|i| (1, format!("d{i}"), 9));
+        assert!(ahead.want(many.clone()));
+        // Said once: the connections are being made.
+        assert!(!ahead.want(many));
     }
 
     #[test]

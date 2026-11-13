@@ -141,6 +141,87 @@ build, as the median of nine runs including reading the files from the cache:
 | binary-moved-wide-shift | 0.002 s | 13 MB | 1 moved block, 524,288 matched bytes |
 | binary-moved-firmware | 0.001 s | 9 MB | 18 moved blocks, 4,014 matched bytes |
 
+## Remote folders
+
+A folder on a server is timed against a real server, which the suite does not have. Name
+the folder, the local folder to compare it with and the password, and run the one test:
+
+```sh
+OXIDEMERGE_BENCH_REMOTE=sftp://user@host:2222/path/to/folder \
+OXIDEMERGE_BENCH_LOCAL=/path/to/its/local/copy \
+OXIDEMERGE_REMOTE_PASSWORD=... \
+cargo test --release --bin oxidemerge bench_remote_folder_compare -- --ignored --nocapture
+```
+
+It reports the median of three runs (`OXIDEMERGE_BENCH_RUNS`) of each step, in one process,
+first signing in anew for each run and then (*kept*) taking the connections the run before
+left open, as a step does within 30 seconds of the one before:
+**connect** signs in once; **scan** lists both folders as *List folders without
+downloading files* does; **verify** compares every file on both sides byte for byte, as
+*Verify All* does; **fetch** downloads the whole folder, as a compare from the command
+line does. Each of the last three connects first, so their times include the first.
+
+Recorded on Windows 11 (build 26300), Intel Core i9-12900KF (24 threads), release build,
+against OpenSSH in Docker Desktop on the same machine (`atmoz/sftp`, password sign-in),
+the FreeRTOS kernel sources: 886 files in 306 folders, 19.2 MB, 131 of the files the same
+size on both sides (2026-11-13). *Before* is 0.9.9 at `0ba994c`; *one connection* is the
+change with `MAX_CONNECTIONS` set to 1, which leaves what the connection fixes and
+hashing during the download give.
+
+| Step | Before | One connection | Six connections | Six, kept |
+| --- | ---: | ---: | ---: | ---: |
+| connect | 541 ms | 239 ms | 243 ms | 0 ms |
+| scan | 861 ms | 525 ms | 549 ms | 137 ms |
+| verify | 2,048 ms | 1,272 ms | 663 ms | 236 ms |
+| fetch | 5,938 ms | 2,159 ms | 1,123 ms | 756 ms |
+
+The whole command-line compare of the two folders, to a text report, went from 6.3 s to
+1.3 s (median of three runs each).
+
+- Connecting took 257 ms to reach `localhost`: `::1` was tried first and given 250 ms
+  before `127.0.0.1`, the only address the forwarded port answers on. Both are now tried
+  at once. Without `TCP_NODELAY` the key exchange took another 40 ms. The rest is the
+  server's: 160 ms from asking for the SFTP subsystem to its first answer.
+- A small file takes about four round trips (open, read, read to the end, close), one
+  after another on a connection, so the gain of more connections is the round-trip time
+  saved; on this machine that is a fraction of a millisecond, and it is larger over a
+  network. Two, four, six and nine connections fetched in 1,448, 1,192, 1,099 and 1,043 ms.
+- Each further connection has to sign in first (240 ms here), which is why a scan of 306
+  folders gains nothing on this machine: it is over about when they are ready. They are
+  made only once 32 files or 8 folders are waiting.
+- Kept connections take the sign-in out of every step after the first, and the further
+  connections are there from the start: the scan then does gain from them (137 ms, against
+  about 300 ms of listing over one).
+
+### FTP
+
+FTP is timed against the test server of the suite, in this process, whose answer to each
+command waits `OXIDEMERGE_BENCH_DELAY_MS` milliseconds (default 2) to stand in for a
+network:
+
+```sh
+cargo test --release --bin oxidemerge bench_ftp_folder_fetch -- --ignored --nocapture
+```
+
+It fetches 100 folders of 3 small files, signing in anew each time, from a server with
+`MLSD` and `EPSV` and from one with only `LIST` and `PASV`, over one connection and over
+four. The median of three runs, on the same Windows machine (2026-11-13):
+
+| Delay | MLSD, one | MLSD, four | LIST, one | LIST, four |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 ms | 407 ms | 171 ms | 755 ms | 488 ms |
+| 1 ms | 1,745 ms | 562 ms | 2,868 ms | 976 ms |
+| 2 ms | 3,270 ms | 1,167 ms | 6,191 ms | 3,050 ms |
+| 5 ms | 6,557 ms | 1,815 ms | 8,703 ms | 2,581 ms |
+
+- The delays are longer than asked: Windows sleeps in steps of its timer.
+- Every file and every listing takes a data connection of its own, and Windows keeps each
+  one's port for a while after. Run several times in a row (or with more files), the
+  benchmark runs out of ports: connecting then fails with error 10022, or the server closes
+  the connection, and several connections measure slower than one. Wait two minutes.
+- A server without `MLSD` gives no sizes or times in its listing, so each file costs a
+  `SIZE` and an `MDTM` more.
+
 ## Baseline
 
 Measured on macOS aarch64, Apple M2 Max, 12 threads, 32 GB memory; OxideMerge 0.9.4,

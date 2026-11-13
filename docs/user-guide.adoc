@@ -31,6 +31,8 @@ Beyond text, OxideMerge compares binary files, images and web pages, and it fits
 version-control and automated workflows.
 OxideMerge is built in Rust.
 
+*See the Difference. Merge with Confidence.*
+
 This guide is also available in xref:user-guide.zh-TW.adoc[繁體中文].
 
 This guide shows you how to install OxideMerge, compare and merge files and folders, and connect

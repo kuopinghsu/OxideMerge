@@ -189,7 +189,6 @@
   "app.drop_overlay": "Déposer pour comparer",
   "app.drop_overlay_desc": "Deux ou trois fichiers ou dossiers s'ouvrent côte à côte ; un seul élément ouvre la boîte de dialogue Ouvrir.",
   "app.ready": "Prêt",
-  "app.tagline": "Comparer et fusionner des fichiers et des dossiers",
   "btn.add": "Ajouter",
   "btn.browse_file": "Choisir un fichier",
   "btn.browse_folder": "Choisir un dossier",

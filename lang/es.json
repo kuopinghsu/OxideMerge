@@ -189,7 +189,6 @@
   "app.drop_overlay": "Suelte para comparar",
   "app.drop_overlay_desc": "Dos o tres archivos o carpetas se abren en paralelo; un solo elemento abre el cuadro de diálogo Abrir.",
   "app.ready": "Listo",
-  "app.tagline": "Comparar y combinar archivos y carpetas",
   "btn.add": "Agregar",
   "btn.browse_file": "Buscar un archivo",
   "btn.browse_folder": "Buscar una carpeta",

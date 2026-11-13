@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -213,6 +213,9 @@ pub fn set_asker(asker: Option<std::sync::Arc<Asker>>) {
 
 /// Puts `challenge` to the user, as [`set_asker`] says.
 fn ask(challenge: &Challenge, cancel: &AtomicBool) -> Option<Vec<String>> {
+    if QUIET.with(|q| q.get()) {
+        return None;
+    }
     let asker = ASKER.read().ok()?.clone()?;
     asker(challenge, cancel).filter(|a| a.len() == challenge.prompts.len())
 }
@@ -1801,8 +1804,8 @@ pub(crate) const CHUNK: usize = 64 * 1024;
 /// `crate::core::extract::MAX_FILE`). The limits are fields, not just constants, so a test can
 /// hit them without actually downloading gigabytes or tens of thousands of files.
 struct Budget {
-    bytes: u64,
-    entries: usize,
+    bytes: AtomicU64,
+    entries: AtomicUsize,
     max_bytes: u64,
     max_entries: usize,
 }
@@ -1831,6 +1834,22 @@ pub fn with_progress<R>(progress: &std::sync::Arc<Progress>, work: impl FnOnce()
     let done = work();
     PROGRESS.with(|p| p.replace(before));
     done
+}
+
+/// What this thread's fetches count into, for a thread reading beside it to count there too.
+pub(crate) fn progress_here() -> Option<std::sync::Arc<Progress>> {
+    PROGRESS.with(|p| p.borrow().clone())
+}
+
+/// [`with_progress`], when there is one to count into.
+pub(crate) fn with_progress_of<R>(
+    progress: &Option<std::sync::Arc<Progress>>,
+    work: impl FnOnce() -> R,
+) -> R {
+    match progress {
+        Some(progress) => with_progress(progress, work),
+        None => work(),
+    }
 }
 
 /// Notes that a server is connected to and signed in to.
@@ -1869,19 +1888,13 @@ pub(super) const MAX_REMOTE_DEPTH: usize = 64;
 
 impl Budget {
     fn new() -> Self {
-        Self {
-            bytes: 0,
-            entries: 0,
-            max_bytes: MAX_REMOTE_BYTES,
-            max_entries: MAX_REMOTE_ENTRIES,
-        }
+        Self::with_limits(MAX_REMOTE_BYTES, MAX_REMOTE_ENTRIES)
     }
 
-    #[cfg(test)]
     fn with_limits(max_bytes: u64, max_entries: usize) -> Self {
         Self {
-            bytes: 0,
-            entries: 0,
+            bytes: AtomicU64::new(0),
+            entries: AtomicUsize::new(0),
             max_bytes,
             max_entries,
         }
@@ -1889,7 +1902,8 @@ impl Budget {
 
     /// How many more files and folders may be read.
     fn entries_left(&self) -> usize {
-        self.max_entries.saturating_sub(self.entries)
+        self.max_entries
+            .saturating_sub(self.entries.load(Ordering::Relaxed))
     }
 
     fn too_many(&self) -> anyhow::Error {
@@ -1899,10 +1913,9 @@ impl Budget {
         ))
     }
 
-    fn take_entry(&mut self) -> Result<()> {
-        self.entries += 1;
+    fn take_entry(&self) -> Result<()> {
         note_progress(0, 1);
-        if self.entries > self.max_entries {
+        if self.entries.fetch_add(1, Ordering::Relaxed) >= self.max_entries {
             return Err(self.too_many());
         }
         Ok(())
@@ -1915,10 +1928,9 @@ impl Budget {
         ))
     }
 
-    fn take_bytes(&mut self, n: u64) -> Result<()> {
+    fn take_bytes(&self, n: u64) -> Result<()> {
         note_progress(n, 0);
-        self.bytes += n;
-        if self.bytes > self.max_bytes {
+        if self.bytes.fetch_add(n, Ordering::Relaxed) + n > self.max_bytes {
             return Err(self.too_large());
         }
         Ok(())
@@ -1948,6 +1960,11 @@ pub(crate) trait RemoteFs {
     /// Whether `remote` (following a symbolic link) is a folder, a regular file, or neither.
     fn kind(&self, remote: &str) -> Result<Option<EntryKind>> {
         bail!(trf("msg.sftp_cannot_read", &[("path", remote.to_string())]))
+    }
+    /// [`RemoteFs::kind`], with [`RemoteFs::stamp`] for a regular file where the server tells
+    /// both at once: asking twice takes twice as long for each of a folder's files.
+    fn kind_stamped(&self, remote: &str) -> Result<(Option<EntryKind>, Option<RemoteStamp>)> {
+        Ok((self.kind(remote)?, None))
     }
     /// The entries of `remote`, a folder, for [`Browser`]: no more than `limit + 1` of them, as
     /// [`RemoteFs::list_dir`]. A symbolic link is listed as what it points to, or as
@@ -2035,7 +2052,8 @@ pub(crate) trait Remote: RemoteFs + RemoteWrite + Send {}
 impl<T: RemoteFs + RemoteWrite + Send> Remote for T {}
 
 /// Connects and signs in as `conn` says, over its protocol. Setting `cancel` stops it between
-/// steps. Fails with [`UnknownHost`] for a server not trusted yet.
+/// steps. Fails with [`UnknownHost`] for a server not trusted yet. A connection a step just
+/// before left is taken instead of making one (see [`KEEP_IDLE`]).
 pub(crate) fn connect(conn: &RemoteConnection, cancel: &AtomicBool) -> Result<Box<dyn Remote>> {
     #[cfg(test)]
     if let Some(fake) = fake::connect(&conn.auth) {
@@ -2044,13 +2062,299 @@ pub(crate) fn connect(conn: &RemoteConnection, cancel: &AtomicBool) -> Result<Bo
         }
         return fake;
     }
-    let remote: Box<dyn Remote> = if conn.protocol.is_ftp() {
-        Box::new(super::ftp::Client::connect(conn, cancel)?)
-    } else {
-        Box::new(session(conn, cancel)?)
+    let session = match take_idle(conn) {
+        Some(session) => session,
+        None if conn.protocol.is_ftp() => {
+            Session::Ftp(Box::new(super::ftp::Client::connect(conn, cancel)?))
+        }
+        None => Session::Sftp(session(conn, cancel)?),
     };
     note_connected();
-    Ok(remote)
+    Ok(Box::new(Kept {
+        session: Some(session),
+        conn: conn.clone(),
+        failed: std::cell::Cell::new(false),
+    }))
+}
+
+/// How long a connection is kept open after its last use, for the next step to take: signing
+/// in again takes a server longer than most steps do.
+const KEEP_IDLE: Duration = Duration::from_secs(30);
+/// The most idle connections kept.
+const MAX_IDLE: usize = 2 * MAX_CONNECTIONS;
+
+/// A signed-in connection, over either kind of protocol.
+enum Session {
+    Sftp(ssh2::Sftp),
+    Ftp(Box<super::ftp::Client>),
+}
+
+impl Session {
+    fn remote(&self) -> &dyn Remote {
+        match self {
+            Self::Sftp(sftp) => sftp,
+            Self::Ftp(ftp) => &**ftp,
+        }
+    }
+
+    /// Whether the server still answers on it.
+    fn alive(&self) -> bool {
+        match self {
+            Self::Sftp(sftp) => sftp.realpath(Path::new(".")).is_ok(),
+            Self::Ftp(ftp) => ftp.alive(),
+        }
+    }
+
+    /// Whether it is between commands, as the next step needs to find it.
+    fn at_rest(&self) -> bool {
+        match self {
+            Self::Sftp(_) => true,
+            Self::Ftp(ftp) => ftp.at_rest(),
+        }
+    }
+}
+
+/// A connection nobody is using, the server it is signed in to, and since when.
+struct Idle {
+    conn: RemoteConnection,
+    session: Session,
+    since: Instant,
+}
+
+#[derive(Default)]
+struct IdlePool {
+    idle: Vec<Idle>,
+    /// Whether a thread is closing the ones kept too long.
+    closing: bool,
+}
+
+static IDLE: std::sync::Mutex<IdlePool> = std::sync::Mutex::new(IdlePool {
+    idle: Vec::new(),
+    closing: false,
+});
+
+fn idle_pool() -> std::sync::MutexGuard<'static, IdlePool> {
+    IDLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether `a` and `b` reach the same server and sign in the same way.
+fn same_connection(a: &RemoteConnection, b: &RemoteConnection) -> bool {
+    let same_auth = match (&a.auth, &b.auth) {
+        (Auth::Password(a), Auth::Password(b)) => a == b,
+        (
+            Auth::Key {
+                path: a,
+                passphrase: p,
+            },
+            Auth::Key {
+                path: b,
+                passphrase: q,
+            },
+        ) => a == b && p == q,
+        (Auth::Agent, Auth::Agent) | (Auth::AgentKeysOnly, Auth::AgentKeysOnly) => true,
+        _ => false,
+    };
+    same_auth
+        && a.protocol == b.protocol
+        && a.host == b.host
+        && a.port == b.port
+        && a.user == b.user
+        && a.options == b.options
+}
+
+/// An idle connection signed in as `conn` says that still answers, if one is kept.
+fn take_idle(conn: &RemoteConnection) -> Option<Session> {
+    loop {
+        let found = {
+            let mut pool = idle_pool();
+            let at = pool
+                .idle
+                .iter()
+                .rposition(|i| i.since.elapsed() < KEEP_IDLE && same_connection(&i.conn, conn))?;
+            pool.idle.remove(at)
+        };
+        // One the server or the network closed meanwhile is dropped for the next.
+        if found.session.alive() {
+            return Some(found.session);
+        }
+    }
+}
+
+/// Keeps `session`, signed in as `conn` says, for the next [`connect`] to the same server.
+fn keep_idle(conn: RemoteConnection, session: Session) {
+    let mut pool = idle_pool();
+    let oldest = (pool.idle.len() >= MAX_IDLE).then(|| pool.idle.remove(0));
+    pool.idle.push(Idle {
+        conn,
+        session,
+        since: Instant::now(),
+    });
+    let close = !std::mem::replace(&mut pool.closing, true);
+    drop(pool);
+    // Closing one tells the server, which is not done holding the lock.
+    drop(oldest);
+    if close {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(5));
+            let mut pool = idle_pool();
+            let (kept, old): (Vec<_>, Vec<_>) = std::mem::take(&mut pool.idle)
+                .into_iter()
+                .partition(|i| i.since.elapsed() < KEEP_IDLE);
+            pool.idle = kept;
+            let last = pool.idle.is_empty();
+            pool.closing = !last;
+            drop(pool);
+            drop(old);
+            if last {
+                return;
+            }
+        });
+    }
+}
+
+/// Closes the idle connections, so that the next [`connect`] signs in anew.
+#[cfg(test)]
+pub(crate) fn close_idle() {
+    let idle = std::mem::take(&mut idle_pool().idle);
+    drop(idle);
+}
+
+/// A connection that is kept for the next [`connect`] once dropped (see [`KEEP_IDLE`]),
+/// unless something failed over it: what state a failure left it in is not known.
+struct Kept {
+    session: Option<Session>,
+    conn: RemoteConnection,
+    failed: std::cell::Cell<bool>,
+}
+
+impl Kept {
+    fn sftp(&self) -> &dyn Remote {
+        self.session.as_ref().expect("held until dropped").remote()
+    }
+
+    fn noting<T>(&self, done: Result<T>) -> Result<T> {
+        if done.is_err() {
+            self.failed.set(true);
+        }
+        done
+    }
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        let failed = self.failed.get();
+        if let Some(session) = self.session.take().filter(|s| !failed && s.at_rest()) {
+            keep_idle(self.conn.clone(), session);
+        }
+    }
+}
+
+/// A file being read over a [`Kept`] connection, noting a read that failed.
+struct KeptRead<'a> {
+    from: Box<dyn Read + 'a>,
+    failed: &'a std::cell::Cell<bool>,
+}
+
+impl Read for KeptRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.from.read(buf);
+        if read.is_err() {
+            self.failed.set(true);
+        }
+        read
+    }
+}
+
+impl RemoteFs for Kept {
+    fn open_read(&self, remote: &str) -> Result<Box<dyn Read + '_>> {
+        let from = self.noting(self.sftp().open_read(remote))?;
+        Ok(Box::new(KeptRead {
+            from,
+            failed: &self.failed,
+        }))
+    }
+
+    fn list_dir(
+        &self,
+        remote: &str,
+        limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<(String, bool, bool)>> {
+        self.noting(self.sftp().list_dir(remote, limit, cancel))
+    }
+
+    fn real_path(&self, remote: &str) -> Result<String> {
+        self.noting(self.sftp().real_path(remote))
+    }
+
+    fn kind(&self, remote: &str) -> Result<Option<EntryKind>> {
+        self.noting(self.sftp().kind(remote))
+    }
+
+    fn kind_stamped(&self, remote: &str) -> Result<(Option<EntryKind>, Option<RemoteStamp>)> {
+        self.noting(self.sftp().kind_stamped(remote))
+    }
+
+    fn list_entries(
+        &self,
+        remote: &str,
+        limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<RemoteEntry>> {
+        self.noting(self.sftp().list_entries(remote, limit, cancel))
+    }
+
+    fn stamp(&self, remote: &str) -> Result<Option<RemoteStamp>> {
+        self.noting(self.sftp().stamp(remote))
+    }
+
+    fn list_dir_stamped(
+        &self,
+        remote: &str,
+        limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Listed>> {
+        self.noting(self.sftp().list_dir_stamped(remote, limit, cancel))
+    }
+}
+
+impl RemoteWrite for Kept {
+    fn put(
+        &self,
+        local: &Path,
+        remote: &str,
+        expected: Option<RemoteStamp>,
+        in_place: bool,
+        cancel: &AtomicBool,
+    ) -> Result<RemoteStamp> {
+        self.noting(self.sftp().put(local, remote, expected, in_place, cancel))
+    }
+
+    fn put_saved(
+        &self,
+        local: &Path,
+        remote: &str,
+        expected: Option<RemoteStamp>,
+        in_place: bool,
+        cancel: &AtomicBool,
+    ) -> Result<super::remote_stage::Saved> {
+        self.noting(
+            self.sftp()
+                .put_saved(local, remote, expected, in_place, cancel),
+        )
+    }
+
+    fn make_dir(&self, remote: &str) -> Result<()> {
+        self.noting(self.sftp().make_dir(remote))
+    }
+
+    fn remove_file(&self, remote: &str) -> Result<()> {
+        self.noting(self.sftp().remove_file(remote))
+    }
+
+    fn remove_dir(&self, remote: &str) -> Result<()> {
+        self.noting(self.sftp().remove_dir(remote))
+    }
 }
 
 /// The entries of `remote` with their names and attributes, no more than `limit + 1` of them,
@@ -2126,6 +2430,15 @@ impl RemoteFs for ssh2::Sftp {
             .stat(Path::new(remote))
             .with_context(|| trf("msg.sftp_cannot_read", &[("path", remote.to_string())]))?;
         Ok(EntryKind::of(&stat))
+    }
+
+    fn kind_stamped(&self, remote: &str) -> Result<(Option<EntryKind>, Option<RemoteStamp>)> {
+        let stat = self
+            .stat(Path::new(remote))
+            .with_context(|| trf("msg.sftp_cannot_read", &[("path", remote.to_string())]))?;
+        let kind = EntryKind::of(&stat);
+        let stamp = (kind == Some(EntryKind::File)).then(|| RemoteStamp::of(&stat));
+        Ok((kind, stamp))
     }
 
     fn stamp(&self, remote: &str) -> Result<Option<RemoteStamp>> {
@@ -2228,26 +2541,30 @@ pub(super) fn local_name_ok(name: &str) -> bool {
     true
 }
 
+/// Downloads the file `remote` to `local`, returning the [`file_hash`] of what it wrote.
 fn download_file(
     fs: &dyn RemoteFs,
     remote: &str,
     local: &Path,
     cancel: &AtomicBool,
-    budget: &mut Budget,
-) -> Result<()> {
+    budget: &Budget,
+) -> Result<u64> {
+    use std::hash::Hasher;
     budget.take_entry()?;
     let mut from = fs.open_read(remote)?;
     let mut to = std::fs::File::create(local)
         .with_context(|| trf("msg.cannot_write", &[("file", local.display().to_string())]))?;
-    let mut buf = [0u8; CHUNK];
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let mut buf = vec![0u8; CHUNK];
     loop {
         check(cancel)?;
         let n = from.read(&mut buf)?;
         if n == 0 {
-            return Ok(());
+            return Ok(hash.finish());
         }
         budget.take_bytes(n as u64)?;
         to.write_all(&buf[..n])?;
+        hash.write(&buf[..n]);
     }
 }
 
@@ -2262,86 +2579,295 @@ fn download_dir(
     local: &Path,
     depth: usize,
     cancel: &AtomicBool,
-    budget: &mut Budget,
+    budget: &Budget,
 ) -> Result<()> {
-    let mut manifest = Manifest::default();
-    let mut at = Walk {
-        rel: String::new(),
-        depth,
+    download_tree(fs, remote, local, depth, cancel, budget, None).map(|_| ())
+}
+
+/// One step of a folder fetch: a folder to list, or a file to download. `rel` is the path
+/// relative to the folder fetched.
+enum Step {
+    Dir {
+        remote: String,
+        local: PathBuf,
+        rel: String,
+        depth: usize,
+    },
+    File {
+        remote: String,
+        local: PathBuf,
+        rel: String,
+        stamp: Option<RemoteStamp>,
+    },
+}
+
+/// The steps of a folder fetch still to do, taken by each of its connections in turn.
+#[derive(Default)]
+struct Steps {
+    /// The last is next, so that one connection alone goes through the folder depth first.
+    waiting: Vec<Step>,
+    /// How many steps are being done, each of which may add more.
+    running: usize,
+    /// The first step that failed, which ends the fetch.
+    failed: Option<anyhow::Error>,
+}
+
+/// A folder fetch as its connections share it.
+struct TreeFetch<'a> {
+    cancel: &'a AtomicBool,
+    budget: &'a Budget,
+    manifest: std::sync::Mutex<Manifest>,
+    steps: std::sync::Mutex<Steps>,
+    changed: std::sync::Condvar,
+}
+
+/// The most connections a folder fetch or a verification reads over. A server takes each
+/// small file in a few round trips, one after another on a connection, so that many files are
+/// read several times faster over several; OpenSSH turns away connections signing in at the
+/// same time from its tenth (`MaxStartups`).
+pub(crate) const MAX_CONNECTIONS: usize = 6;
+/// How many files or folders must be waiting before more connections are made: for fewer,
+/// making them takes longer than reading those.
+pub(crate) const WORTH_CONNECTING: usize = 32;
+
+/// Makes one more connection to the server a fetch reads from; setting the flag stops it.
+type Connect<'a> = &'a (dyn Fn(&AtomicBool) -> Result<Box<dyn Remote>> + Sync);
+/// How to make more connections to the server a fetch reads from, and how many at most.
+type Connector<'a> = (Connect<'a>, usize);
+
+impl TreeFetch<'_> {
+    fn steps(&self) -> std::sync::MutexGuard<'_, Steps> {
+        self.steps.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn manifest(&self) -> std::sync::MutexGuard<'_, Manifest> {
+        self.manifest.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Does `step` over `fs`, returning the steps it leads to, in the order to do them in.
+    fn run(&self, fs: &dyn RemoteFs, step: Step) -> Result<Vec<Step>> {
+        check(self.cancel)?;
+        let (remote, local, rel, depth) = match step {
+            Step::File {
+                remote,
+                local,
+                rel,
+                stamp,
+            } => {
+                // Read before the file, so a change made during the download shows as one
+                // later.
+                let stamp = match stamp {
+                    Some(stamp) => stamp,
+                    None => fs.stamp(&remote).ok().flatten().unwrap_or_default(),
+                };
+                let hash = download_file(fs, &remote, &local, self.cancel, self.budget)?;
+                self.manifest().files.insert(rel, (stamp, hash));
+                return Ok(Vec::new());
+            }
+            Step::Dir {
+                remote,
+                local,
+                rel,
+                depth,
+            } => (remote, local, rel, depth),
+        };
+        if depth > MAX_REMOTE_DEPTH {
+            bail!(trf(
+                "msg.sftp_too_deep",
+                &[
+                    ("path", remote.clone()),
+                    ("count", MAX_REMOTE_DEPTH.to_string())
+                ]
+            ));
+        }
+        self.budget.take_entry()?;
+        std::fs::create_dir_all(&local)?;
+        let entries = fs.list_dir_stamped(&remote, self.budget.entries_left(), self.cancel)?;
+        if entries.len() > self.budget.entries_left() {
+            return Err(self.budget.too_many());
+        }
+        let mut next = Vec::new();
+        for e in entries {
+            // Left out: a name this machine cannot have, a link or other special entry, and a
+            // name this file system takes for one already written here (`a.txt` after `A.txt`
+            // where case does not count), whose download would overwrite the other's. Each
+            // still counts, so a listing of nothing else cannot go on without end.
+            let child_local = local.join(&e.name);
+            if !local_name_ok(&e.name)
+                || !(e.is_dir || e.is_file)
+                || std::fs::symlink_metadata(&child_local).is_ok()
+            {
+                self.budget.take_entry()?;
+                continue;
+            }
+            let child_remote = join(&remote, &e.name);
+            let child_rel = if rel.is_empty() {
+                e.name
+            } else {
+                format!("{rel}/{}", e.name)
+            };
+            // Each is made here as it is listed, to be there for the names after it: its own
+            // step may come after theirs.
+            if e.is_dir {
+                std::fs::create_dir(&child_local)?;
+                self.manifest().dirs.insert(child_rel.clone());
+                next.push(Step::Dir {
+                    remote: child_remote,
+                    local: child_local,
+                    rel: child_rel,
+                    depth: depth + 1,
+                });
+            } else {
+                std::fs::File::create(&child_local).with_context(|| {
+                    trf(
+                        "msg.cannot_write",
+                        &[("file", child_local.display().to_string())],
+                    )
+                })?;
+                next.push(Step::File {
+                    remote: child_remote,
+                    local: child_local,
+                    rel: child_rel,
+                    stamp: e.stamp,
+                });
+            }
+        }
+        Ok(next)
+    }
+
+    /// Does steps over `fs` until none is left, or one failed. `more` is called once, when
+    /// enough steps wait for more connections to be worth making.
+    fn work(&self, fs: &dyn RemoteFs, mut more: Option<&mut dyn FnMut()>) {
+        loop {
+            let step = {
+                let mut steps = self.steps();
+                loop {
+                    if steps.failed.is_some() {
+                        return;
+                    }
+                    if let Some(step) = steps.waiting.pop() {
+                        steps.running += 1;
+                        break step;
+                    }
+                    if steps.running == 0 {
+                        return;
+                    }
+                    steps = self.changed.wait(steps).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            let done = self.run(fs, step);
+            let mut steps = self.steps();
+            steps.running -= 1;
+            match done {
+                Ok(next) => steps.waiting.extend(next.into_iter().rev()),
+                Err(e) => {
+                    steps.failed.get_or_insert(e);
+                }
+            }
+            let many = steps.waiting.len() >= WORTH_CONNECTING;
+            drop(steps);
+            self.changed.notify_all();
+            if many {
+                if let Some(more) = more.take() {
+                    more();
+                }
+            }
+        }
+    }
+}
+
+/// [`download_dir`], returning what it fetched. With `connect`, a folder of many files is
+/// read over several connections at once, each made with it.
+fn download_tree(
+    fs: &dyn RemoteFs,
+    remote: &str,
+    local: &Path,
+    depth: usize,
+    cancel: &AtomicBool,
+    budget: &Budget,
+    connect: Option<Connector>,
+) -> Result<Manifest> {
+    let fetch = TreeFetch {
         cancel,
         budget,
-        manifest: &mut manifest,
+        manifest: Default::default(),
+        steps: Default::default(),
+        changed: Default::default(),
     };
-    download_tree(fs, remote, local, &mut at)
-}
-
-/// Where [`download_tree`] is in a folder fetch: the path relative to the folder fetched, how
-/// many folders deep that is, and what the fetch has read so far.
-struct Walk<'a> {
-    rel: String,
-    depth: usize,
-    cancel: &'a AtomicBool,
-    budget: &'a mut Budget,
-    manifest: &'a mut Manifest,
-}
-
-/// [`download_dir`], recording each folder and file in `at.manifest`.
-fn download_tree(fs: &dyn RemoteFs, remote: &str, local: &Path, at: &mut Walk) -> Result<()> {
-    check(at.cancel)?;
-    if at.depth > MAX_REMOTE_DEPTH {
-        bail!(trf(
-            "msg.sftp_too_deep",
-            &[
-                ("path", remote.to_string()),
-                ("count", MAX_REMOTE_DEPTH.to_string())
-            ]
-        ));
-    }
-    at.budget.take_entry()?;
-    std::fs::create_dir_all(local)?;
-    let entries = fs.list_dir_stamped(remote, at.budget.entries_left(), at.cancel)?;
-    if entries.len() > at.budget.entries_left() {
-        return Err(at.budget.too_many());
-    }
-    for e in entries {
-        // Left out: a name this machine cannot have, a link or other special entry, and a name
-        // this file system takes for one already written here (`a.txt` after `A.txt` where case
-        // does not count), whose download would overwrite the other's. Each still counts, so a
-        // listing of nothing else cannot go on without end.
-        let child_local = local.join(&e.name);
-        if !local_name_ok(&e.name)
-            || !(e.is_dir || e.is_file)
-            || std::fs::symlink_metadata(&child_local).is_ok()
-        {
-            at.budget.take_entry()?;
-            continue;
-        }
-        let child_remote = join(remote, &e.name);
-        let rel = if at.rel.is_empty() {
-            e.name.clone()
-        } else {
-            format!("{}/{}", at.rel, e.name)
-        };
-        if e.is_dir {
-            at.manifest.dirs.insert(rel.clone());
-            let parent = std::mem::replace(&mut at.rel, rel);
-            at.depth += 1;
-            let done = download_tree(fs, &child_remote, &child_local, at);
-            at.depth -= 1;
-            at.rel = parent;
-            done?;
-        } else {
-            // Read before the file, so a change made during the download shows as one later.
-            let stamp = match e.stamp {
-                Some(stamp) => stamp,
-                None => fs.stamp(&child_remote).ok().flatten().unwrap_or_default(),
+    fetch.steps().waiting.push(Step::Dir {
+        remote: remote.to_string(),
+        local: local.to_path_buf(),
+        rel: String::new(),
+        depth,
+    });
+    // Set once the fetch is over, so that a connection still being made then is given up.
+    let over = AtomicBool::new(false);
+    let progress = progress_here();
+    std::thread::scope(|scope| {
+        let (fetch, over, progress) = (&fetch, &over, &progress);
+        let mut more = || {
+            let Some((connect, most)) = connect else {
+                return;
             };
-            download_file(fs, &child_remote, &child_local, at.cancel, at.budget)?;
-            let hash = file_hash(&child_local).unwrap_or_default();
-            at.manifest.files.insert(rel, (stamp, hash));
-        }
+            for _ in 0..most {
+                scope.spawn(move || {
+                    // One that cannot be made is done without: the first reads it all.
+                    let Ok(fs) = quietly(|| connect(over)) else {
+                        return;
+                    };
+                    with_progress_of(progress, || fetch.work(&*fs, None));
+                });
+            }
+        };
+        fetch.work(fs, Some(&mut more));
+        over.store(true, Ordering::Relaxed);
+    });
+    let steps = fetch.steps.into_inner().unwrap_or_else(|e| e.into_inner());
+    match steps.failed {
+        Some(e) => Err(e),
+        None => Ok(fetch
+            .manifest
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())),
     }
-    Ok(())
+}
+
+thread_local! {
+    /// Whether this thread makes a connection besides the one the user signed in to: the
+    /// server's questions are then declined instead of put to the user again.
+    static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `work`, which connects to a server already signed in to, without asking the user
+/// anything: where signing in takes an answer, it fails.
+pub(crate) fn quietly<R>(work: impl FnOnce() -> R) -> R {
+    let before = QUIET.with(|q| q.replace(true));
+    let done = work();
+    QUIET.with(|q| q.set(before));
+    done
+}
+
+/// Set by a benchmark to time one connection alone.
+#[cfg(test)]
+pub(crate) static ALONE: AtomicBool = AtomicBool::new(false);
+
+/// The most connections to an FTP server at once: many allow an account or an address only
+/// a few (two to eight are common limits), and turn the rest away.
+const MAX_FTP_CONNECTIONS: usize = 4;
+
+/// How many more connections like `conn` may be made beside one, to read over several at
+/// once. One a server turns away is done without.
+pub(crate) fn more_connections(conn: &RemoteConnection) -> usize {
+    #[cfg(test)]
+    if fake::installed() || ALONE.load(Ordering::Relaxed) {
+        // The fake server is this thread's alone.
+        return 0;
+    }
+    if conn.protocol.is_ftp() {
+        MAX_FTP_CONNECTIONS - 1
+    } else {
+        MAX_CONNECTIONS - 1
+    }
 }
 
 /// `base` and `name` as one SFTP path: always `/`-separated, whatever this machine's own
@@ -2387,7 +2913,9 @@ pub(crate) fn fetch_with(
     mode: FetchMode,
 ) -> Result<Fetched> {
     let remote = connect(conn, cancel)?;
-    let fetched = fetch_from(&*remote, remote_path, cancel, mode)?;
+    let more = |stop: &AtomicBool| connect(conn, stop);
+    let more: Option<Connector> = Some((&more as Connect, more_connections(conn)));
+    let fetched = fetch_from_over(&*remote, remote_path, cancel, mode, more)?;
     if fetched.is_dir && fetched.manifest.is_none() {
         return Ok(fetched);
     }
@@ -2412,11 +2940,22 @@ pub(crate) fn fetch_from(
     cancel: &AtomicBool,
     mode: FetchMode,
 ) -> Result<Fetched> {
+    fetch_from_over(remote, remote_path, cancel, mode, None)
+}
+
+/// [`fetch_from`], reading a folder of many files over more connections made with `connect`.
+fn fetch_from_over(
+    remote: &dyn RemoteFs,
+    remote_path: &str,
+    cancel: &AtomicBool,
+    mode: FetchMode,
+    connect: Option<Connector>,
+) -> Result<Fetched> {
     let temp = tempfile::Builder::new()
         .prefix("oxidemerge-sftp-")
         .tempdir()?;
     let local = temp.path().join(remote_file_name(remote_path));
-    let staged = fetch_into_mode(remote, remote_path, &local, cancel, mode)?;
+    let staged = fetch_into_mode(remote, remote_path, &local, cancel, mode, connect)?;
     Ok(Fetched {
         temp,
         local,
@@ -2458,8 +2997,9 @@ fn fetch_into(
     remote_path: &str,
     local: &Path,
     cancel: &AtomicBool,
+    connect: Option<Connector>,
 ) -> Result<Staged> {
-    fetch_into_mode(fs, remote_path, local, cancel, FetchMode::Complete)
+    fetch_into_mode(fs, remote_path, local, cancel, FetchMode::Complete, connect)
 }
 
 fn fetch_into_mode(
@@ -2468,12 +3008,14 @@ fn fetch_into_mode(
     local: &Path,
     cancel: &AtomicBool,
     mode: FetchMode,
+    connect: Option<Connector>,
 ) -> Result<Staged> {
     let trimmed = remote_path.trim_end_matches('/');
     let remote_path = if trimmed.is_empty() { "/" } else { trimmed };
     let cannot = || trf("msg.sftp_cannot_read", &[("path", remote_path.to_string())]);
-    let mut budget = Budget::new();
-    match fs.kind(remote_path).with_context(cannot)? {
+    let budget = Budget::new();
+    let (kind, stamp) = fs.kind_stamped(remote_path).with_context(cannot)?;
+    match kind {
         Some(EntryKind::Dir) if matches!(mode, FetchMode::ListFolder) => {
             // A path-field token only. A folder comparison opens the live remote root.
             std::fs::create_dir(local)?;
@@ -2484,15 +3026,7 @@ fn fetch_into_mode(
             })
         }
         Some(EntryKind::Dir) if matches!(mode, FetchMode::Complete) => {
-            let mut manifest = Manifest::default();
-            let mut at = Walk {
-                rel: String::new(),
-                depth: 0,
-                cancel,
-                budget: &mut budget,
-                manifest: &mut manifest,
-            };
-            download_tree(fs, remote_path, local, &mut at)?;
+            let manifest = download_tree(fs, remote_path, local, 0, cancel, &budget, connect)?;
             Ok(Staged {
                 is_dir: true,
                 stamp: None,
@@ -2500,11 +3034,14 @@ fn fetch_into_mode(
             })
         }
         Some(EntryKind::File) => {
-            let stamp = fs.stamp(remote_path)?.with_context(cannot)?;
+            let stamp = match stamp {
+                Some(stamp) => stamp,
+                None => fs.stamp(remote_path)?.with_context(cannot)?,
+            };
             if stamp.size > budget.max_bytes {
                 return Err(budget.too_large());
             }
-            download_file(fs, remote_path, local, cancel, &mut budget)?;
+            download_file(fs, remote_path, local, cancel, &budget)?;
             Ok(Staged {
                 is_dir: false,
                 stamp: Some(stamp),
@@ -2535,7 +3072,9 @@ pub fn refetch(
         .prefix(".oxidemerge-reload-")
         .tempdir_in(parent)?;
     let new = fresh.path().join("new");
-    let staged = fetch_into(&*remote, remote_path, &new, cancel)?;
+    let more = |stop: &AtomicBool| connect(conn, stop);
+    let more: Option<Connector> = Some((&more as Connect, more_connections(conn)));
+    let staged = fetch_into(&*remote, remote_path, &new, cancel, more)?;
     check(cancel)?;
     let old = fresh.path().join("old");
     if local.exists() {
@@ -4405,8 +4944,8 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("big.bin");
-        let mut budget = Budget::new();
-        let err = download_file(&fs, "/big.bin", &local, &cancel, &mut budget).unwrap_err();
+        let budget = Budget::new();
+        let err = download_file(&fs, "/big.bin", &local, &cancel, &budget).unwrap_err();
         assert_eq!(err.to_string(), tr("msg.sftp_cancelled"));
         assert_eq!(std::fs::metadata(&local).unwrap().len(), CHUNK as u64);
     }
@@ -4462,8 +5001,8 @@ mod tests {
         let fs = ManyFiles(10);
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("many");
-        let mut budget = Budget::with_limits(u64::MAX, 4);
-        let err = download_dir(&fs, "/many", &local, 0, &never, &mut budget).unwrap_err();
+        let budget = Budget::with_limits(u64::MAX, 4);
+        let err = download_dir(&fs, "/many", &local, 0, &never, &budget).unwrap_err();
         assert_eq!(
             err.to_string(),
             trf("msg.sftp_too_many", &[("count", "4".to_string())])
@@ -4471,6 +5010,142 @@ mod tests {
         // The folder itself counts as one entry; a listing longer than what is left stops
         // the fetch before any of it is read.
         assert_eq!(std::fs::read_dir(&local).unwrap().count(), 0);
+    }
+
+    /// A folder of this many folders of eight files each, read over any number of
+    /// connections; a file holds its own path.
+    struct Wide(usize);
+
+    impl RemoteFs for Wide {
+        fn open_read(&self, remote: &str) -> Result<Box<dyn Read + '_>> {
+            Ok(Box::new(std::io::Cursor::new(remote.as_bytes().to_vec())))
+        }
+
+        fn list_dir(
+            &self,
+            remote: &str,
+            _limit: usize,
+            _cancel: &AtomicBool,
+        ) -> Result<Vec<(String, bool, bool)>> {
+            Ok(if remote == "/wide" {
+                (0..self.0)
+                    .map(|i| (format!("d{i}"), true, false))
+                    .collect()
+            } else {
+                (0..8).map(|i| (format!("f{i}"), false, true)).collect()
+            })
+        }
+    }
+
+    impl RemoteWrite for Wide {
+        fn put(
+            &self,
+            _local: &Path,
+            _remote: &str,
+            _expected: Option<RemoteStamp>,
+            _in_place: bool,
+            _cancel: &AtomicBool,
+        ) -> Result<RemoteStamp> {
+            unreachable!("only read")
+        }
+
+        fn make_dir(&self, _remote: &str) -> Result<()> {
+            unreachable!("only read")
+        }
+
+        fn remove_file(&self, _remote: &str) -> Result<()> {
+            unreachable!("only read")
+        }
+
+        fn remove_dir(&self, _remote: &str) -> Result<()> {
+            unreachable!("only read")
+        }
+    }
+
+    #[test]
+    fn a_folder_of_many_files_is_fetched_over_several_connections_as_over_one() {
+        let never = AtomicBool::new(false);
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = |name: &str, connect: Option<Connector>| {
+            let local = dir.path().join(name);
+            let budget = Budget::new();
+            let manifest =
+                download_tree(&Wide(40), "/wide", &local, 0, &never, &budget, connect).unwrap();
+            // The folder, its folders and their files.
+            assert_eq!(budget.entries.load(Ordering::Relaxed), 1 + 40 + 40 * 8);
+            assert_eq!(
+                std::fs::read_to_string(local.join("d39/f7")).unwrap(),
+                "/wide/d39/f7"
+            );
+            manifest
+        };
+        let alone = fetch("alone", None);
+        assert_eq!(alone.dirs.len(), 40);
+        assert_eq!(alone.files.len(), 40 * 8);
+        assert_eq!(
+            alone.files["d0/f0"].1,
+            file_hash(&dir.path().join("alone/d0/f0")).unwrap()
+        );
+
+        let made = AtomicUsize::new(0);
+        let connect = |_: &AtomicBool| {
+            made.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(Wide(40)) as Box<dyn Remote>)
+        };
+        assert_eq!(
+            fetch("together", Some((&connect, MAX_CONNECTIONS - 1))),
+            alone
+        );
+        assert_eq!(made.load(Ordering::Relaxed), MAX_CONNECTIONS - 1);
+
+        // Connections that cannot be made are done without.
+        let refused = |_: &AtomicBool| bail!("too many connections");
+        assert_eq!(
+            fetch("refused", Some((&refused, MAX_CONNECTIONS - 1))),
+            alone
+        );
+    }
+
+    #[test]
+    fn a_folder_of_few_files_is_fetched_over_the_one_connection() {
+        let never = AtomicBool::new(false);
+        let dir = tempfile::tempdir().unwrap();
+        let connect = |_: &AtomicBool| unreachable!("not worth another connection");
+        let manifest = download_tree(
+            &Wide(3),
+            "/wide",
+            &dir.path().join("few"),
+            0,
+            &never,
+            &Budget::new(),
+            Some((&connect, MAX_CONNECTIONS - 1)),
+        )
+        .unwrap();
+        assert_eq!(manifest.files.len(), 3 * 8);
+    }
+
+    #[test]
+    fn a_failure_on_one_connection_ends_a_fetch_over_several() {
+        let never = AtomicBool::new(false);
+        let dir = tempfile::tempdir().unwrap();
+        let connect = |_: &AtomicBool| Ok(Box::new(Wide(40)) as Box<dyn Remote>);
+        // The folder, its 40 folders and 100 of their 320 files.
+        let budget = Budget::with_limits(u64::MAX, 141);
+        let local = dir.path().join("wide");
+        let err = download_tree(
+            &Wide(40),
+            "/wide",
+            &local,
+            0,
+            &never,
+            &budget,
+            Some((&connect, MAX_CONNECTIONS - 1)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            trf("msg.sftp_too_many", &[("count", "141".to_string())])
+        );
     }
 
     /// Folders of nothing but links, each listed in full.
@@ -4503,16 +5178,16 @@ mod tests {
         let never = AtomicBool::new(false);
         let dir = tempfile::tempdir().unwrap();
         // The root and its three folders, then three links in each: 13 in all.
-        let mut budget = Budget::with_limits(u64::MAX, 8);
+        let budget = Budget::with_limits(u64::MAX, 8);
         let local = dir.path().join("links");
-        let err = download_dir(&Links, "/links", &local, 0, &never, &mut budget);
+        let err = download_dir(&Links, "/links", &local, 0, &never, &budget);
         assert_eq!(
             err.unwrap_err().to_string(),
             trf("msg.sftp_too_many", &[("count", "8".to_string())])
         );
-        let mut budget = Budget::with_limits(u64::MAX, 13);
+        let budget = Budget::with_limits(u64::MAX, 13);
         let local = dir.path().join("all");
-        download_dir(&Links, "/links", &local, 0, &never, &mut budget).unwrap();
+        download_dir(&Links, "/links", &local, 0, &never, &budget).unwrap();
     }
 
     #[test]
@@ -4525,8 +5200,8 @@ mod tests {
         let local = dir.path().join("big.bin");
         // Exactly one chunk's worth: the first chunk fits and is written, the second would
         // not fit and is rejected before it is, so the file is left with just the first.
-        let mut budget = Budget::with_limits(CHUNK as u64, usize::MAX);
-        let err = download_file(&fs, "/big.bin", &local, &never, &mut budget).unwrap_err();
+        let budget = Budget::with_limits(CHUNK as u64, usize::MAX);
+        let err = download_file(&fs, "/big.bin", &local, &never, &budget).unwrap_err();
         assert_eq!(err.to_string(), budget.too_large().to_string());
         assert_eq!(std::fs::metadata(&local).unwrap().len(), CHUNK as u64);
     }
@@ -4882,16 +5557,9 @@ mod tests {
         }
         let never = AtomicBool::new(false);
         let dir = tempfile::tempdir().unwrap();
-        let mut budget = Budget::new();
-        let err = download_dir(
-            &Endless,
-            "/d",
-            &dir.path().join("d"),
-            0,
-            &never,
-            &mut budget,
-        )
-        .unwrap_err();
+        let budget = Budget::new();
+        let err =
+            download_dir(&Endless, "/d", &dir.path().join("d"), 0, &never, &budget).unwrap_err();
         assert!(
             err.to_string().contains(&MAX_REMOTE_DEPTH.to_string()),
             "{err}"

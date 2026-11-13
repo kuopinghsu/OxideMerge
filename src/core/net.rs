@@ -201,6 +201,10 @@ pub(crate) fn connect(
     };
     tcp.set_read_timeout(Some(CONNECT_TIMEOUT))?;
     tcp.set_write_timeout(Some(CONNECT_TIMEOUT))?;
+    // SSH and FTP send small requests and wait for each one's answer: held back to be sent
+    // with more (Nagle's algorithm), each can wait out the other end's delayed
+    // acknowledgement, 200 ms on Windows.
+    tcp.set_nodelay(true)?;
     Ok(tcp)
 }
 
@@ -209,16 +213,31 @@ pub(crate) fn connect(
 fn direct(host: &str, port: u16, cancel: &AtomicBool) -> Result<std::io::Result<TcpStream>> {
     let addrs = resolve(host, port)?;
     check(cancel)?;
-    // Local services can listen on just one address family. A loopback address that
-    // silently drops connections must not delay trying the other one for 20 seconds.
-    let timeout = if addrs.len() > 1 && addrs.iter().all(|addr| addr.ip().is_loopback()) {
-        Duration::from_millis(250)
-    } else {
-        CONNECT_TIMEOUT
-    };
+    // Local services can listen on just one address family, and a loopback address may
+    // silently drop connections (`localhost` is `::1` first, where a forwarded port often
+    // only answers on `127.0.0.1`): these are all tried at once, and the first to connect is
+    // taken, so that neither the 20 seconds nor a shorter wait for the one before delays it.
+    if addrs.len() > 1 && addrs.iter().all(|addr| addr.ip().is_loopback()) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for addr in addrs {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(TcpStream::connect_timeout(&addr, LOOPBACK_TIMEOUT));
+            });
+        }
+        drop(tx);
+        let mut tcp = Err(std::io::Error::other("no address"));
+        for tried in rx {
+            tcp = tried;
+            if tcp.is_ok() {
+                break;
+            }
+        }
+        return Ok(tcp);
+    }
     let mut tcp = Err(std::io::Error::other("no address"));
     for addr in &addrs {
-        tcp = TcpStream::connect_timeout(addr, timeout);
+        tcp = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT);
         if tcp.is_ok() {
             break;
         }
@@ -226,6 +245,9 @@ fn direct(host: &str, port: u16, cancel: &AtomicBool) -> Result<std::io::Result<
     }
     Ok(tcp)
 }
+
+/// How long connecting to one of this machine's own addresses may take.
+const LOOPBACK_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// A proxy's side of the conversation, read within one time limit for all of it, and stopped
 /// once `cancel` is set, however slowly the proxy answers.
