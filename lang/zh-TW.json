@@ -975,7 +975,7 @@
   "rules.present": "已存在：{names}",
   "rules.replace": "取代為",
   "rules.save": "儲存規則檔",
-  "rules.saved_as": "已儲存為「{name}」",
+  "rules.saved_as": "將儲存為「{name}」",
   "rules.substitute": "取代",
   "rules.substitutions": "取代規則",
   "rules.unclear_lines": "第 {lines} 行無法拆成兩個樣式：請在兩個樣式之間只寫一次「 => 」。",
