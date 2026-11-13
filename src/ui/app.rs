@@ -554,11 +554,14 @@ struct OpenDialog {
     /// Whether this stands for the start page's own fields, submitted there, rather than
     /// being a dialog the user opened: it goes away again if connecting for it is cancelled.
     from_start: bool,
-    recent_remote: Vec<(String, String)>,
     three_way: bool,
     filter: String,
     recursive: bool,
     method: CompareMethod,
+    /// Compare rules file to compare with ("" = none).
+    rules: String,
+    /// The names of the rules files there were when the dialog opened.
+    rule_names: Vec<String>,
     kind: Option<FileKind>,
     read_only: [bool; 3],
 }
@@ -4432,11 +4435,12 @@ impl OxideMergeApp {
         OpenDialog {
             paths: [left.unwrap_or_default(), String::new(), String::new()],
             from_start: false,
-            recent_remote: Vec::new(),
             three_way: false,
             filter: self.cfg.filter.clone(),
             recursive: self.cfg.folder.recursive,
             method: self.cfg.folder.method,
+            rules: self.cfg.rules.clone(),
+            rule_names: rules::list().into_iter().map(|s| s.name).collect(),
             kind: None,
             read_only: [false; 3],
         }
@@ -5641,14 +5645,6 @@ impl OxideMergeApp {
                     .open_dlg
                     .take()
                     .unwrap_or_else(|| self.new_open_dialog(None));
-                if matches!(target, RemoteTarget::Compare(_))
-                    && (!fetched.is_dir || fetched.manifest.is_some())
-                {
-                    d.recent_remote.push((
-                        shown.clone(),
-                        crate::core::remote_url::address(&conn, &remote_path),
-                    ));
-                }
                 d.paths[s] = shown;
                 self.open_dlg = Some(d);
             }
@@ -10387,7 +10383,7 @@ impl OxideMergeApp {
                                     .font(theme::semibold(theme::size::DISPLAY)),
                             );
                             ui.label(
-                                egui::RichText::new(tr("app.tagline"))
+                                egui::RichText::new(tr("about.slogan"))
                                     .size(theme::size::SUBTITLE)
                                     .color(p.text_dim),
                             );
@@ -10871,6 +10867,35 @@ impl OxideMergeApp {
                                     }
                                 });
                             ui.end_row();
+                            ui.label(egui::RichText::new(tr("label.rules")).color(p.text_dim));
+                            let names: Vec<&str> =
+                                d.rule_names.iter().map(String::as_str).collect();
+                            let picked = rules::chosen(&d.rules, &names).map(str::to_string);
+                            let shown = match &picked {
+                                Some(name) => name.as_str(),
+                                None if d.rules.is_empty() => tr("rules.none"),
+                                None => rules::display_name(&d.rules),
+                            };
+                            egui::ComboBox::from_id_salt("open_rules")
+                                .width(220.0)
+                                .selected_text(shown)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(d.rules.is_empty(), tr("rules.none"))
+                                        .clicked()
+                                    {
+                                        d.rules.clear();
+                                    }
+                                    for name in &d.rule_names {
+                                        let on = picked.as_ref() == Some(name);
+                                        if ui.selectable_label(on, name).clicked() {
+                                            d.rules = name.clone();
+                                        }
+                                    }
+                                })
+                                .response
+                                .on_hover_text(tr("tip.rules"));
+                            ui.end_row();
                             ui.label(egui::RichText::new(tr("label.compare_as")).color(p.text_dim));
                             let mut kind = d.kind;
                             widgets::segmented(
@@ -11047,22 +11072,35 @@ impl OxideMergeApp {
             recursive: Some(d.recursive),
             filter: Some(d.filter.clone()),
             method: Some(d.method),
+            // Rules of its own only when they are not the ones of the options.
+            rules: (d.rules != self.cfg.rules).then(|| d.rules.clone()),
             ..Default::default()
         };
-        let recent = (!d.recent_remote.is_empty())
-            .then(|| {
-                req.paths
+        // A side fetched from a server is remembered by its address there, not by its
+        // temporary copy, among the recent comparisons and the recent paths alike.
+        let addresses: Vec<Option<String>> = req
+            .paths
+            .iter()
+            .map(|path| {
+                self.pending_remote
                     .iter()
-                    .map(|path| {
-                        d.recent_remote
-                            .iter()
-                            .find(|(local, _)| Path::new(local) == path)
-                            .map(|(_, url)| url.clone())
-                            .or_else(|| (!self.is_staged(path)).then(|| path.display().to_string()))
-                    })
-                    .collect::<Option<Vec<_>>>()
+                    .rev()
+                    .find(|p| p.local == *path)
+                    .map(|p| crate::core::remote_url::address(&p.file.conn, &p.file.remote_path))
             })
-            .flatten();
+            .collect();
+        for address in addresses.iter().flatten() {
+            self.cfg.add_recent_path(address);
+        }
+        let recent = addresses
+            .iter()
+            .zip(&req.paths)
+            .map(|(address, path)| {
+                address
+                    .clone()
+                    .or_else(|| (!self.is_staged(path)).then(|| path.display().to_string()))
+            })
+            .collect::<Option<Vec<_>>>();
         self.open_with_recent(req, recent);
     }
 

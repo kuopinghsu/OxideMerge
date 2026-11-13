@@ -25,9 +25,30 @@ release on GitHub uses its section of this file as the release notes.
   Opening a verified pair reuses its downloaded copies when they are still cached.
 - On Windows, GNU Make can build both user guide PDFs through Docker Desktop in Linux
   container mode, using the same Asciidoctor versions as CI.
+- SFTP folders with many files are fetched, listed, and verified over up to six connections
+  at once, and each file is hashed as it downloads rather than read again afterwards.
+  Comparing a folder of 886 files on a local test server with its local copy from the
+  command line went from 6.3 s to 1.3 s. Extra connections never ask for a password or
+  passphrase again: where signing in needs one, the first connection does the work alone.
+- FTP and FTPS folders with many files are fetched over up to four connections at once; a
+  server that allows fewer is used over as many as it takes. A server without `EPSV` is
+  asked for it once, not before every file.
+- An SFTP or FTP connection stays open for 30 seconds after its last use, and the next step
+  on the same server takes it instead of signing in again: listing a folder, verifying its
+  files and opening a pair no longer each wait for a new sign-in. One that an operation
+  failed over is closed instead.
+- *More options* on the start page chooses the compare rules for the comparison.
 
 ### Fixed
 
+- A file or folder on a server is remembered by its address among the recent comparisons
+  and the recent paths, also when it was chosen with the remote file chooser or its folder
+  is listed without downloading. It was left out, as its temporary copy is.
+- Connecting to a server on `localhost` no longer waits 250 ms for the IPv6 address when
+  only the IPv4 one answers: both are tried at once.
+- SFTP and FTP connections send each request immediately (`TCP_NODELAY`). Requests could
+  wait for the other end's delayed acknowledgement, which slowed signing in and every
+  small transfer.
 - The formatted comparison location pane marks individual added or removed table
   rows. Paired rows with text or formatting changes are marked on both sides.
 - Live SFTP comparisons pair unambiguous case variants on Windows and macOS and apply

@@ -189,7 +189,6 @@
   "app.drop_overlay": "Zum Vergleichen ablegen",
   "app.drop_overlay_desc": "Zwei oder drei Dateien oder Ordner werden nebeneinander geöffnet; ein einzelnes Element öffnet den Öffnen-Dialog.",
   "app.ready": "Bereit",
-  "app.tagline": "Dateien und Ordner vergleichen und zusammenführen",
   "btn.add": "Hinzufügen",
   "btn.browse_file": "Datei auswählen",
   "btn.browse_folder": "Ordner auswählen",

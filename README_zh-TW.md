@@ -5,7 +5,7 @@
 OxideMerge 是以 Rust 打造、免費且開放原始碼的跨平台差異比較與合併工具。名稱取自氧化鐵（iron
 oxide），也就是鐵鏽（rust）的成分；它讓檔案比較、資料夾同步與衝突解決更清楚、更安心。
 
-**看清每一處差異，安心合併每項變更。**
+**看清每一處差異，掌握每一次合併。**
 
 ![Windows、macOS 與 Linux 上的 OxideMerge](images/banner.jpg)
 

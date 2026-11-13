@@ -421,6 +421,8 @@ struct Control {
     /// Whether the server lists folders with `MLSD` and describes paths with `MLST`, rather
     /// than only the free-form `LIST`.
     mlst: bool,
+    /// Whether the server refused `EPSV`, so that each transfer asks with `PASV` at once.
+    no_epsv: bool,
     /// The folder a relative path is in.
     home: String,
     /// Replies still owed for transfers given up before they ended, read before the next
@@ -524,12 +526,20 @@ impl Control {
     /// Opens a passive data connection, to the control connection's own address, or through
     /// the proxy to the server's name.
     fn open_data(&mut self, cancel: &AtomicBool) -> Result<TcpStream> {
-        let epsv = self.cmd("EPSV")?;
-        let port = if epsv.code == 229 {
-            epsv_port(&epsv.text).with_context(|| epsv.to_string())?
-        } else {
-            let pasv = self.expect("PASV", &[227])?;
-            pasv_port(&pasv.text).with_context(|| pasv.to_string())?
+        let epsv = match self.no_epsv {
+            true => None,
+            false => Some(self.cmd("EPSV")?),
+        };
+        let port = match epsv {
+            Some(epsv) if epsv.code == 229 => {
+                epsv_port(&epsv.text).with_context(|| epsv.to_string())?
+            }
+            epsv => {
+                // A server that does not know the command is not asked again for each file.
+                self.no_epsv |= epsv.is_some_and(|r| matches!(r.code, 500..=502));
+                let pasv = self.expect("PASV", &[227])?;
+                pasv_port(&pasv.text).with_context(|| pasv.to_string())?
+            }
         };
         if let Some(proxy) = &self.proxy {
             return super::net::connect(&self.host, port, Some(proxy), cancel);
@@ -698,6 +708,23 @@ impl Client {
         })
     }
 
+    /// Whether the control connection is between commands, with no reply owed or lost: as
+    /// the next step that takes the connection needs to find it.
+    pub fn at_rest(&self) -> bool {
+        self.control
+            .try_borrow()
+            .is_ok_and(|c| !c.broken && c.owed == 0)
+    }
+
+    /// Whether the server still answers, for a connection that was idle.
+    pub fn alive(&self) -> bool {
+        self.at_rest()
+            && self
+                .control
+                .try_borrow_mut()
+                .is_ok_and(|mut c| c.cmd("NOOP").is_ok_and(|r| r.code == 200))
+    }
+
     /// Makes the control connection again before a transfer when the TLS session tickets the
     /// server gave are used up, so that the data connection can resume the session.
     fn fresh(&self, cancel: &AtomicBool) -> Result<()> {
@@ -740,6 +767,7 @@ impl Client {
             proxy,
             active: conn.options.active,
             mlst: false,
+            no_epsv: false,
             home: "/".to_string(),
             owed: 0,
             broken: false,
@@ -1678,6 +1706,81 @@ mod tests {
         let cancelled = AtomicBool::new(true);
         let c = conn(Protocol::Ftp, server.port);
         assert!(remote::fetch(&c, "/data", &cancelled).is_err());
+    }
+
+    /// `folders` folders of `files` small files each, under `data`.
+    fn seed_wide(root: &Path, folders: usize, files: usize) {
+        for d in 0..folders {
+            let dir = root.join(format!("data/d{d}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..files {
+                std::fs::write(dir.join(format!("f{f}.txt")), format!("{d}/{f}")).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_folder_of_many_files_is_fetched_over_several_connections_then_kept() {
+        let never = AtomicBool::new(false);
+        // Without `EPSV`: asked for once on each connection, not for each file.
+        let server = ts::start(Options {
+            mlst: true,
+            ..Default::default()
+        });
+        seed_wide(server.root.path(), 40, 3);
+        let c = conn(Protocol::Ftp, server.port);
+        let f = remote::fetch(&c, "/data", &never).unwrap();
+        let manifest = f.manifest.as_ref().unwrap();
+        assert_eq!(manifest.dirs.len(), 40);
+        assert_eq!(manifest.files.len(), 40 * 3);
+        assert_eq!(read(f.local.join("d39/f2.txt")), "39/2");
+        // The connections are kept, and the next step takes one: gone with the server, it
+        // would fail instead of signing in again.
+        std::fs::write(server.root.path().join("data/new.txt"), "new").unwrap();
+        let f = remote::fetch(&c, "/data/new.txt", &never).unwrap();
+        assert_eq!(read(&f.local), "new");
+        remote::close_idle();
+    }
+
+    /// Manual benchmark of a folder fetch from the test server on this machine, whose answer
+    /// to each command waits `OXIDEMERGE_BENCH_DELAY_MS` (default 2), as over a network:
+    /// 100 folders of 3 small files, over one connection and over several, each signing in
+    /// anew (see `docs/benchmarks.md`). Every file and listing takes a connection of its
+    /// own, which Windows keeps the port of for a while: run again at once, it can run out.
+    #[test]
+    #[ignore]
+    fn bench_ftp_folder_fetch() {
+        let never = AtomicBool::new(false);
+        let delay_ms = std::env::var("OXIDEMERGE_BENCH_DELAY_MS")
+            .ok()
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(2);
+        for (name, mlst, epsv) in [("mlsd+epsv", true, true), ("list+pasv", false, false)] {
+            let server = ts::start(Options {
+                mlst,
+                epsv,
+                delay_ms,
+                ..Default::default()
+            });
+            seed_wide(server.root.path(), 100, 3);
+            let c = conn(Protocol::Ftp, server.port);
+            for alone in [true, false] {
+                remote::ALONE.store(alone, std::sync::atomic::Ordering::Relaxed);
+                let mut times = Vec::new();
+                for _ in 0..3 {
+                    remote::close_idle();
+                    let start = std::time::Instant::now();
+                    let f = remote::fetch(&c, "/data", &never).unwrap();
+                    times.push(start.elapsed());
+                    assert_eq!(f.manifest.as_ref().unwrap().files.len(), 300);
+                }
+                times.sort();
+                let how = if alone { "one connection" } else { "several" };
+                eprintln!("{name:<10} {how:<15} {:>6} ms", times[1].as_millis());
+            }
+            remote::ALONE.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        remote::close_idle();
     }
 
     // Against real servers on this machine, as the Docker test environments start them

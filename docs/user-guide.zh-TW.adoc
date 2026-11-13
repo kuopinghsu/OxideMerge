@@ -42,6 +42,8 @@ OxideMerge 是一套快速、安全的檔案與資料夾比較及合併工具，
 除了文字，OxideMerge 也能比較二進位檔、影像與網頁，並可融入您的版本控制與自動化流程。
 OxideMerge 以 Rust 打造。
 
+*看清每一處差異，掌握每一次合併。*
+
 本指南另有 xref:user-guide.adoc[英文版]。
 
 本指南說明如何安裝 OxideMerge、比較與合併檔案及資料夾，以及如何將 OxideMerge 整合到版本控制系統與自動化流程中。

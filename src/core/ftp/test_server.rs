@@ -34,6 +34,9 @@ pub struct Options {
     /// Ends each download and listing after this many bytes, without a TLS `close_notify`,
     /// as someone in between could, yet still says it all went.
     pub cut: Option<usize>,
+    /// How long each command waits before it is answered, in milliseconds, as over a network
+    /// that takes that long there and back.
+    pub delay_ms: u64,
 }
 
 pub struct Server {
@@ -332,6 +335,7 @@ impl Session {
             self.send("530 Please sign in")?;
             return Ok(true);
         }
+        std::thread::sleep(Duration::from_millis(self.options.delay_ms));
         match cmd {
             "AUTH" if self.options.security == Security::Explicit => {
                 self.send("234 Go ahead")?;
@@ -372,6 +376,7 @@ impl Session {
                 self.send(&lines.join("\r\n"))?;
             }
             "PWD" => self.send("257 \"/\" is the current folder")?,
+            "NOOP" => self.send("200 Still here")?,
             "EPSV" if self.options.epsv => {
                 let listener = TcpListener::bind("127.0.0.1:0")?;
                 let port = listener.local_addr()?.port();

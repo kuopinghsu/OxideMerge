@@ -189,7 +189,6 @@
   "app.drop_overlay": "Drop to compare",
   "app.drop_overlay_desc": "Two or three files or folders open side by side; a single item opens the Open dialog.",
   "app.ready": "Ready",
-  "app.tagline": "Compare and merge files and folders",
   "btn.add": "Add",
   "btn.browse_file": "Browse for a file",
   "btn.browse_folder": "Browse for a folder",
