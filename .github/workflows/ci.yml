@@ -1,8 +1,8 @@
-# Pushes and pull requests run the full test suite and CLI/window checks on
-# Windows x64, Linux x64 and macOS Apple silicon, plus dependency checks.
-# Release-tag pushes and manual package runs also test Windows/Linux Arm64,
-# build all nine release files and check AppImages on Ubuntu 22.04/AlmaLinux 8.
-# Package runs on release tags publish a GitHub release.
+# Branch pushes and pull requests run Linux x64 checks and dependency checks.
+# Release-tag pushes and manual runs check Windows x64/Arm64, Linux x64/Arm64
+# and macOS. Release tags build packages automatically; manual runs build them
+# with packages enabled (the default). Package runs on release tags publish
+# a GitHub release.
 name: CI
 
 on:
@@ -40,6 +40,7 @@ env:
 
 jobs:
   windows:
+    if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch')
     name: Windows ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -48,7 +49,7 @@ jobs:
       matrix:
         include: >-
           ${{ fromJSON(
-            (((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages)))
+            ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch')
             && '[{"arch":"x64","runner":"windows-latest","target":"x86_64-pc-windows-msvc"},{"arch":"arm64","runner":"windows-11-arm","target":"aarch64-pc-windows-msvc"}]'
             || '[{"arch":"x64","runner":"windows-latest","target":"x86_64-pc-windows-msvc"}]'
           ) }}
@@ -240,7 +241,7 @@ jobs:
       matrix:
         include: >-
           ${{ fromJSON(
-            (((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages)))
+            ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch')
             && '[{"arch":"x64","runner":"ubuntu-22.04"},{"arch":"arm64","runner":"ubuntu-22.04-arm"}]'
             || '[{"arch":"x64","runner":"ubuntu-22.04"}]'
           ) }}
@@ -610,6 +611,7 @@ jobs:
           echo "OxideMerge was still running after 20 seconds"
 
   macos:
+    if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch')
     name: macOS universal
     runs-on: macos-15
     timeout-minutes: 45
