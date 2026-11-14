@@ -1034,6 +1034,7 @@
   "table.choose_keys": "鍵",
   "text.change_counts": "新增 {add} 行，刪除 {del} 行",
   "text.folded": "{n} 行未變更",
+  "text.paste_here": "複製第二段文字，然後按 Ctrl+V 貼上到這裡進行比較",
   "text.rows_selected": "已選取 {n} 行",
   "theme.dark": "深色",
   "theme.light": "淺色",

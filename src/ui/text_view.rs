@@ -1829,6 +1829,9 @@ pub struct TextView {
     note_edit: Option<NoteEdit>,
     /// Off for a preview that must leave the keyboard to the view around it.
     pub keys_enabled: bool,
+    /// The pane that shows a "paste the text here" placeholder while it is blank, for a
+    /// compare that waits for its second text (File → Compare clipboard).
+    pub paste_hint: Option<usize>,
     /// Whether edited lines are marked, so they are only worked out when shown.
     edit_markers: bool,
     tab_size: usize,
@@ -1944,6 +1947,7 @@ impl TextView {
             sync_points: Vec::new(),
             note_edit: None,
             keys_enabled: true,
+            paste_hint: None,
             edit_markers: cfg.show_edit_markers,
             tab_size: cfg.tab_size,
             rules: None,
@@ -4974,6 +4978,12 @@ impl TextView {
 
     /// Pastes `text` into the active pane: it replaces an empty document or the selected lines,
     /// and is otherwise inserted below the cursor row.
+    /// Whether pane `p` holds no text at all: a single empty line.
+    pub fn pane_is_blank(&self, p: usize) -> bool {
+        let doc = &self.panes[p].doc;
+        doc.lines.len() <= 1 && doc.lines.iter().all(String::is_empty)
+    }
+
     pub fn paste(&mut self, text: &str) {
         let p = self.active_pane;
         if p >= self.n() || !self.writable(p) {
@@ -4983,8 +4993,8 @@ impl TextView {
         if new_lines.is_empty() {
             return;
         }
+        let blank = self.pane_is_blank(p);
         let doc = &self.panes[p].doc;
-        let blank = doc.lines.len() <= 1 && doc.lines.iter().all(String::is_empty);
         let range = if blank {
             0..doc.lines.len()
         } else if let Some((r0, r1)) = self.selection() {
@@ -12361,6 +12371,21 @@ impl TextView {
                     );
                 }
             }
+            if self.paste_hint == Some(p) && self.pane_is_blank(p) {
+                let galley = ui.fonts_mut(|f| {
+                    f.layout(
+                        tr("text.paste_here").to_string(),
+                        FontId::proportional(theme::size::CONTROL),
+                        c.ui.text_dim,
+                        (text_rect.width() - 24.0).max(40.0),
+                    )
+                });
+                let at = pos2(
+                    text_rect.center().x - galley.size().x / 2.0,
+                    body_top + row_h * 2.0,
+                );
+                tp.galley(at, galley, c.ui.text_dim);
+            }
             painter.line_segment(
                 [
                     pos2(x0 + pane_w - 1.0, avail.top()),
@@ -17064,6 +17089,33 @@ mod tests {
             frame(&mut v, &ctx, vec![]);
         }
         assert_eq!(v.scroll, last, "the view moved after the drag");
+    }
+
+    #[test]
+    fn a_blank_side_waiting_for_a_paste_says_so_until_text_is_pasted_into_it() {
+        let painted = |out: &egui::FullOutput| {
+            out.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(t)
+                    if t.galley.job.text == tr("text.paste_here"))
+            })
+        };
+        let left = TextDoc::from_text(None, "one\ntwo\n");
+        let mut v = TextView::new(vec![left, TextDoc::from_text(None, "")], &Config::default());
+        let ctx = egui::Context::default();
+        // Only the pane named waits for a paste: a plain new compare shows no placeholder.
+        assert!(!painted(&frame(&mut v, &ctx, Vec::new())));
+        v.paste_hint = Some(1);
+        v.active_pane = 1;
+        assert!(painted(&frame(&mut v, &ctx, Vec::new())));
+
+        let out = frame(&mut v, &ctx, vec![egui::Event::Paste("one\nTWO\n".into())]);
+        assert_eq!(v.panes[0].doc.lines, ["one", "two"]);
+        assert_eq!(v.panes[1].doc.lines, ["one", "TWO"]);
+        assert_eq!(v.diff.blocks.len(), 1);
+        assert!(!painted(&out));
+        // Emptied again, it asks for a text again.
+        v.undo();
+        assert!(painted(&frame(&mut v, &ctx, Vec::new())));
     }
 
     /// Runs one frame of the side-by-side view with `events`.

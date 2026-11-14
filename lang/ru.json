@@ -1034,6 +1034,7 @@
   "table.choose_keys": "Ключи",
   "text.change_counts": "Добавлено строк: {add}, удалено: {del}",
   "text.folded": "Неизменённых строк: {n}",
+  "text.paste_here": "Скопируйте второй текст и вставьте его сюда сочетанием Ctrl+V, чтобы сравнить",
   "text.rows_selected": "Выбрано строк: {n}",
   "theme.dark": "Тёмная",
   "theme.light": "Светлая",

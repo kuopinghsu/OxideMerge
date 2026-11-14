@@ -1034,6 +1034,7 @@
   "table.choose_keys": "Claves",
   "text.change_counts": "{add} líneas añadidas, {del} líneas eliminadas",
   "text.folded": "{n} líneas sin cambios",
+  "text.paste_here": "Copie el segundo texto y péguelo aquí con Ctrl+V para compararlo",
   "text.rows_selected": "{n} líneas seleccionadas",
   "theme.dark": "Oscuro",
   "theme.light": "Claro",

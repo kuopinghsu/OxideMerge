@@ -3060,20 +3060,27 @@ fn compare_clipboard_opens_the_clipboard_text_on_the_left_and_a_blank_right_side
     assert!(gui.shows_text(tr("label.clipboard")));
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
 
-    // The right side is fully editable, so a second text can be pasted in to compare it.
-    let Content::Text(v) = &mut gui.app.tabs[0].content else {
+    // The blank right side has the keys, so Ctrl+V right away pastes the second text there
+    // (not a second copy of the clipboard into the left side), and the two are compared.
+    let Content::Text(v) = &gui.app.tabs[0].content else {
         panic!("Expected a text compare");
     };
-    v.active_pane = 1;
+    assert_eq!(v.active_pane, 1);
+    assert_eq!(v.paste_hint, Some(1));
     gui.events.push(Event::Paste("one\nTWO\n".into()));
     gui.frames(2);
     let Content::Text(v) = &gui.app.tabs[0].content else {
         panic!("Expected a text compare");
     };
     assert_eq!(
+        v.panes[0].doc.lines,
+        vec!["one".to_string(), "two".to_string()]
+    );
+    assert_eq!(
         v.panes[1].doc.lines,
         vec!["one".to_string(), "TWO".to_string()]
     );
+    assert_eq!(v.diff.blocks.len(), 1);
 }
 
 #[test]

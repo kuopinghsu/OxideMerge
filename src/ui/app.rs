@@ -4348,6 +4348,10 @@ impl OxideMergeApp {
         match clipboard_doc(read) {
             Ok(left) => {
                 let mut v = TextView::new(vec![left, blank_doc()], &self.cfg);
+                // The blank side takes the keys, so Ctrl+V pastes the second text there rather
+                // than a second copy of the clipboard into the left side.
+                v.active_pane = 1;
+                v.paste_hint = Some(1);
                 v.status = tr("msg.clipboard_hint").to_string();
                 self.push_tab(Content::Text(v), Vec::new());
             }

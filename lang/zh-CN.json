@@ -1034,6 +1034,7 @@
   "table.choose_keys": "键",
   "text.change_counts": "新增 {add} 行，删除 {del} 行",
   "text.folded": "{n} 行未更改",
+  "text.paste_here": "复制第二段文本，然后按 Ctrl+V 粘贴到这里进行比较",
   "text.rows_selected": "已选择 {n} 行",
   "theme.dark": "深色",
   "theme.light": "浅色",
