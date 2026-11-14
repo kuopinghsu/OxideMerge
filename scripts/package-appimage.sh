@@ -57,6 +57,8 @@ install -Dm 755 "$bin" "$app/usr/bin/oxidemerge"
 strip "$app/usr/bin/oxidemerge"
 install -Dm 755 assets/AppRun "$app/AppRun"
 install -Dm 644 assets/oxidemerge.desktop "$app/oxidemerge.desktop"
+# A Windows working tree can still have CRLF files from before Git's LF rules.
+sed -i 's/\r$//' "$app/AppRun" "$app/oxidemerge.desktop"
 install -Dm 644 assets/oxidemerge.png "$app/oxidemerge.png"
 install -Dm 644 assets/oxidemerge.png "$app/usr/share/icons/hicolor/256x256/apps/oxidemerge.png"
 install -Dm 644 LICENSE "$app/usr/share/doc/oxidemerge/LICENSE"
