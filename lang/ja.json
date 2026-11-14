@@ -1034,6 +1034,7 @@
   "table.choose_keys": "キー",
   "text.change_counts": "{add} 行追加、{del} 行削除",
   "text.folded": "変更のない {n} 行",
+  "text.paste_here": "2 つ目のテキストをコピーし、Ctrl+V でここに貼り付けると比較できます",
   "text.rows_selected": "{n} 行を選択中",
   "theme.dark": "ダーク",
   "theme.light": "ライト",

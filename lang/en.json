@@ -1034,6 +1034,7 @@
   "table.choose_keys": "Keys",
   "text.change_counts": "{add} lines added, {del} lines removed",
   "text.folded": "{n} unchanged lines",
+  "text.paste_here": "Copy the second text, then paste it here with Ctrl+V to compare it",
   "text.rows_selected": "{n} lines selected",
   "theme.dark": "Dark",
   "theme.light": "Light",

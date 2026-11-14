@@ -1034,6 +1034,7 @@
   "table.choose_keys": "Schlüssel",
   "text.change_counts": "{add} Zeilen hinzugefügt, {del} Zeilen entfernt",
   "text.folded": "{n} unveränderte Zeilen",
+  "text.paste_here": "Kopieren Sie den zweiten Text und fügen Sie ihn hier mit Strg+V ein, um ihn zu vergleichen",
   "text.rows_selected": "{n} Zeilen ausgewählt",
   "theme.dark": "Dunkel",
   "theme.light": "Hell",

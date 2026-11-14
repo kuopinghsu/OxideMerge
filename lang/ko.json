@@ -1034,6 +1034,7 @@
   "table.choose_keys": "키",
   "text.change_counts": "{add}줄 추가, {del}줄 삭제",
   "text.folded": "변경되지 않은 줄 {n}개",
+  "text.paste_here": "두 번째 텍스트를 복사한 다음 Ctrl+V로 여기에 붙여 넣어 비교하세요",
   "text.rows_selected": "{n}줄 선택됨",
   "theme.dark": "어둡게",
   "theme.light": "밝게",

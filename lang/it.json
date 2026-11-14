@@ -1034,6 +1034,7 @@
   "table.choose_keys": "Chiavi",
   "text.change_counts": "{add} righe aggiunte, {del} righe rimosse",
   "text.folded": "{n} righe invariate",
+  "text.paste_here": "Copia il secondo testo, poi incollalo qui con Ctrl+V per confrontarlo",
   "text.rows_selected": "{n} righe selezionate",
   "theme.dark": "Scuro",
   "theme.light": "Chiaro",
