@@ -835,11 +835,20 @@ pub fn side_color(ui: &Ui, side: usize, panes: usize) -> Color32 {
     pal(ui).sides[idx.min(2)]
 }
 
+/// `color` as the background of a chip, a badge or a note whose text or icon is in it.
+pub fn tint(ui: &Ui, color: Color32) -> Color32 {
+    color.gamma_multiply(if ui.visuals().dark_mode { 0.22 } else { 0.13 })
+}
+
 /// Chip naming a compare side in its identity color.
 pub fn side_chip(ui: &mut Ui, side: usize, panes: usize) -> Response {
     let c = side_color(ui, side, panes);
-    let bg = c.gamma_multiply(if ui.visuals().dark_mode { 0.22 } else { 0.13 });
-    chip(ui, crate::core::report::side_name(side, panes), c, bg)
+    chip(
+        ui,
+        crate::core::report::side_name(side, panes),
+        c,
+        tint(ui, c),
+    )
 }
 
 /// Rounded, bordered container for grouped content.
@@ -1332,20 +1341,20 @@ pub fn pick_sep(ui: &mut Ui) {
 }
 
 /// The background and the left mark of one row of a pick list; where its label starts, and
-/// the response to its clicks.
+/// the response to its clicks. `info` describes the row to assistive technologies, given
+/// whether it can be used.
 fn pick_row_base(
     ui: &mut Ui,
     on: bool,
     icon: Option<Icon>,
-    role: Role,
-    label: &str,
+    info: impl Fn(bool) -> WidgetInfo,
 ) -> (Rect, Response) {
     let p = pal(ui);
     let (rect, resp) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), PICK_ROW_HEIGHT),
         Sense::click(),
     );
-    resp.widget_info(|| WidgetInfo::selected(role, ui.is_enabled(), on, label));
+    resp.widget_info(|| info(ui.is_enabled()));
     if ui.is_rect_visible(rect) {
         let fill = if on {
             p.accent_soft
@@ -1396,7 +1405,8 @@ fn pick_label(ui: &Ui, rect: Rect, label: &str, font: FontId, color: Color32, ri
 /// `icon` in the check mark's place otherwise. `mono` shows a pattern or a path as typed.
 pub fn pick_row(ui: &mut Ui, on: bool, icon: Option<Icon>, label: &str, mono: bool) -> Response {
     let p = pal(ui);
-    let (rect, resp) = pick_row_base(ui, on, icon, Role::CheckBox, label);
+    let info = |enabled| WidgetInfo::selected(Role::CheckBox, enabled, on, label);
+    let (rect, resp) = pick_row_base(ui, on, icon, info);
     let font = if mono {
         FontId::monospace(theme::size::SMALL)
     } else {
@@ -1410,8 +1420,9 @@ pub fn pick_row(ui: &mut Ui, on: bool, icon: Option<Icon>, label: &str, mono: bo
 /// its right.
 pub fn pick_switch(ui: &mut Ui, on: bool, icon: Icon, label: &str) -> Response {
     let p = pal(ui);
-    let (rect, resp) = pick_row_base(ui, false, Some(icon), Role::CheckBox, label);
-    resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, ui.is_enabled(), on, label));
+    // Its state is the switch's, not a check mark at its left.
+    let info = |enabled| WidgetInfo::selected(Role::CheckBox, enabled, on, label);
+    let (rect, resp) = pick_row_base(ui, false, Some(icon), info);
     pick_label(
         ui,
         rect,
@@ -1441,8 +1452,8 @@ pub fn pick_switch(ui: &mut Ui, on: bool, icon: Icon, label: &str) -> Response {
 /// Something a pick list does rather than a choice of it, below its choices.
 pub fn pick_action(ui: &mut Ui, icon: Icon, label: &str) -> Response {
     let p = pal(ui);
-    let (rect, resp) = pick_row_base(ui, false, Some(icon), Role::Button, label);
-    resp.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), label));
+    let info = |enabled| WidgetInfo::labeled(Role::Button, enabled, label);
+    let (rect, resp) = pick_row_base(ui, false, Some(icon), info);
     pick_label(
         ui,
         rect,

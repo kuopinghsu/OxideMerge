@@ -9,8 +9,9 @@ use crate::core::folder_sync::{
 };
 use crate::core::report::fmt_size;
 use crate::i18n::{tr, trf};
+use crate::ui::icons::Icon;
 use crate::ui::{theme, widgets};
-use egui::{vec2, Color32, Key, Margin, RichText, Ui};
+use egui::{vec2, Color32, Key, Margin, RichText, Sense, Stroke, Ui};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -62,6 +63,9 @@ pub struct SyncDialog {
     /// The operation whose details are shown.
     picked: Option<usize>,
     message: Option<String>,
+    /// The plan last previewed, kept on show, out of reach, while another is worked out:
+    /// the dialog then keeps its size instead of closing up and opening again.
+    last: Option<Arc<SyncPlan>>,
     id: egui::Id,
 }
 
@@ -89,6 +93,7 @@ impl SyncDialog {
             renames: false,
             picked: None,
             message: None,
+            last: None,
             id,
         };
         let pending = Recovery::for_roots(&d.roots);
@@ -117,7 +122,6 @@ impl SyncDialog {
         let job =
             std::thread::spawn(move || folder_sync::plan(&items, &roots, policy, scope, &flag));
         self.state = State::Planning { job, stop };
-        self.picked = None;
     }
 
     /// Whether it is changing files: applying, or undoing an earlier synchronization.
@@ -157,9 +161,21 @@ impl SyncDialog {
         let state = std::mem::replace(&mut self.state, State::Failed(String::new()));
         self.state = match state {
             State::Planning { job, .. } => match job.join() {
-                Ok(Ok(plan)) => State::Preview(Arc::new(plan)),
-                Ok(Err(e)) => State::Failed(e),
-                Err(_) => State::Failed(tr("status.error").to_string()),
+                Ok(Ok(plan)) => {
+                    let plan = Arc::new(plan);
+                    // Its operations are other ones: none of them is picked.
+                    self.picked = None;
+                    self.last = Some(plan.clone());
+                    State::Preview(plan)
+                }
+                Ok(Err(e)) => {
+                    (self.picked, self.last) = (None, None);
+                    State::Failed(e)
+                }
+                Err(_) => {
+                    (self.picked, self.last) = (None, None);
+                    State::Failed(tr("status.error").to_string())
+                }
             },
             State::Applying { job, .. } => match job.join() {
                 Ok(outcome) => State::Done {
@@ -225,13 +241,22 @@ impl SyncDialog {
         self.poll(ui.ctx());
         let mut close = None;
         let mut action: Option<Step> = None;
+        // No way out while files are being changed: only stopping, in the footer.
+        let busy = self.busy();
         egui::Modal::new(self.id.with("sync")).show(ui.ctx(), |ui| {
-            ui.set_min_width(560.0);
-            ui.set_max_width(760.0);
+            // No wider than a narrow window has room for.
+            let room = (ui.ctx().content_rect().width() - 48.0).max(240.0);
+            ui.set_min_width(560.0_f32.min(room));
+            ui.set_max_width(760.0_f32.min(room));
             let pal = widgets::pal(ui);
-            ui.heading(tr("folder_sync.title"));
+            let dismissed = if busy {
+                title(ui);
+                false
+            } else {
+                widgets::dialog_title(ui, tr("folder_sync.title"))
+            };
             self.roots_line(ui);
-            ui.add_space(6.0);
+            ui.add_space(theme::space::MD as f32);
             match &mut self.state {
                 State::Unfinished(recovery) => {
                     let dealt_with = recovery.ui(ui);
@@ -246,29 +271,66 @@ impl SyncDialog {
                         let b = ui.add_enabled_ui(!busy, |ui| {
                             widgets::secondary_button(ui, tr("btn.close"))
                         });
-                        if b.inner.clicked() {
+                        if b.inner.clicked() || (!busy && ui.input(|i| i.key_pressed(Key::Escape)))
+                        {
                             close = Some(recovery.changed);
                         }
                     });
                 }
                 State::Planning { .. } => {
                     self.policy_picker(ui, &mut action, true);
-                    ui.horizontal(|ui| {
+                    let planning = |ui: &mut Ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(tr("folder_sync.planning")).color(pal.text_dim),
+                            )
+                            .truncate(),
+                        );
                         ui.spinner();
-                        ui.label(tr("folder_sync.planning"));
-                    });
-                    widgets::dialog_footer(ui, |ui| {
-                        if widgets::secondary_button(ui, tr("btn.cancel")).clicked()
+                    };
+                    let cancel = |ui: &mut Ui| {
+                        widgets::secondary_button(ui, tr("btn.cancel")).clicked()
                             || ui.input(|i| i.key_pressed(Key::Escape))
-                        {
-                            close = Some(false);
+                    };
+                    match self.last.clone() {
+                        // The plan it replaces stays where it was, out of reach, with the
+                        // buttons of a preview: only what is listed changes when the new
+                        // one is there.
+                        Some(plan) => {
+                            ui.add_enabled_ui(false, |ui| self.preview(ui, &plan));
+                            widgets::dialog_footer(ui, |ui| {
+                                // In the color it had: the same button, out of reach.
+                                ui.add_enabled_ui(false, |ui| {
+                                    let deletes = plan.deletions() > 0;
+                                    apply_button(ui, tr("folder_sync.apply"), deletes)
+                                });
+                                if cancel(ui) {
+                                    close = Some(false);
+                                }
+                                ui.add_enabled_ui(false, |ui| {
+                                    widgets::secondary_button(ui, tr("folder_sync.export"))
+                                });
+                                planning(ui);
+                            });
                         }
-                    });
+                        None => {
+                            ui.add_space(theme::space::SM as f32);
+                            widgets::dialog_footer(ui, |ui| {
+                                if cancel(ui) {
+                                    close = Some(false);
+                                }
+                                planning(ui);
+                            });
+                        }
+                    }
                 }
                 State::Failed(e) => {
                     let e = e.clone();
                     self.policy_picker(ui, &mut action, true);
-                    ui.label(RichText::new(e).color(pal.danger));
+                    ui.add_space(theme::space::SM as f32);
+                    note(ui, Icon::Warning, pal.danger, |ui| {
+                        ui.label(e);
+                    });
                     widgets::dialog_footer(ui, |ui| {
                         if widgets::secondary_button(ui, tr("btn.close")).clicked()
                             || ui.input(|i| i.key_pressed(Key::Escape))
@@ -302,36 +364,51 @@ impl SyncDialog {
                     let destination = &self.names[plan.policy.destination()];
                     let e = &plan.estimate;
                     if *second {
-                        ui.label(
-                            RichText::new(trf(
-                                "folder_sync.confirm_large",
-                                &[("n", e.deletes.to_string()), ("root", destination.clone())],
-                            ))
-                            .color(pal.danger)
-                            .strong(),
-                        );
+                        note(ui, Icon::Warning, pal.danger, |ui| {
+                            ui.label(
+                                RichText::new(trf(
+                                    "folder_sync.confirm_large",
+                                    &[("n", e.deletes.to_string()), ("root", destination.clone())],
+                                ))
+                                .color(pal.danger)
+                                .strong(),
+                            );
+                        });
+                        ui.add_space(theme::space::SM as f32);
                         ui.checkbox(
                             sure,
                             trf("folder_sync.confirm_tick", &[("n", e.deletes.to_string())]),
                         );
                     } else {
+                        // In the color of the button that applies it.
+                        let color = if e.deletes > 0 {
+                            pal.danger
+                        } else {
+                            pal.accent
+                        };
+                        note(ui, Icon::Warning, color, |ui| {
+                            ui.label(
+                                RichText::new(trf(
+                                    "folder_sync.confirm",
+                                    &[
+                                        ("n", plan.changes().to_string()),
+                                        ("root", destination.clone()),
+                                    ],
+                                ))
+                                .strong(),
+                            );
+                        });
+                        ui.add_space(theme::space::SM as f32);
                         ui.label(
                             RichText::new(trf(
-                                "folder_sync.confirm",
+                                "folder_sync.confirm_detail",
                                 &[
-                                    ("n", plan.changes().to_string()),
-                                    ("root", destination.clone()),
+                                    ("replaces", e.replaces.to_string()),
+                                    ("deletes", e.deletes.to_string()),
                                 ],
                             ))
-                            .strong(),
+                            .color(pal.text_dim),
                         );
-                        ui.label(trf(
-                            "folder_sync.confirm_detail",
-                            &[
-                                ("replaces", e.replaces.to_string()),
-                                ("deletes", e.deletes.to_string()),
-                            ],
-                        ));
                     }
                     let ready = !*second || *sure;
                     let mut go = false;
@@ -361,10 +438,13 @@ impl SyncDialog {
                 } => {
                     let n = done.load(Ordering::Relaxed);
                     let stopping = stop.load(Ordering::Relaxed);
-                    ui.label(trf(
-                        "folder_sync.applying",
-                        &[("done", n.to_string()), ("total", total.to_string())],
-                    ));
+                    ui.label(
+                        RichText::new(trf(
+                            "folder_sync.applying",
+                            &[("done", n.to_string()), ("total", total.to_string())],
+                        ))
+                        .strong(),
+                    );
                     // Operations are applied in plan order, so the next one is under way; after
                     // the last, the copies are checked once more.
                     let next = plan.operations.iter().filter(|o| o.action.changes()).nth(n);
@@ -390,9 +470,11 @@ impl SyncDialog {
                             .truncate(),
                         );
                     }
+                    ui.add_space(theme::space::XS as f32);
                     ui.add(
                         egui::ProgressBar::new(n as f32 / (*total).max(1) as f32)
                             .fill(pal.accent)
+                            .corner_radius(theme::radius::XS)
                             .desired_height(6.0),
                     );
                     widgets::dialog_footer(ui, |ui| {
@@ -423,6 +505,20 @@ impl SyncDialog {
                         .color(pal.text_dim),
                 );
             }
+            // The title's close button does what the footer's way out does.
+            // Closing wins over whatever the body was about to start.
+            if dismissed && close.is_none() {
+                match &self.state {
+                    State::Confirm { plan, .. } => action = Some(Step::Back(plan.clone())),
+                    State::Applying { .. } => {}
+                    State::Done { rescan, .. } => close = Some(*rescan),
+                    State::Unfinished(recovery) => close = Some(recovery.changed),
+                    _ => close = Some(false),
+                }
+                if close.is_some() {
+                    action = None;
+                }
+            }
         });
         match action {
             Some(Step::Replan) => self.replan(),
@@ -444,41 +540,51 @@ impl SyncDialog {
         close
     }
 
+    /// The two folders, each after the chip of its side.
     fn roots_line(&self, ui: &mut Ui) {
         let pal = widgets::pal(ui);
-        for (s, name) in self.names.iter().enumerate() {
-            ui.horizontal(|ui| {
-                widgets::side_chip(ui, s, 2);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(name)
-                            .size(theme::size::DENSE)
-                            .color(pal.text_dim),
-                    )
-                    .truncate(),
-                );
-            });
-        }
+        panel(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for (s, name) in self.names.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    widgets::side_chip(ui, s, 2);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(name)
+                                .monospace()
+                                .size(theme::size::SMALL)
+                                .color(pal.text_dim),
+                        )
+                        .truncate(),
+                    );
+                });
+            }
+        });
     }
 
+    /// The direction and kind of synchronization, as a strip of choices, and the note that
+    /// nothing has been changed yet.
     fn policy_picker(&mut self, ui: &mut Ui, action: &mut Option<Step>, enabled: bool) {
+        let pal = widgets::pal(ui);
         ui.add_enabled_ui(enabled, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for p in SyncPolicy::ALL {
-                    let allowed = self.writable[p.destination()];
-                    if ui
-                        .add_enabled(
-                            allowed,
-                            egui::Button::selectable(self.policy == p, tr(p.key())),
-                        )
-                        .clicked()
-                        && self.policy != p
-                    {
-                        self.policy = p;
-                        *action = Some(Step::Replan);
-                    }
-                }
-            });
+            egui::Frame::new()
+                .fill(pal.control)
+                .corner_radius(theme::radius::LG)
+                .inner_margin(Margin::same(theme::space::XXS))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+                        for p in SyncPolicy::ALL {
+                            let allowed = self.writable[p.destination()];
+                            // A side that may not be changed cannot be the destination.
+                            let choice = pill(ui, allowed, self.policy == p, tr(p.key()), 28.0);
+                            if choice.clicked() && self.policy != p {
+                                self.policy = p;
+                                *action = Some(Step::Replan);
+                            }
+                        }
+                    });
+                });
             if cfg!(unix)
                 && ui
                     .checkbox(&mut self.scope.copy_links, tr("folder_sync.copy_links"))
@@ -488,46 +594,68 @@ impl SyncDialog {
                 *action = Some(Step::Replan);
             }
         });
-        let pal = widgets::pal(ui);
-        egui::Frame::new()
-            .fill(pal.surface_alt)
-            .corner_radius(theme::radius::MD)
-            .inner_margin(Margin::symmetric(theme::space::CONTROL, theme::space::SM))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new(tr("folder_sync.preview_only"))
-                        .color(pal.accent)
-                        .strong(),
-                );
-            });
+        ui.add_space(theme::space::SM as f32);
+        note(ui, Icon::Eye, pal.accent, |ui| {
+            ui.label(
+                RichText::new(tr("folder_sync.preview_only"))
+                    .color(pal.accent)
+                    .strong(),
+            );
+        });
+        ui.add_space(theme::space::SM as f32);
     }
 
     fn preview(&mut self, ui: &mut Ui, plan: &SyncPlan) {
         let pal = widgets::pal(ui);
         let e = &plan.estimate;
         if plan.changes() == 0 {
-            ui.label(tr("folder_sync.nothing"));
+            note(ui, Icon::Check, pal.success, |ui| {
+                ui.label(tr("folder_sync.nothing"));
+            });
         } else {
-            ui.label(trf(
-                "folder_sync.summary",
-                &[
-                    ("dirs", e.create_dirs.to_string()),
-                    ("copies", e.copies.to_string()),
-                    ("replaces", e.replaces.to_string()),
-                    ("deletes", e.deletes.to_string()),
-                    ("bytes", fmt_size(Some(e.bytes))),
-                ],
-            ));
+            // What the plan does, in numbers, with the same in words under them.
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = theme::space::SM as f32;
+                for (n, action) in [
+                    (e.create_dirs, Action::CreateDir),
+                    (e.copies, Action::Copy),
+                    (e.replaces, Action::Replace),
+                    (e.deletes, Action::Delete),
+                ] {
+                    stat(ui, n, tr(action.key()), action_color(action, &pal));
+                }
+            });
+            ui.add_space(theme::space::XS as f32);
+            ui.label(
+                RichText::new(trf(
+                    "folder_sync.summary",
+                    &[
+                        ("dirs", e.create_dirs.to_string()),
+                        ("copies", e.copies.to_string()),
+                        ("replaces", e.replaces.to_string()),
+                        ("deletes", e.deletes.to_string()),
+                        ("bytes", fmt_size(Some(e.bytes))),
+                    ],
+                ))
+                .size(theme::size::SMALL)
+                .color(pal.text_dim),
+            );
             if e.renames > 0 {
-                ui.label(trf(
-                    "folder_sync.summary_renames",
-                    &[("n", e.renames.to_string())],
-                ));
+                ui.label(
+                    RichText::new(trf(
+                        "folder_sync.summary_renames",
+                        &[("n", e.renames.to_string())],
+                    ))
+                    .size(theme::size::SMALL)
+                    .color(pal.text_dim),
+                );
             }
         }
         for w in &plan.warnings {
-            ui.label(RichText::new(w.text()).color(pal.warning));
+            ui.add_space(theme::space::XS as f32);
+            note(ui, Icon::Warning, pal.warning, |ui| {
+                ui.label(w.text());
+            });
         }
         if plan.operations.is_empty() {
             return;
@@ -539,41 +667,31 @@ impl SyncDialog {
         if self.shown.is_some_and(|a| plan.count(a) == 0) {
             self.shown = None;
         }
+        ui.add_space(theme::space::MD as f32);
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .selectable_label(
-                    self.shown.is_none() && !self.renames,
-                    format!("{} {}", tr("folder_sync.all"), plan.operations.len()),
-                )
-                .clicked()
-            {
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            let all = format!("{} {}", tr("folder_sync.all"), plan.operations.len());
+            if pill(ui, true, self.shown.is_none() && !self.renames, &all, 24.0).clicked() {
                 (self.shown, self.renames) = (None, false);
             }
             for a in Action::ALL {
                 let n = plan.count(a);
-                if n > 0
-                    && ui
-                        .selectable_label(
-                            self.shown == Some(a) && !self.renames,
-                            format!("{} {n}", tr(a.key())),
-                        )
-                        .clicked()
-                {
+                let label = format!("{} {n}", tr(a.key()));
+                let on = self.shown == Some(a) && !self.renames;
+                if n > 0 && pill(ui, true, on, &label, 24.0).clicked() {
                     (self.shown, self.renames) = (Some(a), false);
                 }
             }
+            let renames = format!("{} {}", tr("folder_sync.action_rename"), e.renames);
             if e.renames > 0
-                && ui
-                    .selectable_label(
-                        self.renames,
-                        format!("{} {}", tr("folder_sync.action_rename"), e.renames),
-                    )
+                && pill(ui, true, self.renames, &renames, 24.0)
                     .on_hover_text(tr("tip.sync_renames"))
                     .clicked()
             {
                 (self.shown, self.renames) = (None, true);
             }
         });
+        ui.add_space(theme::space::XS as f32);
         let listed: Vec<usize> = (0..plan.operations.len())
             .filter(|&i| {
                 let o = &plan.operations[i];
@@ -587,103 +705,236 @@ impl SyncDialog {
         if self.picked.is_some_and(|i| !listed.contains(&i)) {
             self.picked = None;
         }
-        let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-        egui::Frame::new()
-            .fill(pal.surface_alt)
-            .corner_radius(theme::radius::MD)
-            .inner_margin(Margin::same(theme::space::SM))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                egui::ScrollArea::vertical()
-                    .max_height(280.0)
-                    .auto_shrink([false, true])
-                    .show_rows(ui, row_h, listed.len(), |ui, range| {
-                        for &i in &listed[range] {
-                            let o = &plan.operations[i];
-                            let r = ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    vec2(110.0, row_h),
-                                    egui::Label::new(
-                                        RichText::new(if self.renames {
-                                            tr("folder_sync.action_rename")
-                                        } else {
-                                            tr(o.action.key())
-                                        })
-                                        .color(action_color(o.action, &pal)),
-                                    )
-                                    .truncate(),
-                                );
-                                let size = if o.bytes > 0 {
-                                    fmt_size(Some(o.bytes))
-                                } else {
-                                    String::new()
-                                };
-                                ui.add_sized(
-                                    vec2(70.0, row_h),
-                                    egui::Label::new(RichText::new(size).color(pal.text_dim)),
-                                );
-                                let path = match (o.action, &o.renamed) {
-                                    (Action::Copy, Some(from)) => format!("{from} → {}", o.path),
-                                    (_, Some(to)) => format!("{} → {to}", o.path),
-                                    _ => o.path.clone(),
-                                };
-                                ui.selectable_label(
-                                    self.picked == Some(i),
-                                    RichText::new(path).monospace(),
-                                )
-                                .on_hover_text(tr(o.reason.key()))
-                            });
-                            if r.inner.clicked() {
-                                self.picked = Some(i);
-                            }
+        panel(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 1.0;
+            // As tall as the paths, which follow the size of the text style they are in.
+            let row_height =
+                ROW_HEIGHT.max(ui.text_style_height(&egui::TextStyle::Monospace) + 8.0);
+            egui::ScrollArea::vertical()
+                .max_height(280.0)
+                .auto_shrink([false, true])
+                .show_rows(ui, row_height, listed.len(), |ui, range| {
+                    for &i in &listed[range] {
+                        let picked = self.picked == Some(i);
+                        if self.operation_row(ui, &plan.operations[i], picked, row_height) {
+                            self.picked = Some(i);
                         }
-                    });
-            });
+                    }
+                });
+        });
         if let Some(o) = self.picked.and_then(|i| plan.operations.get(i)) {
             self.detail(ui, plan, o);
         }
     }
 
+    /// One operation of the plan: what it does as a badge in its color, how much it
+    /// copies, and the path, each in a column of its own. The whole row picks it and is
+    /// the one thing named to assistive technologies; whether it was clicked.
+    fn operation_row(&self, ui: &mut Ui, o: &SyncOperation, picked: bool, height: f32) -> bool {
+        let pal = widgets::pal(ui);
+        let action = if self.renames {
+            tr("folder_sync.action_rename")
+        } else {
+            tr(o.action.key())
+        };
+        let path = match (o.action, &o.renamed) {
+            (Action::Copy, Some(from)) => format!("{from} → {}", o.path),
+            (_, Some(to)) => format!("{} → {to}", o.path),
+            _ => o.path.clone(),
+        };
+        let size = if o.bytes > 0 {
+            fmt_size(Some(o.bytes))
+        } else {
+            String::new()
+        };
+        let (rect, resp) =
+            ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
+        let resp = resp.on_hover_text(tr(o.reason.key()));
+        resp.widget_info(|| {
+            let name = format!("{action}  {size}  {path}");
+            egui::WidgetInfo::selected(egui::Role::Button, true, picked, name)
+        });
+        if !ui.is_rect_visible(rect) {
+            return resp.clicked();
+        }
+        let fill = if picked {
+            pal.accent_soft
+        } else if resp.hovered() || resp.has_focus() {
+            pal.control_hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, theme::radius::SM, fill);
+        let cut = Some(egui::TextWrapMode::Truncate);
+        let mid = rect.center().y;
+        // The badge, cut short where a language's word for the action is longer than it.
+        let color = action_color(o.action, &pal);
+        let left = rect.left() + theme::space::SM as f32;
+        let badge = egui::WidgetText::from(action).into_galley(
+            ui,
+            cut,
+            BADGE_WIDTH - 2.0 * BADGE_PADDING,
+            theme::semibold(theme::size::SMALL),
+        );
+        let badge_size = badge.size() + vec2(2.0 * BADGE_PADDING, 4.0);
+        let badge_rect =
+            egui::Rect::from_min_size(egui::pos2(left, mid - badge_size.y / 2.0), badge_size);
+        ui.painter()
+            .rect_filled(badge_rect, theme::radius::LG, widgets::tint(ui, color));
+        ui.painter()
+            .galley(badge_rect.min + vec2(BADGE_PADDING, 2.0), badge, color);
+        let size_right = left + BADGE_WIDTH + SIZE_WIDTH;
+        ui.painter().text(
+            egui::pos2(size_right, mid),
+            egui::Align2::RIGHT_CENTER,
+            size,
+            egui::FontId::proportional(theme::size::SMALL),
+            pal.text_dim,
+        );
+        let path_left = size_right + theme::space::LG as f32;
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let galley = egui::WidgetText::from(path.as_str()).into_galley(
+            ui,
+            cut,
+            (rect.right() - path_left - theme::space::SM as f32).max(24.0),
+            font,
+        );
+        ui.painter().galley(
+            egui::pos2(path_left, mid - galley.size().y / 2.0),
+            galley,
+            pal.text,
+        );
+        resp.clicked()
+    }
+
+    /// What the picked operation finds on each side, and why it is in the plan.
     fn detail(&self, ui: &mut Ui, plan: &SyncPlan, o: &SyncOperation) {
         let pal = widgets::pal(ui);
-        ui.add_space(4.0);
-        ui.label(RichText::new(&o.path).monospace().strong());
-        ui.label(tr(o.reason.key()));
-        if let Some(other) = &o.renamed {
-            let (from, to) = if o.action == Action::Copy {
-                (other.as_str(), o.path.as_str())
-            } else {
-                (o.path.as_str(), other.as_str())
-            };
-            ui.label(trf(
-                "folder_sync.renamed_detail",
-                &[("from", from.to_string()), ("to", to.to_string())],
-            ));
-        }
-        let risk = if o.action.destructive() {
-            (tr("folder_sync.risk_destructive"), pal.danger)
-        } else if o.action.changes() {
-            (tr("folder_sync.risk_adds"), pal.text_dim)
-        } else {
-            (tr("folder_sync.risk_none"), pal.text_dim)
-        };
-        ui.label(RichText::new(risk.0).color(risk.1));
-        let (s, d) = (plan.policy.source(), plan.policy.destination());
-        egui::Grid::new(self.id.with("sync_detail")).show(ui, |ui| {
-            ui.label(trf(
-                "folder_sync.source",
-                &[("side", self.names[s].clone())],
-            ));
-            ui.label(describe(&o.source));
-            ui.end_row();
-            ui.label(trf(
-                "folder_sync.destination",
-                &[("side", self.names[d].clone())],
-            ));
-            ui.label(describe(&o.destination));
-            ui.end_row();
-        });
+        ui.add_space(theme::space::SM as f32);
+        egui::Frame::new()
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .corner_radius(theme::radius::MD)
+            .inner_margin(Margin::symmetric(theme::space::CONTROL, theme::space::MD))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&o.path).monospace().strong());
+                    let risk = if o.action.destructive() {
+                        (tr("folder_sync.risk_destructive"), pal.danger)
+                    } else if o.action.changes() {
+                        (tr("folder_sync.risk_adds"), pal.success)
+                    } else {
+                        (tr("folder_sync.risk_none"), pal.text_dim)
+                    };
+                    widgets::chip(ui, risk.0, risk.1, widgets::tint(ui, risk.1));
+                });
+                ui.label(RichText::new(tr(o.reason.key())).color(pal.text_dim));
+                if let Some(other) = &o.renamed {
+                    let (from, to) = if o.action == Action::Copy {
+                        (other.as_str(), o.path.as_str())
+                    } else {
+                        (o.path.as_str(), other.as_str())
+                    };
+                    ui.label(trf(
+                        "folder_sync.renamed_detail",
+                        &[("from", from.to_string()), ("to", to.to_string())],
+                    ));
+                }
+                ui.add_space(theme::space::XS as f32);
+                let (s, d) = (plan.policy.source(), plan.policy.destination());
+                egui::Grid::new(self.id.with("sync_detail"))
+                    .spacing(vec2(theme::space::XL as f32, 2.0))
+                    .show(ui, |ui| {
+                        for (key, side, found) in [
+                            ("folder_sync.source", s, &o.source),
+                            ("folder_sync.destination", d, &o.destination),
+                        ] {
+                            ui.label(
+                                RichText::new(trf(key, &[("side", self.names[side].clone())]))
+                                    .size(theme::size::SMALL)
+                                    .color(pal.text_dim),
+                            );
+                            ui.label(describe(found));
+                            ui.end_row();
+                        }
+                    });
+            });
     }
+}
+
+/// Least height of one operation in the preview's list.
+const ROW_HEIGHT: f32 = 26.0;
+/// Room for the badge naming what an operation does, and for how much it copies.
+const BADGE_WIDTH: f32 = 124.0;
+const BADGE_PADDING: f32 = 8.0;
+const SIZE_WIDTH: f32 = 68.0;
+
+/// The dialog's name, where its title has no close button.
+fn title(ui: &mut Ui) {
+    let font = theme::semibold(theme::size::TITLE);
+    ui.label(RichText::new(tr("folder_sync.title")).font(font));
+    ui.add_space(6.0);
+}
+
+/// The rounded, tinted panel the folders and the list of operations sit in.
+fn panel(ui: &Ui) -> egui::Frame {
+    egui::Frame::new()
+        .fill(widgets::pal(ui).surface_alt)
+        .corner_radius(theme::radius::MD)
+        .inner_margin(Margin::same(theme::space::SM))
+}
+
+/// A note across the dialog, tinted in `color` with `icon` before it: that this is only a
+/// preview, a warning, or how it ended.
+fn note(ui: &mut Ui, icon: Icon, color: Color32, add: impl FnOnce(&mut Ui)) {
+    egui::Frame::new()
+        .fill(widgets::tint(ui, color))
+        .corner_radius(theme::radius::MD)
+        .inner_margin(Margin::symmetric(theme::space::CONTROL, theme::space::SM))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                widgets::inline_icon(ui, icon, color);
+                ui.vertical(add);
+            });
+        });
+}
+
+/// One of a strip of choices, rounded, `height` tall; dimmed and out of reach when it is
+/// not `enabled`.
+fn pill(ui: &mut Ui, enabled: bool, selected: bool, label: &str, height: f32) -> egui::Response {
+    let text = RichText::new(label).size(theme::size::DENSE);
+    ui.add_enabled(
+        enabled,
+        egui::Button::selectable(selected, text)
+            .corner_radius(theme::radius::MD)
+            .min_size(vec2(0.0, height)),
+    )
+}
+
+/// A count of the plan with what it counts under it; dimmed when there is none.
+fn stat(ui: &mut Ui, n: usize, label: &str, color: Color32) {
+    let pal = widgets::pal(ui);
+    panel(ui)
+        .inner_margin(Margin::symmetric(theme::space::LG, theme::space::SM))
+        .show(ui, |ui| {
+            ui.set_min_width(84.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let color = if n == 0 { pal.text_disabled } else { color };
+                ui.label(
+                    RichText::new(n.to_string())
+                        .font(theme::semibold(theme::size::HEADING))
+                        .color(color),
+                );
+                ui.label(
+                    RichText::new(label)
+                        .size(theme::size::SMALL)
+                        .color(pal.text_dim),
+                );
+            });
+        });
 }
 
 enum Step {
@@ -699,8 +950,9 @@ fn apply_button(ui: &mut Ui, label: &str, deletes: bool) -> egui::Response {
     let pal = widgets::pal(ui);
     let fill = if deletes { pal.danger } else { pal.accent };
     ui.add(
-        egui::Button::new(RichText::new(label).color(Color32::WHITE).strong())
+        egui::Button::new(RichText::new(label).color(pal.on_accent).strong())
             .fill(fill)
+            .corner_radius(theme::radius::MD)
             .min_size(vec2(120.0, 32.0)),
     )
 }
@@ -733,21 +985,20 @@ fn outcome_ui(ui: &mut Ui, outcome: &SyncOutcome) {
     let pal = widgets::pal(ui);
     match outcome {
         SyncOutcome::Applied { changes, kept } => {
-            ui.label(
-                RichText::new(trf("folder_sync.done", &[("n", changes.to_string())]))
-                    .color(pal.success),
-            );
+            note(ui, Icon::Check, pal.success, |ui| {
+                ui.label(
+                    RichText::new(trf("folder_sync.done", &[("n", changes.to_string())])).strong(),
+                );
+            });
             if !kept.is_empty() {
                 ui.label(trf("folder_sync.kept", &[("n", kept.len().to_string())]));
                 list(ui, kept.iter().map(String::as_str));
             }
         }
         SyncOutcome::NotApplied(_, errors) => {
-            ui.label(
-                RichText::new(tr("folder_sync.not_applied"))
-                    .color(pal.warning)
-                    .strong(),
-            );
+            note(ui, Icon::Warning, pal.warning, |ui| {
+                ui.label(RichText::new(tr("folder_sync.not_applied")).strong());
+            });
             list(ui, errors.iter().map(String::as_str));
         }
         SyncOutcome::Stopped {
@@ -760,19 +1011,23 @@ fn outcome_ui(ui: &mut Ui, outcome: &SyncOutcome) {
                 ),
                 Some(r) => trf("folder_sync.failed_undone", &[("reason", r.clone())]),
             };
-            ui.label(RichText::new(text).color(pal.warning));
+            note(ui, Icon::Warning, pal.warning, |ui| {
+                ui.label(text);
+            });
         }
         SyncOutcome::Stopped {
             reason, rollback, ..
         } => {
-            ui.label(
-                RichText::new(tr("folder_sync.recovery_required"))
-                    .color(pal.danger)
-                    .strong(),
-            );
-            if let Some(r) = reason {
-                ui.label(r);
-            }
+            note(ui, Icon::Warning, pal.danger, |ui| {
+                ui.label(
+                    RichText::new(tr("folder_sync.recovery_required"))
+                        .color(pal.danger)
+                        .strong(),
+                );
+                if let Some(r) = reason {
+                    ui.label(r);
+                }
+            });
             let path = rollback
                 .journal
                 .as_deref()
@@ -947,24 +1202,27 @@ impl Recovery {
         }
         let mut chosen: Option<(usize, bool)> = None;
         for (i, u) in self.list.iter().enumerate() {
-            ui.separator();
-            ui.label(RichText::new(tr("folder_sync.unfinished_title")).strong());
-            ui.label(trf(
-                "folder_sync.unfinished",
-                &[
-                    ("left", u.roots[0].display().to_string()),
-                    ("right", u.roots[1].display().to_string()),
-                    ("n", u.changes.to_string()),
-                    ("root", u.roots[u.destination].display().to_string()),
-                ],
-            ));
-            ui.horizontal(|ui| {
-                if widgets::primary_button(ui, tr("folder_sync.recover")).clicked() {
-                    chosen = Some((i, true));
-                }
-                if widgets::secondary_button(ui, tr("folder_sync.discard")).clicked() {
-                    chosen = Some((i, false));
-                }
+            ui.add_space(theme::space::XS as f32);
+            note(ui, Icon::Warning, pal.warning, |ui| {
+                ui.label(RichText::new(tr("folder_sync.unfinished_title")).strong());
+                ui.label(trf(
+                    "folder_sync.unfinished",
+                    &[
+                        ("left", u.roots[0].display().to_string()),
+                        ("right", u.roots[1].display().to_string()),
+                        ("n", u.changes.to_string()),
+                        ("root", u.roots[u.destination].display().to_string()),
+                    ],
+                ));
+                ui.add_space(theme::space::XS as f32);
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, tr("folder_sync.recover")).clicked() {
+                        chosen = Some((i, true));
+                    }
+                    if widgets::secondary_button(ui, tr("folder_sync.discard")).clicked() {
+                        chosen = Some((i, false));
+                    }
+                });
             });
         }
         if let Some((i, undo)) = chosen {
@@ -980,7 +1238,7 @@ impl Recovery {
         egui::Modal::new(egui::Id::unique("sync_recovery")).show(ctx, |ui| {
             ui.set_min_width(480.0);
             ui.set_max_width(640.0);
-            ui.heading(tr("folder_sync.title"));
+            title(ui);
             self.ui(ui);
             widgets::dialog_footer(ui, |ui| {
                 let label = if self.list.is_empty() {

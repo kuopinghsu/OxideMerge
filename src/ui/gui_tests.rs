@@ -2126,6 +2126,57 @@ fn folders_are_synchronized_after_a_preview_and_a_confirmation() {
     assert!(!gui.shows(&done));
 }
 
+/// A side that cannot be changed, as a RAR archive is, cannot be synchronized to: the
+/// choices that would are out of reach, and the operations list as rows named in full.
+#[test]
+fn a_read_only_side_is_not_offered_as_the_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    // A zip, which can be written back, beside a RAR, which cannot.
+    let zip = d.join("left.zip");
+    let mut zw = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+    for (name, text) in [("keep.txt", "changed\n"), ("new.txt", "new\n")] {
+        zw.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zw, text.as_bytes()).unwrap();
+    }
+    zw.finish().unwrap();
+    let rar = d.join("right.rar");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar/v5.rar");
+    std::fs::copy(fixture, &rar).unwrap();
+    let mut gui = Gui::start("folder_sync_read_only", compare_folders(&[zip, rar]));
+    gui.wait_until("the compare", |g| !g.busy());
+    gui.click(tr("cmd.sync_folders"));
+    gui.wait_until("the preview", |g| {
+        g.shows_text(tr("folder_sync.preview_only"))
+    });
+    for key in ["folder_sync.mirror_right", "folder_sync.update_right"] {
+        assert!(!gui.widget(tr(key)).enabled, "{key} can be chosen");
+    }
+    for key in ["folder_sync.mirror_left", "folder_sync.update_left"] {
+        assert!(gui.widget(tr(key)).enabled, "{key} cannot be chosen");
+    }
+    // Each operation is one row, named by what it does and to what.
+    gui.wait_until("the plan", |g| g.shows_text("new.txt"));
+    let delete = tr("folder_sync.action_delete");
+    let rows = gui
+        .widgets
+        .iter()
+        .filter(|w| w.label.contains("new.txt") && w.label.starts_with(delete));
+    assert_eq!(rows.count(), 1, "the row is not named once, in full");
+    // Choosing another direction keeps the dialog as it is, buttons and all, while the new
+    // plan is worked out: it does not close up to a line and open again.
+    gui.click(tr("folder_sync.update_left"));
+    assert!(gui.shows(tr("folder_sync.apply")), "the preview went away");
+    assert!(gui.shows(tr("folder_sync.export")), "the preview went away");
+    gui.wait_until("the new plan", |g| {
+        !g.shows_text(tr("folder_sync.planning"))
+    });
+    assert!(gui.shows(tr("folder_sync.apply")));
+    gui.click(tr("btn.close"));
+    assert!(!gui.shows_text(tr("folder_sync.preview_only")));
+}
+
 #[test]
 fn folder_merges_leave_alone_what_changed_meanwhile() {
     let dir = tempfile::tempdir().unwrap();

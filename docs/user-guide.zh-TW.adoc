@@ -1230,11 +1230,11 @@ kbd:[Esc] 會先回到這一個游標；不按 kbd:[Ctrl] 直接按一下也有�
 |`.pas`、`.dpr`、`.dpk`、`.dfm`、`.inc`、`.pp`
 
 |OCaml、F#、Standard ML、Haskell、Erlang、Lisp、Clojure
-|`.ml`、`.mli`、`.caml`、`.fs`、`.fsi`、`.fsx`、`.sml`、`.sig`、`.hs`、`.erl`、`.hrl`、`.lisp`、
+|`.ml`、`.mli`、`.caml`、`.fs`、`.fsi`、`.fsx`、`.sml`、`.hs`、`.erl`、`.hrl`、`.lisp`、
 `.lsp`、`.scm`、`.ss`、`.smd`、`.el`、`.clj`
 
 |Fortran、Smalltalk、MATLAB
-|`.f`、`.for`、`.f77`、`.f90`、`.f95`、`.f03`、`.f08`、`.f2k`、`.st`、`.pac`、`.src`、`.pkg`、
+|`.f`、`.for`、`.f77`、`.f90`、`.f95`、`.f03`、`.f08`、`.f2k`、`.st`、`.pac`、
 `.matlab`
 
 |SQL
@@ -1258,6 +1258,7 @@ kbd:[Esc] 會先回到這一個游標；不按 kbd:[Ctrl] 直接按一下也有�
 |`.md`、`.markdown`、`.rst`、`.tex`、`.bib`、`.textile`、`.diff`、`.patch`、`.dot`
 |===
 
+少數副檔名由多種語言共用（`.inc`、`.spec`、`.cls`、`.cgi` 與 `.fs`），這類檔案依第一行的內容判斷。
 其他副檔名的檔案不會上色。
 非常大的檔案也不會套用醒目提示（請參閱 <<troubleshooting>> 的「效能」）。
 
@@ -2077,6 +2078,7 @@ OxideMerge 會將壓縮檔解壓縮後，以資料夾的方式比較，讓您能
 * `.7z`。
 * `.rar`：支援到 RAR 7 為止的所有格式版本，包括結實（solid）壓縮檔。
   RAR 壓縮檔只能讀取，無法變更（見下文）。
+  RAR 壓縮檔內的符號連結與連接點（junction）不會解壓縮。
 
 開啟受密碼保護的 ZIP（傳統 ZIP 加密「ZipCrypto」或 WinZip AES）、7z 或 RAR
 （包括連檔名也加密的 7z 與 RAR）時，

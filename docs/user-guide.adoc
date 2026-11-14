@@ -1450,11 +1450,11 @@ The following languages are highlighted:
 |`.pas`, `.dpr`, `.dpk`, `.dfm`, `.inc`, `.pp`
 
 |OCaml, F#, Standard ML, Haskell, Erlang, Lisp, Clojure
-|`.ml`, `.mli`, `.caml`, `.fs`, `.fsi`, `.fsx`, `.sml`, `.sig`, `.hs`, `.erl`, `.hrl`, `.lisp`,
+|`.ml`, `.mli`, `.caml`, `.fs`, `.fsi`, `.fsx`, `.sml`, `.hs`, `.erl`, `.hrl`, `.lisp`,
 `.lsp`, `.scm`, `.ss`, `.smd`, `.el`, `.clj`
 
 |Fortran, Smalltalk, MATLAB
-|`.f`, `.for`, `.f77`, `.f90`, `.f95`, `.f03`, `.f08`, `.f2k`, `.st`, `.pac`, `.src`, `.pkg`,
+|`.f`, `.for`, `.f77`, `.f90`, `.f95`, `.f03`, `.f08`, `.f2k`, `.st`, `.pac`,
 `.matlab`
 
 |SQL
@@ -1478,6 +1478,8 @@ The following languages are highlighted:
 |`.md`, `.markdown`, `.rst`, `.tex`, `.bib`, `.textile`, `.diff`, `.patch`, `.dot`
 |===
 
+A few extensions are used by more than one language (`.inc`, `.spec`, `.cls`, `.cgi` and `.fs`);
+for those, the first line of the file decides.
 A file with another extension is shown without colors.
 Very large files are not highlighted either (see <<troubleshooting>>, _Performance_).
 
@@ -2438,6 +2440,7 @@ The following formats are supported:
 * `.7z`.
 * `.rar`, in every version of the format up to RAR 7, solid archives included.
   A RAR archive can be read but not changed (see below).
+  Symbolic links and junctions stored in a RAR archive are left out.
 
 When you open a password-protected ZIP archive (with either the original ZIP encryption,
 "ZipCrypto", or WinZip AES), 7z archive or RAR archive (including a 7z or RAR archive whose file

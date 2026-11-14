@@ -3,7 +3,7 @@
 //! hands over while it does is written by this module, so that nothing lands outside the
 //! file opened for it, no link is ever created, and what is written can be counted.
 
-use std::ffi::c_int;
+use std::ffi::{c_char, c_int, c_uint};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -57,7 +57,6 @@ pub(super) struct Header {
     pub encrypted: bool,
     /// Whether the entry goes on in, or comes from, another volume.
     pub split: bool,
-    pub size: u64,
     pub modified: Option<SystemTime>,
     pub link: Option<Link>,
 }
@@ -83,7 +82,13 @@ pub(super) struct Reader {
     handle: *const sys::Handle,
     state: *mut State,
     names_encrypted: bool,
+    /// Held until the archive is closed: one archive is read at a time.
+    _library: std::sync::MutexGuard<'static, ()>,
 }
+
+/// The library keeps what went wrong in one place for the whole program, so two archives
+/// read at once could be told each other's errors.
+static LIBRARY: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Drop for Reader {
     fn drop(&mut self) {
@@ -121,14 +126,77 @@ fn from_wide(buf: &[sys::WCHAR]) -> PathBuf {
         .into();
 }
 
+/// `RARHeaderDataEx` of the library's `dll.hpp`. That header packs its structures to one
+/// byte, which the ones `unrar_sys` declares are not: every field after the first pointer
+/// would be four bytes off.
+#[repr(C, packed)]
+struct HeaderData {
+    archive_name: [c_char; 1024],
+    archive_name_w: [sys::WCHAR; 1024],
+    filename: [c_char; 1024],
+    filename_w: [sys::WCHAR; 1024],
+    flags: c_uint,
+    pack_size: c_uint,
+    pack_size_high: c_uint,
+    unp_size: c_uint,
+    unp_size_high: c_uint,
+    host_os: c_uint,
+    file_crc: c_uint,
+    file_time: c_uint,
+    unp_ver: c_uint,
+    method: c_uint,
+    file_attr: c_uint,
+    comment_buffer: *mut c_char,
+    comment_buffer_size: c_uint,
+    comment_size: c_uint,
+    comment_state: c_uint,
+    dict_size: c_uint,
+    hash_type: c_uint,
+    hash: [c_char; 32],
+    redir_type: c_uint,
+    redir_name: *mut sys::WCHAR,
+    redir_name_size: c_uint,
+    dir_target: c_uint,
+    mtime_low: c_uint,
+    mtime_high: c_uint,
+    ctime_low: c_uint,
+    ctime_high: c_uint,
+    atime_low: c_uint,
+    atime_high: c_uint,
+    archive_name_ex: *mut sys::WCHAR,
+    archive_name_ex_size: c_uint,
+    filename_ex: *mut sys::WCHAR,
+    filename_ex_size: c_uint,
+    reserved: [c_uint; 982],
+}
+
+/// `RAROpenArchiveDataEx` of the library's `dll.hpp`, packed like [`HeaderData`].
+#[repr(C, packed)]
+struct OpenData {
+    archive_name: *const c_char,
+    archive_name_w: *const sys::WCHAR,
+    open_mode: c_uint,
+    open_result: c_uint,
+    comment_buffer: *mut c_char,
+    comment_buffer_size: c_uint,
+    comment_size: c_uint,
+    comment_state: c_uint,
+    flags: c_uint,
+    callback: Option<sys::Callback>,
+    user_data: sys::LPARAM,
+    op_flags: c_uint,
+    comment_buffer_w: *mut sys::WCHAR,
+    reserved: [c_uint; 25],
+}
+
 /// The name of an entry. Linux builds of the library convert names with the C locale,
 /// which a Rust program leaves unset, so there the bytes are taken as they are.
-fn entry_name(header: &sys::HeaderDataEx) -> PathBuf {
+fn entry_name(header: &HeaderData) -> PathBuf {
     #[cfg(any(target_os = "linux", target_os = "netbsd"))]
     {
         use std::os::unix::ffi::OsStrExt;
-        let bytes: Vec<u8> = header
-            .filename
+        let name = header.filename;
+        let bytes: Vec<u8> = name
             .iter()
             .take_while(|&&c| c != 0)
             .map(|&c| c as u8)
@@ -136,7 +204,36 @@ fn entry_name(header: &sys::HeaderDataEx) -> PathBuf {
         std::ffi::OsStr::from_bytes(&bytes).into()
     }
     #[cfg(not(any(target_os = "linux", target_os = "netbsd")))]
-    from_wide(&header.filename_w)
+    {
+        // Copied out: a field of a packed structure cannot be borrowed.
+        let name = header.filename_w;
+        from_wide(&name)
+    }
+}
+
+/// The name of the entry a link entry stands in for, written by the library to `buf`.
+fn link_name(buf: &[sys::WCHAR]) -> PathBuf {
+    // Where names are taken as bytes (see `entry_name`), the library hands this one over
+    // as wide characters with each byte it could not convert moved to a private area,
+    // after a mark: put back, it is the name as the entries have it.
+    #[cfg(any(target_os = "linux", target_os = "netbsd"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        const MARK: u32 = 0xFFFE;
+        const MAPPED: std::ops::Range<u32> = 0xE080..0xE100;
+        let mut bytes = Vec::new();
+        for c in buf.iter().map(|&c| c as u32).take_while(|&c| c != 0) {
+            if MAPPED.contains(&c) {
+                bytes.push((c - 0xE000) as u8);
+            } else if c != MARK {
+                let c = char::from_u32(c).unwrap_or(char::REPLACEMENT_CHARACTER);
+                bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+            }
+        }
+        std::ffi::OsStr::from_bytes(&bytes).into()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "netbsd")))]
+    from_wide(buf)
 }
 
 /// A time of the library (100 ns steps since 1601) as a system time; none for zero.
@@ -243,11 +340,12 @@ impl Reader {
             handle: std::ptr::null(),
             state,
             names_encrypted: false,
+            _library: LIBRARY.lock().unwrap_or_else(|e| e.into_inner()),
         };
         if narrow.is_none() && wide_name.is_none() {
             return Err(Error::Other("the name of the archive cannot be used"));
         }
-        let mut data = sys::OpenArchiveDataEx {
+        let mut data = OpenData {
             archive_name: narrow.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()),
             archive_name_w: wide_name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()),
             open_mode: sys::RAR_OM_EXTRACT,
@@ -263,17 +361,18 @@ impl Reader {
             comment_buffer_w: std::ptr::null_mut(),
             reserved: [0; 25],
         };
-        // SAFETY: `data` is filled as the library documents, the names it points to live
-        // until the call returns, and `state` lives as long as the handle (see `Drop`).
-        reader.handle = unsafe { sys::RAROpenArchiveEx(&mut data as *mut _ as *const _) };
-        let result = data.open_result as c_int;
+        // SAFETY: `data` has the layout the library reads and is filled as it documents,
+        // the names it points to live until the call returns, and `state` lives as long
+        // as the handle (see `Drop`).
+        reader.handle = unsafe { sys::RAROpenArchiveEx(&mut data as *mut OpenData as *const _) };
+        let (result, flags) = (data.open_result as c_int, data.flags);
         if reader.handle.is_null() || result != sys::ERAR_SUCCESS {
             return Err(reader.error(result));
         }
-        if data.flags & (sys::ROADF_VOLUME | sys::ROADF_FIRSTVOLUME) != 0 {
+        if flags & (sys::ROADF_VOLUME | sys::ROADF_FIRSTVOLUME) != 0 {
             return Err(Error::Volumes);
         }
-        reader.names_encrypted = data.flags & sys::ROADF_ENCHEADERS != 0;
+        reader.names_encrypted = flags & sys::ROADF_ENCHEADERS != 0;
         Ok(reader)
     }
 
@@ -317,29 +416,33 @@ impl Reader {
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Header>, Error> {
         let mut link: Vec<sys::WCHAR> = vec![0; 2048];
-        let mut header = Box::<sys::HeaderDataEx>::default();
+        // SAFETY: the structure is integers, arrays of them and pointers: all zero is the
+        // empty one the library asks for.
+        let mut header: Box<HeaderData> = Box::new(unsafe { std::mem::zeroed() });
         header.redir_name = link.as_mut_ptr();
-        header.redir_name_size = link.len() as std::ffi::c_uint;
-        // SAFETY: `handle` is an open archive, and `header` is the structure the library
-        // fills, with `redir_name` a buffer of the size given with it.
-        let code = unsafe { sys::RARReadHeaderEx(self.handle, &mut *header as *mut _ as *const _) };
+        header.redir_name_size = link.len() as c_uint;
+        // SAFETY: `handle` is an open archive, and `header` has the layout of the structure
+        // the library fills, with `redir_name` a buffer of the size given with it.
+        let code = unsafe {
+            sys::RARReadHeaderEx(self.handle, &mut *header as *mut HeaderData as *const _)
+        };
         match code {
             sys::ERAR_SUCCESS => {}
             sys::ERAR_END_ARCHIVE if !self.state().volumes => return Ok(None),
             _ => return Err(self.error(code)),
         }
         // What the library names the kinds of links: 4 is a hard link, 5 a file stored once.
-        let link = match header.redir_type {
+        let (flags, redir_type) = (header.flags, header.redir_type);
+        let link = match redir_type {
             0 => None,
-            4 | 5 => Some(Link::SameAs(from_wide(&link))),
+            4 | 5 => Some(Link::SameAs(link_name(&link))),
             _ => Some(Link::Symbolic),
         };
         Ok(Some(Header {
             name: entry_name(&header),
-            dir: header.flags & sys::RHDF_DIRECTORY != 0,
-            encrypted: header.flags & sys::RHDF_ENCRYPTED != 0,
-            split: header.flags & (sys::RHDF_SPLITBEFORE | sys::RHDF_SPLITAFTER) != 0,
-            size: u64::from(header.unp_size_high) << 32 | u64::from(header.unp_size),
+            dir: flags & sys::RHDF_DIRECTORY != 0,
+            encrypted: flags & sys::RHDF_ENCRYPTED != 0,
+            split: flags & (sys::RHDF_SPLITBEFORE | sys::RHDF_SPLITAFTER) != 0,
             modified: file_time(header.mtime_low, header.mtime_high),
             link,
         }))
