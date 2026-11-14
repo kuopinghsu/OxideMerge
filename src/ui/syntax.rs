@@ -33,6 +33,17 @@ fn highlighter() -> &'static Highlighter {
     })
 }
 
+/// Loads the syntaxes on a thread of its own, once, so that the first file highlighted, or
+/// the first excerpt a view highlights while drawing, does not wait for them.
+pub fn warm() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            highlighter();
+        });
+    });
+}
+
 /// The default size of a file that is highlighted, in MiB ([`crate::config::Config::highlight_limit_mb`]).
 pub const DEFAULT_LIMIT_MB: u32 = 16;
 
@@ -99,7 +110,10 @@ pub fn key(path: &Path) -> String {
 /// The syntax of a file named with extension `ext` whose first line is `first`, as a shebang
 /// can name it; none for plain text.
 fn find_syntax<'a>(ss: &'a SyntaxSet, ext: &str, first: &str) -> Option<&'a SyntaxReference> {
-    ss.find_syntax_by_extension(langs::alias(ext).unwrap_or(ext))
+    let key = langs::by_first_line(ext, first)
+        .or_else(|| langs::alias(ext))
+        .unwrap_or(ext);
+    ss.find_syntax_by_extension(key)
         .or_else(|| ss.find_syntax_by_first_line(first))
         .filter(|s| s.name != "Plain Text")
 }
@@ -263,6 +277,20 @@ mod tests {
         }
     }
 
+    /// A settings file with a line padded out with spaces is highlighted in a time that
+    /// grows with its length, not with the square of it; warming up loads the same syntaxes.
+    #[test]
+    fn a_long_padded_line_of_settings_is_highlighted() {
+        warm();
+        let lines = vec![
+            format!("name{}", " ".repeat(200_000)),
+            "key = \"x\" ".to_string(),
+        ];
+        let spans = highlight(&lines, "conf", false).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert!(spans[1].len() > 1, "{:?}", spans[1]);
+    }
+
     /// The file extensions other comparison tools highlight are covered: by an added
     /// language, or by one of syntect's under another extension.
     #[test]
@@ -272,7 +300,7 @@ mod tests {
                     asp shtml htd php3 phtml php htt cfm tpl dtd hta vxml xml xsl xslt svg xul \
                     xsd axl xrc rdf vcproj wxs wxi docbook css caml ml mli fs fsi erl hrl f90 \
                     f95 f2k f for lsp lisp scm smd ss pl pm cgi pod py pyw rb rbw sbt sc scala \
-                    st pac src pkg sql spec body sps spb sf sp md toml yaml yml ini cmake ps1 \
+                    st pac sql body sps spb sf sp md toml yaml yml ini cmake ps1 \
                     psm1 kt kts swift go lua v sv svh vhd vhdl asm s proto ts tsx mk sh json rs";
         for ext in exts.split_whitespace() {
             assert!(has_syntax(ext, ""), "{ext}");
@@ -282,6 +310,38 @@ mod tests {
         let sql = highlight(&lines, "sql", false);
         assert_eq!(highlight(&lines, "sps", false), sql);
         assert_ne!(highlight(&lines, "c", false), sql);
+    }
+
+    /// An extension several languages share goes by the first line of the file.
+    #[test]
+    fn shared_extensions_go_by_the_first_line() {
+        let same = |ext: &str, first: &str, as_ext: &str| {
+            let lines = [first.to_string(), "x = \"a\" // b ' c".to_string()];
+            let got = highlight(&lines, ext, false);
+            assert!(got.is_some(), "{ext}: {first}");
+            assert_eq!(got, highlight(&lines, as_ext, false), "{ext}: {first}");
+        };
+        same("cls", "VERSION 1.0 CLASS", "vb");
+        same("cls", "\\NeedsTeXFormat{LaTeX2e}", "sty");
+        same("cgi", "use strict;", "pl");
+        same("cgi", "#!/usr/bin/env ruby", "rb");
+        same("fs", "module Top", "fsx");
+        same("fs", "#version 330 core", "c");
+        same("inc", "<?php", "html");
+        same("inc", "// shared by the pages", "html");
+        same("inc", "typedef struct point point;", "html");
+        same("fs", "in vec2 uv;", "c");
+        same("inc", "{ shared constants }", "pas");
+        same("inc", "; macros", "asm");
+        same("spec", "CREATE OR REPLACE PACKAGE top AS", "sql");
+        same("spec", "# -*- mode: python ; coding: utf-8 -*-", "py");
+        // The description of an RPM package is in no language known here.
+        assert!(!has_syntax("spec", "Name: top"));
+        assert!(highlight(&["Name: top".to_string()], "spec", false).is_none());
+        // Nor are these, which were read as Standard ML and Smalltalk.
+        for ext in ["sig", "fun", "src", "pkg"] {
+            assert!(!has_syntax(ext, ""), "{ext}");
+        }
     }
 
     /// A file whose whole name tells its language is highlighted as that.

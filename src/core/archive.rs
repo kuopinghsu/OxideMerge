@@ -2,7 +2,7 @@
 //! Zip based formats, tar (plain or compressed with gzip, bzip2, xz or Zstandard), 7z and RAR
 //! are supported, password-protected zip, 7z and RAR archives included. Edits saved into the
 //! extracted copy are written back with [`repack`], which keeps every entry left alone as it
-//! was; a RAR archive is only read, as nothing free writes one.
+//! was; a RAR archive is only read (see [`rar`]), as nothing free writes one.
 
 mod rar;
 
@@ -392,6 +392,9 @@ fn extract_rar(
     let mut ar =
         rar::Reader::open(path, password.map(|p| p.as_str())).map_err(|e| failed(e, false))?;
     let names_encrypted = ar.names_encrypted();
+    // Entries stored as a copy of another, made once the whole archive is read: the one
+    // they copy may come after them.
+    let mut copies: Vec<(PathBuf, PathBuf)> = Vec::new();
     while let Some(entry) = ar.next().map_err(|e| failed(e, names_encrypted))? {
         budget.entry()?;
         let encrypted = entry.encrypted || names_encrypted;
@@ -406,24 +409,16 @@ fn extract_rar(
             continue;
         }
         let out = dir.join(&rel);
-        if entry.dir {
+        if entry.dir && entry.link.is_none() {
             ar.skip().map_err(|e| failed(e, encrypted))?;
             std::fs::create_dir_all(&out)?;
         } else if let Some(link) = &entry.link {
             ar.skip().map_err(|e| failed(e, encrypted))?;
-            // Only what was extracted before, a regular file, can be the one to copy.
-            let from = match link {
-                rar::Link::SameAs(name) if name_inside(name) => clean(name),
-                _ => continue,
-            };
-            if !written.borrow().contains(&from) || !dir.join(&from).is_file() {
-                continue;
+            // A symbolic link is left out; a copy is made below.
+            if let rar::Link::SameAs(name) = link {
+                copies.push((name.clone(), rel));
             }
-            Budget::take(&budget.bytes, std::fs::metadata(dir.join(&from))?.len())?;
-            if let Some(p) = out.parent() {
-                std::fs::create_dir_all(p)?;
-            }
-            std::fs::copy(dir.join(&from), &out)?;
+            continue;
         } else {
             if let Some(p) = out.parent() {
                 std::fs::create_dir_all(p)?;
@@ -439,6 +434,27 @@ fn extract_rar(
                 let _ = file.set_modified(time);
             }
         }
+        written.borrow_mut().insert(rel);
+    }
+    for (name, rel) in copies {
+        // Only a regular file extracted from this archive can be the one to copy. Without
+        // it the entry cannot be made, and leaving it out would show it as missing.
+        let from = clean(&name);
+        let source = dir.join(&from);
+        if !name_inside(&name) || !written.borrow().contains(&from) || !source.is_file() {
+            anyhow::bail!(
+                "{}: {} is stored as a copy of {}, which the archive does not hold",
+                path.display(),
+                rel.display(),
+                name.display()
+            );
+        }
+        Budget::take(&budget.bytes, std::fs::metadata(&source)?.len())?;
+        let out = dir.join(&rel);
+        if let Some(p) = out.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::copy(&source, &out)?;
         written.borrow_mut().insert(rel);
     }
     Ok(())

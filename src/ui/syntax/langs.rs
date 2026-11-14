@@ -101,7 +101,9 @@ const LANGS: &[Lang] = &[
         extra: &[
             (r"^\s*[;#].*$", COMMENT),
             (r"^\s*\[[^\]\n]*\]", SECTION),
-            (r"^\s*[^=\[;#\s][^=\n]*?(?=\s*=)", VARIABLE),
+            // Up to the `=`, spaces before it included: looking for those apart would take
+            // a time that grows with the square of a line of spaces.
+            (r"^\s*[^=\[;#\s][^=\n]*(?==)", VARIABLE),
         ],
         ..NONE
     },
@@ -446,7 +448,7 @@ const LANGS: &[Lang] = &[
     },
     Lang {
         name: "Standard ML",
-        exts: &["sml", "sig", "fun"],
+        exts: &["sml"],
         block_comment: Some(("(*", "*)")),
         strings: &[DQ],
         keywords: "abstype and andalso as case datatype do else end eqtype exception fn fun \
@@ -460,8 +462,7 @@ const LANGS: &[Lang] = &[
     },
     Lang {
         name: "Smalltalk",
-        // `src` and `pkg` are Visual DataFlex sources, which read well enough as Smalltalk.
-        exts: &["st", "pac", "src", "pkg"],
+        exts: &["st", "pac"],
         block_comment: Some(("\"", "\"")),
         strings: &[("'", false, true)],
         keywords: "self super thisContext",
@@ -485,13 +486,13 @@ const ALIASES: &[(&str, &[&str])] = &[
     ("as", &["asc"]),
     ("js", &["jsfl", "mjs", "cjs", "jsx"]),
     ("json", &["jsonc", "json5"]),
-    ("pas", &["dpk", "pp", "dfm", "inc", "lpr"]),
+    ("pas", &["dpk", "pp", "dfm", "lpr"]),
     ("ml", &["caml"]),
     ("lisp", &["smd"]),
     ("pl", &["cgi"]),
     ("rb", &["rbw"]),
     ("scala", &["sc"]),
-    ("sql", &["spec", "body", "sps", "spb", "sf", "sp"]),
+    ("sql", &["body", "sps", "spb", "sf", "sp"]),
     ("html", &["htd", "htt", "cfm", "hta"]),
     (
         "xml",
@@ -509,6 +510,49 @@ pub(super) fn alias(ext: &str) -> Option<&'static str> {
         .iter()
         .find(|(_, from)| from.contains(&ext))
         .map(|&(to, _)| to)
+}
+
+/// The extension to look up a file with extension `ext` by when several languages share
+/// that extension and its first line, `first`, tells which it is in; empty when the
+/// extension tells nothing and only the first line can (a script's `#!`).
+pub(super) fn by_first_line(ext: &str, first: &str) -> Option<&'static str> {
+    let line = first.trim_start_matches('\u{feff}').trim_start();
+    let lower = line.to_ascii_lowercase();
+    let starts = |words: &[&str]| words.iter().any(|w| lower.starts_with(w));
+    match ext {
+        // A LaTeX class, not a Visual Basic one.
+        "cls" if starts(&["\\", "%"]) => Some("sty"),
+        // A script in whatever its first line names; Perl without one (see `ALIASES`).
+        "cgi" if line.starts_with("#!") => Some(""),
+        // A fragment shader, not F#.
+        "fs" if starts(&[
+            "#version",
+            "#extension",
+            "#ifdef",
+            "#ifndef",
+            "#define",
+            "precision ",
+            "uniform ",
+            "varying ",
+            "layout",
+            "in ",
+            "out ",
+            "void main",
+        ]) =>
+        {
+            Some("c")
+        }
+        // Included by Pascal or by an assembler, where its first line says so beyond
+        // doubt; by a web page otherwise, as syntect has it.
+        "inc" if starts(&["{", "(*", "unit ", "procedure ", "function "]) => Some("pas"),
+        "inc" if starts(&[";"]) => Some("asm"),
+        // The specification of a database package or a PyInstaller build; anything else
+        // (such as the description of an RPM package) is in no language known here.
+        "spec" if starts(&["create ", "package ", "--", "/*"]) => Some("sql"),
+        "spec" if starts(&["# -*- mode: python"]) => Some("py"),
+        "spec" => Some(""),
+        _ => None,
+    }
 }
 
 /// Files whose whole name tells their language, in lower case, with an extension of it.

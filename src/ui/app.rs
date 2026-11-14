@@ -3602,6 +3602,10 @@ impl OxideMergeApp {
         initial: Option<OpenRequest>,
         fetched: Vec<(remote::RemoteConnection, String, remote::Fetched)>,
     ) -> Self {
+        // The syntaxes, before the first file needs them, if any will.
+        if cfg.syntax_highlight {
+            super::syntax::warm();
+        }
         let lang = i18n::current_language().to_string();
         fonts::setup(&cc.egui_ctx, &lang);
         #[cfg(target_os = "macos")]
@@ -10793,13 +10797,16 @@ impl OxideMergeApp {
                                     widgets::pick_list(ui, width, |ui| {
                                         widgets::pick_caption(ui, tr("label.recent"));
                                         for r in &recent {
+                                            // A long path is cut short in its row: in
+                                            // full when pointed at.
                                             let row = widgets::pick_row(
                                                 ui,
                                                 false,
                                                 Some(Icon::Clock),
                                                 r,
                                                 false,
-                                            );
+                                            )
+                                            .on_hover_text(r.as_str());
                                             if row.clicked() {
                                                 d.paths[s] = r.clone();
                                                 ui.close();

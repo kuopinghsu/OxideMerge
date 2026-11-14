@@ -1,8 +1,8 @@
-# Pull requests run the full test suite and CLI/window checks on Windows x64,
-# Linux x64 and macOS Apple silicon, plus dependency checks. Every push to main
-# or a release tag also tests native Windows/Linux Arm64, builds all nine release
-# files and checks AppImages on Ubuntu 22.04/AlmaLinux 8. Manual runs can opt into
-# packaging; only release-tag pushes publish a GitHub release.
+# Pushes and pull requests run the full test suite and CLI/window checks on
+# Windows x64, Linux x64 and macOS Apple silicon, plus dependency checks.
+# Release-tag pushes and manual package runs also test Windows/Linux Arm64,
+# build all nine release files and check AppImages on Ubuntu 22.04/AlmaLinux 8.
+# Package runs on release tags publish a GitHub release.
 name: CI
 
 on:
@@ -15,7 +15,7 @@ on:
       packages:
         description: Build and validate all release packages (including Windows/Linux Arm64)
         type: boolean
-        default: false
+        default: true
       stress_cases:
         description: Random cases per diff, merge and patch test (blank to skip the stress run)
         required: false
@@ -48,7 +48,7 @@ jobs:
       matrix:
         include: >-
           ${{ fromJSON(
-            (github.event_name == 'push' || inputs.packages)
+            (((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages)))
             && '[{"arch":"x64","runner":"windows-latest","target":"x86_64-pc-windows-msvc"},{"arch":"arm64","runner":"windows-11-arm","target":"aarch64-pc-windows-msvc"}]'
             || '[{"arch":"x64","runner":"windows-latest","target":"x86_64-pc-windows-msvc"}]'
           ) }}
@@ -182,7 +182,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Package
-        if: github.event_name == 'push' || inputs.packages
+        if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
         id: package
         shell: pwsh
         run: |
@@ -223,7 +223,7 @@ jobs:
           Get-ChildItem dist | Format-Table Name, Length
           "name=$name" >> $env:GITHUB_OUTPUT
 
-      - if: github.event_name == 'push' || inputs.packages
+      - if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.package.outputs.name }}
@@ -240,7 +240,7 @@ jobs:
       matrix:
         include: >-
           ${{ fromJSON(
-            (github.event_name == 'push' || inputs.packages)
+            (((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages)))
             && '[{"arch":"x64","runner":"ubuntu-22.04"},{"arch":"arm64","runner":"ubuntu-22.04-arm"}]'
             || '[{"arch":"x64","runner":"ubuntu-22.04"}]'
           ) }}
@@ -307,7 +307,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Package
-        if: github.event_name == 'push' || inputs.packages
+        if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
         id: package
         shell: bash
         run: |
@@ -350,7 +350,7 @@ jobs:
       # What the archive holds, and that the program in it runs without touching the
       # user's settings.
       - name: Check packages
-        if: github.event_name == 'push' || inputs.packages
+        if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
         env:
           NAME: ${{ steps.package.outputs.name }}
         run: |
@@ -371,7 +371,7 @@ jobs:
             ~/.config/OxideMerge/config.json >/dev/null ||
             { echo "::error::Running the program changed the settings"; exit 1; }
 
-      - if: github.event_name == 'push' || inputs.packages
+      - if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.package.outputs.name }}
@@ -379,7 +379,7 @@ jobs:
           if-no-files-found: error
 
   appimage:
-    if: github.event_name == 'push' || inputs.packages
+    if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
     name: Linux AppImage ${{ matrix.arch }}
     # AlmaLinux 8 has glibc 2.28, so the AppImage runs on RHEL 8, Ubuntu 20.04,
     # Debian 10, and newer.
@@ -474,6 +474,7 @@ jobs:
           if-no-files-found: error
 
   appimage-test:
+    if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
     name: AppImage ${{ matrix.arch }} on ${{ matrix.system }}
     needs: appimage
     runs-on: ${{ matrix.runner }}
@@ -620,7 +621,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
-          targets: ${{ (github.event_name == 'push' || inputs.packages) && 'aarch64-apple-darwin,x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
+          targets: ${{ (((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))) && 'aarch64-apple-darwin,x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
           components: clippy
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -641,7 +642,7 @@ jobs:
         run: cargo build --release --locked --target aarch64-apple-darwin
 
       - name: Build Intel slice
-        if: github.event_name == 'push' || inputs.packages
+        if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
         run: cargo build --release --locked --target x86_64-apple-darwin
 
       - name: Window smoke test
@@ -663,7 +664,7 @@ jobs:
       # notarized and stapled (scripts/macos-sign.sh); with none of them, as on forks and pull
       # requests, the app is signed ad hoc. Secrets reach this step only.
       - name: Package
-        if: github.event_name == 'push' || inputs.packages
+        if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
         id: package
         shell: bash
         env:
@@ -779,10 +780,10 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - name: Remove the signing keychain
-        if: always() && (github.event_name == 'push' || inputs.packages)
+        if: always() && (((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages)))
         run: bash scripts/macos-sign.sh cleanup
 
-      - if: github.event_name == 'push' || inputs.packages
+      - if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.package.outputs.name }}
@@ -887,7 +888,7 @@ jobs:
           path: target/bench/results.md
 
   user-guide:
-    if: github.event_name == 'push' || inputs.packages
+    if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
     name: User guide PDF
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -933,7 +934,7 @@ jobs:
   release:
     name: GitHub release
     needs: [windows, linux, appimage, appimage-test, macos, user-guide, dependencies]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages)) && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
