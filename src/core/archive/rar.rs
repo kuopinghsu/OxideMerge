@@ -114,6 +114,7 @@ fn wide(text: &str) -> Vec<sys::WCHAR> {
 }
 
 /// The text of the wide characters in `buf`, up to its ending.
+#[cfg(not(any(target_os = "linux", target_os = "netbsd")))]
 fn from_wide(buf: &[sys::WCHAR]) -> PathBuf {
     let buf = &buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())];
     #[cfg(windows)]
