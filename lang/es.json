@@ -618,6 +618,7 @@
   "msg.cannot_write": "No se pudo escribir {file}",
   "msg.archive_not_writable": "No se puede escribir de vuelta en {file}: es un paquete firmado, que esta aplicación abre como solo lectura.",
   "msg.archive_rar_not_writable": "No se puede escribir de vuelta en {file}: un archivo RAR solo se puede leer, por lo que esta aplicación lo abre como solo lectura.",
+  "msg.archive_copy_locked": "Este archivo procede de un archivo comprimido que solo se puede leer, por lo que sigue siendo de solo lectura. Para editarlo, cópielo primero a una carpeta.",
   "msg.archive_read_only": "{file} es de solo lectura, así que los cambios no se escribieron en él.",
   "msg.archive_changed": "{file} cambió en el disco después de abrirlo, así que los cambios no se escribieron en él. Vuelva a compararlo para editar la nueva versión.",
   "msg.archive_write_failed": "No se pudieron escribir los cambios en {file}.",

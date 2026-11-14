@@ -3287,6 +3287,22 @@ impl TextView {
     }
 
     /// Why typing into pane `pane` was refused: which side it is, and how to edit it if it can be.
+    /// Locks or unlocks the side `pane` for editing. A file out of an archive that cannot
+    /// be written back stays locked: saving it would change nothing but a temporary copy.
+    fn set_lock(&mut self, pane: usize, read_only: bool) {
+        let doc = &mut self.panes[pane].doc;
+        let copy = !read_only
+            && doc
+                .path
+                .as_deref()
+                .is_some_and(crate::core::archive::read_only_copy);
+        if copy {
+            self.status = tr("msg.archive_copy_locked").to_string();
+        } else {
+            doc.read_only = read_only;
+        }
+    }
+
     fn read_only_message(&self, pane: usize) -> String {
         let side = side_name(pane, self.n()).to_string();
         let key = if self.panes[pane].doc.compare_only {
@@ -7383,7 +7399,7 @@ impl TextView {
                             })
                             .inner;
                         if unlocked {
-                            self.panes[p].doc.read_only = ro;
+                            self.set_lock(p, ro);
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             let mut job = LayoutJob::default();
@@ -16180,6 +16196,32 @@ mod tests {
         perms.set_readonly(false);
         std::fs::set_permissions(&path, perms).unwrap();
     }
+    /// A file out of an archive that cannot be written back, as a RAR archive cannot,
+    /// stays locked: unlocked, it would be saved to a temporary copy and nowhere else.
+    #[test]
+    fn a_file_from_a_read_only_archive_cannot_be_unlocked() {
+        let work = tempfile::tempdir().unwrap();
+        let rar = work.path().join("a.rar");
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar/v5.rar");
+        std::fs::copy(fixture, &rar).unwrap();
+        let extracted = crate::core::archive::extract_to_temp(&rar).unwrap();
+        let mut v = two_way("keep\n", "keep\n");
+        for pane in &mut v.panes {
+            pane.doc.read_only = true;
+        }
+        v.panes[1].doc.path = Some(extracted.path().join("keep.txt"));
+        v.set_lock(1, false);
+        assert!(v.panes[1].doc.read_only);
+        assert_eq!(v.status, tr("msg.archive_copy_locked"));
+        assert!(v.save_pane(1).is_err());
+        // Any other file is unlocked as asked, and locking is always allowed.
+        v.set_lock(0, false);
+        assert!(!v.panes[0].doc.read_only);
+        v.set_lock(0, true);
+        assert!(v.panes[0].doc.read_only);
+    }
+
     #[test]
     fn saving_over_a_file_read_only_on_disk_is_refused_and_keeps_the_edit() {
         let dir = tempfile::tempdir().unwrap();

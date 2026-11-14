@@ -618,6 +618,7 @@
   "msg.cannot_write": "Impossible d'écrire {file}",
   "msg.archive_not_writable": "Impossible de réécrire {file} : c'est un paquet signé, que cette application ouvre en lecture seule.",
   "msg.archive_rar_not_writable": "Impossible de réécrire {file} : une archive RAR ne peut qu'être lue, cette application l'ouvre donc en lecture seule.",
+  "msg.archive_copy_locked": "Ce fichier provient d'une archive qui ne peut qu'être lue : il reste donc en lecture seule. Pour le modifier, copiez-le d'abord dans un dossier.",
   "msg.archive_read_only": "{file} est en lecture seule, les modifications n'y ont donc pas été réécrites.",
   "msg.archive_changed": "{file} a changé sur le disque après son ouverture, les modifications n'y ont donc pas été réécrites. Comparez-le à nouveau pour modifier la nouvelle version.",
   "msg.archive_write_failed": "Impossible de réécrire les modifications dans {file}.",

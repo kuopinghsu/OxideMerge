@@ -2157,13 +2157,14 @@ fn a_read_only_side_is_not_offered_as_the_destination() {
         assert!(gui.widget(tr(key)).enabled, "{key} cannot be chosen");
     }
     // Each operation is one row, named by what it does and to what.
-    gui.wait_until("the plan", |g| g.shows_text("new.txt"));
     let delete = tr("folder_sync.action_delete");
-    let rows = gui
-        .widgets
-        .iter()
-        .filter(|w| w.label.contains("new.txt") && w.label.starts_with(delete));
-    assert_eq!(rows.count(), 1, "the row is not named once, in full");
+    let rows = |g: &Gui| {
+        let row = |w: &&Widget| w.label.contains("new.txt") && w.label.starts_with(delete);
+        g.widgets.iter().filter(row).count()
+    };
+    // The folder list behind the dialog names the file too: the plan's row is waited for.
+    gui.wait_until("the plan", |g| rows(g) > 0);
+    assert_eq!(rows(&gui), 1, "the row is not named once, in full");
     // Choosing another direction keeps the dialog as it is, buttons and all, while the new
     // plan is worked out: it does not close up to a line and open again.
     gui.click(tr("folder_sync.update_left"));

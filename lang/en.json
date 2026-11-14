@@ -618,6 +618,7 @@
   "msg.cannot_write": "Could not write {file}",
   "msg.archive_not_writable": "{file} can't be written back: it is a signed package, which this app opens read-only.",
   "msg.archive_rar_not_writable": "{file} can't be written back: a RAR archive can only be read, so this app opens it read-only.",
+  "msg.archive_copy_locked": "This file is from an archive that can only be read, so it stays read-only. To edit it, copy it to a folder first.",
   "msg.archive_read_only": "{file} is read-only, so the edits were not written back into it.",
   "msg.archive_changed": "{file} changed on disk after it was opened, so the edits were not written back into it. Compare it again to edit the new version.",
   "msg.archive_write_failed": "Could not write the edits back into {file}.",

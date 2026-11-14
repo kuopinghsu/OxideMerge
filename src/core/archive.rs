@@ -257,6 +257,13 @@ pub fn inside_extraction(path: &Path) -> bool {
     extraction_of(path).is_some()
 }
 
+/// Whether `path` is a copy extracted from an archive that edits cannot be written back
+/// into (see [`editable`]): saving the copy would change nothing the user keeps, so it is
+/// not to be edited.
+pub fn read_only_copy(path: &Path) -> bool {
+    extraction_of(path).is_some_and(|(archive, _)| !editable(&archive))
+}
+
 /// The archive, and the folder it was extracted to, of the extraction `path` is in.
 fn extraction_of(path: &Path) -> Option<(PathBuf, PathBuf)> {
     let all = extractions();
@@ -2589,6 +2596,18 @@ mod tests {
         assert_eq!(e.to_string(), crate::i18n::trf(key, &[file]));
         assert!(super::repack_all(&path, extracted.path()).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        // Its files are copies that lead nowhere; those of a zip are not.
+        assert!(read_only_copy(&extracted.path().join("keep.txt")));
+        assert!(read_only_copy(&extracted.path().join("dir/a.txt")));
+        assert!(!read_only_copy(&path));
+        let zip_path = path.with_file_name("a.zip");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        zw.start_file("keep.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(b"keep\n").unwrap();
+        zw.finish().unwrap();
+        let unzipped = extract_to_temp(&zip_path).unwrap();
+        assert!(!read_only_copy(&unzipped.path().join("keep.txt")));
     }
 
     /// A volume of a RAR archive in several is turned down, whatever it is named, before

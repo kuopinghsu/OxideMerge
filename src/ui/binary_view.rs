@@ -1296,13 +1296,25 @@ impl BinaryView {
                         } else {
                             Icon::Unlock
                         };
-                        widgets::toggle_icon_button(
+                        let toggled = widgets::toggle_icon_button(
                             ui,
                             &mut self.read_only[p],
                             Some(lock),
                             "",
                             tr("label.read_only"),
                         );
+                        // A file out of an archive that cannot be written back stays
+                        // locked: saving it would change nothing but a temporary copy.
+                        if toggled.clicked()
+                            && !self.read_only[p]
+                            && self
+                                .paths
+                                .get(p)
+                                .is_some_and(|path| crate::core::archive::read_only_copy(path))
+                        {
+                            self.read_only[p] = true;
+                            self.status = tr("msg.archive_copy_locked").to_string();
+                        }
                         widgets::chip(ui, &size, pal.text_dim, pal.control);
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             ui.add(
