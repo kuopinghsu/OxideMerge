@@ -68,7 +68,7 @@ help:
 	@echo '  shell-unregister  Remove the file manager entries'
 	@echo '  languages         List the available UI languages'
 	@echo '  dist              Release build packaged into dist/$(DIST_NAME)'
-	@echo '  appimage          Linux AppImage (x86_64 or aarch64) in dist/'
+	@echo '  appimage          Linux AppImage in dist/ (Docker on Windows/macOS)'
 	@echo '  user-guide        User guide PDF files (English, Traditional Chinese) in dist/'
 	@echo '  user-guide-docs   The latest user guide PDF files in docs/dist, to commit'
 	@echo '  clean             Remove build output and dist/'
@@ -171,11 +171,21 @@ else
 	@echo Created $(DIST_DIR).tar.gz
 endif
 
-# Same AppDir as the CI AppImage job. Linux x86_64 or aarch64 only.
+# Keep the native Linux flow; other hosts build the Linux binary and AppDir in Docker.
+ifneq ($(filter windows darwin,$(PLATFORM)),)
+APPIMAGE_IMAGE := oxidemerge-appimage
+
+.PHONY: appimage-image
+appimage-image:
+	docker build -t $(APPIMAGE_IMAGE) -f docker/appimage.Dockerfile docker
+
+appimage: appimage-image
+	docker run --rm --init --mount "type=bind,source=$(CURDIR),target=/work" --mount "type=volume,source=oxidemerge-appimage-target-$(MACHINE),target=/target" --mount "type=volume,source=oxidemerge-appimage-registry,target=/root/.cargo/registry" --workdir /work --env "VERSION=$(VERSION)" --env CARGO_BUILD_JOBS $(APPIMAGE_IMAGE)
+else ifeq ($(PLATFORM),linux)
 appimage: release
-ifeq ($(PLATFORM),linux)
 	VERSION='$(VERSION)' bash scripts/package-appimage.sh
 else
+appimage:
 	@echo AppImage packages are built on Linux x86_64 or aarch64 >&2
 	@exit 1
 endif

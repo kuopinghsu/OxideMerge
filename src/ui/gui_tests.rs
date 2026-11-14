@@ -2098,6 +2098,9 @@ fn folders_are_synchronized_after_a_preview_and_a_confirmation() {
         "changed by the preview"
     );
 
+    // The asynchronous plan changes the modal's size. Wait for it to finish centering
+    // before taking the button's coordinates, otherwise the next frame can move it.
+    assert!(gui.resting_rect(tr("folder_sync.apply")).is_some());
     gui.click(tr("folder_sync.apply"));
     let Content::Folder(v) = gui.app.tabs[0].content.view() else {
         panic!("not a folder compare");
