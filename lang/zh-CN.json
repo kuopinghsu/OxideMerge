@@ -618,6 +618,7 @@
   "msg.cannot_write": "无法写入 {file}",
   "msg.archive_not_writable": "无法写回 {file}：这是已签名的软件包，本程序只能只读打开。",
   "msg.archive_rar_not_writable": "无法写回 {file}：RAR 压缩包只能读取，因此本程序只能只读打开。",
+  "msg.archive_copy_locked": "此文件来自只能读取的压缩包，因此保持只读。要编辑它，请先将其复制到文件夹。",
   "msg.archive_read_only": "{file} 是只读的，因此编辑内容没有写回其中。",
   "msg.archive_changed": "{file} 在打开后已在磁盘上更改，因此编辑内容没有写回其中。请重新比较以编辑新版本。",
   "msg.archive_write_failed": "无法将编辑内容写回 {file}。",

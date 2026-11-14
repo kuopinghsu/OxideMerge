@@ -618,6 +618,7 @@
   "msg.cannot_write": "無法寫入 {file}",
   "msg.archive_not_writable": "無法寫回 {file}：這是已簽署的套件，本程式只能唯讀開啟。",
   "msg.archive_rar_not_writable": "無法寫回 {file}：RAR 壓縮檔只能讀取，因此本程式只能唯讀開啟。",
+  "msg.archive_copy_locked": "此檔案來自只能讀取的壓縮檔，因此維持唯讀。若要編輯，請先將它複製到資料夾。",
   "msg.archive_read_only": "{file} 是唯讀的，因此編輯內容沒有寫回其中。",
   "msg.archive_changed": "{file} 在開啟後已在磁碟上變更，因此編輯內容沒有寫回其中。請重新比較以編輯新版本。",
   "msg.archive_write_failed": "無法將編輯內容寫回 {file}。",

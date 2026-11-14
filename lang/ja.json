@@ -618,6 +618,7 @@
   "msg.cannot_write": "{file} を書き込めませんでした",
   "msg.archive_not_writable": "{file} には書き戻せません。署名付きパッケージで、このアプリでは読み取り専用で開きます。",
   "msg.archive_rar_not_writable": "{file} には書き戻せません。RAR アーカイブは読み取りのみ可能なため、このアプリでは読み取り専用で開きます。",
+  "msg.archive_copy_locked": "このファイルは読み取り専用のアーカイブから取り出したもののため、読み取り専用のままです。編集するには、先にフォルダーへコピーしてください。",
   "msg.archive_read_only": "{file} は読み取り専用のため、編集内容は書き戻されませんでした。",
   "msg.archive_changed": "{file} は開いた後にディスク上で変更されたため、編集内容は書き戻されませんでした。新しい版を編集するには、もう一度比較してください。",
   "msg.archive_write_failed": "編集内容を {file} に書き戻せませんでした。",
