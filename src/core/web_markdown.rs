@@ -2,7 +2,7 @@
 //! items, tables, code blocks), which are compared block by block and shown formatted.
 
 use super::diff::{inline_diff, DiffOptions};
-use super::web::{attr, entity, has_attr, tokens, Token, BLOCK};
+use super::web::{attr, attr_text, decode, has_attr, tokens, Token, BLOCK};
 use similar::{Algorithm, DiffTag};
 use std::ops::Range;
 use url::Url;
@@ -14,6 +14,13 @@ pub struct Block {
     pub depth: usize,
     pub text: String,
 }
+
+/// Longest `data:` URI of a picture kept in the Markdown, so that it is shown: a longer one
+/// would make the text compared long.
+const MAX_INLINE_IMAGE: usize = 64 << 10;
+
+/// Largest picture file whose fingerprint the Formatted compare of a local page takes.
+const MAX_PRINTED_PICTURE: u64 = 20 << 20;
 
 /// Elements without contents or a closing tag.
 const VOID: &[&str] = &[
@@ -37,11 +44,11 @@ const SCREEN_READER_ONLY: &[&str] = &[
 
 fn is_hidden(attrs: &str) -> bool {
     if has_attr(attrs, "hidden")
-        || attr(attrs, "aria-hidden").is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        || attr_text(attrs, "aria-hidden").is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
     {
         return true;
     }
-    if let Some(style) = attr(attrs, "style") {
+    if let Some(style) = attr_text(attrs, "style") {
         let style: String = style
             .chars()
             .filter(|c| !c.is_whitespace())
@@ -51,7 +58,7 @@ fn is_hidden(attrs: &str) -> bool {
             return true;
         }
     }
-    attr(attrs, "class").is_some_and(|c| {
+    attr_text(attrs, "class").is_some_and(|c| {
         c.split_whitespace()
             .any(|c| SCREEN_READER_ONLY.contains(&c))
     })
@@ -175,29 +182,6 @@ fn skipped(open: &mut Vec<String>, tok: &Token, around: impl Fn(&str) -> bool) -
     true
 }
 
-/// Decodes character references, keeping the white space.
-fn decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(amp) = rest.find('&') {
-        out.push_str(&rest[..amp]);
-        let tail = &rest[amp + 1..];
-        let semi = tail.find(';').filter(|&k| k <= 10);
-        match semi.and_then(|k| entity(&tail[..k]).map(|c| (k, c))) {
-            Some((k, c)) => {
-                out.push(c);
-                rest = &tail[k + 1..];
-            }
-            None => {
-                out.push('&');
-                rest = tail;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 /// Characters that would otherwise be read as Markdown within a line.
 pub(crate) fn escapes(c: char) -> bool {
     matches!(
@@ -253,6 +237,9 @@ enum Mark {
     Strike,
     Code,
     Link(String),
+    /// A picture: `![alt](address)`, or `![alt](address "fingerprint")` with the fingerprint
+    /// of its file, so that a picture changed under the same name is a change.
+    Image(String, Option<String>),
 }
 
 /// Inline formatting opened in the current block: its tag, where its text starts, and what it
@@ -325,6 +312,11 @@ impl Converter {
     /// Decided after entities are decoded and the address is made absolute, so `&#106;avascript:`
     /// is caught; what is kept is the address as parsed, with no line break left in it.
     fn link_to(&self, href: &str) -> Option<String> {
+        self.absolute_link(href).map(|url| self.relative(url))
+    }
+
+    /// [`Self::link_to`], with the address as resolved.
+    fn absolute_link(&self, href: &str) -> Option<String> {
         let url = self.resolve(href);
         let local_page = self.base.as_ref().is_none_or(|b| b.scheme() == "file");
         match Url::parse(&url) {
@@ -342,8 +334,34 @@ impl Converter {
         }
     }
 
+    /// `url` as written from the page converted for the Formatted compare: relative to it when
+    /// on its site, so that pages in other folders, such as two copies of a site, link to the
+    /// same pictures and pages alike. The view resolves it against the page again.
+    fn relative(&self, url: String) -> String {
+        let Some(document) = &self.document_url else {
+            return url;
+        };
+        Url::parse(&url)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https" | "file"))
+            // A file on another drive has no address relative to the page: going up from the
+            // page never leaves its drive.
+            .filter(|u| u.scheme() != "file" || first_segment(u) == first_segment(document))
+            .and_then(|u| document.make_relative(&u))
+            // A link to the page itself names it, as one from another page would.
+            .map(|r| match r.starts_with(['#', '?']) || r.is_empty() {
+                true => {
+                    let name = document.path_segments().and_then(|mut s| s.next_back());
+                    format!("{}{r}", name.unwrap_or_default())
+                }
+                false => r,
+            })
+            .filter(|r| !r.is_empty() && !r.contains(char::is_control))
+            .unwrap_or(url)
+    }
+
     fn anchor_to(&self, href: &str) -> Option<String> {
-        let url = self.link_to(href)?;
+        let url = self.absolute_link(href)?;
         if let Some(document) = self.document_url.as_ref().filter(|_| {
             decode(href.trim())
                 .trim_start_matches(|c| c <= ' ')
@@ -356,7 +374,7 @@ impl Converter {
                 }
             }
         }
-        Some(url)
+        Some(self.relative(url))
     }
 
     fn space(&mut self) {
@@ -411,7 +429,7 @@ impl Converter {
             let o = self.open.pop().expect("open formatting");
             let inner = self.line.split_off(o.start);
             let body = inner.trim();
-            if body.is_empty() {
+            if body.is_empty() && !matches!(o.mark, Mark::Image(..)) {
                 self.line.push_str(&inner);
                 continue;
             }
@@ -432,6 +450,10 @@ impl Converter {
                     format!("{fence}{pad}{body}{pad}{fence}")
                 }
                 Mark::Link(url) => format!("[{body}]({})", destination(&url)),
+                Mark::Image(url, None) => format!("![{body}]({})", destination(&url)),
+                Mark::Image(url, Some(print)) => {
+                    format!("![{body}]({} \"{print}\")", destination(&url))
+                }
             };
             self.line.push_str(lead);
             self.line.push_str(&body);
@@ -664,7 +686,7 @@ impl Converter {
                     self.deep_lists += 1;
                     return;
                 }
-                let next = attr(attrs, "start")
+                let next = attr_text(attrs, "start")
                     .and_then(|s| s.trim().parse().ok())
                     .unwrap_or(1);
                 self.ctx.push(Ctx::List {
@@ -687,7 +709,7 @@ impl Converter {
                 });
                 let marker = match list {
                     Some((true, next)) => {
-                        let n = attr(attrs, "value")
+                        let n = attr_text(attrs, "value")
                             .and_then(|v| v.trim().parse().ok())
                             .unwrap_or(*next);
                         *next = n + 1;
@@ -740,7 +762,7 @@ impl Converter {
                 self.start_cell(false);
                 // `rowspan="0"` reaches to the end of the row group.
                 let span = |name, zero, most| {
-                    attr(attrs, name)
+                    attr_text(attrs, name)
                         .and_then(|v| v.trim().parse::<usize>().ok())
                         .map_or(1, |n| if n == 0 { zero } else { n.min(most) })
                 };
@@ -867,43 +889,109 @@ impl Converter {
     }
 
     /// An image, written as a link to it: Markdown images would need loading to be shown.
+    /// An image without `src` shows the first of its `srcset`; one without alt text is named
+    /// by its file name, also within a link, which would otherwise have no text.
     fn image(&mut self, attrs: &str) {
         let alt = attr(attrs, "alt").map(decode).unwrap_or_default();
         let alt = alt.split_whitespace().collect::<Vec<_>>().join(" ");
-        let src = attr(attrs, "src").map(str::trim).unwrap_or_default();
-        let url = (!self.in_link() && !self.in_code())
-            .then(|| self.link_to(src))
-            .flatten();
-        let Some(url) = url.filter(|_| !src.is_empty()) else {
-            self.text(&alt);
-            return;
-        };
-        let name = if alt.is_empty() {
-            Url::parse(&url)
-                .ok()
-                .and_then(|u| {
-                    u.path_segments()
-                        .and_then(|mut s| s.next_back().map(str::to_string))
-                })
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| url.clone())
-        } else {
+        let srcset = attr(attrs, "srcset").map(decode).unwrap_or_default();
+        let src = attr(attrs, "src")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                super::web::srcset_urls(&srcset)
+                    .first()
+                    .map(|u| u.replace('&', "&amp;"))
+            })
+            .unwrap_or_default();
+        let url = (!src.is_empty()).then(|| self.image_to(&src)).flatten();
+        let inline = url.as_deref().is_some_and(|u| u.starts_with("data:"));
+        // Within code, only what the page wrote: no file name stands in for missing alt text.
+        let name = if !alt.is_empty() || self.in_code() || inline {
             alt
+        } else {
+            url.as_deref()
+                .map(|u| file_name(u).unwrap_or_else(|| u.to_string()))
+                .unwrap_or_default()
         };
+        // Escaped, as `text` decodes character references and the name is decoded already.
+        let name = name.replace('&', "&amp;");
+        match url.filter(|_| !self.in_code()) {
+            Some(url) => {
+                self.space();
+                let print = self.picture_print(&src);
+                self.open_mark("img", Mark::Image(url, print));
+                self.text(&name);
+                self.close_mark("img");
+            }
+            None if name.is_empty() => return,
+            None => {
+                self.space();
+                self.text(&name);
+            }
+        }
+        // A picture stands apart from the words around it.
         self.space();
-        self.open_mark("img", Mark::Link(url));
-        self.text(&name);
-        self.close_mark("img");
+    }
+
+    /// The fingerprint of the picture file at `src`, for the Formatted compare of a page on
+    /// this computer: what tells a picture changed under the same name apart. None for a
+    /// picture on the web, which would have to be downloaded, or stored in the page, whose
+    /// address is its content.
+    fn picture_print(&self, src: &str) -> Option<String> {
+        self.document_url.as_ref()?;
+        let url = Url::parse(&self.absolute_link(src)?).ok()?;
+        let path = url.to_file_path().ok().filter(|_| url.scheme() == "file")?;
+        let meta = std::fs::metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() > MAX_PRINTED_PICTURE {
+            return None;
+        }
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(std::fs::read(&path).ok()?);
+        Some(digest[..4].iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    /// Where the picture at `src` is loaded from: as [`Self::link_to`], or a picture stored in
+    /// the page as a `data:` URI, while it is small enough to compare as text.
+    fn image_to(&self, src: &str) -> Option<String> {
+        let decoded = decode(src.trim());
+        let head = decoded.get(..11).unwrap_or_default();
+        if head.eq_ignore_ascii_case("data:image/") {
+            return (decoded.len() <= MAX_INLINE_IMAGE && !decoded.contains(char::is_control))
+                .then(|| decoded.split_whitespace().collect());
+        }
+        self.link_to(src)
     }
 }
 
+/// The Windows drive (`D:`) a file address is on; None for one on no drive, as on Linux and
+/// macOS, where any file can be reached going up from the page.
+fn first_segment(u: &Url) -> Option<String> {
+    let first = u.path_segments().and_then(|mut s| s.next())?;
+    let b = first.as_bytes();
+    (b.len() == 2 && b[0].is_ascii_alphabetic() && matches!(b[1], b':' | b'|'))
+        .then(|| first[..1].to_ascii_uppercase())
+}
+
+/// The file name an image address ends in, as it reads: `my%20photo.png` is `my photo.png`.
+/// None for an address with no file name, such as `https://example.com/` or `mailto:`.
+fn file_name(url: &str) -> Option<String> {
+    if Url::parse(url).is_ok_and(|u| u.cannot_be_a_base()) {
+        return None;
+    }
+    let path = url.split(['?', '#']).next()?;
+    let name = super::web::percent_decode(path.rsplit('/').next()?);
+    (!name.trim().is_empty()).then_some(name)
+}
+
 fn code_language(attrs: &str) -> String {
-    attr(attrs, "class")
-        .and_then(|c| {
-            c.split_whitespace().find_map(|c| {
-                c.strip_prefix("language-")
-                    .or_else(|| c.strip_prefix("lang-"))
-            })
+    let class = attr_text(attrs, "class").unwrap_or_default();
+    class
+        .split_whitespace()
+        .find_map(|c| {
+            c.strip_prefix("language-")
+                .or_else(|| c.strip_prefix("lang-"))
         })
         .filter(|l| {
             l.chars()
@@ -1658,9 +1746,150 @@ mod tests {
         assert_eq!(
             md(html),
             "[A *link*](https://example.com/a%20b.html) js \
-             [Logo](https://example.com/docs/img/logo.png) \
-             [pic.jpg](https://example.com/i/pic.jpg) inline"
+             ![Logo](https://example.com/docs/img/logo.png) \
+             ![pic.jpg](https://example.com/i/pic.jpg) ![inline](data:image/png;base64,AAA)"
         );
+    }
+
+    #[test]
+    fn images_are_named_and_linked_as_shown() {
+        // No `src`: the first `srcset` image, which may hold commas.
+        assert_eq!(
+            md(r#"<img srcset="/w_200,h_100/a.jpg 1x, b.jpg 2x" alt="A">"#),
+            "![A](https://example.com/w_200,h_100/a.jpg)"
+        );
+        assert_eq!(
+            md(r#"<img srcset="img/x.png?a=1&amp;b=2 1x">"#),
+            "![x.png](https://example.com/docs/img/x.png?a=1&b=2)"
+        );
+        // A file name reads as it is spelled, not percent-encoded.
+        assert_eq!(
+            md(r#"<img src="img/van%20layout.png">"#),
+            "![van layout.png](https://example.com/docs/img/van%20layout.png)"
+        );
+        // A linked image without alt text is named by the image's file name.
+        assert_eq!(
+            md(r#"<a href="/"><img src="logo.png" alt=""></a>"#),
+            "[![logo.png](https://example.com/docs/logo.png)](https://example.com/)"
+        );
+        assert_eq!(
+            md(r#"<a href="/"><img src="logo.png" alt="Home"></a>"#),
+            "[![Home](https://example.com/docs/logo.png)](https://example.com/)"
+        );
+        // A picture stored in the page has no file name: its alt text, or none. One too long
+        // to compare as text, or not a picture, is only its alt text.
+        assert_eq!(
+            md(r#"<p>a <img src="data:image/png;base64,AA BB"> b</p>"#),
+            "a ![](data:image/png;base64,AABB) b"
+        );
+        let big = format!(
+            r#"<img alt="Big" src="data:image/png;base64,{}">"#,
+            "A".repeat(70_000)
+        );
+        assert_eq!(md(&big), "Big");
+        assert_eq!(md(r#"<img alt="Page" src="data:text/html,x">"#), "Page");
+        // Alt text is decoded once, as the browser shows it.
+        assert_eq!(
+            md(r#"<img src="a.png" alt="Use &amp;lt;b&amp;gt; &amp;amp; more">"#),
+            r"![Use \&lt;b\&gt; \&amp; more](https://example.com/docs/a.png)"
+        );
+        assert_eq!(
+            md(r#"<p>R<img src="data:," alt="&amp;amp;">D</p>"#),
+            r"R \&amp; D"
+        );
+        // A picture stands apart from the words around it, also within a link.
+        assert_eq!(
+            md(r#"<a href="/">Home<img src="logo.png" alt="">page</a>"#),
+            "[Home ![logo.png](https://example.com/docs/logo.png) page](https://example.com/)"
+        );
+        // Within code, only alt text the page wrote.
+        assert_eq!(
+            md(r#"<code>run <img src="t.svg">now<img src="t.svg" alt="icon"></code>"#),
+            "`run now icon`"
+        );
+        // Without a page address, a relative image keeps its address.
+        let blocks = html_to_blocks(r#"<img src="images/a.png">"#, None);
+        assert_eq!(blocks[0].text, "![a.png](images/a.png)");
+    }
+
+    #[test]
+    fn formatted_pages_in_other_folders_link_to_their_files_alike() {
+        let abort = std::sync::atomic::AtomicBool::new(false);
+        let left = Url::parse("file:///D:/samples/left/web/handbook.html").unwrap();
+        let right = Url::parse("file:///D:/samples/right/web/handbook.html").unwrap();
+        let html = r#"<p><a href="/"><img src="images/logo.png" alt=""></a>
+            <a href="../docs/guide.html">Guide</a> <a href="https://example.com/x">Site</a>
+            <img src="data:image/png;base64,AA" alt="dot"></p>"#;
+        let blocks = |page: &Url| formatted_html_to_blocks(html, page, &abort).unwrap();
+        let blocks_of = |html: &str, page: &Url| {
+            formatted_html_to_blocks(html, page, &abort).unwrap()[0]
+                .text
+                .clone()
+        };
+        let expected = "[![logo.png](images/logo.png)](../../../) [Guide](../docs/guide.html)             [Site](https://example.com/x) ![dot](data:image/png;base64,AA)";
+        let expected = expected.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(blocks(&left)[0].text, expected);
+        assert_eq!(blocks(&left), blocks(&right));
+        // The warning sign changed under the same name: its fingerprint tells it apart.
+        let dir = tempfile::tempdir().unwrap();
+        for (side, bytes) in [("l", b"red".as_slice()), ("r", b"gold".as_slice())] {
+            std::fs::create_dir_all(dir.path().join(side)).unwrap();
+            std::fs::write(dir.path().join(side).join("sign.png"), bytes).unwrap();
+        }
+        let page = |side: &str| Url::from_file_path(dir.path().join(side).join("p.html")).unwrap();
+        let sign = r#"<img src="sign.png" alt="Sign">"#;
+        let (l, r) = (blocks_of(sign, &page("l")), blocks_of(sign, &page("r")));
+        assert!(l.starts_with(r#"![Sign](sign.png ""#), "{l}");
+        assert_ne!(l, r);
+        let sample = |side: &str| {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("samples");
+            let path = dir.join(side).join("web").join("handbook.html");
+            let html = std::fs::read_to_string(&path).unwrap();
+            formatted_html_to_blocks(&html, &Url::from_file_path(&path).unwrap(), &abort).unwrap()
+        };
+        let real = [sample("left"), sample("right")];
+        let row_of = |want: &str| {
+            align(&real)
+                .into_iter()
+                .find(|r| r.cells[0].is_some_and(|b| real[0][b].text.contains(want)))
+                .unwrap()
+        };
+        assert!(row_of("Warning sign").changed);
+        assert!(!row_of("logo.png").changed);
+        // The handbook samples' logo is the same file beside each page: no difference.
+        let pages = [
+            formatted_html_to_blocks(
+                include_str!("../../samples/left/web/handbook.html"),
+                &left,
+                &abort,
+            )
+            .unwrap(),
+            formatted_html_to_blocks(
+                include_str!("../../samples/right/web/handbook.html"),
+                &right,
+                &abort,
+            )
+            .unwrap(),
+        ];
+        let rows = align(&pages);
+        let logo = rows
+            .iter()
+            .find(|r| r.cells[0].is_some_and(|b| pages[0][b].text.contains("logo.png")))
+            .unwrap();
+        assert!(!logo.changed);
+        // A file on another drive stays where it is.
+        let other_drive = r#"<img src="file:///E:/pics/x.png" alt="x">"#;
+        assert_eq!(blocks_of(other_drive, &left), "![x](file:///E:/pics/x.png)");
+        // Without drives, a file elsewhere is reached going up from the page.
+        let unix = Url::parse("file:///home/a/v1/index.html").unwrap();
+        assert_eq!(
+            blocks_of(r#"<img src="/mnt/shared/logo.png" alt="x">"#, &unix),
+            "![x](../../../mnt/shared/logo.png)"
+        );
+        // Elsewhere the addresses stay absolute.
+        assert!(html_to_blocks(html, Some(&left))[0]
+            .text
+            .contains("(file:///D:/samples/left/web/images/logo.png)"));
     }
 
     #[test]
@@ -1695,15 +1924,12 @@ mod tests {
         let elsewhere =
             r##"<head><base href="other.html"></head><p><a href="#entry">Open</a></p>"##;
         let blocks = formatted_html_to_blocks(elsewhere, &right, &abort).unwrap();
-        assert_eq!(
-            blocks[0].text,
-            "[Open](file:///D:/reports/other.html#entry)"
-        );
+        assert_eq!(blocks[0].text, "[Open](other.html#entry)");
         let explicit = r#"<a href="standard.html#entry">Open</a>"#;
         let a = formatted_html_to_blocks(explicit, &left, &abort).unwrap();
         let b = formatted_html_to_blocks(explicit, &right, &abort).unwrap();
         assert_eq!(a, b);
-        assert_eq!(a[0].text, "[Open](file:///D:/reports/standard.html#entry)");
+        assert_eq!(a[0].text, "[Open](standard.html#entry)");
 
         for href in ["&#32;#entry", "&#9;&#10;#entry"] {
             let html = format!(r#"<a href="{href}">Open</a>"#);
@@ -2194,6 +2420,34 @@ mod tests {
             .filter(|r| r.changed)
             .map(|r| format!("{} => {}", side(0, r.cells[0]), side(1, r.cells[1])))
             .collect()
+    }
+
+    #[test]
+    fn handbook_sample_images_compare_by_alt_text_and_file() {
+        let changes = sample_changes(
+            include_str!("../../samples/left/web/handbook.html"),
+            include_str!("../../samples/right/web/handbook.html"),
+        );
+        let has = |want: &str| changes.iter().any(|c| c.contains(want));
+        // The figure's picture and alt text changed; the badge, with only a `srcset`, is added.
+        assert!(has("(images/van-layout.png)"), "{changes:#?}");
+        assert!(has("(images/van-layout-2026.png)"), "{changes:#?}");
+        assert!(
+            has("![Site access badge](images/badge.png)"),
+            "{changes:#?}"
+        );
+        // The `data:` status dot is compared by its alt text and picture.
+        assert!(
+            has("![Status: draft](data:image/png;base64,") && has("=> ![Status: approved]"),
+            "{changes:#?}"
+        );
+        // The logo in a link has no alt text, so is named by its file; it did not change, nor
+        // did the warning sign, whose new picture keeps its name and alt text.
+        assert!(!has("logo.png") && !has("Warning sign"), "{changes:#?}");
+        let left = html_to_blocks(include_str!("../../samples/left/web/handbook.html"), None);
+        assert!(left[0].text.starts_with(
+            "[![logo.png](images/logo.png)](https://example.com/) [Northwind Services]"
+        ));
     }
 
     #[test]

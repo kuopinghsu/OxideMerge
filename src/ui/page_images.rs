@@ -1,15 +1,23 @@
 //! The pictures of web pages shown in the Formatted compare: loaded away from the window, a few
 //! at a time, as [`crate::core::web::image_bytes`] allows, and kept while the app runs.
+//!
+//! Pictures on this computer and in the page load apart from those on the web, so that slow
+//! web servers never hold up the others; a web picture that failed is tried again after a
+//! while, and forgetting the pictures (a page's Reload) stops the downloads under way.
 
 use egui::load::{ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint};
 use egui::{ColorImage, Context, Id};
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const ID: &str = concat!(module_path!(), "::PageImages");
-/// Pictures loaded at once.
-const WORKERS: usize = 4;
+/// Pictures loaded at once: from this computer or the page, and from the web.
+const WORKERS: [usize; 2] = [2, 4];
+/// How long a picture that failed stays failed before it is tried again: on this computer or
+/// in the page, and on the web.
+const RETRY: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(60)];
 /// Longest side a picture is kept at: a preview needs no more, and a texture costs memory.
 const MAX_SIDE: u32 = 1024;
 /// Longest side a picture may have to be decoded at all.
@@ -18,14 +26,56 @@ const MAX_DECODE_SIDE: u32 = 16_384;
 enum Entry {
     Pending,
     Ready(Arc<ColorImage>),
-    Failed(String),
+    /// Why it failed, and when it may be tried again.
+    Failed(String, Instant),
 }
 
 #[derive(Default)]
 struct State {
     entries: HashMap<String, Entry>,
-    queue: VecDeque<String>,
-    workers: usize,
+    /// Pictures waiting, local ones first and web ones second.
+    queues: [VecDeque<String>; 2],
+    workers: [usize; 2],
+    /// Set to stop the downloads under way; replaced by a new one for those after.
+    abort: Arc<AtomicBool>,
+    /// How many pictures have failed, so that what is laid out by them is worked out again.
+    failures: usize,
+}
+
+/// The state of the loader [`install`] adds, which [`failed`] and [`failures`] read.
+fn shared() -> &'static Arc<Mutex<State>> {
+    static SHARED: OnceLock<Arc<Mutex<State>>> = OnceLock::new();
+    SHARED.get_or_init(Arc::default)
+}
+
+/// Web pictures that may load from this computer or a private network: those of pages there.
+fn trusted() -> &'static Mutex<HashSet<String>> {
+    static TRUSTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    TRUSTED.get_or_init(Mutex::default)
+}
+
+/// Lets the web picture `uri` load from this computer or a private network, as a picture of
+/// a page that is there itself.
+pub fn trust_local(uri: &str) {
+    if let Ok(mut t) = trusted().lock() {
+        t.insert(uri.to_string());
+    }
+}
+
+fn is_trusted(uri: &str) -> bool {
+    trusted().lock().is_ok_and(|t| t.contains(uri))
+}
+
+/// Whether the picture `uri` failed to load the last time it was tried.
+pub fn failed(uri: &str) -> bool {
+    shared()
+        .lock()
+        .is_ok_and(|s| matches!(s.entries.get(uri), Some(Entry::Failed(..))))
+}
+
+/// How many pictures have failed to load so far.
+pub fn failures() -> usize {
+    shared().lock().map_or(0, |s| s.failures)
 }
 
 #[derive(Default)]
@@ -41,6 +91,12 @@ pub fn supported(uri: &str) -> bool {
         .any(|s| head.starts_with(s))
 }
 
+/// Whether `uri` is a picture on the web, which loading contacts the server it is on for.
+pub fn is_remote(uri: &str) -> bool {
+    let head = uri.get(..8).unwrap_or(uri).to_ascii_lowercase();
+    head.starts_with("http://") || head.starts_with("https://")
+}
+
 /// Adds the loader to `ctx` once.
 pub fn install(ctx: &Context) {
     let key = Id::unique(ID);
@@ -49,7 +105,9 @@ pub fn install(ctx: &Context) {
     }
     ctx.data_mut(|d| d.insert_temp(key, true));
     if !ctx.loaders().image.lock().iter().any(|l| l.id() == ID) {
-        ctx.add_image_loader(Arc::new(PageImages::default()));
+        ctx.add_image_loader(Arc::new(PageImages {
+            state: shared().clone(),
+        }));
     }
 }
 
@@ -72,25 +130,31 @@ fn decode(bytes: &[u8]) -> Result<ColorImage, String> {
     Ok(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
 }
 
-fn work(state: Arc<Mutex<State>>, ctx: Context) {
-    let never = AtomicBool::new(false);
+/// Loads the pictures of queue `pool` until it is empty.
+fn work(state: Arc<Mutex<State>>, ctx: Context, pool: usize) {
     loop {
-        let Some(uri) = state.lock().ok().and_then(|mut s| {
-            let next = s.queue.pop_front();
+        let Some((uri, abort)) = state.lock().ok().and_then(|mut s| {
+            let next = s.queues[pool].pop_front();
             if next.is_none() {
-                s.workers -= 1;
+                s.workers[pool] -= 1;
             }
-            next
+            next.map(|uri| (uri, s.abort.clone()))
         }) else {
             return;
         };
-        let entry = crate::core::web::image_bytes(&uri, &never)
+        let entry = crate::core::web::image_bytes(&uri, is_trusted(&uri), &abort)
             .map_err(|e| format!("{e:#}"))
             .and_then(|b| decode(&b))
-            .map_or_else(Entry::Failed, |img| Entry::Ready(Arc::new(img)));
+            .map_or_else(
+                |e| Entry::Failed(e, Instant::now() + RETRY[pool]),
+                |img| Entry::Ready(Arc::new(img)),
+            );
         if let Ok(mut s) = state.lock() {
             // Forgotten while it loaded: not kept.
-            if s.entries.contains_key(&uri) {
+            if !abort.load(Ordering::Relaxed) && s.entries.contains_key(&uri) {
+                if matches!(entry, Entry::Failed(..)) {
+                    s.failures += 1;
+                }
                 s.entries.insert(uri, entry);
             }
         }
@@ -113,16 +177,19 @@ impl ImageLoader for PageImages {
             .map_err(|e| LoadError::Loading(e.to_string()))?;
         match s.entries.get(uri) {
             Some(Entry::Ready(img)) => return Ok(ImagePoll::Ready { image: img.clone() }),
-            Some(Entry::Failed(e)) => return Err(LoadError::Loading(e.clone())),
+            Some(Entry::Failed(e, retry)) if Instant::now() < *retry => {
+                return Err(LoadError::Loading(e.clone()));
+            }
             Some(Entry::Pending) => return Ok(ImagePoll::Pending { size: None }),
-            None => {}
+            _ => {}
         }
         s.entries.insert(uri.to_string(), Entry::Pending);
-        s.queue.push_back(uri.to_string());
-        if s.workers < WORKERS {
-            s.workers += 1;
+        let pool = usize::from(is_remote(uri));
+        s.queues[pool].push_back(uri.to_string());
+        if s.workers[pool] < WORKERS[pool] {
+            s.workers[pool] += 1;
             let (state, ctx) = (self.state.clone(), ctx.clone());
-            std::thread::spawn(move || work(state, ctx));
+            std::thread::spawn(move || work(state, ctx, pool));
         }
         Ok(ImagePoll::Pending { size: None })
     }
@@ -130,12 +197,18 @@ impl ImageLoader for PageImages {
     fn forget(&self, uri: &str) {
         if let Ok(mut s) = self.state.lock() {
             s.entries.remove(uri);
+            for q in &mut s.queues {
+                q.retain(|u| u != uri);
+            }
         }
     }
 
     fn forget_all(&self) {
         if let Ok(mut s) = self.state.lock() {
             s.entries.clear();
+            s.queues.iter_mut().for_each(VecDeque::clear);
+            s.abort.store(true, Ordering::Relaxed);
+            s.abort = Arc::default();
         }
     }
 
@@ -161,6 +234,36 @@ impl ImageLoader for PageImages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_web_pictures_are_tried_again_and_forgetting_stops_loads() {
+        let ctx = Context::default();
+        let loader = PageImages::default();
+        let uri = "https://example.invalid/a.png";
+        let past = Instant::now() - Duration::from_secs(1);
+        let later = Instant::now() + RETRY[1];
+        let set = |e: Entry| {
+            loader.state.lock().unwrap().entries.insert(uri.into(), e);
+        };
+        set(Entry::Failed("down".into(), later));
+        assert!(loader.load(&ctx, uri, SizeHint::default()).is_err());
+        set(Entry::Failed("down".into(), past));
+        assert!(matches!(
+            loader.load(&ctx, uri, SizeHint::default()),
+            Ok(ImagePoll::Pending { .. })
+        ));
+        // Forgetting one picture takes it out of its queue too.
+        loader.state.lock().unwrap().queues[1].push_back("https://x/b.png".into());
+        loader.forget("https://x/b.png");
+        assert!(!loader.state.lock().unwrap().queues[1].contains(&"https://x/b.png".to_string()));
+        let abort = loader.state.lock().unwrap().abort.clone();
+        loader.forget_all();
+        assert!(abort.load(Ordering::Relaxed));
+        let s = loader.state.lock().unwrap();
+        assert!(s.entries.is_empty() && s.queues.iter().all(VecDeque::is_empty));
+        assert!(!s.abort.load(Ordering::Relaxed));
+        assert!(is_remote("HTTPS://x") && !is_remote("file:///a.png"));
+    }
 
     #[test]
     fn only_page_pictures_are_loaded() {
@@ -216,5 +319,11 @@ mod tests {
         assert_eq!(ready, Some([3, 2]));
         assert!(failed);
         assert!(loader.byte_size() >= 24);
+        // A missing file is tried again a few seconds later, so one added beside the page shows.
+        let s = loader.state.lock().unwrap();
+        let Some(Entry::Failed(_, at)) = s.entries.get(&gone) else {
+            panic!("not failed");
+        };
+        assert!(*at <= Instant::now() + RETRY[0]);
     }
 }

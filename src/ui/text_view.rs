@@ -1663,6 +1663,40 @@ enum FormattedKind {
 }
 
 /// Whether `path` can be shown in the Formatted view, and as what.
+/// The name a pane's header gives its file, and the folder shown beside it: its description
+/// when it has one (a web page's address, a file in an archive), or its file name.
+pub(crate) fn pane_name(doc: &TextDoc) -> (String, String) {
+    match (&doc.description, &doc.path) {
+        (Some(d), _) => (d.clone(), String::new()),
+        (None, Some(path)) => (
+            path.file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            path.parent()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default(),
+        ),
+        _ => (tr("untitled").to_string(), String::new()),
+    }
+}
+
+/// What the files of a text compare are, for the views it offers: the documents a Formatted
+/// view reads, and the data format the Semantic and Tree views read.
+struct FileKinds {
+    documents: Option<Vec<std::path::PathBuf>>,
+    format: Option<crate::core::semantic::Format>,
+}
+
+/// How the files of a text compare are shown, chosen on a toolbar row of its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViewMode {
+    Text,
+    Table,
+    Formatted,
+    Semantic,
+    Tree,
+}
+
 fn formatted_kind(path: &std::path::Path) -> Option<FormattedKind> {
     match text::extension(path).as_str() {
         "docx" => Some(FormattedKind::Document),
@@ -1687,8 +1721,21 @@ struct FormattedKey {
 struct FormattedSession {
     /// The view and what it was made from, or why it could not be made.
     view: Option<(FormattedKey, Result<MarkdownView, String>)>,
+    inferred: bool,
+    /// Whether why the view could not be made is only that a file has no text to show, as a
+    /// scan without a text layer: a note rather than an error.
+    no_text: bool,
     /// The view being made, and what from.
-    job: Option<(FormattedKey, super::analysis::Task<Prepared>)>,
+    job: Option<(FormattedKey, super::analysis::Task<(Prepared, bool)>)>,
+}
+
+impl FormattedSession {
+    /// Dropping a job cancels it and prevents its result from replacing the current view.
+    fn discard_stale_job(&mut self, key: &FormattedKey) {
+        if self.job.as_ref().is_some_and(|(pending, _)| pending != key) {
+            self.job = None;
+        }
+    }
 }
 
 impl FormattedKey {
@@ -1829,6 +1876,9 @@ pub struct TextView {
     note_edit: Option<NoteEdit>,
     /// Off for a preview that must leave the keyboard to the view around it.
     pub keys_enabled: bool,
+    /// Whether the view around this one chooses how the files are shown, as a web page compare
+    /// does: no Text / Semantic / Tree switch of this view's own then.
+    pub modes_elsewhere: bool,
     /// The pane that shows a "paste the text here" placeholder while it is blank, for a
     /// compare that waits for its second text (File → Compare clipboard).
     pub paste_hint: Option<usize>,
@@ -1947,6 +1997,7 @@ impl TextView {
             sync_points: Vec::new(),
             note_edit: None,
             keys_enabled: true,
+            modes_elsewhere: false,
             paste_hint: None,
             edit_markers: cfg.show_edit_markers,
             tab_size: cfg.tab_size,
@@ -3031,6 +3082,38 @@ impl TextView {
             Some((_, Ok(view))) if self.formatted_active => Some(view.position()),
             _ => None,
         }
+    }
+
+    /// Why the formatted view shown could not be made, and whether that is only a note, such
+    /// as a file without a text layer.
+    fn formatted_failure(&self) -> Option<(&str, bool)> {
+        match &self.formatted.view {
+            Some((_, Err(error))) if self.formatted_active && !self.formatted_busy() => {
+                Some((error, self.formatted.no_text))
+            }
+            _ => None,
+        }
+    }
+
+    fn formatted_error(&self) -> Option<&str> {
+        self.formatted_failure()
+            .and_then(|(error, note)| (!note).then_some(error))
+    }
+
+    /// Whether the formatted view shown is being made. Only work still going on counts: a
+    /// result waiting to be collected, as by a tab that is not shown, is not.
+    fn formatted_busy(&self) -> bool {
+        self.formatted_active
+            && self
+                .formatted
+                .job
+                .as_ref()
+                .is_some_and(|(_, task)| task.running())
+            && !matches!(self.formatted.view, Some((_, Ok(_))))
+    }
+
+    pub(super) fn difference_navigation_available(&self) -> bool {
+        !self.formatted_active || self.formatted_position().is_some()
     }
 
     pub fn diff_position(&self) -> (Option<usize>, usize) {
@@ -4510,6 +4593,22 @@ impl TextView {
     /// Paste at the carets: with as many lines as carets, one line at each, else all of `text`
     /// at each, as one undo step.
     fn paste_at_carets(&mut self, text: &str) {
+        // Into an empty document, a paste is the whole text, its final line break included,
+        // just as without a caret, rather than text inserted before an empty last line.
+        if let Some(c) = self
+            .caret()
+            .filter(|c| !self.multi_caret() && !c.has_selection())
+        {
+            if self.pane_is_blank(c.pane) {
+                self.active_pane = c.pane;
+                self.paste(text);
+                let lines = &self.panes[c.pane].doc.lines;
+                let end = lines.len().saturating_sub(1);
+                let col = lines.get(end).map_or(0, String::len);
+                self.place_caret(c.pane, (end, col), false);
+                return;
+            }
+        }
         let (lines, ..) = text::split_lines(text);
         self.at_each_caret(|v, i, count| match lines.get(i) {
             Some(line) if count > 1 && lines.len() == count => v.caret_paste(line),
@@ -4976,14 +5075,25 @@ impl TextView {
         self.begin_edit(r, pane);
     }
 
-    /// Pastes `text` into the active pane: it replaces an empty document or the selected lines,
-    /// and is otherwise inserted below the cursor row.
     /// Whether pane `p` holds no text at all: a single empty line.
     pub fn pane_is_blank(&self, p: usize) -> bool {
         let doc = &self.panes[p].doc;
         doc.lines.len() <= 1 && doc.lines.iter().all(String::is_empty)
     }
 
+    /// Makes blank pane `p` wait for the text it is to be compared with: it takes the keys, with
+    /// a caret for typing, and says to paste the text there until it has some.
+    pub fn await_paste(&mut self, p: usize) {
+        if p >= self.n() {
+            return;
+        }
+        self.active_pane = p;
+        self.paste_hint = Some(p);
+        self.place_caret(p, (0, 0), false);
+    }
+
+    /// Pastes `text` into the active pane: it replaces an empty document or the selected lines,
+    /// and is otherwise inserted below the cursor row.
     pub fn paste(&mut self, text: &str) {
         let p = self.active_pane;
         if p >= self.n() || !self.writable(p) {
@@ -6040,7 +6150,11 @@ impl TextView {
     }
 
     pub fn outcome(&self) -> Outcome {
-        if self.diff_position().1 == 0 {
+        if self.formatted_busy() {
+            Outcome::Busy
+        } else if self.formatted_error().is_some() {
+            Outcome::Error
+        } else if self.diff_position().1 == 0 {
             Outcome::Identical
         } else {
             Outcome::Different
@@ -6095,6 +6209,14 @@ impl TextView {
     }
 
     fn status_text(&self, counts: bool) -> String {
+        if self.formatted_busy() {
+            return tr("analysis.progress").to_string();
+        }
+        match self.formatted_failure() {
+            Some((note, true)) => return note.to_string(),
+            Some((error, false)) => return format!("{}: {error}", tr("status.error")),
+            None => {}
+        }
         let (pos, total) = self.diff_position();
         let mut s = if total == 0 {
             tr("msg.identical").to_string()
@@ -6466,12 +6588,121 @@ impl TextView {
         }
     }
 
-    fn toolbar(&mut self, ui: &mut Ui) {
-        widgets::toolbar(ui, |ui| {
+    /// The toolbars: how the files are shown, on a row of its own when there is a choice, and
+    /// below it the differences, merging, editing and the view.
+    fn toolbar(&mut self, ui: &mut Ui, kinds: &FileKinds) {
+        let modes = self.view_modes(kinds);
+        if !modes.is_empty() {
+            widgets::toolbar(ui, |ui| {
+                let mut mode = self.view_mode();
+                if widgets::segmented_tips(ui, &mut mode, &modes) {
+                    self.set_view_mode(mode);
+                }
+            });
+        }
+        widgets::toolbar(ui, |ui| self.toolbar_items(ui));
+    }
+
+    /// The ways these files can be shown: Text and Table for a table, Formatted for a
+    /// document, Semantic and Tree for data files. Empty when only Text is.
+    fn view_modes(&self, kinds: &FileKinds) -> Vec<(ViewMode, &'static str, Option<&'static str>)> {
+        if self.modes_elsewhere {
+            return Vec::new();
+        }
+        let text = (ViewMode::Text, tr("analysis.text"), None);
+        let formatted = (
+            ViewMode::Formatted,
+            tr("analysis.formatted"),
+            Some(tr("analysis.formatted_tip")),
+        );
+        let documents = kinds.documents.is_some();
+        if self.table_delim.is_some() {
+            let mut modes = vec![
+                text,
+                (
+                    ViewMode::Table,
+                    tr("analysis.table"),
+                    Some(tr("analysis.table_tip")),
+                ),
+            ];
+            if documents {
+                modes.push(formatted);
+            }
+            return modes;
+        }
+        if documents {
+            return vec![text, formatted];
+        }
+        let Some(format) = kinds.format else {
+            return Vec::new();
+        };
+        let mut modes = vec![text, (ViewMode::Semantic, tr("analysis.semantic"), None)];
+        if self.n() == 2 {
+            let tip = if format == crate::core::semantic::Format::Xml {
+                "analysis.tree_tip"
+            } else {
+                "analysis.tree_tip_values"
+            };
+            modes.push((ViewMode::Tree, tr("analysis.tree"), Some(tr(tip))));
+        }
+        modes
+    }
+
+    fn view_mode(&self) -> ViewMode {
+        if self.formatted_mode {
+            ViewMode::Formatted
+        } else if self.table_mode {
+            ViewMode::Table
+        } else if self.tree_mode {
+            ViewMode::Tree
+        } else if self.semantic_mode {
+            ViewMode::Semantic
+        } else {
+            ViewMode::Text
+        }
+    }
+
+    fn set_view_mode(&mut self, mode: ViewMode) {
+        if mode == ViewMode::Tree && !self.tree_mode {
+            // the Tree view opens where the text cursor is
+            self.tree.cursor = self.cursor_row.and_then(|row| {
+                let line = self.diff.rows.get(row)?.line(self.active_pane.min(1))?;
+                Some((self.active_pane.min(1), line + 1))
+            });
+        }
+        // The Formatted view keeps which of Text and Table it was opened from.
+        if mode != ViewMode::Formatted {
+            self.table_mode = mode == ViewMode::Table;
+        }
+        self.formatted_mode = mode == ViewMode::Formatted;
+        self.semantic_mode = mode == ViewMode::Semantic;
+        self.tree_mode = mode == ViewMode::Tree;
+    }
+
+    /// The tools: the differences, merging, editing and the view.
+    fn toolbar_items(&mut self, ui: &mut Ui) {
+        {
             let pal = widgets::pal(ui);
             let wide = ui.available_width() > 1250.0;
             let caption = |key: &'static str| wide.then(|| tr(key));
             widgets::tool_group(ui, caption("toolbar.differences"), |ui| {
+                if self.formatted_busy() {
+                    widgets::chip(ui, tr("analysis.progress"), pal.accent, pal.control);
+                    return;
+                }
+                match self.formatted_failure() {
+                    Some((note, true)) => {
+                        widgets::chip(ui, tr("analysis.formatted"), pal.text_dim, pal.control)
+                            .on_hover_text(note);
+                        return;
+                    }
+                    Some((error, false)) => {
+                        widgets::chip(ui, tr("status.error"), pal.danger, pal.control)
+                            .on_hover_text(error);
+                        return;
+                    }
+                    None => {}
+                }
                 if widgets::icon_button(ui, Icon::First, &Cmd::FirstDiff.tip()).clicked() {
                     self.first_diff();
                 }
@@ -6717,7 +6948,7 @@ impl TextView {
                     widgets::drawer_toggle(ui, &mut self.drawer_open);
                 });
             }
-        });
+        }
     }
 
     /// 3-way: how many conflicts are left, what to do with the current difference, and saving
@@ -7361,101 +7592,37 @@ impl TextView {
             rect.bottom() - 0.5,
             Stroke::new(1.0_f32, pal.border),
         );
-        if active {
-            ui.painter().hline(
-                rect.left() + 1.0..=rect.right() - 2.0,
-                rect.bottom() - 1.0,
-                Stroke::new(2.0_f32, widgets::side_color(ui, p, n)),
-            );
+        let doc = &self.panes[p].doc;
+        let title = doc.title();
+        let (name, dir) = pane_name(doc);
+        let modified = doc.modified;
+        let mut ro = doc.read_only;
+        let compare_only = doc.compare_only;
+        let mut unlocked = false;
+        let header = widgets::PaneHeader {
+            side: p,
+            panes: n,
+            active,
+            name: &name,
+            dir: &dir,
+            modified,
+            hover: &title,
+        };
+        widgets::pane_header(ui, rect, &header, |ui| {
+            let lock = if ro { Icon::Lock } else { Icon::Unlock };
+            // Text read from a file cannot be unlocked: saving it would replace the file
+            // with its text.
+            unlocked = ui
+                .add_enabled_ui(!compare_only, |ui| {
+                    widgets::toggle_icon_button(ui, &mut ro, Some(lock), "", tr("label.read_only"))
+                        .on_disabled_hover_text(tr("tip.compare_only"))
+                        .clicked()
+                })
+                .inner;
+        });
+        if unlocked {
+            self.set_lock(p, ro);
         }
-        ui.scope_builder(
-            egui::UiBuilder::new().max_rect(rect.shrink2(vec2(8.0, 3.0))),
-            |ui| {
-                ui.horizontal_centered(|ui| {
-                    let doc = &self.panes[p].doc;
-                    let title = doc.title();
-                    let (name, dir) = match (&doc.description, &doc.path) {
-                        (Some(d), _) => (d.clone(), String::new()),
-                        (None, Some(path)) => (
-                            path.file_name()
-                                .map(|f| f.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
-                            path.parent()
-                                .map(|d| d.display().to_string())
-                                .unwrap_or_default(),
-                        ),
-                        _ => (tr("untitled").to_string(), String::new()),
-                    };
-                    let modified = doc.modified;
-                    let mut ro = doc.read_only;
-                    let compare_only = doc.compare_only;
-                    widgets::side_chip(ui, p, n);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        let lock = if ro { Icon::Lock } else { Icon::Unlock };
-                        // Text read from a file cannot be unlocked: saving it would replace the
-                        // file with its text.
-                        let unlocked = ui
-                            .add_enabled_ui(!compare_only, |ui| {
-                                widgets::toggle_icon_button(
-                                    ui,
-                                    &mut ro,
-                                    Some(lock),
-                                    "",
-                                    tr("label.read_only"),
-                                )
-                                .on_disabled_hover_text(tr("tip.compare_only"))
-                                .clicked()
-                            })
-                            .inner;
-                        if unlocked {
-                            self.set_lock(p, ro);
-                        }
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            let mut job = LayoutJob::default();
-                            let name_font = if active {
-                                theme::semibold(theme::size::CONTROL)
-                            } else {
-                                FontId::proportional(theme::size::CONTROL)
-                            };
-                            job.append(
-                                &name,
-                                0.0,
-                                TextFormat {
-                                    font_id: name_font,
-                                    color: pal.text,
-                                    ..Default::default()
-                                },
-                            );
-                            if modified {
-                                job.append(
-                                    "  ●",
-                                    0.0,
-                                    TextFormat {
-                                        font_id: FontId::proportional(theme::size::CAPTION),
-                                        color: pal.warning,
-                                        ..Default::default()
-                                    },
-                                );
-                            }
-                            if !dir.is_empty() {
-                                job.append(
-                                    &format!("   {dir}"),
-                                    0.0,
-                                    TextFormat {
-                                        font_id: FontId::proportional(theme::size::SMALL),
-                                        color: pal.text_dim,
-                                        ..Default::default()
-                                    },
-                                );
-                            }
-                            ui.add(egui::Label::new(job).truncate().selectable(false))
-                                .on_hover_text(title);
-                        });
-                    });
-                });
-            },
-        );
     }
 
     fn pane_footer(&mut self, ui: &mut Ui, p: usize, rect: Rect) {
@@ -10766,13 +10933,14 @@ impl TextView {
 
     /// The Text / Semantic switch of JSON, XML, TOML and YAML compares, and the semantic view.
     /// Returns true when the semantic view took the place of the text panes.
-    fn analysis_ui(&mut self, ui: &mut Ui) -> bool {
-        use crate::core::{analysis, semantic};
-        self.tree_active = false;
+    /// The data format the Semantic and Tree views read these files as: JSON, XML, YAML or
+    /// TOML, when two or three files are compared.
+    fn analysis_format(&self) -> Option<crate::core::semantic::Format> {
+        use crate::core::semantic;
         if !matches!(self.n(), 2 | 3) {
-            return false;
+            return None;
         }
-        let format = self.panes.first().and_then(|p| {
+        self.panes.first().and_then(|p| {
             let hint = p
                 .doc
                 .syntax
@@ -10803,38 +10971,17 @@ impl TextView {
                     crate::core::prettify::Format::Xml => semantic::Format::Xml,
                 })
             })
-        });
+        })
+    }
+
+    fn analysis_ui(&mut self, ui: &mut Ui, format: Option<crate::core::semantic::Format>) -> bool {
+        use crate::core::{analysis, semantic};
+        self.tree_active = false;
         let Some(format) = format else {
             return false;
         };
-        let tree = self.n() == 2;
-        self.tree_mode &= tree;
-        ui.horizontal(|ui| {
-            let mut mode = if self.tree_mode {
-                2
-            } else {
-                self.semantic_mode as u8
-            };
-            ui.selectable_value(&mut mode, 0, tr("analysis.text"));
-            ui.selectable_value(&mut mode, 1, tr("analysis.semantic"));
-            if tree {
-                ui.selectable_value(&mut mode, 2, tr("analysis.tree"))
-                    .on_hover_text(tr(if format == semantic::Format::Xml {
-                        "analysis.tree_tip"
-                    } else {
-                        "analysis.tree_tip_values"
-                    }));
-            }
-            if mode == 2 && !self.tree_mode {
-                // the Tree view opens where the text cursor is
-                self.tree.cursor = self.cursor_row.and_then(|row| {
-                    let line = self.diff.rows.get(row)?.line(self.active_pane.min(1))?;
-                    Some((self.active_pane.min(1), line + 1))
-                });
-            }
-            self.semantic_mode = mode == 1;
-            self.tree_mode = mode == 2;
-        });
+        // Text, Semantic and Tree are chosen in the toolbar.
+        self.tree_mode &= self.n() == 2;
         if self.tree_mode {
             self.tree_ui(ui, format);
             return true;
@@ -11034,30 +11181,12 @@ impl TextView {
     /// The Text / Table switch of CSV, TSV and spreadsheet compares, where the other views have
     /// their own switch; a workbook that has a Formatted view too has it on the same switch,
     /// which [`Self::formatted_ui`] then leaves out.
-    fn table_tabs(&mut self, ui: &mut Ui) {
+    fn table_tabs(&mut self, documents: bool) {
         if self.table_delim.is_none() {
             return;
         }
-        let formatted = self.documents().is_some();
-        self.formatted_mode &= formatted;
-        let mut mode = match (self.formatted_mode, self.table_mode) {
-            (true, _) => 2,
-            (false, table) => table as u8,
-        };
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut mode, 0, tr("analysis.text"));
-            ui.selectable_value(&mut mode, 1, tr("analysis.table"))
-                .on_hover_text(tr("analysis.table_tip"));
-            if formatted {
-                ui.selectable_value(&mut mode, 2, tr("analysis.formatted"))
-                    .on_hover_text(tr("analysis.formatted_tip"));
-            }
-        });
-        // The Formatted view keeps which of the other two it was opened from.
-        if mode != 2 {
-            self.table_mode = mode == 1;
-        }
-        self.formatted_mode = mode == 2;
+        // Text, Table and Formatted are chosen in the toolbar.
+        self.formatted_mode &= documents;
     }
 
     /// The Text / Formatted switch of Word document, workbook and PDF compares, and the
@@ -11066,23 +11195,24 @@ impl TextView {
     /// a PDF is read from the structure it is tagged with. Made in the background and kept until
     /// a file or the compare options change. Returns true when the Formatted view took the place
     /// of the text panes.
-    fn formatted_ui(&mut self, ui: &mut Ui, cfg: &Config, c: &Colors) -> bool {
+    fn formatted_ui(
+        &mut self,
+        ui: &mut Ui,
+        cfg: &Config,
+        c: &Colors,
+        documents: Option<Vec<std::path::PathBuf>>,
+    ) -> bool {
         self.formatted_active = false;
-        let Some(paths) = self.documents() else {
+        let Some(paths) = documents else {
             return false;
         };
-        if self.table_delim.is_none() {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.formatted_mode, false, tr("analysis.text"));
-                ui.selectable_value(&mut self.formatted_mode, true, tr("analysis.formatted"))
-                    .on_hover_text(tr("analysis.formatted_tip"));
-            });
-        }
+        // Text and Formatted are chosen in the toolbar.
         if !self.formatted_mode {
             return false;
         }
         self.formatted_active = true;
         let key = FormattedKey::of(&paths, &self.opts);
+        self.formatted.discard_stale_job(&key);
         let made = self.formatted.view.as_ref().is_some_and(|(k, _)| *k == key)
             || self.formatted.job.as_ref().is_some_and(|(k, _)| *k == key);
         if !made {
@@ -11090,6 +11220,7 @@ impl TextView {
             self.formatted.job = Some((
                 key,
                 super::analysis::Task::start(move |cancel, _| {
+                    let mut inferred = false;
                     let pages = paths
                         .iter()
                         .map(|p| match formatted_kind(p) {
@@ -11097,29 +11228,37 @@ impl TextView {
                                 crate::core::extract::xlsx_blocks(p, Some(cancel))
                             }
                             Some(FormattedKind::Pdf) => {
-                                crate::core::extract::pdf_blocks(p, Some(cancel))
+                                let (blocks, approximate) =
+                                    crate::core::extract::pdf_blocks(p, Some(cancel))?;
+                                inferred |= approximate;
+                                Ok(blocks)
                             }
                             _ => crate::core::extract::docx_blocks(p, Some(cancel)),
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?;
-                    Ok(Prepared::new(pages, &opts))
+                    Ok((Prepared::new(pages, &opts), inferred))
                 }),
             ));
         }
         if let Some((key, task)) = &mut self.formatted.job {
             if let Some(result) = task.poll() {
                 let labels = self.panes.iter().map(|p| p.doc.title()).collect();
+                let names = self.panes.iter().map(|p| pane_name(&p.doc)).collect();
                 let view = result
                     // The toolbar above steps through its differences and says where it is.
-                    .map(|prepared| MarkdownView::from_prepared(prepared, labels).hosted())
-                    // A PDF without tags is nothing gone wrong: it is said in the user's
-                    // language, as a note.
-                    .map_err(
-                        |e| match e.downcast_ref::<crate::core::extract::NotTagged>() {
-                            Some(_) => tr("analysis.pdf_not_tagged").to_string(),
-                            None => format!("{e:#}"),
-                        },
-                    );
+                    .map(|(prepared, inferred)| {
+                        self.formatted.inferred = inferred;
+                        MarkdownView::from_prepared(prepared, labels)
+                            .with_header_names(names)
+                            .hosted()
+                    })
+                    .map_err(|e| {
+                        // A file without a text layer is nothing gone wrong: it is a note.
+                        self.formatted.no_text = e
+                            .downcast_ref::<crate::core::extract::NoTextLayer>()
+                            .is_some();
+                        format!("{e:#}")
+                    });
                 self.formatted.view = Some((key.clone(), view));
                 self.formatted.job = None;
             }
@@ -11127,12 +11266,16 @@ impl TextView {
         if let Some((_, task)) = &self.formatted.job {
             task.status(ui);
             // the last view stays shown while the next is made
-            if !matches!(self.formatted.view, Some((_, Ok(_)))) {
+            if self.formatted_busy() {
                 return true;
             }
         }
         match &mut self.formatted.view {
             Some((_, Ok(view))) => {
+                if self.formatted.inferred {
+                    let color = widgets::pal(ui).text_dim;
+                    widgets::info_bar(ui, Icon::Help, tr("text.pdf_inferred"), color);
+                }
                 view.ui(ui, c, cfg.show_location_pane);
                 if let Some(forward) = view.step_file.take() {
                     self.step_file = Some(forward);
@@ -11141,7 +11284,7 @@ impl TextView {
             Some((_, Err(error))) => {
                 let p = widgets::pal(ui);
                 ui.add_space(8.0);
-                if error.as_str() == tr("analysis.pdf_not_tagged") {
+                if self.formatted.no_text {
                     ui.horizontal_top(|ui| {
                         widgets::inline_icon(ui, Icon::Help, p.text_dim);
                         ui.add(egui::Label::new(error.as_str()).wrap());
@@ -11152,6 +11295,8 @@ impl TextView {
                 ui.add_space(6.0);
                 if ui.button(tr("analysis.text_fallback")).clicked() {
                     self.formatted_mode = false;
+                    self.formatted_active = false;
+                    ui.ctx().request_repaint();
                 }
             }
             None => {}
@@ -11424,6 +11569,8 @@ impl TextView {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(self.semantic_page > 0, egui::Button::new("←"))
+                .on_hover_text(tr("btn.prev_page"))
+                .on_disabled_hover_text(tr("btn.prev_page"))
                 .clicked()
             {
                 self.semantic_page -= 1;
@@ -11437,6 +11584,8 @@ impl TextView {
             ));
             if ui
                 .add_enabled(self.semantic_page + 1 < pages, egui::Button::new("→"))
+                .on_hover_text(tr("btn.next_page"))
+                .on_disabled_hover_text(tr("btn.next_page"))
                 .clicked()
             {
                 self.semantic_page += 1;
@@ -11483,7 +11632,12 @@ impl TextView {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
-        self.toolbar(ui);
+        // What the files are, worked out once for the toolbar and the views below it.
+        let kinds = FileKinds {
+            documents: self.documents(),
+            format: self.analysis_format(),
+        };
+        self.toolbar(ui, &kinds);
         let tabs = self.panel_tabs();
         if self.drawer_open && !tabs.is_empty() {
             let mut tab = self.drawer_tab;
@@ -11498,8 +11652,9 @@ impl TextView {
         } else {
             self.verification_ui(None, cfg);
         }
-        self.table_tabs(ui);
-        if self.formatted_ui(ui, cfg, c) || self.analysis_ui(ui) {
+        self.table_tabs(kinds.documents.is_some());
+        let format = kinds.format;
+        if self.formatted_ui(ui, cfg, c, kinds.documents) || self.analysis_ui(ui, format) {
             return;
         }
         if self.outcome() == Outcome::Identical {
@@ -11918,6 +12073,17 @@ impl TextView {
                     Some(VLine::Fold(s, _)) if resp.clicked() => {
                         self.expanded.insert(s);
                         self.layout_gen += 1;
+                    }
+                    // Below the last line of an empty pane: it takes the keys, with a caret, so a
+                    // text can be pasted or typed into it. A pane with text is left as it was, so
+                    // that the pane that takes the keys stays the one with the caret.
+                    None if !resp.secondary_clicked()
+                        && self.pane_is_blank(p)
+                        && !self.table_mode =>
+                    {
+                        self.active_pane = p;
+                        self.col_sel = None;
+                        self.place_caret(p, (0, 0), false);
                     }
                     _ => {}
                 }
@@ -12372,9 +12538,16 @@ impl TextView {
                 }
             }
             if self.paste_hint == Some(p) && self.pane_is_blank(p) {
+                // Keys go to the active pane, so another pane is to be clicked first.
+                let key = if p == self.active_pane {
+                    "text.paste_here"
+                } else {
+                    "text.click_to_paste"
+                };
+                let hint = trf(key, &[("key", widgets::key_text("Ctrl+V"))]);
                 let galley = ui.fonts_mut(|f| {
                     f.layout(
-                        tr("text.paste_here").to_string(),
+                        hint.clone(),
                         FontId::proportional(theme::size::CONTROL),
                         c.ui.text_dim,
                         (text_rect.width() - 24.0).max(40.0),
@@ -12384,6 +12557,10 @@ impl TextView {
                     text_rect.center().x - galley.size().x / 2.0,
                     body_top + row_h * 2.0,
                 );
+                // Painted, so it is also named for screen readers; hovering takes no clicks.
+                let rect = Rect::from_min_size(at, galley.size());
+                ui.interact(rect, self.id.with(("paste_hint", p)), Sense::hover())
+                    .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &hint));
                 tp.galley(at, galley, c.ui.text_dim);
             }
             painter.line_segment(
@@ -17093,32 +17270,199 @@ mod tests {
 
     #[test]
     fn a_blank_side_waiting_for_a_paste_says_so_until_text_is_pasted_into_it() {
-        let painted = |out: &egui::FullOutput| {
-            out.shapes.iter().any(|shape| {
-                matches!(&shape.shape, egui::Shape::Text(t)
-                    if t.galley.job.text == tr("text.paste_here"))
-            })
+        let painted = |out: &egui::FullOutput, key: &'static str| {
+            let text = trf(key, &[("key", widgets::key_text("Ctrl+V"))]);
+            out.shapes.iter().any(
+                |shape| matches!(&shape.shape, egui::Shape::Text(t) if t.galley.job.text == text),
+            )
         };
-        let left = TextDoc::from_text(None, "one\ntwo\n");
-        let mut v = TextView::new(vec![left, TextDoc::from_text(None, "")], &Config::default());
+        let any_hint = |out: &egui::FullOutput| {
+            painted(out, "text.paste_here") || painted(out, "text.click_to_paste")
+        };
+        let waiting = || {
+            let left = TextDoc::from_text(None, "one\ntwo\n");
+            TextView::new(vec![left, TextDoc::from_text(None, "")], &Config::default())
+        };
         let ctx = egui::Context::default();
-        // Only the pane named waits for a paste: a plain new compare shows no placeholder.
-        assert!(!painted(&frame(&mut v, &ctx, Vec::new())));
-        v.paste_hint = Some(1);
-        v.active_pane = 1;
-        assert!(painted(&frame(&mut v, &ctx, Vec::new())));
+        crate::ui::fonts::setup(&ctx, "en");
 
-        let out = frame(&mut v, &ctx, vec![egui::Event::Paste("one\nTWO\n".into())]);
+        // Only the pane named waits for a paste: a plain new compare shows no placeholder.
+        let mut v = waiting();
+        assert!(!any_hint(&frame(&mut v, &ctx, Vec::new())));
+        v.await_paste(1);
+        assert_eq!(v.active_pane, 1);
+        assert_eq!(v.caret().map(|c| (c.pane, c.pos)), Some((1, (0, 0))));
+        assert!(painted(&frame(&mut v, &ctx, Vec::new()), "text.paste_here"));
+
+        // Pasted at the caret, the text replaces the blank document whole: no empty last line
+        // is left over to differ from the other side.
+        let paste = vec![egui::Event::Paste("one\nTWO\n".into())];
+        let out = frame(&mut v, &ctx, paste);
         assert_eq!(v.panes[0].doc.lines, ["one", "two"]);
         assert_eq!(v.panes[1].doc.lines, ["one", "TWO"]);
+        assert!(v.panes[1].doc.final_newline);
         assert_eq!(v.diff.blocks.len(), 1);
-        assert!(!painted(&out));
+        assert!(!any_hint(&out));
         // Emptied again, it asks for a text again.
         v.undo();
-        assert!(painted(&frame(&mut v, &ctx, Vec::new())));
+        assert!(painted(&frame(&mut v, &ctx, Vec::new()), "text.paste_here"));
+
+        // The caret also takes typing straight away.
+        let mut v = waiting();
+        v.await_paste(1);
+        frame(&mut v, &ctx, vec![egui::Event::Text("x".into())]);
+        assert_eq!(v.panes[1].doc.lines, ["x"]);
+        assert_eq!(v.panes[0].doc.lines, ["one", "two"]);
+
+        // With the other side active, it says to click it first; a click below its last line
+        // makes it the active side again, with its caret.
+        let mut v = waiting();
+        v.await_paste(1);
+        v.active_pane = 0;
+        v.caret = None;
+        assert!(painted(
+            &frame(&mut v, &ctx, Vec::new()),
+            "text.click_to_paste"
+        ));
+        // The hint is drawn below the blank side's only line: clicking it is clicking there.
+        let at = ctx
+            .read_response(v.id.with(("paste_hint", 1)))
+            .expect("the hint is laid out")
+            .rect
+            .center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        frame(
+            &mut v,
+            &ctx,
+            vec![egui::Event::PointerMoved(at), button(true)],
+        );
+        frame(&mut v, &ctx, vec![button(false)]);
+        assert_eq!(v.active_pane, 1);
+        assert_eq!(v.caret().map(|c| c.pane), Some(1));
+        assert!(painted(&frame(&mut v, &ctx, Vec::new()), "text.paste_here"));
+    }
+
+    #[test]
+    fn a_finished_formatted_job_waiting_to_be_collected_is_not_busy() {
+        let doc = || TextDoc::from_text(None, "same");
+        let mut view = TextView::new(vec![doc(), doc()], &Config::default());
+        view.formatted_active = true;
+        view.formatted.job = Some((
+            FormattedKey::of(&[], &view.opts),
+            super::super::analysis::Task::start(|_, _| anyhow::bail!("done")),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while view
+            .formatted
+            .job
+            .as_ref()
+            .is_some_and(|(_, t)| t.running())
+        {
+            assert!(std::time::Instant::now() < deadline, "the job finishes");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // As in a tab that is not shown, nothing has collected it yet.
+        assert!(view.formatted.job.is_some());
+        assert_ne!(view.outcome(), Outcome::Busy);
+    }
+
+    #[test]
+    fn a_pdf_without_a_text_layer_is_a_note_not_an_error() {
+        let doc = || TextDoc::from_text(None, "same");
+        let mut view = TextView::new(vec![doc(), doc()], &Config::default());
+        view.formatted_active = true;
+        let why = "PDF page 1 contains an image but no extractable text";
+        view.formatted.view = Some((FormattedKey::of(&[], &view.opts), Err(why.into())));
+        view.formatted.no_text = true;
+        assert_ne!(view.outcome(), Outcome::Error);
+        assert_eq!(view.status_line(), why);
+        view.formatted.no_text = false;
+        assert_eq!(view.outcome(), Outcome::Error);
+    }
+
+    #[test]
+    fn a_click_below_the_text_of_the_other_side_keeps_keys_and_caret_together() {
+        let left = TextDoc::from_text(None, "one\ntwo\n");
+        let right = TextDoc::from_text(None, "three\n");
+        let mut v = TextView::new(vec![left, right], &Config::default());
+        let ctx = egui::Context::default();
+        crate::ui::fonts::setup(&ctx, "en");
+        frame(&mut v, &ctx, Vec::new());
+        v.place_caret(0, (0, 1), false);
+        // The frames are 900 by 500 points (see frame_with): the middle of the right half is
+        // below the one line of the right side, whatever the toolbar above it.
+        let at = pos2(900.0 * 0.75, 500.0 * 0.6);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        frame(
+            &mut v,
+            &ctx,
+            vec![egui::Event::PointerMoved(at), button(true)],
+        );
+        frame(&mut v, &ctx, vec![button(false)]);
+        assert_eq!(v.active_pane, 0);
+        assert_eq!(v.caret().map(|c| (c.pane, c.pos)), Some((0, (0, 1))));
     }
 
     /// Runs one frame of the side-by-side view with `events`.
+    #[test]
+    fn reverting_formatted_settings_discards_the_superseded_job() {
+        let mut session = FormattedSession::default();
+        let key = FormattedKey::of(&[], &DiffOptions::default());
+        let other = FormattedKey::of(&["other.pdf".into()], &DiffOptions::default());
+        session.view = Some((key.clone(), Err("cached result".into())));
+        session.job = Some((
+            other.clone(),
+            super::super::analysis::Task::start(|_, _| anyhow::bail!("superseded result")),
+        ));
+        session.discard_stale_job(&other);
+        assert!(session.job.is_some());
+        session.discard_stale_job(&key);
+        assert!(session.job.is_none());
+        assert_eq!(session.view.unwrap().0.files, key.files);
+    }
+
+    #[test]
+    fn a_formatted_extraction_error_takes_precedence_over_the_text_result() {
+        let doc = || TextDoc::from_text(None, "same");
+        let mut view = TextView::new(vec![doc(), doc()], &Config::default());
+        view.formatted.view = Some((
+            FormattedKey::of(&[], &view.opts),
+            Err("PDF page has no extractable text".to_string()),
+        ));
+        assert_eq!(view.outcome(), Outcome::Identical);
+        view.formatted_active = true;
+        assert_eq!(view.outcome(), Outcome::Error);
+        assert!(view
+            .status_line()
+            .contains("PDF page has no extractable text"));
+        // A job still at work, until it is dropped.
+        view.formatted.job = Some((
+            FormattedKey::of(&[], &view.opts),
+            super::super::analysis::Task::start(|cancel, _| {
+                while !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                anyhow::bail!("test job")
+            }),
+        ));
+        assert_eq!(view.outcome(), Outcome::Busy);
+        assert!(!view.difference_navigation_available());
+        assert_eq!(view.status_line(), tr("analysis.progress"));
+        view.formatted_active = false;
+        assert!(view.difference_navigation_available());
+        assert_eq!(view.outcome(), Outcome::Identical);
+    }
+
     fn frame(v: &mut TextView, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
         frame_with(v, ctx, events, Modifiers::NONE)
     }

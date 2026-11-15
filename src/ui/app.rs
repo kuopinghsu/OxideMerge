@@ -147,6 +147,10 @@ pub struct Tab {
     /// The connection and remote path of a side staged from [`remote::fetch`], one slot per
     /// `source`, for *Save* to write it back to; `None` for a side opened any other way.
     remote: Vec<Option<RemoteFile>>,
+    /// For a compare with a revision: the working file or folder, and the revision its
+    /// temporary copy (the first of `source`) is of. A project saved from the tab names these
+    /// rather than the copy, which is gone with the tab.
+    revision: Option<(PathBuf, String)>,
 }
 
 /// A tab's side backed by a file or folder fetched over SFTP or FTP: enough to write it back
@@ -322,7 +326,7 @@ struct Origin {
 
 impl Tab {
     fn project(&self) -> Option<Project> {
-        if self.source.len() < 2 {
+        if self.source.len() < 2 && self.revision.is_none() {
             return None;
         }
         let mut proj = Project {
@@ -377,6 +381,14 @@ impl Tab {
                 proj.read_only = vec![true; v.urls.len()];
             }
             Content::Diffs(_) | Content::RemoteFolder(_) => return None,
+        }
+        // The working side and its revision, read again when the project is opened, rather
+        // than the revision's temporary copy.
+        if let Some((work, rev)) = &self.revision {
+            proj.paths = vec![work.display().to_string()];
+            proj.descriptions = Vec::new();
+            proj.read_only = Vec::new();
+            proj.rev = Some(rev.clone());
         }
         Some(proj)
     }
@@ -2560,10 +2572,25 @@ const BACKGROUND_OPEN_BYTES: u64 = 32 << 20;
 struct RevLoad {
     path: PathBuf,
     rev: String,
+    /// What the tab compares with, other than the options: a project's, say.
+    settings: RevSettings,
     rx: std::sync::mpsc::Receiver<anyhow::Result<(tempfile::TempDir, PathBuf)>>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The dialog it was started from, shown again when reading fails or is stopped.
     dialog: Option<GitDialog>,
+}
+
+/// Settings a compare with a revision takes instead of the options, as a project or the command
+/// line gives them; `None` for those it leaves as the options have them.
+#[derive(Clone, Debug, Default)]
+struct RevSettings {
+    filter: Option<String>,
+    recursive: Option<bool>,
+    method: Option<CompareMethod>,
+    rules: Option<String>,
+    /// For a file: the compare type, and how a table compare matches records.
+    kind: Option<FileKind>,
+    table: Option<crate::core::table_match::TableMatch>,
 }
 
 /// How long the Git dialog's path must stay unchanged before its commits are read.
@@ -2832,6 +2859,7 @@ fn project_request(path: &Path) -> anyhow::Result<OpenRequest> {
     let base = abs.parent().unwrap_or(Path::new(""));
     Ok(OpenRequest {
         paths: p.resolved_paths(&abs),
+        git_rev: p.rev.clone(),
         descriptions: p.descriptions.clone(),
         read_only: p.read_only.clone(),
         kind: p.kind.as_deref().and_then(kind_from_name),
@@ -4349,10 +4377,8 @@ impl OxideMergeApp {
             Ok(left) => {
                 let mut v = TextView::new(vec![left, blank_doc()], &self.cfg);
                 // The blank side takes the keys, so Ctrl+V pastes the second text there rather
-                // than a second copy of the clipboard into the left side.
-                v.active_pane = 1;
-                v.paste_hint = Some(1);
-                v.status = tr("msg.clipboard_hint").to_string();
+                // than a second copy of the clipboard into the left side; it says so itself.
+                v.await_paste(1);
                 self.push_tab(Content::Text(v), Vec::new());
             }
             Err(e) => self.error(e.to_string()),
@@ -4655,7 +4681,15 @@ impl OxideMergeApp {
             return self.try_open(opened);
         }
         if let (Some(rev), [path]) = (&req.git_rev, &paths[..]) {
-            self.open_git_revision(path, rev, None);
+            let settings = RevSettings {
+                filter: req.filter.clone(),
+                recursive: req.recursive,
+                method: req.method,
+                rules: req.rules.clone(),
+                kind: req.kind,
+                table: req.table.clone(),
+            };
+            self.read_revision(path, rev, None, settings);
             return Ok(());
         }
         if paths.len() == 1 && text::extension(&paths[0]) == crate::core::review::EXT {
@@ -4895,6 +4929,17 @@ impl OxideMergeApp {
     /// working copy or Mercurial repository (the left side, read-only). The revision is read on
     /// another thread, as a server may be slow or not answer; `dialog` comes back if it fails.
     fn open_git_revision(&mut self, path: &Path, rev: &str, dialog: Option<GitDialog>) {
+        self.read_revision(path, rev, dialog, RevSettings::default());
+    }
+
+    /// Like [`Self::open_git_revision`], the tab comparing with `settings` where they are given.
+    fn read_revision(
+        &mut self,
+        path: &Path,
+        rev: &str,
+        dialog: Option<GitDialog>,
+        settings: RevSettings,
+    ) {
         if let Some(old) = self.rev_load.take() {
             old.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -4908,6 +4953,7 @@ impl OxideMergeApp {
         self.rev_load = Some(RevLoad {
             path: path.to_path_buf(),
             rev,
+            settings,
             rx,
             cancel,
             dialog,
@@ -6010,8 +6056,9 @@ impl OxideMergeApp {
             return;
         };
         let stopped = load.cancel.load(std::sync::atomic::Ordering::Relaxed);
-        let shown =
-            result.and_then(|(temp, copy)| self.show_revision(&load.path, &load.rev, temp, copy));
+        let shown = result.and_then(|(temp, copy)| {
+            self.show_revision_with(&load.path, &load.rev, &load.settings, temp, copy)
+        });
         if let Err(e) = shown {
             if !stopped {
                 self.error(e.to_string());
@@ -6141,6 +6188,7 @@ impl OxideMergeApp {
     }
 
     /// Opens the tab comparing `path` with `copy`, its copy as of revision `rev` in `temp`.
+    #[cfg(test)]
     fn show_revision(
         &mut self,
         path: &Path,
@@ -6148,18 +6196,43 @@ impl OxideMergeApp {
         temp: tempfile::TempDir,
         copy: PathBuf,
     ) -> anyhow::Result<()> {
+        self.show_revision_with(path, rev, &RevSettings::default(), temp, copy)
+    }
+
+    /// Like [`Self::show_revision`], comparing with `settings` where they are given.
+    fn show_revision_with(
+        &mut self,
+        path: &Path,
+        rev: &str,
+        settings: &RevSettings,
+        temp: tempfile::TempDir,
+        copy: PathBuf,
+    ) -> anyhow::Result<()> {
         let label = format!("{} @ {rev}", path.display());
         if path.is_dir() {
             let display = vec![label, path.display().to_string()];
-            let mut v = FolderView::new(
+            let filter = settings.filter.as_deref().unwrap_or(&self.cfg.filter);
+            // What Git ignores in the working folder, such as build output, is in no revision:
+            // it is left out rather than listed as new.
+            let mut v = FolderView::against_revision(
                 vec![copy, path.to_path_buf()],
                 display,
-                Vec::new(),
-                &self.cfg.filter,
+                filter,
                 &self.named_filters,
                 &self.cfg,
+                path.to_path_buf(),
+                rev,
             );
-            v.read_only[0] = true;
+            if let Some(r) = settings.recursive {
+                v.set_recursive(r);
+            }
+            if let Some(m) = settings.method {
+                v.set_method(m);
+            }
+            if let Some(r) = &settings.rules {
+                v.set_rules(&self.cfg, r.clone());
+            }
+            v.start_compare();
             self.push_tab(Content::Folder(v), Vec::new());
         } else {
             // A file is opened as any two files are, the revision's copy on the left: the
@@ -6172,6 +6245,9 @@ impl OxideMergeApp {
                 descriptions: vec![Some(label), None],
                 read_only: vec![true, false],
                 skip_recent: true,
+                rules: settings.rules.clone(),
+                kind: settings.kind,
+                table: settings.table.clone(),
                 wait: true,
                 ..Default::default()
             })?;
@@ -6183,6 +6259,7 @@ impl OxideMergeApp {
         self.cfg.add_recent_path(&path.display().to_string());
         if let Some(t) = self.tabs.last_mut() {
             t.temps = vec![std::sync::Arc::new(temp)];
+            t.revision = Some((path.to_path_buf(), rev.to_string()));
         }
         Ok(())
     }
@@ -6316,6 +6393,7 @@ impl OxideMergeApp {
             remote,
             no_recovery: false,
             recovered: None,
+            revision: None,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -6406,55 +6484,63 @@ impl OxideMergeApp {
             return;
         };
         let temps = self.tabs[ti].temps.clone();
-        let cfg = &self.cfg;
-        let Some(Content::Folder(f)) = self
-            .tabs
-            .iter_mut()
-            .find(|t| t.id == folder)
-            .map(|t| t.content.view_mut())
-        else {
-            return;
-        };
-        let (origin_roots, origin_archives) = (
-            f.roots.clone(),
-            (0..f.n())
-                .map(|s| f.archive_source(s).map(Path::to_path_buf))
-                .collect(),
-        );
-        let Some(FolderAction::OpenFiles {
-            paths,
-            missing,
-            read_only,
-            descriptions,
-            kind,
-            rel,
-            rules,
-            snapshot_options,
-        }) =
-            adjacent_file(f, cfg, &rel, forward, conflicts).and_then(|i| f.reveal_and_open(i, cfg))
-        else {
-            // The folders were compared again while the tab waited for an answer.
-            let message = f.no_more_files(forward, conflicts);
-            self.notify(tr(message));
-            return;
-        };
-        let count = self.tabs.len();
-        self.open(OpenRequest {
-            paths,
-            missing,
-            read_only,
-            descriptions,
-            kind,
-            skip_recent: true,
-            rules: Some(rules),
-            snapshot_options,
-            ..Default::default()
-        });
-        if self.tabs.len() == count {
-            return;
-        }
-        let Some(mut tab) = self.tabs.pop() else {
-            return;
+        // A file that cannot be opened (a picture on one side only) is passed over, said so by
+        // the error opening it gave, rather than tried again at every step.
+        let mut from = rel;
+        let (mut tab, rel, origin_roots, origin_archives) = loop {
+            let cfg = &self.cfg;
+            let Some(Content::Folder(f)) = self
+                .tabs
+                .iter_mut()
+                .find(|t| t.id == folder)
+                .map(|t| t.content.view_mut())
+            else {
+                return;
+            };
+            let (origin_roots, origin_archives): (_, Vec<_>) = (
+                f.roots.clone(),
+                (0..f.n())
+                    .map(|s| f.archive_source(s).map(Path::to_path_buf))
+                    .collect(),
+            );
+            let Some(FolderAction::OpenFiles {
+                paths,
+                missing,
+                read_only,
+                descriptions,
+                kind,
+                rel,
+                rules,
+                snapshot_options,
+            }) = adjacent_file(f, cfg, &from, forward, conflicts)
+                .and_then(|i| f.reveal_and_open(i, cfg))
+            else {
+                // The folders were compared again while the tab waited for an answer, or the
+                // files left could not be opened.
+                let message = f.no_more_files(forward, conflicts);
+                self.notify(tr(message));
+                return;
+            };
+            let count = self.tabs.len();
+            self.open(OpenRequest {
+                paths,
+                missing,
+                read_only,
+                descriptions,
+                kind,
+                skip_recent: true,
+                rules: Some(rules),
+                snapshot_options,
+                ..Default::default()
+            });
+            if self.tabs.len() == count {
+                from = rel;
+                continue;
+            }
+            let Some(tab) = self.tabs.pop() else {
+                return;
+            };
+            break (tab, rel, origin_roots, origin_archives);
         };
         let mut pass = false;
         match tab.content.view_mut() {
@@ -7372,6 +7458,13 @@ impl OxideMergeApp {
                         Cmd::FindNext => v.find_next(true),
                         Cmd::FindPrev => v.find_next(false),
                         Cmd::GotoLine => v.goto = Some(String::new()),
+                        Cmd::NextDiff
+                        | Cmd::PrevDiff
+                        | Cmd::FirstDiff
+                        | Cmd::LastDiff
+                        | Cmd::NextConflict
+                        | Cmd::PrevConflict
+                            if !v.difference_navigation_available() => {}
                         Cmd::NextDiff if !v.next_diff(false) => v.step_file = Some(true),
                         Cmd::PrevDiff if !v.prev_diff(false) => v.step_file = Some(false),
                         Cmd::FirstDiff => v.first_diff(),
@@ -9063,6 +9156,10 @@ impl OxideMergeApp {
                     ..Default::default()
                 });
             }
+            Some(RunStep::CompareRevision(path, rev)) => {
+                self.run_job = None;
+                self.open_git_revision(&path, &rev, None);
+            }
             None => {}
         }
     }
@@ -9294,7 +9391,7 @@ impl OxideMergeApp {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
-        if tab.source.len() < 2 {
+        if tab.source.len() < 2 && tab.revision.is_none() {
             self.error(tr("msg.project_needs_files"));
             return;
         }
@@ -9726,19 +9823,11 @@ impl OxideMergeApp {
         width
     }
 
+    /// The File menu, grouped so it stays short: opening, the other ways to compare, files on
+    /// a server, projects and workspaces, saving, output, and closing.
     fn file_menu(&mut self, ui: &mut egui::Ui, m: &mut Menus) {
         m.item(ui, Cmd::New);
-        m.item(ui, Cmd::CompareClipboard);
         m.item(ui, Cmd::Open);
-        m.item(ui, Cmd::OpenRemote);
-        m.item(ui, Cmd::ReloadRemote);
-        let in_place = &mut self.cfg.remote_in_place;
-        if widgets::menu_check(ui, *in_place, tr("menu.remote_in_place"), "")
-            .on_hover_text(tr("menu.remote_in_place_tip"))
-            .clicked()
-        {
-            *in_place = !*in_place;
-        }
         let recent = &self.cfg.recent_compares;
         ui.add_enabled_ui(!recent.is_empty(), |ui| {
             submenu_list(ui, tr("menu.open_recent"), |ui| {
@@ -9755,8 +9844,24 @@ impl OxideMergeApp {
                 }
             });
         });
-        m.item(ui, Cmd::OpenConflict);
-        m.item(ui, Cmd::GitCompare);
+        submenu(ui, tr("menu.more_compares"), |ui| {
+            m.item(ui, Cmd::CompareClipboard);
+            m.item(ui, Cmd::GitCompare);
+            m.item(ui, Cmd::OpenConflict);
+            m.item(ui, Cmd::ApplyPatch);
+        });
+        let in_place = &mut self.cfg.remote_in_place;
+        submenu(ui, tr("menu.remote_files"), |ui| {
+            m.item(ui, Cmd::OpenRemote);
+            m.item(ui, Cmd::ReloadRemote);
+            ui.separator();
+            if widgets::menu_check(ui, *in_place, tr("menu.remote_in_place"), "")
+                .on_hover_text(tr("menu.remote_in_place_tip"))
+                .clicked()
+            {
+                *in_place = !*in_place;
+            }
+        });
         ui.separator();
         submenu(ui, tr("menu.projects_jobs"), |ui| {
             m.item(ui, Cmd::OpenProject);
@@ -9818,7 +9923,6 @@ impl OxideMergeApp {
             }
         });
         m.item(ui, Cmd::Print);
-        m.item(ui, Cmd::ApplyPatch);
         ui.separator();
         m.item(ui, Cmd::CloseTab);
         m.item(ui, Cmd::CloseAllTabs);

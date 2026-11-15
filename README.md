@@ -78,7 +78,7 @@ confidence to file comparisons, folder synchronization, and conflict resolution.
   in one step. The merge bar shows how many conflicts are left.
 - Open a file with conflict markers from Git or another version
   control system, and resolve the conflicts side by side.
-- **Compare clipboard:** *File → Compare clipboard* opens a text compare
+- **Compare clipboard:** *File → More comparisons → Compare clipboard* opens a text compare
   with the clipboard's text on the left and a blank, writable right side
   — paste a second text into it to compare the two, with no files needed.
 - Ignore white space, comments or lines that match a pattern. Saved comparison
@@ -113,14 +113,17 @@ confidence to file comparisons, folder synchronization, and conflict resolution.
   as a code cell, a Markdown cell or a raw cell, with that cell's own source
   and nothing else; outputs, execution counts and other run metadata are
   left out, so re-running a notebook without changing it compares equal.
-- **Formatted documents:** choose **Formatted** above the panes to see Word documents, Excel
-  workbooks and tagged PDF files as formatted Markdown side by side: headings, bold and italic
+- **Formatted documents:** choose **Formatted** in the toolbar row above the panes to see Word
+  documents, Excel workbooks and tagged PDF files as formatted Markdown side by side: headings, bold and italic
   words, lists, links, and tables drawn with their merged cells. Each workbook sheet is a table
   with its dates, amounts and percentages as their formats show them. Images are shown with
   their description and a fingerprint of the picture, so a changed picture shows as a change.
 - **Web pages:** by default, both pages are converted to Markdown and shown formatted side by side,
-  with changed blocks and words highlighted. Other modes show the visible text, the HTML source, or
-  the downloaded resources. No mode needs a web browser. Local `.html` files also open as web pages.
+  with changed blocks and words highlighted and each block's pictures shown under it. Pictures and
+  links beside each page are compared by their address relative to it, so two copies of a site in
+  different folders line up. A local page never contacts a web server for its pictures. Other
+  modes show the visible text (a picture by its alt text), the HTML source, or the downloaded
+  resources. No mode needs a web browser. Local `.html` files also open as web pages.
 
 ### Reports and saved work
 

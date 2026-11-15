@@ -405,6 +405,33 @@ fn checkout_into(
     Ok(())
 }
 
+/// What Git ignores in folder `path`: the untracked files and folders its ignore rules match,
+/// relative to `path` with `/` separators, a folder ending with `/`; and the repository's own
+/// `.git`, when `path` is the top of the repository: a folder, or in a linked worktree or a
+/// submodule a file naming where the repository is, so both are listed.
+pub fn ignored(path: &Path, cancel: &AtomicBool) -> Result<Vec<String>> {
+    let (_, rel) = locate(path)?;
+    let mut cmd = command(path);
+    cmd.args([
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "-z",
+    ]);
+    let out = run_cancellable(cmd, cancel)?;
+    let mut list: Vec<String> = out
+        .split(|&b| b == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .collect();
+    if rel.is_empty() {
+        list.extend([".git/".into(), ".git".into()]);
+    }
+    Ok(list)
+}
+
 /// Recent commits touching `path`, newest first: (short hash, subject). Setting `cancel` stops
 /// a log still running (one walking a long history), and the list comes back empty.
 pub fn recent_commits(path: &Path, n: usize, cancel: &AtomicBool) -> Vec<(String, String)> {
@@ -484,6 +511,28 @@ mod tests {
         }
         let out = run_cancellable(cmd, &AtomicBool::new(false)).unwrap();
         assert_eq!(String::from_utf8_lossy(&out).trim(), "done");
+    }
+
+    #[test]
+    fn what_git_ignores_in_a_folder_is_listed_with_its_git_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let cancel = AtomicBool::new(false);
+        if git(repo, &["init", "-q"]).is_err() {
+            return; // git is not installed
+        }
+        std::fs::write(repo.join(".gitignore"), "target/\n*.log\n").unwrap();
+        std::fs::create_dir_all(repo.join("target/debug")).unwrap();
+        std::fs::write(repo.join("target/debug/app"), "built").unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(repo.join("src/run.log"), "noise").unwrap();
+        std::fs::write(repo.join("notes.txt"), "untracked, not ignored").unwrap();
+        let mut list = ignored(repo, &cancel).unwrap();
+        list.sort();
+        assert_eq!(list, [".git", ".git/", "src/run.log", "target/"]);
+        // From a folder inside, paths are relative to it, and the .git folder is not in it.
+        assert_eq!(ignored(&repo.join("src"), &cancel).unwrap(), ["run.log"]);
     }
 
     #[test]

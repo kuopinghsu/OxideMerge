@@ -311,6 +311,11 @@ impl Normalizer {
         Cow::Owned(s)
     }
 
+    /// Whether any line can be one that does not count as a difference on its own.
+    fn ignores_lines(&self) -> bool {
+        self.opts.ignore_blank_lines || !self.line_res.is_empty()
+    }
+
     /// Lines that do not count as differences on their own (blank lines / line filters).
     pub fn is_ignorable(&self, line: &str) -> bool {
         if self.opts.ignore_blank_lines && line.trim().is_empty() {
@@ -854,15 +859,61 @@ impl<'a> Interner<'a> {
     }
 }
 
+thread_local! {
+    /// When every compare of lines on this thread must be done by, if one compare of a file
+    /// is made of many (see [`Budget`]).
+    static UNTIL: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Holds the compares of lines on this thread, while it lives, to the time [`walk_limits`]
+/// gives one compare of a file, as the gaps of one large file are held: so that a file
+/// compared in many parts, such as between the lines [`kept_anchors`] pairs, takes no longer
+/// than one compared whole.
+struct Budget(Option<std::time::Instant>);
+
+impl Budget {
+    fn start() -> Self {
+        let until = std::time::Instant::now() + walk_limits().1;
+        let before = UNTIL.get();
+        UNTIL.set(Some(before.map_or(until, |b| b.min(until))));
+        Budget(before)
+    }
+}
+
+impl Drop for Budget {
+    fn drop(&mut self) {
+        UNTIL.set(self.0);
+    }
+}
+
+/// `deadline`, or the end of the [`Budget`] the compare is held to when that is sooner.
+fn within_budget(deadline: Option<std::time::Instant>) -> Option<std::time::Instant> {
+    match (deadline, UNTIL.get()) {
+        (Some(d), Some(u)) => Some(d.min(u)),
+        (d, u) => d.or(u),
+    }
+}
+
+/// Whether the [`Budget`] the compare is held to is spent.
+fn budget_spent() -> bool {
+    UNTIL
+        .get()
+        .is_some_and(|until| std::time::Instant::now() >= until)
+}
+
 fn line_ops(
     a: &[u32],
     b: &[u32],
     alg: DiffAlgorithm,
 ) -> Vec<(DiffTag, Range<usize>, Range<usize>)> {
     // Past the deadline Myers settles for a coarser diff instead of freezing the window.
-    let deadline = Some(std::time::Instant::now() + GAP_DEADLINE);
-    // LCS needs a table of a.len() * b.len() entries, which the deadline does not bound.
-    let alg = if alg == DiffAlgorithm::Lcs && (a.len() as u64) * (b.len() as u64) > 25_000_000 {
+    let deadline = within_budget(Some(std::time::Instant::now() + GAP_DEADLINE));
+    // LCS needs a table of a.len() * b.len() entries, which the deadline does not bound: a
+    // large one, or any once the budget is spent, is compared by Myers instead.
+    let alg = if alg == DiffAlgorithm::Lcs
+        && ((a.len() as u64) * (b.len() as u64) > 25_000_000 || budget_spent())
+    {
         DiffAlgorithm::Myers
     } else {
         alg
@@ -876,7 +927,8 @@ fn line_ops(
     }
     let started = std::time::Instant::now();
     let (gap, walk) = walk_limits();
-    let gap_deadline = || Some((std::time::Instant::now() + gap).min(started + walk));
+    let gap_deadline =
+        || within_budget(Some((std::time::Instant::now() + gap).min(started + walk)));
     let mut out = Vec::new();
     let (mut pa, mut pb) = (0, 0);
     for (k, (ia, ib)) in unique_anchors(a, b).into_iter().enumerate() {
@@ -1203,58 +1255,228 @@ pub fn compute_synced(
     super::cancel::check();
     let lens: Vec<usize> = panes.iter().map(|p| p.len()).collect();
     let sync = valid_sync_points(sync, &lens);
-    let mut result = if sync.is_empty() {
+    // A compare in parts, between synchronization points or the lines kept_anchors pairs, is
+    // held as a whole to the time one compare of the file may take.
+    let _budget = Budget::start();
+    let points = with_kept_anchors(&ids, &ignorable, &sync, &lens);
+    let mut result = if points.is_empty() {
         diff_segment(&ids, &ignorable, opts)
     } else {
-        // Each synchronization point's lines make a row of their own; between them, the
-        // panes are compared as if they held only those lines.
-        let n = panes.len();
-        let mut result = DiffResult {
-            panes: n,
-            ..Default::default()
-        };
-        let mut start = [0usize; 3];
-        // Rows where a difference before a point's row could run on into it, or one in it
-        // into the next part: such neighbors are one difference.
-        let mut seams = Vec::new();
-        for point in sync.iter().map(Some).chain([None]) {
-            let end: Vec<usize> = (0..n).map(|p| point.map_or(lens[p], |s| s[p])).collect();
-            let part = segment(&ids, &ignorable, &start[..n], &end, opts);
-            append(&mut result, part, &start);
-            if let Some(s) = point {
-                seams.push(result.rows.len());
-                seams.push(result.rows.len() + 1);
-                let ranges: Vec<Range<usize>> = (0..n).map(|p| s[p]..s[p] + 1).collect();
-                let same = (1..n).all(|p| ids[p][s[p]] == ids[0][s[0]]);
-                if same {
-                    result.rows.push(Row::new(
-                        [Some(s[0]), Some(s[1]), (n == 3).then_some(s[2])],
-                        None,
-                    ));
-                } else {
-                    let kind = if n == 3 {
-                        let r = [ranges[0].clone(), ranges[1].clone(), ranges[2].clone()];
-                        kind3(&ids, &r).unwrap_or(BlockKind::Conflict)
-                    } else {
-                        BlockKind::Diff
-                    };
-                    let ignored = ignorable.all(&ranges);
-                    let mut r = [0..0, 0..0, 0..0];
-                    r[..n].clone_from_slice(&ranges);
-                    push_block(&mut result, r, kind, ignored);
-                }
-                for p in 0..n {
-                    start[p] = s[p] + 1;
-                }
-            }
-        }
-        join_at_seams(&mut result, &seams, &ids);
-        result
+        diff_synced(&ids, &ignorable, opts, &points, &lens)
     };
     if opts.detect_moved {
         detect_moved(&mut result, &ids);
     }
     result
+}
+
+/// The compare of `ids` with the lines of each of the points `sync` on one row (see
+/// [`SyncPoint`]); between them, the panes are compared as if they held only those lines.
+fn diff_synced(
+    ids: &[Vec<u32>],
+    ignorable: &Ignorable,
+    opts: &DiffOptions,
+    sync: &[SyncPoint],
+    lens: &[usize],
+) -> DiffResult {
+    let n = ids.len();
+    let mut result = DiffResult {
+        panes: n,
+        ..Default::default()
+    };
+    let mut start = [0usize; 3];
+    // Rows where a difference before a point's row could run on into it, or one in it into
+    // the next part: such neighbors are one difference. A point whose lines are the same has
+    // no difference to run into.
+    let mut seams = Vec::new();
+    for (k, point) in sync.iter().map(Some).chain([None]).enumerate() {
+        super::cancel::check_every(k, 1 << 12);
+        let end: [usize; 3] = std::array::from_fn(|p| match point {
+            _ if p >= n => 0,
+            Some(s) => s[p],
+            None => lens[p],
+        });
+        if (0..n).any(|p| start[p] < end[p]) {
+            let part = segment(ids, ignorable, &start[..n], &end[..n], opts);
+            append(&mut result, part, &start);
+        }
+        if let Some(s) = point {
+            let same = (1..n).all(|p| ids[p][s[p]] == ids[0][s[0]]);
+            if same {
+                result.rows.push(Row::new(
+                    [Some(s[0]), Some(s[1]), (n == 3).then_some(s[2])],
+                    None,
+                ));
+            } else {
+                seams.push(result.rows.len());
+                seams.push(result.rows.len() + 1);
+                let mut ranges = [0..0, 0..0, 0..0];
+                for (p, r) in ranges.iter_mut().enumerate().take(n) {
+                    *r = s[p]..s[p] + 1;
+                }
+                let kind = if n == 3 {
+                    kind3(ids, &ranges).unwrap_or(BlockKind::Conflict)
+                } else {
+                    BlockKind::Diff
+                };
+                let ignored = ignorable.all(&ranges[..n]);
+                push_block(&mut result, ranges, kind, ignored);
+            }
+            for p in 0..n {
+                start[p] = s[p] + 1;
+            }
+        }
+    }
+    join_at_seams(&mut result, &seams, ids);
+    result
+}
+
+/// The user's synchronization points `sync`, with the anchors of [`kept_anchors`] in each
+/// part before, between and after them; none when there are neither.
+fn with_kept_anchors(
+    ids: &[Vec<u32>],
+    ignorable: &Ignorable,
+    sync: &[SyncPoint],
+    lens: &[usize],
+) -> Vec<SyncPoint> {
+    let n = ids.len();
+    // The size past which line filters alone pair no lines first is that of the whole file,
+    // however the synchronization points divide it.
+    if !ignorable.blank_or_skipped() && lens.iter().sum::<usize>() > FILTER_ANCHOR_MAX_LINES {
+        return sync.to_vec();
+    }
+    let mut out = Vec::new();
+    let mut start = [0usize; 3];
+    for point in sync.iter().map(Some).chain([None]) {
+        let end: [usize; 3] = std::array::from_fn(|p| match point {
+            _ if p >= n => 0,
+            Some(s) => s[p],
+            None => lens[p],
+        });
+        out.extend(kept_anchors(ids, ignorable, start, end).unwrap_or_default());
+        if let Some(s) = point {
+            out.push(*s);
+            start = std::array::from_fn(|p| s[p] + 1);
+        }
+    }
+    out
+}
+
+/// The most lines of all panes together whose lines [`kept_anchors`] pairs first when only
+/// line filters, not blank lines, comments or block filters, make lines ignorable.
+const FILTER_ANCHOR_MAX_LINES: usize = 1_000_000;
+
+/// The most lines of each side between two lines that occur once on each side whose other
+/// lines [`kept_anchors`] pairs too; a longer stretch is left to the compare.
+const GAP_PAIR_MAX: usize = 4096;
+
+/// When some lines do not count as differences on their own, such as blank lines with blank
+/// lines ignored, the lines between `start` and `end` of each pane that the other lines pair:
+/// those others are paired first, so that a blank line that moved, as one a page break leaves
+/// in text read from a PDF file, cannot pair blank lines and set the lines around it apart as
+/// changed. Lines that occur once among the other lines of each side are paired first, in
+/// order, as a patience diff pairs them, which is quick; then, in each stretch between two of
+/// them that is no longer than [`GAP_PAIR_MAX`] lines, the other lines are compared and the
+/// ones that match are paired too, so that a line that repeats elsewhere, such as the last
+/// characters of a paragraph a page break carried over, is paired as well. A longer stretch,
+/// as between files with little in common, is left to the compare, so that it is not compared
+/// twice. In a three-way compare, a line of the base is paired when both other panes pair it.
+/// None when no line can be ignorable, or none there is.
+fn kept_anchors(
+    ids: &[Vec<u32>],
+    ignorable: &Ignorable,
+    start: [usize; 3],
+    end: [usize; 3],
+) -> Option<Vec<SyncPoint>> {
+    if !ignorable.any() {
+        return None;
+    }
+    let n = ids.len();
+    // Line filters alone are matched against every line here, where the compare otherwise
+    // matches them only in changed blocks: past a size, that is left to the compare.
+    let lines: usize = (0..n).map(|p| end[p] - start[p]).sum();
+    if !ignorable.blank_or_skipped() && lines > FILTER_ANCHOR_MAX_LINES {
+        return None;
+    }
+    let kept: Vec<Vec<usize>> = (0..n)
+        .map(|p| {
+            (start[p]..end[p])
+                .filter(|&i| {
+                    super::cancel::check_every(i, 1 << 16);
+                    !ignorable.line(p, i)
+                })
+                .collect()
+        })
+        .collect();
+    if (0..n).all(|p| kept[p].len() == end[p] - start[p]) {
+        return None;
+    }
+    let sides: Vec<Vec<u32>> = (0..n)
+        .map(|p| kept[p].iter().map(|&i| ids[p][i]).collect())
+        .collect();
+    // Pairs of kept lines of two sides, by their places among the kept lines: those that
+    // occur once on each side, or, for a stretch between them, those the compare matches.
+    let pairs = |a: &[u32], b: &[u32], unique: bool| -> Vec<(usize, usize)> {
+        if unique {
+            return unique_anchors(a, b)
+                .into_iter()
+                .map(|(i, j)| (i as usize, j as usize))
+                .collect();
+        }
+        // Myers, whose time the budget bounds, whatever algorithm the compare uses.
+        let mut out = Vec::new();
+        for (tag, ra, rb) in line_ops(a, b, DiffAlgorithm::Myers) {
+            if tag == DiffTag::Equal {
+                out.extend(ra.zip(rb));
+            }
+        }
+        out
+    };
+    // The kept lines from `from` to `to` paired in every pane: [a, b, 0] in a two-way
+    // compare, [left, base, right] with the base paired in both others in a three-way one.
+    let paired = |from: [usize; 3], to: [usize; 3], unique: bool| -> Vec<[usize; 3]> {
+        let part = |p: usize| &sides[p][from[p]..to[p]];
+        if n == 2 {
+            return pairs(part(0), part(1), unique)
+                .into_iter()
+                .map(|(i, j)| [from[0] + i, from[1] + j, 0])
+                .collect();
+        }
+        let right: HashMap<usize, usize> = pairs(part(1), part(2), unique).into_iter().collect();
+        pairs(part(1), part(0), unique)
+            .into_iter()
+            .filter_map(|(k, l)| {
+                let r = right.get(&k)?;
+                Some([from[0] + l, from[1] + k, from[2] + r])
+            })
+            .collect()
+    };
+    let ends: [usize; 3] = std::array::from_fn(|p| sides.get(p).map_or(0, Vec::len));
+    let mut points = Vec::new();
+    let mut from = [0usize; 3];
+    for (k, stop) in paired([0; 3], ends, true)
+        .into_iter()
+        .map(Some)
+        .chain([None])
+        .enumerate()
+    {
+        super::cancel::check_every(k, 1 << 12);
+        let to = stop.unwrap_or(ends);
+        let lengths: Vec<usize> = (0..n).map(|p| to[p] - from[p]).collect();
+        if lengths.iter().all(|&l| l > 0 && l <= GAP_PAIR_MAX) && !budget_spent() {
+            points.extend(paired(from, to, false));
+        }
+        if let Some(stop) = stop {
+            points.push(stop);
+            from = std::array::from_fn(|p| stop[p] + 1);
+        }
+    }
+    Some(
+        points
+            .into_iter()
+            .map(|k| std::array::from_fn(|p| if p < n { kept[p][k[p]] } else { 0 }))
+            .collect(),
+    )
 }
 
 fn diff_segment<T: AsRef<[u32]>>(
@@ -1364,16 +1586,29 @@ struct Ignorable<'a> {
 
 impl Ignorable<'_> {
     fn all(&self, ranges: &[Range<usize>]) -> bool {
-        self.panes
+        ranges
             .iter()
-            .zip(ranges)
             .enumerate()
-            .all(|(p, (lines, r))| {
-                r.clone().all(|i| {
-                    self.skip.get(p).is_some_and(|c| c.get(i) == Some(&true))
-                        || self.norm.is_ignorable(&lines[i])
-                })
-            })
+            .all(|(p, r)| r.clone().all(|i| self.line(p, i)))
+    }
+
+    /// Whether some line may not count as a difference on its own: blank lines or lines
+    /// matching a filter are ignored, or lines are passed over as comments or by a block
+    /// filter.
+    fn any(&self) -> bool {
+        self.norm.ignores_lines() || self.skip.iter().any(|s| !s.is_empty())
+    }
+
+    /// Whether blank lines are ignored, or lines are passed over as comments or by a block
+    /// filter: the ignorable lines other than those of line filters.
+    fn blank_or_skipped(&self) -> bool {
+        self.norm.opts.ignore_blank_lines || self.skip.iter().any(|s| !s.is_empty())
+    }
+
+    /// Whether line `i` of pane `p` does not count as a difference on its own.
+    fn line(&self, p: usize, i: usize) -> bool {
+        self.skip.get(p).is_some_and(|c| c.get(i) == Some(&true))
+            || self.norm.is_ignorable(&self.panes[p][i])
     }
 
     /// With a numeric tolerance, splits a changed block whose sides have the same number of
@@ -2355,6 +2590,221 @@ mod tests {
         let r = compute(&[&a, &b], &o);
         assert_eq!(r.blocks.len(), 1);
         assert!(r.is_identical());
+    }
+
+    #[test]
+    fn a_blank_line_that_moved_past_a_line_is_ignored_with_blank_lines() {
+        // Text read from two layouts of a PDF file, where a page break left its blank line on
+        // either side of the last words of a paragraph.
+        let a = v(&["one", "\u{6848}\u{3002}", "", "two", "three"]);
+        let b = v(&["one", "", "\u{6848}\u{3002}", "two", "three"]);
+        for algorithm in [
+            DiffAlgorithm::Myers,
+            DiffAlgorithm::Patience,
+            DiffAlgorithm::Lcs,
+        ] {
+            let o = DiffOptions {
+                ignore_blank_lines: true,
+                algorithm,
+                ..Default::default()
+            };
+            let r = compute(&[&a, &b], &o);
+            assert!(r.is_identical(), "{algorithm:?}: {:?}", r.blocks);
+            assert_eq!(r.significant_blocks(), 0);
+            let paired = r.rows.iter().any(|row| {
+                row.line(0) == Some(1) && row.line(1) == Some(2) && row.block().is_none()
+            });
+            assert!(
+                paired,
+                "{algorithm:?}: the line a blank line moved past is paired"
+            );
+        }
+        assert!(!compute(&[&a, &b], &DiffOptions::default()).is_identical());
+    }
+
+    #[test]
+    fn a_moved_blank_line_is_ignored_in_a_merge_and_beside_a_sync_point() {
+        let page = |blank_first: bool| {
+            let mut lines = vec!["one", "\u{6848}\u{3002}", "two", "three"];
+            lines.insert(if blank_first { 1 } else { 2 }, "");
+            v(&lines)
+        };
+        let (base, moved) = (page(false), page(true));
+        for algorithm in [
+            DiffAlgorithm::Myers,
+            DiffAlgorithm::Patience,
+            DiffAlgorithm::Lcs,
+        ] {
+            let o = DiffOptions {
+                ignore_blank_lines: true,
+                algorithm,
+                ..Default::default()
+            };
+            let merge = compute(&[&base, &base, &moved], &o);
+            assert_eq!(
+                merge.significant_blocks(),
+                0,
+                "{algorithm:?}: {:?}",
+                merge.blocks
+            );
+            let synced = compute_synced(&[&base, &moved], &o, None, &[[0, 0, 0]]);
+            assert_eq!(
+                synced.significant_blocks(),
+                0,
+                "{algorithm:?}: {:?}",
+                synced.blocks
+            );
+        }
+    }
+
+    #[test]
+    fn a_moved_blank_line_beside_a_line_that_repeats_is_ignored() {
+        let a = v(&["x", "案。", "", "y", "案。", "z"]);
+        let b = v(&["x", "", "案。", "y", "案。", "z"]);
+        for algorithm in [
+            DiffAlgorithm::Myers,
+            DiffAlgorithm::Patience,
+            DiffAlgorithm::Lcs,
+        ] {
+            let o = DiffOptions {
+                ignore_blank_lines: true,
+                algorithm,
+                ..Default::default()
+            };
+            let two = compute(&[&a, &b], &o);
+            assert_eq!(
+                two.significant_blocks(),
+                0,
+                "{algorithm:?}: {:?}",
+                two.blocks
+            );
+            let three = compute(&[&a, &a, &b], &o);
+            assert_eq!(
+                three.significant_blocks(),
+                0,
+                "{algorithm:?}: {:?}",
+                three.blocks
+            );
+        }
+    }
+
+    #[test]
+    fn a_spent_budget_leaves_stretches_unpaired_and_lcs_unused() {
+        let a = v(&["x", "案。", "", "y", "案。", "z"]);
+        let b = v(&["x", "", "案。", "y", "案。", "z"]);
+        let o = DiffOptions {
+            ignore_blank_lines: true,
+            ..Default::default()
+        };
+        let norm = Normalizer::new(&o);
+        let panes: Vec<&[String]> = vec![&a, &b];
+        let ignorable = Ignorable {
+            norm: &norm,
+            panes: &panes,
+            skip: Vec::new(),
+        };
+        let ids = vec![vec![0, 1, 2, 3, 1, 4], vec![0, 2, 1, 3, 1, 4]];
+        let anchors = |ids: &[Vec<u32>]| kept_anchors(ids, &ignorable, [0; 3], [6, 6, 0]);
+        assert_eq!(
+            anchors(&ids).map(|a| a.len()),
+            Some(5),
+            "x, 案。, y, 案。, z"
+        );
+        let spent = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let before = UNTIL.replace(Some(spent));
+        assert!(budget_spent());
+        assert_eq!(anchors(&ids).map(|a| a.len()), Some(3), "only x, y and z");
+        let lcs = line_ops(&ids[0], &ids[1], DiffAlgorithm::Lcs);
+        let covered: usize = lcs.iter().map(|(_, a, _)| a.len()).sum();
+        assert_eq!(covered, 6, "Myers still compares every line");
+        UNTIL.set(before);
+    }
+
+    #[test]
+    fn line_filters_alone_pair_no_lines_first_in_a_very_large_file() {
+        let half = FILTER_ANCHOR_MAX_LINES / 2 + 1;
+        let lines: Vec<String> = (0..half).map(|i| format!("line {i}")).collect();
+        let mut o = DiffOptions {
+            line_filters_enabled: true,
+            line_filters: vec!["^#".into()],
+            ..Default::default()
+        };
+        let norm = Normalizer::new(&o);
+        let mut filtered = lines.clone();
+        filtered[1] = "# a line the filter passes over".into();
+        let panes: Vec<&[String]> = vec![&filtered, &lines];
+        let ignorable = Ignorable {
+            norm: &norm,
+            panes: &panes,
+            skip: Vec::new(),
+        };
+        let ids: Vec<Vec<u32>> = vec![(0..half as u32).collect(), (0..half as u32).collect()];
+        let end = [half, half, 0];
+        assert!(kept_anchors(&ids, &ignorable, [0; 3], end).is_none());
+        let small = [100, 100, 0];
+        assert!(kept_anchors(&ids, &ignorable, [0; 3], small).is_some());
+        // Split by a synchronization point into parts under the size, the file is still past it.
+        let point = [half / 2, half / 2, 0];
+        let whole = [half, half];
+        assert_eq!(
+            with_kept_anchors(&ids, &ignorable, &[point], &whole),
+            [point]
+        );
+        o.ignore_blank_lines = true;
+        let norm = Normalizer::new(&o);
+        let ignorable = Ignorable {
+            norm: &norm,
+            panes: &panes,
+            skip: Vec::new(),
+        };
+        // With blank lines ignored, lines are paired first at any size.
+        assert!(kept_anchors(&ids, &ignorable, [0; 3], end).is_some());
+    }
+
+    #[test]
+    fn a_compare_without_ignorable_lines_finds_no_anchors() {
+        let a = v(&["one", "", "two"]);
+        let b = v(&["one", "two", ""]);
+        let norm = Normalizer::new(&DiffOptions::default());
+        let panes: Vec<&[String]> = vec![&a, &b];
+        let ignorable = Ignorable {
+            norm: &norm,
+            panes: &panes,
+            skip: Vec::new(),
+        };
+        let ids = vec![vec![0, 1, 2], vec![0, 2, 1]];
+        assert!(kept_anchors(&ids, &ignorable, [0, 0, 0], [3, 3, 0]).is_none());
+        assert!(with_kept_anchors(&ids, &ignorable, &[], &[3, 3]).is_empty());
+    }
+
+    #[test]
+    fn ignoring_blank_lines_places_an_inserted_block_where_the_plain_compare_does() {
+        let a = v(&["fn a() {", "x", "}", "", "fn b() {", "y", "}"]);
+        let mut b = a.clone();
+        b.splice(4..4, v(&["fn c() {", "z", "}", ""]));
+        let changed = |o: &DiffOptions| -> Vec<[Range<usize>; 3]> {
+            let r = compute(&[&a, &b], o);
+            r.blocks
+                .iter()
+                .filter(|b| !b.ignored)
+                .map(|b| b.ranges.clone())
+                .collect()
+        };
+        for algorithm in [
+            DiffAlgorithm::Myers,
+            DiffAlgorithm::Patience,
+            DiffAlgorithm::Lcs,
+        ] {
+            let plain = DiffOptions {
+                algorithm,
+                ..Default::default()
+            };
+            let blank = DiffOptions {
+                ignore_blank_lines: true,
+                ..plain.clone()
+            };
+            assert_eq!(changed(&blank), changed(&plain), "{algorithm:?}");
+        }
     }
 
     #[test]

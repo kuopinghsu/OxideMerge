@@ -532,7 +532,15 @@ fn popups(gui: &Gui) -> Vec<Rect> {
 
 /// The buttons of the File menu's submenus, in sight or not.
 fn file_submenus(gui: &Gui) -> impl Iterator<Item = &Widget> {
-    let submenus = ["menu.projects_jobs", "menu.workspaces", "menu.export"];
+    let submenus = [
+        "menu.open_recent",
+        "menu.more_compares",
+        "menu.remote_files",
+        "menu.projects_jobs",
+        "menu.workspaces",
+        "menu.save_as",
+        "menu.export",
+    ];
     gui.widgets
         .iter()
         .filter(move |w| submenus.iter().any(|k| named(w, tr(k))))
@@ -3069,7 +3077,9 @@ fn compare_clipboard_opens_the_clipboard_text_on_the_left_and_a_blank_right_side
         panic!("Expected a text compare");
     };
     assert_eq!(v.active_pane, 1);
-    assert_eq!(v.paste_hint, Some(1));
+    // The blank side says what to do, to screen readers too.
+    let hint = trf("text.paste_here", &[("key", widgets::key_text("Ctrl+V"))]);
+    assert!(gui.shows_text(&hint), "{hint:?} is not shown");
     gui.events.push(Event::Paste("one\nTWO\n".into()));
     gui.frames(2);
     let Content::Text(v) = &gui.app.tabs[0].content else {
@@ -7669,6 +7679,44 @@ fn a_folder_compare_saves_as_a_job_and_a_sync_job_runs_only_once_allowed() {
 }
 
 #[test]
+fn a_folder_against_its_revision_leaves_out_what_git_ignores() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !git(&["init", "-q"]) {
+        return; // git is not installed
+    }
+    std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+    std::fs::write(root.join("kept.txt"), "same\n").unwrap();
+    std::fs::write(root.join("new.txt"), "untracked\n").unwrap();
+    std::fs::create_dir(root.join("target")).unwrap();
+    std::fs::write(root.join("target/app.bin"), "built\n").unwrap();
+    // The revision's copy, as vcs::copy_of writes it.
+    let temp = tempfile::tempdir().unwrap();
+    let copy = temp.path().join("rev");
+    std::fs::create_dir(&copy).unwrap();
+    std::fs::write(copy.join(".gitignore"), "target/\n").unwrap();
+    std::fs::write(copy.join("kept.txt"), "same\n").unwrap();
+
+    let mut gui = Gui::start("rev_folder", None);
+    gui.app.show_revision(root, "HEAD", temp, copy).unwrap();
+    gui.settle();
+    let Content::Folder(v) = gui.app.tabs[0].content.view() else {
+        panic!("not a folder compare");
+    };
+    let mut listed: Vec<String> = v.items.iter().map(|i| i.rel_path()).collect();
+    listed.sort();
+    // Build output and the repository's own folder are in no revision: left out, not new.
+    assert_eq!(listed, [".gitignore", "kept.txt", "new.txt"]);
+}
+
+#[test]
 fn compare_with_revision_lists_and_opens_subversion_revisions() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
@@ -7711,7 +7759,11 @@ fn compare_with_revision_lists_and_opens_subversion_revisions() {
     let file = wc.join("f.txt");
 
     let mut gui = Gui::start("svn_revision", None);
-    gui.menu(&[tr("menu.file"), tr("menu.git_compare")]);
+    gui.menu(&[
+        tr("menu.file"),
+        tr("menu.more_compares"),
+        tr("menu.git_compare"),
+    ]);
     gui.app.git_dlg.as_mut().unwrap().path = file.display().to_string();
     gui.wait_until("the revisions", |g| {
         g.app.git_dlg.as_ref().is_some_and(|d| d.commits.len() == 2)
@@ -7742,7 +7794,11 @@ fn compare_with_revision_lists_and_opens_subversion_revisions() {
     );
 
     // A revision picked from the list, as svn log names it.
-    gui.menu(&[tr("menu.file"), tr("menu.git_compare")]);
+    gui.menu(&[
+        tr("menu.file"),
+        tr("menu.more_compares"),
+        tr("menu.git_compare"),
+    ]);
     gui.app.git_dlg.as_mut().unwrap().path = file.display().to_string();
     gui.wait_until("the revisions", |g| {
         g.app.git_dlg.as_ref().is_some_and(|d| d.commits.len() == 2)
@@ -7807,7 +7863,11 @@ fn compare_with_revision_lists_and_opens_mercurial_revisions() {
     .unwrap();
 
     let mut gui = Gui::start("hg_revision", None);
-    gui.menu(&[tr("menu.file"), tr("menu.git_compare")]);
+    gui.menu(&[
+        tr("menu.file"),
+        tr("menu.more_compares"),
+        tr("menu.git_compare"),
+    ]);
     gui.app.git_dlg.as_mut().unwrap().path = file.display().to_string();
     gui.wait_until("the revisions", |g| {
         g.app.git_dlg.as_ref().is_some_and(|d| d.commits.len() == 2)
@@ -7832,7 +7892,11 @@ fn compare_with_revision_lists_and_opens_mercurial_revisions() {
         v.panes[0].doc.description
     );
 
-    gui.menu(&[tr("menu.file"), tr("menu.git_compare")]);
+    gui.menu(&[
+        tr("menu.file"),
+        tr("menu.more_compares"),
+        tr("menu.git_compare"),
+    ]);
     gui.app.git_dlg.as_mut().unwrap().path = file.display().to_string();
     gui.wait_until("the revisions", |g| {
         g.app.git_dlg.as_ref().is_some_and(|d| d.commits.len() == 2)
@@ -7906,7 +7970,11 @@ fn a_revision_is_read_on_another_thread_and_its_error_brings_the_dialog_back() {
     let file = dir.path().join("loose.txt");
     std::fs::write(&file, "text\n").unwrap();
     let mut gui = Gui::start("rev_thread", None);
-    gui.menu(&[tr("menu.file"), tr("menu.git_compare")]);
+    gui.menu(&[
+        tr("menu.file"),
+        tr("menu.more_compares"),
+        tr("menu.git_compare"),
+    ]);
     let dialog = gui.app.git_dlg.take();
     gui.app.open_git_revision(&file, "HEAD", dialog);
     assert!(
@@ -7918,6 +7986,71 @@ fn a_revision_is_read_on_another_thread_and_its_error_brings_the_dialog_back() {
     assert!(!gui.errors().is_empty());
     assert!(gui.app.git_dlg.is_some(), "the dialog is back to try again");
     assert!(gui.app.tabs.is_empty());
+}
+
+#[test]
+fn a_project_saved_from_a_revision_tab_names_the_revision_not_its_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let empty = dir.path().join("empty.gitconfig");
+    std::fs::write(&empty, "").unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", &empty)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "core.hooksPath=",
+            ])
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !git(&["init", "-q"]) {
+        eprintln!("git is not installed; skipped");
+        return;
+    }
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    assert!(git(&["add", "."]) && git(&["commit", "-q", "-m", "first"]));
+    std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+
+    let mut gui = Gui::start("rev_project", None);
+    gui.app.open_git_revision(&repo, "HEAD", None);
+    gui.wait_until("the revision tab", |g| {
+        g.app.rev_load.is_none() && !g.app.tabs.is_empty()
+    });
+    let project = gui.app.tabs[0].project().expect("a project");
+    assert_eq!(project.paths, [repo.display().to_string()]);
+    assert_eq!(project.rev.as_deref(), Some("HEAD"));
+
+    let file = dir.path().join("rev.oxmproj");
+    let mut project = project.relative_to(&file).unwrap();
+    project.filter = Some("*.md".into());
+    project.recursive = Some(false);
+    project.save(&file).unwrap();
+    let req = project_request(&file).unwrap();
+    assert_eq!(req.paths, std::slice::from_ref(&repo));
+    assert_eq!(req.git_rev.as_deref(), Some("HEAD"));
+
+    // Opened again, it reads the revision afresh and compares with the project's settings.
+    gui.app.try_open(req).unwrap();
+    gui.wait_until("the reopened tab", |g| {
+        g.app.rev_load.is_none() && g.app.tabs.len() == 2
+    });
+    let Content::Folder(v) = &gui.app.tabs[1].content else {
+        panic!("a folder compare");
+    };
+    assert_eq!(v.filter_spec, "*.md");
+    assert!(!v.scan_settings().0, "without subfolders, as saved");
+    let again = gui.app.tabs[1].project().unwrap();
+    assert_eq!(again.rev.as_deref(), Some("HEAD"));
+    assert_eq!(again.filter.as_deref(), Some("*.md"));
 }
 
 #[test]
@@ -8529,4 +8662,63 @@ fn binary_aligned_rows_follow_the_text_layout_and_move_the_cursor_by_rows() {
     gui.key(Modifiers::NONE, Key::ArrowDown);
     assert_eq!(binary(&mut gui).cursor, Some(79));
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+}
+
+/// Stepping through the files of a folder compare passes over one that cannot be opened, such
+/// as a picture on one side only, rather than trying it again at every step.
+#[test]
+fn stepping_files_passes_over_a_picture_on_one_side() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(
+        d,
+        &[
+            (
+                "left/a.txt",
+                "one
+left
+",
+            ),
+            (
+                "right/a.txt",
+                "one
+right
+",
+            ),
+            ("left/b.png", "not here on the right"),
+            (
+                "left/c.txt",
+                "two
+left
+",
+            ),
+            (
+                "right/c.txt",
+                "two
+right
+",
+            ),
+        ],
+    );
+    let roots = [d.join("left"), d.join("right")];
+    let mut gui = Gui::start("step_one_sided", compare_folders(&roots));
+    gui.wait_until("compared", |g| !g.busy());
+    gui.click("c.txt");
+    gui.key(Modifiers::NONE, Key::Enter);
+    gui.settle();
+    let origin = |gui: &Gui| {
+        gui.app.tabs[gui.app.active]
+            .origin
+            .as_ref()
+            .map(|o| o.rel.clone())
+    };
+    assert_eq!(origin(&gui).as_deref(), Some("c.txt"));
+    for _ in 0..4 {
+        gui.key(ALT, Key::ArrowUp);
+        gui.settle();
+        if origin(&gui).as_deref() == Some("a.txt") {
+            return;
+        }
+    }
+    panic!("stepping stopped at {:?}", origin(&gui));
 }

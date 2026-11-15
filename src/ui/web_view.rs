@@ -25,8 +25,9 @@ enum Loaded {
     /// Pages downloaded for the text and HTML modes, with the text shown of each.
     Pages(Arc<Vec<Page>>, Vec<String>),
     Tree(Arc<Vec<Page>>, Vec<tempfile::TempDir>, web::TreeOutcome),
-    /// Pages downloaded for the formatted mode, already lined up and compared.
-    Formatted(Arc<Vec<Page>>, Box<Prepared>),
+    /// Pages downloaded for the formatted mode, already lined up and compared, and whether each
+    /// is on this computer or a private network.
+    Formatted(Arc<Vec<Page>>, Box<Prepared>, Vec<bool>),
 }
 
 struct Job {
@@ -42,6 +43,9 @@ pub struct WebView {
     /// between them.
     pages: Option<Arc<Vec<Page>>>,
     pub inner: Option<Box<Content>>,
+    /// Set by a reload: the pictures the Formatted view showed, forgotten on the next frame so
+    /// that they load again. Other views' pictures are kept.
+    forget_pictures: Vec<String>,
     /// The pages as Markdown, shown formatted instead of an inner view.
     pub formatted: Option<MarkdownView>,
     job: Option<Job>,
@@ -100,6 +104,7 @@ impl WebView {
             mode: WebMode::Markdown,
             pages: None,
             inner: None,
+            forget_pictures: Vec::new(),
             formatted: None,
             job: None,
             error: None,
@@ -124,6 +129,10 @@ impl WebView {
     /// Fetches the pages again and redraws the current mode.
     pub fn reload(&mut self, cfg: &Config) {
         self.pages = None;
+        // Its pictures are loaded again too.
+        if let Some(f) = &self.formatted {
+            self.forget_pictures = f.picture_uris();
+        }
         self.start(cfg);
     }
 
@@ -166,9 +175,12 @@ impl WebView {
                             .map(|p| web_markdown::formatted_html_to_blocks(&p.html, &p.url, abort))
                             .collect::<Option<Vec<_>>>()
                             .ok_or_else(|| anyhow::anyhow!(tr("msg.aborted")))?;
+                        // Looked up here, away from the window: it may ask a name server.
+                        let local = pages.iter().map(|p| web::is_local_page(&p.url)).collect();
                         Ok(Loaded::Formatted(
                             pages,
                             Box::new(Prepared::new(blocks, &opts)),
+                            local,
                         ))
                     });
                     let _ = tx.send(r);
@@ -224,10 +236,10 @@ impl WebView {
 
     fn show(&mut self, loaded: Loaded, cfg: &Config, named: &[FltFilter]) -> anyhow::Result<()> {
         let content = match loaded {
-            Loaded::Formatted(pages, prepared) => {
+            Loaded::Formatted(pages, prepared, local) => {
                 let labels = pages.iter().map(label).collect();
                 let mut view = MarkdownView::from_prepared(*prepared, labels)
-                    .with_page_urls(pages.iter().map(|page| page.url.clone()).collect());
+                    .with_page_urls(pages.iter().map(|page| page.url.clone()).collect(), &local);
                 match self.land.take() {
                     Some(true) => view.first_diff(),
                     Some(false) => view.last_diff(),
@@ -252,7 +264,10 @@ impl WebView {
                     })
                     .collect();
                 self.pages = Some(pages);
-                Content::Text(TextView::new(docs, cfg))
+                let mut view = TextView::new(docs, cfg);
+                // How the pages are shown is chosen in this view's toolbar alone.
+                view.modes_elsewhere = true;
+                Content::Text(view)
             }
             Loaded::Tree(pages, temps, outcome) => {
                 let roots = temps.iter().map(|t| t.path().to_path_buf()).collect();
@@ -339,9 +354,14 @@ impl WebView {
         }
     }
 
-    /// Mode switcher and reload button, then a progress or error message while there is no inner view.
+    /// The toolbar choosing how the pages are shown, with the reload button; the view shown
+    /// draws its own toolbar of differences and tools below it. Then a progress or error
+    /// message while there is no view.
     pub fn header(&mut self, ui: &mut Ui, cfg: &Config, named: &[FltFilter]) {
         let was_loading = self.job.is_some();
+        for uri in std::mem::take(&mut self.forget_pictures) {
+            ui.ctx().forget_image(&uri);
+        }
         self.poll(cfg, named);
         let mut mode = self.mode;
         let mut reload = false;
@@ -366,10 +386,6 @@ impl WebView {
             .clicked()
             {
                 reload = true;
-            }
-            if let Some(formatted) = &mut self.formatted {
-                widgets::toolbar_sep(ui);
-                formatted.nav(ui);
             }
         });
         if mode != self.mode {

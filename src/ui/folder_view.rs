@@ -343,6 +343,12 @@ pub struct FolderView {
     pub items: Vec<DirItem>,
     pub filter_spec: String,
     filter: FileFilter,
+    /// For a working folder compared with a revision of it: that folder, and the revision the
+    /// first root is a copy of. What Git ignores in the folder is left out whatever the filter
+    /// says; Git is asked each time the folders are compared, so what it ignores now is left
+    /// out, such as output built after the tab was opened. A job saved from the tab takes the
+    /// revision again from the repository rather than this temporary copy.
+    revision: Option<(PathBuf, String)>,
     fopts: FolderOptions,
     dopts: DiffOptions,
     running: Option<Running>,
@@ -724,7 +730,61 @@ impl FolderView {
         Self::with_snapshot(roots, display_roots, temps, filter_spec, named, cfg, None)
     }
 
+    /// A revision's copy of a folder (the first root) compared with the working folder `work`
+    /// (the second), leaving out what Git ignores in `work` from the first scan on. `rev` is the
+    /// revision the copy is of. The compare is not started, so other settings can be made
+    /// first: call [`FolderView::start_compare`].
+    pub fn against_revision(
+        roots: Vec<PathBuf>,
+        display_roots: Vec<String>,
+        filter_spec: &str,
+        named: &[FltFilter],
+        cfg: &Config,
+        work: PathBuf,
+        rev: &str,
+    ) -> Self {
+        let mut v = Self::with_options(roots, display_roots, Vec::new(), filter_spec, named, cfg);
+        v.revision = Some((work, rev.to_string()));
+        v.read_only[0] = true;
+        v
+    }
+
+    /// Like [`FolderView::new`], without starting the compare.
+    fn with_options(
+        roots: Vec<PathBuf>,
+        display_roots: Vec<String>,
+        temps: Vec<tempfile::TempDir>,
+        filter_spec: &str,
+        named: &[FltFilter],
+        cfg: &Config,
+    ) -> Self {
+        Self::unstarted(roots, display_roots, temps, filter_spec, named, cfg, None)
+    }
+
     fn with_snapshot(
+        roots: Vec<PathBuf>,
+        display_roots: Vec<String>,
+        temps: Vec<tempfile::TempDir>,
+        filter_spec: &str,
+        named: &[FltFilter],
+        cfg: &Config,
+        snapshot_options: Option<DiffOptions>,
+    ) -> Self {
+        let mut v = Self::unstarted(
+            roots,
+            display_roots,
+            temps,
+            filter_spec,
+            named,
+            cfg,
+            snapshot_options,
+        );
+        v.start_compare();
+        v
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unstarted(
         roots: Vec<PathBuf>,
         display_roots: Vec<String>,
         temps: Vec<tempfile::TempDir>,
@@ -780,6 +840,7 @@ impl FolderView {
             items: Vec::new(),
             filter_spec: filter_spec.to_string(),
             filter: FileFilter::resolve(filter_spec, named),
+            revision: None,
             fopts: cfg.folder.clone(),
             dopts: cfg.comparison_options(),
             running: None,
@@ -838,7 +899,6 @@ impl FolderView {
         v.archive_sources = archive_sources;
         v.archive_dirty = archive_dirty;
         v.set_rules(cfg, cfg.rules.clone());
-        v.start_compare();
         v
     }
 
@@ -1026,7 +1086,9 @@ impl FolderView {
     }
 
     /// This comparison as a compare job: its folders, filter, method, rules and the comparison
-    /// options that are on, so the job compares as this tab does.
+    /// options that are on, so the job compares as this tab does. A compare with a revision
+    /// names the working folder and the revision, which the job takes from the repository each
+    /// time it runs, leaving out what Git ignores, as this tab does.
     pub fn as_job(&self, cfg: &Config) -> crate::core::job::Job {
         use crate::core::diff::WhitespaceMode;
         use crate::core::folder::CompareMethod;
@@ -1041,10 +1103,15 @@ impl FolderView {
             CompareMethod::DateSize => "datesize",
             CompareMethod::Size => "size",
         };
+        let (left, rev) = match &self.revision {
+            Some((_, rev)) => (None, Some(rev.clone())),
+            None => (Some(path(0)), None),
+        };
         crate::core::job::Job {
-            left: Some(path(0)),
+            left,
             base: (n == 3).then(|| path(1)),
             right: Some(path(n.saturating_sub(1))),
+            rev,
             recursive: self.fopts.recursive,
             filter: Some(self.filter_spec.trim().to_string()).filter(|f| !f.is_empty()),
             method: Some(method.into()),
@@ -1128,7 +1195,13 @@ impl FolderView {
             self.dopts.clone(),
             progress.clone(),
         );
+        let work = self.revision.as_ref().map(|(work, _)| work.clone());
         let handle = std::thread::spawn(move || {
+            // Asked here, off the window's thread, each time the folders are compared.
+            let filter = match work {
+                Some(work) => crate::core::vcs::without_ignored(filter, &work, &pr.abort),
+                None => filter,
+            };
             Scanner {
                 roots: &roots,
                 filter: &filter,
@@ -2557,7 +2630,9 @@ impl FolderView {
         }
         let scope = folder_sync::Scope {
             complete: true,
-            excluded: self.filter.excludes_anything() || self.fopts.skip_hidden,
+            excluded: self.filter.excludes_anything()
+                || self.revision.is_some()
+                || self.fopts.skip_hidden,
             filter: self.filter_spec.clone(),
             skip_hidden: self.fopts.skip_hidden,
             copy_links: false,

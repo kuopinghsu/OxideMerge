@@ -27,8 +27,8 @@ const STRIPE: f32 = 3.0;
 const MARGIN: f32 = 8.0;
 /// Room between the lines hatched over the place of a block a page lacks.
 const HATCH: f32 = 8.0;
-/// Height of the strip naming the pages.
-const HEADER: f32 = 28.0;
+/// Height of the strip naming the pages, as tall as a text compare pane's.
+const HEADER: f32 = 36.0;
 /// Indentation of a block per list it is nested in.
 const INDENT: f32 = 18.0;
 /// Height of a block not shown yet.
@@ -54,7 +54,14 @@ struct Glide {
 
 pub struct MarkdownView {
     pages: Vec<Vec<Block>>,
+    /// The pictures of each block of each page, as written in its Markdown.
+    images: Vec<Vec<Vec<String>>>,
+    /// The pictures shown under each block: [`Self::images`] made absolute against the page,
+    /// without those that cannot be loaded or may not be (see [`pictures`]).
+    pictures: Vec<Vec<Vec<String>>>,
     labels: Vec<String>,
+    /// The name and folder each page's header shows.
+    names: Vec<(String, String)>,
     rows: Vec<Row>,
     /// What differs within each block of each row, page by page.
     marks: Vec<Vec<Option<Marks>>>,
@@ -75,7 +82,7 @@ pub struct MarkdownView {
     /// so a difference mark stays where it is however far the pages have been scrolled.
     stable: Vec<f32>,
     /// The column width and line height `stable` was worked out for.
-    stable_for: (f32, f32),
+    stable_for: (f32, f32, usize),
     /// The tables laid out so far, by row and page.
     tables: std::collections::HashMap<(usize, usize), TableLayout>,
     /// How far the pages are scrolled down, in pixels.
@@ -102,6 +109,8 @@ pub struct MarkdownView {
 /// pages this takes a while.
 pub struct Prepared {
     pages: Vec<Vec<Block>>,
+    /// The pictures of each block of each page, shown under its text.
+    images: Vec<Vec<Vec<String>>>,
     rows: Vec<Row>,
     marks: Vec<Vec<Option<Marks>>>,
     diffs: Vec<Range<usize>>,
@@ -109,14 +118,40 @@ pub struct Prepared {
 
 impl Prepared {
     /// `opts` says whether and how changed words are found, as in the text compare.
-    pub fn new(pages: Vec<Vec<Block>>, opts: &DiffOptions) -> Self {
+    pub fn new(mut pages: Vec<Vec<Block>>, opts: &DiffOptions) -> Self {
         let rows = web_markdown::align(&pages);
         let mut marks = web_markdown::marks(&pages, &rows, opts);
+        // Pictures are compared as written, `![alt](address)`, and shown as their alt text
+        // with the picture under the block.
+        let mut images = Vec::with_capacity(pages.len());
+        let mut cuts = Vec::with_capacity(pages.len());
+        for page in &mut pages {
+            let (mut page_images, mut page_cuts) = (Vec::new(), Vec::new());
+            for block in page.iter_mut() {
+                let (text, uris, cut) = split_images(&block.text);
+                block.text = text;
+                page_images.push(uris);
+                page_cuts.push(cut);
+            }
+            images.push(page_images);
+            cuts.push(page_cuts);
+        }
         for (row, marks) in rows.iter().zip(&mut marks) {
             for (p, m) in marks.iter_mut().enumerate() {
                 match (m, row.cells[p]) {
-                    (Some(Marks::Text(r)), Some(b)) => *r = viewer_ranges(&pages[p][b].text, r),
-                    (Some(Marks::Table(t)), _) => prepare_table(t),
+                    (Some(Marks::Text(r)), Some(b)) => {
+                        *r = viewer_ranges(&pages[p][b].text, &after_cuts(r, &cuts[p][b]));
+                    }
+                    (Some(Marks::Table(t)), _) => {
+                        for (text, cell) in t.iter_mut().flatten() {
+                            let (shown, _, cut) = split_images(text);
+                            if let Cell::Words(v) = cell {
+                                *v = after_cuts(v, &cut);
+                            }
+                            *text = shown;
+                        }
+                        prepare_table(t);
+                    }
                     _ => {}
                 }
             }
@@ -127,6 +162,7 @@ impl Prepared {
             .collect();
         Prepared {
             pages,
+            images,
             rows,
             marks,
             diffs,
@@ -143,6 +179,7 @@ impl MarkdownView {
     pub fn from_prepared(prepared: Prepared, labels: Vec<String>) -> Self {
         let Prepared {
             pages,
+            images,
             rows,
             marks,
             diffs,
@@ -150,10 +187,13 @@ impl MarkdownView {
         MarkdownView {
             heights: vec![ESTIMATE; rows.len()],
             stable: Vec::new(),
-            stable_for: (0.0, 0.0),
+            stable_for: (0.0, 0.0, 0),
             tables: Default::default(),
             shift: 0.0,
             pages,
+            pictures: pictures(&images, &[], &[]),
+            images,
+            names: labels.iter().map(|l| (l.clone(), String::new())).collect(),
             labels,
             rows,
             marks,
@@ -173,8 +213,23 @@ impl MarkdownView {
         }
     }
 
-    pub fn with_page_urls(mut self, urls: Vec<url::Url>) -> Self {
+    /// The addresses of the pages, which their links and pictures are relative to, and whether
+    /// each is on this computer or a private network, so that its pictures may be there too.
+    pub fn with_page_urls(mut self, urls: Vec<url::Url>, local: &[bool]) -> Self {
+        self.pictures = pictures(&self.images, &urls, local);
         self.page_urls = urls;
+        self
+    }
+
+    /// The pictures this view shows, to forget when the pages are loaded again.
+    pub fn picture_uris(&self) -> Vec<String> {
+        self.pictures.iter().flatten().flatten().cloned().collect()
+    }
+
+    /// The name and folder each page's header shows, as the text compare's panes show them;
+    /// by default the whole label.
+    pub fn with_header_names(mut self, names: Vec<(String, String)>) -> Self {
+        self.names = names;
         self
     }
 
@@ -275,7 +330,9 @@ impl MarkdownView {
     /// to be steady and roughly in proportion, since what it places is the overview.
     fn update_stable(&mut self, ui: &Ui, col: f32) {
         let line = ui.text_style_height(&egui::TextStyle::Body);
-        if self.stable.len() == self.rows.len() && self.stable_for == (col, line) {
+        // Worked out again when a picture fails, which is then not shown.
+        let key = (col, line, crate::ui::page_images::failures());
+        if self.stable.len() == self.rows.len() && self.stable_for == key {
             return;
         }
         let body = egui::TextStyle::Body.resolve(ui.style());
@@ -290,6 +347,8 @@ impl MarkdownView {
                     let block = &self.pages[p][b];
                     let indent = INDENT * block.depth as f32;
                     let width = (col - 2.0 * PAD[0] - indent).max(20.0);
+                    let shown = self.pictures.get(p).and_then(|i| i.get(b));
+                    let pictures = shown.map_or(0.0, |u| pictures_height(u, width));
                     let inner = match self
                         .marks
                         .get(i)
@@ -304,7 +363,7 @@ impl MarkdownView {
                                 .lines()
                                 .map(|l| (l.chars().count() as f32 / per).ceil().max(1.0))
                                 .sum();
-                            lines.max(1.0) * line
+                            lines.max(1.0) * line + pictures
                         }
                     };
                     tall = tall.max(inner + 2.0 * PAD[1]);
@@ -312,7 +371,7 @@ impl MarkdownView {
                 tall
             })
             .collect();
-        self.stable_for = (col, line);
+        self.stable_for = key;
     }
 
     /// Where row `r` starts below the first, in stable heights.
@@ -477,7 +536,38 @@ impl MarkdownView {
     }
 
     /// `location` shows the location pane, as it does in the text compare.
+    /// The header of page `p`, drawn as the text compare draws a pane's, with the lock that
+    /// says the page is only compared here.
+    fn pane_header(&self, ui: &mut Ui, p: usize, n: usize, rect: Rect) {
+        let (name, dir) = self.names.get(p).cloned().unwrap_or_default();
+        let header = widgets::PaneHeader {
+            side: p,
+            panes: n,
+            // As in the text compare, one page is always the active one: the left until
+            // another is clicked.
+            active: p == self.active,
+            name: &name,
+            dir: &dir,
+            modified: false,
+            hover: self.labels.get(p).map_or("", String::as_str),
+        };
+        widgets::pane_header(ui, rect, &header, |ui| {
+            // Pages are only compared here, never edited: locked, as text read from a file is.
+            ui.add_enabled_ui(false, |ui| {
+                widgets::toggle_icon_button(
+                    ui,
+                    &mut true,
+                    Some(Icon::Lock),
+                    "",
+                    tr("label.read_only"),
+                )
+                .on_disabled_hover_text(tr("tip.compare_only"));
+            });
+        });
+    }
+
     pub fn ui(&mut self, ui: &mut Ui, c: &Colors, location: bool) {
+        crate::ui::page_images::install(ui.ctx());
         if !std::mem::take(&mut self.nav_drawn) && !self.hosted {
             widgets::toolbar(ui, |ui| self.nav(ui));
             self.nav_drawn = false;
@@ -495,7 +585,7 @@ impl MarkdownView {
         );
         let (lefts, col) =
             self.columns(header.left() + MARGIN, header.width() - side - 2.0 * MARGIN);
-        for (p, (left, label)) in lefts.iter().zip(&self.labels).enumerate() {
+        for (p, left) in lefts.iter().enumerate().take(self.labels.len()) {
             if p > 0 {
                 ui.painter().vline(
                     left - GAP / 2.0,
@@ -503,26 +593,8 @@ impl MarkdownView {
                     Stroke::new(1.0_f32, pal.border),
                 );
             }
-            let rect = Rect::from_min_size(
-                pos2(*left + PAD[0], header.top()),
-                vec2(col - 2.0 * PAD[0], HEADER),
-            );
-            let mut cell = ui.new_child(
-                UiBuilder::new()
-                    .max_rect(rect)
-                    .layout(Layout::left_to_right(Align::Center)),
-            );
-            // The page last clicked is named in full strength, as its outline is drawn.
-            let color = if self.cursor.is_some() && p == self.active {
-                pal.text
-            } else {
-                pal.text_dim
-            };
-            let text = egui::RichText::new(label)
-                .color(color)
-                .size(crate::ui::theme::size::DENSE);
-            cell.add(egui::Label::new(text).truncate())
-                .on_hover_text(label);
+            let rect = Rect::from_min_size(pos2(*left, header.top()), vec2(col, HEADER));
+            self.pane_header(ui, p, n, rect);
         }
 
         let body = ui.available_rect_before_wrap();
@@ -647,6 +719,7 @@ impl MarkdownView {
             let (lefts, col) = self.columns(origin.x, width);
             let Self {
                 pages,
+                pictures,
                 rows,
                 marks,
                 heights,
@@ -728,6 +801,10 @@ impl MarkdownView {
                                 show_marked(&mut cell, cache, id, &block.text, r, words);
                             }
                             None => show_marked(&mut cell, cache, id, &block.text, &[], words),
+                        }
+                        if !is_table(p) {
+                            let uris = pictures.get(p).and_then(|i| i.get(b));
+                            show_pictures(&mut cell, uris.map_or(&[][..], Vec::as_slice));
                         }
                         if let (Some(page), Some(start)) = (page, commands) {
                             cell.ctx().output_mut(|out| {
@@ -872,16 +949,184 @@ fn hatch(out: &mut Vec<Shape>, rect: Rect, stroke: Stroke) {
     }
 }
 
-/// The viewer emits link clicks as URL commands. Resolve fragments against the clicked pane.
-fn resolve_fragment_links(page: &url::Url, commands: &mut [egui::OutputCommand]) {
-    for command in commands {
-        if let egui::OutputCommand::OpenUrl(open) = command {
-            if open.url.starts_with('#') {
-                if let Ok(url) = page.join(&open.url) {
-                    open.url = url.into();
+/// Tallest a picture is shown under its block.
+const PICTURE_HEIGHT: f32 = 240.0;
+
+/// The pictures shown under each block of each page: their addresses made absolute against
+/// the page they are in, `page_urls`, keeping those this app loads. A picture on the web is
+/// shown only for a page loaded from the web, as its browser would show it: a page on this
+/// computer contacts no server by being compared.
+fn pictures(
+    images: &[Vec<Vec<String>>],
+    page_urls: &[url::Url],
+    local: &[bool],
+) -> Vec<Vec<Vec<String>>> {
+    images
+        .iter()
+        .enumerate()
+        .map(|(p, blocks)| {
+            let page = page_urls.get(p);
+            let web = page.is_some_and(|u| matches!(u.scheme(), "http" | "https"));
+            // A page on this computer or a private network loads its pictures from there too.
+            let local = web && local.get(p).copied().unwrap_or(false);
+            blocks
+                .iter()
+                .map(|uris| {
+                    uris.iter()
+                        .map(|u| page.map_or_else(|| u.clone(), |page| resolve(page, u)))
+                        .filter(|u| {
+                            crate::ui::page_images::supported(u)
+                                && (web || !crate::ui::page_images::is_remote(u))
+                        })
+                        .inspect(|u| {
+                            if local && crate::ui::page_images::is_remote(u) {
+                                crate::ui::page_images::trust_local(u);
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// About how tall the pictures `uris` stand under a block `width` wide, as rows of pictures
+/// of the most common shape, leaving out those that failed to load.
+fn pictures_height(uris: &[String], width: f32) -> f32 {
+    let n = uris
+        .iter()
+        .filter(|u| !crate::ui::page_images::failed(u))
+        .count();
+    if n == 0 {
+        return 0.0;
+    }
+    let per_row = (width / (PICTURE_HEIGHT * 4.0 / 3.0)).floor().max(1.0) as usize;
+    let rows = n.div_ceil(per_row);
+    4.0 + rows as f32 * (PICTURE_HEIGHT + 4.0)
+}
+
+/// Shows the pictures `uris` side by side, each no larger than it is or than the room allows.
+/// One that cannot be loaded (missing, or not a picture) is left out: its alt text above names
+/// it.
+fn show_pictures(ui: &mut Ui, uris: &[String]) {
+    let ctx = ui.ctx().clone();
+    let shown = |u: &&String| {
+        ctx.try_load_image(u, egui::load::SizeHint::default())
+            .is_ok()
+    };
+    if !uris.iter().any(|u| shown(&u)) {
+        return;
+    }
+    let width = ui.available_width();
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        for u in uris.iter().filter(shown) {
+            ui.add(
+                egui::Image::from_uri(u.as_str())
+                    .fit_to_original_size(1.0)
+                    .max_width(width)
+                    .max_height(PICTURE_HEIGHT),
+            )
+            .on_hover_text(u.get(..200).unwrap_or(u));
+        }
+    });
+}
+
+/// Markdown `text` as the viewer shows it, with each picture `![alt](address)` written as a
+/// link to it, `[alt](address)`, or as its alt text alone when it is within a link or stored
+/// in the page (`data:`); the addresses of the pictures, in order; and the
+/// byte ranges taken out of `text`, in order.
+fn split_images(text: &str) -> (String, Vec<String>, Vec<Range<usize>>) {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    if !text.contains("![") {
+        return (text.to_string(), Vec::new(), Vec::new());
+    }
+    let mut uris = Vec::new();
+    let mut cuts: Vec<Range<usize>> = Vec::new();
+    let mut links = 0usize;
+    // An open picture: where it starts, whether to keep only its alt text, where that ends.
+    let mut open: Option<(usize, bool, usize)> = None;
+    for (event, span) in Parser::new_ext(text, viewer_options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Link { .. }) => links += 1,
+            Event::End(TagEnd::Link) => links = links.saturating_sub(1),
+            Event::Start(Tag::Image { dest_url, .. }) if open.is_none() => {
+                let inline = dest_url
+                    .get(..5)
+                    .is_some_and(|h| h.eq_ignore_ascii_case("data:"));
+                uris.push(dest_url.to_string());
+                open = Some((span.start, links > 0 || inline, span.start + 2));
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some((start, alt_only, alt_end)) = open.take() {
+                    if text[start..].starts_with("![") {
+                        if alt_only {
+                            cuts.push(start..start + 2);
+                            cuts.push(alt_end..span.end);
+                        } else {
+                            cuts.push(start..start + 1);
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Some((_, _, alt_end)) = &mut open {
+                    *alt_end = (*alt_end).max(span.end);
                 }
             }
         }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for c in &cuts {
+        out.push_str(&text[at..c.start]);
+        at = c.end;
+    }
+    out.push_str(&text[at..]);
+    (out, uris, cuts)
+}
+
+/// The byte ranges `marks` of a text once the ranges `cuts` (in order) are taken out of it:
+/// moved back by what was cut before them, and without the parts that were cut.
+fn after_cuts(marks: &[Range<usize>], cuts: &[Range<usize>]) -> Vec<Range<usize>> {
+    if cuts.is_empty() {
+        return marks.to_vec();
+    }
+    let map = |at: usize| {
+        let mut gone = 0;
+        for c in cuts {
+            if c.start >= at {
+                break;
+            }
+            gone += at.min(c.end) - c.start;
+        }
+        at - gone
+    };
+    marks
+        .iter()
+        .map(|m| map(m.start)..map(m.end))
+        .filter(|m| m.start < m.end)
+        .collect()
+}
+
+/// The viewer emits link clicks as URL commands. Resolve fragments and relative addresses
+/// against the clicked pane.
+fn resolve_fragment_links(page: &url::Url, commands: &mut [egui::OutputCommand]) {
+    for command in commands {
+        if let egui::OutputCommand::OpenUrl(open) = command {
+            open.url = resolve(page, &open.url);
+        }
+    }
+}
+
+/// `address` as written in a page's Markdown, a fragment or an address relative to the page
+/// on its site, made absolute against the `page` it is in.
+fn resolve(page: &url::Url, address: &str) -> String {
+    match url::Url::parse(address) {
+        Err(url::ParseError::RelativeUrlWithoutBase) => page
+            .join(address)
+            .map_or_else(|_| address.to_string(), String::from),
+        _ => address.to_string(),
     }
 }
 
@@ -1393,6 +1638,131 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pictures_show_as_their_alt_text_with_the_picture_under_it() {
+        let text = "See ![The *van*](https://e.com/v.png) and \
+            [![logo](file:///D:/l.png) Home](https://e.com/) ![](data:image/png;base64,AA) \
+            ![x](rel.png)";
+        let (shown, uris, cuts) = split_images(text);
+        assert_eq!(
+            shown,
+            "See [The *van*](https://e.com/v.png) and [logo Home](https://e.com/)  [x](rel.png)"
+        );
+        assert_eq!(
+            uris,
+            [
+                "https://e.com/v.png",
+                "file:///D:/l.png",
+                "data:image/png;base64,AA",
+                "rel.png"
+            ]
+        );
+        // A relative address is the page's own: loaded and opened from where the page is.
+        let page = url::Url::parse("file:///D:/site/v2/index.html").unwrap();
+        assert_eq!(resolve(&page, "rel.png"), "file:///D:/site/v2/rel.png");
+        assert_eq!(resolve(&page, "#top"), "file:///D:/site/v2/index.html#top");
+        assert_eq!(resolve(&page, "https://e.com/"), "https://e.com/");
+        // Highlights move with the text, and those on what was cut are dropped.
+        let van = text.find("van").unwrap();
+        let home = text.find("Home").unwrap();
+        let marks = after_cuts(&[van..van + 3, home..home + 4, 0..1], &cuts);
+        assert_eq!(&shown[marks[0].clone()], "van");
+        assert_eq!(&shown[marks[1].clone()], "Home");
+        assert_eq!(marks[2], 0..1);
+        let inline = text.find("![](").unwrap();
+        let cut_away = inline..inline + 2;
+        assert!(after_cuts(std::slice::from_ref(&cut_away), &cuts).is_empty());
+        // A fingerprint stays with the link, out of the address the picture loads from.
+        let (shown, uris, _) = split_images(r#"![Sign](img/s.png "3f2a9c1b")"#);
+        assert_eq!(shown, r#"[Sign](img/s.png "3f2a9c1b")"#);
+        assert_eq!(uris, ["img/s.png"]);
+        assert_eq!(
+            split_images("no pictures"),
+            ("no pictures".into(), vec![], vec![])
+        );
+    }
+
+    #[test]
+    fn changed_alt_text_of_a_picture_is_highlighted_where_shown() {
+        let base = url::Url::parse("https://e.com/").unwrap();
+        let pages = vec![
+            web_markdown::html_to_blocks(r#"<p><img src="a.png" alt="old van"></p>"#, Some(&base)),
+            web_markdown::html_to_blocks(r#"<p><img src="a.png" alt="new van"></p>"#, Some(&base)),
+        ];
+        let prepared = Prepared::new(pages, &DiffOptions::default());
+        assert_eq!(prepared.pages[0][0].text, "[old van](https://e.com/a.png)");
+        assert_eq!(prepared.images[1][0], ["https://e.com/a.png"]);
+        let Some(Marks::Text(r)) = &prepared.marks[0][0] else {
+            panic!("{:?}", prepared.marks[0][0]);
+        };
+        assert_eq!(&prepared.pages[0][0].text[r[0].clone()], "old");
+    }
+
+    #[test]
+    fn pictures_are_counted_in_rows_of_the_room() {
+        let one = vec!["data:image/png;base64,AA".to_string()];
+        let six = vec![one[0].clone(); 6];
+        assert_eq!(pictures_height(&[], 600.0), 0.0);
+        assert_eq!(pictures_height(&one, 600.0), 4.0 + PICTURE_HEIGHT + 4.0);
+        // 320 px a picture: one to a row in 600 px, so six rows.
+        assert_eq!(
+            pictures_height(&six, 600.0),
+            4.0 + 6.0 * (PICTURE_HEIGHT + 4.0)
+        );
+        assert_eq!(
+            pictures_height(&six, 1000.0),
+            4.0 + 2.0 * (PICTURE_HEIGHT + 4.0)
+        );
+    }
+
+    #[test]
+    fn pictures_of_a_local_web_page_may_load_from_there() {
+        let images = vec![vec![vec!["img/a.png".to_string()]]];
+        let page = [url::Url::parse("http://intranet.test/docs/").unwrap()];
+        let got = pictures(&images, &page, &[true]);
+        assert_eq!(got[0][0], ["http://intranet.test/docs/img/a.png"]);
+    }
+
+    #[test]
+    fn pictures_load_from_where_the_page_is() {
+        let images = vec![
+            vec![vec![
+                "images/a.png".to_string(),
+                "https://cdn.example.com/b.png".into(),
+                "data:image/png;base64,AA".into(),
+            ]],
+            vec![vec![
+                "images/a.png".to_string(),
+                "https://cdn.example.com/b.png".into(),
+            ]],
+        ];
+        let pages = [
+            url::Url::parse("file:///D:/site/v1/index.html").unwrap(),
+            url::Url::parse("https://example.com/v2/").unwrap(),
+        ];
+        let got = pictures(&images, &pages, &[false, false]);
+        // A page on this computer contacts no web server for its pictures.
+        assert_eq!(
+            got[0][0],
+            [
+                "file:///D:/site/v1/images/a.png",
+                "data:image/png;base64,AA"
+            ]
+        );
+        assert_eq!(
+            got[1][0],
+            [
+                "https://example.com/v2/images/a.png",
+                "https://cdn.example.com/b.png"
+            ]
+        );
+        // Without its page, a relative address cannot be loaded.
+        assert_eq!(
+            pictures(&images, &[], &[])[0][0],
+            ["data:image/png;base64,AA"]
+        );
+    }
+
+    #[test]
     fn table_columns_fit_the_room() {
         assert_eq!(fit(&[10.0, 20.0], 100.0), [10.0, 20.0]);
         // The narrow column keeps its width; the wide ones share what is left.
@@ -1413,7 +1783,7 @@ mod tests {
             vec!["Standard".into(), "Full".into()],
             &DiffOptions::default(),
         )
-        .with_page_urls(pages.to_vec());
+        .with_page_urls(pages.to_vec(), &[]);
         let ctx = egui::Context::default();
         let colors = crate::ui::theme::colors(false);
         let mut frame = |events| {
@@ -1966,7 +2336,7 @@ mod tests {
         let c = crate::ui::theme::colors(true);
         // Steady heights as the window works them out, which drawing never changes.
         v.stable = vec![30.0, 30.0, 300.0, 30.0, 30.0];
-        v.stable_for = (500.0, 14.0);
+        v.stable_for = (500.0, 14.0, crate::ui::page_images::failures());
         v.heights = vec![ESTIMATE; v.rows.len()];
         let before = v.location_marks(&c);
         assert!(!before.is_empty(), "no difference to mark");

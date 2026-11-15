@@ -251,6 +251,7 @@ pub fn mini_icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
         focus_ring(ui, &resp, rect, theme::radius::XS);
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(label)
 }
 
 /// Square toolbar button showing an icon; highlights on hover.
@@ -270,6 +271,7 @@ pub fn icon_button_enabled(ui: &mut Ui, enabled: bool, icon: Icon, tip: &str) ->
         enabled,
     )
     .on_hover_text(tip)
+    .on_disabled_hover_text(tip)
 }
 
 /// [`icon_button`] whose tooltip adds `hint`, dimmed, below `tip`; it is named by `tip` alone.
@@ -412,6 +414,17 @@ pub fn toggle_icon_button(
 
 /// Pill-shaped group of mutually exclusive options.
 pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &str)]) -> bool {
+    let options: Vec<(T, &str, Option<&str>)> =
+        options.iter().map(|&(v, label)| (v, label, None)).collect();
+    segmented_tips(ui, value, &options)
+}
+
+/// [`segmented`] with a tooltip for each choice that has one.
+pub fn segmented_tips<T: PartialEq + Copy>(
+    ui: &mut Ui,
+    value: &mut T,
+    options: &[(T, &str, Option<&str>)],
+) -> bool {
     let p = pal(ui);
     let mut changed = false;
     egui::Frame::new()
@@ -421,9 +434,9 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T,
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                for (v, label) in options {
+                for (v, label, tip) in options {
                     let sel = *value == *v;
-                    if paint_button(
+                    let mut r = paint_button(
                         ui,
                         None,
                         label,
@@ -432,10 +445,11 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T,
                         Vec2::new(0.0, 24.0),
                         Look::Segment(sel),
                         true,
-                    )
-                    .clicked()
-                        && !sel
-                    {
+                    );
+                    if let Some(tip) = tip {
+                        r = r.on_hover_text(*tip);
+                    }
+                    if r.clicked() && !sel {
                         *value = *v;
                         changed = true;
                     }
@@ -773,7 +787,8 @@ pub fn search_edit(ui: &mut Ui, text: &mut String, hint: &str, width: f32) -> Re
         );
         let clear = ui
             .interact(clear_rect, resp.id.with("clear"), Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(crate::i18n::tr("btn.clear_search"));
         clear.widget_info(|| {
             WidgetInfo::labeled(Role::Button, true, crate::i18n::tr("btn.clear_search"))
         });
@@ -830,6 +845,73 @@ impl Outcome {
 }
 
 /// Identity color of a compare side (left / middle / right).
+/// What the header of one side of a comparison names.
+pub struct PaneHeader<'a> {
+    pub side: usize,
+    pub panes: usize,
+    /// The side last clicked: underlined in its color, its name in bold.
+    pub active: bool,
+    pub name: &'a str,
+    /// The folder shown dimmed beside the name; empty for none.
+    pub dir: &'a str,
+    /// Changed and not saved: a dot after the name.
+    pub modified: bool,
+    /// Shown when the name is pointed at.
+    pub hover: &'a str,
+}
+
+/// The header of one side of a text or Formatted comparison, in `rect`: the side's chip, the
+/// name and folder, and `controls` (such as the lock) at the right end.
+pub fn pane_header(ui: &mut Ui, rect: Rect, h: &PaneHeader, controls: impl FnOnce(&mut Ui)) {
+    use egui::text::{LayoutJob, TextFormat};
+    let p = pal(ui);
+    if h.active {
+        ui.painter().hline(
+            rect.left() + 1.0..=rect.right() - 2.0,
+            rect.bottom() - 1.0,
+            Stroke::new(2.0_f32, side_color(ui, h.side, h.panes)),
+        );
+    }
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .id_salt(("pane_header", h.side))
+            .max_rect(rect.shrink2(Vec2::new(8.0, 3.0))),
+        |ui| {
+            ui.horizontal_centered(|ui| {
+                side_chip(ui, h.side, h.panes);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    controls(ui);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let mut job = LayoutJob::default();
+                        let name_font = if h.active {
+                            theme::semibold(theme::size::CONTROL)
+                        } else {
+                            FontId::proportional(theme::size::CONTROL)
+                        };
+                        let format = |font_id, color| TextFormat {
+                            font_id,
+                            color,
+                            ..Default::default()
+                        };
+                        job.append(h.name, 0.0, format(name_font, p.text));
+                        if h.modified {
+                            let font = FontId::proportional(theme::size::CAPTION);
+                            job.append("  ●", 0.0, format(font, p.warning));
+                        }
+                        if !h.dir.is_empty() {
+                            let font = FontId::proportional(theme::size::SMALL);
+                            job.append(&format!("   {}", h.dir), 0.0, format(font, p.text_dim));
+                        }
+                        ui.add(egui::Label::new(job).truncate().selectable(false))
+                            .on_hover_text(h.hover);
+                    });
+                });
+            });
+        },
+    );
+}
+
 pub fn side_color(ui: &Ui, side: usize, panes: usize) -> Color32 {
     let idx = if panes == 2 && side == 1 { 2 } else { side };
     pal(ui).sides[idx.min(2)]

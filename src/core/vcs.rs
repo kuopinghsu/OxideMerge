@@ -577,6 +577,33 @@ fn no_working_copy<T>(path: &Path, result: Result<T>) -> Result<T> {
 
 /// `rev` trimmed, or the default revision of the system holding `path` when it is empty: the
 /// revision that `show_file` and `export_folder` compare with.
+/// `filter`, also leaving out what the Git working copy ignores in folder `path`, as a folder
+/// compared with a revision of it does: no revision holds build output or the like, so it
+/// would only be listed as new. `filter` as it is for another version control system, or when
+/// Git cannot say.
+pub fn without_ignored(
+    filter: crate::core::filter::FileFilter,
+    path: &Path,
+    cancel: &AtomicBool,
+) -> crate::core::filter::FileFilter {
+    use crate::core::filter::{FileFilter, Skipped};
+    match ignored(path, cancel) {
+        Some(paths) => {
+            FileFilter::Except(Box::new(filter), std::sync::Arc::new(Skipped::new(paths)))
+        }
+        None => filter,
+    }
+}
+
+/// What a Git working copy ignores in folder `path` (see [`git::ignored`]); none for another
+/// version control system, or when Git cannot say.
+pub fn ignored(path: &Path, cancel: &AtomicBool) -> Option<Vec<String>> {
+    match Vcs::of(path) {
+        Vcs::Git => git::ignored(path, cancel).ok(),
+        Vcs::Subversion | Vcs::Mercurial => None,
+    }
+}
+
 pub fn rev_or_default<'a>(path: &Path, rev: &'a str) -> &'a str {
     Vcs::of(path).rev_or_default(rev)
 }

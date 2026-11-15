@@ -19,6 +19,9 @@ const MAX_RESOURCES: usize = 400;
 const DOWNLOAD_THREADS: usize = 8;
 /// File name of the page itself in a resource tree.
 pub const PAGE_FILE: &str = "index.html";
+/// Folder of a resource tree holding the pictures and other files stored in the page as
+/// `data:` URIs.
+const INLINE_DIR: &str = "_inline";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum WebMode {
@@ -243,7 +246,7 @@ fn is_local(url: &Url) -> bool {
 
 /// Whether the page at `url` is on this computer or a private network, so that it may load
 /// from there: every address of its host must be.
-fn is_local_page(url: &Url) -> bool {
+pub fn is_local_page(url: &Url) -> bool {
     locality(url) == Some(true)
 }
 
@@ -322,6 +325,44 @@ fn fetch(
         content_type,
         bytes,
     })
+}
+
+/// The bytes of a picture a page shows, for a preview: a `data:` URI, a file on this computer,
+/// or a picture on a web address. Unless `local_ok`, for a picture of a page that is itself on
+/// this computer or a private network (see [`is_local_page`]), addresses there are not loaded
+/// over the web, as a page loaded from the web may name them.
+pub fn image_bytes(uri: &str, local_ok: bool, abort: &AtomicBool) -> Result<Vec<u8>> {
+    if uri
+        .get(..5)
+        .is_some_and(|h| h.eq_ignore_ascii_case("data:"))
+    {
+        let (bytes, _) = data_uri(uri).context("not a readable data: URI")?;
+        if bytes.len() as u64 > RESOURCE_LIMIT {
+            bail!("larger than {} MB", RESOURCE_LIMIT >> 20);
+        }
+        return Ok(bytes);
+    }
+    let url = Url::parse(uri).with_context(|| format!("invalid address: {uri}"))?;
+    match url.scheme() {
+        "file"
+            if url
+                .host_str()
+                .is_none_or(|h| h.is_empty() || h == "localhost") => {}
+        "http" | "https" if local_ok || !is_local(&url) => {}
+        _ => bail!("{url}: not loaded"),
+    }
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    let f = fetch(
+        AGENT.get_or_init(agent),
+        &url,
+        RESOURCE_LIMIT,
+        local_ok,
+        abort,
+    )?;
+    if f.status >= 400 {
+        bail!("{url}: HTTP {}", f.status);
+    }
+    Ok(f.bytes)
 }
 
 /// Charset named in a `Content-Type` header or a `<meta>` tag.
@@ -561,6 +602,12 @@ pub(super) fn attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
     attr_entry(attrs, name).flatten()
 }
 
+/// The attribute `name` as the browser reads it, with its character references decoded:
+/// `src="a.png?w=1&amp;h=2"` is `a.png?w=1&h=2`.
+pub(super) fn attr_text(attrs: &str, name: &str) -> Option<String> {
+    attr(attrs, name).map(decode)
+}
+
 /// Whether the attribute `name` is there, with or without a value.
 pub(super) fn has_attr(attrs: &str, name: &str) -> bool {
     attr_entry(attrs, name).is_some()
@@ -658,14 +705,20 @@ pub(super) fn entity(name: &str) -> Option<char> {
 
 /// Decodes character references and turns every whitespace run into a single space.
 fn push_text(out: &mut String, s: &str) {
+    push_collapsed(out, &decode(s));
+}
+
+/// Decodes character references, keeping the white space.
+pub(super) fn decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(amp) = rest.find('&') {
-        push_collapsed(out, &rest[..amp]);
+        out.push_str(&rest[..amp]);
         let tail = &rest[amp + 1..];
         let semi = tail.find(';').filter(|&k| k <= 10);
         match semi.and_then(|k| entity(&tail[..k]).map(|c| (k, c))) {
             Some((k, c)) => {
-                push_collapsed(out, c.encode_utf8(&mut [0; 4]));
+                out.push(c);
                 rest = &tail[k + 1..];
             }
             None => {
@@ -674,7 +727,8 @@ fn push_text(out: &mut String, s: &str) {
             }
         }
     }
-    push_collapsed(out, rest);
+    out.push_str(rest);
+    out
 }
 
 fn push_collapsed(out: &mut String, s: &str) {
@@ -696,8 +750,18 @@ pub fn html_to_text(html: &str) -> String {
     for tok in super::web_markdown::visible_tokens(html) {
         match tok {
             Token::Text(t) => push_text(&mut out, t),
-            Token::Tag(name, _, closing) => {
-                if BLOCK.contains(&name.as_str()) {
+            Token::Tag(name, attrs, closing) => {
+                // A picture stands in the text as its alt text, so that a changed or added
+                // picture shows; decorative ones (`alt=""`) add nothing.
+                if name == "img" && !closing {
+                    if let Some(alt) = attr(attrs, "alt") {
+                        if !out.is_empty() && !out.ends_with([' ', '\n', '\t']) {
+                            out.push(' ');
+                        }
+                        push_text(&mut out, alt);
+                        out.push(' ');
+                    }
+                } else if BLOCK.contains(&name.as_str()) {
                     while out.ends_with(' ') {
                         out.pop();
                     }
@@ -757,9 +821,63 @@ pub fn format_html(html: &str) -> String {
     out
 }
 
+/// The image addresses of a `srcset` attribute, read as browsers do: an address runs to the
+/// next white space, so it may hold commas (`data:` URIs, `w_100,h_80` paths), and a comma
+/// within the descriptors after it only ends the candidate outside parentheses.
+pub(super) fn srcset_urls(set: &str) -> Vec<&str> {
+    let b = set.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b',') {
+            i += 1;
+        }
+        if i >= b.len() {
+            return out;
+        }
+        let start = i;
+        while i < b.len() && !b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut url = &set[start..i];
+        if url.ends_with(',') {
+            url = url.trim_end_matches(',');
+        } else {
+            let mut in_parens = false;
+            while i < b.len() {
+                match b[i] {
+                    b'(' => in_parens = true,
+                    b')' => in_parens = false,
+                    b',' if !in_parens => {
+                        i += 1;
+                        break;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        if !url.is_empty() {
+            out.push(url);
+        }
+    }
+}
+
 /// Addresses of the scripts, stylesheets, icons, images, media and frames a page loads, in document order.
 pub fn resources(html: &str, page: &Url) -> Vec<Url> {
+    resource_urls(html, page, false)
+}
+
+/// The `data:` URIs of a page's resources (pictures stored in the page itself), in document
+/// order: their files are not downloaded, but are in the page.
+fn inline_resources(html: &str, page: &Url) -> Vec<Url> {
+    resource_urls(html, page, true)
+}
+
+/// [`resources`], or with `inline` its `data:` URIs instead.
+fn resource_urls(html: &str, page: &Url, inline: bool) -> Vec<Url> {
     let mut base = page.clone();
+    let mut based = false;
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     let mut add = |base: &Url, raw: &str, out: &mut Vec<Url>| {
@@ -768,7 +886,9 @@ pub fn resources(html: &str, page: &Url) -> Vec<Url> {
             return;
         }
         let Ok(mut u) = base.join(raw) else { return };
-        if !matches!(u.scheme(), "http" | "https" | "file") {
+        if inline != (u.scheme() == "data")
+            || !matches!(u.scheme(), "http" | "https" | "file" | "data")
+        {
             return;
         }
         u.set_fragment(None);
@@ -780,11 +900,17 @@ pub fn resources(html: &str, page: &Url) -> Vec<Url> {
         let Token::Tag(name, attrs, false) = tok else {
             continue;
         };
-        let a = |n| attr(attrs, n);
+        // Values as the browser reads them: `a.png?w=1&amp;h=2` loads `a.png?w=1&h=2`.
+        let a = |n| attr_text(attrs, n);
         match name.as_str() {
-            "base" => {
-                if let Some(u) = a("href").and_then(|h| page.join(h.trim()).ok()) {
-                    base = u;
+            // Only the first `<base>` with an address counts, also when the address is not
+            // valid: the page's own address is used then.
+            "base" if !based => {
+                if let Some(h) = a("href") {
+                    based = true;
+                    if let Ok(u) = page.join(h.trim()) {
+                        base = u;
+                    }
                 }
             }
             "link" => {
@@ -794,29 +920,33 @@ pub fn resources(html: &str, page: &Url) -> Vec<Url> {
                     .any(|r| rel.contains(r))
                 {
                     if let Some(h) = a("href") {
-                        add(&base, h, &mut out);
+                        add(&base, &h, &mut out);
+                    }
+                    for u in srcset_urls(&a("imagesrcset").unwrap_or_default()) {
+                        add(&base, u, &mut out);
                     }
                 }
             }
             "script" | "img" | "iframe" | "frame" | "embed" | "audio" | "video" | "source"
-            | "track" => {
+            | "track" | "input" => {
+                let image_button =
+                    a("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("image"));
+                if name == "input" && !image_button {
+                    continue;
+                }
                 if let Some(s) = a("src") {
-                    add(&base, s, &mut out);
+                    add(&base, &s, &mut out);
                 }
                 if let Some(p) = a("poster") {
-                    add(&base, p, &mut out);
+                    add(&base, &p, &mut out);
                 }
-                if let Some(set) = a("srcset") {
-                    for cand in set.split(',') {
-                        if let Some(u) = cand.split_whitespace().next() {
-                            add(&base, u, &mut out);
-                        }
-                    }
+                for u in srcset_urls(&a("srcset").unwrap_or_default()) {
+                    add(&base, u, &mut out);
                 }
             }
             "object" => {
                 if let Some(d) = a("data") {
-                    add(&base, d, &mut out);
+                    add(&base, &d, &mut out);
                 }
             }
             _ => {}
@@ -913,7 +1043,11 @@ pub fn resource_path(page: &Url, base: &[String], res: &Url) -> PathBuf {
     out
 }
 
-fn percent_decode(s: &str) -> String {
+pub(super) fn percent_decode(s: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(s)).into_owned()
+}
+
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -932,7 +1066,64 @@ fn percent_decode(s: &str) -> String {
         out.push(b[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
+}
+
+/// The bytes of a `data:` URI and the file extension of its media type; None when it is not
+/// one that can be read.
+fn data_uri(uri: &str) -> Option<(Vec<u8>, &'static str)> {
+    let rest = uri.get(..5).filter(|h| h.eq_ignore_ascii_case("data:"))?;
+    let (head, data) = uri[rest.len()..].split_once(',')?;
+    let mut params = head.split(';').map(str::trim);
+    let media = params.next().unwrap_or_default().to_ascii_lowercase();
+    let base64 = params.any(|p| p.eq_ignore_ascii_case("base64"));
+    let bytes = if base64 {
+        base64_decode(&percent_decode_bytes(data))?
+    } else {
+        percent_decode_bytes(data)
+    };
+    let ext = match media.as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/avif" => "avif",
+        "image/svg+xml" => "svg",
+        "image/x-icon" | "image/vnd.microsoft.icon" => "ico",
+        "image/bmp" => "bmp",
+        "text/css" => "css",
+        "text/javascript" | "application/javascript" => "js",
+        "text/html" => "html",
+        "" | "text/plain" => "txt",
+        _ => "bin",
+    };
+    Some((bytes, ext))
+}
+
+/// Decodes base64, standard or URL-safe, ignoring white space and padding.
+fn base64_decode(b: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(b.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in b {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            c if c.is_ascii_whitespace() => continue,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 /// What happened to the resources of the pages.
@@ -988,6 +1179,23 @@ pub fn download_trees(pages: &[Page], roots: &[PathBuf], progress: &Progress) ->
         }
         let local_ok = lookup(&page.url) == Some(true);
         let mut used: HashSet<PathBuf> = HashSet::from([PathBuf::from(PAGE_FILE)]);
+        // Pictures stored in the page, numbered in page order, so that a changed one shows.
+        let inline = inline_resources(&page.html, &page.url);
+        for (n, url) in inline.iter().enumerate() {
+            let saved = data_uri(url.as_str())
+                .filter(|(bytes, _)| bytes.len() as u64 <= RESOURCE_LIMIT)
+                .is_some_and(|(bytes, ext)| {
+                    let path = Path::new(INLINE_DIR).join(format!("{}.{ext}", n + 1));
+                    let dest = root.join(&path);
+                    used.insert(path);
+                    dest.parent()
+                        .is_none_or(|d| std::fs::create_dir_all(d).is_ok())
+                        && std::fs::write(dest, bytes).is_ok()
+                });
+            if !saved {
+                outcome.failed += 1;
+            }
+        }
         for url in resources(&page.html, &page.url) {
             if progress.abort.load(Ordering::Relaxed) {
                 break;
@@ -1131,6 +1339,123 @@ mod tests {
                 "https://cdn.example.net/lib.js",
             ]
         );
+    }
+
+    #[test]
+    fn reads_srcset_like_a_browser() {
+        assert_eq!(
+            srcset_urls("a.png, b.png 2x,c.png 3x"),
+            ["a.png", "b.png", "c.png"]
+        );
+        // Commas inside an address: a `data:` URI and an image service's options.
+        assert_eq!(
+            srcset_urls("data:image/png;base64,iVBORw0KG== 1x, /w_200,h_100/b.jpg 2x"),
+            ["data:image/png;base64,iVBORw0KG==", "/w_200,h_100/b.jpg"]
+        );
+        // Commas ending an address end the candidate; within one they are part of it, and
+        // one in parentheses does not end a candidate.
+        assert_eq!(srcset_urls("a.png,, b.png 2x"), ["a.png", "b.png"]);
+        assert_eq!(srcset_urls("a.png,b.png 2x"), ["a.png,b.png"]);
+        assert_eq!(srcset_urls(" a.png (x, y) 1x , b.png "), ["a.png", "b.png"]);
+        assert!(srcset_urls(" , ").is_empty());
+    }
+
+    #[test]
+    fn finds_image_resources_as_a_browser_loads_them() {
+        let page = Url::parse("https://example.com/docs/page.html").unwrap();
+        let html = r#"<head><base href="/static/"><base href="/ignored/">
+            <link rel=preload as=image imagesrcset="hero.png 1x, hero@2x.png 2x"></head>
+            <body><img src="thumb.php?w=1&amp;h=2">
+            <img srcset="data:image/png;base64,AAAA,BBBB 1x, img/b.png 2x">
+            <picture><source srcset="img/c.webp" type="image/webp"><img src="img/c.jpg"></picture>
+            <input type="image" src="go.png" alt="Go"><input type="text" src="no.png">
+            <video poster="poster.jpg"></video></body>"#;
+        let found: Vec<String> = resources(html, &page)
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "https://example.com/static/hero.png",
+                "https://example.com/static/hero@2x.png",
+                "https://example.com/static/thumb.php?w=1&h=2",
+                "https://example.com/static/img/b.png",
+                "https://example.com/static/img/c.webp",
+                "https://example.com/static/img/c.jpg",
+                "https://example.com/static/go.png",
+                "https://example.com/static/poster.jpg",
+            ]
+        );
+    }
+
+    #[test]
+    fn local_pages_copy_their_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("site");
+        std::fs::create_dir_all(site.join("images")).unwrap();
+        std::fs::write(site.join("images").join("a b.png"), b"A").unwrap();
+        std::fs::write(site.join("images").join("b.png"), b"B").unwrap();
+        let html = r#"<img src="images/a%20b.png"><img src="images/missing.png">
+            <img srcset="data:image/svg+xml,%3Csvg%2F%3E 1x, images/b.png 2x">
+            <img src="data:image/gif;base64,R0lG OD lh"><img src="data:image/png;base64,***">"#;
+        let page = Page {
+            url: Url::from_file_path(site.join("page.html")).unwrap(),
+            status: 200,
+            html: html.into(),
+        };
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let outcome = download_trees(&[page], std::slice::from_ref(&out), &Progress::default());
+        // The missing file and the unreadable `data:` URI fail.
+        assert_eq!(
+            outcome,
+            TreeOutcome {
+                failed: 2,
+                skipped: 0
+            }
+        );
+        let img = out.join("images");
+        assert_eq!(std::fs::read(img.join("a b.png")).unwrap(), b"A");
+        assert_eq!(std::fs::read(img.join("b.png")).unwrap(), b"B");
+        assert!(!img.join("missing.png").exists());
+        // Pictures stored in the page are saved in page order, so a changed one shows.
+        let inline = out.join(INLINE_DIR);
+        assert_eq!(std::fs::read(inline.join("1.svg")).unwrap(), b"<svg/>");
+        assert_eq!(std::fs::read(inline.join("2.gif")).unwrap(), b"GIF89a");
+        assert!(!inline.join("3.png").exists());
+    }
+
+    #[test]
+    fn reads_data_uris() {
+        assert_eq!(base64_decode(b"R0lGODlh").unwrap(), b"GIF89a");
+        assert_eq!(base64_decode(b"YQ==").unwrap(), b"a");
+        assert_eq!(base64_decode(b"-_8").unwrap(), [0xfb, 0xff]);
+        assert!(base64_decode(b"a,b").is_none());
+        assert_eq!(
+            data_uri("DATA:image/PNG;charset=x;Base64,YWI=").unwrap(),
+            (b"ab".to_vec(), "png")
+        );
+        assert_eq!(data_uri("data:,a%20b").unwrap(), (b"a b".to_vec(), "txt"));
+        assert!(data_uri("data:image/png;base64").is_none());
+        assert!(data_uri("http://x/,y").is_none());
+    }
+
+    #[test]
+    fn an_invalid_first_base_still_counts() {
+        let page = Url::parse("https://example.com/docs/page.html").unwrap();
+        let html = r#"<head><base href="http://[bad"><base href="/cdn/"></head><img src="a.png">"#;
+        assert_eq!(
+            resources(html, &page)[0].as_str(),
+            "https://example.com/docs/a.png"
+        );
+    }
+
+    #[test]
+    fn text_shows_pictures_by_their_alt_text() {
+        let html = r#"<p>Before<img src="a.png" alt="A &amp; B">after <img src="d.png" alt="">
+            <img src="x.png" hidden alt="gone"></p><img alt="Logo">"#;
+        assert_eq!(html_to_text(html), "Before A & B after\nLogo");
     }
 
     #[test]

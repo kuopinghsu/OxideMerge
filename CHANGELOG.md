@@ -12,6 +12,13 @@ release on GitHub uses its section of this file as the release notes.
   comparisons. The default full download supports folder-wide copy, delete, and save operations.
 - The remote connection dialog remembers the ten most recent servers across restarts.
   Select a recent server to restore its connection settings, with credentials entered separately.
+- The Formatted web page compare shows each page's pictures under the blocks they are in,
+  loaded in the background: files beside the page, pictures stored in it as `data:` URIs,
+  and, for pages loaded from the web, pictures on public web addresses. Local pages never
+  contact a web server for their pictures, and Reload loads them again.
+- The sample web pages in `samples/web`, `samples/left/web` and `samples/right/web` show
+  pictures: one changed under the same name, one added with only a `srcset`, one stored in
+  the page, and a logo inside a link.
 
 ### Changed
 
@@ -38,6 +45,17 @@ release on GitHub uses its section of this file as the release notes.
   files and opening a pair no longer each wait for a new sign-in. One that an operation
   failed over is closed instead.
 - *More options* on the start page chooses the compare rules for the comparison.
+- Every text compare puts how the files are shown (Text, Table, Formatted, Semantic or
+  Tree) on a toolbar row of its own, above the row of differences and tools, as the web page
+  compare does; the headers of the Formatted view name each file as the Text view does,
+  with its folder, the lock and the line under the active side.
+- The Formatted web page compare compares a page's own pictures and links by their address
+  relative to the page, so two copies of a site in different folders no longer differ on
+  every picture, and a picture file beside a local page is compared by its content too, so
+  one changed under the same name and alt text is a change. Pages on this computer or a
+  private network show their pictures from there. Text mode shows a picture by its alt
+  text, and the Resources tree saves
+  pictures stored in the page under `_inline/`, so a changed one shows there.
 
 ### Fixed
 
@@ -60,6 +78,15 @@ release on GitHub uses its section of this file as the release notes.
   including formatted documents and workbooks. The revision remains read-only.
 - Formatted Compare explains why untagged PDFs cannot show headings, lists, and tables,
   and offers a return to Text view.
+- Stepping to the next or previous file of a folder compare (Alt+Down, Alt+Up) passes over
+  a file that cannot be opened, such as a picture on one side only, instead of stopping
+  there for good.
+- Web page pictures: `srcset` addresses holding commas (`data:` URIs, image service
+  options) are read as browsers read them, character references in addresses are decoded,
+  only the first `<base>` counts, and `<input type="image">` and `imagesrcset` pictures are
+  listed in the Resources tree. In the Formatted view, a picture with only a `srcset` is
+  shown, a linked picture without alt text is named by its file, file names are no longer
+  percent-encoded, and alt text is no longer decoded twice.
 
 ## [0.9.8] - 2026-11-12
 

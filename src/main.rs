@@ -612,6 +612,14 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     if paths.iter().all(|p| p.is_dir()) {
         let filter_spec = cli.filter.clone().unwrap_or_else(|| cfg.filter.clone());
         let filter = FileFilter::resolve(&filter_spec, &core::filter::load_all_filters());
+        // A folder compared with a revision leaves out what Git ignores in it, as the window
+        // does: build output and the like are in no revision.
+        let filter = match (&cli.git_rev, &cli.paths[..]) {
+            (Some(_), [work]) => {
+                core::vcs::without_ignored(filter, work, &std::sync::atomic::AtomicBool::new(false))
+            }
+            _ => filter,
+        };
         let progress = Progress::default();
         let mut fopts = cfg.folder.clone();
         fopts.recursive = cli.recursive || fopts.recursive;

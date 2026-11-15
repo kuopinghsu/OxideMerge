@@ -64,6 +64,11 @@ pub struct Job {
     pub base: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub right: Option<String>,
+    /// Compares `right`, a working file or folder, with its revision `rev` of Git, Subversion
+    /// or Mercurial (`--rev`), taken from the repository each time the job runs; `left` is not
+    /// given. A folder leaves out what Git ignores in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
     // Synchronization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -273,6 +278,10 @@ impl Job {
         let text = |v: &str| Some(OsString::from(v));
         let mut paths = Vec::new();
         match self.kind {
+            JobKind::Compare if self.rev.is_some() => {
+                opt("rev", self.rev.as_deref().and_then(text));
+                paths.push(path("right", self.right.as_deref().unwrap_or_default())?);
+            }
             JobKind::Compare => {
                 paths.push(path("left", self.left.as_deref().unwrap_or_default())?);
                 if let Some(b) = &self.base {
@@ -394,8 +403,8 @@ impl Job {
             .collect()
     }
 
-    /// The paths the job names, resolved against `dir`: left, base and right of a compare, or
-    /// source and destination of a synchronization.
+    /// The paths the job names, resolved against `dir`: left, base and right of a compare (only
+    /// right when it compares with a revision), or source and destination of a synchronization.
     pub fn paths(&self, dir: &Path) -> Vec<PathBuf> {
         let fields = match self.kind {
             JobKind::Compare => [&self.left, &self.base, &self.right],
@@ -468,7 +477,27 @@ impl Job {
         };
         match self.kind {
             JobKind::Compare => {
-                need(&self.left, "left")?;
+                if self.rev.is_some() {
+                    // The left side is the right one as of the revision, read from its
+                    // repository, and there is no base.
+                    let without = |on: bool, field: &str| -> Result<(), String> {
+                        if on {
+                            Err(trf("job.err_not_with_rev", &[("field", field.into())]))
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    without(self.left.is_some(), "left")?;
+                    without(self.base.is_some(), "base")?;
+                    // As running it reads it: with its environment variables.
+                    let right = self.right.as_deref().unwrap_or_default();
+                    let right = expand(right).unwrap_or_else(|_| right.to_string());
+                    if super::web::is_url(&right) || super::remote_url::is_remote_url(&right) {
+                        return Err(tr("job.err_rev_local").into());
+                    }
+                } else {
+                    need(&self.left, "left")?;
+                }
                 need(&self.right, "right")?;
                 given(self.source.is_some(), "source")?;
                 given(self.destination.is_some(), "destination")?;
@@ -482,6 +511,7 @@ impl Job {
                 need(&self.destination, "destination")?;
                 need(&self.mode, "mode")?;
                 for (on, field) in [
+                    (self.rev.is_some(), "rev"),
                     (self.left.is_some(), "left"),
                     (self.right.is_some(), "right"),
                     (self.base.is_some(), "base"),
@@ -615,6 +645,43 @@ mod tests {
                 abs.to_string_lossy().into_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn a_compare_with_a_revision_names_the_working_side_and_the_revision() {
+        let dir = Path::new("/jobs");
+        let j = job(r#"{"right": "work", "rev": "HEAD~1", "recursive": true}"#).unwrap();
+        let a = args(&j.prepare(dir).unwrap());
+        let work = dir.join("work").to_string_lossy().into_owned();
+        assert_eq!(a, ["--rev=HEAD~1", "--recursive", "--", work.as_str()]);
+        assert_eq!(j.paths(dir), [dir.join("work")]);
+        // The revision is the left side and there is no base: a job naming either is refused.
+        for (json, field) in [
+            (
+                r#"{"left": "copy", "right": "work", "rev": "HEAD"}"#,
+                "left",
+            ),
+            (r#"{"base": "b", "right": "work", "rev": "HEAD"}"#, "base"),
+        ] {
+            let e = job(json).unwrap().validate().unwrap_err();
+            assert_eq!(e, trf("job.err_not_with_rev", &[("field", field.into())]));
+        }
+        // The revision is read from a repository on this machine.
+        std::env::set_var("OXIDEMERGE_TEST_REV_SERVER", "sftp://host");
+        for right in [
+            "sftp://host/repo",
+            "https://example.com/repo",
+            "${env:OXIDEMERGE_TEST_REV_SERVER}/repo",
+        ] {
+            let json = format!(r#"{{"right": "{right}", "rev": "HEAD"}}"#);
+            let e = job(&json).unwrap().validate().unwrap_err();
+            assert_eq!(e, tr("job.err_rev_local"), "{right}");
+        }
+        assert!(job(r#"{"rev": "HEAD"}"#).unwrap().validate().is_err());
+        let sync = r#"{"kind": "sync_plan", "source": "a", "destination": "b", "mode": "mirror",
+            "report": "p.json", "rev": "HEAD"}"#;
+        let e = job(sync).unwrap().validate().unwrap_err();
+        assert!(e.contains("\"rev\""), "{e}");
     }
 
     #[test]

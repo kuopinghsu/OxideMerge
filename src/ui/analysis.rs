@@ -22,6 +22,11 @@ impl<T: Send + 'static> Task<T> {
             handle: Some(std::thread::spawn(move || work(&c, &p))),
         }
     }
+    /// Whether the work is still going on: it has not finished, nor been collected by `poll`.
+    pub fn running(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
     pub fn poll(&mut self) -> Option<anyhow::Result<T>> {
         if !self.handle.as_ref()?.is_finished() {
             return None;

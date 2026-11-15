@@ -12,6 +12,7 @@ pub mod job_dialog;
 #[cfg(target_os = "macos")]
 mod macos;
 pub mod markdown_view;
+pub mod page_images;
 pub mod palette;
 pub(crate) mod remote_folder;
 pub mod sync_dialog;

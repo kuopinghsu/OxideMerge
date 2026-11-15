@@ -2884,7 +2884,7 @@ mod tests {
     /// The text of a PDF as the program's own reader finds it.
     fn read(pdf: &[u8]) -> String {
         assert!(pdf.starts_with(b"%PDF-"));
-        crate::core::extract::pdf::text(pdf, None).expect("the report reads back")
+        crate::core::extract::pdf::text_as_drawn(pdf).expect("the report reads back")
     }
 
     fn report(a: &[String], b: &[String], pdf: &PdfOptions) -> Vec<u8> {

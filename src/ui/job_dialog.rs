@@ -67,8 +67,10 @@ impl SaveJob {
         }
     }
 
+    /// Whether the job compares two folders that may be synchronized: not three, and not a
+    /// folder with a revision of it, which cannot be written to.
     fn two_sides(&self) -> bool {
-        self.template.base.is_none()
+        self.template.base.is_none() && self.template.rev.is_none()
     }
 
     /// The job as set in the dialog, to be saved as `job_file`.
@@ -149,7 +151,11 @@ impl SaveJob {
                 step = Some(SaveStep::Close);
             }
             let side = |s: &Option<String>| s.clone().unwrap_or_default();
-            ui.label(RichText::new(side(&self.template.left)).monospace());
+            let left = match &self.template.rev {
+                Some(rev) => format!("{} @ {rev}", side(&self.template.right)),
+                None => side(&self.template.left),
+            };
+            ui.label(RichText::new(left).monospace());
             if let Some(b) = &self.template.base {
                 ui.label(RichText::new(b).monospace());
             }
@@ -296,6 +302,22 @@ pub enum RunStep {
     },
     Open(PathBuf),
     Compare(Vec<PathBuf>),
+    /// Compare the working file or folder with its revision, as the job did.
+    CompareRevision(PathBuf, String),
+}
+
+/// What *Open compare* opens for `job`, read from a job file in `dir`: the compare of its paths
+/// (the working one with its revision, for a job with `rev`), when they all still exist.
+fn compare_step(job: &Job, dir: &Path) -> Option<RunStep> {
+    let paths = job.paths(dir);
+    if !paths.iter().all(|p| p.exists()) {
+        return None;
+    }
+    match (&job.rev, &paths[..]) {
+        (Some(rev), [work]) => Some(RunStep::CompareRevision(work.clone(), rev.clone())),
+        (None, [_, _, ..]) => Some(RunStep::Compare(paths)),
+        _ => None,
+    }
 }
 
 impl RunJob {
@@ -543,12 +565,10 @@ impl RunJob {
                                             step = Some(RunStep::Open(out));
                                         }
                                     }
-                                    let paths = job.paths(&dir);
-                                    if paths.len() >= 2
-                                        && paths.iter().all(|p| p.exists())
-                                        && ui.small_button(tr("job.open_compare")).clicked()
-                                    {
-                                        step = Some(RunStep::Compare(paths));
+                                    if let Some(open) = compare_step(job, &dir) {
+                                        if ui.small_button(tr("job.open_compare")).clicked() {
+                                            step = Some(open);
+                                        }
                                     }
                                 });
                                 ui.end_row();
@@ -683,6 +703,99 @@ mod tests {
         assert!(std::fs::read_to_string(report)
             .unwrap()
             .contains("only.txt"));
+    }
+
+    #[test]
+    fn a_job_saved_from_a_revision_tab_takes_the_revision_again_and_skips_ignored_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        // Git as installed, without the user's own settings (hooks, signing and the like).
+        let empty = dir.path().join("empty.gitconfig");
+        std::fs::write(&empty, "").unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", &empty)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "core.hooksPath=",
+                ])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !git(&["init", "-q"]) {
+            eprintln!("git is not installed; skipped");
+            return;
+        }
+        std::fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        assert!(git(&["add", "."]) && git(&["commit", "-q", "-m", "first"]));
+        std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+        std::fs::write(repo.join("build.log"), "noise\n").unwrap();
+
+        // The tab as *compare with revision* opens it, on a temporary copy of the revision.
+        let cfg = Config::default();
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let (temp, copy) = crate::core::vcs::copy_of(&repo, "HEAD", &never).unwrap();
+        let mut v = crate::ui::folder_view::FolderView::against_revision(
+            vec![copy, repo.clone()],
+            vec![
+                format!("{} @ HEAD", repo.display()),
+                repo.display().to_string(),
+            ],
+            "",
+            &[],
+            &cfg,
+            repo.clone(),
+            "HEAD",
+        );
+        v.start_compare();
+        let template = v.as_job(&cfg);
+        assert_eq!(template.left, None, "not the temporary copy");
+        assert_eq!(template.right, Some(repo.display().to_string()));
+        assert_eq!(template.rev.as_deref(), Some("HEAD"));
+        // The tab closes, and its copy of the revision goes with it, once nothing reads it.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while v.is_running() {
+            assert!(std::time::Instant::now() < until, "the compare finishes");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            v.poll_background();
+        }
+        drop(v);
+        drop(temp);
+
+        let mut d = SaveJob::new(template, "revision");
+        assert!(!d.two_sides(), "a revision cannot be synchronized");
+        d.kind = SaveKind::Sync;
+        assert!(d.job(&dir.path().join("x.oxjob")).is_err());
+        d.kind = SaveKind::Compare;
+        d.relative = true;
+        let file = dir.path().join("revision.oxjob");
+        d.write(&file).unwrap();
+        let saved = JobFile::parse(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(saved.jobs[0].right.as_deref(), Some("repo"));
+
+        let run = run(&file, false);
+        assert_eq!(run.exit_code(), Some(1), "{:?}", run.results());
+        let report = std::fs::read_to_string(dir.path().join("revision.html")).unwrap();
+        assert!(
+            report.contains("a.txt") && report.contains("new.txt"),
+            "{report}"
+        );
+        assert!(!report.contains("build.log"), "Git ignores it: {report}");
+        // *Open compare* opens the working folder with its revision again.
+        assert_eq!(
+            compare_step(&saved.jobs[0], dir.path()),
+            Some(RunStep::CompareRevision(repo.clone(), "HEAD".into()))
+        );
     }
 
     #[test]

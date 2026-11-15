@@ -1,7 +1,32 @@
 //! File/folder filters: wildcard masks (`*.c;*.h;!*.bak;!.git\`) and WinMerge `.flt` filter files.
 
 use regex::{Regex, RegexBuilder};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// Files and folders a folder compare leaves out by their paths, relative to the compared
+/// root with `/` separators, such as what Git ignores in a working copy compared with a
+/// revision.
+#[derive(Debug, Default)]
+pub struct Skipped {
+    files: HashSet<String>,
+    dirs: HashSet<String>,
+}
+
+impl Skipped {
+    /// From `paths`, a folder's path ending with `/`.
+    pub fn new(paths: impl IntoIterator<Item = String>) -> Self {
+        let mut skipped = Skipped::default();
+        for path in paths {
+            match path.strip_suffix('/') {
+                Some(dir) => skipped.dirs.insert(dir.to_string()),
+                None => skipped.files.insert(path),
+            };
+        }
+        skipped
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct FltFilter {
@@ -23,6 +48,8 @@ pub enum FileFilter {
         dir_excludes: Vec<Regex>,
     },
     Flt(FltFilter),
+    /// What the filter keeps, but for the files and folders named.
+    Except(Box<FileFilter>, Arc<Skipped>),
 }
 
 pub const FLT_PREFIX: &str = "[F] ";
@@ -116,6 +143,9 @@ impl FileFilter {
                     && f.file_except.is_empty()
                     && f.dir_except.is_empty())
             }
+            FileFilter::Except(inner, skipped) => {
+                inner.excludes_anything() || !(skipped.files.is_empty() && skipped.dirs.is_empty())
+            }
         }
     }
 
@@ -138,6 +168,9 @@ impl FileFilter {
                 } else {
                     matched
                 }
+            }
+            FileFilter::Except(inner, skipped) => {
+                !skipped.files.contains(rel_path) && inner.include_file(rel_path, name)
             }
         }
     }
@@ -163,6 +196,9 @@ impl FileFilter {
                     // unless explicitly matched; files decide what is shown.
                     true
                 }
+            }
+            FileFilter::Except(inner, skipped) => {
+                !skipped.dirs.contains(rel_path) && inner.include_dir(rel_path, name)
             }
         }
     }
@@ -311,6 +347,22 @@ d: \\\.git$
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skipped_paths_are_left_out_whatever_the_filter_keeps() {
+        let skipped = Skipped::new(["target/".to_string(), "src/run.log".to_string()]);
+        let f = FileFilter::Except(Box::new(FileFilter::parse_mask("*.*")), Arc::new(skipped));
+        assert!(f.excludes_anything());
+        assert!(!f.include_dir("target", "target"));
+        assert!(f.include_dir("src", "src"));
+        assert!(!f.include_file("src/run.log", "run.log"));
+        assert!(f.include_file("run.log", "run.log"), "only the path named");
+        assert!(f.include_file("src/main.rs", "main.rs"));
+        // What the filter itself leaves out stays out.
+        let skipped = Arc::new(Skipped::new(Vec::new()));
+        let f = FileFilter::Except(Box::new(FileFilter::parse_mask("*.rs")), skipped);
+        assert!(!f.include_file("a.txt", "a.txt"));
+    }
 
     #[test]
     fn mask_filter() {

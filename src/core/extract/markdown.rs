@@ -1,4 +1,4 @@
-//! Word documents, workbooks and tagged PDF files as Markdown blocks, for the formatted compare.
+//! Word documents, workbooks and PDF files as Markdown blocks, for the formatted compare.
 //!
 //! A Word document is read as headings, paragraphs with
 //! their bold, slanted and struck-through words, list items, links, images and tables. A table
@@ -1632,10 +1632,10 @@ fn date_time(n: f64, pattern: &str, date1904: bool) -> Option<String> {
 /// The blocks of the tagged PDF file at `path`, read from the structure it is tagged with:
 /// its headings, paragraphs, list items, tables with their merged cells, and figures with
 /// their descriptions. Text drawn in a bold or slanted font keeps that format. A file that is
-/// not tagged is refused.
-pub fn pdf_blocks(path: &Path, cancel: Option<&AtomicBool>) -> Result<Vec<Block>> {
+/// not tagged is read using its text positions. Returns whether the layout was inferred.
+pub fn pdf_blocks(path: &Path, cancel: Option<&AtomicBool>) -> Result<(Vec<Block>, bool)> {
     let bytes = read_whole(path)?;
-    let tree = pdf::structure(&bytes, cancel)?;
+    let (tree, inferred) = pdf::structure(&bytes, cancel)?;
     let mut writer = Tagged {
         cancel,
         blocks: Vec::new(),
@@ -1644,10 +1644,17 @@ pub fn pdf_blocks(path: &Path, cancel: Option<&AtomicBool>) -> Result<Vec<Block>
         sections: 0,
     };
     writer.block(&tree, 0, 0)?;
+    if inferred && (writer.cut || writer.size > MAX_OUTPUT) {
+        bail!("the PDF has too much formatted text to compare completely");
+    }
     if writer.blocks.is_empty() {
+        if inferred {
+            let why = "the PDF has no extractable text for the formatted view";
+            return Err(pdf::NoTextLayer(why.into()).into());
+        }
         bail!("the PDF file is tagged, but its structure holds no text");
     }
-    Ok(with_cut_note(writer.blocks, writer.cut))
+    Ok((with_cut_note(writer.blocks, writer.cut), inferred))
 }
 
 /// What an element of a tagged file is read as.
@@ -1732,13 +1739,15 @@ struct Gathered<'e> {
     last: Option<Place>,
 }
 
-/// Where a run of text was drawn: its page, line, where it ends and how large it is.
+/// Where a run of text was drawn: its page, line, where it ends, how large it is and the
+/// character it ends with.
 #[derive(Clone, Copy)]
 struct Place {
     page: usize,
     y: f64,
     end: f64,
     size: f64,
+    last: Option<char>,
 }
 
 impl Place {
@@ -1748,14 +1757,25 @@ impl Place {
             y: run.y,
             end: run.end,
             size: run.size,
+            last: run.text.chars().last(),
         }
     }
 
-    /// Whether `next`, drawn after this, is set apart from it by a space.
+    /// Whether `next`, drawn after this, is set apart from it by a space. Chinese and Japanese
+    /// are written without spaces, so text in them that goes on to the next line or page is
+    /// not, nor is text in them spread apart along a justified line (see [`pdf::spaced`]).
     fn apart_from(&self, next: &pdf::Run) -> bool {
-        self.page != next.page
-            || (self.y - next.y).abs() >= 1.0
-            || pdf::gap_is_space(next.x - self.end, self.size.max(next.size))
+        let first = next.text.chars().next();
+        if self.page != next.page || (self.y - next.y).abs() >= 1.0 {
+            let unspaced = |c: Option<char>| c.is_some_and(pdf::is_unspaced);
+            return !(unspaced(self.last) && unspaced(first));
+        }
+        pdf::spaced(
+            self.last,
+            first,
+            next.x - self.end,
+            self.size.max(next.size),
+        )
     }
 }
 

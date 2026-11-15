@@ -597,11 +597,16 @@ impl XmlTreeView {
                 }
             }
             if let Some(s) = self.selected {
-                if right && !diff.rows[s].children.is_empty() && self.expanded.insert(s) {
+                let searching = !self.search.trim().is_empty();
+                if !searching
+                    && right
+                    && !diff.rows[s].children.is_empty()
+                    && self.expanded.insert(s)
+                {
                     self.expansion += 1;
                 }
                 if left {
-                    if self.expanded.remove(&s) {
+                    if !searching && self.expanded.remove(&s) {
                         self.expansion += 1;
                     } else if let Some(p) = diff.rows[s].parent {
                         self.select(diff, p);
@@ -657,12 +662,27 @@ impl XmlTreeView {
                         &label,
                     )
                 });
+                let mut tooltip = label;
+                let searching = !self.search.trim().is_empty();
                 if ui.is_rect_visible(rect) {
-                    if let Some(on_toggle) = self.paint_row(ui, diff, r, rect, &colors) {
+                    let toggles = self.paint_row(ui, diff, r, rect, &colors);
+                    if !searching {
+                        if let Some(side) = response.hover_pos().and_then(|p| {
+                            toggles
+                                .iter()
+                                .position(|hit| hit.is_some_and(|hit| hit.contains(p)))
+                        }) {
+                            let key = if self.expanded.contains(&r) {
+                                "folder.collapse"
+                            } else {
+                                "folder.expand"
+                            };
+                            tooltip = trf(key, &[("name", node_label(diff, side, r))]);
+                        }
                         if response.clicked()
-                            && response
-                                .interact_pointer_pos()
-                                .is_some_and(|p| on_toggle.contains(p))
+                            && response.interact_pointer_pos().is_some_and(|p| {
+                                toggles.iter().flatten().any(|hit| hit.contains(p))
+                            })
                         {
                             toggled = Some(r);
                         }
@@ -671,10 +691,10 @@ impl XmlTreeView {
                 if response.clicked() && toggled != Some(r) {
                     clicked = Some(r);
                 }
-                if response.double_clicked() && !diff.rows[r].children.is_empty() {
+                if !searching && response.double_clicked() && !diff.rows[r].children.is_empty() {
                     toggled = Some(r);
                 }
-                response.on_hover_text(&label);
+                response.on_hover_text(tooltip);
             }
         });
         self.visible = visible;
@@ -748,7 +768,7 @@ impl XmlTreeView {
         format!("{}: {} | {}", status.join(" · "), side(0), side(1))
     }
 
-    /// Paints row `r`; returns where its disclosure triangle is, when it has one.
+    /// Paints row `r` and returns the disclosure hit area for each pane.
     fn paint_row(
         &self,
         ui: &Ui,
@@ -756,7 +776,7 @@ impl XmlTreeView {
         r: usize,
         rect: Rect,
         colors: &theme::Colors,
-    ) -> Option<Rect> {
+    ) -> [Option<Rect>; 2] {
         let row = &diff.rows[r];
         let painter = ui.painter_at(rect);
         let half = (rect.width() - GUTTER) / 2.0;
@@ -779,7 +799,7 @@ impl XmlTreeView {
         let dim = widgets::pal(ui).text_dim;
         let font = egui::TextStyle::Body.resolve(ui.style());
         let mono = egui::TextStyle::Monospace.resolve(ui.style());
-        let mut toggle = None;
+        let mut toggles = [None; 2];
         for (s, &area) in sides.iter().enumerate() {
             let fill = match (row.kind, row.sides[s].is_some()) {
                 (_, false) => Some(colors.missing),
@@ -834,11 +854,13 @@ impl XmlTreeView {
                         egui::pos2(tri.min.x + 3.0, tri.max.y - 1.0),
                     ]
                 };
-                painter.add(egui::Shape::convex_polygon(points, dim, egui::Stroke::NONE));
+                painter
+                    .with_clip_rect(area)
+                    .add(egui::Shape::convex_polygon(points, dim, egui::Stroke::NONE));
                 let mut hit = tri.expand(3.0);
                 hit.max.y = rect.max.y;
                 hit.min.y = rect.min.y;
-                toggle = Some(toggle.map_or(hit, |t: Rect| t.union(hit)));
+                toggles[s] = Some(hit.intersect(area));
             }
             let x = indent + 16.0;
             let clip = Rect::from_min_max(egui::pos2(x, area.min.y), area.max);
@@ -901,7 +923,7 @@ impl XmlTreeView {
             painter.rect_filled(chip, 6.0, widgets::pal(ui).accent);
             painter.galley(chip.min + egui::vec2(5.0, 1.0), galley, Color32::WHITE);
         }
-        toggle
+        toggles
     }
 
     #[allow(clippy::too_many_arguments)]

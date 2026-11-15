@@ -31,6 +31,10 @@ pub struct Project {
     /// How a table compare matches records (by position when absent).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table: Option<crate::core::table_match::TableMatch>,
+    /// Compares the one path, a working file or folder, with this revision of it, read from its
+    /// repository each time the project is opened (as `--rev` does).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
 }
 
 pub fn is_project(path: &Path) -> bool {
@@ -47,7 +51,14 @@ impl Project {
         } else {
             serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?
         };
-        if !(2..=3).contains(&project.paths.len()) {
+        if project.rev.is_some() {
+            if project.paths.len() != 1 {
+                bail!(
+                    "{}: a project with a revision needs exactly 1 path",
+                    path.display()
+                );
+            }
+        } else if !(2..=3).contains(&project.paths.len()) {
             bail!("{}: a project needs 2 or 3 paths", path.display());
         }
         Ok(project)
@@ -275,6 +286,32 @@ mod tests {
         assert!(old.table.is_none());
         let saved = serde_json::to_string(&old).unwrap();
         assert!(!saved.contains("table"));
+    }
+
+    #[test]
+    fn a_project_with_a_revision_names_one_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rev.oxmproj");
+        let p = Project {
+            paths: vec!["work".into()],
+            rev: Some("HEAD~1".into()),
+            filter: Some("*.rs".into()),
+            recursive: Some(true),
+            ..Default::default()
+        };
+        p.save(&file).unwrap();
+        let back = Project::load(&file).unwrap();
+        assert_eq!(back, p);
+        assert_eq!(back.resolved_paths(&file), [dir.path().join("work")]);
+
+        // Two paths with a revision, or one without, is not a project.
+        std::fs::write(&file, r#"{"paths":["a","b"],"rev":"HEAD"}"#).unwrap();
+        assert!(Project::load(&file).is_err());
+        std::fs::write(&file, r#"{"paths":["a"]}"#).unwrap();
+        assert!(Project::load(&file).is_err());
+        // Older projects have no revision.
+        std::fs::write(&file, r#"{"paths":["a","b"]}"#).unwrap();
+        assert!(Project::load(&file).unwrap().rev.is_none());
     }
 
     #[test]

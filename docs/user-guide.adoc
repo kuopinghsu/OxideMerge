@@ -367,7 +367,7 @@ You can start a comparison in several ways, so you can use the one that fits you
 * Choose a recent comparison on the start page, in *File → Open recent* or in the command palette.
 * Start OxideMerge from the command line (see <<command-line>>) or from your file manager
   (see <<file-manager>>).
-* Choose *File → Compare over SFTP/FTP...*, or click the globe button beside a path on the start
+* Choose *File → Files on a server → Compare over SFTP/FTP...*, or click the globe button beside a path on the start
   page or in the *Select files or folders* dialog, to fetch a file or folder from a server over
   SFTP, FTPS or FTP first. See <<remote-sftp>>.
 
@@ -394,7 +394,7 @@ This opens two empty sides.
 Paste text with kbd:[Ctrl+V], or double-click a line to type.
 
 TIP: To compare the clipboard's text with something you are about to paste, choose
-*File → Compare clipboard*.
+*File → More comparisons → Compare clipboard*.
 This opens a text comparison with the clipboard's current text on the left and a blank, writable
 right side; paste the second text with kbd:[Ctrl+V].
 *Save* works as in any other unsaved comparison, because there is no file to write back to.
@@ -404,7 +404,7 @@ right side; paste the second text with kbd:[Ctrl+V].
 
 When the files you need to compare are on a server, OxideMerge can fetch them for you and write
 your changes back.
-*File → Compare over SFTP/FTP...*, and the globe button beside a path on the start page or in
+*File → Files on a server → Compare over SFTP/FTP...*, and the globe button beside a path on the start page or in
 the *Select files or folders* dialog, connect to a server to fetch a file or folder to compare,
 instead of browsing the local disk.
 
@@ -549,7 +549,7 @@ A copy that replaces the original is a new file.
 It keeps the original's owner, group and permissions, but not its access-control lists (ACLs).
 It is not one of the original's hard links either.
 SFTP cannot show these, so OxideMerge cannot tell when a file has them.
-For a server where that matters, turn on *File → Save remote files in place*: *Save* then writes
+For a server where that matters, turn on *File → Files on a server → Save remote files in place*: *Save* then writes
 over the original in place, which keeps them.
 
 OxideMerge also writes in place, without asking, in four cases:
@@ -647,7 +647,7 @@ So is the second of two names that this computer cannot keep apart, such as `A.t
 where letter case does not count.
 No `.bak` backups are made inside a fetched copy, because saving would upload them.
 
-*File → Reload from server* fetches the server's copy of the current tab's remote file or folder
+*File → Files on a server → Reload from server* fetches the server's copy of the current tab's remote file or folder
 again, over a fresh connection, and shows it in place of the copy fetched before.
 If this would replace changes that are not saved to the server yet, OxideMerge asks first.
 Edits of a remote file are then replaced (*Undo* brings them back), and edits of a local side are
@@ -856,7 +856,7 @@ In the window, *Save* writes changes back to the server as described above.
 Without a window, what the run changed in a fetched copy, as a `sync` job does in its
 destination, is written back to the server after the run, with the same checks; a file that the
 server changed in the meantime is reported as an error (exit code 2).
-These writes follow *File → Save remote files in place* as saved in the settings.
+These writes follow *File → Files on a server → Save remote files in place* as saved in the settings.
 A synchronization that stopped part way without undoing all it changed (exit code 5) is undone
 in the fetched copy instead, and nothing is written back.
 A sync plan made with `--sync-plan` names a server folder by its address, so `--sync-apply`
@@ -916,7 +916,7 @@ Web pages are read-only. OxideMerge never saves anything to a web server.
 
 Documents, spreadsheets and programs are compared as the text that OxideMerge reads from them.
 This is a text or table comparison of what was read, rather than a type of its own.
-Word documents, workbooks and tagged PDF files can also be shown *Formatted*, with their
+Word documents, workbooks and PDF files can also be shown *Formatted*, with their
 headings, lists and tables; see <<documents>>.
 
 When *Compare as* is *Automatic*, OxideMerge checks these conditions in this order and uses the
@@ -1618,7 +1618,7 @@ Projects created with older versions open with matching by position.
 [[git-revision]]
 === Comparing with a revision
 
-*File → Compare with revision...* compares a file or folder with an earlier version from Git,
+*File → More comparisons → Compare with revision...* compares a file or folder with an earlier version from Git,
 Subversion or Mercurial.
 The nearest working copy above the path determines which system is used.
 The dialog lists the recent revisions that changed the path.
@@ -1758,7 +1758,7 @@ OxideMerge opens such a file in the three-way view.
 
 To open a conflict file, use any of these:
 
-* *File → Open conflict file...*.
+* *File → More comparisons → Open conflict file...*.
 * *Open conflict file* on the start page.
 * The command line: `oxidemerge conflict.txt`.
 
@@ -2373,8 +2373,15 @@ Text in a bold or slanted font keeps that formatting, unless a whole paragraph o
 that font, as its style already shows it.
 A figure is shown with its alternate text and a fingerprint of its picture.
 Running headers, footers and page numbers are left out, because the file marks them as artifacts.
-A PDF that is not tagged, such as a scan or a file from a program that does not tag, shows a
-message saying so instead; compare such a file as text.
+For an untagged PDF with selectable text, the *Formatted (inferred)* notice means that
+OxideMerge estimates headings and paragraphs from text positions and font sizes.
+This works best for single-column documents. Columns and tables may come out in the wrong
+order, and scans without a text layer require OCR before they can be compared as text.
+In an untagged PDF, lines that repeat at the top or bottom of the pages, and page numbers, are
+taken for running headers and footers and left out of both the Text and the Formatted view, so
+a change made only in them is not shown.
+On a PDF of one page, nothing repeats; a line that holds only a number at its top or bottom
+is taken for its page number in the Formatted view, but kept in the Text view.
 
 The *Text* / *Formatted* switch appears above the panes when every side is a `.docx` file, every
 side is a workbook (`.xlsx`, `.xlsm`) or every side is a `.pdf` file, read by OxideMerge itself.
@@ -3172,6 +3179,10 @@ A project stores:
 * the comparison type, the filter, *Include subfolders* and the compare method;
 * the compare rules file.
 
+A tab opened with *Compare with revision* is saved as the working file or folder and the
+revision (`rev`), not the revision's temporary copy: opening the project reads that revision
+from the repository again, with the saved settings.
+
 To reopen a project, choose *File → Projects and jobs → Open project...*.
 OxideMerge can also open WinMerge projects (`.WinMerge`).
 
@@ -3682,7 +3693,7 @@ Choose the format (*Normal*, *Context* or *Unified*) and the number of context l
   For these files, OxideMerge shows an error instead of creating a patch that would not reproduce
   the changes.
 
-*File → Apply patch...* applies a unified diff, including the output of `git diff` and
+*File → More comparisons → Apply patch...* applies a unified diff, including the output of `git diff` and
 `svn diff`.
 
 * OxideMerge finds each hunk even when its lines have moved.
@@ -4761,6 +4772,13 @@ Every job has an optional `name`, which appears in the summary and in error mess
 `compare` (the default):: Requires `left` and `right` (and `base` for a three-way comparison).
 Options: `recursive`, `report`, `report_diffs`, `report_hide_paths`, `slideshow`, `patch`,
 `patch_style`, `context`, `compare_as`.
+To compare a working file or folder with a revision of it, as `--rev` does, give `right` and
+`rev` instead of `left`: the revision is read from the repository each time the job runs, and a
+folder leaves out what Git ignores in it.
+A revision name such as `HEAD~1` or a branch is looked up again on each run, so it may name a
+later commit than when the job was saved; give a commit hash to always compare with the same one.
+`right` must then be a local file or folder. *Save as job...* from a *Compare with revision* folder tab
+saves such a job.
 `sync_plan`:: Writes a sync plan. Requires `source`, `destination`, `mode` (`mirror` or `update`)
 and `report` (the plan file).
 `sync`:: Plans and applies a synchronization in one step. Requires `source`, `destination`,
@@ -4866,6 +4884,23 @@ To open a revision from within OxideMerge instead, see <<git-revision>>.
 
 [[git]]
 === Git
+
+To compare two revisions from GitHub, open a local clone of the repository in Git Bash
+or another POSIX shell. With OxideMerge on your `PATH`, run:
+
+[source,sh]
+----
+git fetch origin --tags
+git -c 'difftool.oxidemerge.cmd=oxidemerge "$LOCAL" "$REMOTE"' \
+  difftool --tool=oxidemerge --dir-diff REV1 REV2
+----
+
+Replace `REV1` and `REV2` with commits, tags, or branch names such as `origin/main`.
+OxideMerge opens a folder comparison of the changed files, with `REV1` on the left
+and `REV2` on the right. To compare a single file, replace `--dir-diff REV1 REV2`
+with `REV1 REV2 -- path/to/file`. The `-c` setting applies only to this command.
+Within OxideMerge, *File → More comparisons → Compare with revision...* compares one revision with the
+working copy.
 
 With a few configuration settings, Git opens OxideMerge for both `git difftool` and
 `git mergetool`.
