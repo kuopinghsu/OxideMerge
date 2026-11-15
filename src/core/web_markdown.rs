@@ -288,6 +288,8 @@ struct Converter {
     table: Option<Table>,
     /// The elements open in an element being left out, outermost first; empty when none is.
     skip: Vec<String>,
+    /// The fingerprints of the picture files read so far (see [`Converter::picture_print`]).
+    prints: std::collections::HashMap<std::path::PathBuf, Option<String>>,
 }
 
 impl Converter {
@@ -939,17 +941,30 @@ impl Converter {
     /// this computer: what tells a picture changed under the same name apart. None for a
     /// picture on the web, which would have to be downloaded, or stored in the page, whose
     /// address is its content.
-    fn picture_print(&self, src: &str) -> Option<String> {
+    fn picture_print(&mut self, src: &str) -> Option<String> {
         self.document_url.as_ref()?;
         let url = Url::parse(&self.absolute_link(src)?).ok()?;
         let path = url.to_file_path().ok().filter(|_| url.scheme() == "file")?;
-        let meta = std::fs::metadata(&path).ok()?;
-        if !meta.is_file() || meta.len() > MAX_PRINTED_PICTURE {
-            return None;
+        // A picture used again on the page is read once.
+        if let Some(print) = self.prints.get(&path) {
+            return print.clone();
         }
-        use sha2::Digest;
-        let digest = sha2::Sha256::digest(std::fs::read(&path).ok()?);
-        Some(digest[..4].iter().map(|b| format!("{b:02x}")).collect())
+        let print = (|| {
+            let meta = std::fs::metadata(&path).ok()?;
+            if !meta.is_file() || meta.len() > MAX_PRINTED_PICTURE {
+                return None;
+            }
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(std::fs::read(&path).ok()?);
+            Some(
+                digest[..4]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            )
+        })();
+        self.prints.insert(path, print.clone());
+        print
     }
 
     /// Where the picture at `src` is loaded from: as [`Self::link_to`], or a picture stored in
@@ -1036,6 +1051,7 @@ fn convert_html(
         pre: None,
         table: None,
         skip: Vec::new(),
+        prints: Default::default(),
     };
     // The elements open outside the elements left out, outermost first.
     let mut opened = OpenElements::default();

@@ -83,6 +83,9 @@ pub struct MarkdownView {
     stable: Vec<f32>,
     /// The column width and line height `stable` was worked out for.
     stable_for: (f32, f32, usize),
+    /// How many pictures had failed in the whole app, and how many of them are this view's,
+    /// when last looked at: only this view's failures lay its rows out again.
+    failures: (usize, usize),
     /// The tables laid out so far, by row and page.
     tables: std::collections::HashMap<(usize, usize), TableLayout>,
     /// How far the pages are scrolled down, in pixels.
@@ -188,6 +191,7 @@ impl MarkdownView {
             heights: vec![ESTIMATE; rows.len()],
             stable: Vec::new(),
             stable_for: (0.0, 0.0, 0),
+            failures: (0, 0),
             tables: Default::default(),
             shift: 0.0,
             pages,
@@ -331,7 +335,13 @@ impl MarkdownView {
     fn update_stable(&mut self, ui: &Ui, col: f32) {
         let line = ui.text_style_height(&egui::TextStyle::Body);
         // Worked out again when a picture fails, which is then not shown.
-        let key = (col, line, crate::ui::page_images::failures());
+        let all = crate::ui::page_images::failures();
+        if all != self.failures.0 {
+            let mine =
+                crate::ui::page_images::failed_among(self.pictures.iter().flatten().flatten());
+            self.failures = (all, mine);
+        }
+        let key = (col, line, self.failures.1);
         if self.stable.len() == self.rows.len() && self.stable_for == key {
             return;
         }
@@ -978,9 +988,11 @@ fn pictures(
                             crate::ui::page_images::supported(u)
                                 && (web || !crate::ui::page_images::is_remote(u))
                         })
-                        .inspect(|u| {
-                            if local && crate::ui::page_images::is_remote(u) {
-                                crate::ui::page_images::trust_local(u);
+                        .map(|u| {
+                            if local && crate::ui::page_images::is_remote(&u) {
+                                crate::ui::page_images::local_uri(&u)
+                            } else {
+                                u
                             }
                         })
                         .collect()
@@ -1027,7 +1039,10 @@ fn show_pictures(ui: &mut Ui, uris: &[String]) {
                     .max_width(width)
                     .max_height(PICTURE_HEIGHT),
             )
-            .on_hover_text(u.get(..200).unwrap_or(u));
+            .on_hover_text({
+                let shown = crate::ui::page_images::split_local(u).0;
+                shown.get(..200).unwrap_or(shown)
+            });
         }
     });
 }
@@ -1719,7 +1734,12 @@ mod tests {
         let images = vec![vec![vec!["img/a.png".to_string()]]];
         let page = [url::Url::parse("http://intranet.test/docs/").unwrap()];
         let got = pictures(&images, &page, &[true]);
-        assert_eq!(got[0][0], ["http://intranet.test/docs/img/a.png"]);
+        assert_eq!(
+            got[0][0],
+            [crate::ui::page_images::local_uri(
+                "http://intranet.test/docs/img/a.png"
+            )]
+        );
     }
 
     #[test]
@@ -2336,7 +2356,8 @@ mod tests {
         let c = crate::ui::theme::colors(true);
         // Steady heights as the window works them out, which drawing never changes.
         v.stable = vec![30.0, 30.0, 300.0, 30.0, 30.0];
-        v.stable_for = (500.0, 14.0, crate::ui::page_images::failures());
+        v.failures = (crate::ui::page_images::failures(), 0);
+        v.stable_for = (500.0, 14.0, 0);
         v.heights = vec![ESTIMATE; v.rows.len()];
         let before = v.location_marks(&c);
         assert!(!before.is_empty(), "no difference to mark");

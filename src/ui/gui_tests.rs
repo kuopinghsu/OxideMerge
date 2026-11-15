@@ -8686,6 +8686,7 @@ right
 ",
             ),
             ("left/b.png", "not here on the right"),
+            ("right/b2.png", "not here on the left"),
             (
                 "left/c.txt",
                 "two
@@ -8717,6 +8718,15 @@ right
         gui.key(ALT, Key::ArrowUp);
         gui.settle();
         if origin(&gui).as_deref() == Some("a.txt") {
+            // The pictures passed over are named in one message.
+            let errors: Vec<String> = gui
+                .toasts()
+                .into_iter()
+                .filter(|(error, _)| *error)
+                .map(|(_, text)| text)
+                .collect();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(errors[0].contains("b.png") && errors[0].contains("b2.png"));
             return;
         }
     }

@@ -7,7 +7,7 @@
 
 use egui::load::{ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint};
 use egui::{ColorImage, Context, Id};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -48,22 +48,31 @@ fn shared() -> &'static Arc<Mutex<State>> {
     SHARED.get_or_init(Arc::default)
 }
 
-/// Web pictures that may load from this computer or a private network: those of pages there.
-fn trusted() -> &'static Mutex<HashSet<String>> {
-    static TRUSTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    TRUSTED.get_or_init(Mutex::default)
+/// What a web picture's address starts with when it may load from this computer or a private
+/// network, as a picture of a page that is there itself: the permission goes with the address
+/// the view asks for, so another page naming the same picture does not have it.
+const LOCAL: &str = "local+";
+
+/// The address that loads the web picture `uri` of a page on this computer or a private
+/// network, where the picture may be too.
+pub fn local_uri(uri: &str) -> String {
+    format!("{LOCAL}{uri}")
 }
 
-/// Lets the web picture `uri` load from this computer or a private network, as a picture of
-/// a page that is there itself.
-pub fn trust_local(uri: &str) {
-    if let Ok(mut t) = trusted().lock() {
-        t.insert(uri.to_string());
+/// The picture's own address, and whether it may load from this computer or a private network.
+pub fn split_local(uri: &str) -> (&str, bool) {
+    match uri.strip_prefix(LOCAL) {
+        Some(rest) => (rest, true),
+        None => (uri, false),
     }
 }
 
-fn is_trusted(uri: &str) -> bool {
-    trusted().lock().is_ok_and(|t| t.contains(uri))
+/// How many of the pictures `uris` failed to load the last time they were tried.
+pub fn failed_among<'a>(uris: impl Iterator<Item = &'a String>) -> usize {
+    shared().lock().map_or(0, |s| {
+        uris.filter(|u| matches!(s.entries.get(u.as_str()), Some(Entry::Failed(..))))
+            .count()
+    })
 }
 
 /// Whether the picture `uri` failed to load the last time it was tried.
@@ -85,6 +94,7 @@ pub struct PageImages {
 
 /// Whether `uri` names a picture this loader loads: one a page converted to Markdown may show.
 pub fn supported(uri: &str) -> bool {
+    let uri = split_local(uri).0;
     let head = uri.get(..11).unwrap_or(uri).to_ascii_lowercase();
     ["data:image/", "file:", "http://", "https://"]
         .iter()
@@ -93,6 +103,7 @@ pub fn supported(uri: &str) -> bool {
 
 /// Whether `uri` is a picture on the web, which loading contacts the server it is on for.
 pub fn is_remote(uri: &str) -> bool {
+    let uri = split_local(uri).0;
     let head = uri.get(..8).unwrap_or(uri).to_ascii_lowercase();
     head.starts_with("http://") || head.starts_with("https://")
 }
@@ -142,7 +153,8 @@ fn work(state: Arc<Mutex<State>>, ctx: Context, pool: usize) {
         }) else {
             return;
         };
-        let entry = crate::core::web::image_bytes(&uri, is_trusted(&uri), &abort)
+        let (address, local_ok) = split_local(&uri);
+        let entry = crate::core::web::image_bytes(address, local_ok, &abort)
             .map_err(|e| format!("{e:#}"))
             .and_then(|b| decode(&b))
             .map_or_else(
@@ -263,6 +275,14 @@ mod tests {
         assert!(s.entries.is_empty() && s.queues.iter().all(VecDeque::is_empty));
         assert!(!s.abort.load(Ordering::Relaxed));
         assert!(is_remote("HTTPS://x") && !is_remote("file:///a.png"));
+        // Leave to load from a private network goes with the address asked for.
+        let local = local_uri("http://intranet/a.png");
+        assert_eq!(split_local(&local), ("http://intranet/a.png", true));
+        assert_eq!(
+            split_local("http://intranet/a.png"),
+            ("http://intranet/a.png", false)
+        );
+        assert!(supported(&local) && is_remote(&local));
     }
 
     #[test]

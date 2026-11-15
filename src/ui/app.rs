@@ -2852,6 +2852,16 @@ fn adjacent_file(
     }
 }
 
+/// How an open went.
+enum Opened {
+    /// Done: its tab is open, or it needed none.
+    Done,
+    /// Still to come: read on another thread, or waiting for an archive's password.
+    Pending,
+    /// It failed, for this reason.
+    Failed(String),
+}
+
 /// What opening the project file `path` compares.
 fn project_request(path: &Path) -> anyhow::Result<OpenRequest> {
     let p = Project::load(path)?;
@@ -4534,6 +4544,13 @@ impl OxideMergeApp {
     }
 
     fn open_with_recent(&mut self, req: OpenRequest, recent: Option<Vec<String>>) {
+        if let Opened::Failed(e) = self.open_quietly(req, recent) {
+            self.error(e);
+        }
+    }
+
+    /// Opens `req` as [`Self::open`] does, saying how it went instead of showing an error.
+    fn open_quietly(&mut self, req: OpenRequest, recent: Option<Vec<String>>) -> Opened {
         let staged = req.paths.iter().any(|p| self.is_staged(p));
         let recent = recent.or_else(|| {
             (!req.skip_recent && !staged && req.paths.len() >= 2)
@@ -4555,7 +4572,7 @@ impl OxideMergeApp {
                 password: Default::default(),
                 focus: true,
             });
-            return;
+            return Opened::Pending;
         }
         self.forget_archive_passwords();
         match result {
@@ -4564,13 +4581,15 @@ impl OxideMergeApp {
                 if let Some(o) = self.opening.last_mut() {
                     o.recent = recent;
                 }
+                Opened::Pending
             }
             Ok(()) => {
                 if let Some(r) = recent {
                     self.cfg.add_recent_compare(&r);
                 }
+                Opened::Done
             }
-            Err(e) => self.error(format!("{e:#}")),
+            Err(e) => Opened::Failed(format!("{e:#}")),
         }
     }
 
@@ -6484,9 +6503,10 @@ impl OxideMergeApp {
             return;
         };
         let temps = self.tabs[ti].temps.clone();
-        // A file that cannot be opened (a picture on one side only) is passed over, said so by
-        // the error opening it gave, rather than tried again at every step.
+        // A file that cannot be opened (a picture on one side only) is passed over, rather than
+        // tried again at every step; the files passed over are named once, with why.
         let mut from = rel;
+        let mut skipped: Vec<String> = Vec::new();
         let (mut tab, rel, origin_roots, origin_archives) = loop {
             let cfg = &self.cfg;
             let Some(Content::Folder(f)) = self
@@ -6519,10 +6539,11 @@ impl OxideMergeApp {
                 // files left could not be opened.
                 let message = f.no_more_files(forward, conflicts);
                 self.notify(tr(message));
+                self.report_skipped(&skipped);
                 return;
             };
             let count = self.tabs.len();
-            self.open(OpenRequest {
+            let request = OpenRequest {
                 paths,
                 missing,
                 read_only,
@@ -6532,10 +6553,24 @@ impl OxideMergeApp {
                 rules: Some(rules),
                 snapshot_options,
                 ..Default::default()
-            });
+            };
+            match self.open_quietly(request, None) {
+                Opened::Failed(e) => {
+                    skipped.push(format!("{rel}: {e}"));
+                    from = rel;
+                    continue;
+                }
+                // Still opening (a large file read in the background) or waiting for a
+                // password: it opens in a tab of its own, as before.
+                Opened::Pending => {
+                    self.report_skipped(&skipped);
+                    return;
+                }
+                Opened::Done => {}
+            }
+            self.report_skipped(&skipped);
             if self.tabs.len() == count {
-                from = rel;
-                continue;
+                return;
             }
             let Some(tab) = self.tabs.pop() else {
                 return;
@@ -6596,6 +6631,13 @@ impl OxideMergeApp {
         tab.temps = temps;
         self.tabs[ti] = tab;
         self.active = ti;
+    }
+
+    /// Says which files stepping passed over and why, in one message.
+    fn report_skipped(&mut self, skipped: &[String]) {
+        if !skipped.is_empty() {
+            self.error(skipped.join("\n"));
+        }
     }
 
     /// Moves on from a file passed over without open conflicts, as [`Self::pass_on`] asks.
