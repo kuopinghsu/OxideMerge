@@ -16,6 +16,10 @@ or, with OxideMerge installed, `oxidemerge` and the same files.
 HTML files open in the web page compare by default; add `-t text` to compare their source
 as text instead.
 
+The pages show pictures from [`img/`](img): the logo is the same in every version, and the
+search screenshot is added in 2.3 and replaced in 2.4, where a `srcset` also offers a
+sharper copy for high-resolution screens.
+
 What to look for in each mode:
 
 - **Formatted** (the default): the pages as Markdown, shown formatted side by side:
@@ -27,6 +31,12 @@ What to look for in each mode:
   Formatted and Text show the change.
 - **HTML source:** the HTML of the files, with the script but without the `<li>` items it
   adds.
+- **Resources:** the files each page loads, side by side: the logo is the same, the 2.3
+  screenshot is only on the left and the 2.4 screenshot and its sharper copy only on the right.
+
+Formatted shows a picture as a link to its file, named by its alt text: the changed alt
+text and file of the search screenshot show as a change there, and the logo does not. Text
+shows a picture by its alt text alone.
 
 Every mode converts the files as they are, without a browser, so they open at once.
 Scripts do not run, so the "Known issues" list that a script fills in is empty.
