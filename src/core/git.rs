@@ -237,16 +237,60 @@ pub fn export_folder(
     let dir = tempfile::Builder::new()
         .prefix("oxidemerge-git-")
         .tempdir()?;
+    // The tree goes in a folder of its own, beside the list of submodules it could not fill in.
+    let tree = dir.path().join(EXPORT_TREE);
+    std::fs::create_dir_all(&tree)?;
     let mut budget = ExportBudget::new(MAX_EXPORT_BYTES, MAX_EXPORT_FILES);
-    checkout_into(&root, rev, &rel, dir.path(), cancel, &mut budget)?;
+    let mut unexported = Vec::new();
+    checkout_into(&root, rev, &rel, &tree, cancel, &mut budget, ("", &mut unexported))?;
     // A tracked symlink (including one from a submodule) is checked out as a real symlink; one
     // crafted to point outside the temporary folder could otherwise be opened and shown as if
     // it were part of the revision, the same risk `archive::remove_links_outside` already
     // guards extracting an archive against.
     super::archive::remove_links_outside(dir.path())?;
-    let copy = dir.path().join(&rel);
+    // The budget was taken from the objects' sizes before checking out, but a Git LFS file is
+    // stored as a small pointer and written out whole, so where the revision uses LFS, what
+    // was written is checked too.
+    if budget.lfs {
+        super::vcs::bound_with_limits(dir.path(), MAX_EXPORT_BYTES, MAX_EXPORT_FILES as u64)?;
+    }
+    let copy = tree.join(&rel);
     std::fs::create_dir_all(&copy)?;
+    // Relative to the folder compared, as a filter reads paths.
+    let within: Vec<String> = unexported
+        .iter()
+        .filter_map(|p| match rel.as_str() {
+            "" => Some(p.clone()),
+            rel => p.strip_prefix(&format!("{rel}/")).map(str::to_string),
+        })
+        .collect();
+    if !within.is_empty() {
+        std::fs::write(dir.path().join(UNEXPORTED_LIST), within.join("\n"))?;
+    }
     Ok((dir, copy))
+}
+
+/// The folder of an export that holds the revision's tree, and the file beside it that lists
+/// the submodules the export could not fill in, one path a line relative to the folder
+/// exported. Neither is inside the folder compared.
+const EXPORT_TREE: &str = "oxidemerge-tree";
+const UNEXPORTED_LIST: &str = "oxidemerge-unexported-submodules.txt";
+
+/// The submodules that [`export_folder`] could not fill in for the copy `copy` it returned,
+/// relative to `copy` with `/` separators: their recorded commit was not in their repository,
+/// for example. Each is left out of a compare on both sides. None for any other folder.
+pub fn unexported(copy: &Path) -> Vec<String> {
+    let export = copy.ancestors().find(|a| {
+        a.file_name().is_some_and(|n| n == EXPORT_TREE)
+            && a.parent().and_then(Path::file_name).is_some_and(|n| {
+                n.to_string_lossy().starts_with("oxidemerge-git-")
+            })
+    });
+    export
+        .and_then(Path::parent)
+        .and_then(|dir| std::fs::read_to_string(dir.join(UNEXPORTED_LIST)).ok())
+        .map(|list| list.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 /// The most a whole revision export may contain in total, across its folder and every
@@ -267,6 +311,9 @@ struct ExportBudget {
     files: usize,
     max_bytes: u64,
     max_files: usize,
+    /// Whether a `.gitattributes` of the export names the Git LFS filter, whose files are
+    /// written larger than the sizes counted.
+    lfs: bool,
 }
 
 impl ExportBudget {
@@ -276,7 +323,13 @@ impl ExportBudget {
             files: 0,
             max_bytes,
             max_files,
+            lfs: false,
         }
+    }
+
+    /// Whether a limit was gone over: an export that did is stopped whole, wherever it was.
+    fn exceeded(&self) -> bool {
+        self.files > self.max_files || self.bytes > self.max_bytes
     }
 
     fn take_files(&mut self, n: usize) -> Result<()> {
@@ -306,7 +359,8 @@ impl ExportBudget {
 /// `dest` as a checkout would, with its line endings and filters such as Git LFS, through a
 /// separate index so the repository's own index and working copy are left alone. Submodules
 /// are filled in from their checked-out repositories when the recorded commit is there, drawing
-/// on the same `budget` as the folder itself.
+/// on the same `budget` as the folder itself; one that cannot be is left empty and added to
+/// `unexported`, its path after `prefix` (where this repository is in the export).
 fn checkout_into(
     root: &Path,
     rev: &str,
@@ -314,6 +368,7 @@ fn checkout_into(
     dest: &Path,
     cancel: &AtomicBool,
     budget: &mut ExportBudget,
+    (prefix, unexported): (&str, &mut Vec<String>),
 ) -> Result<()> {
     let scratch = tempfile::tempdir()?;
     let index = scratch.path().join("index");
@@ -374,9 +429,9 @@ fn checkout_into(
         budget.take_bytes(total)?;
     }
     if !files.is_empty() {
-        let prefix = format!("--prefix={}/", dest.display());
+        let to = format!("--prefix={}/", dest.display());
         let checkout = |skip_lfs: bool| {
-            let mut cmd = with_index(&["checkout-index", "--stdin", "-z", "-f", &prefix]);
+            let mut cmd = with_index(&["checkout-index", "--stdin", "-z", "-f", &to]);
             if skip_lfs {
                 // LFS files of old revisions may not have been downloaded: show their pointers
                 cmd.env("GIT_LFS_SKIP_SMUDGE", "1");
@@ -390,13 +445,58 @@ fn checkout_into(
                 checkout(true)
             }
         })?;
+        // A file of the Git LFS filter is written whole, larger than the pointer counted
+        // above: the export is measured again once written (see `export_folder`). The rules
+        // that name it may be in the folder exported or in any folder above it, usually the
+        // top of the repository, which a folder below it does not check out.
+        let names_lfs = |text: &[u8]| text.windows(10).any(|w| w == b"filter=lfs");
+        budget.lfs |= files
+            .split(|&b| b == 0)
+            .filter(|p| p.ends_with(b".gitattributes"))
+            .any(|p| {
+                std::fs::read(dest.join(String::from_utf8_lossy(p).as_ref()))
+                    .is_ok_and(|text| names_lfs(&text))
+            });
+        if !budget.lfs && !rel.is_empty() {
+            let mut above = vec![String::new()];
+            let parts: Vec<&str> = rel.split('/').collect();
+            for i in 1..parts.len() {
+                above.push(format!("{}/", parts[..i].join("/")));
+            }
+            budget.lfs = above.iter().any(|dir| {
+                let mut cmd = command(root);
+                cmd.args(["cat-file", "blob", &format!("{rev}:{dir}.gitattributes")]);
+                run_until(cmd, None, cancel).is_ok_and(|text| names_lfs(&text))
+            });
+        }
     }
     for (path, hash) in submodules {
         let target = dest.join(&path);
         std::fs::create_dir_all(&target)?;
         let work = root.join(&path);
+        // A submodule not checked out is empty on both sides. One that is, but cannot be
+        // filled in, such as at a commit never fetched, would look empty in the revision only,
+        // as if all its files were new: it is listed, to be left out on both sides. Going
+        // over the limits or being stopped ends the whole export.
         if work.join(".git").exists() {
-            let _ = checkout_into(&work, &hash, "", &target, cancel, budget);
+            let inner = format!("{prefix}{path}/");
+            let filled = checkout_into(
+                &work,
+                &hash,
+                "",
+                &target,
+                cancel,
+                budget,
+                (&inner, &mut *unexported),
+            );
+            if let Err(e) = filled {
+                if budget.exceeded() || cancel.load(Ordering::Relaxed) {
+                    return Err(e.context(format!("submodule {path}")));
+                }
+                let _ = std::fs::remove_dir_all(&target);
+                std::fs::create_dir_all(&target)?;
+                unexported.push(format!("{prefix}{path}"));
+            }
         }
     }
     if cancel.load(Ordering::Relaxed) {
@@ -428,6 +528,27 @@ pub fn ignored(path: &Path, cancel: &AtomicBool) -> Result<Vec<String>> {
         .collect();
     if rel.is_empty() {
         list.extend([".git/".into(), ".git".into()]);
+    }
+    // `ls-files` does not look inside submodules: each checked-out one has its own `.git` and
+    // its own ignored files, which no revision export holds either. When they cannot be listed,
+    // what is listed so far still stands.
+    let mut cmd = command(path);
+    cmd.args(["ls-files", "--stage", "-z"]);
+    let staged = run_cancellable(cmd, cancel).unwrap_or_default();
+    for entry in staged.split(|&b| b == 0) {
+        let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        if !entry.starts_with(b"160000 ") {
+            continue;
+        }
+        let sub = String::from_utf8_lossy(&entry[tab + 1..]).into_owned();
+        let dir = path.join(&sub);
+        if dir.join(".git").exists() {
+            if let Ok(inner) = ignored(&dir, cancel) {
+                list.extend(inner.into_iter().map(|p| format!("{sub}/{p}")));
+            }
+        }
     }
     Ok(list)
 }
@@ -560,7 +681,7 @@ mod tests {
 
         let out = tempfile::tempdir().unwrap();
         let mut budget = ExportBudget::new(u64::MAX, 0);
-        let err = checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget).unwrap_err();
+        let err = checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget, ("", &mut Vec::new())).unwrap_err();
         assert!(err.to_string().contains("0 files"), "{err}");
     }
 
@@ -584,7 +705,7 @@ mod tests {
         // a byte budget too small for even one of the two 10-byte files
         let out = tempfile::tempdir().unwrap();
         let mut budget = ExportBudget::new(5, usize::MAX);
-        let err = checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget).unwrap_err();
+        let err = checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget, ("", &mut Vec::new())).unwrap_err();
         assert!(err.to_string().contains("GB"), "{err}");
         assert!(
             std::fs::read_dir(out.path()).unwrap().next().is_none(),
@@ -594,14 +715,14 @@ mod tests {
         // a file-count budget too small for the two files
         let out = tempfile::tempdir().unwrap();
         let mut budget = ExportBudget::new(u64::MAX, 1);
-        let err = checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget).unwrap_err();
+        let err = checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget, ("", &mut Vec::new())).unwrap_err();
         assert!(err.to_string().contains("1 files"), "{err}");
         assert!(std::fs::read_dir(out.path()).unwrap().next().is_none());
 
         // budgets large enough for both still succeed
         let out = tempfile::tempdir().unwrap();
         let mut budget = ExportBudget::new(u64::MAX, usize::MAX);
-        checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget).unwrap();
+        checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget, ("", &mut Vec::new())).unwrap();
         assert!(out.path().join("a.txt").is_file());
         assert!(out.path().join("b.txt").is_file());
     }
@@ -660,7 +781,7 @@ mod tests {
         // plus one submodule, but not both submodules together.
         let out = tempfile::tempdir().unwrap();
         let mut budget = ExportBudget::new(u64::MAX, 4);
-        checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget).unwrap();
+        let err = checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget, ("", &mut Vec::new())).unwrap_err();
         assert!(
             out.path().join("a/f.txt").is_file(),
             "the first submodule should still fit"
@@ -669,6 +790,124 @@ mod tests {
             !out.path().join("b/f.txt").exists(),
             "the second submodule should not get a budget of its own"
         );
+        // Going over the budget in a submodule stops the export, as it does in the folder
+        // itself, rather than leaving that submodule empty as if all its files were new.
+        let err = format!("{err:#}");
+        assert!(err.contains("submodule b") && err.contains("stopped after"), "{err}");
+    }
+
+    /// Git LFS rules are found in the `.gitattributes` above the folder exported, where they
+    /// usually are, so its written size is checked; and not where no rules name it.
+    #[test]
+    fn lfs_rules_above_an_exported_folder_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let run = |args: &[&str]| git(repo, args).unwrap();
+        if git(repo, &["init", "-q"]).is_err() {
+            return; // git is not installed
+        }
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "T"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        std::fs::create_dir_all(repo.join("assets/art")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join(".gitattributes"), "assets/** filter=lfs\n").unwrap();
+        std::fs::write(repo.join("assets/art/a.bin"), "pointer\n").unwrap();
+        std::fs::write(repo.join("src/main.c"), "int main;\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "first"]);
+        let never = AtomicBool::new(false);
+        let lfs = |rel: &str| {
+            let out = tempfile::tempdir().unwrap();
+            let mut budget = ExportBudget::new(u64::MAX, usize::MAX);
+            let unexported = &mut Vec::new();
+            checkout_into(repo, "HEAD", rel, out.path(), &never, &mut budget, ("", unexported))
+                .unwrap();
+            budget.lfs
+        };
+        assert!(lfs(""), "in the folder itself");
+        assert!(lfs("assets/art"), "two folders above");
+        // The rules are found by where they are, not by what they match.
+        assert!(lfs("src"));
+        std::fs::write(repo.join(".gitattributes"), "*.c text\n").unwrap();
+        run(&["commit", "-q", "-am", "no lfs"]);
+        assert!(!lfs("assets/art"));
+    }
+
+    /// A checked-out submodule's `.git` and the files its own ignore rules match are in no
+    /// revision, so they are left out; and a submodule whose recorded commit is not there to
+    /// read is left out on both sides and named, while the rest of the folder still compares.
+    #[test]
+    fn submodules_leave_out_their_git_and_ignored_files_and_unreadable_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, sub) = (dir.path().join("repo"), dir.path().join("sub"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        let run = |cwd: &Path, args: &[&str]| git(cwd, args).unwrap();
+        if git(&repo, &["init", "-q"]).is_err() {
+            return; // git is not installed
+        }
+        run(&sub, &["init", "-q"]);
+        for r in [&repo, &sub] {
+            run(r, &["config", "user.email", "t@example.com"]);
+            run(r, &["config", "user.name", "T"]);
+            run(r, &["config", "commit.gpgsign", "false"]);
+        }
+        std::fs::write(sub.join(".gitignore"), "build/\n").unwrap();
+        std::fs::write(sub.join("m.txt"), "m\n").unwrap();
+        run(&sub, &["add", "."]);
+        run(&sub, &["commit", "-q", "-m", "sub"]);
+        let added = git(
+            &repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &sub.display().to_string(),
+                "module",
+            ],
+        );
+        if added.is_err() {
+            return; // local-path submodules refused by this Git's configuration
+        }
+        run(&repo, &["commit", "-q", "-m", "module"]);
+        std::fs::create_dir_all(repo.join("module/build")).unwrap();
+        std::fs::write(repo.join("module/build/out.o"), "x").unwrap();
+
+        let never = AtomicBool::new(false);
+        let list = ignored(&repo, &never).unwrap();
+        assert!(list.contains(&"module/.git".to_string()), "{list:?}");
+        assert!(list.contains(&"module/build/".to_string()), "{list:?}");
+
+        // Record a commit the submodule's repository does not have.
+        let missing = "1234567890123456789012345678901234567890";
+        run(
+            &repo,
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{missing},module"),
+            ],
+        );
+        run(&repo, &["commit", "-q", "-m", "moved on"]);
+        let (_tmp, copy) = export_folder(&repo, "HEAD", &never).unwrap();
+        assert!(copy.join(".gitmodules").is_file(), "the rest of the folder is exported");
+        assert_eq!(unexported(&copy), ["module"]);
+        assert!(copy.join("module").is_dir(), "left as an empty folder");
+        assert_eq!(std::fs::read_dir(copy.join("module")).unwrap().count(), 0);
+        // Left out on both sides of the compare, with the rest still compared.
+        let filter = crate::core::vcs::without_ignored(
+            crate::core::filter::FileFilter::parse_mask("*.*"),
+            &repo,
+            &copy,
+            &never,
+        );
+        assert!(!filter.include_dir("module", "module"));
+        assert!(filter.include_file(".gitmodules", ".gitmodules"));
+        // An export of a folder without such a submodule lists none.
+        assert!(unexported(&repo).is_empty());
     }
 
     /// A tracked symlink pointing outside the repository is checked out as a real symlink by

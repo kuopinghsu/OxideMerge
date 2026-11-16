@@ -2021,6 +2021,51 @@ fn compare_folders(paths: &[PathBuf]) -> Option<OpenRequest> {
     })
 }
 
+/// A folder's patch holds the files that can be written as text and names the others, such
+/// as a file in another encoding than UTF-8, rather than failing and saving nothing.
+#[test]
+fn a_folder_patch_leaves_out_and_names_files_it_cannot_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, &[("left/a.txt", "old\n"), ("right/a.txt", "new\n")]);
+    // "café" in windows-1252, which a text patch cannot hold.
+    std::fs::write(d.join("left/b.txt"), b"caf\xe9 1\n").unwrap();
+    std::fs::write(d.join("right/b.txt"), b"caf\xe9 2\n").unwrap();
+    // A workbook, which the compare reads as a document rather than skipping as bytes.
+    let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("samples");
+    for side in ["left", "right"] {
+        std::fs::copy(
+            samples.join(side).join("docs/budget.xlsx"),
+            d.join(side).join("budget.xlsx"),
+        )
+        .unwrap();
+    }
+    let roots = [d.join("left"), d.join("right")];
+    let mut gui = Gui::start("folder_patch_left_out", compare_folders(&roots));
+    gui.wait_until("the compare", |g| !g.busy());
+    let Content::Folder(v) = gui.app.tabs[0].content.view() else {
+        panic!("not a folder compare");
+    };
+    let patch = v.make_patch(PatchStyle::Unified, 3);
+    assert!(patch.text.contains("-old") && patch.text.contains("+new"), "{}", patch.text);
+    assert!(!patch.text.contains("caf"), "{}", patch.text);
+    let why = |name: &str| {
+        patch
+            .left_out
+            .iter()
+            .find(|(f, _)| f == name)
+            .map(|(_, why)| why.clone())
+    };
+    assert!(why("b.txt").is_some_and(|w| w.contains("UTF-8")), "{:?}", patch.left_out);
+    // Named as not text, never explained by the encoding its bytes would be read in.
+    assert_eq!(
+        why("budget.xlsx").as_deref(),
+        Some(tr("patch.not_text")),
+        "{:?}",
+        patch.left_out
+    );
+}
+
 #[test]
 fn folder_merges_are_previewed_then_carried_out() {
     let dir = tempfile::tempdir().unwrap();
@@ -7965,6 +8010,64 @@ fn a_revision_of_a_file_opens_in_the_same_views_as_two_files() {
             "{name}: the copy is not a recent path"
         );
     }
+}
+
+/// What `--rev` is given with on the command line reaches the compare it opens: the names of
+/// the two sides and the working copy kept read-only, for a file and for a folder.
+#[test]
+fn a_compare_with_a_revision_keeps_the_options_it_was_opened_with() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !git(&["init", "-q"]) {
+        return; // git is not installed
+    }
+    for args in [
+        &["config", "user.email", "t@example.com"][..],
+        &["config", "user.name", "T"],
+        &["config", "commit.gpgsign", "false"],
+    ] {
+        assert!(git(args));
+    }
+    let file = root.join("notes.txt");
+    std::fs::write(&file, "old\n").unwrap();
+    assert!(git(&["add", "."]) && git(&["commit", "-q", "-m", "first"]));
+    std::fs::write(&file, "new\n").unwrap();
+
+    let request = |path: &Path| OpenRequest {
+        paths: vec![path.to_path_buf()],
+        git_rev: Some("HEAD".into()),
+        descriptions: vec![Some("Release".into()), Some("Mine".into())],
+        read_only: vec![true],
+        ..Default::default()
+    };
+    let mut gui = Gui::start("rev_options_file", None);
+    gui.app.open(request(&file));
+    gui.wait_until("the revision", |g| g.app.rev_load.is_none());
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let Content::Text(v) = gui.app.tabs[0].content.view() else {
+        panic!("not a text compare");
+    };
+    assert!(v.panes[0].doc.read_only && v.panes[1].doc.read_only);
+    assert!(gui.shows_text("Release") && gui.shows_text("Mine"));
+
+    let mut gui = Gui::start("rev_options_folder", None);
+    gui.app.open(request(root));
+    gui.wait_until("the revision", |g| g.app.rev_load.is_none());
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let Content::Folder(v) = gui.app.tabs[0].content.view() else {
+        panic!("not a folder compare");
+    };
+    assert_eq!(v.read_only, [true, true], "--wr keeps the working folder read-only");
+    assert_eq!(v.display_roots, ["Release", "Mine"]);
 }
 
 #[test]

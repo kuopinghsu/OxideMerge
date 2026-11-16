@@ -1199,7 +1199,9 @@ impl FolderView {
         let handle = std::thread::spawn(move || {
             // Asked here, off the window's thread, each time the folders are compared.
             let filter = match work {
-                Some(work) => crate::core::vcs::without_ignored(filter, &work, &pr.abort),
+                Some(work) => {
+                    crate::core::vcs::without_ignored(filter, &work, &roots[0], &pr.abort)
+                }
                 None => filter,
             };
             Scanner {
@@ -1460,6 +1462,16 @@ impl FolderView {
                 self.status = tr("msg.aborted").into();
             } else {
                 self.finished = self.elapsed;
+                // Submodules the revision could not be read for are left out on both sides.
+                if self.revision.is_some() {
+                    let left_out = crate::core::git::unexported(&self.roots[0]);
+                    if !left_out.is_empty() {
+                        self.status = trf(
+                            "msg.submodules_unexported",
+                            &[("names", left_out.join(", "))],
+                        );
+                    }
+                }
             }
         } else if r.updated.elapsed() >= UPDATE_INTERVAL.max(self.view_cost * 4) {
             r.updated = Instant::now();
@@ -2991,10 +3003,10 @@ impl FolderView {
         self.request_op_copy(from, to, cfg);
     }
 
-    /// Patch of all differing/unique text files.
-    pub fn make_patch(&self, style: PatchStyle, context: usize) -> Result<String, String> {
+    /// Patch of all differing/unique text files, and those left out of it.
+    pub fn make_patch(&self, style: PatchStyle, context: usize) -> patch::FolderPatch {
         if self.n() != 2 {
-            return Ok(String::new());
+            return patch::FolderPatch::default();
         }
         patch::folder_patch(
             &self.roots,

@@ -289,7 +289,17 @@ pub fn make_doc_patch(
     Ok(PatchPlan::new(old, new, opts, syntax).emit(input, style, context))
 }
 
-/// Patch of all differing or unique text files of a 2-way folder compare.
+/// The patch of a folder compare, and the files left out of it, each with why.
+#[derive(Debug, Default)]
+pub struct FolderPatch {
+    pub text: String,
+    pub left_out: Vec<(String, String)>,
+}
+
+/// Patch of all differing or unique text files of a 2-way folder compare. A file that cannot
+/// be written as a text patch, such as a workbook or a file in another encoding than UTF-8,
+/// is left out and named in [`FolderPatch::left_out`] rather than stopping the whole patch:
+/// what can be written still is.
 pub fn folder_patch(
     roots: &[std::path::PathBuf],
     display_roots: &[String],
@@ -297,9 +307,9 @@ pub fn folder_patch(
     opts: &super::diff::DiffOptions,
     style: PatchStyle,
     context: usize,
-) -> Result<String, String> {
+) -> FolderPatch {
     use super::folder::CmpStatus;
-    let mut out = String::new();
+    let mut out = FolderPatch::default();
     for it in items
         .iter()
         .filter(|i| !i.is_dir && matches!(i.status, CmpStatus::Different | CmpStatus::Unique))
@@ -307,26 +317,72 @@ pub fn folder_patch(
         if it.binary {
             continue;
         }
-        let load = |side: usize| -> Result<super::text::TextDoc, String> {
-            if !it.exists[side] {
-                return Ok(super::text::TextDoc::empty(None));
-            }
-            super::text::load_doc(&it.path(&roots[side]), None).map_err(|e| e.to_string())
-        };
-        let (a, b) = (load(0)?, load(1)?);
-        let input = PatchInput {
-            name_a: &format!("{}/{}", display_roots[0].replace('\\', "/"), it.rel_path()),
-            name_b: &format!("{}/{}", display_roots[1].replace('\\', "/"), it.rel_path()),
-            date_a: &super::report::fmt_time(it.mtime[0]),
-            date_b: &super::report::fmt_time(it.mtime[1]),
-            a: &a.lines,
-            b: &b.lines,
-            final_newline_a: a.final_newline,
-            final_newline_b: b.final_newline,
-        };
-        out.push_str(&make_doc_patch(&input, &[&a, &b], opts, style, context)?);
+        match file_patch(roots, display_roots, it, opts, style, context) {
+            Ok(text) => out.text.push_str(&text),
+            Err(why) => out.left_out.push((it.rel_path(), why)),
+        }
     }
-    Ok(out)
+    out
+}
+
+/// The patch of one file `it` of a folder compare.
+fn file_patch(
+    roots: &[std::path::PathBuf],
+    display_roots: &[String],
+    it: &super::folder::DirItem,
+    opts: &super::diff::DiffOptions,
+    style: PatchStyle,
+    context: usize,
+) -> Result<String, String> {
+    use super::text::TextEncoding;
+    // A picture, a PDF or a workbook is bytes, not text: said so plainly, rather than as the
+    // encoding its bytes would be read in. Looked at only once a file has failed, so a file
+    // that patches is read once; and a file read as UTF-16, whose zero bytes are text, keeps
+    // its own reason (use UTF-8).
+    let not_text = |why: String, decoded: &[Option<TextEncoding>]| {
+        let binary = (0..2).any(|side| {
+            let utf16 = matches!(
+                decoded.get(side).copied().flatten(),
+                Some(TextEncoding::Utf16Le | TextEncoding::Utf16Be)
+            );
+            it.exists[side] && !utf16 && {
+                let mut head = Vec::with_capacity(8192);
+                std::fs::File::open(it.path(&roots[side]))
+                    .and_then(|f| {
+                        use std::io::Read as _;
+                        f.take(8192).read_to_end(&mut head)
+                    })
+                    .is_ok_and(|_| super::text::looks_binary(&head))
+            }
+        });
+        if binary {
+            crate::i18n::tr("patch.not_text").to_string()
+        } else {
+            why
+        }
+    };
+    let load = |side: usize| -> Result<super::text::TextDoc, String> {
+        if !it.exists[side] {
+            return Ok(super::text::TextDoc::empty(None));
+        }
+        super::text::load_doc(&it.path(&roots[side]), None).map_err(|e| e.to_string())
+    };
+    let (a, b) = match (load(0), load(1)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(why), _) | (_, Err(why)) => return Err(not_text(why, &[])),
+    };
+    let decoded = [Some(a.encoding), Some(b.encoding)];
+    let input = PatchInput {
+        name_a: &format!("{}/{}", display_roots[0].replace('\\', "/"), it.rel_path()),
+        name_b: &format!("{}/{}", display_roots[1].replace('\\', "/"), it.rel_path()),
+        date_a: &super::report::fmt_time(it.mtime[0]),
+        date_b: &super::report::fmt_time(it.mtime[1]),
+        a: &a.lines,
+        b: &b.lines,
+        final_newline_a: a.final_newline,
+        final_newline_b: b.final_newline,
+    };
+    make_doc_patch(&input, &[&a, &b], opts, style, context).map_err(|why| not_text(why, &decoded))
 }
 
 fn write_lines(

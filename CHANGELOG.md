@@ -19,8 +19,28 @@ release on GitHub uses its section of this file as the release notes.
 - The sample web pages in `samples/web`, `samples/left/web` and `samples/right/web` show
   pictures: one changed under the same name, one added with only a `srcset`, one stored in
   the page, and a logo inside a link.
+- Macro-enabled Word documents and templates (`.docm`, `.dotx`, `.dotm`) and Excel templates
+  (`.xltx`, `.xltm`) are compared as the documents and workbooks they are laid out as.
+- A `.csv` file's delimiter is detected from its first lines: a comma, semicolon, tab or `|`,
+  or the one an Excel `sep=` line names, which is not read as a row. Each side keeps its own
+  delimiter, so a `.tsv` can be compared with a `.csv`, and a value copied between them is
+  written with the delimiter of the side it goes to.
+- Compared with a revision (`--rev`), the window now takes the options given with it, as
+  `--cli` and `--report` already did: `--filter`, `-r`, `--method`, `--kind`, `-o`, `--wr`,
+  and `--dl`/`--dr` or `-L` to name the sides. `--wr` keeps a working folder read-only too.
 
 ### Changed
+
+- The release executable is smaller: 44.2 MB on Windows instead of 55.3 MB, built for size
+  with fat LTO and stripped. Compare speed is unchanged within measurement noise, except a
+  4K image compare (0.11 s to 0.14 s).
+- *Generate patch...* of a folder compare saves the patch of every file it can write as
+  text, then names each file it left out and why: "not a text file" for a picture, PDF,
+  document or workbook, or the encoding of a text file that is not UTF-8. It no longer
+  saves nothing because of one such file. From the command line, `--patch` still writes
+  the patch, reports each file left out as an error and exits with code 2.
+- Find in the binary compare searches every side; the side with the match is scrolled into
+  view, and editing moves to it.
 
 - *Synchronize folders...* has its own toolbar and menu icon, two sides with an arrow between
   them, instead of the *Copy all* arrows. Its preview shows the share of folders to create,
@@ -91,6 +111,26 @@ release on GitHub uses its section of this file as the release notes.
   listed in the Resources tree. In the Formatted view, a picture with only a `srcset` is
   shown, a linked picture without alt text is named by its file, file names are no longer
   percent-encoded, and alt text is no longer decoded twice.
+- A quote inside a CSV field that does not start with one, as in `55" screen`, is part of
+  the value instead of making the file unreadable as a table. A copy that would split a
+  quoted cell with line breaks is refused, and a cell past the end of a short record can be
+  edited, which lengthens the record.
+- A workbook sheet whose name holds a comma or a quote still reads as one valid table, and
+  sheet headings are recognised whichever language they were read in. In an `.ods` sheet,
+  repeated spaces, tabs and line breaks in a cell are kept, and its paragraphs are its lines.
+- Reports name the right rows and fields for records with a cell spanning several lines,
+  and read a semicolon CSV with its own delimiter.
+- Binary compare: an edit that changes a file's length keeps the differences exact; the
+  location pane stays quick with millions of differences; saving writes every side it can
+  and keeps a half-typed byte; the *Copy all* message's Undo undoes only the copy; and a
+  short shift late in a large file is found even after many overwritten bytes.
+- Comparing a folder with a revision (`--rev`, *Compare with revision*):
+  - A checked-out submodule's `.git` and its own ignored files, such as build output, are
+    no longer listed as new.
+  - A submodule whose recorded commit cannot be read, such as one never fetched, is left out
+    of both sides and named, instead of looking empty, as if all its files were new.
+  - The export size limit also covers Git LFS files, which are written larger than the
+    pointers it counted, also when the LFS rules are in a folder above the one compared.
 
 ## [0.9.8] - 2026-11-12
 

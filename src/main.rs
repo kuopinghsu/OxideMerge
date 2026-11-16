@@ -616,7 +616,15 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         // does: build output and the like are in no revision.
         let filter = match (&cli.git_rev, &cli.paths[..]) {
             (Some(_), [work]) => {
-                core::vcs::without_ignored(filter, work, &std::sync::atomic::AtomicBool::new(false))
+                let never = std::sync::atomic::AtomicBool::new(false);
+                let left_out = core::git::unexported(&paths[0]);
+                if !left_out.is_empty() {
+                    eprintln!(
+                        "note: {}",
+                        i18n::trf("msg.submodules_unexported", &[("names", left_out.join(", "))])
+                    );
+                }
+                core::vcs::without_ignored(filter, work, &paths[0], &never)
             }
             _ => filter,
         };
@@ -644,7 +652,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         let different = files.iter().any(|i| {
             i.status != CmpStatus::Identical && !(i.is_dir && i.status == CmpStatus::NotCompared)
         });
-        let failed = files.iter().any(|i| i.status == CmpStatus::Error);
+        let mut failed = files.iter().any(|i| i.status == CmpStatus::Error);
         // The names reports give the folders.
         let named = core::report::shown_roots(&shown, cli.report_hide_paths);
         let info = core::report::FolderReportInfo {
@@ -700,16 +708,27 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             export(r, &text)?;
         }
         if let Some(p) = patch {
-            let text = core::patch::folder_patch(
+            let patch = core::patch::folder_patch(
                 paths,
                 &display,
                 &items,
                 &cfg.diff,
                 patch_style(cli.patch_style),
                 cli.context,
-            )
-            .map_err(anyhow::Error::msg)?;
-            export(p, &text)?;
+            );
+            for (file, why) in &patch.left_out {
+                eprintln!("error: {file} left out of the patch: {why}");
+            }
+            export(p, &patch.text)?;
+            // A patch without some of the changes is written, so what it holds can be used,
+            // but the run fails: a script applying it must not take it for all of them.
+            if !patch.left_out.is_empty() {
+                eprintln!(
+                    "error: the patch leaves out {} changed files",
+                    patch.left_out.len()
+                );
+                failed = true;
+            }
         }
         if cli.cli {
             let changed: Vec<&core::folder::DirItem> = files
@@ -1867,10 +1886,21 @@ fn main() -> ExitCode {
         .collect();
 
     let initial = if let (Some(rev), [_]) = (&cli.git_rev, &paths[..]) {
+        // The options a compare is opened with apply to one with a revision too, as they do
+        // with --cli and --report. The revision is the left side and always read-only; the
+        // path given is the right side, so --wr is its read-only flag, and --dl and --dr (or
+        // -L) name the revision and the working copy.
         Some(OpenRequest {
             paths,
             git_rev: Some(rev.clone()),
             rules: cli_rules.clone(),
+            descriptions: vec![cli_desc(&cli, 0), cli_desc(&cli, 1)],
+            read_only: vec![cli.wr],
+            kind: cli.kind.map(file_kind),
+            recursive: if cli.recursive { Some(true) } else { None },
+            filter: cli.filter.clone(),
+            method: cli.method.map(method),
+            output: cli.output.clone(),
             ..Default::default()
         })
     } else if paths.is_empty() {

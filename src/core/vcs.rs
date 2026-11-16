@@ -383,7 +383,7 @@ fn bound_exported_folder(dir: &Path) -> Result<()> {
 
 /// What [`bound_exported_folder`] checks `dir` against, with the limits as arguments so a test
 /// can pass small ones without actually writing gigabytes or hundreds of thousands of files.
-fn bound_with_limits(dir: &Path, max_bytes: u64, max_files: u64) -> Result<()> {
+pub(super) fn bound_with_limits(dir: &Path, max_bytes: u64, max_files: u64) -> Result<()> {
     let (mut bytes, mut files) = (0u64, 0u64);
     for entry in walkdir::WalkDir::new(dir) {
         let entry = entry.context("reading the exported folder")?;
@@ -575,24 +575,24 @@ fn no_working_copy<T>(path: &Path, result: Result<T>) -> Result<T> {
     })
 }
 
-/// `rev` trimmed, or the default revision of the system holding `path` when it is empty: the
-/// revision that `show_file` and `export_folder` compare with.
 /// `filter`, also leaving out what the Git working copy ignores in folder `path`, as a folder
 /// compared with a revision of it does: no revision holds build output or the like, so it
-/// would only be listed as new. `filter` as it is for another version control system, or when
-/// Git cannot say.
+/// would only be listed as new. The submodules the revision's copy `export` could not be
+/// filled in for (see [`git::unexported`]) are left out too, on both sides. `filter` as it is
+/// when there is nothing to leave out.
 pub fn without_ignored(
     filter: crate::core::filter::FileFilter,
     path: &Path,
+    export: &Path,
     cancel: &AtomicBool,
 ) -> crate::core::filter::FileFilter {
     use crate::core::filter::{FileFilter, Skipped};
-    match ignored(path, cancel) {
-        Some(paths) => {
-            FileFilter::Except(Box::new(filter), std::sync::Arc::new(Skipped::new(paths)))
-        }
-        None => filter,
+    let mut paths = ignored(path, cancel).unwrap_or_default();
+    paths.extend(git::unexported(export).into_iter().map(|p| format!("{p}/")));
+    if paths.is_empty() {
+        return filter;
     }
+    FileFilter::Except(Box::new(filter), std::sync::Arc::new(Skipped::new(paths)))
 }
 
 /// What a Git working copy ignores in folder `path` (see [`git::ignored`]); none for another
@@ -604,6 +604,8 @@ pub fn ignored(path: &Path, cancel: &AtomicBool) -> Option<Vec<String>> {
     }
 }
 
+/// `rev` trimmed, or the default revision of the system holding `path` when it is empty: the
+/// revision that `save_file` and `export_folder` compare with.
 pub fn rev_or_default<'a>(path: &Path, rev: &'a str) -> &'a str {
     Vcs::of(path).rev_or_default(rev)
 }

@@ -2591,6 +2591,14 @@ struct RevSettings {
     /// For a file: the compare type, and how a table compare matches records.
     kind: Option<FileKind>,
     table: Option<crate::core::table_match::TableMatch>,
+    /// For a file: where the merge result is saved.
+    output: Option<PathBuf>,
+    /// Whether the working copy (the right side) is read-only too: for a folder, nothing may
+    /// be copied to or deleted from it.
+    work_read_only: bool,
+    /// What to call the revision and the working copy, in place of `<path> @ <rev>` and the
+    /// path.
+    labels: [Option<String>; 2],
 }
 
 /// How long the Git dialog's path must stay unchanged before its commits are read.
@@ -2655,6 +2663,8 @@ const MAX_WORKSPACE_NAME: usize = 80;
 struct Toast {
     text: String,
     error: bool,
+    /// Done, but not all of it: stays until closed, as an error does, in the warning color.
+    warning: bool,
     /// When the toast appeared, or when the pointer last left it, in `egui::InputState::time`.
     shown: Option<f64>,
     undo: Option<ToastUndo>,
@@ -4428,12 +4438,22 @@ impl OxideMergeApp {
         self.push_toast(msg.into(), false, None);
     }
 
+    /// Says that something was done, but not all of it, such as a patch saved without some
+    /// files: kept until closed, like an error, but not taken for a failure.
+    fn warn(&mut self, msg: impl Into<String>) {
+        self.push_toast(msg.into(), false, None);
+        if let Some(t) = self.toasts.last_mut() {
+            t.warning = true;
+        }
+    }
+
     fn push_toast(&mut self, text: String, error: bool, undo: Option<ToastUndo>) {
         self.toasts
             .retain(|t| t.text != text && (undo.is_none() || t.undo != undo));
         self.toasts.push(Toast {
             text,
             error,
+            warning: false,
             shown: None,
             undo,
         });
@@ -4707,6 +4727,9 @@ impl OxideMergeApp {
                 rules: req.rules.clone(),
                 kind: req.kind,
                 table: req.table.clone(),
+                output: req.output.clone(),
+                work_read_only: req.read_only.first().copied().unwrap_or(false),
+                labels: [0, 1].map(|i| req.descriptions.get(i).cloned().flatten()),
             };
             self.read_revision(path, rev, None, settings);
             return Ok(());
@@ -6227,9 +6250,10 @@ impl OxideMergeApp {
         temp: tempfile::TempDir,
         copy: PathBuf,
     ) -> anyhow::Result<()> {
-        let label = format!("{} @ {rev}", path.display());
+        let [left, right] = settings.labels.clone();
+        let label = left.unwrap_or_else(|| format!("{} @ {rev}", path.display()));
         if path.is_dir() {
-            let display = vec![label, path.display().to_string()];
+            let display = vec![label, right.unwrap_or_else(|| path.display().to_string())];
             let filter = settings.filter.as_deref().unwrap_or(&self.cfg.filter);
             // What Git ignores in the working folder, such as build output, is in no revision:
             // it is left out rather than listed as new.
@@ -6251,6 +6275,12 @@ impl OxideMergeApp {
             if let Some(r) = &settings.rules {
                 v.set_rules(&self.cfg, r.clone());
             }
+            // --wr: nothing may be copied to or deleted from the working folder either.
+            if settings.work_read_only {
+                if let Some(work) = v.read_only.get_mut(1) {
+                    *work = true;
+                }
+            }
             v.start_compare();
             self.push_tab(Content::Folder(v), Vec::new());
         } else {
@@ -6261,12 +6291,13 @@ impl OxideMergeApp {
             let tabs = self.tabs.len();
             self.try_open(OpenRequest {
                 paths: vec![copy.clone(), path.to_path_buf()],
-                descriptions: vec![Some(label), None],
-                read_only: vec![true, false],
+                descriptions: vec![Some(label), right],
+                read_only: vec![true, settings.work_read_only],
                 skip_recent: true,
                 rules: settings.rules.clone(),
                 kind: settings.kind,
                 table: settings.table.clone(),
+                output: settings.output.clone(),
                 wait: true,
                 ..Default::default()
             })?;
@@ -11864,21 +11895,46 @@ impl OxideMergeApp {
         if go {
             self.cfg.patch_style = d.style;
             self.cfg.patch_context = d.context;
+            // A folder's patch leaves out the files that cannot be written as text, and names
+            // them, rather than saving nothing.
+            let mut left_out = Vec::new();
             let text = match self.tabs.get(self.active).map(|t| t.content.view()) {
                 Some(Content::Text(v)) => v.make_patch(d.style, d.context),
                 Some(Content::Folder(v)) if v.n() == 2 => {
-                    v.make_patch(d.style, d.context).map(Some)
+                    let patch = v.make_patch(d.style, d.context);
+                    left_out = patch.left_out;
+                    Ok(Some(patch.text))
                 }
                 _ => Ok(None),
             };
+            let files = left_out
+                .iter()
+                .map(|(file, why)| format!("• {file}: {why}"))
+                .collect::<Vec<_>>()
+                .join("\n");
             match text {
                 Err(e) => self.error(e),
                 Ok(None) => self.error(tr("msg.patch_two_way")),
                 Ok(Some(_)) if d.path.trim().is_empty() => self.patch_dlg = Some(d),
+                // Nothing to write but what was left out: no empty file is saved.
+                Ok(Some(t)) if t.is_empty() && !left_out.is_empty() => self.error(trf(
+                    "msg.patch_nothing_written",
+                    &[("files", files)],
+                )),
                 Ok(Some(t)) => {
                     let path = Path::new(d.path.trim());
                     match crate::core::fsutil::write_atomic_with(path, t.as_bytes(), false) {
-                        Ok(()) => self.notify(trf("msg.saved", &[("file", d.path.clone())])),
+                        Ok(()) if left_out.is_empty() => {
+                            self.notify(trf("msg.saved", &[("file", d.path.clone())]));
+                        }
+                        Ok(()) => self.warn(trf(
+                            "msg.patch_left_out",
+                            &[
+                                ("file", d.path.clone()),
+                                ("n", left_out.len().to_string()),
+                                ("files", files),
+                            ],
+                        )),
                         Err(e) => self.error(format!("{e:#}")),
                     }
                 }
@@ -12053,12 +12109,20 @@ impl OxideMergeApp {
             } else {
                 TOAST_SECS
             };
-            let alpha = if t.error {
+            // Errors and warnings stay until they are closed.
+            let stays = t.error || t.warning;
+            let alpha = if stays {
                 1.0
             } else {
                 ((life - age) / 0.3).clamp(0.0, 1.0) as f32
             };
-            let accent = if t.error { p.danger } else { p.success };
+            let accent = if t.error {
+                p.danger
+            } else if t.warning {
+                p.warning
+            } else {
+                p.success
+            };
             let area = egui::Area::new(egui::Id::unique(("toast", i)))
                 .order(egui::Order::Tooltip)
                 .pivot(Align2::RIGHT_BOTTOM)
@@ -12079,7 +12143,7 @@ impl OxideMergeApp {
                         .show(ui, |ui| {
                             ui.set_max_width(420.0);
                             ui.horizontal(|ui| {
-                                if t.error {
+                                if stays {
                                     widgets::inline_icon(ui, Icon::Warning, accent);
                                 } else {
                                     let (r, _) =
@@ -12092,8 +12156,8 @@ impl OxideMergeApp {
                                     )
                                     .wrap(),
                                 );
-                                // Errors are read out at once, other messages in turn.
-                                widgets::announce(ui, &said, t.error);
+                                // Errors and warnings are read out at once, others in turn.
+                                widgets::announce(ui, &said, stays);
                                 if t.undo.is_some()
                                     && widgets::ghost_icon_button(ui, Icon::Undo, tr("cmd.undo"))
                                         .clicked()
@@ -12111,7 +12175,7 @@ impl OxideMergeApp {
             let hovered = area.response.contains_pointer();
             if hovered {
                 t.shown = Some(now);
-            } else if !t.error && age >= life {
+            } else if !stays && age >= life {
                 close = close.or(Some(i));
             }
             bottom = area.response.rect.top() - 8.0;
@@ -12138,7 +12202,7 @@ impl OxideMergeApp {
             }
             Some(ToastUndo::Workspace(..)) | None => {}
         }
-        if self.toasts.iter().any(|t| !t.error) {
+        if self.toasts.iter().any(|t| !t.error && !t.warning) {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
@@ -12698,7 +12762,13 @@ impl OxideMergeApp {
             out.push_str(&format!("recovery offered | {}\n", tabs.join(" | ")));
         }
         for t in &self.toasts {
-            let kind = if t.error { "error" } else { "note" };
+            let kind = if t.error {
+                "error"
+            } else if t.warning {
+                "warning"
+            } else {
+                "note"
+            };
             out.push_str(&format!("{kind} {}\n", t.text.replace('\n', " / ")));
         }
         if let Err(e) = std::fs::write(&path, out) {
