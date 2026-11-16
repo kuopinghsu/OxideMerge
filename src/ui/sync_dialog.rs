@@ -613,18 +613,17 @@ impl SyncDialog {
                 ui.label(tr("folder_sync.nothing"));
             });
         } else {
-            // What the plan does, in numbers, with the same in words under them.
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = theme::space::SM as f32;
-                for (n, action) in [
+            // What the plan does: its share of each kind of change as one bar, in the colors
+            // of the rows and filters below, with the same in words under it.
+            share_bar(
+                ui,
+                &[
                     (e.create_dirs, Action::CreateDir),
                     (e.copies, Action::Copy),
                     (e.replaces, Action::Replace),
                     (e.deletes, Action::Delete),
-                ] {
-                    stat(ui, n, tr(action.key()), action_color(action, &pal));
-                }
-            });
+                ],
+            );
             ui.add_space(theme::space::XS as f32);
             ui.label(
                 RichText::new(trf(
@@ -637,8 +636,8 @@ impl SyncDialog {
                         ("bytes", fmt_size(Some(e.bytes))),
                     ],
                 ))
-                .size(theme::size::SMALL)
-                .color(pal.text_dim),
+                .size(theme::size::DENSE)
+                .color(pal.text),
             );
             if e.renames > 0 {
                 ui.label(
@@ -678,11 +677,13 @@ impl SyncDialog {
                 let n = plan.count(a);
                 let label = format!("{} {n}", tr(a.key()));
                 let on = self.shown == Some(a) && !self.renames;
-                if n > 0 && pill(ui, true, on, &label, 24.0).clicked() {
+                let dot = share_color(a, &pal);
+                if n > 0 && dot_pill(ui, on, dot, &label).clicked() {
                     (self.shown, self.renames) = (Some(a), false);
                 }
             }
             let renames = format!("{} {}", tr("folder_sync.action_rename"), e.renames);
+            // Renames are copies, so they have no part of the bar of their own, and no dot.
             if e.renames > 0
                 && pill(ui, true, self.renames, &renames, 24.0)
                     .on_hover_text(tr("tip.sync_renames"))
@@ -913,28 +914,129 @@ fn pill(ui: &mut Ui, enabled: bool, selected: bool, label: &str, height: f32) ->
     )
 }
 
-/// A count of the plan with what it counts under it; dimmed when there is none.
-fn stat(ui: &mut Ui, n: usize, label: &str, color: Color32) {
+/// Diameter of the color dot that keys a filter to its part of [`share_bar`].
+const DOT: f32 = 7.0;
+
+/// A filter pill, 24 tall, whose label follows a dot in the color of what it filters. The dot
+/// is painted in room left before the text, so the pill is named by its label alone.
+fn dot_pill(ui: &mut Ui, selected: bool, dot: Color32, label: &str) -> egui::Response {
+    let font = egui::FontId::proportional(theme::size::DENSE);
+    let mut job = egui::text::LayoutJob::default();
+    // No color of its own, so the button colors it as selected, hovered or disabled.
+    job.append(
+        label,
+        DOT + theme::space::XS as f32,
+        egui::TextFormat::simple(font, Color32::PLACEHOLDER),
+    );
+    let resp = ui.add(
+        egui::Button::selectable(selected, job)
+            .corner_radius(theme::radius::MD)
+            .min_size(vec2(0.0, 24.0)),
+    );
+    let pad = ui.spacing().button_padding.x;
+    let center = egui::pos2(resp.rect.left() + pad + DOT / 2.0, resp.rect.center().y);
+    paint_dot(ui, center, dot);
+    resp
+}
+
+/// The color dot of a kind of change, centered on `center`; dimmed when `ui` is disabled.
+fn paint_dot(ui: &Ui, center: egui::Pos2, color: Color32) {
+    let fill = if ui.is_enabled() {
+        color
+    } else {
+        widgets::pal(ui).text_disabled
+    };
+    ui.painter().circle_filled(center, DOT / 2.0, fill);
+}
+
+/// The color of `a` as a fill, in [`share_bar`] and on its filter's dot: as [`action_color`],
+/// but a folder to make in a softer, still opaque green than a file to copy, so the two adding
+/// kinds stay apart side by side in either theme. Kept apart from [`action_color`] on purpose:
+/// text, as on the rows' badges, keeps the full color, which a softer green would leave too
+/// faint to read.
+fn share_color(a: Action, pal: &theme::Palette) -> Color32 {
+    match a {
+        Action::CreateDir => pal.success.lerp_to_gamma(pal.surface, 0.4),
+        _ => action_color(a, pal),
+    }
+}
+
+/// How wide each of `counts` is drawn in a bar `width` wide with `gap` between them: in
+/// proportion to its count, but never narrower than [`SLIVER`] (or an equal share, where even
+/// that does not fit), so a kind with a small share still shows. The widths and gaps fill the
+/// bar exactly; none when there is no room.
+fn share_widths(counts: &[usize], width: f32, gap: f32) -> Vec<f32> {
+    let total: usize = counts.iter().sum();
+    let room = width - gap * counts.len().saturating_sub(1) as f32;
+    if total == 0 || counts.is_empty() || room <= 0.0 {
+        return Vec::new();
+    }
+    let min = SLIVER.min(room / counts.len() as f32);
+    // Kinds whose share would be narrower than the sliver get the sliver, set aside first; the
+    // rest of the room is shared in proportion among the others. Setting one aside narrows
+    // the rest, so this repeats until no more fall short, at most once a kind.
+    let mut sliver = vec![false; counts.len()];
+    loop {
+        let set_aside = sliver.iter().filter(|&&s| s).count() as f32 * min;
+        let others: usize = counts.iter().zip(&sliver).filter(|(_, &s)| !s).map(|(n, _)| n).sum();
+        let left = room - set_aside;
+        let mut more = false;
+        for (i, &n) in counts.iter().enumerate() {
+            if !sliver[i] && (others == 0 || left * n as f32 / (others as f32) < min) {
+                sliver[i] = true;
+                more = true;
+            }
+        }
+        if !more {
+            return counts
+                .iter()
+                .zip(&sliver)
+                .map(|(&n, &s)| if s { min } else { left * n as f32 / others as f32 })
+                .collect();
+        }
+    }
+}
+
+/// The narrowest a kind of change is drawn in [`share_bar`].
+const SLIVER: f32 = 6.0;
+
+/// One thin bar split in proportion to how many of each kind of change the plan makes, so
+/// its shape (mostly adds, or mostly deletes) reads at a glance. Hovering tells the numbers.
+fn share_bar(ui: &mut Ui, parts: &[(usize, Action)]) {
     let pal = widgets::pal(ui);
-    panel(ui)
-        .inner_margin(Margin::symmetric(theme::space::LG, theme::space::SM))
-        .show(ui, |ui| {
-            ui.set_min_width(84.0);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                let color = if n == 0 { pal.text_disabled } else { color };
-                ui.label(
-                    RichText::new(n.to_string())
-                        .font(theme::semibold(theme::size::HEADING))
-                        .color(color),
-                );
-                ui.label(
-                    RichText::new(label)
-                        .size(theme::size::SMALL)
-                        .color(pal.text_dim),
-                );
+    let height = 6.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let r = (height / 2.0) as u8;
+    ui.painter().rect_filled(rect, r, pal.control);
+    let shown: Vec<_> = parts.iter().filter(|&&(n, _)| n > 0).collect();
+    let gap = 2.0;
+    let counts: Vec<usize> = shown.iter().map(|&&(n, _)| n).collect();
+    let widths = share_widths(&counts, rect.width(), gap);
+    if widths.is_empty() {
+        return;
+    }
+    let mut x = rect.left();
+    for (i, (&&(_, a), &w)) in shown.iter().zip(&widths).enumerate() {
+        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top()), vec2(w, height));
+        let (first, last) = (i == 0, i == shown.len() - 1);
+        let corners = egui::CornerRadius {
+            nw: if first { r } else { 0 },
+            sw: if first { r } else { 0 },
+            ne: if last { r } else { 0 },
+            se: if last { r } else { 0 },
+        };
+        ui.painter().rect_filled(seg, corners, share_color(a, &pal));
+        x += w + gap;
+    }
+    resp.on_hover_ui(|ui| {
+        for &&(n, a) in &shown {
+            ui.horizontal(|ui| {
+                let (spot, _) = ui.allocate_exact_size(vec2(DOT, DOT), Sense::hover());
+                paint_dot(ui, spot.center(), share_color(a, &pal));
+                ui.label(format!("{} {n}", tr(a.key())));
             });
-        });
+        }
+    });
 }
 
 enum Step {
@@ -957,6 +1059,7 @@ fn apply_button(ui: &mut Ui, label: &str, deletes: bool) -> egui::Response {
     )
 }
 
+/// The color of `a` for text: its badge on a row. See [`share_color`] for its fills.
 fn action_color(a: Action, pal: &theme::Palette) -> Color32 {
     match a {
         Action::Delete | Action::RemoveDir => pal.danger,
@@ -1254,5 +1357,52 @@ impl Recovery {
             });
         });
         keep
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{share_widths, SLIVER};
+
+    /// The parts fill the bar with their gaps, in proportion, and a small share keeps a sliver.
+    #[test]
+    fn shares_fill_the_bar_and_keep_a_sliver() {
+        let widths = share_widths(&[1, 2, 1, 2], 306.0, 2.0);
+        assert_eq!(widths.len(), 4);
+        let total: f32 = widths.iter().sum::<f32>() + 3.0 * 2.0;
+        assert!((total - 306.0).abs() < 0.01, "{widths:?}");
+        assert!((widths[1] - 2.0 * widths[0]).abs() < 0.01, "{widths:?}");
+
+        let widths = share_widths(&[1, 10_000], 400.0, 2.0);
+        assert!(widths[0] >= SLIVER, "a small share disappears: {widths:?}");
+        assert!((widths.iter().sum::<f32>() + 2.0 - 400.0).abs() < 0.01);
+
+        // Several small kinds beside a large one each keep the whole sliver, which a
+        // rescale after raising them would shave off.
+        let widths = share_widths(&[1, 1, 1, 10_000], 100.0, 2.0);
+        for w in &widths[..3] {
+            assert!((w - SLIVER).abs() < 0.001, "{widths:?}");
+        }
+        assert!((widths.iter().sum::<f32>() + 3.0 * 2.0 - 100.0).abs() < 0.01);
+        // The large one is still in proportion among the rest.
+        assert!(widths[3] > 70.0, "{widths:?}");
+    }
+
+    /// Where even the slivers do not fit, the kinds share the room equally.
+    #[test]
+    fn too_narrow_for_slivers_shares_equally() {
+        let widths = share_widths(&[1, 50, 1000], 16.0, 2.0);
+        assert_eq!(widths.len(), 3);
+        for w in &widths {
+            assert!((w - 4.0).abs() < 0.001, "{widths:?}");
+        }
+    }
+
+    /// No room, or nothing to show, draws no parts rather than ones of negative width.
+    #[test]
+    fn no_parts_without_room_or_counts() {
+        assert!(share_widths(&[1, 1, 1, 1], 4.0, 2.0).is_empty());
+        assert!(share_widths(&[], 100.0, 2.0).is_empty());
+        assert!(share_widths(&[0, 0], 100.0, 2.0).is_empty());
     }
 }

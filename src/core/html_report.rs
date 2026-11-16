@@ -596,7 +596,12 @@ fn program(command: &str) -> String {
 
 /// Where line `at` of `lines`, read as `read`, is in the file, when the reading says so: the
 /// sheet and rows of a spreadsheet, the pages of a PDF file, or the kind of notebook cell.
-fn location(read: &ReadAs, lines: &[String], range: &Range<usize>) -> Option<String> {
+fn location(
+    read: &ReadAs,
+    lines: &[String],
+    range: &Range<usize>,
+    records: Option<&[LineRecord]>,
+) -> Option<String> {
     let at = range.start.min(lines.len().checked_sub(1)?);
     match read {
         ReadAs::Document(pages) => {
@@ -620,18 +625,30 @@ fn location(read: &ReadAs, lines: &[String], range: &Range<usize>) -> Option<Str
             let heading = lines[..=at]
                 .iter()
                 .rposition(|l| super::extract::is_sheet_heading(l));
-            // A sheet keeps its rows in place, one line each, from the line after its heading.
-            let (sheet, first) = match heading {
-                Some(h) if h == range.start => return Some(lines[h][2..].to_string()),
-                Some(h) => (Some(lines[h][2..].to_string()), range.start - h),
-                None => (None, range.start + 1),
+            let title = |h: usize| super::extract::sheet_title(&lines[h]).unwrap_or_default();
+            // A sheet keeps its rows in place from the line after its heading, a row a record:
+            // one line each, unless a cell has a line break in it.
+            let record = |line: usize| {
+                records
+                    .and_then(|r| r.get(line.min(r.len().checked_sub(1)?)))
+                    .map_or(line, |r| r.record)
             };
-            let rows = match range.len() {
-                0 | 1 => trf("report.loc_row", &[("n", first.to_string())]),
-                n => trf(
+            let (sheet, first) = match heading {
+                Some(h) if h == range.start => return Some(title(h)),
+                Some(h) => (Some(title(h)), record(range.start) - record(h)),
+                None => (None, record(range.start) + 1),
+            };
+            let last = match range.len() {
+                0 | 1 => first,
+                n => first + record(range.start + n - 1) - record(range.start),
+            };
+            let rows = if last == first {
+                trf("report.loc_row", &[("n", first.to_string())])
+            } else {
+                trf(
                     "report.loc_rows",
-                    &[("a", first.to_string()), ("b", (first + n - 1).to_string())],
-                ),
+                    &[("a", first.to_string()), ("b", last.to_string())],
+                )
             };
             Some(match sheet {
                 Some(s) => format!("{s} · {rows}"),
@@ -652,7 +669,7 @@ fn location(read: &ReadAs, lines: &[String], range: &Range<usize>) -> Option<Str
 fn delimiter(read: &ReadAs, doc: &TextDoc) -> Option<char> {
     match read {
         ReadAs::Spreadsheet(_) => Some(','),
-        ReadAs::Text => doc.path.as_deref().and_then(super::table::delimiter_for),
+        ReadAs::Text => super::table::file_delimiter(doc),
         _ => None,
     }
 }
@@ -664,7 +681,12 @@ fn delimiter(read: &ReadAs, doc: &TextDoc) -> Option<char> {
 /// is left to the lines shown. A sheet's column is named by both rows of a header over two
 /// rows, or by its letters when it has no name, and a sheet's value is shown as the sheet shows
 /// it, with what it stores when that differs.
-fn field_changes(reads: &[ReadAs], docs: &[TextDoc], ranges: &[Range<usize>]) -> Vec<String> {
+fn field_changes(
+    reads: &[ReadAs],
+    docs: &[TextDoc],
+    ranges: &[Range<usize>],
+    records: &RecordLines,
+) -> Vec<String> {
     let (Some(da), Some(db)) = (
         delimiter(&reads[0], &docs[0]),
         delimiter(&reads[1], &docs[1]),
@@ -697,9 +719,24 @@ fn field_changes(reads: &[ReadAs], docs: &[TextDoc], ranges: &[Range<usize>]) ->
         (h < at).then_some(h)
     };
     let (la, lb) = (&docs[0].lines, &docs[1].lines);
+    // Fields are read a line at a time, so only lines that are records of their own are: not
+    // those of a cell with a line break in it.
+    let (Some(rec_a), Some(rec_b)) = (records.of(0, reads, docs), records.of(1, reads, docs))
+    else {
+        return Vec::new();
+    };
+    let whole = |r: &[LineRecord], lines: Range<usize>| {
+        r.get(lines).is_some_and(|ls| ls.iter().all(|l| l.whole))
+    };
+    if !whole(rec_a, ra.clone()) || !whole(rec_b, rb.clone()) {
+        return Vec::new();
+    }
     let (Some(ha), Some(hb)) = (header(0, la, ra.start, da), header(1, lb, rb.start, db)) else {
         return Vec::new();
     };
+    if !whole(rec_a, ha..ha + 1) || !whole(rec_b, hb..hb + 1) {
+        return Vec::new();
+    }
     let names = super::table::split_row(&la[ha], da);
     if names.len() < 2 || names != super::table::split_row(&lb[hb], db) {
         return Vec::new();
@@ -856,6 +893,39 @@ pub(crate) struct Extra {
     pub(crate) fields: Vec<String>,
 }
 
+/// The record each line of a table side is in, and whether the line is that record whole.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LineRecord {
+    pub(crate) record: usize,
+    pub(crate) whole: bool,
+}
+
+/// The records of the lines of each side of one compare, read once for all its blocks; a side
+/// that is no table, or whose records cannot be read, has none.
+#[derive(Default)]
+pub(crate) struct RecordLines(Vec<std::sync::OnceLock<Option<Vec<LineRecord>>>>);
+
+impl RecordLines {
+    pub(crate) fn new(sides: usize) -> RecordLines {
+        RecordLines((0..sides).map(|_| Default::default()).collect())
+    }
+
+    fn of(&self, side: usize, reads: &[ReadAs], docs: &[TextDoc]) -> Option<&[LineRecord]> {
+        let read = |side: usize| {
+            let doc = docs.get(side)?;
+            let delim = delimiter(reads.get(side)?, doc)?;
+            let table = super::table::Table::parse(super::table::source(doc), delim).ok()?;
+            let mut out = Vec::with_capacity(doc.lines.len());
+            for (i, r) in table.records.iter().enumerate() {
+                let whole = r.lines.len() == 1;
+                out.extend(r.lines.clone().map(|_| LineRecord { record: i, whole }));
+            }
+            Some(out)
+        };
+        self.0.get(side)?.get_or_init(|| read(side)).as_deref()
+    }
+}
+
 /// The extras of block `b` of the compare of `docs`, each side read as in `reads`: its location
 /// on the first side it has lines on (the base of a three-way compare first), and the field
 /// changes of a two-way compare.
@@ -864,6 +934,7 @@ pub(crate) fn block_extra(
     docs: &[TextDoc],
     result: &DiffResult,
     b: usize,
+    records: &RecordLines,
 ) -> Extra {
     let n = docs.len();
     let ranges = &result.blocks[b].ranges;
@@ -874,12 +945,14 @@ pub(crate) fn block_extra(
         .find(|&p| ranges.get(p).is_some_and(|r| !r.is_empty()))
         .unwrap_or(order[0]);
     Extra {
-        location: reads
-            .get(side)
-            .zip(docs.get(side))
-            .and_then(|(r, d)| location(r, &d.lines, &ranges[side])),
+        location: reads.get(side).zip(docs.get(side)).and_then(|(r, d)| {
+            let lines = matches!(r, ReadAs::Spreadsheet(_))
+                .then(|| records.of(side, reads, docs))
+                .flatten();
+            location(r, &d.lines, &ranges[side], lines)
+        }),
         fields: if n == 2 && reads.len() == 2 {
-            field_changes(reads, docs, ranges)
+            field_changes(reads, docs, ranges, records)
         } else {
             Vec::new()
         },
@@ -2105,6 +2178,7 @@ fn folder_report_within(
                 notes: &[],
                 extracted,
             };
+            let records = RecordLines::new(docs.len());
             let mut cut = 0;
             let mut full = false;
             for (j, h) in list.into_iter().enumerate() {
@@ -2118,7 +2192,7 @@ fn folder_report_within(
                 }
                 budget -= cost;
                 rendered += 1;
-                let extra = block_extra(&reads, docs, result, h.0);
+                let extra = block_extra(&reads, docs, result, h.0, &records);
                 if hunk_html(
                     &mut body,
                     &doc,
@@ -3048,6 +3122,43 @@ mod tests {
         assert!(!html.contains("Carol ·"), "{html}");
     }
 
+    /// A line of a cell with a line break in it is not a record, so its commas are not read as
+    /// fields; a semicolon CSV is read with its own delimiter.
+    #[test]
+    fn only_whole_records_are_read_field_by_field() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let left = "id,name,note\n1,Alice,\"line one\nx,old,tail\"\n";
+        let right = "id,name,note\n1,Alice,\"line one\nx,new,tail\"\n";
+        std::fs::write(a.path().join("multi.csv"), left).unwrap();
+        std::fs::write(b.path().join("multi.csv"), right).unwrap();
+        std::fs::write(a.path().join("semi.csv"), "id;name;score\n1;Alice;90\n").unwrap();
+        std::fs::write(b.path().join("semi.csv"), "id;name;score\n1;Alice;95\n").unwrap();
+        // A quote inside a field above does not stop the rows below being read field by field.
+        std::fs::write(
+            a.path().join("inch.csv"),
+            "item,size\nTV,55\" screen\nPC,old\n",
+        )
+        .unwrap();
+        std::fs::write(
+            b.path().join("inch.csv"),
+            "item,size\nTV,55\" screen\nPC,new\n",
+        )
+        .unwrap();
+        let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        let html = report(
+            &roots,
+            Some(&DiffOptions::default()),
+            &FolderReportInfo::default(),
+        );
+        assert!(!html.contains("x · "), "{html}");
+        assert!(html.contains("<li>PC · size · old → new</li>"), "{html}");
+        assert_eq!(
+            html.matches("<li>Alice · score · 90 → 95</li>").count(),
+            1,
+            "{html}"
+        );
+    }
+
     #[test]
     fn spreadsheet_fields_show_their_formatted_values_with_the_stored_ones() {
         let doc = |lines: &[&str]| {
@@ -3068,7 +3179,7 @@ mod tests {
             shown(&["item,due,share", "rent,2024-01-02,25%"]),
         ];
         assert_eq!(
-            field_changes(&reads, &docs, &[1..2, 1..2]),
+            field_changes(&reads, &docs, &[1..2, 1..2], &RecordLines::new(2)),
             ["rent · due · 2024-01-01 (45292) → 2024-01-02 (45293)"]
         );
         // An .ods sheet compares what it shows and stores the values apart.
@@ -3087,13 +3198,13 @@ mod tests {
             stored(&["item,share", "rent,26%"]),
         ];
         assert_eq!(
-            field_changes(&reads, &docs, &[1..2, 1..2]),
+            field_changes(&reads, &docs, &[1..2, 1..2], &RecordLines::new(2)),
             ["rent · share · 25% (0.25) → 26%"]
         );
         // A reading of another length is not of the same lines, so it is left out.
         let reads = [shown(&["item,share"]), shown(&["item,share"])];
         assert_eq!(
-            field_changes(&reads, &docs, &[1..2, 1..2]),
+            field_changes(&reads, &docs, &[1..2, 1..2], &RecordLines::new(2)),
             ["rent · share · 25% → 26%"]
         );
         // A sheet's rows leave out the empty cells they end with, and a column without a name
@@ -3107,7 +3218,7 @@ mod tests {
             shown(&["item,,total,notes", "rent,1,3,new"]),
         ];
         assert_eq!(
-            field_changes(&reads, &docs, &[1..2, 1..2]),
+            field_changes(&reads, &docs, &[1..2, 1..2], &RecordLines::new(2)),
             ["rent · total · 2 → 3", "rent · notes · — → new"]
         );
         let docs = [
@@ -3115,7 +3226,7 @@ mod tests {
             doc(&["item,,total", "rent,4,2"]),
         ];
         assert_eq!(
-            field_changes(&reads, &docs, &[1..2, 1..2]),
+            field_changes(&reads, &docs, &[1..2, 1..2], &RecordLines::new(2)),
             ["rent · B · 1 → 4"]
         );
         // A title above a sheet's header is not its header; rows of names and numbers are not
@@ -3126,21 +3237,21 @@ mod tests {
         ];
         let reads = [shown(&[]), shown(&[])];
         assert_eq!(
-            field_changes(&reads, &docs, &[3..4, 3..4]),
+            field_changes(&reads, &docs, &[3..4, 3..4], &RecordLines::new(2)),
             ["rent · q2 · 2 → 3"]
         );
         let docs = [
             doc(&["Summary", "Report date,46295", "Headcount,5"]),
             doc(&["Summary", "Report date,46295", "Headcount,6"]),
         ];
-        assert!(field_changes(&reads, &docs, &[2..3, 2..3]).is_empty());
+        assert!(field_changes(&reads, &docs, &[2..3, 2..3], &RecordLines::new(2)).is_empty());
         // A header over two rows names a column by both.
         let docs = [
             doc(&["group,quarter,,,total", ",q1,q2,q3", "rent,1,2,3,6", "x"]),
             doc(&["group,quarter,,,total", ",q1,q2,q3", "rent,1,2,4,7", "x"]),
         ];
         assert_eq!(
-            field_changes(&reads, &docs, &[2..3, 2..3]),
+            field_changes(&reads, &docs, &[2..3, 2..3], &RecordLines::new(2)),
             ["rent · quarter q3 · 3 → 4", "rent · total · 6 → 7"]
         );
         // A row of words under a header that names every column is a row of values.
@@ -3149,7 +3260,7 @@ mod tests {
             doc(&["name,team", "Amy,Sales", "Ben,Data"]),
         ];
         assert_eq!(
-            field_changes(&reads, &docs, &[2..3, 2..3]),
+            field_changes(&reads, &docs, &[2..3, 2..3], &RecordLines::new(2)),
             ["Ben · team · Ops → Data"]
         );
         // A header in the sheet's first row may name its columns by year.
@@ -3158,7 +3269,7 @@ mod tests {
             doc(&["item,2025,2026", "rent,1,3"]),
         ];
         assert_eq!(
-            field_changes(&reads, &docs, &[1..2, 1..2]),
+            field_changes(&reads, &docs, &[1..2, 1..2], &RecordLines::new(2)),
             ["rent · 2026 · 2 → 3"]
         );
         assert_eq!(column_letters(0), "A");
@@ -3238,7 +3349,13 @@ mod tests {
             lines
         };
         let lines = sheet(&["a,b", "", "x,y"]);
-        let at = location(&ReadAs::Spreadsheet(Later::new(None)), &lines, &(3..4)).unwrap();
+        let at = location(
+            &ReadAs::Spreadsheet(Later::new(None)),
+            &lines,
+            &(3..4),
+            None,
+        )
+        .unwrap();
         assert!(
             at.starts_with(&trf("label.sheet", &[("name", "Plan".into())])),
             "{at}"
@@ -3247,37 +3364,55 @@ mod tests {
             at.ends_with(&trf("report.loc_row", &[("n", "3".into())])),
             "{at}"
         );
+        // A cell with a line break in it makes its row two lines; rows are still counted by
+        // records.
+        let multi = sheet(&["a,b", "\"one", "two\",x", "y,z"]);
+        let records = [0, 1, 2, 2, 3].map(|record| LineRecord {
+            record,
+            whole: record != 2,
+        });
+        let at = location(
+            &ReadAs::Spreadsheet(Later::new(None)),
+            &multi,
+            &(4..5),
+            Some(&records),
+        )
+        .unwrap();
+        assert!(
+            at.ends_with(&trf("report.loc_row", &[("n", "3".into())])),
+            "{at}"
+        );
         // One sheet has no heading: lines are its rows from the first.
         let one = v(&["a,b", "c,d"]);
         assert_eq!(
-            location(&ReadAs::Spreadsheet(Later::new(None)), &one, &(0..2)).unwrap(),
+            location(&ReadAs::Spreadsheet(Later::new(None)), &one, &(0..2), None).unwrap(),
             trf("report.loc_rows", &[("a", "1".into()), ("b", "2".into())])
         );
         let cells = v(&["── Code cell ──", "x = 1", "── Markdown cell ──", "# Title"]);
         assert_eq!(
-            location(&ReadAs::Notebook, &cells, &(3..4)).as_deref(),
+            location(&ReadAs::Notebook, &cells, &(3..4), None).as_deref(),
             Some("Markdown cell")
         );
         assert_eq!(
-            location(&ReadAs::Document(Later::new(None)), &cells, &(3..4)),
+            location(&ReadAs::Document(Later::new(None)), &cells, &(3..4), None),
             None
         );
         let pages = ReadAs::Document(known((vec![0, 2, 3], 4)));
         assert_eq!(
-            location(&pages, &cells, &(1..2)).unwrap(),
+            location(&pages, &cells, &(1..2), None).unwrap(),
             trf("report.loc_page", &[("n", "1".into())])
         );
         assert_eq!(
-            location(&pages, &cells, &(1..4)).unwrap(),
+            location(&pages, &cells, &(1..4), None).unwrap(),
             trf("report.loc_pages", &[("a", "1".into()), ("b", "3".into())])
         );
         assert_eq!(
-            location(&pages, &cells, &(2..2)).unwrap(),
+            location(&pages, &cells, &(2..2), None).unwrap(),
             trf("report.loc_page", &[("n", "2".into())])
         );
         // Pages read from text other than the one compared say nothing.
         let stale = ReadAs::Document(known((vec![0, 2], 9)));
-        assert_eq!(location(&stale, &cells, &(1..2)), None);
+        assert_eq!(location(&stale, &cells, &(1..2), None), None);
         assert_eq!(
             program("\"C:\\Tools\\pandoc.exe\" -t plain ${file}"),
             "pandoc.exe"

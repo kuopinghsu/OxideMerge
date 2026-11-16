@@ -154,6 +154,10 @@ fn aligned_runs(
             } else if let Some(region_start) = region.take() {
                 let lo = region_start.saturating_sub(CONTEXT);
                 let hi = (offset + CONTEXT).min(left.len());
+                // Overwritten bytes alone must not use up the budget that a later shift needs.
+                if lo > 0 && !may_shift(&left[lo..hi], &right[lo..hi]) {
+                    continue;
+                }
                 runs.extend(
                     align_with_budget(
                         &left[lo..hi],
@@ -185,6 +189,32 @@ fn aligned_runs(
         }
     }
     runs
+}
+
+/// Whether equally long `left` and `right` may hold a run that alignment would report: eight
+/// bytes found at another offset up to `WIDE_BAND` away. Such a run has a byte that differs
+/// at its own offset, so only the eight-byte windows around differing bytes are looked for.
+/// Many differing bytes are taken as a possible shift without looking.
+fn may_shift(left: &[u8], right: &[u8]) -> bool {
+    const RUN: usize = 8;
+    const PROBED: usize = 16;
+    let differing = (0..left.len()).filter(|&i| left[i] != right[i]);
+    for (count, at) in differing.enumerate() {
+        if count == PROBED {
+            return true;
+        }
+        for start in at.saturating_sub(RUN - 1)..=at {
+            let Some(needle) = left.get(start..start + RUN) else {
+                break;
+            };
+            let lo = start.saturating_sub(WIDE_BAND);
+            let hi = (start + WIDE_BAND + RUN).min(right.len());
+            if memchr::memmem::find_iter(&right[lo..hi], needle).any(|i| lo + i != start) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Banded edit-distance alignment with bounded traceback storage.
@@ -436,14 +466,15 @@ pub fn moved_blocks_until(data: &[&[u8]], cancel: &AtomicBool) -> Option<Vec<Mov
                 if left[a..a + MIN_MOVED_BLOCK] != right[b..b + MIN_MOVED_BLOCK] {
                     continue;
                 }
-                let (mut a, mut b, mut len) = (a, b, MIN_MOVED_BLOCK);
-                while a > lo_a && b > lo_b && left[a - 1] == right[b - 1] {
-                    a -= 1;
-                    b -= 1;
-                    len += 1;
-                }
-                while a + len < hi_a && b + len < hi_b && left[a + len] == right[b + len] {
-                    len += 1;
+                // Compared a chunk at a time: a block can span most of a large file, and an edit
+                // waits for the scan to stop.
+                let back = common_suffix(&left[lo_a..a], &right[lo_b..b]);
+                let (end_a, end_b) = (a + MIN_MOVED_BLOCK, b + MIN_MOVED_BLOCK);
+                let (mut a, mut b) = (a - back, b - back);
+                let mut len =
+                    MIN_MOVED_BLOCK + back + common_prefix(&left[end_a..hi_a], &right[end_b..hi_b]);
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
                 }
                 // Remember even rejected runs, so many anchors in one long run cannot make
                 // extension quadratic. Runs never overlap within a pane pair.
@@ -711,6 +742,29 @@ mod tests {
                 .iter()
                 .any(|m| { m.source == (at + 1..at + 16) && m.target == (at..at + 15) }));
         }
+    }
+
+    #[test]
+    fn many_overwritten_bytes_do_not_hide_a_later_short_shift() {
+        let mut state = 4u32;
+        let right: Vec<_> = (0..1024 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let mut left = right.clone();
+        for k in 0..1000 {
+            left[1000 + k * 800] ^= 0xff;
+        }
+        let at = 900_000;
+        left.insert(at, right[at] ^ 0xff);
+        left.remove(at + 16);
+        assert!(moved_blocks(&[&left, &right])
+            .iter()
+            .any(|m| { m.source == (at + 1..at + 16) && m.target == (at..at + 15) }));
     }
 
     #[test]

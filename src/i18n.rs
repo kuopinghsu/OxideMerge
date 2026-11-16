@@ -223,6 +223,20 @@ pub fn tr(key: &'static str) -> &'static str {
     english().get(key).copied().unwrap_or(key)
 }
 
+/// The text of `key` in the current language first, then in every built-in language, each
+/// once: for reading back text OxideMerge wrote earlier, perhaps in another language.
+pub fn translations(key: &'static str) -> Vec<&'static str> {
+    static BUILT_IN: OnceLock<Vec<Table>> = OnceLock::new();
+    let tables = BUILT_IN.get_or_init(|| EMBEDDED.iter().map(|(_, text)| parse(text)).collect());
+    let mut out = vec![tr(key)];
+    for text in tables.iter().filter_map(|t| t.get(key)) {
+        if !out.contains(text) {
+            out.push(text);
+        }
+    }
+    out
+}
+
 /// Translates and substitutes `{name}` placeholders.
 pub fn trf(key: &'static str, args: &[(&str, String)]) -> String {
     let mut s = tr(key).to_string();

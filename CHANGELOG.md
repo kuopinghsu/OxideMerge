@@ -22,6 +22,10 @@ release on GitHub uses its section of this file as the release notes.
 
 ### Changed
 
+- *Synchronize folders...* has its own toolbar and menu icon, two sides with an arrow between
+  them, instead of the *Copy all* arrows. Its preview shows the share of folders to create,
+  files to copy, files to replace and items to delete as one colored bar, with a matching dot
+  on each filter, in place of a card for each count.
 - Formatted comparisons of web pages, DOCX, XLSX, and PDF files use the Text Compare palette
   for changed blocks and the Table Compare palette for added, removed, and modified cells.
 - The remote file chooser keeps a fixed size and supports breadcrumbs, keyboard navigation,

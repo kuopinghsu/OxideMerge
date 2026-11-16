@@ -18,6 +18,8 @@ pub enum Icon {
     CopyLeft,
     CopyAllRight,
     CopyAllLeft,
+    /// Two sides with an arrow from one to the other: make one folder match the other.
+    Sync,
     Undo,
     Redo,
     Search,
@@ -70,7 +72,7 @@ pub enum Icon {
 
 #[cfg(test)]
 impl Icon {
-    pub const ALL: [Icon; 56] = [
+    pub const ALL: [Icon; 57] = [
         Icon::First,
         Icon::Prev,
         Icon::Next,
@@ -82,6 +84,7 @@ impl Icon {
         Icon::CopyLeft,
         Icon::CopyAllRight,
         Icon::CopyAllLeft,
+        Icon::Sync,
         Icon::Undo,
         Icon::Redo,
         Icon::Search,
@@ -257,6 +260,14 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::CopyAllLeft => {
             pen.line(&[(13.0, 4.0), (9.0, 8.0), (13.0, 12.0)]);
             pen.line(&[(7.0, 4.0), (3.0, 8.0), (7.0, 12.0)]);
+        }
+        Icon::Sync => {
+            // Two sides, as in Compare, with an arrow from one to the other: one is made to
+            // match the other. Unlike Refresh's circle, it says which way changes go.
+            g.rounded(2.0, 5.0, 6.0, 14.0, 2.0);
+            g.rounded(16.0, 5.0, 6.0, 14.0, 2.0);
+            g.line(&[(10.0, 12.0), (14.5, 12.0)]);
+            g.line(&[(12.0, 9.5), (14.5, 12.0), (12.0, 14.5)]);
         }
         Icon::Undo | Icon::Redo => {
             let mirror = icon == Icon::Redo;

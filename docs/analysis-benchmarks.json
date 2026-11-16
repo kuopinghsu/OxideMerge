@@ -192,5 +192,305 @@
     "Shared desktop host; timing varies with load/cache/thermal state.",
     "The failed full-run result is retained; diagnostic success does not erase it.",
     "Existing comparison-engine benchmarks do not measure semantic/impact analysis, new GUI panels or merge confirmation hashing."
-  ]
+  ],
+  "executable_size": {
+    "date": "2026-11-16",
+    "host": "Windows 11 x86_64 (build 26300) / Intel Core i9-12900KF / 24 threads / 32 GB",
+    "commit": "eecf435 with uncommitted changes, version 0.9.9; profile committed in 2c47a92",
+    "toolchain": "rustc 1.100.0",
+    "method": "Each release profile given to Cargo with --config and built into a target folder of its own, from PowerShell. Size is target/release/oxidemerge.exe in bytes. Default benchmark workloads, 5 runs each, median time; no peak memory on Windows. Size breakdown read from the linker map (/MAP) of the 'before' build.",
+    "profiles": [
+      {
+        "id": "base",
+        "profile": "opt-level = 3, lto = \"thin\" (before)",
+        "exe_bytes": 57991168,
+        "exe_mib": 55.3,
+        "change_percent": 0.0,
+        "clean_build_seconds": null
+      },
+      {
+        "id": "thin_cgu1",
+        "profile": "+ codegen-units = 1, strip = true",
+        "exe_bytes": 56845312,
+        "exe_mib": 54.2,
+        "change_percent": -2.0,
+        "clean_build_seconds": 844
+      },
+      {
+        "id": "fat_cgu1",
+        "profile": "+ lto = \"fat\"",
+        "exe_bytes": 55169536,
+        "exe_mib": 52.6,
+        "change_percent": -4.9,
+        "clean_build_seconds": 1315
+      },
+      {
+        "id": "fat_cgu1_s",
+        "profile": "+ opt-level = \"s\" (now)",
+        "exe_bytes": 46322688,
+        "exe_mib": 44.2,
+        "change_percent": -20.1,
+        "clean_build_seconds": 1019
+      }
+    ],
+    "workloads": [
+      {
+        "id": "text-10mb",
+        "median_seconds": {
+          "base": 0.102,
+          "thin_cgu1": 0.101,
+          "fat_cgu1": 0.093,
+          "fat_cgu1_s": 0.091
+        }
+      },
+      {
+        "id": "text-repeated",
+        "median_seconds": {
+          "base": 0.041,
+          "thin_cgu1": 0.038,
+          "fat_cgu1": 0.039,
+          "fat_cgu1_s": 0.042
+        }
+      },
+      {
+        "id": "text-view-10mb",
+        "median_seconds": {
+          "base": 0.457,
+          "thin_cgu1": 0.488,
+          "fat_cgu1": 0.408,
+          "fat_cgu1_s": 0.475
+        }
+      },
+      {
+        "id": "table-10k",
+        "median_seconds": {
+          "base": 0.021,
+          "thin_cgu1": 0.021,
+          "fat_cgu1": 0.018,
+          "fat_cgu1_s": 0.019
+        }
+      },
+      {
+        "id": "table-10k-position",
+        "median_seconds": {
+          "base": 0.023,
+          "thin_cgu1": 0.026,
+          "fat_cgu1": 0.023,
+          "fat_cgu1_s": 0.025
+        }
+      },
+      {
+        "id": "table-100k",
+        "median_seconds": {
+          "base": 0.293,
+          "thin_cgu1": 0.314,
+          "fat_cgu1": 0.271,
+          "fat_cgu1_s": 0.291
+        }
+      },
+      {
+        "id": "table-100k-position",
+        "median_seconds": {
+          "base": 0.326,
+          "thin_cgu1": 0.337,
+          "fat_cgu1": 0.316,
+          "fat_cgu1_s": 0.348
+        }
+      },
+      {
+        "id": "table-cancel-1m",
+        "median_seconds": {
+          "base": 0.899,
+          "thin_cgu1": 0.906,
+          "fat_cgu1": 0.874,
+          "fat_cgu1_s": 0.936
+        }
+      },
+      {
+        "id": "xml-tree-12k",
+        "median_seconds": {
+          "base": 0.235,
+          "thin_cgu1": 0.232,
+          "fat_cgu1": 0.218,
+          "fat_cgu1_s": 0.236
+        }
+      },
+      {
+        "id": "xml-tree-12k-keyed",
+        "median_seconds": {
+          "base": 0.266,
+          "thin_cgu1": 0.274,
+          "fat_cgu1": 0.253,
+          "fat_cgu1_s": 0.269
+        }
+      },
+      {
+        "id": "xml-tree-view-12k",
+        "median_seconds": {
+          "base": 1.113,
+          "thin_cgu1": 1.218,
+          "fat_cgu1": 0.982,
+          "fat_cgu1_s": 1.108
+        }
+      },
+      {
+        "id": "xml-semantic-12k",
+        "median_seconds": {
+          "base": 0.153,
+          "thin_cgu1": 0.158,
+          "fat_cgu1": 0.151,
+          "fat_cgu1_s": 0.162
+        }
+      },
+      {
+        "id": "merge3-10mb",
+        "median_seconds": {
+          "base": 0.323,
+          "thin_cgu1": 0.314,
+          "fat_cgu1": 0.282,
+          "fat_cgu1_s": 0.287
+        }
+      },
+      {
+        "id": "binary-10mb",
+        "median_seconds": {
+          "base": 0.007,
+          "thin_cgu1": 0.007,
+          "fat_cgu1": 0.007,
+          "fat_cgu1_s": 0.007
+        }
+      },
+      {
+        "id": "binary-moved-unrelated",
+        "median_seconds": {
+          "base": 0.055,
+          "thin_cgu1": 0.051,
+          "fat_cgu1": 0.051,
+          "fat_cgu1_s": 0.05
+        }
+      },
+      {
+        "id": "binary-moved-swap",
+        "median_seconds": {
+          "base": 0.014,
+          "thin_cgu1": 0.014,
+          "fat_cgu1": 0.014,
+          "fat_cgu1_s": 0.014
+        }
+      },
+      {
+        "id": "binary-moved-large",
+        "median_seconds": {
+          "base": 0.194,
+          "thin_cgu1": 0.184,
+          "fat_cgu1": 0.187,
+          "fat_cgu1_s": 0.188
+        }
+      },
+      {
+        "id": "binary-moved-short-shift",
+        "median_seconds": {
+          "base": 0.008,
+          "thin_cgu1": 0.008,
+          "fat_cgu1": 0.008,
+          "fat_cgu1_s": 0.008
+        }
+      },
+      {
+        "id": "binary-moved-wide-shift",
+        "median_seconds": {
+          "base": 0.003,
+          "thin_cgu1": 0.003,
+          "fat_cgu1": 0.003,
+          "fat_cgu1_s": 0.003
+        }
+      },
+      {
+        "id": "binary-moved-firmware",
+        "median_seconds": {
+          "base": 0.001,
+          "thin_cgu1": 0.001,
+          "fat_cgu1": 0.001,
+          "fat_cgu1_s": 0.001
+        }
+      },
+      {
+        "id": "image-4k",
+        "median_seconds": {
+          "base": 0.11,
+          "thin_cgu1": 0.106,
+          "fat_cgu1": 0.105,
+          "fat_cgu1_s": 0.138
+        }
+      },
+      {
+        "id": "folder-small-files",
+        "median_seconds": {
+          "base": 0.211,
+          "thin_cgu1": 0.212,
+          "fat_cgu1": 0.219,
+          "fat_cgu1_s": 0.212
+        }
+      },
+      {
+        "id": "sync-preview-20k",
+        "median_seconds": {
+          "base": 2.576,
+          "thin_cgu1": 2.411,
+          "fat_cgu1": 2.299,
+          "fat_cgu1_s": 2.57
+        }
+      },
+      {
+        "id": "folder-navigation-20k",
+        "median_seconds": {
+          "base": 0.369,
+          "thin_cgu1": 0.475,
+          "fat_cgu1": 0.368,
+          "fat_cgu1_s": 0.389
+        }
+      },
+      {
+        "id": "folder-large-files",
+        "median_seconds": {
+          "base": 0.035,
+          "thin_cgu1": 0.035,
+          "fat_cgu1": 0.033,
+          "fat_cgu1_s": 0.034
+        }
+      },
+      {
+        "id": "folder-mixed",
+        "median_seconds": {
+          "base": 0.052,
+          "thin_cgu1": 0.058,
+          "fat_cgu1": 0.046,
+          "fat_cgu1_s": 0.047
+        }
+      }
+    ],
+    "size_breakdown_mb": {
+      "text_total": 34.25,
+      "rdata_total": 19.42,
+      "oxidemerge_code": 17.6,
+      "tree_sitter_grammars": {
+        "total": 8.1,
+        "cpp": 3.1,
+        "typescript_and_tsx": 2.7,
+        "rust": 1.0,
+        "c_python_javascript": 1.3
+      },
+      "libssh2_and_openssl": 4.0,
+      "pdf_export_krilla_stack": 3.5,
+      "rustls_ring_ureq": 1.5,
+      "sevenz_brotli_lz4": 0.8
+    },
+    "limitations": [
+      "clean_build_seconds of the 'before' profile was not measured from clean (an incremental build took 164 s; a clean one about 9 minutes).",
+      "The last two profiles were built after other fixes to the table and document readers landed; they do not change size noticeably.",
+      "image-4k is 25% slower with opt-level = \"s\" (0.110 to 0.138 s); other workloads are within run-to-run variation.",
+      "Impact analysis and GUI rendering were not timed under the new profile.",
+      "The size breakdown attributes inlined and generic code to the crate it was compiled in, so dependency figures are lower bounds."
+    ]
+  }
 }

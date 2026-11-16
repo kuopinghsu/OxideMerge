@@ -2100,6 +2100,9 @@ fn folders_are_synchronized_after_a_preview_and_a_confirmation() {
     // the preview is shown while the files are still being read
     gui.wait_until("the plan summary", |g| g.shows(&summary));
     assert!(gui.shows_text("extra.txt"), "the deletion is not listed");
+    // A filter is named by its words and count alone; its color dot is only painted.
+    let copies = format!("{} 1", tr("folder_sync.action_copy"));
+    assert!(gui.shows(&copies), "no filter named {copies:?}");
     assert_eq!(
         read(&roots[1].join("a.txt")),
         "old\n",

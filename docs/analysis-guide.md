@@ -277,6 +277,14 @@ at all, and lines longer than 4 KiB are explicitly omitted.
 Multi-pattern matching has a 1 MiB pattern budget, 32 MiB matcher budget and 10 million
 match-step limit. Cancellation/error clears partial caches.
 
+The Tree-sitter grammars that impact analysis reads code with are compiled into the
+program, and their parse tables are its largest single part outside OxideMerge's own code:
+about 8.1 MB of the 44.2 MB Windows release executable (C++ 3.1 MB, TypeScript and TSX
+2.7 MB, Rust 1.0 MB, C, Python and JavaScript 1.3 MB together). The release profile is
+built for size (`opt-level = "s"`, fat LTO); the engine benchmarks stayed within run-to-run
+variation apart from image compare, but impact analysis itself was not timed under it. See
+[Executable size and the release profile](benchmarks.md#executable-size-and-the-release-profile-2026-11-16).
+
 Actual folder merge confirmation now hashes regular files with SHA-256, in addition to
 checking metadata, so same-size edits with restored timestamps cannot silently pass the
 stale-input check. This adds file-reading cost to explicit plan/confirmation operations;

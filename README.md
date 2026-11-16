@@ -84,7 +84,9 @@ confidence to file comparisons, folder synchronization, and conflict resolution.
 - Ignore white space, comments or lines that match a pattern. Saved comparison
   rules and number tolerances help with generated files and measurement data.
 - Use syntax highlighting, search and replace, and bookmarks. CSV and TSV files open in a table
-  view that supports records with line breaks, cell editing and cell merging. Rows can be matched by
+  view that supports records with line breaks, cell editing and cell merging. A CSV file's
+  delimiter (comma, semicolon, tab or `|`, or an Excel `sep=` line) is detected from its first
+  lines, and each side keeps its own, so a TSV can be compared with a CSV. Rows can be matched by
   key columns instead of by position, columns by their header names, and numbers within a tolerance
   count as equal. Matched rows are listed in left, right or key order. Large tables are matched
   in the background, with progress and **Cancel**, and reports record how the rows were matched.
@@ -102,8 +104,9 @@ confidence to file comparisons, folder synchronization, and conflict resolution.
   shifted by insertions or deletions. Select a highlighted byte and use **Go to matching
   block** to jump to its counterpart. Detection refreshes in the background after edits.
 - **Images:** compare images side by side, or with the overlay, swipe, blink and difference views.
-- **Documents, spreadsheets and programs:** PDF, Word (`.docx`), OpenDocument text (`.odt`),
-  Rich Text (`.rtf`), Excel (`.xlsx`, `.xlsm`) and OpenDocument spreadsheets (`.ods`) are
+- **Documents, spreadsheets and programs:** PDF, Word (`.docx`, `.docm`, `.dotx`, `.dotm`),
+  OpenDocument text (`.odt`), Rich Text (`.rtf`), Excel (`.xlsx`, `.xlsm`, `.xltx`, `.xltm`) and
+  OpenDocument spreadsheets (`.ods`) are
   compared as the text in them, and ELF programs, shared objects and object files as their
   header, program headers, section table and symbols sorted by name — with nothing to install.
   Workbooks open in **Table** view, with a tab for each sheet in a multi-sheet workbook.

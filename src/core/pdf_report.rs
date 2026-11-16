@@ -12,8 +12,8 @@ use super::diff::{DiffOptions, DiffResult};
 use super::folder::DirItem;
 use super::html_report::{
     block_extra, file_diffs, file_read, hunks_with, ignored_blocks, kind, line_range, row_cells,
-    settings_rows, status_class, summary_reason, FileDiffs, FolderReportInfo, ReadAs, Redact,
-    Setting, HUNK_MAX_ROWS, LINE_CHARS, MAX_BYTES, MAX_LINES,
+    settings_rows, status_class, summary_reason, FileDiffs, FolderReportInfo, ReadAs, RecordLines,
+    Redact, Setting, HUNK_MAX_ROWS, LINE_CHARS, MAX_BYTES, MAX_LINES,
 };
 use super::report::{fmt_size, fmt_time, side_name, status_text};
 use super::text::TextDoc;
@@ -1798,6 +1798,7 @@ impl<'a> Writer<'a> {
         let total = list.len();
         self.unified = opts.layout == Layout::Unified && doc.panes.len() == 2;
         let (mut shown, mut cut, mut cut_short) = (0, 0, 0);
+        let records = RecordLines::new(doc.read.map_or(0, |(_, docs)| docs.len()));
         for (k, (b, rows)) in list.into_iter().enumerate() {
             if self.lines_left == 0 {
                 break;
@@ -1805,7 +1806,7 @@ impl<'a> Writer<'a> {
             shown += 1;
             let extra = doc
                 .read
-                .map(|(reads, docs)| block_extra(reads, docs, doc.result, b))
+                .map(|(reads, docs)| block_extra(reads, docs, doc.result, b, &records))
                 .unwrap_or_default();
             let cap = match opts.context {
                 Some(_) => HUNK_MAX_ROWS.min(self.lines_left),

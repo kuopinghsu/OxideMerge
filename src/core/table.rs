@@ -19,7 +19,7 @@ pub fn delimiter_of_doc(
     opts: &super::diff::DiffOptions,
 ) -> Option<char> {
     let path = doc.path.as_deref()?;
-    if let Some(d) = delimiter_for(path) {
+    if let Some(d) = file_delimiter(doc) {
         return Some(d);
     }
     let read_here = matches!(
@@ -29,6 +29,83 @@ pub fn delimiter_of_doc(
         ))
     );
     read_here.then_some(',')
+}
+
+/// The delimiter of the CSV or TSV file `doc` holds, read from its name and, for a `.csv`, its
+/// first line.
+pub fn file_delimiter(doc: &super::text::TextDoc) -> Option<char> {
+    match delimiter_for(doc.path.as_deref()?)? {
+        ',' => Some(sniff_csv(&doc.lines)),
+        d => Some(d),
+    }
+}
+
+/// How many lines of a `.csv` file are looked at to tell its delimiter.
+const SNIFF_LINES: usize = 20;
+
+/// The delimiter of a `.csv` file: what an Excel `sep=` line names, else the one of `,`, `;`,
+/// a tab and `|` that splits its first lines into the same number of fields most often, at
+/// least two; a comma when none does. A comma in the name of a column of a file separated by
+/// semicolons, as a spreadsheet set to a language that writes decimal commas saves it, does
+/// not make it a comma separated file.
+fn sniff_csv(lines: &[String]) -> char {
+    let lines: Vec<&String> = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .take(SNIFF_LINES)
+        .collect();
+    let Some(first) = lines.first() else {
+        return ',';
+    };
+    // Not trimmed: the delimiter it names can be a tab.
+    if let Some(sep) = first.strip_prefix("sep=") {
+        if let Some(d) = [',', ';', '\t', '|']
+            .into_iter()
+            .find(|&d| sep == d.to_string())
+        {
+            return d;
+        }
+    }
+    // Fewer than all lines may agree: a cell with a line break in it spreads its record over
+    // lines that each read as fewer fields.
+    let score = |d: char| {
+        let fields = split_row(first, d).len();
+        let agree = lines
+            .iter()
+            .filter(|l| split_row(l, d).len() == fields)
+            .count();
+        (fields >= 2).then_some((agree, fields))
+    };
+    [',', ';', '\t', '|']
+        .into_iter()
+        .filter_map(|d| Some((score(d)?, d)))
+        // The first of the best, so a comma wins a tie.
+        .fold(
+            None,
+            |best: Option<((usize, usize), char)>, (s, d)| match best {
+                Some((b, _)) if b >= s => best,
+                _ => Some((s, d)),
+            },
+        )
+        .map_or(',', |(_, d)| d)
+}
+
+/// One record of `cells` separated by `delim`, each quoted when it has to be.
+pub fn encode_record(cells: &[String], delim: char) -> String {
+    let mut out = String::new();
+    for (i, cell) in cells.iter().enumerate() {
+        if i > 0 {
+            out.push(delim);
+        }
+        if cell.contains([delim, '"', '\r', '\n']) {
+            out.push('"');
+            out.push_str(&cell.replace('"', "\"\""));
+            out.push('"');
+        } else {
+            out.push_str(cell);
+        }
+    }
+    out
 }
 
 /// Splits one line into cells, honoring double quotes.
@@ -81,6 +158,8 @@ pub struct Record {
     pub lines: std::ops::Range<usize>,
     pub cells: Vec<String>,
     fields: Vec<std::ops::Range<usize>>,
+    /// A field of the record has a quote in it without starting with one, such as `55" screen`.
+    stray_quote: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -89,6 +168,8 @@ pub struct Table {
     pub records: Vec<Record>,
     /// Byte spans of stored fields hidden by merges, in source order.
     covered_fields: Vec<std::ops::Range<usize>>,
+    /// What separates the fields of a record.
+    pub delim: char,
 }
 
 /// Reconstructs the actual terminators, even when ordinary text editing normalizes EOLs.
@@ -112,6 +193,22 @@ impl Table {
         let mut records = Vec::new();
         let (mut i, mut line, mut start_line) = (0, 0, 0);
         let (mut fields, mut cells) = (Vec::new(), Vec::new());
+        let mut stray_quote = false;
+        // An Excel `sep=;` line names the delimiter; it is not a record of the table, nor its
+        // header row.
+        let sep = format!("sep={delim}");
+        if let Some(rest) = source.strip_prefix(sep.as_str()) {
+            let eol = match rest.as_bytes() {
+                [] => Some(0),
+                [b'\r', b'\n', ..] => Some(2),
+                [b'\r' | b'\n', ..] => Some(1),
+                _ => None,
+            };
+            if let Some(eol) = eol {
+                i = sep.len() + eol;
+                (line, start_line) = (1, 1);
+            }
+        }
         while i < bytes.len() {
             let start = i;
             let quoted = bytes[i] == b'"';
@@ -161,11 +258,11 @@ impl Table {
                     ));
                 }
             } else {
+                // A quote inside a field that does not start with one is part of its value, as
+                // a spreadsheet reads `55" screen` or `a, "b"` (a space before the quote).
                 while i < bytes.len() && ![delim as u8, b'\r', b'\n'].contains(&bytes[i]) {
                     let ch = source[i..].chars().next().unwrap();
-                    if ch == '"' {
-                        return Err(format!("Unexpected quote in record {}", records.len() + 1));
-                    }
+                    stray_quote |= ch == '"';
                     value.push(ch);
                     i += ch.len_utf8();
                 }
@@ -186,6 +283,7 @@ impl Table {
                 lines: start_line..line + 1,
                 cells: std::mem::take(&mut cells),
                 fields: std::mem::take(&mut fields),
+                stray_quote: std::mem::take(&mut stray_quote),
             });
             if bytes.get(i) == Some(&b'\r') {
                 i += 1;
@@ -202,6 +300,7 @@ impl Table {
             source,
             records,
             covered_fields: Vec::new(),
+            delim,
         })
     }
 
@@ -266,6 +365,7 @@ impl Table {
                 lines: line..line,
                 cells: Vec::new(),
                 fields: Vec::new(),
+                stray_quote: false,
             });
         }
         records.extend(written);
@@ -290,17 +390,32 @@ impl Table {
         delim: char,
     ) -> Result<String, String> {
         let record = self.records.get(record).ok_or("Record no longer exists")?;
+        // A record shorter than the table is made long enough for the cells set past its end.
+        let end = record.fields.last().ok_or("Column no longer exists")?.end;
+        let mut added: Vec<&str> = Vec::new();
+        for &(column, value) in cells {
+            if column >= record.fields.len() {
+                let at = column - record.fields.len();
+                if added.len() <= at {
+                    added.resize(at + 1, "");
+                }
+                added[at] = value;
+            }
+        }
         let mut spans = cells
             .iter()
-            .map(|&(column, value)| {
-                let span = record.fields.get(column).ok_or("Column no longer exists")?;
-                Ok((span.clone(), value))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+            .filter(|&&(column, _)| column < record.fields.len())
+            .map(|&(column, value)| (record.fields[column].clone(), value))
+            .collect::<Vec<_>>();
         // Last first, so the spans before stay where they are.
         spans.sort_unstable_by_key(|(span, _)| std::cmp::Reverse(span.start));
         spans.dedup_by_key(|(span, _)| span.start);
         let mut source = self.source.clone();
+        if !added.is_empty() {
+            let tail: Vec<String> = added.iter().map(|v| v.to_string()).collect();
+            let text = format!("{delim}{}", encode_record(&tail, delim));
+            source.insert_str(end, &text);
+        }
         for (span, value) in spans {
             let quoted = self.source[span.clone()].starts_with('"')
                 || value.contains([delim, '"', '\r', '\n']);
@@ -339,6 +454,19 @@ impl Table {
                     .copied()
                     .unwrap_or(table.source.len())
         };
+        if source.delim != self.delim {
+            // Raw lines would bring the other delimiter along: the records are written again
+            // with this table's, whole, each with this table's line ending, in place of the
+            // whole records the lines are part of here.
+            let value: String = source
+                .records
+                .iter()
+                .filter(|r| r.lines.start < source_lines.end && r.lines.end > source_lines.start)
+                .map(|r| encode_record(&r.cells, self.delim) + eol)
+                .collect();
+            let lines = self.whole_records(lines);
+            return self.splice(span(self, lines), value, eol);
+        }
         let destination = span(self, lines);
         let from = span(source, source_lines);
         let first = source
@@ -354,6 +482,34 @@ impl Table {
             at = field.end.min(from.end);
         }
         value.push_str(&source.source[at..from.end]);
+        self.splice(destination, value, eol)
+    }
+
+    /// The physical lines of the records that `lines` is part of; an empty range inside a
+    /// record moves to the end of that record.
+    fn whole_records(&self, lines: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let inside = |r: &&Record| {
+            if lines.is_empty() {
+                r.lines.start < lines.start && lines.start < r.lines.end
+            } else {
+                r.lines.start < lines.end && lines.start < r.lines.end
+            }
+        };
+        let mut found = self.records.iter().filter(inside).peekable();
+        let Some(first) = found.peek().map(|r| r.lines.clone()) else {
+            return lines;
+        };
+        let last = found.last().map_or(first.end, |r| r.lines.end);
+        if lines.is_empty() {
+            last..last
+        } else {
+            first.start.min(lines.start)..last.max(lines.end)
+        }
+    }
+
+    /// The source with the bytes `destination` replaced by `value`, with a line ending added
+    /// where `value` would otherwise run into the line before or after it.
+    fn splice(&self, destination: std::ops::Range<usize>, mut value: String, eol: &str) -> String {
         if !value.is_empty() {
             if destination.end < self.source.len() && !value.ends_with(['\r', '\n']) {
                 value.push_str(eol);
@@ -365,6 +521,29 @@ impl Table {
         let mut result = self.source.clone();
         result.replace_range(destination, &value);
         result
+    }
+
+    /// The source text of each record with a stray quote, as [`Record`] says.
+    fn stray_quote_records(&self) -> std::collections::HashSet<&str> {
+        self.records
+            .iter()
+            .filter(|r| r.stray_quote)
+            .filter_map(|r| Some(&self.source[r.fields.first()?.start..r.fields.last()?.end]))
+            .collect()
+    }
+
+    /// Whether this table, the result of copying lines of `source` into `before`, reads them
+    /// as they were read: a record with a quote inside a field that does not start with one
+    /// must have been such a record on one side already. Otherwise the copy took part of a
+    /// quoted cell with a line break in it, such as only its closing line `b",x`, which a
+    /// lenient reading would take for a value with a quote in it.
+    pub fn copy_is_sound(&self, before: &Table, source: &Table) -> bool {
+        let known: std::collections::HashSet<&str> = before
+            .stray_quote_records()
+            .into_iter()
+            .chain(source.stray_quote_records())
+            .collect();
+        self.stray_quote_records().is_subset(&known)
     }
 
     /// Physical lines occupied by a record range, or its insertion point when empty.
@@ -423,6 +602,91 @@ mod record_tests {
     }
 
     #[test]
+    fn a_quote_inside_an_unquoted_field_is_part_of_its_value() {
+        let table = Table::parse("item,size\nTV,55\" screen\na, \"b,c\"\n".into(), ',').unwrap();
+        assert_eq!(table.records[1].cells, ["TV", "55\" screen"]);
+        // A space before the quote: the field is not quoted, so its comma separates fields.
+        assert_eq!(table.records[2].cells, ["a", " \"b", "c\""]);
+        let edited = table.replace_cell(1, 1, "65\" screen", ',').unwrap();
+        assert_eq!(edited, "item,size\nTV,\"65\"\" screen\"\na, \"b,c\"\n");
+    }
+
+    #[test]
+    fn a_csv_delimiter_is_read_from_its_first_line() {
+        let lines = |s: &str| s.lines().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(sniff_csv(&lines("a,b\n1,2")), ',');
+        assert_eq!(sniff_csv(&lines("a;b;c\n1,5;2;3")), ';');
+        assert_eq!(sniff_csv(&lines("\"x;y\",b\n")), ',');
+        assert_eq!(sniff_csv(&lines("a\tb\n")), '\t');
+        assert_eq!(sniff_csv(&lines("sep=|\na|b\n")), '|');
+        assert_eq!(sniff_csv(&lines("\nonly\n")), ',');
+        // A comma in a column name of a file separated by semicolons.
+        assert_eq!(sniff_csv(&lines("id;Amount, EUR\n1;5\n2;6")), ';');
+        // Decimal commas in the values of a semicolon file.
+        assert_eq!(sniff_csv(&lines("a;b;c\n1,5;2;3\n4;5,5;6")), ';');
+        // A semicolon in a value of a comma file.
+        assert_eq!(sniff_csv(&lines("a,b\nx;y,1\nz,2")), ',');
+        assert_eq!(sniff_csv(&lines("a|b|c\n1|2|3")), '|');
+        assert_eq!(sniff_csv(&lines("sep=\t\na\tb")), '\t');
+    }
+
+    #[test]
+    fn an_excel_sep_line_is_not_a_record() {
+        let table = Table::parse("sep=;\r\nid;v\n1;2\n".into(), ';').unwrap();
+        assert_eq!(table.records.len(), 2);
+        assert_eq!(table.records[0].cells, ["id", "v"]);
+        assert_eq!(table.records[0].lines, 1..2);
+        assert_eq!(
+            table.replace_cell(1, 1, "3", ';').unwrap(),
+            "sep=;\r\nid;v\n1;3\n"
+        );
+        // Another delimiter's line is an ordinary record.
+        let other = Table::parse("sep=,\nid;v\n".into(), ';').unwrap();
+        assert_eq!(other.records[0].cells, ["sep=,"]);
+    }
+
+    #[test]
+    fn records_copied_between_delimiters_are_written_with_the_destination_s() {
+        let tsv = Table::parse("id\tnote\n1\ta,b\n".into(), '\t').unwrap();
+        let csv = Table::parse("id,note\n1,x\n".into(), ',').unwrap();
+        assert_eq!(
+            csv.copy_lines(1..2, &tsv, 1..2, "\n"),
+            "id,note\n1,\"a,b\"\n"
+        );
+        // A line inside a cell with line breaks replaces the whole record it is part of.
+        let src = Table::parse("id\tnote\n1\t\"p\nq\nr\"\n".into(), '\t').unwrap();
+        let dst = Table::parse("id,note\n1,\"p\nX\nr\"\n2,z\n".into(), ',').unwrap();
+        let copied = dst.copy_lines(2..3, &src, 2..3, "\n");
+        assert_eq!(copied, "id,note\n1,\"p\nq\nr\"\n2,z\n");
+        // An insertion point inside a record moves to its end.
+        assert_eq!(
+            dst.copy_lines(2..2, &src, 0..1, "\n"),
+            "id,note\n1,\"p\nX\nr\"\nid,note\n2,z\n"
+        );
+        // A record on several lines is copied whole.
+        let multi = Table::parse("id\tnote\n1\t\"p\nq\"\n".into(), '\t').unwrap();
+        assert_eq!(
+            csv.copy_lines(1..2, &multi, 2..3, "\n"),
+            "id,note\n1,\"p\nq\"\n"
+        );
+    }
+
+    #[test]
+    fn setting_a_cell_past_the_end_of_a_record_lengthens_it() {
+        let table = Table::parse("a,b,c\n1\r\n2,x\n".into(), ',').unwrap();
+        assert_eq!(
+            table.replace_cell(1, 2, "z", ',').unwrap(),
+            "a,b,c\n1,,z\r\n2,x\n"
+        );
+        assert_eq!(
+            table
+                .replace_cells(2, &[(1, "y"), (3, "q,r"), (2, "")], ',')
+                .unwrap(),
+            "a,b,c\n1\r\n2,y,,\"q,r\"\n"
+        );
+    }
+
+    #[test]
     fn edits_multiline_unicode_and_preserves_other_fields_and_endings() {
         let source = "id,note,other\r\n1,\"hello\r\n世界\",\"unchanged\"\n2,last,\r\n";
         let table = Table::parse(source.into(), ',').unwrap();
@@ -457,7 +721,7 @@ mod record_tests {
             Table::parse("a,".into(), ',').unwrap().records[0].cells,
             ["a", ""]
         );
-        for source in ["\"unterminated", "\"ok\"extra,x", "a\"b,x"] {
+        for source in ["\"unterminated", "\"ok\"extra,x"] {
             assert!(Table::parse(source.into(), ',').is_err());
         }
         assert_eq!(

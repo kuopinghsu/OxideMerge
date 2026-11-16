@@ -9,7 +9,8 @@ use super::folder::{CmpStatus, DirItem};
 use super::html_report::{
     block_extra, file_diffs, file_read, has_text_diffs, hunks, ignored_blocks, kind, line_range,
     row_cells, settings_dl, settings_rows, status_class, summary_reason, too_big, Extra, FileDiffs,
-    FolderReportInfo, ReadAs, Redact, CONTEXT, DARK, HUNK_MAX_ROWS, LIGHT, MAX_BYTES, MAX_LINES,
+    FolderReportInfo, ReadAs, RecordLines, Redact, CONTEXT, DARK, HUNK_MAX_ROWS, LIGHT, MAX_BYTES,
+    MAX_LINES,
 };
 use super::report::{esc, esc_marked, fmt_size, side_name};
 use crate::i18n::{tr, trf};
@@ -506,6 +507,7 @@ pub fn folder_slideshow(
             };
             let list = hunks(result);
             count = list.len();
+            let records = RecordLines::new(docs.len());
             for (j, h) in list.into_iter().enumerate() {
                 if total >= MAX_SLIDES {
                     skipped += 1;
@@ -513,7 +515,7 @@ pub fn folder_slideshow(
                 }
                 total += 1;
                 shown += 1;
-                let extra = block_extra(&reads, docs, result, h.0);
+                let extra = block_extra(&reads, docs, result, h.0, &records);
                 if diff_slide(&mut slides, &doc, Some(&file), (j, count), h, &extra) {
                     cut += 1;
                 }

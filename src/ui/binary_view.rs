@@ -183,8 +183,8 @@ pub struct BinaryView {
     /// so the app can move on to the next or previous file of the folder compare.
     pub step_file: Option<bool>,
     pub find: crate::ui::text_view::FindState,
-    /// The bytes found last, highlighted.
-    hit: Option<Range<usize>>,
+    /// The side and bytes found last, highlighted.
+    hit: Option<(usize, Range<usize>)>,
     /// Text of the open "Go to offset" dialog.
     pub goto: Option<String>,
     /// The side that typing edits, chosen by clicking one of its bytes.
@@ -200,6 +200,49 @@ pub struct BinaryView {
     page_rows: usize,
     id: egui::Id,
     bpl: usize,
+    /// A number new for each change of the differences, the moved blocks or the layout.
+    generation: u64,
+    /// The marks of the location pane, built again only when what they show changes: those of
+    /// every difference and moved block, then `marks_base..` those of the current difference.
+    marks: Vec<Mark>,
+    marks_base: usize,
+    marks_key: Option<MarksKey>,
+    marks_cur: Option<usize>,
+    /// The side the last find hit is on, to bring into view rather than the side being edited.
+    scroll_side: Option<usize>,
+    /// Side and contents state left by "Copy all", which its undo toast may undo.
+    bulk_step: Option<(usize, u64)>,
+}
+
+/// What the cached location-pane marks were built for: the generation, bytes per line, how
+/// many rows apart marks are merged, and the colors of moved blocks, changes and the current
+/// difference.
+type MarksKey = (u64, usize, usize, Color32, Color32, Color32);
+
+/// Adds a mark of rows `start..=end` in column `p`, merged into the last mark when that has the
+/// same column and color and ends at most `merge` rows before it.
+fn push_mark(
+    marks: &mut Vec<Mark>,
+    p: usize,
+    (start, end): (usize, usize),
+    color: Color32,
+    merge: usize,
+) {
+    if let Some(last) = marks.last_mut() {
+        let mut columns = [None; 3];
+        columns[p] = Some(color);
+        if last.columns == columns && start <= last.start + last.len + merge {
+            last.len = last.len.max(end + 1 - last.start);
+            return;
+        }
+    }
+    let mut columns = [None; 3];
+    columns[p] = Some(color);
+    marks.push(Mark {
+        start,
+        len: end + 1 - start,
+        columns,
+    });
 }
 
 impl BinaryView {
@@ -254,6 +297,13 @@ impl BinaryView {
             run: None,
             page_rows: 1,
             bpl: 16,
+            generation: 0,
+            marks: Vec::new(),
+            marks_base: 0,
+            marks_key: None,
+            marks_cur: None,
+            scroll_side: None,
+            bulk_step: None,
         };
         v.recompute();
         v.moved_due = Some(0.0);
@@ -301,8 +351,9 @@ impl BinaryView {
         }
     }
 
-    /// The differences again after bytes `lo..hi` of a side changed and its length did not:
-    /// only there and in the differences touching them.
+    /// The differences again after bytes `lo..hi` of a side changed: only there and in the
+    /// differences touching them. After a change of length, `hi` is `usize::MAX`, as every
+    /// byte after the change moved.
     fn recompute_bytes(&mut self, lo: usize, hi: usize) {
         self.invalidate_moved();
         let first = self.diffs.partition_point(|r| r.end < lo);
@@ -329,6 +380,7 @@ impl BinaryView {
     }
 
     fn invalidate_moved(&mut self) {
+        self.generation += 1;
         self.stop_moved_scan();
         self.moved.clear();
         for ranges in &mut self.moved_ranges {
@@ -422,6 +474,7 @@ impl BinaryView {
     }
 
     fn apply_moved(&mut self, moved: Vec<binary::MovedBlock>) {
+        self.generation += 1;
         self.anchors = (0..self.n())
             .map(|p| {
                 if p == HUB {
@@ -529,6 +582,7 @@ impl BinaryView {
             let top = self.offset_at(0, self.scroll as usize * self.bpl);
             let within = self.scroll.fract();
             self.runs = runs;
+            self.generation += 1;
             self.scroll = (self.position_of(0, top) / self.bpl) as f32 + within;
         }
     }
@@ -605,31 +659,103 @@ impl BinaryView {
         (1..refs.len()).any(|p| cell(p) != cell(0))
     }
 
-    /// The bytes of side `p` in each difference that no moved block accounts for, with the
-    /// index of the difference.
-    fn changed_bytes(&self, p: usize) -> Vec<(usize, Range<usize>)> {
-        let (len, moved) = (self.data[p].len(), &self.moved_ranges[p]);
-        let (mut j, mut out) = (0, Vec::new());
-        for (i, r) in self.diffs.iter().enumerate() {
-            let (mut start, end) = (r.start, r.end.min(len));
-            while start < end {
-                while moved.get(j).is_some_and(|m| m.end <= start) {
+    /// The bytes of side `p` in difference `r` that no moved block accounts for.
+    fn changed_parts(&self, p: usize, r: &Range<usize>, mut out: impl FnMut(Range<usize>)) {
+        let moved = &self.moved_ranges[p];
+        let (mut start, end) = (r.start, r.end.min(self.data[p].len()));
+        let mut j = moved.partition_point(|m| m.end <= start);
+        while start < end {
+            match moved.get(j) {
+                Some(m) if m.start <= start => {
+                    start = m.end;
                     j += 1;
                 }
-                match moved.get(j) {
-                    Some(m) if m.start <= start => start = m.end,
-                    Some(m) if m.start < end => {
-                        out.push((i, start..m.start));
-                        start = m.end;
-                    }
-                    _ => {
-                        out.push((i, start..end));
-                        start = end;
-                    }
+                Some(m) if m.start < end => {
+                    out(start..m.start);
+                    start = m.end;
+                    j += 1;
+                }
+                _ => {
+                    out(start..end);
+                    start = end;
                 }
             }
         }
+    }
+
+    /// The bytes of side `p` in each difference that no moved block accounts for, with the
+    /// index of the difference.
+    #[cfg(test)]
+    fn changed_bytes(&self, p: usize) -> Vec<(usize, Range<usize>)> {
+        let mut out = Vec::new();
+        for (i, r) in self.diffs.iter().enumerate() {
+            self.changed_parts(p, r, |part| out.push((i, part)));
+        }
         out
+    }
+
+    /// The difference at offset `off`, if any.
+    fn diff_at(&self, off: usize) -> Option<usize> {
+        let i = self.diffs.partition_point(|r| r.end <= off);
+        self.diffs.get(i).filter(|r| r.contains(&off)).map(|_| i)
+    }
+
+    /// The rows of the location pane that bytes `r` of side `p` are on, first and last.
+    fn mark_rows(&self, p: usize, r: &Range<usize>, bpl: usize) -> (usize, usize) {
+        (
+            self.position_of(p, r.start) / bpl,
+            self.position_of(p, r.end - 1) / bpl,
+        )
+    }
+
+    /// Brings the cached location-pane marks up to date: moved blocks shaded, then the changed
+    /// bytes, then those of the current difference in the accent color, painted last. Only
+    /// the last part is rebuilt when just the current difference changes, so moving between
+    /// differences of a file that differs in millions of places stays quick.
+    fn update_marks(&mut self, key: MarksKey) {
+        let (_, bpl, merge, moved_color, change, accent) = key;
+        if self.marks_key != Some(key) {
+            let mut marks = Vec::new();
+            for p in 0..self.n() {
+                for r in &self.moved_ranges[p] {
+                    push_mark(&mut marks, p, self.mark_rows(p, r, bpl), moved_color, merge);
+                }
+            }
+            for p in 0..self.n() {
+                for r in &self.diffs {
+                    self.changed_parts(p, r, |part| {
+                        push_mark(&mut marks, p, self.mark_rows(p, &part, bpl), change, merge);
+                    });
+                }
+            }
+            self.marks_base = marks.len();
+            self.marks = marks;
+            self.marks_key = Some(key);
+            self.marks_cur = None;
+        }
+        if self.marks_cur != self.cur {
+            let mut marks = std::mem::take(&mut self.marks);
+            marks.truncate(self.marks_base);
+            if let Some(r) = self.cur.and_then(|i| self.diffs.get(i)) {
+                for p in 0..self.n() {
+                    let mut parts = Vec::new();
+                    self.changed_parts(p, r, |part| parts.push(part));
+                    for part in parts {
+                        let rows = self.mark_rows(p, &part, bpl);
+                        // Never merged into a mark of the base.
+                        let mut columns = [None; 3];
+                        columns[p] = Some(accent);
+                        marks.push(Mark {
+                            start: rows.0,
+                            len: rows.1 + 1 - rows.0,
+                            columns,
+                        });
+                    }
+                }
+            }
+            self.marks = marks;
+            self.marks_cur = self.cur;
+        }
     }
 
     fn is_moved(&self, pane: usize, offset: usize) -> bool {
@@ -679,17 +805,15 @@ impl BinaryView {
         let same = range.len() == bytes.len();
         data.splice(range.clone(), bytes.iter().copied());
         self.modified[p] = self.state[p] != self.saved[p];
-        if same {
-            self.recompute_bytes(range.start, range.end);
-        } else {
-            self.recompute();
-        }
+        // After a change of length, every byte after it moved; those before it did not.
+        self.recompute_bytes(range.start, if same { range.end } else { usize::MAX });
     }
 
     fn select(&mut self, i: usize) {
         self.cur = Some(i);
         self.cursor = Some(self.diffs[i].start);
         self.scroll_to = Some(self.diffs[i].start);
+        self.scroll_side = None;
         self.nibble = None;
         self.run = None;
     }
@@ -732,26 +856,28 @@ impl BinaryView {
     }
 
     /// Finds the hex bytes or text of the find bar in any pane, after or before the cursor,
-    /// wrapping around at the end.
+    /// wrapping around at the end. The side being edited wins a tie; when one is chosen,
+    /// editing moves to the side of the hit, which is brought into view.
     pub fn find_next(&mut self, forward: bool) {
         let Some(needle) = binary::parse_pattern(&self.find.query) else {
             return;
         };
         let search = |from: Option<usize>| {
-            let hits = self
-                .data
-                .iter()
-                .filter_map(|d| binary::find(d, &needle, from, forward));
-            if forward {
-                hits.min()
-            } else {
-                hits.max()
-            }
+            (0..self.n())
+                .filter_map(|p| binary::find(&self.data[p], &needle, from, forward).map(|o| (o, p)))
+                .min_by_key(|&(o, p)| {
+                    let order = if forward { o } else { usize::MAX - o };
+                    (order, self.pane != Some(p), p)
+                })
         };
         match search(self.cursor).or_else(|| search(None)) {
-            Some(off) => {
+            Some((off, p)) => {
+                if self.pane.is_some() {
+                    self.pane = Some(p);
+                }
                 self.go_to(off);
-                self.hit = Some(off..off + needle.len());
+                self.hit = Some((p, off..off + needle.len()));
+                self.scroll_side = Some(p);
                 self.status.clear();
             }
             None => self.status = trf("msg.not_found", &[("text", self.find.query.clone())]),
@@ -762,8 +888,9 @@ impl BinaryView {
         let max = self.data.iter().map(|d| d.len()).max().unwrap_or(0);
         let off = off.min(max.saturating_sub(1));
         self.cursor = Some(off);
-        self.cur = self.diffs.iter().position(|r| r.contains(&off));
+        self.cur = self.diff_at(off);
         self.scroll_to = Some(off);
+        self.scroll_side = None;
         self.hit = None;
         self.nibble = None;
         self.run = None;
@@ -778,8 +905,9 @@ impl BinaryView {
         };
         let off = off.min(end);
         self.cursor = Some(off);
-        self.cur = self.diffs.iter().position(|r| r.contains(&off));
+        self.cur = self.diff_at(off);
         self.scroll_to = Some(off);
+        self.scroll_side = None;
         self.hit = None;
         self.nibble = None;
         self.run = None;
@@ -808,8 +936,9 @@ impl BinaryView {
     /// After an edit of side `p` that leaves the cursor at `off`.
     fn edited(&mut self, p: usize, off: usize) {
         self.cursor = Some(off);
-        self.cur = self.diffs.iter().position(|r| r.contains(&off));
+        self.cur = self.diff_at(off);
         self.scroll_to = Some(off);
+        self.scroll_side = None;
         self.hit = None;
         self.run = Some((p, off));
     }
@@ -826,11 +955,14 @@ impl BinaryView {
         let Some(digit) = ch.to_digit(16).map(|d| d as u8) else {
             return;
         };
+        // A new undo step forgets the half-typed byte; one begun before saving still gets its
+        // second digit.
+        let nibble = self.nibble;
         let Some((p, off)) = self.edit_at() else {
             return;
         };
         let data = &self.data[p];
-        if self.nibble == Some((p, off)) && off < data.len() {
+        if nibble == Some((p, off)) && off < data.len() {
             let byte = data[off] & 0xF0 | digit;
             self.splice(p, off..off + 1, &[byte]);
             self.nibble = None;
@@ -942,11 +1074,7 @@ impl BinaryView {
         self.modified[s] = self.state[s] != self.saved[s];
         self.run = None;
         self.nibble = None;
-        if same {
-            self.recompute_bytes(at, at + len);
-        } else {
-            self.recompute();
-        }
+        self.recompute_bytes(at, if same { at + len } else { usize::MAX });
         back
     }
 
@@ -1009,25 +1137,50 @@ impl BinaryView {
         self.push_undo(to);
         let src = self.data[from].clone();
         self.splice(to, 0..self.data[to].len(), &src);
+        self.bulk_step = Some((to, self.state[to]));
         self.bulk_edit = Some(trf("msg.copied_blocks", &[("n", n.to_string())]));
     }
 
+    /// Writes each changed side that is not read-only, even when another cannot be written,
+    /// and returns the first error. Typing after saving starts a new undo step, though the
+    /// second digit of a half-typed byte still completes it.
     pub fn save(&mut self) -> anyhow::Result<()> {
         self.run = None;
-        self.nibble = None;
+        let mut error = None;
         for i in 0..self.n() {
-            if self.modified[i] {
-                anyhow::ensure!(!self.read_only[i], "{}", tr("msg.readonly"));
-                crate::core::fsutil::write_atomic(&self.paths[i], &self.data[i])?;
-                self.saved[i] = self.state[i];
-                self.modified[i] = false;
-                self.status = trf(
-                    "msg.saved",
-                    &[("file", self.paths[i].display().to_string())],
-                );
+            if !self.modified[i] {
+                continue;
+            }
+            let written = if self.read_only[i] {
+                Err(anyhow::anyhow!("{}", tr("msg.readonly")))
+            } else {
+                crate::core::fsutil::write_atomic(&self.paths[i], &self.data[i])
+            };
+            match written {
+                Ok(()) => {
+                    self.saved[i] = self.state[i];
+                    self.modified[i] = false;
+                    self.status = trf(
+                        "msg.saved",
+                        &[("file", self.paths[i].display().to_string())],
+                    );
+                }
+                Err(e) => {
+                    error.get_or_insert(e);
+                }
             }
         }
-        Ok(())
+        error.map_or(Ok(()), Err)
+    }
+
+    /// Undoes "Copy all" from its toast, unless something was changed or undone since.
+    pub fn undo_bulk_edit(&mut self) {
+        let Some((side, state)) = self.bulk_step.take() else {
+            return;
+        };
+        if self.state[side] == state && self.undo.last().is_some_and(|s| s.side == side) {
+            self.undo();
+        }
     }
 
     pub fn outcome(&self) -> Outcome {
@@ -1339,7 +1492,8 @@ impl BinaryView {
             self.scroll -= ui.input(|i| i.smooth_scroll_delta.y) / row_h;
         }
         if let Some(off) = self.scroll_to.take() {
-            let l = (self.position_of(self.side_of(off), off) / bpl) as f32;
+            let side = self.scroll_side.take().unwrap_or_else(|| self.side_of(off));
+            let l = (self.position_of(side, off) / bpl) as f32;
             if l < self.scroll || l > self.scroll + visible - 2.0 {
                 self.scroll = l - (visible / 3.0).floor();
             }
@@ -1417,8 +1571,11 @@ impl BinaryView {
                         (_, true, false) => c.inline,
                         _ => Color32::TRANSPARENT,
                     };
-                    let found =
-                        off.is_some_and(|o| self.hit.as_ref().is_some_and(|h| h.contains(&o)));
+                    let found = at.is_some_and(|o| {
+                        self.hit
+                            .as_ref()
+                            .is_some_and(|(side, h)| *side == p && h.contains(&o))
+                    });
                     let bg = if cursor_at == Some(d) || found {
                         c.find_hit
                     } else {
@@ -1479,40 +1636,24 @@ impl BinaryView {
 
         if cfg.show_location_pane {
             let loc = Rect::from_min_max(pos2(right, top), pos2(right + loc_w - 2.0, bottom));
-            let mark = |p: usize, r: &Range<usize>, color: Color32| {
-                let start = self.position_of(p, r.start) / bpl;
-                let end = self.position_of(p, r.end - 1) / bpl;
-                let mut columns = [None; 3];
-                columns[p] = Some(color);
-                Mark {
-                    start,
-                    len: end - start + 1,
-                    columns,
-                }
-            };
-            // The changed bytes come last, to be painted over the moved blocks around them.
-            let mut marks: Vec<Mark> = Vec::new();
+            // Marks less than a pixel apart look the same merged.
+            let merge = (total as f32 / loc.height().max(1.0)) as usize;
             let moved = c.change_bar.gamma_multiply(0.35);
-            for (p, ranges) in self.moved_ranges.iter().enumerate() {
-                marks.extend(ranges.iter().map(|r| mark(p, r, moved)));
-            }
-            for p in 0..n {
-                for (i, r) in self.changed_bytes(p) {
-                    let color = if self.cur == Some(i) {
-                        c.ui.accent
-                    } else {
-                        c.change_bar
-                    };
-                    marks.push(mark(p, &r, color));
-                }
-            }
+            self.update_marks((
+                self.generation,
+                bpl,
+                merge,
+                moved,
+                c.change_bar,
+                c.ui.accent,
+            ));
             if let Some(t) = widgets::location_pane(
                 ui,
                 self.id.with("loc"),
                 loc,
                 total,
                 n,
-                &marks,
+                &self.marks,
                 self.scroll,
                 visible,
                 c.location_bg,
@@ -2447,6 +2588,118 @@ mod tests {
             "a few edits, not the {} bytes after A5",
             v.data[0].len() - 0x20
         );
+    }
+
+    #[test]
+    fn location_marks_merge_dense_changes_and_rebuild_only_the_current_difference() {
+        let left = vec![0u8; 64 * 1024];
+        let right: Vec<u8> = (0..left.len()).map(|i| (i & 1) as u8).collect();
+        let (_dir, mut v) = view_of(&left, &right);
+        assert_eq!(v.diffs.len(), left.len() / 2);
+        let (moved, change, accent) = (Color32::GRAY, Color32::RED, Color32::BLUE);
+        let rows = left.len() / 16;
+        v.update_marks((v.generation, 16, rows / 400, moved, change, accent));
+        assert!(v.marks.len() <= 2 * 400, "{} marks", v.marks.len());
+        for p in 0..2 {
+            let covered: Vec<_> = v.marks[..v.marks_base]
+                .iter()
+                .filter(|m| m.columns[p].is_some())
+                .collect();
+            assert_eq!(covered.first().unwrap().start, 0);
+            let last = covered.last().unwrap();
+            assert_eq!(last.start + last.len, rows, "side {p}");
+        }
+        let base = v.marks_base;
+        v.select(5);
+        v.update_marks((v.generation, 16, rows / 400, moved, change, accent));
+        assert_eq!(v.marks_base, base);
+        assert_eq!(v.marks.len(), base + 2);
+        assert!(v.marks[base..]
+            .iter()
+            .all(|m| m.columns.contains(&Some(accent)) && m.start == 0));
+    }
+
+    #[test]
+    fn length_changing_edits_keep_the_differences_of_a_full_comparison() {
+        let mut v = BinaryView::load(firmware_paths().into()).unwrap();
+        v.insert = true;
+        for (p, at, insert) in [
+            (0, 0x120, true),
+            (1, 0x40, false),
+            (0, 0xfe0, false),
+            (1, 0, true),
+        ] {
+            v.pane = Some(p);
+            v.move_cursor(at);
+            if insert {
+                v.write_bytes(&[0xa5, 0x5a]);
+            } else {
+                v.delete(false);
+            }
+            let refs: Vec<&[u8]> = v.data.iter().map(|d| d.as_slice()).collect();
+            assert_eq!(v.diffs, binary::diff_ranges(&refs), "after {p} {at:#x}");
+        }
+        for _ in 0..4 {
+            v.undo();
+            let refs: Vec<&[u8]> = v.data.iter().map(|d| d.as_slice()).collect();
+            assert_eq!(v.diffs, binary::diff_ranges(&refs));
+        }
+    }
+
+    #[test]
+    fn saving_keeps_a_half_typed_byte_and_writes_every_side_it_can() {
+        let (_dir, mut v) = view_of(&[0; 4], &[0; 4]);
+        v.pane = Some(0);
+        v.move_cursor(0);
+        v.type_char('4');
+        v.save().unwrap();
+        v.type_char('1');
+        assert_eq!((v.data[0][0], v.cursor), (0x41, Some(1)));
+        v.undo();
+        assert_eq!(v.data[0][0], 0x40);
+        assert!(!v.is_modified(), "back to the saved bytes");
+
+        v.pane = Some(1);
+        v.move_cursor(0);
+        v.write_bytes(&[7]);
+        v.pane = Some(0);
+        v.move_cursor(3);
+        v.write_bytes(&[9]);
+        v.read_only[0] = true;
+        assert!(v.save().is_err());
+        assert_eq!(std::fs::read(&v.paths[1]).unwrap(), [7, 0, 0, 0]);
+        assert_eq!(v.modified, [true, false]);
+    }
+
+    #[test]
+    fn copy_all_toast_undoes_only_the_copy() {
+        let (_dir, mut v) = view_of(&[1; 32], &[2; 32]);
+        v.copy_all(true);
+        v.undo_bulk_edit();
+        assert_eq!(v.data[1].as_slice(), [2; 32]);
+
+        v.copy_all(true);
+        v.pane = Some(0);
+        v.move_cursor(0);
+        v.write_bytes(&[9]);
+        v.undo_bulk_edit();
+        assert_eq!(v.data[0][0], 9, "the later edit stays");
+        assert_eq!(v.data[1].as_slice(), [1; 32]);
+    }
+
+    #[test]
+    fn find_brings_the_side_with_the_hit_into_view() {
+        let right = [vec![0; 300], b"NEEDLE".to_vec()].concat();
+        let (_dir, mut v) = view_of(&[0; 40], &right);
+        v.find.query = "\"NEEDLE\"".into();
+        v.find_next(true);
+        assert_eq!((v.pane, v.cursor), (None, Some(300)));
+        assert_eq!(v.hit, Some((1, 300..306)));
+        assert_eq!(v.scroll_side, Some(1));
+        v.pane = Some(0);
+        v.move_cursor(0);
+        v.find_next(true);
+        assert_eq!((v.pane, v.cursor), (Some(1), Some(300)));
     }
 
     #[test]

@@ -3396,7 +3396,7 @@ impl FolderView {
                 let idle = self.running.is_none() && self.file_job.is_none();
                 if ui
                     .add_enabled_ui(idle, |ui| {
-                        labelled(ui, Icon::CopyAllRight, tr("cmd.sync_folders"))
+                        labelled(ui, Icon::Sync, tr("cmd.sync_folders"))
                             .on_hover_text(tr("folder_sync.tip"))
                     })
                     .inner

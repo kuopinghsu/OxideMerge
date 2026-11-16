@@ -1512,6 +1512,12 @@ CSV and TSV files, and spreadsheets, open in the *Table* view.
 The *Text* / *Table* switch above the panes changes between the lines of the file and the table,
 in the same place as the *Text* / *Formatted* switch of documents; a workbook has all three.
 It compares records rather than lines, so a quoted field can contain line breaks.
+A `.csv` file is read with the delimiter that splits its first lines into the same number of
+fields most often: a comma, semicolon, tab or `|` (a comma when they tie), or the one an Excel
+`sep=` line names; the `sep=` line itself is not a row. A file keeps the delimiter it was opened
+with while you edit it. Each side keeps its own delimiter, so a `.tsv` can be compared with a
+`.csv`, and a copied value is written with the delimiter of the side it goes to.
+A quote inside a field that does not start with one, as in `55" screen`, is part of the value.
 
 .The table view of two CSV files
 image::csv.png[Table view of two CSV files]
@@ -1541,7 +1547,8 @@ letters, or by their names when the first row is the header.
   A cell can contain several lines.
 * To copy one field to the matching record on another side, right-click the cell and choose
   *Copy cell*.
-  Both records must have that column.
+  The column must be compared with one on the other side; a record too short to have it is
+  lengthened, as editing a cell past the end of a short record does.
 * The arrow keys move between records and columns.
   kbd:[PgUp] and kbd:[PgDn] move through the records a page at a time, and kbd:[Ctrl+Home] and
   kbd:[Ctrl+End] select the first and the last record.
@@ -2285,13 +2292,14 @@ read, or a font without a table of the characters that its glyphs stand for, a l
 states that the text is incomplete and why.
 A file whose text cannot be read at all is reported.
 
-|`.docx`, `.odt`, `.rtf`
+|`.docx`, `.docm`, `.dotx`, `.dotm`, `.odt`, `.rtf`
 |The words of the document, one line per paragraph or heading.
 The cells of a table are separated by tabs, one row per line.
 Words shown as deleted and field codes are left out.
 
-|`.xlsx`, `.xlsm`, `.ods`
+|`.xlsx`, `.xlsm`, `.xltx`, `.xltm`, `.ods`
 |Every sheet, one line per row, with its cells separated by commas.
+A cell with several lines keeps them, and in an `.ods` sheet so do repeated spaces and tabs.
 Empty rows between rows are kept, so rows keep their places; empty rows after the last row are
 not.
 A workbook opens as a <<table-compare,table compare>>.
@@ -2520,7 +2528,8 @@ Binary files open in a side-by-side hexadecimal view.
 Bytes that differ are highlighted, and both sides scroll together.
 
 * kbd:[Alt+↓] and kbd:[Alt+↑] go to the next and the previous difference.
-* kbd:[Ctrl+F] finds hexadecimal bytes, such as `DE AD BE EF`, or text.
+* kbd:[Ctrl+F] finds hexadecimal bytes, such as `DE AD BE EF`, or text, on any side.
+  The side with the match is scrolled into view; if you are editing, editing moves to that side.
 * kbd:[Ctrl+G] goes to an offset, which you can write as `0x1F00`, `1F00h` or a decimal number.
 * You can copy differences to the other side and save them, as in a text comparison.
 
@@ -2634,6 +2643,7 @@ Typing after the last byte always adds bytes.
 * Pasting (kbd:[Ctrl+V]) in the hexadecimal column writes hexadecimal bytes such as `DE AD BE EF`;
   other text is refused there. In the text column, the text is written as it is.
 * kbd:[Ctrl+Z] undoes either the typing since you last moved the cursor, or a paste.
+  The last 20 such steps can be undone.
 
 A side that is read-only cannot be changed.
 To change this, click the lock icon above the side.

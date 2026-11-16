@@ -62,10 +62,11 @@ impl Kind {
     pub fn of(path: &Path) -> Option<Kind> {
         let extension = super::text::extension(path);
         match extension.as_str() {
-            "docx" | "odt" => Some(Kind::Document),
+            // Macro-enabled documents and templates are laid out as the documents are.
+            "docx" | "docm" | "dotx" | "dotm" | "odt" => Some(Kind::Document),
             "rtf" => Some(Kind::Rtf),
             "pdf" => Some(Kind::Pdf),
-            "xlsx" | "xlsm" | "ods" => Some(Kind::Spreadsheet),
+            "xlsx" | "xlsm" | "xltx" | "xltm" | "ods" => Some(Kind::Spreadsheet),
             "ipynb" => Some(Kind::Notebook),
             "so" | "o" | "ko" | "elf" | "axf" => Some(Kind::Elf),
             // A program on Unix usually has no extension of its own, so those are the only
@@ -725,18 +726,66 @@ pub fn other_cells(path: &Path, cancel: Option<&AtomicBool>) -> Result<OtherCell
 
 /// The first line of a sheet's records when a workbook has several, so that a reader can tell
 /// a workbook of several sheets, which is not one table, from a workbook of one.
+/// The line is read as it is written, quoted or not; a heading is recognised in any built-in
+/// language, so a workbook read before the language changed still has its sheets.
 pub fn is_sheet_heading(line: &str) -> bool {
-    let heading = crate::i18n::trf("label.sheet", &[("name", String::new())]);
-    line.strip_prefix("# ")
-        .is_some_and(|rest| rest.starts_with(heading.trim_end()))
+    sheet_title(line).is_some()
 }
 
-/// The heading of the sheet `name`.
+/// The words of the heading line `line` after its `# `, such as `Sheet: Plan`, without the
+/// quotes a sheet name with a comma or a quote in it is written in.
+pub fn sheet_title(line: &str) -> Option<String> {
+    // Most lines are rows, told apart without reading them as a record or looking the
+    // heading up in every language.
+    let cell: std::borrow::Cow<str> = if line.starts_with("\"# ") {
+        match super::table::split_row(line, ',').as_slice() {
+            [cell] => cell.clone().into(),
+            _ => return None,
+        }
+    } else if line.starts_with("# ") {
+        line.into()
+    } else {
+        return None;
+    };
+    sheet_name(&cell)?;
+    cell.strip_prefix("# ").map(str::to_string)
+}
+
+/// The name of the sheet whose heading is the cell `cell` of a record, as the table reads it.
+pub fn sheet_name(cell: &str) -> Option<&str> {
+    if !cell.starts_with("# ") {
+        return None;
+    }
+    sheet_name_after(cell, &sheet_prefixes())
+}
+
+/// What a sheet heading starts with, in each language it can have been written in, for
+/// [`sheet_name_after`].
+pub fn sheet_prefixes() -> Vec<String> {
+    crate::i18n::translations("label.sheet")
+        .into_iter()
+        .filter_map(|label| label.split("{name}").next())
+        .map(str::trim_end)
+        .filter(|prefix| !prefix.is_empty())
+        .map(|prefix| format!("# {prefix}"))
+        .collect()
+}
+
+/// [`sheet_name`] with the prefixes worked out once, for reading many records.
+pub fn sheet_name_after<'a>(cell: &'a str, prefixes: &[String]) -> Option<&'a str> {
+    prefixes
+        .iter()
+        .find_map(|prefix| cell.strip_prefix(prefix.as_str()))
+        .map(str::trim)
+}
+
+/// The heading of the sheet `name`, as one comma separated record: quoted when the name has a
+/// comma or a quote in it, so that the heading is still one cell of a valid record.
 fn sheet_heading(name: &str) -> String {
-    format!(
-        "# {}\n",
+    record(&[format!(
+        "# {}",
         crate::i18n::trf("label.sheet", &[("name", name.to_string())])
-    )
+    )])
 }
 
 /// The most columns a row is read as; as many as the widest spreadsheet programs allow.
@@ -1257,6 +1306,17 @@ fn ods(xml: &[u8], cancel: Option<&AtomicBool>, stored: bool) -> Result<String> 
                         // ones is how a sheet records its unused width.
                         repeat = repeated(e, "number-columns-repeated");
                     }
+                    // Spaces after the first, tabs and line breaks are elements of their own,
+                    // and part of the value as much as its words.
+                    (Some(ODF_TEXT), "s") if in_cell => {
+                        let n: usize = attribute(e, "c")
+                            .and_then(|c| c.parse().ok())
+                            .unwrap_or(1)
+                            .min(1000);
+                        cell.push_str(&" ".repeat(n));
+                    }
+                    (Some(ODF_TEXT), "tab") if in_cell => cell.push('\t'),
+                    (Some(ODF_TEXT), "line-break") if in_cell => cell.push('\n'),
                     _ => {}
                 }
             }
@@ -1273,7 +1333,9 @@ fn ods(xml: &[u8], cancel: Option<&AtomicBool>, stored: bool) -> Result<String> 
             Ok(quick_xml::events::Event::End(ref e)) => {
                 let (ns, local) = named(&reader, e.name());
                 match (ns.as_deref(), local.as_str()) {
-                    (Some(ODF_TEXT), "p") if in_cell && !cell.ends_with(' ') => cell.push(' '),
+                    // A cell's paragraphs are its lines, as a line break in a cell of a
+                    // workbook is.
+                    (Some(ODF_TEXT), "p") if in_cell => cell.push('\n'),
                     (Some(ODF_TABLE), "table-cell" | "covered-table-cell") => {
                         in_cell = false;
                         let text = match value.take() {
@@ -2156,6 +2218,44 @@ mod tests {
         zipped(dir, "rows.ods", &[("content.xml", &content)])
     }
 
+    /// Spaces after the first, tabs and line breaks in a cell are part of its value, so a change
+    /// to them alone is a difference; a cell's paragraphs are its lines.
+    #[test]
+    fn spaces_tabs_and_line_breaks_in_an_ods_cell_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = concat!(
+            r#"<table:table-row><table:table-cell><text:p>a <text:s text:c="2"/>b</text:p></table:table-cell>"#,
+            r#"<table:table-cell><text:p>c<text:tab/>d<text:line-break/>e</text:p><text:p>f</text:p></table:table-cell></table:table-row>"#
+        );
+        let path = ods_with(dir.path(), rows);
+        let text = Kind::Spreadsheet.read(&path, None).unwrap();
+        let table = super::super::table::Table::parse(text.clone(), ',').unwrap();
+        assert_eq!(table.records[0].cells, ["a   b", "c\td\ne\nf"], "{text:?}");
+    }
+
+    /// Macro-enabled documents and workbooks and templates are read as the documents and
+    /// workbooks they are laid out as.
+    #[test]
+    fn macro_enabled_files_and_templates_are_read_too() {
+        for name in ["a.docm", "a.dotx", "a.dotm"] {
+            assert_eq!(Kind::of(Path::new(name)), Some(Kind::Document), "{name}");
+        }
+        for name in ["a.xltx", "a.xltm"] {
+            assert_eq!(Kind::of(Path::new(name)), Some(Kind::Spreadsheet), "{name}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = zipped(dir.path(), "a.docm", &[("word/document.xml", DOCX)]);
+        assert_eq!(
+            Kind::Document.read(&path, None).unwrap(),
+            Kind::Document
+                .read(
+                    &zipped(dir.path(), "a.docx", &[("word/document.xml", DOCX)]),
+                    None
+                )
+                .unwrap()
+        );
+    }
+
     /// A run of equal rows is recorded once, as the unused rows at the end of a sheet are.
     #[test]
     fn an_opendocument_spreadsheet_repeats_the_rows_it_records_once() {
@@ -2220,6 +2320,59 @@ mod tests {
         let text = Kind::Spreadsheet.read(&path, None).unwrap();
         assert!(text.len() <= MAX_OUTPUT + 1024, "{}", text.len());
         assert!(text.ends_with(&format!("{}\n", crate::i18n::tr("msg.extract_truncated"))));
+    }
+
+    /// A sheet named with a quote or a comma, as a spreadsheet allows, still reads as one valid
+    /// table whose headings name every sheet.
+    #[test]
+    fn sheet_names_with_quotes_and_commas_keep_the_table_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let parts = workbook(
+            &[
+                (
+                    "Sales &quot;EU&quot;",
+                    r#"<row r="1"><c r="A1"><v>1</v></c></row>"#,
+                ),
+                ("Q1, Q2", r#"<row r="1"><c r="A1"><v>2</v></c></row>"#),
+            ],
+            &[],
+        );
+        let borrowed: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let path = zipped(dir.path(), "names.xlsx", &borrowed);
+        let text = Kind::Spreadsheet.read(&path, None).unwrap();
+        let table = super::super::table::Table::parse(text.clone(), ',').unwrap();
+        let names: Vec<&str> = table
+            .records
+            .iter()
+            .filter_map(|r| match r.cells.as_slice() {
+                [cell] => sheet_name(cell),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["Sales \"EU\"", "Q1, Q2"]);
+        let lines: Vec<&str> = text.lines().filter(|l| is_sheet_heading(l)).collect();
+        assert_eq!(lines.len(), 2, "{text:?}");
+        assert_eq!(
+            sheet_title(lines[1]).unwrap(),
+            crate::i18n::trf("label.sheet", &[("name", "Q1, Q2".into())])
+        );
+    }
+
+    /// A heading written in one language is still a heading once another is chosen.
+    #[test]
+    fn a_sheet_heading_is_recognised_in_any_built_in_language() {
+        crate::i18n::set_language("en");
+        let heading = sheet_heading("Plan");
+        crate::i18n::set_language("de");
+        assert!(is_sheet_heading(heading.trim_end()));
+        assert_eq!(sheet_name(heading.trim_end()), Some("Plan"));
+        crate::i18n::set_language("en");
+        for row in ["1,2", "\"a\",b", "#,x", "# not a sheet", ""] {
+            assert!(!is_sheet_heading(row), "{row}");
+        }
     }
 
     /// A workbook of several sheets is compared as a table too: the table view shows each

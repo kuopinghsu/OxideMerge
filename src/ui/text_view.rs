@@ -766,18 +766,16 @@ fn is_number(cell: &str) -> bool {
         && bare.parse::<f64>().is_ok()
 }
 
-/// What the heading of a sheet starts with in the records of a workbook of several sheets.
-fn sheet_prefix() -> String {
-    format!(
-        "# {}",
-        trf("label.sheet", &[("name", String::new())]).trim_end()
-    )
+/// What the heading of a sheet starts with in the records of a workbook of several sheets, in
+/// any language it can have been read in.
+fn sheet_prefix() -> Vec<String> {
+    crate::core::extract::sheet_prefixes()
 }
 
 /// The name of the sheet whose heading the record of `cells` is; `prefix` is [`sheet_prefix`].
-fn sheet_name<'a>(cells: &'a [String], prefix: &str) -> Option<&'a str> {
+fn sheet_name<'a>(cells: &'a [String], prefix: &[String]) -> Option<&'a str> {
     match cells {
-        [cell] => cell.strip_prefix(prefix).map(str::trim),
+        [cell] => crate::core::extract::sheet_name_after(cell, prefix),
         _ => None,
     }
 }
@@ -995,26 +993,22 @@ fn copy_record_cells(
     r: &table_match::MatchedRow,
     (src, s, from): (&table::Table, usize, usize),
     (dst, t, to): (&table::Table, usize, usize),
-    delim: char,
 ) -> Option<String> {
     let (a, b) = (&src.records[s], &dst.records[t]);
-    if r.changed[to].iter().any(|&c| {
-        d.paired_column(to, c, from)
-            .is_none_or(|f| f >= a.cells.len())
-    }) {
+    if b.cells.is_empty()
+        || r.changed[to].iter().any(|&c| {
+            d.paired_column(to, c, from)
+                .is_none_or(|f| f >= a.cells.len())
+        })
+    {
         return None;
     }
+    // A destination record shorter than a column is lengthened by the copy.
     let cells = r.changed[from]
         .iter()
-        .map(|&c| {
-            Some((
-                d.paired_column(from, c, to)
-                    .filter(|&t| t < b.cells.len())?,
-                a.cells[c].as_str(),
-            ))
-        })
+        .map(|&c| Some((d.paired_column(from, c, to)?, a.cells[c].as_str())))
         .collect::<Option<Vec<_>>>()?;
-    dst.replace_cells(t, &cells, delim).ok()
+    dst.replace_cells(t, &cells, dst.delim).ok()
 }
 
 /// Makes the merge result pane (the middle of three, else the right one) save to `out`.
@@ -1699,8 +1693,8 @@ enum ViewMode {
 
 fn formatted_kind(path: &std::path::Path) -> Option<FormattedKind> {
     match text::extension(path).as_str() {
-        "docx" => Some(FormattedKind::Document),
-        "xlsx" | "xlsm" => Some(FormattedKind::Workbook),
+        "docx" | "docm" | "dotx" | "dotm" => Some(FormattedKind::Document),
+        "xlsx" | "xlsm" | "xltx" | "xltm" => Some(FormattedKind::Workbook),
         "pdf" => Some(FormattedKind::Pdf),
         _ => None,
     }
@@ -1827,9 +1821,12 @@ pub struct TextView {
     pub goto: Option<String>,
     pub table_mode: bool,
     pub table_delim: Option<char>,
+    /// The delimiter of each pane's records; see [`Self::pane_delim`].
+    table_delims: Vec<char>,
+    /// The file each of [`Self::table_delims`] was worked out for.
+    table_delim_paths: Vec<Option<std::path::PathBuf>>,
     /// How the table view matches records: by position, or by key columns (2-way).
     pub table_match: TableMatch,
-    col_widths: Vec<usize>,
     table: Box<TableState>,
     pub status: String,
     /// Message about an edit that changed many differences at once, for an undo toast.
@@ -1969,8 +1966,9 @@ impl TextView {
             goto: None,
             table_mode: table_delim.is_some(),
             table_delim,
+            table_delims: Vec::new(),
+            table_delim_paths: Vec::new(),
             table_match: TableMatch::default(),
-            col_widths: Vec::new(),
             table: Box::default(),
             status: String::new(),
             bulk_edit: None,
@@ -2328,11 +2326,13 @@ impl TextView {
             .map(|l| l.chars().count() + l.matches('\t').count() * 3)
             .max()
             .unwrap_or(0);
-        if let Some(d) = self.table_delim {
+        if self.table_delim.is_some() {
+            self.update_table_delims();
             self.table.docs = self
                 .panes
                 .iter()
-                .map(|p| {
+                .zip(&self.table_delims)
+                .map(|(p, &d)| {
                     table::Table::parse(table::source(&p.doc), d)
                         .map(|t| Arc::new(t.with_spreadsheet_merges(&p.doc.sheet_merges)))
                 })
@@ -2370,18 +2370,6 @@ impl TextView {
                 self.table.diff = DiffResult::default();
             }
             self.select_table_lines(selected);
-            let mut w: Vec<usize> = Vec::new();
-            for p in &self.panes {
-                for l in p.doc.lines.iter().take(20000) {
-                    for (i, c) in table::split_row(l, d).iter().enumerate() {
-                        if w.len() <= i {
-                            w.push(3);
-                        }
-                        w[i] = w[i].max(c.chars().count().min(40));
-                    }
-                }
-            }
-            self.col_widths = w;
         }
     }
 
@@ -3434,7 +3422,23 @@ impl TextView {
                     block.ranges[from].clone(),
                     self.panes[to].doc.eol.as_str(),
                 );
-                if let Err(error) = self.replace_table_source(to, source) {
+                // A line block can hold part of a quoted cell with line breaks in it; copied
+                // without the rest, its quotes no longer open and close the cell.
+                let (a, btable) = (a.clone(), btable.clone());
+                let checked = self
+                    .pane_delim(to)
+                    .ok_or("No table delimiter".to_string())
+                    .and_then(|d| {
+                        let copied = table::Table::parse(source.clone(), d)?;
+                        if copied.copy_is_sound(&btable, &a) {
+                            Ok(source)
+                        } else {
+                            Err("The copy would split a quoted field that has line breaks"
+                                .to_string())
+                        }
+                    });
+                if let Err(error) = checked.and_then(|source| self.replace_table_source(to, source))
+                {
                     self.status = error;
                 }
             }
@@ -8533,9 +8537,6 @@ impl TextView {
         if !r.differs(true) || from == to || !self.writable(to) {
             return;
         }
-        let Some(delim) = self.table_delim else {
-            return;
-        };
         let d = self.keyed().unwrap();
         let (Some(Ok(src)), Some(Ok(dst))) = (self.table.docs.get(from), self.table.docs.get(to))
         else {
@@ -8548,18 +8549,16 @@ impl TextView {
             .all(|c| c[0].is_none() || c[1].is_none() || c[0] == c[1]);
         let eol = self.panes[to].doc.eol.as_str();
         let result = match (r.records[from], r.records[to]) {
-            (Some(s), Some(t)) => {
-                match copy_record_cells(d, &r, (src, s, from), (dst, t, to), delim) {
-                    Some(source) => Ok(source),
-                    None if in_place => Ok(dst.copy_lines(
-                        dst.records[t].lines.clone(),
-                        src,
-                        src.records[s].lines.clone(),
-                        eol,
-                    )),
-                    None => Err(tr("table.copy_columns_differ").to_string()),
-                }
-            }
+            (Some(s), Some(t)) => match copy_record_cells(d, &r, (src, s, from), (dst, t, to)) {
+                Some(source) => Ok(source),
+                None if in_place => Ok(dst.copy_lines(
+                    dst.records[t].lines.clone(),
+                    src,
+                    src.records[s].lines.clone(),
+                    eol,
+                )),
+                None => Err(tr("table.copy_columns_differ").to_string()),
+            },
             (Some(s), None) if in_place => {
                 let at = d.rows[..row]
                     .iter()
@@ -8826,14 +8825,21 @@ impl TextView {
         let Some(table) = self.table.docs.get(pane).and_then(|t| t.as_ref().ok()) else {
             return;
         };
-        let Some(value) = table.records.get(record).and_then(|r| r.cells.get(column)) else {
+        // A cell past the end of a short record is empty, and editing it lengthens the record;
+        // a blank row added only to show a merge has no fields to edit.
+        let Some(value) = table
+            .records
+            .get(record)
+            .filter(|r| !r.cells.is_empty())
+            .map(|r| r.cells.get(column).cloned().unwrap_or_default())
+        else {
             return;
         };
         self.table.edit = Some(CellEdit {
             pane,
             record,
             column,
-            value: value.clone(),
+            value,
             source: table.source.clone(),
             focus: true,
         });
@@ -8846,7 +8852,7 @@ impl TextView {
         if table::source(&self.panes[edit.pane].doc) != edit.source {
             return Err(tr("table.stale").into());
         }
-        let delim = self.table_delim.ok_or("No table delimiter")?;
+        let delim = self.pane_delim(edit.pane).ok_or("No table delimiter")?;
         let table = table::Table::parse(edit.source.clone(), delim)?;
         let source = table.replace_cell(edit.record, edit.column, &edit.value, delim)?;
         if source == edit.source {
@@ -8855,10 +8861,44 @@ impl TextView {
         self.replace_table_source(edit.pane, source)
     }
 
+    /// What separates the fields of pane `pane`'s records: its own delimiter, as a `.tsv` and a
+    /// `.csv` compared with each other each keep theirs.
+    fn pane_delim(&self, pane: usize) -> Option<char> {
+        self.table_delim?;
+        self.table_delims.get(pane).copied().or(self.table_delim)
+    }
+
+    /// Works out [`Self::table_delims`] for the panes whose file it is not known for yet. A
+    /// pane keeps the delimiter its file was opened with, so that editing the first line, such
+    /// as a column name with a comma in it, never reads the whole file another way.
+    fn update_table_delims(&mut self) {
+        let Some(fallback) = self.table_delim else {
+            self.table_delims.clear();
+            self.table_delim_paths.clear();
+            return;
+        };
+        let n = self.panes.len();
+        self.table_delims.truncate(n);
+        self.table_delim_paths.truncate(n);
+        for (i, pane) in self.panes.iter().enumerate() {
+            let path = pane.doc.path.clone();
+            if self.table_delim_paths.get(i) == Some(&path) {
+                continue;
+            }
+            let d = table::delimiter_of_doc(&pane.doc, &self.opts).unwrap_or(fallback);
+            if i < self.table_delims.len() {
+                (self.table_delims[i], self.table_delim_paths[i]) = (d, path);
+            } else {
+                self.table_delims.push(d);
+                self.table_delim_paths.push(path);
+            }
+        }
+    }
+
     fn replace_table_source(&mut self, pane: usize, source: String) -> Result<(), String> {
         table::Table::parse(
             source.clone(),
-            self.table_delim.ok_or("No table delimiter")?,
+            self.pane_delim(pane).ok_or("No table delimiter")?,
         )?;
         self.replace_source(pane, source);
         Ok(())
@@ -9382,7 +9422,8 @@ impl TextView {
             .map(|p| {
                 let path = p.doc.path.as_deref()?;
                 let read_here = table::delimiter_for(path).is_none() && self.table_delim.is_some();
-                let sheet = matches!(text::extension(path).as_str(), "xlsx" | "xlsm" | "ods");
+                let sheet = crate::core::extract::Kind::of(path)
+                    == Some(crate::core::extract::Kind::Spreadsheet);
                 (read_here && sheet).then(|| path.to_path_buf())
             })
             .collect()
@@ -11839,15 +11880,7 @@ impl TextView {
         }
         self.scroll = self.scroll.clamp(0.0, max_scroll);
 
-        let content_w = if self.table_mode {
-            self.col_widths
-                .iter()
-                .map(|w| (*w as f32 + 1.0) * char_w + 8.0)
-                .sum::<f32>()
-                + 20.0
-        } else {
-            self.max_cols as f32 * char_w + 40.0
-        };
+        let content_w = self.max_cols as f32 * char_w + 40.0;
         self.hscroll = if wrap {
             0.0
         } else {
@@ -12339,43 +12372,6 @@ impl TextView {
                 let fg = if ignored { c.gutter_text } else { c.text };
                 let sel = row.block().is_some() && row.block() == self.cur_block;
                 let inline_bg = if sel { c.inline_sel } else { c.inline };
-                if let (true, Some(delim)) = (self.table_mode, self.table_delim) {
-                    let cells = table::split_row(line, delim);
-                    let others: Vec<Vec<String>> = (0..n)
-                        .filter(|&q| q != p)
-                        .filter_map(|q| {
-                            row.line(q)
-                                .map(|ol| table::split_row(&self.panes[q].doc.lines[ol], delim))
-                        })
-                        .collect();
-                    let mut x = text_rect.left() + 4.0 - self.hscroll;
-                    for (ci, cell) in cells.iter().enumerate() {
-                        let w = (self.col_widths.get(ci).copied().unwrap_or(3) as f32 + 1.0)
-                            * char_w
-                            + 8.0;
-                        let cell_rect = Rect::from_min_size(pos2(x, y), vec2(w, row_h));
-                        let differs = row.block().is_some()
-                            && !ignored
-                            && others.iter().any(|o| o.get(ci) != Some(cell));
-                        if differs {
-                            tp.rect_filled(cell_rect.shrink(1.0), 0.0, inline_bg);
-                        }
-                        let cp = tp.with_clip_rect(cell_rect.intersect(text_rect));
-                        cp.text(
-                            pos2(x + 4.0, y + row_h / 2.0),
-                            Align2::LEFT_CENTER,
-                            cell,
-                            font.clone(),
-                            fg,
-                        );
-                        tp.line_segment(
-                            [pos2(x + w, y), pos2(x + w, y + row_h)],
-                            Stroke::new(1.0_f32, c.table_grid),
-                        );
-                        x += w;
-                    }
-                    continue;
-                }
                 if laid.as_ref().map(|(lr, ..)| *lr) != Some(r) {
                     let spans = if ignored {
                         None
@@ -13517,6 +13513,128 @@ mod tests {
         assert!(!v.panes[1].doc.modified);
         assert!(!v.can_undo());
         assert!(!v.status.is_empty());
+    }
+
+    /// Copying only the closing line of a quoted cell would leave a line that reads as a
+    /// value with a quote in it; the copy is refused. A record with such a value on the side
+    /// copied from is copied as it is.
+    #[test]
+    fn table_block_merge_refuses_half_of_a_quoted_cell_but_copies_stray_quotes() {
+        let right = "a\nsame\nsame2\nb,x\n";
+        let mut v = TextView::new(
+            vec![
+                TextDoc::from_text(Some("left.csv".into()), "\"a\nsame\nsame2\nb\",x\n"),
+                TextDoc::from_text(Some("right.csv".into()), right),
+            ],
+            &Config::default(),
+        );
+        assert_eq!(v.diff.blocks.len(), 2);
+        v.copy_block(1, 0, 1);
+        assert_eq!(v.panes[1].doc.text(), right);
+        assert!(!v.can_undo());
+        assert!(!v.status.is_empty());
+
+        let left = "id,size\nTV,55\" screen\n";
+        let mut v = TextView::new(
+            vec![
+                TextDoc::from_text(Some("left.csv".into()), left),
+                TextDoc::from_text(Some("right.csv".into()), "id,size\nTV,60\n"),
+            ],
+            &Config::default(),
+        );
+        v.copy_block(0, 0, 1);
+        assert_eq!(v.panes[1].doc.text(), left);
+    }
+
+    /// A TSV compared with a CSV reads each side with its own delimiter, and a cell copied from
+    /// one to the other is written with the other's.
+    #[test]
+    fn each_side_of_a_table_keeps_its_own_delimiter() {
+        let mut v = TextView::new(
+            vec![
+                TextDoc::from_text(Some("left.tsv".into()), "id\tname\n1\t\"A, B\"\n"),
+                TextDoc::from_text(Some("right.csv".into()), "id,name\n1,Bob\n"),
+            ],
+            &Config::default(),
+        );
+        let cells =
+            |v: &TextView, p: usize| v.table.docs[p].as_ref().unwrap().records[1].cells.clone();
+        assert_eq!(cells(&v, 0), ["1", "A, B"]);
+        assert_eq!(cells(&v, 1), ["1", "Bob"]);
+        let row = v
+            .table
+            .diff
+            .rows
+            .iter()
+            .position(|r| r.line(1) == Some(1))
+            .unwrap();
+        v.copy_cell(row, 1, 0, 1);
+        assert_eq!(v.panes[1].doc.text(), "id,name\n1,\"A, B\"\n");
+    }
+
+    /// A CSV saved with semicolons, as a spreadsheet set to a language with decimal commas
+    /// writes it, is read as the table it is.
+    #[test]
+    fn a_semicolon_csv_is_read_with_its_delimiter() {
+        let v = TextView::new(
+            vec![
+                TextDoc::from_text(Some("a.csv".into()), "id;name\n1;\"Smith, J\"\n"),
+                TextDoc::from_text(Some("b.csv".into()), "sep=;\nid;name\n1;Doe\n"),
+            ],
+            &Config::default(),
+        );
+        assert_eq!(v.table_delims, [';', ';']);
+        let a = v.table.docs[0].as_ref().unwrap();
+        assert_eq!(a.records[1].cells, ["1", "Smith, J"]);
+        // The `sep=;` line is not a record: the header row is the one after it.
+        let b = v.table.docs[1].as_ref().unwrap();
+        assert_eq!(b.records[0].cells, ["id", "name"]);
+        assert_eq!(b.records[0].lines, 1..2);
+        assert_eq!(b.records[1].cells, ["1", "Doe"]);
+    }
+
+    /// A pane keeps the delimiter its file was opened with: a comma typed into a column name
+    /// of a semicolon file does not make the file read as comma separated.
+    #[test]
+    fn editing_the_first_line_keeps_the_delimiter() {
+        let mut v = TextView::new(
+            vec![
+                TextDoc::from_text(Some("a.csv".into()), "id;name\n"),
+                TextDoc::from_text(Some("b.csv".into()), "id;other\n"),
+            ],
+            &Config::default(),
+        );
+        v.begin_cell_edit(0, 0, 1);
+        let mut edit = v.table.edit.take().unwrap();
+        edit.value = "name, full".into();
+        v.apply_cell_edit(&edit).unwrap();
+        assert_eq!(v.panes[0].doc.text(), "id;name, full\n");
+        // Read afresh, the line alone splits as well at its comma, and a tie is a comma.
+        assert_eq!(v.table_delims, [';', ';']);
+        let a = v.table.docs[0].as_ref().unwrap();
+        assert_eq!(a.records[0].cells, ["id", "name, full"]);
+    }
+
+    /// A cell past the end of a short record can be edited, which lengthens the record.
+    #[test]
+    fn a_cell_past_the_end_of_a_short_record_can_be_edited() {
+        let mut v = TextView::new(
+            vec![
+                TextDoc::from_text(Some("a.csv".into()), "a,b,c\n1\n"),
+                TextDoc::from_text(Some("b.csv".into()), "a,b,c\n1,2,3\n"),
+            ],
+            &Config::default(),
+        );
+        v.begin_cell_edit(0, 1, 2);
+        let mut edit = v
+            .table
+            .edit
+            .take()
+            .expect("the empty cell opens for editing");
+        assert_eq!(edit.value, "");
+        edit.value = "x,y".into();
+        v.apply_cell_edit(&edit).unwrap();
+        assert_eq!(v.panes[0].doc.text(), "a,b,c\n1,,\"x,y\"\n");
     }
 
     #[test]

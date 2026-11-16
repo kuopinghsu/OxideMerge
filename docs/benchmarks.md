@@ -531,6 +531,8 @@ for libssh2 picks up Git's Perl, which lacks a module it needs.
 | + `lto = "fat"` | 55,169,536 bytes (52.6 MiB) | −4.9% | 22 min |
 | + `opt-level = "s"` (now) | 46,322,688 bytes (44.2 MiB) | −20.1% | 17 min |
 
+The same figures are kept in
+[`analysis-benchmarks.json`](analysis-benchmarks.json) under `executable_size`.
 Only the profile changed between the rows. The last two were built after other sessions'
 fixes to the table and document readers had landed; those don't change the size noticeably.
 

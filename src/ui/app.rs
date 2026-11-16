@@ -12124,7 +12124,7 @@ impl OxideMergeApp {
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
                     match t.content.view_mut() {
                         Content::Text(v) => v.undo(),
-                        Content::Binary(v) => v.undo(),
+                        Content::Binary(v) => v.undo_bulk_edit(),
                         _ => {}
                     }
                 }
