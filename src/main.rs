@@ -105,7 +105,9 @@ struct Cli {
     /// ftp://, ftpes:// (explicit FTPS) or ftps:// (implicit FTPS); /~/path is in the user's
     /// home folder. The password, or the --ssh-key passphrase, is read from
     /// OXIDEMERGE_REMOTE_PASSWORD; SFTP signs in with ssh-agent's and ~/.ssh/config's keys
-    /// without either, and follows ~/.ssh/config for host aliases, users, ports and jump hosts
+    /// without either, and follows ~/.ssh/config for host aliases, users, ports and jump hosts.
+    /// Archives, or an archive and a folder, are compared as the folders they unpack to; the
+    /// password of an encrypted one is read from OXIDEMERGE_ARCHIVE_PASSWORD
     paths: Vec<PathBuf>,
     /// Private key file to sign in to SFTP servers with
     #[arg(long, value_name = "FILE")]
@@ -549,6 +551,9 @@ fn note_pdf_options(cli: &Cli) {
 }
 
 /// Non-interactive operations (console compare, report, patch). Returns the process exit code.
+/// Where the command line reads the password of an encrypted archive from.
+const ARCHIVE_PASSWORD_ENV: &str = "OXIDEMERGE_ARCHIVE_PASSWORD";
+
 fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
     if analysis_mode(cli) {
         return run_analysis(cli, cfg);
@@ -562,6 +567,57 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
         git_desc = Some(format!("{} @ {rev}", path.display()));
         cli_paths = vec![copy, path.clone()];
         _git_temp = Some(temp);
+    }
+    // Archives are compared as the folders they unpack to, as the window compares them,
+    // under their own names; so is an archive with a folder. An encrypted one is opened with
+    // the password in `OXIDEMERGE_ARCHIVE_PASSWORD`, kept out of the command line, where other
+    // users could read it.
+    let mut _archive_temps = Vec::new();
+    let mut archive_names = None;
+    let unpacked = |p: &PathBuf| {
+        core::archive::is_archive(p) && core::unpacker::find(&cfg.comparison_options(), p).is_none()
+    };
+    if cli.git_rev.is_none()
+        && cli.kind.is_none()
+        && cli_paths.iter().any(unpacked)
+        && cli_paths.iter().all(|p| p.is_dir() || unpacked(p))
+    {
+        let password = std::env::var(ARCHIVE_PASSWORD_ENV).ok();
+        let mut roots = Vec::new();
+        for p in &cli_paths {
+            if p.is_dir() {
+                roots.push(p.clone());
+                continue;
+            }
+            if let Some(pw) = &password {
+                core::archive::give_password(p, zeroize::Zeroizing::new(pw.clone()));
+            }
+            let temp = core::archive::extract_to_temp(p);
+            core::archive::forget_password(p);
+            let temp = temp.map_err(|e| match e.downcast_ref::<core::archive::NeedsPassword>() {
+                Some(n) if !n.wrong => anyhow::anyhow!(
+                    "{}: it is encrypted; give its password in {ARCHIVE_PASSWORD_ENV}",
+                    p.display()
+                ),
+                Some(_) => anyhow::anyhow!(
+                    "{}: the password in {ARCHIVE_PASSWORD_ENV} is wrong",
+                    p.display()
+                ),
+                None => e,
+            })?;
+            let skipped = core::archive::skipped(temp.path());
+            if !skipped.is_empty() {
+                eprintln!(
+                    "note: {} entries of {} not unpacked, so not compared: {}",
+                    skipped.len(),
+                    p.display(),
+                    skipped.join(", ")
+                );
+            }
+            roots.push(temp.path().to_path_buf());
+            _archive_temps.push(temp);
+        }
+        archive_names = Some(std::mem::replace(&mut cli_paths, roots));
     }
     let paths = &cli_paths;
     let cli_desc = |cli: &Cli, i: usize| match (i, &git_desc) {
@@ -639,7 +695,7 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             progress: &progress,
         }
         .run();
-        let mut shown: Vec<PathBuf> = paths.clone();
+        let mut shown: Vec<PathBuf> = archive_names.clone().unwrap_or_else(|| paths.clone());
         if let Some(d) = &git_desc {
             shown[0] = PathBuf::from(d);
         }
@@ -716,17 +772,26 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
                 patch_style(cli.patch_style),
                 cli.context,
             );
-            for (file, why) in &patch.left_out {
-                eprintln!("error: {file} left out of the patch: {why}");
+            // A file that is not text, such as a picture, is never in a text patch, as `diff`
+            // says only that such files differ: a note. A text file whose changes could not be
+            // written, such as one not in UTF-8, is an error.
+            // These lines are in English whatever the window's language, as the rest of what
+            // the command line prints is, so a script reads the same words on every system;
+            // the reason for a text file is the patch writer's own, which is English too.
+            for l in &patch.left_out {
+                if l.binary {
+                    eprintln!("note: {} left out of the patch: not a text file", l.file);
+                } else {
+                    eprintln!("error: {} left out of the patch: {}", l.file, l.why);
+                }
             }
             export(p, &patch.text)?;
-            // A patch without some of the changes is written, so what it holds can be used,
-            // but the run fails: a script applying it must not take it for all of them.
-            if !patch.left_out.is_empty() {
-                eprintln!(
-                    "error: the patch leaves out {} changed files",
-                    patch.left_out.len()
-                );
+            // The patch is written so what it holds can be used, but the run fails: a script
+            // applying it must not take it for all the text changes.
+            if patch.lost_text() {
+                let lost = patch.left_out.iter().filter(|l| !l.binary).count();
+                let files = if lost == 1 { "file" } else { "files" };
+                eprintln!("error: the patch leaves out the changes of {lost} text {files}");
                 failed = true;
             }
         }

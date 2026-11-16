@@ -26,8 +26,9 @@ release on GitHub uses its section of this file as the release notes.
   delimiter, so a `.tsv` can be compared with a `.csv`, and a value copied between them is
   written with the delimiter of the side it goes to.
 - Compared with a revision (`--rev`), the window now takes the options given with it, as
-  `--cli` and `--report` already did: `--filter`, `-r`, `--method`, `--kind`, `-o`, `--wr`,
-  and `--dl`/`--dr` or `-L` to name the sides. `--wr` keeps a working folder read-only too.
+  `--cli` and `--report` already did: `--filter`, `-r`, `--method`, `--kind`, `--wr`, and
+  `--dl`/`--dr` or `-L` to name the sides; for a file, `-o` too. `--wr` keeps a working
+  folder read-only as well.
 
 ### Changed
 
@@ -37,10 +38,13 @@ release on GitHub uses its section of this file as the release notes.
 - *Generate patch...* of a folder compare saves the patch of every file it can write as
   text, then names each file it left out and why: "not a text file" for a picture, PDF,
   document or workbook, or the encoding of a text file that is not UTF-8. It no longer
-  saves nothing because of one such file. From the command line, `--patch` still writes
-  the patch, reports each file left out as an error and exits with code 2.
-- Find in the binary compare searches every side; the side with the match is scrolled into
-  view, and editing moves to it.
+  saves nothing because of one such file. From the command line, `--patch` writes the patch
+  and notes each file that is not text; a text file whose changes are missing from it is an
+  error, and the run then exits with code 2.
+- Find in the binary compare scrolls the side with the match into view, and while editing,
+  editing moves to that side.
+- In the binary compare, an edit that changes a file's length works out the differences
+  again from the edit on, not for the whole file, so such edits in a large file are quicker.
 
 - *Synchronize folders...* has its own toolbar and menu icon, two sides with an arrow between
   them, instead of the *Copy all* arrows. Its preview shows the share of folders to create,
@@ -80,8 +84,37 @@ release on GitHub uses its section of this file as the release notes.
   private network show their pictures from there. Text mode shows a picture by its alt
   text, and the Resources tree saves
   pictures stored in the page under `_inline/`, so a changed one shows there.
+- Archives open on another thread, with a *Cancel* button, instead of holding the window
+  still while they are unpacked. Saving edits into a `.tar.gz`, `.tar.bz2`, `.tar.zst` or
+  any archive of 64 MB or more also runs on another thread, as `.tar.xz` and `.7z` did.
+- `--report` and `--cli` compare archives, or an archive and a folder, as the folders they
+  unpack to, as the window does, and note any entries they could not unpack. The password
+  of an encrypted archive is read from `OXIDEMERGE_ARCHIVE_PASSWORD`.
+- Unpacking `.tar.xz` streams the data instead of writing the whole tar to a temporary file
+  first, and is faster.
 
 ### Fixed
+
+- Saving into an archive holding two entries whose names differ only in case (`A.txt` and
+  `a.txt`) no longer gives one the contents of the other on Windows and macOS: the entry
+  that could not be shown is kept as it was, and is named in the status line.
+- A file or folder renamed only in case (`readme` to `README`) inside an archive is saved
+  under its new name alone, not as a second entry beside the old one.
+- A zip entry whose name is not stored as UTF-8 (one made by Windows in a code page such as
+  Big5) is no longer renamed when it is edited; writing it back is refused instead. A zip
+  holding two entries of the same name opens read-only, as only the last can be read.
+- Entries an archive cannot unpack here (a name Windows does not allow, an unsafe name, a
+  link that cannot be made) are named in the folder compare's status line instead of
+  missing without a word. A 7z with such an entry now opens instead of failing.
+- Files unpacked from a zip, and empty files from a 7z, keep the times stored for them, so
+  comparing by date works.
+- A damaged or cut short `.tar.gz`, `.tar.bz2`, `.tar.xz` or `.tar.zst` fails to open
+  instead of opening as if whole: its checksum is now read. Padding after the compressed
+  data is still allowed.
+- A disk-full or other write error while unpacking an encrypted 7z, or a damaged AES zip,
+  is reported as such, not as a wrong password.
+- Temporary folders left by a run that ended without removing them are removed by the
+  next run.
 
 - A file or folder on a server is remembered by its address among the recent comparisons
   and the recent paths, also when it was chosen with the remote file chooser or its folder
@@ -120,8 +153,8 @@ release on GitHub uses its section of this file as the release notes.
   repeated spaces, tabs and line breaks in a cell are kept, and its paragraphs are its lines.
 - Reports name the right rows and fields for records with a cell spanning several lines,
   and read a semicolon CSV with its own delimiter.
-- Binary compare: an edit that changes a file's length keeps the differences exact; the
-  location pane stays quick with millions of differences; saving writes every side it can
+- Binary compare: the location pane stays quick with millions of differences; saving writes
+  every side it can
   and keeps a half-typed byte; the *Copy all* message's Undo undoes only the copy; and a
   short shift late in a large file is found even after many overwritten bytes.
 - Comparing a folder with a revision (`--rev`, *Compare with revision*):
@@ -129,8 +162,10 @@ release on GitHub uses its section of this file as the release notes.
     no longer listed as new.
   - A submodule whose recorded commit cannot be read, such as one never fetched, is left out
     of both sides and named, instead of looking empty, as if all its files were new.
-  - The export size limit also covers Git LFS files, which are written larger than the
-    pointers it counted, also when the LFS rules are in a folder above the one compared.
+  - Git LFS files, which are written larger than the pointers the export size limit counts
+    before writing, are measured once written, and an export over the limit is then refused
+    and deleted, as a Subversion or Mercurial export is. Git's own rules decide which files
+    use LFS, wherever they are kept.
 
 ## [0.9.8] - 2026-11-12
 

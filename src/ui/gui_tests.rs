@@ -190,6 +190,8 @@ impl Gui {
             || self.app.rev_load.is_some()
             || self.app.remote_load.is_some()
             || self.app.repack.is_some()
+            // Archives being unpacked to be compared.
+            || self.app.opening.iter().any(|o| o.archives.is_some())
             || self
                 .app
                 .tabs
@@ -2047,23 +2049,24 @@ fn a_folder_patch_leaves_out_and_names_files_it_cannot_write() {
         panic!("not a folder compare");
     };
     let patch = v.make_patch(PatchStyle::Unified, 3);
-    assert!(patch.text.contains("-old") && patch.text.contains("+new"), "{}", patch.text);
-    assert!(!patch.text.contains("caf"), "{}", patch.text);
-    let why = |name: &str| {
-        patch
-            .left_out
-            .iter()
-            .find(|(f, _)| f == name)
-            .map(|(_, why)| why.clone())
-    };
-    assert!(why("b.txt").is_some_and(|w| w.contains("UTF-8")), "{:?}", patch.left_out);
-    // Named as not text, never explained by the encoding its bytes would be read in.
-    assert_eq!(
-        why("budget.xlsx").as_deref(),
-        Some(tr("patch.not_text")),
-        "{:?}",
-        patch.left_out
+    assert!(
+        patch.text.contains("-old") && patch.text.contains("+new"),
+        "{}",
+        patch.text
     );
+    assert!(!patch.text.contains("caf"), "{}", patch.text);
+    let left = |name: &str| patch.left_out.iter().find(|l| l.file == name).cloned();
+    // A text file whose changes are lost: not binary, explained by its encoding.
+    let text = left("b.txt").expect("b.txt is left out");
+    assert!(!text.binary && text.why.contains("UTF-8"), "{text:?}");
+    // Named as not text, never explained by the encoding its bytes would be read in, and
+    // not a lost text change.
+    let book = left("budget.xlsx").expect("budget.xlsx is left out");
+    assert_eq!(
+        (book.why.as_str(), book.binary),
+        (tr("patch.not_text"), true)
+    );
+    assert!(patch.lost_text(), "the text file's changes are missing");
 }
 
 #[test]
@@ -8066,7 +8069,11 @@ fn a_compare_with_a_revision_keeps_the_options_it_was_opened_with() {
     let Content::Folder(v) = gui.app.tabs[0].content.view() else {
         panic!("not a folder compare");
     };
-    assert_eq!(v.read_only, [true, true], "--wr keeps the working folder read-only");
+    assert_eq!(
+        v.read_only,
+        [true, true],
+        "--wr keeps the working folder read-only"
+    );
     assert_eq!(v.display_roots, ["Release", "Mine"]);
 }
 

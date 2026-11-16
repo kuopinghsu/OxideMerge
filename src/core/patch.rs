@@ -289,11 +289,29 @@ pub fn make_doc_patch(
     Ok(PatchPlan::new(old, new, opts, syntax).emit(input, style, context))
 }
 
-/// The patch of a folder compare, and the files left out of it, each with why.
+/// The patch of a folder compare, and the files left out of it.
 #[derive(Debug, Default)]
 pub struct FolderPatch {
     pub text: String,
-    pub left_out: Vec<(String, String)>,
+    pub left_out: Vec<LeftOut>,
+}
+
+impl FolderPatch {
+    /// Whether a text file's changes are missing from the patch, as a picture's never are in
+    /// a text patch: a failure, where a file that is not text is only a note.
+    pub fn lost_text(&self) -> bool {
+        self.left_out.iter().any(|l| !l.binary)
+    }
+}
+
+/// A file a folder's patch left out, and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeftOut {
+    pub file: String,
+    pub why: String,
+    /// Not a text file, such as a picture, a PDF or a workbook, which a text patch never
+    /// holds; otherwise a text file whose changes are missing, such as one not in UTF-8.
+    pub binary: bool,
 }
 
 /// Patch of all differing or unique text files of a 2-way folder compare. A file that cannot
@@ -319,13 +337,18 @@ pub fn folder_patch(
         }
         match file_patch(roots, display_roots, it, opts, style, context) {
             Ok(text) => out.text.push_str(&text),
-            Err(why) => out.left_out.push((it.rel_path(), why)),
+            Err((why, binary)) => out.left_out.push(LeftOut {
+                file: it.rel_path(),
+                why,
+                binary,
+            }),
         }
     }
     out
 }
 
-/// The patch of one file `it` of a folder compare.
+/// The patch of one file `it` of a folder compare; or why it cannot be written, and whether
+/// that is because the file is not text.
 fn file_patch(
     roots: &[std::path::PathBuf],
     display_roots: &[String],
@@ -333,32 +356,49 @@ fn file_patch(
     opts: &super::diff::DiffOptions,
     style: PatchStyle,
     context: usize,
-) -> Result<String, String> {
+) -> Result<String, (String, bool)> {
     use super::text::TextEncoding;
     // A picture, a PDF or a workbook is bytes, not text: said so plainly, rather than as the
     // encoding its bytes would be read in. Looked at only once a file has failed, so a file
     // that patches is read once; and a file read as UTF-16, whose zero bytes are text, keeps
     // its own reason (use UTF-8).
     let not_text = |why: String, decoded: &[Option<TextEncoding>]| {
-        let binary = (0..2).any(|side| {
-            let utf16 = matches!(
-                decoded.get(side).copied().flatten(),
-                Some(TextEncoding::Utf16Le | TextEncoding::Utf16Be)
-            );
-            it.exists[side] && !utf16 && {
-                let mut head = Vec::with_capacity(8192);
-                std::fs::File::open(it.path(&roots[side]))
-                    .and_then(|f| {
-                        use std::io::Read as _;
-                        f.take(8192).read_to_end(&mut head)
-                    })
-                    .is_ok_and(|_| super::text::looks_binary(&head))
-            }
+        // Known by its kind first, as a PDF may well have no zero byte near its start; then by
+        // its bytes. The kind of a file without an extension is read from its first bytes, so
+        // it is asked of the compared file itself, on a side it is on.
+        let known = (0..2).filter(|&side| it.exists[side]).any(|side| {
+            let path = it.path(&roots[side]);
+            super::text::is_image_path(&path)
+                || matches!(
+                    super::extract::Kind::of(&path),
+                    Some(
+                        super::extract::Kind::Document
+                            | super::extract::Kind::Pdf
+                            | super::extract::Kind::Spreadsheet
+                            | super::extract::Kind::Elf
+                    )
+                )
         });
+        let binary = known
+            || (0..2).any(|side| {
+                let utf16 = matches!(
+                    decoded.get(side).copied().flatten(),
+                    Some(TextEncoding::Utf16Le | TextEncoding::Utf16Be)
+                );
+                it.exists[side] && !utf16 && {
+                    let mut head = Vec::with_capacity(8192);
+                    std::fs::File::open(it.path(&roots[side]))
+                        .and_then(|f| {
+                            use std::io::Read as _;
+                            f.take(8192).read_to_end(&mut head)
+                        })
+                        .is_ok_and(|_| super::text::looks_binary(&head))
+                }
+            });
         if binary {
-            crate::i18n::tr("patch.not_text").to_string()
+            (crate::i18n::tr("patch.not_text").to_string(), true)
         } else {
-            why
+            (why, false)
         }
     };
     let load = |side: usize| -> Result<super::text::TextDoc, String> {
@@ -862,6 +902,61 @@ pub fn apply(lines: &[String], patch: &FilePatch) -> Applied {
 mod tests {
     use super::*;
     use crate::core::diff::{compute, DiffOptions};
+
+    /// A file that is not text is named so, and kept apart from lost text changes, also when
+    /// its bytes alone would pass for text, as a PDF's first kilobytes may: its kind says so.
+    /// A text file not in UTF-8 is a lost text change, explained by its encoding.
+    #[test]
+    fn a_folder_patch_tells_files_that_are_not_text_from_lost_text() {
+        use crate::core::folder::{CmpStatus, DirItem};
+        let dir = tempfile::tempdir().unwrap();
+        let roots = [dir.path().join("left"), dir.path().join("right")];
+        let files: [(&str, &[u8], &[u8]); 3] = [
+            ("a.txt", b"old\n", b"new\n"),
+            // No zero byte anywhere, and not UTF-8.
+            (
+                "r.pdf",
+                b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n(one)\n",
+                b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n(two)\n",
+            ),
+            ("latin.txt", b"caf\xe9 1\n", b"caf\xe9 2\n"),
+        ];
+        let mut items = Vec::new();
+        for (name, left, right) in files {
+            for (root, bytes) in roots.iter().zip([left, right]) {
+                std::fs::create_dir_all(root).unwrap();
+                std::fs::write(root.join(name), bytes).unwrap();
+            }
+            items.push(DirItem {
+                rel_dir: String::new(),
+                name: name.into(),
+                is_dir: false,
+                exists: [true, true, false],
+                size: [None; 3],
+                mtime: [None; 3],
+                status: CmpStatus::Different,
+                diff_side: None,
+                binary: false,
+                error: None,
+                depth: 0,
+                parent: None,
+                children: Vec::new(),
+            });
+        }
+        let display = ["left".to_string(), "right".to_string()];
+        let opts = DiffOptions::default();
+        let patch = folder_patch(&roots, &display, &items, &opts, PatchStyle::Unified, 3);
+        assert!(patch.text.contains("+new"), "{}", patch.text);
+        let left = |name: &str| patch.left_out.iter().find(|l| l.file == name).unwrap();
+        let pdf = left("r.pdf");
+        assert_eq!(
+            (pdf.why.as_str(), pdf.binary),
+            (crate::i18n::tr("patch.not_text"), true)
+        );
+        let latin = left("latin.txt");
+        assert!(!latin.binary && latin.why.contains("UTF-8"), "{latin:?}");
+        assert!(patch.lost_text());
+    }
 
     fn v(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()

@@ -160,7 +160,11 @@ impl Budget {
         }
     }
 
+    /// Counts an entry; also where an extraction that was told to stop leaves (see
+    /// [`crate::core::cancel`]), between two entries. Never called from inside the UnRAR
+    /// library, which an unwinding must not cross.
     fn entry(&self) -> std::io::Result<()> {
+        crate::core::cancel::check();
         Budget::take(&self.entries, 1)
     }
 
@@ -190,6 +194,8 @@ struct Counted<'a, T> {
 
 impl<T: Read> Read for Counted<'_, T> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // A large entry is left part way through when the extraction is told to stop.
+        crate::core::cancel::check();
         let n = self.inner.read(buf)?;
         Budget::take(&self.budget.bytes, n as u64)?;
         Ok(n)
@@ -226,6 +232,166 @@ fn stamp(path: &Path) -> Option<Stamp> {
 /// The entries an extraction wrote, by their paths in the archive.
 type Written = std::sync::Arc<HashSet<PathBuf>>;
 
+/// Whether file systems usually ignore case here, so that `A.txt` and `a.txt` are one file:
+/// what [`ignores_case`] goes by when it cannot tell.
+const CASE_INSENSITIVE: bool = cfg!(windows) || cfg!(target_os = "macos");
+
+/// Whether the file system holding `dir` ignores case: whether `dir` is found under its name
+/// in other case. A case-sensitive volume on macOS, a folder made case-sensitive on Windows
+/// and a case-folding one on Linux are each told this way.
+fn ignores_case(dir: &Path) -> bool {
+    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return CASE_INSENSITIVE;
+    };
+    let (upper, lower) = (name.to_uppercase(), name.to_lowercase());
+    if upper == lower {
+        return CASE_INSENSITIVE;
+    }
+    let other = if name == upper { lower } else { upper };
+    dir.with_file_name(other).exists()
+}
+
+/// `rel` as a file system ignoring case (`fold_case`) tells it from other paths.
+fn fold(rel: &Path, fold_case: bool) -> PathBuf {
+    if fold_case {
+        PathBuf::from(rel.to_string_lossy().to_lowercase())
+    } else {
+        rel.to_path_buf()
+    }
+}
+
+/// What an extraction wrote, and what it left out.
+#[derive(Default)]
+struct Unpacked {
+    /// The folder extracted to.
+    root: PathBuf,
+    /// Whether the folder extracted to ignores case (see [`ignores_case`]).
+    fold_case: bool,
+    /// The entries whose data is on disk, by their paths in the archive.
+    paths: HashSet<PathBuf>,
+    /// For each path as the file system tells it from others (see [`fold`]), the entry
+    /// written there last: of entries that differ only in case, the one left on disk.
+    folded: HashMap<PathBuf, PathBuf>,
+    /// The entries not unpacked (an unsafe or invalid name, a link that cannot be made), by
+    /// their names in the archive.
+    skipped: Vec<String>,
+}
+
+impl Unpacked {
+    /// Notes that the entry at `rel` was written. An earlier entry the file system takes for
+    /// the same path was written over: it is no longer on disk, so [`repack`] keeps it as it
+    /// was rather than giving it the contents of this one.
+    /// The entry written over is listed as skipped: it is in the archive, but not to be seen.
+    fn insert(&mut self, rel: PathBuf) {
+        if let Some(old) = self.folded.insert(fold(&rel, self.fold_case), rel.clone()) {
+            // Folders differing only in case are one folder holding what both held: nothing
+            // of the earlier one is hidden.
+            if old != rel && self.paths.remove(&old) && !self.root.join(&old).is_dir() {
+                self.skipped.push(zip_name(&old));
+            }
+        }
+        self.paths.insert(rel);
+    }
+
+    fn remove(&mut self, rel: &Path) {
+        self.paths.remove(rel);
+        let key = fold(rel, self.fold_case);
+        if self.folded.get(&key).is_some_and(|p| p == rel) {
+            self.folded.remove(&key);
+        }
+    }
+
+    fn contains(&self, rel: &Path) -> bool {
+        self.paths.contains(rel)
+    }
+
+    fn skip(&mut self, name: impl Into<String>) {
+        self.skipped.push(name.into());
+    }
+}
+
+type Record = std::cell::RefCell<Unpacked>;
+
+/// A lock file held beside an extraction's folder for as long as it is in use, so that a
+/// later run can tell the folder of one that ended without removing it (see [`sweep_stale`]).
+/// Removed once dropped.
+struct Lease {
+    file: Option<std::fs::File>,
+    path: PathBuf,
+}
+
+impl Lease {
+    fn take(dir: &Path) -> Option<Lease> {
+        let path = lease_path(dir);
+        let file = std::fs::File::create(&path).ok()?;
+        file.lock().ok()?;
+        Some(Lease {
+            file: Some(file),
+            path,
+        })
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // Closed first: an open file cannot be removed on Windows.
+        drop(self.file.take());
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Prefix of the names of the temporary folders archives are extracted to.
+const TEMP_PREFIX: &str = "oxidemerge-";
+const LEASE_EXT: &str = ".lease";
+/// How old a lease must be for [`sweep_stale`] to look at it.
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn lease_path(dir: &Path) -> PathBuf {
+    let mut name = dir.as_os_str().to_os_string();
+    name.push(LEASE_EXT);
+    PathBuf::from(name)
+}
+
+/// Removes, once per run, the folders extractions of earlier runs left in `temp` (after a
+/// crash, say): those whose lease no running process holds. A folder without a lease is left
+/// alone, as nothing tells whether it is still in use.
+fn sweep_stale(temp: &Path) {
+    let Ok(entries) = std::fs::read_dir(temp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name
+            .strip_prefix(TEMP_PREFIX)
+            .and_then(|n| n.strip_suffix(LEASE_EXT))
+        else {
+            continue;
+        };
+        let lease = entry.path();
+        // A lease made a moment ago may not be locked yet by the run that made it.
+        let recent = std::fs::metadata(&lease)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_none_or(|age| age < STALE_AFTER);
+        if recent {
+            continue;
+        }
+        let Ok(file) = std::fs::File::options().write(true).open(&lease) else {
+            continue;
+        };
+        if file.try_lock().is_err() {
+            continue;
+        }
+        let dir = temp.join(format!("{TEMP_PREFIX}{stem}"));
+        let removed = !dir.exists() || std::fs::remove_dir_all(&dir).is_ok();
+        drop(file);
+        if removed {
+            let _ = std::fs::remove_file(&lease);
+        }
+    }
+}
+
 /// A folder [`extract_to_temp`] filled: the archive, how it was then, and the entries it
 /// wrote, so that [`repack`] keeps every other entry as it was and refuses to write over an
 /// archive changed since.
@@ -236,8 +402,11 @@ struct Extraction {
     real: Option<PathBuf>,
     stamp: Option<Stamp>,
     written: Written,
+    /// The entries of the archive left out of `dir`, by name.
+    skipped: Vec<String>,
     /// What the archive was opened with, if it is encrypted.
     password: Option<Secret>,
+    _lease: Option<Lease>,
 }
 
 static EXTRACTIONS: std::sync::Mutex<Vec<Extraction>> = std::sync::Mutex::new(Vec::new());
@@ -294,16 +463,61 @@ pub fn extract_to_temp(path: &Path) -> Result<tempfile::TempDir> {
     extract_with(path, LIMITS)
 }
 
+/// The password [`give_password`] gave for the archive at `path`, held for an extraction on
+/// another thread (see [`extract_to_temp_with`]): the one given may be forgotten before that
+/// thread starts.
+pub struct GivenPassword(Secret);
+
+pub fn given_password(path: &Path) -> Option<GivenPassword> {
+    password_for(path).map(GivenPassword)
+}
+
+/// Like [`extract_to_temp`], with the password taken by [`given_password`]. Run as a job of
+/// [`crate::core::cancel::run`], it stops when told to, leaving nothing behind.
+pub fn extract_to_temp_with(
+    path: &Path,
+    password: Option<GivenPassword>,
+) -> Result<tempfile::TempDir> {
+    extract_using(path, LIMITS, password.map(|p| p.0))
+}
+
+/// The names of the entries of the archive extracted to `dir` that were left out of it: with
+/// a name that is unsafe or not allowed here, or a link that cannot be made here.
+pub fn skipped(dir: &Path) -> Vec<String> {
+    find_extraction(&mut extractions(), dir).map_or_else(Vec::new, |e| e.skipped.clone())
+}
+
 fn extract_with(path: &Path, limits: Limits) -> Result<tempfile::TempDir> {
-    let dir = tempfile::Builder::new().prefix("oxidemerge-").tempdir()?;
+    extract_using(path, limits, password_for(path))
+}
+
+fn extract_using(
+    path: &Path,
+    limits: Limits,
+    password: Option<Secret>,
+) -> Result<tempfile::TempDir> {
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    // Off this thread: what a crashed run left may be gigabytes, slow to remove.
+    SWEPT.call_once(|| {
+        std::thread::spawn(|| sweep_stale(&std::env::temp_dir()));
+    });
+    let dir = tempfile::Builder::new().prefix(TEMP_PREFIX).tempdir()?;
+    // Taken first, so that a crash while extracting leaves a folder the next run removes.
+    let lease = Lease::take(dir.path());
     let budget = Budget::new(limits);
     let stamp = stamp(path);
-    let written = std::cell::RefCell::new(HashSet::new());
-    let password = password_for(path);
+    let written = Record::new(Unpacked {
+        root: dir.path().to_path_buf(),
+        fold_case: ignores_case(dir.path()),
+        ..Default::default()
+    });
     extract(path, dir.path(), &budget, &written, password.as_ref())
         .map_err(|e| budget.error(path, e))?;
     let mut written = written.into_inner();
     for gone in remove_links_outside(dir.path())? {
+        if written.contains(&gone) {
+            written.skip(zip_name(&gone));
+        }
         written.remove(&gone);
     }
     forget_removed();
@@ -312,8 +526,10 @@ fn extract_with(path: &Path, limits: Limits) -> Result<tempfile::TempDir> {
         dir: dir.path().to_path_buf(),
         real: std::fs::canonicalize(dir.path()).ok(),
         stamp,
-        written: std::sync::Arc::new(written),
+        written: std::sync::Arc::new(written.paths),
+        skipped: written.skipped,
         password,
+        _lease: lease,
     });
     Ok(dir)
 }
@@ -322,50 +538,145 @@ fn extract(
     path: &Path,
     dir: &Path,
     budget: &Budget,
-    written: &std::cell::RefCell<HashSet<PathBuf>>,
+    written: &Record,
     password: Option<&Secret>,
 ) -> Result<()> {
     let open = || std::fs::File::open(path).with_context(|| format!("open {}", path.display()));
-    let extract_tar = |input: &mut dyn Read| extract_tar(input, dir, budget, written);
+    let extract_tar = |input: &mut dyn Read, whole: &dyn Fn() -> bool| {
+        extract_tar(input, dir, budget, written, whole)
+            .with_context(|| path.display().to_string())
+    };
+    // Whether the first compressed stream of the file `decode` reads is whole, its check
+    // included: bytes after it that are no stream (padding to a block size, say) are then
+    // ignored, as `gzip`, `bzip2` and `zstd` do.
+    let first_whole = |decode: &dyn Fn(std::fs::File) -> std::io::Result<Box<dyn Read>>| {
+        std::fs::File::open(path)
+            .and_then(decode)
+            .and_then(|mut r| std::io::copy(&mut r, &mut std::io::sink()))
+            .is_ok()
+    };
     match kind(path).unwrap_or(Kind::Zip) {
         Kind::Zip => extract_zip(path, open()?, dir, budget, written, password)
             .with_context(|| path.display().to_string()),
-        Kind::Tar => extract_tar(&mut open()?),
-        Kind::TarGz => extract_tar(&mut flate2::read::MultiGzDecoder::new(open()?)),
-        Kind::TarBz2 => extract_tar(&mut bzip2::read::MultiBzDecoder::new(open()?)),
-        Kind::TarXz => {
-            // Unpacked to a file first, as the tar inside may be larger than memory.
-            let mut input = std::io::BufReader::new(open()?);
-            let mut tar = tempfile::tempfile()?;
-            let mut out = Counted {
-                inner: std::io::BufWriter::new(&mut tar),
-                budget,
-            };
-            lzma_rs::xz_decompress(&mut input, &mut out)
-                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-            out.flush()?;
-            drop(out);
-            tar.rewind()?;
-            // The bytes were counted as they were unpacked.
-            budget.bytes.set(Some(budget.limits.bytes));
-            extract_tar(&mut std::io::BufReader::new(tar))
-        }
-        Kind::TarZst => extract_tar(&mut zstd::stream::read::Decoder::new(open()?)?),
-        Kind::SevenZ => sevenz_rust2::decompress_with_extract_fn_and_password(
-            std::io::BufReader::new(open()?),
-            dir,
-            sevenz_password(password),
-            |e, r, dest| {
-                budget.entry()?;
-                let mut r = Counted { inner: r, budget };
-                let done = sevenz_rust2::default_entry_extract_fn(e, &mut r, dest)?;
-                written.borrow_mut().insert(clean(Path::new(e.name())));
-                Ok(done)
+        Kind::Tar => extract_tar(&mut open()?, &|| false),
+        Kind::TarGz => extract_tar(
+            &mut flate2::read::MultiGzDecoder::new(open()?),
+            &|| first_whole(&|f| Ok(Box::new(flate2::read::GzDecoder::new(f)))),
+        ),
+        Kind::TarBz2 => extract_tar(
+            &mut bzip2::read::MultiBzDecoder::new(open()?),
+            &|| first_whole(&|f| Ok(Box::new(bzip2::read::BzDecoder::new(f)))),
+        ),
+        // xz itself allows padding after a stream, and nothing else.
+        Kind::TarXz => extract_tar(&mut xz_reader(open()?), &|| false),
+        Kind::TarZst => extract_tar(
+            &mut zstd::stream::read::Decoder::new(open()?)?,
+            &|| {
+                first_whole(&|f| {
+                    Ok(Box::new(zstd::stream::read::Decoder::new(f)?.single_frame()))
+                })
             },
-        )
-        .map_err(|e| sevenz_error(path, password, e)),
+        ),
+        Kind::SevenZ => extract_7z(open()?, dir, budget, written, password)
+            .map_err(|e| sevenz_error(path, password, e)),
         Kind::Rar => extract_rar(path, dir, budget, written, password),
     }
+}
+
+/// The most memory an xz stream may ask for to be unpacked, in KiB: what the largest
+/// dictionary `xz` makes (1.5 GiB) needs, so that a small file can't take all memory.
+const XZ_MEM_LIMIT_KIB: u32 = 1600 << 10;
+
+/// The data of the xz file `input`, unpacked as it is read, every stream of it.
+fn xz_reader(input: std::fs::File) -> impl Read {
+    lzma_rust2::XzReader::new_mem_limit(std::io::BufReader::new(input), true, XZ_MEM_LIMIT_KIB)
+}
+
+/// Where a 7z entry named `name` is extracted to, relative to the folder: its name with `\`
+/// read as a separator too, as 7-Zip on Windows may write one.
+fn sevenz_rel(name: &str) -> PathBuf {
+    clean(Path::new(&name.replace('\\', "/")))
+}
+
+/// Removes the file at `out` before an entry is written there: where the file system ignores
+/// case, a file an earlier entry wrote under a name differing only in case would otherwise
+/// keep that name, not the one of the entry now on disk.
+fn clear_for(out: &Path) {
+    if std::fs::symlink_metadata(out).is_ok_and(|m| m.is_file()) {
+        let _ = std::fs::remove_file(out);
+    }
+}
+
+/// Whether a failure to create an entry's file or folder only leaves that entry out: a name
+/// the file system turns down, or a place another entry took (a file where a folder is to
+/// go). A full disk stops the extraction (and so does a limit passed, told by the [`Budget`]).
+fn skippable(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind as K;
+    !matches!(
+        e.kind(),
+        K::StorageFull | K::QuotaExceeded | K::FileTooLarge | K::OutOfMemory
+    )
+}
+
+/// Extracts the 7z archive `file` to `dir`. An entry whose name leads out of the archive, or
+/// that the file system turns down, is left out, as for a zip.
+fn extract_7z(
+    file: std::fs::File,
+    dir: &Path,
+    budget: &Budget,
+    written: &Record,
+    password: Option<&Secret>,
+) -> std::result::Result<(), sevenz_rust2::Error> {
+    let mut ar =
+        sevenz_rust2::ArchiveReader::new(std::io::BufReader::new(file), sevenz_password(password))?;
+    ar.for_each_entries(|e, r| {
+        budget.entry()?;
+        let rel = sevenz_rel(e.name());
+        let unsafe_name = !name_inside(&PathBuf::from(e.name().replace('\\', "/")));
+        if e.is_anti_item() || apple_metadata(&rel) || unsafe_name || rel.as_os_str().is_empty() {
+            if unsafe_name {
+                written.borrow_mut().skip(e.name());
+            }
+            std::io::copy(r, &mut std::io::sink())?;
+            return Ok(true);
+        }
+        let dest = dir.join(&rel);
+        if e.is_directory() {
+            match std::fs::create_dir_all(&dest) {
+                Ok(()) => written.borrow_mut().insert(rel),
+                Err(err) if skippable(&err) => written.borrow_mut().skip(e.name()),
+                Err(err) => return Err(err.into()),
+            }
+            return Ok(true);
+        }
+        clear_for(&dest);
+        let mut counted = Counted { inner: r, budget };
+        match sevenz_rust2::default_entry_extract_fn(e, &mut counted, &dest) {
+            Ok(_) => {}
+            Err(sevenz_rust2::Error::FileOpen(err, _)) if skippable(&err) => {
+                written.borrow_mut().skip(e.name());
+                std::io::copy(&mut counted, &mut std::io::sink())?;
+                return Ok(true);
+            }
+            Err(err) => return Err(err),
+        }
+        // The library sets no time on an empty file.
+        if e.size() == 0 && e.has_last_modified_date {
+            // 100 ns steps since 1601; one before 1970 is left unset.
+            let ticks = u64::from(e.last_modified_date()).checked_sub(116_444_736_000_000_000);
+            let t = ticks.and_then(|t| {
+                std::time::UNIX_EPOCH
+                    .checked_add(std::time::Duration::from_nanos(t.checked_mul(100)?))
+            });
+            if let Some(t) = t {
+                if let Ok(f) = std::fs::File::options().write(true).open(&dest) {
+                    let _ = f.set_modified(t);
+                }
+            }
+        }
+        written.borrow_mut().insert(rel);
+        Ok(true)
+    })
 }
 
 /// Whether `name`, the name of an archive's entry, stays in the archive: no step of it
@@ -382,7 +693,7 @@ fn extract_rar(
     path: &Path,
     dir: &Path,
     budget: &Budget,
-    written: &std::cell::RefCell<HashSet<PathBuf>>,
+    written: &Record,
     password: Option<&Secret>,
 ) -> Result<()> {
     // Only a RAR 5 archive can tell a wrong password; an older one decrypts to data that
@@ -411,26 +722,50 @@ fn extract_rar(
         }
         // A name leading out of the archive is not extracted, as for a zip.
         let rel = clean(&entry.name);
+        let shown = || entry.name.to_string_lossy().into_owned();
         if !name_inside(&entry.name) || apple_metadata(&rel) || rel.as_os_str().is_empty() {
             ar.skip().map_err(|e| failed(e, encrypted))?;
+            if !name_inside(&entry.name) {
+                written.borrow_mut().skip(shown());
+            }
             continue;
         }
         let out = dir.join(&rel);
         if entry.dir && entry.link.is_none() {
             ar.skip().map_err(|e| failed(e, encrypted))?;
-            std::fs::create_dir_all(&out)?;
+            match std::fs::create_dir_all(&out) {
+                Ok(()) => {}
+                Err(e) if skippable(&e) => {
+                    written.borrow_mut().skip(shown());
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
         } else if let Some(link) = &entry.link {
             ar.skip().map_err(|e| failed(e, encrypted))?;
             // A symbolic link is left out; a copy is made below.
-            if let rar::Link::SameAs(name) = link {
-                copies.push((name.clone(), rel));
+            match link {
+                rar::Link::SameAs(name) => copies.push((name.clone(), rel)),
+                rar::Link::Symbolic => written.borrow_mut().skip(shown()),
             }
             continue;
         } else {
-            if let Some(p) = out.parent() {
-                std::fs::create_dir_all(p)?;
-            }
-            let file = std::fs::File::create(&out)?;
+            let created = out
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| {
+                    clear_for(&out);
+                    std::fs::File::create(&out)
+                });
+            let file = match created {
+                Ok(f) => f,
+                Err(e) if skippable(&e) => {
+                    ar.skip().map_err(|e| failed(e, encrypted))?;
+                    written.borrow_mut().skip(shown());
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             // The header's size is only what the archive says: what is written counts.
             let limit = budget.bytes.get().unwrap_or(0);
             let n = ar.extract(file, limit).map_err(|e| failed(e, encrypted))?;
@@ -461,6 +796,7 @@ fn extract_rar(
         if let Some(p) = out.parent() {
             std::fs::create_dir_all(p)?;
         }
+        clear_for(&out);
         std::fs::copy(&source, &out)?;
         written.borrow_mut().insert(rel);
     }
@@ -480,6 +816,16 @@ fn sevenz_error(path: &Path, password: Option<&Secret>, e: sevenz_rust2::Error) 
         E::MaybeBadPassword(_) => needs_password(path, password),
         // A wrong key decrypts to garbage, which fails however it happens to.
         E::FileOpen(..) | E::MaxMemLimited { .. } => anyhow::anyhow!("{}: {e}", path.display()),
+        // A failure to write, or to read the archive file, says nothing of the password: only
+        // data that does not decode does.
+        E::Io(ref io, _)
+            if !matches!(
+                io.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            anyhow::anyhow!("{}: {e}", path.display())
+        }
         _ if password.is_some() && sevenz_encrypted(path) => needs_password(path, password),
         e => anyhow::anyhow!("{}: {e}", path.display()),
     }
@@ -544,34 +890,84 @@ fn extract_zip(
     file: std::fs::File,
     dir: &Path,
     budget: &Budget,
-    written: &std::cell::RefCell<HashSet<PathBuf>>,
+    written: &Record,
     password: Option<&Secret>,
 ) -> Result<()> {
     let mut ar = zip::ZipArchive::new(std::io::BufReader::new(file))?;
     for i in 0..ar.len() {
         budget.entry()?;
-        let (rel, is_dir, encrypted) = {
+        let (rel, shown, is_dir, classic, modified) = {
             let f = ar.by_index_raw(i)?;
-            (f.enclosed_name(), f.is_dir(), f.encrypted())
+            let shown = f.name().map_or_else(
+                |_| String::from_utf8_lossy(f.name_raw()).into_owned(),
+                |n| n.into_owned(),
+            );
+            let classic = zip_lock(&f) == Some(ZipLock::Classic);
+            (f.enclosed_name(), shown, f.is_dir(), classic, zip_modified(&f))
         };
-        let Some(rel) = rel.filter(|r| !apple_metadata(r)) else {
+        let Some(rel) = rel else {
+            // A name leading out of the archive, or one this system does not allow.
+            written.borrow_mut().skip(shown);
             continue;
         };
+        if apple_metadata(&rel) {
+            continue;
+        }
         let out = dir.join(&rel);
         if is_dir {
-            std::fs::create_dir_all(&out)?;
-        } else {
-            if let Some(p) = out.parent() {
-                std::fs::create_dir_all(p)?;
+            match std::fs::create_dir_all(&out) {
+                Ok(()) => {}
+                Err(e) if skippable(&e) => {
+                    written.borrow_mut().skip(shown);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
             }
+        } else {
+            let created = out
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| {
+                    clear_for(&out);
+                    std::fs::File::create(&out)
+                });
+            let mut w = match created {
+                Ok(w) => w,
+                Err(e) if skippable(&e) => {
+                    written.borrow_mut().skip(shown);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             let f = zip_entry(&mut ar, i, path, password)?;
-            let mut w = std::fs::File::create(&out)?;
             std::io::copy(&mut Counted { inner: f, budget }, &mut w)
-                .map_err(|e| zip_read_error(path, password, encrypted, e))?;
+                .map_err(|e| zip_read_error(path, password, classic, e))?;
+            if let Some(t) = modified {
+                // Not every file system keeps a time: the file is extracted all the same.
+                let _ = w.set_modified(t);
+            }
         }
         written.borrow_mut().insert(clean(&rel));
     }
     Ok(())
+}
+
+/// When the zip entry `f` was last modified: by its extended timestamp, in UTC, where it has
+/// one, or else by its DOS date and time, which are local time.
+fn zip_modified<R: Read>(f: &zip::read::ZipFile<'_, R>) -> Option<std::time::SystemTime> {
+    use chrono::TimeZone;
+    let unix = f.extra_data_fields().find_map(|x| match x {
+        zip::extra_fields::ExtraField::ExtendedTimestamp(ts) => ts.mod_time(),
+        _ => None,
+    });
+    if let Some(secs) = unix {
+        return std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs.into()));
+    }
+    let t = f.last_modified()?;
+    let local = chrono::NaiveDate::from_ymd_opt(t.year().into(), t.month().into(), t.day().into())?
+        .and_hms_opt(t.hour().into(), t.minute().into(), t.second().into())?;
+    let at = chrono::Local.from_local_datetime(&local).earliest()?;
+    Some(at.into())
 }
 
 /// Entry `i` of `ar` (in the archive at `path`), decompressed and, when it is encrypted,
@@ -595,16 +991,17 @@ fn zip_entry<'a, R: Read + Seek>(
     }
 }
 
-/// The error for reading an entry of the zip at `path` that failed: for an encrypted one,
-/// data that does not check out means the password was wrong (a wrong one passes the first
-/// check one time in 256 for the old zip encryption).
+/// The error for reading an entry of the zip at `path` that failed: for one with the old zip
+/// encryption (`classic`), data that does not check out means the password was wrong (a
+/// wrong one passes its first check one time in 256). AES checks the password before any data
+/// is read, so data failing there is damaged, not opened with the wrong password.
 fn zip_read_error(
     path: &Path,
     password: Option<&Secret>,
-    encrypted: bool,
+    classic: bool,
     e: std::io::Error,
 ) -> anyhow::Error {
-    if encrypted && e.kind() == std::io::ErrorKind::InvalidData {
+    if classic && e.kind() == std::io::ErrorKind::InvalidData {
         needs_password(path, password)
     } else {
         e.into()
@@ -637,14 +1034,17 @@ fn link_inside(rel: &Path, target: &Path, hard: bool) -> bool {
     true
 }
 
-/// Entries that cannot be created here (links on Windows, device files) are skipped, and so
-/// are links to anything outside the archive; `unpack_in` also skips any that would land
-/// outside `dir`.
+/// Entries that cannot be created here (links on Windows, device files, names the file system
+/// turns down) are skipped, and so are links to anything outside the archive; `unpack_in` also
+/// skips any that would land outside `dir`. Each is noted in `written` as skipped. The
+/// stream is read to its end, for a compressed one to check its trailer; when bytes after the
+/// end fail to decode, `whole` says whether what came before them was whole.
 fn extract_tar(
     input: impl Read,
     dir: &Path,
     budget: &Budget,
-    written: &std::cell::RefCell<HashSet<PathBuf>>,
+    written: &Record,
+    whole: &dyn Fn() -> bool,
 ) -> Result<()> {
     let mut ar = tar::Archive::new(Counted {
         inner: input,
@@ -658,7 +1058,11 @@ fn extract_tar(
             let stored = entry.header().entry_size().unwrap_or(0);
             Budget::take(&budget.bytes, entry.size().saturating_sub(stored))?;
         }
+        let name = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+        let shown = || name.clone();
         let Ok(rel) = entry.path().map(|p| p.into_owned()) else {
+            // A name this system cannot hold.
+            written.borrow_mut().skip(shown());
             continue;
         };
         if apple_metadata(&rel) {
@@ -672,16 +1076,39 @@ fn extract_tar(
                 .flatten()
                 .is_some_and(|t| link_inside(&rel, &t, kind.is_hard_link()));
             if !inside {
+                written.borrow_mut().skip(shown());
                 continue;
             }
         }
-        if entry.unpack_in(dir).unwrap_or(false) {
-            if let Some(rel) = unpacked_at(&rel) {
-                written.borrow_mut().insert(rel);
+        // No file is cleared out of the way first, as for the other formats: `unpack_in`
+        // writes over one itself, once it has checked that the place is inside `dir`, which a
+        // link unpacked earlier might lead out of.
+        match entry.unpack_in(dir) {
+            Ok(true) => {
+                if let Some(rel) = unpacked_at(&rel) {
+                    written.borrow_mut().insert(rel);
+                }
             }
+            // A name going up with `..`.
+            Ok(false) => written.borrow_mut().skip(shown()),
+            // A limit passed inside the entry.
+            Err(_) if budget.passed() => anyhow::bail!("archive too large"),
+            Err(e) if skippable(&e) => written.borrow_mut().skip(shown()),
+            Err(e) => return Err(anyhow::Error::from(e).context(shown())),
         }
     }
-    // A limit passed inside an entry fails only that entry.
+    // `tar` stops at the archive's end marker, before the end of the stream: read on to it,
+    // so that a compressed one checks its trailer (its checksum, its length) and a damaged or
+    // cut short one is not taken for whole.
+    // Only so far, though: what follows the end marker is no part of the archive, and a
+    // stream holding gigabytes more is read no further than this (its check then unread).
+    const PAST_END: u64 = 64 << 20;
+    let rest = ar.into_inner().take(PAST_END);
+    if let Err(e) = std::io::copy(&mut { rest }, &mut std::io::sink()) {
+        if budget.passed() || !whole() {
+            return Err(anyhow::Error::from(e).context("read to the end"));
+        }
+    }
     if budget.passed() {
         anyhow::bail!("archive too large");
     }
@@ -780,6 +1207,61 @@ fn parent_dir(path: &Path) -> &Path {
     path.parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
+}
+
+/// The names found in the folders of an extracted copy, read once per folder, to tell an
+/// entry whose file was renamed only in case: where the file system ignores case, `readme`
+/// still opens the file renamed `README`, which is then a new entry, and `readme` is gone.
+struct OnDisk<'a> {
+    root: &'a Path,
+    fold_case: bool,
+    names: std::cell::RefCell<HashMap<PathBuf, Vec<std::ffi::OsString>>>,
+}
+
+impl<'a> OnDisk<'a> {
+    fn new(root: &'a Path) -> Self {
+        OnDisk {
+            root,
+            fold_case: ignores_case(root),
+            names: Default::default(),
+        }
+    }
+
+    /// Whether the file at `rel`, or a folder it is in, was renamed to a name differing only
+    /// in case. A name matching none by case alone (Unicode written another way, say) is not
+    /// told apart here: it is taken as found.
+    fn renamed(&self, rel: &Path) -> bool {
+        if !self.fold_case {
+            return false;
+        }
+        let mut parent = PathBuf::new();
+        for part in rel.components() {
+            let Component::Normal(name) = part else {
+                continue;
+            };
+            if self.renamed_in(&parent, name) {
+                return true;
+            }
+            parent.push(name);
+        }
+        false
+    }
+
+    fn renamed_in(&self, parent: &Path, name: &std::ffi::OsStr) -> bool {
+        let mut all = self.names.borrow_mut();
+        let names = all.entry(parent.to_path_buf()).or_insert_with(|| {
+            std::fs::read_dir(self.root.join(parent))
+                .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+                .unwrap_or_default()
+        });
+        if names.iter().any(|n| n == name) {
+            return false;
+        }
+        let lower = name.to_string_lossy().to_lowercase();
+        names
+            .iter()
+            .any(|n| n.to_string_lossy().to_lowercase() == lower)
+    }
 }
 
 /// Drops the `.` parts of a path stored in an archive, so it compares equal to the same path
@@ -1069,6 +1551,7 @@ fn copy_tar<W: Write>(
     // where a file was): written from disk at the end, as new ones are.
     let mut replaced = HashSet::new();
     let mut changed = false;
+    let on_disk = OnDisk::new(dir);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -1108,6 +1591,9 @@ fn copy_tar<W: Write>(
         let abs = dir.join(&rel);
         let keep = if apple_metadata(&rel) || !ours(&rel) {
             true
+        } else if on_disk.renamed(&rel) {
+            // Written under its new name with the new entries.
+            false
         } else if kind.is_dir() || old_dir {
             abs.is_dir()
         } else if kind.is_symlink() {
@@ -1198,15 +1684,26 @@ const SIGNED_EXTS: &[&str] = &["apk", "ipa", "appx", "msix", "crx", "xpi"];
 
 /// Whether edits to an extraction of `path` can be written back with [`repack`]. Not for a
 /// signed package, whose signature a change would break, nor for a RAR archive, which can
-/// only be read.
+/// only be read, nor for a zip holding two entries of the same name, of which only the last
+/// is read.
 pub fn writable(path: &Path) -> bool {
     match kind(path) {
         None | Some(Kind::Rar) => false,
         Some(Kind::Zip) => {
-            !SIGNED_EXTS.contains(&super::text::extension(path).as_str()) && !zip_signed(path)
+            !SIGNED_EXTS.contains(&super::text::extension(path).as_str())
+                && !zip_signed(path)
+                && !zip_duplicates(path)
         }
         Some(_) => true,
     }
+}
+
+/// Whether the zip at `path` holds two entries of the same name.
+fn zip_duplicates(path: &Path) -> bool {
+    std::fs::File::open(path)
+        .ok()
+        .and_then(|f| zip::ZipArchive::new(std::io::BufReader::new(f)).ok())
+        .is_some_and(|ar| ar.has_duplicate_names())
 }
 
 /// Whether edits to an extraction of `path` reach a file of the user's with [`repack_all`]:
@@ -1302,12 +1799,21 @@ fn rerecord(dir: &Path, archive: &Path) {
     }
 }
 
+/// Archives at least this large take a noticeable time to be written again, however they
+/// are compressed.
+const SLOW_REPACK_BYTES: u64 = 64 << 20;
+
 /// Whether [`repack_all`] of `path` may take long: it, or an archive it sits in an extraction
-/// of, is compressed with xz or 7z's LZMA, which can take minutes for a large one.
+/// of, is compressed as a whole (xz, 7z's LZMA, bzip2, gzip, Zstandard), which is compressed
+/// again for any change and can take minutes for a large one, or is large.
 pub fn slow_to_repack(path: &Path) -> bool {
     let mut path = path.to_path_buf();
     loop {
-        if matches!(kind(&path), Some(Kind::TarXz | Kind::SevenZ)) {
+        if matches!(
+            kind(&path),
+            Some(Kind::TarXz | Kind::SevenZ | Kind::TarBz2 | Kind::TarGz | Kind::TarZst)
+        ) || std::fs::metadata(&path).is_ok_and(|m| m.len() >= SLOW_REPACK_BYTES)
+        {
             return true;
         }
         match extraction_of(&path) {
@@ -1354,6 +1860,9 @@ pub fn repack(path: &Path, dir: &Path) -> Result<bool> {
         anyhow::bail!(trf("msg.archive_rar_not_writable", &[file()]));
     }
     if !writable(path) {
+        if kind(path) == Some(Kind::Zip) && zip_duplicates(path) {
+            anyhow::bail!(trf("msg.archive_duplicate_names", &[file()]));
+        }
         anyhow::bail!(trf("msg.archive_not_writable", &[file()]));
     }
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -1427,7 +1936,7 @@ fn repack_into(
             let mut tar = tempfile::tempfile()?;
             {
                 let mut out = std::io::BufWriter::new(&mut tar);
-                lzma_rs::xz_decompress(&mut open()?, &mut out)
+                std::io::copy(&mut xz_reader(std::fs::File::open(path)?), &mut out)
                     .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
                 out.flush()?;
             }
@@ -1530,15 +2039,21 @@ fn repack_zip(
     let mut implied = HashSet::new();
     let mut changed = false;
     let now = zip_now();
+    let on_disk = OnDisk::new(dir);
     {
         let mut w = zip::ZipWriter::new(std::io::BufWriter::new(tmp.as_file_mut()));
         w.set_raw_comment(ar.comment().into())?;
         for i in 0..ar.len() {
-            let (name, rel, is_dir, method, mode, len, lock) = {
+            let (name, utf8, rel, is_dir, method, mode, len, lock) = {
                 let f = ar.by_index_raw(i)?;
                 let rel = f.enclosed_name().map(|r| clean(&r));
+                let name = f.name().map(|n| n.into_owned()).unwrap_or_default();
+                // A name in a code page (no UTF-8 flag) was read as CP437: the entry can be
+                // copied, but not written again under the name it has.
+                let utf8 = f.name_raw() == name.as_bytes();
                 (
-                    f.name().map(|n| n.into_owned()).unwrap_or_default(),
+                    name,
+                    utf8,
                     rel,
                     f.is_dir(),
                     f.compression(),
@@ -1553,6 +2068,7 @@ fn repack_zip(
             let rel = rel.filter(|r| seen.insert(r.clone()) && !apple_metadata(r) && ours(r));
             let keep = match rel {
                 None => true,
+                Some(rel) if on_disk.renamed(&rel) => false,
                 Some(rel) if is_dir => dir.join(rel).is_dir(),
                 Some(rel) => {
                     let abs = dir.join(&rel);
@@ -1563,6 +2079,15 @@ fn repack_zip(
                     match same {
                         Some(true) => true,
                         Some(false) => {
+                            if !utf8 {
+                                anyhow::bail!(crate::i18n::trf(
+                                    "msg.archive_name_not_utf8",
+                                    &[
+                                        ("name", name.clone()),
+                                        ("file", path.display().to_string()),
+                                    ]
+                                ));
+                            }
                             changed = true;
                             let size = std::fs::metadata(&abs)?.len();
                             let mut o = SimpleFileOptions::default()
@@ -1596,7 +2121,7 @@ fn repack_zip(
                 let o = f.options().compression_method(rewritten_method(method));
                 w.start_file(name, locked(o, lock, password)?)?;
                 std::io::copy(&mut f, &mut w)
-                    .map_err(|e| zip_read_error(path, password, true, e))?;
+                    .map_err(|e| zip_read_error(path, password, classic, e))?;
             } else if keep {
                 w.raw_copy_file(ar.by_index_raw(i)?)?;
             } else {
@@ -1737,7 +2262,7 @@ fn repack_7z(
     let rels: Vec<PathBuf> = ar
         .files
         .iter()
-        .map(|e| clean(Path::new(e.name())))
+        .map(|e| sevenz_rel(e.name()))
         .collect();
     let last: HashMap<&PathBuf, usize> = rels.iter().enumerate().map(|(i, r)| (r, i)).collect();
     let seen: HashSet<PathBuf> = rels.iter().cloned().collect();
@@ -1747,13 +2272,14 @@ fn repack_7z(
     }
     // Whether the extraction wrote the entry, so that it can be told from what is there now.
     let compared = |i: usize| !ar.files[i].is_anti_item() && ours(&rels[i]);
+    let on_disk = OnDisk::new(dir);
     let mut fate: Vec<Fate> = (0..ar.files.len())
         .map(|i| {
             let e = &ar.files[i];
             let abs = dir.join(&rels[i]);
             if !compared(i) {
                 Fate::Same
-            } else if last[&rels[i]] != i {
+            } else if last[&rels[i]] != i || on_disk.renamed(&rels[i]) {
                 Fate::Gone
             } else if e.is_directory() {
                 if abs.is_dir() {
@@ -3522,5 +4048,492 @@ mod tests {
             }
             assert!(out.path().join("a/s1").is_dir());
         }
+    }
+
+
+    fn zip_of(path: &Path, files: &[(&str, &str)]) {
+        use std::io::Write as _;
+        let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (name, data) in files {
+            w.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            w.write_all(data.as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    fn zip_entries(path: &Path) -> Vec<(String, String)> {
+        let mut ar = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        (0..ar.len())
+            .map(|i| {
+                let mut f = ar.by_index(i).unwrap();
+                let mut s = String::new();
+                f.read_to_string(&mut s).unwrap();
+                (f.name().unwrap().into_owned(), s)
+            })
+            .collect()
+    }
+
+    fn tar_of(path: &Path, files: &[(&str, &str)]) {
+        let mut b = tar::Builder::new(std::fs::File::create(path).unwrap());
+        for (name, data) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, name, data.as_bytes()).unwrap();
+        }
+        b.finish().unwrap();
+    }
+
+    fn tar_entries(path: &Path) -> Vec<(String, String)> {
+        let mut ar = tar::Archive::new(std::fs::File::open(path).unwrap());
+        ar.entries()
+            .unwrap()
+            .map(|e| {
+                let mut e = e.unwrap();
+                let mut s = String::new();
+                e.read_to_string(&mut s).unwrap();
+                (e.path().unwrap().display().to_string(), s)
+            })
+            .collect()
+    }
+
+    fn sevenz_of(path: &Path, files: &[(&str, &str)]) {
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader};
+        let mut w = ArchiveWriter::create(path).unwrap();
+        w.push_archive_entries(
+            files.iter().map(|(n, _)| ArchiveEntry::new_file(n)).collect(),
+            files
+                .iter()
+                .map(|(_, d)| SourceReader::new(d.as_bytes()))
+                .collect(),
+        )
+        .unwrap();
+        w.finish().unwrap();
+    }
+
+    fn sevenz_entries(path: &Path) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut r =
+            sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty()).unwrap();
+        r.for_each_entries(|e, rd| {
+            let mut s = String::new();
+            rd.read_to_string(&mut s)?;
+            out.push((e.name().to_string(), s));
+            Ok(true)
+        })
+        .unwrap();
+        out.sort();
+        out
+    }
+
+    /// Two entries whose names differ only in case are one file where the file system ignores
+    /// case: saving an edit to another file must not give the one written over the contents
+    /// of the other.
+    #[test]
+    fn entries_differing_in_case_keep_their_contents_when_saved() {
+        let work = tempfile::tempdir().unwrap();
+        let files = [("A.txt", "upper"), ("a.txt", "lower"), ("other.txt", "x")];
+        let sorted = |mut v: Vec<(String, String)>| {
+            v.sort();
+            v
+        };
+        let expected = vec![
+            ("A.txt".to_string(), "upper".to_string()),
+            ("a.txt".to_string(), "lower".to_string()),
+            ("other.txt".to_string(), "edited".to_string()),
+        ];
+
+        let tar = work.path().join("c.tar");
+        tar_of(&tar, &files);
+        let zip = work.path().join("c.zip");
+        zip_of(&zip, &files);
+        let sevenz = work.path().join("c.7z");
+        sevenz_of(&sevenz, &files);
+        for path in [&tar, &zip, &sevenz] {
+            let x = extract_to_temp(path).unwrap();
+            std::fs::write(x.path().join("other.txt"), "edited").unwrap();
+            assert!(repack(path, x.path()).unwrap(), "{}", path.display());
+        }
+        assert_eq!(sorted(tar_entries(&tar)), expected);
+        assert_eq!(sorted(zip_entries(&zip)), expected);
+        assert_eq!(sevenz_entries(&sevenz), expected);
+    }
+
+    /// A file renamed in its extracted copy only by case is saved under its new name alone,
+    /// not as a second entry beside the old one.
+    #[test]
+    fn a_file_renamed_by_case_is_saved_under_its_new_name_only() {
+        let work = tempfile::tempdir().unwrap();
+        let tar = work.path().join("r.tar");
+        tar_of(&tar, &[("readme", "text")]);
+        let zip = work.path().join("r.zip");
+        zip_of(&zip, &[("readme", "text")]);
+        let sevenz = work.path().join("r.7z");
+        sevenz_of(&sevenz, &[("readme", "text")]);
+        for path in [&tar, &zip, &sevenz] {
+            let x = extract_to_temp(path).unwrap();
+            std::fs::rename(x.path().join("readme"), x.path().join("README")).unwrap();
+            assert!(repack(path, x.path()).unwrap(), "{}", path.display());
+        }
+        let only = vec![("README".to_string(), "text".to_string())];
+        assert_eq!(tar_entries(&tar), only);
+        assert_eq!(zip_entries(&zip), only);
+        assert_eq!(sevenz_entries(&sevenz), only);
+    }
+
+    /// A zip entry named in a code page (here Big5, without the UTF-8 flag) keeps its name:
+    /// an edit to another entry copies it as it was, and an edit to it is refused rather than
+    /// renaming it for every other program.
+    #[test]
+    fn a_zip_name_not_in_utf8_is_never_rewritten() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("big5.zip");
+        zip_of(&path, &[("QQQQ.txt", "big5"), ("other.txt", "x")]);
+        let big5 = [0xA4u8, 0xA4, 0xA4, 0xE5];
+        let mut bytes = std::fs::read(&path).unwrap();
+        for i in 0..bytes.len() - 4 {
+            if &bytes[i..i + 4] == b"QQQQ" {
+                bytes[i..i + 4].copy_from_slice(&big5);
+            }
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let x = extract_to_temp(&path).unwrap();
+        std::fs::write(x.path().join("other.txt"), "edited").unwrap();
+        assert!(repack(&path, x.path()).unwrap());
+        let written = std::fs::read(&path).unwrap();
+        assert!(written.windows(4).any(|w| w == big5));
+
+        let x = extract_to_temp(&path).unwrap();
+        let named = std::fs::read_dir(x.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| !p.ends_with("other.txt"))
+            .unwrap();
+        std::fs::write(&named, "edited").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(repack(&path, x.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A zip holding two entries of the same name can't be written back: only the last of
+    /// them can be read, so writing it would drop the other.
+    #[test]
+    fn a_zip_with_duplicate_names_is_not_writable() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("dup.zip");
+        zip_of(&path, &[("d1.txt", "first"), ("d2.txt", "second")]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        for i in 0..bytes.len() - 6 {
+            if &bytes[i..i + 6] == b"d2.txt" {
+                bytes[i..i + 6].copy_from_slice(b"d1.txt");
+            }
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(!writable(&path));
+        let x = extract_to_temp(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(x.path().join("d1.txt")).unwrap(),
+            "second"
+        );
+        std::fs::write(x.path().join("d1.txt"), "edited").unwrap();
+        assert!(repack(&path, x.path()).is_err());
+    }
+
+    /// An entry whose name leads out of the archive is left out, and said to be, in every
+    /// format, rather than failing the whole archive (7z did) or vanishing without a word.
+    #[test]
+    fn entries_left_out_are_listed() {
+        let work = tempfile::tempdir().unwrap();
+        let files = [("../evil.txt", "e"), ("ok.txt", "x")];
+        let zip = work.path().join("dd.zip");
+        zip_of(&zip, &files);
+        let sevenz = work.path().join("dd.7z");
+        sevenz_of(&sevenz, &files);
+        // The tar builder refuses `..`, so the name is written into the header directly.
+        let tar = work.path().join("dd.tar");
+        {
+            let mut b = tar::Builder::new(std::fs::File::create(&tar).unwrap());
+            for (name, data) in files {
+                let mut h = tar::Header::new_gnu();
+                h.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name.as_bytes());
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append(&h, data.as_bytes()).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        for path in [&zip, &sevenz, &tar] {
+            let x = extract_to_temp(path).unwrap();
+            assert!(x.path().join("ok.txt").is_file(), "{}", path.display());
+            assert!(!work.path().join("evil.txt").exists());
+            assert_eq!(skipped(x.path()), vec!["../evil.txt"], "{}", path.display());
+        }
+    }
+
+    /// Extracted files keep the times their entries carry, as folder compares by date need.
+    #[test]
+    fn zip_and_7z_entries_keep_their_times() {
+        use chrono::TimeZone;
+        let work = tempfile::tempdir().unwrap();
+        let zip = work.path().join("old.zip");
+        {
+            use std::io::Write as _;
+            let mut w = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+            let o = zip::write::SimpleFileOptions::default().last_modified_time(
+                zip::DateTime::from_date_and_time(2001, 2, 3, 4, 5, 6).unwrap(),
+            );
+            w.start_file("a.txt", o).unwrap();
+            w.write_all(b"x").unwrap();
+            w.finish().unwrap();
+        }
+        let x = extract_to_temp(&zip).unwrap();
+        let got = std::fs::metadata(x.path().join("a.txt")).unwrap().modified().unwrap();
+        let want: std::time::SystemTime = chrono::Local
+            .with_ymd_and_hms(2001, 2, 3, 4, 5, 6)
+            .earliest()
+            .unwrap()
+            .into();
+        assert_eq!(got, want);
+
+        // An empty 7z file, which the library leaves with no time of its own.
+        let sevenz = work.path().join("old.7z");
+        let mut e = sevenz_rust2::ArchiveEntry::new_file("empty.txt");
+        e.last_modified_date = sevenz_rust2::NtTime::from(130_000_000_000_000_000u64);
+        e.has_last_modified_date = true;
+        let mut w = sevenz_rust2::ArchiveWriter::create(&sevenz).unwrap();
+        w.push_archive_entry::<&[u8]>(e, None).unwrap();
+        w.finish().unwrap();
+        let x = extract_to_temp(&sevenz).unwrap();
+        let got = std::fs::metadata(x.path().join("empty.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let secs = (130_000_000_000_000_000u64 - 116_444_736_000_000_000) / 10_000_000;
+        assert_eq!(
+            got.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            secs
+        );
+    }
+
+    /// The folder of an extraction whose lease no process holds (a run that crashed) is
+    /// removed; one still held, or one without a lease, is left alone.
+    #[test]
+    fn stale_extraction_folders_are_swept() {
+        let temp = tempfile::tempdir().unwrap();
+        let dead = temp.path().join(format!("{TEMP_PREFIX}dead"));
+        std::fs::create_dir_all(dead.join("sub")).unwrap();
+        std::fs::write(dead.join("sub/f.txt"), "x").unwrap();
+        std::fs::write(lease_path(&dead), "").unwrap();
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let age = |p: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(hour_ago)
+                .unwrap();
+        };
+        age(&lease_path(&dead));
+        // A lease just made, perhaps not locked yet, is left for a later run.
+        let young = temp.path().join(format!("{TEMP_PREFIX}young"));
+        std::fs::create_dir(&young).unwrap();
+        std::fs::write(lease_path(&young), "").unwrap();
+        let live = temp.path().join(format!("{TEMP_PREFIX}live"));
+        std::fs::create_dir(&live).unwrap();
+        let lease = Lease::take(&live).unwrap();
+        age(&lease_path(&live));
+        let unleased = temp.path().join(format!("{TEMP_PREFIX}other"));
+        std::fs::create_dir(&unleased).unwrap();
+
+        sweep_stale(temp.path());
+        assert!(!dead.exists());
+        assert!(!lease_path(&dead).exists());
+        assert!(young.is_dir());
+        assert!(live.is_dir());
+        assert!(unleased.is_dir());
+        drop(lease);
+        assert!(!lease_path(&live).exists());
+    }
+
+    /// An archive compressed as a whole is written back on another thread, as is a large one.
+    #[test]
+    fn whole_archive_compression_is_slow_to_repack() {
+        let work = tempfile::tempdir().unwrap();
+        for name in ["a.tar.gz", "a.tar.bz2", "a.tar.zst", "a.tar.xz", "a.7z"] {
+            let path = work.path().join(name);
+            std::fs::write(&path, "").unwrap();
+            assert!(slow_to_repack(&path), "{name}");
+        }
+        let small = work.path().join("a.zip");
+        zip_of(&small, &[("a.txt", "x")]);
+        assert!(!slow_to_repack(&small));
+    }
+
+
+    /// A damaged or cut short archive fails to open, rather than showing part of what it
+    /// holds as if it were all: for every format whose data carries a check, including the
+    /// checks a compressed tar keeps after the archive's end marker.
+    #[test]
+    fn a_damaged_archive_is_not_opened_in_part() {
+        use std::io::Write as _;
+        let data = |seed: u32| -> Vec<u8> {
+            let mut x = seed.wrapping_mul(2_654_435_761).max(1);
+            (0..60_000)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    (x % 26) as u8 + b'a'
+                })
+                .collect()
+        };
+        let mut b = tar::Builder::new(Vec::new());
+        for i in 0..3u32 {
+            let d = data(i + 1);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(d.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, format!("f{i}.txt"), d.as_slice()).unwrap();
+        }
+        let tar = b.into_inner().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let mut archives: Vec<(&str, Vec<u8>)> = Vec::new();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for i in 0..3u32 {
+            zip.start_file(format!("f{i}.txt"), zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&data(i + 1)).unwrap();
+        }
+        archives.push(("a.zip", zip.finish().unwrap().into_inner()));
+        let sevenz = work.path().join("src.7z");
+        {
+            use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader};
+            let files: Vec<Vec<u8>> = (0..3).map(|i| data(i + 1)).collect();
+            let mut w = ArchiveWriter::create(&sevenz).unwrap();
+            w.push_archive_entries(
+                (0..3)
+                    .map(|i| ArchiveEntry::new_file(&format!("f{i}.txt")))
+                    .collect(),
+                files.iter().map(|d| SourceReader::new(d.as_slice())).collect(),
+            )
+            .unwrap();
+            w.finish().unwrap();
+        }
+        archives.push(("a.7z", std::fs::read(&sevenz).unwrap()));
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), Default::default());
+        gz.write_all(&tar).unwrap();
+        archives.push(("a.tar.gz", gz.finish().unwrap()));
+        let mut bz = bzip2::write::BzEncoder::new(Vec::new(), Default::default());
+        bz.write_all(&tar).unwrap();
+        archives.push(("a.tar.bz2", bz.finish().unwrap()));
+        let mut xz = XzWriter::new(Vec::new(), XZ_PRESET).unwrap();
+        xz.write_all(&tar).unwrap();
+        archives.push(("a.tar.xz", xz.finish().unwrap()));
+        let mut zst = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+        zst.include_checksum(true).unwrap();
+        zst.write_all(&tar).unwrap();
+        archives.push(("a.tar.zst", zst.finish().unwrap()));
+        archives.push(("a.tar", tar.clone()));
+
+        for (name, good) in &archives {
+            let path = work.path().join(name);
+            std::fs::write(&path, good).unwrap();
+            assert!(extract_to_temp(&path).is_ok(), "{name}");
+            let mut flipped = good.clone();
+            let at = flipped.len() * 6 / 10;
+            for b in &mut flipped[at..at + 16] {
+                *b ^= 0x5A;
+            }
+            let mut cases = vec![
+                ("cut in half", good[..good.len() / 2].to_vec()),
+            ];
+            // A plain tar has no check of its data, and its last bytes are padding.
+            if *name != "a.tar" {
+                cases.push(("cut by a byte", good[..good.len() - 1].to_vec()));
+                cases.push(("damaged", flipped));
+            }
+            for (what, bytes) in cases {
+                std::fs::write(&path, bytes).unwrap();
+                assert!(extract_to_temp(&path).is_err(), "{name} {what}");
+            }
+        }
+    }
+
+    /// Bytes after a whole compressed stream (padding to a block size, say) are ignored, as
+    /// `gzip`, `bzip2` and `zstd` ignore them, while a stream cut short still fails.
+    #[test]
+    fn padding_after_a_compressed_tar_is_ignored() {
+        use std::io::Write as _;
+        let work = tempfile::tempdir().unwrap();
+        let tar = work.path().join("src.tar");
+        tar_of(&tar, &[("f.txt", "x")]);
+        let tar = std::fs::read(&tar).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), Default::default());
+        gz.write_all(&tar).unwrap();
+        let mut bz = bzip2::write::BzEncoder::new(Vec::new(), Default::default());
+        bz.write_all(&tar).unwrap();
+        let mut zst = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+        zst.include_checksum(true).unwrap();
+        zst.write_all(&tar).unwrap();
+        let mut xz = XzWriter::new(Vec::new(), XZ_PRESET).unwrap();
+        xz.write_all(&tar).unwrap();
+        for (name, data) in [
+            ("a.tar.gz", gz.finish().unwrap()),
+            ("a.tar.bz2", bz.finish().unwrap()),
+            ("a.tar.zst", zst.finish().unwrap()),
+            ("a.tar.xz", xz.finish().unwrap()),
+        ] {
+            let path = work.path().join(name);
+            let mut padded = data.clone();
+            padded.extend([0u8; 512]);
+            std::fs::write(&path, &padded).unwrap();
+            let x = extract_to_temp(&path).unwrap();
+            assert!(x.path().join("f.txt").is_file(), "{name}");
+            std::fs::write(&path, &data[..data.len() - 1]).unwrap();
+            assert!(extract_to_temp(&path).is_err(), "{name} cut short");
+        }
+    }
+
+    /// A folder renamed only by case is saved under its new name, its files with it, not as
+    /// a second copy beside the old one.
+    #[test]
+    fn a_folder_renamed_by_case_is_saved_under_its_new_name_only() {
+        let work = tempfile::tempdir().unwrap();
+        let zip = work.path().join("d.zip");
+        zip_of(&zip, &[("docs/a.txt", "a")]);
+        let x = extract_to_temp(&zip).unwrap();
+        std::fs::rename(x.path().join("docs"), x.path().join("Docs")).unwrap();
+        assert!(repack(&zip, x.path()).unwrap());
+        let names: Vec<String> = zip_entries(&zip).into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&"Docs/a.txt".to_string()), "{names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("docs/")), "{names:?}");
+    }
+
+    /// An entry written over by a later one differing only in case is said to be left out,
+    /// where the file system ignores case: it is in the archive but cannot be seen.
+    #[test]
+    fn an_entry_hidden_by_case_is_listed_as_skipped() {
+        let work = tempfile::tempdir().unwrap();
+        let zip = work.path().join("c.zip");
+        zip_of(
+            &zip,
+            &[
+                ("A.txt", "upper"),
+                ("a.txt", "lower"),
+                ("Dir/x.txt", "x"),
+                ("dir/y.txt", "y"),
+            ],
+        );
+        let x = extract_to_temp(&zip).unwrap();
+        let expected: Vec<String> = if ignores_case(x.path()) {
+            vec!["A.txt".into()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(skipped(x.path()), expected);
     }
 }

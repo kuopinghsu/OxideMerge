@@ -242,7 +242,15 @@ pub fn export_folder(
     std::fs::create_dir_all(&tree)?;
     let mut budget = ExportBudget::new(MAX_EXPORT_BYTES, MAX_EXPORT_FILES);
     let mut unexported = Vec::new();
-    checkout_into(&root, rev, &rel, &tree, cancel, &mut budget, ("", &mut unexported))?;
+    checkout_into(
+        &root,
+        rev,
+        &rel,
+        &tree,
+        cancel,
+        &mut budget,
+        ("", &mut unexported),
+    )?;
     // A tracked symlink (including one from a submodule) is checked out as a real symlink; one
     // crafted to point outside the temporary folder could otherwise be opened and shown as if
     // it were part of the revision, the same risk `archive::remove_links_outside` already
@@ -282,14 +290,19 @@ const UNEXPORTED_LIST: &str = "oxidemerge-unexported-submodules.txt";
 pub fn unexported(copy: &Path) -> Vec<String> {
     let export = copy.ancestors().find(|a| {
         a.file_name().is_some_and(|n| n == EXPORT_TREE)
-            && a.parent().and_then(Path::file_name).is_some_and(|n| {
-                n.to_string_lossy().starts_with("oxidemerge-git-")
-            })
+            && a.parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n.to_string_lossy().starts_with("oxidemerge-git-"))
     });
     export
         .and_then(Path::parent)
         .and_then(|dir| std::fs::read_to_string(dir.join(UNEXPORTED_LIST)).ok())
-        .map(|list| list.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+        .map(|list| {
+            list.lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -446,28 +459,15 @@ fn checkout_into(
             }
         })?;
         // A file of the Git LFS filter is written whole, larger than the pointer counted
-        // above: the export is measured again once written (see `export_folder`). The rules
-        // that name it may be in the folder exported or in any folder above it, usually the
-        // top of the repository, which a folder below it does not check out.
-        let names_lfs = |text: &[u8]| text.windows(10).any(|w| w == b"filter=lfs");
-        budget.lfs |= files
-            .split(|&b| b == 0)
-            .filter(|p| p.ends_with(b".gitattributes"))
-            .any(|p| {
-                std::fs::read(dest.join(String::from_utf8_lossy(p).as_ref()))
-                    .is_ok_and(|text| names_lfs(&text))
-            });
-        if !budget.lfs && !rel.is_empty() {
-            let mut above = vec![String::new()];
-            let parts: Vec<&str> = rel.split('/').collect();
-            for i in 1..parts.len() {
-                above.push(format!("{}/", parts[..i].join("/")));
-            }
-            budget.lfs = above.iter().any(|dir| {
-                let mut cmd = command(root);
-                cmd.args(["cat-file", "blob", &format!("{rev}:{dir}.gitattributes")]);
-                run_until(cmd, None, cancel).is_ok_and(|text| names_lfs(&text))
-            });
+        // above: the export is measured again once written (see `export_folder`). Git says
+        // which files the filter is for, from every place it reads rules the checkout above
+        // used: the revision's own `.gitattributes`, in any folder above the one exported too
+        // (`--cached` reads them from the index of the revision), `.git/info/attributes` and
+        // the user's own attributes file. When it cannot say, the export is measured anyway.
+        // Without the filter set up, the pointers are written as they are and nothing grew,
+        // so Git is not asked.
+        if lfs_set_up(root, cancel) {
+            budget.lfs |= lfs_filtered(&with_index, files, cancel).unwrap_or(true);
         }
     }
     for (path, hash) in submodules {
@@ -503,6 +503,34 @@ fn checkout_into(
         bail!("git was stopped");
     }
     Ok(())
+}
+
+/// Whether the repository at `root` has the Git LFS filter set up, so that a checkout writes
+/// LFS files whole: Git runs it as a long-running `process`, as a `smudge` command, or as
+/// either one alone, so both are looked at.
+fn lfs_set_up(root: &Path, cancel: &AtomicBool) -> bool {
+    ["filter.lfs.process", "filter.lfs.smudge"].iter().any(|key| {
+        let mut get = command(root);
+        get.args(["config", "--get", key]);
+        run_until(get, None, cancel).is_ok_and(|out| !out.trim_ascii().is_empty())
+    })
+}
+
+/// Whether any of `files` (paths ending in a zero byte, as `checkout-index` takes them) has the
+/// Git LFS filter, as `git check-attr` reads the attributes of the index `with_index` uses.
+fn lfs_filtered(
+    with_index: &dyn Fn(&[&str]) -> Command,
+    files: Vec<u8>,
+    cancel: &AtomicBool,
+) -> Result<bool> {
+    let cmd = with_index(&["check-attr", "--cached", "-z", "--stdin", "filter"]);
+    let out = run_until(cmd, Some(files), cancel)?;
+    // Each answer is "path NUL attribute NUL value NUL".
+    Ok(out
+        .split(|&b| b == 0)
+        .collect::<Vec<_>>()
+        .chunks(3)
+        .any(|answer| answer.get(2) == Some(&&b"lfs"[..])))
 }
 
 /// What Git ignores in folder `path`: the untracked files and folders its ignore rules match,
@@ -681,7 +709,16 @@ mod tests {
 
         let out = tempfile::tempdir().unwrap();
         let mut budget = ExportBudget::new(u64::MAX, 0);
-        let err = checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget, ("", &mut Vec::new())).unwrap_err();
+        let err = checkout_into(
+            repo,
+            "HEAD",
+            "",
+            out.path(),
+            &cancel,
+            &mut budget,
+            ("", &mut Vec::new()),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("0 files"), "{err}");
     }
 
@@ -705,7 +742,16 @@ mod tests {
         // a byte budget too small for even one of the two 10-byte files
         let out = tempfile::tempdir().unwrap();
         let mut budget = ExportBudget::new(5, usize::MAX);
-        let err = checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget, ("", &mut Vec::new())).unwrap_err();
+        let err = checkout_into(
+            repo,
+            "HEAD",
+            "",
+            out.path(),
+            &cancel,
+            &mut budget,
+            ("", &mut Vec::new()),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("GB"), "{err}");
         assert!(
             std::fs::read_dir(out.path()).unwrap().next().is_none(),
@@ -715,14 +761,32 @@ mod tests {
         // a file-count budget too small for the two files
         let out = tempfile::tempdir().unwrap();
         let mut budget = ExportBudget::new(u64::MAX, 1);
-        let err = checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget, ("", &mut Vec::new())).unwrap_err();
+        let err = checkout_into(
+            repo,
+            "HEAD",
+            "",
+            out.path(),
+            &cancel,
+            &mut budget,
+            ("", &mut Vec::new()),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("1 files"), "{err}");
         assert!(std::fs::read_dir(out.path()).unwrap().next().is_none());
 
         // budgets large enough for both still succeed
         let out = tempfile::tempdir().unwrap();
         let mut budget = ExportBudget::new(u64::MAX, usize::MAX);
-        checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget, ("", &mut Vec::new())).unwrap();
+        checkout_into(
+            repo,
+            "HEAD",
+            "",
+            out.path(),
+            &cancel,
+            &mut budget,
+            ("", &mut Vec::new()),
+        )
+        .unwrap();
         assert!(out.path().join("a.txt").is_file());
         assert!(out.path().join("b.txt").is_file());
     }
@@ -781,7 +845,16 @@ mod tests {
         // plus one submodule, but not both submodules together.
         let out = tempfile::tempdir().unwrap();
         let mut budget = ExportBudget::new(u64::MAX, 4);
-        let err = checkout_into(repo, "HEAD", "", out.path(), &cancel, &mut budget, ("", &mut Vec::new())).unwrap_err();
+        let err = checkout_into(
+            repo,
+            "HEAD",
+            "",
+            out.path(),
+            &cancel,
+            &mut budget,
+            ("", &mut Vec::new()),
+        )
+        .unwrap_err();
         assert!(
             out.path().join("a/f.txt").is_file(),
             "the first submodule should still fit"
@@ -793,11 +866,15 @@ mod tests {
         // Going over the budget in a submodule stops the export, as it does in the folder
         // itself, rather than leaving that submodule empty as if all its files were new.
         let err = format!("{err:#}");
-        assert!(err.contains("submodule b") && err.contains("stopped after"), "{err}");
+        assert!(
+            err.contains("submodule b") && err.contains("stopped after"),
+            "{err}"
+        );
     }
 
-    /// Git LFS rules are found in the `.gitattributes` above the folder exported, where they
-    /// usually are, so its written size is checked; and not where no rules name it.
+    /// Git LFS rules are found wherever Git reads them: in the `.gitattributes` above the
+    /// folder exported, where they usually are, and in `.git/info/attributes`; and only for
+    /// the files they name, so a folder of none, or a commented-out rule, is not measured.
     #[test]
     fn lfs_rules_above_an_exported_folder_are_found() {
         let dir = tempfile::tempdir().unwrap();
@@ -809,6 +886,9 @@ mod tests {
         run(&["config", "user.email", "t@example.com"]);
         run(&["config", "user.name", "T"]);
         run(&["config", "commit.gpgsign", "false"]);
+        // The LFS filter set up as `git lfs install` does, here passing contents through.
+        run(&["config", "filter.lfs.smudge", "cat"]);
+        run(&["config", "filter.lfs.clean", "cat"]);
         std::fs::create_dir_all(repo.join("assets/art")).unwrap();
         std::fs::create_dir_all(repo.join("src")).unwrap();
         std::fs::write(repo.join(".gitattributes"), "assets/** filter=lfs\n").unwrap();
@@ -821,17 +901,44 @@ mod tests {
             let out = tempfile::tempdir().unwrap();
             let mut budget = ExportBudget::new(u64::MAX, usize::MAX);
             let unexported = &mut Vec::new();
-            checkout_into(repo, "HEAD", rel, out.path(), &never, &mut budget, ("", unexported))
-                .unwrap();
+            checkout_into(
+                repo,
+                "HEAD",
+                rel,
+                out.path(),
+                &never,
+                &mut budget,
+                ("", unexported),
+            )
+            .unwrap();
             budget.lfs
         };
         assert!(lfs(""), "in the folder itself");
         assert!(lfs("assets/art"), "two folders above");
-        // The rules are found by where they are, not by what they match.
-        assert!(lfs("src"));
-        std::fs::write(repo.join(".gitattributes"), "*.c text\n").unwrap();
+        assert!(!lfs("src"), "a folder with no file the rule names");
+        std::fs::write(
+            repo.join(".gitattributes"),
+            "# assets/** filter=lfs\n*.c text\n",
+        )
+        .unwrap();
         run(&["commit", "-q", "-am", "no lfs"]);
-        assert!(!lfs("assets/art"));
+        assert!(!lfs("assets/art"), "a commented-out rule");
+        // The repository's own rules, outside any revision.
+        std::fs::create_dir_all(repo.join(".git/info")).unwrap();
+        std::fs::write(repo.join(".git/info/attributes"), "*.bin filter=lfs\n").unwrap();
+        assert!(lfs("assets/art"), "in .git/info/attributes");
+        // Without the filter set up, pointers are written as they are: nothing to measure.
+        // Only this repository's own setting is removed (an empty one would be a filter Git
+        // tries to run), so on a machine where Git LFS is installed for every repository it
+        // is still set up, and this part is left out.
+        run(&["config", "--unset", "filter.lfs.smudge"]);
+        if !lfs_set_up(repo, &never) {
+            assert!(!lfs("assets/art"), "no LFS filter set up");
+        }
+        // A long-running process alone, as Git can run the filter, is set up too. (Not
+        // checked out with: `cat` does not speak the process protocol.)
+        run(&["config", "filter.lfs.process", "git-lfs filter-process"]);
+        assert!(lfs_set_up(repo, &never), "set up as a process only");
     }
 
     /// A checked-out submodule's `.git` and the files its own ignore rules match are in no
@@ -893,7 +1000,10 @@ mod tests {
         );
         run(&repo, &["commit", "-q", "-m", "moved on"]);
         let (_tmp, copy) = export_folder(&repo, "HEAD", &never).unwrap();
-        assert!(copy.join(".gitmodules").is_file(), "the rest of the folder is exported");
+        assert!(
+            copy.join(".gitmodules").is_file(),
+            "the rest of the folder is exported"
+        );
         assert_eq!(unexported(&copy), ["module"]);
         assert!(copy.join("module").is_dir(), "left as an empty folder");
         assert_eq!(std::fs::read_dir(copy.join("module")).unwrap().count(), 0);

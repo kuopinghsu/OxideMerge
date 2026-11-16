@@ -1235,6 +1235,42 @@ impl FolderView {
         self.status.clear();
     }
 
+    /// What says which entries of the archives compared were left out when they were
+    /// extracted (names this system turns down, links it cannot make), so that a file missing
+    /// on both sides is not taken for one the same; `None` when none was.
+    fn archive_entries_skipped(&self) -> Option<String> {
+        /// The most names listed for one archive.
+        const SHOWN: usize = 5;
+        let parts: Vec<String> = self
+            .roots
+            .iter()
+            .zip(&self.display_roots)
+            .filter(|(root, _)| self.temps.iter().any(|t| root.starts_with(t.path())))
+            .filter_map(|(root, shown)| {
+                let skipped = archive::skipped(root);
+                if skipped.is_empty() {
+                    return None;
+                }
+                let mut names = skipped[..skipped.len().min(SHOWN)].join(", ");
+                if skipped.len() > SHOWN {
+                    names.push_str(", …");
+                }
+                let file = Path::new(shown)
+                    .file_name()
+                    .map_or_else(|| shown.clone(), |n| n.to_string_lossy().into_owned());
+                Some(trf(
+                    "msg.archive_entries_skipped",
+                    &[
+                        ("file", file),
+                        ("n", skipped.len().to_string()),
+                        ("names", names),
+                    ],
+                ))
+            })
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("  "))
+    }
+
     /// Re-runs the comparison with new options (F5 / options changed).
     pub fn refresh(&mut self, cfg: &Config, named: &[FltFilter]) {
         if self.snapshot_options.is_some() {
@@ -1471,6 +1507,12 @@ impl FolderView {
                             &[("names", left_out.join(", "))],
                         );
                     }
+                }
+                if let Some(skipped) = self.archive_entries_skipped() {
+                    if !self.status.is_empty() {
+                        self.status.push_str("  ");
+                    }
+                    self.status.push_str(&skipped);
                 }
             }
         } else if r.updated.elapsed() >= UPDATE_INTERVAL.max(self.view_cost * 4) {

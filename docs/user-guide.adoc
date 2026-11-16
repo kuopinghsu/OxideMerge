@@ -2464,6 +2464,24 @@ If the password is wrong, it asks again; *Cancel* gives up opening the archive.
 The password is kept only in memory, only while the comparison is open, and is overwritten there
 once it is no longer needed.
 
+Archives are extracted in the background, with a window showing which ones and a *Cancel*
+button, so a large archive does not hold the window still.
+An archive that is damaged or cut short does not open: OxideMerge reads each format's checksums,
+including the one at the end of a compressed `.tar`, rather than show part of an archive as if
+it were all of it.
+Padding after the compressed data of a `.tar.gz`, `.tar.bz2` or `.tar.zst` is ignored, as the
+`gzip`, `bzip2` and `zstd` commands ignore it.
+Files keep the dates stored in the archive, so comparing by date works.
+
+An entry that cannot be extracted here is left out, and the status line of the folder compare
+names it once the comparison is done, so that a file missing on both sides is not taken for
+one that is the same.
+This covers a name that leads out of the archive, a name that Windows does not allow (such as
+`what?.txt` or `aux.txt`), a symbolic link that cannot be made, and, on Windows and macOS, an
+entry whose name differs only in case from a later one (`A.txt` and `a.txt`), which would be
+written over.
+Saving keeps such entries in the archive exactly as they were.
+
 Edits to the extracted files are saved back into the archive.
 When you copy, delete, merge or edit a file and then save, OxideMerge writes a new archive in place
 of the original and keeps its permissions.
@@ -2486,9 +2504,13 @@ entries are encrypted again, because a copy would lose the mark that says they a
 
 A `.tar.xz` archive is compressed again as `xz` does by default, and a `.tar.zst` archive as
 `zstd` does.
-Compressing a large `.tar.xz` or 7z archive can take a while, so it is written in the background
-while a window shows which archive is being written; uploads, closing a tab and quitting wait for
-it.
+Compressing a `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst` or 7z archive, or any archive of
+64 MB or more, can take a while, so it is written in the background while a window shows which
+archive is being written; uploads, closing a tab and quitting wait for it.
+A file or folder renamed only in case is saved under its new name.
+A ZIP entry whose name is not stored as UTF-8 (one written in a Windows code page such as Big5)
+is copied as it was, but saving a change to it is refused, as writing it again would change its
+name for other programs; a ZIP archive holding two entries of the same name opens read-only.
 If the archive itself was changed on disk after it was extracted, or is read-only, saving into it
 is refused instead of losing those changes.
 No `.bak` backups are made inside an extracted archive.
@@ -4478,6 +4500,11 @@ See <<pdf-reports>>.
 
 |`--patch <FILE>`
 |Writes a patch for two files or folders.
+A folder's patch holds every changed file that can be written as text and leaves out the
+others, each named on the error output: a file that is not text, such as a picture, a PDF or
+a workbook, as a `note:`; a text file whose changes cannot be written, such as one not in
+UTF-8, as an `error:`, which makes the run end with exit code `2`. The patch is written
+either way.
 
 |`--patch-style <S>`
 |Sets the patch format: `normal`, `context` or `unified` (the default).
@@ -4624,6 +4651,9 @@ This code is also returned when a report or patch was written successfully.
 
 |`2`
 |An error occurred.
+With `--patch` for folders, this also means that the patch, which is still written, leaves out
+the changes of a text file it could not write, such as one not in UTF-8. A file that is not
+text, such as a picture, is left out of every text patch and does not change the exit code.
 |===
 
 IMPORTANT: Exit code `1` is a comparison result, not an error. Make sure that your scripts treat it

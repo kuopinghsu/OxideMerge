@@ -74,6 +74,10 @@ struct State {
     left: u64,
     over: bool,
     failed: Option<std::io::Error>,
+    /// The flag of the job reading the archive (see [`crate::core::cancel`]): set, the library
+    /// is told to stop at the next piece of data, and the job then leaves once back in Rust,
+    /// as an unwinding must not cross the library.
+    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// A RAR archive open for reading its entries one after another: [`Reader::next`], then
@@ -289,6 +293,13 @@ extern "C" fn callback(
                 if p1 == 0 || p2 <= 0 {
                     return 1;
                 }
+                if state
+                    .stop
+                    .as_ref()
+                    .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    return -1;
+                }
                 // SAFETY: the library passes `p2` bytes of unpacked data at `p1`.
                 let data = unsafe { std::slice::from_raw_parts(p1 as *const u8, p2 as usize) };
                 let Some(left) = state.left.checked_sub(data.len() as u64) else {
@@ -322,6 +333,7 @@ impl Reader {
             left: 0,
             over: false,
             failed: None,
+            stop: crate::core::cancel::current(),
         }));
         // The library takes the name as bytes on Linux (see `entry_name`), wide elsewhere.
         #[cfg(any(target_os = "linux", target_os = "netbsd"))]
@@ -471,6 +483,8 @@ impl Reader {
         let state = self.state();
         (state.out, state.left) = (Some(file), limit);
         let done = self.process(sys::RAR_TEST);
+        // Told to stop part way through: the job leaves here, out of the library.
+        crate::core::cancel::check();
         let state = self.state();
         let flushed = state.out.take().map_or(Ok(()), |mut f| f.flush());
         done?;

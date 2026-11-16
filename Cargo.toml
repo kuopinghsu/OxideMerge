@@ -30,9 +30,8 @@ zip = { version = "9.4", default-features = false, features = ["deflate-flate2",
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
 bzip2 = "0.6"
-lzma-rs = "0.3"
-# The LZMA2 encoder `sevenz-rust2` already builds, used for writing `.tar.xz`.
-lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "encoder", "optimization"] }
+# The LZMA2 coder `sevenz-rust2` already builds, used for reading and writing `.tar.xz`.
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "encoder", "optimization", "xz"] }
 sevenz-rust2 = { version = "0.25", default-features = false, features = ["util", "compress", "bzip2", "deflate", "ppmd", "aes256", "zstd", "brotli", "lz4"] }
 # The UnRAR library, built from its C++ source, which reads RAR archives. It comes under its
 # own license (the crate's `vendor/unrar/license.txt`): free to use and distribute, but not
@@ -88,6 +87,10 @@ objc2-foundation = { version = "0.2", default-features = false, features = ["std
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+# An xz coder of its own, so that tests check `.tar.xz` files against another one.
+lzma-rs = "0.3"
 
 [build-dependencies]
 winresource = "0.1"

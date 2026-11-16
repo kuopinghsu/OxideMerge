@@ -438,6 +438,65 @@ fn folder_patches_cover_every_changed_text_file() {
     }
 }
 
+/// A folder's patch leaves out what it cannot write and says so on the error output. Files
+/// that are not text, such as pictures and documents, are only noted, so the run still ends
+/// as a compare with differences; a text file whose changes are missing is an error, and the
+/// run ends with 2. The patch is written either way.
+#[test]
+fn folder_patches_note_files_that_are_not_text_and_fail_on_lost_text() {
+    let d = tmp();
+    let d = d.path();
+    let write = |name: &str, bytes: &[u8]| {
+        let p = d.join(name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    };
+    write("left/a.txt", b"old\n");
+    write("right/a.txt", b"new\n");
+    // A picture and a document, which no text patch holds. Real files: one the compare
+    // cannot read at all is an error of its own.
+    let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("samples");
+    for side in ["left", "right"] {
+        for (from, to) in [
+            ("web/images/van-layout.png", "p.png"),
+            ("docs/report.pdf", "r.pdf"),
+        ] {
+            let source = samples.join(side).join(from);
+            if source.exists() {
+                write(&format!("{side}/{to}"), &std::fs::read(source).unwrap());
+            }
+        }
+    }
+    let run = oxidemerge(d, &["--patch", "notes.patch", "-r", "left", "right"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(read(d.join("notes.patch")).contains("+new"));
+    assert!(
+        // In English whatever language the window is in.
+        run.stderr
+            .contains("note: r.pdf left out of the patch: not a text file"),
+        "{}",
+        run.stderr
+    );
+    assert!(!run.stderr.contains("error:"), "{}", run.stderr);
+
+    // A text file in windows-1252, which a text patch cannot hold: its changes are lost.
+    write("left/latin.txt", b"caf\xe9 1\n");
+    write("right/latin.txt", b"caf\xe9 2\n");
+    let run = oxidemerge(d, &["--patch", "lost.patch", "-r", "left", "right"]);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    assert!(read(d.join("lost.patch")).contains("+new"), "still written");
+    assert!(
+        run.stderr.contains("error: latin.txt left out"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("changes of 1 text file\n") || run.stderr.contains("changes of 1 text file\r\n"),
+        "{}",
+        run.stderr
+    );
+}
+
 #[test]
 fn three_way_compares_list_their_blocks() {
     let d = tmp();
@@ -2223,4 +2282,68 @@ fn paths_on_a_server_are_checked_before_anything_connects() {
         .as_str()
         .unwrap()
         .contains("OXIDEMERGE_REMOTE_PASSWORD"));
+}
+
+/// Two archives are compared as the folders they unpack to, as the window compares them, and
+/// the report names them, not the temporary folders they were unpacked to.
+#[test]
+fn archives_are_reported_as_the_folders_they_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let make = |name: &str, files: &[(&str, &str)]| {
+        let mut b = tar::Builder::new(std::fs::File::create(d.join(name)).unwrap());
+        for (n, text) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(text.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, n, text.as_bytes()).unwrap();
+        }
+        b.finish().unwrap();
+    };
+    make("left.tar", &[("same.txt", "x\n"), ("changed.txt", "old\n")]);
+    make("right.tar", &[("same.txt", "x\n"), ("changed.txt", "new\n")]);
+
+    let run = oxidemerge(d, &["--report", "report.txt", "left.tar", "right.tar"]);
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let text = std::fs::read_to_string(d.join("report.txt")).unwrap();
+    assert!(text.contains("changed.txt"), "{text}");
+    assert!(text.contains("left.tar"), "{text}");
+    assert!(!text.contains("oxidemerge-"), "a temporary folder is named:\n{text}");
+
+    make("same.tar", &[("same.txt", "x\n"), ("changed.txt", "old\n")]);
+    let run = oxidemerge(d, &["--cli", "left.tar", "same.tar"]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+}
+
+/// An archive is compared with a folder as the folder it unpacks to, and an encrypted one is
+/// opened with the password in `OXIDEMERGE_ARCHIVE_PASSWORD`.
+#[test]
+fn an_encrypted_archive_is_compared_with_a_folder() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    {
+        let mut w = zip::ZipWriter::new(std::fs::File::create(d.join("a.zip")).unwrap());
+        let o = zip::write::SimpleFileOptions::default()
+            .with_aes_encryption(zip::AesMode::Aes256, "sesame");
+        w.start_file("f.txt", o).unwrap();
+        w.write_all(b"same\n").unwrap();
+        w.finish().unwrap();
+    }
+    std::fs::create_dir(d.join("folder")).unwrap();
+    std::fs::write(d.join("folder/f.txt"), "same\n").unwrap();
+
+    let none = oxidemerge(d, &["--cli", "a.zip", "folder"]);
+    assert_eq!(none.code, 2, "{}", none.stderr);
+    assert!(none.stderr.contains("OXIDEMERGE_ARCHIVE_PASSWORD"), "{}", none.stderr);
+
+    let env = [("OXIDEMERGE_ARCHIVE_PASSWORD", "wrong")];
+    let wrong = oxidemerge_with_env(d, &["--cli", "a.zip", "folder"], &env);
+    assert_eq!(wrong.code, 2, "{}", wrong.stderr);
+    assert!(wrong.stderr.contains("wrong"), "{}", wrong.stderr);
+
+    let env = [("OXIDEMERGE_ARCHIVE_PASSWORD", "sesame")];
+    let ok = oxidemerge_with_env(d, &["--cli", "a.zip", "folder"], &env);
+    assert_eq!(ok.code, 0, "{}{}", ok.stdout, ok.stderr);
 }

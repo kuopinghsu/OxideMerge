@@ -2546,12 +2546,21 @@ struct RemoteLoad {
 /// A text comparison of large files being opened on another thread (see
 /// [`OxideMergeApp::start_background_open`]). Its result opens a tab only while it is still
 /// listed: a cancelled one is taken off the list, so whatever it sends later is thrown away.
+/// What an open on another thread made.
+enum Made {
+    Text(TextView),
+    /// The archives compared, unpacked to these folders: compared once back on this thread.
+    Archives(Vec<tempfile::TempDir>),
+}
+
 struct PendingOpen {
     id: u64,
     names: String,
     started: std::time::Instant,
     /// `None` when the job stopped because it was cancelled.
-    rx: std::sync::mpsc::Receiver<Option<anyhow::Result<TextView>>>,
+    rx: std::sync::mpsc::Receiver<Option<anyhow::Result<Made>>>,
+    /// For archives being unpacked: the request to open with what they unpack to.
+    archives: Option<OpenRequest>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     source: Vec<PathBuf>,
     descriptions: Vec<Option<String>>,
@@ -2708,6 +2717,9 @@ pub struct OxideMergeApp {
     rev_load: Option<RevLoad>,
     /// Text comparisons being opened on other threads, oldest first.
     opening: Vec<PendingOpen>,
+    /// Archives an open unpacked on another thread, for [`Self::try_open`] to compare: the
+    /// paths it was asked for, and the folders they were unpacked to, in their order.
+    extracted: Option<(Vec<PathBuf>, Vec<tempfile::TempDir>)>,
     next_open: u64,
     /// See [`BACKGROUND_OPEN_BYTES`]; tests lower it.
     background_open_bytes: u64,
@@ -3692,6 +3704,7 @@ impl OxideMergeApp {
             archive_passwords: Vec::new(),
             rev_load: None,
             opening: Vec::new(),
+            extracted: None,
             next_open: 0,
             background_open_bytes: BACKGROUND_OPEN_BYTES,
             report_job: None,
@@ -4862,10 +4875,22 @@ impl OxideMergeApp {
                     && unpacker::find(&self.cfg.comparison_options(), p).is_none()
             })
         {
-            let mut temps = Vec::new();
-            for p in &paths {
-                temps.push(archive::extract_to_temp(p)?);
-            }
+            // Unpacked on another thread, unless the caller waits for the tab; back here, the
+            // folders it unpacked to are compared.
+            let temps = match self.extracted.take() {
+                Some((asked, temps)) if asked == paths => temps,
+                _ if !req.wait => {
+                    self.start_archive_open(&req, paths);
+                    return Ok(());
+                }
+                _ => {
+                    let mut temps = Vec::new();
+                    for p in &paths {
+                        temps.push(archive::extract_to_temp(p)?);
+                    }
+                    temps
+                }
+            };
             let roots = temps.iter().map(|t| t.path().to_path_buf()).collect();
             let display = paths.iter().map(|p| p.display().to_string()).collect();
             make_folder(self, roots, display, temps);
@@ -5929,7 +5954,7 @@ impl OxideMergeApp {
         let job_paths = paths.clone();
         let job_descriptions = descriptions.clone();
         std::thread::spawn(move || {
-            let made = crate::core::cancel::run(stop, || -> anyhow::Result<TextView> {
+            let made = crate::core::cancel::run(stop, || -> anyhow::Result<Made> {
                 let mut docs = Vec::new();
                 for (i, p) in job_paths.iter().enumerate() {
                     let mut d = text::load_doc(p, None)?;
@@ -5942,7 +5967,7 @@ impl OxideMergeApp {
                     docs.push(d);
                     crate::core::cancel::check();
                 }
-                Ok(TextView::new(docs, &cfg))
+                Ok(Made::Text(TextView::new(docs, &cfg)))
             });
             let _ = tx.send(made);
         });
@@ -5957,8 +5982,59 @@ impl OxideMergeApp {
             source,
             descriptions,
             recent: None,
+            archives: None,
             temps,
             remote,
+        });
+    }
+
+    /// Unpacks the archives `paths` on another thread, to compare them as folders once done
+    /// (see [`Self::opening_progress`]), with a *Cancel* button meanwhile: a large archive can
+    /// take minutes. The passwords given for them are taken now, as they are forgotten once
+    /// this open returns.
+    fn start_archive_open(&mut self, req: &OpenRequest, paths: Vec<PathBuf>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let names = paths
+            .iter()
+            .map(|p| {
+                p.file_name().map_or_else(
+                    || p.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ↔ ");
+        let jobs: Vec<(PathBuf, Option<archive::GivenPassword>)> = paths
+            .iter()
+            .map(|p| (p.clone(), archive::given_password(p)))
+            .collect();
+        let stop = cancel.clone();
+        std::thread::spawn(move || {
+            let made = crate::core::cancel::run(stop, || -> anyhow::Result<Made> {
+                let mut temps = Vec::new();
+                for (p, password) in jobs {
+                    temps.push(archive::extract_to_temp_with(&p, password)?);
+                }
+                Ok(Made::Archives(temps))
+            });
+            let _ = tx.send(made);
+        });
+        self.next_open += 1;
+        let mut retry = req.clone();
+        retry.paths = paths;
+        self.opening.push(PendingOpen {
+            id: self.next_open,
+            names,
+            started: std::time::Instant::now(),
+            rx,
+            cancel,
+            source: Vec::new(),
+            descriptions: req.descriptions.clone(),
+            recent: None,
+            archives: Some(retry),
+            temps: Vec::new(),
+            remote: Vec::new(),
         });
     }
 
@@ -6013,8 +6089,39 @@ impl OxideMergeApp {
         }
         for (k, result) in done.into_iter().rev() {
             let o = self.opening.remove(k);
+            if let Some(req) = o.archives {
+                match result {
+                    Some(Ok(Made::Archives(temps))) => {
+                        // Compared by the open that started this, now with the folders.
+                        self.extracted = Some((req.paths.clone(), temps));
+                        let before = (self.tabs.len(), self.opening.len());
+                        let opened = self.open_quietly(req, o.recent);
+                        self.extracted = None;
+                        // Staged copies handed to this open go to its tab, as for text.
+                        self.give_staged(before, o.temps, o.remote);
+                        if let Opened::Failed(e) = opened {
+                            self.error(e);
+                        }
+                    }
+                    Some(Err(e)) => match e.downcast_ref::<archive::NeedsPassword>() {
+                        Some(n) => {
+                            self.archive_password = Some(ArchivePrompt {
+                                archive: n.archive.clone(),
+                                wrong: n.wrong,
+                                req,
+                                recent: o.recent,
+                                password: Default::default(),
+                                focus: true,
+                            });
+                        }
+                        None => self.error(format!("{e:#}")),
+                    },
+                    Some(Ok(Made::Text(_))) | None => {}
+                }
+                continue;
+            }
             match result {
-                Some(Ok(view)) => {
+                Some(Ok(Made::Text(view))) => {
                     let opening = self.opening.len();
                     self.push_tab(Content::Text(view), o.source);
                     self.tabs.last_mut().unwrap().descriptions = o.descriptions;
@@ -6024,7 +6131,7 @@ impl OxideMergeApp {
                     }
                 }
                 Some(Err(e)) => self.error(format!("{e:#}")),
-                None => {}
+                Some(Ok(Made::Archives(_))) | None => {}
             }
         }
         if self.opening.is_empty() {
@@ -6041,8 +6148,13 @@ impl OxideMergeApp {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         // Not a live region: its seconds would be read out every second.
+                        let key = if o.archives.is_some() {
+                            "open.unpacking"
+                        } else {
+                            "open.comparing"
+                        };
                         ui.label(trf(
-                            "open.comparing",
+                            key,
                             &[
                                 ("name", o.names.clone()),
                                 ("secs", o.started.elapsed().as_secs().to_string()),
@@ -11909,7 +12021,7 @@ impl OxideMergeApp {
             };
             let files = left_out
                 .iter()
-                .map(|(file, why)| format!("• {file}: {why}"))
+                .map(|l| format!("• {}: {}", l.file, l.why))
                 .collect::<Vec<_>>()
                 .join("\n");
             match text {
@@ -11917,24 +12029,33 @@ impl OxideMergeApp {
                 Ok(None) => self.error(tr("msg.patch_two_way")),
                 Ok(Some(_)) if d.path.trim().is_empty() => self.patch_dlg = Some(d),
                 // Nothing to write but what was left out: no empty file is saved.
-                Ok(Some(t)) if t.is_empty() && !left_out.is_empty() => self.error(trf(
-                    "msg.patch_nothing_written",
-                    &[("files", files)],
-                )),
+                Ok(Some(t)) if t.is_empty() && !left_out.is_empty() => {
+                    self.error(trf("msg.patch_nothing_written", &[("files", files)]))
+                }
                 Ok(Some(t)) => {
                     let path = Path::new(d.path.trim());
                     match crate::core::fsutil::write_atomic_with(path, t.as_bytes(), false) {
                         Ok(()) if left_out.is_empty() => {
                             self.notify(trf("msg.saved", &[("file", d.path.clone())]));
                         }
-                        Ok(()) => self.warn(trf(
-                            "msg.patch_left_out",
-                            &[
-                                ("file", d.path.clone()),
-                                ("n", left_out.len().to_string()),
-                                ("files", files),
-                            ],
-                        )),
+                        Ok(()) => {
+                            let said = trf(
+                                "msg.patch_left_out",
+                                &[
+                                    ("file", d.path.clone()),
+                                    ("n", left_out.len().to_string()),
+                                    ("files", files),
+                                ],
+                            );
+                            // Pictures and documents are in no text patch, as on the command
+                            // line, where they are a note: a warning only when the changes of
+                            // a text file are missing.
+                            if left_out.iter().any(|l| !l.binary) {
+                                self.warn(said);
+                            } else {
+                                self.notify(said);
+                            }
+                        }
                         Err(e) => self.error(format!("{e:#}")),
                     }
                 }
