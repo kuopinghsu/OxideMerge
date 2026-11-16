@@ -854,7 +854,13 @@ impl<'a> Document<'a> {
         let mut body = raw.to_vec();
         for (i, filter) in filters.iter().enumerate() {
             body = match filter.as_str() {
-                "FlateDecode" | "Fl" => inflate(&body)?,
+                "FlateDecode" | "Fl" => {
+                    let (body, whole) = inflate(&body)?;
+                    if !whole {
+                        self.unreadable(|| "a compressed part of the file is damaged".into());
+                    }
+                    body
+                }
                 "ASCIIHexDecode" | "AHx" => ascii_hex(&body),
                 "ASCII85Decode" | "A85" => ascii85(&body),
                 "RunLengthDecode" | "RL" => run_length(&body),
@@ -1107,6 +1113,7 @@ impl<'a> Document<'a> {
         (ctm, page): (Matrix, usize),
     ) -> Vec<TextLine> {
         if depth >= MAX_FORM_DEPTH || self.forms.get() >= MAX_FORMS {
+            self.unreadable(|| "the PDF exceeded its form traversal limit".into());
             return Vec::new();
         }
         self.forms.set(self.forms.get() + 1);
@@ -1174,8 +1181,8 @@ impl<'a> Document<'a> {
                         match self.resolve(item) {
                             Object::Number(n) => code = n as u32,
                             Object::Name(name) => {
-                                if let Some(c) = glyph_char(&name) {
-                                    font.differences.insert(code, c);
+                                if let Some(text) = glyph_text(&name) {
+                                    font.differences.insert(code, text);
                                 }
                                 code += 1;
                             }
@@ -1213,6 +1220,8 @@ impl<'a> Document<'a> {
         // often is, reads as lines, whichever way the line runs.
         let mut text = TextState::default();
         let (mut ctm, mut saved) = (start, Vec::new());
+        // States saved past the most kept, which their `Q`s restore nothing for.
+        let mut unsaved = 0usize;
         let mut last: Option<Drawn> = None;
         // Where the line being read starts, ends and how large it is drawn.
         let mut line_at: Option<Run> = None;
@@ -1243,8 +1252,22 @@ impl<'a> Document<'a> {
                         out.extend(self.form_text(resources, name, depth, room, cut, at));
                     }
                 }
-                "q" if saved.len() < 64 => saved.push(ctm),
-                "Q" => ctm = saved.pop().unwrap_or(ctm),
+                // The font and the text state are part of the graphics state; the text
+                // matrices are not.
+                "q" if saved.len() < 64 => saved.push((ctm, font, text)),
+                "q" => unsaved += 1,
+                "Q" if unsaved > 0 => unsaved -= 1,
+                "Q" => {
+                    if let Some((transform, selected_font, state)) = saved.pop() {
+                        ctm = transform;
+                        font = selected_font;
+                        text = TextState {
+                            tm: text.tm,
+                            tlm: text.tlm,
+                            ..state
+                        };
+                    }
+                }
                 "cm" => {
                     if let Some(m) = numbers::<6>(operands) {
                         ctm = then(m, ctm);
@@ -1477,7 +1500,7 @@ struct Font {
     unmapped: bool,
     to_unicode: HashMap<u32, String>,
     encoding: Option<String>,
-    differences: HashMap<u32, char>,
+    differences: HashMap<u32, String>,
     /// Whether its name or description says it is bold, or slanted.
     bold: bool,
     italic: bool,
@@ -1528,15 +1551,17 @@ impl Font {
                     let mut buffer = [0; 4];
                     let text = if let Some(text) = self.to_unicode.get(&code) {
                         text.as_str()
+                    } else if let Some(text) = self.differences.get(&code) {
+                        text.as_str()
                     } else {
-                        self.differences
-                            .get(&code)
-                            .copied()
-                            .unwrap_or_else(|| match self.encoding.as_deref() {
-                                Some("MacRomanEncoding") => mac_roman(code),
-                                _ => win_ansi(code),
-                            })
-                            .encode_utf8(&mut buffer)
+                        let c = match self.encoding.as_deref() {
+                            Some("MacRomanEncoding") => mac_roman(code),
+                            _ => win_ansi(code),
+                        };
+                        // A control code is a glyph the font names some other way, such as
+                        // a ligature of TeX's fonts; which one is not known.
+                        let c = if c.is_control() { '\u{fffd}' } else { c };
+                        c.encode_utf8(&mut buffer)
                     };
                     let remaining = room.saturating_sub(shown.text.len());
                     if text.len() > remaining {
@@ -1725,7 +1750,7 @@ fn win_ansi(code: u32) -> char {
 /// The character a code stands for in MacRomanEncoding, for the part that differs from ASCII.
 fn mac_roman(code: u32) -> char {
     const HIGH: &str = "ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø\
-                        ¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄¤‹›ﬁﬂ‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔﾀÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ";
+                        ¿¡¬√ƒ≈∆«»…\u{a0}ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄¤‹›ﬁﬂ‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔ\u{f8ff}ÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ";
     if code < 0x80 {
         return char::from_u32(code).unwrap_or('\u{fffd}');
     }
@@ -1734,14 +1759,66 @@ fn mac_roman(code: u32) -> char {
         .unwrap_or('\u{fffd}')
 }
 
-/// The character a glyph name stands for, for the names a font lists for itself.
+/// The names of the characters U+00A0 to U+00FF, in order.
+const LATIN1_NAMES: &str = "\
+    nbspace exclamdown cent sterling currency yen brokenbar section \
+    dieresis copyright ordfeminine guillemotleft logicalnot sfthyphen \
+    registered macron degree plusminus twosuperior threesuperior acute mu \
+    paragraph periodcentered cedilla onesuperior ordmasculine guillemotright \
+    onequarter onehalf threequarters questiondown Agrave Aacute Acircumflex \
+    Atilde Adieresis Aring AE Ccedilla Egrave Eacute Ecircumflex \
+    Edieresis Igrave Iacute Icircumflex Idieresis Eth Ntilde Ograve \
+    Oacute Ocircumflex Otilde Odieresis multiply Oslash Ugrave Uacute \
+    Ucircumflex Udieresis Yacute Thorn germandbls agrave aacute \
+    acircumflex atilde adieresis aring ae ccedilla egrave eacute \
+    ecircumflex edieresis igrave iacute icircumflex idieresis eth ntilde \
+    ograve oacute ocircumflex otilde odieresis divide oslash ugrave \
+    uacute ucircumflex udieresis yacute thorn ydieresis";
+
+/// The text a glyph name stands for, for the names a font lists for itself: its characters,
+/// or the letters of a ligature, which is how a document compares with one that spells them
+/// out. A suffix after a `.` names a variant of the same glyph, and names joined by `_` a
+/// ligature of them.
+fn glyph_text(name: &str) -> Option<String> {
+    let name = name.split('.').next().unwrap_or(name);
+    if name.contains('_') {
+        return name
+            .split('_')
+            .map(glyph_text)
+            .collect::<Option<String>>()
+            .filter(|t| !t.is_empty());
+    }
+    match name {
+        "ff" | "ffi" | "ffl" | "fi" | "fl" | "IJ" | "ij" => return Some(name.to_string()),
+        "uniFB00" => return Some("ff".into()),
+        "uniFB01" => return Some("fi".into()),
+        "uniFB02" => return Some("fl".into()),
+        "uniFB03" => return Some("ffi".into()),
+        "uniFB04" => return Some("ffl".into()),
+        _ => {}
+    }
+    // `uniXXXX`, with one or more groups of four hex digits, names characters by number.
+    if let Some(hex) = name.strip_prefix("uni") {
+        if !hex.is_empty() && hex.len() % 4 == 0 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return (0..hex.len())
+                .step_by(4)
+                .map(|i| {
+                    u32::from_str_radix(&hex[i..i + 4], 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                })
+                .collect();
+        }
+    }
+    glyph_char(name).map(String::from)
+}
+
+/// The character a single glyph name stands for.
 fn glyph_char(name: &str) -> Option<char> {
-    // `uniXXXX` and `uXXXX[XX]` name a character by number.
-    if let Some(hex) = name.strip_prefix("uni").or_else(|| name.strip_prefix('u')) {
-        if hex.len() >= 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            return u32::from_str_radix(&hex[..4.max(hex.len().min(6))], 16)
-                .ok()
-                .and_then(char::from_u32);
+    // `uXXXX` to `uXXXXXX` names one character by number.
+    if let Some(hex) = name.strip_prefix('u') {
+        if (4..=6).contains(&hex.len()) && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
         }
     }
     let named = [
@@ -1792,11 +1869,47 @@ fn glyph_char(name: &str) -> Option<char> {
         ("endash", '\u{2013}'),
         ("emdash", '\u{2014}'),
         ("bullet", '\u{2022}'),
-        ("fi", '\u{fb01}'),
-        ("fl", '\u{fb02}'),
+        ("quotesinglbase", '\u{201a}'),
+        ("quotedblbase", '\u{201e}'),
+        ("guilsinglleft", '\u{2039}'),
+        ("guilsinglright", '\u{203a}'),
+        ("dagger", '\u{2020}'),
+        ("daggerdbl", '\u{2021}'),
+        ("ellipsis", '\u{2026}'),
+        ("perthousand", '\u{2030}'),
+        ("trademark", '\u{2122}'),
+        ("minus", '\u{2212}'),
+        ("fraction", '\u{2044}'),
+        ("Euro", '\u{20ac}'),
+        ("florin", '\u{0192}'),
+        ("dotlessi", '\u{0131}'),
+        ("dotlessj", '\u{0237}'),
+        ("OE", '\u{0152}'),
+        ("oe", '\u{0153}'),
+        ("Scaron", '\u{0160}'),
+        ("scaron", '\u{0161}'),
+        ("Zcaron", '\u{017d}'),
+        ("zcaron", '\u{017e}'),
+        ("Ydieresis", '\u{0178}'),
+        ("Lslash", '\u{0141}'),
+        ("lslash", '\u{0142}'),
+        ("grave", '`'),
+        ("asciicircum", '^'),
+        ("asciitilde", '~'),
+        ("circumflex", '\u{02c6}'),
+        ("tilde", '\u{02dc}'),
+        ("breve", '\u{02d8}'),
+        ("dotaccent", '\u{02d9}'),
+        ("ring", '\u{02da}'),
+        ("ogonek", '\u{02db}'),
+        ("hungarumlaut", '\u{02dd}'),
+        ("caron", '\u{02c7}'),
     ];
     if let Some((_, c)) = named.iter().find(|(n, _)| *n == name) {
         return Some(*c);
+    }
+    if let Some(i) = LATIN1_NAMES.split_whitespace().position(|n| n == name) {
+        return char::from_u32(0xa0 + i as u32);
     }
     let mut chars = name.chars();
     match (chars.next(), chars.next()) {
@@ -1807,20 +1920,31 @@ fn glyph_char(name: &str) -> Option<char> {
 
 // ---------- the filters a stream may be written with ----------
 
-fn inflate(body: &[u8]) -> Result<Vec<u8>> {
+/// A Flate stream's bytes, and whether they are all there: a stream damaged or cut short
+/// keeps what came before the damage. A stream that holds nothing is read as nothing.
+fn inflate(body: &[u8]) -> Result<(Vec<u8>, bool)> {
     use std::io::Read as _;
+    // `read_to_end` keeps the bytes read before an error.
     let mut out = Vec::new();
     let mut reader = flate2::read::ZlibDecoder::new(body).take(MAX_STREAM as u64);
-    if reader.read_to_end(&mut out).is_ok() && !out.is_empty() {
-        return Ok(out);
+    if reader.read_to_end(&mut out).is_ok() {
+        return Ok((out, true));
     }
     // Some files leave off the two bytes a zlib stream starts with.
-    out.clear();
+    let mut raw_out = Vec::new();
     let mut raw = flate2::read::DeflateDecoder::new(body).take(MAX_STREAM as u64);
-    match raw.read_to_end(&mut out) {
-        Ok(_) if !out.is_empty() => Ok(out),
-        _ => bail!("a compressed part of the file could not be read"),
+    if raw.read_to_end(&mut raw_out).is_ok() && !raw_out.is_empty() {
+        return Ok((raw_out, true));
     }
+    let partial = if raw_out.len() > out.len() {
+        raw_out
+    } else {
+        out
+    };
+    if partial.is_empty() {
+        bail!("a compressed part of the file could not be read");
+    }
+    Ok((partial, false))
 }
 
 fn ascii_hex(body: &[u8]) -> Vec<u8> {
@@ -5654,6 +5778,113 @@ second page
                      1 beginbfrange\n<FFFFFFF0> <FFFFFFFF> [<0041> <0042>]\nendbfrange endcmap"
             .to_vec();
         assert!(read_cmap(&cmap).len() <= MAX_CMAP);
+    }
+
+    fn zlib(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// A compressed stream that holds nothing is read as nothing, not as damage; one damaged
+    /// only at its end keeps what came before the damage, and says that some is missing.
+    #[test]
+    fn an_empty_compressed_stream_is_read_as_nothing_and_a_damaged_one_keeps_its_start() {
+        let page = "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> \
+                    /Contents [4 0 R 6 0 R] >>";
+        let mut objects = one_page(
+            stream("", b"BT /F1 12 Tf 72 720 Td (readable) Tj ET\n"),
+            HELVETICA,
+        );
+        objects[2] = page.as_bytes().to_vec();
+        objects.push(stream("/Filter /FlateDecode", &zlib(b"")));
+        assert_eq!(text(&build(&objects, "")).unwrap(), "readable\n");
+
+        let mut packed = zlib(b"BT /F1 12 Tf 72 720 Td (kept) Tj ET\n");
+        let last = packed.len() - 1;
+        packed[last] ^= 0xff;
+        let damaged = one_page(stream("/Filter /FlateDecode", &packed), HELVETICA);
+        let read = text(&build(&damaged, "")).unwrap();
+        assert!(read.starts_with("kept\n"), "{read}");
+        assert!(read.contains(&incomplete_note()), "{read}");
+    }
+
+    /// pdfLaTeX names its ligatures and accented letters in `Differences`, without a
+    /// `ToUnicode` table; a code no name or encoding gives a character for is not read as a
+    /// control character.
+    #[test]
+    fn ligatures_and_other_glyph_names_a_font_lists_are_read_as_their_letters() {
+        let font = "<< /Type /Font /Subtype /Type1 /BaseFont /CMR10 /Encoding \
+                    << /Type /Encoding /Differences [11 /ff /ffi /ffl 16 /dotlessi \
+                    /uni00660069 /eacute /germandbls /ellipsis /minus /f_l /a.sc /u1F600] >> >>";
+        let content =
+            b"BT /F1 12 Tf 72 720 Td (e\\013ect \\014x \\015y \\020\\021\\022\\023\\024\\025\\026\\027\\030) Tj ET\n"
+                .to_vec();
+        let file = build(&one_page(stream("", &content), font), "");
+        assert_eq!(
+            text(&file).unwrap(),
+            "effect ffix ffly \u{131}fi\u{e9}\u{df}\u{2026}\u{2212}fla\u{1f600}\n"
+        );
+
+        assert_eq!(LATIN1_NAMES.split_whitespace().count(), 96);
+        assert_eq!(glyph_char("ydieresis"), Some('\u{ff}'));
+
+        let content = b"BT /F1 12 Tf 72 720 Td (a\\013b) Tj ET\n".to_vec();
+        let file = build(&one_page(stream("", &content), HELVETICA), "");
+        assert_eq!(text(&file).unwrap(), "a\u{fffd}b\n");
+    }
+
+    /// The font and its size are part of the graphics state, which `Q` restores.
+    #[test]
+    fn the_font_chosen_inside_a_saved_graphics_state_is_put_back_after_it() {
+        let page = "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> \
+                    /Contents 4 0 R >>";
+        let content = b"BT /F1 12 Tf ET q BT /F2 12 Tf 72 700 Td (A) Tj ET Q \
+                        BT 72 600 Td (A) Tj ET\n"
+            .to_vec();
+        let mut objects = one_page(stream("", &content), HELVETICA);
+        objects[2] = page.as_bytes().to_vec();
+        objects.push(
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Custom /Encoding \
+              << /Type /Encoding /Differences [65 /bullet] >> >>"
+                .to_vec(),
+        );
+        assert_eq!(text(&build(&objects, "")).unwrap(), "\u{2022}\nA\n");
+    }
+
+    /// Forms past the most a file may draw are said to be missing.
+    #[test]
+    fn forms_drawn_past_the_most_followed_are_reported() {
+        let page = "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> \
+                    /XObject << /Fm1 6 0 R >> >> /Contents 4 0 R >>";
+        let mut content = b"BT /F1 12 Tf 72 720 Td (page) Tj ET\n".to_vec();
+        content.extend_from_slice(&b"/Fm1 Do\n".repeat(MAX_FORMS + 5));
+        let mut objects = one_page(stream("", &content), HELVETICA);
+        objects[2] = page.as_bytes().to_vec();
+        objects.push(stream(
+            "/Type /XObject /Subtype /Form /Resources << /Font << /F1 5 0 R >> >>",
+            b"BT /F1 12 Tf (x) Tj ET\n",
+        ));
+        let read = text(&build(&objects, "")).unwrap();
+        assert!(
+            read.contains(&incomplete_note()),
+            "{}",
+            &read[read.len() - 200..]
+        );
+    }
+
+    /// MacRoman has 128 characters above ASCII; 0xCA is a no-break space and 0xF0 the Apple
+    /// logo, which Unicode keeps in its private area.
+    #[test]
+    fn mac_roman_gives_the_characters_its_table_names() {
+        assert_eq!(mac_roman(0xCA), '\u{a0}');
+        assert_eq!(mac_roman(0xF0), '\u{f8ff}');
+        assert_eq!(mac_roman(0xFF), '\u{2c7}');
+        assert_eq!(mac_roman(0x80), '\u{c4}');
+        // 0xFF is the last of exactly 128.
+        assert_eq!(mac_roman(0x100), '\u{fffd}');
     }
 
     /// Reading stops once it is no longer wanted.
