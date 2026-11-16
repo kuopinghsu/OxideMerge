@@ -515,6 +515,73 @@ left out.
   is 724 ms at 500 MB; a scrolled frame and a step stay under 16 ms at every size
   (15.17 ms worst, at 1 GiB).
 
+## Executable size and the release profile (2026-11-16)
+
+The release executable had grown to 55.3 MB on Windows. Four release profiles were built
+from the same source and timed with the default workloads, five runs each, median time, on
+the Windows machine above (Intel Core i9-12900KF, 24 threads); OxideMerge 0.9.9 (`eecf435`
+with uncommitted changes), rustc 1.100.0. Each profile was given to Cargo with `--config`
+and built into a target folder of its own, from PowerShell: under Git Bash, OpenSSL's build
+for libssh2 picks up Git's Perl, which lacks a module it needs.
+
+| Release profile | `oxidemerge.exe` | Change | Build from clean |
+| --- | ---: | ---: | ---: |
+| `opt-level = 3`, `lto = "thin"` (before) | 57,991,168 bytes (55.3 MiB) | | about 9 min |
+| + `codegen-units = 1`, `strip = true` | 56,845,312 bytes (54.2 MiB) | −2.0% | 14 min |
+| + `lto = "fat"` | 55,169,536 bytes (52.6 MiB) | −4.9% | 22 min |
+| + `opt-level = "s"` (now) | 46,322,688 bytes (44.2 MiB) | −20.1% | 17 min |
+
+Only the profile changed between the rows. The last two were built after other sessions'
+fixes to the table and document readers had landed; those don't change the size noticeably.
+
+| Workload | Before | + cgu 1, strip | + fat LTO | + `opt-level = "s"` |
+| --- | ---: | ---: | ---: | ---: |
+| text-10mb | 0.102 s | 0.101 s | 0.093 s | 0.091 s |
+| text-repeated | 0.041 s | 0.038 s | 0.039 s | 0.042 s |
+| text-view-10mb | 0.457 s | 0.488 s | 0.408 s | 0.475 s |
+| table-10k | 0.021 s | 0.021 s | 0.018 s | 0.019 s |
+| table-10k-position | 0.023 s | 0.026 s | 0.023 s | 0.025 s |
+| table-100k | 0.293 s | 0.314 s | 0.271 s | 0.291 s |
+| table-100k-position | 0.326 s | 0.337 s | 0.316 s | 0.348 s |
+| table-cancel-1m | 0.899 s | 0.906 s | 0.874 s | 0.936 s |
+| xml-tree-12k | 0.235 s | 0.232 s | 0.218 s | 0.236 s |
+| xml-tree-12k-keyed | 0.266 s | 0.274 s | 0.253 s | 0.269 s |
+| xml-tree-view-12k | 1.113 s | 1.218 s | 0.982 s | 1.108 s |
+| xml-semantic-12k | 0.153 s | 0.158 s | 0.151 s | 0.162 s |
+| merge3-10mb | 0.323 s | 0.314 s | 0.282 s | 0.287 s |
+| binary-10mb | 0.007 s | 0.007 s | 0.007 s | 0.007 s |
+| binary-moved-unrelated | 0.055 s | 0.051 s | 0.051 s | 0.050 s |
+| binary-moved-swap | 0.014 s | 0.014 s | 0.014 s | 0.014 s |
+| binary-moved-large | 0.194 s | 0.184 s | 0.187 s | 0.188 s |
+| binary-moved-short-shift | 0.008 s | 0.008 s | 0.008 s | 0.008 s |
+| binary-moved-wide-shift | 0.003 s | 0.003 s | 0.003 s | 0.003 s |
+| binary-moved-firmware | 0.001 s | 0.001 s | 0.001 s | 0.001 s |
+| image-4k | 0.110 s | 0.106 s | 0.105 s | 0.138 s |
+| folder-small-files | 0.211 s | 0.212 s | 0.219 s | 0.212 s |
+| sync-preview-20k | 2.576 s | 2.411 s | 2.299 s | 2.570 s |
+| folder-navigation-20k | 0.369 s | 0.475 s | 0.368 s | 0.389 s |
+| folder-large-files | 0.035 s | 0.035 s | 0.033 s | 0.034 s |
+| folder-mixed | 0.052 s | 0.058 s | 0.046 s | 0.047 s |
+
+- The release profile is now the last row (`opt-level = "s"`, fat LTO, one codegen unit,
+  `strip`). Every workload is within run-to-run variation of the old profile except
+  image-4k, 25% slower (0.110 to 0.138 s): decoding and comparing the images at the
+  smaller optimization level. Building the `image` crates with `opt-level = 3` should win it back;
+  that was not measured.
+- `panic = "abort"` was not tried: *Cancel* stops a job by unwinding out of it
+  (`core::cancel`), which aborting would turn into a crash.
+- Where the size goes, read from the linker's map of the old profile (`/MAP`): of 34.3 MB of
+  code, OxideMerge's own crate, with what was inlined into it, is about 18 MB; libssh2 with
+  OpenSSL about 4 MB of code and data; the PDF export stack (krilla, skrifa, vello_cpu,
+  harfrust, write-fonts, subsetter) about 3.5 MB; rustls, ring and ureq about 1.5 MB. Of
+  19.4 MB of read-only data, the Tree-sitter grammars' parse tables are 8.1 MB (C++ 3.1 MB,
+  TypeScript and TSX 2.7 MB, Rust 1.0 MB, C, Python and JavaScript 1.3 MB together).
+- Every one of these is a documented feature, so no dependency was removed. OpenSSL is
+  built on Windows (`openssl-on-win32`) for key types, such as Ed25519, that the Windows
+  backend of libssh2 does not support. The only part no document names is brotli and LZ4 in 7z
+  archives (`sevenz-rust2`), about 0.8 MB; it stays, since without it such archives would
+  not open.
+
 ## Findings
 
 - Text comparisons retain decoded lines and alignment data. Memory depends on line count,
