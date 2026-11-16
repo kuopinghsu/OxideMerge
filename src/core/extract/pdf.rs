@@ -2059,6 +2059,9 @@ fn undo_predictor(body: Vec<u8>, parms: &HashMap<String, Object>, doc: &Document
     else {
         return body;
     };
+    // A row wider than the data is the only one, and its bytes past the data are not there:
+    // reading it no wider than the data gives the same bytes without making room for the rest.
+    let row = row.min(body.len().saturating_sub(1)).max(1);
     let mut out = Vec::with_capacity(body.len());
     let mut previous = vec![0u8; row];
     let mut at = 0usize;
@@ -5809,6 +5812,30 @@ second page
         let read = text(&build(&damaged, "")).unwrap();
         assert!(read.starts_with("kept\n"), "{read}");
         assert!(read.contains(&incomplete_note()), "{read}");
+
+        // A stream cut short of its checksum still holds all of its bytes.
+        let mut packed = zlib(b"BT /F1 12 Tf 72 720 Td (all there) Tj ET\n");
+        packed.truncate(packed.len() - 4);
+        let cut = one_page(stream("/Filter /FlateDecode", &packed), HELVETICA);
+        let read = text(&build(&cut, "")).unwrap();
+        assert!(read.starts_with("all there\n"), "{read}");
+    }
+
+    /// A predictor row the parameters make far wider than the stream is read no wider than
+    /// the stream, the same bytes as before.
+    #[test]
+    fn a_predictor_row_wider_than_its_stream_is_read_as_wide_as_the_stream() {
+        let objects = [b"<< /Columns 20000000 /Predictor 12 >>".to_vec()];
+        let file = build(&objects, "");
+        let doc = Document::read(&file, None).unwrap();
+        let Object::Dict(parms) = doc.object(1) else {
+            panic!("no parameters")
+        };
+        // Up from a zero row, then the bytes as they are.
+        let body = vec![2u8, 5, 6, 7];
+        let out = undo_predictor(body, &parms, &doc);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out, [5, 6, 7]);
     }
 
     /// pdfLaTeX names its ligatures and accented letters in `Differences`, without a
