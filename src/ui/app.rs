@@ -2548,7 +2548,7 @@ struct RemoteLoad {
 /// listed: a cancelled one is taken off the list, so whatever it sends later is thrown away.
 /// What an open on another thread made.
 enum Made {
-    Text(TextView),
+    Text(Box<TextView>),
     /// The archives compared, unpacked to these folders: compared once back on this thread.
     Archives(Vec<tempfile::TempDir>),
 }
@@ -5967,7 +5967,7 @@ impl OxideMergeApp {
                     docs.push(d);
                     crate::core::cancel::check();
                 }
-                Ok(Made::Text(TextView::new(docs, &cfg)))
+                Ok(Made::Text(Box::new(TextView::new(docs, &cfg))))
             });
             let _ = tx.send(made);
         });
@@ -6123,7 +6123,7 @@ impl OxideMergeApp {
             match result {
                 Some(Ok(Made::Text(view))) => {
                     let opening = self.opening.len();
-                    self.push_tab(Content::Text(view), o.source);
+                    self.push_tab(Content::Text(*view), o.source);
                     self.tabs.last_mut().unwrap().descriptions = o.descriptions;
                     self.give_staged((self.tabs.len() - 1, opening), o.temps, o.remote);
                     if let Some(r) = o.recent {
