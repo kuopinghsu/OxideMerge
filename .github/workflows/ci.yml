@@ -94,12 +94,12 @@ jobs:
       # Built apart from running them: building alone takes 20 minutes on a cold cache
       # (OpenSSL for libssh2 is compiled from source).
       - name: Build tests
-        run: cargo test --release --locked --target ${{ matrix.target }} --no-run
+        run: cargo test --profile release-size --locked --target ${{ matrix.target }} --no-run
 
       # A test that hangs fails here instead of holding the runner until the job's timeout.
       - name: Test
         timeout-minutes: 20
-        run: cargo test --release --locked --target ${{ matrix.target }}
+        run: cargo test --profile release-size --locked --target ${{ matrix.target }}
 
       # An explicit target, so the package is for this architecture even if the
       # toolchain on the runner is not.
@@ -270,11 +270,11 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Build tests
-        run: cargo test --release --locked --no-run
+        run: cargo test --profile release-size --locked --no-run
 
       - name: Test
         timeout-minutes: 20
-        run: cargo test --release --locked
+        run: cargo test --profile release-size --locked
 
       - name: Build
         run: cargo build --profile release-size --locked
@@ -634,11 +634,11 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Build tests
-        run: cargo test --release --locked --target aarch64-apple-darwin --no-run
+        run: cargo test --profile release-size --locked --target aarch64-apple-darwin --no-run
 
       - name: Test
         timeout-minutes: 20
-        run: cargo test --release --locked --target aarch64-apple-darwin
+        run: cargo test --profile release-size --locked --target aarch64-apple-darwin
 
       - name: Build
         run: cargo build --profile release-size --locked --target aarch64-apple-darwin
@@ -881,7 +881,7 @@ jobs:
         env:
           OXIDEMERGE_BENCH_LARGE: "1"
         run: |
-          cargo test --release --locked --bin oxidemerge bench -- --ignored --nocapture --test-threads 1
+          cargo test --profile release-size --locked --bin oxidemerge bench -- --ignored --nocapture --test-threads 1
           cat target/bench/results.md >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

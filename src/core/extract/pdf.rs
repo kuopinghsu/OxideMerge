@@ -785,7 +785,9 @@ impl<'a> Document<'a> {
         self.resolve(dict.get(key).cloned().unwrap_or(Object::Null))
     }
 
-    /// The bytes of a stream whose dictionary may still hold references.
+    /// The bytes of a stream whose dictionary may still hold references: a table of the
+    /// file's objects, which is not read from a damaged stream, since the objects can be
+    /// looked for instead.
     fn stream_bytes(&mut self, dict: &HashMap<String, Object>, start: usize) -> Result<Vec<u8>> {
         let length = dict
             .get("Length")
@@ -799,7 +801,7 @@ impl<'a> Document<'a> {
                 .map(|p| start + p)
                 .unwrap_or(self.bytes.len()),
         };
-        self.decode(dict, start, end)
+        self.decode_stream(dict, start, end, true)
     }
 
     /// Counts `bytes` more decoded against [`MAX_DECODED`], and stops when the work is cancelled.
@@ -829,8 +831,21 @@ impl<'a> Document<'a> {
         }
     }
 
-    /// A stream's bytes with its filters undone.
+    /// A stream's bytes with its filters undone; what is left of a damaged one is kept, and
+    /// noted as incomplete.
     fn decode(&self, dict: &HashMap<String, Object>, start: usize, end: usize) -> Result<Vec<u8>> {
+        self.decode_stream(dict, start, end, false)
+    }
+
+    /// A stream's bytes with its filters undone. With `whole`, a damaged stream is an error
+    /// rather than what is left of it.
+    fn decode_stream(
+        &self,
+        dict: &HashMap<String, Object>,
+        start: usize,
+        end: usize,
+        whole: bool,
+    ) -> Result<Vec<u8>> {
         let raw = self
             .bytes
             .get(start..end)
@@ -855,8 +870,11 @@ impl<'a> Document<'a> {
         for (i, filter) in filters.iter().enumerate() {
             body = match filter.as_str() {
                 "FlateDecode" | "Fl" => {
-                    let (body, whole) = inflate(&body)?;
-                    if !whole {
+                    let (body, all) = inflate(&body)?;
+                    if !all && whole {
+                        bail!("a compressed part of the file is damaged");
+                    }
+                    if !all {
                         self.unreadable(|| "a compressed part of the file is damaged".into());
                     }
                     body
@@ -1112,11 +1130,6 @@ impl<'a> Document<'a> {
         cut: &mut bool,
         (ctm, page): (Matrix, usize),
     ) -> Vec<TextLine> {
-        if depth >= MAX_FORM_DEPTH || self.forms.get() >= MAX_FORMS {
-            self.unreadable(|| "the PDF exceeded its form traversal limit".into());
-            return Vec::new();
-        }
-        self.forms.set(self.forms.get() + 1);
         let Some(xobjects) = resources.as_dict().map(|r| self.get(r, "XObject")) else {
             return Vec::new();
         };
@@ -1128,6 +1141,11 @@ impl<'a> Document<'a> {
         if self.get(&dict, "Subtype").as_name() != Some("Form") {
             return Vec::new();
         }
+        if depth >= MAX_FORM_DEPTH || self.forms.get() >= MAX_FORMS {
+            self.unreadable(|| "the PDF exceeded its form traversal limit".into());
+            return Vec::new();
+        }
+        self.forms.set(self.forms.get() + 1);
         let body = match self.decode(&dict, start, end) {
             Ok(body) => body,
             Err(e) => {
@@ -1181,10 +1199,14 @@ impl<'a> Document<'a> {
                         match self.resolve(item) {
                             Object::Number(n) => code = n as u32,
                             Object::Name(name) => {
+                                // A name that is not known is not the character the
+                                // encoding has at its code; `.notdef` names no glyph.
                                 if let Some(text) = glyph_text(&name) {
                                     font.differences.insert(code, text);
+                                } else if name != ".notdef" {
+                                    font.differences.insert(code, '\u{fffd}'.into());
                                 }
-                                code += 1;
+                                code = code.saturating_add(1);
                             }
                             _ => {}
                         }
@@ -1219,9 +1241,7 @@ impl<'a> Document<'a> {
         // leaves that line or steps back along it, so text drawn a glyph at a time, as Chinese
         // often is, reads as lines, whichever way the line runs.
         let mut text = TextState::default();
-        let (mut ctm, mut saved) = (start, Vec::new());
-        // States saved past the most kept, which their `Q`s restore nothing for.
-        let mut unsaved = 0usize;
+        let (mut ctm, mut saved) = (start, Saved::default());
         let mut last: Option<Drawn> = None;
         // Where the line being read starts, ends and how large it is drawn.
         let mut line_at: Option<Run> = None;
@@ -1254,18 +1274,14 @@ impl<'a> Document<'a> {
                 }
                 // The font and the text state are part of the graphics state; the text
                 // matrices are not.
-                "q" if saved.len() < 64 => saved.push((ctm, font, text)),
-                "q" => unsaved += 1,
-                "Q" if unsaved > 0 => unsaved -= 1,
+                "q" => {
+                    saved.save((ctm, font, text));
+                }
                 "Q" => {
-                    if let Some((transform, selected_font, state)) = saved.pop() {
+                    if let Some((transform, selected_font, state)) = saved.restore() {
                         ctm = transform;
                         font = selected_font;
-                        text = TextState {
-                            tm: text.tm,
-                            tlm: text.tlm,
-                            ..state
-                        };
+                        text = text.restored(state);
                     }
                 }
                 "cm" => {
@@ -1560,7 +1576,12 @@ impl Font {
                         };
                         // A control code is a glyph the font names some other way, such as
                         // a ligature of TeX's fonts; which one is not known.
-                        let c = if c.is_control() { '\u{fffd}' } else { c };
+                        // A tab or a line end is the space it always was.
+                        let c = if c.is_control() && !matches!(c, '\t' | '\n' | '\r') {
+                            '\u{fffd}'
+                        } else {
+                            c
+                        };
                         c.encode_utf8(&mut buffer)
                     };
                     let remaining = room.saturating_sub(shown.text.len());
@@ -1920,21 +1941,63 @@ fn glyph_char(name: &str) -> Option<char> {
 
 // ---------- the filters a stream may be written with ----------
 
+/// How the reading of a Flate stream ended.
+#[derive(PartialEq)]
+enum Inflated {
+    /// At the end the stream marks, or at the most bytes a stream is read for.
+    Whole,
+    /// Out of bytes before the end the stream marks.
+    Cut,
+    Damaged,
+}
+
+/// The bytes of the Flate stream `body` up to where its reading ended, with the two bytes
+/// and the checksum of a zlib stream around it when `zlib` is set.
+fn inflate_as(body: &[u8], zlib: bool) -> (Vec<u8>, Inflated) {
+    let mut reader = flate2::Decompress::new(zlib);
+    let mut out = Vec::new();
+    loop {
+        if out.len() >= MAX_STREAM {
+            return (out, Inflated::Whole);
+        }
+        // Room to write into, so that a step that reads and writes nothing is out of bytes.
+        if out.len() == out.capacity() {
+            out.reserve(out.len().clamp(32 << 10, 8 << 20));
+        }
+        let (read, written) = (reader.total_in(), reader.total_out());
+        let rest = body.get(read as usize..).unwrap_or(&[]);
+        match reader.decompress_vec(rest, &mut out, flate2::FlushDecompress::None) {
+            Ok(flate2::Status::StreamEnd) => return (out, Inflated::Whole),
+            Ok(_) if reader.total_in() == read && reader.total_out() == written => {
+                return (out, Inflated::Cut)
+            }
+            Ok(_) => {}
+            Err(_) => return (out, Inflated::Damaged),
+        }
+    }
+}
+
 /// A Flate stream's bytes, and whether they are all there: a stream damaged or cut short
 /// keeps what came before the damage. A stream that holds nothing is read as nothing.
 fn inflate(body: &[u8]) -> Result<(Vec<u8>, bool)> {
-    use std::io::Read as _;
-    // `read_to_end` keeps the bytes read before an error.
-    let mut out = Vec::new();
-    let mut reader = flate2::read::ZlibDecoder::new(body).take(MAX_STREAM as u64);
-    if reader.read_to_end(&mut out).is_ok() {
+    if body.is_empty() {
+        return Ok((Vec::new(), true));
+    }
+    let (out, ended) = inflate_as(body, true);
+    if ended == Inflated::Whole {
         return Ok((out, true));
     }
     // Some files leave off the two bytes a zlib stream starts with.
-    let mut raw_out = Vec::new();
-    let mut raw = flate2::read::DeflateDecoder::new(body).take(MAX_STREAM as u64);
-    if raw.read_to_end(&mut raw_out).is_ok() && !raw_out.is_empty() {
+    let (raw_out, raw_ended) = inflate_as(body, false);
+    if raw_ended == Inflated::Whole && !raw_out.is_empty() {
         return Ok((raw_out, true));
+    }
+    // A stream cut short of its checksum alone still holds all of its bytes.
+    if ended == Inflated::Cut {
+        let (data, data_ended) = inflate_as(body.get(2..).unwrap_or(&[]), false);
+        if data_ended == Inflated::Whole {
+            return Ok((data, true));
+        }
     }
     let partial = if raw_out.len() > out.len() {
         raw_out
@@ -2279,6 +2342,16 @@ impl Default for TextState {
 }
 
 impl TextState {
+    /// This state with the graphics state `saved` put back: the font size and the spacing
+    /// are part of the graphics state, and the text matrices are not.
+    fn restored(self, saved: TextState) -> TextState {
+        TextState {
+            tm: self.tm,
+            tlm: self.tlm,
+            ..saved
+        }
+    }
+
     fn next_line(&mut self, tx: f64, ty: f64) {
         self.tlm = then([1.0, 0.0, 0.0, 1.0, tx, ty], self.tlm);
         self.tm = self.tlm;
@@ -2291,6 +2364,49 @@ impl TextState {
             + self.word_space * shown.spaces as f64)
             * self.scale;
         self.tm = then([1.0, 0.0, 0.0, 1.0, tx, 0.0], self.tm);
+    }
+}
+
+/// The graphics states a content stream saves with `q` and puts back with `Q`.
+struct Saved<T> {
+    kept: Vec<T>,
+    /// States saved past the most kept, whose `Q`s restore nothing rather than a state
+    /// saved before them.
+    unsaved: usize,
+}
+
+impl<T> Default for Saved<T> {
+    fn default() -> Self {
+        Saved {
+            kept: Vec::new(),
+            unsaved: 0,
+        }
+    }
+}
+
+impl<T> Saved<T> {
+    /// The most states kept.
+    const MOST: usize = 64;
+
+    /// Saves `state`; `false` when it is past the most kept.
+    fn save(&mut self, state: T) -> bool {
+        if self.kept.len() < Self::MOST {
+            self.kept.push(state);
+            true
+        } else {
+            self.unsaved += 1;
+            false
+        }
+    }
+
+    /// The state the matching `q` saved, if it was kept.
+    fn restore(&mut self) -> Option<T> {
+        if self.unsaved > 0 {
+            self.unsaved -= 1;
+            None
+        } else {
+            self.kept.pop()
+        }
     }
 }
 
@@ -2600,9 +2716,8 @@ impl Document<'_> {
         let (mut font, mut text) = inherited;
         (text.tm, text.tlm) = (IDENTITY, IDENTITY);
         let default = Font::default();
-        // The placement, with the states saved by `q`; a `q` past the most kept is counted,
-        // so that its `Q` restores nothing rather than a state saved before it.
-        let (mut ctm, mut saved, mut unsaved) = (ctm, Vec::new(), 0usize);
+        // The placement, with the states saved by `q`.
+        let (mut ctm, mut saved) = (ctm, Saved::default());
         let marks_at_start = marking.marks.len();
         let mut count = 0usize;
         while let Some(operator) = ops.next() {
@@ -2613,27 +2728,19 @@ impl Document<'_> {
             }
             let operands = &ops.operands;
             match operator.as_str() {
-                "q" if saved.len() < 64 => saved.push((ctm, font, text)),
                 "q" => {
-                    if marking.inferred {
+                    if !saved.save((ctm, font, text)) && marking.inferred {
                         self.unreadable(|| {
                             "the PDF exceeded its graphics-state stack limit".into()
                         });
                         break;
                     }
-                    unsaved += 1;
                 }
-                "Q" if unsaved > 0 => unsaved -= 1,
                 "Q" => {
-                    if let Some((transform, selected_font, state)) = saved.pop() {
+                    if let Some((transform, selected_font, state)) = saved.restore() {
                         ctm = transform;
                         font = selected_font;
-                        // Text matrices are separate from the graphics state.
-                        text = TextState {
-                            tm: text.tm,
-                            tlm: text.tlm,
-                            ..state
-                        };
+                        text = text.restored(state);
                     }
                 }
                 "cm" => {
@@ -5900,6 +6007,28 @@ second page
             "{}",
             &read[read.len() - 200..]
         );
+    }
+
+    /// A compressed stream that runs out before its end keeps what it has, and says that some
+    /// is missing; a tab in a string stays the space it is.
+    #[test]
+    fn a_compressed_stream_cut_short_in_its_data_is_said_to_be_incomplete() {
+        let mut content = b"BT /F1 12 Tf 72 720 Td 14 TL\n".to_vec();
+        for i in 0..400 {
+            content.extend_from_slice(format!("(line {i} {}) Tj T*\n", i * 7919 % 1000).as_bytes());
+        }
+        content.extend_from_slice(b"ET\n");
+        let mut packed = zlib(&content);
+        packed.truncate(packed.len() / 2);
+        let cut = one_page(stream("/Filter /FlateDecode", &packed), HELVETICA);
+        let read = text(&build(&cut, "")).unwrap();
+        assert!(read.starts_with("line 0 "), "{read}");
+        assert!(!read.contains("line 399 "), "{read}");
+        assert!(read.contains(&incomplete_note()), "{read}");
+
+        let tabbed = b"BT /F1 12 Tf 72 720 Td (a\\tb) Tj ET\n".to_vec();
+        let file = build(&one_page(stream("", &tabbed), HELVETICA), "");
+        assert_eq!(text(&file).unwrap(), "a\tb\n");
     }
 
     /// MacRoman has 128 characters above ASCII; 0xCA is a no-break space and 0xF0 the Apple
