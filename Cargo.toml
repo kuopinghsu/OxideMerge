@@ -95,14 +95,22 @@ lzma-rs = "0.3"
 [build-dependencies]
 winresource = "0.1"
 
-# Tuned for size: on Windows this takes the program from 55.3 MB to 44.2 MB, and the
-# benchmarks in `src/core/bench.rs` run as fast as with `opt-level = 3` and thin LTO, within
-# noise, except a 4K image compare (0.11 s to 0.14 s). `panic = "abort"` must not be used: stopping a job unwinds out of it (`core::cancel`).
+# `cargo build --release` (`make release`) is the everyday optimized build, quick to build.
+# `panic = "abort"` must not be used in either profile: stopping a job unwinds out of it
+# (`core::cancel`).
 [profile.release]
+strip = true
+
+# Tuned for size, for the packages CI builds: `cargo build --profile release-size` (`make
+# opt-size`), into `target/release-size/`. On Windows this takes the program from 55.3 MB to
+# 44.2 MB, and the benchmarks in `src/core/bench.rs` run as fast as with `opt-level = 3` and
+# thin LTO, within noise, except a 4K image compare (0.11 s to 0.14 s), but it builds much
+# more slowly.
+[profile.release-size]
+inherits = "release"
 opt-level = "s"
 lto = "fat"
 codegen-units = 1
-strip = true
 
 [profile.dev.package."*"]
 opt-level = 2

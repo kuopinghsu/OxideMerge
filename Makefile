@@ -27,12 +27,14 @@ endif
 
 TARGET_DIR  := $(if $(CARGO_TARGET_DIR),$(subst \,/,$(CARGO_TARGET_DIR)),target)
 RELEASE_BIN := $(TARGET_DIR)/release/$(BIN)$(EXE)
+# The build tuned for size (the `release-size` profile in Cargo.toml), as CI packages it.
+SIZE_BIN    := $(TARGET_DIR)/release-size/$(BIN)$(EXE)
 DIST_NAME   := $(BIN)-$(VERSION)-$(PLATFORM)-$(MACHINE)
 DIST_DIR    := dist/$(DIST_NAME)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all help build release run run-release demo demo-text demo-3way demo-3way-merge demo-3way-folder demo-conflict \
+.PHONY: all help build release opt-size run run-release demo demo-text demo-3way demo-3way-merge demo-3way-folder demo-conflict \
         demo-web demo-web-text demo-web-headings demo-web-tables \
         test gui-smoke docker-test check check-platforms lint fmt fmt-check ci install uninstall shell-register shell-unregister \
         languages dist appimage user-guide user-guide-docs clean
@@ -40,7 +42,8 @@ DIST_DIR    := dist/$(DIST_NAME)
 help:
 	@echo 'OxideMerge $(VERSION) - make targets'
 	@echo '  all               Release build (default, same as release)'
-	@echo '  release           Optimized build in $(RELEASE_BIN)'
+	@echo '  release           Optimized build in $(RELEASE_BIN), quick to build'
+	@echo '  opt-size          Build tuned for size, as CI packages it, in $(SIZE_BIN)'
 	@echo '  build             Debug build'
 	@echo '  run               Run the debug build, pass arguments with ARGS="left right"'
 	@echo '  run-release       Run the release build with ARGS'
@@ -67,7 +70,7 @@ help:
 	@echo '  shell-register    Install, then add the file manager entries (Explorer, Finder, Linux)'
 	@echo '  shell-unregister  Remove the file manager entries'
 	@echo '  languages         List the available UI languages'
-	@echo '  dist              Release build packaged into dist/$(DIST_NAME)'
+	@echo '  dist              Size-tuned build packaged into dist/$(DIST_NAME)'
 	@echo '  appimage          Linux AppImage in dist/ (Docker on Windows/macOS)'
 	@echo '  user-guide        User guide PDF files (English, Traditional Chinese) in dist/'
 	@echo '  user-guide-docs   The latest user guide PDF files in docs/dist, to commit'
@@ -81,6 +84,10 @@ build:
 release:
 	$(CARGO) build --release
 	@echo Built $(RELEASE_BIN)
+
+opt-size:
+	$(CARGO) build --profile release-size
+	@echo Built $(SIZE_BIN)
 
 run:
 	$(CARGO) run -- $(ARGS)
@@ -160,13 +167,13 @@ shell-unregister:
 languages: build
 	$(CARGO) run -- --list-languages
 
-dist: release
+dist: opt-size
 ifeq ($(OS),Windows_NT)
-	powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path '$(DIST_DIR)' | Out-Null; Copy-Item -Force '$(RELEASE_BIN)', 'README.md', 'LICENSE' '$(DIST_DIR)'; Remove-Item -Force -ErrorAction SilentlyContinue '$(DIST_DIR).zip'; Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::CreateFromDirectory('$(DIST_DIR)', '$(DIST_DIR).zip')"
+	powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path '$(DIST_DIR)' | Out-Null; Copy-Item -Force '$(SIZE_BIN)', 'README.md', 'LICENSE' '$(DIST_DIR)'; Remove-Item -Force -ErrorAction SilentlyContinue '$(DIST_DIR).zip'; Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::CreateFromDirectory('$(DIST_DIR)', '$(DIST_DIR).zip')"
 	@echo Created $(DIST_DIR).zip
 else
 	mkdir -p $(DIST_DIR)
-	cp $(RELEASE_BIN) README.md LICENSE $(DIST_DIR)/
+	cp $(SIZE_BIN) README.md LICENSE $(DIST_DIR)/
 	tar -C dist -czf $(DIST_DIR).tar.gz $(DIST_NAME)
 	@echo Created $(DIST_DIR).tar.gz
 endif
@@ -182,7 +189,7 @@ appimage-image:
 appimage: appimage-image
 	docker run --rm --init --mount "type=bind,source=$(CURDIR),target=/work" --mount "type=volume,source=oxidemerge-appimage-target-$(MACHINE),target=/target" --mount "type=volume,source=oxidemerge-appimage-registry,target=/root/.cargo/registry" --workdir /work --env "VERSION=$(VERSION)" --env CARGO_BUILD_JOBS $(APPIMAGE_IMAGE)
 else ifeq ($(PLATFORM),linux)
-appimage: release
+appimage: opt-size
 	VERSION='$(VERSION)' bash scripts/package-appimage.sh
 else
 appimage:

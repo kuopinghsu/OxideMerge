@@ -41,9 +41,10 @@ if [ -z "${VERSION:-}" ]; then
 fi
 
 target_dir=${CARGO_TARGET_DIR:-target}
-bin=$target_dir/release/oxidemerge
+# The build tuned for size, as CI packages it (the `release-size` profile).
+bin=$target_dir/release-size/oxidemerge
 if [ ! -x "$bin" ]; then
-    echo "Missing $bin; run 'make release' first" >&2
+    echo "Missing $bin; run 'make opt-size' first" >&2
     exit 1
 fi
 

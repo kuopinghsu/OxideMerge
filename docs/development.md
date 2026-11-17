@@ -61,7 +61,8 @@ Run `make help` to list all targets.
 
 | Command | What it does |
 | --- | --- |
-| `make` or `make release` | Builds an optimized program. |
+| `make` or `make release` | Builds an optimized program, quickly: `target/release/oxidemerge`. |
+| `make opt-size` | Builds the program tuned for size, as CI packages it (the `release-size` profile: `opt-level = "s"`, fat LTO, one codegen unit), into `target/release-size/`. It takes much longer. |
 | `make build` | Builds a debug program. |
 | `make run ARGS="a.txt b.txt"` | Runs the debug build with the given paths. |
 | `make demo`, `make demo-text`, `make demo-3way`, `make demo-3way-merge`, `make demo-3way-folder`, `make demo-conflict` | Opens sample comparisons. |
@@ -90,7 +91,7 @@ shows. For the web page samples, see [samples/web/README.md](../samples/web/READ
 
 | Command | What it does |
 | --- | --- |
-| `make dist` | Creates a package in `dist/`: a ZIP file on Windows, or a TAR.GZ file on macOS and Linux. |
+| `make dist` | Builds with `make opt-size` and creates a package in `dist/`: a ZIP file on Windows, or a TAR.GZ file on macOS and Linux. |
 | `make appimage` | Creates a Linux AppImage for this computer's processor (x86_64 or aarch64). It needs the X11, Wayland and keyboard libraries, and it downloads `appimagetool`. |
 | `make user-guide` | Creates the English and Traditional Chinese PDF guides in `dist/`. |
 | `make user-guide-docs` | Creates the same guides in `docs/dist/`, as `oxidemerge-user-guide.pdf` and `oxidemerge-user-guide.zh-TW.pdf`. These files are committed, and each build replaces them. |

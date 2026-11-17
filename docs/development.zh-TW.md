@@ -58,7 +58,8 @@ macOS 與 Linux 的程式位於 `target/release/oxidemerge`，Windows 則為
 
 | 指令 | 用途 |
 | --- | --- |
-| `make` 或 `make release` | 建置最佳化的程式。 |
+| `make` 或 `make release` | 快速建置最佳化的程式：`target/release/oxidemerge`。 |
+| `make opt-size` | 建置最佳化檔案大小的程式，與 CI 打包的相同（`release-size` 設定檔：`opt-level = "s"`、fat LTO、單一 codegen unit），輸出到 `target/release-size/`。建置時間長得多。 |
 | `make build` | 建置偵錯版本。 |
 | `make run ARGS="a.txt b.txt"` | 以指定的路徑執行偵錯版本。 |
 | `make demo`、`make demo-text`、`make demo-3way`、`make demo-3way-merge`、`make demo-3way-folder`、`make demo-conflict` | 開啟範例比較。 |
@@ -87,7 +88,7 @@ macOS 與 Linux 的程式位於 `target/release/oxidemerge`，Windows 則為
 
 | 指令 | 用途 |
 | --- | --- |
-| `make dist` | 在 `dist/` 產生套件：Windows 為 ZIP 檔，macOS 與 Linux 為 TAR.GZ 檔。 |
+| `make dist` | 以 `make opt-size` 建置，並在 `dist/` 產生套件：Windows 為 ZIP 檔，macOS 與 Linux 為 TAR.GZ 檔。 |
 | `make appimage` | 依本機處理器架構（x86_64 或 aarch64）產生 Linux AppImage。需要 X11、Wayland 與鍵盤函式庫，並會下載 `appimagetool`。 |
 | `make user-guide` | 在 `dist/` 產生英文與繁體中文 PDF 指南。 |
 | `make user-guide-docs` | 在 `docs/dist/` 產生相同的指南，檔名為 `oxidemerge-user-guide.pdf` 與 `oxidemerge-user-guide.zh-TW.pdf`。這些檔案會提交到儲存庫，每次建置都會取代它們。 |

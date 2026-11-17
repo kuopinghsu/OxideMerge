@@ -19,4 +19,4 @@ ENV PATH="/root/.cargo/bin:${PATH}" \
 # away from native target/ files and Windows filesystem symlink restrictions.
 RUN git config --global --add safe.directory /work
 WORKDIR /work
-CMD ["bash", "-c", "cargo build --release --locked && bash scripts/package-appimage.sh"]
+CMD ["bash", "-c", "cargo build --profile release-size --locked && bash scripts/package-appimage.sh"]

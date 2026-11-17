@@ -104,13 +104,13 @@ jobs:
       # An explicit target, so the package is for this architecture even if the
       # toolchain on the runner is not.
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --profile release-size --locked --target ${{ matrix.target }}
 
       - name: Command line smoke test
         shell: bash
         run: |
           set -euo pipefail
-          bin=target/$TARGET/release/oxidemerge
+          bin=target/$TARGET/release-size/oxidemerge
           "$bin" --version
           "$bin" --list-languages
           "$bin" --cli samples/left/same.txt samples/right/same.txt
@@ -169,7 +169,7 @@ jobs:
           else
             "$SYSTEMROOT/System32/tar.exe" -xf "$(cygpath -w "$cached")" -C "$dir" opengl32.dll
           fi
-          cp "target/$TARGET/release/oxidemerge.exe" "$dir/"
+          cp "target/$TARGET/release-size/oxidemerge.exe" "$dir/"
           bash scripts/gui-smoke.sh "$dir/oxidemerge.exe" target/gui-smoke
 
       - name: Keep test output
@@ -198,7 +198,7 @@ jobs:
             $label = "$version-$($env:GITHUB_SHA.Substring(0, 7))"
           }
           $name = "oxidemerge-$label-windows-$env:ARCH"
-          $exe = "target/$env:TARGET/release/oxidemerge.exe"
+          $exe = "target/$env:TARGET/release-size/oxidemerge.exe"
 
           # The machine field of the PE header: 0x8664 for x64, 0xAA64 for arm64.
           $bytes = [IO.File]::ReadAllBytes($exe)
@@ -277,12 +277,12 @@ jobs:
         run: cargo test --release --locked
 
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --profile release-size --locked
 
       - name: Command line smoke test
         run: |
           set -euo pipefail
-          bin=target/release/oxidemerge
+          bin=target/release-size/oxidemerge
           "$bin" --version
           "$bin" --list-languages
           "$bin" --cli samples/left/same.txt samples/right/same.txt
@@ -295,7 +295,7 @@ jobs:
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
           GUI_SMOKE_STRICT: "1"
-        run: bash scripts/gui-smoke.sh target/release/oxidemerge target/gui-smoke
+        run: bash scripts/gui-smoke.sh target/release-size/oxidemerge target/gui-smoke
 
       - name: Keep test output
         if: failure()
@@ -333,15 +333,15 @@ jobs:
             label="$version-${GITHUB_SHA::7}"
           fi
           name="oxidemerge-$label-linux-$ARCH"
-          strip target/release/oxidemerge
+          strip target/release-size/oxidemerge
           want=$([ "$ARCH" = arm64 ] && echo aarch64 || echo x86-64)
-          file target/release/oxidemerge | tee /dev/stderr | grep -q "$want" || {
+          file target/release-size/oxidemerge | tee /dev/stderr | grep -q "$want" || {
             echo "::error::oxidemerge is not a $want program"
             exit 1
           }
           mkdir -p dist "staging/$name"
 
-          install -m 755 target/release/oxidemerge "staging/$name/"
+          install -m 755 target/release-size/oxidemerge "staging/$name/"
           install -m 644 README.md LICENSE assets/oxidemerge.desktop assets/oxidemerge.png "staging/$name/"
           tar -C staging -czf "dist/$name.tar.gz" "$name"
 
@@ -448,7 +448,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --profile release-size --locked
 
       - name: Package
         id: package
@@ -641,16 +641,16 @@ jobs:
         run: cargo test --release --locked --target aarch64-apple-darwin
 
       - name: Build
-        run: cargo build --release --locked --target aarch64-apple-darwin
+        run: cargo build --profile release-size --locked --target aarch64-apple-darwin
 
       - name: Build Intel slice
         if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
-        run: cargo build --release --locked --target x86_64-apple-darwin
+        run: cargo build --profile release-size --locked --target x86_64-apple-darwin
 
       - name: Window smoke test
         env:
           GUI_SMOKE_STRICT: "1"
-        run: bash scripts/gui-smoke.sh target/aarch64-apple-darwin/release/oxidemerge target/gui-smoke
+        run: bash scripts/gui-smoke.sh target/aarch64-apple-darwin/release-size/oxidemerge target/gui-smoke
 
       - name: Keep test output
         if: failure()
@@ -696,8 +696,8 @@ jobs:
 
           # One binary for Apple silicon and Intel Macs.
           lipo -create -output "$app/Contents/MacOS/oxidemerge" \
-            target/aarch64-apple-darwin/release/oxidemerge \
-            target/x86_64-apple-darwin/release/oxidemerge
+            target/aarch64-apple-darwin/release-size/oxidemerge \
+            target/x86_64-apple-darwin/release-size/oxidemerge
           strip -x "$app/Contents/MacOS/oxidemerge"
           lipo -info "$app/Contents/MacOS/oxidemerge"
           lipo "$app/Contents/MacOS/oxidemerge" -verify_arch arm64 x86_64 || {
