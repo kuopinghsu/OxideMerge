@@ -273,9 +273,19 @@ struct ReloadRun {
     _keep: Vec<std::sync::Arc<tempfile::TempDir>>,
 }
 
+/// A side of a tab to fetch again: side, connection, path on the server, local copy, and the
+/// entries of the folder chosen to fetch when only those were (see [`remote::fetch_selected`]).
+type ReloadSide = (
+    usize,
+    remote::RemoteConnection,
+    String,
+    PathBuf,
+    Vec<String>,
+);
+
 /// The sides of `tab` that came from a server and are still read from it (not moved to a local
-/// path of their own by *Save As*): side, connection, path on the server, and local copy.
-fn reload_sides(tab: &Tab) -> Vec<(usize, remote::RemoteConnection, String, PathBuf)> {
+/// path of their own by *Save As*).
+fn reload_sides(tab: &Tab) -> Vec<ReloadSide> {
     let paths = tab.paths();
     tab.remote
         .iter()
@@ -283,7 +293,14 @@ fn reload_sides(tab: &Tab) -> Vec<(usize, remote::RemoteConnection, String, Path
         .filter_map(|(i, r)| {
             let r = r.as_ref()?;
             let local = paths.get(i).filter(|p| tab.source.get(i) == Some(*p))?;
-            Some((i, r.conn.clone(), r.remote_path.clone(), local.clone()))
+            let chosen = (r.manifest.as_ref()).map_or_else(Vec::new, |m| m.chosen.clone());
+            Some((
+                i,
+                r.conn.clone(),
+                r.remote_path.clone(),
+                local.clone(),
+                chosen,
+            ))
         })
         .collect()
 }
@@ -295,6 +312,8 @@ struct HostPrompt {
     target: RemoteTarget,
     conn: remote::RemoteConnection,
     remote_path: String,
+    /// The paths to fetch after `remote_path`, for [`RemoteTarget::Selected`].
+    also: Vec<String>,
     dialog: Option<RemoteDialog>,
     /// Stopped listing the server's folders for `dialog` (see [`RemoteBrowse`]), not fetching:
     /// trusting the server lists `remote_path` again instead.
@@ -1474,6 +1493,9 @@ enum RemoteTarget {
     Open(usize),
     /// A typed SFTP address to resolve before resuming a submitted comparison.
     Compare(usize),
+    /// No field: what was selected in the chooser's list, compared with each other once
+    /// fetched.
+    Selected,
 }
 
 /// How the remote connection dialog signs in. FTP has only a password.
@@ -1868,7 +1890,24 @@ struct RemoteBrowse {
     field: String,
     /// The path field when the chooser opened, put back if it is cancelled.
     before: String,
-    /// The entry of `listing` the keyboard is on, shown selected.
+    /// The folders opened in place under the one listed, by path.
+    open: std::collections::HashSet<String>,
+    /// What each folder opened in place holds, once the server listed it, or why it could not.
+    children: std::collections::HashMap<String, Result<remote::Listing, String>>,
+    /// The folder opened in place being listed, and those to list after it: one at a time,
+    /// over the one connection.
+    expanding: Option<String>,
+    queue: std::collections::VecDeque<String>,
+    /// What the list shows: the entries of `listing` and, under each folder opened in place,
+    /// its own. Made again whenever any of those change.
+    rows: Vec<RemoteTreeRow>,
+    /// Why the last click on the list did nothing, said over it until the next one.
+    note: Option<String>,
+    /// The paths of the entries selected, to compare with each other.
+    selection: std::collections::BTreeSet<String>,
+    /// The row a Shift-click or a Shift-arrow selects from.
+    anchor: Option<usize>,
+    /// The row of `rows` the keyboard is on.
     cursor: Option<usize>,
     /// Whether the list still has to scroll to bring `cursor` into view.
     reveal: bool,
@@ -1889,6 +1928,14 @@ impl RemoteBrowse {
             error: None,
             field: String::new(),
             before: path.to_string(),
+            open: Default::default(),
+            children: Default::default(),
+            expanding: None,
+            queue: Default::default(),
+            rows: Vec::new(),
+            note: None,
+            selection: Default::default(),
+            anchor: None,
             cursor: None,
             reveal: false,
             offset: 0.0,
@@ -1902,10 +1949,14 @@ impl RemoteBrowse {
         self.asked = path.to_string();
         self.field = field.to_string();
         self.loading = true;
+        // Folders being opened in place belong to the tree this listing replaces.
+        self.expanding = None;
+        self.queue.clear();
         self.browser.list(path);
     }
 
-    /// Shows `listing`, from its top, or from the file it was asked for.
+    /// Shows `listing`, from its top, or from the file it was asked for, with no folder
+    /// opened in place.
     fn show(&mut self, listing: remote::Listing) {
         self.cursor = listing
             .file
@@ -1914,7 +1965,384 @@ impl RemoteBrowse {
         self.reveal = self.cursor.is_some();
         self.offset = 0.0;
         self.error = None;
+        self.open.clear();
+        self.children.clear();
+        // Folders opened in the list this one replaces, while it was on its way.
+        self.queue.clear();
+        self.expanding = None;
+        self.selection.clear();
+        if let (Some(file), Some(_)) = (&listing.file, self.cursor) {
+            self.selection.insert(remote::join(&listing.path, file));
+        }
+        self.anchor = self.cursor;
         self.listing = Some(listing);
+        self.retree();
+    }
+
+    /// Whether the server is being asked for a folder: the one shown, or one opened in place.
+    fn busy(&self) -> bool {
+        self.loading || self.expanding.is_some()
+    }
+
+    /// Makes `rows` again, keeping the keyboard and the start of a range on the entries they
+    /// were on, where those are still shown.
+    fn retree(&mut self) {
+        let path_at = |rows: &[RemoteTreeRow], at: Option<usize>| {
+            at.and_then(|i| rows.get(i))
+                .filter(|r| r.entry().is_some())
+                .map(|r| r.path.clone())
+        };
+        let (cursor, anchor) = (
+            path_at(&self.rows, self.cursor),
+            path_at(&self.rows, self.anchor),
+        );
+        let mut rows = Vec::new();
+        if let Some(l) = &self.listing {
+            remote_tree_rows(l, &l.path, 0, &self.open, &self.children, &mut rows);
+        }
+        let find = |path: Option<String>| {
+            let path = path?;
+            rows.iter()
+                .position(|r| r.entry().is_some() && r.path == path)
+        };
+        (self.cursor, self.anchor) = (find(cursor), find(anchor));
+        self.rows = rows;
+    }
+
+    /// Opens the folder `path` in place, asking the server for what it holds the first time
+    /// (or again, if that failed), or closes it. Entries ticked inside a folder closed stay
+    /// ticked, and are shown so again when it is opened.
+    fn toggle(&mut self, path: &str) {
+        if self.open.remove(path) {
+            self.queue.retain(|p| p != path);
+        } else {
+            self.open.insert(path.to_string());
+            if !matches!(self.children.get(path), Some(Ok(_))) {
+                self.children.remove(path);
+                if self.expanding.as_deref() != Some(path) && !self.queue.iter().any(|p| p == path)
+                {
+                    self.queue.push_back(path.to_string());
+                }
+            }
+        }
+        self.retree();
+        self.pump();
+    }
+
+    /// Asks the server for the next folder opened in place, once it is done with the last.
+    fn pump(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if let Some(path) = self.queue.pop_front() {
+            self.browser.list(&path);
+            self.expanding = Some(path);
+        }
+    }
+
+    /// Takes in what the server listed for `path`, a folder opened in place.
+    fn expanded(&mut self, path: String, listed: anyhow::Result<remote::Listing>) {
+        let listed = match listed {
+            // A path that is no folder lists the folder it is in instead: not what was asked.
+            Ok(l) if l.file.is_none() && remote::normalize(&l.path) == remote::normalize(&path) => {
+                Ok(l)
+            }
+            Ok(_) => Err(tr("status.error").to_string()),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        if self.open.contains(&path) || listed.is_ok() {
+            self.children.insert(path, listed);
+        }
+        self.retree();
+        self.pump();
+    }
+
+    /// The entries selected, in the order the list shows them, then those in folders closed:
+    /// their paths and what they are.
+    fn chosen(&self) -> Vec<(String, remote::EntryKind)> {
+        let mut chosen: Vec<(String, remote::EntryKind)> = (self.rows.iter())
+            .filter_map(|r| Some((r.path.clone(), r.entry()?.kind)))
+            .filter(|(path, _)| self.selection.contains(path))
+            .collect();
+        for path in &self.selection {
+            if !chosen.iter().any(|(p, _)| p == path) {
+                if let Some(kind) = self.kind_of(path) {
+                    chosen.push((path.clone(), kind));
+                }
+            }
+        }
+        chosen
+    }
+
+    /// What the entry at `path` is, as the listing of the folder it is in says.
+    fn kind_of(&self, path: &str) -> Option<remote::EntryKind> {
+        let (folder, name) = path.rsplit_once('/')?;
+        let listing = match self.listing.as_ref() {
+            Some(l) if l.path.trim_end_matches('/') == folder => l,
+            _ => self.children.get(folder)?.as_ref().ok()?,
+        };
+        (listing.entries.iter())
+            .find(|e| e.name == name)
+            .map(|e| e.kind)
+    }
+
+    /// The deepest folder all the entries selected are in, and their paths relative to it, in
+    /// the order the list shows them: what a copy of only them is rooted at, to compare with
+    /// the folder that holds the same names elsewhere. Entries ticked in `FreeRTOS-Kernel`,
+    /// opened in place from the home folder, give `…/FreeRTOS-Kernel`, not the home folder.
+    fn ticked(&self) -> Option<(String, Vec<String>)> {
+        let chosen = self.chosen();
+        let parents: Vec<Vec<&str>> = (chosen.iter())
+            .map(|(path, _)| {
+                let mut parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+                parts.pop();
+                parts
+            })
+            .collect();
+        let first = parents.first()?;
+        let depth = (0..first.len())
+            .take_while(|&i| parents.iter().all(|p| p.get(i) == first.get(i)))
+            .count();
+        let base = format!("/{}", first[..depth].join("/"));
+        let rels = (chosen.iter())
+            .map(|(path, _)| {
+                let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+                parts[depth..].join("/")
+            })
+            .collect();
+        Some((base, rels))
+    }
+
+    /// Selects only the entry of row `at`, which a range then starts from.
+    fn select_only(&mut self, at: usize) {
+        self.selection.clear();
+        if let Some(row) = self.rows.get(at).filter(|r| r.entry().is_some()) {
+            self.selection.insert(row.path.clone());
+        }
+        self.anchor = Some(at);
+    }
+
+    /// Selects the entries from the row a range starts at to row `to`, and no others.
+    fn select_range(&mut self, to: usize) {
+        let from = self.anchor.unwrap_or(to);
+        self.anchor = Some(from);
+        self.selection = self.rows[from.min(to)..=from.max(to).min(self.rows.len() - 1)]
+            .iter()
+            .filter(|r| r.entry().is_some())
+            .map(|r| r.path.clone())
+            .collect();
+    }
+
+    /// Selects the entry of row `at` if it is not selected, and the other way round.
+    ///
+    /// A folder ticked takes all it holds with it, shown ticked too, those listed later
+    /// included. Taking out an entry of a ticked folder unticks that folder and ticks instead
+    /// what else is beside the entry, at each level down to it.
+    fn select_toggle(&mut self, at: usize) {
+        let Some(path) = (self.rows.get(at))
+            .filter(|r| r.entry().is_some())
+            .map(|r| r.path.clone())
+        else {
+            return;
+        };
+        self.anchor = Some(at);
+        if self.selection.remove(&path) {
+            return;
+        }
+        // A folder of more entries than are listed cannot be ticked but for one: those not
+        // listed would be left out unseen. The folder is to be unticked as a whole.
+        if let Some(outer) = self.ticked_folder_of(&path) {
+            let truncated =
+                |folder: &String| matches!(self.children.get(folder), Some(Ok(l)) if l.truncated);
+            let mut on_the_way = vec![outer.clone()];
+            on_the_way.extend(
+                (path.char_indices())
+                    .filter(|(i, c)| *c == '/' && *i > outer.len())
+                    .map(|(i, _)| path[..i].to_string()),
+            );
+            if on_the_way.iter().any(truncated) {
+                self.note = Some(trf(
+                    "msg.remote_untick_truncated",
+                    &[(
+                        "name",
+                        outer.rsplit('/').next().unwrap_or_default().to_string(),
+                    )],
+                ));
+                return;
+            }
+        }
+        let Some(outer) = self.ticked_folder_of(&path) else {
+            // Ticked, with what is inside it ticked through it, not each on its own.
+            let inside = format!("{path}/");
+            self.selection.retain(|p| !p.starts_with(&inside));
+            self.selection.insert(path);
+            return;
+        };
+        self.selection.remove(&outer);
+        // Down from the folder ticked to the entry: what else each folder on the way holds.
+        let mut folder = outer;
+        while folder != path {
+            let Some(Ok(listing)) = self.children.get(&folder) else {
+                break;
+            };
+            let next = (listing.entries.iter())
+                .map(|e| remote::join(&folder, &e.name))
+                .find(|child| path == *child || path.starts_with(&format!("{child}/")));
+            for e in &listing.entries {
+                let child = remote::join(&folder, &e.name);
+                if Some(&child) != next.as_ref() {
+                    self.selection.insert(child);
+                }
+            }
+            match next {
+                Some(next) => folder = next,
+                None => break,
+            }
+        }
+    }
+
+    /// The folder ticked that `path` is inside, if any.
+    fn ticked_folder_of(&self, path: &str) -> Option<String> {
+        (path.char_indices())
+            .filter(|(_, c)| *c == '/')
+            .map(|(i, _)| &path[..i])
+            .find(|folder| self.selection.contains(*folder))
+            .map(str::to_string)
+    }
+
+    /// Whether `path` is shown ticked: it is, or a folder it is in is.
+    fn is_ticked(&self, path: &str) -> bool {
+        self.selection.contains(path) || self.ticked_folder_of(path).is_some()
+    }
+
+    /// What the remote path becomes once an entry was taken out of the selection or added to
+    /// it: the one entry left selected, or the folder shown when none is. With several
+    /// selected it stays as it is, as they are compared, not taken as a path.
+    fn path_of_selection(&self) -> Option<String> {
+        let mut selected = self.selection.iter();
+        match (selected.next(), selected.next()) {
+            (None, _) => self.listing.as_ref().map(|l| l.path.clone()),
+            (Some(only), None) => Some(only.clone()),
+            _ => None,
+        }
+    }
+
+    /// The row with an entry nearest to `at`, looking down the list first if `down`.
+    fn entry_near(&self, at: usize, down: bool) -> Option<usize> {
+        let is_entry = |i: &usize| self.rows[*i].entry().is_some();
+        let below = || (at..self.rows.len()).find(is_entry);
+        let above = || {
+            (0..=at.min(self.rows.len().checked_sub(1)?))
+                .rev()
+                .find(is_entry)
+        };
+        if down {
+            below().or_else(above)
+        } else {
+            above().or_else(below)
+        }
+    }
+}
+
+/// One row of the remote chooser's list: an entry of the folder shown or of a folder opened
+/// in place under it, or a line saying how such a folder is.
+struct RemoteTreeRow {
+    /// How many folders opened in place it is inside.
+    depth: usize,
+    /// The entry's path on the server; for a line about a folder, that folder's.
+    path: String,
+    what: RemoteRowKind,
+}
+
+enum RemoteRowKind {
+    Entry(remote::RemoteEntry),
+    /// The folder opened in place is still being listed.
+    Loading,
+    /// It has nothing in it.
+    Empty,
+    /// It could not be listed, and why.
+    Failed(String),
+    /// It has more entries than are shown (see [`remote::MAX_BROWSE_ENTRIES`]).
+    Truncated,
+}
+
+impl RemoteTreeRow {
+    fn entry(&self) -> Option<&remote::RemoteEntry> {
+        match &self.what {
+            RemoteRowKind::Entry(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Adds to `rows` the entries of `listing`, the folder at `base`, and under each folder opened
+/// in place (`open`) what `children` has of it.
+fn remote_tree_rows(
+    listing: &remote::Listing,
+    base: &str,
+    depth: usize,
+    open: &std::collections::HashSet<String>,
+    children: &std::collections::HashMap<String, Result<remote::Listing, String>>,
+    rows: &mut Vec<RemoteTreeRow>,
+) {
+    for e in &listing.entries {
+        let path = remote::join(base, &e.name);
+        rows.push(RemoteTreeRow {
+            depth,
+            path: path.clone(),
+            what: RemoteRowKind::Entry(e.clone()),
+        });
+        if e.kind != remote::EntryKind::Dir || !open.contains(&path) {
+            continue;
+        }
+        let note = match children.get(&path) {
+            Some(Ok(inside)) if !inside.entries.is_empty() => {
+                remote_tree_rows(inside, &path, depth + 1, open, children, rows);
+                continue;
+            }
+            Some(Ok(_)) => RemoteRowKind::Empty,
+            Some(Err(e)) => RemoteRowKind::Failed(e.clone()),
+            None => RemoteRowKind::Loading,
+        };
+        rows.push(RemoteTreeRow {
+            depth: depth + 1,
+            path,
+            what: note,
+        });
+    }
+    if listing.truncated {
+        rows.push(RemoteTreeRow {
+            depth,
+            path: base.to_string(),
+            what: RemoteRowKind::Truncated,
+        });
+    }
+}
+
+/// How to use the remote chooser's list, naming the key that adds to a selection as this
+/// system does: Cmd on macOS, where the translations say Ctrl (German *Strg*).
+fn remote_browse_hint() -> String {
+    let hint = tr("msg.remote_browse_hint");
+    if cfg!(target_os = "macos") {
+        hint.replace("Ctrl", "Cmd").replace("Strg", "Cmd")
+    } else {
+        hint.to_string()
+    }
+}
+
+/// Why what is selected in the remote chooser cannot be compared, as the key of its words:
+/// a comparison takes two or three files, or two or three folders. A link not looked up may
+/// be either, and is found out when it is fetched.
+fn remote_selection_problem(kinds: &[remote::EntryKind]) -> Option<&'static str> {
+    let has = |kind| kinds.contains(&kind);
+    if kinds.len() < 2 {
+        Some("msg.remote_select_few")
+    } else if kinds.len() > 3 {
+        Some("msg.remote_select_many")
+    } else if has(remote::EntryKind::File) && has(remote::EntryKind::Dir) {
+        Some("msg.remote_select_mixed")
+    } else {
+        None
     }
 }
 
@@ -1927,6 +2355,11 @@ struct BrowseAsk {
     pick: Option<String>,
     /// A file to fetch straight away.
     fetch: Option<String>,
+    /// The paths selected, to fetch and compare with each other.
+    compare: Option<Vec<String>>,
+    /// The folder shown, and the entries ticked in it (relative to it, any number): fetched
+    /// together as a copy of that folder holding only them, for the path field.
+    items: Option<(String, Vec<String>)>,
     /// Closes the chooser, keeping the remote path chosen.
     accept: bool,
     /// Closes the chooser, putting the remote path back as it was.
@@ -1946,6 +2379,10 @@ fn remote_chooser_size(ctx: &egui::Context) -> egui::Vec2 {
 const REMOTE_CHOOSER_SIZE: egui::Vec2 = vec2(640.0, 520.0);
 /// The height of one entry of the remote chooser's list.
 const REMOTE_ROW_HEIGHT: f32 = 28.0;
+/// How far an entry of a folder opened in place is set in from that folder.
+const REMOTE_INDENT: f32 = 16.0;
+/// How wide the check box at the left of each entry of the remote chooser is.
+const REMOTE_TICK: f32 = 24.0;
 
 /// The folders `path` is in, outermost first, each with its name: `/home/ann` gives
 /// `("", "/")`, `("home", "/home")` and `("ann", "/home/ann")`.
@@ -1960,10 +2397,22 @@ fn remote_crumbs(path: &str) -> Vec<(String, String)> {
     crumbs
 }
 
-/// One entry of the remote chooser's list, as wide as the list: an icon, the name, cut short
-/// if it is too long, and a file's size at the right.
-fn remote_row(ui: &mut egui::Ui, entry: &remote::RemoteEntry, selected: bool) -> egui::Response {
+/// One entry of the remote chooser's list, as wide as the list: a check box, an icon, the
+/// name, cut short if it is too long, and a file's size at the right. It is set in by
+/// `depth`, the folders opened in place it is inside; a folder (`open` is whether it is
+/// opened in place) has an arrow before its icon that opens and closes it. `cursor` is
+/// whether the keyboard is on it. Returns the row's response, the arrow's and the check
+/// box's, which is ticked when the entry is `selected`.
+fn remote_row(
+    ui: &mut egui::Ui,
+    entry: &remote::RemoteEntry,
+    depth: usize,
+    open: Option<bool>,
+    selected: bool,
+    cursor: bool,
+) -> RemoteRowResponse {
     let p = pal(ui);
+    let indent = depth as f32 * REMOTE_INDENT;
     // Not a stop for Tab: the arrow keys go through the list as a whole.
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), REMOTE_ROW_HEIGHT), Sense::CLICK);
@@ -1981,13 +2430,21 @@ fn remote_row(ui: &mut egui::Ui, entry: &remote::RemoteEntry, selected: bool) ->
             egui::Color32::TRANSPARENT
         };
         ui.painter().rect_filled(rect, theme::radius::SM, fill);
+        if cursor && !selected {
+            ui.painter().rect_stroke(
+                rect.shrink(0.5),
+                theme::radius::SM,
+                Stroke::new(1.0_f32, p.accent),
+                egui::StrokeKind::Inside,
+            );
+        }
         let (icon, tint) = match entry.kind {
             remote::EntryKind::Dir => (Icon::Folder, p.folder),
             remote::EntryKind::File => (Icon::File, p.text_dim),
             remote::EntryKind::Link => (Icon::ChevronRight, p.text_dim),
         };
         let icon_rect = egui::Rect::from_center_size(
-            egui::pos2(rect.left() + 16.0, rect.center().y),
+            egui::pos2(rect.left() + indent + REMOTE_TICK + 30.0, rect.center().y),
             egui::Vec2::splat(16.0),
         );
         crate::ui::icons::paint(ui.painter(), icon_rect, icon, tint);
@@ -2006,7 +2463,7 @@ fn remote_row(ui: &mut egui::Ui, entry: &remote::RemoteEntry, selected: bool) ->
             );
             right -= 12.0;
         }
-        let left = rect.left() + 32.0;
+        let left = rect.left() + indent + REMOTE_TICK + 46.0;
         let name = egui::WidgetText::from(entry.name.as_str()).into_galley(
             ui,
             Some(egui::TextWrapMode::Truncate),
@@ -2019,7 +2476,77 @@ fn remote_row(ui: &mut egui::Ui, entry: &remote::RemoteEntry, selected: bool) ->
             p.text,
         );
     }
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    // The arrow is a widget of its own, over the row, so that a click on it is not one on
+    // the row.
+    let arrow = open.map(|open| {
+        let at = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + indent + REMOTE_TICK + 12.0, rect.center().y),
+            egui::Vec2::splat(18.0),
+        );
+        let (icon, key) = if open {
+            (Icon::Next, "folder.collapse")
+        } else {
+            (Icon::ChevronRight, "folder.expand")
+        };
+        let name = trf(key, &[("name", entry.name.clone())]);
+        let arrow = ui.interact(at, resp.id.with("arrow"), Sense::CLICK);
+        arrow.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &name));
+        if ui.is_rect_visible(at) {
+            if arrow.hovered() {
+                ui.painter()
+                    .rect_filled(at, theme::radius::SM, p.control_hover);
+            }
+            crate::ui::icons::paint(ui.painter(), at.shrink(3.0), icon, p.text_dim);
+        }
+        arrow.on_hover_text(name)
+    });
+    // The check box, a widget of its own over the row too, at the left of the list so that
+    // ticked entries line up whatever folder they are in.
+    let tick = {
+        let at = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 14.0, rect.center().y),
+            egui::Vec2::splat(20.0),
+        );
+        let name = trf("label.remote_tick", &[("name", entry.name.clone())]);
+        let tick = ui.interact(at, resp.id.with("tick"), Sense::CLICK);
+        tick.widget_info(|| {
+            egui::WidgetInfo::selected(egui::Role::CheckBox, true, selected, &name)
+        });
+        if ui.is_rect_visible(at) {
+            let boxed = at.shrink(3.0);
+            let (fill, stroke) = if selected {
+                (p.accent, p.accent)
+            } else if tick.hovered() {
+                (p.control_hover, p.text_dim)
+            } else {
+                (p.input, p.border)
+            };
+            ui.painter().rect_filled(boxed, theme::radius::SM, fill);
+            ui.painter().rect_stroke(
+                boxed,
+                theme::radius::SM,
+                Stroke::new(1.0_f32, stroke),
+                egui::StrokeKind::Inside,
+            );
+            if selected {
+                let mark = boxed.shrink(2.0);
+                crate::ui::icons::paint(ui.painter(), mark, Icon::Check, p.on_accent);
+            }
+        }
+        tick
+    };
+    RemoteRowResponse {
+        row: resp.on_hover_cursor(egui::CursorIcon::PointingHand),
+        arrow,
+        tick,
+    }
+}
+
+/// What [`remote_row`] responds with.
+struct RemoteRowResponse {
+    row: egui::Response,
+    arrow: Option<egui::Response>,
+    tick: egui::Response,
 }
 
 /// What a listing under way is doing, and how far it is: connecting to the server or listing
@@ -2100,55 +2627,114 @@ fn remote_chooser(
         None if b.asked.starts_with('/') && !b.loading => remote::parent_path(&b.asked),
         None => None,
     };
-    let count = b.listing.as_ref().map_or(0, |l| l.entries.len());
+    let count = b.rows.len();
+    let chosen = b.chosen();
+    let kinds: Vec<remote::EntryKind> = chosen.iter().map(|(_, kind)| *kind).collect();
+    let problem = remote_selection_problem(&kinds);
 
-    // The keyboard: the arrows go through the list, Enter opens a folder or takes what is
-    // chosen, and Backspace goes up. A button Tab went to keeps Enter for itself.
+    // The keyboard: the arrows go through the list (with Shift, selecting from where they
+    // started; with Ctrl, leaving what is selected alone, for Space to add to), Right and Left
+    // open and close a folder in place, Enter opens a folder, compares what is selected or
+    // takes what is chosen, and Backspace goes up. A button Tab went to keeps Enter for itself.
     let focused = ctx.memory(|m| m.focused());
+    let (shift, command) = ctx.input(|i| (i.modifiers.shift, i.modifiers.command));
     let mut moved = None;
+    let mut toggle = None;
     if keys && count > 0 {
         let page = ((b.view_height / REMOTE_ROW_HEIGHT) as usize).max(1);
         let at = b.cursor;
+        let last = count - 1;
         ctx.input(|i| {
-            let last = count - 1;
-            for (key, to) in [
-                (Key::ArrowDown, at.map_or(0, |c| (c + 1).min(last))),
-                (Key::ArrowUp, at.map_or(last, |c| c.saturating_sub(1))),
-                (Key::PageDown, at.map_or(0, |c| (c + page).min(last))),
-                (Key::PageUp, at.map_or(0, |c| c.saturating_sub(page))),
-                (Key::Home, 0),
-                (Key::End, last),
+            for (key, to, down) in [
+                (Key::ArrowDown, at.map_or(0, |c| (c + 1).min(last)), true),
+                (
+                    Key::ArrowUp,
+                    at.map_or(last, |c| c.saturating_sub(1)),
+                    false,
+                ),
+                (Key::PageDown, at.map_or(0, |c| (c + page).min(last)), true),
+                (Key::PageUp, at.map_or(0, |c| c.saturating_sub(page)), false),
+                (Key::Home, 0, true),
+                (Key::End, last, false),
             ] {
                 if i.key_pressed(key) {
-                    moved = Some(to);
+                    moved = Some((to, down));
                 }
             }
         });
+        let (right, left, all, space) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::ArrowRight),
+                i.key_pressed(Key::ArrowLeft),
+                i.modifiers.command && i.key_pressed(Key::A),
+                i.key_pressed(Key::Space),
+            )
+        });
+        if let Some((c, row)) = at.and_then(|c| Some((c, b.rows.get(c)?))) {
+            let folder = row
+                .entry()
+                .is_some_and(|e| e.kind == remote::EntryKind::Dir);
+            let open = folder && b.open.contains(&row.path);
+            if (right && folder && !open) || (left && open) {
+                toggle = Some(row.path.clone());
+            } else if right && open {
+                // Into the folder: its first entry, if it has one listed.
+                moved = (b.rows.get(c + 1))
+                    .filter(|next| next.depth > row.depth && next.entry().is_some())
+                    .map(|_| (c + 1, true));
+            } else if left && row.depth > 0 {
+                // Out to the folder it is in.
+                moved = (0..c)
+                    .rev()
+                    .find(|i| b.rows[*i].depth < row.depth)
+                    .map(|i| (i, false));
+            }
+            if space && focused.is_none() {
+                b.select_toggle(c);
+                ask.pick = b.path_of_selection();
+            }
+        }
+        if all && focused.is_none() {
+            b.selection = (b.rows.iter())
+                .filter(|r| r.entry().is_some())
+                .map(|r| r.path.clone())
+                .collect();
+        }
     }
-    if let (Some(to), Some(l)) = (moved, &b.listing) {
+    if let Some(to) = moved.and_then(|(to, down)| b.entry_near(to, down)) {
         // The arrows are the list's here, not for moving between buttons.
         if let Some(id) = focused {
             ctx.memory_mut(|m| m.surrender_focus(id));
         }
         b.cursor = Some(to);
         b.reveal = true;
-        let e = &l.entries[to];
-        ask.pick = Some(if e.kind == remote::EntryKind::File {
-            remote::join(&l.path, &e.name)
-        } else {
-            l.path.clone()
-        });
+        if shift {
+            b.select_range(to);
+        } else if !command {
+            b.select_only(to);
+        }
+        if !command {
+            ask.pick = Some(b.rows[to].path.clone());
+        }
+    }
+    if let Some(path) = toggle {
+        if let Some(id) = focused {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+        }
+        b.toggle(&path);
     }
     if keys && focused.is_none() {
         let (enter, back) =
             ctx.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Backspace)));
         let on = b
-            .listing
-            .as_ref()
-            .and_then(|l| Some((l, l.entries.get(b.cursor?)?)));
+            .cursor
+            .and_then(|c| b.rows.get(c))
+            .and_then(|row| Some((row, row.entry()?)));
         match on {
-            Some((l, e)) if enter && e.kind != remote::EntryKind::File => {
-                ask.go = Some(remote::join(&l.path, &e.name));
+            // Several ticked are taken together, as *OK* takes them.
+            _ if enter && chosen.len() > 1 => ask.items = b.ticked(),
+            Some((row, e)) if enter && e.kind != remote::EntryKind::File => {
+                ask.go = Some(row.path.clone());
             }
             _ if enter && !remote_path.trim().is_empty() => ask.accept = true,
             _ => {}
@@ -2221,7 +2807,7 @@ fn remote_chooser(
                             }
                         }
                     });
-                if b.loading {
+                if b.busy() {
                     ui.add_space(4.0);
                     ui.spinner();
                 }
@@ -2237,13 +2823,41 @@ fn remote_chooser(
                 Layout::right_to_left(Align::Center),
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    ui.add_enabled_ui(!remote_path.trim().is_empty(), |ui| {
+                    // *OK* takes the path chosen; with several entries ticked, all of them,
+                    // fetched together to compare with another folder.
+                    let several = chosen.len() > 1;
+                    ui.add_enabled_ui(several || !remote_path.trim().is_empty(), |ui| {
                         if widgets::primary_button(ui, tr("btn.ok")).clicked() {
-                            ask.accept = true;
+                            if several {
+                                ask.items = b.ticked();
+                            } else {
+                                ask.accept = true;
+                            }
                         }
                     });
                     if widgets::secondary_button(ui, tr("btn.cancel")).clicked() {
                         ask.cancel = true;
+                    }
+                    // Compares what is selected with each other, when that can be done: the
+                    // button says why not otherwise.
+                    // In a chooser too narrow for the three buttons, a shorter name.
+                    let name = if size.x < 440.0 {
+                        tr("btn.compare")
+                    } else {
+                        tr("btn.remote_compare_selected")
+                    };
+                    let compare = ui
+                        .add_enabled_ui(problem.is_none(), |ui| {
+                            widgets::secondary_button(ui, name)
+                                .on_hover_text(tr("btn.remote_compare_selected"))
+                        })
+                        .inner;
+                    if compare.clicked() {
+                        ask.compare = Some(chosen.iter().map(|(path, _)| path.clone()).collect());
+                    }
+                    if let Some(key) = problem {
+                        let count = ("count", chosen.len().to_string());
+                        compare.on_disabled_hover_text(trf(key, &[count]));
                     }
                     // What OK takes: the folder shown, or the file picked in it. While another
                     // folder is being listed, how far that is instead.
@@ -2268,16 +2882,24 @@ fn remote_chooser(
                 },
             );
             ui.add_space(6.0);
+            // How to use the list; with several entries selected, how many, or why they
+            // cannot be compared.
+            let p = pal(ui);
+            let count = ("count", chosen.len().to_string());
+            let (words, color) = match problem {
+                _ if chosen.len() < 2 => (remote_browse_hint(), p.text_dim),
+                Some(key) => (trf(key, &[count]), p.warning),
+                None => (trf("msg.remote_selected", &[count]), p.text_dim),
+            };
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(tr("msg.remote_browse_hint"))
+                    egui::RichText::new(words)
                         .size(theme::size::SMALL)
-                        .weak(),
+                        .color(color),
                 )
                 .wrap(),
             );
             ui.add_space(2.0);
-            let p = pal(ui);
             let frame = egui::Frame::new()
                 .fill(p.input)
                 .stroke(Stroke::new(1.0_f32, p.border))
@@ -2288,7 +2910,7 @@ fn remote_chooser(
                 frame.show(ui, |ui| {
                     ui.set_min_size(inner);
                     ui.set_max_size(inner);
-                    remote_chooser_list(ui, b, remote_path, &mut ask);
+                    remote_chooser_list(ui, b, &mut ask);
                 });
             });
         });
@@ -2301,15 +2923,10 @@ fn remote_chooser(
 
 /// The list of the remote chooser, filling `ui`: the folder's entries, or why there are none
 /// to show.
-fn remote_chooser_list(
-    ui: &mut egui::Ui,
-    b: &mut RemoteBrowse,
-    remote_path: &str,
-    ask: &mut BrowseAsk,
-) {
+fn remote_chooser_list(ui: &mut egui::Ui, b: &mut RemoteBrowse, ask: &mut BrowseAsk) {
     let p = pal(ui);
     ui.spacing_mut().item_spacing.y = 0.0;
-    let Some(l) = &b.listing else {
+    if b.listing.is_none() {
         if let Some(e) = &b.error {
             let asked = b.asked.clone();
             remote_notice(ui, Some(Icon::Warning), e, p.danger, |ui| {
@@ -2326,9 +2943,10 @@ fn remote_chooser_list(
             });
         }
         return;
-    };
-    // A folder that could not be opened says so over the one still shown.
-    if let Some(e) = &b.error {
+    }
+    // A folder that could not be opened says so over the one still shown, as does why the
+    // last click did nothing.
+    if let Some(e) = b.error.as_ref().or(b.note.as_ref()) {
         egui::Frame::new()
             .fill(p.danger.gamma_multiply(0.12))
             .corner_radius(theme::radius::SM)
@@ -2342,7 +2960,7 @@ fn remote_chooser_list(
             });
         ui.add_space(4.0);
     }
-    if l.entries.is_empty() {
+    if b.rows.is_empty() {
         remote_notice(
             ui,
             Some(Icon::Folder),
@@ -2353,7 +2971,6 @@ fn remote_chooser_list(
         return;
     }
     // Only the rows in view are laid out, so a folder of thousands scrolls like one of ten.
-    let rows = l.entries.len() + usize::from(l.truncated);
     let mut area = egui::ScrollArea::vertical()
         .id_salt("remote_entries")
         .auto_shrink([false, false]);
@@ -2369,43 +2986,100 @@ fn remote_chooser_list(
         }
     }
     let cursor = b.cursor;
+    // What a click asked for: an entry to select, and how (as the Shift and Ctrl held say),
+    // or a folder to open or close in place.
     let mut clicked = None;
-    let out = area.show_rows(ui, REMOTE_ROW_HEIGHT, rows, |ui, range| {
+    let mut ticked = None;
+    let mut toggle = None;
+    let (shift, command) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+    let out = area.show_rows(ui, REMOTE_ROW_HEIGHT, b.rows.len(), |ui, range| {
         for i in range {
-            let Some(e) = l.entries.get(i) else {
-                ui.allocate_ui_with_layout(
-                    vec2(ui.available_width(), REMOTE_ROW_HEIGHT),
-                    Layout::left_to_right(Align::Center),
-                    |ui| {
-                        ui.add_space(10.0);
-                        ui.weak(trf(
-                            "msg.remote_truncated",
-                            &[("count", remote::MAX_BROWSE_ENTRIES.to_string())],
-                        ));
-                    },
-                );
-                continue;
-            };
-            let full = remote::join(&l.path, &e.name);
-            let file = e.kind == remote::EntryKind::File;
-            let selected = cursor == Some(i) || (file && remote_path == full);
-            let row = remote_row(ui, e, selected);
-            if !file {
-                if row.clicked() {
-                    ask.go = Some(full);
+            let row = &b.rows[i];
+            let e = match &row.what {
+                RemoteRowKind::Entry(e) => e,
+                note => {
+                    // A line about a folder opened in place, set in as its entries would be.
+                    let (words, color) = match note {
+                        RemoteRowKind::Loading => (
+                            trf("msg.remote_listing", &[("path", row.path.clone())]),
+                            p.text_dim,
+                        ),
+                        RemoteRowKind::Empty => (tr("msg.remote_empty").to_string(), p.text_dim),
+                        RemoteRowKind::Failed(e) => (e.clone(), p.danger),
+                        _ => (
+                            trf(
+                                "msg.remote_truncated",
+                                &[("count", remote::MAX_BROWSE_ENTRIES.to_string())],
+                            ),
+                            p.text_dim,
+                        ),
+                    };
+                    ui.allocate_ui_with_layout(
+                        vec2(ui.available_width(), REMOTE_ROW_HEIGHT),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.add_space(row.depth as f32 * REMOTE_INDENT + REMOTE_TICK + 24.0);
+                            if matches!(note, RemoteRowKind::Loading) {
+                                ui.add(egui::Spinner::new().size(12.0));
+                            }
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(words).color(color))
+                                    .truncate(),
+                            );
+                        },
+                    );
+                    continue;
                 }
-            } else if row.double_clicked() {
-                ask.fetch = Some(full);
-            } else if row.clicked() {
-                ask.pick = Some(full);
+            };
+            let file = e.kind == remote::EntryKind::File;
+            let folder = e.kind == remote::EntryKind::Dir;
+            let selected = b.is_ticked(&row.path);
+            let open = folder.then(|| b.open.contains(&row.path));
+            let RemoteRowResponse {
+                row: resp,
+                arrow,
+                tick,
+            } = remote_row(ui, e, row.depth, open, selected, cursor == Some(i));
+            if arrow.is_some_and(|a| a.clicked()) {
+                toggle = Some(row.path.clone());
+            } else if tick.clicked() {
+                // As a Ctrl-click: what else is ticked stays so.
+                ticked = Some(i);
+            } else if resp.double_clicked() && !shift && !command {
+                // A file is fetched, and a folder becomes the one shown.
+                if file {
+                    ask.fetch = Some(row.path.clone());
+                } else {
+                    ask.go = Some(row.path.clone());
+                }
+            } else if resp.clicked() {
                 clicked = Some(i);
             }
         }
     });
     b.offset = out.state.clamped_offset().y;
     b.view_height = out.inner_rect.height();
-    if clicked.is_some() {
-        b.cursor = clicked;
+    if clicked.is_some() || ticked.is_some() {
+        b.note = None;
+    }
+    if let Some(i) = ticked {
+        b.cursor = Some(i);
+        b.select_toggle(i);
+        ask.pick = b.path_of_selection();
+    } else if let Some(i) = clicked {
+        b.cursor = Some(i);
+        if shift {
+            b.select_range(i);
+        } else if command {
+            b.select_toggle(i);
+            ask.pick = b.path_of_selection();
+        } else {
+            b.select_only(i);
+            ask.pick = Some(b.rows[i].path.clone());
+        }
+    }
+    if let Some(path) = toggle {
+        b.toggle(&path);
     }
 }
 
@@ -2533,7 +3207,10 @@ struct RemoteLoad {
     target: RemoteTarget,
     conn: remote::RemoteConnection,
     remote_path: String,
-    rx: std::sync::mpsc::Receiver<anyhow::Result<remote::Fetched>>,
+    /// The paths fetched after `remote_path`, to compare with it.
+    also: Vec<String>,
+    /// What was fetched: `remote_path`, then each of `also`.
+    rx: std::sync::mpsc::Receiver<anyhow::Result<Vec<remote::Fetched>>>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// How much was read from the server so far, shown while waiting, and since when.
     progress: std::sync::Arc<remote::Progress>,
@@ -5051,9 +5728,16 @@ impl OxideMergeApp {
             }
         }
         if let Some(b) = &mut d.browse {
-            if let Some(listed) = b.browser.poll() {
-                b.loading = false;
+            if let Some(path) = b.expanding.clone() {
+                // A folder opened in place: its entries go under it.
+                if let Some(listed) = b.browser.poll() {
+                    b.expanding = None;
+                    b.expanded(path, listed);
+                    ctx.request_repaint();
+                }
+            } else if let Some(listed) = b.browser.poll() {
                 ctx.request_repaint();
+                b.loading = false;
                 match listed {
                     Ok(l) => {
                         if d.remote_path == b.field {
@@ -5074,6 +5758,7 @@ impl OxideMergeApp {
                                 target: d.target,
                                 conn: b.conn.clone(),
                                 remote_path: b.asked.clone(),
+                                also: Vec::new(),
                                 dialog: Some(d),
                                 browse: true,
                             });
@@ -5084,7 +5769,10 @@ impl OxideMergeApp {
                 }
             }
         }
-        if d.browse.as_ref().is_some_and(|b| b.loading) {
+        if let Some(b) = &mut d.browse {
+            b.pump();
+        }
+        if d.browse.as_ref().is_some_and(|b| b.busy()) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let needs_password = matches!(d.target, RemoteTarget::Compare(_))
@@ -5093,12 +5781,16 @@ impl OxideMergeApp {
         // *Connect* needs no remote path: without one it lists the server to choose from.
         let ready = conn.is_some() && !needs_password;
         let (mut toggle_browse, mut go, mut pick, mut fetch_now) = (false, None, None, None);
+        let mut compare = None;
+        let mut items = None;
         // Whether an address in the host field was just taken apart into the other fields.
         let mut split = false;
         // The chooser takes the dialog's place while it is shown.
         if let Some(b) = &mut d.browse {
             let ask = remote_chooser(ctx, b, &d.remote_path, self.ask.is_none());
             (go, pick, fetch_now) = (ask.go, ask.pick, ask.fetch);
+            compare = ask.compare.filter(|paths| paths.len() > 1);
+            items = ask.items.filter(|(_, rels)| !rels.is_empty());
             if ask.cancel {
                 pick = Some(b.before.clone());
             }
@@ -5402,10 +6094,24 @@ impl OxideMergeApp {
             connect = true;
         }
         match conn {
+            // What is selected in the chooser is fetched and compared; the chooser stays as
+            // it is, to come back to if that fails or is stopped.
+            // What is ticked is fetched together, as a copy of the folder shown holding only
+            // that, for the path field; the chooser comes back if that fails or is stopped.
+            Some(conn) if items.is_some() && !cancel => {
+                let (base, rels) = items.unwrap_or_default();
+                let target = d.target;
+                self.open_remote(target, conn, base, rels, Some(d));
+            }
+            Some(conn) if compare.is_some() && !cancel => {
+                let mut paths = compare.unwrap_or_default();
+                let first = paths.remove(0);
+                self.open_remote(RemoteTarget::Selected, conn, first, paths, Some(d));
+            }
             Some(conn) if connect && !cancel && !d.remote_path.trim().is_empty() => {
                 let remote_path = d.remote_path.trim().to_string();
                 let target = d.target;
-                self.open_remote(target, conn, remote_path, Some(d));
+                self.open_remote(target, conn, remote_path, Vec::new(), Some(d));
             }
             _ if cancel => {
                 // The start page's fields were being compared, not a dialog of the user's:
@@ -5499,13 +6205,16 @@ impl OxideMergeApp {
     }
 
     /// Fetches `remote_path` over SFTP for `target`'s path field, authenticated as `conn`
-    /// says. Read on another thread, as a server may be slow or not answer; `dialog` comes
-    /// back if it fails or is stopped.
+    /// says. For [`RemoteTarget::Selected`], each path of `also` is fetched after it, to
+    /// compare with it; for a path field, `also` names entries of the folder `remote_path`
+    /// relative to it, fetched instead of all of it (see [`remote::fetch_selected`]). Read on another thread, as a server may be slow or not
+    /// answer; `dialog` comes back if it fails or is stopped.
     fn open_remote(
         &mut self,
         target: RemoteTarget,
         conn: remote::RemoteConnection,
         remote_path: String,
+        also: Vec<String>,
         dialog: Option<RemoteDialog>,
     ) {
         if let Some(old) = self.remote_load.take() {
@@ -5514,6 +6223,8 @@ impl OxideMergeApp {
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (c, p, stop) = (conn.clone(), remote_path.clone(), cancel.clone());
+        let more = also.clone();
+        let selected = matches!(target, RemoteTarget::Selected);
         let mode = if conn.protocol == remote::Protocol::Sftp
             && dialog.as_ref().is_some_and(|d| d.list_folder)
         {
@@ -5531,8 +6242,15 @@ impl OxideMergeApp {
         let progress = std::sync::Arc::<remote::Progress>::default();
         let counted = progress.clone();
         let fetch = move || {
-            let fetched =
-                remote::with_progress(&counted, || remote::fetch_with(&c, &p, &stop, mode));
+            let fetched = remote::with_progress(&counted, || {
+                if !selected && !more.is_empty() {
+                    return remote::fetch_selected(&c, &p, &more, &stop).map(|f| vec![f]);
+                }
+                std::iter::once(&p)
+                    .chain(&more)
+                    .map(|path| remote::fetch_with(&c, path, &stop, mode))
+                    .collect::<anyhow::Result<Vec<_>>>()
+            });
             let _ = tx.send(fetched);
         };
         if on_this_thread {
@@ -5544,6 +6262,7 @@ impl OxideMergeApp {
             target,
             conn,
             remote_path,
+            also,
             rx,
             cancel,
             progress,
@@ -5566,7 +6285,20 @@ impl OxideMergeApp {
             Err(std::sync::mpsc::TryRecvError::Empty) => None,
         };
         let Some(result) = result else {
-            let label = remote::label(&load.conn, &load.remote_path);
+            let mut label = remote::label(&load.conn, &load.remote_path);
+            // More paths fetched to compare with it, or the entries of the folder fetched.
+            match load.also.len() {
+                0 => {}
+                n if matches!(load.target, RemoteTarget::Selected) => {
+                    label = format!("{label}  (+{n})");
+                }
+                n => {
+                    label = format!(
+                        "{label}  ({})",
+                        trf("msg.remote_selected_count", &[("count", n.to_string())])
+                    )
+                }
+            }
             let mut stop = false;
             egui::Modal::new(egui::Id::unique("remote_load_dialog")).show(ctx, |ui| {
                 ui.set_width(480.0);
@@ -5625,7 +6357,15 @@ impl OxideMergeApp {
                     conn.auth = remote::Auth::Agent;
                 }
                 self.cfg.add_recent_remote(recent_remote(&conn));
-                self.use_remote_fetch(load.target, conn, load.remote_path, fetched);
+                let mut paths = load.also;
+                paths.insert(0, load.remote_path);
+                if matches!(load.target, RemoteTarget::Selected) {
+                    self.compare_remote_selection(conn, paths, fetched, load.dialog);
+                } else if let (Some(path), Some(fetched)) =
+                    (paths.into_iter().next(), fetched.into_iter().next())
+                {
+                    self.use_remote_fetch(load.target, conn, path, fetched);
+                }
             }
             Ok(_) => self.remote_dlg = load.dialog,
             Err(e) => match e.downcast::<remote::UnknownHost>() {
@@ -5635,6 +6375,7 @@ impl OxideMergeApp {
                         target: load.target,
                         conn: load.conn,
                         remote_path: load.remote_path,
+                        also: load.also,
                         dialog: load.dialog,
                         browse: false,
                     });
@@ -5720,7 +6461,7 @@ impl OxideMergeApp {
                         d
                     });
                 }
-                Ok(()) => self.open_remote(p.target, p.conn, p.remote_path, p.dialog),
+                Ok(()) => self.open_remote(p.target, p.conn, p.remote_path, p.also, p.dialog),
                 Err(e) => {
                     self.error(format!("{e:#}"));
                     self.remote_dlg = p.dialog;
@@ -5769,6 +6510,7 @@ impl OxideMergeApp {
                 d.paths[s] = shown;
                 self.open_dlg = Some(d);
             }
+            RemoteTarget::Selected => {}
         }
         self.stage_fetch(conn, remote_path, fetched);
         if matches!(target, RemoteTarget::Compare(_)) {
@@ -5776,6 +6518,47 @@ impl OxideMergeApp {
             self.submit_open(d);
         } else if compare {
             self.submit_start();
+        }
+    }
+
+    /// Compares with each other what was selected in the remote chooser's list: `fetched`,
+    /// from `paths` over `conn`, in the order they were listed. No path field is filled in,
+    /// and a comparison form left open is not needed any more. If they cannot be compared
+    /// after all (a link selected with files turned out to be a folder, say), `dialog` comes
+    /// back with its chooser, saying why, and the copies fetched are let go.
+    fn compare_remote_selection(
+        &mut self,
+        conn: remote::RemoteConnection,
+        paths: Vec<String>,
+        fetched: Vec<remote::Fetched>,
+        dialog: Option<RemoteDialog>,
+    ) {
+        // A link is known for a file or a folder only once it is fetched.
+        let folders = fetched.iter().filter(|f| f.is_dir).count();
+        if folders > 0 && folders < fetched.len() {
+            self.remote_dlg = dialog;
+            let count = ("count", fetched.len().to_string());
+            self.error(trf("msg.remote_select_mixed", &[count]));
+            return;
+        }
+        let mut local = Vec::with_capacity(paths.len());
+        let mut descriptions = Vec::with_capacity(paths.len());
+        for (path, fetched) in paths.into_iter().zip(fetched) {
+            local.push(fetched.local.clone());
+            descriptions.push(Some(remote::label(&conn, &path)));
+            self.stage_fetch(conn.clone(), path, fetched);
+        }
+        let form = self.open_dlg.take();
+        let request = OpenRequest {
+            paths: local.clone(),
+            descriptions,
+            ..Default::default()
+        };
+        if let Opened::Failed(e) = self.open_quietly(request, None) {
+            self.pending_remote.retain(|p| !local.contains(&p.local));
+            self.open_dlg = form;
+            self.remote_dlg = dialog;
+            self.error(e);
         }
     }
 
@@ -5822,12 +6605,13 @@ impl OxideMergeApp {
         {
             return Ok(false);
         }
+        // Two folders, or three, each listed or local.
         anyhow::ensure!(
-            req.paths.len() == 2 && req.kind.is_none(),
+            matches!(req.paths.len(), 2 | 3) && req.kind.is_none(),
             "{}",
             tr("remote_compare.two_folders")
         );
-        let mut sides = Vec::with_capacity(2);
+        let mut sides = Vec::with_capacity(req.paths.len());
         for path in &req.paths {
             if let Some(p) = pending(path) {
                 anyhow::ensure!(p.list_folder, "{}", tr("remote_compare.two_folders"));
@@ -5852,12 +6636,14 @@ impl OxideMergeApp {
             options.method = method;
         }
         let view = super::remote_folder::RemoteFolder::new(
-            sides.try_into().ok().expect("two folder sides"),
+            sides,
             req.filter
                 .clone()
                 .unwrap_or_else(|| self.cfg.filter.clone()),
             options,
-            std::array::from_fn(|side| req.read_only.get(side).copied().unwrap_or(false)),
+            (0..req.paths.len())
+                .map(|side| req.read_only.get(side).copied().unwrap_or(false))
+                .collect(),
             req.rules.clone().unwrap_or_else(|| self.cfg.rules.clone()),
             &self.named_filters,
         );
@@ -5883,8 +6669,8 @@ impl OxideMergeApp {
     fn open_live_remote_files(&mut self, request: super::remote_folder::OpenFiles) {
         let parent = self.tabs[self.active].id;
         let count = self.tabs.len();
-        let mut paths = Vec::with_capacity(2);
-        let mut descriptions = Vec::with_capacity(2);
+        let mut paths = Vec::with_capacity(request.files.len());
+        let mut descriptions = Vec::with_capacity(request.files.len());
         for file in request.files {
             paths.push(file.path);
             descriptions.push(file.fetched.map(|(conn, path, fetched)| {
@@ -5896,7 +6682,7 @@ impl OxideMergeApp {
         self.open(OpenRequest {
             paths,
             descriptions,
-            read_only: request.read_only.to_vec(),
+            read_only: request.read_only,
             rules: Some(request.rules),
             skip_recent: true,
             ..Default::default()
@@ -6542,6 +7328,14 @@ impl OxideMergeApp {
                 if r.as_ref().is_some_and(|r| r.manifest.is_some()) {
                     v.set_remote_side(i);
                 }
+            }
+            // Sides holding only some of a server's folder: every side shows only those.
+            let chosen: Vec<String> = (remote.iter().flatten())
+                .filter_map(|r| r.manifest.as_ref())
+                .flat_map(|m| m.chosen.iter().cloned())
+                .collect();
+            if !chosen.is_empty() {
+                v.show_only(&chosen);
             }
         }
         self.tabs.push(Tab {
@@ -8600,7 +9394,7 @@ impl OxideMergeApp {
         }
         let names = sides
             .iter()
-            .map(|(_, conn, path, _)| remote::label(conn, path))
+            .map(|(_, conn, path, ..)| remote::label(conn, path))
             .collect::<Vec<_>>()
             .join("\n");
         let (tab_id, keep) = (tab.id, tab.shown_temps());
@@ -8608,9 +9402,9 @@ impl OxideMergeApp {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = cancel.clone();
         let run = move || {
-            for (side, conn, path, local) in sides {
+            for (side, conn, path, local, chosen) in sides {
                 if tx
-                    .send((side, remote::refetch(&conn, &path, &local, &stop)))
+                    .send((side, remote::refetch(&conn, &path, &local, &chosen, &stop)))
                     .is_err()
                 {
                     return;
@@ -11369,7 +12163,13 @@ impl OxideMergeApp {
                     } else {
                         conn.auth = remote::Auth::AgentKeysOnly;
                     }
-                    self.open_remote(target, conn, dialog.remote_path.clone(), Some(dialog));
+                    self.open_remote(
+                        target,
+                        conn,
+                        dialog.remote_path.clone(),
+                        Vec::new(),
+                        Some(dialog),
+                    );
                 }
                 Err(error) => self.error(format!("{error:#}")),
             }

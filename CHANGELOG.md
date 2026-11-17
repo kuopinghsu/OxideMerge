@@ -7,7 +7,15 @@ release on GitHub uses its section of this file as the release notes.
 
 ### Added
 
-- SFTP can compare folders from directory listings, then verify file contents on demand.
+- The list of a server's folders and files in the SFTP/FTP connection dialog is a tree: the
+  arrow before a folder shows what is in it, in place, listed when it is first opened.
+  Each entry has a check box: tick any number of files and folders, and *OK* fetches only
+  those, as a copy of the folder holding nothing else, to compare with another folder, local or
+  on a server; the comparison shows only those entries, on both sides. Or select two or three files, or two or three folders, and *Compare selected*
+  fetches them and compares them with each other; the list says why a selection cannot be. Clicking a folder now selects it;
+  double-click it, or press Enter, to open it.
+- SFTP can compare folders from directory listings, two or three at a time, then verify file
+  contents on demand.
   Enable *List folders without downloading files* for local-to-remote or remote-to-remote
   comparisons. The default full download supports folder-wide copy, delete, and save operations.
 - The remote connection dialog remembers the ten most recent servers across restarts.

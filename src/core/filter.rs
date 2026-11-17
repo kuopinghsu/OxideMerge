@@ -28,6 +28,53 @@ impl Skipped {
     }
 }
 
+/// The only files and folders a folder compare shows, by their paths relative to the
+/// compared root with `/` separators: each, what is inside a folder of them, and the folders
+/// on the way to them. Where names do not tell case apart, neither does it.
+#[derive(Debug, Default)]
+pub struct Chosen {
+    paths: Vec<String>,
+}
+
+impl Chosen {
+    pub fn new(paths: impl IntoIterator<Item = String>) -> Self {
+        let paths = paths
+            .into_iter()
+            .map(|p| Self::key(p.trim_matches('/')))
+            .filter(|p| !p.is_empty())
+            .collect();
+        Chosen { paths }
+    }
+
+    fn key(path: &str) -> String {
+        if cfg!(any(windows, target_os = "macos")) {
+            path.to_lowercase()
+        } else {
+            path.to_string()
+        }
+    }
+
+    /// Whether `inner` is `outer` or inside it.
+    fn within(inner: &str, outer: &str) -> bool {
+        inner == outer
+            || inner
+                .strip_prefix(outer)
+                .is_some_and(|r| r.starts_with('/'))
+    }
+
+    fn file(&self, rel: &str) -> bool {
+        let rel = Self::key(rel);
+        self.paths.iter().any(|p| Self::within(&rel, p))
+    }
+
+    fn dir(&self, rel: &str) -> bool {
+        let rel = Self::key(rel);
+        self.paths
+            .iter()
+            .any(|p| Self::within(&rel, p) || Self::within(p, &rel))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FltFilter {
     pub name: String,
@@ -50,6 +97,8 @@ pub enum FileFilter {
     Flt(FltFilter),
     /// What the filter keeps, but for the files and folders named.
     Except(Box<FileFilter>, Arc<Skipped>),
+    /// What the filter keeps of the files and folders chosen, and nothing else.
+    Only(Box<FileFilter>, Arc<Chosen>),
 }
 
 pub const FLT_PREFIX: &str = "[F] ";
@@ -146,6 +195,7 @@ impl FileFilter {
             FileFilter::Except(inner, skipped) => {
                 inner.excludes_anything() || !(skipped.files.is_empty() && skipped.dirs.is_empty())
             }
+            FileFilter::Only(..) => true,
         }
     }
 
@@ -171,6 +221,9 @@ impl FileFilter {
             }
             FileFilter::Except(inner, skipped) => {
                 !skipped.files.contains(rel_path) && inner.include_file(rel_path, name)
+            }
+            FileFilter::Only(inner, chosen) => {
+                chosen.file(rel_path) && inner.include_file(rel_path, name)
             }
         }
     }
@@ -199,6 +252,9 @@ impl FileFilter {
             }
             FileFilter::Except(inner, skipped) => {
                 !skipped.dirs.contains(rel_path) && inner.include_dir(rel_path, name)
+            }
+            FileFilter::Only(inner, chosen) => {
+                chosen.dir(rel_path) && inner.include_dir(rel_path, name)
             }
         }
     }
@@ -361,6 +417,40 @@ mod tests {
         // What the filter itself leaves out stays out.
         let skipped = Arc::new(Skipped::new(Vec::new()));
         let f = FileFilter::Except(Box::new(FileFilter::parse_mask("*.rs")), skipped);
+        assert!(!f.include_file("a.txt", "a.txt"));
+    }
+
+    #[test]
+    fn only_the_chosen_paths_what_is_in_them_and_the_way_to_them_are_kept() {
+        let chosen = Chosen::new(["a.txt", "data", "deep/er/e.txt"].map(String::from));
+        let f = FileFilter::Only(Box::new(FileFilter::parse_mask("*.*")), Arc::new(chosen));
+        assert!(f.excludes_anything());
+        assert!(f.include_file("a.txt", "a.txt"));
+        assert!(!f.include_file("b.txt", "b.txt"));
+        assert!(f.include_dir("data", "data"));
+        assert!(f.include_dir("data/sub", "sub"));
+        assert!(
+            f.include_file("data/sub/d.txt", "d.txt"),
+            "inside a chosen folder"
+        );
+        assert!(
+            !f.include_dir("database", "database"),
+            "a name that only starts the same"
+        );
+        assert!(f.include_dir("deep", "deep") && f.include_dir("deep/er", "er"));
+        assert!(f.include_file("deep/er/e.txt", "e.txt"));
+        assert!(
+            !f.include_file("deep/er/not.txt", "not.txt"),
+            "beside, not on the way"
+        );
+        assert!(!f.include_file("deep/x.txt", "x.txt"));
+        assert_eq!(
+            f.include_file("A.TXT", "A.TXT"),
+            cfg!(any(windows, target_os = "macos"))
+        );
+        // What the filter itself leaves out stays out.
+        let chosen = Arc::new(Chosen::new(["a.txt".to_string()]));
+        let f = FileFilter::Only(Box::new(FileFilter::parse_mask("*.rs")), chosen);
         assert!(!f.include_file("a.txt", "a.txt"));
     }
 

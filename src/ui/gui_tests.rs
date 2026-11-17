@@ -279,6 +279,14 @@ impl Gui {
         }
     }
 
+    /// Clicks the widget named `label` twice, long enough after the last click for the two not
+    /// to count as part of a triple-click.
+    fn double_click(&mut self, label: &str) {
+        self.time += 1.0;
+        self.click(label);
+        self.click(label);
+    }
+
     fn click_at(&mut self, at: Pos2) {
         self.events.push(Event::PointerMoved(at));
         self.frame();
@@ -4387,15 +4395,18 @@ fn the_connection_dialog_lists_the_servers_folders_to_pick_the_remote_path_from(
     // The list is a chooser in the dialog's place, which comes back with what was chosen.
     assert!(!gui.shows(tr("btn.connect")));
 
-    // Clicking a folder opens it; clicking a file picks it; *Up* goes back.
+    // Clicking a folder or a file picks it; double-clicking a folder opens it; *Up* goes back.
     gui.click("srv");
+    assert_eq!(remote_path(&gui), "/home/ann/srv");
+    assert!(gui.shows("notes.txt") && !gui.shows("a.txt"));
+    gui.double_click("srv");
     assert_eq!(remote_path(&gui), "/home/ann/srv");
     assert!(gui.shows("a.txt") && !gui.shows("notes.txt"));
     gui.click("b.txt");
     assert_eq!(remote_path(&gui), "/home/ann/srv/b.txt");
     gui.click(tr("btn.remote_up"));
     assert_eq!(remote_path(&gui), "/home/ann");
-    gui.click("srv");
+    gui.double_click("srv");
     gui.click("a.txt");
     gui.click(tr("btn.ok"));
     assert!(gui.app.remote_dlg.as_ref().unwrap().browse.is_none());
@@ -4465,7 +4476,8 @@ fn connecting_without_a_remote_path_lists_the_server_and_fetches_what_is_chosen(
     assert!(gui.errors().is_empty(), "{:?}", gui.errors());
     assert!(gui.app.remote_load.is_none(), "nothing is fetched yet");
     assert!(gui.app.remote_dlg.as_ref().unwrap().browse.is_some());
-    gui.click("srv");
+    // The folder is opened in place, and the file picked inside it.
+    gui.click(&trf("folder.expand", &[("name", "srv".to_string())]));
     gui.click("a.txt");
     gui.click(tr("btn.ok"));
     assert!(gui.app.remote_dlg.is_none(), "what was chosen is fetched");
@@ -4583,11 +4595,11 @@ fn the_remote_chooser_keeps_its_size_and_place_whatever_it_lists() {
     assert!(gui.shows("empty") && gui.shows("few") && gui.shows("many"));
 
     // Three entries, three thousand with names far wider than the chooser, and none.
-    gui.click("few");
+    gui.double_click("few");
     assert!(gui.shows("a.txt") && gui.shows("c.txt"));
     assert_eq!(place(&mut gui), at_first, "with three entries");
     gui.click(tr("btn.remote_up"));
-    gui.click("many");
+    gui.double_click("many");
     assert_eq!(remote_path(&gui), "/data/many");
     assert_eq!(place(&mut gui), at_first, "with three thousand entries");
     let rows: Vec<Rect> = gui
@@ -4658,6 +4670,491 @@ fn the_remote_chooser_keeps_its_size_and_place_whatever_it_lists() {
     assert!(d.browse.is_none());
     assert_eq!(d.remote_path, "/data");
     assert!(gui.shows(tr("btn.connect")));
+
+    remote::fake::uninstall();
+}
+
+/// The chooser's list is a tree: a folder opens in place, listed when it is first opened.
+/// Several entries can be selected, with Ctrl and Shift, and compared with each other: two or
+/// three files, or two or three folders. Anything else says why it cannot be compared.
+#[test]
+fn the_remote_chooser_opens_folders_in_place_and_compares_what_is_selected() {
+    use remote::EntryKind::{Dir, File, Link};
+    assert_eq!(remote_selection_problem(&[]), Some("msg.remote_select_few"));
+    assert_eq!(
+        remote_selection_problem(&[File]),
+        Some("msg.remote_select_few")
+    );
+    assert_eq!(remote_selection_problem(&[File, File]), None);
+    assert_eq!(remote_selection_problem(&[File, File, File]), None);
+    assert_eq!(remote_selection_problem(&[Dir, Dir]), None);
+    assert_eq!(remote_selection_problem(&[Dir, Dir, Dir]), None);
+    assert_eq!(remote_selection_problem(&[File, Link]), None);
+    assert_eq!(
+        remote_selection_problem(&[File, Dir]),
+        Some("msg.remote_select_mixed")
+    );
+    assert_eq!(
+        remote_selection_problem(&[Dir, Dir, File]),
+        Some("msg.remote_select_mixed")
+    );
+    assert_eq!(
+        remote_selection_problem(&[File; 4]),
+        Some("msg.remote_select_many")
+    );
+
+    let server = || {
+        remote::fake::Server::new()
+            .dir("/data")
+            .dir("/data/one")
+            .dir("/data/one/sub")
+            .file("/data/one/sub/deep.txt", "deep\n")
+            .file("/data/one/inner.txt", "one\n")
+            .dir("/data/two")
+            .file("/data/two/inner.txt", "two\n")
+            .dir("/data/zed")
+            .file("/data/zed/inner.txt", "zed\n")
+            .file("/data/w.txt", "w\n")
+            .file("/data/x.txt", "x\n")
+            .file("/data/y.txt", "y\n")
+            .file("/data/z.txt", "z\n")
+    };
+    remote::fake::install(server());
+    let mut gui = Gui::start("remote_tree_select", None);
+    // Opens the chooser on `/data`, over `protocol`.
+    let list = |gui: &mut Gui, protocol: remote::Protocol| {
+        gui.app.start_remote_connect(RemoteTarget::Start(0));
+        gui.frames(2);
+        {
+            let d = gui.app.remote_dlg.as_mut().unwrap();
+            d.set_protocol(protocol);
+            d.host = "example.com".to_string();
+            d.user = "ann".to_string();
+            d.remote_path = "/data".to_string();
+        }
+        gui.frames(2);
+        gui.click(tr("btn.list_remote"));
+        gui.frames(3);
+    };
+    fn browse(gui: &Gui) -> &RemoteBrowse {
+        let d = gui.app.remote_dlg.as_ref().expect("the dialog");
+        d.browse.as_ref().expect("the chooser")
+    }
+    let selected = |gui: &Gui| -> Vec<String> { browse(gui).selection.iter().cloned().collect() };
+    let name = |key: &'static str, name: &str| trf(key, &[("name", name.to_string())]);
+    let compare = tr("btn.remote_compare_selected");
+    let says = |gui: &Gui, key: &'static str, count: usize| {
+        gui.shows(&trf(key, &[("count", count.to_string())]))
+    };
+
+    list(&mut gui, remote::Protocol::Sftp);
+    assert!(gui.shows("one") && gui.shows("two") && gui.shows("x.txt"));
+    assert!(
+        !gui.shows("inner.txt"),
+        "only the folder asked for is listed"
+    );
+    assert!(browse(&gui).children.is_empty());
+
+    // A folder opens in place, its entries under it and the rest of the list after them;
+    // closing it hides them, and opening it again does not ask the server again.
+    gui.click(&name("folder.expand", "one"));
+    assert!(gui.shows("inner.txt") && gui.shows("sub") && gui.shows("x.txt"));
+    assert!(
+        !gui.shows("deep.txt"),
+        "a folder inside it is not listed yet"
+    );
+    let shown: Vec<&str> = (browse(&gui).rows.iter())
+        .map(|r| r.path.as_str())
+        .collect();
+    assert_eq!(
+        shown[..4],
+        [
+            "/data/one",
+            "/data/one/sub",
+            "/data/one/inner.txt",
+            "/data/two"
+        ]
+    );
+    assert!(
+        gui.widget("inner.txt").rect.left() >= gui.widget("x.txt").rect.left(),
+        "rows are as wide as the list"
+    );
+    gui.click(&name("folder.expand", "sub"));
+    assert!(gui.shows("deep.txt"));
+    gui.click(&name("folder.collapse", "one"));
+    assert!(!gui.shows("inner.txt") && !gui.shows("deep.txt") && gui.shows("x.txt"));
+    remote::fake::install(remote::fake::Server::new().failing("connection lost"));
+    gui.click(&name("folder.expand", "one"));
+    assert!(gui.shows("inner.txt") && gui.shows("deep.txt"));
+    assert!(!gui.shows_text("connection lost"));
+    remote::fake::install(server());
+    gui.click(&name("folder.collapse", "one"));
+
+    // The keyboard opens and closes the folder it is on with Right and Left.
+    gui.click("two");
+    assert_eq!(selected(&gui), ["/data/two"]);
+    gui.key(Modifiers::NONE, Key::ArrowRight);
+    gui.frames(3);
+    assert!(browse(&gui).open.contains("/data/two") && gui.shows("inner.txt"));
+    gui.key(Modifiers::NONE, Key::ArrowRight);
+    assert_eq!(selected(&gui), ["/data/two/inner.txt"], "into the folder");
+    gui.key(Modifiers::NONE, Key::ArrowLeft);
+    assert_eq!(selected(&gui), ["/data/two"], "out to the folder");
+    gui.key(Modifiers::NONE, Key::ArrowLeft);
+    gui.frames(2);
+    assert!(!gui.shows("inner.txt"));
+
+    // One entry cannot be compared, and the button says so.
+    gui.click("x.txt");
+    assert_eq!(selected(&gui), ["/data/x.txt"]);
+    assert!(!gui.widget(compare).enabled);
+    assert!(gui.shows(&remote_browse_hint()));
+    assert!(gui.widget(tr("btn.ok")).enabled);
+
+    // Ctrl-click adds an entry to what is selected, or takes it out: a file with a folder
+    // cannot be compared.
+    gui.modifiers = CMD;
+    gui.click("one");
+    assert_eq!(selected(&gui), ["/data/one", "/data/x.txt"]);
+    assert!(!gui.widget(compare).enabled);
+    assert!(says(&gui, "msg.remote_select_mixed", 2));
+    assert!(
+        gui.widget(tr("btn.ok")).enabled,
+        "OK takes several, to compare with another folder"
+    );
+    gui.click("one");
+    assert_eq!(selected(&gui), ["/data/x.txt"]);
+    // Taking the last entry out leaves nothing selected, shown so, and the folder as the
+    // path; putting it back selects it again.
+    gui.click("x.txt");
+    assert!(selected(&gui).is_empty());
+    assert_eq!(gui.app.remote_dlg.as_ref().unwrap().remote_path, "/data");
+    let shown_selected = |gui: &Gui| gui.widget("x.txt").toggled == Some(accesskit::Toggled::True);
+    assert!(!shown_selected(&gui));
+    gui.click("x.txt");
+    assert_eq!(selected(&gui), ["/data/x.txt"]);
+    assert_eq!(
+        gui.app.remote_dlg.as_ref().unwrap().remote_path,
+        "/data/x.txt"
+    );
+    assert!(shown_selected(&gui));
+
+    // Shift-click selects a range, and so do the arrows with Shift: three files can be
+    // compared, four cannot.
+    gui.modifiers = Modifiers::NONE;
+    gui.click("x.txt");
+    gui.modifiers = Modifiers::SHIFT;
+    gui.click("z.txt");
+    assert_eq!(
+        selected(&gui),
+        ["/data/x.txt", "/data/y.txt", "/data/z.txt"]
+    );
+    assert!(gui.widget(compare).enabled);
+    assert!(says(&gui, "msg.remote_selected", 3));
+    gui.modifiers = CMD;
+    gui.click("w.txt");
+    assert_eq!(selected(&gui).len(), 4);
+    assert!(!gui.widget(compare).enabled);
+    assert!(says(&gui, "msg.remote_select_many", 4));
+    gui.modifiers = Modifiers::NONE;
+    gui.click("x.txt");
+    gui.key(Modifiers::SHIFT, Key::ArrowDown);
+    assert_eq!(selected(&gui), ["/data/x.txt", "/data/y.txt"]);
+    assert!(says(&gui, "msg.remote_selected", 2));
+
+    // Two files selected open as a file compare, each fetched from the server.
+    gui.click(compare);
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert!(gui.app.remote_dlg.is_none() && gui.app.remote_load.is_none());
+    assert_eq!(gui.app.tabs.len(), 1);
+    let Content::Text(v) = gui.app.tabs[0].content.view() else {
+        panic!("a file compare");
+    };
+    let texts: Vec<String> = (v.panes.iter()).map(|p| p.doc.lines.join("\n")).collect();
+    assert_eq!(texts, ["x", "y"]);
+
+    // Two folders selected open as a folder compare, here over FTP.
+    list(&mut gui, remote::Protocol::Ftp);
+    gui.click("one");
+    gui.modifiers = CMD;
+    gui.click("two");
+    gui.modifiers = Modifiers::NONE;
+    assert_eq!(selected(&gui), ["/data/one", "/data/two"]);
+    assert!(gui.widget(compare).enabled);
+    gui.click(compare);
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert!(gui.app.remote_dlg.is_none());
+    assert_eq!(gui.app.tabs.len(), 2);
+    assert!(matches!(gui.app.tabs[1].content.view(), Content::Folder(_)));
+
+    // Three files open as a three-way compare.
+    list(&mut gui, remote::Protocol::Sftp);
+    gui.click("x.txt");
+    gui.modifiers = Modifiers::SHIFT;
+    gui.click("z.txt");
+    gui.modifiers = Modifiers::NONE;
+    gui.click(compare);
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(gui.app.tabs.len(), 3);
+    let Content::Text(v) = gui.app.tabs[2].content.view() else {
+        panic!("a three-way file compare");
+    };
+    assert_eq!(v.panes.len(), 3);
+
+    // With *List folders without downloading files*, two SFTP folders selected are compared
+    // from their listings.
+    list(&mut gui, remote::Protocol::Sftp);
+    gui.app.remote_dlg.as_mut().unwrap().list_folder = true;
+    gui.click("one");
+    gui.modifiers = CMD;
+    gui.click("two");
+    gui.modifiers = Modifiers::NONE;
+    gui.click(compare);
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(gui.app.tabs.len(), 4);
+    assert!(matches!(gui.app.tabs[3].content, Content::RemoteFolder(_)));
+
+    // So are three: a file all three have opens as a three-way compare.
+    list(&mut gui, remote::Protocol::Sftp);
+    gui.app.remote_dlg.as_mut().unwrap().list_folder = true;
+    gui.click("one");
+    gui.modifiers = Modifiers::SHIFT;
+    gui.click("zed");
+    gui.modifiers = Modifiers::NONE;
+    assert_eq!(selected(&gui), ["/data/one", "/data/two", "/data/zed"]);
+    gui.click(compare);
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(gui.app.tabs.len(), 5);
+    let Content::RemoteFolder(view) = &gui.app.tabs[4].content else {
+        panic!("a comparison of the folders' listings");
+    };
+    assert_eq!(
+        view.title(),
+        ["one", "two", "zed"]
+            .map(|name| format!("sftp://ann@example.com:22/data/{name}"))
+            .join(" ↔ ")
+    );
+    // Only the first folder has `sub`.
+    let only = ("side", tr("side.left").to_string());
+    assert!(gui.shows(&trf("status.only", &[only])));
+    gui.click("inner.txt");
+    gui.click(tr("remote_compare.verify_selected"));
+    gui.settle();
+    assert!(gui.shows(tr("remote_compare.content_different")));
+    gui.click(tr("remote_compare.open"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(gui.app.tabs.len(), 6);
+    let Content::Text(v) = gui.app.tabs[5].content.view() else {
+        panic!("a three-way file compare");
+    };
+    let texts: Vec<String> = (v.panes.iter()).map(|p| p.doc.lines.join("\n")).collect();
+    assert_eq!(texts, ["one", "two", "zed"]);
+
+    // What was fetched and cannot be compared after all (a link that was a folder, selected
+    // with a file) comes back to the chooser, which says why, and keeps no copy of it.
+    list(&mut gui, remote::Protocol::Sftp);
+    let dialog = gui.app.remote_dlg.take().expect("the dialog");
+    let conn = dialog.conn().expect("a connection");
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let paths = vec!["/data/x.txt".to_string(), "/data/one".to_string()];
+    let fetched: Vec<remote::Fetched> = (paths.iter())
+        .map(|path| remote::fetch(&conn, path, &never).unwrap())
+        .collect();
+    let staged = gui.app.pending_remote.len();
+    gui.app
+        .compare_remote_selection(conn, paths, fetched, Some(dialog));
+    gui.frames(2);
+    let count = ("count", "2".to_string());
+    assert_eq!(
+        gui.errors(),
+        [trf("msg.remote_select_mixed", &[count])],
+        "why it cannot be compared"
+    );
+    assert_eq!(gui.app.tabs.len(), 6);
+    assert_eq!(gui.app.pending_remote.len(), staged);
+    let d = gui.app.remote_dlg.as_ref().expect("the dialog is back");
+    assert!(d.browse.is_some(), "with its chooser");
+
+    // Any number of entries, files and folders together, ticked with their check boxes:
+    // *OK* fetches only those, as a copy of the folder shown, into the path field, to compare
+    // with another folder; here a local one.
+    gui.app.start_paths = Default::default();
+    gui.app.toasts.clear();
+    list(&mut gui, remote::Protocol::Sftp);
+    let tick = |gui: &mut Gui, name: &str| {
+        gui.click_a(
+            accesskit::Role::CheckBox,
+            &trf("label.remote_tick", &[("name", name.to_string())]),
+        )
+    };
+    for name in ["one", "w.txt", "x.txt", "y.txt", "z.txt"] {
+        tick(&mut gui, name);
+    }
+    assert_eq!(selected(&gui).len(), 5);
+    assert!(says(&gui, "msg.remote_select_many", 5));
+    assert!(
+        !gui.widget(compare).enabled,
+        "with each other, three at most"
+    );
+    tick(&mut gui, "w.txt");
+    assert_eq!(
+        selected(&gui).len(),
+        4,
+        "a check box takes its entry out too"
+    );
+    tick(&mut gui, "w.txt");
+    gui.click(tr("btn.ok"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert!(gui.app.remote_dlg.is_none());
+    let copy = PathBuf::from(&gui.app.start_paths[0]);
+    let mut fetched: Vec<String> = walkdir::WalkDir::new(&copy)
+        .min_depth(1)
+        .into_iter()
+        .map(|e| {
+            let e = e.unwrap();
+            let rel = e.path().strip_prefix(&copy).unwrap();
+            rel.to_string_lossy().replace('\\', "/")
+        })
+        .collect();
+    fetched.sort();
+    assert_eq!(
+        fetched,
+        [
+            "one",
+            "one/inner.txt",
+            "one/sub",
+            "one/sub/deep.txt",
+            "w.txt",
+            "x.txt",
+            "y.txt",
+            "z.txt"
+        ],
+        "only what was ticked"
+    );
+    let local = tempfile::tempdir().unwrap();
+    for (file, text) in [("x.txt", "x\n"), ("y.txt", "changed\n"), ("extra.txt", "!")] {
+        std::fs::write(local.path().join(file), text).unwrap();
+    }
+    gui.app.start_paths[2] = local.path().display().to_string();
+    let before = gui.app.tabs.len();
+    gui.app.submit_start();
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    assert_eq!(gui.app.tabs.len(), before + 1);
+    let Content::Folder(v) = gui.app.tabs[before].content.view() else {
+        panic!("a folder compare");
+    };
+    assert!(v.is_remote_side(0));
+    // Only what was ticked, on both sides: not what else the local folder holds.
+    assert!(gui.shows("x.txt") && gui.shows("y.txt") && gui.shows("one"));
+    assert!(!gui.shows("extra.txt"));
+
+    // A folder ticked ticks what it holds, those listed only later too; taking one out of it
+    // unticks the folder and keeps what is beside it ticked.
+    list(&mut gui, remote::Protocol::Sftp);
+    let ticked = |gui: &Gui, name: &str| {
+        let label = trf("label.remote_tick", &[("name", name.to_string())]);
+        gui.widget(&label).toggled == Some(accesskit::Toggled::True)
+    };
+    gui.click(&name("folder.expand", "one"));
+    tick(&mut gui, "one");
+    assert!(ticked(&gui, "one") && ticked(&gui, "inner.txt") && ticked(&gui, "sub"));
+    assert!(!ticked(&gui, "two") && !ticked(&gui, "x.txt"));
+    gui.click(&name("folder.expand", "sub"));
+    assert!(
+        ticked(&gui, "deep.txt"),
+        "listed after the folder was ticked"
+    );
+    assert_eq!(
+        selected(&gui),
+        ["/data/one"],
+        "the folder stands for what it holds"
+    );
+    tick(&mut gui, "deep.txt");
+    assert!(!ticked(&gui, "one") && !ticked(&gui, "sub") && !ticked(&gui, "deep.txt"));
+    assert!(ticked(&gui, "inner.txt"));
+    assert_eq!(selected(&gui), ["/data/one/inner.txt"]);
+    // Closing the folder keeps what is ticked in it: still counted, and shown again on opening.
+    gui.click(&name("folder.collapse", "one"));
+    assert!(!gui.shows("inner.txt"));
+    assert_eq!(selected(&gui), ["/data/one/inner.txt"]);
+    gui.modifiers = CMD;
+    gui.click("x.txt");
+    gui.modifiers = Modifiers::NONE;
+    assert!(
+        says(&gui, "msg.remote_selected", 2),
+        "one in a folder closed counts"
+    );
+    gui.click(&name("folder.expand", "one"));
+    assert!(ticked(&gui, "inner.txt"));
+    tick(&mut gui, "x.txt");
+    // Ticking the folder again takes in what was ticked inside it.
+    tick(&mut gui, "one");
+    assert_eq!(selected(&gui), ["/data/one"]);
+    assert!(ticked(&gui, "deep.txt"));
+    tick(&mut gui, "one");
+    assert!(selected(&gui).is_empty() && !ticked(&gui, "inner.txt"));
+    // In a folder of more entries than are listed, one cannot be left out: the list says so,
+    // and the folder stays ticked.
+    tick(&mut gui, "one");
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        let b = d.browse.as_mut().unwrap();
+        if let Some(Ok(l)) = b.children.get_mut("/data/one") {
+            l.truncated = true;
+        }
+        b.retree();
+    }
+    gui.frames(2);
+    tick(&mut gui, "inner.txt");
+    assert_eq!(selected(&gui), ["/data/one"]);
+    let one = ("name", "one".to_string());
+    assert!(gui.shows_text(&trf("msg.remote_untick_truncated", &[one])));
+    tick(&mut gui, "one");
+    assert!(selected(&gui).is_empty());
+
+    // Entries ticked inside a folder opened in place: the copy is rooted at that folder, the
+    // deepest they share, not at the one shown, so they pair with a local copy of it.
+    gui.app.start_paths = Default::default();
+    list(&mut gui, remote::Protocol::Sftp);
+    gui.click(&name("folder.expand", "one"));
+    tick(&mut gui, "sub");
+    tick(&mut gui, "inner.txt");
+    gui.click(tr("btn.ok"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let copy = PathBuf::from(&gui.app.start_paths[0]);
+    assert_eq!(copy.file_name().unwrap(), "one");
+    assert!(copy.join("inner.txt").is_file() && copy.join("sub/deep.txt").is_file());
+    let local = tempfile::tempdir().unwrap();
+    std::fs::write(local.path().join("inner.txt"), "one\n").unwrap();
+    std::fs::write(local.path().join("unticked.txt"), "!").unwrap();
+    gui.app.start_paths[2] = local.path().display().to_string();
+    let before = gui.app.tabs.len();
+    gui.app.submit_start();
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let Content::Folder(v) = gui.app.tabs[before].content.view() else {
+        panic!("a folder compare");
+    };
+    let items = &v.items;
+    let inner = items
+        .iter()
+        .find(|it| it.name == "inner.txt")
+        .expect("inner.txt");
+    assert_eq!(
+        inner.exists[..2],
+        [true, true],
+        "paired with the local inner.txt"
+    );
+    assert!(!items.iter().any(|it| it.name == "unticked.txt"));
 
     remote::fake::uninstall();
 }

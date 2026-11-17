@@ -30,7 +30,7 @@
 //! GUI tests.
 
 use crate::i18n::{tr, trf};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -305,6 +305,13 @@ pub struct Manifest {
     /// Each file: how it was on the server, and a hash of its bytes as written here.
     pub files: std::collections::BTreeMap<String, (RemoteStamp, u64)>,
     pub dirs: std::collections::BTreeSet<String>,
+    /// The entries of the folder chosen to fetch, when only those were (see
+    /// [`fetch_selected`]); empty when it was fetched whole. A folder compare of the copy
+    /// shows only them, on every side.
+    pub chosen: Vec<String>,
+    /// The folders of `dirs` made only to hold chosen entries, which have more in them on the
+    /// server: deleted here, they are not removed there.
+    pub partial: std::collections::BTreeSet<String>,
 }
 
 /// A hash of the file at `path`'s bytes, to tell whether it changed since it was fetched or
@@ -2923,6 +2930,144 @@ pub(crate) fn fetch_with(
     Ok(fetched)
 }
 
+/// Fetches only `items` of the folder `base`, each a file or a folder at a path relative to
+/// it, into a new temporary copy of `base` that holds nothing else: what a folder compare then
+/// shows of the server, and what saving it writes back. An item inside another one is fetched
+/// with that one. Bounded as [`fetch`] is, all the items together.
+pub fn fetch_selected(
+    conn: &RemoteConnection,
+    base: &str,
+    items: &[String],
+    cancel: &AtomicBool,
+) -> Result<Fetched> {
+    let remote = connect(conn, cancel)?;
+    let more = |stop: &AtomicBool| connect(conn, stop);
+    let more: Option<Connector> = Some((&more as Connect, more_connections(conn)));
+    let fetched = fetch_selected_over(&*remote, base, items, cancel, more)?;
+    register_fetch(&fetched);
+    Ok(fetched)
+}
+
+/// [`fetch_selected`], over the connection `fs`.
+fn fetch_selected_over(
+    fs: &dyn RemoteFs,
+    base: &str,
+    items: &[String],
+    cancel: &AtomicBool,
+    connect: Option<Connector>,
+) -> Result<Fetched> {
+    let base = match base.trim_end_matches('/') {
+        "" => "/",
+        base => base,
+    };
+    let temp = tempfile::Builder::new()
+        .prefix("oxidemerge-sftp-")
+        .tempdir()?;
+    let local = temp.path().join(remote_file_name(base));
+    let manifest = fetch_selected_into(fs, base, items, &local, cancel, connect)?;
+    Ok(Fetched {
+        temp,
+        local,
+        is_dir: true,
+        stamp: None,
+        manifest: Some(manifest),
+    })
+}
+
+/// Downloads `items` of the folder `base` (see [`fetch_selected`]) into `local`, which must
+/// not exist yet, returning what it fetched.
+fn fetch_selected_into(
+    fs: &dyn RemoteFs,
+    base: &str,
+    items: &[String],
+    local: &Path,
+    cancel: &AtomicBool,
+    connect: Option<Connector>,
+) -> Result<Manifest> {
+    let base = match base.trim_end_matches('/') {
+        "" => "/",
+        base => base,
+    };
+    std::fs::create_dir(local)?;
+    let budget = Budget::new();
+    let mut manifest = Manifest::default();
+    // Each item once, without what is inside another item: that comes with it.
+    let wanted: std::collections::HashSet<&str> = (items.iter())
+        .map(|rel| rel.trim_matches('/'))
+        .filter(|rel| !rel.is_empty())
+        .collect();
+    let inside_another = |rel: &str| {
+        (rel.char_indices())
+            .filter(|(_, c)| *c == '/')
+            .any(|(i, _)| wanted.contains(&rel[..i]))
+    };
+    for rel in items {
+        check(cancel)?;
+        let rel = rel.trim_matches('/');
+        if rel.is_empty() || inside_another(rel) {
+            continue;
+        }
+        let remote = join(base, rel);
+        let cannot = || trf("msg.sftp_cannot_read", &[("path", remote.clone())]);
+        let not_regular = || anyhow!(trf("msg.sftp_not_regular", &[("path", remote.clone())]));
+        // The folders it is in are made here, and are on the server already.
+        let mut parts: Vec<&str> = rel.split('/').collect();
+        if !parts.iter().all(|part| local_name_ok(part)) {
+            return Err(not_regular());
+        }
+        let name = parts.pop().unwrap_or_default();
+        let (mut at, mut dir) = (local.to_path_buf(), String::new());
+        for part in &parts {
+            at.push(part);
+            if !dir.is_empty() {
+                dir.push('/');
+            }
+            dir.push_str(part);
+            if !at.is_dir() {
+                std::fs::create_dir(&at)?;
+            }
+            manifest.dirs.insert(dir.clone());
+            manifest.partial.insert(dir.clone());
+        }
+        let target = at.join(name);
+        // Left out, as a folder fetch leaves it out: a name this file system takes for one
+        // already written here (`a.txt` after `A.txt` where case does not count), or the same
+        // entry twice. Written over, the manifest would hold both, and saving would take the
+        // one no longer here for deleted, and delete it on the server.
+        if std::fs::symlink_metadata(&target).is_ok() {
+            continue;
+        }
+        let (kind, stamp) = fs.kind_stamped(&remote).with_context(cannot)?;
+        match kind {
+            Some(EntryKind::Dir) => {
+                let depth = parts.len() + 1;
+                let inner = download_tree(fs, &remote, &target, depth, cancel, &budget, connect)?;
+                manifest.dirs.insert(rel.to_string());
+                manifest
+                    .dirs
+                    .extend(inner.dirs.iter().map(|dir| format!("{rel}/{dir}")));
+                manifest.files.extend(
+                    (inner.files.into_iter()).map(|(file, read)| (format!("{rel}/{file}"), read)),
+                );
+            }
+            Some(EntryKind::File) => {
+                let stamp = match stamp {
+                    Some(stamp) => stamp,
+                    None => fs.stamp(&remote)?.with_context(cannot)?,
+                };
+                if stamp.size > budget.max_bytes {
+                    return Err(budget.too_large());
+                }
+                let hash = download_file(fs, &remote, &target, cancel, &budget)?;
+                manifest.files.insert(rel.to_string(), (stamp, hash));
+            }
+            _ => return Err(not_regular()),
+        }
+        manifest.chosen.push(rel.to_string());
+    }
+    Ok(manifest)
+}
+
 /// Notes `fetched` as a copy of something on a server, whose contents saving uploads (see
 /// [`inside_fetch`]): what [`fetch`] does for what it fetches itself.
 pub(crate) fn register_fetch(fetched: &Fetched) {
@@ -3056,12 +3201,14 @@ fn fetch_into_mode(
 }
 
 /// Fetches `remote_path` again over the local copy at `local` an earlier [`fetch`] staged,
-/// discarding what changed there. The new copy is downloaded beside it first, so a failed or
-/// cancelled fetch leaves the old copy as it was.
+/// discarding what changed there; for a copy of only `chosen` of the folder (see
+/// [`fetch_selected`]), only those again. The new copy is downloaded beside it first, so a
+/// failed or cancelled fetch leaves the old copy as it was.
 pub fn refetch(
     conn: &RemoteConnection,
     remote_path: &str,
     local: &Path,
+    chosen: &[String],
     cancel: &AtomicBool,
 ) -> Result<Staged> {
     let remote = connect(conn, cancel)?;
@@ -3074,7 +3221,22 @@ pub fn refetch(
     let new = fresh.path().join("new");
     let more = |stop: &AtomicBool| connect(conn, stop);
     let more: Option<Connector> = Some((&more as Connect, more_connections(conn)));
-    let staged = fetch_into(&*remote, remote_path, &new, cancel, more)?;
+    let staged = if chosen.is_empty() {
+        fetch_into(&*remote, remote_path, &new, cancel, more)?
+    } else {
+        Staged {
+            is_dir: true,
+            stamp: None,
+            manifest: Some(fetch_selected_into(
+                &*remote,
+                remote_path,
+                chosen,
+                &new,
+                cancel,
+                more,
+            )?),
+        }
+    };
     check(cancel)?;
     let old = fresh.path().join("old");
     if local.exists() {
@@ -4555,6 +4717,110 @@ mod tests {
             label(&conn, "notes.txt"),
             "sftp://ann@example.com:22/~/notes.txt"
         );
+    }
+
+    #[test]
+    /// Only the entries chosen of a folder are fetched, each where it is in the folder, and
+    /// the manifest says so: saving the copy back writes those, not the folder's others.
+    fn only_the_entries_chosen_of_a_folder_are_fetched() {
+        let never = AtomicBool::new(false);
+        let conn = RemoteConnection {
+            protocol: Protocol::Sftp,
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: Auth::Password(String::new()),
+            options: Default::default(),
+        };
+        fake::install(
+            fake::Server::new()
+                .dir("/srv")
+                .file("/srv/a.txt", "a")
+                .file("/srv/b.txt", "b")
+                .file("/srv/A.txt", "A")
+                .file("/srv/left-out.txt", "x")
+                .dir("/srv/data")
+                .file("/srv/data/c.txt", "c")
+                .dir("/srv/data/sub")
+                .file("/srv/data/sub/d.txt", "d")
+                .dir("/srv/deep")
+                .dir("/srv/deep/er")
+                .file("/srv/deep/er/e.txt", "e")
+                .file("/srv/deep/er/not.txt", "n"),
+        );
+        let items = ["a.txt", "b.txt", "data", "data/c.txt", "deep/er/e.txt"].map(String::from);
+        let f = fetch_selected(&conn, "/srv/", &items, &never).unwrap();
+        assert!(f.is_dir && inside_fetch(&f.local));
+        assert_eq!(f.local.file_name().unwrap(), "srv");
+        let read = |rel: &str| std::fs::read_to_string(f.local.join(rel)).ok();
+        assert_eq!(read("a.txt").as_deref(), Some("a"));
+        assert_eq!(read("data/sub/d.txt").as_deref(), Some("d"));
+        assert_eq!(read("deep/er/e.txt").as_deref(), Some("e"));
+        assert_eq!(read("left-out.txt"), None);
+        assert_eq!(read("deep/er/not.txt"), None);
+        let manifest = f.manifest.as_ref().unwrap();
+        assert_eq!(
+            manifest.files.keys().collect::<Vec<_>>(),
+            [
+                "a.txt",
+                "b.txt",
+                "data/c.txt",
+                "data/sub/d.txt",
+                "deep/er/e.txt"
+            ]
+        );
+        assert_eq!(
+            manifest.dirs.iter().collect::<Vec<_>>(),
+            ["data", "data/sub", "deep", "deep/er"]
+        );
+        assert_eq!(
+            manifest.chosen,
+            ["a.txt", "b.txt", "data", "deep/er/e.txt"],
+            "an entry inside another chosen is fetched with it"
+        );
+        assert_eq!(
+            manifest.partial.iter().collect::<Vec<_>>(),
+            ["deep", "deep/er"]
+        );
+        // Reloading the copy from the server fetches only what was chosen again.
+        std::fs::write(f.local.join("a.txt"), "edited").unwrap();
+        let staged = refetch(&conn, "/srv", &f.local, &manifest.chosen, &never).unwrap();
+        assert_eq!(staged.manifest.as_ref(), Some(manifest));
+        assert_eq!(read("a.txt").as_deref(), Some("a"));
+        assert_eq!(read("left-out.txt"), None, "not the whole folder");
+        // Deleting a folder here that was made only to hold a chosen entry deletes that entry on
+        // the server, and leaves the folder there with what else it holds.
+        std::fs::remove_dir_all(f.local.join("deep")).unwrap();
+        let saved =
+            crate::core::remote_sync::save_folder(&conn, &f.local, "/srv", manifest, &never)
+                .unwrap();
+        assert!(saved.errors.is_empty(), "{:?}", saved.errors);
+        assert!(fake::was_removed("/srv/deep/er/e.txt"));
+        assert!(!fake::was_removed("/srv/deep/er") && !fake::was_removed("/srv/deep"));
+        assert!(fake::entry("/srv/deep/er/not.txt").is_some());
+        assert!(fake::entry("/srv/left-out.txt").is_some());
+        assert!(saved.manifest.partial.is_empty() && !saved.manifest.dirs.contains("deep"));
+        // Two names this file system takes for one: only the first is fetched, and saving
+        // cannot take the other for deleted.
+        let twice = ["a.txt", "A.txt", "a.txt"].map(String::from);
+        let f = fetch_selected(&conn, "/srv", &twice, &never).unwrap();
+        let files = &f.manifest.as_ref().unwrap().files;
+        if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(files.keys().collect::<Vec<_>>(), ["a.txt"]);
+        }
+        assert!(!crate::core::remote_sync::changed(
+            &f.local,
+            f.manifest.as_ref().unwrap()
+        ));
+        // A name this machine cannot have, or an entry that is gone, is said, not skipped.
+        let gone = ["a.txt".to_string(), "nothing.txt".to_string()];
+        let Err(e) = fetch_selected(&conn, "/srv", &gone, &never) else {
+            panic!("an entry that is gone");
+        };
+        assert!(format!("{e:#}").contains("/srv/nothing.txt"), "{e:#}");
+        let bad = ["../etc/passwd".to_string()];
+        assert!(fetch_selected(&conn, "/srv", &bad, &never).is_err());
+        fake::uninstall();
     }
 
     #[test]

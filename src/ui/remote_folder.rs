@@ -20,7 +20,7 @@ enum Update {
         anyhow::Result<bool>,
         Vec<crate::core::remote::Fetched>,
     ),
-    Finished(anyhow::Result<Option<Box<[Opened; 2]>>>),
+    Finished(anyhow::Result<Option<Vec<Opened>>>),
 }
 
 struct Job {
@@ -34,7 +34,7 @@ struct Job {
 
 impl Job {
     fn start(
-        work: impl FnOnce(&AtomicBool, &mpsc::Sender<Update>) -> anyhow::Result<Option<[Opened; 2]>>
+        work: impl FnOnce(&AtomicBool, &mpsc::Sender<Update>) -> anyhow::Result<Option<Vec<Opened>>>
             + Send
             + 'static,
     ) -> Self {
@@ -45,7 +45,7 @@ impl Job {
         let counted = progress.clone();
         let run = move || {
             let result = crate::core::remote::with_progress(&counted, || work(&cancel, &send));
-            let _ = send.send(Update::Finished(result.map(|opened| opened.map(Box::new))));
+            let _ = send.send(Update::Finished(result));
         };
         #[cfg(test)]
         if crate::core::remote::fake::installed() {
@@ -75,16 +75,18 @@ impl Drop for Job {
     }
 }
 
+/// The files of one row to open as a file compare: one for each side, two or three.
 pub(crate) struct OpenFiles {
-    pub files: [Opened; 2],
+    pub files: Vec<Opened>,
     pub path: String,
-    pub read_only: [bool; 2],
+    pub read_only: Vec<bool>,
     pub rules: String,
 }
 
+/// Two or three folders compared from their listings.
 pub struct RemoteFolder {
-    sides: [Side; 2],
-    labels: [String; 2],
+    sides: Vec<Side>,
+    labels: Vec<String>,
     rows: Vec<Row>,
     selected: Option<usize>,
     verified: HashMap<String, Result<Status, String>>,
@@ -112,21 +114,21 @@ pub struct RemoteFolder {
     filter: String,
     options: FolderOptions,
     method: CompareMethod,
-    read_only: [bool; 2],
+    read_only: Vec<bool>,
     rules: String,
     resolved_rules: Option<crate::core::rules::RuleSet>,
 }
 
 impl RemoteFolder {
     pub(crate) fn new(
-        sides: [Side; 2],
+        sides: Vec<Side>,
         filter: String,
         options: FolderOptions,
-        read_only: [bool; 2],
+        read_only: Vec<bool>,
         rules: String,
         named: &[FltFilter],
     ) -> Self {
-        let labels = sides.each_ref().map(Side::label);
+        let labels = sides.iter().map(Side::label).collect();
         let method = if options.method == CompareMethod::FullContents {
             CompareMethod::FullContents
         } else {
@@ -207,14 +209,14 @@ impl RemoteFolder {
                 .find(|row| !row.directory && row.path == path)
             {
                 row.status = Status::Unverified;
-                row.sizes = [None; 2];
+                row.sizes.fill(None);
             }
         }
     }
 
     fn start(
         &mut self,
-        work: impl FnOnce(&AtomicBool, &mpsc::Sender<Update>) -> anyhow::Result<Option<[Opened; 2]>>
+        work: impl FnOnce(&AtomicBool, &mpsc::Sender<Update>) -> anyhow::Result<Option<Vec<Opened>>>
             + Send
             + 'static,
     ) {
@@ -226,7 +228,7 @@ impl RemoteFolder {
         self.job = Some(Job::start(work));
     }
 
-    fn poll(&mut self) -> Option<[Opened; 2]> {
+    fn poll(&mut self) -> Option<Vec<Opened>> {
         let job = self.job.as_ref()?;
         loop {
             match job.updates.try_recv() {
@@ -287,7 +289,7 @@ impl RemoteFolder {
                         self.verification_done();
                     }
                     return match result {
-                        Ok(opened) => opened.map(|files| *files),
+                        Ok(opened) => opened,
                         Err(error) => {
                             self.error = Some(format!("{error:#}"));
                             None
@@ -346,7 +348,7 @@ impl RemoteFolder {
         let found: Vec<String> = counts
             .iter()
             .filter(|(shown, _)| verified(shown))
-            .map(|(shown, count)| format!("{count} {}", tr(shown.key())))
+            .map(|(shown, count)| format!("{count} {}", shown.text(self.sides.len())))
             .collect();
         let differs = counts
             .iter()
@@ -378,7 +380,8 @@ impl RemoteFolder {
     /// How many files are in each state, the ones that differ first; folders are not counted.
     fn counts(&mut self) -> Vec<(Shown, usize)> {
         if self.counts.is_none() {
-            let mut counts: Vec<(Shown, usize)> = Shown::ORDER.iter().map(|s| (*s, 0)).collect();
+            let order = Shown::order(self.sides.len());
+            let mut counts: Vec<(Shown, usize)> = order.into_iter().map(|s| (s, 0)).collect();
             for row in self.rows.iter().filter(|r| !r.directory) {
                 let shown = self.shown(row);
                 if let Some(c) = counts.iter_mut().find(|c| c.0 == shown) {
@@ -426,14 +429,15 @@ impl RemoteFolder {
         let opened = self.poll().map(|files| OpenFiles {
             files,
             path: self.opening_path.take().expect("path of opened file pair"),
-            read_only: self.read_only,
+            read_only: self.read_only.clone(),
             rules: self.rules.clone(),
         });
         let mut open = false;
         let mut verify_selected = false;
         let mut verify_all = false;
         let mut refresh = false;
-        let paired = |row: &Row| !row.directory && row.present == [true, true];
+        let paired = |row: &Row| !row.directory && row.on_all();
+        let sides = self.sides.len();
         let selected = self
             .selected
             .map(|index| &self.rows[index])
@@ -451,7 +455,7 @@ impl RemoteFolder {
                 ui.spacing_mut().item_spacing.y = 4.0;
                 for (side, label) in self.labels.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        widgets::side_chip(ui, side, 2);
+                        widgets::side_chip(ui, side, sides);
                         ui.add(egui::Label::new(egui::RichText::new(label).monospace()).truncate());
                     });
                 }
@@ -612,17 +616,17 @@ impl RemoteFolder {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
                         for (shown, count) in &counts {
-                            let (fg, bg, _) = shown.tone(ui);
-                            widgets::chip(ui, &format!("{count}  {}", tr(shown.key())), fg, bg);
+                            let (fg, bg, _) = shown.tone(ui, sides);
+                            widgets::chip(ui, &format!("{count}  {}", shown.text(sides)), fg, bg);
                         }
                     });
                 });
         }
 
-        // The list: a name, a state and the two sizes, each in a column of its own.
+        // The list: a name, a state and each side's size, each in a column of its own.
         let (header, _) =
             ui.allocate_exact_size(vec2(ui.available_width(), HEADER_HEIGHT), Sense::hover());
-        let cols = Columns::of(header);
+        let cols = Columns::of(header, sides);
         ui.painter().rect_filled(header, 0.0, p.surface_alt);
         ui.painter().hline(
             header.x_range(),
@@ -648,8 +652,8 @@ impl RemoteFolder {
             Align2::LEFT_CENTER,
             tr("analysis.tree_status").into(),
         );
-        for (side, col) in [cols.left, cols.right].into_iter().enumerate() {
-            let side = crate::core::report::side_name(side, 2);
+        for (side, col) in cols.sizes.iter().enumerate() {
+            let side = crate::core::report::side_name(side, sides);
             caption(
                 col.max,
                 Align2::RIGHT_CENTER,
@@ -705,7 +709,7 @@ impl RemoteFolder {
                         return Some(OpenFiles {
                             files,
                             path,
-                            read_only: self.read_only,
+                            read_only: self.read_only.clone(),
                             rules: self.rules.clone(),
                         })
                     }
@@ -716,9 +720,9 @@ impl RemoteFolder {
                 }
             }
             // What is fetched: each side on a server, at the size its listing gave.
-            let bytes = (self.sides.iter().zip(row.sizes))
+            let bytes = (self.sides.iter().zip(&row.sizes))
                 .filter(|(side, _)| matches!(side, Side::Sftp(..)))
-                .filter_map(|(_, size)| size)
+                .filter_map(|(_, size)| *size)
                 .sum();
             self.start(move |stop, _| remote_compare::open(&sides, &row, stop).map(Some));
             self.opening_path = Some(path);
@@ -773,29 +777,33 @@ const HEADER_HEIGHT: f32 = 26.0;
 const ROW_HEIGHT: f32 = 26.0;
 
 /// Where the columns of the list are across `rect`, a row or the header: the name takes what
-/// the state and the two sizes leave.
+/// the state and the sizes, one for each side, leave.
 struct Columns {
     name: egui::Rangef,
     status: egui::Rangef,
-    left: egui::Rangef,
-    right: egui::Rangef,
+    /// The size on each side, the first side's leftmost.
+    sizes: Vec<egui::Rangef>,
 }
 
 impl Columns {
-    fn of(rect: Rect) -> Self {
+    fn of(rect: Rect, sides: usize) -> Self {
         const STATUS: f32 = 190.0;
         const SIZE: f32 = 96.0;
         let end = rect.right() - 12.0;
-        let right = egui::Rangef::new(end - SIZE, end);
-        let left = egui::Rangef::new(right.min - SIZE, right.min);
-        let status = egui::Rangef::new(left.min - STATUS, left.min);
+        let first = end - SIZE * sides as f32;
+        let sizes = (0..sides)
+            .map(|side| {
+                let left = first + SIZE * side as f32;
+                egui::Rangef::new(left, left + SIZE)
+            })
+            .collect();
+        let status = egui::Rangef::new(first - STATUS, first);
         let start = rect.left() + 12.0;
         let name = egui::Rangef::new(start, (status.min - 12.0).max(start + 60.0));
         Self {
             name,
             status,
-            left,
-            right,
+            sizes,
         }
     }
 }
@@ -808,37 +816,74 @@ enum Shown {
 }
 
 impl Shown {
-    /// The states the summary counts, the ones that need a look first.
-    const ORDER: [Shown; 8] = [
-        Shown::Status(Status::ContentDifferent),
-        Shown::Status(Status::MetadataDifferent),
-        Shown::Error,
-        Shown::Status(Status::LeftOnly),
-        Shown::Status(Status::RightOnly),
-        Shown::Status(Status::Unverified),
-        Shown::Status(Status::ContentMatch),
-        Shown::Status(Status::MetadataMatch),
-    ];
-
-    fn key(self) -> &'static str {
-        match self {
-            Shown::Status(status) => status_key(status),
-            Shown::Error => "status.error",
+    /// The states the summary counts for a comparison of `sides` folders, the ones that need
+    /// a look first.
+    fn order(sides: usize) -> Vec<Shown> {
+        let mut order = vec![
+            Shown::Status(Status::ContentDifferent),
+            Shown::Status(Status::MetadataDifferent),
+            Shown::Error,
+        ];
+        order.extend((0..sides).map(|side| Shown::Status(Status::Only(side))));
+        if sides > 2 {
+            order.extend((0..sides).map(|side| Shown::Status(Status::Missing(side))));
         }
+        order.extend([
+            Shown::Status(Status::Unverified),
+            Shown::Status(Status::ContentMatch),
+            Shown::Status(Status::MetadataMatch),
+        ]);
+        order
+    }
+
+    /// Its words, in a comparison of `sides` folders, which name the sides as it does.
+    fn text(self, sides: usize) -> String {
+        let side = |side| {
+            (
+                "side",
+                crate::core::report::side_name(side, sides).to_string(),
+            )
+        };
+        let key = match self {
+            Shown::Error => "status.error",
+            Shown::Status(Status::Only(0)) if sides == 2 => "remote_compare.left_only",
+            Shown::Status(Status::Only(_)) if sides == 2 => "remote_compare.right_only",
+            Shown::Status(Status::Only(only)) => return trf("status.only", &[side(only)]),
+            Shown::Status(Status::Missing(absent)) => {
+                return trf("status.missing", &[side(absent)])
+            }
+            Shown::Status(Status::Folder) => "remote_compare.folder",
+            Shown::Status(Status::MetadataMatch) => "remote_compare.metadata_match",
+            Shown::Status(Status::MetadataDifferent) => "remote_compare.metadata_different",
+            Shown::Status(Status::Unverified) => "remote_compare.unverified",
+            Shown::Status(Status::ContentMatch) => "remote_compare.content_match",
+            Shown::Status(Status::ContentDifferent) => "remote_compare.content_different",
+        };
+        tr(key).to_string()
     }
 
     /// The colors of its text and of the pill behind it, and the icon before it: red for
-    /// files that differ, amber for ones that may, green for ones read and found the same,
-    /// the side's own color for a file only one side has, and grey for what is not known.
-    fn tone(self, ui: &egui::Ui) -> (Color32, Color32, Option<Icon>) {
+    /// files that differ, amber for ones that may or that a side lacks, green for ones read
+    /// and found the same, the side's own color for a file only one side has, and grey for
+    /// what is not known.
+    fn tone(self, ui: &egui::Ui, sides: usize) -> (Color32, Color32, Option<Icon>) {
         let p = pal(ui);
         let (color, icon) = match self {
             Shown::Status(Status::ContentDifferent) => (p.danger, Some(Icon::Close)),
             Shown::Error => (p.danger, Some(Icon::Warning)),
-            Shown::Status(Status::MetadataDifferent) => (p.warning, Some(Icon::Warning)),
+            Shown::Status(Status::MetadataDifferent | Status::Missing(_)) => {
+                (p.warning, Some(Icon::Warning))
+            }
             Shown::Status(Status::ContentMatch) => (p.success, Some(Icon::Check)),
-            Shown::Status(Status::LeftOnly) => (widgets::side_color(ui, 0, 2), Some(Icon::Prev)),
-            Shown::Status(Status::RightOnly) => (widgets::side_color(ui, 1, 2), Some(Icon::Next)),
+            Shown::Status(Status::Only(side)) => {
+                // An arrow to the side that has it; none for the middle of three.
+                let icon = match side {
+                    0 => Some(Icon::Prev),
+                    side if side + 1 == sides => Some(Icon::Next),
+                    _ => None,
+                };
+                (widgets::side_color(ui, side, sides), icon)
+            }
             Shown::Status(Status::MetadataMatch | Status::Unverified | Status::Folder) => {
                 return (p.text_dim, p.control, None);
             }
@@ -863,12 +908,13 @@ fn remote_compare_row(
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, &row.path));
-    let cols = Columns::of(rect);
-    let status_text = tr(shown.key());
+    let sides = row.present.len();
+    let cols = Columns::of(rect, sides);
+    let status_text = shown.text(sides);
     // The state is read out, and found by its words, as a label of its own.
     let status_rect = Rect::from_x_y_ranges(cols.status, rect.y_range());
     ui.interact(status_rect, resp.id.with("status"), Sense::hover())
-        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, status_text));
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &status_text));
     if !ui.is_rect_visible(rect) {
         return resp;
     }
@@ -914,12 +960,10 @@ fn remote_compare_row(
     ui.painter()
         .galley(pos2(left, mid - galley.size().y / 2.0), galley, p.text);
 
-    let (fg, bg, mark) = shown.tone(ui);
-    let text = ui.painter().layout_no_wrap(
-        status_text.to_string(),
-        theme::semibold(theme::size::SMALL),
-        fg,
-    );
+    let (fg, bg, mark) = shown.tone(ui, sides);
+    let text = ui
+        .painter()
+        .layout_no_wrap(status_text, theme::semibold(theme::size::SMALL), fg);
     let lead = if waiting || mark.is_some() { 16.0 } else { 0.0 };
     let pill = Rect::from_min_size(
         pos2(cols.status.min, mid - 10.0),
@@ -942,11 +986,11 @@ fn remote_compare_row(
     );
 
     if !row.directory {
-        for (col, bytes) in [cols.left, cols.right].into_iter().zip(row.sizes) {
+        for (col, bytes) in cols.sizes.iter().zip(&row.sizes) {
             ui.painter().text(
                 pos2(col.max, mid),
                 Align2::RIGHT_CENTER,
-                size(bytes),
+                size(*bytes),
                 FontId::proportional(theme::size::SMALL),
                 p.text_dim,
             );
@@ -960,19 +1004,6 @@ fn size(size: Option<u64>) -> String {
         || "—".into(),
         |size| crate::core::report::fmt_size(Some(size)),
     )
-}
-
-fn status_key(status: Status) -> &'static str {
-    match status {
-        Status::Folder => "remote_compare.folder",
-        Status::LeftOnly => "remote_compare.left_only",
-        Status::RightOnly => "remote_compare.right_only",
-        Status::MetadataMatch => "remote_compare.metadata_match",
-        Status::MetadataDifferent => "remote_compare.metadata_different",
-        Status::Unverified => "remote_compare.unverified",
-        Status::ContentMatch => "remote_compare.content_match",
-        Status::ContentDifferent => "remote_compare.content_different",
-    }
 }
 
 #[cfg(test)]
@@ -1020,7 +1051,7 @@ mod threaded_tests {
         std::fs::write(dir.path().join("l/only.txt"), "x").unwrap();
         let cfg = Config::default();
         let ctx = egui::Context::default();
-        let sides = [
+        let sides = vec![
             Side::Local(dir.path().join("l")),
             Side::Local(dir.path().join("r")),
         ];
@@ -1030,7 +1061,7 @@ mod threaded_tests {
             sides,
             "*.*".into(),
             options,
-            [false, false],
+            vec![false, false],
             String::new(),
             &[],
         );
@@ -1039,7 +1070,7 @@ mod threaded_tests {
         let paired: Vec<Row> = view
             .rows
             .iter()
-            .filter(|r| !r.directory && r.present == [true, true])
+            .filter(|r| !r.directory && r.on_all())
             .cloned()
             .collect();
         assert_eq!(paired.len(), 2);

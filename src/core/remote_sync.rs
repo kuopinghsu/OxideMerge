@@ -275,10 +275,16 @@ fn save_with(
         }
     }
 
-    // Folders deleted here, each after what was in it.
+    // Folders deleted here, each after what was in it. One made only to hold entries chosen
+    // of it has more in it on the server, which was never here to delete: it stays there.
     for rel in gone_dirs.into_iter().rev() {
         if stopped(&mut out) {
             break;
+        }
+        if manifest.partial.contains(rel) {
+            out.manifest.dirs.remove(rel);
+            out.manifest.partial.remove(rel);
+            continue;
         }
         match r.remove_dir(&at(rel)) {
             Ok(()) => {
@@ -531,7 +537,7 @@ mod tests {
         std::fs::write(f.local.join("a.txt"), "local edit").unwrap();
         std::fs::write(f.local.join("stray.txt"), "x").unwrap();
         fake::change("/srv/data/b.txt", "newer");
-        let staged = remote::refetch(&conn(), "/srv/data", &f.local, &never).unwrap();
+        let staged = remote::refetch(&conn(), "/srv/data", &f.local, &[], &never).unwrap();
         assert!(staged.is_dir);
         assert_eq!(std::fs::read_to_string(f.local.join("a.txt")).unwrap(), "a");
         assert_eq!(
@@ -550,7 +556,7 @@ mod tests {
         // A failed fetch leaves the old copy as it was.
         std::fs::write(f.local.join("a.txt"), "kept").unwrap();
         fake::install(fake::Server::new().failing("connection refused"));
-        assert!(remote::refetch(&conn(), "/srv/data", &f.local, &never).is_err());
+        assert!(remote::refetch(&conn(), "/srv/data", &f.local, &[], &never).is_err());
         assert_eq!(
             std::fs::read_to_string(f.local.join("a.txt")).unwrap(),
             "kept"
@@ -561,7 +567,7 @@ mod tests {
         let f = remote::fetch(&conn(), "/srv/data/a.txt", &never).unwrap();
         std::fs::write(&f.local, "edit").unwrap();
         fake::change("/srv/data/a.txt", "server");
-        let staged = remote::refetch(&conn(), "/srv/data/a.txt", &f.local, &never).unwrap();
+        let staged = remote::refetch(&conn(), "/srv/data/a.txt", &f.local, &[], &never).unwrap();
         assert!(!staged.is_dir);
         assert_eq!(std::fs::read_to_string(&f.local).unwrap(), "server");
         assert_eq!(staged.stamp.unwrap().size, 6);

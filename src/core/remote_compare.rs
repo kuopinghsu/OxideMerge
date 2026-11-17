@@ -1,4 +1,5 @@
-//! Live SFTP folder comparisons. Listing and reading file contents are separate operations.
+//! Live SFTP folder comparisons, of two or three folders. Listing and reading file contents
+//! are separate operations.
 use super::diff::{DiffOptions, Normalizer};
 use super::filter::FileFilter;
 use super::folder::{self, CmpStatus, CompareMethod, DirItem, FolderOptions};
@@ -70,7 +71,8 @@ struct Entry {
     metadata: Metadata,
 }
 
-type MatchedEntry = ([Option<String>; 2], [Option<Metadata>; 2]);
+/// The name of an entry on each side, and what each side lists of it.
+type MatchedEntry = (Vec<Option<String>>, Vec<Option<Metadata>>);
 
 fn list_local(
     path: &Path,
@@ -203,8 +205,10 @@ fn check(stop: &AtomicBool) -> Result<()> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Status {
     Folder,
-    LeftOnly,
-    RightOnly,
+    /// Only this side has it.
+    Only(usize),
+    /// Of three sides, only this one does not have it.
+    Missing(usize),
     MetadataMatch,
     MetadataDifferent,
     Unverified,
@@ -215,39 +219,67 @@ pub(crate) enum Status {
 #[derive(Clone)]
 pub(crate) struct Row {
     pub path: String,
-    paths: [Option<String>; 2],
+    /// Its path on each side, one for each side compared.
+    paths: Vec<Option<String>>,
     pub directory: bool,
     pub status: Status,
-    pub present: [bool; 2],
-    pub sizes: [Option<u64>; 2],
+    pub present: Vec<bool>,
+    pub sizes: Vec<Option<u64>>,
 }
 
-fn status(entries: &[Option<Metadata>; 2], directory: bool, tolerance: u64) -> Status {
-    match entries {
-        [Some(_), None] => Status::LeftOnly,
-        [None, Some(_)] => Status::RightOnly,
-        [Some(_), Some(_)] if directory => Status::Folder,
-        [Some(a), Some(b)] => {
-            if a.size.zip(b.size).is_some_and(|(a, b)| a != b) {
-                return Status::MetadataDifferent;
-            }
-            let within_tolerance = a.modified.zip(b.modified).map(|(a, b)| {
-                a.duration_since(b).unwrap_or_else(|e| e.duration())
-                    <= Duration::from_secs(tolerance)
-            });
-            match (a.size.zip(b.size), within_tolerance) {
-                (_, Some(false)) => Status::MetadataDifferent,
-                (Some(_), Some(true)) => Status::MetadataMatch,
-                _ => Status::Unverified,
-            }
-        }
-        [None, None] => unreachable!("a row comes from a directory entry"),
+impl Row {
+    /// Whether every side has it: what can be verified and opened.
+    pub fn on_all(&self) -> bool {
+        self.present.iter().all(|present| *present)
     }
 }
 
-/// How many more connections to make to both sides, to read them over several at once: as
+/// What the listings of two sides say of a file both have.
+fn pair_status(a: &Metadata, b: &Metadata, tolerance: u64) -> Status {
+    if a.size.zip(b.size).is_some_and(|(a, b)| a != b) {
+        return Status::MetadataDifferent;
+    }
+    let within_tolerance = a.modified.zip(b.modified).map(|(a, b)| {
+        a.duration_since(b).unwrap_or_else(|e| e.duration()) <= Duration::from_secs(tolerance)
+    });
+    match (a.size.zip(b.size), within_tolerance) {
+        (_, Some(false)) => Status::MetadataDifferent,
+        (Some(_), Some(true)) => Status::MetadataMatch,
+        _ => Status::Unverified,
+    }
+}
+
+/// What the listings say of an entry, `entries` being what each side lists of it: which sides
+/// have it when not all do; for a file all have, whether their sizes and times agree, each
+/// side's with the first's.
+fn status(entries: &[Option<Metadata>], directory: bool, tolerance: u64) -> Status {
+    let there: Vec<usize> = (0..entries.len())
+        .filter(|&side| entries[side].is_some())
+        .collect();
+    let absent = (0..entries.len()).find(|&side| entries[side].is_none());
+    match (there.as_slice(), absent) {
+        ([], _) => unreachable!("a row comes from a directory entry"),
+        ([only], Some(_)) => return Status::Only(*only),
+        (_, Some(absent)) => return Status::Missing(absent),
+        _ if directory => return Status::Folder,
+        _ => {}
+    }
+    let mut metadata = entries.iter().flatten();
+    let first = metadata.next().expect("a side with the entry");
+    let mut all = Status::MetadataMatch;
+    for other in metadata {
+        match pair_status(first, other, tolerance) {
+            Status::MetadataDifferent => return Status::MetadataDifferent,
+            Status::Unverified => all = Status::Unverified,
+            _ => {}
+        }
+    }
+    all
+}
+
+/// How many more connections to make to every side, to read them over several at once: as
 /// many as the server that takes the fewest does.
-fn more_connections(sides: &[Side; 2]) -> usize {
+fn more_connections(sides: &[Side]) -> usize {
     sides
         .iter()
         .map(Side::more_connections)
@@ -329,7 +361,7 @@ impl Ahead {
     }
 
     /// Lists wanted folders over `sources`, connections of its own, until the scan is over.
-    fn list(&self, sources: &[Source<'_>; 2], hidden: bool, stop: &AtomicBool) {
+    fn list(&self, sources: &[Source<'_>], hidden: bool, stop: &AtomicBool) {
         let mut state = self.state();
         loop {
             if state.over {
@@ -358,16 +390,25 @@ impl Ahead {
     }
 }
 
+/// One connection to each of `sides`, in order.
+fn connect_all<'a>(sides: &'a [Side], stop: &AtomicBool) -> Result<Vec<Source<'a>>> {
+    sides.iter().map(|side| side.connect(stop)).collect()
+}
+
+/// Lists the folders `sides`, two or three, giving `send` the rows of each folder in them
+/// as it is listed on every side that has it.
 pub(crate) fn scan(
-    sides: &[Side; 2],
+    sides: &[Side],
     options: &FolderOptions,
     filter: &FileFilter,
     stop: &AtomicBool,
     send: impl FnMut(Vec<Row>),
 ) -> Result<()> {
-    let sources = [sides[0].connect(stop)?, sides[1].connect(stop)?];
+    let sources = connect_all(sides, stop)?;
     // The sides whose folders more connections can list ahead.
-    let ahead_of = sides.each_ref().map(|side| side.more_connections() > 0);
+    let ahead_of: Vec<bool> = (sides.iter())
+        .map(|side| side.more_connections() > 0)
+        .collect();
     let more = more_connections(sides);
     let ahead = Ahead::default();
     // Set with the scan over, so that a connection still being made then is given up.
@@ -379,8 +420,7 @@ pub(crate) fn scan(
             for _ in 0..more {
                 scope.spawn(move || {
                     // One that cannot be made is done without: the scan lists it all.
-                    let connect = || anyhow::Ok([sides[0].connect(over)?, sides[1].connect(over)?]);
-                    if let Ok(sources) = remote::quietly(connect) {
+                    if let Ok(sources) = remote::quietly(|| connect_all(sides, over)) {
                         remote::with_progress_of(progress, || {
                             ahead.list(&sources, options.skip_hidden, stop)
                         });
@@ -389,7 +429,7 @@ pub(crate) fn scan(
             }
         };
         let done = scan_over(
-            &sources, ahead_of, ahead, &connect, options, filter, stop, send,
+            &sources, &ahead_of, ahead, &connect, options, filter, stop, send,
         );
         over.store(true, Ordering::Relaxed);
         ahead.finish();
@@ -401,8 +441,8 @@ pub(crate) fn scan(
 /// listed ahead through `ahead`, once `connect` made the connections for it.
 #[allow(clippy::too_many_arguments)]
 fn scan_over(
-    sources: &[Source<'_>; 2],
-    ahead_of: [bool; 2],
+    sources: &[Source<'_>],
+    ahead_of: &[bool],
     ahead: &Ahead,
     connect: &dyn Fn(),
     options: &FolderOptions,
@@ -410,14 +450,17 @@ fn scan_over(
     stop: &AtomicBool,
     mut send: impl FnMut(Vec<Row>),
 ) -> Result<()> {
-    let mut pending = vec![(String::new(), [Some(String::new()), Some(String::new())], 0)];
-    let mut remaining = sources.each_ref().map(|source| match source {
-        Source::Local(_) => usize::MAX,
-        Source::Sftp(..) => remote::MAX_REMOTE_ENTRIES,
-    });
+    let sides = sources.len();
+    let mut pending = vec![(String::new(), vec![Some(String::new()); sides], 0)];
+    let mut remaining: Vec<usize> = (sources.iter())
+        .map(|source| match source {
+            Source::Local(_) => usize::MAX,
+            Source::Sftp(..) => remote::MAX_REMOTE_ENTRIES,
+        })
+        .collect();
     while let Some((rel, paths, depth)) = pending.pop() {
         check(stop)?;
-        let mut entries = BTreeMap::<_, BTreeMap<String, [Option<Metadata>; 2]>>::new();
+        let mut entries = BTreeMap::<_, BTreeMap<String, Vec<Option<Metadata>>>>::new();
         for (side, source) in sources.iter().enumerate() {
             let Some(path) = &paths[side] else { continue };
             anyhow::ensure!(
@@ -439,7 +482,7 @@ fn scan_over(
                         .entry(folder::name_key(&entry.name, entry.directory))
                         .or_default()
                         .entry(entry.name)
-                        .or_default()[side] = Some(entry.metadata);
+                        .or_insert_with(|| vec![None; sides])[side] = Some(entry.metadata);
                 }
             }
         }
@@ -457,16 +500,18 @@ fn scan_over(
                 if !keep {
                     continue;
                 }
-                let present = entries.map(|e| e.is_some());
-                let child_paths = std::array::from_fn(|side| {
-                    Some(relative_child(
-                        paths[side].as_deref()?,
-                        names[side].as_deref()?,
-                    ))
-                });
+                let present: Vec<bool> = entries.iter().map(|e| e.is_some()).collect();
+                let child_paths: Vec<Option<String>> = (0..sides)
+                    .map(|side| {
+                        Some(relative_child(
+                            paths[side].as_deref()?,
+                            names[side].as_deref()?,
+                        ))
+                    })
+                    .collect();
                 if !file
                     && options.recursive
-                    && (present == [true, true] || options.include_unique_subfolders)
+                    && (present.iter().all(|p| *p) || options.include_unique_subfolders)
                 {
                     pending.push((path.clone(), child_paths.clone(), depth + 1));
                 }
@@ -476,13 +521,15 @@ fn scan_over(
                     directory: !file,
                     status: status(&entries, !file, options.time_tolerance_secs),
                     present,
-                    sizes: entries.map(|e| if file { e.and_then(|m| m.size) } else { None }),
+                    sizes: (entries.iter())
+                        .map(|e| e.filter(|_| file).and_then(|m| m.size))
+                        .collect(),
                 });
             }
         }
         pending[children_start..].reverse(); // visit this directory's children in name order
         let next = pending[children_start..].iter().flat_map(|(_, paths, _)| {
-            (0..2)
+            (0..sides)
                 .filter(|&side| ahead_of[side])
                 .filter_map(|side| Some((side, paths[side].clone()?, remaining[side])))
                 .rev()
@@ -503,24 +550,26 @@ fn relative_child(parent: &str, name: &str) -> String {
     }
 }
 
-fn pair_spellings(spellings: BTreeMap<String, [Option<Metadata>; 2]>) -> Vec<MatchedEntry> {
-    let mut exact: Vec<_> = spellings
+fn pair_spellings(spellings: BTreeMap<String, Vec<Option<Metadata>>>) -> Vec<MatchedEntry> {
+    let mut exact: Vec<MatchedEntry> = spellings
         .into_iter()
-        .map(|(name, entries)| (entries.map(|entry| entry.map(|_| name.clone())), entries))
+        .map(|(name, entries)| {
+            let names = entries.iter().map(|e| e.map(|_| name.clone())).collect();
+            (names, entries)
+        })
         .collect();
-    // Match different spellings only when there is exactly one candidate on each side.
-    if let [left, right] = exact.as_mut_slice() {
-        for (a, b) in [(0, 1), (1, 0)] {
-            if left.1[a].is_some()
-                && left.1[b].is_none()
-                && right.1[a].is_none()
-                && right.1[b].is_some()
-            {
-                left.0[b] = right.0[b].take();
-                left.1[b] = right.1[b].take();
-                exact.pop();
-                break;
+    // Match different spellings only when there is exactly one candidate on each side: two
+    // spellings, with no side that has both.
+    if let [first, second] = exact.as_mut_slice() {
+        let apart = (first.1.iter().zip(&second.1)).all(|(a, b)| a.is_none() || b.is_none());
+        if apart {
+            for side in 0..first.1.len() {
+                if first.1[side].is_none() {
+                    first.0[side] = second.0[side].take();
+                    first.1[side] = second.1[side].take();
+                }
             }
+            exact.pop();
         }
     }
     exact
@@ -531,7 +580,8 @@ pub(crate) struct Opened {
     pub fetched: Option<(RemoteConnection, String, Fetched)>,
 }
 
-pub(crate) fn open(sides: &[Side; 2], row: &Row, stop: &AtomicBool) -> Result<[Opened; 2]> {
+/// The file of `row` on each of `sides` as a local path, fetching the ones on servers.
+pub(crate) fn open(sides: &[Side], row: &Row, stop: &AtomicBool) -> Result<Vec<Opened>> {
     fn one(side: &Side, path: &str, stop: &AtomicBool) -> Result<Opened> {
         check(stop)?;
         match side {
@@ -557,23 +607,14 @@ pub(crate) fn open(sides: &[Side; 2], row: &Row, stop: &AtomicBool) -> Result<[O
             }
         }
     }
-    Ok([
-        one(
-            &sides[0],
-            row.paths[0].as_deref().context("Missing left path")?,
-            stop,
-        )?,
-        one(
-            &sides[1],
-            row.paths[1].as_deref().context("Missing right path")?,
-            stop,
-        )?,
-    ])
+    (sides.iter().zip(&row.paths))
+        .map(|(side, path)| one(side, path.as_deref().context("Missing path")?, stop))
+        .collect()
 }
 
-/// Opens the pair of `row` from `kept`, the copies a verification fetched of it (one for each
+/// Opens the files of `row` from `kept`, the copies a verification fetched of it (one for each
 /// side on a server, in order), without fetching them again.
-pub(crate) fn open_kept(sides: &[Side; 2], row: &Row, kept: Vec<Fetched>) -> Result<[Opened; 2]> {
+pub(crate) fn open_kept(sides: &[Side], row: &Row, kept: Vec<Fetched>) -> Result<Vec<Opened>> {
     let mut kept = kept.into_iter();
     let mut one = |side: usize| -> Result<Opened> {
         let path = row.paths[side].as_deref().context("Missing path")?;
@@ -600,25 +641,25 @@ pub(crate) fn open_kept(sides: &[Side; 2], row: &Row, kept: Vec<Fetched>) -> Res
             }
         }
     };
-    Ok([one(0)?, one(1)?])
+    (0..sides.len()).map(&mut one).collect()
 }
 
 /// The largest file a byte-for-byte verification fetches whole, to keep for opening later;
 /// larger ones are compared as they stream, stopping at the first difference.
 const MAX_KEPT_FILE: u64 = 32 << 20;
 
-/// Verifies each of `rows`, giving `send` its path, whether both sides hold the same, and the
+/// Verifies each of `rows`, giving `send` its path, whether all sides hold the same, and the
 /// copies fetched of it from servers (one for each side on one, in order; none when it was
 /// compared as it streamed), which open it later without another fetch.
 pub(crate) fn verify(
-    sides: &[Side; 2],
+    sides: &[Side],
     rows: Vec<Row>,
     fopts: &FolderOptions,
     dopts: &DiffOptions,
     stop: &AtomicBool,
     mut send: impl FnMut(String, Result<bool>, Vec<Fetched>),
 ) -> Result<()> {
-    let sources = [sides[0].connect(stop)?, sides[1].connect(stop)?];
+    let sources = connect_all(sides, stop)?;
     let norm = Normalizer::new(dopts);
     let mut send = |path: String, result: Result<(bool, Vec<Fetched>)>| match result {
         Ok((same, kept)) => send(path, Ok(same), kept),
@@ -643,8 +684,7 @@ pub(crate) fn verify(
             let (next, over, progress, done) = (&next, &over, &progress, done.clone());
             scope.spawn(move || {
                 // One that cannot be made is done without: the first verifies them all.
-                let connect = || anyhow::Ok([sides[0].connect(over)?, sides[1].connect(over)?]);
-                let Ok(sources) = remote::quietly(connect) else {
+                let Ok(sources) = remote::quietly(|| connect_all(sides, over)) else {
                     return;
                 };
                 let norm = Normalizer::new(dopts);
@@ -683,15 +723,15 @@ pub(crate) fn verify(
     })
 }
 
-/// The two files of a pair as local paths, fetching the ones on servers; with the fetches.
+/// The files of a row as local paths, fetching the ones on servers; with the fetches.
 fn fetch_pair(
-    sources: &[Source<'_>; 2],
-    rels: [&str; 2],
+    sources: &[Source<'_>],
+    rels: &[&str],
     stop: &AtomicBool,
 ) -> Result<(Vec<PathBuf>, Vec<Fetched>)> {
     let mut fetched = Vec::new();
     let mut paths = Vec::new();
-    for (source, rel) in sources.iter().zip(rels) {
+    for (source, &rel) in sources.iter().zip(rels) {
         match source {
             Source::Local(root) => paths.push(root.join(rel)),
             Source::Sftp(fs, root) => {
@@ -706,36 +746,42 @@ fn fetch_pair(
 }
 
 fn verify_file(
-    sources: &[Source<'_>; 2],
+    sources: &[Source<'_>],
     row: &Row,
     fopts: &FolderOptions,
     dopts: &DiffOptions,
     norm: &Normalizer,
     stop: &AtomicBool,
 ) -> Result<(bool, Vec<Fetched>)> {
-    let left = row.paths[0].as_deref().context("Missing left path")?;
-    let right = row.paths[1].as_deref().context("Missing right path")?;
-    let before = [
-        sources[0].file_metadata(left)?,
-        sources[1].file_metadata(right)?,
-    ];
+    let rels: Vec<&str> = (row.paths.iter())
+        .map(|path| path.as_deref().context("Missing path"))
+        .collect::<Result<_>>()?;
+    let stamps = || {
+        (sources.iter().zip(&rels))
+            .map(|(source, rel)| source.file_metadata(rel))
+            .collect::<Result<Vec<_>>>()
+    };
+    let before = stamps()?;
     let mut kept = Vec::new();
     let remote = sources.iter().any(|s| matches!(s, Source::Sftp(..)));
+    let sizes_differ = before[1..]
+        .iter()
+        .any(|m| before[0].size.zip(m.size).is_some_and(|(a, b)| a != b));
     let same = if fopts.method == CompareMethod::FullContents {
-        let (paths, fetched) = fetch_pair(sources, [left, right], stop)?;
+        let (paths, fetched) = fetch_pair(sources, &rels, stop)?;
         kept = fetched;
         let name = row.path.rsplit('/').next().unwrap_or(&row.path);
+        let mut size = [None; 3];
+        for (size, path) in size.iter_mut().zip(&paths) {
+            *size = Some(std::fs::metadata(path)?.len());
+        }
         let item = DirItem {
             rel_dir: String::new(),
             name: name.to_string(),
             is_dir: false,
-            exists: [true, true, false],
-            size: [
-                Some(std::fs::metadata(&paths[0])?.len()),
-                Some(std::fs::metadata(&paths[1])?.len()),
-                None,
-            ],
-            mtime: [before[0].modified, before[1].modified, None],
+            exists: std::array::from_fn(|side| side < paths.len()),
+            size,
+            mtime: std::array::from_fn(|side| before.get(side).and_then(|m| m.modified)),
             status: CmpStatus::Pending,
             diff_side: None,
             binary: false,
@@ -746,36 +792,36 @@ fn verify_file(
         };
         folder::compare_files_with_cancel(&paths, &item, fopts, dopts, norm, Some(stop))?.0
             == CmpStatus::Identical
-    } else if before[0]
-        .size
-        .zip(before[1].size)
-        .is_some_and(|(a, b)| a != b)
-    {
+    } else if sizes_differ {
         false
     } else if remote
         && before
             .iter()
             .all(|m| m.size.is_some_and(|size| size <= MAX_KEPT_FILE))
     {
-        // Fetched whole, so that opening the pair later needs no second fetch.
-        let (paths, fetched) = fetch_pair(sources, [left, right], stop)?;
+        // Fetched whole, so that opening the files later needs no second fetch.
+        let (paths, fetched) = fetch_pair(sources, &rels, stop)?;
         kept = fetched;
-        equal_streams(
-            &mut std::fs::File::open(&paths[0])?,
-            &mut std::fs::File::open(&paths[1])?,
-            stop,
-        )?
+        let mut same = true;
+        for other in &paths[1..] {
+            same = same
+                && equal_streams(
+                    &mut std::fs::File::open(&paths[0])?,
+                    &mut std::fs::File::open(other)?,
+                    stop,
+                )?;
+        }
+        same
     } else {
-        equal_streams(
-            &mut sources[0].read(left)?,
-            &mut sources[1].read(right)?,
-            stop,
-        )?
+        // Each side is read against the first, which is read again for a third side.
+        let mut same = true;
+        for (source, rel) in sources.iter().zip(&rels).skip(1) {
+            same = same
+                && equal_streams(&mut sources[0].read(rels[0])?, &mut source.read(rel)?, stop)?;
+        }
+        same
     };
-    let after = [
-        sources[0].file_metadata(left)?,
-        sources[1].file_metadata(right)?,
-    ];
+    let after = stamps()?;
     anyhow::ensure!(before == after, "{}", tr("remote_compare.changed"));
     Ok((same, kept))
 }
@@ -879,8 +925,8 @@ mod tests {
             modified: None,
         });
         let rows = pair_spellings(BTreeMap::from([
-            ("README.txt".to_owned(), [meta, meta]),
-            ("Readme.txt".to_owned(), [None, meta]),
+            ("README.txt".to_owned(), vec![meta, meta]),
+            ("Readme.txt".to_owned(), vec![None, meta]),
         ]));
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -888,6 +934,87 @@ mod tests {
             [Some("README.txt".into()), Some("README.txt".into())]
         );
         assert_eq!(rows[1].0, [None, Some("Readme.txt".into())]);
+    }
+
+    /// Three folders are listed together: a file is on all of them, on one, or missing from
+    /// one; verifying reads all three, and opening gives one file for each side.
+    #[test]
+    fn three_folders_are_listed_verified_and_opened_together() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |file: &str, text: &str| {
+            let path = root.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        for side in ["a", "b", "c"] {
+            write(&format!("{side}/same.txt"), "same");
+            write(
+                &format!("{side}/sub/odd.txt"),
+                if side == "c" { "else" } else { "text" },
+            );
+        }
+        write("b/middle.txt", "x");
+        write("a/pair.txt", "x");
+        write("c/pair.txt", "x");
+        // Spelled another way on the third side only: the same file, where names fold.
+        write("a/Case.txt", "x");
+        write("b/Case.txt", "x");
+        write("c/case.TXT", "x");
+        let sides = ["a", "b", "c"].map(|side| Side::Local(root.path().join(side)));
+        let options = FolderOptions {
+            method: CompareMethod::BinaryContents,
+            recursive: true,
+            ..Default::default()
+        };
+        let never = AtomicBool::new(false);
+        let mut rows = Vec::new();
+        let filter = FileFilter::parse_mask("");
+        scan(&sides, &options, &filter, &never, |batch| {
+            rows.extend(batch)
+        })
+        .unwrap();
+        let row = |path: &str| rows.iter().find(|r| r.path == path).expect(path);
+        assert_eq!(row("middle.txt").status, Status::Only(1));
+        assert_eq!(row("middle.txt").present, [false, true, false]);
+        assert_eq!(row("pair.txt").status, Status::Missing(1));
+        assert!(!row("pair.txt").on_all());
+        assert_eq!(row("sub").status, Status::Folder);
+        assert!(row("same.txt").on_all() && row("sub/odd.txt").on_all());
+        assert_eq!(row("same.txt").sizes, [Some(4); 3]);
+        if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(
+                row("Case.txt").present,
+                [true; 3],
+                "one file, spelled two ways"
+            );
+        }
+
+        let files: Vec<Row> = (rows.iter())
+            .filter(|r| !r.directory && r.on_all() && r.path.ends_with(".txt"))
+            .filter(|r| r.path == "same.txt" || r.path == "sub/odd.txt")
+            .cloned()
+            .collect();
+        let mut same = BTreeMap::new();
+        verify(
+            &sides,
+            files,
+            &options,
+            &DiffOptions::default(),
+            &never,
+            |path, result, _| {
+                same.insert(path, result.unwrap());
+            },
+        )
+        .unwrap();
+        assert!(same["same.txt"]);
+        assert!(!same["sub/odd.txt"], "the third side differs");
+
+        let opened = open(&sides, row("sub/odd.txt"), &never).unwrap();
+        let texts: Vec<String> = (opened.iter())
+            .map(|o| std::fs::read_to_string(&o.path).unwrap())
+            .collect();
+        assert_eq!(texts, ["text", "text", "else"]);
+        assert!(open(&sides, row("pair.txt"), &never).is_err());
     }
 
     #[test]
@@ -915,7 +1042,7 @@ mod tests {
         .unwrap();
         assert!(rows
             .iter()
-            .any(|row| row.path.ends_with("/a.txt") && row.status == Status::LeftOnly));
+            .any(|row| row.path.ends_with("/a.txt") && row.status == Status::Only(0)));
         remote::fake::uninstall();
     }
 

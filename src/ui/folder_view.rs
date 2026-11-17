@@ -349,6 +349,9 @@ pub struct FolderView {
     /// out, such as output built after the tab was opened. A job saved from the tab takes the
     /// revision again from the repository rather than this temporary copy.
     revision: Option<(PathBuf, String)>,
+    /// The only entries the compare shows, when a side is a copy of only some of a server's
+    /// folder (see [`crate::core::remote::fetch_selected`]).
+    only: Option<Arc<crate::core::filter::Chosen>>,
     fopts: FolderOptions,
     dopts: DiffOptions,
     running: Option<Running>,
@@ -841,6 +844,7 @@ impl FolderView {
             filter_spec: filter_spec.to_string(),
             filter: FileFilter::resolve(filter_spec, named),
             revision: None,
+            only: None,
             fopts: cfg.folder.clone(),
             dopts: cfg.comparison_options(),
             running: None,
@@ -1196,12 +1200,17 @@ impl FolderView {
             progress.clone(),
         );
         let work = self.revision.as_ref().map(|(work, _)| work.clone());
+        let only = self.only.clone();
         let handle = std::thread::spawn(move || {
             // Asked here, off the window's thread, each time the folders are compared.
             let filter = match work {
                 Some(work) => {
                     crate::core::vcs::without_ignored(filter, &work, &roots[0], &pr.abort)
                 }
+                None => filter,
+            };
+            let filter = match only {
+                Some(chosen) => FileFilter::Only(Box::new(filter), chosen),
                 None => filter,
             };
             Scanner {
@@ -1341,6 +1350,14 @@ impl FolderView {
         if let Some(r) = self.remote_sides.get_mut(s) {
             *r = true;
         }
+    }
+
+    /// Shows only `chosen` of the folders, and what is inside or on the way to them (see
+    /// [`crate::core::filter::Chosen`]), comparing them again.
+    pub fn show_only(&mut self, chosen: &[String]) {
+        let chosen = crate::core::filter::Chosen::new(chosen.iter().cloned());
+        self.only = Some(Arc::new(chosen));
+        self.start_compare();
     }
 
     pub fn is_remote_side(&self, s: usize) -> bool {
