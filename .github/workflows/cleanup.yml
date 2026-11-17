@@ -1,24 +1,38 @@
 # Deletes old workflow runs, to keep the Actions list and its storage small.
 #
-# By default a run is deleted when it is older than `days`, did not succeed, and is not a
-# release: runs of `v*` tags, and runs started by a published release, are always kept. Runs
-# still queued or in progress are never touched. Run it by hand from the Actions tab, or let
-# the weekly schedule clean up with the defaults.
+# What is deleted is chosen for each kind of run:
+#   unsuccessful runs: those older than `days` (the default), or all of them whatever their age;
+#   successful runs:   none (the default), or those older than `days`.
+# An unsuccessful run is one that failed, was cancelled or skipped, timed out, or ended neutral
+# or stale. A run waiting to be approved is deleted only once it is older than `days`.
+# A release run is always kept: a run of a `v*` tag, or one started by a published release.
+# Runs still queued or in progress are never touched. Run it by hand from the Actions tab, or
+# let the weekly schedule clean up with the defaults.
 name: Cleanup workflow runs
 
 on:
   workflow_dispatch:
     inputs:
+      unsuccessful:
+        description: "Unsuccessful runs to delete: those older than days, or all of them whatever their age"
+        type: choice
+        options:
+          - older-than-days
+          - all
+        default: older-than-days
+      successful:
+        description: "Successful runs to delete: none, or those older than days (release runs are always kept)"
+        type: choice
+        options:
+          - none
+          - older-than-days
+        default: none
       days:
-        description: Delete runs older than this many days
+        description: Days a run must be older than, for older-than-days
         type: number
         default: 30
-      include_successful:
-        description: Also delete successful runs (release runs are still kept)
-        type: boolean
-        default: false
       dry_run:
-        description: Only list the runs that would be deleted
+        description: Dry run - only list the runs that would be deleted
         type: boolean
         default: false
   schedule:
@@ -41,26 +55,49 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          # Empty on the schedule, which has no inputs; 0 is a number of days like any other.
+          # All three are empty on the schedule, which has no inputs and so deletes what the
+          # defaults say; 0 is a number of days like any other.
           DAYS: ${{ inputs.days }}
-          INCLUDE_SUCCESSFUL: ${{ inputs.include_successful || false }}
+          UNSUCCESSFUL: ${{ inputs.unsuccessful }}
+          SUCCESSFUL: ${{ inputs.successful }}
           DRY_RUN: ${{ inputs.dry_run || false }}
-          SELF_RUN: ${{ github.run_id }}
         run: |
           set -euo pipefail
           DAYS=${DAYS:-30}
+          UNSUCCESSFUL=${UNSUCCESSFUL:-older-than-days}
+          SUCCESSFUL=${SUCCESSFUL:-none}
           if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
             echo "::error::days must be a whole number, got '$DAYS'"
             exit 1
           fi
           cutoff=$(date -u -d "$DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
-          echo "Deleting runs created before $cutoff (successful too: $INCLUDE_SUCCESSFUL, dry run: $DRY_RUN)"
+          older="&created=%3C$cutoff"
+          echo "Unsuccessful runs: $UNSUCCESSFUL; successful runs: $SUCCESSFUL; days: $DAYS (before $cutoff); dry run: $DRY_RUN"
 
-          # Every completed run created before the cutoff. A field with nothing in it is written
-          # as `-`: `read` takes two tabs with nothing between them for one.
-          gh api --paginate "repos/$REPO/actions/runs?status=completed&created=%3C$cutoff&per_page=100" \
-            --jq '.workflow_runs[] | [.id, .conclusion, .event, .head_branch, .name, .created_at] | map(if . == null or . == "" then "-" else . end) | @tsv' \
-            > runs.tsv
+          # The runs that ended one way, `$1`, created as `$2` says. GitHub lists no more than
+          # 1000 runs for one question, so each way of ending is asked for by itself, and only
+          # the ways that are deleted: the runs that are kept then never fill the list. A field
+          # with nothing in it is written as `-`: `read` takes two tabs with nothing between
+          # them for one.
+          : > runs.tsv
+          list() {
+            gh api --paginate "repos/$REPO/actions/runs?status=$1$2&per_page=100" \
+              --jq '.workflow_runs[] | [.id, .conclusion, .event, .head_branch, .name, .created_at] | map(if . == null or . == "" then "-" else . end) | @tsv' \
+              >> runs.tsv
+          }
+
+          unsuccessful_from=$older
+          if [ "$UNSUCCESSFUL" = "all" ]; then
+            unsuccessful_from=""
+          fi
+          for ended in failure cancelled skipped timed_out neutral stale startup_failure; do
+            list "$ended" "$unsuccessful_from"
+          done
+          # A run waiting to be approved is still wanted while it is new.
+          list action_required "$older"
+          if [ "$SUCCESSFUL" = "older-than-days" ]; then
+            list success "$older"
+          fi
 
           # A run whose ref is a `v*` tag of the repository is a release run, and is kept.
           gh api --paginate "repos/$REPO/tags?per_page=100" --jq '.[].name' > tags.txt
@@ -69,12 +106,7 @@ jobs:
           kept=0
           failed=0
           while IFS=$'\t' read -r id conclusion event branch name created; do
-            [ "$id" = "$SELF_RUN" ] && continue
             if [ "$event" = "release" ] || { [[ "$branch" == v* ]] && grep -Fxq "$branch" tags.txt; }; then
-              kept=$((kept + 1))
-              continue
-            fi
-            if [ "$conclusion" = "success" ] && [ "$INCLUDE_SUCCESSFUL" != "true" ]; then
               kept=$((kept + 1))
               continue
             fi
@@ -90,5 +122,5 @@ jobs:
           done < runs.tsv
 
           verb=$([ "$DRY_RUN" = "true" ] && echo "Would delete" || echo "Deleted")
-          echo "$verb $deleted run(s); kept $kept older run(s); $failed could not be deleted."
-          echo "$verb $deleted workflow run(s) older than $DAYS days; kept $kept; $failed could not be deleted." >> "$GITHUB_STEP_SUMMARY"
+          echo "$verb $deleted run(s); kept $kept release run(s); $failed could not be deleted."
+          echo "$verb $deleted workflow run(s) (unsuccessful: $UNSUCCESSFUL; successful: $SUCCESSFUL; days: $DAYS); kept $kept release run(s); $failed could not be deleted." >> "$GITHUB_STEP_SUMMARY"
