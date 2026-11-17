@@ -1,32 +1,24 @@
-# Deletes old workflow runs, to keep the Actions list and its storage small.
+# Deletes workflow runs, to keep the Actions list and its storage small.
 #
-# What is deleted is chosen for each kind of run:
-#   unsuccessful runs: those older than `days` (the default), or all of them whatever their age;
-#   successful runs:   none (the default), or those older than `days`.
-# An unsuccessful run is one that failed, was cancelled or skipped, timed out, or ended neutral
-# or stale. A run waiting to be approved is deleted only once it is older than `days`.
+# One of two things is deleted:
+#   older-than-days:   every run older than `days`, successful or not (the default);
+#   all-unsuccessful:  every run that did not succeed, whatever its age (`days` is not used).
 # A release run is always kept: a run of a `v*` tag, or one started by a published release.
-# Runs still queued or in progress are never touched. Run it by hand from the Actions tab, or
-# let the weekly schedule clean up with the defaults.
+# Runs still queued or in progress are never touched, and with all-unsuccessful neither is a
+# run waiting to be approved. Run it by hand from the Actions tab, or let the weekly schedule
+# delete the runs older than 30 days.
 name: Cleanup workflow runs
 
 on:
   workflow_dispatch:
     inputs:
-      unsuccessful:
-        description: "Unsuccessful runs to delete: those older than days, or all of them whatever their age"
+      delete:
+        description: "Runs to delete (release runs are always kept): every run older than days, or every unsuccessful run whatever its age"
         type: choice
         options:
           - older-than-days
-          - all
+          - all-unsuccessful
         default: older-than-days
-      successful:
-        description: "Successful runs to delete: none, or those older than days (release runs are always kept)"
-        type: choice
-        options:
-          - none
-          - older-than-days
-        default: none
       days:
         description: Days a run must be older than, for older-than-days
         type: number
@@ -51,53 +43,55 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Delete old runs
+      - name: Delete runs
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          # All three are empty on the schedule, which has no inputs and so deletes what the
+          # Both are empty on the schedule, which has no inputs and so deletes what the
           # defaults say; 0 is a number of days like any other.
+          DELETE: ${{ inputs.delete }}
           DAYS: ${{ inputs.days }}
-          UNSUCCESSFUL: ${{ inputs.unsuccessful }}
-          SUCCESSFUL: ${{ inputs.successful }}
           DRY_RUN: ${{ inputs.dry_run || false }}
         run: |
           set -euo pipefail
+          DELETE=${DELETE:-older-than-days}
           DAYS=${DAYS:-30}
-          UNSUCCESSFUL=${UNSUCCESSFUL:-older-than-days}
-          SUCCESSFUL=${SUCCESSFUL:-none}
           if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
             echo "::error::days must be a whole number, got '$DAYS'"
             exit 1
           fi
           cutoff=$(date -u -d "$DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
-          older="&created=%3C$cutoff"
-          echo "Unsuccessful runs: $UNSUCCESSFUL; successful runs: $SUCCESSFUL; days: $DAYS (before $cutoff); dry run: $DRY_RUN"
+          if [ "$DELETE" = "all-unsuccessful" ]; then
+            what="every unsuccessful run"
+            last=$(date -u +%s)
+          else
+            what="every run older than $DAYS days (before $cutoff)"
+            last=$(( $(date -u -d "$cutoff" +%s) - 1 ))
+          fi
+          echo "Deleting $what; dry run: $DRY_RUN"
 
-          # The runs that ended one way, `$1`, created as `$2` says. GitHub lists no more than
-          # 1000 runs for one question, so each way of ending is asked for by itself, and only
-          # the ways that are deleted: the runs that are kept then never fill the list. A field
-          # with nothing in it is written as `-`: `read` takes two tabs with nothing between
-          # them for one.
+          # The completed runs, from the oldest there is to the newest that may be deleted.
+          # GitHub lists no more than 1000 runs for one question about them, so they are asked
+          # for a week at a time; the list of all runs has no such limit, and its last run is
+          # the oldest. A field with nothing in it is written as `-`: `read` takes two tabs
+          # with nothing between them for one.
           : > runs.tsv
-          list() {
-            gh api --paginate "repos/$REPO/actions/runs?status=$1$2&per_page=100" \
+          stamp() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+          total=$(gh api "repos/$REPO/actions/runs?per_page=1" --jq '.total_count')
+          oldest=""
+          if [ "$total" -gt 0 ]; then
+            oldest=$(gh api "repos/$REPO/actions/runs?per_page=1&page=$total" --jq '.workflow_runs[0].created_at // empty')
+          fi
+          week=$((7 * 24 * 60 * 60))
+          from=$(date -u -d "${oldest:-@$((last + 1))}" +%s)
+          while [ "$from" -le "$last" ]; do
+            to=$((from + week - 1))
+            [ "$to" -le "$last" ] || to=$last
+            gh api --paginate "repos/$REPO/actions/runs?status=completed&created=$(stamp "$from")..$(stamp "$to")&per_page=100" \
               --jq '.workflow_runs[] | [.id, .conclusion, .event, .head_branch, .name, .created_at] | map(if . == null or . == "" then "-" else . end) | @tsv' \
               >> runs.tsv
-          }
-
-          unsuccessful_from=$older
-          if [ "$UNSUCCESSFUL" = "all" ]; then
-            unsuccessful_from=""
-          fi
-          for ended in failure cancelled skipped timed_out neutral stale startup_failure; do
-            list "$ended" "$unsuccessful_from"
+            from=$((to + 1))
           done
-          # A run waiting to be approved is still wanted while it is new.
-          list action_required "$older"
-          if [ "$SUCCESSFUL" = "older-than-days" ]; then
-            list success "$older"
-          fi
 
           # A run whose ref is a `v*` tag of the repository is a release run, and is kept.
           gh api --paginate "repos/$REPO/tags?per_page=100" --jq '.[].name' > tags.txt
@@ -106,6 +100,13 @@ jobs:
           kept=0
           failed=0
           while IFS=$'\t' read -r id conclusion event branch name created; do
+            # Every run listed is old enough; of the unsuccessful ones, a run waiting to be
+            # approved is still wanted.
+            if [ "$DELETE" = "all-unsuccessful" ]; then
+              case "$conclusion" in
+                success | action_required | -) continue ;;
+              esac
+            fi
             if [ "$event" = "release" ] || { [[ "$branch" == v* ]] && grep -Fxq "$branch" tags.txt; }; then
               kept=$((kept + 1))
               continue
@@ -123,4 +124,4 @@ jobs:
 
           verb=$([ "$DRY_RUN" = "true" ] && echo "Would delete" || echo "Deleted")
           echo "$verb $deleted run(s); kept $kept release run(s); $failed could not be deleted."
-          echo "$verb $deleted workflow run(s) (unsuccessful: $UNSUCCESSFUL; successful: $SUCCESSFUL; days: $DAYS); kept $kept release run(s); $failed could not be deleted." >> "$GITHUB_STEP_SUMMARY"
+          echo "$verb $deleted workflow run(s) ($what); kept $kept release run(s); $failed could not be deleted." >> "$GITHUB_STEP_SUMMARY"
