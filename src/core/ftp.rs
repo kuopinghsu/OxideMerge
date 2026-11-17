@@ -1635,6 +1635,9 @@ mod tests {
             let hex: String = ts::CERT.iter().map(|b| format!("{b:02x}")).collect();
             assert!(pinned.contains(&hex));
             std::fs::write(&file, pinned.replace(&hex, "00ff")).unwrap();
+            // A connection kept from the round trip was checked when it was made, and would
+            // be used again without asking: the check is of a new one.
+            remote::close_idle();
             let err = remote::fetch(&c, "/data", &never).err().unwrap();
             assert!(err.downcast_ref::<remote::UnknownHost>().is_none());
             assert!(
