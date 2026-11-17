@@ -1,24 +1,25 @@
 # Deletes workflow runs, to keep the Actions list and its storage small.
 #
-# One of two things is deleted:
-#   older-than-days:   every run older than `days`, successful or not (the default);
-#   all-unsuccessful:  every run that did not succeed, whatever its age (`days` is not used).
+# Two things can be deleted, each chosen by itself, so either or both:
+#   older_than_days:   every run older than `days`, successful or not (on by default);
+#   all_unsuccessful:  every run that did not succeed, whatever its age (off by default).
 # A release run is always kept: a run of a `v*` tag, or one started by a published release.
-# Runs still queued or in progress are never touched, and with all-unsuccessful neither is a
-# run waiting to be approved. Run it by hand from the Actions tab, or let the weekly schedule
+# Runs still queued or in progress are never touched, and all_unsuccessful leaves a run that
+# is waiting to be approved. Run it by hand from the Actions tab, or let the weekly schedule
 # delete the runs older than 30 days.
 name: Cleanup workflow runs
 
 on:
   workflow_dispatch:
     inputs:
-      delete:
-        description: "Runs to delete (release runs are always kept): every run older than days, or every unsuccessful run whatever its age"
-        type: choice
-        options:
-          - older-than-days
-          - all-unsuccessful
-        default: older-than-days
+      older_than_days:
+        description: "older-than-days: delete every run older than days, successful or not, except release"
+        type: boolean
+        default: true
+      all_unsuccessful:
+        description: "all-unsuccessful: delete every unsuccessful run, whatever its age, except release"
+        type: boolean
+        default: false
       days:
         description: Days a run must be older than, for older-than-days
         type: number
@@ -47,26 +48,37 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          # Both are empty on the schedule, which has no inputs and so deletes what the
+          # All three are empty on the schedule, which has no inputs and so deletes what the
           # defaults say; 0 is a number of days like any other.
-          DELETE: ${{ inputs.delete }}
+          OLDER_THAN_DAYS: ${{ inputs.older_than_days }}
+          ALL_UNSUCCESSFUL: ${{ inputs.all_unsuccessful }}
           DAYS: ${{ inputs.days }}
           DRY_RUN: ${{ inputs.dry_run || false }}
         run: |
           set -euo pipefail
-          DELETE=${DELETE:-older-than-days}
+          OLDER_THAN_DAYS=${OLDER_THAN_DAYS:-true}
+          ALL_UNSUCCESSFUL=${ALL_UNSUCCESSFUL:-false}
           DAYS=${DAYS:-30}
           if ! [[ "$DAYS" =~ ^[0-9]+$ ]]; then
             echo "::error::days must be a whole number, got '$DAYS'"
             exit 1
           fi
           cutoff=$(date -u -d "$DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
-          if [ "$DELETE" = "all-unsuccessful" ]; then
-            what="every unsuccessful run"
-            last=$(date -u +%s)
-          else
+          # The newest run that may be deleted, and what is deleted, in words.
+          what=""
+          last=0
+          if [ "$OLDER_THAN_DAYS" = "true" ]; then
             what="every run older than $DAYS days (before $cutoff)"
             last=$(( $(date -u -d "$cutoff" +%s) - 1 ))
+          fi
+          if [ "$ALL_UNSUCCESSFUL" = "true" ]; then
+            what="${what:+$what, and }every unsuccessful run"
+            last=$(date -u +%s)
+          fi
+          if [ -z "$what" ]; then
+            echo "Neither option is chosen, so there is nothing to delete."
+            echo "Nothing to delete: neither option was chosen." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           echo "Deleting $what; dry run: $DRY_RUN"
 
@@ -100,13 +112,20 @@ jobs:
           kept=0
           failed=0
           while IFS=$'\t' read -r id conclusion event branch name created; do
-            # Every run listed is old enough; of the unsuccessful ones, a run waiting to be
-            # approved is still wanted.
-            if [ "$DELETE" = "all-unsuccessful" ]; then
+            # A run is deleted for being old, or for not having succeeded; of the unsuccessful
+            # ones, a run waiting to be approved is still wanted. The dates are written the same
+            # way, so they compare as text.
+            wanted=false
+            if [ "$OLDER_THAN_DAYS" = "true" ] && [[ "$created" < "$cutoff" ]]; then
+              wanted=true
+            fi
+            if [ "$ALL_UNSUCCESSFUL" = "true" ]; then
               case "$conclusion" in
-                success | action_required | -) continue ;;
+                success | action_required | -) ;;
+                *) wanted=true ;;
               esac
             fi
+            $wanted || continue
             if [ "$event" = "release" ] || { [[ "$branch" == v* ]] && grep -Fxq "$branch" tags.txt; }; then
               kept=$((kept + 1))
               continue
