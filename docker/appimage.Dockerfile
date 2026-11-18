@@ -19,4 +19,6 @@ ENV PATH="/root/.cargo/bin:${PATH}" \
 # away from native target/ files and Windows filesystem symlink restrictions.
 RUN git config --global --add safe.directory /work
 WORKDIR /work
-CMD ["bash", "-c", "cargo build --profile release-size --locked && bash scripts/package-appimage.sh"]
+# The registry is the container's own volume, so the glutin patch for Mesa before 21 can go into
+# it, as in CI.
+CMD ["bash", "-c", "bash scripts/patch-glutin.sh && cargo build --profile release-size --locked && bash scripts/package-appimage.sh"]

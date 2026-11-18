@@ -275,81 +275,64 @@ AppImage 與 DMG 必須帶有其格式標記，PDF 必須完整。之後會將 `
 
 ### 為 Mesa 21 之前的版本修補 glutin
 
-發布的套件使用 crates.io 上原版的 glutin。在 Mesa 早於 21 的系統（RHEL 8.4）上使用軟體繪製器時，
-視窗會在開啟時當掉：glutin 呼叫 `glXSwapIntervalEXT`，而 Mesa 在其中呼叫了軟體繪製器沒有的函式。
-README 的「已知限制」列有此問題。本儲存庫不保留修補過的 glutin，但自行建置時可以加入。以下步驟適用於
-`Cargo.lock` 中的 glutin 0.32.3；請先確認該處的版本，並查看 glutin 的 `master` 分支，截至 2026 年
-11 月該問題仍未修正。
+在 Mesa 早於 21 的系統（RHEL 8.4）上使用軟體繪製器時，glutin 呼叫的 `glXSwapIntervalEXT`
+會執行到繪製器沒有的函式，視窗在開啟時當掉。截至 2026 年 11 月，glutin 的 `master` 分支仍有此問題。
+本儲存庫不保留 glutin 的複本：AppImage 工作會在建置前執行 `scripts/patch-glutin.sh`，由它將
+`scripts/patches/glutin-<version>-mesa-swap-interval.patch` 套用到 Cargo 已下載的 glutin。
 
-1. 將發布的 crate 複製到工作目錄中（`vendor/` 不受版本控制，只留在本機）：
+- 此修補變更 `src/api/glx/surface.rs` 中的 `set_swap_interval`。列出 `GLX_MESA_swap_control`
+  時（只有 Mesa 會列出），glutin 只使用 `glXSwapIntervalMESA`。驅動程式無法設定間隔時，Mesa
+  會從中傳回錯誤；eframe 會記錄一則警告，視窗照常開啟，只是沒有垂直同步。其他驅動程式（例如
+  NVIDIA）仍使用 `glXSwapIntervalEXT`。
+- 指令稿修補的是 `$CARGO_HOME/registry/src`，因此 `Cargo.toml` 與 `Cargo.lock` 維持提交時的內容，
+  加上標籤的建置仍會得到發行版本標記。使用相同 `CARGO_HOME` 建置的所有專案都共用這份複本：只在 CI
+  與擁有獨立 registry 磁碟區的 AppImage 容器中執行此指令稿。在 Windows 與 macOS 上，
+  `make appimage` 會在該容器中執行它。
+- 下載的 crate 檔案變更後，Cargo 不會重新建置它，因此指令稿也會刪除 glutin 在 `PROFILE`
+  （預設為 `release-size`）下的建置產物。再次執行不會有其他作用。
+- TAR.GZ 套件不會修補。它們需要比 RHEL 8 更新的 glibc，本來就無法在其上執行。直接以
+  `cargo build` 建置的程式也不會修補。
+
+`Cargo.lock` 改用其他 glutin 版本時，指令稿會以「No patch for glutin <version>」停止；修補無法套用時，
+則以「does not apply」停止。為新版本製作修補檔：
+
+1. 在儲存庫外解開該版本，並保留一份檔案複本：
 
    ```sh
    cargo fetch --locked
-   mkdir -p vendor
-   cp -r ~/.cargo/registry/src/index.crates.io-*/glutin-0.32.3 vendor/glutin
-   chmod -R u+w vendor/glutin
+   mkdir -p /tmp/glutin && cd /tmp/glutin
+   cp -r ~/.cargo/registry/src/index.crates.io-*/glutin-<version> a
+   cp -r a b
    ```
 
-   接著將 `/vendor/` 加入 `.git/info/exclude`，讓 Git 不列出它。
-
-2. 在 `vendor/glutin/src/api/glx/surface.rs` 的 `set_swap_interval` 中，將以
-   ``// Apply the `EXT` first since it's per window.`` 開頭的區塊，以及其後的
-   `GLX_MESA_swap_control` 區塊，換成放在最前面、無論成功與否都會返回的 Mesa 區塊：
+2. 在 `b/src/api/glx/surface.rs` 中做上述變更：在 `set_swap_interval` 裡，將下列區塊放在
+   `GLX_EXT_swap_control` 區塊之前，並刪除其後原有的 `GLX_MESA_swap_control` 區塊：
 
    ```rust
-   // On Mesa, use only its own extension. It returns an error where the driver
-   // cannot set the interval; glXSwapIntervalEXT before Mesa 21 crashes there.
    if self.display.inner.client_extensions.contains("GLX_MESA_swap_control") {
        unsafe {
            applied = extra.SwapIntervalMESA(interval as _) != glx::BAD_CONTEXT as _;
        }
        return if applied { Ok(()) } else { Err(ErrorKind::BadContext.into()) };
    }
-
-   if !applied && self.display.inner.client_extensions.contains("GLX_EXT_swap_control") {
-       // ... unchanged ...
-   }
    ```
 
-   `GLX_SGI_swap_control` 區塊維持不變。Mesa 無法設定間隔時，eframe 會記錄一則警告，視窗照常開啟，
-   只是沒有垂直同步。其他驅動程式（例如 NVIDIA）不會列出 `GLX_MESA_swap_control`，仍使用
-   `glXSwapIntervalEXT`。
-
-3. 在 `Cargo.toml` 結尾讓 Cargo 改用這份複本：
-
-   ```toml
-   [patch.crates-io]
-   glutin = { path = "vendor/glutin" }
-   ```
-
-4. 更新鎖定檔並建置 AppImage。`Cargo.lock` 中只有 glutin 的項目會變更：移除其 `source` 與
-   `checksum` 兩行。
+3. 以從 crate 開始的路徑寫出修補檔，並刪除舊的修補檔：
 
    ```sh
-   cargo update -p glutin --offline
+   diff -u a/src/api/glx/surface.rs b/src/api/glx/surface.rs |
+       sed '1,2s/\t.*//' > <repository>/scripts/patches/glutin-<version>-mesa-swap-interval.patch
    ```
 
-   在 Windows 與 macOS 上，`make appimage` 會像 CI 一樣在 AlmaLinux 8 容器中建置。在 Linux 上它會使用
-   主機的 glibc 建置，產生的程式無法在 RHEL 8.4 等較舊的系統上啟動，因此請改用同一個容器：
-
-   ```sh
-   docker build -t oxidemerge-appimage -f docker/appimage.Dockerfile docker
-   docker run --rm --init -v "$PWD:/work" -w /work oxidemerge-appimage
-   ```
-
-   AppImage 會寫入 `dist/`。
-
-5. 在受影響的系統上，或在任何將 RHEL 8.4 的 Mesa 函式庫放在函式庫路徑上的 Linux 系統上，
-   強制使用軟體繪製器檢查視窗：
+4. 在 Mesa 20.3 或 RHEL 8.4 本身上，強制使用軟體繪製器檢查視窗。未修補時，視窗開啟時會發生記憶體
+   區段錯誤；修補後可正常開啟：
 
    ```sh
    WAYLAND_DISPLAY= LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe ./oxidemerge-*.AppImage
    ```
 
-   未修補時，視窗開啟時會發生記憶體區段錯誤；修補後視窗可正常開啟。
-
-提交時請排除這些變更：不要在修補生效時提交 `Cargo.toml`、`Cargo.lock` 或 `vendor/`。若要復原，
-請刪除 `vendor/glutin` 與 `[patch.crates-io]` 那幾行，並執行 `git checkout -- Cargo.lock`。
+若 glutin 本身修正了此問題，請刪除修補檔、指令稿，以及 `.github/workflows/ci.yml` 與
+`docker/appimage.Dockerfile` 中執行它的步驟。
 
 ## 版本發布
 

@@ -26,6 +26,10 @@ release on GitHub uses its section of this file as the release notes.
   failed. Comparing the folders again used to clear it.
 - Entries ticked in the SFTP/FTP chooser are compared with their subfolders even when *Include
   subfolders* is off, which showed only the top level and hid entries ticked inside folders.
+- The Linux AppImage no longer crashes as its window opens on RHEL 8.4 and other systems with
+  Mesa older than 21 when OpenGL is drawn in software, as in a virtual machine or over a remote
+  desktop. The AppImage build patches glutin to set the swap interval through Mesa's own
+  extension, which reports that the driver cannot set it; the window then opens without vsync.
 
 ## [0.9.9] - 2026-11-17
 

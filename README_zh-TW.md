@@ -539,9 +539,11 @@ Subversion 的 `merge-tool-cmd` 與 Perforce 的 `P4MERGE` 可以直接設為 `o
 - AppImage 需要 glibc 2.28 或更新版本。在 RHEL 7 與 CentOS 7（glibc 2.17）上，它會立即停止並顯示
   `GLIBC_2.xx not found`。
 - 在 RHEL 8.4 及其他 Mesa 早於 21 的系統上，若 OpenGL 以軟體繪製（llvmpipe），例如在虛擬機器中或
-  透過遠端桌面，視窗可能在開啟時當掉。Mesa 的 `glXSwapIntervalEXT` 會呼叫其軟體繪製器沒有的函式。
-  命令列仍可使用。請更新 Mesa（RHEL 8.7 及更新版本不受影響），或改用 Wayland 工作階段，在那裡
-  視窗透過 EGL 而非 GLX 繪製。
+  透過遠端桌面，從原始碼建置的程式可能在視窗開啟時當掉：Mesa 的 `glXSwapIntervalEXT`
+  會呼叫其軟體繪製器沒有的函式。0.9.10 起的 AppImage 會避開這個呼叫（請參閱
+  [開發指南](docs/development.zh-TW.md#為-mesa-21-之前的版本修補-glutin)）；0.9.10 之前的版本同樣會當掉。
+  命令列仍可使用。否則請更新 Mesa（RHEL 8.7 及更新版本不受影響），或改用 Wayland 工作階段，
+  在那裡視窗透過 EGL 而非 GLX 繪製。
 
 ### 介面與整合
 
