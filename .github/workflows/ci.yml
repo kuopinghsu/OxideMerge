@@ -447,6 +447,11 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Mesa before 21 (RHEL 8.4) crashes in glXSwapIntervalEXT with its software renderer.
+      # The patch goes into the downloaded glutin, so Cargo.lock stays as committed.
+      - name: Patch glutin for Mesa before 21
+        run: bash scripts/patch-glutin.sh
+
       - name: Build
         run: cargo build --profile release-size --locked
 

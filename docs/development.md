@@ -298,84 +298,69 @@ must be whole. It then publishes `SHA256SUMS` with the packages.
 
 ### Patch glutin for Mesa before 21
 
-The released packages use glutin as published. On Mesa older than 21 (RHEL 8.4) with the software
-renderer, the window crashes as it opens: glutin calls `glXSwapIntervalEXT`, and Mesa calls a
-function from it that its software renderer does not have. The README lists this under *Known
-limitations*. The repository does not keep a patched glutin, but a build of your own can carry
-one. The steps are for glutin 0.32.3, the version in `Cargo.lock`; check the version there first,
-and check glutin's `master` branch, which still had the problem in November 2026.
+On Mesa older than 21 (RHEL 8.4) with the software renderer, glutin's call to
+`glXSwapIntervalEXT` reaches a function the renderer does not have, and the window crashes as it
+opens. glutin's `master` branch still had the problem in November 2026. The repository does not
+keep a copy of glutin: the AppImage job runs `scripts/patch-glutin.sh` before it builds, and the
+script applies `scripts/patches/glutin-<version>-mesa-swap-interval.patch` to the glutin that
+Cargo has downloaded.
 
-1. Copy the published crate into the checkout (`vendor/` is not tracked, so it stays local):
+- The patch changes `set_swap_interval` in `src/api/glx/surface.rs`. When
+  `GLX_MESA_swap_control` is listed, which only Mesa does, glutin uses only
+  `glXSwapIntervalMESA`. Mesa returns an error from it where the driver cannot set the interval;
+  eframe logs a warning and the window opens without vsync. Other drivers, such as NVIDIA's, still
+  use `glXSwapIntervalEXT`.
+- The script patches `$CARGO_HOME/registry/src`, so `Cargo.toml` and `Cargo.lock` stay as
+  committed and a tagged build still gets its release label. That copy is shared by every project
+  built with the same `CARGO_HOME`: run the script only in CI and in the AppImage container, which
+  has a registry volume of its own. `make appimage` on Windows and macOS runs it there.
+- Cargo does not rebuild a downloaded crate whose files change, so the script also removes
+  glutin's build output for `PROFILE` (default `release-size`). Running it again does nothing more.
+- The TAR.GZ packages are not patched. They need a newer glibc than RHEL 8 has, so they do not run
+  there. A program built with plain `cargo build` is not patched either.
+
+When `Cargo.lock` moves to another glutin version, the script stops with "No patch for glutin
+<version>", and when the patch no longer applies, with "does not apply". To make the patch for a
+new version:
+
+1. Unpack that version outside the repository and keep a copy of the file:
 
    ```sh
    cargo fetch --locked
-   mkdir -p vendor
-   cp -r ~/.cargo/registry/src/index.crates.io-*/glutin-0.32.3 vendor/glutin
-   chmod -R u+w vendor/glutin
+   mkdir -p /tmp/glutin && cd /tmp/glutin
+   cp -r ~/.cargo/registry/src/index.crates.io-*/glutin-<version> a
+   cp -r a b
    ```
 
-   Then add `/vendor/` to `.git/info/exclude`, so Git does not list it.
-
-2. In `vendor/glutin/src/api/glx/surface.rs`, in `set_swap_interval`, replace the block that
-   starts ``// Apply the `EXT` first since it's per window.`` and the `GLX_MESA_swap_control` block
-   after it with a Mesa block placed first, which returns either way:
+2. In `b/src/api/glx/surface.rs`, make the change described above: in `set_swap_interval`, put
+   this block before the `GLX_EXT_swap_control` one, and remove the old `GLX_MESA_swap_control`
+   block after it:
 
    ```rust
-   // On Mesa, use only its own extension. It returns an error where the driver
-   // cannot set the interval; glXSwapIntervalEXT before Mesa 21 crashes there.
    if self.display.inner.client_extensions.contains("GLX_MESA_swap_control") {
        unsafe {
            applied = extra.SwapIntervalMESA(interval as _) != glx::BAD_CONTEXT as _;
        }
        return if applied { Ok(()) } else { Err(ErrorKind::BadContext.into()) };
    }
-
-   if !applied && self.display.inner.client_extensions.contains("GLX_EXT_swap_control") {
-       // ... unchanged ...
-   }
    ```
 
-   Leave the `GLX_SGI_swap_control` block as it is. When Mesa cannot set the interval, eframe logs
-   a warning and the window opens without vsync. Other drivers, such as NVIDIA's, do not list
-   `GLX_MESA_swap_control` and still use `glXSwapIntervalEXT`.
-
-3. Point Cargo at the copy, at the end of `Cargo.toml`:
-
-   ```toml
-   [patch.crates-io]
-   glutin = { path = "vendor/glutin" }
-   ```
-
-4. Update the lock file and build the AppImage. Only glutin's entry in `Cargo.lock` changes: it
-   loses its `source` and `checksum` lines.
+3. Write the patch with paths that start at the crate, and remove the old one:
 
    ```sh
-   cargo update -p glutin --offline
+   diff -u a/src/api/glx/surface.rs b/src/api/glx/surface.rs |
+       sed '1,2s/\t.*//' > <repository>/scripts/patches/glutin-<version>-mesa-swap-interval.patch
    ```
 
-   On Windows and macOS, `make appimage` builds in the AlmaLinux 8 container, as CI does. On Linux
-   it builds with the host's glibc, and the result does not start on an older system such as RHEL
-   8.4, so use the same container there:
-
-   ```sh
-   docker build -t oxidemerge-appimage -f docker/appimage.Dockerfile docker
-   docker run --rm --init -v "$PWD:/work" -w /work oxidemerge-appimage
-   ```
-
-   The AppImage is written to `dist/`.
-
-5. Check the window on the affected system, or on any Linux system with RHEL 8.4's Mesa libraries
-   on the library path, with the software renderer forced:
+4. Check it with the window on Mesa 20.3, or on RHEL 8.4 itself, with the software renderer
+   forced. Unpatched, the window ends in a segmentation fault as it opens; patched, it opens:
 
    ```sh
    WAYLAND_DISPLAY= LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe ./oxidemerge-*.AppImage
    ```
 
-   Unpatched, this ends in a segmentation fault as the window opens; patched, the window opens.
-
-Leave these changes out of commits: do not commit `Cargo.toml`, `Cargo.lock` or `vendor/` with the
-patch in place. To undo it, remove `vendor/glutin` and the `[patch.crates-io]` lines, and run
-`git checkout -- Cargo.lock`.
+If glutin fixes the problem itself, remove the patch, the script and the step that runs it in
+`.github/workflows/ci.yml` and `docker/appimage.Dockerfile`.
 
 ## Releases
 
