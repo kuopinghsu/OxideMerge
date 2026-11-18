@@ -16,17 +16,15 @@
 
 ## 從原始碼建置
 
-請先透過 [rustup](https://rustup.rs/) 安裝 Rust 工具鏈。Linux 另需要 C 與 C++ 編譯器
-（`gcc` 與 `g++`，Fedora 系列為 `gcc-c++`）：讀取 RAR 壓縮檔的 UnRAR 程式庫以 C++ 撰寫。
-X11、Wayland、鍵盤與 OpenGL 函式庫會在程式啟動時才載入，
-因此建置時不需要安裝這些函式庫的開發套件。
+請先透過 [rustup](https://rustup.rs/) 安裝 Rust 工具鏈。Linux 另需要 C 與 C++ 編譯器（`gcc` 與
+`g++`，Fedora 系列為 `gcc-c++`）：讀取 RAR 壓縮檔的 UnRAR 程式庫以 C++ 撰寫。 X11、Wayland、鍵盤與
+OpenGL 函式庫會在程式啟動時才載入，因此建置時不需要安裝這些函式庫的開發套件。
 
 SFTP 功能會從原始碼建置 OpenSSL，因此需要 Perl：
 
 - **Windows：** 安裝 [Strawberry Perl](https://strawberryperl.com/)，例如執行
-  `winget install StrawberryPerl.StrawberryPerl`，然後開啟新的終端機。若要使用不在 `PATH`
-  中的 Perl，請將 `OPENSSL_SRC_PERL` 設為其 `perl.exe`。Git for Windows 附帶的 Perl 無法
-  使用。
+  `winget install StrawberryPerl.StrawberryPerl`，然後開啟新的終端機。若要使用不在 `PATH` 中的
+  Perl，請將 `OPENSSL_SRC_PERL` 設為其 `perl.exe`。Git for Windows 附帶的 Perl 無法使用。
 - **Linux：** `perl` 及其 `IPC::Cmd` 模組（Fedora 為 `perl-IPC-Cmd`）。
 - **macOS：** 系統內建的 Perl 即可。
 
@@ -51,8 +49,7 @@ macOS 與 Linux 的程式位於 `target/release/oxidemerge`，Windows 則為
 
 ## 建置指令
 
-[Makefile](../Makefile) 為常用工作提供簡短的指令，需要 GNU Make。
-執行 `make help` 可列出所有目標。
+[Makefile](../Makefile) 為常用工作提供簡短的指令，需要 GNU Make。執行 `make help` 可列出所有目標。
 
 ### 建置與執行
 
@@ -68,8 +65,8 @@ macOS 與 Linux 的程式位於 `target/release/oxidemerge`，Windows 則為
 | `make shell-register` | 安裝程式，並註冊檔案管理員整合。 |
 | `make clean` | 移除建置結果與本機產生的套件。 |
 
-[samples/README.md](../samples/README.md) 列出每個範例及其示範的功能。
-網頁比較範例請參閱 [samples/web/README.md](../samples/web/README.md)。
+[samples/README.md](../samples/README.md) 列出每個範例及其示範的功能。網頁比較範例請參閱
+[samples/web/README.md](../samples/web/README.md)。
 
 ### 檢查程式碼
 
@@ -93,11 +90,12 @@ macOS 與 Linux 的程式位於 `target/release/oxidemerge`，Windows 則為
 | `make user-guide` | 在 `dist/` 產生英文與繁體中文 PDF 指南。 |
 | `make user-guide-docs` | 在 `docs/dist/` 產生相同的指南，檔名為 `oxidemerge-user-guide.pdf` 與 `oxidemerge-user-guide.zh-TW.pdf`。這些檔案會提交到儲存庫，每次建置都會取代它們。 |
 
-變更使用者指南或其圖片後，請執行 `make user-guide-docs`，並將 PDF 檔案與變更一起提交，
-讓 `docs/dist/` 始終保有最新的指南。
+變更使用者指南或其圖片後，請執行 `make user-guide-docs`，並將 PDF 檔案與變更一起提交，讓
+`docs/dist/` 始終保有最新的指南。
 
-在 Windows 與 macOS 上，這兩個目標都在 Docker 中執行：請啟動 Docker Desktop（在 Windows 上使用 Linux 容器模式），再用 GNU Make 執行任一目標。
-目標會建置可重複使用的映像檔，其中的 Asciidoctor 版本與 CI 相同，並將 PDF 寫回儲存庫。
+在 Windows 與 macOS 上，這兩個目標都在 Docker 中執行：請啟動 Docker Desktop（在 Windows 上使用 Linux
+容器模式），再用 GNU Make 執行任一目標。目標會建置可重複使用的映像檔，其中的 Asciidoctor 版本與 CI
+相同，並將 PDF 寫回儲存庫。
 
 在 macOS 與 Linux 上，這兩個目標需要 Asciidoctor PDF、`curl`、`shasum`、含 `fontTools` 的 Python 3、
 fontconfig 與 DejaVu Sans 字型。建置指令碼會自動下載所需的 Noto Sans CJK 字型。
@@ -118,28 +116,27 @@ fontconfig 與 DejaVu Sans 字型。建置指令碼會自動下載所需的 Noto
 | `recovery_needed` | 變更中途停止且無法完全復原，並保留了復原日誌 | 無法完全還原的回復 |
 
 功能若有自己的結果類型，應對應到上述分類，而非取而代之：I/O 錯誤使用 `Problem::of_io`
-（結果依讀取或寫入而不同），無法依要求使用的索引鍵或表格則使用 `Problem::of_table`。
-需要新的對應時，請在這些函式旁新增對應函式，而不是新增列舉。
+（結果依讀取或寫入而不同），無法依要求使用的索引鍵或表格則使用 `Problem::of_table`。需要新的對應時，
+請在這些函式旁新增對應函式，而不是新增列舉。
 
-這些名稱會以兩種方式呈現給使用者。`--sync-apply` 與 `--sync-recover` 會在 JSON 中以
-`problem` 輸出結果，使用上表中的序列化名稱，供指令稿判斷；這屬於相容性介面，
-變更列舉名稱時必須在發行說明中記載。`Problem::label()` 提供已翻譯的簡短名稱
-（`lang/*.json` 中的 `problem.*`），供會先標示問題類型再說明細節的檢視使用。
-細節仍沿用各功能自己的用語：分類說明的是發生了哪一類情況，而不是發生了什麼事。
+這些名稱會以兩種方式呈現給使用者。`--sync-apply` 與 `--sync-recover` 會在 JSON 中以 `problem`
+輸出結果，使用上表中的序列化名稱，供指令稿判斷；這屬於相容性介面，變更列舉名稱時必須在發行說明中記載
+。`Problem::label()` 提供已翻譯的簡短名稱（`lang/*.json` 中的 `problem.*`），
+供會先標示問題類型再說明細節的檢視使用。細節仍沿用各功能自己的用語：分類說明的是發生了哪一類情況，
+而不是發生了什麼事。
 
 ## 測試
 
 `cargo test` 涵蓋三個部分：
 
-- **核心功能：** 比較、合併、修補檔、資料夾與檔案操作。
-  `src/core/regress.rs` 中的隨機測試也會產生差異、合併與修補案例進行驗證。
+- **核心功能：** 比較、合併、修補檔、資料夾與檔案操作。 `src/core/regress.rs`
+  中的隨機測試也會產生差異、合併與修補案例進行驗證。
 - **介面操作：** 在沒有顯示器的情況下操作實際的檢視畫面，涵蓋選單、編輯、拖放檔案與儲存結果。
   視窗測試失敗時，會將詳細資訊寫入 `target/gui-tests/<test>.txt`。
 - **指令列行為：** `tests/cli.rs` 中的測試會執行程式，檢查結束代碼、報告、修補檔與錯誤訊息。
 
-測試使用獨立的設定資料夾，不會變更您的設定。其他不應影響設定的測試，
-也可以將 `OXIDEMERGE_CONFIG_DIR` 指向另一個資料夾。
-部分網頁測試會啟動本機 HTTP 伺服器，因此測試環境必須允許程式監聽本機網路連接埠。
+測試使用獨立的設定資料夾，不會變更您的設定。其他不應影響設定的測試，也可以將 `OXIDEMERGE_CONFIG_DIR`
+指向另一個資料夾。部分網頁測試會啟動本機 HTTP 伺服器，因此測試環境必須允許程式監聽本機網路連接埠。
 
 版本控制的測試會使用實際的程式：Git、Subversion 的 `svn` 與 `svnadmin`，以及 Mercurial 的 `hg`。
 找不到 Subversion 或 Mercurial 時，相關測試會印出已略過並視為通過，因此請先安裝它們再執行這些測試。
@@ -148,9 +145,9 @@ fontconfig 與 DejaVu Sans 字型。建置指令碼會自動下載所需的 Noto
 
 ### 已保存的報告
 
-以固定輸入產生的語意、版本摘要與影響報告，必須與 `tests/fixtures/reports` 中的
-JSON 與 XML 報告相同，只有擷取時間可以不同。若您有意變更報告內容，
-請執行下列指令更新已保存的報告，再檢查其中的變更：
+以固定輸入產生的語意、版本摘要與影響報告，必須與 `tests/fixtures/reports` 中的 JSON 與 XML
+報告相同，只有擷取時間可以不同。若您有意變更報告內容，請執行下列指令更新已保存的報告，
+再檢查其中的變更：
 
 ```sh
 OXIDEMERGE_UPDATE_REPORTS=1 cargo test --test cli reports_match
@@ -164,20 +161,18 @@ OXIDEMERGE_UPDATE_REPORTS=1 cargo test --test cli reports_match
 cargo test --release --locked format_regression -- --nocapture
 ```
 
-這些檢查確認修補檔會保留位元組順序標記與換行字元、已忽略的文字變更維持忽略，
-以及在混用換行字元時，合併、儲存與復原都能正確運作。
-它們也會確認結果與 Git 簽出及 Git 修補檔相容，因此必須安裝 Git。
+這些檢查確認修補檔會保留位元組順序標記與換行字元、已忽略的文字變更維持忽略，以及在混用換行字元時，
+合併、儲存與復原都能正確運作。它們也會確認結果與 Git 簽出及 Git 修補檔相容，因此必須安裝 Git。
 持續整合會在 Windows、Linux 與 macOS 上，於完整測試中執行這些檢查。
 
 ### 翻譯檢查
 
-若 `lang/` 中的語言檔缺少 `lang/en.json` 的鍵、含有英文沒有的鍵、同一個鍵出現兩次、
-少了或多了 `{placeholder}`、提到的按鍵與英文不同（`Ctrl+V`、`F5`；德文的 *Strg* 視為 *Ctrl*），
-或將刪除、取代或遺失工作的警告留為英文，`i18n` 測試就會讓建置失敗。
-這些測試也會確認 `docs/user-guide.zh-TW.adoc`、`docs/development.zh-TW.md` 與 `README_zh-TW.md`
-的標題、層級與錨點都與英文文件相同，且使用者指南中的每個 `<<anchor>>` 都存在。
-另有一個視窗測試會以每種語言，在 800 × 600 的視窗中開啟復原提示與「選項」對話方塊，
-若有按鈕超出視窗或與其他按鈕重疊就會失敗。
+若 `lang/` 中的語言檔缺少 `lang/en.json` 的鍵、含有英文沒有的鍵、同一個鍵出現兩次、少了或多了
+`{placeholder}`、提到的按鍵與英文不同（`Ctrl+V`、`F5`；德文的 *Strg* 視為 *Ctrl*），或將刪除、
+取代或遺失工作的警告留為英文，`i18n` 測試就會讓建置失敗。這些測試也會確認
+`docs/user-guide.zh-TW.adoc`、`docs/development.zh-TW.md` 與 `README_zh-TW.md` 的標題、
+層級與錨點都與英文文件相同，且使用者指南中的每個 `<<anchor>>` 都存在。另有一個視窗測試會以每種語言，
+在 800 × 600 的視窗中開啟復原提示與「選項」對話方塊，若有按鈕超出視窗或與其他按鈕重疊就會失敗。
 
 ```sh
 cargo test --locked i18n::
@@ -196,10 +191,9 @@ OXIDEMERGE_TEST_CASES=20000 cargo test --release regress
 
 ### 視窗測試
 
-若要以實際的程式視窗進行測試，請執行 `make gui-smoke` 或
-`scripts/gui-smoke.sh path/to/oxidemerge`。指令碼會檢查雙檔、三檔與資料夾比較。
-Linux 沒有顯示環境時，會自動啟動 Xvfb。設定 `OXIDEMERGE_SMOKE_REPORT=<file>` 後，
-程式會在比較完成時，將分頁與訊息寫入該檔案，然後關閉。
+若要以實際的程式視窗進行測試，請執行 `make gui-smoke` 或 `scripts/gui-smoke.sh path/to/oxidemerge`。
+指令碼會檢查雙檔、三檔與資料夾比較。 Linux 沒有顯示環境時，會自動啟動 Xvfb。設定
+`OXIDEMERGE_SMOKE_REPORT=<file>` 後，程式會在比較完成時，將分頁與訊息寫入該檔案，然後關閉。
 
 在 Linux 與 macOS 上，指令碼也會以實際的程序檢查當機復原：先開啟復原功能啟動程式，
 等第一份快照寫入後以 `kill -9` 結束程式，再確認下次啟動時會提供兩個檔案的復原，
@@ -207,23 +201,22 @@ Linux 沒有顯示環境時，會自動啟動 Xvfb。設定 `OXIDEMERGE_SMOKE_RE
 
 若要製作文件圖片，設定 `OXIDEMERGE_SCREENSHOT=<file.png>` 後，程式會在比較完成時，
 直接儲存它所繪製的視窗畫面（不需擷取螢幕），然後關閉。將 `OXIDEMERGE_SCREENSHOT_COMMAND`
-設為命令的標籤鍵（例如 `cmd.sync_folders`），會先執行該命令。搭配 `OXIDEMERGE_CONFIG_DIR`
-與設定 `language` 的 `config.json`，即可擷取其他語言的畫面。
+設為命令的標籤鍵（例如 `cmd.sync_folders`），會先執行該命令。搭配 `OXIDEMERGE_CONFIG_DIR` 與設定
+`language` 的 `config.json`，即可擷取其他語言的畫面。
 
 ### Docker 測試環境
 
-在任何裝有 Docker 的電腦上（包括 Mac），都可以執行 `scripts/docker-test.sh`（或
-`make docker-test`）來檢查 Linux。容器定義於 [docker/Dockerfile](../docker/Dockerfile)，會執行
-Clippy、完整測試、發行版本建置，以及在 Xvfb 上的指令列與視窗檢查；
-測試與持續整合相同，以發行模式建置。測試以一般使用者身分執行。
-容器也會啟動實際的伺服器（[docker/servers.sh](../docker/servers.sh)），
+在任何裝有 Docker 的電腦上（包括 Mac），都可以執行 `scripts/docker-test.sh`（或 `make docker-test`）
+來檢查 Linux。容器定義於 [docker/Dockerfile](../docker/Dockerfile)，會執行 Clippy、完整測試、
+發行版本建置，以及在 Xvfb 上的指令列與視窗檢查；測試與持續整合相同，以發行模式建置。
+測試以一般使用者身分執行。容器也會啟動實際的伺服器（[docker/servers.sh](../docker/servers.sh)），
 並安裝 Subversion 與 Mercurial，執行一般 `cargo test` 會略過的測試：
 
-- OpenSSH：以金鑰登入、金鑰密碼、主機憑證、跳板主機與 `ProxyCommand`，
-  以及透過 PAM 的鍵盤互動式登入。
+- OpenSSH：以金鑰登入、金鑰密碼、主機憑證、跳板主機與 `ProxyCommand`，以及透過 PAM
+  的鍵盤互動式登入。
 - vsftpd 與 ProFTPD：FTP、明確與隱含 FTPS、主動模式，以及用戶端憑證。
-- Dante 與 tinyproxy：透過 SOCKS5 與 HTTP CONNECT 代理伺服器（需登入與不需登入）
-  使用 SFTP、FTP 與 FTPS。
+- Dante 與 tinyproxy：透過 SOCKS5 與 HTTP CONNECT 代理伺服器（需登入與不需登入）使用 SFTP、FTP 與
+  FTPS。
 - Subversion 與 Mercurial：以實際的工作複本與修訂版本比較。
 
 Cargo 以離線方式執行，使用已下載到 `~/.cargo/registry` 的套件；在新電腦上，請先執行
@@ -233,8 +226,8 @@ Cargo 以離線方式執行，使用已下載到 `~/.cargo/registry` 的套件�
 
 ### 效能測試
 
-效能測試不包含在 `cargo test` 中。指令、量測方法與參考結果，請參閱
-[效能測試說明](benchmarks.md)（英文）。
+效能測試不包含在 `cargo test` 中。指令、量測方法與參考結果，請參閱 [效能測試說明](benchmarks.md)（英
+文）。
 
 ## 持續整合
 
@@ -258,22 +251,21 @@ Cargo 以離線方式執行，使用已下載到 `~/.cargo/registry` 的套件�
 
 推送到 `main`、推送發行標籤，以及開啟 `packages` 的手動執行，都會產生並驗證下列套件：
 
-- **Windows x64 與 Arm64：** 只包含 `oxidemerge.exe` 的 ZIP 套件。
-  會檢查每個程式的處理器架構，並實際啟動。
-- **Linux x64 與 Arm64：** 在 Ubuntu 22.04 上建置的 TAR.GZ 套件。
-  會實際啟動程式，並確認不會變更設定。
-- **Linux AppImage：** 在使用 glibc 2.28 的 AlmaLinux 8 上建置。
-  套件內含 X11、Wayland 與鍵盤函式庫，系統缺少這些函式庫時才會使用。
-  兩種處理器架構都會在 Ubuntu 22.04 與 AlmaLinux 8 上，檢查函式庫載入、指令列行為與視窗啟動。
+- **Windows x64 與 Arm64：** 只包含 `oxidemerge.exe` 的 ZIP 套件。會檢查每個程式的處理器架構，
+  並實際啟動。
+- **Linux x64 與 Arm64：** 在 Ubuntu 22.04 上建置的 TAR.GZ 套件。會實際啟動程式，
+  並確認不會變更設定。
+- **Linux AppImage：** 在使用 glibc 2.28 的 AlmaLinux 8 上建置。套件內含 X11、Wayland 與鍵盤函式庫，
+  系統缺少這些函式庫時才會使用。兩種處理器架構都會在 Ubuntu 22.04 與 AlmaLinux 8 上，
+  檢查函式庫載入、指令列行為與視窗啟動。
 - **macOS：** 以 DMG 套件提供的通用應用程式，由 `scripts/macos-sign.sh` 簽署：
-  沒有簽署機密時採用臨時簽署；五個 `MACOS_*` 機密都設定時，則以 Developer ID 簽署、公證並裝訂
-  （請參閱 [macOS 簽署](macos-signing.md)）。
-  會驗證 Apple 晶片與 Intel 兩種程式碼，並透過 Rosetta 測試 Intel 程式。
-  接著 `scripts/macos-install-check.sh` 會像下載的檔案一樣，從 DMG 安裝應用程式
-  （安裝到獨立的「應用程式」資料夾並加上隔離標記），檢查 Gatekeeper 的判定
-  （臨時簽署時應被拒絕，Developer ID 簽署時應被接受為已公證），依 README 的說明清除標記，
-  執行程式後再移除，並確認沒有留下任何檔案。若該 Mac 已關閉 Gatekeeper，只會發出警告；
-  在 CI 中會先開啟 Gatekeeper，無法開啟時即失敗（`INSTALL_CHECK_GATEKEEPER=require`）。
+  沒有簽署機密時採用臨時簽署；五個 `MACOS_*` 機密都設定時，則以 Developer ID 簽署、
+  公證並裝訂（請參閱 [macOS 簽署](macos-signing.md)）。會驗證 Apple 晶片與 Intel 兩種程式碼，並透過
+  Rosetta 測試 Intel 程式。接著 `scripts/macos-install-check.sh` 會像下載的檔案一樣，從 DMG
+  安裝應用程式（安裝到獨立的「應用程式」資料夾並加上隔離標記），檢查 Gatekeeper
+  的判定（臨時簽署時應被拒絕，Developer ID 簽署時應被接受為已公證），依 README 的說明清除標記，
+  執行程式後再移除，並確認沒有留下任何檔案。若該 Mac 已關閉 Gatekeeper，只會發出警告；在 CI
+  中會先開啟 Gatekeeper，無法開啟時即失敗（`INSTALL_CHECK_GATEKEEPER=require`）。
 - **說明文件：** 英文與繁體中文 PDF 指南。若字型缺少所需字元，文件建置會失敗。
 
 Windows 與 Linux 的 Arm64 套件會在實體 Arm 架構電腦上建置與測試，而非使用模擬環境。
@@ -285,7 +277,7 @@ AppImage 與 DMG 必須帶有其格式標記，PDF 必須完整。之後會將 `
 
 ### 發布規則
 
-- 推送 `v0.9.9` 這類標籤時，會將套件發布到 GitHub 的發行頁面。
+- 推送 `v0.9.10` 這類標籤時，會將套件發布到 GitHub 的發行頁面。
 - 標籤必須與 `Cargo.toml` 中的版本一致。
 - `CHANGELOG.md` 必須有該版本的段落。
 - 含有 `-` 的標籤（例如 `v1.0.0-rc1`）會發布為預先發行版本。
@@ -293,37 +285,37 @@ AppImage 與 DMG 必須帶有其格式標記，PDF 必須完整。之後會將 `
 發行說明取自變更紀錄中對應的段落，後面附上下載說明。工作流程只會讀取變更紀錄，不會修改它。
 
 發布前，工作流程會確認該版本尚未發布，並確認所有預期的套件都已產生，且沒有多餘的檔案。
-每個版本都會註明建置時使用的原始碼提交，GitHub 也會列出每個檔案的 SHA-256 檢查碼。
-以 0.9.9 版為例，發行版本只包含下列檔案：
+每個版本都會註明建置時使用的原始碼提交，GitHub 也會列出每個檔案的 SHA-256 檢查碼。以 0.9.10 版為例，
+發行版本只包含下列檔案：
 
 ```text
-oxidemerge-0.9.9-linux-arm64.AppImage
-oxidemerge-0.9.9-linux-arm64.tar.gz
-oxidemerge-0.9.9-linux-x64.AppImage
-oxidemerge-0.9.9-linux-x64.tar.gz
-oxidemerge-0.9.9-macos-universal.dmg
-oxidemerge-0.9.9-user-guide.pdf
-oxidemerge-0.9.9-user-guide.zh-TW.pdf
-oxidemerge-0.9.9-windows-arm64.zip
-oxidemerge-0.9.9-windows-x64.zip
+oxidemerge-0.9.10-linux-arm64.AppImage
+oxidemerge-0.9.10-linux-arm64.tar.gz
+oxidemerge-0.9.10-linux-x64.AppImage
+oxidemerge-0.9.10-linux-x64.tar.gz
+oxidemerge-0.9.10-macos-universal.dmg
+oxidemerge-0.9.10-user-guide.pdf
+oxidemerge-0.9.10-user-guide.zh-TW.pdf
+oxidemerge-0.9.10-windows-arm64.zip
+oxidemerge-0.9.10-windows-x64.zip
 ```
 
 ### 發布新版本
 
-以下以 `0.9.9` 版為例，請改為您要發布的版本號。
+以下以 `0.9.10` 版為例，請改為您要發布的版本號。
 
 1. 修改 `Cargo.toml` 中的 `version`，再執行 `cargo build` 更新 `Cargo.lock`。
-2. 檢查 `CHANGELOG.md` 中 `0.9.9` 的段落，
-   將標題中的 `Unreleased` 改為 `YYYY-MM-DD` 格式的發行日期。
-3. 執行 `make fmt-check ci`，並以 `scripts/release-notes.sh 0.9.9` 檢查發行說明。
-   執行 `make user-guide-docs`，讓 `docs/dist/` 中的指南顯示新版本。
+2. 檢查 `CHANGELOG.md` 中 `0.9.10` 的段落，將標題中的 `Unreleased` 改為 `YYYY-MM-DD`
+   格式的發行日期。
+3. 執行 `make fmt-check ci`，並以 `scripts/release-notes.sh 0.9.10` 檢查發行說明。執行
+   `make user-guide-docs`，讓 `docs/dist/` 中的指南顯示新版本。
 4. 提交並推送到 `main`，等待所有平台的必要持續整合檢查都通過。
-5. 為通過檢查的提交加上標籤，並推送標籤。加上標籤前，請先以 `git log -1 --oneline`
-   確認 `HEAD` 就是通過檢查的提交。
+5. 為通過檢查的提交加上標籤，並推送標籤。加上標籤前，請先以 `git log -1 --oneline` 確認 `HEAD`
+   就是通過檢查的提交。
 
    ```sh
-   git tag -a v0.9.9 -m "OxideMerge 0.9.9"
-   git push origin v0.9.9
+   git tag -a v0.9.10 -m "OxideMerge 0.9.10"
+   git push origin v0.9.10
    ```
 
 6. 工作流程完成後，檢查 GitHub 上的新發行版本，確認所有套件與 PDF 指南都已提供。
@@ -331,26 +323,23 @@ oxidemerge-0.9.9-windows-x64.zip
 
 ### 修正建置失敗的版本
 
-工作流程只會在所有建置與測試工作都通過後才發布版本。
-因此，若發行標籤的其中一項建置或測試工作失敗，就不會發布任何內容，
-您可以從修正後的提交，重新發布同一個版本。以下以 `v0.9.9` 為例，請改為建置失敗的版本號。
+工作流程只會在所有建置與測試工作都通過後才發布版本。因此，若發行標籤的其中一項建置或測試工作失敗，
+就不會發布任何內容，您可以從修正後的提交，重新發布同一個版本。以下以 `v0.9.10` 為例，
+請改為建置失敗的版本號。
 
-1. 確認 GitHub 上沒有 `v0.9.9` 的發行版本：
+1. 確認 GitHub 上沒有 `v0.9.10` 的發行版本：
 
    ```sh
-   gh release view v0.9.9
+   gh release view v0.9.10
    ```
 
    此指令需要已登入的 GitHub 命令列工具，且必須回覆 `release not found`。
-   您也可以到[發行頁面](https://github.com/kuopinghsu/OxideMerge/releases)確認。
-   若該版本已存在，即使只有部分檔案，也請勿移動標籤，改依
-   [修正已發布的版本](#修正已發布的版本)處理。
+   您也可以到[發行頁面](https://github.com/kuopinghsu/OxideMerge/releases)確認。若該版本已存在，
+   即使只有部分檔案，也請勿移動標籤，改依 [修正已發布的版本](#修正已發布的版本)處理。
 
-2. 在 `main` 上修正問題。`Cargo.toml` 與變更紀錄中的版本維持 `0.9.9`；
-   若發行日期改變，請更新變更紀錄標題中的日期。執行 `make fmt-check ci`，並以
-   `scripts/release-notes.sh 0.9.9` 檢查發行說明，
-   再提交並推送到 `main`，
-   等待所有平台的必要持續整合檢查都通過。
+2. 在 `main` 上修正問題。`Cargo.toml` 與變更紀錄中的版本維持 `0.9.10`；若發行日期改變，
+   請更新變更紀錄標題中的日期。執行 `make fmt-check ci`，並以 `scripts/release-notes.sh 0.9.10`
+   檢查發行說明，再提交並推送到 `main`，等待所有平台的必要持續整合檢查都通過。
 
 3. 將標籤移到修正後的提交，再重新推送：
 
@@ -358,19 +347,18 @@ oxidemerge-0.9.9-windows-x64.zip
    git switch main
    git pull --ff-only origin main
    git log -1 --oneline
-   git tag -a -f v0.9.9 -m "OxideMerge 0.9.9"
-   git push --force origin v0.9.9
+   git tag -a -f v0.9.10 -m "OxideMerge 0.9.10"
+   git push --force origin v0.9.10
    ```
 
    `git log` 顯示的必須是通過檢查的提交。推送標籤後，會為修正後的提交重新執行工作流程。
 
-   請勿對舊標籤失敗的執行結果使用「**Re-run jobs**」（重新執行工作）。
-   該次執行會建置舊的提交，可能以移動後的標籤發布舊的套件。
+   請勿對舊標籤失敗的執行結果使用「**Re-run jobs**」（重新執行工作）。該次執行會建置舊的提交，
+   可能以移動後的標籤發布舊的套件。
 
 4. 工作流程完成後，檢查 GitHub 上的新發行版本，確認所有套件與 PDF 指南都已提供。
 
-若建置再次失敗，請重複步驟 2 到 4。其他複本仍保有舊標籤，可執行 `git fetch --tags --force`
-更新。
+若建置再次失敗，請重複步驟 2 到 4。其他複本仍保有舊標籤，可執行 `git fetch --tags --force` 更新。
 
 ### 修正已發布的版本
 
@@ -378,7 +366,7 @@ oxidemerge-0.9.9-windows-x64.zip
 工作流程也會拒絕發布已存在的版本。請改為發布新的修補版本：
 
 1. 在 `main` 上修正問題。
-2. 以下一個修補版本號（例如 `0.9.9` 之後使用 `0.9.10`）依照[發布新版本](#發布新版本)的步驟操作，
+2. 以下一個修補版本號（例如 `0.9.10` 之後使用 `0.9.11`）依照[發布新版本](#發布新版本)的步驟操作，
    並在新版本的變更紀錄段落中說明修正內容。
 
 請保留舊標籤與舊版本已發布的檔案。

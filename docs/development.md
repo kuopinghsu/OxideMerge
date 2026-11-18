@@ -2,8 +2,8 @@
 
 English | [繁體中文](development.zh-TW.md)
 
-This guide is for people who build, test or release OxideMerge. To install and use the
-program, see the [README](../README.md) and the [user guide](user-guide.adoc).
+This guide is for people who build, test or release OxideMerge. To install and use the program, see
+the [README](../README.md) and the [user guide](user-guide.adoc).
 
 ## Contents
 
@@ -16,17 +16,17 @@ program, see the [README](../README.md) and the [user guide](user-guide.adoc).
 
 ## Build from source
 
-You need a Rust toolchain from [rustup](https://rustup.rs/). On Linux, you also need a C
-and C++ compiler (`gcc` and `g++`, or `gcc-c++` on Fedora and its relatives): the UnRAR library
-that reads RAR archives is written in C++. OxideMerge loads the X11, Wayland, keyboard and OpenGL libraries when it starts,
-so you do not need their development packages to build it.
+You need a Rust toolchain from [rustup](https://rustup.rs/). On Linux, you also need a C and C++
+compiler (`gcc` and `g++`, or `gcc-c++` on Fedora and its relatives): the UnRAR library that reads
+RAR archives is written in C++. OxideMerge loads the X11, Wayland, keyboard and OpenGL libraries
+when it starts, so you do not need their development packages to build it.
 
 The SFTP support builds OpenSSL from source, which needs Perl:
 
 - **Windows:** install [Strawberry Perl](https://strawberryperl.com/), for example with
-  `winget install StrawberryPerl.StrawberryPerl`, and open a new terminal. To use a Perl
-  that is not on `PATH`, set `OPENSSL_SRC_PERL` to its `perl.exe`. The Perl that comes
-  with Git for Windows does not work.
+  `winget install StrawberryPerl.StrawberryPerl`, and open a new terminal. To use a Perl that is not
+  on `PATH`, set `OPENSSL_SRC_PERL` to its `perl.exe`. The Perl that comes with Git for Windows does
+  not work.
 - **Linux:** `perl` with its `IPC::Cmd` module (`perl-IPC-Cmd` on Fedora).
 - **macOS:** the Perl that comes with the system is enough.
 
@@ -37,25 +37,23 @@ cargo build --release --locked
 cargo test --locked
 ```
 
-The program is `target/release/oxidemerge` on macOS and Linux, and
-`target/release/oxidemerge.exe` on Windows. To open the sample folder comparison, run
-`make demo`.
+The program is `target/release/oxidemerge` on macOS and Linux, and `target/release/oxidemerge.exe`
+on Windows. To open the sample folder comparison, run `make demo`.
 
 ### Version information
 
 **About** and `--version` show which build you are running:
 
-- A development build shows its short Git revision. If tracked files have changes that are
-  not committed, `-dirty` follows the revision.
-- A clean optimized build of a `vVERSION` tag shows its build date in UTC. To get the same
-  date in every build (a reproducible build), set `SOURCE_DATE_EPOCH`.
-- Without Git information, the build uses `GITHUB_SHA` if it is valid. Otherwise it shows
-  `unknown`.
+- A development build shows its short Git revision. If tracked files have changes that are not
+  committed, `-dirty` follows the revision.
+- A clean optimized build of a `vVERSION` tag shows its build date in UTC. To get the same date in
+  every build (a reproducible build), set `SOURCE_DATE_EPOCH`.
+- Without Git information, the build uses `GITHUB_SHA` if it is valid. Otherwise it shows `unknown`.
 
 ## Make targets
 
-The [Makefile](../Makefile) has short commands for common tasks. It requires GNU Make.
-Run `make help` to list all targets.
+The [Makefile](../Makefile) has short commands for common tasks. It requires GNU Make. Run
+`make help` to list all targets.
 
 ### Build and run
 
@@ -71,8 +69,8 @@ Run `make help` to list all targets.
 | `make shell-register` | Installs the program and registers the file manager integration. |
 | `make clean` | Removes build output and local packages. |
 
-[samples/README.md](../samples/README.md) lists every sample and the feature that it
-shows. For the web page samples, see [samples/web/README.md](../samples/web/README.md).
+[samples/README.md](../samples/README.md) lists every sample and the feature that it shows. For the
+web page samples, see [samples/web/README.md](../samples/web/README.md).
 
 ### Check the code
 
@@ -96,23 +94,21 @@ shows. For the web page samples, see [samples/web/README.md](../samples/web/READ
 | `make user-guide` | Creates the English and Traditional Chinese PDF guides in `dist/`. |
 | `make user-guide-docs` | Creates the same guides in `docs/dist/`, as `oxidemerge-user-guide.pdf` and `oxidemerge-user-guide.zh-TW.pdf`. These files are committed, and each build replaces them. |
 
-After you change a user guide or its images, run `make user-guide-docs` and commit the PDF
-files with the change, so that `docs/dist/` always has the latest guides.
+After you change a user guide or its images, run `make user-guide-docs` and commit the PDF files
+with the change, so that `docs/dist/` always has the latest guides.
 
 On Windows and macOS, both targets run in Docker: start Docker Desktop (on Windows, in Linux
-container mode) and run either target with GNU Make.
-The targets build a reusable image with the same Asciidoctor versions as CI and write the
-PDFs back into the checkout.
+container mode) and run either target with GNU Make. The targets build a reusable image with the
+same Asciidoctor versions as CI and write the PDFs back into the checkout.
 
 On macOS and Linux, both targets need Asciidoctor PDF, `curl`, `shasum`, Python 3 with `fontTools`,
-fontconfig and the DejaVu Sans font. The build script downloads the Noto Sans CJK fonts
-that it needs.
+fontconfig and the DejaVu Sans font. The build script downloads the Noto Sans CJK fonts that it
+needs.
 
 ## How outcomes are named
 
-Every feature that can end in something other than plain success reports which of seven
-outcomes it was. `core::problem::Problem` is that taxonomy, and nothing else should invent
-a parallel one:
+Every feature that can end in something other than plain success reports which of seven outcomes it
+was. `core::problem::Problem` is that taxonomy, and nothing else should invent a parallel one:
 
 | Outcome | What it means | Where it comes from |
 | --- | --- | --- |
@@ -124,49 +120,45 @@ a parallel one:
 | `canceled` | The user stopped it | *Stop* or *Cancel* |
 | `recovery_needed` | A change was cut short and could not be wholly undone; a recovery journal is kept | A rollback that could not put everything back |
 
-A feature with outcomes of its own maps them onto these rather than replacing them:
-`Problem::of_io` for an I/O error (which differs by whether it was reading or writing) and
-`Problem::of_table` for a key or table that cannot be used as asked. Add a mapping
-function beside those rather than a new enum.
+A feature with outcomes of its own maps them onto these rather than replacing them: `Problem::of_io`
+for an I/O error (which differs by whether it was reading or writing) and `Problem::of_table` for a
+key or table that cannot be used as asked. Add a mapping function beside those rather than a new
+enum.
 
-The names reach users two ways. `--sync-apply` and `--sync-recover` put the outcome in
-their JSON as `problem`, which is the serialized name in the table above, so scripts can
-branch on it; this is a compatibility surface, so do not rename a variant without a
-release note. `Problem::label()` gives the translated short name (`problem.*` in
-`lang/*.json`) for a view that leads with the kind of problem before the detail of what
-went wrong. The detail stays the feature's own wording: the taxonomy says what kind of
-thing happened, not what happened.
+The names reach users two ways. `--sync-apply` and `--sync-recover` put the outcome in their JSON as
+`problem`, which is the serialized name in the table above, so scripts can branch on it; this is a
+compatibility surface, so do not rename a variant without a release note. `Problem::label()` gives
+the translated short name (`problem.*` in `lang/*.json`) for a view that leads with the kind of
+problem before the detail of what went wrong. The detail stays the feature's own wording: the
+taxonomy says what kind of thing happened, not what happened.
 
 ## Testing
 
 `cargo test` checks three areas:
 
-- **Core behavior:** comparing, merging, patches, folders and file operations. Random
-  tests in `src/core/regress.rs` also check generated diff, merge and patch cases.
-- **Interface behavior:** the tests use the real views without a display. They cover
-  menus, editing, dropped files and saved results. When a window test fails, it writes
-  details to `target/gui-tests/<test>.txt`.
-- **Command-line behavior:** the tests in `tests/cli.rs` run the program and check exit
-  codes, reports, patches and error messages.
+- **Core behavior:** comparing, merging, patches, folders and file operations. Random tests in
+  `src/core/regress.rs` also check generated diff, merge and patch cases.
+- **Interface behavior:** the tests use the real views without a display. They cover menus, editing,
+  dropped files and saved results. When a window test fails, it writes details to
+  `target/gui-tests/<test>.txt`.
+- **Command-line behavior:** the tests in `tests/cli.rs` run the program and check exit codes,
+  reports, patches and error messages.
 
-The tests use their own settings folder, so they do not change your settings. For other
-test runs that must not touch your settings, set `OXIDEMERGE_CONFIG_DIR` to a separate
-folder. Some web tests start a local HTTP server, so the test system must allow programs
-to listen on local network ports.
+The tests use their own settings folder, so they do not change your settings. For other test runs
+that must not touch your settings, set `OXIDEMERGE_CONFIG_DIR` to a separate folder. Some web tests
+start a local HTTP server, so the test system must allow programs to listen on local network ports.
 
-The version-control tests use the real programs: Git, `svn` and `svnadmin` from
-Subversion, and `hg` from Mercurial. When Subversion or Mercurial is missing, its tests
-print that they were skipped and pass, so install both to run them. The CI workflow does
-not install Subversion or Mercurial, so there these tests run only where the runner already
-has them; the [Docker test environment](#docker-test-environment) installs both. Perforce
-has no automated test.
+The version-control tests use the real programs: Git, `svn` and `svnadmin` from Subversion, and `hg`
+from Mercurial. When Subversion or Mercurial is missing, its tests print that they were skipped and
+pass, so install both to run them. The CI workflow does not install Subversion or Mercurial, so
+there these tests run only where the runner already has them; the
+[Docker test environment](#docker-test-environment) installs both. Perforce has no automated test.
 
 ### Saved reports
 
-The semantic, release summary and impact reports of fixed inputs must match the JSON and
-XML reports in `tests/fixtures/reports`. Only the capture times may differ. If you change
-a report on purpose, update the saved reports with this command, then review their
-changes:
+The semantic, release summary and impact reports of fixed inputs must match the JSON and XML reports
+in `tests/fixtures/reports`. Only the capture times may differ. If you change a report on purpose,
+update the saved reports with this command, then review their changes:
 
 ```sh
 OXIDEMERGE_UPDATE_REPORTS=1 cargo test --test cli reports_match
@@ -180,23 +172,21 @@ This command runs the format checks only:
 cargo test --release --locked format_regression -- --nocapture
 ```
 
-They check that patches keep the byte order mark (BOM) and line endings, that ignored text
-changes stay ignored, and that merging, saving and undoing work with mixed line endings.
-They also check that the results work with Git checkout and Git patches, so Git must be
-installed. Continuous integration runs these checks on Windows, Linux and macOS as part of
-the full test suite.
+They check that patches keep the byte order mark (BOM) and line endings, that ignored text changes
+stay ignored, and that merging, saving and undoing work with mixed line endings. They also check
+that the results work with Git checkout and Git patches, so Git must be installed. Continuous
+integration runs these checks on Windows, Linux and macOS as part of the full test suite.
 
 ### Translation checks
 
-The `i18n` tests fail the build when a language file in `lang/` lacks a key of
-`lang/en.json`, has a key English does not, gives a key twice, drops or adds a
-`{placeholder}`, names other keys than English (`Ctrl+V`, `F5`; German *Strg* counts as
-*Ctrl*), or leaves a warning about deleting, replacing or losing work in English. They
-also check that `docs/user-guide.zh-TW.adoc`, `docs/development.zh-TW.md` and
-`README_zh-TW.md` have the same headings, at the same levels, and the same anchors as their
-English documents, and that every `<<anchor>>` in a user guide exists. A window test opens
-the recovery prompt and the Options dialog in every language on an 800 × 600 window and
-fails when a button is outside it or covers another.
+The `i18n` tests fail the build when a language file in `lang/` lacks a key of `lang/en.json`, has a
+key English does not, gives a key twice, drops or adds a `{placeholder}`, names other keys than
+English (`Ctrl+V`, `F5`; German *Strg* counts as *Ctrl*), or leaves a warning about deleting,
+replacing or losing work in English. They also check that `docs/user-guide.zh-TW.adoc`,
+`docs/development.zh-TW.md` and `README_zh-TW.md` have the same headings, at the same levels, and
+the same anchors as their English documents, and that every `<<anchor>>` in a user guide exists. A
+window test opens the recovery prompt and the Options dialog in every language on an 800 × 600
+window and fails when a button is outside it or covers another.
 
 ```sh
 cargo test --locked i18n::
@@ -206,8 +196,8 @@ They cannot tell whether a translation reads naturally; that still needs a nativ
 
 ### Random tests
 
-When a random test fails, it prints a seed. Use the seed to run the same case again, or
-run more cases:
+When a random test fails, it prints a seed. Use the seed to run the same case again, or run more
+cases:
 
 ```sh
 OXIDEMERGE_TEST_SEED=<seed> cargo test regress
@@ -217,54 +207,51 @@ OXIDEMERGE_TEST_CASES=20000 cargo test --release regress
 ### Window tests
 
 To test with real program windows, run `make gui-smoke` or
-`scripts/gui-smoke.sh path/to/oxidemerge`. The script checks two-file, three-file and
-folder comparisons. On Linux without a display, it starts Xvfb. If you set
-`OXIDEMERGE_SMOKE_REPORT=<file>`, the program writes its tabs and messages to that file
-after the comparison, and then closes.
+`scripts/gui-smoke.sh path/to/oxidemerge`. The script checks two-file, three-file and folder
+comparisons. On Linux without a display, it starts Xvfb. If you set
+`OXIDEMERGE_SMOKE_REPORT=<file>`, the program writes its tabs and messages to that file after the
+comparison, and then closes.
 
-On Linux and macOS the script also checks crash recovery with a real process: it starts the
-program with recovery turned on, waits for the first snapshot, ends the program with
-`kill -9`, and checks that the next start offers the two files for recovery and keeps the
-snapshot until the user chooses.
+On Linux and macOS the script also checks crash recovery with a real process: it starts the program
+with recovery turned on, waits for the first snapshot, ends the program with `kill -9`, and checks
+that the next start offers the two files for recovery and keeps the snapshot until the user chooses.
 
-For documentation pictures, `OXIDEMERGE_SCREENSHOT=<file.png>` saves the window as the
-program draws it, without a screen grab, once the comparison is done, and then closes. Set
-`OXIDEMERGE_SCREENSHOT_COMMAND` to a command's label key, such as `cmd.sync_folders`, to
-run it first. Use `OXIDEMERGE_CONFIG_DIR` with a `config.json` that sets `language` to
-take a picture in another language.
+For documentation pictures, `OXIDEMERGE_SCREENSHOT=<file.png>` saves the window as the program draws
+it, without a screen grab, once the comparison is done, and then closes. Set
+`OXIDEMERGE_SCREENSHOT_COMMAND` to a command's label key, such as `cmd.sync_folders`, to run it
+first. Use `OXIDEMERGE_CONFIG_DIR` with a `config.json` that sets `language` to take a picture in
+another language.
 
 ### Docker test environment
 
-To check Linux from any computer with Docker, including a Mac, run `scripts/docker-test.sh`
-(or `make docker-test`). [docker/Dockerfile](../docker/Dockerfile) defines the container. It
-runs Clippy, the full test suite, a release build, and the command-line and window checks on
-Xvfb, building the tests for release as continuous integration does. The tests run as an
-ordinary user. The container also starts real servers ([docker/servers.sh](../docker/servers.sh)),
-has Subversion and Mercurial installed, and runs the tests that a normal `cargo test` run
-skips:
+To check Linux from any computer with Docker, including a Mac, run `scripts/docker-test.sh` (or
+`make docker-test`). [docker/Dockerfile](../docker/Dockerfile) defines the container. It runs
+Clippy, the full test suite, a release build, and the command-line and window checks on Xvfb,
+building the tests for release as continuous integration does. The tests run as an ordinary user.
+The container also starts real servers ([docker/servers.sh](../docker/servers.sh)), has Subversion
+and Mercurial installed, and runs the tests that a normal `cargo test` run skips:
 
-- OpenSSH: sign-in with keys, passphrases, host certificates, jump hosts and a
-  `ProxyCommand`, and keyboard-interactive sign-in through PAM.
+- OpenSSH: sign-in with keys, passphrases, host certificates, jump hosts and a `ProxyCommand`, and
+  keyboard-interactive sign-in through PAM.
 - vsftpd and ProFTPD: FTP, explicit and implicit FTPS, active mode, and a client certificate.
-- Dante and tinyproxy: SFTP, FTP and FTPS through SOCKS5 and HTTP CONNECT proxies, with and
-  without sign-in.
+- Dante and tinyproxy: SFTP, FTP and FTPS through SOCKS5 and HTTP CONNECT proxies, with and without
+  sign-in.
 - Subversion and Mercurial: comparing real working copies with their revisions.
 
-Cargo runs offline. It uses the crates already downloaded to `~/.cargo/registry`, so on a
-new computer, run `cargo fetch --locked` first. Building the container the first time needs
-the network. Build output stays in Docker volumes (`oxidemerge-test-*`), so later runs are
-faster. Each check writes its log to `out/docker/linux`. If Docker has little memory, set
-`CARGO_BUILD_JOBS` to a small number.
+Cargo runs offline. It uses the crates already downloaded to `~/.cargo/registry`, so on a new
+computer, run `cargo fetch --locked` first. Building the container the first time needs the network.
+Build output stays in Docker volumes (`oxidemerge-test-*`), so later runs are faster. Each check
+writes its log to `out/docker/linux`. If Docker has little memory, set `CARGO_BUILD_JOBS` to a small
+number.
 
 ### Benchmarks
 
-Benchmarks are not part of `cargo test`. For the commands, the method and the reference
-results, see [Benchmarks](benchmarks.md).
+Benchmarks are not part of `cargo test`. For the commands, the method and the reference results, see
+[Benchmarks](benchmarks.md).
 
 ## Continuous integration
 
-The [CI workflow](../.github/workflows/ci.yml) runs for pushes to `main` and for pull
-requests.
+The [CI workflow](../.github/workflows/ci.yml) runs for pushes to `main` and for pull requests.
 
 | Event | What runs |
 | --- | --- |
@@ -282,112 +269,105 @@ Some more details:
 
 ### Packages
 
-Pushes to `main`, release tags and manual runs with `packages` build and check these
-packages:
+Pushes to `main`, release tags and manual runs with `packages` build and check these packages:
 
-- **Windows x64 and Arm64:** ZIP packages with only `oxidemerge.exe`. Each program is
-  checked for the right processor and is started.
-- **Linux x64 and Arm64:** TAR.GZ packages built on Ubuntu 22.04. The program is started,
-  and the check confirms that it does not change the settings.
-- **Linux AppImage:** packages built on AlmaLinux 8 with glibc 2.28. They include the X11,
-  Wayland and keyboard libraries and use them when the system does not have them. Both
-  processor types are checked on Ubuntu 22.04 and AlmaLinux 8: library loading,
-  command-line behavior and window start.
-- **macOS:** a universal app in a DMG package, signed by `scripts/macos-sign.sh`: ad hoc
-  without signing secrets, or with a Developer ID, notarized and stapled when all five
-  `MACOS_*` secrets are set (see [macOS signing](macos-signing.md)). Both Apple silicon and
-  Intel code are checked. The Intel program is tested with Rosetta.
-  `scripts/macos-install-check.sh` then installs the app from the DMG as a download would
-  arrive (into an Applications folder of its own, with the quarantine flag), checks
-  Gatekeeper's verdict (rejected when ad hoc, accepted as notarized with a Developer ID),
-  clears the flag as the README says, runs the program, and removes it again, checking
-  that it left nothing behind. Where Gatekeeper is turned off it only warns; in CI it turns
-  Gatekeeper on first and fails if it cannot (`INSTALL_CHECK_GATEKEEPER=require`).
-- **Documentation:** the English and Traditional Chinese PDF guides. The build fails if a
-  font is missing characters.
+- **Windows x64 and Arm64:** ZIP packages with only `oxidemerge.exe`. Each program is checked for
+  the right processor and is started.
+- **Linux x64 and Arm64:** TAR.GZ packages built on Ubuntu 22.04. The program is started, and the
+  check confirms that it does not change the settings.
+- **Linux AppImage:** packages built on AlmaLinux 8 with glibc 2.28. They include the X11, Wayland
+  and keyboard libraries and use them when the system does not have them. Both processor types are
+  checked on Ubuntu 22.04 and AlmaLinux 8: library loading, command-line behavior and window start.
+- **macOS:** a universal app in a DMG package, signed by `scripts/macos-sign.sh`: ad hoc without
+  signing secrets, or with a Developer ID, notarized and stapled when all five `MACOS_*` secrets are
+  set (see [macOS signing](macos-signing.md)). Both Apple silicon and Intel code are checked. The
+  Intel program is tested with Rosetta. `scripts/macos-install-check.sh` then installs the app from
+  the DMG as a download would arrive (into an Applications folder of its own, with the quarantine
+  flag), checks Gatekeeper's verdict (rejected when ad hoc, accepted as notarized with a Developer
+  ID), clears the flag as the README says, runs the program, and removes it again, checking that it
+  left nothing behind. Where Gatekeeper is turned off it only warns; in CI it turns Gatekeeper on
+  first and fails if it cannot (`INSTALL_CHECK_GATEKEEPER=require`).
+- **Documentation:** the English and Traditional Chinese PDF guides. The build fails if a font is
+  missing characters.
 
 The Windows and Linux Arm64 packages are built and tested on Arm computers, not emulated.
 
-Before publishing, the release job checks each downloaded package with
-`scripts/check-release.sh`: archives must list and decompress, the AppImage and DMG must
-carry their format marks, and the PDFs must be whole. It then publishes `SHA256SUMS` with
-the packages.
+Before publishing, the release job checks each downloaded package with `scripts/check-release.sh`:
+archives must list and decompress, the AppImage and DMG must carry their format marks, and the PDFs
+must be whole. It then publishes `SHA256SUMS` with the packages.
 
 ## Releases
 
 ### Release rules
 
-- Pushing a tag such as `v0.9.9` publishes the packages on GitHub Releases.
+- Pushing a tag such as `v0.9.10` publishes the packages on GitHub Releases.
 - The tag must match the version in `Cargo.toml`.
 - `CHANGELOG.md` must have a section for that version.
 - A tag that contains `-`, such as `v1.0.0-rc1`, is published as a pre-release.
 
-The release notes are the matching changelog section, followed by download instructions.
-The workflow reads the changelog but does not change it.
+The release notes are the matching changelog section, followed by download instructions. The
+workflow reads the changelog but does not change it.
 
-Before publishing, the workflow checks that the release does not exist yet. It also checks
-that all expected packages exist, and no other files. Each release names the source commit
-that it was built from, and GitHub lists the SHA-256 checksum of every file. For version
-0.9.9, a release has exactly these files:
+Before publishing, the workflow checks that the release does not exist yet. It also checks that all
+expected packages exist, and no other files. Each release names the source commit that it was built
+from, and GitHub lists the SHA-256 checksum of every file. For version 0.9.10, a release has exactly
+these files:
 
 ```text
-oxidemerge-0.9.9-linux-arm64.AppImage
-oxidemerge-0.9.9-linux-arm64.tar.gz
-oxidemerge-0.9.9-linux-x64.AppImage
-oxidemerge-0.9.9-linux-x64.tar.gz
-oxidemerge-0.9.9-macos-universal.dmg
-oxidemerge-0.9.9-user-guide.pdf
-oxidemerge-0.9.9-user-guide.zh-TW.pdf
-oxidemerge-0.9.9-windows-arm64.zip
-oxidemerge-0.9.9-windows-x64.zip
+oxidemerge-0.9.10-linux-arm64.AppImage
+oxidemerge-0.9.10-linux-arm64.tar.gz
+oxidemerge-0.9.10-linux-x64.AppImage
+oxidemerge-0.9.10-linux-x64.tar.gz
+oxidemerge-0.9.10-macos-universal.dmg
+oxidemerge-0.9.10-user-guide.pdf
+oxidemerge-0.9.10-user-guide.zh-TW.pdf
+oxidemerge-0.9.10-windows-arm64.zip
+oxidemerge-0.9.10-windows-x64.zip
 ```
 
 ### Publish a release
 
-These steps use version `0.9.9` as an example. Use the version that you want to release.
+These steps use version `0.9.10` as an example. Use the version that you want to release.
 
 1. Change `version` in `Cargo.toml`. Run `cargo build` to update `Cargo.lock`.
-2. Check the `0.9.9` section in `CHANGELOG.md`. In its heading, replace `Unreleased` with
-   the release date in the form `YYYY-MM-DD`.
-3. Run `make fmt-check ci`. Check the release notes with `scripts/release-notes.sh 0.9.9`.
-   Run `make user-guide-docs`, so that the guides in `docs/dist/` show the new version.
+2. Check the `0.9.10` section in `CHANGELOG.md`. In its heading, replace `Unreleased` with the
+   release date in the form `YYYY-MM-DD`.
+3. Run `make fmt-check ci`. Check the release notes with `scripts/release-notes.sh 0.9.10`. Run
+   `make user-guide-docs`, so that the guides in `docs/dist/` show the new version.
 4. Commit, and push to `main`. Wait until the required CI checks pass on all platforms.
-5. Tag the checked commit and push the tag. First make sure with `git log -1 --oneline`
-   that `HEAD` is the commit that passed the checks.
+5. Tag the checked commit and push the tag. First make sure with `git log -1 --oneline` that `HEAD`
+   is the commit that passed the checks.
 
    ```sh
-   git tag -a v0.9.9 -m "OxideMerge 0.9.9"
-   git push origin v0.9.9
+   git tag -a v0.9.10 -m "OxideMerge 0.9.10"
+   git push origin v0.9.10
    ```
 
-6. When the workflow finishes, check the new GitHub release. Make sure that all packages
-   and PDF guides are there.
-7. Add an `Unreleased` section for the next version to `CHANGELOG.md`. Record later
-   changes there.
+6. When the workflow finishes, check the new GitHub release. Make sure that all packages and PDF
+   guides are there.
+7. Add an `Unreleased` section for the next version to `CHANGELOG.md`. Record later changes there.
 
 ### Fix a failed release build
 
-The workflow publishes a release only after all build and test jobs pass. So if one of
-these jobs fails for a release tag, nothing is published, and you can publish the same
-version again from a fixed commit. These steps use `v0.9.9` as an example. Use the version
-whose build failed.
+The workflow publishes a release only after all build and test jobs pass. So if one of these jobs
+fails for a release tag, nothing is published, and you can publish the same version again from a
+fixed commit. These steps use `v0.9.10` as an example. Use the version whose build failed.
 
-1. Make sure that GitHub has no `v0.9.9` release:
+1. Make sure that GitHub has no `v0.9.10` release:
 
    ```sh
-   gh release view v0.9.9
+   gh release view v0.9.10
    ```
 
-   This command needs the GitHub CLI, signed in. It must answer `release not found`. You
-   can also look for the release on the
-   [Releases page](https://github.com/kuopinghsu/OxideMerge/releases). If the release
-   exists, even with only some files, do not move the tag. See
+   This command needs the GitHub CLI, signed in. It must answer `release not found`. You can also
+   look for the release on the [Releases page](https://github.com/kuopinghsu/OxideMerge/releases).
+   If the release exists, even with only some files, do not move the tag. See
    [Fix a published release](#fix-a-published-release) instead.
 
-2. Fix the problem on `main`. Keep the version `0.9.9` in `Cargo.toml` and in the
-   changelog. If the release date changes, update it in the changelog heading. Run
-   `make fmt-check ci`, and check the release notes with `scripts/release-notes.sh 0.9.9`.
-   Commit, and push to `main`. Wait until the required CI checks pass on all platforms.
+2. Fix the problem on `main`. Keep the version `0.9.10` in `Cargo.toml` and in the changelog. If the
+   release date changes, update it in the changelog heading. Run `make fmt-check ci`, and check the
+   release notes with `scripts/release-notes.sh 0.9.10`. Commit, and push to `main`. Wait until the
+   required CI checks pass on all platforms.
 
 3. Move the tag to the fixed commit, and push it again:
 
@@ -395,31 +375,30 @@ whose build failed.
    git switch main
    git pull --ff-only origin main
    git log -1 --oneline
-   git tag -a -f v0.9.9 -m "OxideMerge 0.9.9"
-   git push --force origin v0.9.9
+   git tag -a -f v0.9.10 -m "OxideMerge 0.9.10"
+   git push --force origin v0.9.10
    ```
 
-   `git log` must show the commit that passed the checks. The tag push starts a new
-   workflow run for the fixed commit.
+   `git log` must show the commit that passed the checks. The tag push starts a new workflow run for
+   the fixed commit.
 
-   Do not use **Re-run jobs** on the failed run of the old tag. That run builds the old
-   commit, and it could publish the old packages under the moved tag.
+   Do not use **Re-run jobs** on the failed run of the old tag. That run builds the old commit, and
+   it could publish the old packages under the moved tag.
 
-4. When the workflow finishes, check the new GitHub release. Make sure that all packages
-   and PDF guides are there.
+4. When the workflow finishes, check the new GitHub release. Make sure that all packages and PDF
+   guides are there.
 
-If the build fails again, repeat steps 2 to 4. Other clones still have the old tag. To
-update it there, run `git fetch --tags --force`.
+If the build fails again, repeat steps 2 to 4. Other clones still have the old tag. To update it
+there, run `git fetch --tags --force`.
 
 ### Fix a published release
 
-Never change a release after it is published. Packages that people have downloaded must
-always match the published checksums. The workflow also refuses to publish a version that
-already has a release. Instead, publish a new patch version:
+Never change a release after it is published. Packages that people have downloaded must always match
+the published checksums. The workflow also refuses to publish a version that already has a release.
+Instead, publish a new patch version:
 
 1. Fix the problem on `main`.
-2. Follow the steps in [Publish a release](#publish-a-release) with the next patch
-   version, for example `0.9.10` after `0.9.9`. Describe the fix in the changelog section
-   of the new version.
+2. Follow the steps in [Publish a release](#publish-a-release) with the next patch version, for
+   example `0.9.11` after `0.9.10`. Describe the fix in the changelog section of the new version.
 
 Keep the old tag and the files of the old release.
