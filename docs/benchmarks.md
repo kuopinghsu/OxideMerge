@@ -13,7 +13,7 @@ benchmarks yourself. The workloads are described at the end ([Workloads](#worklo
 | Column | Machine | Build |
 | --- | --- | --- |
 | **Windows** | Windows 11 (build 26300), Intel Core i9-12900KF (24 threads), 32 GB | 2026-11-18: OxideMerge 0.9.9, built with `release-size` as the packages are; rustc 1.100.0 |
-| **Linux** | Ubuntu in WSL2 on the same PC, 15 GB given to the virtual machine | 2026-11-11 (`2eb8793`), before line numbering on several threads |
+| **Linux** | Ubuntu in WSL2 on the same PC, 15 GB given to the virtual machine | 2026-11-18: OxideMerge at `b55dd64` (reports 0.9.10), built with `release-size`; rustc 1.100.0 |
 | **macOS** | Apple M2 Max (12 threads), 32 GB; macOS 27.3 pre-release for the large text runs | 2026-11-02 to 2026-11-10, before line numbering on several threads |
 
 Each figure is the median of three runs (five for some table and size runs), each run in a process
@@ -25,8 +25,13 @@ The Windows column is one run, of the source of the `v0.9.9` tag (its build repo
 version bump not yet committed), with other programs open but idle. text-100mb is the median of nine
 runs: three gave 1.627 s, from something else on the machine, and nine gave 0.811 s.
 
-The Linux and macOS text times are from before line numbering ran on several threads; on Windows
-that change halved the time of the large text workloads (see [History](#history)). Every result
+The Linux column is one pass of the workloads, three runs each, on an otherwise idle virtual machine.
+text-view-10mb, xml-tree-view-12k and sync-preview-20k are the median of five runs made again
+straight after: sync-preview-20k first took 7.354 s, from reading a cold cache (see
+[Running the benchmarks](#running-the-benchmarks)).
+
+The macOS text times are from before line numbering ran on several threads; on Windows that change
+halved the time of the large text workloads (see [History](#history)). Every result
 count is the same on all three machines, except the 1 GiB difference count explained under
 [What the results show](#what-the-results-show).
 
@@ -39,12 +44,12 @@ workload was not run on that machine.
 
 | Workload | Windows | Linux | macOS | Result |
 | --- | ---: | ---: | ---: | --- |
-| text-10mb | 0.090 s | 0.098 s, 87 MB | 0.112 s, 100 MB | 14,305 differences |
-| text-repeated | 0.041 s | 0.045 s, 54 MB | 0.025 s, 41 MB | 300 differences |
-| text-100mb | 0.811 s | 0.695 s, 540 MB | 0.962 s, 552 MB | 15,086 differences |
-| text-500mb | 5.147 s | 4.764 s, 2,563 MB | 7.697 s, 2,663 MB | 74,725 differences |
-| text-1gb | 11.062 s | 11.071 s, 5,234 MB | 17.162 s, 5,440 MB | 152,526 differences (152,372 on Windows, 152,307 on Linux) |
-| merge3-10mb | 0.284 s | 0.275 s, 124 MB | 0.321 s, 149 MB | 14,107 differences, conflicts left |
+| text-10mb | 0.090 s | 0.085 s, 86 MB | 0.112 s, 100 MB | 14,305 differences |
+| text-repeated | 0.041 s | 0.048 s, 52 MB | 0.025 s, 41 MB | 300 differences |
+| text-100mb | 0.811 s | 0.728 s, 538 MB | 0.962 s, 552 MB | 15,086 differences |
+| text-500mb | 5.147 s | 4.217 s, 2,562 MB | 7.697 s, 2,663 MB | 74,725 differences |
+| text-1gb | 11.062 s | 9.295 s, 5,233 MB | 17.162 s, 5,440 MB | 152,526 differences (152,372 on Windows, 152,447 on Linux) |
+| merge3-10mb | 0.284 s | 0.237 s, 125 MB | 0.321 s, 149 MB | 14,107 differences, conflicts left |
 
 ### Text view
 
@@ -55,22 +60,22 @@ another line, and a *step* moves to the next difference and draws it. One frame 
 | Workload | Machine | Total | Peak | Load | Compare | First frame | Scrolled frame | Step |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | text-view-10mb | Windows | 0.449 s | — | 44 ms | 79 ms | 14 ms | 1.41 ms | 1.40 ms |
-| | Linux | 0.350 s | 104 MB | 48 ms | 74 ms | 10 ms | 0.98 ms | 1.00 ms |
+| | Linux | 0.394 s | 114 MB | 49 ms | 68 ms | 12 ms | 1.24 ms | 1.24 ms |
 | text-view-100mb | Windows | 1.676 s | — | 412 ms | 715 ms | 58 ms | 1.60 ms | 1.57 ms |
-| | Linux | 1.448 s | 685 MB | 376 ms | 669 ms | 63 ms | 1.08 ms | 1.06 ms |
+| | Linux | 1.522 s | 694 MB | 383 ms | 665 ms | 70 ms | 1.39 ms | 1.34 ms |
 | | macOS | 1.376 s | 674 MB | 304 ms | 814 ms | 37 ms | 0.63 ms | 0.63 ms |
 | text-view-500mb | Windows | 9.483 s | — | 2,055 ms | 4,537 ms | 229 ms | 9.99 ms | 9.24 ms |
-| | Linux | 9.207 s | 3,214 MB | 1,863 ms | 4,584 ms | 724 ms | 7.13 ms | 7.02 ms |
+| | Linux | 8.480 s | 3,225 MB | 1,826 ms | 4,033 ms | 394 ms | 8.48 ms | 8.36 ms |
 | | macOS | 9.476 s | 3,433 MB | 1,566 ms | 6,607 ms | 172 ms | 4.03 ms | 3.85 ms |
 | text-view-1gb | Windows | 20.164 s | — | 4,275 ms | 9,490 ms | 474 ms | 20.04 ms | 20.79 ms |
-| | Linux | 55.723 s | 6,479 MB | 40,503 ms | 10,335 ms | 800 ms | 14.97 ms | 15.17 ms |
+| | Linux | 18.410 s | 6,495 MB | 3,887 ms | 8,835 ms | 1,064 ms | 17.76 ms | 17.80 ms |
 | | macOS | 23.750 s | 7,019 MB | 3,453 ms | 16,719 ms | 404 ms | 10.84 ms | 10.74 ms |
 
 The rows are 303,878, 2,993,833, 14,970,455 and about 30,659,207 for the four sizes (at 1 GiB the
 count follows the difference count, below). The 1 GiB frame times move between runs by 15–20%: the
 quick `--release` build, the same day, drew the first frame in 606 ms, a scrolled frame in 17.49 ms
-and a step in 17.20 ms. The Linux load at 1 GiB is a limit of that virtual machine, not of
-OxideMerge (see below).
+and a step in 17.20 ms. On Linux, the same source built with rustc 1.97.1 drew the first frame at
+1 GiB in 916 ms and a step in 17.54 ms.
 
 ### Cancelling a large open
 
@@ -82,59 +87,60 @@ it built. The window waits for neither.
 | Workload | Machine | Whole open | Stopped (worst) | Freed (worst) |
 | --- | --- | ---: | ---: | ---: |
 | text-cancel-100mb | Windows | 1,137 ms | 4 ms | 129 ms |
-| | Linux | 1,001 ms | 3 ms | 96 ms |
+| | Linux | 968 ms | 4 ms | 103 ms |
 | | macOS | 1,252 ms | 5 ms | 83 ms |
 | text-cancel-500mb | Windows | 6,435 ms | 4 ms | 791 ms |
-| | Linux | 5,930 ms | 3 ms | 484 ms |
+| | Linux | 5,475 ms | 17 ms | 497 ms |
 | | macOS | 7,546 ms | 6 ms | 403 ms |
 
 ### Tables and XML
 
 | Workload | Windows | Linux | macOS | Result |
 | --- | ---: | ---: | ---: | --- |
-| table-10k | 0.018 s | 0.017 s, 29 MB | 0.012 s, 24 MB | 95 modified, 50 added, 55 removed, 9,749 reordered |
-| table-10k-position | 0.024 s | 0.018 s, 28 MB | 0.016 s, 22 MB | 197 differences |
-| table-100k | 0.285 s | 0.262 s, 160 MB | 0.133 s, 135 MB | 1,030 modified, 500 added, 532 removed, 98,850 reordered |
-| table-100k-position | 0.350 s | 0.261 s, 142 MB | 0.231 s, 125 MB | 614 differences |
-| table-cancel-1m | 0.938 s | 0.874 s, 928 MB | 0.479 s, 748 MB | stopped 44 / 32 / 23 ms after asked, half way through |
-| xml-tree-12k | 0.227 s | 0.175 s, 103 MB | 0.153 s, 116 MB | 72,297 rows; 59 added, 64 removed, 252 modified, 1 moved, 1 ambiguous |
-| xml-tree-12k-keyed | 0.264 s | 0.192 s, 103 MB | 0.172 s, 120 MB | 72,302 rows; 60 added, 65 removed, 248 modified, 11,718 moved, 96 ambiguous |
-| xml-tree-view-12k | 0.966 s | 0.793 s, 112 MB | — | 72,297 rows, 376 changes |
-| xml-semantic-12k | 0.161 s | 0.145 s, 122 MB | 0.131 s, 128 MB | 29,430 changes |
+| table-10k | 0.018 s | 0.019 s, 28 MB | 0.012 s, 24 MB | 95 modified, 50 added, 55 removed, 9,749 reordered |
+| table-10k-position | 0.024 s | 0.021 s, 27 MB | 0.016 s, 22 MB | 197 differences |
+| table-100k | 0.285 s | 0.256 s, 160 MB | 0.133 s, 135 MB | 1,030 modified, 500 added, 532 removed, 98,850 reordered |
+| table-100k-position | 0.350 s | 0.282 s, 142 MB | 0.231 s, 125 MB | 614 differences |
+| table-cancel-1m | 0.938 s | 0.934 s, 944 MB | 0.479 s, 748 MB | stopped 44 / 34 / 23 ms after asked, half way through |
+| xml-tree-12k | 0.227 s | 0.179 s, 102 MB | 0.153 s, 116 MB | 72,297 rows; 59 added, 64 removed, 252 modified, 1 moved, 1 ambiguous |
+| xml-tree-12k-keyed | 0.264 s | 0.209 s, 102 MB | 0.172 s, 120 MB | 72,302 rows; 60 added, 65 removed, 248 modified, 11,718 moved, 96 ambiguous |
+| xml-tree-view-12k | 0.966 s | 0.837 s, 110 MB | — | 72,297 rows, 376 changes |
+| xml-semantic-12k | 0.161 s | 0.162 s, 121 MB | 0.131 s, 128 MB | 29,430 changes |
 
-In the XML Tree view, drawing is cheap next to the comparison. On Linux, of 0.793 s the comparison
-takes 165 ms and the first rows 4 ms; a frame while scrolling 72,297 rows takes 0.26 ms, because
+In the XML Tree view, drawing is cheap next to the comparison. On Linux, of 0.837 s the comparison
+takes 167 ms and the first rows 5 ms; a frame while scrolling 72,297 rows takes 0.32 ms, because
 only the rows in view are built; folding and unfolding the whole tree take 1–2 ms; and a step to the
-next change, drawn, takes 1.31 ms (Windows: 220, 7, 0.35, 1–2 and 1.84 ms).
+next change, drawn, takes 1.66 ms (Windows: 220, 7, 0.35, 1–2 and 1.84 ms).
 
 ### Binary and images
 
 | Workload | Windows | Linux | macOS | Result |
 | --- | ---: | ---: | ---: | --- |
-| binary-10mb | 0.007 s | 0.008 s, 31 MB | 0.003 s, 29 MB | 100 ranges |
-| binary-100mb | 0.068 s | 0.076 s, 211 MB | 0.031 s, 208 MB | 100 ranges |
+| binary-10mb | 0.007 s | 0.010 s, 31 MB | 0.003 s, 29 MB | 100 ranges |
+| binary-100mb | 0.068 s | 0.081 s, 211 MB | 0.031 s, 208 MB | 100 ranges |
 | binary-1gb | — | — | 0.34 s, 2,057 MB | 100 ranges |
-| binary-moved-unrelated | 0.049 s | 0.051 s, 32 MB | 0.056 s, 29 MB | 0 moved blocks |
-| binary-moved-swap | 0.013 s | 0.014 s, 25 MB | 0.014 s, 22 MB | 2 moved blocks, 131,072 matched bytes |
-| binary-moved-large | 0.185 s | 0.192 s, 143 MB | 0.202 s, 142 MB | 2 moved blocks, 2,097,152 matched bytes |
-| binary-moved-short-shift | 0.008 s | 0.008 s, 19 MB | 0.007 s, 17 MB | 1 moved block, 15 matched bytes |
-| binary-moved-wide-shift | 0.003 s | 0.003 s, 15 MB | 0.002 s, 13 MB | 1 moved block, 524,288 matched bytes |
-| binary-moved-firmware | 0.001 s | 0.001 s, 12 MB | 0.001 s, 9 MB | 18 moved blocks, 4,014 matched bytes |
-| image-4k | 0.135 s | 0.125 s, 109 MB | 0.103 s, 105 MB | 82,116 pixels differ |
+| binary-moved-unrelated | 0.049 s | 0.050 s, 32 MB | 0.056 s, 29 MB | 0 moved blocks |
+| binary-moved-swap | 0.013 s | 0.014 s, 24 MB | 0.014 s, 22 MB | 2 moved blocks, 131,072 matched bytes |
+| binary-moved-large | 0.185 s | 0.190 s, 144 MB | 0.202 s, 142 MB | 2 moved blocks, 2,097,152 matched bytes |
+| binary-moved-short-shift | 0.008 s | 0.008 s, 20 MB | 0.007 s, 17 MB | 1 moved block, 15 matched bytes |
+| binary-moved-wide-shift | 0.003 s | 0.003 s, 14 MB | 0.002 s, 13 MB | 1 moved block, 524,288 matched bytes |
+| binary-moved-firmware | 0.001 s | 0.001 s, 13 MB | 0.001 s, 9 MB | 18 moved blocks, 4,014 matched bytes |
+| image-4k | 0.135 s | 0.163 s, 140 MB | 0.103 s, 105 MB | 82,116 pixels differ |
 
 On Windows, image-4k takes 0.109 s in the quick `--release` build: the size-tuned profile the
-packages use costs it about 25% (see
+packages use costs it about 25%. On Linux it went from 0.125 s with the old `--release` profile to
+0.163 s with `release-size`, about 30% (see
 [Executable size](#executable-size-and-the-release-profile-2026-11-16)).
 
 ### Folders and synchronization
 
 | Workload | Windows | Linux | macOS | Result |
 | --- | ---: | ---: | ---: | --- |
-| folder-small-files | 0.214 s | 0.247 s, 29 MB | 0.599 s, 33 MB | 220 differ, 198 unique; first result after 2 ms |
-| folder-large-files | 0.032 s | 0.025 s, 143 MB | 0.013 s, 139 MB | 2 differ |
-| folder-mixed | 0.043 s | 0.024 s, 50 MB | 0.054 s, 37 MB | 80 differ; first result after 2 ms |
-| folder-navigation-20k | 0.363 s | 0.334 s, 31 MB | 0.653 s, 40 MB | 418 files; a step 0.34 / 0.21 / 0.19 ms |
-| sync-preview-20k | 2.375 s | 0.740 s, 28 MB | 2.005 s, 33 MB | 198 copies, 220 replaces; plan 2,169 / 499 / 1,427 ms |
+| folder-small-files | 0.214 s | 0.238 s, 30 MB | 0.599 s, 33 MB | 220 differ, 198 unique; first result after 2 ms |
+| folder-large-files | 0.032 s | 0.030 s, 150 MB | 0.013 s, 139 MB | 2 differ |
+| folder-mixed | 0.043 s | 0.025 s, 51 MB | 0.054 s, 37 MB | 80 differ; first result after 2 ms |
+| folder-navigation-20k | 0.363 s | 0.341 s, 30 MB | 0.653 s, 40 MB | 418 files; a step 0.34 / 0.24 / 0.19 ms |
+| sync-preview-20k | 2.375 s | 0.712 s, 28 MB | 2.005 s, 33 MB | 198 copies, 220 replaces; plan 2,169 / 489 / 1,427 ms |
 | sync-apply-large | — | — | 74.653 s, 15 MB | 2 changes applied; preview 28.5 s, apply 45.6 s |
 
 ## Release gates
@@ -147,18 +153,18 @@ baseline made on that machine (see [Baselines](#baselines)).
 | Gate | Limit | macOS | Windows | Linux |
 | --- | --- | --- | --- | --- |
 | Time of each workload (text-cancel left out) | at most 1.25 × the machine's baseline | pass | — | — |
-| Peak of text-100mb / 500mb / 1gb | 610 / 2,930 / 5,990 MB | pass: 552 / 2,663 / 5,440 | not measured | pass: 540 / 2,563 / 5,234 |
-| Peak of text-view-100mb / 500mb / 1gb | 745 / 3,780 / 7,720 MB | pass: 674 / 3,433 / 7,019 | not measured | pass: 685 / 3,214 / 6,479 |
-| First frame | 100 ms at 100 MB, 500 ms at 1 GiB | pass: 37 / 404 ms | pass: 58 / 474 ms (606 ms in the quick build) | **over at 1 GiB**: 63 / 800 ms |
-| A scrolled frame and a step | 16 ms at every size | pass: 10.84 ms | **over at 1 GiB**: 20.79 ms | pass: 15.17 ms |
-| Work stopped after *Cancel* | 50 ms | pass: 6 ms | pass: 4 ms | pass: 3 ms |
-| Memory freed after *Cancel* at 500 MB | 1 s | pass: 0.40 s | pass: 0.79 s | pass: 0.48 s |
-| Difference count at 100 MB, 500 MB, 1 GiB | 15,086, 74,725, 152,526 | pass | 152,372 at 1 GiB | 152,307 at 1 GiB |
+| Peak of text-100mb / 500mb / 1gb | 610 / 2,930 / 5,990 MB | pass: 552 / 2,663 / 5,440 | not measured | pass: 538 / 2,562 / 5,233 |
+| Peak of text-view-100mb / 500mb / 1gb | 745 / 3,780 / 7,720 MB | pass: 674 / 3,433 / 7,019 | not measured | pass: 694 / 3,225 / 6,495 |
+| First frame | 100 ms at 100 MB, 500 ms at 1 GiB | pass: 37 / 404 ms | pass: 58 / 474 ms (606 ms in the quick build) | **over at 1 GiB**: 70 / 1,064 ms |
+| A scrolled frame and a step | 16 ms at every size | pass: 10.84 ms | **over at 1 GiB**: 20.79 ms | **over at 1 GiB**: 17.80 ms |
+| Work stopped after *Cancel* | 50 ms | pass: 6 ms | pass: 4 ms | pass: 17 ms |
+| Memory freed after *Cancel* at 500 MB | 1 s | pass: 0.40 s | pass: 0.79 s | pass: 0.50 s |
+| Difference count at 100 MB, 500 MB, 1 GiB | 15,086, 74,725, 152,526 | pass | 152,372 at 1 GiB | 152,447 at 1 GiB |
 
 The harness checks only the time gate itself; the others are read from its output. The misses are
-all at 1 GiB: a scrolled frame and a step on Windows (about 20 ms), and the first frame on Linux. At
-500 MB and below, every machine draws a scrolled frame or a step in under 10 ms and stops after
-*Cancel* within 6 ms. The 1 GiB count on Windows and Linux comes from the benchmark, not the window:
+all at 1 GiB: a scrolled frame and a step on Windows (about 20 ms) and Linux (about 18 ms), and the
+first frame on Linux (0.9–1.1 s). At 500 MB and below, every machine draws a scrolled frame or a step
+in under 10 ms and stops after *Cancel* within 17 ms. The 1 GiB count on Windows and Linux comes from the benchmark, not the window:
 see below.
 
 ## What the results show
@@ -171,7 +177,7 @@ see below.
 - **Using the view does not depend on the file size up to 500 MB.** Only the rows in view are built,
   so a scrolled frame or a step takes under 2 ms up to 100 MB and under 10 ms at 500 MB. At 1 GiB it
   is 11–21 ms, around the 16 ms of one frame.
-- **Cancel is immediate.** The open stops within 6 ms on every machine; freeing what it built takes
+- **Cancel is immediate.** The open stops within 17 ms on every machine; freeing what it built takes
   up to 0.8 s at 500 MB, but the window does not wait for it.
 - **Binary and image compares hold the files whole**: two 1 GB files take 2 GB.
 - **Folder compares are usable at once.** The first items are listed within 2 ms while the rest is
@@ -185,14 +191,15 @@ see below.
   whole walk 20, so a 1 GiB pair always gives 152,526 differences. The text-1gb and text-view-1gb
   workloads compare on the calling thread, where the gaps share one 2-second limit; Windows and
   Linux pass it, and the gaps left are compared coarsely, so the count there depends on how far the
-  walk got: 152,307 to 152,394 in these runs. Comparing every gap finely costs about 1.5 s at 1 GiB.
-- **Linux is faster than Windows on the same CPU** for text and synchronization (before line
-  numbering on several threads: text-100mb 0.695 against 1.657 s; the sync plan 499 against 2,109
-  ms, which is file system calls). Binary, image and table workloads are within a few percent of
-  each other.
-- **The Linux 1 GiB view load (40.5 s) is the virtual machine's.** With 6.5 GB of peak and 4 GB of
-  input on a 15 GB virtual machine, the files were read from disk again rather than from the cache;
-  at 500 MB the load (1.9 s) is in line with Windows (2.1 s).
+  walk got: 152,307 to 152,447 in these runs. Comparing every gap finely costs about 1.5 s at 1 GiB.
+- **Linux is faster than Windows on the same CPU** for large text and synchronization: with the
+  same build profile and compiler, text-1gb 9.30 against 11.06 s, and the sync plan 489 against
+  2,169 ms, which is file system calls. Binary, image and table workloads are within a few percent
+  of each other, and the 1 GiB view draws its first frame faster on Windows (474 against 1,064 ms).
+- **On WSL, the timings need the inputs in the page cache.** The 2026-11-11 run loaded the 1 GiB
+  view in 40.5 s, reading the files from disk again; in this run it took 3.9 s. The cache can also
+  be emptied while the virtual machine sits idle (see
+  [Running the benchmarks](#running-the-benchmarks)).
 - **On the macOS 27.3 pre-release, large freed blocks are not reused.** Loading the 100 MB pair,
   dropping it and loading it again adds about 137 MB of resident memory each time, also in a 20-line
   Rust program outside OxideMerge, and not on Linux. Opening large comparisons again and again in
@@ -297,6 +304,16 @@ except where noted:
 The measurements that changed the results above, newest first. Each was made on one machine, before
 and after the change, with the same inputs.
 
+- **2026-11-18, Linux with `release-size` and rustc 1.100.0:** the whole Linux column measured
+  again, after line numbering on several threads and with the build the packages use. Against
+  2026-11-11 (quick `--release`): text-500mb 4.76 → 4.22 s, text-1gb 11.07 → 9.30 s,
+  text-view-500mb 9.21 → 8.48 s, text-view-1gb 55.7 → 18.4 s (the load 40.5 → 3.9 s, from the cache).
+  Slower: image-4k 0.125 → 0.163 s, from the size-tuned profile; text-view-10mb 0.350 → 0.394 s and
+  xml-tree-view-12k 0.793 → 0.837 s. The first frame at 1 GiB went from 800 to 1,064 ms and a step
+  from 15.17 to 17.80 ms, now over the 16 ms frame. The same source built with rustc 1.97.1 was
+  slower at the large sizes: text-1gb 10.54 s, text-view-1gb 19.44 s, text-100mb 0.777 s
+  (1.100.0: 9.30, 18.41 and 0.728 s); the other workloads were within run-to-run variation.
+
 - **2026-11-18, 0.9.9 on Windows:** the whole Windows column measured again, with the `release-size`
   build the packages use. Everything is the same as or slightly faster than the 2026-11-11 and
   2026-11-16 runs: text-500mb 5.85 → 5.15 s, text-1gb 12.90 → 11.06 s, text-view-1gb 23.04 → 20.16
@@ -363,6 +380,11 @@ page are of that build on Windows.
 | `OXIDEMERGE_BENCH_SAVE=base.txt` | Saves the times as a baseline |
 | `OXIDEMERGE_BENCH_BASELINE=base.txt` | Fails if a workload that took at least 50 ms is now more than `OXIDEMERGE_BENCH_TOLERANCE` (default 1.5) times slower |
 | `OXIDEMERGE_BENCH_PROFILE=file.log` | Records line lengths, capacities and resident memory at each stage of loading and comparing; it adds overhead, so leave it off for timing |
+
+On WSL, keep the virtual machine busy between the build and the runs, or run each pass twice: when
+it sits idle, the page cache can be emptied, and the first runs then read from the virtual disk. In
+the 2026-11-18 Linux run, sync-preview-20k took 7.354 s for that reason (1 MB/s of reads with 70%
+of the time waiting for I/O, as `/proc/pressure/io` showed) and 0.712 s run again straight after.
 
 On Windows, peak memory and the resident memory of each stage are missing: they come from
 `/usr/bin/time` and `ps`. Build from PowerShell, not Git Bash, whose Perl cannot build OpenSSL for
