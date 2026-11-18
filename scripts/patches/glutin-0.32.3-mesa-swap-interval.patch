@@ -1,0 +1,35 @@
+--- a/src/api/glx/surface.rs
++++ b/src/api/glx/surface.rs
+@@ -250,7 +250,18 @@
+ 
+         let mut applied = false;
+ 
+-        // Apply the `EXT` first since it's per window.
++        // On Mesa, use only its own extension. It sets the interval of the current drawable,
++        // which is this surface, and returns an error where the driver cannot. The `EXT` and
++        // `SGI` entry points reach the same driver hook, and Mesa before 21 (RHEL 8.4) calls
++        // it from `glXSwapIntervalEXT` without checking that the software rasterizer has one:
++        // a call to address 0.
++        if self.display.inner.client_extensions.contains("GLX_MESA_swap_control") {
++            unsafe {
++                applied = extra.SwapIntervalMESA(interval as _) != glx::BAD_CONTEXT as _;
++            }
++            return if applied { Ok(()) } else { Err(ErrorKind::BadContext.into()) };
++        }
++
+         if !applied && self.display.inner.client_extensions.contains("GLX_EXT_swap_control") {
+             super::last_glx_error(|| unsafe {
+                 // Check for error explicitly here, other apis do have indication for failure.
+@@ -259,12 +270,6 @@
+             })?;
+         }
+ 
+-        if !applied && self.display.inner.client_extensions.contains("GLX_MESA_swap_control") {
+-            unsafe {
+-                applied = extra.SwapIntervalMESA(interval as _) != glx::BAD_CONTEXT as _;
+-            }
+-        }
+-
+         if !applied && self.display.inner.client_extensions.contains("GLX_SGI_swap_control") {
+             unsafe {
+                 applied = extra.SwapIntervalSGI(interval as _) != glx::BAD_CONTEXT as _;
