@@ -4078,6 +4078,27 @@ fn a_folder_compared_without_subfolders_is_fetched_without_them() {
     remote::fake::uninstall();
 }
 
+/// Software renderers are told apart from the hardware ones by their names.
+#[test]
+fn software_opengl_is_told_from_hardware_by_its_name() {
+    for name in [
+        "llvmpipe (LLVM 10.0.1, 256 bits)",
+        "Gallium 0.4 on softpipe",
+        "Mesa DRI swrast",
+        "LLVMPIPE",
+    ] {
+        assert!(software_renderer(name), "{name}");
+    }
+    for name in [
+        "Mesa Intel(R) UHD Graphics 630 (CFL GT2)",
+        "NVIDIA GeForce RTX 3080/PCIe/SSE2",
+        "AMD Radeon RX 6800 (radeonsi, navi21, LLVM 15.0.7, DRM 3.49)",
+        "",
+    ] {
+        assert!(!software_renderer(name), "{name}");
+    }
+}
+
 #[test]
 fn the_sftp_password_can_be_shown_and_hidden_again() {
     let mut gui = Gui::start("sftp_password_visibility", None);

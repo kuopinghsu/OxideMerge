@@ -256,8 +256,10 @@ Cargo 以離線方式執行，使用已下載到 `~/.cargo/registry` 的套件�
 - **Linux x64 與 Arm64：** 在 Ubuntu 22.04 上建置的 TAR.GZ 套件。會實際啟動程式，
   並確認不會變更設定。
 - **Linux AppImage：** 在使用 glibc 2.28 的 AlmaLinux 8 上建置。套件內含 X11、Wayland 與鍵盤函式庫，
-  系統缺少這些函式庫時才會使用。兩種處理器架構都會在 Ubuntu 22.04 與 AlmaLinux 8 上，
-  檢查函式庫載入、指令列行為與視窗啟動。
+  系統缺少這些函式庫時才會使用。兩種處理器架構都會在 Ubuntu 22.04、AlmaLinux 8 與 AlmaLinux 8.4 上，
+  檢查函式庫載入、指令列行為與視窗啟動。AlmaLinux 8.4 取自其封存庫，內含 Mesa 20.3，
+  因此在其上的視窗啟動會以軟體繪製器檢查下方的 glutin 修補；若其 Mesa 為 21 或更新版本，
+  該工作會失敗。
 - **macOS：** 以 DMG 套件提供的通用應用程式，由 `scripts/macos-sign.sh` 簽署：
   沒有簽署機密時採用臨時簽署；五個 `MACOS_*` 機密都設定時，則以 Developer ID 簽署、
   公證並裝訂（請參閱 [macOS 簽署](macos-signing.md)）。會驗證 Apple 晶片與 Intel 兩種程式碼，並透過
@@ -282,19 +284,22 @@ AppImage 與 DMG 必須帶有其格式標記，PDF 必須完整。之後會將 `
 
 - 此修補變更 `src/api/glx/surface.rs` 中的 `set_swap_interval`。列出 `GLX_MESA_swap_control`
   時（只有 Mesa 會列出），glutin 只使用 `glXSwapIntervalMESA`。驅動程式無法設定間隔時，Mesa
-  會從中傳回錯誤；eframe 會記錄一則警告，視窗照常開啟，只是沒有垂直同步。其他驅動程式（例如
-  NVIDIA）仍使用 `glXSwapIntervalEXT`。
+  會從中傳回錯誤；eframe 會記錄一則警告，視窗照常開啟，只是沒有垂直同步。其他驅動程式（例如 NVIDIA）
+  仍使用 `glXSwapIntervalEXT`。
 - 指令稿修補的是 `$CARGO_HOME/registry/src`，因此 `Cargo.toml` 與 `Cargo.lock` 維持提交時的內容，
   加上標籤的建置仍會得到發行版本標記。使用相同 `CARGO_HOME` 建置的所有專案都共用這份複本：只在 CI
-  與擁有獨立 registry 磁碟區的 AppImage 容器中執行此指令稿。在 Windows 與 macOS 上，
-  `make appimage` 會在該容器中執行它。
-- 下載的 crate 檔案變更後，Cargo 不會重新建置它，因此指令稿也會刪除 glutin 在 `PROFILE`
-  （預設為 `release-size`）下的建置產物。再次執行不會有其他作用。
-- TAR.GZ 套件不會修補。它們需要比 RHEL 8 更新的 glibc，本來就無法在其上執行。直接以
-  `cargo build` 建置的程式也不會修補。
+  與擁有獨立 registry 磁碟區的 AppImage 容器中執行此指令稿。在 Windows 與 macOS 上， `make appimage`
+  會在該容器中執行它。
+- 下載的 crate 檔案變更後，Cargo 不會重新建置它，因此指令稿也會刪除 glutin 在 `PROFILE` （預設為
+  `release-size`）下的建置產物。再次執行不會有其他作用。
+- 無法設定交換間隔時，視窗就沒有垂直同步。以軟體繪製 OpenGL 時（`GL_RENDERER` 為 llvmpipe、softpipe
+  或 swrast）， OxideMerge 會讓每個畫面至少間隔一個 60 Hz 畫面，因此像轉圈圖示之類的動畫不會以處理器
+  的最大速度繪製。
+- TAR.GZ 套件不會修補。它們需要比 RHEL 8 更新的 glibc，本來就無法在其上執行。直接以 `cargo build`
+  建置的程式也不會修補。
 
-`Cargo.lock` 改用其他 glutin 版本時，指令稿會以「No patch for glutin <version>」停止；修補無法套用時，
-則以「does not apply」停止。為新版本製作修補檔：
+`Cargo.lock` 改用其他 glutin 版本時，指令稿會以「No patch for glutin <version>」停止；
+修補無法套用時，則以「does not apply」停止。為新版本製作修補檔：
 
 1. 在儲存庫外解開該版本，並保留一份檔案複本：
 
@@ -324,8 +329,8 @@ AppImage 與 DMG 必須帶有其格式標記，PDF 必須完整。之後會將 `
        sed '1,2s/\t.*//' > <repository>/scripts/patches/glutin-<version>-mesa-swap-interval.patch
    ```
 
-4. 在 Mesa 20.3 或 RHEL 8.4 本身上，強制使用軟體繪製器檢查視窗。未修補時，視窗開啟時會發生記憶體
-   區段錯誤；修補後可正常開啟：
+4. 在 Mesa 20.3 或 RHEL 8.4 本身上，強制使用軟體繪製器檢查視窗。未修補時，
+   視窗開啟時會發生記憶體區段錯誤；修補後可正常開啟：
 
    ```sh
    WAYLAND_DISPLAY= LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe ./oxidemerge-*.AppImage

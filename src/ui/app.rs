@@ -3430,6 +3430,12 @@ pub struct OxideMergeApp {
     archive_passwords: Vec<PathBuf>,
     /// A folder report with file differences being written on another thread: its file.
     report_job: Option<(PathBuf, std::sync::mpsc::Receiver<Result<(), String>>)>,
+    /// The shortest time between two frames, worked out on the first frame: one frame at 60 Hz
+    /// when OpenGL is drawn in software, where there may be no vsync to wait for (see
+    /// [`software_renderer`]), and none otherwise. `None` until then.
+    frame_floor: Option<Option<std::time::Duration>>,
+    /// When the last frame started, to keep frames `frame_floor` apart.
+    last_frame: Option<std::time::Instant>,
     /// Whether the report being written opens in the system's viewer once done, to be printed.
     report_opens: bool,
     /// The PDF files written to be printed, readable only by the user; deleted when the
@@ -4392,6 +4398,8 @@ impl OxideMergeApp {
             next_open: 0,
             background_open_bytes: BACKGROUND_OPEN_BYTES,
             report_job: None,
+            frame_floor: None,
+            last_frame: None,
             report_opens: false,
             prints: Vec::new(),
             tab_keys: Vec::new(),
@@ -13311,6 +13319,16 @@ impl OxideMergeApp {
     }
 }
 
+/// Whether OpenGL named `renderer` (its `GL_RENDERER`) draws in software: Mesa's llvmpipe,
+/// softpipe or swrast, as in a virtual machine, over a remote desktop or with
+/// `LIBGL_ALWAYS_SOFTWARE`.
+fn software_renderer(renderer: &str) -> bool {
+    let renderer = renderer.to_ascii_lowercase();
+    ["llvmpipe", "softpipe", "swrast"]
+        .iter()
+        .any(|name| renderer.contains(name))
+}
+
 impl eframe::App for OxideMergeApp {
     /// A report still being written is finished before the program ends, which would cut it.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -13353,7 +13371,24 @@ impl eframe::App for OxideMergeApp {
         });
     }
 
-    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // Drawn in software, a window may have no vsync (Mesa before 21 cannot set it), and an
+        // animation such as a spinner, which asks for the next frame at once, would then draw
+        // as fast as the processor allows. Frames are kept one 60 Hz frame apart there.
+        let floor = *self.frame_floor.get_or_insert_with(|| {
+            use eframe::glow::HasContext;
+            let gl = frame.gl()?;
+            let name = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
+            software_renderer(&name).then_some(std::time::Duration::from_micros(16_667))
+        });
+        if let Some(floor) = floor {
+            if let Some(spent) = self.last_frame.map(|t| t.elapsed()) {
+                if spent < floor {
+                    std::thread::sleep(floor - spent);
+                }
+            }
+            self.last_frame = Some(std::time::Instant::now());
+        }
         let ctx = &root.ctx().clone();
         self.cfg.dark_mode = match self.cfg.theme {
             ThemeMode::Light => false,

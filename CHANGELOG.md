@@ -30,6 +30,9 @@ release on GitHub uses its section of this file as the release notes.
   Mesa older than 21 when OpenGL is drawn in software, as in a virtual machine or over a remote
   desktop. The AppImage build patches glutin to set the swap interval through Mesa's own
   extension, which reports that the driver cannot set it; the window then opens without vsync.
+  With OpenGL drawn in software, frames are kept one 60 Hz frame apart, so an animation without
+  vsync does not keep the processor busy. The AppImage is now also tested on AlmaLinux 8.4, whose
+  Mesa 20.3 had the crash.
 
 ## [0.9.9] - 2026-11-17
 

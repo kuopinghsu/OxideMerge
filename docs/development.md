@@ -277,7 +277,9 @@ Pushes to `main`, release tags and manual runs with `packages` build and check t
   check confirms that it does not change the settings.
 - **Linux AppImage:** packages built on AlmaLinux 8 with glibc 2.28. They include the X11, Wayland
   and keyboard libraries and use them when the system does not have them. Both processor types are
-  checked on Ubuntu 22.04 and AlmaLinux 8: library loading, command-line behavior and window start.
+  checked on Ubuntu 22.04, AlmaLinux 8 and AlmaLinux 8.4: library loading, command-line behavior and
+  window start. AlmaLinux 8.4, from its vault, has Mesa 20.3, so the window start there checks the
+  glutin patch below with the software renderer; the job fails if its Mesa is 21 or newer.
 - **macOS:** a universal app in a DMG package, signed by `scripts/macos-sign.sh`: ad hoc without
   signing secrets, or with a Developer ID, notarized and stapled when all five `MACOS_*` secrets are
   set (see [macOS signing](macos-signing.md)). Both Apple silicon and Intel code are checked. The
@@ -298,26 +300,27 @@ must be whole. It then publishes `SHA256SUMS` with the packages.
 
 ### Patch glutin for Mesa before 21
 
-On Mesa older than 21 (RHEL 8.4) with the software renderer, glutin's call to
-`glXSwapIntervalEXT` reaches a function the renderer does not have, and the window crashes as it
-opens. glutin's `master` branch still had the problem in November 2026. The repository does not
-keep a copy of glutin: the AppImage job runs `scripts/patch-glutin.sh` before it builds, and the
-script applies `scripts/patches/glutin-<version>-mesa-swap-interval.patch` to the glutin that
-Cargo has downloaded.
+On Mesa older than 21 (RHEL 8.4) with the software renderer, glutin's call to `glXSwapIntervalEXT`
+reaches a function the renderer does not have, and the window crashes as it opens. glutin's `master`
+branch still had the problem in November 2026. The repository does not keep a copy of glutin: the
+AppImage job runs `scripts/patch-glutin.sh` before it builds, and the script applies
+`scripts/patches/glutin-<version>-mesa-swap-interval.patch` to the glutin that Cargo has downloaded.
 
-- The patch changes `set_swap_interval` in `src/api/glx/surface.rs`. When
-  `GLX_MESA_swap_control` is listed, which only Mesa does, glutin uses only
-  `glXSwapIntervalMESA`. Mesa returns an error from it where the driver cannot set the interval;
-  eframe logs a warning and the window opens without vsync. Other drivers, such as NVIDIA's, still
-  use `glXSwapIntervalEXT`.
-- The script patches `$CARGO_HOME/registry/src`, so `Cargo.toml` and `Cargo.lock` stay as
-  committed and a tagged build still gets its release label. That copy is shared by every project
-  built with the same `CARGO_HOME`: run the script only in CI and in the AppImage container, which
-  has a registry volume of its own. `make appimage` on Windows and macOS runs it there.
-- Cargo does not rebuild a downloaded crate whose files change, so the script also removes
-  glutin's build output for `PROFILE` (default `release-size`). Running it again does nothing more.
+- The patch changes `set_swap_interval` in `src/api/glx/surface.rs`. When `GLX_MESA_swap_control` is
+  listed, which only Mesa does, glutin uses only `glXSwapIntervalMESA`. Mesa returns an error from
+  it where the driver cannot set the interval; eframe logs a warning and the window opens without
+  vsync. Other drivers, such as NVIDIA's, still use `glXSwapIntervalEXT`.
+- The script patches `$CARGO_HOME/registry/src`, so `Cargo.toml` and `Cargo.lock` stay as committed
+  and a tagged build still gets its release label. That copy is shared by every project built with
+  the same `CARGO_HOME`: run the script only in CI and in the AppImage container, which has a
+  registry volume of its own. `make appimage` on Windows and macOS runs it there.
+- Cargo does not rebuild a downloaded crate whose files change, so the script also removes glutin's
+  build output for `PROFILE` (default `release-size`). Running it again does nothing more.
 - The TAR.GZ packages are not patched. They need a newer glibc than RHEL 8 has, so they do not run
   there. A program built with plain `cargo build` is not patched either.
+- Where the swap interval cannot be set, the window has no vsync. With OpenGL drawn in software
+  (`GL_RENDERER` llvmpipe, softpipe or swrast), OxideMerge keeps its frames one 60 Hz frame apart,
+  so an animation such as a spinner does not draw as fast as the processor allows.
 
 When `Cargo.lock` moves to another glutin version, the script stops with "No patch for glutin
 <version>", and when the patch no longer applies, with "does not apply". To make the patch for a
@@ -332,9 +335,9 @@ new version:
    cp -r a b
    ```
 
-2. In `b/src/api/glx/surface.rs`, make the change described above: in `set_swap_interval`, put
-   this block before the `GLX_EXT_swap_control` one, and remove the old `GLX_MESA_swap_control`
-   block after it:
+2. In `b/src/api/glx/surface.rs`, make the change described above: in `set_swap_interval`, put this
+   block before the `GLX_EXT_swap_control` one, and remove the old `GLX_MESA_swap_control` block
+   after it:
 
    ```rust
    if self.display.inner.client_extensions.contains("GLX_MESA_swap_control") {
@@ -352,8 +355,8 @@ new version:
        sed '1,2s/\t.*//' > <repository>/scripts/patches/glutin-<version>-mesa-swap-interval.patch
    ```
 
-4. Check it with the window on Mesa 20.3, or on RHEL 8.4 itself, with the software renderer
-   forced. Unpatched, the window ends in a segmentation fault as it opens; patched, it opens:
+4. Check it with the window on Mesa 20.3, or on RHEL 8.4 itself, with the software renderer forced.
+   Unpatched, the window ends in a segmentation fault as it opens; patched, it opens:
 
    ```sh
    WAYLAND_DISPLAY= LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe ./oxidemerge-*.AppImage

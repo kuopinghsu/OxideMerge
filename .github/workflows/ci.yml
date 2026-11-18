@@ -490,7 +490,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x64, arm64]
-        system: [Ubuntu 22.04, RHEL 8 (AlmaLinux 8)]
+        system: [Ubuntu 22.04, RHEL 8 (AlmaLinux 8), RHEL 8.4 (AlmaLinux 8.4)]
         include:
           - arch: x64
             runner: ubuntu-24.04
@@ -500,6 +500,13 @@ jobs:
             image: ubuntu:22.04
           - system: RHEL 8 (AlmaLinux 8)
             image: almalinux:8
+            repo: https://repo.almalinux.org/almalinux/$releasever
+          # Mesa 20, before 21: the software renderer that crashed in glXSwapIntervalEXT
+          # until glutin was patched (scripts/patch-glutin.sh). 8.4 is in the vault now.
+          - system: RHEL 8.4 (AlmaLinux 8.4)
+            image: almalinux:8.4
+            repo: https://vault.almalinux.org/8.4
+            mesa_before: 21
     defaults:
       run:
         shell: bash
@@ -556,6 +563,8 @@ jobs:
 
       - name: Install a virtual display
         timeout-minutes: 10
+        env:
+          REPO: ${{ matrix.repo }}
         run: |
           if command -v apt-get >/dev/null; then
             # archive.ubuntu.com can stall for minutes from GitHub's runners; its Azure mirror
@@ -577,14 +586,15 @@ jobs:
               sleep $((attempt * 5))
             done
           else
+            # $REPO keeps dnf's own $releasever; $basearch is dnf's too.
             dnf_options=(
               --setopt=timeout=20 --setopt=retries=2 --setopt=minrate=100000
               --setopt=baseos.mirrorlist=
-              '--setopt=baseos.baseurl=https://repo.almalinux.org/almalinux/$releasever/BaseOS/$basearch/os/'
+              "--setopt=baseos.baseurl=$REPO/BaseOS/"'$basearch/os/'
               --setopt=appstream.mirrorlist=
-              '--setopt=appstream.baseurl=https://repo.almalinux.org/almalinux/$releasever/AppStream/$basearch/os/'
+              "--setopt=appstream.baseurl=$REPO/AppStream/"'$basearch/os/'
               --setopt=extras.mirrorlist=
-              '--setopt=extras.baseurl=https://repo.almalinux.org/almalinux/$releasever/extras/$basearch/os/'
+              "--setopt=extras.baseurl=$REPO/extras/"'$basearch/os/'
             )
             for attempt in 1 2 3; do
               if dnf "${dnf_options[@]}" install -y --setopt=install_weak_deps=False \
@@ -598,6 +608,17 @@ jobs:
               dnf clean metadata
               sleep $((attempt * 5))
             done
+          fi
+
+      # The system tested for Mesa before 21 must have it, or the test would prove nothing.
+      - name: Check the Mesa version
+        if: matrix.mesa_before
+        run: |
+          version=$(rpm -q --queryformat '%{VERSION}' mesa-dri-drivers)
+          echo "Mesa $version"
+          if [ "${version%%.*}" -ge "${{ matrix.mesa_before }}" ]; then
+            echo "::error::Expected Mesa before ${{ matrix.mesa_before }}, got $version"
+            exit 1
           fi
 
       # OxideMerge should open its window and keep running until timeout stops it.
