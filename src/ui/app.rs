@@ -13319,6 +13319,22 @@ impl OxideMergeApp {
     }
 }
 
+/// The shortest time between two frames with OpenGL named `renderer`: one 60 Hz frame when it
+/// draws in software (see [`software_renderer`]), none otherwise.
+fn frame_floor(renderer: &str) -> Option<std::time::Duration> {
+    software_renderer(renderer).then_some(std::time::Duration::from_micros(16_667))
+}
+
+/// How long to wait before a frame `since_last` after the one before, to keep them `floor`
+/// apart; nothing without a floor, for the first frame, or once that long has passed.
+fn frame_pause(
+    floor: Option<std::time::Duration>,
+    since_last: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    let (floor, since_last) = (floor?, since_last?);
+    (since_last < floor).then(|| floor - since_last)
+}
+
 /// Whether OpenGL named `renderer` (its `GL_RENDERER`) draws in software: Mesa's llvmpipe,
 /// softpipe or swrast, as in a virtual machine, over a remote desktop or with
 /// `LIBGL_ALWAYS_SOFTWARE`.
@@ -13378,14 +13394,12 @@ impl eframe::App for OxideMergeApp {
         let floor = *self.frame_floor.get_or_insert_with(|| {
             use eframe::glow::HasContext;
             let gl = frame.gl()?;
-            let name = unsafe { gl.get_parameter_string(eframe::glow::RENDERER) };
-            software_renderer(&name).then_some(std::time::Duration::from_micros(16_667))
+            frame_floor(&unsafe { gl.get_parameter_string(eframe::glow::RENDERER) })
         });
-        if let Some(floor) = floor {
-            if let Some(spent) = self.last_frame.map(|t| t.elapsed()) {
-                if spent < floor {
-                    std::thread::sleep(floor - spent);
-                }
+        if floor.is_some() {
+            let since_last = self.last_frame.map(|t| t.elapsed());
+            if let Some(pause) = frame_pause(floor, since_last) {
+                std::thread::sleep(pause);
             }
             self.last_frame = Some(std::time::Instant::now());
         }

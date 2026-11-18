@@ -4099,6 +4099,40 @@ fn software_opengl_is_told_from_hardware_by_its_name() {
     }
 }
 
+/// Drawn in software, frames are kept one 60 Hz frame apart: the next waits for the rest of it,
+/// and none waits after the window was idle that long, or with OpenGL on a graphics card.
+#[test]
+fn frames_drawn_in_software_are_kept_apart() {
+    use std::time::Duration;
+    let floor = frame_floor("llvmpipe (LLVM 10.0.1, 256 bits)");
+    assert_eq!(floor, Some(Duration::from_micros(16_667)));
+    assert_eq!(frame_floor("NVIDIA GeForce RTX 3080/PCIe/SSE2"), None);
+    let ms = Duration::from_millis;
+    assert_eq!(frame_pause(floor, None), None, "the first frame");
+    assert_eq!(
+        frame_pause(floor, Some(ms(4))),
+        Some(Duration::from_micros(12_667))
+    );
+    assert_eq!(
+        frame_pause(floor, Some(ms(17))),
+        None,
+        "after an idle while"
+    );
+    assert_eq!(frame_pause(None, Some(ms(1))), None, "on a graphics card");
+
+    // In the window: frames asked for one after another are held that far apart.
+    let mut gui = Gui::start("frame_floor", None);
+    gui.app.frame_floor = Some(Some(ms(40)));
+    gui.frame();
+    let start = Instant::now();
+    gui.frames(3);
+    assert!(
+        start.elapsed() >= ms(120),
+        "three frames in {:?}",
+        start.elapsed()
+    );
+}
+
 #[test]
 fn the_sftp_password_can_be_shown_and_hidden_again() {
     let mut gui = Gui::start("sftp_password_visibility", None);
