@@ -309,9 +309,17 @@ pub struct Manifest {
     /// [`fetch_selected`]); empty when it was fetched whole. A folder compare of the copy
     /// shows only them, on every side.
     pub chosen: Vec<String>,
-    /// The folders of `dirs` made only to hold chosen entries, which have more in them on the
-    /// server: deleted here, they are not removed there.
+    /// The folders of `dirs` that have more in them on the server than here: made only to hold
+    /// chosen entries, or with entries the filter left out. Deleted here, they are not removed
+    /// there. `""` stands for the folder fetched itself.
     pub partial: std::collections::BTreeSet<String>,
+    /// The filter the fetch left entries out by, as the comparison names it (`[F] Exclude
+    /// Source Control`, `*.c`); `None` when it fetched everything. A comparison of the copy
+    /// shows only what this filter keeps, on every side.
+    pub filter: Option<String>,
+    /// Whether the folder's subfolders were left empty, for a comparison without them: they
+    /// are in `dirs` and `partial`, and a comparison of the copy stays without subfolders.
+    pub shallow: bool,
 }
 
 /// A hash of the file at `path`'s bytes, to tell whether it changed since it was fetched or
@@ -2588,7 +2596,7 @@ fn download_dir(
     cancel: &AtomicBool,
     budget: &Budget,
 ) -> Result<()> {
-    download_tree(fs, remote, local, depth, cancel, budget, None).map(|_| ())
+    download_tree(fs, remote, local, depth, cancel, budget, None, None).map(|_| ())
 }
 
 /// One step of a folder fetch: a folder to list, or a file to download. `rel` is the path
@@ -2623,6 +2631,8 @@ struct Steps {
 struct TreeFetch<'a> {
     cancel: &'a AtomicBool,
     budget: &'a Budget,
+    /// What to leave out, and where the folder fetched is in what the filter is given.
+    leave_out: Option<LeaveOut<'a>>,
     manifest: std::sync::Mutex<Manifest>,
     steps: std::sync::Mutex<Steps>,
     changed: std::sync::Condvar,
@@ -2709,10 +2719,29 @@ impl TreeFetch<'_> {
             }
             let child_remote = join(&remote, &e.name);
             let child_rel = if rel.is_empty() {
-                e.name
+                e.name.clone()
             } else {
                 format!("{rel}/{}", e.name)
             };
+            // Left out by the comparison's filter (`.git` under *Exclude Source Control*, say):
+            // never listed further or downloaded. The folder it is in has more on the server
+            // than here, so deleting that folder here does not remove it there.
+            if let Some(leave) = &self.leave_out {
+                if !leave.keeps(&child_rel, &e.name, e.is_dir) {
+                    self.manifest().partial.insert(rel.clone());
+                    continue;
+                }
+                // A comparison without subfolders compares only whether each is there: it is
+                // made here, empty, and not listed. It has more on the server than here.
+                if e.is_dir && !leave.subfolders {
+                    std::fs::create_dir(&child_local)?;
+                    let mut manifest = self.manifest();
+                    manifest.dirs.insert(child_rel.clone());
+                    manifest.partial.insert(child_rel);
+                    manifest.shallow = true;
+                    continue;
+                }
+            }
             // Each is made here as it is listed, to be there for the names after it: its own
             // step may come after theirs.
             if e.is_dir {
@@ -2783,8 +2812,56 @@ impl TreeFetch<'_> {
     }
 }
 
+/// What of a folder a fetch is for: what `filter` keeps (everything without one), and, without
+/// `subfolders`, only the folder's own files, its subfolders left empty: what a comparison
+/// with that filter and without subfolders shows.
+#[derive(Clone, Copy)]
+pub struct FetchScope<'a> {
+    pub filter: Option<&'a super::filter::FileFilter>,
+    pub subfolders: bool,
+}
+
+impl FetchScope<'_> {
+    /// All of a folder.
+    pub const ALL: FetchScope<'static> = FetchScope {
+        filter: None,
+        subfolders: true,
+    };
+
+    fn is_all(&self) -> bool {
+        self.filter.is_none() && self.subfolders
+    }
+}
+
+/// What a folder fetch leaves out (see [`FetchScope`]), at paths relative to what is compared,
+/// of which the folder fetched is at `prefix` (`""`, or `"data/"` for an entry chosen of a
+/// folder; see [`fetch_selected`]).
+#[derive(Clone, Copy)]
+pub(crate) struct LeaveOut<'a> {
+    pub filter: Option<&'a super::filter::FileFilter>,
+    pub prefix: &'a str,
+    pub subfolders: bool,
+}
+
+impl LeaveOut<'_> {
+    /// Whether the entry `name`, at `rel` in the folder fetched, is fetched.
+    fn keeps(&self, rel: &str, name: &str, dir: bool) -> bool {
+        let Some(filter) = self.filter else {
+            return true;
+        };
+        let path = format!("{}{rel}", self.prefix);
+        if dir {
+            filter.include_dir(&path, name)
+        } else {
+            filter.include_file(&path, name)
+        }
+    }
+}
+
 /// [`download_dir`], returning what it fetched. With `connect`, a folder of many files is
-/// read over several connections at once, each made with it.
+/// read over several connections at once, each made with it; with `leave_out`, what it does
+/// not keep is not fetched.
+#[allow(clippy::too_many_arguments)]
 fn download_tree(
     fs: &dyn RemoteFs,
     remote: &str,
@@ -2793,10 +2870,12 @@ fn download_tree(
     cancel: &AtomicBool,
     budget: &Budget,
     connect: Option<Connector>,
+    leave_out: Option<LeaveOut>,
 ) -> Result<Manifest> {
     let fetch = TreeFetch {
         cancel,
         budget,
+        leave_out,
         manifest: Default::default(),
         steps: Default::default(),
         changed: Default::default(),
@@ -2902,6 +2981,7 @@ fn remote_file_name(remote_path: &str) -> std::ffi::OsString {
 /// dropped). Setting `cancel` stops it, and it fails. Bounded by [`MAX_REMOTE_BYTES`],
 /// [`MAX_REMOTE_ENTRIES`] and [`MAX_REMOTE_DEPTH`]. Fails with [`UnknownHost`] for a server
 /// not trusted yet.
+#[cfg(test)]
 pub fn fetch(conn: &RemoteConnection, remote_path: &str, cancel: &AtomicBool) -> Result<Fetched> {
     fetch_with(conn, remote_path, cancel, FetchMode::Complete)
 }
@@ -2919,10 +2999,29 @@ pub(crate) fn fetch_with(
     cancel: &AtomicBool,
     mode: FetchMode,
 ) -> Result<Fetched> {
+    fetch_leaving_out(conn, remote_path, cancel, mode, FetchScope::ALL)
+}
+
+/// [`fetch_with`], of a folder only what `scope` is for: the entries a folder compare with that
+/// filter, and with or without subfolders, would not show are not downloaded. The manifest notes
+/// the folders that have more on the server (see [`Manifest::partial`]) and a fetch without
+/// subfolders ([`Manifest::shallow`]); the caller notes the filter in it.
+pub(crate) fn fetch_leaving_out(
+    conn: &RemoteConnection,
+    remote_path: &str,
+    cancel: &AtomicBool,
+    mode: FetchMode,
+    scope: FetchScope,
+) -> Result<Fetched> {
     let remote = connect(conn, cancel)?;
     let more = |stop: &AtomicBool| connect(conn, stop);
     let more: Option<Connector> = Some((&more as Connect, more_connections(conn)));
-    let fetched = fetch_from_over(&*remote, remote_path, cancel, mode, more)?;
+    let leave_out = (!scope.is_all()).then_some(LeaveOut {
+        filter: scope.filter,
+        prefix: "",
+        subfolders: scope.subfolders,
+    });
+    let fetched = fetch_from_over(&*remote, remote_path, cancel, mode, more, leave_out)?;
     if fetched.is_dir && fetched.manifest.is_none() {
         return Ok(fetched);
     }
@@ -2939,11 +3038,12 @@ pub fn fetch_selected(
     base: &str,
     items: &[String],
     cancel: &AtomicBool,
+    filter: Option<&super::filter::FileFilter>,
 ) -> Result<Fetched> {
     let remote = connect(conn, cancel)?;
     let more = |stop: &AtomicBool| connect(conn, stop);
     let more: Option<Connector> = Some((&more as Connect, more_connections(conn)));
-    let fetched = fetch_selected_over(&*remote, base, items, cancel, more)?;
+    let fetched = fetch_selected_over(&*remote, base, items, cancel, more, filter)?;
     register_fetch(&fetched);
     Ok(fetched)
 }
@@ -2955,6 +3055,7 @@ fn fetch_selected_over(
     items: &[String],
     cancel: &AtomicBool,
     connect: Option<Connector>,
+    filter: Option<&super::filter::FileFilter>,
 ) -> Result<Fetched> {
     let base = match base.trim_end_matches('/') {
         "" => "/",
@@ -2964,7 +3065,7 @@ fn fetch_selected_over(
         .prefix("oxidemerge-sftp-")
         .tempdir()?;
     let local = temp.path().join(remote_file_name(base));
-    let manifest = fetch_selected_into(fs, base, items, &local, cancel, connect)?;
+    let manifest = fetch_selected_into(fs, base, items, &local, cancel, connect, filter)?;
     Ok(Fetched {
         temp,
         local,
@@ -2975,7 +3076,8 @@ fn fetch_selected_over(
 }
 
 /// Downloads `items` of the folder `base` (see [`fetch_selected`]) into `local`, which must
-/// not exist yet, returning what it fetched.
+/// not exist yet, returning what it fetched. Inside a chosen folder, what `filter` does not
+/// keep is left out; a chosen entry itself is always fetched.
 fn fetch_selected_into(
     fs: &dyn RemoteFs,
     base: &str,
@@ -2983,6 +3085,7 @@ fn fetch_selected_into(
     local: &Path,
     cancel: &AtomicBool,
     connect: Option<Connector>,
+    filter: Option<&super::filter::FileFilter>,
 ) -> Result<Manifest> {
     let base = match base.trim_end_matches('/') {
         "" => "/",
@@ -3041,8 +3144,24 @@ fn fetch_selected_into(
         match kind {
             Some(EntryKind::Dir) => {
                 let depth = parts.len() + 1;
-                let inner = download_tree(fs, &remote, &target, depth, cancel, &budget, connect)?;
+                let prefix = format!("{rel}/");
+                // A folder chosen is fetched with its subfolders: it was chosen to be compared.
+                let leave_out = filter.map(|filter| LeaveOut {
+                    filter: Some(filter),
+                    prefix: &prefix,
+                    subfolders: true,
+                });
+                let inner = download_tree(
+                    fs, &remote, &target, depth, cancel, &budget, connect, leave_out,
+                )?;
                 manifest.dirs.insert(rel.to_string());
+                manifest.partial.extend(inner.partial.iter().map(|p| {
+                    if p.is_empty() {
+                        rel.to_string()
+                    } else {
+                        format!("{rel}/{p}")
+                    }
+                }));
                 manifest
                     .dirs
                     .extend(inner.dirs.iter().map(|dir| format!("{rel}/{dir}")));
@@ -3085,7 +3204,7 @@ pub(crate) fn fetch_from(
     cancel: &AtomicBool,
     mode: FetchMode,
 ) -> Result<Fetched> {
-    fetch_from_over(remote, remote_path, cancel, mode, None)
+    fetch_from_over(remote, remote_path, cancel, mode, None, None)
 }
 
 /// [`fetch_from`], reading a folder of many files over more connections made with `connect`.
@@ -3095,12 +3214,21 @@ fn fetch_from_over(
     cancel: &AtomicBool,
     mode: FetchMode,
     connect: Option<Connector>,
+    leave_out: Option<LeaveOut>,
 ) -> Result<Fetched> {
     let temp = tempfile::Builder::new()
         .prefix("oxidemerge-sftp-")
         .tempdir()?;
     let local = temp.path().join(remote_file_name(remote_path));
-    let staged = fetch_into_mode(remote, remote_path, &local, cancel, mode, connect)?;
+    let staged = fetch_into_mode(
+        remote,
+        remote_path,
+        &local,
+        cancel,
+        mode,
+        connect,
+        leave_out,
+    )?;
     Ok(Fetched {
         temp,
         local,
@@ -3143,8 +3271,17 @@ fn fetch_into(
     local: &Path,
     cancel: &AtomicBool,
     connect: Option<Connector>,
+    leave_out: Option<LeaveOut>,
 ) -> Result<Staged> {
-    fetch_into_mode(fs, remote_path, local, cancel, FetchMode::Complete, connect)
+    fetch_into_mode(
+        fs,
+        remote_path,
+        local,
+        cancel,
+        FetchMode::Complete,
+        connect,
+        leave_out,
+    )
 }
 
 fn fetch_into_mode(
@@ -3154,6 +3291,7 @@ fn fetch_into_mode(
     cancel: &AtomicBool,
     mode: FetchMode,
     connect: Option<Connector>,
+    leave_out: Option<LeaveOut>,
 ) -> Result<Staged> {
     let trimmed = remote_path.trim_end_matches('/');
     let remote_path = if trimmed.is_empty() { "/" } else { trimmed };
@@ -3171,7 +3309,18 @@ fn fetch_into_mode(
             })
         }
         Some(EntryKind::Dir) if matches!(mode, FetchMode::Complete) => {
-            let manifest = download_tree(fs, remote_path, local, 0, cancel, &budget, connect)?;
+            let mut manifest = download_tree(
+                fs,
+                remote_path,
+                local,
+                0,
+                cancel,
+                &budget,
+                connect,
+                leave_out,
+            )?;
+            // The folder fetched is the root of the comparison, never deleted on the server.
+            manifest.partial.remove("");
             Ok(Staged {
                 is_dir: true,
                 stamp: None,
@@ -3202,13 +3351,15 @@ fn fetch_into_mode(
 
 /// Fetches `remote_path` again over the local copy at `local` an earlier [`fetch`] staged,
 /// discarding what changed there; for a copy of only `chosen` of the folder (see
-/// [`fetch_selected`]), only those again. The new copy is downloaded beside it first, so a
-/// failed or cancelled fetch leaves the old copy as it was.
+/// [`fetch_selected`]), only those again, and of a folder again only what `scope` (the one the
+/// copy was fetched for) is for. The new copy is downloaded beside it first, so a failed or
+/// cancelled fetch leaves the old copy as it was.
 pub fn refetch(
     conn: &RemoteConnection,
     remote_path: &str,
     local: &Path,
     chosen: &[String],
+    scope: FetchScope,
     cancel: &AtomicBool,
 ) -> Result<Staged> {
     let remote = connect(conn, cancel)?;
@@ -3222,7 +3373,12 @@ pub fn refetch(
     let more = |stop: &AtomicBool| connect(conn, stop);
     let more: Option<Connector> = Some((&more as Connect, more_connections(conn)));
     let staged = if chosen.is_empty() {
-        fetch_into(&*remote, remote_path, &new, cancel, more)?
+        let leave_out = (!scope.is_all()).then_some(LeaveOut {
+            filter: scope.filter,
+            prefix: "",
+            subfolders: scope.subfolders,
+        });
+        fetch_into(&*remote, remote_path, &new, cancel, more, leave_out)?
     } else {
         Staged {
             is_dir: true,
@@ -3234,6 +3390,7 @@ pub fn refetch(
                 &new,
                 cancel,
                 more,
+                scope.filter,
             )?),
         }
     };
@@ -4749,7 +4906,7 @@ mod tests {
                 .file("/srv/deep/er/not.txt", "n"),
         );
         let items = ["a.txt", "b.txt", "data", "data/c.txt", "deep/er/e.txt"].map(String::from);
-        let f = fetch_selected(&conn, "/srv/", &items, &never).unwrap();
+        let f = fetch_selected(&conn, "/srv/", &items, &never, None).unwrap();
         assert!(f.is_dir && inside_fetch(&f.local));
         assert_eq!(f.local.file_name().unwrap(), "srv");
         let read = |rel: &str| std::fs::read_to_string(f.local.join(rel)).ok();
@@ -4784,7 +4941,15 @@ mod tests {
         );
         // Reloading the copy from the server fetches only what was chosen again.
         std::fs::write(f.local.join("a.txt"), "edited").unwrap();
-        let staged = refetch(&conn, "/srv", &f.local, &manifest.chosen, &never).unwrap();
+        let staged = refetch(
+            &conn,
+            "/srv",
+            &f.local,
+            &manifest.chosen,
+            FetchScope::ALL,
+            &never,
+        )
+        .unwrap();
         assert_eq!(staged.manifest.as_ref(), Some(manifest));
         assert_eq!(read("a.txt").as_deref(), Some("a"));
         assert_eq!(read("left-out.txt"), None, "not the whole folder");
@@ -4803,7 +4968,7 @@ mod tests {
         // Two names this file system takes for one: only the first is fetched, and saving
         // cannot take the other for deleted.
         let twice = ["a.txt", "A.txt", "a.txt"].map(String::from);
-        let f = fetch_selected(&conn, "/srv", &twice, &never).unwrap();
+        let f = fetch_selected(&conn, "/srv", &twice, &never, None).unwrap();
         let files = &f.manifest.as_ref().unwrap().files;
         if cfg!(any(windows, target_os = "macos")) {
             assert_eq!(files.keys().collect::<Vec<_>>(), ["a.txt"]);
@@ -4814,12 +4979,185 @@ mod tests {
         ));
         // A name this machine cannot have, or an entry that is gone, is said, not skipped.
         let gone = ["a.txt".to_string(), "nothing.txt".to_string()];
-        let Err(e) = fetch_selected(&conn, "/srv", &gone, &never) else {
+        let Err(e) = fetch_selected(&conn, "/srv", &gone, &never, None) else {
             panic!("an entry that is gone");
         };
         assert!(format!("{e:#}").contains("/srv/nothing.txt"), "{e:#}");
         let bad = ["../etc/passwd".to_string()];
-        assert!(fetch_selected(&conn, "/srv", &bad, &never).is_err());
+        assert!(fetch_selected(&conn, "/srv", &bad, &never, None).is_err());
+        fake::uninstall();
+    }
+
+    /// What the comparison's filter leaves out of a folder is not downloaded: with *Exclude
+    /// Source Control*, no `.git` folder is listed further or read. Saving the copy keeps the
+    /// server's `.git` folders, also of a folder deleted here, and reloading leaves them out
+    /// again.
+    #[test]
+    fn what_the_filter_leaves_out_of_a_folder_is_not_fetched() {
+        let never = AtomicBool::new(false);
+        let conn = RemoteConnection {
+            protocol: Protocol::Sftp,
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: Auth::Password(String::new()),
+            options: Default::default(),
+        };
+        let server = || {
+            fake::Server::new()
+                .dir("/srv")
+                .dir("/srv/proj")
+                .file("/srv/proj/main.c", "int main;")
+                .file("/srv/proj/.gitignore", "*.o")
+                .dir("/srv/proj/.git")
+                .file("/srv/proj/.git/HEAD", "ref: refs/heads/main")
+                .dir("/srv/proj/.git/objects")
+                .file("/srv/proj/.git/objects/pack", "big")
+                .dir("/srv/proj/lib")
+                .file("/srv/proj/lib/util.c", "int util;")
+                .dir("/srv/proj/lib/.svn")
+                .file("/srv/proj/lib/.svn/entries", "12")
+        };
+        fake::install(server());
+        let spec = "[F] Exclude Source Control";
+        let filter = super::super::filter::FileFilter::resolve(
+            spec,
+            &super::super::filter::builtin_filters(),
+        );
+        let mode = FetchMode::Complete;
+        let scope = FetchScope {
+            filter: Some(&filter),
+            subfolders: true,
+        };
+        let mut f = fetch_leaving_out(&conn, "/srv/proj", &never, mode, scope).unwrap();
+        f.manifest.as_mut().unwrap().filter = Some(spec.to_string());
+        let read: Vec<String> = fake::opened_paths();
+        assert!(
+            read.iter()
+                .all(|p| !p.contains("/.git") && !p.contains("/.svn")),
+            "{read:?}"
+        );
+        assert!(f.local.join("main.c").is_file() && f.local.join("lib/util.c").is_file());
+        for gone in [".git", ".gitignore", "lib/.svn"] {
+            assert!(!f.local.join(gone).exists(), "{gone} was fetched");
+        }
+        let manifest = f.manifest.clone().unwrap();
+        assert_eq!(
+            manifest.files.keys().collect::<Vec<_>>(),
+            ["lib/util.c", "main.c"]
+        );
+        assert_eq!(manifest.dirs.iter().collect::<Vec<_>>(), ["lib"]);
+        assert_eq!(
+            manifest.partial.iter().collect::<Vec<_>>(),
+            ["lib"],
+            "the folder fetched itself is never deleted, so it is not noted"
+        );
+        assert!(!crate::core::remote_sync::changed(&f.local, &manifest));
+
+        // Reloading leaves the same out.
+        let staged = refetch(&conn, "/srv/proj", &f.local, &[], scope, &never).unwrap();
+        let mut again = staged.manifest.unwrap();
+        again.filter = manifest.filter.clone();
+        assert_eq!(again, manifest);
+        assert!(!f.local.join(".git").exists());
+
+        // `lib` deleted here: its file is deleted on the server, the folder and its `.svn`
+        // are not, and nothing under `.git` is touched.
+        std::fs::remove_dir_all(f.local.join("lib")).unwrap();
+        let saved =
+            crate::core::remote_sync::save_folder(&conn, &f.local, "/srv/proj", &manifest, &never)
+                .unwrap();
+        assert!(saved.errors.is_empty(), "{:?}", saved.errors);
+        assert!(fake::was_removed("/srv/proj/lib/util.c"));
+        assert!(!fake::was_removed("/srv/proj/lib"));
+        let kept = ("path", "/srv/proj/lib".to_string());
+        assert_eq!(saved.kept, [trf("msg.remote_kept_partial", &[kept])]);
+        assert!(fake::entry("/srv/proj/lib/.svn/entries").is_some());
+        assert!(fake::entry("/srv/proj/.git/HEAD").is_some());
+
+        // A folder chosen of another is fetched without what the filter leaves out of it; a
+        // file chosen is fetched whatever the filter says.
+        fake::install(server());
+        let items = ["proj".to_string(), "proj/.gitignore".to_string()];
+        let f = fetch_selected(&conn, "/srv", &items, &never, Some(&filter)).unwrap();
+        assert!(f.local.join("proj/main.c").is_file());
+        assert!(!f.local.join("proj/.git").exists() && !f.local.join("proj/lib/.svn").exists());
+        let manifest = f.manifest.unwrap();
+        assert_eq!(
+            manifest.partial.iter().collect::<Vec<_>>(),
+            ["proj", "proj/lib"]
+        );
+        let only = ["proj/.gitignore".to_string()];
+        let f = fetch_selected(&conn, "/srv", &only, &never, Some(&filter)).unwrap();
+        assert!(f.local.join("proj/.gitignore").is_file());
+        fake::uninstall();
+    }
+
+    /// For a comparison without subfolders, a folder is fetched with its own files and its
+    /// subfolders empty: they are noted as having more on the server, so deleting one here does
+    /// not remove it there, and reloading fetches the same way again.
+    #[test]
+    fn a_folder_fetched_without_subfolders_has_them_empty() {
+        let never = AtomicBool::new(false);
+        let conn = RemoteConnection {
+            protocol: Protocol::Sftp,
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: Auth::Password(String::new()),
+            options: Default::default(),
+        };
+        fake::install(
+            fake::Server::new()
+                .dir("/srv")
+                .dir("/srv/proj")
+                .file("/srv/proj/main.c", "int main;")
+                .dir("/srv/proj/lib")
+                .file("/srv/proj/lib/util.c", "int util;")
+                .dir("/srv/proj/lib/deep")
+                .file("/srv/proj/lib/deep/x.c", "int x;"),
+        );
+        let scope = FetchScope {
+            filter: None,
+            subfolders: false,
+        };
+        let f = fetch_leaving_out(&conn, "/srv/proj", &never, FetchMode::Complete, scope).unwrap();
+        assert!(f.local.join("main.c").is_file());
+        assert!(f.local.join("lib").is_dir());
+        assert!(!f.local.join("lib/util.c").exists());
+        assert_eq!(fake::opened_paths(), ["/srv/proj/main.c"]);
+        let manifest = f.manifest.clone().unwrap();
+        assert!(manifest.shallow);
+        assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["main.c"]);
+        assert_eq!(manifest.dirs.iter().collect::<Vec<_>>(), ["lib"]);
+        assert_eq!(manifest.partial.iter().collect::<Vec<_>>(), ["lib"]);
+        assert!(!crate::core::remote_sync::changed(&f.local, &manifest));
+
+        let staged = refetch(&conn, "/srv/proj", &f.local, &[], scope, &never).unwrap();
+        assert_eq!(staged.manifest.as_ref(), Some(&manifest));
+        assert!(!f.local.join("lib/util.c").exists());
+
+        std::fs::remove_dir(f.local.join("lib")).unwrap();
+        let saved =
+            crate::core::remote_sync::save_folder(&conn, &f.local, "/srv/proj", &manifest, &never)
+                .unwrap();
+        assert!(saved.errors.is_empty(), "{:?}", saved.errors);
+        assert!(!fake::was_removed("/srv/proj/lib"));
+        assert!(fake::entry("/srv/proj/lib/deep/x.c").is_some());
+        let kept = ("path", "/srv/proj/lib".to_string());
+        assert_eq!(saved.kept, [trf("msg.remote_kept_partial", &[kept])]);
+
+        // With subfolders, as before.
+        let f = fetch_leaving_out(
+            &conn,
+            "/srv/proj",
+            &never,
+            FetchMode::Complete,
+            FetchScope::ALL,
+        )
+        .unwrap();
+        assert!(f.local.join("lib/deep/x.c").is_file());
+        assert!(!f.manifest.unwrap().shallow);
         fake::uninstall();
     }
 
@@ -5335,8 +5673,17 @@ mod tests {
         let fetch = |name: &str, connect: Option<Connector>| {
             let local = dir.path().join(name);
             let budget = Budget::new();
-            let manifest =
-                download_tree(&Wide(40), "/wide", &local, 0, &never, &budget, connect).unwrap();
+            let manifest = download_tree(
+                &Wide(40),
+                "/wide",
+                &local,
+                0,
+                &never,
+                &budget,
+                connect,
+                None,
+            )
+            .unwrap();
             // The folder, its folders and their files.
             assert_eq!(budget.entries.load(Ordering::Relaxed), 1 + 40 + 40 * 8);
             assert_eq!(
@@ -5385,6 +5732,7 @@ mod tests {
             &never,
             &Budget::new(),
             Some((&connect, MAX_CONNECTIONS - 1)),
+            None,
         )
         .unwrap();
         assert_eq!(manifest.files.len(), 3 * 8);
@@ -5406,6 +5754,7 @@ mod tests {
             &never,
             &budget,
             Some((&connect, MAX_CONNECTIONS - 1)),
+            None,
         )
         .unwrap_err();
         assert_eq!(

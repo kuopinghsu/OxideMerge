@@ -99,6 +99,8 @@ pub enum FileFilter {
     Except(Box<FileFilter>, Arc<Skipped>),
     /// What the filter keeps of the files and folders chosen, and nothing else.
     Only(Box<FileFilter>, Arc<Chosen>),
+    /// What both filters keep.
+    Both(Box<FileFilter>, Box<FileFilter>),
 }
 
 pub const FLT_PREFIX: &str = "[F] ";
@@ -196,6 +198,7 @@ impl FileFilter {
                 inner.excludes_anything() || !(skipped.files.is_empty() && skipped.dirs.is_empty())
             }
             FileFilter::Only(..) => true,
+            FileFilter::Both(a, b) => a.excludes_anything() || b.excludes_anything(),
         }
     }
 
@@ -224,6 +227,9 @@ impl FileFilter {
             }
             FileFilter::Only(inner, chosen) => {
                 chosen.file(rel_path) && inner.include_file(rel_path, name)
+            }
+            FileFilter::Both(a, b) => {
+                a.include_file(rel_path, name) && b.include_file(rel_path, name)
             }
         }
     }
@@ -255,6 +261,9 @@ impl FileFilter {
             }
             FileFilter::Only(inner, chosen) => {
                 chosen.dir(rel_path) && inner.include_dir(rel_path, name)
+            }
+            FileFilter::Both(a, b) => {
+                a.include_dir(rel_path, name) && b.include_dir(rel_path, name)
             }
         }
     }

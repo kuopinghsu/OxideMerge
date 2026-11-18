@@ -352,6 +352,18 @@ pub struct FolderView {
     /// The only entries the compare shows, when a side is a copy of only some of a server's
     /// folder (see [`crate::core::remote::fetch_selected`]).
     only: Option<Arc<crate::core::filter::Chosen>>,
+    /// The filter a side on a server was fetched with: what it left out is not on that side
+    /// here, so the comparison shows only what it keeps, whatever filter is chosen after.
+    fetched_filter: Option<FileFilter>,
+    /// That filter as it was named, said over the list while another filter is chosen.
+    fetched_spec: Option<String>,
+    /// The sides on a server fetched without their subfolders (see
+    /// [`crate::core::remote::FetchScope`]): they are empty there, so the comparison stays
+    /// without subfolders, whatever is chosen after.
+    shallow_sides: Vec<usize>,
+    /// What the last copy or deletion of folders did and why it failed, said again once the
+    /// comparison it started is done.
+    op_note: Option<String>,
     fopts: FolderOptions,
     dopts: DiffOptions,
     running: Option<Running>,
@@ -845,6 +857,10 @@ impl FolderView {
             filter: FileFilter::resolve(filter_spec, named),
             revision: None,
             only: None,
+            fetched_filter: None,
+            fetched_spec: None,
+            shallow_sides: Vec::new(),
+            op_note: None,
             fopts: cfg.folder.clone(),
             dopts: cfg.comparison_options(),
             running: None,
@@ -1191,16 +1207,21 @@ impl FolderView {
             r.progress.abort.store(true, Ordering::Relaxed);
         }
         let progress = Arc::new(Progress::live());
-        self.whole_tree = self.fopts.recursive && self.fopts.include_unique_subfolders;
-        let (roots, filter, fopts, dopts, pr) = (
+        // A side fetched without subfolders has them empty: they are not compared, and the
+        // comparison is not whole, so nothing that needs a whole one (a sync, say) runs on it.
+        let recursive = self.fopts.recursive && self.shallow_sides.is_empty();
+        self.whole_tree = recursive && self.fopts.include_unique_subfolders;
+        let (roots, filter, mut fopts, dopts, pr) = (
             self.roots.clone(),
             self.filter.clone(),
             self.fopts.clone(),
             self.dopts.clone(),
             progress.clone(),
         );
+        fopts.recursive = recursive;
         let work = self.revision.as_ref().map(|(work, _)| work.clone());
         let only = self.only.clone();
+        let fetched_filter = self.fetched_filter.clone();
         let handle = std::thread::spawn(move || {
             // Asked here, off the window's thread, each time the folders are compared.
             let filter = match work {
@@ -1211,6 +1232,10 @@ impl FolderView {
             };
             let filter = match only {
                 Some(chosen) => FileFilter::Only(Box::new(filter), chosen),
+                None => filter,
+            };
+            let filter = match fetched_filter {
+                Some(fetched) => FileFilter::Both(Box::new(filter), Box::new(fetched)),
                 None => filter,
             };
             Scanner {
@@ -1242,6 +1267,8 @@ impl FolderView {
         self.view_key = None;
         self.list_gen += 1;
         self.status.clear();
+        // A note of an operation is the caller's to give again (see `execute`).
+        self.op_note = None;
     }
 
     /// What says which entries of the archives compared were left out when they were
@@ -1353,11 +1380,26 @@ impl FolderView {
     }
 
     /// Shows only `chosen` of the folders, and what is inside or on the way to them (see
-    /// [`crate::core::filter::Chosen`]), comparing them again.
+    /// [`crate::core::filter::Chosen`]), from the next comparison on.
     pub fn show_only(&mut self, chosen: &[String]) {
         let chosen = crate::core::filter::Chosen::new(chosen.iter().cloned());
         self.only = Some(Arc::new(chosen));
-        self.start_compare();
+    }
+
+    /// Shows only what `filter`, the one a side on a server was fetched with, keeps, from the
+    /// next comparison on: the side has nothing of what it left out (see
+    /// [`crate::core::remote::fetch_leaving_out`]).
+    pub fn limit_to_fetched(&mut self, filter: FileFilter, spec: String) {
+        self.fetched_filter = Some(filter);
+        self.fetched_spec = Some(spec);
+    }
+
+    /// Compares without subfolders from the next comparison on, as side `s`, on a server, has
+    /// them empty.
+    pub fn limit_to_top_level(&mut self, s: usize) {
+        if !self.shallow_sides.contains(&s) {
+            self.shallow_sides.push(s);
+        }
     }
 
     pub fn is_remote_side(&self, s: usize) -> bool {
@@ -1509,12 +1551,18 @@ impl FolderView {
             self.view_key = None;
             self.list_gen += 1;
             self.peek_cache = None;
+            // What an operation that started this comparison did, said first whatever came of it;
+            // the status meanwhile said it already, so it is said once, not twice.
+            let note = self.op_note.take();
             if self.failed {
                 self.status = tr("status.error").into();
             } else if aborted {
                 self.status = tr("msg.aborted").into();
             } else {
                 self.finished = self.elapsed;
+                if note.is_some() {
+                    self.status.clear();
+                }
                 // Submodules the revision could not be read for are left out on both sides.
                 if self.revision.is_some() {
                     let left_out = crate::core::git::unexported(&self.roots[0]);
@@ -1531,6 +1579,13 @@ impl FolderView {
                     }
                     self.status.push_str(&skipped);
                 }
+            }
+            if let Some(note) = note {
+                self.status = if self.status.is_empty() {
+                    note
+                } else {
+                    format!("{note}  {}", self.status)
+                };
             }
         } else if r.updated.elapsed() >= UPDATE_INTERVAL.max(self.view_cost * 4) {
             r.updated = Instant::now();
@@ -2203,7 +2258,23 @@ impl FolderView {
             any_dir |= it.is_dir;
             let r = match op.kind {
                 OpKind::Copy { from, to } => {
-                    folder::copy_recursive(&it.path(&self.roots[from]), &it.path(&self.roots[to]))
+                    let (src, dest) = (it.path(&self.roots[from]), it.path(&self.roots[to]));
+                    let fetched = self.is_remote_side(to);
+                    // On the server's side only as an empty folder: what it holds there was not
+                    // fetched, so copying into it would meet files not known here, and copying it
+                    // elsewhere would copy an empty folder for one that is not.
+                    let placeholder = |s: usize| self.shallow_sides.contains(&s) && it.exists[s];
+                    if it.is_dir && (placeholder(to) || placeholder(from)) {
+                        let option = ("option", tr("label.recursive").to_string());
+                        Err(anyhow::anyhow!(trf("folder.copy_shallow", &[option])))
+                    } else if let (true, true, Some(filter)) =
+                        (fetched, it.is_dir, &self.fetched_filter)
+                    {
+                        // What the server's side was fetched without is not copied to it either.
+                        folder::copy_filtered(&src, &dest, filter, &it.rel_path())
+                    } else {
+                        folder::copy_recursive(&src, &dest)
+                    }
                 }
                 OpKind::Delete { side } => {
                     let sides: Vec<usize> = match side {
@@ -2231,15 +2302,20 @@ impl FolderView {
                 self.mark_written(s);
             }
         }
-        self.status = trf("msg.op_done", &[("n", done.to_string())]);
+        let mut said = trf("msg.op_done", &[("n", done.to_string())]);
         if !errors.is_empty() {
-            self.status
-                .push_str(&format!(" — {}: {}", tr("status.error"), errors.join("; ")));
+            said.push_str(&format!(" — {}: {}", tr("status.error"), errors.join("; ")));
         }
+        // A folder copied or deleted (or partly, before an error) changes what is listed under
+        // it: compared again. What the operation did and why it failed stays said meanwhile,
+        // and after the comparison, which would otherwise clear it.
         if any_dir {
             self.start_compare();
+            self.status = said.clone();
+            self.op_note = Some(said);
             return;
         }
+        self.status = said;
         for &i in &op.targets {
             folder::refresh_file_item(&mut self.items, i, &self.roots, &self.fopts, &self.dopts);
             // ancestors may now exist on the target side
@@ -4307,6 +4383,22 @@ impl FolderView {
         self.update_visible(ui.ctx(), cfg);
         self.nav_text = self.nav_label(cfg);
         let (refresh, header_action) = self.header_bar(ui, cfg, named);
+        // Another filter chosen than the one the server's side was fetched with: what that one
+        // left out is still not shown, and this says why.
+        if let Some(spec) = self
+            .fetched_spec
+            .as_ref()
+            .filter(|s| **s != self.filter_spec)
+        {
+            let text = trf("folder.fetched_filter", &[("filter", spec.clone())]);
+            widgets::info_bar(ui, widgets::Icon::Filter, &text, widgets::pal(ui).accent);
+        }
+        // Subfolders asked for, which the server's side does not have.
+        if !self.shallow_sides.is_empty() && self.fopts.recursive {
+            let option = ("option", tr("label.recursive").to_string());
+            let text = trf("folder.fetched_shallow", &[option]);
+            widgets::info_bar(ui, widgets::Icon::Folder, &text, widgets::pal(ui).accent);
+        }
         if refresh {
             self.refresh(cfg, named);
         }

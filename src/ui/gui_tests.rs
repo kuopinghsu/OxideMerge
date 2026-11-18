@@ -3795,6 +3795,289 @@ fn a_file_opened_from_a_remote_folder_is_uploaded_when_saved_also_once_the_folde
     remote::fake::uninstall();
 }
 
+/// With *Exclude Source Control* chosen, a folder fetched over SFTP comes without its `.git`
+/// and `.svn` folders, which are never downloaded; the folder compare of it shows none on
+/// either side, also once another filter is chosen, as the server's side has none to show.
+#[test]
+fn a_folder_is_fetched_without_what_the_filter_leaves_out() {
+    remote::fake::install(
+        remote::fake::Server::new()
+            .dir("/srv")
+            .dir("/srv/proj")
+            .file("/srv/proj/main.c", "int main;\n")
+            .dir("/srv/proj/.git")
+            .file("/srv/proj/.git/HEAD", "ref: refs/heads/main\n")
+            .dir("/srv/proj/lib")
+            .file("/srv/proj/lib/util.c", "int util;\n")
+            .dir("/srv/proj/lib/.svn")
+            .file("/srv/proj/lib/.svn/entries", "12\n"),
+    );
+    let mut gui = Gui::start("sftp_fetch_filtered", None);
+    gui.app.cfg.filter = "[F] Exclude Source Control".to_string();
+    gui.app.start_remote_connect(RemoteTarget::Start(0));
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+        d.remote_path = "/srv/proj".to_string();
+    }
+    gui.frames(2);
+    gui.click(tr("btn.connect"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let copy = PathBuf::from(&gui.app.start_paths[0]);
+    assert!(copy.join("main.c").is_file() && copy.join("lib/util.c").is_file());
+    assert!(!copy.join(".git").exists() && !copy.join("lib/.svn").exists());
+    let read = remote::fake::opened_paths();
+    assert!(
+        read.iter()
+            .all(|p| !p.contains("/.git") && !p.contains("/.svn")),
+        "{read:?}"
+    );
+
+    // Compared with a local copy that has its `.git`: not shown, whatever the filter.
+    let local = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(local.path().join(".git")).unwrap();
+    std::fs::write(local.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(local.path().join("main.c"), "int main;\n").unwrap();
+    gui.app.start_paths[2] = local.path().display().to_string();
+    gui.app.submit_start();
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let at = gui.app.tabs.len() - 1;
+    let names = |gui: &Gui| -> Vec<String> {
+        let Content::Folder(v) = gui.app.tabs[at].content.view() else {
+            panic!("a folder compare");
+        };
+        v.items.iter().map(|it| it.rel_path()).collect()
+    };
+    assert!(names(&gui).iter().any(|n| n == "main.c"));
+    assert!(
+        !names(&gui).iter().any(|n| n.contains(".git")),
+        "{:?}",
+        names(&gui)
+    );
+    {
+        let app = &mut gui.app;
+        let Content::Folder(v) = &mut app.tabs[at].content else {
+            panic!("a folder compare");
+        };
+        v.filter_spec = "*.*".to_string();
+        v.refresh(&app.cfg, &app.named_filters);
+    }
+    gui.settle();
+    let fetched = ("filter", "[F] Exclude Source Control".to_string());
+    assert!(
+        gui.shows_text(&trf("folder.fetched_filter", &[fetched])),
+        "the list says why"
+    );
+    assert!(names(&gui).iter().any(|n| n == "main.c"));
+    assert!(
+        !names(&gui).iter().any(|n| n.contains(".git")),
+        "the server's side has no .git to compare: {:?}",
+        names(&gui)
+    );
+
+    // A folder copied to the server's side is copied without what the fetch left out.
+    std::fs::create_dir_all(local.path().join("lib/.svn")).unwrap();
+    std::fs::write(
+        local.path().join("lib/.svn/entries"),
+        "13
+",
+    )
+    .unwrap();
+    std::fs::write(
+        local.path().join("lib/util.c"),
+        "int util2;
+",
+    )
+    .unwrap();
+    gui.app.cfg.confirm_operations = false;
+    {
+        let app = &mut gui.app;
+        let Content::Folder(v) = &mut app.tabs[at].content else {
+            panic!("a folder compare");
+        };
+        v.refresh(&app.cfg, &app.named_filters);
+    }
+    gui.settle();
+    {
+        let app = &mut gui.app;
+        let Content::Folder(v) = &mut app.tabs[at].content else {
+            panic!("a folder compare");
+        };
+        v.select_matching("lib", &app.cfg);
+        v.copy_selected(false, &app.cfg);
+    }
+    gui.settle();
+    assert_eq!(
+        std::fs::read_to_string(copy.join("lib/util.c")).unwrap(),
+        "int util2;
+"
+    );
+    assert!(
+        !copy.join("lib/.svn").exists(),
+        "left out of the copy as of the fetch"
+    );
+    remote::fake::uninstall();
+}
+
+/// Two sides fetched with the same filter as the comparison's: nothing says another filter is
+/// chosen, as none is.
+#[test]
+fn two_sides_fetched_with_the_comparisons_filter_say_nothing_of_it() {
+    remote::fake::install(
+        remote::fake::Server::new()
+            .dir("/srv")
+            .dir("/srv/a")
+            .file("/srv/a/main.c", "int a;\n")
+            .dir("/srv/a/.git")
+            .file("/srv/a/.git/HEAD", "ref\n")
+            .dir("/srv/b")
+            .file("/srv/b/main.c", "int b;\n"),
+    );
+    let mut gui = Gui::start("sftp_two_filtered", None);
+    let spec = "[F] Exclude Source Control".to_string();
+    gui.app.cfg.filter = spec.clone();
+    for (slot, path) in [(0, "/srv/a"), (2, "/srv/b")] {
+        gui.app.start_remote_connect(RemoteTarget::Start(slot));
+        gui.frames(2);
+        {
+            let d = gui.app.remote_dlg.as_mut().unwrap();
+            d.host = "example.com".to_string();
+            d.user = "ann".to_string();
+            d.remote_path = path.to_string();
+        }
+        gui.frames(2);
+        gui.click(tr("btn.connect"));
+        gui.settle();
+        assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    }
+    // The second fetch filled the last field, which compares at once.
+    let Some(Content::Folder(v)) = gui.app.tabs.last().map(|t| t.content.view()) else {
+        panic!("a folder compare");
+    };
+    assert!(v.items.iter().any(|it| it.name == "main.c"));
+    assert!(!v.items.iter().any(|it| it.name == ".git"));
+    // Whatever filter it would name: the words before the name.
+    let notice = tr("folder.fetched_filter")
+        .split("{filter}")
+        .next()
+        .unwrap();
+    assert!(
+        !notice.is_empty() && !gui.shows_text(notice),
+        "nothing to say: {spec}"
+    );
+    remote::fake::uninstall();
+}
+
+/// A folder compared without subfolders is fetched without what they hold; the comparison
+/// stays without them once *Include subfolders* is turned on, and says why.
+#[test]
+fn a_folder_compared_without_subfolders_is_fetched_without_them() {
+    remote::fake::install(
+        remote::fake::Server::new()
+            .dir("/srv")
+            .dir("/srv/proj")
+            .file("/srv/proj/main.c", "int main;\n")
+            .dir("/srv/proj/lib")
+            .file("/srv/proj/lib/util.c", "int util;\n")
+            .dir("/srv/proj/extra")
+            .file("/srv/proj/extra/e.c", "int e;\n"),
+    );
+    let mut gui = Gui::start("sftp_fetch_shallow", None);
+    gui.app.cfg.folder.recursive = false;
+    gui.app.start_remote_connect(RemoteTarget::Start(0));
+    gui.frames(2);
+    {
+        let d = gui.app.remote_dlg.as_mut().unwrap();
+        d.host = "example.com".to_string();
+        d.user = "ann".to_string();
+        d.remote_path = "/srv/proj".to_string();
+    }
+    gui.frames(2);
+    gui.click(tr("btn.connect"));
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let copy = PathBuf::from(&gui.app.start_paths[0]);
+    assert!(copy.join("main.c").is_file() && copy.join("lib").is_dir());
+    assert!(!copy.join("lib/util.c").exists());
+    assert_eq!(remote::fake::opened_paths(), ["/srv/proj/main.c"]);
+
+    let local = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(local.path().join("lib")).unwrap();
+    std::fs::write(local.path().join("lib/util.c"), "int util;\n").unwrap();
+    std::fs::write(local.path().join("main.c"), "int main;\n").unwrap();
+    gui.app.start_paths[2] = local.path().display().to_string();
+    gui.app.submit_start();
+    gui.settle();
+    assert!(gui.errors().is_empty(), "{:?}", gui.errors());
+    let at = gui.app.tabs.len() - 1;
+    let names = |gui: &Gui| -> Vec<String> {
+        let Content::Folder(v) = gui.app.tabs[at].content.view() else {
+            panic!("a folder compare");
+        };
+        v.items.iter().map(|it| it.rel_path()).collect()
+    };
+    assert!(names(&gui).iter().any(|n| n == "lib") && names(&gui).iter().any(|n| n == "main.c"));
+    assert!(!names(&gui).iter().any(|n| n == "lib/util.c"));
+    {
+        let Content::Folder(v) = &mut gui.app.tabs[at].content else {
+            panic!("a folder compare");
+        };
+        v.set_recursive(true);
+        v.start_compare();
+    }
+    gui.settle();
+    assert!(names(&gui).iter().any(|n| n == "lib") && names(&gui).iter().any(|n| n == "main.c"));
+    assert!(
+        !names(&gui).iter().any(|n| n == "lib/util.c"),
+        "the server's side has no subfolders to compare: {:?}",
+        names(&gui)
+    );
+    let option = ("option", tr("label.recursive").to_string());
+    assert!(gui.shows_text(&trf(
+        "folder.fetched_shallow",
+        std::slice::from_ref(&option)
+    )));
+
+    // Nothing is copied into a folder the server's side has only as an empty one, nor from
+    // it, as an empty folder for one that is not; the status says why, also once the folders
+    // are compared again.
+    gui.app.cfg.confirm_operations = false;
+    let refused = trf("folder.copy_shallow", &[option]);
+    let copy_named = |gui: &mut Gui, name: &str, to_right: bool| -> String {
+        {
+            let app = &mut gui.app;
+            let Content::Folder(v) = &mut app.tabs[at].content else {
+                panic!("a folder compare");
+            };
+            v.select_matching(name, &app.cfg);
+            v.copy_selected(to_right, &app.cfg);
+        }
+        gui.settle();
+        let Content::Folder(v) = gui.app.tabs[at].content.view() else {
+            panic!("a folder compare");
+        };
+        v.status.clone()
+    };
+    let status = copy_named(&mut gui, "lib", false);
+    assert!(!copy.join("lib/util.c").exists());
+    assert_eq!(
+        status.matches(refused.as_str()).count(),
+        1,
+        "said once: {status}"
+    );
+    let status = copy_named(&mut gui, "extra", true);
+    assert!(
+        !local.path().join("extra").exists(),
+        "no empty folder for the server's"
+    );
+    assert!(status.contains(&refused), "{status}");
+    remote::fake::uninstall();
+}
+
 #[test]
 fn the_sftp_password_can_be_shown_and_hidden_again() {
     let mut gui = Gui::start("sftp_password_visibility", None);
@@ -5137,6 +5420,8 @@ fn the_remote_chooser_opens_folders_in_place_and_compares_what_is_selected() {
     std::fs::write(local.path().join("inner.txt"), "one\n").unwrap();
     std::fs::write(local.path().join("unticked.txt"), "!").unwrap();
     gui.app.start_paths[2] = local.path().display().to_string();
+    // Compared with what was ticked in `sub`, though the folder options say no subfolders.
+    gui.app.cfg.folder.recursive = false;
     let before = gui.app.tabs.len();
     gui.app.submit_start();
     gui.settle();
@@ -5145,6 +5430,10 @@ fn the_remote_chooser_opens_folders_in_place_and_compares_what_is_selected() {
         panic!("a folder compare");
     };
     let items = &v.items;
+    assert!(
+        items.iter().any(|it| it.rel_path() == "sub/deep.txt"),
+        "a ticked folder's files are compared"
+    );
     let inner = items
         .iter()
         .find(|it| it.name == "inner.txt")

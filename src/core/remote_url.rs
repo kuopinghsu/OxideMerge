@@ -9,6 +9,7 @@
 //! says how to reach a host (an alias, its user, port and jump hosts). A proxy's password
 //! comes from [`PROXY_PASSWORD_ENV`] the same way.
 
+use super::filter::FileFilter;
 use super::folder_sync;
 use super::remote::{self, Auth, Fetched, Protocol, RemoteConnection, UnknownHost};
 use super::remote_sync;
@@ -406,18 +407,33 @@ fn same_fingerprint(given: &str, shown: &str) -> bool {
 }
 
 /// Fetches `path` over `conn`, trusting a server not trusted yet only when it shows exactly the
-/// fingerprint `trust`.
+/// fingerprint `trust`, and leaving out of a folder what `filter` (its spec and the filter) does
+/// not keep, and its subfolders' contents without `subfolders`.
 fn fetch_trusting(
     conn: &RemoteConnection,
     path: &str,
     trust: Option<&str>,
+    filter: Option<(&str, &FileFilter)>,
+    subfolders: bool,
     cancel: &AtomicBool,
 ) -> Result<Fetched> {
-    match remote::fetch(conn, path, cancel) {
+    let fetch = || {
+        let mode = remote::FetchMode::Complete;
+        let scope = remote::FetchScope {
+            filter: filter.map(|(_, f)| f),
+            subfolders,
+        };
+        let mut fetched = remote::fetch_leaving_out(conn, path, cancel, mode, scope)?;
+        if let (Some((spec, _)), Some(m)) = (filter, fetched.manifest.as_mut()) {
+            m.filter = Some(spec.to_string());
+        }
+        anyhow::Ok(fetched)
+    };
+    match fetch() {
         Err(e) => match e.downcast::<UnknownHost>() {
             Ok(host) if trust.is_some_and(|t| same_fingerprint(t, &host.fingerprint)) => {
                 remote::trust_host(&host)?;
-                remote::fetch(conn, path, cancel)
+                fetch()
             }
             Ok(host) => bail!(
                 "{host}\n{}",
@@ -452,10 +468,14 @@ impl Staged {
     }
 }
 
-/// Fetches each of `paths` that is a remote URL, replacing it with its local copy.
+/// Fetches each of `paths` that is a remote URL, replacing it with its local copy. Of a folder,
+/// what `filter` (the comparison's, by its spec) does not keep is not fetched, nor, without
+/// `subfolders`, what its subfolders hold.
 pub fn stage(
     paths: &mut [PathBuf],
     creds: &Credentials,
+    filter: Option<(&str, &FileFilter)>,
+    subfolders: bool,
     cancel: &AtomicBool,
 ) -> Result<Vec<Staged>> {
     let mut staged = Vec::new();
@@ -466,8 +486,15 @@ pub fn stage(
         let url = parse(text)?;
         let conn = connection(&url, creds)?;
         let label = remote::label(&conn, &url.path);
-        let fetched = fetch_trusting(&conn, &url.path, creds.trust.as_deref(), cancel)
-            .with_context(|| label.clone())?;
+        let fetched = fetch_trusting(
+            &conn,
+            &url.path,
+            creds.trust.as_deref(),
+            filter,
+            subfolders,
+            cancel,
+        )
+        .with_context(|| label.clone())?;
         *p = fetched.local.clone();
         let sent = (!fetched.is_dir)
             .then(|| remote::file_hash(&fetched.local))
@@ -531,6 +558,10 @@ pub fn write_back(staged: &[Staged], cancel: &AtomicBool) -> Vec<String> {
             Some(manifest) => {
                 match remote_sync::save_folder(&s.conn, local, &s.remote_path, manifest, cancel) {
                     Ok(saved) => {
+                        // Saved all the same: said, but not a failure.
+                        for note in saved.left_over.iter().chain(&saved.kept) {
+                            eprintln!("note: {label}: {note}");
+                        }
                         errors.extend(saved.errors.into_iter().map(|e| format!("{label}: {e}")))
                     }
                     Err(e) => errors.push(format!("{label}: {e:#}")),
@@ -687,6 +718,38 @@ mod tests {
         assert!(!same_fingerprint("SHA256:abcdef", "SHA256:abcDEF"));
     }
 
+    /// A folder named on the command line is fetched without what the comparison's filter
+    /// leaves out, and the manifest names that filter.
+    #[test]
+    fn a_staged_folder_is_fetched_without_what_the_filter_leaves_out() {
+        let never = AtomicBool::new(false);
+        let creds = Credentials {
+            ssh_key: None,
+            secret: Some("pw".into()),
+            trust: None,
+            options: Default::default(),
+        };
+        fake::install(
+            fake::Server::new()
+                .dir("/srv")
+                .dir("/srv/proj")
+                .file("/srv/proj/main.c", "int main;")
+                .dir("/srv/proj/.git")
+                .file("/srv/proj/.git/HEAD", "ref"),
+        );
+        let spec = "[F] Exclude Source Control";
+        let filter = FileFilter::resolve(spec, &super::super::filter::builtin_filters());
+        let mut paths = vec![PathBuf::from("sftp://ann@example.com/srv/proj")];
+        let staged = stage(&mut paths, &creds, Some((spec, &filter)), true, &never).unwrap();
+        assert!(paths[0].join("main.c").is_file());
+        assert!(!paths[0].join(".git").exists());
+        assert!(fake::opened_paths().iter().all(|p| !p.contains("/.git")));
+        let manifest = staged[0].fetched.manifest.as_ref().unwrap();
+        assert_eq!(manifest.filter.as_deref(), Some(spec));
+        assert!(write_back(&staged, &never).is_empty(), "nothing changed");
+        fake::uninstall();
+    }
+
     #[test]
     fn staged_paths_are_fetched_and_what_changed_is_written_back() {
         let never = AtomicBool::new(false);
@@ -710,16 +773,18 @@ mod tests {
             PathBuf::from("/local/side"),
             PathBuf::from("sftp://ann@example.com/srv/b.txt"),
         ];
-        let e = stage(&mut paths.clone(), &plain, &never).err().unwrap();
+        let e = stage(&mut paths.clone(), &plain, None, true, &never)
+            .err()
+            .unwrap();
         let e = format!("{e:#}");
         assert!(
             e.contains("SHA256:fake") && e.contains("--trust-fingerprint"),
             "{e}"
         );
         let wrong = creds(Some("SHA256:other"));
-        assert!(stage(&mut paths.clone(), &wrong, &never).is_err());
+        assert!(stage(&mut paths.clone(), &wrong, None, true, &never).is_err());
         let trusting = creds(Some("SHA256:fake"));
-        let staged = stage(&mut paths, &trusting, &never).unwrap();
+        let staged = stage(&mut paths, &trusting, None, true, &never).unwrap();
         assert_eq!(staged.len(), 2);
         assert_eq!(paths[1], PathBuf::from("/local/side"));
         assert_eq!(
@@ -759,7 +824,7 @@ mod tests {
                 .file("/srv/data/a.txt", "server a"),
         );
         let mut paths = vec![PathBuf::from("sftp://ann@example.com/srv/data")];
-        let staged = stage(&mut paths, &creds, &never).unwrap();
+        let staged = stage(&mut paths, &creds, None, true, &never).unwrap();
         let mine = tempfile::tempdir().unwrap();
         std::fs::write(mine.path().join("a.txt"), "local a").unwrap();
         std::fs::write(mine.path().join("b.txt"), "local b").unwrap();

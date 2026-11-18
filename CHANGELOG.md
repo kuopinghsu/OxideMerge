@@ -5,6 +5,28 @@ release on GitHub uses its section of this file as the release notes.
 
 ## [0.9.10] - Unreleased
 
+### Changed
+
+- A folder fetched over SFTP or FTP is downloaded without what the comparison's filter leaves
+  out: with *Exclude Source Control*, its `.git`, `.svn` and other version-control folders are no
+  longer downloaded only to be hidden. The folder comparison stays limited to what that filter
+  keeps, *Reload from server* uses it again, and saving never deletes on the server what was left
+  out. The command line does the same with `--filter`.
+- A folder compared without subfolders is fetched with its own files only, its subfolders
+  created empty, instead of downloading everything in them. The comparison stays without
+  subfolders and says why if *Include subfolders* is turned on afterwards; saving never removes
+  those folders on the server. Synchronization, merge plans, baselines and release reports from
+  the command line still fetch every subfolder.
+- Copying a folder to a side fetched over SFTP or FTP with a filter copies only what that filter
+  keeps, and copying to or from a folder fetched only as an empty one is refused, saying why.
+
+### Fixed
+
+- After copying or deleting folders, the status bar keeps saying what was done and why anything
+  failed. Comparing the folders again used to clear it.
+- Entries ticked in the SFTP/FTP chooser are compared with their subfolders even when *Include
+  subfolders* is off, which showed only the top level and hid entries ticked inside folders.
+
 ## [0.9.9] - 2026-11-17
 
 ### Added

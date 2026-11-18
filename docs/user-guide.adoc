@@ -440,6 +440,32 @@ field shows the address on the server it came from, such as
 field starts the comparison at once. A fetch into a field that already held a path only replaces it;
 click *Compare* when the other side is right.
 
+A folder is fetched without what the comparison's filter leaves out: with *Exclude Source Control*,
+for example, its `.git` and `.svn` folders are never downloaded. The filter is the one of the *Open*
+dialog, or else the one chosen for the start page. The folder comparison then shows only what that
+filter keeps, on both sides, even if you choose a wider filter afterwards, because the server's side
+has nothing else to compare, and a line above the list says so; connect again to fetch with the
+wider filter. *Reload from server* fetches the folder again with the same filter. Saving the copy
+never deletes on the server what was left out: a folder that had something left out, deleted in the
+copy, stays on the server with what it still holds there, and saving names each folder kept.
+Compares from the command line leave out what `--filter`, or the saved filter, leaves out in the
+same way.
+
+The same goes for subfolders: when the comparison does not include subfolders (*Include subfolders*
+off in the *Open* dialog, or in the folder options for the start page), a folder is fetched with its
+own files only, and its subfolders are created empty, so the comparison still shows which folders
+each side has. Turning *Include subfolders* on afterwards does not compare them, and a line above
+the list says why; connect again with it on. The comparison is not complete without subfolders, so
+it cannot be synchronized. A folder deleted in the copy stays on the server with what it holds
+there. From the command line, a folder is fetched with its subfolders when `-r` or the saved option
+asks for them, and always for synchronization, merge plans, baselines, release reports and
+`--impact`.
+
+Copying a folder to a side fetched this way copies only what the comparison shows: not what the
+filter left out, and nothing to or from a folder the server side has only as an empty one, which
+would meet files there that were never fetched; the status bar says so. Connect again with the
+filter or *Include subfolders* you need to copy those.
+
 The folder button connects and opens a chooser in place of the dialog, listing the folder of the
 *Remote path*, or your home folder on the server if the *Remote path* is empty. The chooser keeps
 the same size however many entries a folder has: the list scrolls inside it, and a name too long for
@@ -468,11 +494,13 @@ rest of its contents ticked. The copy is of the deepest folder all the ticked en
 `FreeRTOS-Kernel`, to compare with a local `FreeRTOS-Kernel`. Entries in different folders keep
 their place under those folders in the copy. The folder comparison then shows only the ticked
 entries, on both sides: what they hold, and the folders on the way to them, but nothing else the
-other folder has. Saving the copy writes back what you changed in it; the server's other entries are
-left alone, and *Reload from server* fetches only the ticked entries again. *List folders without
-downloading files* does not apply here: ticked entries are downloaded. Deleting a folder in the copy
-that holds only some of what it has on the server deletes those entries there, and leaves the folder
-with the rest. Of two names that differ only in case, Windows and macOS keep the first one ticked.
+other folder has. The ticked entries are compared with their subfolders, whether or not *Include
+subfolders* is on. Saving the copy writes back what you changed in it; the server's other entries
+are left alone, and *Reload from server* fetches only the ticked entries again. *List folders
+without downloading files* does not apply here: ticked entries are downloaded. Deleting a folder in
+the copy that holds only some of what it has on the server deletes those entries there, and leaves
+the folder with the rest. Of two names that differ only in case, Windows and macOS keep the first
+one ticked.
 
 To compare entries of one server with each other instead, select two or three and click *Compare
 selected*:

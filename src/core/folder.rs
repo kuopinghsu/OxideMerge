@@ -969,6 +969,16 @@ pub fn refresh_file_item(
 /// Copies a file or folder over `to`. Refuses to copy a file onto itself (also through a link),
 /// which would empty it, and a folder into itself, which would never end.
 pub fn copy_recursive(from: &Path, to: &Path) -> Result<()> {
+    copy_kept(from, to, None)
+}
+
+/// [`copy_recursive`], copying of a folder only what `filter` keeps, at paths relative to the
+/// compared root, of which `from` is at `rel`: what a comparison with that filter shows of it.
+pub fn copy_filtered(from: &Path, to: &Path, filter: &FileFilter, rel: &str) -> Result<()> {
+    copy_kept(from, to, Some((filter, rel)))
+}
+
+fn copy_kept(from: &Path, to: &Path, keep: Option<(&FileFilter, &str)>) -> Result<()> {
     let src = std::fs::canonicalize(from).with_context(|| format!("{}", from.display()))?;
     let mut dest = to.to_path_buf();
     let mut missing = Vec::new();
@@ -995,12 +1005,24 @@ pub fn copy_recursive(from: &Path, to: &Path) -> Result<()> {
             to.display()
         );
     }
-    copy_tree(from, to, &mut Vec::new())
+    let keep = keep.map(|(filter, rel)| (filter, rel.to_string()));
+    copy_tree(
+        from,
+        to,
+        &mut Vec::new(),
+        keep.as_ref().map(|(f, r)| (*f, r.as_str())),
+    )
 }
 
 /// `inside` holds the folders being copied around `from`, so a link back to one of them stops
-/// the copy instead of repeating it forever.
-fn copy_tree(from: &Path, to: &Path, inside: &mut Vec<PathBuf>) -> Result<()> {
+/// the copy instead of repeating it forever. With `keep`, only what the filter keeps is copied
+/// of a folder, `from` being at the path given.
+fn copy_tree(
+    from: &Path,
+    to: &Path,
+    inside: &mut Vec<PathBuf>,
+    keep: Option<(&FileFilter, &str)>,
+) -> Result<()> {
     let md = std::fs::metadata(from).with_context(|| format!("{}", from.display()))?;
     if md.is_dir() {
         let real = std::fs::canonicalize(from)?;
@@ -1011,7 +1033,29 @@ fn copy_tree(from: &Path, to: &Path, inside: &mut Vec<PathBuf>) -> Result<()> {
         inside.push(real);
         for e in std::fs::read_dir(from)? {
             let e = e?;
-            copy_tree(&e.path(), &to.join(e.file_name()), inside)?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            let rel = keep.map(|(_, rel)| {
+                if rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{rel}/{name}")
+                }
+            });
+            if let (Some((filter, _)), Some(rel)) = (keep, &rel) {
+                let dir = std::fs::metadata(e.path()).is_ok_and(|m| m.is_dir());
+                let kept = if dir {
+                    filter.include_dir(rel, &name)
+                } else {
+                    filter.include_file(rel, &name)
+                };
+                if !kept {
+                    continue;
+                }
+            }
+            let keep = keep
+                .zip(rel.as_deref())
+                .map(|((filter, _), rel)| (filter, rel));
+            copy_tree(&e.path(), &to.join(e.file_name()), inside, keep)?;
         }
         inside.pop();
     } else {
@@ -1173,6 +1217,35 @@ mod tests {
         item.status = CmpStatus::Pending;
         let status = compare_files(&paths, &item, &fopts, &dopts, &Normalizer::new(&dopts));
         assert_eq!(status.unwrap().0, CmpStatus::Identical);
+    }
+
+    /// A folder copied through a filter is copied without what the filter leaves out, at paths
+    /// relative to the compared root.
+    #[test]
+    fn a_folder_copied_through_a_filter_leaves_out_what_it_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for file in [
+            "lib/util.c",
+            "lib/.svn/entries",
+            "lib/deep/x.c",
+            "lib/.gitignore",
+        ] {
+            let path = root.join("left").join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, file).unwrap();
+        }
+        let filter = FileFilter::resolve(
+            "[F] Exclude Source Control",
+            &super::super::filter::builtin_filters(),
+        );
+        let (from, to) = (root.join("left/lib"), root.join("right/lib"));
+        copy_filtered(&from, &to, &filter, "lib").unwrap();
+        assert!(to.join("util.c").is_file() && to.join("deep/x.c").is_file());
+        assert!(!to.join(".svn").exists() && !to.join(".gitignore").exists());
+        // Without a filter, all of it, as before.
+        copy_recursive(&from, &root.join("all/lib")).unwrap();
+        assert!(root.join("all/lib/.svn/entries").is_file());
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::config::{Config, SessionTab, TextLayout, ThemeMode, Workspace};
 use crate::core::archive;
 use crate::core::conflict;
 use crate::core::diff::{DiffAlgorithm, DiffOptions, InlineMode, WhitespaceMode};
-use crate::core::filter::{self, FltFilter, FLT_PREFIX};
+use crate::core::filter::{self, FileFilter, FltFilter, FLT_PREFIX};
 use crate::core::folder::CompareMethod;
 use crate::core::patch::{self, PatchStyle};
 use crate::core::project::{self, Project};
@@ -273,14 +273,17 @@ struct ReloadRun {
     _keep: Vec<std::sync::Arc<tempfile::TempDir>>,
 }
 
-/// A side of a tab to fetch again: side, connection, path on the server, local copy, and the
-/// entries of the folder chosen to fetch when only those were (see [`remote::fetch_selected`]).
+/// A side of a tab to fetch again: side, connection, path on the server, local copy, the
+/// entries of the folder chosen to fetch when only those were (see [`remote::fetch_selected`]),
+/// the filter it was fetched with, and whether it was fetched without subfolders.
 type ReloadSide = (
     usize,
     remote::RemoteConnection,
     String,
     PathBuf,
     Vec<String>,
+    Option<String>,
+    bool,
 );
 
 /// The sides of `tab` that came from a server and are still read from it (not moved to a local
@@ -294,12 +297,16 @@ fn reload_sides(tab: &Tab) -> Vec<ReloadSide> {
             let r = r.as_ref()?;
             let local = paths.get(i).filter(|p| tab.source.get(i) == Some(*p))?;
             let chosen = (r.manifest.as_ref()).map_or_else(Vec::new, |m| m.chosen.clone());
+            let filter = r.manifest.as_ref().and_then(|m| m.filter.clone());
+            let shallow = r.manifest.as_ref().is_some_and(|m| m.shallow);
             Some((
                 i,
                 r.conn.clone(),
                 r.remote_path.clone(),
                 local.clone(),
                 chosen,
+                filter,
+                shallow,
             ))
         })
         .collect()
@@ -6225,6 +6232,13 @@ impl OxideMergeApp {
         let (c, p, stop) = (conn.clone(), remote_path.clone(), cancel.clone());
         let more = also.clone();
         let selected = matches!(target, RemoteTarget::Selected);
+        // What the comparison will leave out of a folder is not fetched (see
+        // `remote::fetch_leaving_out`); the manifest notes the filter.
+        let spec = self.comparison_filter(target);
+        let filter = Some(FileFilter::resolve(&spec, &self.named_filters))
+            .filter(FileFilter::excludes_anything);
+        // Nor the subfolders of a comparison without them: only whether each is there.
+        let subfolders = self.comparison_recursive(target);
         let mode = if conn.protocol == remote::Protocol::Sftp
             && dialog.as_ref().is_some_and(|d| d.list_folder)
         {
@@ -6243,13 +6257,28 @@ impl OxideMergeApp {
         let counted = progress.clone();
         let fetch = move || {
             let fetched = remote::with_progress(&counted, || {
-                if !selected && !more.is_empty() {
-                    return remote::fetch_selected(&c, &p, &more, &stop).map(|f| vec![f]);
-                }
-                std::iter::once(&p)
-                    .chain(&more)
-                    .map(|path| remote::fetch_with(&c, path, &stop, mode))
-                    .collect::<anyhow::Result<Vec<_>>>()
+                let fetched = if !selected && !more.is_empty() {
+                    remote::fetch_selected(&c, &p, &more, &stop, filter.as_ref()).map(|f| vec![f])
+                } else {
+                    std::iter::once(&p)
+                        .chain(&more)
+                        .map(|path| {
+                            let scope = remote::FetchScope {
+                                filter: filter.as_ref(),
+                                subfolders,
+                            };
+                            remote::fetch_leaving_out(&c, path, &stop, mode, scope)
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()
+                };
+                fetched.map(|mut fetched| {
+                    if filter.is_some() {
+                        for m in fetched.iter_mut().filter_map(|f| f.manifest.as_mut()) {
+                            m.filter = Some(spec.clone());
+                        }
+                    }
+                    fetched
+                })
             });
             let _ = tx.send(fetched);
         };
@@ -6472,6 +6501,26 @@ impl OxideMergeApp {
         } else {
             self.host_prompt = Some(p);
         }
+    }
+
+    /// Whether the comparison that a fetch for `target` is for includes subfolders: as the Open
+    /// dialog says, or else as the folder options do.
+    fn comparison_recursive(&self, target: RemoteTarget) -> bool {
+        match target {
+            RemoteTarget::Open(_) | RemoteTarget::Compare(_) => self.open_dlg.as_ref(),
+            RemoteTarget::Start(_) | RemoteTarget::Selected => None,
+        }
+        .map_or(self.cfg.folder.recursive, |d| d.recursive)
+    }
+
+    /// The filter the comparison that a fetch for `target` is for will use: the Open dialog's,
+    /// or else the one chosen for the start page.
+    fn comparison_filter(&self, target: RemoteTarget) -> String {
+        match target {
+            RemoteTarget::Open(_) | RemoteTarget::Compare(_) => self.open_dlg.as_ref(),
+            RemoteTarget::Start(_) | RemoteTarget::Selected => None,
+        }
+        .map_or_else(|| self.cfg.filter.clone(), |d| d.filter.clone())
     }
 
     /// Fills in the path field a fetch over SFTP was started for, and remembers the fetch to
@@ -7329,6 +7378,35 @@ impl OxideMergeApp {
                     v.set_remote_side(i);
                 }
             }
+            // A side fetched with a filter has nothing of what it left out: every side shows only
+            // what that filter keeps, whatever filter is chosen after. Each filter once, so that
+            // sides fetched with the same one name it as the comparison's own.
+            let mut specs: Vec<String> = Vec::new();
+            for spec in
+                (remote.iter().flatten()).filter_map(|r| r.manifest.as_ref()?.filter.clone())
+            {
+                if !specs.contains(&spec) {
+                    specs.push(spec);
+                }
+            }
+            let fetched = (specs.iter())
+                .map(|spec| FileFilter::resolve(spec, &self.named_filters))
+                .reduce(|a, b| FileFilter::Both(Box::new(a), Box::new(b)));
+            let limited = fetched.is_some();
+            if let Some(filter) = fetched {
+                v.limit_to_fetched(filter, specs.join(", "));
+            }
+            // A side fetched without subfolders has them empty: the comparison stays without
+            // them, whatever is chosen after.
+            let mut shallow = false;
+            for (s, r) in remote.iter().enumerate() {
+                if r.as_ref()
+                    .is_some_and(|r| r.manifest.as_ref().is_some_and(|m| m.shallow))
+                {
+                    v.limit_to_top_level(s);
+                    shallow = true;
+                }
+            }
             // Sides holding only some of a server's folder: every side shows only those.
             let chosen: Vec<String> = (remote.iter().flatten())
                 .filter_map(|r| r.manifest.as_ref())
@@ -7336,6 +7414,15 @@ impl OxideMergeApp {
                 .collect();
             if !chosen.is_empty() {
                 v.show_only(&chosen);
+                // Entries chosen inside folders are compared where they are, whatever the
+                // folder options say: they were chosen to be compared, and are all there is.
+                if !shallow {
+                    v.set_recursive(true);
+                }
+            }
+            // Compared again, once, with all of these.
+            if limited || shallow || !chosen.is_empty() {
+                v.start_compare();
             }
         }
         self.tabs.push(Tab {
@@ -9398,15 +9485,26 @@ impl OxideMergeApp {
             .collect::<Vec<_>>()
             .join("\n");
         let (tab_id, keep) = (tab.id, tab.shown_temps());
+        let named = self.named_filters.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = cancel.clone();
         let run = move || {
-            for (side, conn, path, local, chosen) in sides {
-                if tx
-                    .send((side, remote::refetch(&conn, &path, &local, &chosen, &stop)))
-                    .is_err()
-                {
+            for (side, conn, path, local, chosen, spec, shallow) in sides {
+                let filter = spec.as_deref().map(|s| FileFilter::resolve(s, &named));
+                let scope = remote::FetchScope {
+                    filter: filter.as_ref(),
+                    subfolders: !shallow,
+                };
+                let fetched = remote::refetch(&conn, &path, &local, &chosen, scope, &stop).map(
+                    |mut staged| {
+                        if let Some(m) = staged.manifest.as_mut() {
+                            m.filter = spec.clone();
+                        }
+                        staged
+                    },
+                );
+                if tx.send((side, fetched)).is_err() {
                     return;
                 }
             }
@@ -9644,9 +9742,8 @@ impl OxideMergeApp {
                                 }
                             }
                             left_over.extend(
-                                saved
-                                    .left_over
-                                    .iter()
+                                (saved.left_over.iter())
+                                    .chain(&saved.kept)
                                     .map(|l| format!("{}: {l}", done.label)),
                             );
                             let failed = !saved.errors.is_empty();

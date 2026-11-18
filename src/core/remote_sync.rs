@@ -29,6 +29,9 @@ pub struct Saved {
     /// Files saved, whose original renamed aside could not be removed from the server once
     /// replaced: one message each, naming it for the user to delete.
     pub left_over: Vec<String>,
+    /// Folders deleted here that are kept on the server, as they hold more there than was
+    /// fetched (see [`Manifest::partial`]): one message each.
+    pub kept: Vec<String>,
 }
 
 /// The files and folders of a local copy, by their `/`-separated paths relative to it.
@@ -284,6 +287,8 @@ fn save_with(
         if manifest.partial.contains(rel) {
             out.manifest.dirs.remove(rel);
             out.manifest.partial.remove(rel);
+            out.kept
+                .push(trf("msg.remote_kept_partial", &[("path", at(rel))]));
             continue;
         }
         match r.remove_dir(&at(rel)) {
@@ -537,7 +542,15 @@ mod tests {
         std::fs::write(f.local.join("a.txt"), "local edit").unwrap();
         std::fs::write(f.local.join("stray.txt"), "x").unwrap();
         fake::change("/srv/data/b.txt", "newer");
-        let staged = remote::refetch(&conn(), "/srv/data", &f.local, &[], &never).unwrap();
+        let staged = remote::refetch(
+            &conn(),
+            "/srv/data",
+            &f.local,
+            &[],
+            remote::FetchScope::ALL,
+            &never,
+        )
+        .unwrap();
         assert!(staged.is_dir);
         assert_eq!(std::fs::read_to_string(f.local.join("a.txt")).unwrap(), "a");
         assert_eq!(
@@ -556,7 +569,15 @@ mod tests {
         // A failed fetch leaves the old copy as it was.
         std::fs::write(f.local.join("a.txt"), "kept").unwrap();
         fake::install(fake::Server::new().failing("connection refused"));
-        assert!(remote::refetch(&conn(), "/srv/data", &f.local, &[], &never).is_err());
+        assert!(remote::refetch(
+            &conn(),
+            "/srv/data",
+            &f.local,
+            &[],
+            remote::FetchScope::ALL,
+            &never
+        )
+        .is_err());
         assert_eq!(
             std::fs::read_to_string(f.local.join("a.txt")).unwrap(),
             "kept"
@@ -567,7 +588,15 @@ mod tests {
         let f = remote::fetch(&conn(), "/srv/data/a.txt", &never).unwrap();
         std::fs::write(&f.local, "edit").unwrap();
         fake::change("/srv/data/a.txt", "server");
-        let staged = remote::refetch(&conn(), "/srv/data/a.txt", &f.local, &[], &never).unwrap();
+        let staged = remote::refetch(
+            &conn(),
+            "/srv/data/a.txt",
+            &f.local,
+            &[],
+            remote::FetchScope::ALL,
+            &never,
+        )
+        .unwrap();
         assert!(!staged.is_dir);
         assert_eq!(std::fs::read_to_string(&f.local).unwrap(), "server");
         assert_eq!(staged.stamp.unwrap().size, 6);

@@ -1539,12 +1539,32 @@ fn run_jobs(file: &std::path::Path, yes: bool, base: &Config) -> anyhow::Result<
     Ok(summary.exit_code)
 }
 
+/// Whether what `cli` does reads the subfolders of the folders it is given: a compare with
+/// subfolders, and every synchronization, merge plan or check, baseline, release report and
+/// impact analysis, which always read the whole tree. A folder on a server is fetched without its subfolders' contents
+/// otherwise.
+fn reads_subfolders(cli: &Cli, cfg: &Config) -> bool {
+    cli.recursive
+        || cfg.folder.recursive
+        || cli.sync_plan.is_some()
+        || cli.sync_apply.is_some()
+        || cli.sync_recover
+        || cli.baseline_left.is_some()
+        || cli.release_report.is_some()
+        || cli.impact
+        || cli.merge_plan
+        || cli.validate_merge.is_some()
+}
+
 /// Fetches the paths of `cli` that are on a server (see [`core::remote_url`]) to temporary
 /// copies, which it then compares instead. `in_place` is the *Save remote files in place*
-/// setting, for writing them back.
+/// setting, for writing them back. What `filter`, the comparison's filter, leaves out of a
+/// folder is not fetched, nor, without `subfolders`, what its subfolders hold.
 fn stage_remote(
     cli: &mut Cli,
     in_place: bool,
+    filter: &str,
+    subfolders: bool,
     cancel: &AtomicBool,
 ) -> anyhow::Result<Vec<core::remote_url::Staged>> {
     let remote = |p: &PathBuf| p.to_str().is_some_and(core::remote_url::is_remote_url);
@@ -1564,7 +1584,9 @@ fn stage_remote(
         in_place,
         port_given: false,
     };
-    let staged = core::remote_url::stage(&mut cli.paths, &creds, cancel)?;
+    let resolved = FileFilter::resolve(filter, &core::filter::load_all_filters());
+    let leave_out = resolved.excludes_anything().then_some((filter, &resolved));
+    let staged = core::remote_url::stage(&mut cli.paths, &creds, leave_out, subfolders, cancel)?;
     // A side is described by its address on the server, not by its temporary copy.
     for (&i, s) in sides.iter().zip(&staged) {
         if s.fetched.is_dir {
@@ -1662,7 +1684,9 @@ pub(crate) fn job_summary(
                     )]
                 )
             );
-            let staged = stage_remote(&mut cli, cfg.remote_in_place, stop)?;
+            let filter = cli.filter.clone().unwrap_or_else(|| cfg.filter.clone());
+            let subfolders = job.kind == JobKind::Sync || reads_subfolders(&cli, &cfg);
+            let staged = stage_remote(&mut cli, cfg.remote_in_place, &filter, subfolders, stop)?;
             let result = if job.kind == JobKind::Sync {
                 sync_now(&cli, &cfg, prepared.allow_large_deletion, stop)
                     .map(|(code, report)| (code, Some(report)))
@@ -1905,7 +1929,9 @@ fn main() -> ExitCode {
     let never = AtomicBool::new(false);
     cli.paths = paths;
     core::remote::set_asker(Some(std::sync::Arc::new(prompt::ask)));
-    let staged = match stage_remote(&mut cli, cfg.remote_in_place, &never) {
+    let filter = cli.filter.clone().unwrap_or_else(|| cfg.filter.clone());
+    let subfolders = reads_subfolders(&cli, &cfg);
+    let staged = match stage_remote(&mut cli, cfg.remote_in_place, &filter, subfolders, &never) {
         Ok(staged) => staged,
         Err(e) => {
             eprintln!("error: {e:#}");
