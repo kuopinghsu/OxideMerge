@@ -591,6 +591,16 @@ most shortcuts use Command instead of Ctrl. The app shows the right keys for you
   export; a scan or an untagged PDF can be compared as text only. Fills, fonts,
   borders, formulas and charts are not compared in the Formatted view either.
 
+### Linux
+
+- The AppImage needs glibc 2.28 or newer. On RHEL 7 and CentOS 7 (glibc 2.17) it stops at
+  once with `GLIBC_2.xx not found`.
+- On RHEL 8.4 and other systems with Mesa older than 21, the window can crash as it opens
+  when OpenGL is drawn in software (llvmpipe), as in a virtual machine or over a remote
+  desktop. Mesa's `glXSwapIntervalEXT` calls a function its software renderer does not
+  have. The command line works. Update Mesa (RHEL 8.7 and newer are not affected), or use
+  a Wayland session, where the window is drawn through EGL instead of GLX.
+
 ### Interface and integration
 
 - WinMerge project files and filter files work. WinMerge plugin DLLs and scripts do not work.

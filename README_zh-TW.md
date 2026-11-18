@@ -534,6 +534,15 @@ Subversion 的 `merge-tool-cmd` 與 Perforce 的 `P4MERGE` 可以直接設為 `o
   多數文書處理程式匯出的 PDF 都有標籤；掃描檔或沒有標籤的 PDF 只能以文字比較。格式化檢視同樣不
   比較填色、字型、框線、公式與圖表。舊版 Word `.doc` 與 Excel `.xls` 尚未支援，請改用外掛程式。
 
+### Linux
+
+- AppImage 需要 glibc 2.28 或更新版本。在 RHEL 7 與 CentOS 7（glibc 2.17）上，它會立即停止並顯示
+  `GLIBC_2.xx not found`。
+- 在 RHEL 8.4 及其他 Mesa 早於 21 的系統上，若 OpenGL 以軟體繪製（llvmpipe），例如在虛擬機器中或
+  透過遠端桌面，視窗可能在開啟時當掉。Mesa 的 `glXSwapIntervalEXT` 會呼叫其軟體繪製器沒有的函式。
+  命令列仍可使用。請更新 Mesa（RHEL 8.7 及更新版本不受影響），或改用 Wayland 工作階段，在那裡
+  視窗透過 EGL 而非 GLX 繪製。
+
 ### 介面與整合
 
 - 支援 WinMerge 專案檔與篩選器檔案，但不支援 WinMerge 的外掛程式動態連結程式庫與指令碼。

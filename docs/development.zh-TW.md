@@ -273,6 +273,84 @@ Windows 與 Linux 的 Arm64 套件會在實體 Arm 架構電腦上建置與測�
 發布前，發行工作會以 `scripts/check-release.sh` 檢查下載的每個套件：壓縮檔必須能列出內容並解壓縮，
 AppImage 與 DMG 必須帶有其格式標記，PDF 必須完整。之後會將 `SHA256SUMS` 與套件一併發布。
 
+### 為 Mesa 21 之前的版本修補 glutin
+
+發布的套件使用 crates.io 上原版的 glutin。在 Mesa 早於 21 的系統（RHEL 8.4）上使用軟體繪製器時，
+視窗會在開啟時當掉：glutin 呼叫 `glXSwapIntervalEXT`，而 Mesa 在其中呼叫了軟體繪製器沒有的函式。
+README 的「已知限制」列有此問題。本儲存庫不保留修補過的 glutin，但自行建置時可以加入。以下步驟適用於
+`Cargo.lock` 中的 glutin 0.32.3；請先確認該處的版本，並查看 glutin 的 `master` 分支，截至 2026 年
+11 月該問題仍未修正。
+
+1. 將發布的 crate 複製到工作目錄中（`vendor/` 不受版本控制，只留在本機）：
+
+   ```sh
+   cargo fetch --locked
+   mkdir -p vendor
+   cp -r ~/.cargo/registry/src/index.crates.io-*/glutin-0.32.3 vendor/glutin
+   chmod -R u+w vendor/glutin
+   ```
+
+   接著將 `/vendor/` 加入 `.git/info/exclude`，讓 Git 不列出它。
+
+2. 在 `vendor/glutin/src/api/glx/surface.rs` 的 `set_swap_interval` 中，將以
+   ``// Apply the `EXT` first since it's per window.`` 開頭的區塊，以及其後的
+   `GLX_MESA_swap_control` 區塊，換成放在最前面、無論成功與否都會返回的 Mesa 區塊：
+
+   ```rust
+   // On Mesa, use only its own extension. It returns an error where the driver
+   // cannot set the interval; glXSwapIntervalEXT before Mesa 21 crashes there.
+   if self.display.inner.client_extensions.contains("GLX_MESA_swap_control") {
+       unsafe {
+           applied = extra.SwapIntervalMESA(interval as _) != glx::BAD_CONTEXT as _;
+       }
+       return if applied { Ok(()) } else { Err(ErrorKind::BadContext.into()) };
+   }
+
+   if !applied && self.display.inner.client_extensions.contains("GLX_EXT_swap_control") {
+       // ... unchanged ...
+   }
+   ```
+
+   `GLX_SGI_swap_control` 區塊維持不變。Mesa 無法設定間隔時，eframe 會記錄一則警告，視窗照常開啟，
+   只是沒有垂直同步。其他驅動程式（例如 NVIDIA）不會列出 `GLX_MESA_swap_control`，仍使用
+   `glXSwapIntervalEXT`。
+
+3. 在 `Cargo.toml` 結尾讓 Cargo 改用這份複本：
+
+   ```toml
+   [patch.crates-io]
+   glutin = { path = "vendor/glutin" }
+   ```
+
+4. 更新鎖定檔並建置 AppImage。`Cargo.lock` 中只有 glutin 的項目會變更：移除其 `source` 與
+   `checksum` 兩行。
+
+   ```sh
+   cargo update -p glutin --offline
+   ```
+
+   在 Windows 與 macOS 上，`make appimage` 會像 CI 一樣在 AlmaLinux 8 容器中建置。在 Linux 上它會使用
+   主機的 glibc 建置，產生的程式無法在 RHEL 8.4 等較舊的系統上啟動，因此請改用同一個容器：
+
+   ```sh
+   docker build -t oxidemerge-appimage -f docker/appimage.Dockerfile docker
+   docker run --rm --init -v "$PWD:/work" -w /work oxidemerge-appimage
+   ```
+
+   AppImage 會寫入 `dist/`。
+
+5. 在受影響的系統上，或在任何將 RHEL 8.4 的 Mesa 函式庫放在函式庫路徑上的 Linux 系統上，
+   強制使用軟體繪製器檢查視窗：
+
+   ```sh
+   WAYLAND_DISPLAY= LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe ./oxidemerge-*.AppImage
+   ```
+
+   未修補時，視窗開啟時會發生記憶體區段錯誤；修補後視窗可正常開啟。
+
+提交時請排除這些變更：不要在修補生效時提交 `Cargo.toml`、`Cargo.lock` 或 `vendor/`。若要復原，
+請刪除 `vendor/glutin` 與 `[patch.crates-io]` 那幾行，並執行 `git checkout -- Cargo.lock`。
+
 ## 版本發布
 
 ### 發布規則
