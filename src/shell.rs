@@ -152,7 +152,12 @@ fn gather_in(dir: &Path, path: &Path, quiet: Duration) -> Option<Vec<PathBuf>> {
         .map_or(0, |d| d.as_nanos());
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let mine = dir.join(format!("{stamp:032}-{}-{seq}.path", std::process::id()));
-    if std::fs::write(&mine, path.to_string_lossy().as_bytes()).is_err() {
+    let incoming = mine.with_extension("incoming");
+    if std::fs::write(&incoming, path.to_string_lossy().as_bytes())
+        .and_then(|()| std::fs::rename(&incoming, &mine))
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&incoming);
         return alone();
     }
     let lock = dir.join(LOCK);
@@ -162,7 +167,12 @@ fn gather_in(dir: &Path, path: &Path, quiet: Duration) -> Option<Vec<PathBuf>> {
     let start = Instant::now();
     let mut seen = 0;
     let mut changed = Instant::now();
-    while changed.elapsed() < quiet && start.elapsed() < Duration::from_secs(5) {
+    // Allow more time for Explorer to launch the second process. Once multiple paths
+    // have arrived, use the shorter quiet period to allow for a third selection.
+    let first_item_wait = quiet * 3;
+    while changed.elapsed() < if seen < 2 { first_item_wait } else { quiet }
+        && start.elapsed() < Duration::from_secs(5)
+    {
         std::thread::sleep(Duration::from_millis(40));
         let n = pending(dir).len();
         if n != seen {
@@ -807,7 +817,9 @@ mod tests {
                 .map(|(i, name)| {
                     let dir = dir.path();
                     s.spawn(move || {
-                        std::thread::sleep(Duration::from_millis(30 * i as u64));
+                        if i != 0 {
+                            std::thread::sleep(Duration::from_millis(450 + 30 * i as u64));
+                        }
                         gather_in(dir, Path::new(name), quiet)
                     })
                 })

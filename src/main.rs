@@ -1824,6 +1824,16 @@ fn main() -> ExitCode {
     let matches = <Cli as clap::CommandFactory>::command().get_matches_from(winmerge_args());
     let mut cli =
         <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    // Join the Explorer batch before loading configuration and comparison rules. A slower
+    // startup in one of Explorer's processes can otherwise turn one selection into two windows.
+    let mut paths = if let Some(path) = &cli.shell_compare {
+        let Some(items) = shell::gather(&shell::clean_arg(path)) else {
+            return ExitCode::SUCCESS;
+        };
+        items
+    } else {
+        cli.paths.clone()
+    };
     let mut cfg = Config::load();
     cfg.diff = cfg.comparison_options();
     if core::rules::load_selected(&mut cfg) {
@@ -1867,12 +1877,8 @@ fn main() -> ExitCode {
         selection.save();
         return ExitCode::SUCCESS;
     }
-    let mut paths = cli.paths.clone();
-    if let Some(p) = &cli.shell_compare {
-        match shell::gather(&shell::clean_arg(p)) {
-            Some(items) => paths = shell::compare_paths(items),
-            None => return ExitCode::SUCCESS,
-        }
+    if cli.shell_compare.is_some() {
+        paths = shell::compare_paths(paths);
     } else if let Some(p) = &cli.compare_to {
         paths = shell::compare_paths(vec![shell::clean_arg(p)]);
     } else if cli.compare_selected {

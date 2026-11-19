@@ -22,6 +22,8 @@ release on GitHub uses its section of this file as the release notes.
 
 ### Fixed
 
+- On Windows, *OxideMerge → Compare* in File Explorer collects selected files into one
+  comparison window even when Explorer starts the second process a little later.
 - After copying or deleting folders, the status bar keeps saying what was done and why anything
   failed. Comparing the folders again used to clear it.
 - Entries ticked in the SFTP/FTP chooser are compared with their subfolders even when *Include
