@@ -1,6 +1,6 @@
 [package]
 name = "oxidemerge"
-version = "0.9.10"
+version = "0.9.11"
 edition = "2021"
 description = "OxideMerge - a cross-platform differencing and merging tool for Windows, macOS and Linux"
 license = "MIT"
@@ -61,7 +61,7 @@ sys-locale = "0.3"
 ttf-parser = "0.25"
 krilla = { version = "0.8", default-features = false, features = ["raster-images"] }
 ureq = "3"
-url = "2"
+url = "2.5.9"
 unicode-segmentation = "1"
 tree-sitter = "0.27.1"
 tree-sitter-rust = "0.24.2"
