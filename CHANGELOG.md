@@ -22,6 +22,8 @@ release on GitHub uses its section of this file as the release notes.
 
 ### Fixed
 
+- On WSLg, OxideMerge uses XWayland when an X11 display is available to avoid a Wayland
+  disconnect when resizing the window. Set `OXIDEMERGE_WSLG_WAYLAND=1` to use Wayland.
 - On Windows, *OxideMerge → Compare* in File Explorer collects selected files into one
   comparison window even when Explorer starts the second process a little later.
 - After copying or deleting folders, the status bar keeps saying what was done and why anything

@@ -2043,6 +2043,8 @@ fn main() -> ExitCode {
     }
     let options = eframe::NativeOptions {
         viewport,
+        #[cfg(target_os = "linux")]
+        event_loop_builder: wslg_event_loop_builder(),
         // Automated window checks leave the user's window size and place alone.
         persist_window: std::env::var_os("OXIDEMERGE_SMOKE_REPORT").is_none(),
         // A settings folder of its own keeps the window state there too.
@@ -2080,6 +2082,23 @@ fn main() -> ExitCode {
             eprintln!("{e}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// Use WSLg's XWayland display to avoid resize-time Wayland disconnects.
+#[cfg(target_os = "linux")]
+fn wslg_event_loop_builder() -> Option<eframe::EventLoopBuilderHook> {
+    use winit::platform::x11::EventLoopBuilderExtX11;
+
+    if std::path::Path::new("/mnt/wslg/versions.txt").is_file()
+        && std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty())
+        && std::env::var_os("OXIDEMERGE_WSLG_WAYLAND").as_deref() != Some(std::ffi::OsStr::new("1"))
+    {
+        Some(Box::new(|builder| {
+            builder.with_x11();
+        }))
+    } else {
+        None
     }
 }
 
