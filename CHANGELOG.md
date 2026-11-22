@@ -3,7 +3,7 @@
 All notable changes to OxideMerge are listed here, newest first. Each
 release on GitHub uses its section of this file as the release notes.
 
-## [0.9.11] - 2026-11-22
+## [0.9.10] - Unreleased
 
 ### Changed
 
@@ -1885,7 +1885,7 @@ First release.
   opening a window, and WinMerge-style switches on Windows.
 - Chinese, Japanese and Korean fonts on Linux and WSL, and GPU acceleration under WSL2.
 
-[0.9.11]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.9...v0.9.11
+[0.9.10]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.9...HEAD
 [0.9.9]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.6...v0.9.7
