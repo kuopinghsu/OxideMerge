@@ -2217,9 +2217,19 @@ impl TextView {
     }
 
     pub fn rediff(&mut self) {
+        self.rediff_after_edit(None);
+    }
+
+    fn rediff_after_edit(&mut self, changed: Option<&[usize]>) {
         let started = std::time::Instant::now();
+        // A pending typing edit may have changed a pane outside this edit's scope.
+        let changed = if self.rediff_due.is_some() {
+            None
+        } else {
+            changed
+        };
         self.rediff_due = None;
-        self.rediff_inner();
+        self.rediff_inner(changed);
         self.rediff_ms = started.elapsed().as_secs_f32() * 1000.0;
     }
 
@@ -2279,7 +2289,7 @@ impl TextView {
         }
     }
 
-    fn rediff_inner(&mut self) {
+    fn rediff_inner(&mut self, changed: Option<&[usize]>) {
         self.hold_view();
         let syntax = self.comment_syntax();
         let refs: Vec<&[String]> = self.panes.iter().map(|p| p.doc.lines.as_slice()).collect();
@@ -2297,7 +2307,7 @@ impl TextView {
             let n = self.panes[p].doc.lines.len();
             marks.retain(|&l, _| l < n);
         }
-        self.update_edited();
+        self.update_edited(changed);
         self.recheck_review_hunks();
         self.inline_cache.clear();
         self.sel_anchor = None;
@@ -2430,7 +2440,7 @@ impl TextView {
         if let Some(s) = last {
             self.undo.push(s);
         }
-        self.rediff();
+        self.rediff_after_edit(Some(panes));
     }
 
     /// Notes where the view is by source line, while the rows and the layout are still those of
@@ -3453,11 +3463,10 @@ impl TextView {
         // stay near the merged position
         self.cur_block = None;
         self.cursor_row = Some(row);
-        let next = self
-            .significant()
-            .find(|&nb| self.diff.blocks[nb].first_row >= row);
-        if let Some(nb) = next {
-            self.select_block(nb);
+        let blocks = &self.diff.blocks;
+        let start = blocks.partition_point(|block| block.first_row < row);
+        if let Some(offset) = blocks[start..].iter().position(|block| !block.ignored) {
+            self.select_block(start + offset);
         }
     }
 
@@ -10607,8 +10616,11 @@ impl TextView {
     }
 
     /// Works out the edited lines of every pane, when they are marked.
-    fn update_edited(&mut self) {
-        for pane in &mut self.panes {
+    fn update_edited(&mut self, changed: Option<&[usize]>) {
+        for (index, pane) in self.panes.iter_mut().enumerate() {
+            if changed.is_some_and(|panes| !panes.contains(&index)) {
+                continue;
+            }
             pane.edited = if self.edit_markers {
                 edited_lines(&pane.baseline, &pane.doc.lines)
             } else {
@@ -11663,7 +11675,7 @@ impl TextView {
         self.poll_highlight(cfg);
         if self.edit_markers != cfg.show_edit_markers {
             self.edit_markers = cfg.show_edit_markers;
-            self.update_edited();
+            self.update_edited(None);
         }
         if self
             .panes
@@ -18274,6 +18286,25 @@ mod tests {
     fn fresh_diff_state(v: &TextView) -> String {
         let docs = v.panes.iter().map(|p| p.doc.clone()).collect();
         diff_state(&TextView::new(docs, &Config::default()))
+    }
+
+    #[test]
+    fn copying_left_advances_and_refreshes_pending_edit_markers() {
+        let mut v = two_way("old\nanchor\nleft\nend\n", "new\nanchor\nright\nend\n");
+        v.place_caret(1, (3, 3), false);
+        v.rediff_ms = 100.0;
+        v.caret_insert("!");
+        assert!(v.rediff_due.is_some());
+        assert!(v.panes[1].edited.is_empty());
+
+        v.select_block(0);
+        v.copy_current(false);
+
+        assert_eq!(lines(&v, 0), ["new", "anchor", "left", "end"]);
+        assert_eq!(v.cursor_row, Some(2));
+        assert_eq!(v.scroll_to, Some(2));
+        assert_eq!(v.panes[0].edited, HashSet::from([0]));
+        assert_eq!(v.panes[1].edited, HashSet::from([3]));
     }
 
     #[test]

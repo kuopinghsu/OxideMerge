@@ -22,6 +22,8 @@ release on GitHub uses its section of this file as the release notes.
 
 ### Fixed
 
+- Copying a difference between text files recalculates edit markers only for the file that
+  changed and starts looking for the next difference at the merge position.
 - Updated the URL parser to 2.5.9 to address RUSTSEC-2026-0592.
 - On WSLg, OxideMerge uses XWayland when an X11 display is available to avoid a Wayland
   disconnect when resizing the window. Set `OXIDEMERGE_WSLG_WAYLAND=1` to use Wayland.
