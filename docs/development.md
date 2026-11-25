@@ -90,7 +90,7 @@ web page samples, see [samples/web/README.md](../samples/web/README.md).
 | Command | What it does |
 | --- | --- |
 | `make dist` | Builds with `make opt-size` and creates a package in `dist/`: a ZIP file on Windows, or a TAR.GZ file on macOS and Linux. |
-| `make appimage` | Creates a Linux AppImage for this computer's processor (x86_64 or aarch64). It needs the X11, Wayland and keyboard libraries, and it downloads `appimagetool`. |
+| `make appimage` | Creates a Linux AppImage for this computer's processor (x86_64 or aarch64). Where Docker is installed (always on Windows and macOS, and on Linux and WSL when `docker` is found), it builds in an AlmaLinux 8 container with glibc 2.28, as CI does, so the AppImage runs on RHEL 8. `make appimage-native` (or `APPIMAGE_DOCKER=0`) builds on the Linux host instead: that needs the X11, Wayland and keyboard libraries, and the AppImage needs the host's glibc or newer. Both download `appimagetool`. |
 | `make user-guide` | Creates the English and Traditional Chinese PDF guides in `dist/`. |
 | `make user-guide-docs` | Creates the same guides in `docs/dist/`, as `oxidemerge-user-guide.pdf` and `oxidemerge-user-guide.zh-TW.pdf`. These files are committed, and each build replaces them. |
 
@@ -313,14 +313,23 @@ AppImage job runs `scripts/patch-glutin.sh` before it builds, and the script app
 - The script patches `$CARGO_HOME/registry/src`, so `Cargo.toml` and `Cargo.lock` stay as committed
   and a tagged build still gets its release label. That copy is shared by every project built with
   the same `CARGO_HOME`: run the script only in CI and in the AppImage container, which has a
-  registry volume of its own. `make appimage` on Windows and macOS runs it there.
+  registry volume of its own. `make appimage` runs it there whenever it builds in Docker.
 - Cargo does not rebuild a downloaded crate whose files change, so the script also removes glutin's
   build output for `PROFILE` (default `release-size`). Running it again does nothing more.
 - The TAR.GZ packages are not patched. They need a newer glibc than RHEL 8 has, so they do not run
   there. A program built with plain `cargo build` is not patched either.
 - Where the swap interval cannot be set, the window has no vsync. With OpenGL drawn in software
   (`GL_RENDERER` llvmpipe, softpipe or swrast), OxideMerge keeps its frames one 60 Hz frame apart,
-  so an animation such as a spinner does not draw as fast as the processor allows.
+  so an animation such as a spinner does not draw as fast as the processor allows. It also turns
+  off animations there, as the Reduce motion option does, without changing that option: each frame
+  is a whole window drawn by the processor, and over a remote desktop also sent across the network,
+  so a jump to a difference far away, which scrolls over a dozen frames, could take seconds.
+- On an X11 display sent across the network, as `ssh -X` and `ssh -Y` set it up (an SSH session
+  with a `DISPLAY` that names a host, such as `localhost:10.0`, and no `WAYLAND_DISPLAY`),
+  frames are kept a tenth of a second apart and animations are off. Each frame is the whole
+  window, megabytes of pixels with OpenGL drawn in software, so a key's press, its release and
+  the change of the modifiers then share a frame. Comparing the files over SFTP from OxideMerge
+  on the user's own computer, or a remote desktop such as NoMachine, X2Go or VNC, is much faster.
 
 When `Cargo.lock` moves to another glutin version, the script stops with "No patch for glutin
 <version>", and when the patch no longer applies, with "does not apply". To make the patch for a

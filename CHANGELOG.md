@@ -19,6 +19,16 @@ release on GitHub uses its section of this file as the release notes.
   the command line still fetch every subfolder.
 - Copying a folder to a side fetched over SFTP or FTP with a filter copies only what that filter
   keeps, and copying to or from a folder fetched only as an empty one is refused, saying why.
+- With OpenGL drawn in software (llvmpipe, softpipe or swrast), animations are off, as with
+  *Reduce motion*, without changing that option: a jump to a difference far away is drawn in one
+  frame instead of scrolling there over a dozen frames, each a whole window drawn by the
+  processor.
+- On an X11 display sent across the network, as `ssh -X` and `ssh -Y` set it up (an SSH session
+  with a `DISPLAY` that names a host, such as `localhost:10.0`), frames are kept a tenth of a
+  second apart and animations are off. Each frame is the whole window sent as pixels, megabytes
+  with OpenGL drawn in software, so a key's press, its release and the change of the modifiers
+  now share a frame, and *Next difference* sends fewer of them. Comparing the files over SFTP
+  from OxideMerge on your own computer, or a remote desktop, is still much faster.
 
 ### Fixed
 
@@ -40,6 +50,11 @@ release on GitHub uses its section of this file as the release notes.
   With OpenGL drawn in software, frames are kept one 60 Hz frame apart, so an animation without
   vsync does not keep the processor busy. The AppImage is now also tested on AlmaLinux 8.4, whose
   Mesa 20.3 had the crash.
+- `make appimage` on Linux, WSL included, builds in the AlmaLinux 8 container whenever Docker is
+  installed, as it already did on Windows and macOS. Built on the host, the AppImage needed that
+  host's glibc, and one from a newer distribution failed on RHEL 8 with "GLIBC_2.xx not found".
+  `make appimage-native` (or `APPIMAGE_DOCKER=0`) still builds on the host, and the packaging
+  script now warns when the AppImage needs a glibc newer than 2.28.
 
 ## [0.9.9] - 2026-11-17
 

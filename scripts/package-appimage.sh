@@ -97,6 +97,20 @@ done
 echo "Bundled libraries:"
 ls "$app/usr/lib/oxidemerge"
 
+# glibc is never bundled, so the newest GLIBC_ version anything needs is the oldest glibc the
+# AppImage runs on. RHEL 8 has 2.28; a build on a newer host (Ubuntu 22.04, most WSL
+# distributions) stops there with "GLIBC_2.xx not found".
+glibc_max=2.28
+glibc_needed=$(find "$app/usr" -type f \( -name '*.so*' -o -path '*/bin/*' \) -print0 |
+    xargs -0 objdump -T 2>/dev/null | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' |
+    sort -uV | tail -n 1 || true)
+echo "Needs glibc ${glibc_needed:-unknown}"
+if [ -n "$glibc_needed" ] &&
+    [ "$(printf '%s\n%s\n' "$glibc_max" "$glibc_needed" | sort -V | tail -n 1)" != "$glibc_max" ]; then
+    echo "${GITHUB_ACTIONS:+::warning::}This AppImage needs glibc $glibc_needed, so it does not run on RHEL 8 (glibc $glibc_max)." >&2
+    echo "Build it in the AlmaLinux 8 container with 'make appimage' (Docker) for RHEL 8." >&2
+fi
+
 tool=$work/appimagetool-$tool_version-$tool_arch.AppImage
 if [ ! -x "$tool" ]; then
     curl -fsSL -o "$tool.part" \

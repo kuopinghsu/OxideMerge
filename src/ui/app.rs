@@ -3430,8 +3430,9 @@ pub struct OxideMergeApp {
     archive_passwords: Vec<PathBuf>,
     /// A folder report with file differences being written on another thread: its file.
     report_job: Option<(PathBuf, std::sync::mpsc::Receiver<Result<(), String>>)>,
-    /// The shortest time between two frames, worked out on the first frame: one frame at 60 Hz
-    /// when OpenGL is drawn in software, where there may be no vsync to wait for (see
+    /// The shortest time between two frames, worked out on the first frame: a tenth of a second
+    /// on an X11 display sent across the network (see [`remote_x11`]), one frame at 60 Hz when
+    /// OpenGL is drawn in software, where there may be no vsync to wait for (see
     /// [`software_renderer`]), and none otherwise. `None` until then.
     frame_floor: Option<Option<std::time::Duration>>,
     /// When the last frame started, to keep frames `frame_floor` apart.
@@ -13319,10 +13320,46 @@ impl OxideMergeApp {
     }
 }
 
-/// The shortest time between two frames with OpenGL named `renderer`: one 60 Hz frame when it
-/// draws in software (see [`software_renderer`]), none otherwise.
-fn frame_floor(renderer: &str) -> Option<std::time::Duration> {
-    software_renderer(renderer).then_some(std::time::Duration::from_micros(16_667))
+/// The shortest time between two frames with OpenGL named `renderer`, on a display sent across
+/// the network (`remote`, see [`remote_x11`]) or not: a tenth of a second on a remote display,
+/// one 60 Hz frame when OpenGL draws in software (see [`software_renderer`]), none otherwise.
+fn frame_floor(renderer: &str, remote: bool) -> Option<std::time::Duration> {
+    if remote {
+        Some(REMOTE_FRAME_FLOOR)
+    } else {
+        software_renderer(renderer).then_some(std::time::Duration::from_micros(16_667))
+    }
+}
+
+/// The shortest time between two frames on an X11 display sent across the network. Each frame
+/// is the whole window, megabytes of pixels when OpenGL draws in software, so a key's press,
+/// its release and the change of the modifiers held share a frame rather than each sending one.
+const REMOTE_FRAME_FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether the window goes to an X server across the network, as `ssh -X` and `ssh -Y` set it
+/// up: in an SSH session (`ssh`) with `display` (`DISPLAY`) naming a host, such as
+/// `localhost:10.0`, where sshd forwards it, rather than `:0`, a local server's socket. Not with
+/// `wayland` (`WAYLAND_DISPLAY`) set, where the window is a Wayland one.
+fn remote_x11(display: Option<&str>, wayland: Option<&str>, ssh: bool) -> bool {
+    if !ssh || wayland.is_some_and(|w| !w.is_empty()) {
+        return false;
+    }
+    display
+        .and_then(|d| d.rsplit_once(':'))
+        .is_some_and(|(host, _)| !host.is_empty() && host != "unix")
+}
+
+/// [`remote_x11`] for this process's environment; never on Windows or macOS.
+fn remote_x11_here() -> bool {
+    if !cfg!(all(unix, not(target_os = "macos"))) {
+        return false;
+    }
+    let var = |name| std::env::var(name).ok();
+    remote_x11(
+        var("DISPLAY").as_deref(),
+        var("WAYLAND_DISPLAY").as_deref(),
+        var("SSH_CONNECTION").is_some() || var("SSH_CLIENT").is_some(),
+    )
 }
 
 /// How long to wait before a frame `since_last` after the one before, to keep them `floor`
@@ -13390,11 +13427,15 @@ impl eframe::App for OxideMergeApp {
     fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
         // Drawn in software, a window may have no vsync (Mesa before 21 cannot set it), and an
         // animation such as a spinner, which asks for the next frame at once, would then draw
-        // as fast as the processor allows. Frames are kept one 60 Hz frame apart there.
+        // as fast as the processor allows. Frames are kept one 60 Hz frame apart there, and a
+        // tenth of a second apart on a display sent across the network (`ssh -X`).
         let floor = *self.frame_floor.get_or_insert_with(|| {
             use eframe::glow::HasContext;
             let gl = frame.gl()?;
-            frame_floor(&unsafe { gl.get_parameter_string(eframe::glow::RENDERER) })
+            frame_floor(
+                &unsafe { gl.get_parameter_string(eframe::glow::RENDERER) },
+                remote_x11_here(),
+            )
         });
         if floor.is_some() {
             let since_last = self.last_frame.map(|t| t.elapsed());
@@ -13411,7 +13452,12 @@ impl eframe::App for OxideMergeApp {
                 .system_theme()
                 .map_or(self.cfg.dark_mode, |t| t == egui::Theme::Dark),
         };
-        let look = (self.cfg.dark_mode, theme::Look::of(&self.cfg));
+        let mut look = (self.cfg.dark_mode, theme::Look::of(&self.cfg));
+        // Drawn in software or sent across the network, every frame of an animation costs a
+        // full window drawn by the processor or sent as pixels: a jump to a difference far away
+        // scrolls there over a dozen frames and can take seconds. Motion is reduced there, so
+        // the jump takes one frame.
+        look.1.reduce_motion |= floor.is_some();
         if self.visuals_dark != Some(look) {
             self.visuals_dark = Some(look);
             theme::apply(ctx, look.0, look.1);

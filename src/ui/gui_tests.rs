@@ -4099,14 +4099,59 @@ fn software_opengl_is_told_from_hardware_by_its_name() {
     }
 }
 
+/// An X11 display sent across the network is told by an SSH session with a `DISPLAY` that
+/// names a host, as `ssh -X` sets it up; a local server's socket and Wayland are not.
+#[test]
+fn remote_x11_displays_are_told_apart() {
+    for display in [
+        "localhost:10.0",
+        "192.0.2.10:20.0",
+        "myhost:10",
+        "[::1]:10.0",
+    ] {
+        assert!(remote_x11(Some(display), None, true), "{display}");
+    }
+    for (display, wayland, ssh) in [
+        (Some(":0"), None, true),
+        (Some(":20.0"), None, true),
+        (Some("unix:0"), None, true),
+        (Some("localhost:10.0"), None, false),
+        (Some("localhost:10.0"), Some("wayland-0"), true),
+        (None, None, true),
+    ] {
+        assert!(
+            !remote_x11(display, wayland, ssh),
+            "{display:?} {wayland:?} {ssh}"
+        );
+    }
+    assert!(
+        remote_x11(Some("localhost:10.0"), Some(""), true),
+        "an empty WAYLAND_DISPLAY"
+    );
+}
+
 /// Drawn in software, frames are kept one 60 Hz frame apart: the next waits for the rest of it,
 /// and none waits after the window was idle that long, or with OpenGL on a graphics card.
 #[test]
 fn frames_drawn_in_software_are_kept_apart() {
     use std::time::Duration;
-    let floor = frame_floor("llvmpipe (LLVM 10.0.1, 256 bits)");
+    let floor = frame_floor("llvmpipe (LLVM 10.0.1, 256 bits)", false);
     assert_eq!(floor, Some(Duration::from_micros(16_667)));
-    assert_eq!(frame_floor("NVIDIA GeForce RTX 3080/PCIe/SSE2"), None);
+    assert_eq!(
+        frame_floor("NVIDIA GeForce RTX 3080/PCIe/SSE2", false),
+        None
+    );
+    // Sent across the network, frames are a tenth of a second apart, whatever draws them.
+    for renderer in [
+        "llvmpipe (LLVM 11.0.0, 256 bits)",
+        "NVIDIA GeForce RTX 3080/PCIe/SSE2",
+    ] {
+        assert_eq!(
+            frame_floor(renderer, true),
+            Some(Duration::from_millis(100)),
+            "{renderer}"
+        );
+    }
     let ms = Duration::from_millis;
     assert_eq!(frame_pause(floor, None), None, "the first frame");
     assert_eq!(
@@ -4131,6 +4176,9 @@ fn frames_drawn_in_software_are_kept_apart() {
         "three frames in {:?}",
         start.elapsed()
     );
+    // Animations, such as the scroll to a difference far away, are turned off there.
+    assert_eq!(gui.ctx.global_style().animation_time, 0.0);
+    assert!(!gui.app.cfg.reduce_motion, "the setting is left as it is");
 }
 
 #[test]

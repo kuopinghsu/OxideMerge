@@ -86,7 +86,7 @@ macOS 與 Linux 的程式位於 `target/release/oxidemerge`，Windows 則為
 | 指令 | 用途 |
 | --- | --- |
 | `make dist` | 以 `make opt-size` 建置，並在 `dist/` 產生套件：Windows 為 ZIP 檔，macOS 與 Linux 為 TAR.GZ 檔。 |
-| `make appimage` | 依本機處理器架構（x86_64 或 aarch64）產生 Linux AppImage。需要 X11、Wayland 與鍵盤函式庫，並會下載 `appimagetool`。 |
+| `make appimage` | 依本機處理器架構（x86_64 或 aarch64）產生 Linux AppImage。有安裝 Docker 時（Windows 與 macOS 一律如此，Linux 與 WSL 則在找得到 `docker` 時），會如同 CI 在 glibc 2.28 的 AlmaLinux 8 容器中建置，因此 AppImage 可在 RHEL 8 上執行。`make appimage-native`（或 `APPIMAGE_DOCKER=0`）則直接在 Linux 主機上建置：需要 X11、Wayland 與鍵盤函式庫，且產生的 AppImage 需要與主機相同或更新的 glibc。兩者都會下載 `appimagetool`。 |
 | `make user-guide` | 在 `dist/` 產生英文與繁體中文 PDF 指南。 |
 | `make user-guide-docs` | 在 `docs/dist/` 產生相同的指南，檔名為 `oxidemerge-user-guide.pdf` 與 `oxidemerge-user-guide.zh-TW.pdf`。這些檔案會提交到儲存庫，每次建置都會取代它們。 |
 
@@ -288,13 +288,19 @@ AppImage 與 DMG 必須帶有其格式標記，PDF 必須完整。之後會將 `
   仍使用 `glXSwapIntervalEXT`。
 - 指令稿修補的是 `$CARGO_HOME/registry/src`，因此 `Cargo.toml` 與 `Cargo.lock` 維持提交時的內容，
   加上標籤的建置仍會得到發行版本標記。使用相同 `CARGO_HOME` 建置的所有專案都共用這份複本：只在 CI
-  與擁有獨立 registry 磁碟區的 AppImage 容器中執行此指令稿。在 Windows 與 macOS 上， `make appimage`
+  與擁有獨立 registry 磁碟區的 AppImage 容器中執行此指令稿。 `make appimage` 在 Docker 中建置時，
   會在該容器中執行它。
 - 下載的 crate 檔案變更後，Cargo 不會重新建置它，因此指令稿也會刪除 glutin 在 `PROFILE` （預設為
   `release-size`）下的建置產物。再次執行不會有其他作用。
 - 無法設定交換間隔時，視窗就沒有垂直同步。以軟體繪製 OpenGL 時（`GL_RENDERER` 為 llvmpipe、softpipe
   或 swrast）， OxideMerge 會讓每個畫面至少間隔一個 60 Hz 畫面，因此像轉圈圖示之類的動畫不會以處理器
-  的最大速度繪製。
+  的最大速度繪製。此時它也會關閉動畫，效果如同「減少動態效果」選項，但不會變更該選項：每個畫面都是由處理器
+  繪製整個視窗，經由遠端桌面時還要透過網路傳送，因此跳到遠處的差異時捲動的十幾個畫面可能要花上數秒。
+- 在透過網路傳送的 X11 顯示上（如 `ssh -X` 與 `ssh -Y` 所設定：在 SSH 工作階段中，`DISPLAY` 指名主機，
+  例如 `localhost:10.0`，且未設定 `WAYLAND_DISPLAY`），畫面之間至少間隔十分之一秒，且動畫關閉。每個畫面
+  都是整個視窗，以軟體繪製 OpenGL 時就是數 MB 的像素，因此按鍵的按下、放開與修飾鍵的變更會合併在同一個
+  畫面中。在使用者自己的電腦上以 OxideMerge 透過 SFTP 比較檔案，或使用 NoMachine、X2Go、VNC 等遠端桌面，
+  會快得多。
 - TAR.GZ 套件不會修補。它們需要比 RHEL 8 更新的 glibc，本來就無法在其上執行。直接以 `cargo build`
   建置的程式也不會修補。
 
