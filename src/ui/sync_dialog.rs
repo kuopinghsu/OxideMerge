@@ -978,7 +978,12 @@ fn share_widths(counts: &[usize], width: f32, gap: f32) -> Vec<f32> {
     let mut sliver = vec![false; counts.len()];
     loop {
         let set_aside = sliver.iter().filter(|&&s| s).count() as f32 * min;
-        let others: usize = counts.iter().zip(&sliver).filter(|(_, &s)| !s).map(|(n, _)| n).sum();
+        let others: usize = counts
+            .iter()
+            .zip(&sliver)
+            .filter(|(_, &s)| !s)
+            .map(|(n, _)| n)
+            .sum();
         let left = room - set_aside;
         let mut more = false;
         for (i, &n) in counts.iter().enumerate() {
@@ -991,7 +996,13 @@ fn share_widths(counts: &[usize], width: f32, gap: f32) -> Vec<f32> {
             return counts
                 .iter()
                 .zip(&sliver)
-                .map(|(&n, &s)| if s { min } else { left * n as f32 / others as f32 })
+                .map(|(&n, &s)| {
+                    if s {
+                        min
+                    } else {
+                        left * n as f32 / others as f32
+                    }
+                })
                 .collect();
         }
     }

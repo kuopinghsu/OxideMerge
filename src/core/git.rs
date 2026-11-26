@@ -509,11 +509,13 @@ fn checkout_into(
 /// LFS files whole: Git runs it as a long-running `process`, as a `smudge` command, or as
 /// either one alone, so both are looked at.
 fn lfs_set_up(root: &Path, cancel: &AtomicBool) -> bool {
-    ["filter.lfs.process", "filter.lfs.smudge"].iter().any(|key| {
-        let mut get = command(root);
-        get.args(["config", "--get", key]);
-        run_until(get, None, cancel).is_ok_and(|out| !out.trim_ascii().is_empty())
-    })
+    ["filter.lfs.process", "filter.lfs.smudge"]
+        .iter()
+        .any(|key| {
+            let mut get = command(root);
+            get.args(["config", "--get", key]);
+            run_until(get, None, cancel).is_ok_and(|out| !out.trim_ascii().is_empty())
+        })
 }
 
 /// Whether any of `files` (paths ending in a zero byte, as `checkout-index` takes them) has the

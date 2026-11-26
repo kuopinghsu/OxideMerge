@@ -543,8 +543,7 @@ fn extract(
 ) -> Result<()> {
     let open = || std::fs::File::open(path).with_context(|| format!("open {}", path.display()));
     let extract_tar = |input: &mut dyn Read, whole: &dyn Fn() -> bool| {
-        extract_tar(input, dir, budget, written, whole)
-            .with_context(|| path.display().to_string())
+        extract_tar(input, dir, budget, written, whole).with_context(|| path.display().to_string())
     };
     // Whether the first compressed stream of the file `decode` reads is whole, its check
     // included: bytes after it that are no stream (padding to a block size, say) are then
@@ -559,24 +558,21 @@ fn extract(
         Kind::Zip => extract_zip(path, open()?, dir, budget, written, password)
             .with_context(|| path.display().to_string()),
         Kind::Tar => extract_tar(&mut open()?, &|| false),
-        Kind::TarGz => extract_tar(
-            &mut flate2::read::MultiGzDecoder::new(open()?),
-            &|| first_whole(&|f| Ok(Box::new(flate2::read::GzDecoder::new(f)))),
-        ),
-        Kind::TarBz2 => extract_tar(
-            &mut bzip2::read::MultiBzDecoder::new(open()?),
-            &|| first_whole(&|f| Ok(Box::new(bzip2::read::BzDecoder::new(f)))),
-        ),
+        Kind::TarGz => extract_tar(&mut flate2::read::MultiGzDecoder::new(open()?), &|| {
+            first_whole(&|f| Ok(Box::new(flate2::read::GzDecoder::new(f))))
+        }),
+        Kind::TarBz2 => extract_tar(&mut bzip2::read::MultiBzDecoder::new(open()?), &|| {
+            first_whole(&|f| Ok(Box::new(bzip2::read::BzDecoder::new(f))))
+        }),
         // xz itself allows padding after a stream, and nothing else.
         Kind::TarXz => extract_tar(&mut xz_reader(open()?), &|| false),
-        Kind::TarZst => extract_tar(
-            &mut zstd::stream::read::Decoder::new(open()?)?,
-            &|| {
-                first_whole(&|f| {
-                    Ok(Box::new(zstd::stream::read::Decoder::new(f)?.single_frame()))
-                })
-            },
-        ),
+        Kind::TarZst => extract_tar(&mut zstd::stream::read::Decoder::new(open()?)?, &|| {
+            first_whole(&|f| {
+                Ok(Box::new(
+                    zstd::stream::read::Decoder::new(f)?.single_frame(),
+                ))
+            })
+        }),
         Kind::SevenZ => extract_7z(open()?, dir, budget, written, password)
             .map_err(|e| sevenz_error(path, password, e)),
         Kind::Rar => extract_rar(path, dir, budget, written, password),
@@ -903,7 +899,13 @@ fn extract_zip(
                 |n| n.into_owned(),
             );
             let classic = zip_lock(&f) == Some(ZipLock::Classic);
-            (f.enclosed_name(), shown, f.is_dir(), classic, zip_modified(&f))
+            (
+                f.enclosed_name(),
+                shown,
+                f.is_dir(),
+                classic,
+                zip_modified(&f),
+            )
         };
         let Some(rel) = rel else {
             // A name leading out of the archive, or one this system does not allow.
@@ -2082,10 +2084,7 @@ fn repack_zip(
                             if !utf8 {
                                 anyhow::bail!(crate::i18n::trf(
                                     "msg.archive_name_not_utf8",
-                                    &[
-                                        ("name", name.clone()),
-                                        ("file", path.display().to_string()),
-                                    ]
+                                    &[("name", name.clone()), ("file", path.display().to_string()),]
                                 ));
                             }
                             changed = true;
@@ -2259,11 +2258,7 @@ fn repack_7z(
     if any_locked && secret.is_none() {
         return Err(needs_password(path, None));
     }
-    let rels: Vec<PathBuf> = ar
-        .files
-        .iter()
-        .map(|e| sevenz_rel(e.name()))
-        .collect();
+    let rels: Vec<PathBuf> = ar.files.iter().map(|e| sevenz_rel(e.name())).collect();
     let last: HashMap<&PathBuf, usize> = rels.iter().enumerate().map(|(i, r)| (r, i)).collect();
     let seen: HashSet<PathBuf> = rels.iter().cloned().collect();
     let mut implied = HashSet::new();
@@ -4050,7 +4045,6 @@ mod tests {
         }
     }
 
-
     fn zip_of(path: &Path, files: &[(&str, &str)]) {
         use std::io::Write as _;
         let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
@@ -4103,7 +4097,10 @@ mod tests {
         use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader};
         let mut w = ArchiveWriter::create(path).unwrap();
         w.push_archive_entries(
-            files.iter().map(|(n, _)| ArchiveEntry::new_file(n)).collect(),
+            files
+                .iter()
+                .map(|(n, _)| ArchiveEntry::new_file(n))
+                .collect(),
             files
                 .iter()
                 .map(|(_, d)| SourceReader::new(d.as_bytes()))
@@ -4290,7 +4287,10 @@ mod tests {
             w.finish().unwrap();
         }
         let x = extract_to_temp(&zip).unwrap();
-        let got = std::fs::metadata(x.path().join("a.txt")).unwrap().modified().unwrap();
+        let got = std::fs::metadata(x.path().join("a.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
         let want: std::time::SystemTime = chrono::Local
             .with_ymd_and_hms(2001, 2, 3, 4, 5, 6)
             .earliest()
@@ -4372,7 +4372,6 @@ mod tests {
         assert!(!slow_to_repack(&small));
     }
 
-
     /// A damaged or cut short archive fails to open, rather than showing part of what it
     /// holds as if it were all: for every format whose data carries a check, including the
     /// checks a compressed tar keeps after the archive's end marker.
@@ -4397,15 +4396,19 @@ mod tests {
             h.set_size(d.len() as u64);
             h.set_mode(0o644);
             h.set_cksum();
-            b.append_data(&mut h, format!("f{i}.txt"), d.as_slice()).unwrap();
+            b.append_data(&mut h, format!("f{i}.txt"), d.as_slice())
+                .unwrap();
         }
         let tar = b.into_inner().unwrap();
         let work = tempfile::tempdir().unwrap();
         let mut archives: Vec<(&str, Vec<u8>)> = Vec::new();
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         for i in 0..3u32 {
-            zip.start_file(format!("f{i}.txt"), zip::write::SimpleFileOptions::default())
-                .unwrap();
+            zip.start_file(
+                format!("f{i}.txt"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
             zip.write_all(&data(i + 1)).unwrap();
         }
         archives.push(("a.zip", zip.finish().unwrap().into_inner()));
@@ -4418,7 +4421,10 @@ mod tests {
                 (0..3)
                     .map(|i| ArchiveEntry::new_file(&format!("f{i}.txt")))
                     .collect(),
-                files.iter().map(|d| SourceReader::new(d.as_slice())).collect(),
+                files
+                    .iter()
+                    .map(|d| SourceReader::new(d.as_slice()))
+                    .collect(),
             )
             .unwrap();
             w.finish().unwrap();
@@ -4448,9 +4454,7 @@ mod tests {
             for b in &mut flipped[at..at + 16] {
                 *b ^= 0x5A;
             }
-            let mut cases = vec![
-                ("cut in half", good[..good.len() / 2].to_vec()),
-            ];
+            let mut cases = vec![("cut in half", good[..good.len() / 2].to_vec())];
             // A plain tar has no check of its data, and its last bytes are padding.
             if *name != "a.tar" {
                 cases.push(("cut by a byte", good[..good.len() - 1].to_vec()));

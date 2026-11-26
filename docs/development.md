@@ -101,9 +101,10 @@ On Windows and macOS, both targets run in Docker: start Docker Desktop (on Windo
 container mode) and run either target with GNU Make. The targets build a reusable image with the
 same Asciidoctor versions as CI and write the PDFs back into the checkout.
 
-On macOS and Linux, both targets need Asciidoctor PDF, `curl`, `shasum`, Python 3 with `fontTools`,
-fontconfig and the DejaVu Sans font. The build script downloads the Noto Sans CJK fonts that it
-needs.
+On Linux, both targets run `scripts/build-user-guide.sh` directly. Running this script directly
+on Linux or macOS requires Asciidoctor PDF, `curl`, `shasum`, Python 3 with `fontTools`, fontconfig
+and the DejaVu Sans font. The script downloads the Noto Sans CJK fonts that it needs. The Docker
+targets provide these dependencies inside the container.
 
 ## How outcomes are named
 

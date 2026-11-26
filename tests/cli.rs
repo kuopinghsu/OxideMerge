@@ -491,7 +491,8 @@ fn folder_patches_note_files_that_are_not_text_and_fail_on_lost_text() {
         run.stderr
     );
     assert!(
-        run.stderr.contains("changes of 1 text file\n") || run.stderr.contains("changes of 1 text file\r\n"),
+        run.stderr.contains("changes of 1 text file\n")
+            || run.stderr.contains("changes of 1 text file\r\n"),
         "{}",
         run.stderr
     );
@@ -2302,14 +2303,20 @@ fn archives_are_reported_as_the_folders_they_hold() {
         b.finish().unwrap();
     };
     make("left.tar", &[("same.txt", "x\n"), ("changed.txt", "old\n")]);
-    make("right.tar", &[("same.txt", "x\n"), ("changed.txt", "new\n")]);
+    make(
+        "right.tar",
+        &[("same.txt", "x\n"), ("changed.txt", "new\n")],
+    );
 
     let run = oxidemerge(d, &["--report", "report.txt", "left.tar", "right.tar"]);
     assert_eq!(run.code, 1, "{}", run.stderr);
     let text = std::fs::read_to_string(d.join("report.txt")).unwrap();
     assert!(text.contains("changed.txt"), "{text}");
     assert!(text.contains("left.tar"), "{text}");
-    assert!(!text.contains("oxidemerge-"), "a temporary folder is named:\n{text}");
+    assert!(
+        !text.contains("oxidemerge-"),
+        "a temporary folder is named:\n{text}"
+    );
 
     make("same.tar", &[("same.txt", "x\n"), ("changed.txt", "old\n")]);
     let run = oxidemerge(d, &["--cli", "left.tar", "same.tar"]);
@@ -2336,7 +2343,11 @@ fn an_encrypted_archive_is_compared_with_a_folder() {
 
     let none = oxidemerge(d, &["--cli", "a.zip", "folder"]);
     assert_eq!(none.code, 2, "{}", none.stderr);
-    assert!(none.stderr.contains("OXIDEMERGE_ARCHIVE_PASSWORD"), "{}", none.stderr);
+    assert!(
+        none.stderr.contains("OXIDEMERGE_ARCHIVE_PASSWORD"),
+        "{}",
+        none.stderr
+    );
 
     let env = [("OXIDEMERGE_ARCHIVE_PASSWORD", "wrong")];
     let wrong = oxidemerge_with_env(d, &["--cli", "a.zip", "folder"], &env);

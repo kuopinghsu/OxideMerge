@@ -97,8 +97,10 @@ macOS 與 Linux 的程式位於 `target/release/oxidemerge`，Windows 則為
 容器模式），再用 GNU Make 執行任一目標。目標會建置可重複使用的映像檔，其中的 Asciidoctor 版本與 CI
 相同，並將 PDF 寫回儲存庫。
 
-在 macOS 與 Linux 上，這兩個目標需要 Asciidoctor PDF、`curl`、`shasum`、含 `fontTools` 的 Python 3、
-fontconfig 與 DejaVu Sans 字型。建置指令碼會自動下載所需的 Noto Sans CJK 字型。
+在 Linux 上，這兩個目標會直接執行 `scripts/build-user-guide.sh`。在 Linux 或 macOS 上直接執行
+此指令碼時，需要 Asciidoctor PDF、`curl`、`shasum`、含 `fontTools` 的 Python 3、fontconfig 與
+DejaVu Sans 字型。指令碼會自動下載所需的 Noto Sans CJK 字型。使用 Docker 的目標會在容器內提供
+這些相依套件。
 
 ## 結果的命名方式
 

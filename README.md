@@ -48,7 +48,8 @@ confidence to file comparisons, folder synchronization, and conflict resolution.
   conflict** go on to the next file that both sides changed and that still has an open conflict.
 - **Synchronize two folders:** preview how one folder would be made to match the
   other, or only brought up to date from it, then apply the changes after you
-  confirm. If applying fails or you stop it, the changes made so far are undone.
+  confirm. If applying fails or you stop it, OxideMerge attempts to undo the changes made so far;
+  if recovery is incomplete, it keeps the journal and reports which files need attention.
 - Open ZIP, TAR, 7z, RAR and other supported archives as folders, including password-protected
   ZIP, 7z and RAR archives and ZIP entries compressed with any common method. Edit, copy, merge or
   delete their files and save to write the changes back into the archive, which stays encrypted
@@ -282,10 +283,12 @@ You can also open one file that contains conflict markers.
 A three-way folder merge writes into the middle folder. **Merge → Auto merge folders...**
 first shows the planned copies, deletions and merges. Nothing changes until you confirm.
 
-The merge either completes fully or changes nothing:
+OxideMerge checks the inputs and keeps copies so it can undo an interrupted merge:
 
 - If an item changed after the plan was made, nothing is merged.
-- If you stop the merge, or a change fails, all changes made so far are undone.
+- If you stop the merge, or a change fails, OxideMerge attempts to undo all changes made so far.
+  If a file cannot be restored, it keeps the recovery copies and shows their location for manual
+  restoration.
 
 ### Synchronize two folders
 

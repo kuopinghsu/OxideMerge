@@ -1961,7 +1961,8 @@ comparison, refresh the comparison and try again.
 
 ==== How the merge protects your files
 
-The merge is all-or-nothing: either every change is made, or the middle folder stays as it was.
+OxideMerge checks the inputs and keeps original copies so it can undo an interrupted merge.
+If restoring a file fails, manual recovery may be needed, as described below.
 
 * _Before the merge_, OxideMerge checks every item. Nothing is merged if an item changed after the
   plan was made, if an item would be written outside the middle folder, or if a backup file would
@@ -1969,9 +1970,9 @@ The merge is all-or-nothing: either every change is made, or the middle folder s
 * _During the merge_, OxideMerge checks each file again immediately before it writes the file. If
   another program changes a file, the merge stops. You can also click *Stop* to stop the merge.
 * _When the merge stops or fails_, for example because a folder is read-only or the disk is full,
-  OxideMerge undoes all changes made so far. The middle folder is then restored to its previous
-  state, and removed folders regain their permissions. A file that the merge moved to the trash is
-  restored from a copy, so the trash keeps a copy as well.
+  OxideMerge attempts to undo all changes made so far. When restoration succeeds, the middle
+  folder returns to its previous state, and removed folders regain their permissions. A file that
+  the merge moved to the trash is restored from a copy, so the trash keeps a copy as well.
 
 To make the undo possible, OxideMerge keeps copies of the original files in a `.oxidemerge-undo-…`
 folder at the top of the middle folder. If it cannot create this folder there, it uses the system's
@@ -5249,8 +5250,9 @@ _Solution:_ Turn on *Include subfolders* and *Include contents of unique subfold
 comparison finish.
 +
 If a file changed after the comparison, nothing is merged and the file is listed. If a change fails
-during the merge, all changes made so far are undone. Refresh the comparison and review the merge
-plan again.
+during the merge, OxideMerge attempts to undo all changes made so far. If restoration fails, it
+keeps the recovery copies and shows their location for manual restoration. Refresh the comparison
+and review the merge plan again.
 
 === Web pages
 

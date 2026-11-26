@@ -594,17 +594,18 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
             }
             let temp = core::archive::extract_to_temp(p);
             core::archive::forget_password(p);
-            let temp = temp.map_err(|e| match e.downcast_ref::<core::archive::NeedsPassword>() {
-                Some(n) if !n.wrong => anyhow::anyhow!(
-                    "{}: it is encrypted; give its password in {ARCHIVE_PASSWORD_ENV}",
-                    p.display()
-                ),
-                Some(_) => anyhow::anyhow!(
-                    "{}: the password in {ARCHIVE_PASSWORD_ENV} is wrong",
-                    p.display()
-                ),
-                None => e,
-            })?;
+            let temp =
+                temp.map_err(|e| match e.downcast_ref::<core::archive::NeedsPassword>() {
+                    Some(n) if !n.wrong => anyhow::anyhow!(
+                        "{}: it is encrypted; give its password in {ARCHIVE_PASSWORD_ENV}",
+                        p.display()
+                    ),
+                    Some(_) => anyhow::anyhow!(
+                        "{}: the password in {ARCHIVE_PASSWORD_ENV} is wrong",
+                        p.display()
+                    ),
+                    None => e,
+                })?;
             let skipped = core::archive::skipped(temp.path());
             if !skipped.is_empty() {
                 eprintln!(
@@ -677,7 +678,10 @@ fn run_batch(cli: &Cli, cfg: &Config) -> anyhow::Result<u8> {
                 if !left_out.is_empty() {
                     eprintln!(
                         "note: {}",
-                        i18n::trf("msg.submodules_unexported", &[("names", left_out.join(", "))])
+                        i18n::trf(
+                            "msg.submodules_unexported",
+                            &[("names", left_out.join(", "))]
+                        )
                     );
                 }
                 core::vcs::without_ignored(filter, work, &paths[0], &never)
