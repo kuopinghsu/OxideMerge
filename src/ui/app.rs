@@ -3430,13 +3430,15 @@ pub struct OxideMergeApp {
     archive_passwords: Vec<PathBuf>,
     /// A folder report with file differences being written on another thread: its file.
     report_job: Option<(PathBuf, std::sync::mpsc::Receiver<Result<(), String>>)>,
-    /// The shortest time between two frames, worked out on the first frame: a tenth of a second
-    /// on an X11 display sent across the network (see [`remote_x11`]), one frame at 60 Hz when
-    /// OpenGL is drawn in software, where there may be no vsync to wait for (see
-    /// [`software_renderer`]), and none otherwise. `None` until then.
-    frame_floor: Option<Option<std::time::Duration>>,
+    /// The shortest time between two frames, worked out on the first frame (see
+    /// [`frame_floor`]); `None` until then.
+    frame_floor: Option<Option<FrameFloor>>,
     /// When the last frame started, to keep frames `frame_floor` apart.
     last_frame: Option<std::time::Instant>,
+    /// Whether this frame came with input, such as a key or the mouse, set before it is drawn.
+    input_frame: bool,
+    /// Whether the frame before this one came with input.
+    after_input: bool,
     /// Whether the report being written opens in the system's viewer once done, to be printed.
     report_opens: bool,
     /// The PDF files written to be printed, readable only by the user; deleted when the
@@ -4401,6 +4403,8 @@ impl OxideMergeApp {
             report_job: None,
             frame_floor: None,
             last_frame: None,
+            input_frame: false,
+            after_input: false,
             report_opens: false,
             prints: Vec::new(),
             tab_keys: Vec::new(),
@@ -11787,7 +11791,10 @@ impl OxideMergeApp {
                 .tempdir()?;
             let files: &[(&str, &str)] = &[
                 ("left/README.md", "# Sample\n\nTwo folders to compare.\n"),
-                ("right/README.md", "# Sample\n\nTwo folders to compare and merge.\n"),
+                (
+                    "right/README.md",
+                    "# Sample\n\nTwo folders to compare and merge.\n",
+                ),
                 (
                     "left/src/main.rs",
                     "fn main() {\n    let name = \"world\";\n    println!(\"Hello, {}!\", name);\n}\n",
@@ -13320,28 +13327,63 @@ impl OxideMergeApp {
     }
 }
 
+/// The shortest time between two frames: `input` for a frame that answers a key, the mouse or
+/// the one after it, `idle` for the others, such as a spinner turning or a check on work done
+/// on another thread.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FrameFloor {
+    input: std::time::Duration,
+    idle: std::time::Duration,
+}
+
+impl FrameFloor {
+    /// The floor for a frame that answers input (`input`) or not.
+    fn of(self, input: bool) -> std::time::Duration {
+        if input {
+            self.input
+        } else {
+            self.idle
+        }
+    }
+}
+
 /// The shortest time between two frames with OpenGL named `renderer`, on a display sent across
-/// the network (`remote`, see [`remote_x11`]) or not: a tenth of a second on a remote display,
-/// one 60 Hz frame when OpenGL draws in software (see [`software_renderer`]), none otherwise.
-fn frame_floor(renderer: &str, remote: bool) -> Option<std::time::Duration> {
+/// the network (`remote`, see [`remote_x11`]) or not: [`REMOTE_FRAME_FLOOR`] on a remote
+/// display, [`SOFTWARE_FRAME_FLOOR`] when OpenGL draws in software (see [`software_renderer`]),
+/// none otherwise.
+fn frame_floor(renderer: &str, remote: bool) -> Option<FrameFloor> {
     if remote {
         Some(REMOTE_FRAME_FLOOR)
     } else {
-        software_renderer(renderer).then_some(std::time::Duration::from_micros(16_667))
+        software_renderer(renderer).then_some(SOFTWARE_FRAME_FLOOR)
     }
 }
 
 /// The shortest time between two frames on an X11 display sent across the network. Each frame
 /// is the whole window, megabytes of pixels when OpenGL draws in software, so a key's press,
-/// its release and the change of the modifiers held share a frame rather than each sending one.
-const REMOTE_FRAME_FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
+/// its release and the change of the modifiers held share a frame rather than each sending one:
+/// a tenth of a second, and a quarter of one for frames no input asked for, four turns of a
+/// spinner a second rather than ten.
+const REMOTE_FRAME_FLOOR: FrameFloor = FrameFloor {
+    input: std::time::Duration::from_millis(100),
+    idle: std::time::Duration::from_millis(250),
+};
 
-/// Whether the window goes to an X server across the network, as `ssh -X` and `ssh -Y` set it
-/// up: in an SSH session (`ssh`) with `display` (`DISPLAY`) naming a host, such as
-/// `localhost:10.0`, where sshd forwards it, rather than `:0`, a local server's socket. Not with
-/// `wayland` (`WAYLAND_DISPLAY`) set, where the window is a Wayland one.
-fn remote_x11(display: Option<&str>, wayland: Option<&str>, ssh: bool) -> bool {
-    if !ssh || wayland.is_some_and(|w| !w.is_empty()) {
+/// The shortest time between two frames drawn in software on this computer, where there may
+/// be no vsync to wait for: one frame at 60 Hz, and one at 30 Hz for frames no input asked for.
+const SOFTWARE_FRAME_FLOOR: FrameFloor = FrameFloor {
+    input: std::time::Duration::from_micros(16_667),
+    idle: std::time::Duration::from_micros(33_333),
+};
+
+/// Whether the window goes to an X server across the network: `display` (`DISPLAY`) names a
+/// host, such as `localhost:10.0` where `ssh -X` and `ssh -Y` forward it, or another computer's
+/// address, rather than `:0`, a local server's socket. That holds outside the SSH session too,
+/// as under `sudo`, which keeps `DISPLAY` but not `SSH_CONNECTION`. Not with `wayland`
+/// (`WAYLAND_DISPLAY`) set, where the window is a Wayland one, nor in WSL (`wsl`) outside an
+/// SSH session (`ssh`), where an X server on Windows, such as VcXsrv, is named by its address.
+fn remote_x11(display: Option<&str>, wayland: Option<&str>, wsl: bool, ssh: bool) -> bool {
+    if (wsl && !ssh) || wayland.is_some_and(|w| !w.is_empty()) {
         return false;
     }
     display
@@ -13358,6 +13400,7 @@ fn remote_x11_here() -> bool {
     remote_x11(
         var("DISPLAY").as_deref(),
         var("WAYLAND_DISPLAY").as_deref(),
+        var("WSL_DISTRO_NAME").is_some() || var("WSL_INTEROP").is_some(),
         var("SSH_CONNECTION").is_some() || var("SSH_CLIENT").is_some(),
     )
 }
@@ -13403,7 +13446,12 @@ impl eframe::App for OxideMergeApp {
 
     /// Takes Ctrl+Tab before egui sees it: egui moves the keyboard focus on Tab whatever the
     /// modifiers, which would leave a button focused and the view's keys off.
+    ///
+    /// Also notes whether the frame answers input, which [`FrameFloor`] paces apart from others.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.input_frame = !raw.events.is_empty()
+            || !raw.dropped_files.is_empty()
+            || !raw.hovered_files.is_empty();
         raw.events.retain(|e| match e {
             egui::Event::Key {
                 key: egui::Key::Tab,
@@ -13427,19 +13475,20 @@ impl eframe::App for OxideMergeApp {
     fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
         // Drawn in software, a window may have no vsync (Mesa before 21 cannot set it), and an
         // animation such as a spinner, which asks for the next frame at once, would then draw
-        // as fast as the processor allows. Frames are kept one 60 Hz frame apart there, and a
-        // tenth of a second apart on a display sent across the network (`ssh -X`).
+        // as fast as the processor allows. Frames are kept apart there, and further apart on a
+        // display sent across the network (`ssh -X`); see [`FrameFloor`]. The frame after one
+        // that answers input is paced as that one, as work a key starts may take two frames.
         let floor = *self.frame_floor.get_or_insert_with(|| {
             use eframe::glow::HasContext;
-            let gl = frame.gl()?;
-            frame_floor(
-                &unsafe { gl.get_parameter_string(eframe::glow::RENDERER) },
-                remote_x11_here(),
-            )
+            let renderer = frame
+                .gl()
+                .map(|gl| unsafe { gl.get_parameter_string(eframe::glow::RENDERER) });
+            frame_floor(renderer.as_deref().unwrap_or(""), remote_x11_here())
         });
-        if floor.is_some() {
+        let input = std::mem::replace(&mut self.after_input, self.input_frame) || self.input_frame;
+        if let Some(floor) = floor.map(|f| f.of(input)) {
             let since_last = self.last_frame.map(|t| t.elapsed());
-            if let Some(pause) = frame_pause(floor, since_last) {
+            if let Some(pause) = frame_pause(Some(floor), since_last) {
                 std::thread::sleep(pause);
             }
             self.last_frame = Some(std::time::Instant::now());

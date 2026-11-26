@@ -23,11 +23,13 @@ release on GitHub uses its section of this file as the release notes.
   *Reduce motion*, without changing that option: a jump to a difference far away is drawn in one
   frame instead of scrolling there over a dozen frames, each a whole window drawn by the
   processor.
-- On an X11 display sent across the network, as `ssh -X` and `ssh -Y` set it up (an SSH session
-  with a `DISPLAY` that names a host, such as `localhost:10.0`), frames are kept a tenth of a
+- On an X11 display sent across the network, as `ssh -X` and `ssh -Y` set it up (a `DISPLAY`
+  that names a host, such as `localhost:10.0`, under `sudo` too), frames are kept a tenth of a
   second apart and animations are off. Each frame is the whole window sent as pixels, megabytes
   with OpenGL drawn in software, so a key's press, its release and the change of the modifiers
-  now share a frame, and *Next difference* sends fewer of them. Comparing the files over SFTP
+  now share a frame, and *Next difference* sends fewer of them. Frames no input asks for, such
+  as a spinner's while a folder loads, are a quarter of a second apart there, and one 30 Hz
+  frame apart with OpenGL drawn in software. Comparing the files over SFTP
   from OxideMerge on your own computer, or a remote desktop, is still much faster.
 
 ### Fixed

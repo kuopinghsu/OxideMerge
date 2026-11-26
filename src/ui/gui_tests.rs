@@ -2417,8 +2417,10 @@ fn spreadsheets_are_compared_as_tables() {
             ),
             (
                 "xl/sharedStrings.xml",
-                format!("<sst xmlns=\"{ns}\"><si><t>item</t></si><si><t>price</t></si>\
-                         <si><t>apple</t></si></sst>"),
+                format!(
+                    "<sst xmlns=\"{ns}\"><si><t>item</t></si><si><t>price</t></si>\
+                         <si><t>apple</t></si></sst>"
+                ),
             ),
             (
                 "xl/worksheets/sheet1.xml",
@@ -4099,8 +4101,9 @@ fn software_opengl_is_told_from_hardware_by_its_name() {
     }
 }
 
-/// An X11 display sent across the network is told by an SSH session with a `DISPLAY` that
-/// names a host, as `ssh -X` sets it up; a local server's socket and Wayland are not.
+/// An X11 display sent across the network is told by a `DISPLAY` that names a host, as
+/// `ssh -X` sets it up, in the SSH session or out of it, as under `sudo`; a local server's
+/// socket, Wayland and an X server on Windows seen from WSL are not.
 #[test]
 fn remote_x11_displays_are_told_apart() {
     for display in [
@@ -4109,23 +4112,37 @@ fn remote_x11_displays_are_told_apart() {
         "myhost:10",
         "[::1]:10.0",
     ] {
-        assert!(remote_x11(Some(display), None, true), "{display}");
-    }
-    for (display, wayland, ssh) in [
-        (Some(":0"), None, true),
-        (Some(":20.0"), None, true),
-        (Some("unix:0"), None, true),
-        (Some("localhost:10.0"), None, false),
-        (Some("localhost:10.0"), Some("wayland-0"), true),
-        (None, None, true),
-    ] {
-        assert!(
-            !remote_x11(display, wayland, ssh),
-            "{display:?} {wayland:?} {ssh}"
-        );
+        for ssh in [true, false] {
+            assert!(
+                remote_x11(Some(display), None, false, ssh),
+                "{display} {ssh}"
+            );
+        }
     }
     assert!(
-        remote_x11(Some("localhost:10.0"), Some(""), true),
+        remote_x11(Some("localhost:10.0"), None, true, true),
+        "ssh -X into WSL"
+    );
+    for (display, wayland) in [
+        (Some(":0"), None),
+        (Some(":20.0"), None),
+        (Some("unix:0"), None),
+        (Some("localhost:10.0"), Some("wayland-0")),
+        (None, None),
+    ] {
+        for ssh in [true, false] {
+            assert!(
+                !remote_x11(display, wayland, false, ssh),
+                "{display:?} {wayland:?} {ssh}"
+            );
+        }
+    }
+    assert!(
+        !remote_x11(Some("192.0.2.1:0"), None, true, false),
+        "VcXsrv on Windows, seen from WSL"
+    );
+    assert!(
+        remote_x11(Some("localhost:10.0"), Some(""), false, true),
         "an empty WAYLAND_DISPLAY"
     );
 }
@@ -4135,24 +4152,32 @@ fn remote_x11_displays_are_told_apart() {
 #[test]
 fn frames_drawn_in_software_are_kept_apart() {
     use std::time::Duration;
-    let floor = frame_floor("llvmpipe (LLVM 10.0.1, 256 bits)", false);
-    assert_eq!(floor, Some(Duration::from_micros(16_667)));
+    let ms = Duration::from_millis;
+    let software = frame_floor("llvmpipe (LLVM 10.0.1, 256 bits)", false).unwrap();
+    assert_eq!(software.of(true), Duration::from_micros(16_667));
+    assert_eq!(
+        software.of(false),
+        Duration::from_micros(33_333),
+        "a spinner"
+    );
+    let floor = Some(software.of(true));
     assert_eq!(
         frame_floor("NVIDIA GeForce RTX 3080/PCIe/SSE2", false),
         None
     );
-    // Sent across the network, frames are a tenth of a second apart, whatever draws them.
+    // Sent across the network, frames are a tenth of a second apart, whatever draws them, and
+    // a quarter of one when no input asked for them.
     for renderer in [
         "llvmpipe (LLVM 11.0.0, 256 bits)",
         "NVIDIA GeForce RTX 3080/PCIe/SSE2",
     ] {
+        let remote = frame_floor(renderer, true).unwrap();
         assert_eq!(
-            frame_floor(renderer, true),
-            Some(Duration::from_millis(100)),
+            (remote.of(true), remote.of(false)),
+            (ms(100), ms(250)),
             "{renderer}"
         );
     }
-    let ms = Duration::from_millis;
     assert_eq!(frame_pause(floor, None), None, "the first frame");
     assert_eq!(
         frame_pause(floor, Some(ms(4))),
@@ -4167,7 +4192,10 @@ fn frames_drawn_in_software_are_kept_apart() {
 
     // In the window: frames asked for one after another are held that far apart.
     let mut gui = Gui::start("frame_floor", None);
-    gui.app.frame_floor = Some(Some(ms(40)));
+    gui.app.frame_floor = Some(Some(FrameFloor {
+        input: ms(40),
+        idle: ms(40),
+    }));
     gui.frame();
     let start = Instant::now();
     gui.frames(3);
@@ -4176,6 +4204,19 @@ fn frames_drawn_in_software_are_kept_apart() {
         "three frames in {:?}",
         start.elapsed()
     );
+    // A frame with no input, such as a spinner's, is told apart from one that answers a key.
+    let mut raw = egui::RawInput::default();
+    eframe::App::raw_input_hook(&mut gui.app, &gui.ctx, &mut raw);
+    assert!(!gui.app.input_frame);
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::ArrowDown,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::ALT,
+    });
+    eframe::App::raw_input_hook(&mut gui.app, &gui.ctx, &mut raw);
+    assert!(gui.app.input_frame);
     // Animations, such as the scroll to a difference far away, are turned off there.
     assert_eq!(gui.ctx.global_style().animation_time, 0.0);
     assert!(!gui.app.cfg.reduce_motion, "the setting is left as it is");

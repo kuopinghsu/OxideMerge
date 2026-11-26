@@ -320,15 +320,19 @@ AppImage job runs `scripts/patch-glutin.sh` before it builds, and the script app
   there. A program built with plain `cargo build` is not patched either.
 - Where the swap interval cannot be set, the window has no vsync. With OpenGL drawn in software
   (`GL_RENDERER` llvmpipe, softpipe or swrast), OxideMerge keeps its frames one 60 Hz frame apart,
-  so an animation such as a spinner does not draw as fast as the processor allows. It also turns
+  and frames no input asks for, such as a spinner's, one 30 Hz frame apart, so an animation does
+  not draw as fast as the processor allows. It also turns
   off animations there, as the Reduce motion option does, without changing that option: each frame
   is a whole window drawn by the processor, and over a remote desktop also sent across the network,
   so a jump to a difference far away, which scrolls over a dozen frames, could take seconds.
-- On an X11 display sent across the network, as `ssh -X` and `ssh -Y` set it up (an SSH session
-  with a `DISPLAY` that names a host, such as `localhost:10.0`, and no `WAYLAND_DISPLAY`),
-  frames are kept a tenth of a second apart and animations are off. Each frame is the whole
-  window, megabytes of pixels with OpenGL drawn in software, so a key's press, its release and
-  the change of the modifiers then share a frame. Comparing the files over SFTP from OxideMerge
+- On an X11 display sent across the network, as `ssh -X` and `ssh -Y` set it up (a `DISPLAY` that
+  names a host, such as `localhost:10.0`, and no `WAYLAND_DISPLAY`; under `sudo` too, which drops
+  `SSH_CONNECTION`; in WSL only in an SSH session, as an X server on Windows such as VcXsrv is
+  named by its address), frames are kept a tenth of a second apart and animations are off. Frames
+  no input asks for, such as a spinner's or a check on work in progress, are a quarter of a second
+  apart. Each frame is the whole window, megabytes of pixels with OpenGL drawn in software, so a
+  key's press, its release and the change of the modifiers then share a frame. `ssh -C` (or
+  `Compression yes`) helps a lot: the mostly flat colors of a frame compress well. Comparing the files over SFTP from OxideMerge
   on the user's own computer, or a remote desktop such as NoMachine, X2Go or VNC, is much faster.
 
 When `Cargo.lock` moves to another glutin version, the script stops with "No patch for glutin
