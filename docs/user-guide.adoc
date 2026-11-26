@@ -47,10 +47,11 @@ familiar with a terminal and with your version-control system.
 
 === How this guide is organized
 
-* <<introduction>> describes what OxideMerge does, the conventions of this guide and the terms that
+* <<introduction>> describes what OxideMerge does, how to read this guide and the terms that
   it uses.
 * The installation and getting-started chapters take you from download to your first comparison.
-* The chapters from <<text-comparison>> to <<web-comparison>> explain each kind of comparison.
+* The chapters from <<text-comparison>> to <<remote-sftp>> cover text and merging, folders,
+  archives, binary files, images, documents, web pages and files on servers.
 * <<differences-shown>>, <<reports>> and <<analysis>> explain how to focus a comparison, share the
   results and analyze changes.
 * <<command-line>>, <<integration>>, <<options>> and <<keyboard-shortcuts>> are reference material.
@@ -79,8 +80,14 @@ Before you report a problem, see <<troubleshooting>> and <<limitations>>.
 |===
 |Version |Date |Changes
 
-|0.9.8
+|0.9.10
 |Unreleased
+|Moved server, document and archive comparisons into separate chapters.
+Simplified English instructions and revised Traditional Chinese wording.
+Aligned the two guides and updated descriptions of number comparison and synchronization.
+
+|0.9.8
+|2026-11-12
 |Text rewritten for clarity and consistency.
 Added this preface, the Perforce setup instructions, an example of compare rules, SFTP and FTP
 comparisons, document and spreadsheet comparison, folder synchronization and job files.
@@ -112,10 +119,10 @@ Added the first comparison walkthrough, workflows and synchronization points.
 [[introduction]]
 == Introduction
 
-OxideMerge shows you what changed between versions of your files and folders, and helps you combine
-those changes into the result you want. Use it to review changes to source code and configuration
-files, resolve version-control conflicts, compare two releases, or run comparisons from scripts and
-as the diff and merge tool for Git. Beyond text, it also compares folders, archives, binary files,
+OxideMerge shows the differences between versions of files and folders and helps you combine
+changes. Use it to review source code and configuration files, resolve version-control conflicts,
+or compare two releases. You can also run it from scripts or use it as the diff and merge tool
+for Git. Beyond text, it also compares folders, archives, binary files,
 images and web pages. This chapter summarizes what OxideMerge can do, explains how this guide is
 organized and defines the terms that the rest of the guide uses.
 
@@ -144,6 +151,7 @@ This guide uses these conventions:
 * Command-line examples assume that `oxidemerge` is in your `PATH`. If it is not, use the full path
   of the program.
 * Replace example paths, such as `old-folder`, with your own paths.
+* Product names, file formats and command-line options keep their original spelling.
 
 NOTE: *Keyboard shortcuts on macOS.* This guide uses the key names of Windows and Linux. On macOS,
 press Command (kbd:[⌘]) instead of kbd:[Ctrl], and Option (kbd:[⌥]) instead of kbd:[Alt]. The one
@@ -166,6 +174,10 @@ Merge:: To copy or combine changes into a destination version.
 Filter:: A rule that selects which files and folders a folder comparison includes.
 Compare rule:: A rule that changes which text differences count.
 It does not change the files.
+Snapshot:: A saved copy of content at a specific time. Later changes to the original files do not
+change the snapshot.
+Fingerprint:: A short value calculated from content to help identify it. A server key or certificate
+fingerprint lets you check that you are connecting to the expected server.
 
 IMPORTANT: A merge changes its destination. Before you copy or save, check the source, the
 destination and the output path. Make a side read-only if you only need to look at it.
@@ -375,477 +387,6 @@ TIP: To compare the clipboard's text with something you are about to paste, choo
 comparisons → Compare clipboard*. This opens a text comparison with the clipboard's current text on
 the left and a blank, writable right side; paste the second text with kbd:[Ctrl+V]. *Save* works as
 in any other unsaved comparison, because there is no file to write back to.
-
-[[remote-sftp]]
-=== Comparing over SFTP or FTP
-
-When the files you need to compare are on a server, OxideMerge can fetch them for you and write your
-changes back. *File → Files on a server → Compare over SFTP/FTP...*, and the globe button beside a
-path on the start page or in the *Select files or folders* dialog, connect to a server to fetch a
-file or folder to compare, instead of browsing the local disk.
-
-To enter an SFTP or FTP address directly, paste it into a comparison path field on the start page or
-in the *Select files or folders* dialog, then click *Compare*. You can enter an address on either
-side or both sides.
-
-----
-sftp://[username[:password]@]hostname[:port][/path/to/file_or_directory]
-sftp://ann@build.example.com:2222/var/www/site
-----
-
-An FTP address works the same way, with `ftp://`, `ftpes://` (explicit TLS) or `ftps://` (implicit
-TLS) in place of `sftp://`. FTP without a user name, or as `anonymous`, signs in anonymously; with a
-user name and no password, the connection dialog opens for the password.
-
-If an SFTP URL has no password, OxideMerge first tries SSH agent and configured keys. If that fails,
-it opens the connection dialog with the URL fields filled in and a note saying so. If you connected
-to that server before, the dialog also recalls how you signed in, such as your key file. Enter the
-password and click *Connect* to continue. The eye icon in the password field toggles visibility. You
-can also select *Private key* or *SSH agent*. *Cancel* returns to where you typed the address. If
-you include a password in the URL, percent-encode reserved characters such as `@` (`%40`) and `/`
-(`%2F`). OxideMerge removes the password from the path field when you submit it. After a comparison
-opens, its addresses appear without passwords in the start page's recent list. Select the entry to
-connect and compare again.
-
-image::sftp-connect.png[SFTP connection dialog with the password field and visibility icon]
-
-To fetch a file or folder from a server:
-
-. Choose the *Protocol*. Changing the protocol changes the *Port* to that protocol's usual one,
-  unless you typed another. The protocols are:
-** *SFTP (over SSH)*.
-** *FTPS (explicit TLS)*, which connects to the FTP port (21) and switches to TLS before signing in.
-** *FTPS (implicit TLS, port 990)*, for servers that expect TLS from the start.
-** *FTP (not encrypted)*.
-. Enter the server's *Host*, *Port* and *User*. You can also type or paste an address such as
-  `ann@build.example.com` or `sftp://ann@build.example.com:2222/var/www` into *Host*: when you leave
-  the field, its parts move to the fields they belong to. For SFTP, the host can be a `Host` alias
-  of your `~/.ssh/config`, and you can leave the user empty, as with `ssh` (see
-  <<remote-ssh-config>>).
-. For SFTP, choose how to sign in: *Password*, *Private key* (which can have a *Passphrase*), or
-  *SSH agent*. *SSH agent* uses the keys that `ssh-agent` holds (Pageant on Windows) and the keys
-  that `~/.ssh/config` names, so you type nothing here. FTP and FTPS sign in with a password.
-. If needed, open *Advanced* for a proxy, FTP's active mode or an FTPS client certificate (see
-  <<remote-advanced>>).
-. Enter the *Remote path* of the file or folder to fetch, or leave it empty to choose it from a list
-  of the server's folders and files.
-. Click *Connect*. With a *Remote path*, the file or folder is fetched. Without one, OxideMerge
-  connects and lists your home folder on the server: open the folder or choose the file you want and
-  click *OK* to fetch it.
-
-When the dialog opens, the keyboard is in the first field left to fill in: *Host*, or for a server
-you connected to before, its password or passphrase. Once a file or folder is fetched, its path
-field shows the address on the server it came from, such as
-`sftp://ann@build.example.com:22/var/www`. On the start page, a fetch that fills the last empty path
-field starts the comparison at once. A fetch into a field that already held a path only replaces it;
-click *Compare* when the other side is right.
-
-A folder is fetched without what the comparison's filter leaves out: with *Exclude Source Control*,
-for example, its `.git` and `.svn` folders are never downloaded. The filter is the one of the *Open*
-dialog, or else the one chosen for the start page. The folder comparison then shows only what that
-filter keeps, on both sides, even if you choose a wider filter afterwards, because the server's side
-has nothing else to compare, and a line above the list says so; connect again to fetch with the
-wider filter. *Reload from server* fetches the folder again with the same filter. Saving the copy
-never deletes on the server what was left out: a folder that had something left out, deleted in the
-copy, stays on the server with what it still holds there, and saving names each folder kept.
-Compares from the command line leave out what `--filter`, or the saved filter, leaves out in the
-same way.
-
-The same goes for subfolders: when the comparison does not include subfolders (*Include subfolders*
-off in the *Open* dialog, or in the folder options for the start page), a folder is fetched with its
-own files only, and its subfolders are created empty, so the comparison still shows which folders
-each side has. Turning *Include subfolders* on afterwards does not compare them, and a line above
-the list says why; connect again with it on. The comparison is not complete without subfolders, so
-it cannot be synchronized. A folder deleted in the copy stays on the server with what it holds
-there. From the command line, a folder is fetched with its subfolders when `-r` or the saved option
-asks for them, and always for synchronization, merge plans, baselines, release reports and
-`--impact`.
-
-Copying a folder to a side fetched this way copies only what the comparison shows: not what the
-filter left out, and nothing to or from a folder the server side has only as an empty one, which
-would meet files there that were never fetched; the status bar says so. Connect again with the
-filter or *Include subfolders* you need to copy those.
-
-The folder button connects and opens a chooser in place of the dialog, listing the folder of the
-*Remote path*, or your home folder on the server if the *Remote path* is empty. The chooser keeps
-the same size however many entries a folder has: the list scrolls inside it, and a name too long for
-it is cut short. Folders come first, then files with their sizes; hidden entries, whose names start
-with a dot, come last in each group. Click a file or a folder to choose it; double-click a folder to
-open it. The list is a tree: the arrow before a folder shows what is in it, in place under it, and
-the arrow closes it again. A folder is listed the first time you open it, not before, so a large
-server is never listed as a whole. The path at the bottom of the chooser follows what you click: the
-file or folder you chose. When you opened the chooser with the folder button, *OK* returns to the
-dialog with that path as the *Remote path*, ready for *Connect*; when *Connect* opened it, *OK*
-fetches that path. *Cancel* or Esc returns to the dialog with the *Remote path* as it was.
-Double-click a file to fetch it immediately. The bar above the list names the server and each folder
-on the way to the one shown; click any of them to open it. The up-arrow button opens the folder
-above, and the refresh button lists the folder again. With the keyboard, the arrow keys, Page Up,
-Page Down, Home and End move through the list, Enter opens the folder you are on or accepts the file
-you chose, and Backspace opens the folder above. Right opens the folder you are on in place and Left
-closes it; Left on an entry inside a folder goes out to that folder.
-
-Each entry has a check box at the left of the list. Tick several entries, files and folders together
-and as many as you like, to compare them with another folder: *OK* (or Enter) fetches only those, as
-a copy of the folder shown that holds nothing else, into the path field. Choose the other side as
-usual, a local folder or one on a server, and compare. Ticking a folder ticks everything in it,
-including what you only open later; unticking an entry inside it unticks the folder and keeps the
-rest of its contents ticked. The copy is of the deepest folder all the ticked entries are in: tick
-`tasks.c` and `list.c` inside `upload/FreeRTOS-Kernel`, opened in place, and the copy is of
-`FreeRTOS-Kernel`, to compare with a local `FreeRTOS-Kernel`. Entries in different folders keep
-their place under those folders in the copy. The folder comparison then shows only the ticked
-entries, on both sides: what they hold, and the folders on the way to them, but nothing else the
-other folder has. The ticked entries are compared with their subfolders, whether or not *Include
-subfolders* is on. Saving the copy writes back what you changed in it; the server's other entries
-are left alone, and *Reload from server* fetches only the ticked entries again. *List folders
-without downloading files* does not apply here: ticked entries are downloaded. Deleting a folder in
-the copy that holds only some of what it has on the server deletes those entries there, and leaves
-the folder with the rest. Of two names that differ only in case, Windows and macOS keep the first
-one ticked.
-
-To compare entries of one server with each other instead, select two or three and click *Compare
-selected*:
-
-* kbd:[Ctrl]-click (kbd:[Cmd]-click on macOS) adds an entry to the selection or takes it out, and
-  kbd:[Shift]-click selects from the entry selected last to the one you click.
-* With the keyboard, kbd:[Shift] with an arrow key extends the selection, kbd:[Ctrl] with an arrow
-  key moves without changing it, Space selects or deselects the entry you are on, and kbd:[Ctrl+A]
-  selects everything shown.
-* Two files open as a file compare and three as a three-way compare; two or three folders open as a
-  folder compare. The entries are compared in the order the list shows them, and they can be in
-  different folders of the tree.
-* The line under the list says how many entries are selected, or why *Compare selected* cannot take
-  them: only one is selected, files are selected together with folders, or more than three are
-  selected. *OK* takes them in any of those cases.
-
-The selected files or folders are fetched like any other remote path, with the same window to
-*Cancel* the fetch, which returns to the chooser. With *List folders without downloading files* set,
-two or three selected SFTP folders are compared from their listings (see below). A path that does
-not exist lists the nearest folder above it. If the server refuses a folder or the connection drops,
-the list says why; refresh or *Retry* asks again. The chooser stays connected while it is shown, so
-moving between folders does not sign in again each time. A folder shows its first 10,000 entries.
-
-The fetched path then fills in the *Left*, *Middle* or *Right* path, the same as a local path. To
-compare two remote locations with each other, connect again for the other side. To compare a remote
-path with a local one, leave the other side local. OxideMerge remembers the last ten servers you
-connected to, in its settings file, so they are there the next time you start it: the protocol,
-host, port, user, how you signed in and the key file's path. The dialog starts with the last one
-filled in, so that you can fetch a second path from the same server, and *Recent* at the top of the
-dialog lists the others; choose one to fill in its settings. The button beside *Recent* removes the
-server shown from the list. A password or a key's passphrase is never saved or filled in this way;
-type it each time. While waiting, the window says what it is doing and for how long: connecting to
-the server, then fetching, with the bytes and, for a folder, the number of entries that have
-arrived. The folder chooser shows the same while it lists a folder, with the entries received so
-far.
-
-A fetched *file* is writable. When you edit it, *Save* uploads it back to the server over a fresh
-connection in the background. If the server's path is a link, the file it points to is updated. If
-the server's file changed or disappeared after you fetched it, the upload is refused before writing.
-
-Over SFTP, the upload goes to a hidden temporary file beside the original, named
-`.NAME.oxidemerge-new-...` and ending in the original's extension (`.config.oxidemerge-new-....php`
-for `config.php`), so a web server never shows a script's source as text. Only you can read that
-copy until it is checked. OxideMerge then reads that copy back and compares it with the file here.
-Only a complete, matching copy is given the original's owner, group and permissions (set-user-ID and
-set-group-ID bits included) and replaces the original. If someone else puts another file or a link
-in the copy's place meanwhile, the save is refused. Just before the swap, OxideMerge checks again
-that nobody else changed the file on the server. So a dropped connection, a full disk or *Cancel*
-leaves the server's file as it was, and the message says so.
-
-Most SFTP servers, OpenSSH's included, cannot rename one file over another in one step. OxideMerge
-then renames the original aside first (`.NAME.oxidemerge-old-...`), renames the new copy into its
-place, and deletes the original. For that moment the file is missing, but it is never partly
-written. If the connection drops between the two renames, the message names the file that holds the
-other version, so you can check the server and rename it back if needed. A temporary file that could
-not be removed is named the same way, and you can delete it. If only the original renamed aside
-cannot be deleted once the new copy is in its place, the file is saved all the same, and a warning
-names the copy to delete. A connection that drops just after the new copy took the original's place
-does not fail the save either.
-
-A copy that replaces the original is a new file. It keeps the original's owner, group and
-permissions, but not its access-control lists (ACLs). It is not one of the original's hard links
-either. SFTP cannot show these, so OxideMerge cannot tell when a file has them. For a server where
-that matters, turn on *File → Files on a server → Save remote files in place*: *Save* then writes
-over the original in place, which keeps them.
-
-OxideMerge also writes in place, without asking, in four cases:
-
-* The file belongs to someone else.
-* No new file can be created in its folder.
-* The server does not show who owns the file.
-* The server does not rename files.
-
-Over FTP, *Save* always writes in place, because FTP cannot set a new file's owner or permissions.
-
-An upload in place can be cancelled until it starts writing. After that, a dropped connection can
-leave the file partly written on the server. The message says so, and choosing *Save* again finishes
-writing it.
-
-Your edits stay in the tab, and you can compare them with the server's version. Until an upload
-succeeds, the tab counts as unsaved, so closing it or quitting asks first, and *Save* tries again.
-When you close a tab with *Save*, the tab waits for its upload to finish before it closes.
-
-*Comparing SFTP folders from listings*
-
-By default, *Connect* fetches a folder whole and it opens in the usual folder comparison, which
-shows every difference at once (see below for saving back to the server). For folders too large to
-fetch, select *List folders without downloading files* in the SFTP connection dialog; it is off by
-default. Use it to compare two or three folders, any of them on SFTP servers. The comparison shows
-rows as the listings arrive. With three folders, a file that not all of them have is shown as *Left
-only*, *Middle only* or *Right only*, or as missing in one of them, and a file is verified or opened
-when all three have it: verifying says whether all three hold the same, and opening gives a
-three-way compare. *Metadata match* means that size and modification time match within the
-configured tolerance. Use *Verify Selected* or *Verify All* to check the contents of paired files.
-*Binary contents* compares the bytes, and *Full contents* applies the comparison options for the
-file type.
-
-The list is a table with a column for the name, the state and the size on each side. Each state has
-its own color and mark: red for contents that differ, amber for metadata that differs, green for
-contents read and found the same, and the side's color for a file only one side has. The row above
-the list counts the files in each state, those that differ first. While something is running, a
-strip below the toolbar shows how far it is: the number of entries listed so far, the files verified
-out of those to verify, or the bytes fetched of a file being opened. Until the server is reached,
-the strip says that it is connecting. The files a verification has yet to read show a spinner in
-their state. *Stop* in the strip ends it.
-
-Verifying does not open a comparison: it marks each file's state in the list. When it is done, a
-line over the list says how many files differ and how many match, and after *Verify All* the first
-file that differs is selected and scrolled into view; double-click it to compare. What a
-verification fetched is kept until you refresh. *Verify All* reads only the files not verified since
-the last refresh, so clicking it again fetches nothing; *Verify Selected* reads the selected file
-again. Opening a verified pair uses the copies the verification fetched, without another download.
-Files larger than 32 MB compared as *Binary contents* are compared as they arrive and are not kept,
-and at most 512 MB of copies are kept; those are fetched again when opened. *Refresh*, or saving a
-file to the server, discards what was kept for it and reads it again.
-
-Double-click a paired file to open it in a separate comparison, or choose *Open File Comparison*.
-OxideMerge fetches the selected remote files and uploads your edits when you save them. Use
-*Refresh* in the folder comparison to get an updated listing. For folder-wide copy, delete or save
-operations, leave *List folders without downloading files* cleared when connecting to each remote
-folder.
-
-A fully fetched *folder* is writable too. Copy or delete files in the folder comparison, or open a
-file from it and edit it. *Save* then writes what changed back to the server:
-
-* Files that are new or whose contents changed are uploaded.
-* Folders that are new are created.
-* Files and folders that were removed are deleted on the server.
-
-Files that you did not change are not sent again. Before each upload or deletion, OxideMerge checks
-that the server's file is still the one it fetched. A file that changed on the server in the
-meantime is neither overwritten nor deleted, and a new file whose name was created on the server in
-the meantime is not overwritten. A file that changed within a few seconds before it was fetched is
-also checked by its contents, because a second change in the same second would leave its size and
-time unchanged. The message after the save lists those files. Your copies stay in the tab, so you
-can compare them with the server's files and save again. The rest is written as usual. Until every
-change is written, the tab counts as unsaved. If the folder's local copy is gone, or part of it
-cannot be read, nothing is written, so a file that could not be read is never deleted on the server.
-
-Files are uploaded before the removed files are deleted. As a result, a file that you moved to
-another folder is deleted from its old place only once its new copy is on the server; if that upload
-fails, the old copy stays. A symbolic link or special file in the fetched copy, or a name that is
-not valid Unicode, is never uploaded and never counts as removed. The server's file stays as it is,
-and the message after the save names it.
-
-So that a very large folder cannot be fetched by mistake, a fetch is limited to 4 GiB, 50,000 files
-and folders, and folders nested 64 deep. Names that cannot be file names on this computer are left
-out. So is the second of two names that this computer cannot keep apart, such as `A.txt` and `a.txt`
-where letter case does not count. No `.bak` backups are made inside a fetched copy, because saving
-would upload them.
-
-*File → Files on a server → Reload from server* fetches the server's copy of the current tab's
-remote file or folder again, over a fresh connection, and shows it in place of the copy fetched
-before. If this would replace changes that are not saved to the server yet, OxideMerge asks first.
-Edits of a remote file are then replaced (*Undo* brings them back), and edits of a local side are
-kept.
-
-On FTP and FTPS, OxideMerge detects whether a file changed on the server by its size and the
-modification time that the server reports. For a server that reports no modification time, it reads
-the file and compares its contents instead. Servers that cannot list folders in the standard
-machine-readable way (`MLSD`) are read from their plain listing instead, and links are followed to
-the file or folder they point to. Transfers use passive mode unless *Active mode* is set (see
-<<remote-advanced>>), and always connect to the server that the sign-in went to.
-
-Over FTPS, a download whose connection ended without TLS's closing message, which anyone in between
-could cause, is checked against the size that the server reports, and refused if it came up short.
-Many FTPS servers, such as ProFTPD and vsftpd, require each transfer to resume the TLS session of
-the sign-in. Each session ticket that a server gives for this is good for one transfer, so when the
-tickets run out, OxideMerge signs in again before the next transfer.
-
-IMPORTANT: Plain FTP sends your password and your files unencrypted: anyone on the network between
-you and the server can read them, and the dialog says so. Use FTPS or SFTP whenever the server
-offers them.
-
-The connection, including the password or the key's passphrase, is kept only in memory for as long
-as the tab stays open, and the password is overwritten in memory once it is no longer needed. It is
-never written to the settings file. Tabs that show a fetched file or folder are left out of saved
-workspaces (see <<workspaces>>), of the session that OxideMerge reopens on its own at startup, and
-of the recent paths, because their temporary copies are gone after the app closes. To compare the
-same remote path again, connect again.
-
-Before the password or key is sent, OxideMerge checks the server's host key. It first reads your own
-SSH `~/.ssh/known_hosts` the way `ssh` does: host patterns such as `*.example.com` or
-`!host.example.com`, in any letter case, and names hashed by `ssh-keygen -H` all match, and a server
-on a port other than 22 is found under `[host]:port`. A server listed there with the same key is
-trusted, provided that the key also matches the one that OxideMerge saved for that server, if there
-is one. A server listed there with a different key of the same type, or whose key is marked
-`@revoked` there, is refused, as `ssh` refuses it. If the server was reinstalled, remove its old key
-with `ssh-keygen -R host` (or `ssh-keygen -R "[host]:port"`) and connect again. OxideMerge also
-checks its own `known_hosts` file, next to its settings file. The first time you connect to a server
-that is found in neither file, OxideMerge shows the key's type and fingerprint (`SHA256:...`, as
-`ssh` shows it) and asks whether to trust it. Compare the fingerprint with the one that the server's
-administrator gives you before you click *Trust and connect*. A warning is shown when your
-`~/.ssh/known_hosts` lists only keys of other types for that server.
-
-A server can also prove its identity with a host certificate, signed by an authority that your
-`~/.ssh/known_hosts` names in a `@cert-authority` line, such as
-`@cert-authority *.example.com ssh-ed25519 AAAA...`. OxideMerge asks for a certificate only from a
-server that such a line names. It trusts the certificate, without asking you first, when that
-authority signed it, it names the server (or its `HostKeyAlias`) among its principals, it is valid
-now, and it has no critical options. A certificate that fails any of these checks is refused, and so
-is one whose authority or key is marked `@revoked`. Certificates signed with Ed25519, ECDSA (P-256
-or P-384) or RSA with SHA-2 are checked; an authority that uses another algorithm, such as RSA with
-SHA-1 or ECDSA P-521, is refused. A certificate from a server for which no authority is named is
-checked like its plain key.
-
-On every later connection, the key is checked against the one remembered. If it no longer matches,
-OxideMerge refuses the connection rather than trust a server that may not be the one you expect.
-This usually means that the server was rebuilt or reinstalled. If you are sure that this is what
-happened, remove that server's old entries from OxideMerge's `known_hosts` file (`host:port`
-followed by its key) and connect again. If either `known_hosts` file exists but cannot be read, or
-holds a line that OxideMerge cannot read (any line of its own file, or a line of
-`~/.ssh/known_hosts` for a key type it checks), OxideMerge connects to no server until it can.
-
-FTPS servers are checked the way a web browser checks a website: their certificate must be valid for
-the host name and vouched for by a well-known certificate authority. Many FTP servers have a
-self-signed certificate instead. The first time you connect to one, OxideMerge shows the
-certificate's fingerprint and asks whether to trust it, as for an unknown SSH host key. Once
-trusted, the certificate is remembered in the `known_certs` file next to the settings file
-(`oxidemerge-known_certs` in portable use), and a later connection that shows another certificate is
-refused. If the server's certificate was renewed, remove the server's line (`host:port` followed by
-the certificate) from that file. In both cases, the certificate is checked before the password is
-sent, and a server that does not offer TLS is refused for FTPS rather than signed in to without it.
-
-[[remote-ssh-config]]
-==== SSH configuration, jump hosts and sign-in questions
-
-OxideMerge reaches an SFTP server the way `ssh` reaches it, as your `~/.ssh/config` (and the
-system's `/etc/ssh/ssh_config`) specifies. A *Host* such as `prod` can be an alias there, and its
-block can set the `HostName`, `User`, `Port`, `IdentityFile` (with `IdentitiesOnly`), `HostKeyAlias`
-(the name under which its key is looked up and certified) and `UserKnownHostsFile`. A `#` that
-starts a word begins a comment. `Include` is read in place, skipping files whose names start with a
-dot unless the pattern's file name does too. `Match` blocks on `host` (the `HostName` set so far, as
-in `ssh`), `originalhost`, `user`, `localuser` or `all` apply; `Match exec` is never run. As in
-`ssh`, the first value found wins, and a user, or a port other than 22, typed in the dialog wins
-over the file. In an address on the command line, any port written wins, `:22` included. Without a
-user, the file's `User` or your own user name is used.
-
-A server that is reached through jump hosts (`ProxyJump bastion` or `ProxyJump user@hop1,hop2:2222`)
-is connected to through each in turn, up to 8, as `ssh -J` does. A jump host signs in with the SSH
-agent's keys and the keys that its own block names, and its key is checked like the server's before
-anything is sent to it. A `ProxyCommand` is run as `ssh` runs it, by the shell, with `%h`, `%p`,
-`%r` and `%n` filled in, and the connection goes through it. As in OpenSSH, a host or user name that
-contains characters the shell would act on (quotes, `$`, `;`, `|`, spaces and the like), or that
-starts with `-`, is refused before any command runs.
-
-A server can ask questions while you sign in (*keyboard-interactive* sign-in), such as a one-time
-code, a second factor or a new password. OxideMerge shows them in a *Sign-in question* window that
-names the server. The answers are hidden unless the server says that they may be shown; *Cancel*
-declines. The password you gave answers a server's single password question automatically. For a
-private key that is encrypted and was given without a passphrase, the passphrase is asked for the
-same way; when the key's `.pub` file is beside it, only after the server has said that it would take
-the key. A password that the server refused is not sent again. For servers that need more than one
-way of signing in, the ways are tried in turn, starting with the one you chose.
-
-[[remote-advanced]]
-==== Proxies, active mode and client certificates
-
-*Advanced* in the connection dialog holds settings that most servers do not need:
-
-* *Proxy*: connect through a SOCKS5 proxy (`socks5://host:1080`, or `socks5://user@host:1080` with a
-  *Proxy password*) or an HTTP proxy that allows `CONNECT` (`http://host:8080`). A password typed
-  into the address moves to *Proxy password*, where it is hidden, once you leave the field. Both
-  SFTP and FTP use the proxy, every FTP data connection included. For the servers that a jump host
-  or a `ProxyCommand` from `~/.ssh/config` applies to, that is used instead of the proxy; the first
-  jump host is reached through the proxy.
-* *Active mode* (FTP): for servers that refuse passive mode, the server connects back to this
-  computer for each transfer (`EPRT`, or `PORT` for a server without it). A data connection is
-  accepted only from the server's address. Active mode cannot go through a proxy, and usually does
-  not work from behind a router that translates addresses (NAT) or a firewall that blocks incoming
-  connections.
-* *Client certificate* and *Certificate key* (FTPS): a certificate to present to a server that asks
-  for one, in PEM, with its private key in the same file or in the key file. The key must not be
-  encrypted.
-
-The proxy's address, active mode and the certificate's files are remembered with each recent server,
-but never the proxy password.
-
-[[remote-command-line]]
-==== Server paths on the command line and in jobs
-
-On the command line and in job files (see <<jobs>>), a path can also be a file or folder on a
-server, written as an address:
-
-[source,sh]
-----
-oxidemerge sftp://ann@build.example.com/var/www/site ./site     # SFTP, port 22
-oxidemerge ftpes://ann@ftp.example.com/public/index.html index.html  # explicit FTPS, port 21
-oxidemerge ftps://ann@ftp.example.com:990/public ./public -r    # implicit FTPS
-oxidemerge --cli ftp://ftp.example.com/pub/README README         # anonymous plain FTP
-oxidemerge sftp://ann@host/~/notes.txt notes.txt                # in ann's home folder
-----
-
-The address has the form `scheme://[user@]host[:port]/path`. An IPv6 address goes in brackets, as in
-`sftp://ann@[2001:db8::1]/srv`. A path that starts with `/~/` is in the user's home folder on the
-server, and other characters can be written as `%XX`. For SFTP, the host can be an alias of
-`~/.ssh/config` (see <<remote-ssh-config>>), and without a user name, its `User` or your own user
-name is used. FTP without a user name signs in as `anonymous`, with `anonymous@` as the password,
-never the one in `OXIDEMERGE_REMOTE_PASSWORD`.
-
-A password never goes in the address, where anyone who can see the command line or the job file
-could read it; an address that contains one is refused. Put the password in the
-`OXIDEMERGE_REMOTE_PASSWORD` environment variable instead. SFTP signs in with `--ssh-key FILE` when
-it is given (the variable then holds the key's passphrase, if it has one), otherwise with the
-password in the variable, and otherwise with `ssh-agent` and the keys that `~/.ssh/config` names.
-FTP and FTPS need the password, unless they sign in as `anonymous`. OxideMerge removes the variable
-when it starts, so the programs it runs, such as an external tool, do not inherit it. Questions that
-a server asks while signing in, and the passphrase of an encrypted key given without one, are asked
-on the terminal without echoing the answer (*Ctrl+C* there turns the echo back on as it stops the
-program); without a terminal, they are declined.
-
-`--proxy URL` connects through a proxy, as *Proxy* does in the dialog. A proxy password is read from
-the `OXIDEMERGE_PROXY_PASSWORD` environment variable, which is also removed at startup, and a
-password in the address is refused. `--ftp-active` uses FTP's active mode. `--client-cert FILE`
-presents an FTPS client certificate, with its key from `--client-key FILE` when the key is not in
-the same file.
-
-Servers are checked as in the program, against the same `known_hosts` and `known_certs` files. A
-server that is not trusted yet is refused, and the error shows its fingerprint. Compare it with the
-fingerprint that its administrator gives you, then run the command again with
-`--trust-fingerprint SHA256:...` to trust the server; it is then remembered, as when you click
-*Trust and connect*. A server whose key or certificate changed is refused.
-
-Each server path is fetched to a temporary copy before the comparison and opened like a local path.
-In the window, *Save* writes changes back to the server as described above. Without a window, what
-the run changed in a fetched copy, as a `sync` job does in its destination, is written back to the
-server after the run, with the same checks; a file that the server changed in the meantime is
-reported as an error (exit code 2). These writes follow *File → Files on a server → Save remote
-files in place* as saved in the settings. A synchronization that stopped part way without undoing
-all it changed (exit code 5) is undone in the fetched copy instead, and nothing is written back. A
-sync plan made with `--sync-plan` names a server folder by its address, so `--sync-apply` applies it
-to the copy that its run fetches; as for local folders, the plan is refused if the files it plans to
-change are no longer as planned.
-
-NOTE: Checked on Linux with OpenSSH 10.5p1 and vsftpd 3.0.5. With a private key, SFTP refuses a
-server it has not been told to trust and shows that server's fingerprint, the same one
-`ssh-keygen -lf` prints; `--trust-fingerprint` then connects and the key is remembered. An identical
-file exits 0, a different file exits 1, and a folder compare names the file that differs. The window
-opens the fetched file as writable and shows the difference. A sync job uploads a new file.
-Uploading a shorter file replaces it in place, and an upload is refused when the file on the server
-has changed since it was fetched. Anonymous FTP used a vsftpd process running as the current user,
-with no chroot, so the remote path was the real directory. An identical file exits 0, a different
-file exits 1, and the window opens it as writable. A sync job uploads a file, and a second run
-updates it. `--ftp-active` compared an identical file and exited 0. An address that contains a
-password is refused for both.
 
 [[compare-types]]
 === Comparison types
@@ -1124,10 +665,10 @@ as in any text editor.
 * The arrow keys, kbd:[Home], kbd:[End], kbd:[PgUp] and kbd:[PgDn] move the cursor. kbd:[Ctrl+Home]
   and kbd:[Ctrl+End] go to the start and end of the file. On macOS, kbd:[Cmd+←] and kbd:[Cmd+→] go
   to the start and end of the line. With word wrap on, the up and down arrows, kbd:[PgUp] and
-  kbd:[PgDn] move by display line, so a long line takes several presses; kbd:[Home] and kbd:[End]
-  (kbd:[Cmd+←] and kbd:[Cmd+→]) first go to the start or end of the display line, and to the start
-  or end of the whole line on a second press. With kbd:[Shift] held down, each of these keys extends
-  the same selection.
+  kbd:[PgDn] move by display line. A long line may therefore take several key presses.
+  kbd:[Home] and kbd:[End] (kbd:[Cmd+←] and kbd:[Cmd+→]) first go to the start or end of the
+  display line. Press again to go to the start or end of the whole line. Hold kbd:[Shift] with
+  any of these keys to extend the selection.
 * kbd:[Tab] types a tab, or indents the lines when the selection spans more than one line or is a
   whole line; kbd:[Shift+Tab] outdents the selected lines, or the line with the cursor.
   kbd:[Ctrl+\]] and kbd:[Ctrl+[] do the same when the text cursor is in a pane. A file that indents
@@ -1198,6 +739,9 @@ The view follows the cursor that was added last, and an input method shows its c
 kbd:[Esc] first goes back to that single cursor, and so does a click without kbd:[Ctrl]. The column
 selection (kbd:[Alt]+drag) is separate: making a column selection removes the extra cursors.
 
+[[editing-status]]
+==== Editing status and read-only files
+
 The pane that has the cursor shows a colored line under its header. Where typing goes into the text,
 the cursor is a solid bar; it is thin and faint in a read-only pane, while a field such as the
 search bar has the keyboard, and while the window is in the background. Typing into a read-only pane
@@ -1225,6 +769,9 @@ The bar under each pane shows whether you can edit it:
 The status bar at the bottom of the window shows the same information for the active pane. It also
 shows *Compare only* for the Tree and Formatted views and for web pages shown as Markdown.
 
+[[column-selection]]
+==== Column selection
+
 To select a column of text, hold down kbd:[Alt] (kbd:[Option] on macOS) and drag. The selection
 covers the same columns on every line it crosses. Column selection is not available with word wrap
 or in the table view.
@@ -1249,6 +796,9 @@ Right-click a line to edit it, insert a line below it, delete it, copy its text,
 create a compare rule from it (see <<add-rule>>). Right-clicking inside selected text keeps the
 selection, and *Copy text* then copies only that text; right-clicking elsewhere moves the cursor
 there first.
+
+[[tracking-edits]]
+==== Edit markers and reloading files
 
 Edit markers in the gutter show the lines that have changed since you opened the files.
 
@@ -1330,6 +880,27 @@ session. The same setting lays out the moved blocks of a binary comparison (see
 <<binary-comparison>>). The toolbar buttons are unavailable in the inline view and the table view,
 which show no empty space either way. The layout does not change the files or the compare rules.
 
+[[inline-view]]
+==== Inline view
+
+In a two-way comparison, the *Inline view* button next to *Word wrap* shows the differences in a
+single column. The command palette offers the same command.
+
+.The inline view
+image::inline.png[Inline view]
+
+* Removed lines come first, followed by the lines that replace them. Each line shows both its old
+  and its new line number.
+* When *Collapse unchanged lines* is on, unchanged lines are hidden; click a fold to show them.
+* You can move between differences and copy them as usual, and Undo and Redo work. The arrow keys
+  move from line to line, and kbd:[Ctrl+C] copies the current line.
+* The inline view is for viewing only: a bar at its top says so, and typing, pasting, indenting and
+  *Replace* have no effect there. To edit, click *Edit side by side* on that bar, double-click a
+  line, or press kbd:[Enter] or kbd:[F2]; the side-by-side view opens with the text cursor at the
+  start of the current line.
+* Switching between the views keeps every edit and the selected difference, as well as the text
+  cursor and its selection from the side-by-side view, which return when you switch back.
+
 [[syntax-highlighting]]
 === Syntax highlighting
 
@@ -1405,36 +976,16 @@ A few extensions are used by more than one language (`.inc`, `.spec`, `.cls`, `.
 those, the first line of the file decides. A file with another extension is shown without colors.
 Very large files are not highlighted either (see <<troubleshooting>>, _Performance_).
 
-[[inline-view]]
-==== Inline view
-
-In a two-way comparison, the *Inline view* button next to *Word wrap* shows the differences in a
-single column. The command palette offers the same command.
-
-.The inline view
-image::inline.png[Inline view]
-
-* Removed lines come first, followed by the lines that replace them. Each line shows both its old
-  and its new line number.
-* When *Collapse unchanged lines* is on, unchanged lines are hidden; click a fold to show them.
-* You can move between differences and copy them as usual, and Undo and Redo work. The arrow keys
-  move from line to line, and kbd:[Ctrl+C] copies the current line.
-* The inline view is for viewing only: a bar at its top says so, and typing, pasting, indenting and
-  *Replace* have no effect there. To edit, click *Edit side by side* on that bar, double-click a
-  line, or press kbd:[Enter] or kbd:[F2]; the side-by-side view opens with the text cursor at the
-  start of the current line.
-* Switching between the views keeps every edit and the selected difference, as well as the text
-  cursor and its selection from the side-by-side view, which return when you switch back.
-
 [[table-compare]]
 === CSV and TSV files
 
 CSV and TSV files, and spreadsheets, open in the *Table* view. The *Text* / *Table* switch above the
 panes changes between the lines of the file and the table, in the same place as the *Text* /
 *Formatted* switch of documents; a workbook has all three. It compares records rather than lines, so
-a quoted field can contain line breaks. A `.csv` file is read with the delimiter that splits its
-first lines into the same number of fields most often: a comma, semicolon, tab or `|` (a comma when
-they tie), or the one an Excel `sep=` line names; the `sep=` line itself is not a row. A file keeps
+a quoted field can contain line breaks. OxideMerge detects the delimiter from the first lines of a `.csv` file. It tests commas,
+semicolons, tabs and `|`, and chooses the one that most often produces a consistent number of
+fields. A tie uses a comma. An Excel `sep=` line overrides this choice and is not treated as
+a data row. A file keeps
 the delimiter it was opened with while you edit it. Each side keeps its own delimiter, so a `.tsv`
 can be compared with a `.csv`, and a copied value is written with the delimiter of the side it goes
 to. A quote inside a field that does not start with one, as in `55" screen`, is part of the value.
@@ -2134,164 +1685,12 @@ Before it replaces or deletes a file, OxideMerge copies the file into a recovery
   a full disk, a missing permission, or a file changed since), then choose *Undo those changes*
   again.
 
-IMPORTANT: Applying a plan to several files is not a single atomic step. Each file is replaced
-atomically, but another program can see some files already changed. The trash is not used.
-
-[[documents]]
-=== Documents, spreadsheets and programs
-
-Some files are not plain text but contain text. OxideMerge reads these files itself, with nothing to
-install, so you can compare PDF files, office documents, spreadsheets, programs and notebooks by
-their content:
-
-[cols="1,3"]
-|===
-|Files |What is compared
-
-|`.pdf`
-|The text of each page, in the order in which it is drawn, with a blank line between pages,
-including the text of forms that a page draws.
-The characters come from the `ToUnicode` table that the file carries for its fonts, or from the
-encoding that the font names.
-An encrypted file is reported rather than read.
-When part of a file cannot be read, such as a stream in a compression that OxideMerge does not
-read, or a font without a table of the characters that its glyphs stand for, a line at the end
-states that the text is incomplete and why.
-A file whose text cannot be read at all is reported.
-
-|`.docx`, `.docm`, `.dotx`, `.dotm`, `.odt`, `.rtf`
-|The words of the document, one line per paragraph or heading.
-The cells of a table are separated by tabs, one row per line.
-Words shown as deleted and field codes are left out.
-
-|`.xlsx`, `.xlsm`, `.xltx`, `.xltm`, `.ods`
-|Every sheet, one line per row, with its cells separated by commas.
-A cell with several lines keeps them, and in an `.ods` sheet so do repeated spaces and tabs.
-Empty rows between rows are kept, so rows keep their places; empty rows after the last row are
-not.
-A workbook opens as a <<table-compare,table compare>>.
-With one sheet, columns, sorting and *Match rows by → Key columns* all apply.
-With more than one sheet, each sheet has a tab below the table that shows how many of its rows
-differ; the rows are matched by position, because the sheets do not form one table.
-Sheets are paired by name, so a sheet that only one side has is one whole difference.
-*Formatted values* shows numbers and dates as their number formats do, as a spreadsheet program
-shows them; turn it off to see the values as stored. The rows are compared by the stored values
-either way.
-In the text view, each sheet is named before its rows.
-
-|ELF programs, shared objects and object files
-|First, the header: class, byte order, kind, machine, ABI, entry point and the counts of the
-headers.
-Next, the program headers, one line per segment, with its type, offset, virtual and physical
-address, sizes in the file and in memory, alignment and `R`, `W`, `E` flags (plus the interpreter
-that a dynamically linked program requests).
-Then the section table, one line per section, with its name, type, address, offset, size,
-alignment and flags.
-Finally, the symbols of each symbol table (`.symtab`, `.dynsym`), sorted by name, one line per
-symbol with its address, size, type, binding, visibility and section (`UND` when the symbol is
-undefined, `ABS` for an absolute value).
-As a result, two builds line up function by function, and a function that grew or moved shows as
-a changed line.
-The mapping symbols that ARM and RISC-V assemblers add (`$x`, `$d`, …) are left out and only
-counted, and at most 100,000 symbols of a table are listed.
-
-|`.ipynb`
-|A Jupyter notebook, cell by cell: each cell appears under a line that identifies it as a code
-cell, a Markdown cell or a raw cell, followed by that cell's own source and nothing else.
-Cells are not numbered, so adding a cell does not change the label of every cell after it.
-Outputs, execution counts and other metadata that a notebook collects when it is run are left out,
-so a notebook that is re-run without changes compares as equal.
-Older nbformat 3 notebooks are read as well, with their heading cells read as Markdown headings.
-At most 20,000 cells are read; the end of the text states how many were left out.
-A notebook that cannot be read this way, such as a broken one, is compared as its JSON text.
-|===
-
-A file read this way is *read-only*: the pane states what was read (for example
-`report.docx [text of the document]`), and nothing can be edited or saved over the original. The
-text is a reading of the file, not a copy of it, so the layout, fonts, formulas and anything else
-that the format holds are not compared.
-
-You can also compare two or three `.docx` files *Formatted* by choosing that view above the panes.
-The documents are then shown as Markdown, block by block and side by side: headings, paragraphs with
-their bold, slanted and struck-through words, list items, links and tables. Each block that differs
-is highlighted together with its changed words. Tables are drawn as tables, with merged cells drawn
-across the rows and columns they cover. A row added inside a merged cell is highlighted where it is,
-and the rows that a header cell reaches down into are part of the header. An image is shown as its
-description with a short fingerprint of its picture, so a changed picture shows as a change even
-when its description is the same. *Next difference* and *Previous difference* step through the
-changed blocks. As in the text, the Formatted view leaves out headers, footers, notes and comments,
-and shows tracked changes as accepted.
-
-Workbooks (`.xlsx`, `.xlsm`) can also be compared *Formatted*, whether they have one sheet or
-several. Each sheet appears as a heading and a table. Sheets are matched by name, so a sheet that
-was added or removed shows as one whole difference. Merged cells are drawn across the cells they
-cover. Numbers are shown in their number formats: dates and times in ISO form (`2026-09-30 18:00`),
-whatever order the format puts them in, and amounts with their decimals, thousands separators,
-currency and percent signs. A formula shows the result it was saved with. A run of three or more
-empty rows is shown as one row that states how many rows there are, so a value that moved down a row
-still shows as a change. Each picture placed on a sheet is listed after its table with its
-description, the cell where it is placed and a fingerprint of the picture, so a changed or moved
-picture shows as a change. Fills, fonts, borders, the formulas themselves and charts drawn from data
-are not compared.
-
-A tagged PDF file can be compared *Formatted* as well. Most word processors tag the PDF files they
-export, marking which text is a heading, a paragraph, a list item, a table cell or a figure, and
-which cells span several rows or columns. The view is read from those tags, so a PDF made from a
-document reads much as the document itself does. Text in a bold or slanted font keeps that
-formatting, unless a whole paragraph or heading is in that font, as its style already shows it. A
-figure is shown with its alternate text and a fingerprint of its picture. Running headers, footers
-and page numbers are left out, because the file marks them as artifacts. For an untagged PDF with
-selectable text, the *Formatted (inferred)* notice means that OxideMerge estimates headings and
-paragraphs from text positions and font sizes. This works best for single-column documents. Columns
-and tables may come out in the wrong order, and scans without a text layer require OCR before they
-can be compared as text. In an untagged PDF, lines that repeat at the top or bottom of the pages,
-and page numbers, are taken for running headers and footers and left out of both the Text and the
-Formatted view, so a change made only in them is not shown. On a PDF of one page, nothing repeats; a
-line that holds only a number at its top or bottom is taken for its page number in the Formatted
-view, but kept in the Text view.
-
-The *Text* / *Formatted* switch appears above the panes when every side is a `.docx` file, every
-side is a workbook (`.xlsx`, `.xlsm`) or every side is a `.pdf` file, read by OxideMerge itself. It
-is not offered for `.odt`, `.rtf` or `.ods` files. A comparison of `.docx` or `.pdf` files opens in
-the Formatted view; a workbook opens in the Table view. The Formatted view reads the files itself
-even when a converter is set up for them under *Options → Plugins*. Whether a block differs depends
-on its text alone; the comparison options decide only which words of a changed block are
-highlighted. The view is rebuilt when a file or an option changes. While the view is shown, the
-difference counter on the toolbar still counts the differences of the text comparison, whereas *Next
-difference* and *Previous difference* step through the changed blocks of the Formatted view.
-
-The following limits and rules apply:
-
-* A PDF or RTF file can be at most 256 MiB, because it is read in full. A larger file is reported
-  rather than read.
-* Each part of a `.docx`, `.odt`, `.xlsx` or `.ods` file can be at most 64 MiB. A file with a larger
-  part, or with a part that cannot be read, is reported rather than compared without that part.
-* An ELF file can be any size: only its headers, section table and symbol tables are read, each up
-  to 64 MiB. Because two different builds can still read the same, a folder comparison by *Full
-  contents* compares programs by their bytes.
-* A PDF file can request at most 1 GiB of decoded content in total; a file that needs more is
-  reported rather than read.
-* The text read from one file can be at most 16 MiB, in the *Text* and the *Formatted* modes alike.
-  The rest is left out, and a line at the end says so.
-* In the *Formatted* mode, a table shows at most 1,048,576 cells and 1,024 columns; the rows beyond
-  that are left out, with the same line at the end. A part of more than 3 million elements is too
-  large to show formatted and is reported; the *Text* mode still reads it.
-* A workbook in which none of the listed sheets can be found is reported rather than compared as
-  empty.
-
-A converter set up under *Options → Plugins* takes precedence over this built-in reading, so you can
-always put a better reader in front, such as `pdftotext` for PDF, or Pandoc or Tika for more
-formats. The output of a converter is compared as text, even for a spreadsheet. If you turn off
-*Read documents, spreadsheets and ELF files as text* there, these files are compared as the archives
-or the bytes that they are.
-
-NOTE: The older Word `.doc` and the older Excel `.xls` formats are not read here yet; use a
-converter under *Options → Plugins* for those. A PDF holds the positions of glyphs rather than
-words, so columns, tables and ligatures may not come out as they look on the page; a converter such
-as `pdftotext -layout` reads a complex page better.
+IMPORTANT: Changes to several files do not happen all at once. Each file is replaced as a whole,
+but another program may see some files already changed while others are still unchanged.
+Synchronization does not use the trash.
 
 [[archives]]
-=== Archives
+== Comparing archives
 
 OxideMerge extracts archives and compares them as folders, so you can review and edit the contents
 of an archive in the same way as an ordinary folder. The following formats are supported:
@@ -2311,18 +1710,25 @@ password is wrong, it asks again; *Cancel* gives up opening the archive. The pas
 in memory, only while the comparison is open, and is overwritten there once it is no longer needed.
 
 Archives are extracted in the background, with a window showing which ones and a *Cancel* button, so
-a large archive does not hold the window still. An archive that is damaged or cut short does not
+the window remains responsive even for a large archive. A damaged or incomplete archive does not
 open: OxideMerge reads each format's checksums, including the one at the end of a compressed `.tar`,
 rather than show part of an archive as if it were all of it. Padding after the compressed data of a
 `.tar.gz`, `.tar.bz2` or `.tar.zst` is ignored, as the `gzip`, `bzip2` and `zstd` commands ignore
 it. Files keep the dates stored in the archive, so comparing by date works.
 
-An entry that cannot be extracted here is left out, and the status line of the folder compare names
-it once the comparison is done, so that a file missing on both sides is not taken for one that is
-the same. This covers a name that leads out of the archive, a name that Windows does not allow (such
-as `what?.txt` or `aux.txt`), a symbolic link that cannot be made, and, on Windows and macOS, an
-entry whose name differs only in case from a later one (`A.txt` and `a.txt`), which would be written
-over. Saving keeps such entries in the archive exactly as they were.
+Entries that cannot be extracted are skipped. After comparison, the status bar lists them so
+you can distinguish missing content from identical content. Examples include:
+
+* A path that points outside the extraction folder.
+* A name that Windows does not allow, such as `what?.txt` or `aux.txt`.
+* A symbolic link that cannot be created.
+* On Windows and macOS, a name that differs only in letter case from a later entry, such as
+  `A.txt` and `a.txt`. The later entry would overwrite the earlier one.
+
+Saving preserves these skipped entries exactly as they were.
+
+[[archives-saving]]
+=== Saving archive changes
 
 Edits to the extracted files are saved back into the archive. When you copy, delete, merge or edit a
 file and then save, OxideMerge writes a new archive in place of the original and keeps its
@@ -2344,16 +1750,18 @@ A `.tar.xz` archive is compressed again as `xz` does by default, and a `.tar.zst
 does. Compressing a `.tar.gz`, `.tar.bz2`, `.tar.xz`, `.tar.zst` or 7z archive, or any archive of 64
 MB or more, can take a while, so it is written in the background while a window shows which archive
 is being written; uploads, closing a tab and quitting wait for it. A file or folder renamed only in
-case is saved under its new name. A ZIP entry whose name is not stored as UTF-8 (one written in a
-Windows code page such as Big5) is copied as it was, but saving a change to it is refused, as
-writing it again would change its name for other programs; a ZIP archive holding two entries of the
-same name opens read-only. If the archive itself was changed on disk after it was extracted, or is
+case is saved under its new name. ZIP entries with names stored in an encoding other than UTF-8, such as Big5, are preserved
+unchanged. You cannot save changes to these entries because rewriting them would make other
+programs read their names differently. A ZIP archive with duplicate entry names opens read-only. If the archive itself was changed on disk after it was extracted, or is
 read-only, saving into it is refused instead of losing those changes. No `.bak` backups are made
 inside an extracted archive. An archive fetched over SFTP or FTP is uploaded again after it is
 saved.
 
 You can also edit an archive inside an extracted archive. Saving it also writes the archive it came
 from, and so on out to the outermost one, and an open comparison of that archive is compared again.
+
+[[archives-read-only]]
+=== Read-only archives and limits
 
 The following archives stay read-only, because there is nowhere for their changes to go back to, or
 because writing them again would break them:
@@ -2525,6 +1933,159 @@ To zoom and move:
 
 The status bar shows how many pixels are different, and in how many regions.
 
+[[documents]]
+== Comparing documents, spreadsheets and programs
+
+Some files are not plain text but contain text. OxideMerge reads these files itself, with nothing to
+install, so you can compare PDF files, office documents, spreadsheets, programs and notebooks by
+their content:
+
+[cols="1,3"]
+|===
+|Files |What is compared
+
+|`.pdf`
+|The text of each page, in drawing order, with a blank line between pages.
+This includes text inside PDF form objects used by the page.
+Characters are decoded using the font's `ToUnicode` table or its specified encoding.
+Encrypted files produce an error instead of appearing empty.
+If some content cannot be read, a message at the end explains why the extracted text is incomplete.
+For example, a compressed stream may use an unsupported method, or a font may lack a character map.
+If no text can be read, OxideMerge reports an error.
+
+|`.docx`, `.docm`, `.dotx`, `.dotm`, `.odt`, `.rtf`
+|The words of the document, one line per paragraph or heading.
+The cells of a table are separated by tabs, one row per line.
+Words shown as deleted and field codes are left out.
+
+|`.xlsx`, `.xlsm`, `.xltx`, `.xltm`, `.ods`
+|Each sheet is read as rows of comma-separated cells.
+Line breaks inside a cell are preserved. In `.ods` files, repeated spaces and tabs are preserved too.
+Blank rows between data rows are kept so that row positions stay the same; trailing blank rows are omitted.
+A workbook opens in the <<table-compare,Table view>>.
+For a single sheet, you can choose columns, sort rows and use *Match rows by → Key columns*.
+For multiple sheets, tabs below the table show each sheet and its count of changed rows.
+Rows in these sheets are matched by position because the sheets are separate tables.
+Sheets are matched by name, so a sheet present on only one side is shown as a whole difference.
+*Formatted values* displays numbers and dates using their number formats, as a spreadsheet program does.
+Turn it off to see the stored values. Rows are always compared using the stored values.
+In the Text view, each sheet's name appears before its rows.
+
+|ELF programs, shared objects and object files
+|First, the header: class, byte order, kind, machine, ABI, entry point and the counts of the
+headers.
+Next, the program headers, one line per segment, with its type, offset, virtual and physical
+address, sizes in the file and in memory, alignment and `R`, `W`, `E` flags (plus the interpreter
+that a dynamically linked program requests).
+Then the section table, one line per section, with its name, type, address, offset, size,
+alignment and flags.
+Finally, the symbols of each symbol table (`.symtab`, `.dynsym`), sorted by name, one line per
+symbol with its address, size, type, binding, visibility and section (`UND` when the symbol is
+undefined, `ABS` for an absolute value).
+As a result, two builds line up function by function, and a function that grew or moved shows as
+a changed line.
+The mapping symbols that ARM and RISC-V assemblers add (`$x`, `$d`, …) are left out and only
+counted, and at most 100,000 symbols of a table are listed.
+
+|`.ipynb`
+|A Jupyter notebook, cell by cell: each cell appears under a line that identifies it as a code
+cell, a Markdown cell or a raw cell, followed by that cell's own source and nothing else.
+Cells are not numbered, so adding a cell does not change the label of every cell after it.
+Outputs, execution counts and other metadata that a notebook collects when it is run are left out,
+so a notebook that is re-run without changes compares as equal.
+Older nbformat 3 notebooks are read as well, with their heading cells read as Markdown headings.
+At most 20,000 cells are read; the end of the text states how many were left out.
+A notebook that cannot be read this way, such as a broken one, is compared as its JSON text.
+|===
+
+A file read this way is *read-only*: the pane states what was read (for example
+`report.docx [text of the document]`), and nothing can be edited or saved over the original. The
+extracted text does not include all the original file's information. Layout, fonts, formulas
+and other content that is not extracted are not compared.
+
+[[documents-formatted]]
+=== Formatted comparison
+
+You can also compare two or three `.docx` files *Formatted* by choosing that view above the panes.
+The documents are then shown as Markdown, block by block and side by side: headings, paragraphs with
+their bold, italic and strikethrough text, list items, links and tables. Each block that differs
+is highlighted together with its changed words. Tables are drawn as tables, with merged cells drawn
+across the rows and columns they cover. A row added inside a merged cell is highlighted where it is,
+and the rows that a header cell reaches down into are part of the header. An image is shown as its
+description with a short fingerprint of its picture, so a changed picture shows as a change even
+when its description is the same. *Next difference* and *Previous difference* step through the
+changed blocks. As in the text, the Formatted view leaves out headers, footers, notes and comments,
+and shows tracked changes as accepted.
+
+Workbooks (`.xlsx`, `.xlsm`) can also be compared *Formatted*, whether they have one sheet or
+several. Each sheet appears as a heading and a table. Sheets are matched by name, so a sheet that
+was added or removed shows as one whole difference. Merged cells are drawn across the cells they
+cover. Numbers are shown in their number formats: dates and times in ISO form (`2026-09-30 18:00`),
+whatever order the format puts them in, and amounts with their decimals, thousands separators,
+currency and percent signs. A formula shows the result it was saved with. A run of three or more
+empty rows is shown as one row that states how many rows there are, so a value that moved down a row
+still shows as a change. Each picture placed on a sheet is listed after its table with its
+description, the cell where it is placed and a fingerprint of the picture, so a changed or moved
+picture shows as a change. Fills, fonts, borders, the formulas themselves and charts drawn from data
+are not compared.
+
+A tagged PDF file can be compared *Formatted* as well. Most word processors tag the PDF files they
+export, marking which text is a heading, a paragraph, a list item, a table cell or a figure, and
+which cells span several rows or columns. The view is read from those tags, so a PDF made from a
+document reads much as the document itself does. Text in a bold or italic font keeps that
+formatting, unless a whole paragraph or heading is in that font, as its style already shows it. A
+figure is shown with its alternate text and a fingerprint of its picture. Running headers, footers
+and page numbers are left out, because the file marks them as artifacts. For an untagged PDF with
+selectable text, the *Formatted (inferred)* notice means that OxideMerge estimates headings and
+paragraphs from text positions and font sizes. This works best for single-column documents. Columns
+and tables may come out in the wrong order, and scans without a text layer require OCR before they
+can be compared as text. In an untagged PDF, lines that repeat at the top or bottom of the pages,
+and page numbers, are taken for running headers and footers and left out of both the Text and the
+Formatted view, so a change made only in them is not shown. On a PDF of one page, nothing repeats; a
+line that holds only a number at its top or bottom is taken for its page number in the Formatted
+view, but kept in the Text view.
+
+The *Text* / *Formatted* switch appears above the panes when every side is a `.docx` file, every
+side is a workbook (`.xlsx`, `.xlsm`) or every side is a `.pdf` file, read by OxideMerge itself. It
+is not offered for `.odt`, `.rtf` or `.ods` files. A comparison of `.docx` or `.pdf` files opens in
+the Formatted view; a workbook opens in the Table view. The Formatted view reads the files itself
+even when a converter is set up for them under *Options → Plugins*. Whether a block differs depends
+on its text alone; the comparison options decide only which words of a changed block are
+highlighted. The view is rebuilt when a file or an option changes. While the view is shown, the
+difference counter on the toolbar still counts the differences of the text comparison, whereas *Next
+difference* and *Previous difference* step through the changed blocks of the Formatted view.
+
+[[documents-limits]]
+=== Limits and converters
+
+* A PDF or RTF file can be at most 256 MiB, because it is read in full. A larger file is reported
+  rather than read.
+* Each part of a `.docx`, `.odt`, `.xlsx` or `.ods` file can be at most 64 MiB. A file with a larger
+  part, or with a part that cannot be read, is reported rather than compared without that part.
+* An ELF file can be any size: only its headers, section table and symbol tables are read, each up
+  to 64 MiB. Because two different builds can still read the same, a folder comparison by *Full
+  contents* compares programs by their bytes.
+* A PDF file can request at most 1 GiB of decoded content in total; a file that needs more is
+  reported rather than read.
+* The text read from one file can be at most 16 MiB, in the *Text* and the *Formatted* modes alike.
+  The rest is left out, and a line at the end says so.
+* In the *Formatted* mode, a table shows at most 1,048,576 cells and 1,024 columns; the rows beyond
+  that are left out, with the same line at the end. A part of more than 3 million elements is too
+  large to show formatted and is reported; the *Text* mode still reads it.
+* A workbook in which none of the listed sheets can be found is reported rather than compared as
+  empty.
+
+A converter set up under *Options → Plugins* takes precedence over this built-in reading, so you can
+always put a better reader in front, such as `pdftotext` for PDF, or Pandoc or Tika for more
+formats. The output of a converter is compared as text, even for a spreadsheet. If you turn off
+*Read documents, spreadsheets and ELF files as text* there, these files are compared as the archives
+or the bytes that they are.
+
+NOTE: The older Word `.doc` and the older Excel `.xls` formats are not read here yet; use a
+converter under *Options → Plugins* for those. A PDF holds the positions of glyphs rather than
+words, so columns, tables and ligatures may not come out as they look on the page; a converter such
+as `pdftotext -layout` reads a complex page better.
+
 [[web-comparison]]
 == Comparing web pages
 
@@ -2653,6 +2214,495 @@ HTML files, or with `-t web`) uses the last mode that you chose in the window:
 
 NOTE: No mode runs the scripts of the page. Logins are not supported, so a page that needs a login
 can show its login page instead. No mode saves changes to a web server.
+
+[[remote-sftp]]
+== Comparing over SFTP or FTP
+
+OxideMerge can download files or folders from a server for comparison and upload your changes.
+Choose *File → Files on a server → Compare over SFTP/FTP...* to connect. You can also click the
+globe button beside a path on the start page or in the *Select files or folders* dialog.
+
+To enter an SFTP or FTP address directly, paste it into a comparison path field on the start page or
+in the *Select files or folders* dialog, then click *Compare*. You can enter an address on either
+side or both sides.
+
+----
+sftp://[username[:password]@]hostname[:port][/path/to/file_or_directory]
+sftp://ann@build.example.com:2222/var/www/site
+----
+
+An FTP address works the same way, with `ftp://`, `ftpes://` (explicit TLS) or `ftps://` (implicit
+TLS) in place of `sftp://`. FTP without a user name, or as `anonymous`, signs in anonymously; with a
+user name and no password, the connection dialog opens for the password.
+
+If an SFTP URL has no password, OxideMerge first tries SSH agent and configured keys. If that fails,
+it opens the connection dialog with the URL fields filled in and a note saying so. If you connected
+to that server before, the dialog also recalls how you signed in, such as your key file. Enter the
+password and click *Connect* to continue. The eye icon in the password field toggles visibility. You
+can also select *Private key* or *SSH agent*. *Cancel* returns to where you typed the address. If
+you include a password in the URL, percent-encode reserved characters such as `@` (`%40`) and `/`
+(`%2F`). OxideMerge removes the password from the path field when you submit it. After a comparison
+opens, its addresses appear without passwords in the start page's recent list. Select the entry to
+connect and compare again.
+
+image::sftp-connect.png[SFTP connection dialog with the password field and visibility icon]
+
+[[remote-connect]]
+=== Connecting to a server
+
+To fetch a file or folder from a server:
+
+. Choose the *Protocol*. Changing the protocol changes the *Port* to that protocol's usual one,
+  unless you typed another. The protocols are:
+** *SFTP (over SSH)*.
+** *FTPS (explicit TLS)*, which connects to the FTP port (21) and switches to TLS before signing in.
+** *FTPS (implicit TLS, port 990)*, for servers that expect TLS from the start.
+** *FTP (not encrypted)*.
+. Enter the server's *Host*, *Port* and *User*. You can also type or paste an address such as
+  `ann@build.example.com` or `sftp://ann@build.example.com:2222/var/www` into *Host*: when you leave
+  the field, its parts move to the fields they belong to. For SFTP, the host can be a `Host` alias
+  of your `~/.ssh/config`, and you can leave the user empty, as with `ssh` (see
+  <<remote-ssh-config>>).
+. For SFTP, choose how to sign in: *Password*, *Private key* (which can have a *Passphrase*), or
+  *SSH agent*. *SSH agent* uses the keys that `ssh-agent` holds (Pageant on Windows) and the keys
+  that `~/.ssh/config` names, so you type nothing here. FTP and FTPS sign in with a password.
+. If needed, open *Advanced* for a proxy, FTP's active mode or an FTPS client certificate (see
+  <<remote-advanced>>).
+. Enter the *Remote path* of the file or folder to fetch, or leave it empty to choose it from a list
+  of the server's folders and files.
+. Click *Connect*. With a *Remote path*, the file or folder is fetched. Without one, OxideMerge
+  connects and lists your home folder on the server: open the folder or choose the file you want and
+  click *OK* to fetch it.
+
+When the dialog opens, the keyboard is in the first field left to fill in: *Host*, or for a server
+you connected to before, its password or passphrase. Once a file or folder is fetched, its path
+field shows the address on the server it came from, such as
+`sftp://ann@build.example.com:22/var/www`. On the start page, a fetch that fills the last empty path
+field starts the comparison at once. A fetch into a field that already held a path only replaces it;
+click *Compare* when the other side is right.
+
+[[remote-filtering]]
+=== Filters and subfolders
+
+A folder is fetched without what the comparison's filter leaves out: with *Exclude Source Control*,
+for example, its `.git` and `.svn` folders are never downloaded. The filter is the one of the *Open*
+dialog, or else the one chosen for the start page. The folder comparison then shows only what that
+filter keeps, on both sides, even if you choose a wider filter afterwards, because the server's side
+has nothing else to compare, and a line above the list says so; connect again to fetch with the
+wider filter. *Reload from server* fetches the folder again with the same filter. Saving the copy
+never deletes on the server what was left out: a folder that had something left out, deleted in the
+copy, stays on the server with what it still holds there, and saving names each folder kept.
+Compares from the command line leave out what `--filter`, or the saved filter, leaves out in the
+same way.
+
+If *Include subfolders* is off in the *Open* dialog or the start page's folder options, only
+files directly inside the folder are downloaded. Empty subfolders are created in the local copy
+so you can still see which folders exist on each side. Turning *Include subfolders* on afterwards does not compare them, and a line above
+the list says why; connect again with it on. The comparison is not complete without subfolders, so
+it cannot be synchronized. A folder deleted in the copy stays on the server with what it holds
+there. From the command line, a folder is fetched with its subfolders when `-r` or the saved option
+asks for them, and always for synchronization, merge plans, baselines, release reports and
+`--impact`.
+
+When you copy a folder to a downloaded side, only the items shown in the comparison are copied.
+Items excluded by the filter are not copied. You also cannot copy to or from a subfolder that
+was created empty because its contents were not downloaded. The status bar explains why.
+Reconnect with the required filter and *Include subfolders* setting to copy those items.
+
+[[remote-browsing]]
+=== Choosing files and folders on a server
+
+The folder button connects and opens a chooser in place of the dialog, listing the folder of the
+*Remote path*, or your home folder on the server if the *Remote path* is empty. The chooser keeps
+the same size however many entries a folder has: the list scrolls inside it, and a name too long for
+it is cut short. Folders come first, then files with their sizes; hidden entries, whose names start
+with a dot, come last in each group. Click a file or a folder to choose it; double-click a folder to
+open it. The list is a tree: the arrow before a folder shows what is in it, in place under it, and
+the arrow closes it again. A folder is listed the first time you open it, not before, so a large
+server is never listed as a whole. The path at the bottom of the chooser follows what you click: the
+file or folder you chose. When you opened the chooser with the folder button, *OK* returns to the
+dialog with that path as the *Remote path*, ready for *Connect*; when *Connect* opened it, *OK*
+fetches that path. *Cancel* or Esc returns to the dialog with the *Remote path* as it was.
+Double-click a file to fetch it immediately. The bar above the list names the server and each folder
+on the way to the one shown; click any of them to open it. The up-arrow button opens the folder
+above, and the refresh button lists the folder again. With the keyboard, the arrow keys, Page Up,
+Page Down, Home and End move through the list, Enter opens the folder you are on or accepts the file
+you chose, and Backspace opens the folder above. Right opens the folder you are on in place and Left
+closes it; Left on an entry inside a folder goes out to that folder.
+
+Each entry has a check box at the left of the list. Tick several entries, files and folders together
+and as many as you like, to compare them with another folder: *OK* (or Enter) fetches only those, as
+a copy of the folder shown that holds nothing else, into the path field. Choose the other side as
+usual, a local folder or one on a server, and compare. Ticking a folder ticks everything in it,
+including what you only open later; unticking an entry inside it unticks the folder and keeps the
+rest of its contents ticked. The copy is of the deepest folder all the ticked entries are in: tick
+`tasks.c` and `list.c` inside `upload/FreeRTOS-Kernel`, opened in place, and the copy is of
+`FreeRTOS-Kernel`, to compare with a local `FreeRTOS-Kernel`. Entries in different folders keep
+their place under those folders in the copy. The folder comparison then shows only the ticked
+entries, on both sides: what they hold, and the folders on the way to them, but nothing else the
+other folder has. The ticked entries are compared with their subfolders, whether or not *Include
+subfolders* is on. Saving the copy writes back what you changed in it; the server's other entries
+are left alone, and *Reload from server* fetches only the ticked entries again. *List folders
+without downloading files* does not apply here: ticked entries are downloaded. Deleting a folder in
+the copy that holds only some of what it has on the server deletes those entries there, and leaves
+the folder with the rest. Of two names that differ only in case, Windows and macOS keep the first
+one ticked.
+
+To compare entries of one server with each other instead, select two or three and click *Compare
+selected*:
+
+* kbd:[Ctrl]-click (kbd:[Cmd]-click on macOS) adds an entry to the selection or takes it out, and
+  kbd:[Shift]-click selects from the entry selected last to the one you click.
+* With the keyboard, kbd:[Shift] with an arrow key extends the selection, kbd:[Ctrl] with an arrow
+  key moves without changing it, Space selects or deselects the entry you are on, and kbd:[Ctrl+A]
+  selects everything shown.
+* Two files open as a file compare and three as a three-way compare; two or three folders open as a
+  folder compare. The entries are compared in the order the list shows them, and they can be in
+  different folders of the tree.
+* The line under the list says how many entries are selected, or why *Compare selected* cannot take
+  them: only one is selected, files are selected together with folders, or more than three are
+  selected. *OK* takes them in any of those cases.
+
+The selected files or folders are fetched like any other remote path, with the same window to
+*Cancel* the fetch, which returns to the chooser. With *List folders without downloading files* set,
+two or three selected SFTP folders are compared from their listings (see below). A path that does
+not exist lists the nearest folder above it. If the server refuses a folder or the connection drops,
+the list says why; refresh or *Retry* asks again. The chooser stays connected while it is shown, so
+moving between folders does not sign in again each time. A folder shows its first 10,000 entries.
+
+[[remote-recent]]
+=== Recent connections and progress
+
+The fetched path then fills in the *Left*, *Middle* or *Right* path, the same as a local path. To
+compare two remote locations with each other, connect again for the other side. To compare a remote
+path with a local one, leave the other side local. OxideMerge remembers the last ten servers you
+connected to, in its settings file, so they are there the next time you start it: the protocol,
+host, port, user, how you signed in and the key file's path. The dialog starts with the last one
+filled in, so that you can fetch a second path from the same server, and *Recent* at the top of the
+dialog lists the others; choose one to fill in its settings. The button beside *Recent* removes the
+server shown from the list. A password or a key's passphrase is never saved or filled in this way;
+type it each time. While waiting, the window says what it is doing and for how long: connecting to
+the server, then fetching, with the bytes and, for a folder, the number of entries that have
+arrived. The folder chooser shows the same while it lists a folder, with the entries received so
+far.
+
+[[remote-save-files]]
+=== Saving remote files
+
+A fetched *file* is writable. When you edit it, *Save* uploads it back to the server over a fresh
+connection in the background. If the server's path is a link, the file it points to is updated. If
+the server's file changed or disappeared after you fetched it, the upload is refused before writing.
+
+Over SFTP, the upload goes to a hidden temporary file beside the original, named
+`.NAME.oxidemerge-new-...` and ending in the original's extension (`.config.oxidemerge-new-....php`
+for `config.php`), so a web server never shows a script's source as text. Only you can read that
+copy until it is checked. OxideMerge then reads that copy back and compares it with the file here.
+Only a complete, matching copy is given the original's owner, group and permissions (set-user-ID and
+set-group-ID bits included) and replaces the original. If someone else puts another file or a link
+in the copy's place meanwhile, the save is refused. Just before the swap, OxideMerge checks again
+that nobody else changed the file on the server. So a dropped connection, a full disk or *Cancel*
+leaves the server's file as it was, and the message says so.
+
+Most SFTP servers, OpenSSH's included, cannot rename one file over another in one step. OxideMerge
+then renames the original aside first (`.NAME.oxidemerge-old-...`), renames the new copy into its
+place, and deletes the original. For that moment the file is missing, but it is never partly
+written. If the connection drops between the two renames, the message names the file that holds the
+other version, so you can check the server and rename it back if needed. A temporary file that could
+not be removed is named the same way, and you can delete it. If only the original renamed aside
+cannot be deleted once the new copy is in its place, the file is saved all the same, and a warning
+names the copy to delete. A connection that drops just after the new copy took the original's place
+does not fail the save either.
+
+A copy that replaces the original is a new file. It keeps the original's owner, group and
+permissions, but not its access-control lists (ACLs). It is not one of the original's hard links
+either. SFTP cannot show these, so OxideMerge cannot tell when a file has them. For a server where
+that matters, turn on *File → Files on a server → Save remote files in place*: *Save* then writes
+over the original in place, which keeps them.
+
+OxideMerge also writes in place, without asking, in four cases:
+
+* The file belongs to someone else.
+* No new file can be created in its folder.
+* The server does not show who owns the file.
+* The server does not rename files.
+
+Over FTP, *Save* always writes in place, because FTP cannot set a new file's owner or permissions.
+
+An upload in place can be cancelled until it starts writing. After that, a dropped connection can
+leave the file partly written on the server. The message says so, and choosing *Save* again finishes
+writing it.
+
+Your edits stay in the tab, and you can compare them with the server's version. Until an upload
+succeeds, the tab counts as unsaved, so closing it or quitting asks first, and *Save* tries again.
+When you close a tab with *Save*, the tab waits for its upload to finish before it closes.
+
+[[remote-listings]]
+=== Comparing SFTP folders from listings
+
+By default, *Connect* fetches a folder whole and it opens in the usual folder comparison, which
+shows every difference at once (see below for saving back to the server). For folders too large to
+fetch, select *List folders without downloading files* in the SFTP connection dialog; it is off by
+default. Use it to compare two or three folders, any of them on SFTP servers. The comparison shows
+rows as the listings arrive. With three folders, the status shows which sides contain each file. A file can be verified or
+opened only when it exists on all three sides. Verification checks whether all three copies have
+the same content. Opening the file starts a three-way comparison. *Metadata match* means that size and modification time match within the
+configured tolerance. Use *Verify Selected* or *Verify All* to check the contents of paired files.
+*Binary contents* compares the bytes, and *Full contents* applies the comparison options for the
+file type.
+
+The list is a table with a column for the name, the state and the size on each side. Each state has
+its own color and mark: red for contents that differ, amber for metadata that differs, green for
+contents read and found the same, and the side's color for a file only one side has. The row above
+the list counts the files in each state, those that differ first. While something is running, a
+strip below the toolbar shows how far it is: the number of entries listed so far, the files verified
+out of those to verify, or the bytes fetched of a file being opened. Until the server is reached,
+the strip says that it is connecting. The files a verification has yet to read show a spinner in
+their state. *Stop* in the strip ends it.
+
+Verifying does not open a comparison: it marks each file's state in the list. When it is done, a
+line over the list says how many files differ and how many match, and after *Verify All* the first
+file that differs is selected and scrolled into view; double-click it to compare. What a
+verification fetched is kept until you refresh. *Verify All* reads only the files not verified since
+the last refresh, so clicking it again fetches nothing; *Verify Selected* reads the selected file
+again. Opening a verified pair uses the copies the verification fetched, without another download.
+Files larger than 32 MB compared as *Binary contents* are compared as they arrive and are not kept,
+and at most 512 MB of copies are kept; those are fetched again when opened. *Refresh*, or saving a
+file to the server, discards what was kept for it and reads it again.
+
+Double-click a paired file to open it in a separate comparison, or choose *Open File Comparison*.
+OxideMerge fetches the selected remote files and uploads your edits when you save them. Use
+*Refresh* in the folder comparison to get an updated listing. For folder-wide copy, delete or save
+operations, leave *List folders without downloading files* cleared when connecting to each remote
+folder.
+
+[[remote-save-folders]]
+=== Saving and reloading remote folders
+
+A fully fetched *folder* is writable too. Copy or delete files in the folder comparison, or open a
+file from it and edit it. *Save* then writes what changed back to the server:
+
+* Files that are new or whose contents changed are uploaded.
+* Folders that are new are created.
+* Files and folders that were removed are deleted on the server.
+
+Files that you did not change are not sent again. Before each upload or deletion, OxideMerge checks
+that the server's file is still the one it fetched. A file that changed on the server in the
+meantime is neither overwritten nor deleted, and a new file whose name was created on the server in
+the meantime is not overwritten. A file that changed within a few seconds before it was fetched is
+also checked by its contents, because a second change in the same second would leave its size and
+time unchanged. The message after the save lists those files. Your copies stay in the tab, so you
+can compare them with the server's files and save again. The rest is written as usual. Until every
+change is written, the tab counts as unsaved. If the folder's local copy is gone, or part of it
+cannot be read, nothing is written, so a file that could not be read is never deleted on the server.
+
+Files are uploaded before the removed files are deleted. As a result, a file that you moved to
+another folder is deleted from its old place only once its new copy is on the server; if that upload
+fails, the old copy stays. A symbolic link or special file in the fetched copy, or a name that is
+not valid Unicode, is never uploaded and never counts as removed. The server's file stays as it is,
+and the message after the save names it.
+
+So that a very large folder cannot be fetched by mistake, a fetch is limited to 4 GiB, 50,000 files
+and folders, and folders nested 64 deep. Names that cannot be file names on this computer are left
+out. So is the second of two names that this computer cannot keep apart, such as `A.txt` and `a.txt`
+where letter case does not count. No `.bak` backups are made inside a fetched copy, because saving
+would upload them.
+
+*File → Files on a server → Reload from server* fetches the server's copy of the current tab's
+remote file or folder again, over a fresh connection, and shows it in place of the copy fetched
+before. If this would replace changes that are not saved to the server yet, OxideMerge asks first.
+Edits of a remote file are then replaced (*Undo* brings them back), and edits of a local side are
+kept.
+
+On FTP and FTPS, OxideMerge detects whether a file changed on the server by its size and the
+modification time that the server reports. For a server that reports no modification time, it reads
+the file and compares its contents instead. Servers that cannot list folders in the standard
+machine-readable way (`MLSD`) are read from their plain listing instead, and links are followed to
+the file or folder they point to. Transfers use passive mode unless *Active mode* is set (see
+<<remote-advanced>>), and always connect to the server that the sign-in went to.
+
+Over FTPS, a download whose connection ended without TLS's closing message, which anyone in between
+could cause, is checked against the size that the server reports, and refused if it came up short.
+Many FTPS servers, such as ProFTPD and vsftpd, require each transfer to resume the TLS session of
+the sign-in. Each session ticket that a server gives for this is good for one transfer, so when the
+tickets run out, OxideMerge signs in again before the next transfer.
+
+IMPORTANT: Plain FTP sends your password and your files unencrypted: anyone on the network between
+you and the server can read them, and the dialog says so. Use FTPS or SFTP whenever the server
+offers them.
+
+[[remote-security]]
+=== Passwords and server identity
+
+The connection, including the password or the key's passphrase, is kept only in memory for as long
+as the tab stays open, and the password is overwritten in memory once it is no longer needed. It is
+never written to the settings file. Tabs that show a fetched file or folder are left out of saved
+workspaces (see <<workspaces>>), of the session that OxideMerge reopens on its own at startup, and
+of the recent paths, because their temporary copies are gone after the app closes. To compare the
+same remote path again, connect again.
+
+Before the password or key is sent, OxideMerge checks the server's host key. It first reads your own
+SSH `~/.ssh/known_hosts` the way `ssh` does: host patterns such as `*.example.com` or
+`!host.example.com`, in any letter case, and names hashed by `ssh-keygen -H` all match, and a server
+on a port other than 22 is found under `[host]:port`. A server listed there with the same key is
+trusted, provided that the key also matches the one that OxideMerge saved for that server, if there
+is one. A server listed there with a different key of the same type, or whose key is marked
+`@revoked` there, is refused, as `ssh` refuses it. If the server was reinstalled, remove its old key
+with `ssh-keygen -R host` (or `ssh-keygen -R "[host]:port"`) and connect again. OxideMerge also
+checks its own `known_hosts` file, next to its settings file. The first time you connect to a server
+that is found in neither file, OxideMerge shows the key's type and fingerprint (`SHA256:...`, as
+`ssh` shows it) and asks whether to trust it. Compare the fingerprint with the one that the server's
+administrator gives you before you click *Trust and connect*. A warning is shown when your
+`~/.ssh/known_hosts` lists only keys of other types for that server.
+
+A server can also prove its identity with a host certificate, signed by an authority that your
+`~/.ssh/known_hosts` names in a `@cert-authority` line, such as
+`@cert-authority *.example.com ssh-ed25519 AAAA...`. OxideMerge asks for a certificate only from a
+server that such a line names. It trusts the certificate, without asking you first, when that
+authority signed it, it names the server (or its `HostKeyAlias`) among its principals, it is valid
+now, and it has no critical options. A certificate that fails any of these checks is refused, and so
+is one whose authority or key is marked `@revoked`. Certificates signed with Ed25519, ECDSA (P-256
+or P-384) or RSA with SHA-2 are checked; an authority that uses another algorithm, such as RSA with
+SHA-1 or ECDSA P-521, is refused. A certificate from a server for which no authority is named is
+checked like its plain key.
+
+On every later connection, the key is checked against the one remembered. If it no longer matches,
+OxideMerge refuses the connection rather than trust a server that may not be the one you expect.
+This usually means that the server was rebuilt or reinstalled. If you are sure that this is what
+happened, remove that server's old entries from OxideMerge's `known_hosts` file (`host:port`
+followed by its key) and connect again. If either `known_hosts` file exists but cannot be read, or
+holds a line that OxideMerge cannot read (any line of its own file, or a line of
+`~/.ssh/known_hosts` for a key type it checks), OxideMerge connects to no server until it can.
+
+FTPS servers are checked the way a web browser checks a website: their certificate must be valid for
+the host name and vouched for by a well-known certificate authority. Many FTP servers have a
+self-signed certificate instead. The first time you connect to one, OxideMerge shows the
+certificate's fingerprint and asks whether to trust it, as for an unknown SSH host key. Once
+trusted, the certificate is remembered in the `known_certs` file next to the settings file
+(`oxidemerge-known_certs` in portable use), and a later connection that shows another certificate is
+refused. If the server's certificate was renewed, remove the server's line (`host:port` followed by
+the certificate) from that file. In both cases, the certificate is checked before the password is
+sent, and a server that does not offer TLS is refused for FTPS rather than signed in to without it.
+
+[[remote-ssh-config]]
+=== SSH configuration, jump hosts and sign-in questions
+
+OxideMerge reaches an SFTP server the way `ssh` reaches it, as your `~/.ssh/config` (and the
+system's `/etc/ssh/ssh_config`) specifies. A *Host* such as `prod` can be an alias there, and its
+block can set the `HostName`, `User`, `Port`, `IdentityFile` (with `IdentitiesOnly`), `HostKeyAlias`
+(the name under which its key is looked up and certified) and `UserKnownHostsFile`. A `#` that
+starts a word begins a comment. `Include` is read in place, skipping files whose names start with a
+dot unless the pattern's file name does too. `Match` blocks on `host` (the `HostName` set so far, as
+in `ssh`), `originalhost`, `user`, `localuser` or `all` apply; `Match exec` is never run. As in
+`ssh`, the first value found wins, and a user, or a port other than 22, typed in the dialog wins
+over the file. In an address on the command line, any port written wins, `:22` included. Without a
+user, the file's `User` or your own user name is used.
+
+A server that is reached through jump hosts (`ProxyJump bastion` or `ProxyJump user@hop1,hop2:2222`)
+is connected to through each in turn, up to 8, as `ssh -J` does. A jump host signs in with the SSH
+agent's keys and the keys that its own block names, and its key is checked like the server's before
+anything is sent to it. A `ProxyCommand` is run as `ssh` runs it, by the shell, with `%h`, `%p`,
+`%r` and `%n` filled in, and the connection goes through it. As in OpenSSH, a host or user name that
+contains characters the shell would act on (quotes, `$`, `;`, `|`, spaces and the like), or that
+starts with `-`, is refused before any command runs.
+
+A server can ask questions while you sign in (*keyboard-interactive* sign-in), such as a one-time
+code, a second factor or a new password. OxideMerge shows them in a *Sign-in question* window that
+names the server. The answers are hidden unless the server says that they may be shown; *Cancel*
+declines. The password you gave answers a server's single password question automatically. For a
+private key that is encrypted and was given without a passphrase, the passphrase is asked for the
+same way; when the key's `.pub` file is beside it, only after the server has said that it would take
+the key. A password that the server refused is not sent again. For servers that need more than one
+way of signing in, the ways are tried in turn, starting with the one you chose.
+
+[[remote-advanced]]
+=== Proxies, active mode and client certificates
+
+*Advanced* in the connection dialog holds settings that most servers do not need:
+
+* *Proxy*: connect through a SOCKS5 proxy (`socks5://host:1080`, or `socks5://user@host:1080` with a
+  *Proxy password*) or an HTTP proxy that allows `CONNECT` (`http://host:8080`). A password typed
+  into the address moves to *Proxy password*, where it is hidden, once you leave the field. Both
+  SFTP and FTP use the proxy, every FTP data connection included. For the servers that a jump host
+  or a `ProxyCommand` from `~/.ssh/config` applies to, that is used instead of the proxy; the first
+  jump host is reached through the proxy.
+* *Active mode* (FTP): for servers that refuse passive mode, the server connects back to this
+  computer for each transfer (`EPRT`, or `PORT` for a server without it). A data connection is
+  accepted only from the server's address. Active mode cannot go through a proxy, and usually does
+  not work from behind a router that translates addresses (NAT) or a firewall that blocks incoming
+  connections.
+* *Client certificate* and *Certificate key* (FTPS): a certificate to present to a server that asks
+  for one, in PEM, with its private key in the same file or in the key file. The key must not be
+  encrypted.
+
+The proxy's address, active mode and the certificate's files are remembered with each recent server,
+but never the proxy password.
+
+[[remote-command-line]]
+=== Server paths on the command line and in jobs
+
+On the command line and in job files (see <<jobs>>), a path can also be a file or folder on a
+server, written as an address:
+
+[source,sh]
+----
+oxidemerge sftp://ann@build.example.com/var/www/site ./site     # SFTP, port 22
+oxidemerge ftpes://ann@ftp.example.com/public/index.html index.html  # explicit FTPS, port 21
+oxidemerge ftps://ann@ftp.example.com:990/public ./public -r    # implicit FTPS
+oxidemerge --cli ftp://ftp.example.com/pub/README README         # anonymous plain FTP
+oxidemerge sftp://ann@host/~/notes.txt notes.txt                # in ann's home folder
+----
+
+The address has the form `scheme://[user@]host[:port]/path`. An IPv6 address goes in brackets, as in
+`sftp://ann@[2001:db8::1]/srv`. A path that starts with `/~/` is in the user's home folder on the
+server, and other characters can be written as `%XX`. For SFTP, the host can be an alias of
+`~/.ssh/config` (see <<remote-ssh-config>>), and without a user name, its `User` or your own user
+name is used. FTP without a user name signs in as `anonymous`, with `anonymous@` as the password,
+never the one in `OXIDEMERGE_REMOTE_PASSWORD`.
+
+A password never goes in the address, where anyone who can see the command line or the job file
+could read it; an address that contains one is refused. Put the password in the
+`OXIDEMERGE_REMOTE_PASSWORD` environment variable instead. SFTP signs in with `--ssh-key FILE` when
+it is given (the variable then holds the key's passphrase, if it has one), otherwise with the
+password in the variable, and otherwise with `ssh-agent` and the keys that `~/.ssh/config` names.
+FTP and FTPS need the password, unless they sign in as `anonymous`. OxideMerge removes the variable
+when it starts, so the programs it runs, such as an external tool, do not inherit it. Questions that
+a server asks while signing in, and the passphrase of an encrypted key given without one, are asked
+on the terminal without echoing the answer (*Ctrl+C* there turns the echo back on as it stops the
+program); without a terminal, they are declined.
+
+`--proxy URL` connects through a proxy, as *Proxy* does in the dialog. A proxy password is read from
+the `OXIDEMERGE_PROXY_PASSWORD` environment variable, which is also removed at startup, and a
+password in the address is refused. `--ftp-active` uses FTP's active mode. `--client-cert FILE`
+presents an FTPS client certificate, with its key from `--client-key FILE` when the key is not in
+the same file.
+
+Servers are checked as in the program, against the same `known_hosts` and `known_certs` files. A
+server that is not trusted yet is refused, and the error shows its fingerprint. Compare it with the
+fingerprint that its administrator gives you, then run the command again with
+`--trust-fingerprint SHA256:...` to trust the server; it is then remembered, as when you click
+*Trust and connect*. A server whose key or certificate changed is refused.
+
+Each server path is fetched to a temporary copy before the comparison and opened like a local path.
+In the window, *Save* writes changes back to the server as described above. When no window is opened, changes to a downloaded copy are uploaded after the run. For example,
+a `sync` job uploads changes to its destination. The same checks apply: if a file changed on the
+server during the run, OxideMerge reports an error with exit code 2. These writes follow *File → Files on a server → Save remote
+files in place* as saved in the settings. A synchronization that stopped part way without undoing
+all it changed (exit code 5) is undone in the fetched copy instead, and nothing is written back. A
+sync plan made with `--sync-plan` names a server folder by its address, so `--sync-apply` applies it
+to the copy that its run fetches; as for local folders, the plan is refused if the files it plans to
+change are no longer as planned.
+
+NOTE: Checked on Linux with OpenSSH 10.5p1 and vsftpd 3.0.5. With a private key, SFTP refuses a
+server it has not been told to trust and shows that server's fingerprint, the same one
+`ssh-keygen -lf` prints; `--trust-fingerprint` then connects and the key is remembered. An identical
+file exits 0, a different file exits 1, and a folder compare names the file that differs. The window
+opens the fetched file as writable and shows the difference. A sync job uploads a new file.
+Uploading a shorter file replaces it in place, and an upload is refused when the file on the server
+has changed since it was fetched. Anonymous FTP used a vsftpd process running as the current user,
+with no chroot, so the remote path was the real directory. An identical file exits 0, a different
+file exits 1, and the window opens it as writable. A sync job uploads a file, and a second run
+updates it. `--ftp-active` compared an identical file and exited 0. An address that contains a
+password is refused for both.
 
 [[differences-shown]]
 == Controlling which differences are shown
@@ -3058,13 +3108,17 @@ its settings.
 [[recovery]]
 === Recovering unsaved work
 
-With *Keep unsaved work for recovery* turned on in *Options → General* (it is off by default),
-OxideMerge keeps a snapshot of its open comparisons while it runs: their paths and settings, the
-selected difference, the line of the text cursor, the bookmarks, the size and modification time of
-each compared file, and the whole text of every side that has edits you have not saved. The snapshot
-is written every 5 seconds while a side has unsaved edits, and every 30 seconds otherwise, to a
-private `recovery` folder beside the settings file (readable only by you on Linux and macOS), never
-next to the compared files. In portable mode, that folder is next to the program. Each running
+To keep recovery snapshots, turn on *Keep unsaved work for recovery* in *Options → General*.
+It is off by default. A snapshot contains:
+
+* The paths and settings of open comparisons.
+* The selected difference, text cursor line and bookmarks.
+* The size and modification time of each compared file.
+* The complete text of each side with unsaved edits.
+
+The snapshot is written every 5 seconds while a side has unsaved edits, or every 30 seconds
+otherwise. It is stored in a private `recovery` folder beside the settings file, not beside the
+compared files. On Linux and macOS, only you can read this folder. In portable mode, that folder is next to the program. Each running
 window has a snapshot of its own; it is deleted when the window closes normally, or when you turn
 the option off. Turning the option off, or starting with it off, also deletes the snapshots that
 windows which did not close normally left behind, without asking.
@@ -3093,8 +3147,8 @@ Limits:
   inside archives) are left out. Unsaved text is kept for text comparisons only.
 * At most 32 MB of unsaved text is kept in one snapshot; sides past it are left out, and the details
   say how many.
-* A snapshot is only as recent as its last write: edits made in the last few seconds before a crash
-  can be missing.
+* A snapshot contains only the content from its last write. Edits made in the last few seconds
+  before a crash can be missing.
 * A running window holds a lock on its snapshot, so another window never offers it, however long ago
   it was written; once the window is gone, the next start offers it at once. Where the lock cannot
   be taken, a snapshot is taken as left behind once it has not been written for 2 minutes. At most
@@ -3507,9 +3561,12 @@ OxideMerge provides these optional tools:
 * <<baselines>> summarizes the changes between two releases.
 * <<impact>> lists the places where changed files may be used.
 
-The analysis tools are read-only: they never change your files, and they do nothing until you open
-them. In the window, you find them in the side drawer: click *Side panel* at the right end of the
-toolbar, then choose a tab. You can also run them from the command line (see
+Running an analysis does not write to your input files, and analyses run only when you open them.
+In the Semantic view, explicit copy commands can change the text in a pane. Those changes are
+written to the file only when you save.
+
+To open an analysis in the window, click *Side panel* at the right end of the toolbar, then choose
+a tab. You can also run analyses from the command line (see
 <<analysis-command-line>>).
 
 For the exact rules of each analysis, see xref:analysis-guide.md[the analysis guide].
@@ -3578,6 +3635,7 @@ image::semantic.png[Semantic comparison]
 
 JSON::
 * The order of object keys does not count.
+* Numbers are compared by value, so `1` and `1.0` are equal.
 * The order of array elements counts.
 * A missing value and `null` are different.
 * Duplicate keys are an error.
@@ -3688,8 +3746,8 @@ counterparts. Because the Semantic view compares by position, it can list more c
 files. What counts as a change is the same as in the Semantic view:
 
 * *JSON, YAML and TOML*: key order, comments, quoting and block or flow style do not count. In YAML
-  and TOML, how a number is written (`8_080`, `0x1F90`, `1.0`) does not count either; in JSON, `1`
-  and `1.0` differ. A value that changed type, such as a number that became a string, is shown as
+  and TOML, number notation such as `8_080` or `0x1F90` does not count either. JSON, YAML and
+  TOML all compare numbers by value, so `1` and `1.0` are equal. A value that changed type, such as a number that became a string, is shown as
   *Type changed*.
 * *XML*: attribute order and namespace prefixes do not count, CDATA is text, and child order,
   whitespace in text and comments count. Rows of whitespace-only text that did not change are left
@@ -3702,12 +3760,11 @@ change inside a folded node is not skipped: its parents unfold. *Change 3 / 12* 
 The filters show and visit only added, removed, modified, moved or ambiguous changes, and the change
 counts on folded rows follow the filter.
 
-*Keyboard*:: As is usual for a tree, the tree is a single stop in the tab order: press `Tab` until
-it has an outline, or click a row. The arrow keys then move the selection: kbd:[↑] and kbd:[↓] from
-row to row, kbd:[→] to unfold a row, and kbd:[←] to fold it or to go to its parent. `Tab` leaves the
-tree rather than stepping to the next row, and `Esc` releases it. While the tree has the keyboard, a
-screen reader reads out the selected row: what it is, then each side. Every row is in the
-accessibility tree and can be read one by one, whether the tree has the keyboard or not.
+*Keyboard*:: Press kbd:[Tab] until the tree has an outline, or click a row to give it
+keyboard focus. The arrow keys then move the selection: kbd:[↑] and kbd:[↓] from
+row to row, kbd:[→] to unfold a row, and kbd:[←] to fold it or to go to its parent. Press kbd:[Tab] again to move focus to the next control, or kbd:[Esc] to release
+keyboard focus. A screen reader announces the selected row's status and the content on each side.
+Screen readers can also read each row when the tree does not have keyboard focus.
 
 *Folding*:: *Expand changes* (also the starting state) unfolds every node with changes inside.
 *Collapse unchanged* folds the rest, *Expand to level* unfolds the tree to a given depth, and *Reset
@@ -3726,13 +3783,16 @@ node and everything below it. In XML, text that starts with `/` is a small XPath
 and `[n]` conditions, such as `//book[@id='b102']/title`. Other XPath is refused with a message.
 
 *Key rules*:: Repeated nodes are paired by position unless they can be told apart.
-In JSON, YAML and TOML, the objects of an array that all have an `id`, `name` or `key` member with a
-different value on each side are paired by that member without a rule, and the toolbar says how many
-were, such as *3 objects paired by their id member*. Otherwise, write a rule in the form `name@key`.
-In JSON, YAML and TOML, `servers@name` pairs the objects of arrays named `servers` by their `name`
-member, `ports@name+protocol` pairs them by two members, and `spec/ports@name` applies only below
-`spec`; `*@id` covers every array, including a file that is a single array and an array directly
-inside another array, which has no name. In XML, `book@id` pairs `book` elements by their `id`
+For JSON, YAML and TOML arrays, OxideMerge first looks for an `id`, `name` or `key` member.
+If every object has that member and its values are unique within each side, objects are paired
+by its value. No rule is needed. The toolbar shows the result, such as
+*3 objects paired by their id member*. Otherwise, write a rule in the form `name@key`.
+For JSON, YAML and TOML, `servers@name` pairs objects in arrays named `servers` by their
+`name` member. `ports@name+protocol` uses both members as the key. `spec/ports@name` applies
+only below `spec`. `*@id` applies to every array, including an array that is the whole file and
+an unnamed array directly inside another array.
+
+In XML, `book@id` pairs `book` elements by their `id`
 attribute, `book@id+lang` pairs them by two attributes, and `catalog/book@id` applies only below
 `catalog`; a rule matches local names, but never pairs elements of different namespaces. Separate
 several rules with `;`; they take effect once you stop typing. Entries that swapped places are then
@@ -3743,19 +3803,18 @@ without the rule and are marked ambiguous. Key rules belong to this view: they d
 Semantic view or `--semantic` reports.
 
 *Collections*:: When the selected row holds an array of objects or repeated XML elements,
-*View as collection* lists them as a table with one row for each entry. Each row shows the status
-and the value on each side, in a column for each member that holds a single value, or for each
-attribute, each child element that holds only text, and each attribute of such a child (plus one
-column for the text when the entries hold only text). Choose the columns and filter by status; click
+*View as collection* lists them as a table with one row for each entry. Each row shows its status and the values on both sides.
+For JSON, YAML and TOML, each member with a single value has a column. For XML, columns show
+attributes, child elements that contain only text, and those children's attributes. Entries that
+contain only text also have a text column. Choose the columns and filter by status; click
 a row to select it in the tree. Entries that hold deeper objects, arrays, elements or mixed content
 are flagged, because the table does not show that content.
 +
 image::xml-collection.png[Collection table]
 
-Ambiguous rows:: A row is marked ambiguous when another pairing fits as well: several siblings of
-the same name on one side with fewer on the other, a key rule that could not be used, an addition
-next to an identical sibling, or a swap where either node could be the one that moved. Check these
-rows yourself.
+Ambiguous rows:: A row is marked ambiguous when more than one pairing is equally reasonable.
+This can happen with repeated names, an unusable key rule, an addition beside an identical node,
+or a swap where either node could have moved. Check these rows yourself.
 
 The Tree view is built in the background, with a progress display and *Cancel*, within the same
 limits as the Semantic view (100,000 nodes and 64 levels). It is available for two files; three-way
@@ -5305,8 +5364,10 @@ plan a workflow that depends on one of these areas.
   is not compared.
 * Semantic comparison copies one value at a time, and only when it can confirm the edit by reading
   the file again. It does not move array elements or merge all changes at once.
-* Folder synchronization works on local folders only, and runs only when you start it. A renamed
-  file appears as a deletion and a copy.
+* Folder synchronization runs only when you start it; it does not watch for changes. Remote
+  synchronization works on downloaded copies and then uploads the result (see
+  <<remote-command-line>>). Renames or moves that can be identified by content are listed as
+  *Rename*. Otherwise, they appear as a deletion and a copy.
 * SFTP and FTP: FTP active mode does not go through a proxy, and rarely works from behind NAT. SSH
   host certificates signed with RSA SHA-1 or ECDSA P-521 are refused. `Match exec` and
   `Match canonical` in `~/.ssh/config` never match. A prompt on the terminal can be stopped only

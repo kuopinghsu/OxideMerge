@@ -1,6 +1,6 @@
-# Web page compare samples
+# Web page comparison samples
 
-Three versions of a release notes page, for trying web page compare without a network:
+Use these three versions of a release notes page to try web page comparison without a network connection:
 
 - `left.html`: release 2.3
 - `right.html`: release 2.4
@@ -11,9 +11,9 @@ Open them from the project folder with:
     cargo run -- samples/web/left.html samples/web/right.html
     cargo run -- samples/web/left.html samples/web/base.html samples/web/right.html
 
-or, with OxideMerge installed, `oxidemerge` and the same files.
+If OxideMerge is installed, replace `cargo run --` with `oxidemerge` and use the same paths.
 
-HTML files open in the web page compare by default; add `-t text` to compare their source
+HTML files open as web page comparisons by default; add `-t text` to compare their source
 as text instead.
 
 The pages show pictures from [`img/`](img): the logo is the same in every version, and the
@@ -34,18 +34,17 @@ What to look for in each mode:
 - **Resources:** the files each page loads, side by side: the logo is the same, the 2.3
   screenshot is only on the left and the 2.4 screenshot and its sharper copy only on the right.
 
-Formatted shows a picture as a link to its file, named by its alt text: the changed alt
-text and file of the search screenshot show as a change there, and the logo does not. Text
-shows a picture by its alt text alone.
+In Formatted mode, each image appears below its block with a link labeled by its alternative text.
+Changes to the screenshot's alternative text and file appear as differences; the unchanged logo
+does not. Text mode shows only the alternative text.
 
-Every mode converts the files as they are, without a browser, so they open at once.
+All modes read the files directly without opening a browser.
 Scripts do not run, so the "Known issues" list that a script fills in is empty.
 
 ## Formatted mode samples
 
-Three pairs of pages, each testing one topic: complex text, headings and tables. A pair
-opens in **Formatted**, the default mode; if you chose another mode before, it is
-remembered, so pick **Formatted** in the tab's toolbar:
+Three pairs of pages, each testing one topic: complex text, headings and tables. New comparisons use **Formatted** by default. If you previously chose another mode,
+OxideMerge remembers it; select **Formatted** in the tab's toolbar:
 
     cargo run -- samples/web/formatted/text/left.html samples/web/formatted/text/right.html
     cargo run -- samples/web/formatted/headings/left.html samples/web/formatted/headings/right.html
@@ -59,7 +58,7 @@ work in the other modes too; Text shows the same changes as lines of words.
 - **Inline formatting:** bold with italic inside, inline code, strikethrough and keyboard
   keys. The changed link address (`/migrate/v2` to `/migrate/v3`) counts as a change even
   though the link text is the same.
-- **Characters Markdown would read:** `*`, `_`, `#`, `|`, `[brackets]` and a paragraph
+- **Characters with special meanings in Markdown:** `*`, `_`, `#`, `|`, `[brackets]` and a paragraph
   starting with `1.` stay plain text, and are not compared as changed.
 - **Entities, Chinese text and line breaks:** `&mdash;`, `&copy;` and `&lt;`; a Chinese
   paragraph with a changed number; an address whose `<br>` lines stay lines.
@@ -77,7 +76,7 @@ work in the other modes too; Text shows the same changes as lines of words.
 
 - The title and a section are renamed (*Getting started* to *Quick start*).
 - New sections are added (*Import notes*, *Conflicts*) and one is removed (*Appendix*);
-  they face a gap on the other side.
+  the other side shows an empty space at those positions.
 - *Tags* moves above *Folders*: it shows as removed in one place and added in another.
 - *Nested folders* goes from level 4 to level 3: the headings still line up, changed.
 - Levels 4 to 6 are used under *Troubleshooting*, which gains inline code in its title.
@@ -93,7 +92,7 @@ work in the other modes too; Text shows the same changes as lines of words.
   cell), emphasis, a link and a list; a cell gains text and a row is removed.
 - **Release schedule:** a cell spanning two columns (`colspan`) is replaced by two dates.
 - **Contact:** a layout table without header cells; its first row is used as the header.
-- **Limits:** a table nested in a cell, whose cells run together as text.
+- **Limits:** a table nested inside a cell, with its contents combined as text.
 - **Server status:** rows added by a script, so the table is empty.
 
 Each table is one block, drawn with lines around its cells: a change anywhere in it

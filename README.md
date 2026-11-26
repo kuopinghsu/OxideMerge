@@ -2,9 +2,9 @@
 
 English | [繁體中文](README_zh-TW.md)
 
-OxideMerge is a free, open-source, cross-platform diff and merge tool built in Rust.
-Named after iron oxide—the compound associated with rust—it brings clarity and
-confidence to file comparisons, folder synchronization, and conflict resolution.
+OxideMerge is a free, open-source tool for comparing and merging files and folders on
+Windows, macOS and Linux. It is built in Rust and named after iron oxide, a component of rust.
+Use it to review changes, synchronize folders and resolve merge conflicts.
 
 **See the Difference. Merge with Confidence.**
 
@@ -38,7 +38,7 @@ confidence to file comparisons, folder synchronization, and conflict resolution.
 ### Files and folders
 
 - Compare two files or folders. You can also compare three,
-  with the original version that the other two are based on.
+  with the original version that both edited versions came from.
 - Compare folders with their subfolders, filter items
   by name, and copy items from one folder to the other.
 - See all changed text files of a folder comparison in one list with **All differences**.
@@ -56,19 +56,16 @@ confidence to file comparisons, folder synchronization, and conflict resolution.
   with the same password; a slow-to-compress `.tar.xz` or 7z is written in the background.
   RAR archives are read-only.
 - Compare a file or folder with a Git, Subversion or Mercurial revision.
-- **Compare over SFTP and FTP:** connect to a server over SFTP, FTPS or plain FTP by host, port,
-  user, and a password, a private key or `ssh-agent`, and fetch a file or folder to compare
-  — open it twice for two remote locations, or once against a local path. Type the remote
-  path, or pick it from a list of the server's folders and files. Fetched files and folders
-  are writable: *Save* uploads what changed and deletes what was removed, except what changed
-  on the server meanwhile, and *Reload from server* fetches again. A new server's host key
-  or self-signed certificate fingerprint is shown for you to confirm before anything is sent.
-  On the command line and in jobs, a path can be `sftp://`, `ftp://`, `ftpes://` or `ftps://`,
-  with the password from `OXIDEMERGE_REMOTE_PASSWORD`. SFTP follows `~/.ssh/config` (aliases,
-  keys, `ProxyJump` and `ProxyCommand`), asks the server's sign-in questions such as one-time
-  codes, and accepts host certificates from a `@cert-authority`; SFTP and FTP can go through a
-  SOCKS5 or HTTP proxy, FTP can use active mode, and FTPS can present a client certificate. The
-  connection, including the password or passphrase, is kept only in memory for the tab's lifetime.
+- **Compare over SFTP and FTP:** download a file or folder from a server and compare it with
+  a local path or another remote location. Enter a path or choose from the server's file list.
+  Use a password, private key or SSH agent to sign in. *Save* uploads changes and deletes removed
+  items, with checks to protect files changed on the server. *Reload from server* downloads again.
+  Unknown host keys or self-signed certificates are shown for confirmation before credentials
+  are sent. Passwords and passphrases stay in memory only while the tab is open.
+  SFTP supports `~/.ssh/config`, jump hosts, sign-in questions and host certificates. Proxy
+  connections, FTP active mode and FTPS client certificates are also supported.
+  Command-line and job paths can use `sftp://`, `ftp://`, `ftpes://` or `ftps://`, with passwords
+  from `OXIDEMERGE_REMOTE_PASSWORD`. See the [server comparison guide](docs/user-guide.adoc#remote-sftp).
 
 ### Text
 
@@ -84,15 +81,16 @@ confidence to file comparisons, folder synchronization, and conflict resolution.
   — paste a second text into it to compare the two, with no files needed.
 - Ignore white space, comments or lines that match a pattern. Saved comparison
   rules and number tolerances help with generated files and measurement data.
-- Use syntax highlighting, search and replace, and bookmarks. CSV and TSV files open in a table
-  view that supports records with line breaks, cell editing and cell merging. A CSV file's
+- Use syntax highlighting, find and replace, and bookmarks.
+- **CSV and TSV files:** compare records in a table, including records with line breaks.
+  Edit cells or copy cell values between sides. A CSV file's
   delimiter (comma, semicolon, tab or `|`, or an Excel `sep=` line) is detected from its first
   lines, and each side keeps its own, so a TSV can be compared with a CSV. Rows can be matched by
   key columns instead of by position, columns by their header names, and numbers within a tolerance
   count as equal. Matched rows are listed in left, right or key order. Large tables are matched
   in the background, with progress and **Cancel**, and reports record how the rows were matched.
 - Add synchronization points to match lines that the comparison paired wrongly.
-- Choose one of two row layouts in **View → Text compare** or **Options → General**:
+- Choose a row layout in **View → Layout** or **Options → General**:
   - **Compact rows** (the default) shows the text without gaps.
   - **Aligned rows** adds blank space opposite inserted and
     deleted lines, so that matching lines stay side by side.
@@ -105,23 +103,23 @@ confidence to file comparisons, folder synchronization, and conflict resolution.
   shifted by insertions or deletions. Select a highlighted byte and use **Go to matching
   block** to jump to its counterpart. Detection refreshes in the background after edits.
 - **Images:** compare images side by side, or with the overlay, swipe, blink and difference views.
-- **Documents, spreadsheets and programs:** PDF, Word (`.docx`, `.docm`, `.dotx`, `.dotm`),
-  OpenDocument text (`.odt`), Rich Text (`.rtf`), Excel (`.xlsx`, `.xlsm`, `.xltx`, `.xltm`) and
-  OpenDocument spreadsheets (`.ods`) are
-  compared as the text in them, and ELF programs, shared objects and object files as their
-  header, program headers, section table and symbols sorted by name — with nothing to install.
-  Workbooks open in **Table** view, with a tab for each sheet in a multi-sheet workbook.
-  Single-sheet workbooks support matching rows by key. Excel merged cells show their range
-  in each pane while cell values determine differences. These comparisons are read-only.
+- **Documents, spreadsheets and programs:** compare the text extracted from PDF, Word
+  (`.docx`, `.docm`, `.dotx`, `.dotm`), OpenDocument text (`.odt`), Rich Text (`.rtf`), Excel
+  (`.xlsx`, `.xlsm`, `.xltx`, `.xltm`) and OpenDocument spreadsheets (`.ods`). ELF programs,
+  shared libraries and object files are compared by their headers, sections and symbols.
+  No extra software is needed. These comparisons are read-only.
+  Workbooks open in **Table** view, with a tab for each sheet. Single-sheet workbooks can match
+  rows by key. Excel merged cells show their range; differences depend on cell values.
 - **Jupyter notebooks (`.ipynb`):** compared cell by cell, each one labeled
   as a code cell, a Markdown cell or a raw cell, with that cell's own source
   and nothing else; outputs, execution counts and other run metadata are
   left out, so re-running a notebook without changing it compares equal.
-- **Formatted documents:** choose **Formatted** in the toolbar row above the panes to see Word
-  documents, Excel workbooks and tagged PDF files as formatted Markdown side by side: headings, bold and italic
-  words, lists, links, and tables drawn with their merged cells. Each workbook sheet is a table
-  with its dates, amounts and percentages as their formats show them. Images are shown with
-  their description and a fingerprint of the picture, so a changed picture shows as a change.
+- **Formatted documents:** Word and PDF comparisons open in **Formatted** view by default.
+  Workbooks open in **Table** view; choose **Formatted** above the panes for formatted content.
+  Headings, bold and italic text, lists, links and tables appear side by side. Tables show merged
+  cells, and workbook values use date, amount and percentage formats. Images show a description
+  and a content fingerprint so changes to the image can be detected. Tagged PDFs use their
+  structure tags; untagged PDFs with selectable text use inferred headings and paragraphs.
 - **Web pages:** by default, both pages are converted to Markdown and shown formatted side by side,
   with changed blocks and words highlighted and each block's pictures shown under it. Pictures and
   links beside each page are compared by their address relative to it, so two copies of a site in
@@ -144,12 +142,14 @@ confidence to file comparisons, folder synchronization, and conflict resolution.
 
 ### Review and analysis
 
-These tools only read files. They run only when you open them.
+Analyses run only when you open them and do not write to input files. In the Semantic view,
+copy commands can change the text in a pane; those changes reach the file only when you save.
 
 - **Merge verification:** in a three-way text or folder comparison, expand **Merge
   Verification**. Preview the merge in memory, or check the bytes of the saved result.
 - **Semantic comparison:** **Text / Semantic** compares JSON, XML, TOML and YAML files by
-  their structure. Changes appear in a tree of paths. Moved array items are marked, and you
+  their structure. JSON, TOML and YAML numbers are compared by value, so `1` equals `1.0`.
+  Changes appear in a tree of paths. Moved array items are marked, and you
   can choose a key that matches array items. Copy a single value to the other side without
   touching the rest of the file, or compare three files and take the left or right value
   for each conflict. A folder option counts files with the same structure as identical.
@@ -415,7 +415,7 @@ was made for other folders. A file touched without changing its contents still f
 
 ### Jobs
 
-A job file (`.oxjob`, JSON) lists compares, reports, sync plans and syncs to run in order:
+A job file (`.oxjob`, JSON) lists comparisons, reports and synchronization tasks to run in order:
 
 ```json
 {
@@ -431,12 +431,13 @@ A job file (`.oxjob`, JSON) lists compares, reports, sync plans and syncs to run
 oxidemerge --job nightly.oxjob --yes
 ```
 
-Each job runs as its command line would. Paths are relative to the job file's folder,
-and in paths `${env:NAME}` is the only expansion; nothing is run through a shell.
-A sync job needs `"apply": true` in the file and `--yes` on the command line,
-and so does a report or patch outside the job file's folder. The run stops at the
-first job that fails, unless `"continue_on_error": true`, prints a JSON summary,
-and exits with the worst code of its jobs. See the user guide for every field.
+Each job runs like the corresponding command. Paths are relative to the job file's folder.
+Only `${env:NAME}` is expanded in paths; commands are not run through a shell.
+A sync job needs `"apply": true` in the file and `--yes` on the command line.
+A report or patch outside the job file's folder also needs `--yes`.
+The run stops at the first failed job unless `"continue_on_error": true` is set.
+It prints a JSON summary and returns the highest exit code from its jobs.
+See the user guide for all fields.
 
 In the program, *File → Projects and jobs → Save as job...* saves a folder
 comparison as a job, and *File → Projects and jobs → Run job...* runs a job file
@@ -467,8 +468,8 @@ For more details, see the [user guide](docs/user-guide.adoc).
 
 ### Subversion, Mercurial and Perforce
 
-`svn diff --diff-cmd oxidemerge` works as it is: OxideMerge accepts the `-u` and `-L` titles that
-Subversion passes, so the panes show revision names. Mercurial (`extdiff` and `merge-tools`) and
+`svn diff --diff-cmd oxidemerge` works directly. OxideMerge accepts Subversion's `-u` option
+and the titles passed with `-L`, so the panes show revision names. Mercurial (`extdiff` and `merge-tools`) and
 Perforce (`P4DIFF`, `P4MERGE`, or P4V's *Diff* and *Merge* preferences) are set up in their own
 configuration. Subversion's `merge-tool-cmd` and Perforce's `P4MERGE` can be `oxidemerge` itself:
 the files are reordered, and an unchanged result exits with code 1 so the conflict stays unresolved.
@@ -565,7 +566,9 @@ most shortcuts use Command instead of Ctrl. The app shows the right keys for you
   comparisons, folder comparisons of full contents, the command line and
   reports, and a plugin is always used in preference to what OxideMerge reads
   itself. The presets need conversion tools that you install separately.
-- Folder synchronization changes files one at a time, so it is not one atomic step.
+- Folder synchronization changes files one at a time. Other programs may see some files
+  already changed while others are still unchanged. It runs when you start it, without
+  continuously watching for changes.
   A renamed or moved file is moved in the destination, also when only its letter case or the
   way its accents are written changed, but it is copied and deleted when the two places are
   on different drives. Folders renamed only in letter case, and other names that differ only
@@ -589,10 +592,11 @@ most shortcuts use Command instead of Ctrl. The app shows the right keys for you
   else the format holds are not compared, and the comparison is read-only. A PDF records
   where each glyph goes rather than words, so columns, tables and ligatures may not come out
   as they look. The older Word `.doc` and Excel `.xls` are not read; use a plugin for those.
-- The **Formatted** view of a PDF needs a tagged PDF, which says which text is
-  a heading, paragraph, list or table. Most word processors tag the PDFs they
-  export; a scan or an untagged PDF can be compared as text only. Fills, fonts,
-  borders, formulas and charts are not compared in the Formatted view either.
+- Tagged PDFs provide structure for the **Formatted** view. For untagged PDFs with selectable
+  text, OxideMerge estimates headings and paragraphs and shows **Formatted (inferred)**.
+  This works best for single-column documents; columns and tables may appear in the wrong order.
+  Scans without a text layer need OCR before text can be compared. Fills, fonts, borders,
+  formulas and charts are not compared in the Formatted view.
 
 ### Linux
 
@@ -613,7 +617,8 @@ most shortcuts use Command instead of Ctrl. The app shows the right keys for you
 - Perforce has no *Compare with revision*. On Windows, Mercurial can only open a file name the ANSI
   code page can spell, which is the same limit `hg` has. A Subversion or Perforce server can still
   ask for a sign-in that OxideMerge cannot give; sign in with `svn` or `p4` first. P4V uses its own
-  argument string, so closing it without saving does not by itself leave the conflict unresolved.
+  argument string. In P4V, save the result in OxideMerge before choosing *Accept Merged*.
+  Closing the comparison window does not confirm that the result was saved.
 - The translations were made with machine help. Native speakers have not reviewed them yet.
 
 ## Development

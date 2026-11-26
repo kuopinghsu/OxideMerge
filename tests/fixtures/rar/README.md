@@ -1,6 +1,7 @@
 # RAR archives for the tests
 
-Nothing free writes a RAR archive, so the tests of `src/core/archive.rs` read these.
+These RAR archives are fixed input files for the tests in `src/core/archive.rs`.
+The tests read them directly rather than generating RAR archives at runtime.
 
 | File | Format | Password | Holds |
 |------|--------|----------|-------|
@@ -16,6 +17,8 @@ Nothing free writes a RAR archive, so the tests of `src/core/archive.rs` read th
 | `v4.rar` | RAR 4 | | `VERSION` |
 | `v4-password.rar` | RAR 4, data encrypted | `unrar` | `.gitignore` |
 
-The `v5` ones were made with RAR 7.23 (`rar a -ma5 -m3 -r`, with `-s`, `-psecret` and
-`-hpsecret`; `-v1k` for the volume), which no longer writes the older format. The `v4` ones are `data/version.rar` and
-`data/crypted.rar` of the [`unrar`](https://github.com/muja/unrar.rs) crate (MIT OR Apache-2.0).
+The RAR 5 files were created with RAR 7.23, using `rar a -ma5 -m3 -r`.
+The variants use `-s` for solid compression, `-psecret` for data encryption,
+`-hpsecret` for encrypted file names, and `-v1k` for multiple volumes.
+RAR 7.23 does not write RAR 4 files. The RAR 4 files come from `data/version.rar` and
+`data/crypted.rar` in the [`unrar`](https://github.com/muja/unrar.rs) crate (MIT OR Apache-2.0).

@@ -8,7 +8,7 @@ project folder: `cargo run --` runs the debug build; with OxideMerge installed, 
 
     cargo run -- -r samples/left samples/right      # or: make demo
 
-The two folders differ in every way a folder compare shows: changed text and binary files,
+These folders demonstrate the main results of a folder comparison: changed text and binary files,
 identical files (`same.txt`, `src/util/strings.rs`), and files and folders on one side
 only (`only_left/`, `docs/README.md`). Select files by name with patterns such as
 `*.log; *.py`, open the **All differences** view, or write a report or slideshow from the
@@ -35,13 +35,62 @@ Each pair below can also be opened on its own, for example
 | `text/encoding.txt` | The same text in ISO-8859-1 and in UTF-8 with a byte order mark. It compares equal by default; turn off **Ignore code page differences** to see the difference. |
 | `images/chart.png` | A bar chart where one bar grew and two changed color. Try the side by side, overlay, swipe, blink and difference views. |
 | `images/gradient.ppm`, `images/stamp.pbm` | Netpbm images (binary PPM and plain-text PBM) with a few changed areas. The square at the bottom right of the gradient is one shade greener, which the eye cannot tell: the blink and difference views mark it, and the status bar shows both colors under the pointer. Zoom in on the small stamp. |
-| `bin/firmware.bin` | A mixed binary edit fixture. The left side has bytes inserted, deleted and overwritten throughout, so its copy of the right side's bytes is from 1 byte behind to 21 bytes ahead. Enable **Moved blocks** to see 18 unchanged runs at shifted offsets. |
-| `docs/report.docx`, `docs/report.pdf`, `docs/budget.xlsx` | Word, Excel and PDF files read by the built-in readers, with no converter installed. **The report:** edited and added paragraphs, bullet lists, a header with a logo, a changed chart and an added map image (as text, image changes show through the captions; choose **Formatted** above the panes to see the tables drawn with their merged cells and each image's fingerprint), and tables with merged cells: header cells spanning columns and rows, areas merged down over their regions, with an added region inside a merge, and total and notes rows spanning several columns. `report.pdf` is the report as LibreOffice prints it, tagged, for comparing the same changes as a PDF; **Formatted** reads it from its tags, with the same headings, lists, merged table cells and figures as the Word file. **The budget:** six sheets with merged titles and headers, group cells merged down over their rows (with a row added inside a merge and one removed), formulas whose stored results change, dates, percentages, booleans, an error value, rich and inline text, text that needs quoting (commas, quotes, line breaks), rows that swap places, cells far apart on a sparse sheet, a hidden sheet, a sheet removed and one added with a Chinese name, and pictures placed over cells. As text, only values are compared, dates as serial numbers. Choose **Formatted** above the panes to see each sheet as a table with its merged cells, dates, amounts and percentages as their formats show them, and each picture with its cell and fingerprint, so the photo changed on its own (the first staff row) shows as a change. A fill changed on its own (Utilities Q2) compares as equal either way: open the workbook as an archive to see it in `xl/worksheets/sheet2.xml` (the cell's style). |
+| `bin/firmware.bin` | A mixed binary edit fixture. Insertions, deletions and overwritten bytes on the left shift matching data by offsets ranging from 1 byte behind to 21 bytes ahead. Enable **Moved blocks** to see 18 unchanged runs at shifted offsets. |
+| `docs/report.docx`, `docs/report.pdf`, `docs/budget.xlsx` | Compare documents and workbooks with the built-in readers. Try Text, Table and Formatted views; see [Document and workbook samples](#document-and-workbook-samples). |
 | `docs/report.ipynb` | A Jupyter notebook read cell by cell: the second code cell has the same source on each side but a different execution count and output, so it compares equal; the third has a line added, and the closing note's wording changed. Outputs, execution counts and other run metadata never show up in the comparison. |
 | `prog/prog.elf` | Two 32-bit RISC-V programs for the same board, CoreMark on the left and Dhrystone on the right, read by the built-in ELF reader: the header, the program headers (segments with their addresses, sizes and flags), the section table, and the symbols sorted by name with their address, size, type, binding, visibility and section. The start-up code and memory map they share line up, the benchmark functions show as added and removed, and the shared functions show as moved to new addresses. |
-| `web/handbook.html` | A long web page compared as a web page, in the **Formatted** mode by default: headings at three levels, edited paragraphs with bold, italic and code words, nested and numbered lists with items added, a quote, a definition list, a code block, a figure whose alt text and picture changed, an added section and a changed email link. The pictures are in `web/images`: a logo inside a link (it has no alt text, so Formatted names it by its file name), a warning sign whose picture changed under the same name and alt text (Formatted compares the picture files beside the page by their content, and **Resources** shows the changed file), a badge added on the right with only a `srcset`, and a status dot stored in the page as a `data:` URI whose alt text and colour changed (**Resources** saves it as `_inline/1.png`, so the new colour shows there). Two tables have merged cells (`rowspan`, `colspan`): header cells spanning rows and columns, regions merged down over their areas with a row added inside a merge and a region replaced, and footer rows spanning several columns; they are drawn with their merged cells. A note hidden with an inline `display: none` changes too, and is left out of the Formatted and Text modes (HTML source still shows it). |
+| `web/handbook.html` | Compare formatted headings, text, lists, pictures and tables. See [Web handbook sample](#web-handbook-sample). |
 | `archives/bundle.zip` | Open it from the folder compare to compare the archives as folders: changed files and one added file. |
 | `blob.bin`, `picture.png`, `data.csv` | The original small binary, image and CSV samples. |
+
+### Document and workbook samples
+
+The built-in readers open these files without an external converter. These comparisons are
+read-only; use the views to review content rather than edit the original documents.
+
+**Reports: `docs/report.docx` and `docs/report.pdf`**
+
+- Compare edited and added paragraphs, bullet lists, a header with a logo, a changed chart
+  and an added map. Text view shows image changes through captions. **Formatted** view
+  also uses an image fingerprint to detect changes to the picture itself.
+- Review tables with merged cells across rows and columns. The samples include a new region
+  inside a merged area, plus total and notes rows that span several columns.
+- The PDF is a tagged export from LibreOffice. **Formatted** uses its tags to show headings,
+  lists, merged cells and figures, as in the Word file.
+
+**Workbook: `docs/budget.xlsx`**
+
+- Compare six sheets with merged titles, headers and groups. Some rows and sheets are added,
+  removed or reordered, and one new sheet has a Chinese name.
+- Review changed formula results, dates, percentages, Boolean values, an error value and text
+  containing commas, quotes or line breaks. The samples also include rich text, inline text,
+  a hidden sheet and cells far apart on a sparse sheet.
+- **Text** compares stored values; dates appear as serial numbers. **Table** opens one tab per
+  sheet. **Formatted** shows merged cells and formatted dates, amounts and percentages.
+- Pictures show their cell position and content fingerprint. The photo in the first staff row
+  changes without a change to the cell values, so it still appears as a difference.
+- A change to the Utilities Q2 fill color is ignored in all three views. To inspect the style
+  change, open the workbook as an archive and compare `xl/worksheets/sheet2.xml`.
+
+### Web handbook sample
+
+`web/handbook.html` opens in **Formatted** mode by default. Compare headings at three levels,
+paragraphs with bold, italic and code text, nested and numbered lists, a quote, a definition list
+and a code block. The samples also have an added section and a changed email link.
+
+The pictures are stored in `web/images`:
+
+- The logo has no alternative text, so Formatted uses its file name.
+- The warning picture changes while keeping its name and alternative text. Formatted compares
+  the local picture contents, and **Resources** shows the changed file.
+- The right side adds a badge with only a `srcset` attribute.
+- A status dot is stored as a `data:` URI. Its alternative text and color change. **Resources**
+  saves it as `_inline/1.png`, where the color change can be compared.
+
+Two tables use `rowspan` and `colspan`. Their headers, regions and footer rows include merged
+cells. One region is added inside a merged area and another is replaced. Formatted displays
+these merged cells. A note hidden by an inline `display: none` style also changes; only **HTML
+source** shows that change, because Formatted and Text omit hidden content.
 
 ## Three-way compare: `three`
 
@@ -62,7 +111,7 @@ Each pair below can also be opened on its own, for example
   same on both, in conflict, added on the left, and removed on the right. Use
   **Auto merge** on the folder compare too. **Next conflict** (Alt+PgDn) goes through the
   open conflicts of `conflict.txt` and `docs/install.md`, passing over `docs/guide.md`,
-  which both sides changed but which merges cleanly. Turn on
+  which both sides changed without a merge conflict. Turn on
   **View → File compare below the folder list** to step through them without opening tabs.
 - `conflict.txt` and `diff3-conflict.py`: files with version-control conflict markers. The
   second has two conflicts in Git's diff3 style, with the base version between `|||||||`
@@ -91,8 +140,8 @@ Choose **Synchronize folders...** in the folder compare, then **Mirror left → 
 preview lists a folder to create, a replaced `README.txt`, a copied `new.txt` and a
 deleted `obsolete.txt`; `q3-report.txt` moved to `reports/2026-q3.txt` in the source, so
 it shows under **Rename** too. **Update right from left** keeps `obsolete.txt` and
-`q3-report.txt`. Nothing changes until you choose **Apply changes**, and **Stop** undoes
-what was done.
+`q3-report.txt`. Nothing changes until you choose **Apply changes**. **Stop** attempts to undo completed changes.
+If recovery is incomplete, the recovery journal is kept and the message lists the files that need attention.
 
 ## XML tree compare: `xml`
 
