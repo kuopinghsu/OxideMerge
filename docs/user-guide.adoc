@@ -2,6 +2,7 @@ ifdef::backend-pdf[= OxideMerge User Guide: Compare, review and merge files and 
 ifndef::backend-pdf[= OxideMerge User Guide]
 :description: How to compare, review and merge files and folders with OxideMerge.
 :revnumber: 0.9.10
+:revdate: 2026-11-26
 :doctype: book
 :toc: left
 :toclevels: 2
@@ -81,10 +82,15 @@ Before you report a problem, see <<troubleshooting>> and <<limitations>>.
 |Version |Date |Changes
 
 |0.9.10
-|Unreleased
-|Moved server, document and archive comparisons into separate chapters.
-Simplified English instructions and revised Traditional Chinese wording.
-Aligned the two guides and updated descriptions of number comparison and synchronization.
+|2026-11-26
+|Reorganized comparison chapters and simplified English and Traditional Chinese instructions.
+Updated remote folder filters and subfolders, number comparison, synchronization recovery,
+Linux AppImages and remote displays.
+
+|0.9.9
+|2026-11-17
+|Added instructions for the remote file tree, comparing selected items, SFTP folder comparisons
+from listings and recent connections. Updated pictures in formatted web comparisons and examples.
 
 |0.9.8
 |2026-11-12
