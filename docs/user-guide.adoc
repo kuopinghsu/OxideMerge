@@ -5235,6 +5235,15 @@ example, may not have one.
 _Solution:_ Start OxideMerge with `LIBGL_ALWAYS_SOFTWARE=1 oxidemerge`. This uses the Mesa software
 renderer.
 
+OxideMerge responds slowly over `ssh -X`::
+_Cause:_ Over `ssh -X` or `ssh -Y`, every frame is the whole window sent across the network as
+pixels. OxideMerge then keeps frames at least a tenth of a second apart, a quarter of a second
+while only a progress indicator moves, and turns animations off.
++
+_Solution:_ Turn on SSH compression with `ssh -C` (or `Compression yes` in `~/.ssh/config`). It is
+much faster to run OxideMerge on your own computer and compare the files over SFTP (see
+<<remote-sftp>>), or to use a remote desktop.
+
 File dialogs do not open on Linux::
 _Cause:_ File dialogs use the XDG desktop portal.
 +

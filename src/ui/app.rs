@@ -3435,6 +3435,9 @@ pub struct OxideMergeApp {
     frame_floor: Option<Option<FrameFloor>>,
     /// When the last frame started, to keep frames `frame_floor` apart.
     last_frame: Option<std::time::Instant>,
+    /// When the last frame that answered input started: such frames are kept apart from each
+    /// other only (see [`frame_wait`]).
+    last_input_frame: Option<std::time::Instant>,
     /// Whether this frame came with input, such as a key or the mouse, set before it is drawn.
     input_frame: bool,
     /// Whether the frame before this one came with input.
@@ -4403,6 +4406,7 @@ impl OxideMergeApp {
             report_job: None,
             frame_floor: None,
             last_frame: None,
+            last_input_frame: None,
             input_frame: false,
             after_input: false,
             report_opens: false,
@@ -13391,6 +13395,17 @@ fn remote_x11(display: Option<&str>, wayland: Option<&str>, wsl: bool, ssh: bool
         .is_some_and(|(host, _)| !host.is_empty() && host != "unix")
 }
 
+/// Whether this Linux runs in WSL, told by its kernel's release (`5.15.167.4-microsoft-standard-WSL2`,
+/// say): `sudo` drops `WSL_DISTRO_NAME` and `WSL_INTEROP` but keeps `DISPLAY`.
+fn wsl_kernel() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease").is_ok_and(|release| wsl_release(&release))
+}
+
+/// Whether the kernel release `release` is WSL's.
+fn wsl_release(release: &str) -> bool {
+    release.to_ascii_lowercase().contains("microsoft")
+}
+
 /// [`remote_x11`] for this process's environment; never on Windows or macOS.
 fn remote_x11_here() -> bool {
     if !cfg!(all(unix, not(target_os = "macos"))) {
@@ -13400,9 +13415,25 @@ fn remote_x11_here() -> bool {
     remote_x11(
         var("DISPLAY").as_deref(),
         var("WAYLAND_DISPLAY").as_deref(),
-        var("WSL_DISTRO_NAME").is_some() || var("WSL_INTEROP").is_some(),
+        var("WSL_DISTRO_NAME").is_some() || var("WSL_INTEROP").is_some() || wsl_kernel(),
         var("SSH_CONNECTION").is_some() || var("SSH_CLIENT").is_some(),
     )
+}
+
+/// How long to wait before a frame `since_last` after the one before and `since_last_input`
+/// after the last one that answered input, to keep frames `floor` apart. A frame that answers
+/// input (`input`) is kept [`FrameFloor::input`] from the last such frame only, not from a
+/// spinner's frame in between: a key pressed while that frame waited is then drawn as soon as
+/// that frame is, rather than after a second wait. Other frames are kept [`FrameFloor::idle`]
+/// from any frame.
+fn frame_wait(
+    floor: FrameFloor,
+    input: bool,
+    since_last: Option<std::time::Duration>,
+    since_last_input: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    let since = if input { since_last_input } else { since_last };
+    frame_pause(Some(floor.of(input)), since)
 }
 
 /// How long to wait before a frame `since_last` after the one before, to keep them `floor`
@@ -13476,8 +13507,9 @@ impl eframe::App for OxideMergeApp {
         // Drawn in software, a window may have no vsync (Mesa before 21 cannot set it), and an
         // animation such as a spinner, which asks for the next frame at once, would then draw
         // as fast as the processor allows. Frames are kept apart there, and further apart on a
-        // display sent across the network (`ssh -X`); see [`FrameFloor`]. The frame after one
-        // that answers input is paced as that one, as work a key starts may take two frames.
+        // display sent across the network (`ssh -X`); see [`FrameFloor`] and [`frame_wait`]. The
+        // frame after one that answers input is paced as that one, as work a key starts may take
+        // two frames.
         let floor = *self.frame_floor.get_or_insert_with(|| {
             use eframe::glow::HasContext;
             let renderer = frame
@@ -13485,13 +13517,26 @@ impl eframe::App for OxideMergeApp {
                 .map(|gl| unsafe { gl.get_parameter_string(eframe::glow::RENDERER) });
             frame_floor(renderer.as_deref().unwrap_or(""), remote_x11_here())
         });
-        let input = std::mem::replace(&mut self.after_input, self.input_frame) || self.input_frame;
-        if let Some(floor) = floor.map(|f| f.of(input)) {
-            let since_last = self.last_frame.map(|t| t.elapsed());
-            if let Some(pause) = frame_pause(Some(floor), since_last) {
+        // egui runs `ui` again within the same frame when a layout asks for another pass (a grid
+        // shown for the first time, say); that pass is no new frame, so it does not wait again.
+        if let (Some(floor), 0) = (floor, root.ctx().current_pass_index()) {
+            let input =
+                std::mem::replace(&mut self.after_input, self.input_frame) || self.input_frame;
+            let since = |t: Option<std::time::Instant>| t.map(|t| t.elapsed());
+            let wait = frame_wait(
+                floor,
+                input,
+                since(self.last_frame),
+                since(self.last_input_frame),
+            );
+            if let Some(pause) = wait {
                 std::thread::sleep(pause);
             }
-            self.last_frame = Some(std::time::Instant::now());
+            let started = std::time::Instant::now();
+            self.last_frame = Some(started);
+            if input {
+                self.last_input_frame = Some(started);
+            }
         }
         let ctx = &root.ctx().clone();
         self.cfg.dark_mode = match self.cfg.theme {

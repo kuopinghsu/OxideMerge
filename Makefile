@@ -71,7 +71,7 @@ help:
 	@echo '  shell-unregister  Remove the file manager entries'
 	@echo '  languages         List the available UI languages'
 	@echo '  dist              Size-tuned build packaged into dist/$(DIST_NAME)'
-	@echo '  appimage          Linux AppImage in dist/ for RHEL 8+ (in Docker when installed)'
+	@echo '  appimage          Linux AppImage in dist/ for RHEL 8+ (in Docker when it answers)'
 	@echo '  appimage-native   Linux AppImage built on this Linux host (needs its glibc or newer)'
 	@echo '  user-guide        User guide PDF files (English, Traditional Chinese) in dist/'
 	@echo '  user-guide-docs   The latest user guide PDF files in docs/dist, to commit'
@@ -182,11 +182,12 @@ endif
 # The AppImage is built in an AlmaLinux 8 container (glibc 2.28, as CI builds it), so it runs on
 # RHEL 8 and newer. A native Linux build links to the host's glibc: one from Ubuntu 22.04 or a
 # newer WSL distribution fails on RHEL 8 with "GLIBC_2.xx not found". On Linux, Docker is used
-# when it is installed; APPIMAGE_DOCKER=0 (or `make appimage-native`) builds on the host instead.
+# when its daemon answers as `make appimage` runs (APPIMAGE_DOCKER=auto); APPIMAGE_DOCKER=0 (or
+# `make appimage-native`) builds on the host, and APPIMAGE_DOCKER=1 always in Docker.
 ifneq ($(filter windows darwin,$(PLATFORM)),)
 APPIMAGE_DOCKER := 1
 else ifeq ($(PLATFORM),linux)
-APPIMAGE_DOCKER ?= $(if $(shell command -v docker 2>/dev/null),1,0)
+APPIMAGE_DOCKER ?= auto
 # Files the root user in the container writes to dist/ are given back to the host user.
 APPIMAGE_OWNER := --env "HOST_UID=$(shell id -u)" --env "HOST_GID=$(shell id -g)"
 endif
@@ -197,15 +198,31 @@ appimage-native: opt-size
 	VERSION='$(VERSION)' bash scripts/package-appimage.sh
 endif
 
-ifeq ($(APPIMAGE_DOCKER),1)
+ifneq ($(filter 1 auto,$(APPIMAGE_DOCKER)),)
 APPIMAGE_IMAGE := oxidemerge-appimage
 
-.PHONY: appimage-image
+.PHONY: appimage-image appimage-docker
 appimage-image:
 	docker build -t $(APPIMAGE_IMAGE) -f docker/appimage.Dockerfile docker
 
-appimage: appimage-image
+appimage-docker: appimage-image
 	docker run --rm --init --mount "type=bind,source=$(CURDIR),target=/work" --mount "type=volume,source=oxidemerge-appimage-target-$(MACHINE),target=/target" --mount "type=volume,source=oxidemerge-appimage-registry,target=/root/.cargo/registry" --workdir /work --env "VERSION=$(VERSION)" --env CARGO_BUILD_JOBS $(APPIMAGE_OWNER) $(APPIMAGE_IMAGE)
+endif
+
+ifeq ($(APPIMAGE_DOCKER),1)
+appimage: appimage-docker
+else ifeq ($(APPIMAGE_DOCKER),auto)
+# A `docker` command whose daemon does not answer (stopped, or a user not allowed to use it)
+# builds on the host, as without Docker, saying so.
+appimage:
+	@if docker info >/dev/null 2>&1; then \
+		$(MAKE) --no-print-directory appimage-docker; \
+	else \
+		if command -v docker >/dev/null 2>&1; then \
+			echo "Docker does not answer (is it running, and may this user use it?), so the AppImage is built on this host and needs its glibc or newer." >&2; \
+		fi; \
+		$(MAKE) --no-print-directory appimage-native; \
+	fi
 else ifeq ($(PLATFORM),linux)
 appimage: appimage-native
 else

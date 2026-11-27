@@ -28,7 +28,8 @@ release on GitHub uses its section of this file as the release notes.
   second apart and animations are off. Each frame is the whole window sent as pixels, megabytes
   with OpenGL drawn in software, so a key's press, its release and the change of the modifiers
   now share a frame, and *Next difference* sends fewer of them. Frames no input asks for, such
-  as a spinner's while a folder loads, are a quarter of a second apart there, and one 30 Hz
+  as a spinner's while a folder loads, are a quarter of a second apart there (a key pressed
+  meanwhile is drawn with the next frame, not after a further wait), and one 30 Hz
   frame apart with OpenGL drawn in software. Comparing the files over SFTP
   from OxideMerge on your own computer, or a remote desktop, is still much faster.
 
@@ -52,11 +53,15 @@ release on GitHub uses its section of this file as the release notes.
   With OpenGL drawn in software, frames are kept one 60 Hz frame apart, so an animation without
   vsync does not keep the processor busy. The AppImage is now also tested on AlmaLinux 8.4, whose
   Mesa 20.3 had the crash.
-- `make appimage` on Linux, WSL included, builds in the AlmaLinux 8 container whenever Docker is
-  installed, as it already did on Windows and macOS. Built on the host, the AppImage needed that
+- `make appimage` on Linux, WSL included, builds in the AlmaLinux 8 container whenever Docker
+  answers, as it already did on Windows and macOS. Built on the host, the AppImage needed that
   host's glibc, and one from a newer distribution failed on RHEL 8 with "GLIBC_2.xx not found".
+  When Docker is installed but its daemon does not answer, the build says so and runs on the
+  host. The files the container writes to `dist/` are given back to the user, also when the
+  build stops, and left as they are with rootless Docker or Podman.
   `make appimage-native` (or `APPIMAGE_DOCKER=0`) still builds on the host, and the packaging
-  script now warns when the AppImage needs a glibc newer than 2.28.
+  script now warns when the AppImage needs a glibc newer than 2.28, or that it cannot check
+  without `objdump`.
 
 ## [0.9.9] - 2026-11-17
 

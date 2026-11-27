@@ -2084,7 +2084,7 @@ fn repack_zip(
                             if !utf8 {
                                 anyhow::bail!(crate::i18n::trf(
                                     "msg.archive_name_not_utf8",
-                                    &[("name", name.clone()), ("file", path.display().to_string()),]
+                                    &[("name", name.clone()), ("file", path.display().to_string())]
                                 ));
                             }
                             changed = true;

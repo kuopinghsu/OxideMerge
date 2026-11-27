@@ -101,6 +101,9 @@ ls "$app/usr/lib/oxidemerge"
 # AppImage runs on. RHEL 8 has 2.28; a build on a newer host (Ubuntu 22.04, most WSL
 # distributions) stops there with "GLIBC_2.xx not found".
 glibc_max=2.28
+if ! command -v objdump >/dev/null; then
+    echo "${GITHUB_ACTIONS:+::warning::}objdump (binutils) is missing, so the glibc this AppImage needs is not checked." >&2
+fi
 glibc_needed=$(find "$app/usr" -type f \( -name '*.so*' -o -path '*/bin/*' \) -print0 |
     xargs -0 objdump -T 2>/dev/null | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' |
     sort -uV | tail -n 1 || true)

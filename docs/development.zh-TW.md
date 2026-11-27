@@ -86,7 +86,7 @@ macOS 與 Linux 的程式位於 `target/release/oxidemerge`，Windows 則為
 | 指令 | 用途 |
 | --- | --- |
 | `make dist` | 以 `make opt-size` 建置，並在 `dist/` 產生套件：Windows 為 ZIP 檔，macOS 與 Linux 為 TAR.GZ 檔。 |
-| `make appimage` | 依本機處理器架構（x86_64 或 aarch64）產生 Linux AppImage。有安裝 Docker 時（Windows 與 macOS 一律如此，Linux 與 WSL 則在找得到 `docker` 時），會如同 CI 在 glibc 2.28 的 AlmaLinux 8 容器中建置，因此 AppImage 可在 RHEL 8 上執行。`make appimage-native`（或 `APPIMAGE_DOCKER=0`）則直接在 Linux 主機上建置：需要 X11、Wayland 與鍵盤函式庫，且產生的 AppImage 需要與主機相同或更新的 glibc。兩者都會下載 `appimagetool`。 |
+| `make appimage` | 依本機處理器架構（x86_64 或 aarch64）產生 Linux AppImage。Docker 可以使用時（Windows 與 macOS 一律如此，Linux 與 WSL 則在 `docker info` 成功時；若不成功，會顯示訊息並改在主機上建置），會如同 CI 在 glibc 2.28 的 AlmaLinux 8 容器中建置，因此 AppImage 可在 RHEL 8 上執行。`make appimage-native`（或 `APPIMAGE_DOCKER=0`）則直接在 Linux 主機上建置：需要 X11、Wayland 與鍵盤函式庫，且產生的 AppImage 需要與主機相同或更新的 glibc。兩者都會下載 `appimagetool`。 |
 | `make user-guide` | 在 `dist/` 產生英文與繁體中文 PDF 指南。 |
 | `make user-guide-docs` | 在 `docs/dist/` 產生相同的指南，檔名為 `oxidemerge-user-guide.pdf` 與 `oxidemerge-user-guide.zh-TW.pdf`。這些檔案會提交到儲存庫，每次建置都會取代它們。 |
 
@@ -301,7 +301,7 @@ AppImage 與 DMG 必須帶有其格式標記，PDF 必須完整。之後會將 `
 - 在透過網路傳送的 X11 顯示上（如 `ssh -X` 與 `ssh -Y` 所設定：`DISPLAY` 指名主機，例如
   `localhost:10.0`，且未設定 `WAYLAND_DISPLAY`；在會移除 `SSH_CONNECTION` 的 `sudo` 下也是如此；在 WSL
   中則只限於 SSH 工作階段，因為 VcXsrv 等 Windows 上的 X 伺服器是以位址指名），畫面之間至少間隔十分之一
-  秒，且動畫關閉。非由輸入引發的畫面（例如轉圈圖示或檢查進行中的工作）至少間隔四分之一秒。每個畫面都是
+  秒，且動畫關閉。非由輸入引發的畫面（例如轉圈圖示或檢查進行中的工作）至少間隔四分之一秒；回應輸入的畫面只與上一個回應輸入的畫面保持間隔，因此在轉圈圖示的畫面等待時按下的鍵，會在該畫面之後立即繪製。每個畫面都是
   整個視窗，以軟體繪製 OpenGL 時就是數 MB 的像素，因此按鍵的按下、放開與修飾鍵的變更會合併在同一個畫面
   中。`ssh -C`（或 `Compression yes`）幫助很大：畫面大多是單色區塊，壓縮效果很好。在使用者自己的電腦上以 OxideMerge 透過 SFTP 比較檔案，或使用 NoMachine、X2Go、VNC 等遠端桌面，
   會快得多。

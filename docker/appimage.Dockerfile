@@ -21,5 +21,5 @@ RUN git config --global --add safe.directory /work
 WORKDIR /work
 # The registry is the container's own volume, so the glutin patch for Mesa before 21 can go into
 # it, as in CI.
-# On a Linux host, `make appimage` passes HOST_UID and HOST_GID so dist/ stays the user's.
-CMD ["bash", "-c", "bash scripts/patch-glutin.sh && cargo build --profile release-size --locked && bash scripts/package-appimage.sh && if [ -n \"${HOST_UID:-}\" ]; then chown \"$HOST_UID:${HOST_GID:-$HOST_UID}\" dist dist/*.AppImage; fi"]
+# scripts/appimage-container.sh also gives dist/ back to the host user on a Linux host.
+CMD ["bash", "scripts/appimage-container.sh"]

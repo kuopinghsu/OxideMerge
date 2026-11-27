@@ -4145,6 +4145,66 @@ fn remote_x11_displays_are_told_apart() {
         remote_x11(Some("localhost:10.0"), Some(""), false, true),
         "an empty WAYLAND_DISPLAY"
     );
+    // WSL is told by its kernel too, as `sudo` drops its variables.
+    assert!(wsl_release("5.15.167.4-microsoft-standard-WSL2\n"));
+    assert!(wsl_release("4.4.0-19041-Microsoft"));
+    assert!(!wsl_release("6.8.0-45-generic"));
+}
+
+/// A frame that answers input waits only for the last frame that did, so a key pressed while a
+/// spinner's frame waited is not held for a second wait; other frames wait for any frame.
+#[test]
+fn frames_that_answer_input_wait_for_input_frames_only() {
+    let ms = Duration::from_millis;
+    let floor = REMOTE_FRAME_FLOOR;
+    // A spinner's frame drew 5 ms ago; the last key was answered a second ago.
+    assert_eq!(frame_wait(floor, true, Some(ms(5)), Some(ms(1000))), None);
+    assert_eq!(
+        frame_wait(floor, true, Some(ms(5)), None),
+        None,
+        "the first key"
+    );
+    // Keys a moment apart still share the frames sent across the network.
+    assert_eq!(
+        frame_wait(floor, true, Some(ms(5)), Some(ms(30))),
+        Some(ms(70))
+    );
+    // A spinner's frame waits for the frame before it, whatever that answered.
+    assert_eq!(
+        frame_wait(floor, false, Some(ms(50)), Some(ms(50))),
+        Some(ms(200))
+    );
+    assert_eq!(frame_wait(floor, false, Some(ms(300)), None), None);
+}
+
+/// A pass egui runs again within one frame, for a layout that needs it, does not wait again.
+#[test]
+fn a_frame_run_again_for_its_layout_waits_once() {
+    let ms = Duration::from_millis;
+    let mut gui = Gui::start("frame_discard", None);
+    gui.frame();
+    gui.app.frame_floor = Some(Some(FrameFloor {
+        input: ms(300),
+        idle: ms(300),
+    }));
+    gui.app.last_frame = None;
+    gui.app.last_input_frame = None;
+    let start = Instant::now();
+    let (app, frame) = (&mut gui.app, &mut gui.frame);
+    let mut passes = 0;
+    let _ = gui.ctx.run_ui(egui::RawInput::default(), |ui| {
+        passes += 1;
+        eframe::App::ui(app, ui, frame);
+        if ui.ctx().current_pass_index() == 0 {
+            ui.ctx().request_discard("test");
+        }
+    });
+    assert_eq!(passes, 2);
+    assert!(
+        start.elapsed() < ms(300),
+        "two passes in {:?}",
+        start.elapsed()
+    );
 }
 
 /// Drawn in software, frames are kept one 60 Hz frame apart: the next waits for the rest of it,

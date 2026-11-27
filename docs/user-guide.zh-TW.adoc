@@ -4581,6 +4581,13 @@ AppImage 無法啟動::
 +
 解決方法：請以 `LIBGL_ALWAYS_SOFTWARE=1 oxidemerge` 啟動，改用 Mesa 的軟體繪圖。
 
+透過 `ssh -X` 使用時 OxideMerge 反應緩慢::
+原因：透過 `ssh -X` 或 `ssh -Y` 時，每個畫面都是以像素形式經由網路傳送的整個視窗。OxideMerge
+因此會讓畫面之間至少間隔十分之一秒，只有進度指示在動時則間隔四分之一秒，並關閉動畫。
++
+解決方法：請以 `ssh -C`（或在 `~/.ssh/config` 中設定 `Compression yes`）開啟 SSH 壓縮。在您自己的電腦上
+執行 OxideMerge 並透過 SFTP 比較檔案（請參閱 <<remote-sftp>>），或使用遠端桌面，會快得多。
+
 在 Linux 上無法開啟檔案對話框::
 原因：檔案對話框使用 XDG 桌面入口服務。
 +
