@@ -1,4 +1,8 @@
-# Branch pushes and pull requests run Linux x64 checks and dependency checks.
+# Branch pushes and pull requests run only the checks their changes can affect (see the
+# `changes` job): the Linux x64 checks for code, two document tests for the README and the
+# guides, and dependency checks for Cargo.toml, Cargo.lock and deny.toml. A change to this
+# workflow runs all three; one to anything else, such as the PDFs, CHANGELOG.md or the
+# packaging scripts, runs none of them. A weekly run checks for new advisories.
 # Release-tag pushes and manual runs check Windows x64/Arm64, Linux x64/Arm64
 # and macOS. Release tags build packages automatically; manual runs build them
 # with packages enabled (the default). Package runs on release tags publish
@@ -10,6 +14,9 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  # Advisories published since the dependencies last changed.
+  schedule:
+    - cron: "17 3 * * 1"
   workflow_dispatch:
     inputs:
       packages:
@@ -39,6 +46,62 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  # Which checks a branch push or pull request needs, from the files it changed. Release tags
+  # and manual runs need them all; a scheduled run, the dependency checks only. When the files
+  # cannot be listed (a new branch, a force push past a commit that is gone, 300 files or more),
+  # every check runs.
+  changes:
+    name: Changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+      docs: ${{ steps.classify.outputs.docs }}
+      deps: ${{ steps.classify.outputs.deps }}
+    steps:
+      - name: Classify the changed files
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          out() { printf 'code=%s\ndocs=%s\ndeps=%s\n' "$1" "$2" "$3" | tee -a "$GITHUB_OUTPUT"; }
+          all() { echo "$1: every check runs"; out true true true; exit 0; }
+          case "$EVENT" in
+            schedule) echo "Scheduled: the dependency checks run"; out false false true; exit 0 ;;
+            push | pull_request) ;;
+            *) all "$EVENT" ;;
+          esac
+          [ "$GITHUB_REF_TYPE" != tag ] || all "Release tag"
+          case "$BASE" in "" | 0000000000000000000000000000000000000000) all "No earlier commit" ;; esac
+          gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD" >compare.json 2>/dev/null ||
+            all "Cannot compare $BASE with $HEAD"
+          count=$(jq '.files | length' compare.json)
+          [ "$count" -lt 300 ] || all "$count files changed"
+          code=false docs=false deps=false
+          while IFS= read -r f; do
+            echo "$f"
+            case "$f" in
+              .github/workflows/ci.yml) code=true docs=true deps=true ;;
+              Cargo.toml | Cargo.lock) code=true deps=true ;;
+              deny.toml) deps=true ;;
+              # Read by i18n::tests and core::job::tests.
+              README.md | README_zh-TW.md | docs/user-guide.adoc | docs/user-guide.zh-TW.adoc | \
+                docs/development.md | docs/development.zh-TW.md) docs=true ;;
+              scripts/gui-smoke.sh) code=true ;;
+              # Notes on the test files; no test reads them.
+              samples/README.md | samples/web/README.md | tests/fixtures/*/README.md) ;;
+              # Used only by release-tag jobs, by hand, or not by a check at all.
+              docs/* | scripts/* | docker/* | .github/* | CHANGELOG.md | SECURITY.md | LICENSE | \
+                Makefile | .gitignore | .gitattributes | .vscode/* | .claude/*) ;;
+              *) code=true ;;
+            esac
+          done < <(jq -r '.files[] | .filename, (.previous_filename // empty)' compare.json)
+          out "$code" "$docs" "$deps"
+
   windows:
     if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch')
     name: Windows ${{ matrix.arch }}
@@ -233,6 +296,8 @@ jobs:
 
   linux:
     name: Linux ${{ matrix.arch }}
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     # The oldest supported runners, so the binary runs on older glibc too.
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -821,8 +886,40 @@ jobs:
 
   # deny.toml lists the licenses allowed and the advisories reviewed. New advisories appear
   # without any change here, so outside of release tags they warn instead of failing.
+  # The tests that read the README and the guides, for a change to those alone: the Linux job
+  # runs them with the others whenever code changed too.
+  docs:
+    name: Documents
+    needs: changes
+    if: needs.changes.outputs.docs == 'true' && needs.changes.outputs.code != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Document tests
+        run: >-
+          cargo test --locked --bin oxidemerge -- --exact
+          i18n::tests::english_and_chinese_documents_keep_the_same_structure
+          core::job::tests::a_job_without_a_kind_compares_as_the_readme_example_shows
+
   dependencies:
     name: Dependencies
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -835,7 +932,8 @@ jobs:
 
       - name: Advisories
         if: ${{ !cancelled() }}
-        continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        # A new advisory warns on a push, and fails a release tag or the weekly run.
+        continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'schedule' }}
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories

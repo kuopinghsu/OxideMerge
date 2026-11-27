@@ -32,11 +32,27 @@ if [ "$(uname -s)" = Linux ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY
     [ "${GUI_SMOKE_STRICT:-0}" = 1 ] && exit 1
     exit 0
   fi
-  Xvfb -displayfd 3 -screen 0 1600x1000x24 -nolisten tcp 3>"$work/display" 2>"$artifacts/xvfb.log" &
-  xvfb=$!
-  for _ in $(seq 50); do
+  # A busy CI runner (arm64 ones especially) can take well over ten seconds to bring Xvfb up, so
+  # it is given a minute, and started once more if it ends before it names its display.
+  for attempt in 1 2; do
+    : >"$work/display"
+    Xvfb -displayfd 3 -screen 0 1600x1000x24 -nolisten tcp 3>"$work/display" 2>>"$artifacts/xvfb.log" &
+    xvfb=$!
+    for _ in $(seq 300); do
+      [ -s "$work/display" ] && break
+      kill -0 "$xvfb" 2>/dev/null || break
+      sleep 0.2
+    done
     [ -s "$work/display" ] && break
-    sleep 0.2
+    if kill -0 "$xvfb" 2>/dev/null; then
+      echo "gui-smoke: Xvfb named no display within a minute (attempt $attempt)"
+      kill "$xvfb" 2>/dev/null || true
+    else
+      status=0
+      wait "$xvfb" 2>/dev/null || status=$?
+      echo "gui-smoke: Xvfb ended with status $status before naming a display (attempt $attempt)"
+    fi
+    xvfb=
   done
   [ -s "$work/display" ] || { echo "gui-smoke: Xvfb did not start"; cat "$artifacts/xvfb.log"; exit 1; }
   export DISPLAY=:$(cat "$work/display")
