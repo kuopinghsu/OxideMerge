@@ -2,7 +2,7 @@ ifdef::backend-pdf[= OxideMerge 使用者指南: 比較、檢查與合併檔案�
 ifndef::backend-pdf[= OxideMerge 使用者指南]
 :description: 使用 OxideMerge 比較、檢查與合併檔案及資料夾的操作指南。
 :revnumber: 0.9.10
-:revdate: 2026-11-26
+:revdate: 2026-11-27
 :lang: zh-TW
 :scripts: cjk
 :chapter-signifier!:
@@ -88,7 +88,7 @@ OxideMerge 是一套快速、安全的檔案與資料夾比較及合併工具，
 |版本 |日期 |變更內容
 
 |0.9.10
-|2026-11-26
+|2026-11-27
 |調整比較章節，簡化英文與繁體中文操作說明。
 更新遠端資料夾的篩選與子資料夾規則、數字比較、同步復原、Linux AppImage 與遠端顯示的說明。
 

@@ -2,7 +2,7 @@ ifdef::backend-pdf[= OxideMerge User Guide: Compare, review and merge files and 
 ifndef::backend-pdf[= OxideMerge User Guide]
 :description: How to compare, review and merge files and folders with OxideMerge.
 :revnumber: 0.9.10
-:revdate: 2026-11-26
+:revdate: 2026-11-27
 :doctype: book
 :toc: left
 :toclevels: 2
@@ -82,7 +82,7 @@ Before you report a problem, see <<troubleshooting>> and <<limitations>>.
 |Version |Date |Changes
 
 |0.9.10
-|2026-11-26
+|2026-11-27
 |Reorganized comparison chapters and simplified English and Traditional Chinese instructions.
 Updated remote folder filters and subfolders, number comparison, synchronization recovery,
 Linux AppImages and remote displays.
