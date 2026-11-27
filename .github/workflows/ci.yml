@@ -1,8 +1,10 @@
-# Branch pushes and pull requests run only the checks their changes can affect (see the
-# `changes` job): the Linux x64 checks for code, two document tests for the README and the
+# Commits to main are checked once a day, not one by one: the daily run looks at what changed
+# since the last daily run that passed, and runs only the checks those changes can affect (see
+# the `changes` job): the Linux x64 checks for code, two document tests for the README and the
 # guides, and dependency checks for Cargo.toml, Cargo.lock and deny.toml. A change to this
 # workflow runs all three; one to anything else, such as the PDFs, CHANGELOG.md or the
-# packaging scripts, runs none of them. A weekly run checks for new advisories.
+# packaging scripts, runs none of them. The dependency checks run every day, for advisories
+# published since. Pull requests are not checked; start a run by hand to check a branch.
 # Release-tag pushes and manual runs check Windows x64/Arm64, Linux x64/Arm64
 # and macOS. Release tags build packages automatically; manual runs build them
 # with packages enabled (the default). Package runs on release tags publish
@@ -11,12 +13,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-  pull_request:
-  # Advisories published since the dependencies last changed.
+  # Once a day, on main, at 17:00 Taipei time (09:00 UTC; see the `changes` job).
   schedule:
-    - cron: "17 3 * * 1"
+    - cron: "0 9 * * *"
   workflow_dispatch:
     inputs:
       packages:
@@ -46,14 +46,18 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  # Which checks a branch push or pull request needs, from the files it changed. Release tags
-  # and manual runs need them all; a scheduled run, the dependency checks only. When the files
-  # cannot be listed (a new branch, a force push past a commit that is gone, 300 files or more),
-  # every check runs.
+  # Which checks the daily run needs, from the files changed on main since the last daily run
+  # that passed: a failed day is checked again the next day, with what came after it. The
+  # dependency checks always run then. Release tags and manual runs need every check. When the
+  # files cannot be listed (no daily run has passed yet, a force push past that run's commit,
+  # 300 files or more), every check runs.
   changes:
     name: Changes
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     outputs:
       code: ${{ steps.classify.outputs.code }}
       docs: ${{ steps.classify.outputs.docs }}
@@ -64,30 +68,32 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          HEAD: ${{ github.sha }}
         run: |
           set -euo pipefail
           out() { printf 'code=%s\ndocs=%s\ndeps=%s\n' "$1" "$2" "$3" | tee -a "$GITHUB_OUTPUT"; }
           all() { echo "$1: every check runs"; out true true true; exit 0; }
-          case "$EVENT" in
-            schedule) echo "Scheduled: the dependency checks run"; out false false true; exit 0 ;;
-            push | pull_request) ;;
-            *) all "$EVENT" ;;
-          esac
-          [ "$GITHUB_REF_TYPE" != tag ] || all "Release tag"
-          case "$BASE" in "" | 0000000000000000000000000000000000000000) all "No earlier commit" ;; esac
+          [ "$EVENT" = schedule ] || all "$EVENT"
+          BASE=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?event=schedule&branch=main&status=success&per_page=1" \
+            --jq '.workflow_runs[0].head_sha // empty' 2>/dev/null) || BASE=
+          [ -n "$BASE" ] || all "No daily run has passed yet"
+          if [ "$BASE" = "$HEAD" ]; then
+            echo "No commits since the last daily run that passed: the dependency checks run"
+            out false false true
+            exit 0
+          fi
+          echo "Changes since $BASE:"
           gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD" >compare.json 2>/dev/null ||
             all "Cannot compare $BASE with $HEAD"
           count=$(jq '.files | length' compare.json)
           [ "$count" -lt 300 ] || all "$count files changed"
-          code=false docs=false deps=false
+          code=false docs=false
           while IFS= read -r f; do
             echo "$f"
             case "$f" in
-              .github/workflows/ci.yml) code=true docs=true deps=true ;;
-              Cargo.toml | Cargo.lock) code=true deps=true ;;
-              deny.toml) deps=true ;;
+              .github/workflows/ci.yml) code=true docs=true ;;
+              Cargo.toml | Cargo.lock) code=true ;;
+              deny.toml) ;;
               # Read by i18n::tests and core::job::tests.
               README.md | README_zh-TW.md | docs/user-guide.adoc | docs/user-guide.zh-TW.adoc | \
                 docs/development.md | docs/development.zh-TW.md) docs=true ;;
@@ -100,7 +106,8 @@ jobs:
               *) code=true ;;
             esac
           done < <(jq -r '.files[] | .filename, (.previous_filename // empty)' compare.json)
-          out "$code" "$docs" "$deps"
+          # The dependency checks run every day, for advisories published since the last run.
+          out "$code" "$docs" true
 
   windows:
     if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch')
@@ -932,7 +939,7 @@ jobs:
 
       - name: Advisories
         if: ${{ !cancelled() }}
-        # A new advisory warns on a push, and fails a release tag or the weekly run.
+        # A new advisory warns on a manual run, and fails a release tag or the daily run.
         continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'schedule' }}
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:

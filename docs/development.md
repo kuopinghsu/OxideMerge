@@ -252,25 +252,48 @@ Benchmarks are not part of `cargo test`. For the commands, the method and the re
 
 ## Continuous integration
 
-The [CI workflow](../.github/workflows/ci.yml) runs for pushes to `main` and for pull requests.
+The [CI workflow](../.github/workflows/ci.yml) does not run for each push or pull request. It
+checks `main` once a day, and runs every check for release tags and when started by hand.
 
 | Event | What runs |
 | --- | --- |
-| Pull request | Clippy, the full test suite, release builds, and command-line and window checks on Windows x64, Linux x64 and macOS on Apple silicon. |
-| Push to `main` | The pull request checks, plus all packages and their checks. The packages are kept as build files. Nothing is published. |
-| Push of a release tag | The same as a push to `main`. Then the release is published. |
-| Manual run | The pull request checks. Turn on `packages` to build and check all packages. Turn on `stress_cases` or `benchmarks` for more random test cases or benchmarks. |
+| Daily on `main`, at 17:00 Taipei time (09:00 UTC) | The checks that the changes since the last daily run that passed can affect (see the next table), and the dependency checks. |
+| Push of a release tag | Clippy, the full test suite, release builds, and command-line and window checks on Windows x64 and Arm64, Linux x64 and Arm64, and macOS, plus all packages and their checks. Then the release is published. |
+| Manual run | The same checks as a release tag, on the branch you choose. With `packages` on (the default), it also builds and checks all packages, and publishes nothing. Turn on `stress_cases` or `benchmarks` for more random test cases or benchmarks. |
+
+Pull requests are not checked automatically. To check a branch, start a run by hand from the
+Actions tab, or with the GitHub CLI:
+
+```sh
+gh workflow run ci.yml --ref <branch>
+```
+
+The daily run compares `main` with the commit of the last daily run that passed. A day that fails is
+checked again the next day, together with the commits after it. The `changes` job sorts the changed
+files:
+
+| Changed files | What runs |
+| --- | --- |
+| Code: `src/`, `tests/`, `lang/`, `samples/`, `assets/`, `images/`, `build.rs`, `build_info.rs`, `Cargo.toml`, `Cargo.lock`, `scripts/gui-smoke.sh`, and any file that is not listed in the last row | Clippy, the full test suite, a release build, and the command-line and window checks on Linux x64. |
+| `README.md`, `README_zh-TW.md`, `docs/user-guide*.adoc` or `docs/development*.md`, and no code | Only the two tests that read these files. |
+| `.github/workflows/ci.yml` | Both of the above. |
+| Other files in `docs/` (the PDFs, for example), `CHANGELOG.md`, `SECURITY.md`, `LICENSE`, `Makefile`, `docker/`, other files in `scripts/` and `.github/`, and the READMEs in `samples/` and `tests/fixtures/` | Nothing besides the dependency checks. |
+
+Without new commits, only the dependency checks run. When the changed files cannot be listed (no
+daily run has passed yet, a force push removed that run's commit, or 300 files or more changed),
+every check of the daily run runs.
 
 Some more details:
 
 - The Windows and Linux window checks use Mesa's software renderer. Linux also uses Xvfb.
 - When a test fails, its output is kept in a `test-output-*` file of the workflow run.
-- A separate `cargo deny` job checks the dependencies. See [SECURITY.md](../SECURITY.md).
+- A separate `cargo deny` job checks the dependencies. A new advisory only warns in a manual run,
+  and fails a release tag or the daily run. See [SECURITY.md](../SECURITY.md).
 - The extra random tests and benchmarks are optional. Releases do not depend on them.
 
 ### Packages
 
-Pushes to `main`, release tags and manual runs with `packages` build and check these packages:
+Release tags and manual runs with `packages` build and check these packages:
 
 - **Windows x64 and Arm64:** ZIP packages with only `oxidemerge.exe`. Each program is checked for
   the right processor and is started.
@@ -384,7 +407,7 @@ If glutin fixes the problem itself, remove the patch, the script and the step th
 
 ### Release rules
 
-- Pushing a tag such as `v0.9.10` publishes the packages on GitHub Releases.
+- Pushing a tag such as `v0.9.11` publishes the packages on GitHub Releases.
 - The tag must match the version in `Cargo.toml`.
 - `CHANGELOG.md` must have a section for that version.
 - A tag that contains `-`, such as `v1.0.0-rc1`, is published as a pre-release.
@@ -394,37 +417,43 @@ workflow reads the changelog but does not change it.
 
 Before publishing, the workflow checks that the release does not exist yet. It also checks that all
 expected packages exist, and no other files. Each release names the source commit that it was built
-from, and GitHub lists the SHA-256 checksum of every file. For version 0.9.10, a release has exactly
+from, and GitHub lists the SHA-256 checksum of every file. For version 0.9.11, a release has exactly
 these files:
 
 ```text
-oxidemerge-0.9.10-linux-arm64.AppImage
-oxidemerge-0.9.10-linux-arm64.tar.gz
-oxidemerge-0.9.10-linux-x64.AppImage
-oxidemerge-0.9.10-linux-x64.tar.gz
-oxidemerge-0.9.10-macos-universal.dmg
-oxidemerge-0.9.10-user-guide.pdf
-oxidemerge-0.9.10-user-guide.zh-TW.pdf
-oxidemerge-0.9.10-windows-arm64.zip
-oxidemerge-0.9.10-windows-x64.zip
+oxidemerge-0.9.11-linux-arm64.AppImage
+oxidemerge-0.9.11-linux-arm64.tar.gz
+oxidemerge-0.9.11-linux-x64.AppImage
+oxidemerge-0.9.11-linux-x64.tar.gz
+oxidemerge-0.9.11-macos-universal.dmg
+oxidemerge-0.9.11-user-guide.pdf
+oxidemerge-0.9.11-user-guide.zh-TW.pdf
+oxidemerge-0.9.11-windows-arm64.zip
+oxidemerge-0.9.11-windows-x64.zip
 ```
 
 ### Publish a release
 
-These steps use version `0.9.10` as an example. Use the version that you want to release.
+These steps use version `0.9.11` as an example. Use the version that you want to release.
 
 1. Change `version` in `Cargo.toml`. Run `cargo build` to update `Cargo.lock`.
-2. Check the `0.9.10` section in `CHANGELOG.md`. In its heading, replace `Unreleased` with the
+2. Check the `0.9.11` section in `CHANGELOG.md`. In its heading, replace `Unreleased` with the
    release date in the form `YYYY-MM-DD`.
-3. Run `make fmt-check ci`. Check the release notes with `scripts/release-notes.sh 0.9.10`. Run
+3. Run `make fmt-check ci`. Check the release notes with `scripts/release-notes.sh 0.9.11`. Run
    `make user-guide-docs`, so that the guides in `docs/dist/` show the new version.
-4. Commit, and push to `main`. Wait until the required CI checks pass on all platforms.
+4. Commit, and push to `main`. Start a manual run of the CI workflow on `main`, which checks all
+   platforms and packages, and wait until it passes:
+
+   ```sh
+   gh workflow run ci.yml --ref main
+   ```
+
 5. Tag the checked commit and push the tag. First make sure with `git log -1 --oneline` that `HEAD`
    is the commit that passed the checks.
 
    ```sh
-   git tag -a v0.9.10 -m "OxideMerge 0.9.10"
-   git push origin v0.9.10
+   git tag -a v0.9.11 -m "OxideMerge 0.9.11"
+   git push origin v0.9.11
    ```
 
 6. When the workflow finishes, check the new GitHub release. Make sure that all packages and PDF
@@ -435,12 +464,12 @@ These steps use version `0.9.10` as an example. Use the version that you want to
 
 The workflow publishes a release only after all build and test jobs pass. So if one of these jobs
 fails for a release tag, nothing is published, and you can publish the same version again from a
-fixed commit. These steps use `v0.9.10` as an example. Use the version whose build failed.
+fixed commit. These steps use `v0.9.11` as an example. Use the version whose build failed.
 
-1. Make sure that GitHub has no `v0.9.10` release:
+1. Make sure that GitHub has no `v0.9.11` release:
 
    ```sh
-   gh release view v0.9.10
+   gh release view v0.9.11
    ```
 
    This command needs the GitHub CLI, signed in. It must answer `release not found`. You can also
@@ -448,10 +477,11 @@ fixed commit. These steps use `v0.9.10` as an example. Use the version whose bui
    If the release exists, even with only some files, do not move the tag. See
    [Fix a published release](#fix-a-published-release) instead.
 
-2. Fix the problem on `main`. Keep the version `0.9.10` in `Cargo.toml` and in the changelog. If the
+2. Fix the problem on `main`. Keep the version `0.9.11` in `Cargo.toml` and in the changelog. If the
    release date changes, update it in the changelog heading. Run `make fmt-check ci`, and check the
-   release notes with `scripts/release-notes.sh 0.9.10`. Commit, and push to `main`. Wait until the
-   required CI checks pass on all platforms.
+   release notes with `scripts/release-notes.sh 0.9.11`. Commit, and push to `main`. Start a
+   manual run of the CI workflow on `main` (`gh workflow run ci.yml --ref main`), and wait until it
+   passes.
 
 3. Move the tag to the fixed commit, and push it again:
 
@@ -459,8 +489,8 @@ fixed commit. These steps use `v0.9.10` as an example. Use the version whose bui
    git switch main
    git pull --ff-only origin main
    git log -1 --oneline
-   git tag -a -f v0.9.10 -m "OxideMerge 0.9.10"
-   git push --force origin v0.9.10
+   git tag -a -f v0.9.11 -m "OxideMerge 0.9.11"
+   git push --force origin v0.9.11
    ```
 
    `git log` must show the commit that passed the checks. The tag push starts a new workflow run for
@@ -483,6 +513,6 @@ Instead, publish a new patch version:
 
 1. Fix the problem on `main`.
 2. Follow the steps in [Publish a release](#publish-a-release) with the next patch version, for
-   example `0.9.11` after `0.9.10`. Describe the fix in the changelog section of the new version.
+   example `0.9.12` after `0.9.11`. Describe the fix in the changelog section of the new version.
 
 Keep the old tag and the files of the old release.

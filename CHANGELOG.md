@@ -3,6 +3,19 @@
 All notable changes to OxideMerge are listed here, newest first. Each
 release on GitHub uses its section of this file as the release notes.
 
+## [0.9.11] - Unreleased
+
+### Changed
+
+- CI checks `main` once a day, at 17:00 Taipei time (09:00 UTC), instead of on every push and
+  pull request. The daily run runs only the checks that the changes since the last daily run
+  that passed can affect: the Linux checks for code, the two document tests for the README and
+  the guides, and nothing for files such as the PDFs or CHANGELOG.md. The dependency checks run
+  every day, and a new advisory fails that run. Release tags and runs started by hand still run
+  every check. Pull requests are no longer checked automatically.
+- The window smoke test gives Xvfb a minute to start instead of ten seconds, says why when it
+  does not start, and starts it once more before failing.
+
 ## [0.9.10] - 2026-11-27
 
 ### Changed
@@ -1909,7 +1922,8 @@ First release.
   opening a window, and WinMerge-style switches on Windows.
 - Chinese, Japanese and Korean fonts on Linux and WSL, and GPU acceleration under WSL2.
 
-[0.9.10]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.9...HEAD
+[0.9.11]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.10...HEAD
+[0.9.10]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/kuopinghsu/OxideMerge/compare/v0.9.6...v0.9.7
