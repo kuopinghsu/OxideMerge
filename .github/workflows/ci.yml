@@ -650,9 +650,41 @@ jobs:
             exit 1
           }
 
-      # The bare image has no display libraries, so AppRun would use every
-      # bundled one: together with glibc they must cover everything
-      # OxideMerge and each of them needs.
+      # The AppImage leaves out the base X11 and Wayland client libraries that every system with a
+      # display has (scripts/package-appimage.sh). The bare image gets only those, so AppRun uses
+      # every bundled library: with glibc and libstdc++ they must cover everything.
+      - name: Install the base display client libraries
+        timeout-minutes: 10
+        env:
+          REPO: ${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          if command -v apt-get >/dev/null; then
+            sed -i 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+              /etc/apt/sources.list
+            install() {
+              apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update &&
+                DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y \
+                  --no-install-recommends libx11-6 libx11-xcb1 libxcb1 libwayland-client0
+            }
+          else
+            install() {
+              dnf --setopt=timeout=20 --setopt=retries=2 --setopt=minrate=100000 \
+                --setopt=baseos.mirrorlist= "--setopt=baseos.baseurl=$REPO/BaseOS/"'$basearch/os/' \
+                --setopt=appstream.mirrorlist= "--setopt=appstream.baseurl=$REPO/AppStream/"'$basearch/os/' \
+                --setopt=extras.mirrorlist= "--setopt=extras.baseurl=$REPO/extras/"'$basearch/os/' \
+                install -y --setopt=install_weak_deps=False libX11 libX11-xcb libxcb libwayland-client
+            }
+          fi
+          for attempt in 1 2 3; do
+            install && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Installing the base display client libraries failed after 3 attempts"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
       - name: Check bundled libraries
         working-directory: squashfs-root
         run: |
@@ -763,6 +795,41 @@ jobs:
             exit 1
           fi
           echo "OxideMerge was still running after 20 seconds"
+
+      # libxkbcommon-x11 calls into libxkbcommon's internals, so AppRun takes both from the system
+      # or both from the AppImage. A system with libxkbcommon but not libxkbcommon-x11 (Ubuntu with
+      # xdotool, say) crashed when AppRun mixed them.
+      - name: Start OxideMerge with the system's libxkbcommon only
+        if: startsWith(matrix.image, 'ubuntu')
+        run: |
+          set -euo pipefail
+          DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y \
+            --no-install-recommends libxkbcommon0
+          if ldconfig -p | grep -q 'libxkbcommon-x11.so.0 '; then
+            echo "::error::libxkbcommon-x11 is installed, so this would test nothing"
+            exit 1
+          fi
+          Xvfb :99 -screen 0 1280x800x24 >xvfb.log 2>&1 &
+          xvfb=$!
+          sleep 3
+          status=0
+          DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 timeout 20 squashfs-root/AppRun || status=$?
+          kill "$xvfb"
+          if [ "$status" != 124 ]; then
+            echo "::error::OxideMerge quit with status $status within 20 seconds"
+            exit 1
+          fi
+          echo "OxideMerge was still running after 20 seconds"
+
+      # What AppImageHub (github.com/AppImage/appimage.github.io) and software centres check.
+      - name: Check the desktop file and AppStream metadata
+        if: startsWith(matrix.image, 'ubuntu')
+        run: |
+          set -euo pipefail
+          DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y \
+            --no-install-recommends desktop-file-utils appstream
+          desktop-file-validate squashfs-root/oxidemerge.desktop
+          appstreamcli validate-tree --no-net --explain squashfs-root
 
   macos:
     needs: changes
@@ -1199,7 +1266,7 @@ jobs:
             cat <<'EOF'
           **Windows (x64 or Arm64):** download `oxidemerge-*-windows-x64.zip` (Intel and AMD PCs) or `oxidemerge-*-windows-arm64.zip` (Arm PCs such as Snapdragon laptops), unzip it, and run `oxidemerge.exe`; there is nothing to install. Run `oxidemerge --register-shell` once to add the Explorer context menu.
 
-          **Linux (x64 or Arm64):** pick the `linux-x64` packages for Intel and AMD machines and the `linux-arm64` ones for 64-bit Arm (aarch64). `oxidemerge-*-linux-<arch>.AppImage` runs without installing anything on Ubuntu 20.04, RHEL 8, Debian 10, and newer: `chmod +x` it, then run it. It carries the libraries OxideMerge needs besides glibc and the graphics driver. Without FUSE, start it with `--appimage-extract-and-run`. To update it in place later, run [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) on it (`appimageupdatetool oxidemerge-*.AppImage`): it downloads only what changed, using the `.AppImage.zsync` file published here. `oxidemerge-*-linux-<arch>.tar.gz` holds the bare program instead, with a desktop file and icon. File dialogs use the XDG desktop portal (`xdg-desktop-portal`).
+          **Linux (x64 or Arm64):** pick the `linux-x64` packages for Intel and AMD machines and the `linux-arm64` ones for 64-bit Arm (aarch64). `oxidemerge-*-linux-<arch>.AppImage` runs without installing anything on Ubuntu 20.04, RHEL 8, Debian 10, and newer: `chmod +x` it, then run it. It carries the libraries OxideMerge needs besides glibc, libstdc++, the graphics driver and the base X11 and Wayland client libraries that every desktop has. Without FUSE, start it with `--appimage-extract-and-run`. To update it in place later, run [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) on it (`appimageupdatetool oxidemerge-*.AppImage`): it downloads only what changed, using the `.AppImage.zsync` file published here. `oxidemerge-*-linux-<arch>.tar.gz` holds the bare program instead, with a desktop file and icon. File dialogs use the XDG desktop portal (`xdg-desktop-portal`).
 
           **macOS 11 or later (Apple silicon and Intel):** open `oxidemerge-*-macos-universal.dmg` and drag OxideMerge to Applications. The app is not notarized, so macOS blocks it the first time: try to open it once, then choose **Open Anyway** in **System Settings → Privacy & Security** (up to macOS 14, Control-clicking it and choosing **Open** also works), or run `xattr -dr com.apple.quarantine /Applications/OxideMerge.app`. To use it from the terminal, run `sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin/oxidemerge`.
 

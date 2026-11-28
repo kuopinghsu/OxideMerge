@@ -1,10 +1,11 @@
 #!/bin/sh
 # Starts OxideMerge inside its AppImage.
 #
-# The AppImage carries every library OxideMerge loads at runtime, apart from
-# glibc and the OpenGL driver, each in a folder of its own under
-# usr/lib/oxidemerge. Only the folders of libraries the system lacks go on the
-# library path, so the system's own copies, which match its display setup,
+# The AppImage carries the libraries OxideMerge loads at runtime, each in a
+# folder of its own under usr/lib/oxidemerge, apart from glibc, libstdc++, the
+# OpenGL driver, and the base X11 and Wayland client libraries that every
+# system with a display has. Only the folders of libraries the system lacks
+# go on the library path, so the system's own copies, which match its display setup,
 # come first, and programs OxideMerge starts, such as a browser for web page
 # screenshots or an unpacker, are not handed libraries that differ from the
 # system's.
@@ -22,14 +23,31 @@ if [ -z "$abi" ]; then
     esac
 fi
 installed=$({ /sbin/ldconfig -p || ldconfig -p; } 2>/dev/null)
+has() {
+    case $installed in
+        *"$tab$1 (libc6,$abi"*) return 0 ;;
+    esac
+    return 1
+}
+# Libraries of one family that must come from the same release: libxkbcommon-x11 calls into
+# libxkbcommon's internals, and a bundled one next to the system's other crashes. When the
+# system lacks any of a family, every bundled one of it is used.
+families="libxkbcommon.so.0 libxkbcommon-x11.so.0"
 bundled=
 for dir in "$here"/usr/lib/oxidemerge/*/; do
     dir=${dir%/}
     name=${dir##*/}
-    case $installed in
-        *"$tab$name (libc6,$abi"*) ;;
-        *) bundled=$bundled${bundled:+:}$dir ;;
+    use=
+    has "$name" || use=1
+    case " $families " in
+        *" $name "*)
+            for member in $families; do
+                has "$member" || use=1
+            done ;;
     esac
+    if [ -n "$use" ]; then
+        bundled=$bundled${bundled:+:}$dir
+    fi
 done
 if [ -n "$bundled" ]; then
     export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$bundled"

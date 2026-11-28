@@ -7,6 +7,6 @@ Exec=oxidemerge %F
 Icon=oxidemerge
 Terminal=false
 StartupWMClass=oxidemerge
-Categories=Development;Utility;TextTools;
+Categories=Development;RevisionControl;
 Keywords=diff;merge;compare;folder;text;binary;image;conflict;winmerge;
 MimeType=inode/directory;text/plain;

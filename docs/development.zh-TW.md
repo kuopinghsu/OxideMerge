@@ -277,9 +277,14 @@ gh workflow run ci.yml --ref <branch>
   並實際啟動。
 - **Linux x64 與 Arm64：** 在 Ubuntu 22.04 上建置的 TAR.GZ 套件。會實際啟動程式，
   並確認不會變更設定。
-- **Linux AppImage：** 在使用 glibc 2.28 的 AlmaLinux 8 上建置。套件內含 X11、Wayland 與鍵盤函式庫，
-  系統缺少這些函式庫時才會使用。兩種處理器架構都會在 Ubuntu 22.04、AlmaLinux 8 與 AlmaLinux 8.4 上，
-  檢查函式庫載入、指令列行為與視窗啟動。AlmaLinux 8.4 取自其封存庫，內含 Mesa 20.3，
+- **Linux AppImage：** 在使用 glibc 2.28 的 AlmaLinux 8 上建置。套件內含 X11 擴充、Wayland 游標與鍵盤函式庫，
+  系統缺少這些函式庫時才會使用；`libxkbcommon` 與 `libxkbcommon-x11` 會一併取用，兩者皆來自系統或皆來自套件。
+  依照 AppImage 的 excludelist，套件不含 glibc、libstdc++ 以及所有具備顯示環境的系統都有的 X11 與 Wayland
+  基本用戶端函式庫（`libX11`、`libX11-xcb`、`libxcb`、`libwayland-client`）。每個套件都帶有 AppStream
+  中繼資料（`assets/oxidemerge.appdata.xml`），供軟體中心與 AppImageHub 使用。兩種處理器架構都會在只安裝
+  這些基本函式庫的 Ubuntu 22.04、AlmaLinux 8 與 AlmaLinux 8.4 上，檢查函式庫載入、指令列行為與視窗啟動。
+  在 Ubuntu 上，還會以系統的 `libxkbcommon`（但沒有 `libxkbcommon-x11`）再檢查一次視窗啟動，並驗證桌面項目檔與
+  AppStream 中繼資料。AlmaLinux 8.4 取自其封存庫，內含 Mesa 20.3，
   因此在其上的視窗啟動會以軟體繪製器檢查下方的 glutin 修補；若其 Mesa 為 21 或更新版本，
   該工作會失敗。每個 AppImage 都內嵌指向 GitHub 發行版本的更新資訊，其 `.AppImage.zsync`
   檔案也會一併發布，讓 AppImageUpdate 可以更新它；測試會檢查這兩者。正式版本追蹤 `latest`，

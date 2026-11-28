@@ -299,10 +299,16 @@ Release tags and manual runs with `packages` build and check these packages:
   the right processor and is started.
 - **Linux x64 and Arm64:** TAR.GZ packages built on Ubuntu 22.04. The program is started, and the
   check confirms that it does not change the settings.
-- **Linux AppImage:** packages built on AlmaLinux 8 with glibc 2.28. They include the X11, Wayland
-  and keyboard libraries and use them when the system does not have them. Both processor types are
-  checked on Ubuntu 22.04, AlmaLinux 8 and AlmaLinux 8.4: library loading, command-line behavior and
-  window start. AlmaLinux 8.4, from its vault, has Mesa 20.3, so the window start there checks the
+- **Linux AppImage:** packages built on AlmaLinux 8 with glibc 2.28. They include the X11 extension,
+  Wayland cursor and keyboard libraries and use them when the system does not have them;
+  `libxkbcommon` and `libxkbcommon-x11` are used together, both from the system or both bundled.
+  Following AppImage's excludelist, they leave out glibc, libstdc++ and the base X11 and Wayland
+  client libraries (`libX11`, `libX11-xcb`, `libxcb`, `libwayland-client`), which every system with
+  a display has. Each carries AppStream metadata (`assets/oxidemerge.appdata.xml`) for software
+  centres and AppImageHub. Both processor types are checked on Ubuntu 22.04, AlmaLinux 8 and
+  AlmaLinux 8.4 with only those base libraries installed: library loading, command-line behavior
+  and window start. On Ubuntu, the window start is checked again with the system's `libxkbcommon`
+  but not `libxkbcommon-x11`, and the desktop file and AppStream metadata are validated. AlmaLinux 8.4, from its vault, has Mesa 20.3, so the window start there checks the
   glutin patch below with the software renderer; the job fails if its Mesa is 21 or newer. Each
   AppImage carries update information for GitHub releases, and its `.AppImage.zsync` file is
   published beside it, so AppImageUpdate can update it; the test checks both. A release follows

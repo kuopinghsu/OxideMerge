@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata for the Linux AppImage. scripts/package-appimage.sh installs it into
+     usr/share/metainfo, named .appdata.xml as appdir-lint.sh looks for, and replaces <releases/>
+     with the version it packages. -->
+<component type="desktop-application">
+  <id>io.github.kuopinghsu.OxideMerge</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>OxideMerge</name>
+  <summary>Compare and merge folders, text, binary files, images and web pages</summary>
+  <developer id="io.github.kuopinghsu">
+    <name>Kuoping Hsu</name>
+  </developer>
+  <description>
+    <p>
+      OxideMerge is a diff and merge tool. It compares two or three folders, text files, binary
+      files, images and web pages side by side, and merges the differences.
+    </p>
+    <ul>
+      <li>Two-way and three-way comparison of files and folders, with filters and rules</li>
+      <li>Resolve Git merge conflicts in a three-way view</li>
+      <li>Compare local folders with SFTP, FTP or web addresses</li>
+      <li>Binary, image, CSV and web page comparison</li>
+      <li>Release summaries that compare two folders or saved reviews</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">oxidemerge.desktop</launchable>
+  <url type="homepage">https://github.com/kuopinghsu/OxideMerge</url>
+  <url type="bugtracker">https://github.com/kuopinghsu/OxideMerge/issues</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Folder comparison</caption>
+      <image>https://raw.githubusercontent.com/kuopinghsu/OxideMerge/main/docs/images/en/folder.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Text comparison with inline differences</caption>
+      <image>https://raw.githubusercontent.com/kuopinghsu/OxideMerge/main/docs/images/en/inline.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Resolving a merge conflict in a three-way view</caption>
+      <image>https://raw.githubusercontent.com/kuopinghsu/OxideMerge/main/docs/images/en/conflict.png</image>
+    </screenshot>
+  </screenshots>
+  <categories>
+    <category>Development</category>
+    <category>RevisionControl</category>
+  </categories>
+  <keywords>
+    <keyword>diff</keyword>
+    <keyword>merge</keyword>
+    <keyword>compare</keyword>
+    <keyword>folder</keyword>
+    <keyword>conflict</keyword>
+  </keywords>
+  <provides>
+    <binary>oxidemerge</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases/>
+</component>

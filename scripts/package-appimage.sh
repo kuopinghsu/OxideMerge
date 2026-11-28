@@ -81,9 +81,16 @@ mkdir -p dist "$work"
 install -Dm 755 "$bin" "$app/usr/bin/oxidemerge"
 strip "$app/usr/bin/oxidemerge"
 install -Dm 755 assets/AppRun "$app/AppRun"
-install -Dm 644 assets/oxidemerge.desktop "$app/oxidemerge.desktop"
+install -Dm 644 assets/oxidemerge.desktop "$app/usr/share/applications/oxidemerge.desktop"
+ln -s usr/share/applications/oxidemerge.desktop "$app/oxidemerge.desktop"
+# AppStream metadata, for software centres and AppImageHub, with this version as its release.
+install -Dm 644 assets/oxidemerge.appdata.xml \
+    "$app/usr/share/metainfo/io.github.kuopinghsu.OxideMerge.appdata.xml"
 # A Windows working tree can still have CRLF files from before Git's LF rules.
-sed -i 's/\r$//' "$app/AppRun" "$app/oxidemerge.desktop"
+sed -i 's/\r$//' "$app/AppRun" "$app/usr/share/applications/oxidemerge.desktop" \
+    "$app/usr/share/metainfo/io.github.kuopinghsu.OxideMerge.appdata.xml"
+sed -i "s|<releases/>|<releases><release version=\"$VERSION\" date=\"$(date -u +%Y-%m-%d)\"/></releases>|" \
+    "$app/usr/share/metainfo/io.github.kuopinghsu.OxideMerge.appdata.xml"
 install -Dm 644 assets/oxidemerge.png "$app/oxidemerge.png"
 install -Dm 644 assets/oxidemerge.png "$app/usr/share/icons/hicolor/256x256/apps/oxidemerge.png"
 install -Dm 644 LICENSE "$app/usr/share/doc/oxidemerge/LICENSE"
@@ -92,11 +99,16 @@ ln -s oxidemerge.png "$app/.DirIcon"
 mkdir -p "$app/usr/share/oxidemerge"
 echo "$abi" >"$app/usr/share/oxidemerge/abi"
 
-# Libraries OxideMerge links to or opens at runtime (X11, Wayland, and
-# keyboard maps through winit), with everything they need.
-wanted="libxcb.so.1 libX11.so.6 libX11-xcb.so.1 libXcursor.so.1 libXi.so.6
-    libxkbcommon.so.0 libxkbcommon-x11.so.0 libwayland-client.so.0 libwayland-cursor.so.0 libwayland-egl.so.1"
-system='^(ld-linux-x86-64|ld-linux-aarch64|libc|libm|libdl|libpthread|librt|libresolv|libutil|libgcc_s|libGL|libEGL|libGLX|libGLdispatch|libOpenGL|libvulkan)\.so'
+# Libraries OxideMerge opens at runtime (X11, Wayland, and keyboard maps through winit), with
+# everything they need.
+wanted="libXcursor.so.1 libXi.so.6 libxkbcommon.so.0 libxkbcommon-x11.so.0
+    libwayland-cursor.so.0 libwayland-egl.so.1"
+# Never bundled: glibc, libgcc and libstdc++, the OpenGL and Vulkan drivers, and the base X11
+# and Wayland client libraries (libX11, libX11-xcb, libxcb and its libXau, libwayland-client and
+# its libffi). Every system with a display has those, and a bundled copy next to the system's
+# Mesa or xcb libraries breaks them: AppImage's excludelist (github.com/AppImage/pkg2appimage)
+# lists why.
+system='^(ld-linux-x86-64|ld-linux-aarch64|libc|libm|libdl|libpthread|librt|libresolv|libutil|libgcc_s|libstdc\+\+|libGL|libEGL|libGLX|libGLdispatch|libOpenGL|libvulkan|libX11|libX11-xcb|libxcb|libXau|libwayland-client|libffi)\.so'
 
 {
     ldd "$bin"

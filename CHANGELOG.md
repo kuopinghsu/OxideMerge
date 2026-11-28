@@ -7,6 +7,8 @@ release on GitHub uses its section of this file as the release notes.
 
 ### Added
 
+- The Linux AppImage carries AppStream metadata, with a description and screenshots for software
+  centres and AppImageHub.
 - The Linux AppImage carries update information, and each release publishes its
   `.AppImage.zsync` file beside it, so AppImageUpdate and similar tools can update it to the
   latest release, downloading only what changed.
@@ -22,6 +24,16 @@ release on GitHub uses its section of this file as the release notes.
 - The window smoke test gives Xvfb a minute to start instead of ten seconds, says why when it
   does not start, and starts it once more before failing.
 - `make user-guide-docs` is now `make user-guide-pdf`.
+- The Linux AppImage no longer bundles libstdc++ or the base X11 and Wayland client libraries
+  (`libX11`, `libX11-xcb`, `libxcb`, `libwayland-client`), which every system with a display has
+  and which AppImage's excludelist says not to bundle. Its desktop entry is listed under
+  Development and Revision Control only, so it no longer appears twice in some menus.
+
+### Fixed
+
+- The Linux AppImage no longer crashes as it starts on a system that has `libxkbcommon` but not
+  `libxkbcommon-x11`, such as a minimal Ubuntu with xdotool: it used the system's `libxkbcommon`
+  with its own, older `libxkbcommon-x11`. The two now come from the same place.
 
 ## [0.9.10] - 2026-11-27
 
