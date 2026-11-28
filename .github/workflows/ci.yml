@@ -97,7 +97,7 @@ jobs:
               # Read by i18n::tests and core::job::tests.
               README.md | README_zh-TW.md | docs/user-guide.adoc | docs/user-guide.zh-TW.adoc | \
                 docs/development.md | docs/development.zh-TW.md) docs=true ;;
-              scripts/gui-smoke.sh) code=true ;;
+              scripts/gui-smoke.sh | scripts/release-latest.sh) code=true ;;
               # Notes on the test files; no test reads them.
               samples/README.md | samples/web/README.md | tests/fixtures/*/README.md) ;;
               # Used only by release-tag jobs, by hand, or not by a check at all.
@@ -336,6 +336,11 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The release job decides with this script; it is checked here, long before a release.
+      - name: Check the latest-release decision
+        if: matrix.arch == 'x64'
+        run: bash scripts/release-latest.sh --test
 
       - name: Clippy
         if: matrix.arch == 'x64'
@@ -1108,6 +1113,12 @@ jobs:
     if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages)) && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # One release job at a time, so each one decides the latest release from the releases
+    # published before it. GitHub keeps only one waiting run: with three tags pushed at once, the
+    # middle one's release job is cancelled and has to be re-run.
+    concurrency:
+      group: release-${{ github.repository }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -1117,6 +1128,7 @@ jobs:
             CHANGELOG.md
             scripts/release-notes.sh
             scripts/check-release.sh
+            scripts/release-latest.sh
           sparse-checkout-cone-mode: false
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -1198,20 +1210,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          v=${GITHUB_REF_NAME#v}
-          if [[ $v == *-* ]]; then
-            echo "make_latest=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          bash scripts/release-latest.sh --test
+          # A failed request stops the release: guessing would risk marking an older line latest.
+          tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
+          make_latest=$(printf '%s\n' "$tags" | bash scripts/release-latest.sh "$GITHUB_REF_NAME")
+          if [ "$make_latest" = false ] && [[ $GITHUB_REF_NAME != *-* ]]; then
+            echo "::notice::$GITHUB_REF_NAME is older than a published release, so it is not marked as the latest release"
           fi
-          highest=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
-            sed 's/^v//' | grep -v -- - | sort -V | tail -n 1 || true)
-          if [ -z "$highest" ] || [ "$(printf '%s\n%s\n' "$highest" "$v" | sort -V | tail -n 1)" = "$v" ]; then
-            echo "make_latest=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::$v is older than release $highest, so it is not marked as the latest release"
-            echo "make_latest=false" >> "$GITHUB_OUTPUT"
-          fi
+          echo "make_latest=$make_latest" | tee -a "$GITHUB_OUTPUT"
 
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:

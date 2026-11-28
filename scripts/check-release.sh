@@ -21,14 +21,18 @@ fail() {
   bad=1
 }
 
-# The SHA-1 digest of $1, as zsync writes it: lowercase hex. A missing tool stops the check
-# here, rather than making every .zsync look damaged.
-if command -v sha1sum >/dev/null; then
+# The SHA-1 digest of $1, as zsync writes it: lowercase hex. Only a .zsync needs it; when one is
+# there, a missing tool stops the check here, rather than making every .zsync look damaged.
+shopt -s nullglob
+zsyncs=(*.AppImage.zsync)
+if [ "${#zsyncs[@]}" = 0 ]; then
+  sha1_tool=()
+elif command -v sha1sum >/dev/null; then
   sha1_tool=(sha1sum)
 elif command -v shasum >/dev/null; then
   sha1_tool=(shasum -a 1)
 else
-  echo "::error::check-release.sh needs sha1sum or shasum" >&2
+  echo "::error::check-release.sh needs sha1sum or shasum to check ${zsyncs[*]}" >&2
   exit 1
 fi
 sha1() {
