@@ -6,9 +6,10 @@
 #
 # A .zip or .tar.gz must list and decompress without error, an .AppImage must be an ELF
 # program with the AppImage type 2 mark, an .AppImage.zsync must be a zsync control file that
-# points to the AppImage beside it and gives its size, a .dmg must end with its "koly" trailer,
-# and a .pdf must start with %PDF- and end with %%EOF. Any other file fails the check. This
-# catches truncated or damaged uploads; it does not check signatures (see docs/macos-signing.md).
+# points to the AppImage beside it and gives its size and SHA-1, a .dmg must end with its "koly"
+# trailer, and a .pdf must start with %PDF- and end with %%EOF. Any other file fails the check.
+# This catches truncated or damaged uploads; it does not check signatures (see
+# docs/macos-signing.md).
 set -euo pipefail
 
 dist=${1:?usage: $0 <dist>}
@@ -18,6 +19,15 @@ bad=0
 fail() {
   echo "::error::$1: $2" >&2
   bad=1
+}
+
+# The SHA-1 digest of $1, as zsync writes it: lowercase hex.
+sha1() {
+  if command -v sha1sum >/dev/null; then
+    sha1sum "$1" | cut -d ' ' -f 1
+  else
+    shasum -a 1 "$1" | cut -d ' ' -f 1
+  fi
 }
 
 # The bytes of $1 from offset $2, $3 of them, as hex.
@@ -54,11 +64,12 @@ for f in *; do
     image=${f%.zsync}
     if [[ $header != "zsync: "* ]]; then
       fail "$f" "is not a zsync control file"
-    elif ! grep -qx "URL: $image" <<<"$header"; then
+    elif ! grep -qxF "URL: $image" <<<"$header"; then
       fail "$f" "does not point to $image beside it"
     elif [ ! -f "$image" ]; then
       fail "$f" "has no $image beside it"
-    elif ! grep -qx "Length: $(wc -c <"$image" | tr -d ' ')" <<<"$header"; then
+    elif ! grep -qxF "Length: $(wc -c <"$image" | tr -d ' ')" <<<"$header" ||
+      ! grep -qxF "SHA-1: $(sha1 "$image")" <<<"$header"; then
       fail "$f" "does not describe $image as it is"
     fi
     ;;

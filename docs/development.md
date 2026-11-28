@@ -304,8 +304,11 @@ Release tags and manual runs with `packages` build and check these packages:
   checked on Ubuntu 22.04, AlmaLinux 8 and AlmaLinux 8.4: library loading, command-line behavior and
   window start. AlmaLinux 8.4, from its vault, has Mesa 20.3, so the window start there checks the
   glutin patch below with the software renderer; the job fails if its Mesa is 21 or newer. Each
-  AppImage carries update information for the latest GitHub release, and its `.AppImage.zsync`
-  file is published beside it, so AppImageUpdate can update it; the test checks both.
+  AppImage carries update information for GitHub releases, and its `.AppImage.zsync` file is
+  published beside it, so AppImageUpdate can update it; the test checks both. A release follows
+  `latest`, the newest release that is not a prerelease. A prerelease or untagged build, whose
+  version has a `-`, follows `latest-all`, so it moves on to a newer stable release, never back
+  to an older one.
   `scripts/package-appimage.sh` names the repository in `GITHUB_REPOSITORY`
   (`kuopinghsu/OxideMerge` outside CI), `UPDATE_INFORMATION` replaces the information, and an
   empty `UPDATE_INFORMATION` leaves it out.
@@ -325,7 +328,8 @@ The Windows and Linux Arm64 packages are built and tested on Arm computers, not 
 
 Before publishing, the release job checks each downloaded package with `scripts/check-release.sh`:
 archives must list and decompress, the AppImage and DMG must carry their format marks, each
-`.zsync` file must point to the AppImage beside it, and the PDFs must be whole. It then publishes `SHA256SUMS` with the packages.
+`.zsync` file must point to the AppImage beside it and give its size and SHA-1, and the PDFs must
+be whole. It then publishes `SHA256SUMS` with the packages.
 
 ### Patch glutin for Mesa before 21
 

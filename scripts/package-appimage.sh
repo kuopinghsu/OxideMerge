@@ -12,12 +12,14 @@
 # builds include the commit.
 #
 # The AppImage carries update information, so AppImageUpdate and similar tools
-# can update it from the latest GitHub release, and appimagetool writes
+# can update it from GitHub releases, and appimagetool writes
 # dist/$name.AppImage.zsync beside it, to be published with it. The information
 # names the GitHub repository kuopinghsu/OxideMerge unless GITHUB_REPOSITORY
 # (owner/name, set in GitHub Actions) names another; UPDATE_INFORMATION replaces
-# it, and an empty UPDATE_INFORMATION builds an AppImage without it. Requires Linux on x86_64 or aarch64, curl, and the
-# runtime libraries listed below (the same packages the AppImage job installs).
+# it, and an empty UPDATE_INFORMATION builds an AppImage without it.
+#
+# Requires Linux on x86_64 or aarch64, curl, and the runtime libraries listed
+# below (the same packages the AppImage job installs).
 
 set -euo pipefail
 
@@ -56,10 +58,18 @@ if [ ! -x "$bin" ]; then
 fi
 
 name="oxidemerge-$VERSION-linux-$arch"
-# gh-releases-zsync|owner|repository|release|zsync file: "latest" is the newest release that is
-# not a prerelease, and the pattern picks this architecture's .zsync from it.
+# gh-releases-zsync|owner|repository|release|zsync file. A release version follows "latest", the
+# newest release that is not a prerelease. A prerelease such as 1.0.0-rc1, or an untagged build
+# such as 0.9.11-abc1234, follows "latest-all", the newest release of either kind, so it moves to
+# a stable release once one is newer instead of back to an older one. The pattern picks this
+# architecture's .zsync from that release.
+case $VERSION in
+    *-*) channel=latest-all ;;
+    *) channel=latest ;;
+esac
 repo=${GITHUB_REPOSITORY:-kuopinghsu/OxideMerge}
-update_info=${UPDATE_INFORMATION-gh-releases-zsync|${repo%%/*}|${repo#*/}|latest|oxidemerge-*-linux-$arch.AppImage.zsync}
+default_info="gh-releases-zsync|${repo%%/*}|${repo#*/}|$channel|oxidemerge-*-linux-$arch.AppImage.zsync"
+update_info=${UPDATE_INFORMATION-$default_info}
 work=$target_dir/appimage
 app=$work/OxideMerge.AppDir
 rm -rf "$app"

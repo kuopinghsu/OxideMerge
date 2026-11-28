@@ -281,8 +281,10 @@ gh workflow run ci.yml --ref <branch>
   系統缺少這些函式庫時才會使用。兩種處理器架構都會在 Ubuntu 22.04、AlmaLinux 8 與 AlmaLinux 8.4 上，
   檢查函式庫載入、指令列行為與視窗啟動。AlmaLinux 8.4 取自其封存庫，內含 Mesa 20.3，
   因此在其上的視窗啟動會以軟體繪製器檢查下方的 glutin 修補；若其 Mesa 為 21 或更新版本，
-  該工作會失敗。每個 AppImage 都內嵌指向 GitHub 最新發行版本的更新資訊，其 `.AppImage.zsync`
-  檔案也會一併發布，讓 AppImageUpdate 可以更新它；測試會檢查這兩者。
+  該工作會失敗。每個 AppImage 都內嵌指向 GitHub 發行版本的更新資訊，其 `.AppImage.zsync`
+  檔案也會一併發布，讓 AppImageUpdate 可以更新它；測試會檢查這兩者。正式版本追蹤 `latest`，
+  即最新的非預覽版本；版本號含 `-` 的預覽版本或未加標籤的建置則追蹤 `latest-all`，
+  因此只會更新到較新的正式版本，不會退回較舊的版本。
   `scripts/package-appimage.sh` 使用 `GITHUB_REPOSITORY` 所指的儲存庫（CI 之外為
   `kuopinghsu/OxideMerge`），`UPDATE_INFORMATION` 可取代更新資訊，設為空字串則不內嵌。
 - **macOS：** 以 DMG 套件提供的通用應用程式，由 `scripts/macos-sign.sh` 簽署：
@@ -298,7 +300,8 @@ gh workflow run ci.yml --ref <branch>
 Windows 與 Linux 的 Arm64 套件會在實體 Arm 架構電腦上建置與測試，而非使用模擬環境。
 
 發布前，發行工作會以 `scripts/check-release.sh` 檢查下載的每個套件：壓縮檔必須能列出內容並解壓縮，
-AppImage 與 DMG 必須帶有其格式標記，每個 `.zsync` 檔案必須指向旁邊的 AppImage，PDF 必須完整。之後會將 `SHA256SUMS` 與套件一併發布。
+AppImage 與 DMG 必須帶有其格式標記，每個 `.zsync` 檔案必須指向旁邊的 AppImage 並列出其大小與
+SHA-1，PDF 必須完整。之後會將 `SHA256SUMS` 與套件一併發布。
 
 ### 為 Mesa 21 之前的版本修補 glutin
 
