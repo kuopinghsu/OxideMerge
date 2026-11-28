@@ -1113,12 +1113,6 @@ jobs:
     if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages)) && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # One release job at a time, so each one decides the latest release from the releases
-    # published before it. GitHub keeps only one waiting run: with three tags pushed at once, the
-    # middle one's release job is cancelled and has to be re-run.
-    concurrency:
-      group: release-${{ github.repository }}
-      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -1227,3 +1221,27 @@ jobs:
           overwrite_files: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           make_latest: ${{ steps.latest.outputs.make_latest }}
+
+      # Two release jobs at once can each decide before the other publishes. Each one checks again
+      # after publishing its own release, so the job that publishes last, seeing every release,
+      # leaves the highest stable version marked as the latest release.
+      - name: Correct the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
+          highest=$(printf '%s\n' "$tags" | bash scripts/release-latest.sh --highest)
+          if [ -z "$highest" ]; then
+            echo "No stable release yet"
+            exit 0
+          fi
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          if [ "$latest" = "$highest" ]; then
+            echo "$latest is the latest release"
+            exit 0
+          fi
+          echo "::warning::$latest was marked as the latest release; marking $highest instead"
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$highest" --jq .id)
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -f make_latest=true --jq .tag_name

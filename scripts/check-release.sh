@@ -23,6 +23,7 @@ fail() {
 
 # The SHA-1 digest of $1, as zsync writes it: lowercase hex. Only a .zsync needs it; when one is
 # there, a missing tool stops the check here, rather than making every .zsync look damaged.
+# nullglob also keeps the file loop below from seeing a literal "*" in an empty folder.
 shopt -s nullglob
 zsyncs=(*.AppImage.zsync)
 if [ "${#zsyncs[@]}" = 0 ]; then
@@ -44,7 +45,6 @@ bytes() {
   od -An -tx1 -j "$2" -N "$3" "$1" | tr -d ' \n'
 }
 
-shopt -s nullglob
 files=()
 for f in *; do
   [ "$f" = SHA256SUMS ] && continue
