@@ -306,9 +306,11 @@ Release tags and manual runs with `packages` build and check these packages:
   glutin patch below with the software renderer; the job fails if its Mesa is 21 or newer. Each
   AppImage carries update information for GitHub releases, and its `.AppImage.zsync` file is
   published beside it, so AppImageUpdate can update it; the test checks both. A release follows
-  `latest`, the newest release that is not a prerelease. A prerelease or untagged build, whose
-  version has a `-`, follows `latest-all`, so it moves on to a newer stable release, never back
-  to an older one.
+  `latest`, the release GitHub marks as latest; the release job marks a release as latest only
+  when it is the highest stable version, so a patch for an older line never moves users down. A
+  prerelease or untagged build, whose version has a `-`, follows `latest-all`, the most recently
+  published release, stable or prerelease. It moves to the next prerelease or to the stable
+  release, whichever comes out first, but also to a patch for an older line published after it.
   `scripts/package-appimage.sh` names the repository in `GITHUB_REPOSITORY`
   (`kuopinghsu/OxideMerge` outside CI), `UPDATE_INFORMATION` replaces the information, and an
   empty `UPDATE_INFORMATION` leaves it out.

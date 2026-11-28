@@ -283,8 +283,9 @@ gh workflow run ci.yml --ref <branch>
   因此在其上的視窗啟動會以軟體繪製器檢查下方的 glutin 修補；若其 Mesa 為 21 或更新版本，
   該工作會失敗。每個 AppImage 都內嵌指向 GitHub 發行版本的更新資訊，其 `.AppImage.zsync`
   檔案也會一併發布，讓 AppImageUpdate 可以更新它；測試會檢查這兩者。正式版本追蹤 `latest`，
-  即最新的非預覽版本；版本號含 `-` 的預覽版本或未加標籤的建置則追蹤 `latest-all`，
-  因此只會更新到較新的正式版本，不會退回較舊的版本。
+  即 GitHub 標示為最新的版本；發行工作只會將版本號最高的正式版本標示為最新，因此舊版本線的修補版
+  不會讓使用者退回。版本號含 `-` 的預覽版本或未加標籤的建置則追蹤 `latest-all`，即最近發布的版本，
+  不論正式或預覽：會更新到先發布的下一個預覽版本或正式版本，但在其後發布的舊版本線修補版也會成為更新目標。
   `scripts/package-appimage.sh` 使用 `GITHUB_REPOSITORY` 所指的儲存庫（CI 之外為
   `kuopinghsu/OxideMerge`），`UPDATE_INFORMATION` 可取代更新資訊，設為空字串則不內嵌。
 - **macOS：** 以 DMG 套件提供的通用應用程式，由 `scripts/macos-sign.sh` 簽署：

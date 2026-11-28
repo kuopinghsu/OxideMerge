@@ -21,13 +21,18 @@ fail() {
   bad=1
 }
 
-# The SHA-1 digest of $1, as zsync writes it: lowercase hex.
+# The SHA-1 digest of $1, as zsync writes it: lowercase hex. A missing tool stops the check
+# here, rather than making every .zsync look damaged.
+if command -v sha1sum >/dev/null; then
+  sha1_tool=(sha1sum)
+elif command -v shasum >/dev/null; then
+  sha1_tool=(shasum -a 1)
+else
+  echo "::error::check-release.sh needs sha1sum or shasum" >&2
+  exit 1
+fi
 sha1() {
-  if command -v sha1sum >/dev/null; then
-    sha1sum "$1" | cut -d ' ' -f 1
-  else
-    shasum -a 1 "$1" | cut -d ' ' -f 1
-  fi
+  "${sha1_tool[@]}" "$1" | cut -d ' ' -f 1
 }
 
 # The bytes of $1 from offset $2, $3 of them, as hex.

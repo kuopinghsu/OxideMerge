@@ -58,11 +58,12 @@ if [ ! -x "$bin" ]; then
 fi
 
 name="oxidemerge-$VERSION-linux-$arch"
-# gh-releases-zsync|owner|repository|release|zsync file. A release version follows "latest", the
-# newest release that is not a prerelease. A prerelease such as 1.0.0-rc1, or an untagged build
-# such as 0.9.11-abc1234, follows "latest-all", the newest release of either kind, so it moves to
-# a stable release once one is newer instead of back to an older one. The pattern picks this
-# architecture's .zsync from that release.
+# gh-releases-zsync|owner|repository|release|zsync file. A release version follows "latest",
+# the release GitHub marks as latest (the release job marks only the highest stable version). A
+# prerelease such as 1.0.0-rc1, or an untagged build such as 0.9.11-abc1234, follows
+# "latest-all", the most recently published release, stable or prerelease: it moves to the next
+# prerelease or the stable release, whichever comes out first, but also to a patch for an older
+# line published after it. The pattern picks this architecture's .zsync from that release.
 case $VERSION in
     *-*) channel=latest-all ;;
     *) channel=latest ;;

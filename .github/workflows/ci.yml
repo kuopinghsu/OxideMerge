@@ -608,13 +608,13 @@ jobs:
           image=${images[0]}
           info=$("./$image" --appimage-updateinfo)
           echo "$info"
-          # A prerelease or untagged build (a version with "-") follows "latest-all".
-          version=${image#oxidemerge-}
-          version=${version%-linux-*}
-          case $version in
-            *-*) channel=latest-all ;;
-            *) channel=latest ;;
-          esac
+          # Only a release tag (no "-") follows "latest"; a prerelease tag or an untagged run
+          # follows "latest-all". Worked out from the ref, not the file name the build chose.
+          if [ "$GITHUB_REF_TYPE" = tag ] && [[ $GITHUB_REF_NAME != *-* ]]; then
+            channel=latest
+          else
+            channel=latest-all
+          fi
           expected="gh-releases-zsync|${GITHUB_REPOSITORY%%/*}|${GITHUB_REPOSITORY#*/}|$channel|oxidemerge-*-linux-${{ matrix.arch }}.AppImage.zsync"
           if [ "$info" != "$expected" ]; then
             echo "::error::Expected the update information $expected"
@@ -1190,9 +1190,33 @@ jobs:
           } > release-notes.md
           cat release-notes.md
 
+      # AppImages of releases follow GitHub's latest release, so only the highest stable version
+      # becomes it: a patch for an older line, published later, must not move users down.
+      - name: Decide whether this is the latest release
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v=${GITHUB_REF_NAME#v}
+          if [[ $v == *-* ]]; then
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          highest=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
+            sed 's/^v//' | grep -v -- - | sort -V | tail -n 1 || true)
+          if [ -z "$highest" ] || [ "$(printf '%s\n%s\n' "$highest" "$v" | sort -V | tail -n 1)" = "$v" ]; then
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$v is older than release $highest, so it is not marked as the latest release"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: dist/*
           body_path: release-notes.md
           overwrite_files: false
           prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ steps.latest.outputs.make_latest }}
