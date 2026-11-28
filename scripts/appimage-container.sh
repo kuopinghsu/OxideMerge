@@ -2,9 +2,9 @@
 # Builds the AppImage in the AlmaLinux 8 container of docker/appimage.Dockerfile, which
 # `make appimage` runs with the checkout mounted at /work.
 #
-# On a Linux host, `make appimage` passes HOST_UID and HOST_GID: dist/ and the AppImage, which
-# root in the container writes, are given back to that user, even when the build stops after
-# dist/ was made. With rootless Docker or Podman, root in the container already is the user
+# On a Linux host, `make appimage` passes HOST_UID and HOST_GID: dist/, the AppImage and its
+# .zsync, which root in the container writes, are given back to that user, even when the build
+# stops after dist/ was made. With rootless Docker or Podman, root in the container already is the user
 # outside it, and a chown would hand the files to one of that user's subordinate ids instead,
 # so they are left as they are there.
 
@@ -21,7 +21,7 @@ give_back() {
     if [ -n "${HOST_UID:-}" ] && [ -d dist ] && real_root; then
         local owner="$HOST_UID:${HOST_GID:-$HOST_UID}"
         chown "$owner" dist || true
-        find dist -maxdepth 1 -name '*.AppImage' -exec chown "$owner" {} + || true
+        find dist -maxdepth 1 \( -name '*.AppImage' -o -name '*.AppImage.zsync' \) -exec chown "$owner" {} + || true
     fi
     exit "$status"
 }

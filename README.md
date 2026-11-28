@@ -238,6 +238,9 @@ and click **Open Anyway**. For more information, see [macOS signing](docs/macos-
 - **AppImage:** runs on Ubuntu 20.04, RHEL 8, Debian 10 and newer.
   Make the file executable with `chmod +x <filename>.AppImage`, then run it.
   If FUSE is not available, start it with `--appimage-extract-and-run`.
+  To update it to the latest release, run
+  [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) on it;
+  it downloads only what changed.
 - **TAR.GZ:** contains the program, a desktop file and an icon.
 
 File dialogs use `xdg-desktop-portal`. Most desktop environments include it.

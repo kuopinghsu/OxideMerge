@@ -88,9 +88,9 @@ macOS 與 Linux 的程式位於 `target/release/oxidemerge`，Windows 則為
 | `make dist` | 以 `make opt-size` 建置，並在 `dist/` 產生套件：Windows 為 ZIP 檔，macOS 與 Linux 為 TAR.GZ 檔。 |
 | `make appimage` | 依本機處理器架構（x86_64 或 aarch64）產生 Linux AppImage。Docker 可以使用時（Windows 與 macOS 一律如此，Linux 與 WSL 則在 `docker info` 成功時；若不成功，會顯示訊息並改在主機上建置），會如同 CI 在 glibc 2.28 的 AlmaLinux 8 容器中建置，因此 AppImage 可在 RHEL 8 上執行。`make appimage-native`（或 `APPIMAGE_DOCKER=0`）則直接在 Linux 主機上建置：需要 X11、Wayland 與鍵盤函式庫，且產生的 AppImage 需要與主機相同或更新的 glibc。兩者都會下載 `appimagetool`。 |
 | `make user-guide` | 在 `dist/` 產生英文與繁體中文 PDF 指南。 |
-| `make user-guide-docs` | 在 `docs/dist/` 產生相同的指南，檔名為 `oxidemerge-user-guide.pdf` 與 `oxidemerge-user-guide.zh-TW.pdf`。這些檔案會提交到儲存庫，每次建置都會取代它們。 |
+| `make user-guide-pdf` | 在 `docs/dist/` 產生相同的指南，檔名為 `oxidemerge-user-guide.pdf` 與 `oxidemerge-user-guide.zh-TW.pdf`。這些檔案會提交到儲存庫，每次建置都會取代它們。 |
 
-變更使用者指南或其圖片後，請執行 `make user-guide-docs`，並將 PDF 檔案與變更一起提交，讓
+變更使用者指南或其圖片後，請執行 `make user-guide-pdf`，並將 PDF 檔案與變更一起提交，讓
 `docs/dist/` 始終保有最新的指南。
 
 在 Windows 與 macOS 上，這兩個目標都在 Docker 中執行：請啟動 Docker Desktop（在 Windows 上使用 Linux
@@ -281,7 +281,10 @@ gh workflow run ci.yml --ref <branch>
   系統缺少這些函式庫時才會使用。兩種處理器架構都會在 Ubuntu 22.04、AlmaLinux 8 與 AlmaLinux 8.4 上，
   檢查函式庫載入、指令列行為與視窗啟動。AlmaLinux 8.4 取自其封存庫，內含 Mesa 20.3，
   因此在其上的視窗啟動會以軟體繪製器檢查下方的 glutin 修補；若其 Mesa 為 21 或更新版本，
-  該工作會失敗。
+  該工作會失敗。每個 AppImage 都內嵌指向 GitHub 最新發行版本的更新資訊，其 `.AppImage.zsync`
+  檔案也會一併發布，讓 AppImageUpdate 可以更新它；測試會檢查這兩者。
+  `scripts/package-appimage.sh` 使用 `GITHUB_REPOSITORY` 所指的儲存庫（CI 之外為
+  `kuopinghsu/OxideMerge`），`UPDATE_INFORMATION` 可取代更新資訊，設為空字串則不內嵌。
 - **macOS：** 以 DMG 套件提供的通用應用程式，由 `scripts/macos-sign.sh` 簽署：
   沒有簽署機密時採用臨時簽署；五個 `MACOS_*` 機密都設定時，則以 Developer ID 簽署、
   公證並裝訂（請參閱 [macOS 簽署](macos-signing.md)）。會驗證 Apple 晶片與 Intel 兩種程式碼，並透過
@@ -295,7 +298,7 @@ gh workflow run ci.yml --ref <branch>
 Windows 與 Linux 的 Arm64 套件會在實體 Arm 架構電腦上建置與測試，而非使用模擬環境。
 
 發布前，發行工作會以 `scripts/check-release.sh` 檢查下載的每個套件：壓縮檔必須能列出內容並解壓縮，
-AppImage 與 DMG 必須帶有其格式標記，PDF 必須完整。之後會將 `SHA256SUMS` 與套件一併發布。
+AppImage 與 DMG 必須帶有其格式標記，每個 `.zsync` 檔案必須指向旁邊的 AppImage，PDF 必須完整。之後會將 `SHA256SUMS` 與套件一併發布。
 
 ### 為 Mesa 21 之前的版本修補 glutin
 
@@ -386,8 +389,10 @@ AppImage 與 DMG 必須帶有其格式標記，PDF 必須完整。之後會將 `
 
 ```text
 oxidemerge-0.9.11-linux-arm64.AppImage
+oxidemerge-0.9.11-linux-arm64.AppImage.zsync
 oxidemerge-0.9.11-linux-arm64.tar.gz
 oxidemerge-0.9.11-linux-x64.AppImage
+oxidemerge-0.9.11-linux-x64.AppImage.zsync
 oxidemerge-0.9.11-linux-x64.tar.gz
 oxidemerge-0.9.11-macos-universal.dmg
 oxidemerge-0.9.11-user-guide.pdf
@@ -404,7 +409,7 @@ oxidemerge-0.9.11-windows-x64.zip
 2. 檢查 `CHANGELOG.md` 中 `0.9.11` 的段落，將標題中的 `Unreleased` 改為 `YYYY-MM-DD`
    格式的發行日期。
 3. 執行 `make fmt-check ci`，並以 `scripts/release-notes.sh 0.9.11` 檢查發行說明。執行
-   `make user-guide-docs`，讓 `docs/dist/` 中的指南顯示新版本。
+   `make user-guide-pdf`，讓 `docs/dist/` 中的指南顯示新版本。
 4. 提交並推送到 `main`。在 `main` 上手動執行持續整合工作流程（會檢查所有平台與套件），並等待它通過：
 
    ```sh

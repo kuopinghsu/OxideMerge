@@ -92,9 +92,9 @@ web page samples, see [samples/web/README.md](../samples/web/README.md).
 | `make dist` | Builds with `make opt-size` and creates a package in `dist/`: a ZIP file on Windows, or a TAR.GZ file on macOS and Linux. |
 | `make appimage` | Creates a Linux AppImage for this computer's processor (x86_64 or aarch64). Where Docker answers (always on Windows and macOS, and on Linux and WSL when `docker info` succeeds; when it does not, the build says so and runs on the host), it builds in an AlmaLinux 8 container with glibc 2.28, as CI does, so the AppImage runs on RHEL 8. `make appimage-native` (or `APPIMAGE_DOCKER=0`) builds on the Linux host instead: that needs the X11, Wayland and keyboard libraries, and the AppImage needs the host's glibc or newer. Both download `appimagetool`. |
 | `make user-guide` | Creates the English and Traditional Chinese PDF guides in `dist/`. |
-| `make user-guide-docs` | Creates the same guides in `docs/dist/`, as `oxidemerge-user-guide.pdf` and `oxidemerge-user-guide.zh-TW.pdf`. These files are committed, and each build replaces them. |
+| `make user-guide-pdf` | Creates the same guides in `docs/dist/`, as `oxidemerge-user-guide.pdf` and `oxidemerge-user-guide.zh-TW.pdf`. These files are committed, and each build replaces them. |
 
-After you change a user guide or its images, run `make user-guide-docs` and commit the PDF files
+After you change a user guide or its images, run `make user-guide-pdf` and commit the PDF files
 with the change, so that `docs/dist/` always has the latest guides.
 
 On Windows and macOS, both targets run in Docker: start Docker Desktop (on Windows, in Linux
@@ -303,7 +303,12 @@ Release tags and manual runs with `packages` build and check these packages:
   and keyboard libraries and use them when the system does not have them. Both processor types are
   checked on Ubuntu 22.04, AlmaLinux 8 and AlmaLinux 8.4: library loading, command-line behavior and
   window start. AlmaLinux 8.4, from its vault, has Mesa 20.3, so the window start there checks the
-  glutin patch below with the software renderer; the job fails if its Mesa is 21 or newer.
+  glutin patch below with the software renderer; the job fails if its Mesa is 21 or newer. Each
+  AppImage carries update information for the latest GitHub release, and its `.AppImage.zsync`
+  file is published beside it, so AppImageUpdate can update it; the test checks both.
+  `scripts/package-appimage.sh` names the repository in `GITHUB_REPOSITORY`
+  (`kuopinghsu/OxideMerge` outside CI), `UPDATE_INFORMATION` replaces the information, and an
+  empty `UPDATE_INFORMATION` leaves it out.
 - **macOS:** a universal app in a DMG package, signed by `scripts/macos-sign.sh`: ad hoc without
   signing secrets, or with a Developer ID, notarized and stapled when all five `MACOS_*` secrets are
   set (see [macOS signing](macos-signing.md)). Both Apple silicon and Intel code are checked. The
@@ -319,8 +324,8 @@ Release tags and manual runs with `packages` build and check these packages:
 The Windows and Linux Arm64 packages are built and tested on Arm computers, not emulated.
 
 Before publishing, the release job checks each downloaded package with `scripts/check-release.sh`:
-archives must list and decompress, the AppImage and DMG must carry their format marks, and the PDFs
-must be whole. It then publishes `SHA256SUMS` with the packages.
+archives must list and decompress, the AppImage and DMG must carry their format marks, each
+`.zsync` file must point to the AppImage beside it, and the PDFs must be whole. It then publishes `SHA256SUMS` with the packages.
 
 ### Patch glutin for Mesa before 21
 
@@ -422,8 +427,10 @@ these files:
 
 ```text
 oxidemerge-0.9.11-linux-arm64.AppImage
+oxidemerge-0.9.11-linux-arm64.AppImage.zsync
 oxidemerge-0.9.11-linux-arm64.tar.gz
 oxidemerge-0.9.11-linux-x64.AppImage
+oxidemerge-0.9.11-linux-x64.AppImage.zsync
 oxidemerge-0.9.11-linux-x64.tar.gz
 oxidemerge-0.9.11-macos-universal.dmg
 oxidemerge-0.9.11-user-guide.pdf
@@ -440,7 +447,7 @@ These steps use version `0.9.11` as an example. Use the version that you want to
 2. Check the `0.9.11` section in `CHANGELOG.md`. In its heading, replace `Unreleased` with the
    release date in the form `YYYY-MM-DD`.
 3. Run `make fmt-check ci`. Check the release notes with `scripts/release-notes.sh 0.9.11`. Run
-   `make user-guide-docs`, so that the guides in `docs/dist/` show the new version.
+   `make user-guide-pdf`, so that the guides in `docs/dist/` show the new version.
 4. Commit, and push to `main`. Start a manual run of the CI workflow on `main`, which checks all
    platforms and packages, and wait until it passes:
 

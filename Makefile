@@ -37,7 +37,7 @@ DIST_DIR    := dist/$(DIST_NAME)
 .PHONY: all help build release opt-size run run-release demo demo-text demo-3way demo-3way-merge demo-3way-folder demo-conflict \
         demo-web demo-web-text demo-web-headings demo-web-tables \
         test gui-smoke docker-test check check-platforms lint fmt fmt-check ci install uninstall shell-register shell-unregister \
-        languages dist appimage user-guide user-guide-docs clean
+        languages dist appimage user-guide user-guide-pdf clean
 
 help:
 	@echo 'OxideMerge $(VERSION) - make targets'
@@ -74,7 +74,7 @@ help:
 	@echo '  appimage          Linux AppImage in dist/ for RHEL 8+ (in Docker when it answers)'
 	@echo '  appimage-native   Linux AppImage built on this Linux host (needs its glibc or newer)'
 	@echo '  user-guide        User guide PDF files (English, Traditional Chinese) in dist/'
-	@echo '  user-guide-docs   The latest user guide PDF files in docs/dist, to commit'
+	@echo '  user-guide-pdf    The latest user guide PDF files in docs/dist, to commit'
 	@echo '  clean             Remove build output and dist/'
 
 all: release
@@ -245,14 +245,14 @@ user-guide-image:
 user-guide: user-guide-image
 	$(GUIDE_DOCKER) $(GUIDE_IMAGE) bash scripts/build-user-guide.sh dist
 
-user-guide-docs: user-guide-image
+user-guide-pdf: user-guide-image
 	$(GUIDE_DOCKER) --env UNVERSIONED=1 $(GUIDE_IMAGE) bash scripts/build-user-guide.sh docs/dist
 else
 user-guide:
 	VERSION='$(VERSION)' bash scripts/build-user-guide.sh dist
 
 # The guides kept in the repository, under names that stay the same from one version to the next.
-user-guide-docs:
+user-guide-pdf:
 	UNVERSIONED=1 VERSION='$(VERSION)' bash scripts/build-user-guide.sh docs/dist
 endif
 

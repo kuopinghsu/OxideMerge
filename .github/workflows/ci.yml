@@ -594,6 +594,26 @@ jobs:
           ./oxidemerge-*.AppImage --appimage-extract >/dev/null
           ls squashfs-root/usr/lib/oxidemerge
 
+      # AppImageUpdate finds the newest release from the update information in the image, and
+      # downloads only what changed using the .zsync published beside it.
+      - name: Check update information
+        run: |
+          set -euo pipefail
+          image=$(echo oxidemerge-*.AppImage)
+          info=$("./$image" --appimage-updateinfo)
+          echo "$info"
+          expected="gh-releases-zsync|${GITHUB_REPOSITORY%%/*}|${GITHUB_REPOSITORY#*/}|latest|oxidemerge-*-linux-${{ matrix.arch }}.AppImage.zsync"
+          if [ "$info" != "$expected" ]; then
+            echo "::error::Expected the update information $expected"
+            exit 1
+          fi
+          zsync=$image.zsync
+          head -n 8 "$zsync"
+          grep -qx "URL: $image" "$zsync" || {
+            echo "::error::$zsync does not point to the AppImage beside it"
+            exit 1
+          }
+
       # The bare image has no display libraries, so AppRun would use every
       # bundled one: together with glibc they must cover everything
       # OxideMerge and each of them needs.
@@ -1105,8 +1125,8 @@ jobs:
           # Exactly these files are published, nothing missing and nothing else.
           v=${GITHUB_REF_NAME#v}
           expected=$(for f in \
-            "linux-arm64.AppImage" "linux-arm64.tar.gz" \
-            "linux-x64.AppImage" "linux-x64.tar.gz" \
+            "linux-arm64.AppImage" "linux-arm64.AppImage.zsync" "linux-arm64.tar.gz" \
+            "linux-x64.AppImage" "linux-x64.AppImage.zsync" "linux-x64.tar.gz" \
             "macos-universal.dmg" \
             "user-guide.pdf" "user-guide.zh-TW.pdf" \
             "windows-arm64.zip" "windows-x64.zip"; do
@@ -1140,7 +1160,7 @@ jobs:
             cat <<'EOF'
           **Windows (x64 or Arm64):** download `oxidemerge-*-windows-x64.zip` (Intel and AMD PCs) or `oxidemerge-*-windows-arm64.zip` (Arm PCs such as Snapdragon laptops), unzip it, and run `oxidemerge.exe`; there is nothing to install. Run `oxidemerge --register-shell` once to add the Explorer context menu.
 
-          **Linux (x64 or Arm64):** pick the `linux-x64` packages for Intel and AMD machines and the `linux-arm64` ones for 64-bit Arm (aarch64). `oxidemerge-*-linux-<arch>.AppImage` runs without installing anything on Ubuntu 20.04, RHEL 8, Debian 10, and newer: `chmod +x` it, then run it. It carries the libraries OxideMerge needs besides glibc and the graphics driver. Without FUSE, start it with `--appimage-extract-and-run`. `oxidemerge-*-linux-<arch>.tar.gz` holds the bare program instead, with a desktop file and icon. File dialogs use the XDG desktop portal (`xdg-desktop-portal`).
+          **Linux (x64 or Arm64):** pick the `linux-x64` packages for Intel and AMD machines and the `linux-arm64` ones for 64-bit Arm (aarch64). `oxidemerge-*-linux-<arch>.AppImage` runs without installing anything on Ubuntu 20.04, RHEL 8, Debian 10, and newer: `chmod +x` it, then run it. It carries the libraries OxideMerge needs besides glibc and the graphics driver. Without FUSE, start it with `--appimage-extract-and-run`. To update it in place later, run [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) on it (`appimageupdatetool oxidemerge-*.AppImage`): it downloads only what changed, using the `.AppImage.zsync` file published here. `oxidemerge-*-linux-<arch>.tar.gz` holds the bare program instead, with a desktop file and icon. File dialogs use the XDG desktop portal (`xdg-desktop-portal`).
 
           **macOS 11 or later (Apple silicon and Intel):** open `oxidemerge-*-macos-universal.dmg` and drag OxideMerge to Applications. The app is not notarized, so macOS blocks it the first time: try to open it once, then choose **Open Anyway** in **System Settings → Privacy & Security** (up to macOS 14, Control-clicking it and choosing **Open** also works), or run `xattr -dr com.apple.quarantine /Applications/OxideMerge.app`. To use it from the terminal, run `sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin/oxidemerge`.
 

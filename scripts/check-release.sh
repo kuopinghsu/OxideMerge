@@ -5,9 +5,10 @@
 #   check-release.sh <dist>
 #
 # A .zip or .tar.gz must list and decompress without error, an .AppImage must be an ELF
-# program with the AppImage type 2 mark, a .dmg must end with its "koly" trailer, and a .pdf
-# must start with %PDF- and end with %%EOF. Any other file fails the check. This catches
-# truncated or damaged uploads; it does not check signatures (see docs/macos-signing.md).
+# program with the AppImage type 2 mark, an .AppImage.zsync must be a zsync control file that
+# points to the AppImage beside it and gives its size, a .dmg must end with its "koly" trailer,
+# and a .pdf must start with %PDF- and end with %%EOF. Any other file fails the check. This
+# catches truncated or damaged uploads; it does not check signatures (see docs/macos-signing.md).
 set -euo pipefail
 
 dist=${1:?usage: $0 <dist>}
@@ -45,6 +46,21 @@ for f in *; do
   *.AppImage)
     [ "$(bytes "$f" 0 4)" = 7f454c46 ] || fail "$f" "is not an ELF program"
     [ "$(bytes "$f" 8 3)" = 414902 ] || fail "$f" "has no AppImage type 2 mark"
+    ;;
+  *.AppImage.zsync)
+    # The header is text up to its first empty line; the block checksums follow it. sed reads
+    # everything head gives it, so neither stops early under pipefail.
+    header=$(head -c 4096 "$f" | LC_ALL=C sed '/^\r*$/,$d' | tr -d '\r')
+    image=${f%.zsync}
+    if [[ $header != "zsync: "* ]]; then
+      fail "$f" "is not a zsync control file"
+    elif ! grep -qx "URL: $image" <<<"$header"; then
+      fail "$f" "does not point to $image beside it"
+    elif [ ! -f "$image" ]; then
+      fail "$f" "has no $image beside it"
+    elif ! grep -qx "Length: $(wc -c <"$image" | tr -d ' ')" <<<"$header"; then
+      fail "$f" "does not describe $image as it is"
+    fi
     ;;
   *.dmg)
     size=$(wc -c <"$f")

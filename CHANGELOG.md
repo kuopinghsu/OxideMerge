@@ -5,6 +5,12 @@ release on GitHub uses its section of this file as the release notes.
 
 ## [0.9.11] - Unreleased
 
+### Added
+
+- The Linux AppImage carries update information, and each release publishes its
+  `.AppImage.zsync` file beside it, so AppImageUpdate and similar tools can update it to the
+  latest release, downloading only what changed.
+
 ### Changed
 
 - CI checks `main` once a day, at 17:00 Taipei time (09:00 UTC), instead of on every push and
@@ -15,6 +21,7 @@ release on GitHub uses its section of this file as the release notes.
   every check. Pull requests are no longer checked automatically.
 - The window smoke test gives Xvfb a minute to start instead of ten seconds, says why when it
   does not start, and starts it once more before failing.
+- `make user-guide-docs` is now `make user-guide-pdf`.
 
 ## [0.9.10] - 2026-11-27
 

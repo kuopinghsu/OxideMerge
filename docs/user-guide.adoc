@@ -242,6 +242,9 @@ Before you start OxideMerge on Linux, check these requirements:
 * Use a desktop session with X11 or Wayland.
 * Make the AppImage executable before you start it: `chmod +x oxidemerge-*.AppImage`.
 * If your system does not have FUSE, start the AppImage with `--appimage-extract-and-run`.
+* To update the AppImage to the latest release, run
+  https://github.com/AppImageCommunity/AppImageUpdate[AppImageUpdate] on it, for example
+  `appimageupdatetool oxidemerge-*.AppImage`. It downloads only what changed.
 * File dialogs need `xdg-desktop-portal`, which most desktop environments include.
 * To display Chinese, Japanese and Korean text, install a CJK font, such as Noto Sans CJK.
 

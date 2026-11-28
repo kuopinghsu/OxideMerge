@@ -188,6 +188,9 @@ SHA-256 檢查碼，`SHA256SUMS` 檔案則列出全部的檢查碼，方便您�
 - **AppImage：** 可在 Ubuntu 20.04、RHEL 8、Debian 10 及更新版本上執行。
   先以 `chmod +x <filename>.AppImage` 將檔案設為可執行，再啟動它。
   若系統無法使用 FUSE，請在啟動時加上 `--appimage-extract-and-run`。
+  若要更新到最新版本，請以
+  [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) 更新它；
+  它只會下載變更的部分。
 - **TAR.GZ：** 內含程式、桌面項目檔與圖示。
 
 檔案對話框使用 `xdg-desktop-portal`，大多數桌面環境都已內建。

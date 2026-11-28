@@ -232,6 +232,9 @@ sudo ln -s /Applications/OxideMerge.app/Contents/MacOS/oxidemerge /usr/local/bin
 * 請在使用 X11 或 Wayland 的桌面環境中執行。
 * 啟動 AppImage 前，請先讓它可以執行：`chmod +x oxidemerge-*.AppImage`。
 * 若系統沒有 FUSE，請加上 `--appimage-extract-and-run` 啟動 AppImage。
+* 若要將 AppImage 更新到最新版本，請以
+  https://github.com/AppImageCommunity/AppImageUpdate[AppImageUpdate] 更新它，例如
+  `appimageupdatetool oxidemerge-*.AppImage`。它只會下載變更的部分。
 * 檔案對話框需要 `xdg-desktop-portal`，大多數桌面環境已內建。
 * 若要顯示中文、日文與韓文，請安裝 Noto Sans CJK 等中日韓字型。
 

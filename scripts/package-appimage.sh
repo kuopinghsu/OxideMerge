@@ -9,7 +9,14 @@
 # system does not already provide it.
 #
 # VERSION overrides the version in the file name. CI sets it so untagged
-# builds include the commit. Requires Linux on x86_64 or aarch64, curl, and the
+# builds include the commit.
+#
+# The AppImage carries update information, so AppImageUpdate and similar tools
+# can update it from the latest GitHub release, and appimagetool writes
+# dist/$name.AppImage.zsync beside it, to be published with it. The information
+# names the GitHub repository kuopinghsu/OxideMerge unless GITHUB_REPOSITORY
+# (owner/name, set in GitHub Actions) names another; UPDATE_INFORMATION replaces
+# it, and an empty UPDATE_INFORMATION builds an AppImage without it. Requires Linux on x86_64 or aarch64, curl, and the
 # runtime libraries listed below (the same packages the AppImage job installs).
 
 set -euo pipefail
@@ -49,6 +56,10 @@ if [ ! -x "$bin" ]; then
 fi
 
 name="oxidemerge-$VERSION-linux-$arch"
+# gh-releases-zsync|owner|repository|release|zsync file: "latest" is the newest release that is
+# not a prerelease, and the pattern picks this architecture's .zsync from it.
+repo=${GITHUB_REPOSITORY:-kuopinghsu/OxideMerge}
+update_info=${UPDATE_INFORMATION-gh-releases-zsync|${repo%%/*}|${repo#*/}|latest|oxidemerge-*-linux-$arch.AppImage.zsync}
 work=$target_dir/appimage
 app=$work/OxideMerge.AppDir
 rm -rf "$app"
@@ -129,7 +140,19 @@ fi
 # --appimage-extract works without FUSE. The extracted tool then packs the image.
 rm -rf "$work/squashfs-root"
 (cd "$work" && "./${tool##*/}" --appimage-extract >/dev/null)
-rm -f "dist/$name.AppImage"
-ARCH=$tool_arch VERSION="$VERSION" "$work/squashfs-root/AppRun" --no-appstream "$app" "dist/$name.AppImage"
+rm -f "dist/$name.AppImage" "dist/$name.AppImage.zsync"
+# With update information, appimagetool embeds it and, with its bundled zsyncmake, writes the
+# .zsync into the current folder, naming the AppImage beside it. So it runs in dist/.
+tool_run=$(cd "$work/squashfs-root" && pwd)/AppRun
+app_dir=$(cd "$app" && pwd)
+(cd dist && ARCH=$tool_arch VERSION="$VERSION" "$tool_run" --no-appstream \
+    ${update_info:+--updateinformation "$update_info"} "$app_dir" "$name.AppImage")
 
 echo "Created dist/$name.AppImage"
+if [ -n "$update_info" ]; then
+    if [ ! -s "dist/$name.AppImage.zsync" ]; then
+        echo "${GITHUB_ACTIONS:+::error::}appimagetool did not write dist/$name.AppImage.zsync" >&2
+        exit 1
+    fi
+    echo "Created dist/$name.AppImage.zsync; update information: $update_info"
+fi
