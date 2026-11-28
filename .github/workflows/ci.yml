@@ -1223,25 +1223,43 @@ jobs:
           make_latest: ${{ steps.latest.outputs.make_latest }}
 
       # Two release jobs at once can each decide before the other publishes. Each one checks again
-      # after publishing its own release, so the job that publishes last, seeing every release,
-      # leaves the highest stable version marked as the latest release.
+      # after publishing its own release and marks the highest stable version as the latest
+      # release, overriding a mark set by hand on GitHub. The release is published by now, so a
+      # re-run stops at "Check the release": the requests are retried here instead, and
+      # docs/development.md says how to set the mark by hand if they still fail.
       - name: Correct the latest release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+          # gh with up to five attempts, 2, 4, 8 and 16 seconds apart.
+          retry() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if "$@"; then
+                return 0
+              fi
+              [ "$attempt" = 5 ] || sleep $((2 ** attempt))
+            done
+            echo "::error::Failed five times: $*; set the latest release by hand (docs/development.md)" >&2
+            return 1
+          }
+          tags=$(retry gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
             --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
+          # The list can lag behind the release this job has just published, so it is added here.
+          if [[ $GITHUB_REF_NAME != *-* ]]; then
+            tags=$(printf '%s\n%s\n' "$tags" "$GITHUB_REF_NAME")
+          fi
           highest=$(printf '%s\n' "$tags" | bash scripts/release-latest.sh --highest)
           if [ -z "$highest" ]; then
             echo "No stable release yet"
             exit 0
           fi
-          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          latest=$(retry gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
           if [ "$latest" = "$highest" ]; then
             echo "$latest is the latest release"
             exit 0
           fi
           echo "::warning::$latest was marked as the latest release; marking $highest instead"
-          id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$highest" --jq .id)
-          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -f make_latest=true --jq .tag_name
+          id=$(retry gh api "repos/$GITHUB_REPOSITORY/releases/tags/$highest" --jq .id)
+          retry gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -f make_latest=true --jq .tag_name

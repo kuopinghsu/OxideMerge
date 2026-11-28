@@ -285,7 +285,9 @@ gh workflow run ci.yml --ref <branch>
   檔案也會一併發布，讓 AppImageUpdate 可以更新它；測試會檢查這兩者。正式版本追蹤 `latest`，
   即 GitHub 標示為最新的版本；發行工作只會將版本號最高的正式版本標示為最新（`scripts/release-latest.sh`，
   其案例由 `scripts/release-latest.sh --test` 檢查），因此舊版本線的修補版不會讓使用者退回。
-  發布後會再次檢查此標示；若同時執行的另一個發行工作取得了它，會將它移回版本號最高的正式版本。版本號含 `-` 的預覽版本或未加標籤的建置則追蹤 `latest-all`，即最近發布的版本，
+  發布後，每個發行工作都會再次將此標示設為版本號最高的正式版本，因此同時執行的兩個發行工作最後仍會得到正確結果；
+  這也會取代在 GitHub 上手動設定的標示。若該步驟重試後仍失敗，請手動設定：
+  `gh api -X PATCH repos/<owner>/<repo>/releases/$(gh api repos/<owner>/<repo>/releases/tags/<tag> --jq .id) -f make_latest=true`。版本號含 `-` 的預覽版本或未加標籤的建置則追蹤 `latest-all`，即最近發布的版本，
   不論正式或預覽：會更新到先發布的下一個預覽版本或正式版本，但在其後發布的舊版本線修補版也會成為更新目標。
   `scripts/package-appimage.sh` 使用 `GITHUB_REPOSITORY` 所指的儲存庫（CI 之外為
   `kuopinghsu/OxideMerge`），`UPDATE_INFORMATION` 可取代更新資訊，設為空字串則不內嵌。

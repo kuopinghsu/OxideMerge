@@ -6,8 +6,10 @@
 #   release-latest.sh --test                   checks the cases below
 #
 # The standard input lists the tags of the published releases that are not prereleases, one per
-# line. <tag> becomes the latest release only when it is a stable version (no "-") at least as
-# high as each of them, so a patch for an older line, published later, does not take that place.
+# line. A stable tag is v and dotted numbers, such as v1.2.3; a prerelease tag has a "-" after
+# them, such as v1.2.3-rc1. Any other tag is refused as <tag> and ignored on the standard input.
+# <tag> becomes the latest release only when it is stable and at least as high as each of them,
+# so a patch for an older line, published later, does not take that place.
 # AppImageUpdate resolves "latest" through GitHub's /releases/latest, which follows this mark
 # (see scripts/package-appimage.sh).
 set -euo pipefail
@@ -17,17 +19,25 @@ usage() {
   exit 2
 }
 
+# The one rule for tags, used for <tag> and for the standard input alike.
+stable_re='^v?[0-9]+(\.[0-9]+)*$'
+prerelease_re='^v?[0-9]+(\.[0-9]+)*-[0-9A-Za-z.-]+$'
+
 # The highest stable tag on the standard input, as it is written there; nothing when there is none.
 highest() {
-  { grep -E '^v?[0-9]+(\.[0-9]+)*$' || true; } |
+  { grep -E "$stable_re" || true; } |
     awk '{ v = $0; sub(/^v/, "", v); print v "\t" $0 }' | sort -V -k 1,1 | tail -n 1 | cut -f 2
 }
 
 decide() {
   local v=${1#v} top
-  if [[ $v == *-* ]]; then
+  if [[ $1 =~ $prerelease_re ]]; then
     echo false
     return
+  fi
+  if [[ ! $1 =~ $stable_re ]]; then
+    echo "$0: $1 is neither a stable tag (v1.2.3) nor a prerelease tag (v1.2.3-rc1)" >&2
+    usage
   fi
   top=$(highest)
   top=${top#v}
@@ -79,6 +89,19 @@ case "${1:-}" in
   check_highest v0.10.0 v0.9.11 v0.10.0 v0.9.9
   check_highest v1.0.0 v1.0.0 v1.1.0-rc1
   check_highest ""                         # no release yet
+  check_highest v1.1.5 v1.1.5 v1.2.0+1     # a tag of neither kind is ignored
+  # A tag of neither kind is refused as <tag>, rather than judged by a different rule.
+  for tag in v1.2.0+1 v1.2 v1.2.3.beta; do
+    case $tag in
+    v1.2) want=true ;;
+    *) want=refused ;;
+    esac
+    got=$(printf 'v1.1.0\n' | decide "$tag" 2>/dev/null) || got=refused
+    if [ "$got" != "$want" ]; then
+      echo "::error::release-latest.sh $tag: expected $want, got $got" >&2
+      failed=1
+    fi
+  done
   [ "$failed" = 0 ] && echo "release-latest.sh: all cases pass"
   exit "$failed"
   ;;

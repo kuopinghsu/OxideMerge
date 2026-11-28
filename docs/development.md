@@ -309,8 +309,10 @@ Release tags and manual runs with `packages` build and check these packages:
   `latest`, the release GitHub marks as latest; the release job marks a release as latest only
   when it is the highest stable version (`scripts/release-latest.sh`, whose cases
   `scripts/release-latest.sh --test` checks), so a patch for an older line never moves users
-  down. After publishing, it checks the mark again and moves it to the highest stable version if
-  another release job, running at the same time, took it. A
+  down. After publishing, each release job sets the mark again to the highest stable version, so
+  two release jobs at the same time end with it right; this also replaces a mark set by hand on
+  GitHub. If that step still fails after its retries, set the mark by hand:
+  `gh api -X PATCH repos/<owner>/<repo>/releases/$(gh api repos/<owner>/<repo>/releases/tags/<tag> --jq .id) -f make_latest=true`. A
   prerelease or untagged build, whose version has a `-`, follows `latest-all`, the most recently
   published release, stable or prerelease. It moves to the next prerelease or to the stable
   release, whichever comes out first, but also to a patch for an older line published after it.
