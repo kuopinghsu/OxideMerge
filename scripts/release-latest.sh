@@ -3,6 +3,7 @@
 #
 #   release-latest.sh <tag> < published-tags   prints true or false: whether <tag> becomes it
 #   release-latest.sh --highest < published-tags   prints the tag that should be it, if any
+#   release-latest.sh --check <tag>            fails unless <tag> is a stable or prerelease tag
 #   release-latest.sh --test                   checks the cases below
 #
 # The standard input lists the tags of the published releases that are not prereleases, one per
@@ -15,7 +16,8 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <tag> < published-tags, $0 --highest < published-tags, or $0 --test" >&2
+  echo "usage: $0 <tag> < published-tags, $0 --highest < published-tags, $0 --check <tag>," \
+    "or $0 --test" >&2
   exit 2
 }
 
@@ -29,15 +31,20 @@ highest() {
     awk '{ v = $0; sub(/^v/, "", v); print v "\t" $0 }' | sort -V -k 1,1 | tail -n 1 | cut -f 2
 }
 
+# Stops with the usage unless $1 is a stable or a prerelease tag.
+check_tag() {
+  if [[ ! $1 =~ $stable_re && ! $1 =~ $prerelease_re ]]; then
+    echo "${GITHUB_ACTIONS:+::error::}$0: $1 is neither a stable tag (v1.2.3) nor a prerelease tag (v1.2.3-rc1)" >&2
+    usage
+  fi
+}
+
 decide() {
   local v=${1#v} top
+  check_tag "$1"
   if [[ $1 =~ $prerelease_re ]]; then
     echo false
     return
-  fi
-  if [[ ! $1 =~ $stable_re ]]; then
-    echo "$0: $1 is neither a stable tag (v1.2.3) nor a prerelease tag (v1.2.3-rc1)" >&2
-    usage
   fi
   top=$(highest)
   top=${top#v}
@@ -102,8 +109,24 @@ case "${1:-}" in
       failed=1
     fi
   done
+  for tag in v1.2.3 v1.2.3-rc1 v1.2.3-alpha.1 v10; do
+    (check_tag "$tag") 2>/dev/null || {
+      echo "::error::release-latest.sh --check $tag: expected it to pass" >&2
+      failed=1
+    }
+  done
+  for tag in v1.2.0+1 v1.2.3- 1.2.3x vx main; do
+    if (check_tag "$tag") 2>/dev/null; then
+      echo "::error::release-latest.sh --check $tag: expected it to be refused" >&2
+      failed=1
+    fi
+  done
   [ "$failed" = 0 ] && echo "release-latest.sh: all cases pass"
   exit "$failed"
+  ;;
+--check)
+  [ $# = 2 ] || usage
+  check_tag "$2"
   ;;
 --highest)
   [ $# = 1 ] || usage

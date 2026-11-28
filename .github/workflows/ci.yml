@@ -63,6 +63,18 @@ jobs:
       docs: ${{ steps.classify.outputs.docs }}
       deps: ${{ steps.classify.outputs.deps }}
     steps:
+      # A tag that the release job would refuse fails here, in the first minute, rather than
+      # after every package is built. The package jobs wait for this job for that reason.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.ref_type == 'tag'
+        with:
+          sparse-checkout: scripts/release-latest.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Check the release tag
+        if: github.ref_type == 'tag'
+        run: bash scripts/release-latest.sh --check "$GITHUB_REF_NAME"
+
       - name: Classify the changed files
         id: classify
         env:
@@ -110,6 +122,7 @@ jobs:
           out "$code" "$docs" true
 
   windows:
+    needs: changes
     if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch')
     name: Windows ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
@@ -457,6 +470,7 @@ jobs:
           if-no-files-found: error
 
   appimage:
+    needs: changes
     if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
     name: Linux AppImage ${{ matrix.arch }}
     # AlmaLinux 8 has glibc 2.28, so the AppImage runs on RHEL 8, Ubuntu 20.04,
@@ -751,6 +765,7 @@ jobs:
           echo "OxideMerge was still running after 20 seconds"
 
   macos:
+    needs: changes
     if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch')
     name: macOS universal
     runs-on: macos-15
@@ -1064,6 +1079,7 @@ jobs:
           path: target/bench/results.md
 
   user-guide:
+    needs: changes
     if: ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.packages))
     name: User guide PDF
     runs-on: ubuntu-24.04
@@ -1232,11 +1248,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # gh with up to five attempts, 2, 4, 8 and 16 seconds apart.
+          # gh with up to five attempts, 2, 4, 8 and 16 seconds apart. Only the output of the
+          # attempt that succeeds is printed, so a failed one leaves nothing in the result.
           retry() {
-            local attempt
+            local attempt out
             for attempt in 1 2 3 4 5; do
-              if "$@"; then
+              if out=$("$@"); then
+                printf '%s\n' "$out"
                 return 0
               fi
               [ "$attempt" = 5 ] || sleep $((2 ** attempt))

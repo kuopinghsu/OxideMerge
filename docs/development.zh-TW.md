@@ -286,8 +286,15 @@ gh workflow run ci.yml --ref <branch>
   即 GitHub 標示為最新的版本；發行工作只會將版本號最高的正式版本標示為最新（`scripts/release-latest.sh`，
   其案例由 `scripts/release-latest.sh --test` 檢查），因此舊版本線的修補版不會讓使用者退回。
   發布後，每個發行工作都會再次將此標示設為版本號最高的正式版本，因此同時執行的兩個發行工作最後仍會得到正確結果；
-  這也會取代在 GitHub 上手動設定的標示。若該步驟重試後仍失敗，請手動設定：
-  `gh api -X PATCH repos/<owner>/<repo>/releases/$(gh api repos/<owner>/<repo>/releases/tags/<tag> --jq .id) -f make_latest=true`。版本號含 `-` 的預覽版本或未加標籤的建置則追蹤 `latest-all`，即最近發布的版本，
+  這也會取代在 GitHub 上手動設定的標示。若該步驟重試後仍失敗，請以儲存庫與版本號最高的正式版本標籤手動設定：
+
+  ```sh
+  repo=kuopinghsu/OxideMerge tag=v0.9.11
+  id=$(gh api "repos/$repo/releases/tags/$tag" --jq .id)
+  gh api -X PATCH "repos/$repo/releases/$id" -f make_latest=true
+  ```
+
+  版本號含 `-` 的預覽版本或未加標籤的建置則追蹤 `latest-all`，即最近發布的版本，
   不論正式或預覽：會更新到先發布的下一個預覽版本或正式版本，但在其後發布的舊版本線修補版也會成為更新目標。
   `scripts/package-appimage.sh` 使用 `GITHUB_REPOSITORY` 所指的儲存庫（CI 之外為
   `kuopinghsu/OxideMerge`），`UPDATE_INFORMATION` 可取代更新資訊，設為空字串則不內嵌。
@@ -384,7 +391,9 @@ SHA-1，PDF 必須完整。之後會將 `SHA256SUMS` 與套件一併發布。
 ### 發布規則
 
 - 推送 `v0.9.11` 這類標籤時，會將套件發布到 GitHub 的發行頁面。
-- 標籤必須與 `Cargo.toml` 中的版本一致。
+- 標籤必須與 `Cargo.toml` 中的版本一致，並由 `v` 與以點分隔的數字組成（例如 `v1.2.3`），
+  可再加上預先發行部分（例如 `-rc1`）。第一個持續整合工作會檢查這一點，因此 `v1.2.3+build1`
+  這類標籤會在建置任何套件之前失敗。
 - `CHANGELOG.md` 必須有該版本的段落。
 - 含有 `-` 的標籤（例如 `v1.0.0-rc1`）會發布為預先發行版本。
 
